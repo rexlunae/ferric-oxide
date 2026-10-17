@@ -23,10 +23,10 @@ struct Cli {
     /// Build system root (default: nearest directory with features.toml)
     #[arg(long, global = true)]
     root: Option<PathBuf>,
-    /// Feature catalog (default: <root>/features.toml)
+    /// Feature catalog (default: `<root>/features.toml`)
     #[arg(long, global = true)]
     schema: Option<PathBuf>,
-    /// Your configuration (default: <root>/ferric.toml)
+    /// Your configuration (default: `<root>/ferric.toml`)
     #[arg(long, global = true, env = "FERRIC_CONFIG")]
     config: Option<PathBuf>,
     /// Where generated files go, relative to the root
