@@ -6,6 +6,9 @@ pub struct PageTable<A> {
     base: VirtualAddress,
     phys: PhysicalAddress,
     level: usize,
+    // Ferric Oxide (KPTI): the page after this top-level table is a second table whose user half
+    // must stay identical to this one's, so writes to the user half go to both.
+    user_shadow: bool,
     phantom: PhantomData<A>,
 }
 
@@ -15,8 +18,20 @@ impl<A: Arch> PageTable<A> {
             base,
             phys,
             level,
+            user_shadow: false,
             phantom: PhantomData,
         }
+    }
+
+    /// Ferric Oxide (KPTI): marks a top-level table as followed by a shadow table whose user half
+    /// mirrors this one. Writes to entries in the user half then update both tables.
+    ///
+    /// # Safety
+    ///
+    /// The page right after this table must be a top-level table owned by the same address space.
+    pub(super) unsafe fn with_user_shadow(mut self, user_shadow: bool) -> Self {
+        self.user_shadow = user_shadow && self.level == A::PAGE_LEVELS - 1;
+        self
     }
 
     pub fn base(&self) -> VirtualAddress {
@@ -59,6 +74,9 @@ impl<A: Arch> PageTable<A> {
         unsafe {
             let addr = self.entry_virt(i)?;
             A::write::<usize>(addr, entry.data());
+            if self.user_shadow && i < A::PAGE_ENTRIES / 2 {
+                A::write::<usize>(addr.add(A::PAGE_SIZE), entry.data());
+            }
             Some(())
         }
     }

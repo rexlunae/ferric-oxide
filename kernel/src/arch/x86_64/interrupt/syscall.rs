@@ -6,11 +6,7 @@ use crate::{
     syscall::flag::{PTRACE_FLAG_IGNORE, PTRACE_STOP_POST_SYSCALL, PTRACE_STOP_PRE_SYSCALL},
 };
 use core::mem::offset_of;
-use x86::{
-    bits64::{rflags::RFlags, task::TaskStateSegment},
-    msr,
-    segmentation::SegmentSelector,
-};
+use x86::{bits64::rflags::RFlags, msr, segmentation::SegmentSelector};
 
 pub unsafe fn init() {
     unsafe {
@@ -98,6 +94,12 @@ pub unsafe extern "C" fn syscall_instruction() {
     // Yes, this is magic. No, you don't need to understand
     "swapgs;",                    // Swap KGSBASE with GSBASE, allowing fast TSS access.
     "mov gs:[{sp}], rsp;",        // Save userspace stack pointer
+    // Ferric Oxide (KPTI): load the kernel page table, using RSP as the scratch register.
+    kpti_alternative!("
+        mov rsp, cr3
+        btr rsp, 12
+        mov cr3, rsp
+    "),
     "mov rsp, gs:[{ksp}];",       // Load kernel stack pointer
     "push QWORD PTR {ss_sel};",   // Push fake userspace SS (resembling iret frame)
     "push QWORD PTR gs:[{sp}];",  // Push userspace rsp
@@ -122,6 +124,9 @@ pub unsafe extern "C" fn syscall_instruction() {
     // Pop context registers
     pop_preserved!(),
     pop_scratch!(),
+
+    // Ferric Oxide (KPTI): move the return frame to the entry stack and load the shadow table.
+    kpti_exit!("0"),
 
     // Restore user GSBASE by swapping GSBASE and KGSBASE.
     "swapgs;",
@@ -179,9 +184,11 @@ __syscall_instruction_end:
     ",
 
     sp = const(offset_of!(gdt::ProcessorControlRegion, user_rsp_tmp)),
-    ksp = const(offset_of!(gdt::ProcessorControlRegion, tss) + offset_of!(TaskStateSegment, rsp)),
+    ksp = const(offset_of!(gdt::ProcessorControlRegion, kernel_rsp)),
     ss_sel = const(SegmentSelector::new(gdt::GDT_USER_DATA as u16, x86::Ring::Ring3).bits()),
     cs_sel = const(SegmentSelector::new(gdt::GDT_USER_CODE as u16, x86::Ring::Ring3).bits()),
+    KPTI_SCRATCH = const(super::handler::KPTI_SCRATCH),
+    KPTI_ENTRY_TOP = const(super::handler::KPTI_ENTRY_TOP),
     );
 }
 unsafe extern "C" {
