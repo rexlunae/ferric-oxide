@@ -696,7 +696,17 @@ impl<D: Disk> Resource<D> for FileResource {
         let mut affected_fmaps = fmap_info.ranges.remove(offset..offset + size as u64);
 
         for (range, mut fmap) in affected_fmaps {
-            fmap.rc = fmap.rc.checked_sub(1).unwrap();
+            // Ferric Oxide: a process can make the kernel send funmap for a
+            // range that is no longer mapped (found by ferric-syscall-fuzz).
+            // Leave the count at zero rather than panicking the daemon.
+            match fmap.rc.checked_sub(1) {
+                Some(rc) => fmap.rc = rc,
+                None => log::warn!(
+                    "funmap of unmapped range {}..{} ignored",
+                    range.start,
+                    range.end
+                ),
+            }
 
             //log::info!("SYNCING {}..{}", range.start, range.end);
             unsafe {
