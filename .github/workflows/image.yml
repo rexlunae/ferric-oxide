@@ -215,6 +215,18 @@ jobs:
         # that the disk, network and AHCI drivers each DMA through a domain they bound.
         run: scripts/ferric-ci/check-iommu-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
 
+      # The tail of the serial log as annotations, readable through the check-run API when
+      # the log artifact cannot be fetched.
+      - name: Annotate the serial log on failure
+        if: failure()
+        run: |
+          tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tail -n 200 > "$RUNNER_TEMP/tail.log" || true
+          split -l 40 "$RUNNER_TEMP/tail.log" "$RUNNER_TEMP/tail."
+          for part in "$RUNNER_TEMP"/tail.a?; do
+            body="$(sed 's/%/%25/g' "$part" | sed ':a;N;$!ba;s/\n/%0A/g')"
+            echo "::notice title=serial log ($(basename "$part"))::$body"
+          done
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
