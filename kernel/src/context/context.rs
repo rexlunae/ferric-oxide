@@ -1,0 +1,1247 @@
+use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
+use arrayvec::ArrayString;
+use core::{
+    mem::{self, size_of, ManuallyDrop},
+    num::NonZeroUsize,
+    sync::atomic::{AtomicU32, Ordering},
+};
+use syscall::{SigProcControl, Sigcontrol, UPPER_FDTBL_TAG};
+
+use crate::{
+    arch::interrupt::InterruptStack,
+    common::aligned_box::AlignedBox,
+    context::{
+        self, arch,
+        file::{FileDescriptor, LockedFileDescription},
+    },
+    cpu_set::{LogicalCpuId, LogicalCpuSet},
+    cpu_stats,
+    memory::{
+        allocate_p2frame, deallocate_p2frame, Enomem, Frame, FrameAllocated, RaiiFrame, RmmA,
+        RmmArch, PAGE_SIZE,
+    },
+    percpu::PercpuBlock,
+    scheme::{CallerCtx, FileHandle, SchemeId},
+    sync::{CleanLockToken, LockToken, RwLock, L1, L3, L4, L5},
+    syscall::usercopy::UserSliceRw,
+};
+
+use crate::syscall::error::{Error, Result, EAGAIN, EBADF, EEXIST, EINVAL, EMFILE, ENOMEM, ESRCH};
+
+use super::{
+    empty_cr3,
+    memory::{AddrSpaceWrapper, GrantFileRef},
+    ContextQueueKey,
+};
+
+/// The status of a context - used for scheduling
+#[derive(Clone, Debug)]
+pub enum Status {
+    Runnable,
+
+    // TODO: Rename to SoftBlocked and move status_reason to this variant.
+    /// Not currently runnable, typically due to some blocking syscall, but it can be trivially
+    /// unblocked by e.g. signals.
+    Blocked,
+
+    /// Not currently runnable, and cannot be runnable until manually unblocked, depending on what
+    /// reason.
+    HardBlocked {
+        reason: HardBlockedReason,
+    },
+    Dead {
+        excp: Option<syscall::Exception>,
+    },
+}
+
+impl Status {
+    pub fn is_runnable(&self) -> bool {
+        matches!(self, Self::Runnable)
+    }
+    pub fn is_soft_blocked(&self) -> bool {
+        matches!(self, Self::Blocked)
+    }
+    pub fn is_dead(&self) -> bool {
+        matches!(self, Self::Dead { .. })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum HardBlockedReason {
+    /// "SIGSTOP", only procmgr is allowed to switch contexts this state
+    Stopped,
+    AwaitingMmap {
+        file_ref: GrantFileRef,
+    },
+    // TODO: PageFaultOom?
+    NotYetStarted,
+}
+
+pub const CONTEXT_NAME_CAPAC: usize = 32;
+
+#[derive(Debug)]
+pub enum SyscallFrame {
+    Free(RaiiFrame),
+    // The field is used by the consistency checker of the kernel debugger
+    Used { _frame: Frame },
+    Dummy,
+}
+
+/// A context, which is typically mapped to a userspace thread
+#[derive(Debug)]
+pub struct Context {
+    /// Internal ID used to distinguish between contexts.
+    ///
+    /// Userspace addresses contexts only through capabilities (file descriptors), except for
+    /// profiling interfaces and some statistics.
+    pub debug_id: u32,
+    /// Signal handler
+    pub sig: Option<SignalState>,
+    /// Status of context
+    pub status: Status,
+    pub status_reason: &'static str,
+    /// Whether the context is running, i.e. some hw-thread is using its stack, registers, address
+    /// space, etc.
+    ///
+    /// Formally, true iff there exists a hw-thread such that its percpu.current_ctxt is this context
+    pub running: bool,
+    /// Whether the context is currently-scheduled, i.e. has been assigned the current timeslice by
+    /// the scheduler of some hw-thread. This can differ from `running` if direct switching has
+    /// occurred.
+    ///
+    /// Same formal condition as `running` except for percpu.sched_ctxt
+    pub currently_scheduled: bool,
+    /// Current CPU ID.
+    // TODO: Define more rigorously the role of this field. Its meaning is obvious when `running`
+    // at least.
+    pub cpu_id: Option<LogicalCpuId>,
+    /// Time this context was scheduler-switched to (see `currently_scheduled`)
+    pub schedule_time: u128,
+    /// Time this context was context-switched to (see `running`)
+    // TODO: Is it mandatory to track the time of this? Unlike `schedule_time`, and unless the
+    // scheduler additionally were to use this information for decision-making, it's primarily a
+    // statistic where RDTSC does add some overhead.
+    pub switch_time: u128,
+    /// Amount of CPU time while being the current context (see `running`)
+    pub active_cpu_time: u128,
+    /// Amount of CPU time while being the sched context (see `currently_scheduled`)
+    pub sched_cpu_time: u128,
+    /// Scheduler CPU affinity. If set, [`cpu_id`] can except [`None`] never be anything outside
+    /// this set, and hence, this context can never run on CPUs outside it.
+    pub sched_affinity: LogicalCpuSet,
+    /// Keeps track of whether this context is currently handling a syscall. Only up-to-date when
+    /// not running, otherwise the status must be read from the percpu (which can not be accessed
+    /// by other hw-threads, unless frozen).
+    pub inside_syscall: bool,
+
+    #[cfg(feature = "syscall_debug")]
+    pub syscall_debug_info: crate::syscall::debug::SyscallDebugInfo,
+
+    /// Head buffer to use when system call buffers are not page aligned
+    // TODO: Store in user memory?
+    pub syscall_head: SyscallFrame,
+    /// Tail buffer to use when system call buffers are not page aligned
+    // TODO: Store in user memory?
+    pub syscall_tail: SyscallFrame,
+    /// Context should wake up at specified time
+    pub wake: Option<u128>,
+    /// The architecture specific context
+    pub arch: arch::Context,
+    /// Kernel FX - used to store SIMD and FPU registers on context switch
+    pub kfx: AlignedBox<[u8], { arch::KFX_ALIGN }>,
+    /// Kernel stack, if located on the heap.
+    pub kstack: Kstack,
+    /// Address space containing a page table lock, and grants. Normally this will have a value,
+    /// but can be None while the context is being reaped or when a new context is created but has
+    /// not yet had its address space changed. Note that these are only for user mappings; kernel
+    /// mappings are universal and independent on address spaces or contexts.
+    pub addr_space: Option<Arc<AddrSpaceWrapper>>,
+    /// The name of the context
+    pub name: ArrayString<CONTEXT_NAME_CAPAC>,
+    /// The open files in the scheme
+    pub files: Arc<LockedFdTbl>,
+    /// All contexts except kmain will primarily live in userspace, and enter the kernel only when
+    /// interrupts or syscalls occur. This flag is set for all contexts but kmain.
+    pub userspace: bool,
+    pub being_sigkilled: bool,
+    pub fmap_ret: Option<Frame>,
+    /// Priority
+    pub prio: usize,
+    /// Virtual Run Time
+    pub vtime: u64,
+    /// Virtual Deadline
+    pub vd: u64,
+    /// Remaining Slice of allocated time
+    pub rem_slice: u64,
+    /// Is currently active?
+    pub is_active: bool,
+    /// Key for the RunQueue.
+    ///
+    /// This will be set to the corresponding key iff a hw-thread contains this context in its
+    /// `run_queue`.
+    // TODO: what guarantees are there that contexts are not in multiple hw-threads' run_queues?
+    pub queue_key: Option<ContextQueueKey>,
+
+    // TODO: id can reappear after wraparound?
+    pub owner_proc_id: Option<NonZeroUsize>,
+
+    // TODO: Temporary replacement for existing kernel logic, replace with capabilities!
+    pub euid: u32,
+    pub egid: u32,
+    pub pid: usize,
+
+    // See [`PreemptGuard`]
+    //
+    // When > 0, preemption is disabled.
+    // TODO: This is (and has always been) unnecessary since interrupts are disabled everywhere in
+    // the kernel except kmain. It was added to fix a userspace hang, and should be removed once a
+    // proper fix is found.
+    pub(super) preempt_locks: usize,
+}
+
+#[derive(Debug)]
+pub struct SignalState {
+    /// Offset to jump to when a signal is received.
+    pub user_handler: NonZeroUsize,
+    /// Offset to jump to when a program fault occurs. If None, the context is sigkilled.
+    pub excp_handler: Option<NonZeroUsize>,
+
+    /// Signal control pages, shared memory
+    pub thread_control: RaiiFrame,
+    pub proc_control: RaiiFrame,
+    /// Offset within the control pages of respective word-aligned structs.
+    pub threadctl_off: u16,
+    pub procctl_off: u16,
+}
+
+impl Context {
+    pub fn new(owner_proc_id: Option<NonZeroUsize>, kstack: Kstack) -> Result<Context> {
+        static DEBUG_ID: AtomicU32 = AtomicU32::new(1);
+        let this = Self {
+            debug_id: DEBUG_ID.fetch_add(1, Ordering::Relaxed),
+            sig: None,
+            status: Status::HardBlocked {
+                reason: HardBlockedReason::NotYetStarted,
+            },
+            status_reason: "",
+            running: false,
+            currently_scheduled: false,
+            cpu_id: None,
+            schedule_time: 0,
+            switch_time: 0,
+            active_cpu_time: 0,
+            sched_cpu_time: 0,
+            sched_affinity: LogicalCpuSet::all(),
+            inside_syscall: false,
+            syscall_head: SyscallFrame::Free(RaiiFrame::allocate()?),
+            syscall_tail: SyscallFrame::Free(RaiiFrame::allocate()?),
+            wake: None,
+            arch: arch::Context::new(),
+            kfx: AlignedBox::<[u8], { arch::KFX_ALIGN }>::try_zeroed_slice(crate::arch::kfx_size())?,
+            kstack,
+            addr_space: None,
+            name: ArrayString::new(),
+            files: Arc::new(RwLock::new(FdTbl::new())),
+            userspace: false,
+            fmap_ret: None,
+            prio: 20,
+            vtime: 0,
+            vd: 0,
+            rem_slice: 0,
+            is_active: false,
+            queue_key: None,
+            being_sigkilled: false,
+            owner_proc_id,
+
+            euid: 0,
+            egid: 0,
+            pid: 0,
+
+            #[cfg(feature = "syscall_debug")]
+            syscall_debug_info: crate::syscall::debug::SyscallDebugInfo::default(),
+
+            preempt_locks: 0,
+        };
+        cpu_stats::add_context();
+        Ok(this)
+    }
+
+    pub fn is_preemptable(&self) -> bool {
+        self.preempt_locks == 0
+    }
+
+    /// Block the context, and return true if it was runnable before being blocked
+    pub fn block(&mut self, reason: &'static str) -> bool {
+        if self.status.is_runnable() {
+            self.status = Status::Blocked;
+            self.status_reason = reason;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn hard_block(&mut self, reason: HardBlockedReason) -> bool {
+        if self.status.is_runnable() {
+            self.status = Status::HardBlocked { reason };
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unblock context without IPI, and return true if it was blocked before being marked runnable
+    pub fn unblock_no_ipi(&mut self) -> bool {
+        if self.status.is_soft_blocked() {
+            self.status = Status::Runnable;
+            self.status_reason = "";
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bulk-insert multiple files
+    pub fn bulk_insert_files(
+        &self,
+        files_to_insert: Vec<FileDescriptor>,
+        handles: &[FileHandle],
+        lock_token: &mut LockToken<L4>,
+    ) -> Result<()> {
+        self.files
+            .write(lock_token.token())
+            .bulk_insert_files(files_to_insert, handles)
+    }
+
+    /// Get a file
+    pub fn get_file(
+        &self,
+        i: FileHandle,
+        lock_token: &mut LockToken<L4>,
+    ) -> Option<FileDescriptor> {
+        self.files.read(lock_token.token()).get_file(i).cloned()
+    }
+
+    /// Bulk get files
+    pub fn bulk_get_files(
+        &self,
+        handles: &[FileHandle],
+        lock_token: &mut LockToken<L4>,
+    ) -> Result<Vec<FileDescriptor>> {
+        self.files
+            .read(lock_token.token())
+            .bulk_get_files(handles)
+            .map(|files| files.into_iter().cloned().collect())
+    }
+
+    /// Insert a file with a specific handle number. This is used by dup2
+    /// Return the file descriptor number or None if the slot was not empty, or i was invalid
+    pub fn insert_file(
+        &self,
+        i: FileHandle,
+        file: FileDescriptor,
+        lock_token: &mut LockToken<L4>,
+    ) -> Option<FileHandle> {
+        self.files.write(lock_token.token()).insert_file(i, file)
+    }
+
+    /// Remove a file
+    // TODO: adjust files vector to smaller size if possible
+    pub fn remove_file(
+        &self,
+        i: FileHandle,
+        lock_token: &mut LockToken<L4>,
+    ) -> Option<FileDescriptor> {
+        self.files.write(lock_token.token()).remove_file(i)
+    }
+
+    /// Bulk remove files
+    pub fn bulk_remove_files(
+        &self,
+        handles: &[FileHandle],
+        lock_token: &mut LockToken<L4>,
+    ) -> Result<Vec<FileDescriptor>> {
+        self.files
+            .write(lock_token.token())
+            .bulk_remove_files(handles)
+    }
+
+    pub fn is_current_context(&self) -> bool {
+        self.running && self.cpu_id == Some(crate::cpu_id())
+    }
+
+    pub fn addr_space(&self) -> Result<&Arc<AddrSpaceWrapper>> {
+        self.addr_space.as_ref().ok_or(Error::new(ESRCH))
+    }
+    pub fn set_addr_space(
+        &mut self,
+        addr_space: Option<Arc<AddrSpaceWrapper>>,
+        token: LockToken<L4>,
+    ) -> Option<Arc<AddrSpaceWrapper>> {
+        if let (Some(old), Some(new)) = (&self.addr_space, &addr_space)
+            && Arc::ptr_eq(old, new)
+        {
+            return addr_space;
+        };
+
+        if self.is_current_context() {
+            // TODO: Share more code with context::arch::switch_to.
+            let this_percpu = PercpuBlock::current();
+
+            if let Some(ref prev_addrsp) = self.addr_space {
+                assert!(Arc::ptr_eq(
+                    this_percpu.current_addrsp.borrow().as_ref().unwrap(),
+                    prev_addrsp
+                ));
+
+                // See [`crate::percpu::switch_arch_hook`].
+                prev_addrsp.used_by.atomic_clear(this_percpu.cpu_id);
+
+                core::sync::atomic::fence(Ordering::SeqCst);
+                this_percpu.maybe_handle_tlb_shootdown();
+            }
+
+            let _old_addrsp = mem::replace(
+                &mut *this_percpu.current_addrsp.borrow_mut(),
+                addr_space.clone(),
+            );
+
+            match addr_space {
+                Some(ref new) => {
+                    new.used_by.atomic_set(this_percpu.cpu_id);
+                    let new_addrsp = new.acquire_read(token);
+                    unsafe {
+                        new_addrsp.table.utable.make_current();
+                    }
+                }
+                _ => unsafe {
+                    crate::memory::RmmA::set_table(rmm::TableKind::User, empty_cr3());
+                },
+            }
+        } else {
+            assert!(!self.running);
+        }
+
+        core::mem::replace(&mut self.addr_space, addr_space)
+    }
+
+    fn can_access_regs(&self) -> bool {
+        self.userspace
+    }
+
+    pub fn regs(&self) -> Option<&InterruptStack> {
+        if !self.can_access_regs() {
+            return None;
+        }
+        Some(unsafe {
+            &*self
+                .kstack
+                .initial_top()
+                .sub(size_of::<InterruptStack>())
+                .cast()
+        })
+    }
+    pub fn regs_mut(&mut self) -> Option<&mut InterruptStack> {
+        if !self.can_access_regs() {
+            return None;
+        }
+        Some(unsafe {
+            &mut *self
+                .kstack
+                .initial_top()
+                .sub(size_of::<InterruptStack>())
+                .cast()
+        })
+    }
+    pub fn sigcontrol(&self) -> Option<(&Sigcontrol, &SigProcControl, &SignalState)> {
+        let (for_thread, for_proc) = Self::sigcontrol_raw(self.sig.as_ref()?);
+        Some((for_thread, for_proc, self.sig.as_ref()?))
+    }
+    pub fn sigcontrol_raw(sig: &SignalState) -> (&Sigcontrol, &SigProcControl) {
+        let check = |off| {
+            assert_eq!(usize::from(off) % align_of::<usize>(), 0);
+            assert!(usize::from(off).saturating_add(size_of::<Sigcontrol>()) < PAGE_SIZE);
+        };
+        check(sig.procctl_off);
+        check(sig.threadctl_off);
+
+        let for_thread = unsafe {
+            &*(RmmA::phys_to_virt(sig.thread_control.get().base()).data() as *const Sigcontrol)
+                .byte_add(usize::from(sig.threadctl_off))
+        };
+        let for_proc = unsafe {
+            &*(RmmA::phys_to_virt(sig.proc_control.get().base()).data() as *const SigProcControl)
+                .byte_add(usize::from(sig.procctl_off))
+        };
+
+        (for_thread, for_proc)
+    }
+    pub fn caller_ctx(&self) -> CallerCtx {
+        CallerCtx {
+            uid: self.euid,
+            gid: self.egid,
+            pid: self.pid,
+        }
+    }
+}
+
+/// Wrapper struct for borrowing the syscall head or tail buf.
+#[derive(Debug)]
+pub struct BorrowedHtBuf {
+    inner: Option<RaiiFrame>,
+    head_and_not_tail: bool,
+}
+impl BorrowedHtBuf {
+    pub fn head_locked(token: LockToken<L3>) -> Result<Self> {
+        let current = context::current();
+        let frame = &mut current.write(token).syscall_head;
+        match mem::replace(frame, SyscallFrame::Dummy) {
+            SyscallFrame::Free(free_frame) => {
+                *frame = SyscallFrame::Used {
+                    _frame: free_frame.get(),
+                };
+                Ok(Self {
+                    inner: Some(free_frame),
+                    head_and_not_tail: true,
+                })
+            }
+            SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
+        }
+    }
+    pub fn tail_locked(token: LockToken<L3>) -> Result<Self> {
+        let current = context::current();
+        let frame = &mut current.write(token).syscall_tail;
+        match mem::replace(frame, SyscallFrame::Dummy) {
+            SyscallFrame::Free(free_frame) => {
+                *frame = SyscallFrame::Used {
+                    _frame: free_frame.get(),
+                };
+                Ok(Self {
+                    inner: Some(free_frame),
+                    head_and_not_tail: false,
+                })
+            }
+            SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
+        }
+    }
+    pub fn buf(&self) -> &[u8; PAGE_SIZE] {
+        unsafe {
+            &*(RmmA::phys_to_virt(self.inner.as_ref().expect("must succeed").get().base()).data()
+                as *const [u8; PAGE_SIZE])
+        }
+    }
+    pub fn buf_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        unsafe {
+            &mut *(RmmA::phys_to_virt(self.inner.as_mut().expect("must succeed").get().base())
+                .data() as *mut [u8; PAGE_SIZE])
+        }
+    }
+    pub fn frame(&self) -> Frame {
+        self.inner.as_ref().expect("must succeed").get()
+    }
+    /*
+    pub fn use_for_slice(&mut self, raw: UserSlice) -> Result<Option<&[u8]>> {
+        if raw.len() > self.buf().len() {
+            return Ok(None);
+        }
+        raw.copy_to_slice(&mut self.buf_mut()[..raw.len()])?;
+        Ok(Some(&self.buf()[..raw.len()]))
+    }
+    pub fn use_for_string(&mut self, raw: UserSlice) -> Result<&str> {
+        let slice = self.use_for_slice(raw)?.ok_or(Error::new(ENAMETOOLONG))?;
+        core::str::from_utf8(slice).map_err(|_| Error::new(EINVAL))
+    }
+    pub unsafe fn use_for_struct<T>(&mut self) -> Result<&mut T> {
+        if size_of::<T>() > PAGE_SIZE || align_of::<T>() > PAGE_SIZE {
+            return Err(Error::new(EINVAL));
+        }
+        self.buf_mut().fill(0_u8);
+        Ok(unsafe { &mut *self.buf_mut().as_mut_ptr().cast() })
+    }
+    */
+
+    pub fn into_drop(self, token: &mut CleanLockToken) {
+        let mut this = ManuallyDrop::new(self);
+        this.inner_drop(token);
+        // this.inner is already dropped
+    }
+
+    fn inner_drop(&mut self, token: &mut CleanLockToken) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let context = context::current();
+        let mut context = context.write(token.token());
+        {
+            *(if self.head_and_not_tail {
+                &mut context.syscall_head
+            } else {
+                &mut context.syscall_tail
+            }) = SyscallFrame::Free(inner);
+        }
+    }
+}
+
+impl Drop for BorrowedHtBuf {
+    fn drop(&mut self) {
+        let mut token = unsafe { CleanLockToken::new() };
+        self.inner_drop(&mut token);
+        #[cfg(feature = "drop_panic")]
+        {
+            panic!("BorrowedHtBuf dropped");
+        }
+    }
+}
+
+pub struct Kstack {
+    /// naturally aligned, order 4
+    base: Frame,
+}
+impl Kstack {
+    pub fn new() -> Result<Self, Enomem> {
+        let must_be_zero = true;
+        Ok(Self {
+            base: allocate_p2frame(4, must_be_zero).ok_or(Enomem)?,
+        })
+    }
+    pub fn initial_top(&self) -> *mut u8 {
+        unsafe { (RmmA::phys_to_virt(self.base.base()).data() as *mut u8).add(PAGE_SIZE << 4) }
+    }
+    pub fn initial_top_phys(&self) -> usize {
+        self.base.base().data() + self.len()
+    }
+    pub fn len(&self) -> usize {
+        PAGE_SIZE << 4
+    }
+}
+
+impl Drop for Kstack {
+    fn drop(&mut self) {
+        let range = self.initial_top().wrapping_sub(self.len())..self.initial_top();
+        assert!(
+            !range.contains(&crate::arch::current_stack_ptr()),
+            "trying to deallocate a currently running kstack!"
+        );
+
+        unsafe { deallocate_p2frame(self.base, 4) }
+    }
+}
+impl core::fmt::Debug for Kstack {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "[kstack at {:?}]", self.base)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FdTbl {
+    pub lower_fdtbl: RadixFdTbl,
+    pub upper_fdtbl: RadixFdTbl,
+    active_count: usize,
+}
+
+pub type LockedFdTbl = RwLock<L5, FdTbl>;
+
+impl FdTbl {
+    pub fn new() -> Self {
+        Self {
+            lower_fdtbl: RadixFdTbl::new(),
+            upper_fdtbl: RadixFdTbl::new(),
+            active_count: 0,
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            lower_fdtbl: self.lower_fdtbl.try_clone()?,
+            upper_fdtbl: self.upper_fdtbl.try_clone()?,
+            active_count: self.active_count,
+        })
+    }
+
+    pub fn resize(&mut self, which: usize, size: usize) -> Result<()> {
+        let (fdtbl, _) = self.select_fdtbl_mut(which);
+        if super::CONTEXT_MAX_FILES < size {
+            return Err(Error::new(EMFILE));
+        }
+
+        fdtbl.resize(size)
+    }
+
+    fn strip_tags(index: usize) -> usize {
+        index & !UPPER_FDTBL_TAG
+    }
+
+    fn select_fdtbl(&self, index: usize) -> (&RadixFdTbl, usize) {
+        if index & UPPER_FDTBL_TAG == 0 {
+            (&self.lower_fdtbl, index)
+        } else {
+            (&self.upper_fdtbl, Self::strip_tags(index))
+        }
+    }
+
+    fn select_fdtbl_mut(&mut self, index: usize) -> (&mut RadixFdTbl, usize) {
+        if index & UPPER_FDTBL_TAG == 0 {
+            (&mut self.lower_fdtbl, index)
+        } else {
+            (&mut self.upper_fdtbl, Self::strip_tags(index))
+        }
+    }
+
+    fn validate_handles(&self, handles: &[FileHandle]) -> Result<()> {
+        let mut checked_handles = BTreeSet::new();
+        for i in handles {
+            let index = i.get();
+            if Self::strip_tags(index) >= super::CONTEXT_MAX_FILES {
+                return Err(Error::new(EMFILE));
+            }
+            if !checked_handles.insert(index) {
+                return Err(Error::new(EBADF)); // Duplicate handle
+            }
+            if !self.is_occupied(index) {
+                return Err(Error::new(EBADF));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_free_slots(&self, handles: &[FileHandle]) -> Result<()> {
+        let mut checked_slots = BTreeSet::new();
+        for i in handles {
+            let index = i.get();
+            if Self::strip_tags(index) >= super::CONTEXT_MAX_FILES {
+                return Err(Error::new(EMFILE));
+            }
+            if !checked_slots.insert(index) {
+                return Err(Error::new(EINVAL)); // Duplicate slots
+            }
+            if self.is_occupied(index) {
+                return Err(Error::new(EEXIST));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_file(&mut self, i: FileHandle, file: FileDescriptor) -> Option<FileHandle> {
+        let index = i.get();
+        let is_occupied = self.is_occupied(index);
+
+        if !is_occupied && self.active_count >= super::CONTEXT_MAX_FILES {
+            return None;
+        }
+
+        let (fdtbl, real_index) = self.select_fdtbl_mut(index);
+        let old = fdtbl.insert(real_index, file)?;
+
+        if old.is_none() {
+            self.active_count += 1;
+        }
+
+        Some(i)
+    }
+
+    fn bulk_insert_files(
+        &mut self,
+        files_to_insert: Vec<FileDescriptor>,
+        handles: &[FileHandle],
+    ) -> Result<()> {
+        if handles.len() != files_to_insert.len() {
+            return Err(Error::new(EINVAL));
+        }
+        let count = files_to_insert.len();
+        if count == 0 {
+            return Ok(());
+        }
+        if self.active_count + count > super::CONTEXT_MAX_FILES {
+            return Err(Error::new(EMFILE));
+        }
+        self.validate_free_slots(handles)?;
+
+        for (file, &handle) in files_to_insert.into_iter().zip(handles) {
+            self.insert_file(handle, file).ok_or(Error::new(EMFILE))?;
+        }
+        Ok(())
+    }
+
+    pub fn is_occupied(&self, index: usize) -> bool {
+        let (fdtbl, real_index) = self.select_fdtbl(index);
+        fdtbl.is_occupied(real_index)
+    }
+
+    pub fn get_file(&self, i: FileHandle) -> Option<&FileDescriptor> {
+        let (fdtbl, real_index) = self.select_fdtbl(i.get());
+        fdtbl.get(real_index)
+    }
+
+    pub fn get_file_mut(&mut self, i: FileHandle) -> Option<&mut FileDescriptor> {
+        let (fdtbl, real_index) = self.select_fdtbl_mut(i.get());
+        fdtbl.get_mut(real_index)
+    }
+
+    fn bulk_get_files(&self, handles: &[FileHandle]) -> Result<Vec<&FileDescriptor>> {
+        // Validate that all handles are valid before proceeding to avoid partial results.
+        self.validate_handles(handles)?;
+
+        let files = handles
+            .iter()
+            .map(|&i| self.get_file(i).expect("File should exist"))
+            .collect();
+
+        Ok(files)
+    }
+
+    /// Find a file descriptor by scheme id and number.
+    // TODO: This method is bad, but since it's only used by UserScheme's fmap, it should be
+    // relatively easy to modify kfmap to also take the file description as an additional argument.
+    pub fn find_by_scheme(
+        &self,
+        scheme_id: SchemeId,
+        scheme_number: usize,
+        token: &mut LockToken<L5>,
+    ) -> Result<FileDescriptor> {
+        let mut found = None;
+        self.for_each(|fd_opt| {
+            if found.is_some() {
+                return;
+            }
+            let Some(context_fd) = fd_opt else {
+                return;
+            };
+            let desc = context_fd.description.read(token.token());
+            // TODO: possibly quite slow
+            if let Ok(s) = desc.scheme_ref.upgrade()
+                && s.scheme_id() == scheme_id
+                && desc.number == scheme_number
+            {
+                found = Some(context_fd.clone());
+            }
+        });
+        found.ok_or(Error::new(EBADF))
+    }
+
+    pub fn remove_file(&mut self, i: FileHandle) -> Option<FileDescriptor> {
+        let index = i.get();
+        let (fdtbl, real_index) = self.select_fdtbl_mut(index);
+
+        let removed_file_opt = fdtbl.remove(real_index);
+        if removed_file_opt.is_some() {
+            self.active_count -= 1;
+        }
+
+        removed_file_opt
+    }
+
+    pub fn bulk_remove_files(&mut self, handles: &[FileHandle]) -> Result<Vec<FileDescriptor>> {
+        // Validate that all handles are valid before proceeding to avoid partial results.
+        self.validate_handles(handles)?;
+
+        let files = handles
+            .iter()
+            .map(|&i| self.remove_file(i).expect("File should exist"))
+            .collect();
+
+        Ok(files)
+    }
+
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&Option<FileDescriptor>),
+    {
+        self.lower_fdtbl.for_each(&mut f);
+        self.upper_fdtbl.for_each(&mut f);
+    }
+
+    pub fn for_each_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Option<FileDescriptor>),
+    {
+        self.lower_fdtbl.for_each_mut(&mut f);
+        self.upper_fdtbl.for_each_mut(&mut f);
+    }
+
+    pub fn force_close_all(&mut self, token: &mut CleanLockToken) {
+        self.for_each_mut(|file_opt| {
+            if let Some(file) = file_opt.take() {
+                let _ = file.close(token);
+            }
+        });
+        self.active_count = 0;
+    }
+}
+
+impl FdTbl {
+    pub fn enumerate_fds(&self) -> impl Iterator<Item = (usize, &FileDescriptor)> {
+        self.lower_fdtbl.enumerate_fds().chain(
+            self.upper_fdtbl
+                .enumerate_fds()
+                .map(|(i, fd)| (i | UPPER_FDTBL_TAG, fd)),
+        )
+    }
+}
+
+pub fn bulk_insert_fds(
+    descriptions: Vec<Arc<LockedFileDescription>>,
+    payload: UserSliceRw,
+    token: &mut LockToken<L1>,
+) -> Result<usize> {
+    let cnt = descriptions.len();
+    if payload.len() != cnt * size_of::<usize>() {
+        return Err(Error::new(EINVAL));
+    }
+    if descriptions.is_empty() {
+        return Ok(0);
+    }
+    let files_iter = descriptions
+        .into_iter()
+        .map(|description| FileDescriptor { description });
+    let current_lock = context::current();
+    let mut current = current_lock.read(token.token());
+    let (current, mut token) = current.token_split();
+
+    let handles: Vec<FileHandle> = payload
+        .usizes()
+        .map(|res| res.map(FileHandle::from))
+        .collect::<Result<_, _>>()?;
+    let files = files_iter.collect::<Vec<_>>();
+    current.bulk_insert_files(files, &handles, &mut token)?;
+    Ok(handles.len())
+}
+
+#[cfg(target_pointer_width = "64")]
+pub const NODE_BITS: usize = 9; // 512 entries
+
+#[cfg(target_pointer_width = "32")]
+pub const NODE_BITS: usize = 10; // 1024 entries
+
+pub const NODE_SIZE: usize = 1 << NODE_BITS;
+pub const NODE_MASK: usize = NODE_SIZE - 1;
+
+#[derive(Debug)]
+pub enum Node {
+    Leaf([Option<FileDescriptor>; NODE_SIZE]),
+    Branch([Option<FrameAllocated<Node>>; NODE_SIZE]),
+}
+
+impl Node {
+    pub const fn empty_leaf() -> Self {
+        Self::Leaf([const { None }; NODE_SIZE])
+    }
+
+    pub const fn empty_branch() -> Self {
+        Self::Branch([const { None }; NODE_SIZE])
+    }
+
+    pub fn get(&self, handle: usize, shift: usize) -> Option<&Option<FileDescriptor>> {
+        let index = (handle >> shift) & NODE_MASK;
+        match self {
+            Self::Leaf(slots) => slots.get(index),
+            Self::Branch(children) => {
+                let child = children.get(index)?.as_deref()?;
+                child.get(handle, shift.checked_sub(NODE_BITS)?)
+            }
+        }
+    }
+
+    pub fn get_mut(&mut self, handle: usize, shift: usize) -> Option<&mut Option<FileDescriptor>> {
+        let index = (handle >> shift) & NODE_MASK;
+        match self {
+            Self::Leaf(slots) => slots.get_mut(index),
+            Self::Branch(children) => {
+                let child = children.get_mut(index)?.as_deref_mut()?;
+                child.get_mut(handle, shift.checked_sub(NODE_BITS)?)
+            }
+        }
+    }
+
+    pub fn ensure_path(&mut self, max_index: usize, shift: usize) -> Result<()> {
+        let max_idx = (max_index >> shift) & NODE_MASK;
+        let next_shift = shift.saturating_sub(NODE_BITS);
+
+        if let Self::Branch(children) = self {
+            for child in children.iter_mut() {
+                let child = match child {
+                    Some(child) => child,
+                    slot @ None => {
+                        let child = FrameAllocated::try_new(if next_shift == 0 {
+                            Node::empty_leaf()
+                        } else {
+                            Node::empty_branch()
+                        })
+                        .ok_or(Error::new(ENOMEM))?;
+                        slot.insert(child)
+                    }
+                };
+                if next_shift > 0 {
+                    let sub_max = (1 << shift) - 1;
+                    child.ensure_path(sub_max, next_shift)?;
+                }
+            }
+
+            let child = match &mut children[max_idx] {
+                Some(child) => child,
+                slot @ None => {
+                    let child = FrameAllocated::try_new(if next_shift == 0 {
+                        Node::empty_leaf()
+                    } else {
+                        Node::empty_branch()
+                    })
+                    .ok_or(Error::new(ENOMEM))?;
+                    slot.insert(child)
+                }
+            };
+            if next_shift > 0 {
+                child.ensure_path(max_index, next_shift)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn for_each<F>(&self, f: &mut F)
+    where
+        F: FnMut(&Option<FileDescriptor>),
+    {
+        match self {
+            Self::Leaf(slots) => {
+                for slot in slots.iter() {
+                    f(slot);
+                }
+            }
+            Self::Branch(children) => {
+                for child in children.iter().flatten() {
+                    child.for_each(f);
+                }
+            }
+        }
+    }
+
+    pub fn for_each_mut<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(&mut Option<FileDescriptor>),
+    {
+        match self {
+            Self::Leaf(slots) => {
+                for slot in slots.iter_mut() {
+                    f(slot);
+                }
+            }
+            Self::Branch(children) => {
+                for child in children.iter_mut().flatten() {
+                    child.for_each_mut(f);
+                }
+            }
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Leaf(fds) => Ok(Self::Leaf(core::array::from_fn(|i| fds[i].clone()))),
+            Self::Branch(nodes) => {
+                let mut new_nodes = [const { None }; NODE_SIZE];
+                for (i, node_opt) in nodes.iter().enumerate() {
+                    if let Some(node) = node_opt {
+                        new_nodes[i] = Some(
+                            FrameAllocated::try_new(node.try_clone()?).ok_or(Error::new(ENOMEM))?,
+                        );
+                    }
+                }
+                Ok(Self::Branch(new_nodes))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RadixFdTbl {
+    root: Option<FrameAllocated<Node>>,
+    levels: usize,
+    allocated_size: usize,
+}
+
+impl Default for RadixFdTbl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RadixFdTbl {
+    pub const fn new() -> Self {
+        Self {
+            root: None,
+            levels: 0,
+            allocated_size: 0,
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            root: match &self.root {
+                None => None,
+                Some(root) => {
+                    Some(FrameAllocated::try_new(root.try_clone()?).ok_or(Error::new(ENOMEM))?)
+                }
+            },
+            levels: self.levels,
+            allocated_size: self.allocated_size,
+        })
+    }
+
+    #[inline]
+    fn root_shift(&self) -> usize {
+        self.levels.saturating_sub(1) * NODE_BITS
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        if self.levels == 0 {
+            0
+        } else {
+            1 << (self.levels * NODE_BITS)
+        }
+    }
+
+    #[inline]
+    pub fn allocated_size(&self) -> usize {
+        self.allocated_size
+    }
+
+    pub fn get(&self, handle: usize) -> Option<&FileDescriptor> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        self.root
+            .as_deref()?
+            .get(handle, self.root_shift())?
+            .as_ref()
+    }
+
+    pub fn get_mut(&mut self, handle: usize) -> Option<&mut FileDescriptor> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        let shift = self.root_shift();
+        self.root.as_deref_mut()?.get_mut(handle, shift)?.as_mut()
+    }
+
+    pub fn get_slot(&self, handle: usize) -> Option<&Option<FileDescriptor>> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        self.root.as_deref()?.get(handle, self.root_shift())
+    }
+
+    pub fn get_slot_mut(&mut self, handle: usize) -> Option<&mut Option<FileDescriptor>> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        let shift = self.root_shift();
+        self.root.as_deref_mut()?.get_mut(handle, shift)
+    }
+
+    #[inline]
+    pub fn is_occupied(&self, handle: usize) -> bool {
+        self.get(handle).is_some()
+    }
+
+    pub fn insert(&mut self, handle: usize, fd: FileDescriptor) -> Option<Option<FileDescriptor>> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        let shift = self.root_shift();
+        self.root
+            .as_deref_mut()?
+            .get_mut(handle, shift)
+            .map(|slot| slot.replace(fd))
+    }
+
+    pub fn remove(&mut self, handle: usize) -> Option<FileDescriptor> {
+        if handle >= self.allocated_size {
+            return None;
+        }
+        let shift = self.root_shift();
+        self.root.as_deref_mut()?.get_mut(handle, shift)?.take()
+    }
+
+    pub fn resize(&mut self, size: usize) -> Result<()> {
+        if size < self.allocated_size {
+            return Err(Error::new(EINVAL));
+        }
+        let max_index = size - 1;
+
+        if self.root.is_none() {
+            self.root =
+                Some(FrameAllocated::try_new(Node::empty_leaf()).ok_or(Error::new(ENOMEM))?);
+            self.levels = 1;
+        }
+
+        while max_index >= self.capacity() {
+            let old_root = self.root.take().unwrap();
+            let mut new_branch = Node::empty_branch();
+            if let Node::Branch(ref mut children) = new_branch {
+                children[0] = Some(old_root);
+            }
+            self.root = Some(FrameAllocated::try_new(new_branch).ok_or(Error::new(ENOMEM))?);
+            self.levels += 1;
+        }
+
+        let shift = self.root_shift();
+        if let Some(ref mut root) = self.root
+            && self.levels > 1
+        {
+            root.ensure_path(max_index, shift)?;
+        }
+
+        self.allocated_size = size;
+        Ok(())
+    }
+
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&Option<FileDescriptor>),
+    {
+        if let Some(ref root) = self.root {
+            root.for_each(&mut f);
+        }
+    }
+
+    pub fn for_each_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Option<FileDescriptor>),
+    {
+        if let Some(ref mut root) = self.root {
+            root.for_each_mut(&mut f);
+        }
+    }
+
+    #[inline]
+    pub fn enumerate_fds(&self) -> RadixFdTblEnumerateFds<'_> {
+        RadixFdTblEnumerateFds {
+            tbl: self,
+            cur: 0,
+            max: self.allocated_size,
+        }
+    }
+}
+
+pub struct RadixFdTblEnumerateFds<'a> {
+    tbl: &'a RadixFdTbl,
+    cur: usize,
+    max: usize,
+}
+
+impl<'a> Iterator for RadixFdTblEnumerateFds<'a> {
+    type Item = (usize, &'a FileDescriptor);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.cur < self.max {
+            let handle = self.cur;
+            self.cur += 1;
+            if let Some(fd) = self.tbl.get(handle) {
+                return Some((handle, fd));
+            }
+        }
+        None
+    }
+}
