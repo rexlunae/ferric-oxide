@@ -1,10 +1,13 @@
 ENTRY(kstart)
 OUTPUT_FORMAT(elf64-x86-64)
 
-KERNEL_OFFSET = 0xFFFFFFFF80000000;
+/* Ferric Oxide: the link address. KERNEL_OFFSET, which the kernel reads, is
+ * defined in .dummy below relative to the image, so it stays right when the
+ * bootloader moves the image (kernel image KASLR). */
+KERNEL_LINK_BASE = 0xFFFFFFFF80000000;
 
 SECTIONS {
-    . = KERNEL_OFFSET;
+    . = KERNEL_LINK_BASE;
 
     . += SIZEOF_HEADERS;
 
@@ -18,14 +21,16 @@ SECTIONS {
      * this would result in a crash. A similar issue likely exists
      * with multiboot/multiboot2 and the paddr of the segment.
      */
-    .dummy : AT(ADDR(.dummy) - KERNEL_OFFSET) {}
+    .dummy : AT(ADDR(.dummy) - KERNEL_LINK_BASE) {
+        KERNEL_OFFSET = . - SIZEOF_HEADERS;
+    }
 
-    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_OFFSET) {
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_LINK_BASE) {
         __text_start = .;
         *(.text*)
     }
 
-    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_OFFSET) {
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_LINK_BASE) {
         __text_end = .;
         __rodata_start = .;
         *(.rodata*)
@@ -41,7 +46,7 @@ SECTIONS {
         __altfeatures_end = .;
     }
 
-    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_OFFSET) {
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_LINK_BASE) {
         __rodata_end = .;
         *(.data*)
         . = ALIGN(4K);

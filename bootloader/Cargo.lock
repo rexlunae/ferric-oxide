@@ -144,6 +144,14 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
 
 [[package]]
+name = "ferric-elfreloc"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-hwrand"
+version = "0.1.0"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -222,6 +230,8 @@ dependencies = [
  "byteorder",
  "dmidecode",
  "fdt",
+ "ferric-elfreloc",
+ "ferric-hwrand",
  "linked_list_allocator",
  "log",
  "redox_syscall",

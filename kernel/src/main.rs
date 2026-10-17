@@ -166,5 +166,19 @@ mod kernel_executable_offsets {
     );
 
     #[cfg(target_arch = "x86_64")]
-    linker_offsets!(__altrelocs_start, __altrelocs_end);
+    linker_offsets!(__altrelocs_start, __altrelocs_end, KERNEL_LINK_BASE);
+}
+
+/// Ferric Oxide: how far above its link address the bootloader loaded the kernel (kernel image
+/// KASLR), or 0 when it did not move it.
+pub fn kernel_image_slide() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // KERNEL_OFFSET moves with the image; KERNEL_LINK_BASE is an absolute symbol.
+        kernel_executable_offsets::KERNEL_OFFSET() - kernel_executable_offsets::KERNEL_LINK_BASE()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }

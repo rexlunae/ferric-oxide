@@ -1,7 +1,9 @@
 name: kernel-lints
 
 # Holds kernel Clippy warnings and `unsafe` uses at or below the baseline in
-# ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh).
+# ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh), and
+# checks that the bootloader can relocate the kernel (kernel image KASLR; see
+# scripts/ferric-ci/check-kernel-relocs.sh).
 
 on:
   push:
@@ -12,6 +14,7 @@ on:
       - "crates/**"
       - "ci/kernel-lints.json"
       - "scripts/ferric-ci/kernel-lint-ratchet.sh"
+      - "scripts/ferric-ci/check-kernel-relocs.sh"
       - ".github/workflows/kernel-lints.yml"
 
 jobs:
@@ -36,3 +39,5 @@ jobs:
           restore-keys: kernel-lints-
       - name: Lint ratchet
         run: scripts/ferric-ci/kernel-lint-ratchet.sh
+      - name: Kernel relocations replay exactly
+        run: scripts/ferric-ci/check-kernel-relocs.sh

@@ -96,6 +96,9 @@ pub unsafe fn stack_trace() {
             + usize::from(elf_header.e_shnum(NativeEndian))
                 * usize::from(elf_header.e_shentsize(NativeEndian));
         let kernel_slice = slice::from_raw_parts(kernel_ptr, kernel_size);
+        // Ferric Oxide: symbols carry link addresses. Print and look up link addresses too, so
+        // they match kernel.sym and do not give away where KASLR put the kernel.
+        let slide = crate::kernel_image_slide();
 
         let symbols = elf_header
             .sections(NativeEndian, kernel_slice)
@@ -129,6 +132,7 @@ pub unsafe fn stack_trace() {
                 break;
             }
 
+            let pc = pc.wrapping_sub(slide);
             println!("  FP {:>016x}: PC {:>016x}", frame_.fp, pc);
 
             for sym in symbols.iter() {

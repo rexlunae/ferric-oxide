@@ -17,7 +17,9 @@ const KERNEL_OFFSET: usize = (1_usize << 31).wrapping_neg();
 /// Offset to kernel heap
 #[inline(always)]
 pub fn kernel_heap_offset() -> usize {
-    crate::kernel_executable_offsets::KERNEL_OFFSET() - PML4_SIZE
+    // Ferric Oxide: from the link address, not the loaded one, so the heap stays put when the
+    // bootloader moves the kernel image (KASLR) and its address says nothing about where.
+    KERNEL_OFFSET - PML4_SIZE
 }
 
 /// End offset of the user image, i.e. kernel start

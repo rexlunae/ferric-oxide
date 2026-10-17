@@ -9,11 +9,23 @@ script = """
 OUTDIR="${COOKBOOK_BUILD}"
 mkdir -pv "${COOKBOOK_STAGE}/usr/lib/boot"
 
+# Ferric Oxide: shared crates are path dependencies at ../crates from
+# bootloader/; give the cookbook's copy in source/ the same neighbour.
+ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../crates"
+# Cargo features from ferric.toml (kaslr for kernel image KASLR). The
+# Makefile only tracks sources, so rebuild when they change.
+if [ "$(cat "${OUTDIR}/ferric.stamp" 2>/dev/null)" != "${FERRIC_BOOTLOADER_FEATURES}" ]
+then
+    rm -f "${OUTDIR}"/*.efi "${OUTDIR}"/*.bin
+fi
+printf '%s' "${FERRIC_BOOTLOADER_FEATURES}" > "${OUTDIR}/ferric.stamp"
+
 function bootloader {
     export TARGET="$1"
     src="$2"
     dst="$3"
-    "${COOKBOOK_MAKE}" -j "${COOKBOOK_MAKE_JOBS}" -f "${COOKBOOK_SOURCE}/Makefile" -C "${OUTDIR}" "${OUTDIR}/${src}"
+    "${COOKBOOK_MAKE}" -j "${COOKBOOK_MAKE_JOBS}" -f "${COOKBOOK_SOURCE}/Makefile" -C "${OUTDIR}" \\
+        BOOTLOADER_FEATURES="${FERRIC_BOOTLOADER_FEATURES}" "${OUTDIR}/${src}"
     cp -v "${OUTDIR}/${src}" "${COOKBOOK_STAGE}/usr/lib/boot/${dst}"
 }
 
