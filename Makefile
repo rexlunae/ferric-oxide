@@ -102,6 +102,9 @@ include mk/virtualbox.mk
 # CI
 include mk/ci.mk
 
+# Feature configuration (make menuconfig)
+include mk/ferric.mk
+
 env: prefix FORCE $(CONTAINER_TAG)
 ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@

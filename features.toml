@@ -1,0 +1,662 @@
+# Ferric Oxide feature catalog
+#
+# This file describes every option that `make menuconfig` (tools/ferric-config)
+# shows and that ferric.toml may set. It is the schema, not your configuration:
+# put your choices in ferric.toml (untracked, like .config). Only options you
+# set explicitly are written there; everything else follows the defaults below.
+#
+# Option ids are dotted paths, and ferric.toml uses the same nesting:
+#
+#     [cpu]
+#     x86_64_level = "v4"
+#
+#     [kernel]
+#     numa = true
+#
+# Expressions (used by `depends`, `defaults[].when`, `effect[].when` and
+# `rule[].when`) support option ids, `value` (the option being defined),
+# string/number/bool literals, lists, == != < <= > >=, `in`, !, && and ||.
+#
+# Effects say how a value reaches the build:
+#   make_var            assign a make variable (bool -> make_true/make_false)
+#   kernel_feature      add a kernel Cargo feature when the bool is on
+#   kernel_config       set a key in the kernel's config.toml
+#   [[option.effect]]   anything else: make, make_append, packages,
+#                       ignore_packages, packages_from_value,
+#                       ignore_from_value, general, kernel_features
+#   rebuild             recipes to mark stale when the value changes
+#                       ("*" means every recipe)
+# "{value}" in a string is replaced by the option's value.
+
+[[menu]]
+id = "target"
+title = "Target"
+help = "Architecture and board the image is built for."
+
+[[menu]]
+id = "cpu"
+title = "Processor baseline"
+help = """
+The oldest CPU the userspace build has to run on. Raising the baseline lets
+the compiler use newer instructions (AVX2, BMI2, FMA, AVX-512) everywhere
+without runtime dispatch. Ferric Oxide targets modern processors, so the
+default for x86-64 is level v3 (Intel Haswell / AMD Excavator and newer).
+
+The kernel and bootloader are excluded by default: the kernel is built
+soft-float without SSE/AVX, and its use of CPU features is controlled
+under Kernel > CPU feature use instead."""
+
+[[menu]]
+id = "kernel"
+title = "Kernel"
+help = "Cargo features and build-time policy for the kernel."
+
+[[menu]]
+id = "kernel.cpu"
+parent = "kernel"
+title = "CPU feature use"
+depends = "target.arch == 'x86_64'"
+help = """
+How the kernel uses optional CPU features. "always" assumes the feature
+exists, "never" never uses it, and "auto" detects it at boot and patches
+the code (needs Kernel > Self-modifying code; without it "auto" acts like
+"never"). Defaults follow the processor baseline."""
+
+[[menu]]
+id = "image"
+title = "Image contents"
+help = "Which filesystem configuration the image starts from, and changes on top of it."
+
+[[menu]]
+id = "build"
+title = "Build system"
+help = "How the build itself runs."
+
+[[menu]]
+id = "qemu"
+title = "Emulator (make qemu)"
+help = "Settings used by `make qemu` when testing an image."
+
+# ---------------------------------------------------------------- target
+
+[[option]]
+id = "target.arch"
+menu = "target"
+type = "choice"
+title = "Architecture"
+default = "x86_64"
+make_var = "ARCH"
+rebuild = ["*"]
+help = "CPU architecture to build for. Sets ARCH."
+choices = [
+  { value = "x86_64", title = "x86-64 (AMD64)" },
+  { value = "aarch64", title = "AArch64 (ARM64)" },
+  { value = "riscv64gc", title = "RISC-V 64 (RV64GC)" },
+]
+
+[[option]]
+id = "target.board"
+menu = "target"
+type = "string"
+title = "Board"
+default = ""
+depends = "target.arch == 'aarch64'"
+make_var = "BOARD"
+help = "Sub-device for AArch64 images, for example raspi3bp. Empty means generic. Sets BOARD."
+
+# ---------------------------------------------------------------- cpu
+
+[[option]]
+id = "cpu.x86_64_level"
+menu = "cpu"
+type = "choice"
+title = "x86-64 microarchitecture level"
+default = "v3"
+depends = "target.arch == 'x86_64'"
+rebuild = ["*"]
+help = """
+psABI microarchitecture level for all userspace code.
+
+  v1  baseline x86-64 (SSE2). Runs anywhere; no gain.
+  v2  + SSE4.2, POPCNT, SSSE3, CMPXCHG16B. Nehalem / Bulldozer and newer.
+  v3  + AVX, AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE, XSAVE.
+      Haswell / Excavator / Zen and newer.
+  v4  + AVX-512 F/BW/CD/DQ/VL. Skylake-SP, Ice Lake, Zen 4 and newer.
+
+An image built for a level will not boot userspace on an older CPU.
+`make qemu` picks a matching emulated CPU when KVM is off.
+
+v4 is not usable yet: the kernel only enables AVX state in XCR0, so
+AVX-512 instructions fault until it also saves opmask and ZMM state."""
+choices = [
+  { value = "v1", title = "v1 (baseline)" },
+  { value = "v2", title = "v2" },
+  { value = "v3", title = "v3 (AVX2)" },
+  { value = "v4", title = "v4 (AVX-512, needs kernel work)" },
+]
+
+[[option.effect]]
+when = "value == 'v1'"
+make = { QEMU_CPU = "core2duo" }
+
+[[option.effect]]
+when = "value == 'v2'"
+make = { QEMU_CPU = "Nehalem" }
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v2", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v2" }
+
+[[option.effect]]
+when = "value == 'v3'"
+make = { QEMU_CPU = "max" }
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v3", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v3" }
+
+[[option.effect]]
+when = "value == 'v4'"
+make = { QEMU_CPU = "max" }
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v4", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v4" }
+
+[[option]]
+id = "cpu.aarch64_level"
+menu = "cpu"
+type = "choice"
+title = "AArch64 architecture version"
+default = "armv8.0-a"
+depends = "target.arch == 'aarch64'"
+rebuild = ["*"]
+help = """
+Minimum Arm architecture version for userspace code.
+
+  armv8.0-a  generic; runs on every 64-bit Arm core.
+  armv8.2-a  + LSE atomics, FP16, RAS. Cortex-A55/A75, Neoverse N1, Apple M1.
+  armv9-a    + SVE2. Cortex-A510/A710, Neoverse N2/V2."""
+choices = [
+  { value = "armv8.0-a", title = "ARMv8.0-A (generic)" },
+  { value = "armv8.2-a", title = "ARMv8.2-A" },
+  { value = "armv9-a", title = "ARMv9-A" },
+]
+
+[[option.effect]]
+when = "value == 'armv8.2-a'"
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-feature=+v8.2a", FERRIC_TARGET_CPPFLAGS = "-march=armv8.2-a" }
+
+[[option.effect]]
+when = "value == 'armv9-a'"
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-feature=+v9a", FERRIC_TARGET_CPPFLAGS = "-march=armv9-a" }
+
+[[option]]
+id = "cpu.extra_rustflags"
+menu = "cpu"
+type = "string"
+title = "Extra target RUSTFLAGS"
+default = ""
+rebuild = ["*"]
+help = "Appended to RUSTFLAGS for every userspace Rust package, e.g. \"-C target-feature=+aes\"."
+
+[[option.effect]]
+when = "value != ''"
+make_append = { FERRIC_TARGET_RUSTFLAGS = "{value}" }
+
+[[option]]
+id = "cpu.extra_cflags"
+menu = "cpu"
+type = "string"
+title = "Extra target C/C++ flags"
+default = ""
+rebuild = ["*"]
+help = "Appended to CPPFLAGS (so C and C++) for every userspace package."
+
+[[option.effect]]
+when = "value != ''"
+make_append = { FERRIC_TARGET_CPPFLAGS = "{value}" }
+
+[[option]]
+id = "cpu.flags_exclude"
+menu = "cpu"
+type = "list"
+title = "Recipes built without baseline flags"
+default = ["kernel", "bootloader"]
+make_var = "FERRIC_TARGET_FLAGS_EXCLUDE"
+rebuild = ["*"]
+help = """
+Recipes that never get the CPU baseline or extra flags. The kernel and
+bootloader must stay here: they run before the FPU/AVX state is set up."""
+
+# ---------------------------------------------------------------- kernel
+
+[[option]]
+id = "kernel.acpi"
+menu = "kernel"
+type = "bool"
+title = "ACPI support"
+default = true
+kernel_feature = "acpi"
+rebuild = ["kernel"]
+help = "Parse ACPI tables (MADT, HPET, ...). Required for multi-core."
+
+[[option]]
+id = "kernel.multi_core"
+menu = "kernel"
+type = "bool"
+title = "Multi-core (SMP)"
+default = true
+selects = ["kernel.acpi"]
+kernel_feature = "multi_core"
+rebuild = ["kernel"]
+help = "Bring up application processors. Turning this off gives a single-CPU kernel, useful when bisecting races."
+
+[[option]]
+id = "kernel.numa"
+menu = "kernel"
+type = "bool"
+title = "NUMA awareness"
+default = false
+depends = "kernel.multi_core"
+kernel_feature = "numa"
+rebuild = ["kernel"]
+help = "Parse SRAT and keep per-node memory information. Experimental upstream."
+
+[[option]]
+id = "kernel.self_modifying"
+menu = "kernel"
+type = "bool"
+title = "Self-modifying code (CPU feature patching)"
+default = true
+kernel_feature = "self_modifying"
+rebuild = ["kernel"]
+help = "Patch hot paths at boot based on detected CPU features. Required for \"auto\" under CPU feature use."
+
+[[option]]
+id = "kernel.x86_kvm_pv"
+menu = "kernel"
+type = "bool"
+title = "KVM paravirtual clock"
+default = true
+depends = "target.arch == 'x86_64'"
+kernel_feature = "x86_kvm_pv"
+rebuild = ["kernel"]
+help = "Use the KVM paravirtualized clock when running under KVM."
+
+[[option]]
+id = "kernel.pti"
+menu = "kernel"
+type = "bool"
+title = "Page table isolation (KPTI)"
+default = false
+experimental = true
+kernel_feature = "pti"
+rebuild = ["kernel"]
+help = """
+Unmap the kernel from user page tables (Meltdown mitigation). Upstream
+marks this broken with threading; enable only to test it."""
+
+[[option]]
+id = "kernel.serial_debug"
+menu = "kernel"
+type = "bool"
+title = "Serial console debug output"
+default = true
+kernel_feature = "serial_debug"
+rebuild = ["kernel"]
+help = "Send kernel log output to the serial port."
+
+[[option]]
+id = "kernel.qemu_debug"
+menu = "kernel"
+type = "bool"
+title = "QEMU debug port output"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "qemu_debug"
+rebuild = ["kernel"]
+help = "Write kernel log output to QEMU's 0xE9 debug port."
+
+[[option]]
+id = "kernel.lpss_debug"
+menu = "kernel"
+type = "bool"
+title = "Intel LPSS UART debug output"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "lpss_debug"
+rebuild = ["kernel"]
+help = "Log through the Intel Low Power Subsystem UART found on some laptops."
+
+[[option]]
+id = "kernel.system76_ec_debug"
+menu = "kernel"
+type = "bool"
+title = "System76 EC debug output"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "system76_ec_debug"
+rebuild = ["kernel"]
+help = "Log through the System76 embedded controller."
+
+[[option]]
+id = "kernel.debugger"
+menu = "kernel"
+type = "bool"
+title = "Built-in kernel debugger"
+default = false
+selects = ["kernel.syscall_debug"]
+kernel_feature = "debugger"
+rebuild = ["kernel"]
+help = "Include the in-kernel debugger. Selects syscall debugging."
+
+[[option]]
+id = "kernel.syscall_debug"
+menu = "kernel"
+type = "bool"
+title = "Syscall tracing"
+default = false
+kernel_feature = "syscall_debug"
+rebuild = ["kernel"]
+help = "Log system calls. Very noisy; for debugging only."
+
+[[option]]
+id = "kernel.profiling"
+menu = "kernel"
+type = "bool"
+title = "Kernel profiling"
+default = false
+kernel_feature = "profiling"
+rebuild = ["kernel"]
+help = "Sample kernel execution for the profiling tools."
+
+[[option]]
+id = "kernel.sys_fdstat"
+menu = "kernel"
+type = "bool"
+title = "File descriptor statistics in sys:"
+default = false
+kernel_feature = "sys_fdstat"
+rebuild = ["kernel"]
+help = "Expose per-process file descriptor statistics through the sys: scheme."
+
+[[option]]
+id = "kernel.busy_panic"
+menu = "kernel"
+type = "bool"
+title = "Spin on panic"
+default = false
+kernel_feature = "busy_panic"
+rebuild = ["kernel"]
+help = "Busy-loop instead of halting after a panic, so a debugger can attach."
+
+[[option]]
+id = "kernel.drop_panic"
+menu = "kernel"
+type = "bool"
+title = "Panic on unexpected drops"
+default = false
+kernel_feature = "drop_panic"
+rebuild = ["kernel"]
+help = "Panic when certain kernel objects are dropped unexpectedly. For debugging leaks and use-after-free."
+
+[[option]]
+id = "kernel.cpu.smap"
+menu = "kernel.cpu"
+type = "choice"
+title = "SMAP (supervisor mode access prevention)"
+default = "auto"
+defaults = [{ when = "cpu.x86_64_level == 'v4'", value = "always" }]
+kernel_config = "arch.x86_64.features.smap"
+rebuild = ["kernel"]
+help = "Stops the kernel touching user memory by accident. Every v4 CPU has it; Haswell (v3) does not."
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.fsgsbase"
+menu = "kernel.cpu"
+type = "choice"
+title = "FSGSBASE instructions"
+default = "auto"
+defaults = [{ when = "cpu.x86_64_level in ['v3', 'v4']", value = "always" }]
+kernel_config = "arch.x86_64.features.fsgsbase"
+rebuild = ["kernel"]
+help = "Fast FS/GS base switching on context switch. Present on every v3 and v4 CPU."
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.xsave"
+menu = "kernel.cpu"
+type = "choice"
+title = "XSAVE"
+default = "auto"
+defaults = [{ when = "cpu.x86_64_level in ['v3', 'v4']", value = "always" }]
+kernel_config = "arch.x86_64.features.xsave"
+rebuild = ["kernel"]
+help = "Save extended (AVX/AVX-512) register state with XSAVE. Required by level v3 and up."
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.xsaveopt"
+menu = "kernel.cpu"
+type = "choice"
+title = "XSAVEOPT"
+default = "auto"
+defaults = [{ when = "cpu.x86_64_level in ['v3', 'v4']", value = "always" }]
+kernel_config = "arch.x86_64.features.xsaveopt"
+rebuild = ["kernel"]
+help = "Skip saving unmodified register state. Present on every v3 and v4 CPU."
+choices = ["always", "auto", "never"]
+
+# ---------------------------------------------------------------- image
+
+[[option]]
+id = "image.config"
+menu = "image"
+type = "choice"
+title = "Base filesystem configuration"
+default = "desktop"
+make_var = "CONFIG_NAME"
+help = """
+Which config/*.toml (or config/<arch>/*.toml) the image starts from.
+Sets CONFIG_NAME; the build directory is build/<arch>/<config>."""
+choices = [
+  { value = "minimal", title = "minimal: console only" },
+  { value = "server", title = "server: console and network services" },
+  { value = "desktop-minimal", title = "desktop-minimal: Orbital and a terminal" },
+  { value = "desktop", title = "desktop: the default desktop" },
+  { value = "dev", title = "dev: desktop plus compilers" },
+  { value = "demo", title = "demo: desktop plus apps and games" },
+  { value = "full", title = "full: everything that builds (x86-64)" },
+  { value = "wayland", title = "wayland: Wayland session" },
+  { value = "x11", title = "x11: X11 session" },
+  { value = "tests", title = "tests: test suites" },
+]
+
+[[option]]
+id = "image.filesystem_size"
+menu = "image"
+type = "int"
+title = "Filesystem size in MiB (0 = from config)"
+default = 0
+min = 0
+max = 1048576
+help = "Overrides filesystem_size from the base configuration."
+
+[[option.effect]]
+when = "value > 0"
+general = { filesystem_size = "{value}" }
+
+[[option]]
+id = "image.packages_add"
+menu = "image"
+type = "list"
+title = "Extra packages"
+default = []
+help = "Recipe names to add to the image, e.g. [\"vim\", \"htop\"]."
+
+[[option.effect]]
+packages_from_value = true
+
+[[option]]
+id = "image.packages_remove"
+menu = "image"
+type = "list"
+title = "Packages to leave out"
+default = []
+help = "Recipe names to drop from the base configuration (written as \"ignore\")."
+
+[[option.effect]]
+ignore_from_value = true
+
+[[option]]
+id = "image.encrypt"
+menu = "image"
+type = "bool"
+title = "Encrypt the root filesystem"
+default = false
+help = "Pass --encrypt to redoxfs-mkfs. The image build asks for a password."
+
+[[option.effect]]
+make = { REDOXFS_MKFS_FLAGS = "--encrypt" }
+
+# ---------------------------------------------------------------- build
+
+[[option]]
+id = "build.podman"
+menu = "build"
+type = "bool"
+title = "Build inside Podman"
+default = true
+make_var = "PODMAN_BUILD"
+help = "Run the build in the Podman container (recommended). Sets PODMAN_BUILD."
+
+[[option]]
+id = "build.prefix_binary"
+menu = "build"
+type = "bool"
+title = "Download the prebuilt toolchain"
+default = true
+make_var = "PREFIX_BINARY"
+help = "Use the prebuilt cross toolchain instead of building GCC/LLVM/Rust. Sets PREFIX_BINARY."
+
+[[option]]
+id = "build.repo_binary"
+menu = "build"
+type = "bool"
+title = "Download prebuilt packages"
+default = false
+make_var = "REPO_BINARY"
+make_false = ""
+help = """
+Fetch packages from the upstream package server instead of building them.
+Much faster, but those packages ignore every compile-time option here
+(processor baseline, kernel features). Sets REPO_BINARY."""
+
+[[option]]
+id = "build.debug"
+menu = "build"
+type = "bool"
+title = "Debug info"
+default = false
+make_var = "REPO_DEBUG"
+rebuild = ["*"]
+help = "Keep debug info and skip stripping in locally built packages. Sets REPO_DEBUG."
+
+[[option]]
+id = "build.offline"
+menu = "build"
+type = "bool"
+title = "Offline (do not update sources)"
+default = false
+make_var = "REPO_OFFLINE"
+help = "Build from the sources already fetched. Sets REPO_OFFLINE."
+
+[[option]]
+id = "build.nonstop"
+menu = "build"
+type = "bool"
+title = "Keep going after package failures"
+default = false
+make_var = "REPO_NONSTOP"
+help = "Try to build every package even when some fail. Sets REPO_NONSTOP."
+
+# ---------------------------------------------------------------- qemu
+
+[[option]]
+id = "qemu.kvm"
+menu = "qemu"
+type = "choice"
+title = "Hardware virtualization"
+default = "auto"
+help = "auto uses KVM when host and target architectures match."
+choices = ["auto", "yes", "no"]
+
+[[option.effect]]
+when = "value != 'auto'"
+make = { kvm = "{value}" }
+
+[[option]]
+id = "qemu.memory"
+menu = "qemu"
+type = "int"
+title = "Memory in MiB (0 = default)"
+default = 0
+min = 0
+max = 1048576
+help = "Sets QEMU_MEM."
+
+[[option.effect]]
+when = "value > 0"
+make = { QEMU_MEM = "{value}" }
+
+[[option]]
+id = "qemu.cpus"
+menu = "qemu"
+type = "int"
+title = "CPU count (0 = default)"
+default = 0
+min = 0
+max = 1024
+help = "Sets QEMU_SMP."
+
+[[option.effect]]
+when = "value > 0"
+make = { QEMU_SMP = "{value}" }
+
+[[option]]
+id = "qemu.cpu_model"
+menu = "qemu"
+type = "string"
+title = "Emulated CPU model override"
+default = ""
+help = "QEMU -cpu model when KVM is off. Empty picks one that matches the processor baseline."
+
+[[option.effect]]
+when = "value != ''"
+override = true
+make = { QEMU_CPU = "{value}" }
+
+# ---------------------------------------------------------------- rules
+
+[[rule]]
+level = "warn"
+when = "build.repo_binary && target.arch == 'x86_64' && cpu.x86_64_level != 'v1'"
+message = "Prebuilt packages are compiled for baseline x86-64; only packages you build locally use the selected level."
+
+[[rule]]
+level = "warn"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto')"
+message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4'"
+message = "The kernel does not enable AVX-512 state in XCR0 yet, so v4 userspace will fault on AVX-512 instructions."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && qemu.kvm != 'yes' && qemu.cpu_model == ''"
+message = "QEMU cannot emulate AVX-512 without KVM; run `make qemu` with KVM on an AVX-512 host (qemu.kvm = \"yes\")."
+
+[[rule]]
+level = "error"
+when = "target.arch == 'x86_64' && cpu.x86_64_level in ['v3', 'v4'] && kernel.cpu.xsave == 'never'"
+message = "Level v3 and up use AVX state, which the kernel can only save with XSAVE; kernel.cpu.xsave cannot be \"never\"."
+
+[[rule]]
+level = "error"
+when = "image.config == 'full' && target.arch != 'x86_64'"
+message = "The full configuration only exists for x86_64."

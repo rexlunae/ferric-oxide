@@ -38,6 +38,10 @@ function DYNAMIC_INIT {
     export RUSTFLAGS="-C target-feature=-crt-static -L native=${COOKBOOK_SYSROOT}/lib -C link-arg=-Wl,-rpath-link,${COOKBOOK_SYSROOT}/lib"
     export COOKBOOK_DYNAMIC=1
 
+    if [ "function" = "$(type -t ferric_target_rustflags)" ]; then
+        ferric_target_rustflags
+    fi
+
     if [ "function" = "$(type -t reexport_flags)" ]; then
         reexport_flags
     fi
@@ -141,6 +145,36 @@ if [ ! -z "${COOKBOOK_OFFLINE}" ]
 then
 build_flags+=" --offline"
 install_flags+=" --offline"
+fi
+
+# Ferric Oxide: processor baseline and extra target flags from ferric.toml
+# (make menuconfig). Only packages built for the target get them, and never
+# the recipes in FERRIC_TARGET_FLAGS_EXCLUDE (the kernel and bootloader).
+function ferric_target_flags_apply {
+    [ "${TARGET}" != "${COOKBOOK_HOST_TARGET}" ] || return 1
+    case " ${FERRIC_TARGET_FLAGS_EXCLUDE} " in
+        *" ${COOKBOOK_NAME} "*) return 1 ;;
+    esac
+}
+
+function ferric_target_rustflags {
+    [ -n "${FERRIC_TARGET_RUSTFLAGS}" ] && ferric_target_flags_apply || return 0
+    # redoxer moves RUSTFLAGS into the per-target variable it names here
+    if [ -n "${RUSTFLAGS}" ]
+    then
+        export RUSTFLAGS="${RUSTFLAGS} ${FERRIC_TARGET_RUSTFLAGS}"
+    elif [ -n "${REDOXER_RUSTFLAGS_KEY}" ]
+    then
+        export "${REDOXER_RUSTFLAGS_KEY}=${!REDOXER_RUSTFLAGS_KEY:+${!REDOXER_RUSTFLAGS_KEY} }${FERRIC_TARGET_RUSTFLAGS}"
+    else
+        export RUSTFLAGS="${FERRIC_TARGET_RUSTFLAGS}"
+    fi
+}
+
+ferric_target_rustflags
+if [ -n "${FERRIC_TARGET_CPPFLAGS}" ] && ferric_target_flags_apply
+then
+    export CPPFLAGS="${CPPFLAGS} ${FERRIC_TARGET_CPPFLAGS}"
 fi
 
 reexport_flags
