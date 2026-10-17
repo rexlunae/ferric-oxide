@@ -183,6 +183,8 @@ fn continue_after_kmain_stack(
         let bootstrap = {
             #[cfg(target_arch = "x86_64")]
             crate::arch::alternative::early_init(true);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::kpti::init_bsp();
 
             // Set up syscall instruction
             interrupt::syscall::init();
@@ -280,6 +282,8 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
 
             #[cfg(target_arch = "x86_64")]
             crate::arch::alternative::early_init(false);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::kpti::init_cpu();
 
             // Set up syscall instruction
             interrupt::syscall::init();

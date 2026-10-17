@@ -519,6 +519,23 @@ when the CPU has AVX512F; level v4 requires them. Costs about 1.7 KB more
 XSAVE area per thread on AVX-512 CPUs, and nothing elsewhere."""
 choices = ["always", "auto", "never"]
 
+[[option]]
+id = "kernel.cpu.kpti"
+menu = "kernel.cpu"
+type = "choice"
+title = "Kernel page-table isolation (Meltdown)"
+default = "auto"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.kpti"
+rebuild = ["kernel"]
+help = """
+Give each process a second page table that maps almost none of the kernel and
+is loaded while user code runs, so Meltdown (CVE-2017-5754) cannot read kernel
+memory. "auto" turns it on for Intel CPUs that do not report RDCL_NO; AMD CPUs
+and recent Intel ones are not affected and pay nothing. It costs two page-table
+switches and TLB flushes per system call and interrupt on affected CPUs."""
+choices = ["always", "auto", "never"]
+
 # ---------------------------------------------------------------- image
 
 [[option]]
@@ -717,7 +734,7 @@ message = "Prebuilt packages are compiled for baseline x86-64; only packages you
 
 [[rule]]
 level = "warn"
-when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto')"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto')"
 message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
 
 [[rule]]

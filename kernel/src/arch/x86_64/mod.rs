@@ -22,6 +22,9 @@ pub mod interrupt;
 /// Miscellaneous processor features
 pub mod misc;
 
+/// Ferric Oxide: kernel page-table isolation
+pub mod kpti;
+
 // TODO: Maybe support rewriting relocations (using LD's --emit-relocs) when working with entire
 // functions?
 #[unsafe(naked)]
