@@ -23,7 +23,10 @@
 //! Usage: `ferric-syscall-fuzz [--seed N] [--seconds S] [--calls C] [--procs P]`.
 //! Prints `FERRIC_TEST_PASS fuzz ...` with the seed and what the children
 //! did, and `FERRIC_TEST_FAIL fuzz ...` if a child could not be started or
-//! reaped.
+//! reaped, or if a child hung and had to be killed.
+
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::IntoRawFd;
@@ -86,6 +89,13 @@ mod sys {
     /// `redox_syscall::UPPER_FDTBL_TAG`: descriptors with this bit live in the
     /// upper table, where relibc keeps its process and thread handles. The
     /// fuzzer never names one, so it cannot act on its own process.
+    /// `CallFlags::CONSUME`: the call takes ownership of the descriptors it
+    /// is passed, which leave the caller's table.
+    pub const CALL_CONSUME: usize = 1 << 8;
+    /// `CallFlags::MULTIPLE_FDS2`: the first argument points at a list of
+    /// descriptors instead of naming one.
+    pub const CALL_MULTIPLE_FDS2: usize = 1 << 19;
+
     pub const UPPER_FDTBL_TAG: usize = 1 << (usize::BITS - 2);
 
     /// Makes a raw system call and returns the kernel's result register.
@@ -539,12 +549,9 @@ impl Fuzzer {
             }
             25 => {
                 let any = self.int();
-                let prot = self.rng.pick(&[
-                    0,
-                    sys::PROT_READ,
-                    sys::PROT_READ | sys::PROT_WRITE,
-                    any,
-                ]);
+                let prot =
+                    self.rng
+                        .pick(&[0, sys::PROT_READ, sys::PROT_READ | sys::PROT_WRITE, any]);
                 (sys::MPROTECT, [self.addr(), self.map_len(), prot, 0, 0, 0])
             }
             26 => {
@@ -563,7 +570,6 @@ impl Fuzzer {
     /// Arguments for `SYS_CALL`: our descriptors, a payload in `buf`, call
     /// flags with the payload length in the low byte, and metadata words.
     fn call_args(&mut self, fd: usize) -> (usize, [usize; 6]) {
-        const MULTIPLE_FDS2: usize = 1 << 19;
         let (payload, payload_len) = self.slice();
         let mut flags = self
             .rng
@@ -584,7 +590,7 @@ impl Fuzzer {
                 self.buf[at + i * 8..at + i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
             }
             fd_arg = self.buf.as_ptr() as usize + at + n % 8;
-            flags |= MULTIPLE_FDS2;
+            flags |= sys::CALL_MULTIPLE_FDS2;
         }
         let meta_words = self.rng.below(4);
         flags = (flags & !(0xff | (1 << 17))) | meta_words;
@@ -659,6 +665,7 @@ impl Fuzzer {
         self.open_fds();
         self.map_victim();
         self.fill();
+        self.regressions();
         for i in 0..calls {
             let (n, args) = self.next_call();
             if self.verbose {
@@ -667,6 +674,9 @@ impl Fuzzer {
             // SAFETY: the arguments name only this process's descriptors and
             // memory; the kernel may break this process, which is allowed.
             let ret = unsafe { sys::call(n, args) };
+            if n == sys::CALL {
+                self.forget_consumed(&args);
+            }
             if sys::is_err(ret) {
                 continue;
             }
@@ -684,6 +694,48 @@ impl Fuzzer {
                 _ => {}
             }
         }
+    }
+
+    /// Calls that crashed the kernel before, made once at the start so a
+    /// regression shows up on every run rather than only for the seed that
+    /// first found it.
+    fn regressions(&mut self) {
+        // mremap onto the top of the kernel half panicked the kernel with
+        // "Grant dropped while still mapped" (fixed by validating the range).
+        let args = [
+            self.victim,
+            0x4000,
+            0xFFFF_FFFF_FFFF_F000,
+            0x10_0000,
+            0x3,
+            0,
+        ];
+        // SAFETY: the kernel must refuse this; if it does not, only this
+        // process's mapping is affected.
+        let _ = unsafe { sys::call(sys::MREMAP, args) };
+    }
+
+    /// Drops the descriptors a `SYS_CALL` with `CONSUME` was given from the
+    /// rotation, whether or not the call succeeded, so later calls do not
+    /// keep failing with `EBADF` on descriptors that are gone.
+    fn forget_consumed(&mut self, args: &[usize; 6]) {
+        if args[3] & sys::CALL_CONSUME == 0 {
+            return;
+        }
+        let gone: Vec<usize> = if args[3] & sys::CALL_MULTIPLE_FDS2 == 0 {
+            vec![args[0]]
+        } else {
+            // `call_args` puts the list in `buf` and the count in the low bits
+            // of the pointer; random flag bits can set the flag without a list.
+            let base = self.buf.as_ptr() as usize;
+            let at = (args[0] & !7).wrapping_sub(base);
+            let n = args[0] & 7;
+            (0..n)
+                .filter_map(|i| self.buf.get(at + i * 8..at + i * 8 + 8))
+                .map(|b| usize::from_ne_bytes(b.try_into().expect("8 bytes")))
+                .collect()
+        };
+        self.fds.retain(|fd| !gone.contains(fd));
     }
 }
 
@@ -710,10 +762,13 @@ struct Tally {
     timed_out: usize,
 }
 
+/// A child that has not been reaped yet.
 struct Running {
     child: Child,
     seed: u64,
     started: Instant,
+    /// The child's scratch directory, removed once it is reaped.
+    dir: String,
 }
 
 /// Options for the parent.
@@ -803,25 +858,41 @@ fn reap(running: &mut Vec<Running>, tally: &mut Tally) -> Result<(), String> {
         } else {
             tally.exited += 1;
         }
-        running.swap_remove(i);
+        let done = running.swap_remove(i);
+        // Children can leave files behind; a long nightly run starts tens of
+        // thousands, which would fill the image if the directories stayed.
+        let _ = std::fs::remove_dir_all(&done.dir);
     }
     Ok(())
 }
 
+/// Runs children until the deadline and returns how they ended. The scratch
+/// directory is removed on every path out, including errors.
 fn parent_main(opts: &Options) -> Result<Tally, String> {
+    let dir = format!("/tmp/ferric-fuzz-{}", opts.seed);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+    let mut running = Vec::new();
+    let result = run_children(opts, &dir, &mut running);
+    for r in &mut running {
+        let _ = r.child.kill();
+        let _ = r.child.wait();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// The parent's loop: keeps `opts.procs` children running until the deadline,
+/// then waits for the last ones.
+fn run_children(opts: &Options, dir: &str, running: &mut Vec<Running>) -> Result<Tally, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("current_exe: {e}"))?
         .to_string_lossy()
         .into_owned();
-    let dir = format!("/tmp/ferric-fuzz-{}", opts.seed);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
-
     let deadline = Instant::now() + Duration::from_secs(opts.seconds);
     let mut tally = Tally::default();
-    let mut running = Vec::new();
     let mut next = 0_u64;
     loop {
-        reap(&mut running, &mut tally)?;
+        reap(running, &mut tally)?;
         let more = Instant::now() < deadline || tally.children == 0;
         if !more && running.is_empty() {
             break;
@@ -838,12 +909,12 @@ fn parent_main(opts: &Options) -> Result<Tally, String> {
                 child,
                 seed,
                 started: Instant::now(),
+                dir: child_dir,
             });
             continue;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(tally)
 }
 
@@ -867,6 +938,15 @@ fn main() -> ExitCode {
         opts.seed, opts.seconds, opts.calls, opts.procs
     );
     match parent_main(&opts) {
+        Ok(t) if t.timed_out > 0 => {
+            // A child stuck in the kernel past the timeout is a hang, which
+            // the fuzzer exists to find; its seed replays it.
+            println!(
+                "FERRIC_TEST_FAIL fuzz seed={} {} of {} children hung (seeds printed above)",
+                opts.seed, t.timed_out, t.children
+            );
+            ExitCode::FAILURE
+        }
         Ok(t) => {
             println!(
                 "FERRIC_TEST_PASS fuzz seed={} children={} exited={} signaled={} timed_out={}",
