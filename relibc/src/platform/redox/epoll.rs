@@ -1,0 +1,164 @@
+use super::{
+    super::{
+        Pal, PalEpoll,
+        types::{c_int, c_uint},
+    },
+    Sys,
+};
+
+use crate::{
+    error::Errno,
+    header::{bits_sigset_t::sigset_t, errno::*, fcntl::*, sys_epoll::*},
+};
+use core::{mem, slice};
+use syscall::{data::Event, flag::EVENT_READ};
+
+fn epoll_to_event_flags(epoll: c_uint) -> syscall::EventFlags {
+    let mut event_flags = syscall::EventFlags::empty();
+
+    if epoll & EPOLLIN != 0 {
+        event_flags |= syscall::EventFlags::EVENT_READ;
+    }
+
+    if epoll & EPOLLOUT != 0 {
+        event_flags |= syscall::EventFlags::EVENT_WRITE;
+    }
+
+    /*TODO: support more EPOLL flags  */
+    let unsupported = !(EPOLLIN | EPOLLOUT);
+    if epoll & unsupported != 0 {
+        log::trace!("epoll unsupported flags 0x{:X}", epoll & unsupported);
+    }
+
+    event_flags
+}
+
+fn event_flags_to_epoll(flags: syscall::EventFlags) -> c_uint {
+    let mut epoll = 0;
+
+    if flags.contains(syscall::EventFlags::EVENT_READ) {
+        epoll |= EPOLLIN;
+    }
+
+    if flags.contains(syscall::EventFlags::EVENT_WRITE) {
+        epoll |= EPOLLOUT;
+    }
+
+    epoll
+}
+
+impl PalEpoll for Sys {
+    fn epoll_create1(flags: c_int) -> Result<c_int, Errno> {
+        match redox_rt::sys::open("/scheme/event", (O_RDWR | flags) as usize) {
+            Ok(fd) => Ok(fd as c_int),
+            Err(e) => Err(Errno::from(e)),
+        }
+    }
+
+    unsafe fn epoll_ctl(
+        epfd: c_int,
+        op: c_int,
+        fd: c_int,
+        event: *mut epoll_event,
+    ) -> Result<(), Errno> {
+        match op {
+            EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+                Sys::write(
+                    epfd,
+                    &Event {
+                        id: fd as usize,
+                        flags: unsafe { epoll_to_event_flags((*event).events) },
+                        // NOTE: Danger when using something smaller than 64-bit
+                        // systems. If this is needed, use a box or something
+                        data: unsafe { (*event).data.u64 as usize },
+                    },
+                )?;
+            }
+            EPOLL_CTL_DEL => {
+                Sys::write(
+                    epfd,
+                    &Event {
+                        id: fd as usize,
+                        flags: syscall::EventFlags::empty(),
+                        //TODO: Is data required?
+                        data: 0,
+                    },
+                )?;
+            }
+            _ => return Err(Errno(EINVAL)),
+        }
+        Ok(())
+    }
+
+    unsafe fn epoll_pwait(
+        epfd: c_int,
+        events: *mut epoll_event,
+        maxevents: c_int,
+        timeout: c_int,
+        sigset: *const sigset_t,
+    ) -> Result<usize, Errno> {
+        assert_eq!(mem::size_of::<epoll_event>(), mem::size_of::<Event>());
+
+        if maxevents <= 0 {
+            return Err(Errno(EINVAL));
+        }
+
+        if timeout != -1 {
+            register_timeout(epfd, timeout)?;
+        }
+
+        let callback = || {
+            syscall::read(epfd as usize, unsafe {
+                slice::from_raw_parts_mut(
+                    events.cast::<u8>(),
+                    maxevents as usize * mem::size_of::<syscall::Event>(),
+                )
+            })
+        };
+
+        let bytes_read = if sigset.is_null() {
+            callback()
+        } else {
+            // Allowset is inverse of sigset mask
+            let allowset = !unsafe { *sigset };
+            redox_rt::signal::callback_or_signal_async(allowset, callback)
+        }?;
+
+        let read = bytes_read as usize / mem::size_of::<syscall::Event>();
+
+        let mut count = 0;
+        for i in 0..read {
+            unsafe {
+                let event_ptr = (events.cast::<Event>()).add(i);
+                let target_ptr = events.add(count);
+                let event = *event_ptr;
+                if event.id == syscall::EVENT_TIMEOUT_ID {
+                    continue;
+                }
+                *target_ptr = epoll_event::new(
+                    event_flags_to_epoll(event.flags),
+                    epoll_data {
+                        u64: event.data as u64,
+                    },
+                );
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+}
+
+fn register_timeout(epfd: i32, timeout: i32) -> Result<usize, Errno> {
+    if timeout < 0 {
+        return Err(Errno(EINVAL));
+    }
+    Sys::write(
+        epfd,
+        &Event {
+            id: syscall::EVENT_TIMEOUT_ID,
+            flags: EVENT_READ,
+            data: timeout as usize,
+        },
+    )
+}

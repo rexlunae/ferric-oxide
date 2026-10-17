@@ -1,0 +1,27 @@
+[package]
+name = "redox-rt"
+authors = ["4lDO2 <4lDO2@protonmail.com>"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Libc-independent runtime for Redox"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitflags.workspace = true
+goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "endian_fd"] }
+plain.workspace = true
+ioslice.workspace = true
+redox_syscall.workspace = true
+redox-path.workspace = true
+redox_protocols.workspace = true
+
+generic-rt = { path = "../generic-rt" }
+
+[features]
+proc = []
+default = ["proc"]
+
+[lints]
+workspace = true
