@@ -124,6 +124,8 @@ pub struct Domain {
     attached: Vec<(Device, usize)>,
     /// The RMRRs mapped one-to-one for attached devices.
     reserved: Vec<Range<u64>>,
+    /// Set by [`Domain::close`]: whether the domain was torn down cleanly.
+    closed: Option<bool>,
 }
 
 impl Domain {
@@ -164,6 +166,7 @@ impl Domain {
             iova: IovaAllocator::new(layout.iova_limit, reserved),
             attached: Vec::new(),
             reserved: Vec::new(),
+            closed: None,
         })
     }
 
@@ -402,20 +405,39 @@ impl Domain {
     }
 }
 
-impl Drop for Domain {
-    fn drop(&mut self) {
+impl Domain {
+    /// Blocks every attached device (with the context-cache and IOTLB invalidations that
+    /// takes, waited for), then frees the tables and the domain ID. Returns `false` when a
+    /// device could not be blocked: a unit may then still translate through the domain, so its
+    /// tables are leaked, and so must be any memory mapped in it. Later calls do nothing and
+    /// return the first call's answer.
+    pub fn close(&mut self) -> bool {
+        if let Some(clean) = self.closed {
+            return clean;
+        }
+        let mut clean = true;
         for (device, index) in core::mem::take(&mut self.attached) {
             if let Err(err) = set_context(index, device.bdf, Target::Blocked, |_| Ok(())) {
-                // The unit may still use the tables, so they cannot be freed.
                 error!(
                     "IOMMU: cannot detach {:04x}:{} from domain {}: {err}; leaking its tables",
                     device.segment, device.bdf, self.did
                 );
-                return;
+                clean = false;
+                break;
             }
         }
-        self.tables.free_all();
-        release_did(self.did);
+        if clean {
+            self.tables.free_all();
+            release_did(self.did);
+        }
+        self.closed = Some(clean);
+        clean
+    }
+}
+
+impl Drop for Domain {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

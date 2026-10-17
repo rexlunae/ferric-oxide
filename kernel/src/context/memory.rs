@@ -338,13 +338,17 @@ impl AddrSpaceWrapper {
         let guard = &mut *guard;
 
         let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
-        AddrSpace::munmap_inner(
+        let result = AddrSpace::munmap_inner(
             &mut guard.grants,
             &mut guard.table.utable,
             &mut flusher,
             requested_span,
             unpin,
-        )
+        );
+        // Ferric Oxide: take down DMA mappings of the unmapped memory (scheme/iommu.rs).
+        #[cfg(iommu_enabled)]
+        crate::scheme::iommu::release(self, requested_span);
+        result
     }
     pub fn r#move(
         &self,
@@ -360,6 +364,10 @@ impl AddrSpaceWrapper {
         // SAFETY: This is moving data between two AddrSpace. Caller ensures the two is a different AddrSpace
         let mut dst = unsafe { dst_lock.acquire_rewrite(token) };
         let dst = &mut *dst;
+
+        // Ferric Oxide: the moved memory leaves its DMA mappings behind (scheme/iommu.rs).
+        #[cfg(iommu_enabled)]
+        let src_owner: &AddrSpaceWrapper = src_opt.as_ref().map_or(dst_lock, |(aw, _)| *aw);
 
         let mut src_flusher;
         let mut src_opt = match src_opt {
@@ -393,6 +401,9 @@ impl AddrSpaceWrapper {
                     PageSpan::new(base, new_page_count),
                     unpin,
                 )?;
+                // Ferric Oxide: see `munmap`.
+                #[cfg(iommu_enabled)]
+                crate::scheme::iommu::release(dst_lock, PageSpan::new(base, new_page_count));
                 if let Some(notify_files_out) = notify_files_out.as_mut() {
                     notify_files_out.extend(notify_files);
                 }
@@ -427,6 +438,8 @@ impl AddrSpaceWrapper {
         if PageSpan::new(dst_base, new_page_count).intersects(src_span) {
             return Err(Error::new(EBUSY));
         }
+        #[cfg(iommu_enabled)]
+        crate::scheme::iommu::release(src_owner, src_span);
 
         if new_page_count < src_span.count {
             let unpin = false;
@@ -749,6 +762,9 @@ impl AddrSpace {
                         requested_span,
                         unpin,
                     )?;
+                    // Ferric Oxide: see `AddrSpaceWrapper::munmap`.
+                    #[cfg(iommu_enabled)]
+                    crate::scheme::iommu::release(dst_lock, requested_span);
                     if let Some(notify_files_out) = notify_files_out {
                         notify_files_out.append(&mut notify_files);
                     }

@@ -166,7 +166,9 @@ pub enum Request {
     Attach(PciDevice),
     /// Take a device out of the domain; its DMA faults until it is attached again.
     Detach(PciDevice),
-    /// Make the domain the calling process's own. A process binds at most one domain.
+    /// Make the domain the calling process's own. A process binds at most one domain. From
+    /// then on `memory:translation` answers the process with IOVAs in the domain, mapping each
+    /// buffer on its first translation and unmapping it when the process unmaps the memory.
     Bind,
     /// Report a bridge.
     Bridge(Bridge),

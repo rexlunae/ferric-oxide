@@ -9,5 +9,6 @@ description = "The kernel iommu scheme's interface and PCI requester-ID alias ru
 
 [features]
 default = []
-## Requester-ID alias computation (`alias`), which returns a `Vec`.
+## Requester-ID alias computation (`alias`) and the DMA mapping bookkeeping (`dma`),
+## which need a heap.
 alloc = []

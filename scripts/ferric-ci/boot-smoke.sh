@@ -48,6 +48,12 @@ case "${BOOT_IOMMU:-none}" in
         ;;
 esac
 
+# QEMU's edu device can DMA between its own buffer and memory, which
+# ferric-iommu-test (recipes/tests) drives to test DMA remapping. Its default
+# 28-bit DMA mask would clamp addresses; let it reach all of memory. A fixed
+# slot gives it a known requester ID, 00:10.0.
+edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
+
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
@@ -62,6 +68,7 @@ qemu-system-x86_64 \
     "${iommu[@]}" \
     -drive file="$disk",format=raw,if=none,id=drv0 -device nvme,drive=drv0,serial=NVME_SERIAL \
     -netdev user,id=net0 -device e1000,netdev=net0 \
+    "${edu[@]}" \
     -nographic -vga none -no-reboot \
     -serial mon:stdio < /dev/null > "$log" 2>&1 &
 qemu_pid=$!

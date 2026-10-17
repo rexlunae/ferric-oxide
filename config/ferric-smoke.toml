@@ -21,7 +21,8 @@ ferric-aslr-test = "source"
 ferric-guard-test = "source"
 ferric-tlb-test = "source"
 ferric-syscall-fuzz = "source"
-# pcid-spawner starts it for the host bridge: it gets a DMA domain from pcid.
+# pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
+# DMA domain from pcid and has the device DMA through it.
 ferric-iommu-test = "source"
 
 [[files]]

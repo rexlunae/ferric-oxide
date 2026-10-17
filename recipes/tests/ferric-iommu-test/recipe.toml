@@ -1,10 +1,11 @@
-# Ferric Oxide: a test driver for DMA domains (kernel.iommu = "auto" or
-# "enforce"). pcid-spawner starts it for the host bridge (PCI class 06h,
-# subclass 00h, which never initiates DMA); it asks pcid for a DMA domain over
-# its channel, receives the domain's descriptor and binds it. The kernel logs
-# the attach and the bind, which the vtd boot CI job checks. Only for test
-# images: it claims the host bridge. Source lives in files/; as a path source
-# (relative to the repository root) edits there rebuild it.
+# Ferric Oxide: a test driver for DMA domains and DMA remapping
+# (kernel.iommu = "auto" or "enforce"). pcid-spawner starts it for QEMU's edu
+# device (vendor 1234h, device 11E8h), which CI adds to its QEMU command line.
+# It asks pcid for a DMA domain, binds it, and has the device DMA to buffers it
+# translated (IOVAs), to memory it did not, and to a buffer it unmapped; the
+# kernel logs the attach, the bind, the faults and the release, which the vtd
+# boot CI job checks. Only for test images. Source lives in files/; as a path
+# source (relative to the repository root) edits there rebuild it.
 [source]
 path = "recipes/tests/ferric-iommu-test/files"
 

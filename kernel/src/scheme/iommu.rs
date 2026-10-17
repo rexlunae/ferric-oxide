@@ -11,11 +11,16 @@
 //!   device scopes that name bridges.
 //! - [`Request::Bind`] on a domain makes it the calling process's own: a process (an address
 //!   space) binds at most one domain, and a domain is bound by at most one process. Under
-//!   `kernel.iommu = "enforce"` only a domain with a device attached can be bound. Binding is
-//!   recorded only; `memory:translation` returns IOVAs in the bound domain in a later step.
-//! - Closing the last descriptor of a domain blocks its devices (DMA faults) and frees its
-//!   tables. Domain descriptors cannot be duplicated into new descriptions, so the scheme's
-//!   close is the last close.
+//!   `kernel.iommu = "enforce"` only a domain with a device attached can be bound.
+//! - Once a process has bound a domain, `memory:translation` ([`translate`]) answers with IOVAs
+//!   in it: the frames are pinned and mapped with the page's protection, and repeat
+//!   translations return the same IOVA (`arch/x86_64/iommu/dma.rs`). When the process unmaps
+//!   that memory, the address-space code calls [`release`], which takes the mappings down
+//!   strictly. A process without a bound domain gets physical addresses, or `EACCES` under
+//!   `enforce`.
+//! - Closing the last descriptor of a domain blocks its devices (DMA faults), frees its
+//!   tables and unpins every frame mapped in it. Domain descriptors cannot be duplicated into
+//!   new descriptions, so the scheme's close is the last close.
 //!
 //! The call encoding is in the shared `ferric-iommu` crate (`crates/iommu`), which pcid uses
 //! too.
@@ -36,12 +41,16 @@ use syscall::{
 
 use super::{CallerCtx, KernelScheme, OpenResult, StrOrBytes};
 use crate::{
-    arch::iommu::domain::{self, Device, Domain, DomainError},
+    arch::iommu::{
+        dma::{DmaError, DmaSpace},
+        domain::{self, Device, Domain, DomainError},
+    },
     context::{
         self,
         file::InternalFlags,
-        memory::{AddrSpace, AddrSpaceWrapper},
+        memory::{AddrSpace, AddrSpaceWrapper, PageSpan},
     },
+    memory::{VirtualAddress, PAGE_SIZE},
     sync::CleanLockToken,
     syscall::usercopy::UserSliceRw,
 };
@@ -56,9 +65,9 @@ pub struct IommuScheme;
 enum Handle {
     /// The attach capability.
     AttachCap,
-    /// A domain, and the address space that bound it.
+    /// A domain with its translation mappings, and the address space that bound it.
     Domain {
-        domain: Domain,
+        space: DmaSpace,
         bound: Option<Weak<AddrSpaceWrapper>>,
     },
 }
@@ -68,6 +77,10 @@ static HANDLES: Mutex<BTreeMap<usize, Handle>> = Mutex::new(BTreeMap::new());
 
 /// The next handle number.
 static NEXT_ID: AtomicUsize = AtomicUsize::new(ROOT + 1);
+
+/// How many domains have been bound and not closed. While it is zero, translation and unmapping
+/// skip the handle table.
+static BOUND: AtomicUsize = AtomicUsize::new(0);
 
 /// Stores `handle` and returns its number.
 fn insert(handle: Handle) -> usize {
@@ -89,6 +102,17 @@ fn errno(err: &DomainError) -> Error {
         DomainError::NotAttached => ENOENT,
         DomainError::Map(_) | DomainError::Unmap(_) | DomainError::Hardware(_) => EIO,
     })
+}
+
+/// The errno a failed translation into a domain returns to user space.
+fn dma_errno(err: &DmaError) -> Error {
+    match err {
+        // As without a domain: the page is not there.
+        DmaError::NotMapped { .. } => Error::new(ENOENT),
+        DmaError::PinOverflow { .. } => Error::new(ENOMEM),
+        DmaError::FreeFrame { .. } | DmaError::Overlap(_) => Error::new(EIO),
+        DmaError::Domain(err) => errno(err),
+    }
 }
 
 /// The kernel's form of a device address.
@@ -135,7 +159,7 @@ impl KernelScheme for IommuScheme {
                 errno(&err)
             })?;
             Handle::Domain {
-                domain,
+                space: DmaSpace::new(domain),
                 bound: None,
             }
         };
@@ -148,11 +172,15 @@ impl KernelScheme for IommuScheme {
     fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
         // Dropping a domain blocks its devices and frees its tables; do that outside the lock.
         let handle = HANDLES.lock().remove(&id);
-        if let Some(Handle::Domain { domain, .. }) = &handle {
+        if let Some(Handle::Domain { space, bound }) = &handle {
+            if bound.is_some() {
+                BOUND.fetch_sub(1, Ordering::Relaxed);
+            }
             info!(
-                "IOMMU: domain {} closed, {} device(s) blocked",
-                domain.id(),
-                domain.device_count()
+                "IOMMU: domain {} closed, {} device(s) blocked, {} DMA mapping(s) unpinned",
+                space.id(),
+                space.device_count(),
+                space.mapping_count()
             );
         }
         drop(handle);
@@ -203,10 +231,10 @@ fn require_cap(cap: usize) -> Result<()> {
 fn with_domain<T>(
     handles: &mut BTreeMap<usize, Handle>,
     id: usize,
-    f: impl FnOnce(&mut Domain, &mut Option<Weak<AddrSpaceWrapper>>) -> Result<T>,
+    f: impl FnOnce(&mut DmaSpace, &mut Option<Weak<AddrSpaceWrapper>>) -> Result<T>,
 ) -> Result<T> {
     match handles.get_mut(&id) {
-        Some(Handle::Domain { domain, bound }) => f(domain, bound),
+        Some(Handle::Domain { space, bound }) => f(space, bound),
         Some(Handle::AttachCap) => Err(Error::new(EINVAL)),
         None => Err(Error::new(EBADF)),
     }
@@ -215,7 +243,8 @@ fn with_domain<T>(
 /// Attaches `device` to domain `id`, with the attach capability `cap`.
 fn attach(cap: usize, id: usize, device: Device) -> Result<()> {
     require_cap(cap)?;
-    with_domain(&mut HANDLES.lock(), id, |domain, _| {
+    with_domain(&mut HANDLES.lock(), id, |space, _| {
+        let domain = space.domain();
         domain.attach(device).map_err(|err| {
             warn!(
                 "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
@@ -238,8 +267,8 @@ fn attach(cap: usize, id: usize, device: Device) -> Result<()> {
 /// Detaches `device` from domain `id`, with the attach capability `cap`.
 fn detach(cap: usize, id: usize, device: Device) -> Result<()> {
     require_cap(cap)?;
-    with_domain(&mut HANDLES.lock(), id, |domain, _| {
-        domain.detach(device).map_err(|err| errno(&err))
+    with_domain(&mut HANDLES.lock(), id, |space, _| {
+        space.domain().detach(device).map_err(|err| errno(&err))
     })
 }
 
@@ -255,7 +284,8 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
         Handle::Domain { bound: Some(w), .. } => mine(w),
         _ => false,
     });
-    with_domain(&mut handles, id, |domain, bound| {
+    with_domain(&mut handles, id, |space, bound| {
+        let domain = space.domain();
         if bound.as_ref().is_some_and(|w| w.strong_count() > 0) || already {
             return Err(Error::new(EBUSY));
         }
@@ -266,6 +296,9 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
             );
             return Err(Error::new(EINVAL));
         }
+        if bound.is_none() {
+            BOUND.fetch_add(1, Ordering::Relaxed);
+        }
         *bound = Some(alloc::sync::Arc::downgrade(&addr_space));
         info!(
             "IOMMU: domain {} ({} device(s)) bound by {name}",
@@ -274,4 +307,79 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The domain bound by the address space at `owner`, if any.
+fn bound_to<'a>(
+    handles: &'a mut BTreeMap<usize, Handle>,
+    owner: *const AddrSpaceWrapper,
+) -> Option<&'a mut DmaSpace> {
+    handles.values_mut().find_map(|h| match h {
+        Handle::Domain {
+            space,
+            bound: Some(w),
+        } if w.strong_count() > 0 && core::ptr::eq(w.as_ptr(), owner) => Some(space),
+        _ => None,
+    })
+}
+
+/// What `memory:translation` answers without a bound domain: the physical address (`None`
+/// here), or `EACCES` under `kernel.iommu = "enforce"`.
+fn unbound() -> Result<Option<usize>> {
+    if cfg!(iommu = "enforce") {
+        Err(Error::new(EACCES))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `memory:translation` for the calling process: the IOVA of the page at `virt` in the domain
+/// the process has bound, mapping it first if needed; `None` when the process has bound no
+/// domain and gets the physical address instead.
+///
+/// # Errors
+///
+/// `EACCES` without a bound domain under `kernel.iommu = "enforce"`; `ENOENT` when the page is
+/// not mapped; `ENOMEM` when the IOVA space or memory for tables runs out or a frame cannot be
+/// pinned; `EIO` when the unit fails an invalidation.
+pub fn translate(virt: VirtualAddress, token: &mut CleanLockToken) -> Result<Option<usize>> {
+    if BOUND.load(Ordering::Relaxed) == 0 {
+        return unbound();
+    }
+    let addr_space = AddrSpace::current()?;
+    let mut lock_token = token.token();
+    // Held throughout, so the page cannot be unmapped (and released) between being found and
+    // being mapped. The order, address space before handle table, is the one the release hook
+    // takes too.
+    let guard = addr_space.acquire_write(lock_token.downgrade());
+    let mut handles = HANDLES.lock();
+    let Some(space) = bound_to(&mut handles, alloc::sync::Arc::as_ptr(&addr_space)) else {
+        return unbound();
+    };
+    let iova = space.translate(&guard, virt).map_err(|err| {
+        if !matches!(err, DmaError::NotMapped { .. }) {
+            warn!(
+                "IOMMU: cannot map {:#x} in domain {}: {err}",
+                virt.data(),
+                space.id()
+            );
+        }
+        dma_errno(&err)
+    })?;
+    usize::try_from(iova).map(Some).map_err(|_| Error::new(EIO))
+}
+
+/// The release hook: the address space at `owner` unmapped (or moved away) `span`, so the DMA
+/// mappings only that memory reached are taken down. Cheap when no domain is bound.
+pub fn release(owner: &AddrSpaceWrapper, span: PageSpan) {
+    if BOUND.load(Ordering::Relaxed) == 0 || span.is_empty() {
+        return;
+    }
+    let mut handles = HANDLES.lock();
+    if let Some(space) = bound_to(&mut handles, owner) {
+        space.release(
+            span.base.start_address().data(),
+            span.count.saturating_mul(PAGE_SIZE),
+        );
+    }
 }
