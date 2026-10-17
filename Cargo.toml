@@ -22,7 +22,7 @@ members = [
 # The bootloader and user space build for other targets but have no
 # [workspace] table upstream, so they are excluded here to build standalone.
 exclude = [
-    "bootloader",
+    "crates/bootloader",
     "userspace",
     "tools/redoxer/example",
     "recipes",

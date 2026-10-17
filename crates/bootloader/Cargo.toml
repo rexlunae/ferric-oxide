@@ -22,8 +22,8 @@ redox_syscall = "0.5"
 spin = "0.9.5"
 
 # Ferric Oxide: kernel image KASLR (the `kaslr` feature).
-ferric-elfreloc = { path = "../crates/elfreloc", optional = true }
-ferric-hwrand = { path = "../crates/hwrand", optional = true }
+ferric-elfreloc = { path = "../elfreloc", optional = true }
+ferric-hwrand = { path = "../hwrand", optional = true }
 
 [dependencies.redoxfs]
 version = "0.8"

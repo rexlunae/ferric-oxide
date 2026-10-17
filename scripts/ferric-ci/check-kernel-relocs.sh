@@ -21,15 +21,15 @@ link_args="-C link-arg=--emit-relocs"
 # exactly what a relocated image looks like.
 sed -e "s/^\(    \. = KERNEL_LINK_BASE\);/\1 + $slide;/" \
     -e "s/- KERNEL_LINK_BASE)/- (KERNEL_LINK_BASE + $slide))/" \
-    kernel/linkers/x86_64.ld > "$work/moved.ld"
-if cmp -s kernel/linkers/x86_64.ld "$work/moved.ld"; then
+    crates/kernel/linkers/x86_64.ld > "$work/moved.ld"
+if cmp -s crates/kernel/linkers/x86_64.ld "$work/moved.ld"; then
     echo "check-kernel-relocs: could not move the linker script" >&2
     exit 2
 fi
 
-[ -f kernel/config.toml ] || cp kernel/config.toml.example kernel/config.toml
-make -s -C kernel BUILD="$work/base" OBJCOPY="$objcopy" KERNEL_LINK_ARGS="$link_args" "$work/base/kernel"
-make -s -C kernel BUILD="$work/moved" OBJCOPY="$objcopy" KERNEL_LINK_ARGS="$link_args" \
+[ -f crates/kernel/config.toml ] || cp crates/kernel/config.toml.example crates/kernel/config.toml
+make -s -C crates/kernel BUILD="$work/base" OBJCOPY="$objcopy" KERNEL_LINK_ARGS="$link_args" "$work/base/kernel"
+make -s -C crates/kernel BUILD="$work/moved" OBJCOPY="$objcopy" KERNEL_LINK_ARGS="$link_args" \
     LD_SCRIPT="$work/moved.ld" "$work/moved/kernel"
 
 cargo run --quiet -p ferric-elfreloc --example relocate -- \

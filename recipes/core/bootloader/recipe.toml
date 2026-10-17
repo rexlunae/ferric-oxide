@@ -1,7 +1,7 @@
 [source]
-# The bootloader lives in this repository at bootloader/, a git subtree of
+# The bootloader lives in this repository at crates/bootloader/, a git subtree of
 # gitlab.redox-os.org/redox-os/bootloader (see .github/workflows/subtree-sync.yml).
-path = "bootloader"
+path = "crates/bootloader"
 
 [build]
 template = "custom"
@@ -9,9 +9,15 @@ script = """
 OUTDIR="${COOKBOOK_BUILD}"
 mkdir -pv "${COOKBOOK_STAGE}/usr/lib/boot"
 
-# Ferric Oxide: shared crates are path dependencies at ../crates from
-# bootloader/; give the cookbook's copy in source/ the same neighbour.
-ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../crates"
+# Ferric Oxide: the bootloader uses the shared crates beside it in crates/ as
+# ../<name> path dependencies (kaslr uses ../elfreloc and ../hwrand). The
+# cookbook builds a copy of crates/bootloader/ in this recipe's source/, so
+# give that copy the same neighbours.
+for dep in "${COOKBOOK_ROOT}"/crates/*/
+do
+    name="$(basename "${dep}")"
+    [ "${name}" = bootloader ] || ln -sfn "${dep%/}" "${COOKBOOK_SOURCE}/../${name}"
+done
 # Cargo features from ferric.toml (kaslr for kernel image KASLR). The
 # Makefile only tracks sources, so rebuild when they change.
 if [ "$(cat "${OUTDIR}/ferric.stamp" 2>/dev/null)" != "${FERRIC_BOOTLOADER_FEATURES}" ]
