@@ -640,6 +640,14 @@ pub fn mremap(
     if old_size == 0 || new_size == 0 {
         return Err(Error::new(EINVAL));
     }
+    // Ferric Oxide: both ranges must lie in user space. A destination in the kernel half (found
+    // by the syscall fuzzer: mremap to 0xffff_ffff_ffff_f000) panicked the kernel while inserting
+    // the grant.
+    if PageSpan::validate(VirtualAddress::new(old_address), old_size).is_none()
+        || PageSpan::validate(VirtualAddress::new(new_address), new_size).is_none()
+    {
+        return Err(Error::new(EINVAL));
+    }
 
     let old_base = Page::containing_address(VirtualAddress::new(old_address));
     let new_base = Page::containing_address(VirtualAddress::new(new_address));
