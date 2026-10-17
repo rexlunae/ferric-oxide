@@ -695,18 +695,28 @@ impl<D: Disk> Resource<D> for FileResource {
         #[allow(unused_mut)]
         let mut affected_fmaps = fmap_info.ranges.remove(offset..offset + size as u64);
 
+        let mut unmapped = false;
+        let mut ignored = false;
         for (range, mut fmap) in affected_fmaps {
             // Ferric Oxide: a process can make the kernel send funmap for a
             // range that is no longer mapped (found by ferric-syscall-fuzz).
-            // Leave the count at zero rather than panicking the daemon.
-            match fmap.rc.checked_sub(1) {
-                Some(rc) => fmap.rc = rc,
-                None => log::warn!(
+            // Ignore it rather than panicking the daemon, and don't sync: the
+            // retained buffer may be older than later writes to the file.
+            let Some(rc) = fmap.rc.checked_sub(1) else {
+                log::warn!(
                     "funmap of unmapped range {}..{} ignored",
                     range.start,
                     range.end
-                ),
-            }
+                );
+                //FIXME: Use result?
+                let _ = fmap_info
+                    .ranges
+                    .insert(range.start, range.end - range.start, fmap);
+                ignored = true;
+                continue;
+            };
+            fmap.rc = rc;
+            unmapped = true;
 
             //log::info!("SYNCING {}..{}", range.start, range.end);
             unsafe {
@@ -725,6 +735,12 @@ impl<D: Disk> Resource<D> for FileResource {
                 .insert(range.start, range.end - range.start, fmap);
         }
         //dbg!(&self.fmaps);
+
+        // Ferric Oxide: a funmap that only hit already-unmapped ranges must not
+        // close the node a second time.
+        if ignored && !unmapped {
+            return Ok(());
+        }
 
         // Allow release of node if not in use anymore
         if !fmap_info.in_use() {
