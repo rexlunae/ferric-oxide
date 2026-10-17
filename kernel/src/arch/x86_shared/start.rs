@@ -51,6 +51,9 @@ extern "C" fn kstart() {
         jmp eax
     ",
 
+        // Ferric Oxide (IBT): the bootloader jumps here indirectly.
+        #[cfg(target_arch = "x86_64")]
+        ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // BSS should already be zero
@@ -95,6 +98,9 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
         // Stop early with a clear message on CPUs below the configured baseline.
         #[cfg(target_arch = "x86_64")]
         crate::arch::cpu_level::check();
+        // Ferric Oxide: stop here if the build requires IBT and this CPU lacks it.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::ibt::check();
 
         // Set up GDT
         gdt::init_bsp(stack_end);
@@ -245,6 +251,9 @@ pub extern "C" fn kstart_ap() {
         jmp {start_ap}
     ",
 
+        // Ferric Oxide (IBT): the AP trampoline jumps here indirectly (`jmp rax`).
+        #[cfg(target_arch = "x86_64")]
+        ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // Note: The System V ABI requires the stack to be aligned to 16 bytes

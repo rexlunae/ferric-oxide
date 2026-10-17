@@ -91,6 +91,8 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_instruction() {
     core::arch::naked_asm!(
+    // Ferric Oxide (IBT): SYSCALL enters through IA32_LSTAR like an indirect branch.
+    ibt_endbr!(),
     // Yes, this is magic. No, you don't need to understand
     "swapgs;",                    // Swap KGSBASE with GSBASE, allowing fast TSS access.
     "mov gs:[{sp}], rsp;",        // Save userspace stack pointer
