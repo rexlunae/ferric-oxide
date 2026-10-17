@@ -220,7 +220,11 @@ jobs:
       - name: Annotate the serial log on failure
         if: failure()
         run: |
-          tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tail -n 200 > "$RUNNER_TEMP/tail.log" || true
+          # Test results and IOMMU, pcid and interrupt lines first, then the tail.
+          tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$RUNNER_TEMP/clean.log" || true
+          { grep -aE 'FERRIC_TEST_(FAIL|SKIP)|FERRIC_IOMMU|IOMMU|pcid|iommu|interrupt|panic|PANIC|EXCEPTION' "$RUNNER_TEMP/clean.log" \
+              | grep -av 'funmap passed' | tail -n 120
+            grep -av 'funmap passed' "$RUNNER_TEMP/clean.log" | tail -n 40; } > "$RUNNER_TEMP/tail.log" || true
           split -l 40 "$RUNNER_TEMP/tail.log" "$RUNNER_TEMP/tail."
           for part in "$RUNNER_TEMP"/tail.a?; do
             body="$(sed 's/%/%25/g' "$part" | sed ':a;N;$!ba;s/\n/%0A/g')"
