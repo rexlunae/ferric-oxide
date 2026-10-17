@@ -1,16 +1,20 @@
 [source]
-# The kernel lives in this repository at kernel/, a git subtree of
+# The kernel lives in this repository at crates/kernel/, a git subtree of
 # gitlab.redox-os.org/redox-os/kernel (see .github/workflows/subtree-sync.yml).
 # The path is relative to the repository root, where the cookbook runs.
-path = "kernel"
+path = "crates/kernel"
 
 [build]
 template = "custom"
 script = """
-# Shared Ferric Oxide crates are path dependencies at ../crates from kernel/.
-# The cookbook builds a copy of kernel/ in this recipe's source/, so give that
-# copy the same neighbour.
-ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../crates"
+# The kernel uses the shared crates beside it in crates/ as ../<name> path
+# dependencies. The cookbook builds a copy of crates/kernel/ in this recipe's
+# source/, so give that copy the same neighbours.
+for dep in "${COOKBOOK_ROOT}"/crates/*/
+do
+    name="$(basename "${dep}")"
+    [ "${name}" = kernel ] || ln -sfn "${dep%/}" "${COOKBOOK_SOURCE}/../${name}"
+done
 cd "${COOKBOOK_SOURCE}"
 KERNEL_MAKE_ARGS=()
 # Ferric Oxide: kernel features and CPU feature policy from ferric.toml

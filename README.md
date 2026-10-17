@@ -52,11 +52,11 @@ The kernel, bootloader, relibc, base, RedoxFS and book are imported upstream tre
 
 | Component | Upstream repository |
 |-----------|---------------------|
-| Kernel ([local](kernel/)) | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
+| Kernel ([local](crates/kernel/)) | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
 | Base (essential system components and drivers) | [redox-os/base](https://gitlab.redox-os.org/redox-os/base) |
 | RedoxFS (default file system) | [redox-os/redoxfs](https://gitlab.redox-os.org/redox-os/redoxfs) |
-| relibc (C POSIX library written in Rust) | [redox-os/relibc](https://gitlab.redox-os.org/redox-os/relibc) |
-| Bootloader | [redox-os/bootloader](https://gitlab.redox-os.org/redox-os/bootloader) |
+| relibc (C POSIX library written in Rust, [local](crates/relibc/)) | [redox-os/relibc](https://gitlab.redox-os.org/redox-os/relibc) |
+| Bootloader ([local](crates/bootloader/)) | [redox-os/bootloader](https://gitlab.redox-os.org/redox-os/bootloader) |
 | Ion (default shell) | [redox-os/ion](https://gitlab.redox-os.org/redox-os/ion) |
 | pkgutils (package manager) | [redox-os/pkgutils](https://gitlab.redox-os.org/redox-os/pkgutils) |
 | Orbital (display server and window manager) | [redox-os/orbital](https://gitlab.redox-os.org/redox-os/orbital) |
