@@ -480,7 +480,8 @@ impl PciFunctionHandle {
                 process::exit(1);
             }
         }
-        let mut fd = [0_u8; size_of::<usize>()];
+        // usize::MAX asks the kernel to pick the descriptor number.
+        let mut fd = usize::MAX.to_ne_bytes();
         if let Err(err) = libredox::call::call_ro(
             self.channel.as_raw_fd() as usize,
             &mut fd,

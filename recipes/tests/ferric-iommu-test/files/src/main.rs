@@ -148,7 +148,9 @@ fn test(channel: &mut File, channel_fd: usize) -> Result<bool, Failure> {
         Some(tag) if tag == RESPONSE_ERROR.to_le_bytes() => return Ok(false),
         _ => return Err(Failure::Response(response)),
     }
-    let mut fd = [0_u8; size_of::<usize>()];
+    // usize::MAX asks the kernel to pick the descriptor number; any other value is the slot
+    // to put it in, which must be free.
+    let mut fd = usize::MAX.to_ne_bytes();
     call(channel_fd, &mut fd, CALL_READ | CALL_FD, &[])
         .map_err(|errno| Failure::Call("receiving the domain descriptor", errno))?;
     let domain = usize::from_ne_bytes(fd);
