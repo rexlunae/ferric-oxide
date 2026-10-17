@@ -1,6 +1,8 @@
 # Hardware Compatibility
 
-This document tracks the current hardware compatibility of Redox OS.
+This document tracks the current hardware compatibility of Ferric Oxide.
+
+Ferric Oxide is a fork of Redox OS, so the reports below were inherited from the upstream Redox OS hardware list and refer to Redox OS images. New reports should name the Ferric Oxide version or commit they were tested with.
 
 - [Why are hardware reports needed?](#why-are-hardware-reports-needed)
 - [What if my computer is customized?](#what-if-my-computer-is-customized)
@@ -28,7 +30,7 @@ If your desktop is customized (common) you should use the "Custom" word on the "
 
 A customized laptop should only be reported if you replaced the original CPU, report the CPU vendor and model in the "Model" category.
 
-We also recommend to add your `pciutils` log as a comment on [this](https://gitlab.redox-os.org/redox-os/redox/-/issues/1797) tracking issue to help us with probable device porting.
+We also recommend attaching your `pciutils` log to a GitHub issue in this repository to help with device porting.
 
 ## Status
 
@@ -39,7 +41,7 @@ The following limitations apply to any status.
 - Only Intel GPUs are supported, other GPU vendors use BIOS VESA or UEFI GOP
 - I2C devices aren't supported yet (PS/2 or USB devices should be used)
 - USB support varies on each device model because some USB devices require specific drivers (use input devices with standardized controls for more compatibility)
-- Automatic operating system discovery is not implemented in the boot loader yet (remember this before installing Redox)
+- Automatic operating system discovery is not implemented in the boot loader yet (remember this before installing Ferric Oxide)
 
 ### Recommended
 
