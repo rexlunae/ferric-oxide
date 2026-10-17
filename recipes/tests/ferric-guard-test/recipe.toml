@@ -5,4 +5,12 @@
 path = "recipes/tests/ferric-guard-test/files"
 
 [build]
-template = "cargo"
+template = "custom"
+# Link against this repository's relibc, not the toolchain's prebuilt copy:
+# what the test checks lives in relibc, and statically linked programs carry
+# their libc with them.
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""
