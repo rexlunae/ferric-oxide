@@ -338,10 +338,10 @@ interrupt!(fault_interrupt, || {
     unsafe { local_apic::the_local_apic().eoi() };
 });
 
-/// The highest physical address the identity map must cover: the end of the memory map
-/// (RAM and the firmware's reserved ranges) or of any RMRR, whichever is higher.
+/// The highest physical address the identity map must cover: the end of RAM or of any RMRR,
+/// whichever is higher. Everything below it, holes included, is mapped.
 fn identity_top(dmar: &Dmar<'_>) -> u64 {
-    let mut top = crate::startup::memory::phys_end() as u64;
+    let mut top = crate::startup::memory::ram_end() as u64;
     for rmrr in dmar.structures().filter_map(|s| match s {
         Ok(Structure::Rmrr(rmrr)) => Some(rmrr),
         _ => None,
