@@ -1,0 +1,405 @@
+//! # Context management
+//!
+//! For resources on contexts, please consult [wikipedia](https://en.wikipedia.org/wiki/Context_switch) and  [osdev](https://wiki.osdev.org/Context_Switching)
+
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Weak},
+};
+use core::{cell::Ref, cmp::Reverse, num::NonZeroUsize, ops::Deref, sync::atomic::Ordering};
+
+use crate::{
+    context::memory::AddrSpaceWrapper,
+    cpu_set::{LogicalCpuId, LogicalCpuSet},
+    cpu_stats::CpuStatsData,
+    ipi::{ipi, IpiKind, IpiTarget},
+    memory::{RmmA, RmmArch, TableKind},
+    percpu::{get_percpu_block, PercpuBlock},
+    sync::{
+        ArcRwLockWriteGuard, CleanLockToken, LockToken, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        L1, L2, L3, L4,
+    },
+    syscall::error::Result,
+};
+
+use self::context::Kstack;
+pub use self::{
+    context::{BorrowedHtBuf, Context, Status},
+    switch::switch,
+};
+
+pub type ContextLock = RwLock<L4, Context>;
+pub type ArcContextLockWriteGuard = ArcRwLockWriteGuard<L4, Context>;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64.rs"]
+mod arch;
+
+#[cfg(target_arch = "x86")]
+#[path = "arch/x86.rs"]
+mod arch;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64.rs"]
+mod arch;
+
+#[cfg(target_arch = "riscv64")]
+#[path = "arch/riscv64.rs"]
+mod arch;
+
+/// Context struct
+pub mod context;
+
+/// Context switch function
+pub mod switch;
+
+/// File struct - defines a scheme and a file number
+pub mod file;
+
+/// Memory struct - contains a set of pages for a context
+pub mod memory;
+
+/// Signal handling
+pub mod signal;
+
+/// Timeout handling
+pub mod timeout;
+
+pub use self::switch::switch_finish_hook;
+
+/// Maximum context files
+pub const CONTEXT_MAX_FILES: usize = 65_536;
+
+pub use self::arch::empty_cr3;
+
+// Set of weak references to all contexts available for scheduling. The only strong references are
+// the context file descriptors.
+static CONTEXTS: RwLock<L2, BTreeSet<ContextRef>> = RwLock::new(BTreeSet::new());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContextQueueKey {
+    vd: u64,
+    rem_slice: Reverse<u64>,
+    ctxt_id: u32,
+}
+
+#[derive(Debug)]
+pub struct ContextQueueValue {
+    vtime: u64,
+    weight: u64,
+    context_ref: WeakContextRef,
+}
+
+#[derive(Debug)]
+pub struct RunContextData {
+    queue: BTreeMap<ContextQueueKey, ContextQueueValue>,
+    timers: BTreeSet<(u128, WeakContextRef)>, // (wake, context)
+    v: u64,
+    total_weight: u64,
+    min_vtime: u64,
+}
+
+impl RunContextData {
+    pub const fn new() -> Self {
+        Self {
+            queue: BTreeMap::new(),
+            timers: BTreeSet::new(),
+            v: 0,
+            total_weight: 0,
+            min_vtime: 0,
+        }
+    }
+    pub fn is_stealable(&self) -> bool {
+        !self.queue.is_empty()
+    }
+    fn queue_insert(&mut self, k: ContextQueueKey, v: ContextQueueValue) {
+        // it is forbidden to push kmain context
+        /*
+        if let Some(ctx) = v.context_ref.upgrade() {
+            let mut t = unsafe { CleanLockToken::new() };
+            if let Some(g) = ctx.try_read(t.token()) {
+                if !g.userspace {
+                    panic!(
+                        "CPU {} was trying to push {:?} {id}",
+                        crate::cpu_id().get(),
+                        g.name.as_str(),
+                    );
+                }
+            }
+        }
+        */
+        self.queue.insert(k, v);
+    }
+}
+
+/// Get the global schemes list, const
+pub fn contexts(token: LockToken<'_, L1>) -> RwLockReadGuard<'_, L2, BTreeSet<ContextRef>> {
+    CONTEXTS.read(token)
+}
+
+/// Get per cpu contexts, mutable
+pub fn contexts_mut(token: LockToken<'_, L1>) -> RwLockWriteGuard<'_, L2, BTreeSet<ContextRef>> {
+    CONTEXTS.write(token)
+}
+
+pub fn unblock_context(context_lock: &Arc<ContextLock>, token: &mut LockToken<'_, L3>) -> bool {
+    let cpu_id = {
+        let mut guard = context_lock.write(token.token());
+        if !guard.unblock_no_ipi() {
+            let guard_runnable = guard.status.is_runnable();
+            let guard_cpu_id = guard.cpu_id;
+            if guard_runnable {
+                // already set to runnable externally
+                drop(guard);
+                wakeup_context(context_lock, guard_cpu_id, token);
+            }
+            return false;
+        }
+        guard.cpu_id
+    };
+
+    wakeup_context(context_lock, cpu_id, token);
+
+    true
+}
+
+pub fn wakeup_context(
+    context_lock: &Arc<ContextLock>,
+    cpu_id: Option<LogicalCpuId>,
+    token: &mut LockToken<'_, L3>,
+) {
+    let weak = WeakContextRef(Arc::downgrade(context_lock));
+    let curr_cpu = crate::cpu_id();
+
+    let target_cpu = cpu_id.unwrap_or(curr_cpu);
+
+    if target_cpu != curr_cpu
+        && let Some(percpu) = get_percpu_block(target_cpu)
+    {
+        // non-local wakeup
+        percpu
+            .switch_internals
+            .ipi_context_wakeup_list
+            .lock(token.token())
+            .push(weak);
+        ipi(IpiKind::Wakeup, IpiTarget::Other);
+        return;
+    }
+
+    // local wakeup
+    PercpuBlock::current()
+        .switch_internals
+        .local_wakeup_list
+        .borrow_mut()
+        .push(weak);
+}
+
+pub fn init(token: &mut CleanLockToken, kstack: Kstack) {
+    let owner = None; // kmain not owned by any fd
+    let mut context = Context::new(owner, kstack).expect("failed to create kmain context");
+    context.sched_affinity = LogicalCpuSet::empty();
+    context.sched_affinity.atomic_set(crate::cpu_id());
+
+    context.name.clear();
+    context.name.push_str("[kmain]");
+
+    #[cfg(feature = "profiling")]
+    {
+        crate::profiling::DBG_ID_MAP
+            .write(token.token())
+            .insert(context.debug_id, context.name);
+    }
+
+    self::arch::EMPTY_CR3.call_once(|| RmmA::table(TableKind::User));
+
+    context.status = Status::Runnable;
+    context.running = true;
+    context.cpu_id = Some(crate::cpu_id());
+
+    let context_lock = Arc::new(ContextLock::new(context));
+
+    let context_ref = ContextRef(Arc::clone(&context_lock));
+    contexts_mut(token.token().downgrade()).insert(context_ref.clone());
+    // Set this as current context and idle context, but don't treat it as regular context queue
+    unsafe {
+        let percpu = PercpuBlock::current();
+        percpu
+            .switch_internals
+            .set_current_context(Arc::clone(&context_lock));
+        percpu
+            .switch_internals
+            .set_sched_context(Arc::clone(&context_lock));
+        percpu.switch_internals.set_idle_context(context_lock);
+    }
+}
+
+// TODO: Maybe use lock tokens to forbid holding this reference across context::switch (where the
+// RefCell's borrow_mut will fail if the reference is kept?)? If so, maybe even avoid `RefCell`
+// entirely, if it can be done sufficiently rigorously and without breaking soundness?
+pub fn current() -> Ref<'static, Arc<ContextLock>> {
+    PercpuBlock::current().switch_internals.current_context()
+}
+
+pub fn try_current() -> Ref<'static, Option<Arc<ContextLock>>> {
+    PercpuBlock::current()
+        .switch_internals
+        .current_context_raw()
+}
+pub fn is_current(context: &Arc<ContextLock>) -> bool {
+    PercpuBlock::current()
+        .switch_internals
+        .current_context_raw()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, context))
+}
+
+#[derive(Clone)]
+pub struct ContextRef(pub Arc<ContextLock>);
+impl Deref for ContextRef {
+    type Target = Arc<ContextLock>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Ord for ContextRef {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        Ord::cmp(&Arc::as_ptr(&self.0), &Arc::as_ptr(&other.0))
+    }
+}
+impl PartialOrd for ContextRef {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+impl PartialEq for ContextRef {
+    fn eq(&self, other: &Self) -> bool {
+        Ord::cmp(self, other) == core::cmp::Ordering::Equal
+    }
+}
+impl Eq for ContextRef {}
+
+#[derive(Clone)]
+pub struct WeakContextRef(pub Weak<ContextLock>);
+impl WeakContextRef {
+    pub fn upgrade(&self) -> Option<Arc<ContextLock>> {
+        self.0.upgrade()
+    }
+}
+
+impl Ord for WeakContextRef {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        Ord::cmp(&Weak::as_ptr(&self.0), &Weak::as_ptr(&other.0))
+    }
+}
+impl PartialOrd for WeakContextRef {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+impl PartialEq for WeakContextRef {
+    fn eq(&self, other: &Self) -> bool {
+        Ord::cmp(self, other) == core::cmp::Ordering::Equal
+    }
+}
+impl Eq for WeakContextRef {}
+impl core::fmt::Debug for WeakContextRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:p}", Weak::as_ptr(&self.0))
+    }
+}
+
+/// Spawn a context from a function.
+pub fn spawn(
+    userspace_allowed: bool,
+    owner_proc_id: Option<NonZeroUsize>,
+    func: extern "C" fn(),
+    token: &mut CleanLockToken,
+) -> Result<Arc<ContextLock>> {
+    let stack = Kstack::new()?;
+
+    let mut context = Context::new(owner_proc_id, stack)?;
+
+    let _ = context.set_addr_space(Some(AddrSpaceWrapper::new()?), token.downgrade());
+    context
+        .arch
+        .setup_initial_call(&context.kstack, func, userspace_allowed);
+
+    context.userspace = userspace_allowed;
+    context.queue_key = Some(ContextQueueKey {
+        vd: context.vd,
+        rem_slice: Reverse(context.rem_slice),
+        ctxt_id: context.debug_id,
+    });
+
+    let context_lock = Arc::new(ContextLock::new(context));
+    let context_ref = ContextRef(Arc::clone(&context_lock));
+    contexts_mut(token.downgrade()).insert(context_ref);
+
+    Ok(context_lock)
+}
+
+/// A guard that disables preemption for a context while it is alive.
+///
+/// This guard is used to ensure that a sequence of operations is atomic with respect to preemption.
+/// It automatically re-enables preemption when dropped.
+///
+/// Because the guard must hold a mutable reference to the `CleanLockToken` to re-enable preemption
+/// in `Drop`, it consumes the token. The `token()` method allows re-borrowing the token for use
+/// within the guard's scope.
+pub struct PreemptGuardL1<'a> {
+    context: &'a ContextLock,
+    token: &'a mut LockToken<'a, L1>,
+}
+
+impl<'a> PreemptGuardL1<'a> {
+    pub fn new(context: &'a ContextLock, token: &'a mut LockToken<'a, L1>) -> PreemptGuardL1<'a> {
+        context.write(token.token()).preempt_locks += 1;
+        PreemptGuardL1 { context, token }
+    }
+
+    /// Get a mutable reference to the underlying `LockToken<L1>`.
+    pub fn token(&mut self) -> &mut LockToken<'a, L1> {
+        self.token
+    }
+}
+
+impl Drop for PreemptGuardL1<'_> {
+    fn drop(&mut self) {
+        self.context.write(self.token.token()).preempt_locks -= 1;
+    }
+}
+
+pub fn get_contexts_stats(token: &mut CleanLockToken) -> [usize; 6] {
+    let alive = contexts(token.downgrade()).len();
+
+    let mut running = 0;
+    let mut switches = 0;
+    let mut syscall_switches = 0;
+    let mut idling_cpu = 0;
+
+    for percpu in crate::percpu::all_percpu_blocks() {
+        let (queue, stealable) = {
+            let lock = percpu.switch_internals.run_queue.lock();
+            (lock.queue.len(), lock.is_stealable())
+        };
+        running += queue;
+        let data = CpuStatsData::from(&percpu.stats);
+        switches += data.context_switches as usize;
+        syscall_switches += data.syscall_switches as usize;
+        if !stealable {
+            idling_cpu += 1;
+        }
+    }
+
+    let blocked = alive.saturating_sub(running);
+
+    [
+        alive,
+        running,
+        blocked,
+        switches,
+        syscall_switches,
+        idling_cpu,
+    ]
+}

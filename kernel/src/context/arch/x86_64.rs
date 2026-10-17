@@ -1,0 +1,481 @@
+use core::ptr::{addr_of, addr_of_mut};
+
+use crate::syscall::FloatRegisters;
+
+use crate::{arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA};
+use core::mem::offset_of;
+use rmm::{Arch, VirtualAddress};
+use spin::Once;
+use syscall::{error::*, EnvRegisters};
+use x86::msr;
+
+const ST_RESERVED: u128 = 0xFFFF_FFFF_FFFF_0000_0000_0000_0000_0000;
+
+#[cfg(cpu_feature_never = "xsave")]
+pub const KFX_ALIGN: usize = 16;
+
+#[cfg(not(cpu_feature_never = "xsave"))]
+pub const KFX_ALIGN: usize = 64;
+
+// TODO: stack guarding?
+
+#[repr(C)]
+struct InFxsaveAvailable {
+    /// RBX register
+    rbx: usize,
+    /// R12 register
+    r12: usize,
+    /// R13 register
+    r13: usize,
+    /// R14 register
+    r14: usize,
+    /// R15 register
+    r15: usize,
+    /// Base pointer
+    rbp: usize,
+}
+
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct Context {
+    /// Stack pointer
+    pub(crate) rsp: usize,
+    /// FSBASE.
+    ///
+    /// NOTE: Same fsgsbase behavior as with gsbase.
+    pub(crate) fsbase: usize,
+    /// GSBASE.
+    ///
+    /// NOTE: Without fsgsbase, this register will strictly be equal to the register value when
+    /// running. With fsgsbase, this is neither saved nor restored upon every syscall (there is no
+    /// need to!), and thus it must be re-read from the register before copying this struct.
+    pub(crate) gsbase: usize,
+    userspace_io_allowed: bool,
+}
+
+impl Context {
+    pub fn new() -> Context {
+        Context {
+            rsp: 0,
+            fsbase: 0,
+            gsbase: 0,
+            userspace_io_allowed: false,
+        }
+    }
+
+    fn set_stack(&mut self, address: usize) {
+        self.rsp = address;
+    }
+
+    pub(crate) fn setup_initial_call(
+        &mut self,
+        stack: &Kstack,
+        func: extern "C" fn(),
+        userspace_allowed: bool,
+    ) {
+        let mut stack_top = stack.initial_top();
+
+        const INT_REGS_SIZE: usize = size_of::<InterruptStack>();
+
+        // Kstack::initial_top() is always at least 8 byte aligned. assertion to be safe
+        debug_assert!(
+            (stack_top as usize).is_multiple_of(8),
+            "Kstack not 8 byte aligned"
+        );
+        #[expect(clippy::cast_ptr_alignment)]
+        unsafe {
+            if userspace_allowed {
+                // Zero-initialize InterruptStack registers.
+                stack_top = stack_top.sub(INT_REGS_SIZE);
+                stack_top.write_bytes(0_u8, INT_REGS_SIZE);
+                (*stack_top.cast::<InterruptStack>()).init();
+
+                stack_top = stack_top.sub(size_of::<usize>());
+                stack_top
+                    .cast::<usize>()
+                    .write(crate::arch::interrupt::syscall::enter_usermode as *const () as usize);
+            }
+
+            stack_top = stack_top.sub(size_of::<usize>());
+            stack_top.cast::<usize>().write(func as usize);
+        }
+
+        self.set_stack(stack_top as usize);
+    }
+}
+impl super::Context {
+    pub fn get_fx_regs(&self) -> FloatRegisters {
+        let mut regs = unsafe { self.kfx.as_ptr().cast::<FloatRegisters>().read() };
+        regs._reserved = 0;
+        let mut new_st = regs.st_space;
+        for st in &mut new_st {
+            // Only allow access to the 80 lowest bits
+            *st &= !ST_RESERVED;
+        }
+        regs.st_space = new_st;
+        regs
+    }
+
+    pub fn set_fx_regs(&mut self, mut new: FloatRegisters) {
+        {
+            let old = unsafe { &*(self.kfx.as_ptr().cast::<FloatRegisters>()) };
+            new._reserved = old._reserved;
+            let old_st = new.st_space;
+            let mut new_st = new.st_space;
+            for (new_st, old_st) in new_st.iter_mut().zip(&old_st) {
+                *new_st &= !ST_RESERVED;
+                *new_st |= old_st & ST_RESERVED;
+            }
+            new.st_space = new_st;
+
+            // Make sure we don't use `old` from now on
+        }
+
+        unsafe {
+            self.kfx.as_mut_ptr().cast::<FloatRegisters>().write(new);
+        }
+    }
+
+    pub fn set_userspace_io_allowed(&mut self, allowed: bool) {
+        self.arch.userspace_io_allowed = allowed;
+
+        if self.is_current_context() {
+            unsafe {
+                crate::arch::gdt::set_userspace_io_allowed(crate::arch::gdt::pcr(), allowed);
+            }
+        }
+    }
+
+    pub(crate) fn current_syscall(&self) -> Option<[usize; 7]> {
+        if !self.inside_syscall {
+            return None;
+        }
+        let regs = self.regs()?;
+        let scratch = &regs.scratch;
+        Some([
+            scratch.rax,
+            scratch.rdi,
+            scratch.rsi,
+            scratch.rdx,
+            scratch.r10,
+            scratch.r8,
+            scratch.r9,
+        ])
+    }
+
+    pub(crate) fn read_current_env_regs(&self) -> Result<EnvRegisters> {
+        // TODO: Avoid rdmsr if fsgsbase is not enabled, if this is worth optimizing for.
+        unsafe {
+            Ok(EnvRegisters {
+                fsbase: msr::rdmsr(msr::IA32_FS_BASE),
+                gsbase: msr::rdmsr(msr::IA32_KERNEL_GSBASE),
+            })
+        }
+    }
+
+    pub(crate) fn read_env_regs(&self) -> Result<EnvRegisters> {
+        Ok(EnvRegisters {
+            fsbase: self.arch.fsbase as u64,
+            gsbase: self.arch.gsbase as u64,
+        })
+    }
+
+    pub(crate) fn write_current_env_regs(&mut self, regs: EnvRegisters) -> Result<()> {
+        if RmmA::virt_is_valid(VirtualAddress::new(regs.fsbase as usize))
+            && RmmA::virt_is_valid(VirtualAddress::new(regs.gsbase as usize))
+        {
+            unsafe {
+                x86::msr::wrmsr(x86::msr::IA32_FS_BASE, regs.fsbase);
+                // We have to write to KERNEL_GSBASE, because when the kernel returns to
+                // userspace, it will have executed SWAPGS first.
+                x86::msr::wrmsr(x86::msr::IA32_KERNEL_GSBASE, regs.gsbase);
+            }
+            self.arch.fsbase = regs.fsbase as usize;
+            self.arch.gsbase = regs.gsbase as usize;
+
+            Ok(())
+        } else {
+            Err(Error::new(EINVAL))
+        }
+    }
+
+    pub(crate) fn write_env_regs(&mut self, regs: EnvRegisters) -> Result<()> {
+        if RmmA::virt_is_valid(VirtualAddress::new(regs.fsbase as usize))
+            && RmmA::virt_is_valid(VirtualAddress::new(regs.gsbase as usize))
+        {
+            self.arch.fsbase = regs.fsbase as usize;
+            self.arch.gsbase = regs.gsbase as usize;
+            Ok(())
+        } else {
+            Err(Error::new(EINVAL))
+        }
+    }
+}
+
+pub static EMPTY_CR3: Once<rmm::PhysicalAddress> = Once::new();
+
+// SAFETY: EMPTY_CR3 must be initialized.
+pub unsafe fn empty_cr3() -> rmm::PhysicalAddress {
+    unsafe {
+        debug_assert!(EMPTY_CR3.poll().is_some());
+        *EMPTY_CR3.get_unchecked()
+    }
+}
+
+/// Switch to the next context by restoring its stack and registers
+pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
+    unsafe {
+        let pcr = crate::arch::gdt::pcr();
+
+        crate::arch::gdt::set_tss_stack(pcr, next.kstack.initial_top() as usize);
+        crate::arch::gdt::set_userspace_io_allowed(pcr, next.arch.userspace_io_allowed);
+
+        // The syscall ABI allows the kernel to clobber the xmm/ymm/zmm registers. Hence, if the
+        // kernel is later going to zero those registers when switching back, there's no need to
+        // save them. However, MXCSR and the x87 status word will be saved. This saves unnecessary
+        // cache writes and the slow xsave/xsaveopt instructions (200-300 cycles on zen3/zen4).
+        //
+        // When not inside a syscall, the context switch was (mostly likely) caused by preemption,
+        // in which case the slower full path is needed.
+        if !prev.inside_syscall {
+            core::arch::asm!(
+                alternative2!(
+                    feature1: "xsaveopt",
+                    then1: ["
+                    xsaveopt64 [{prev_fx}]
+                "],
+                    feature2: "xsave",
+                    then2: ["
+                    xsave64 [{prev_fx}]
+                "],
+                    default: ["
+                    fxsave64 [{prev_fx}]
+                "]
+                ),
+                prev_fx = in(reg) prev.kfx.as_mut_ptr(),
+                in("eax") 0xffff_ffff_u32,
+                in("edx") 0xffff_ffff_u32,
+            );
+        } else {
+            // TODO: Depending on whether we choose to avoid mapping `long double` to x87 in
+            // userspace, it may be possible to ignore saving the FCW and just zero it as with all
+            // the other float registers.
+            core::arch::asm!("
+                fnstcw [{prev_fx}+{FCW_OFFSET}]
+                stmxcsr [{prev_fx}+{MXCSR_OFFSET}]
+            ",
+                prev_fx = in(reg) prev.kfx.as_mut_ptr(),
+                FCW_OFFSET = const(0),
+                MXCSR_OFFSET = const(24),
+            );
+        }
+
+        // As mentioned above, there's a fast path when switching to the return of a syscall, where
+        // vector registers can be zeroed. This avoids unnecessary cache fetches and the slow
+        // XRSTOR instruction (>200 cycles on zen3 and >300 on zen4 with avx512 according to Agner
+        // Fog's instruction tables).
+        if next.inside_syscall {
+            core::arch::asm!(concat!(
+                alternative!(
+                    feature: "xsave",
+                    // AVX is available. On AVX-512 CPUs this also zeroes the upper bits of
+                    // zmm0-zmm15; zmm16-zmm31 and k0-k7 are handled below.
+                    then: [
+                        "vzeroall"
+                    ],
+
+                    // AVX is not available
+                    default: ["
+                        pxor xmm0, xmm0
+                        pxor xmm1, xmm1
+                        pxor xmm2, xmm2
+                        pxor xmm3, xmm3
+                        pxor xmm4, xmm4
+                        pxor xmm5, xmm5
+                        pxor xmm6, xmm6
+                        pxor xmm7, xmm7
+                        pxor xmm8, xmm8
+                        pxor xmm9, xmm9
+                        pxor xmm10, xmm10
+                        pxor xmm11, xmm11
+                        pxor xmm12, xmm12
+                        pxor xmm13, xmm13
+                        pxor xmm14, xmm14
+                        pxor xmm15, xmm15
+                    "]
+                ), "
+                    emms
+                    fldcw [{next_fx}+{FCW_OFFSET}]
+                    ldmxcsr [{next_fx}+{MXCSR_OFFSET}]
+                "),
+                next_fx = in(reg) next.kfx.as_ptr(),
+                FCW_OFFSET = const(0),
+                MXCSR_OFFSET = const(24),
+            );
+            // With AVX-512 state enabled, zmm16-zmm31 and the opmask registers still hold
+            // whatever the last context to run on this CPU left there. Zero them so nothing
+            // leaks across contexts. VEX-encoded kxorw zero-extends into the full 64-bit k
+            // register, so this needs only AVX512F.
+            core::arch::asm!(alternative!(
+                feature: "avx512",
+                then: ["
+                    vpxord zmm16, zmm16, zmm16
+                    vpxord zmm17, zmm17, zmm17
+                    vpxord zmm18, zmm18, zmm18
+                    vpxord zmm19, zmm19, zmm19
+                    vpxord zmm20, zmm20, zmm20
+                    vpxord zmm21, zmm21, zmm21
+                    vpxord zmm22, zmm22, zmm22
+                    vpxord zmm23, zmm23, zmm23
+                    vpxord zmm24, zmm24, zmm24
+                    vpxord zmm25, zmm25, zmm25
+                    vpxord zmm26, zmm26, zmm26
+                    vpxord zmm27, zmm27, zmm27
+                    vpxord zmm28, zmm28, zmm28
+                    vpxord zmm29, zmm29, zmm29
+                    vpxord zmm30, zmm30, zmm30
+                    vpxord zmm31, zmm31, zmm31
+                    kxorw k0, k0, k0
+                    kxorw k1, k1, k1
+                    kxorw k2, k2, k2
+                    kxorw k3, k3, k3
+                    kxorw k4, k4, k4
+                    kxorw k5, k5, k5
+                    kxorw k6, k6, k6
+                    kxorw k7, k7, k7
+                "],
+                default: [""]
+            ));
+        } else {
+            core::arch::asm!(
+                alternative!(
+                    feature: "xsave",
+                    then: ["
+                    xrstor64 [{next_fx}]
+                    "],
+                    default: ["
+                    fxrstor64 [{next_fx}]
+                    "]
+                ),
+                next_fx = in(reg) next.kfx.as_ptr(),
+                in("eax") 0xffff_ffff_u32,
+                in("edx") 0xffff_ffff_u32,
+            );
+        }
+
+        {
+            core::arch::asm!(
+                alternative!(
+                    feature: "fsgsbase",
+                    then: ["
+                    mov rax, [{next}+{fsbase_off}]
+                    mov rcx, [{next}+{gsbase_off}]
+
+                    rdfsbase rdx
+                    wrfsbase rax
+                    swapgs
+                    rdgsbase rax
+                    wrgsbase rcx
+                    swapgs
+
+                    mov [{prev}+{fsbase_off}], rdx
+                    mov [{prev}+{gsbase_off}], rax
+                "],
+                    // TODO: Most applications will set FSBASE, but won't touch GSBASE. Maybe avoid
+                    // wrmsr or even the swapgs+rdgsbase+wrgsbase+swapgs sequence if they are already
+                    // equal?
+                    default: ["
+                    mov ecx, {MSR_FSBASE}
+                    mov rdx, [{next}+{fsbase_off}]
+                    mov eax, edx
+                    shr rdx, 32
+                    wrmsr
+
+                    mov ecx, {MSR_KERNEL_GSBASE}
+                    mov rdx, [{next}+{gsbase_off}]
+                    mov eax, edx
+                    shr rdx, 32
+                    wrmsr
+
+                    // {prev}
+                "]
+                ),
+                out("rax") _,
+                out("rdx") _,
+                out("ecx") _, prev = in(reg) addr_of_mut!(prev.arch), next = in(reg) addr_of!(next.arch),
+                MSR_FSBASE = const msr::IA32_FS_BASE,
+                MSR_KERNEL_GSBASE = const msr::IA32_KERNEL_GSBASE,
+                gsbase_off = const offset_of!(Context, gsbase),
+                fsbase_off = const offset_of!(Context, fsbase),
+            );
+        }
+
+        (*pcr).percpu.new_addrsp_tmp.set(next.addr_space.clone());
+
+        switch_to_inner(
+            &mut prev.arch,
+            &mut next.arch,
+            prev.kfx.as_mut_ptr().byte_add(464).cast(),
+            next.kfx.as_mut_ptr().byte_add(464).cast(),
+        )
+    }
+}
+
+// Check disassembly!
+#[unsafe(naked)]
+unsafe extern "sysv64" fn switch_to_inner(
+    _prev: &mut Context,
+    _next: &mut Context,
+    _prev_fxavail: *mut InFxsaveAvailable,
+    _next_fxavail: *mut InFxsaveAvailable,
+) {
+    core::arch::naked_asm!(
+        // System V ABI:
+        //
+        // - the current parameters are passed in the registers `rdi`, `rsi`, `rdx`, `rcx`,
+        // - we can modify scratch registers, e.g. rax
+        // - we cannot change callee-preserved registers arbitrarily, e.g. rbx, which is why we
+        //   store them here in the first place.
+        concat!("
+        // Save old registers, and load new ones
+        mov [rdx + {off_rbx}], rbx
+        mov rbx, [rcx + {off_rbx}]
+
+        mov [rdx + {off_r12}], r12
+        mov r12, [rcx + {off_r12}]
+
+        mov [rdx + {off_r13}], r13
+        mov r13, [rcx + {off_r13}]
+
+        mov [rdx + {off_r14}], r14
+        mov r14, [rcx + {off_r14}]
+
+        mov [rdx + {off_r15}], r15
+        mov r15, [rcx + {off_r15}]
+
+        mov [rdx + {off_rbp}], rbp
+        mov rbp, [rcx + {off_rbp}]
+
+        mov [rdi + {off_rsp}], rsp
+        mov rsp, [rsi + {off_rsp}]
+
+        // When we return, we cannot even guarantee that the return address on the stack, points to
+        // the calling function, `context::switch`. Thus, we have to execute this Rust hook by
+        // ourselves, which will unlock the contexts before the later switch.
+
+        // Note that switch_finish_hook will be responsible for executing `ret`.
+        jmp {switch_hook}
+
+        "),
+
+        off_rbx = const offset_of!(InFxsaveAvailable, rbx),
+        off_r12 = const offset_of!(InFxsaveAvailable, r12),
+        off_r13 = const offset_of!(InFxsaveAvailable, r13),
+        off_r14 = const offset_of!(InFxsaveAvailable, r14),
+        off_r15 = const offset_of!(InFxsaveAvailable, r15),
+        off_rbp = const offset_of!(InFxsaveAvailable, rbp),
+        off_rsp = const offset_of!(Context, rsp),
+
+        switch_hook = sym crate::context::switch_finish_hook,
+    );
+}

@@ -1,0 +1,182 @@
+use alloc::vec::Vec;
+use core::{
+    fmt,
+    sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+};
+
+/// Number of times each Interrupt happened.
+// TODO: isn't this already tracked by the irq scheme?
+static IRQ_COUNT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+/// Number of contexts that were created.
+// TODO: isn't this also already tracked?
+static CONTEXTS_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Current state of a CPU
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default)]
+pub enum CpuState {
+    /// Waiting for runnable context
+    #[default]
+    Idle = 0,
+    /// Running a kernel context
+    Kernel = 1,
+    /// Running a context in the userspace
+    User = 2,
+}
+
+/// Per-cpu statistics
+#[derive(Debug, Default)]
+pub struct CpuStats {
+    /// Number of ticks spent on userspace contexts
+    user: AtomicU64,
+    /// Number of ticks spent on Niced userspace contexts
+    nice: AtomicU64,
+    /// Number of ticks spent on kernel contexts
+    kernel: AtomicU64,
+    /// Number of ticks spent idle
+    idle: AtomicU64,
+    /// Number of times the CPU handled an interrupt
+    irq: AtomicU64,
+    /// Current state of the CPU
+    state: AtomicU8,
+    /// The number of times this CPU switched from one context to another.
+    context_switches: AtomicU64,
+    /// The number of times this CPU switched while handling a syscall.
+    syscall_switches: AtomicU64,
+}
+
+impl CpuStats {
+    pub const fn default() -> Self {
+        Self {
+            user: AtomicU64::new(0),
+            nice: AtomicU64::new(0),
+            kernel: AtomicU64::new(0),
+            idle: AtomicU64::new(0),
+            irq: AtomicU64::new(0),
+            state: AtomicU8::new(0),
+            context_switches: AtomicU64::new(0),
+            syscall_switches: AtomicU64::new(0),
+        }
+    }
+}
+
+pub struct CpuStatsData {
+    /// Number of ticks spent on userspace contexts
+    pub user: u64,
+    /// Number of ticks spent on Niced userspace contexts
+    pub nice: u64,
+    /// Number of ticks spent on kernel contexts
+    pub kernel: u64,
+    /// Number of ticks spent idle
+    pub idle: u64,
+    /// Number of times the CPU handled an interrupt
+    pub irq: u64,
+    /// Number of context switches on this CPU
+    pub context_switches: u64,
+    /// Number of syscall-caused context switches on this CPU
+    pub syscall_switches: u64,
+}
+
+impl CpuStats {
+    /// Set the CPU's current state for the following ticks.
+    #[inline]
+    pub fn set_state(&self, new_state: CpuState) {
+        self.state.store(new_state as u8, Ordering::Relaxed);
+    }
+
+    /// Increments time statistics of a CPU, return the state is was accounting to.
+    ///
+    /// Which statistic is incremented depends on the [`State`] of the CPU.
+    #[inline]
+    pub fn add_time(&self, nanos: u64) -> u8 {
+        let state = self.state.load(Ordering::Relaxed);
+        // Note that these counters are read-only when accessed by other CPUs, which means it's
+        // valid not to use fetch_add (as long as the loads/stores are atomic).
+        match state {
+            val if val == CpuState::Idle as u8 => self
+                .idle
+                .store(self.idle.load(Ordering::Relaxed) + nanos, Ordering::Relaxed),
+            val if val == CpuState::User as u8 => self
+                .user
+                .store(self.user.load(Ordering::Relaxed) + nanos, Ordering::Relaxed),
+            val if val == CpuState::Kernel as u8 => self.kernel.store(
+                self.kernel.load(Ordering::Relaxed) + nanos,
+                Ordering::Relaxed,
+            ),
+            _ => unreachable!("all possible values are covered"),
+        };
+        state
+    }
+
+    /// Add an IRQ event to both the global count and the CPU that handled it.
+    ///
+    /// This should be called in all [`crate::arch::interrupt:irq::eoi`],
+    /// for all architectures.
+    #[inline]
+    pub fn add_irq(&self, irq: u8) {
+        IRQ_COUNT[irq as usize].fetch_add(1, Ordering::Relaxed);
+        // Since this is percpu, but allowed to be accessed readonly from the outside, fetch_add is
+        // not needed.
+        self.irq
+            .store(self.irq.load(Ordering::Relaxed) + 1, Ordering::Relaxed)
+    }
+
+    /// Add a context switch to the count.
+    #[inline]
+    pub fn add_context_switch(&self, inside_syscall: bool) {
+        // Again this is percpu, so fetch_add is unnecessary.
+        self.context_switches.store(
+            self.context_switches.load(Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
+        if inside_syscall {
+            self.syscall_switches.store(
+                self.syscall_switches.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+impl fmt::Display for CpuStatsData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {}",
+            self.user, self.nice, self.kernel, self.idle, self.irq, self.context_switches
+        )
+    }
+}
+
+impl From<&CpuStats> for CpuStatsData {
+    fn from(val: &CpuStats) -> Self {
+        CpuStatsData {
+            user: val.user.load(Ordering::Relaxed),
+            nice: val.nice.load(Ordering::Relaxed),
+            kernel: val.kernel.load(Ordering::Relaxed),
+            idle: val.idle.load(Ordering::Relaxed),
+            irq: val.irq.load(Ordering::Relaxed),
+            context_switches: val.context_switches.load(Ordering::Relaxed),
+            syscall_switches: val.syscall_switches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Add a context creation to the count.
+#[inline]
+pub fn add_context() {
+    CONTEXTS_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Get the number of contexts created.
+pub fn get_contexts_count() -> usize {
+    CONTEXTS_COUNT.load(Ordering::Relaxed)
+}
+
+/// Get the count of each interrupt.
+pub fn irq_counts() -> Vec<usize> {
+    IRQ_COUNT
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect()
+}
