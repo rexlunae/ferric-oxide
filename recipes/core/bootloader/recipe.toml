@@ -20,12 +20,18 @@ then
 fi
 printf '%s' "${FERRIC_BOOTLOADER_FEATURES}" > "${OUTDIR}/ferric.stamp"
 
+# Features apply to UEFI builds only: Ferric Oxide adds no BIOS boot paths, so
+# the BIOS bootloader keeps its upstream feature set.
 function bootloader {
     export TARGET="$1"
     src="$2"
     dst="$3"
+    features=""
+    case "${TARGET}" in
+        *-unknown-uefi) features="${FERRIC_BOOTLOADER_FEATURES}" ;;
+    esac
     "${COOKBOOK_MAKE}" -j "${COOKBOOK_MAKE_JOBS}" -f "${COOKBOOK_SOURCE}/Makefile" -C "${OUTDIR}" \\
-        BOOTLOADER_FEATURES="${FERRIC_BOOTLOADER_FEATURES}" "${OUTDIR}/${src}"
+        BOOTLOADER_FEATURES="${features}" "${OUTDIR}/${src}"
     cp -v "${OUTDIR}/${src}" "${COOKBOOK_STAGE}/usr/lib/boot/${dst}"
 }
 

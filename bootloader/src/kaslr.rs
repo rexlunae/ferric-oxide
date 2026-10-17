@@ -41,12 +41,17 @@ pub fn randomize(kernel: &mut [u8], kernel_64bit: bool) -> u64 {
         log::warn!("KASLR: no RDRAND; kernel image not moved");
         return 0;
     };
-    let slide = random % (room + 1) * PAGE_SIZE;
+    // Never pick slide 0: a randomized boot must actually move the image, so
+    // the kernel (and CI) can tell it was randomized. 0 stays the fallback.
+    if room == 0 {
+        return 0;
+    }
+    let slide = (random % room + 1) * PAGE_SIZE;
     match ferric_elfreloc::relocate(kernel, slide) {
         Ok(_) => {
             log::info!(
                 "KASLR: kernel image moved ({} bits)",
-                u64::BITS - 1 - (room + 1).leading_zeros()
+                u64::BITS - 1 - room.leading_zeros()
             );
             SLIDE.store(slide as usize, Ordering::Relaxed);
             slide
