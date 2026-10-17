@@ -19,6 +19,7 @@ name = "bootstrap"
 version = "0.0.0"
 dependencies = [
  "arrayvec",
+ "ferric-iommu",
  "hashbrown",
  "libredox",
  "linked_list_allocator",
@@ -31,6 +32,10 @@ dependencies = [
  "redox_syscall",
  "slab",
 ]
+
+[[package]]
+name = "ferric-iommu"
+version = "0.1.0"
 
 [[package]]
 name = "foldhash"

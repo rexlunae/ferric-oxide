@@ -36,11 +36,23 @@ KERNEL_CARGO_FEATURES?=
 # -C link-arg=--emit-relocs for kernel image KASLR.
 KERNEL_LINK_ARGS?=
 
+# Ferric Oxide: kernel indirect branch tracking (arch.x86_64.features.ibt in config.toml, set by
+# kernel.cpu.ibt in ferric.toml). Unless it is "never", every crate is built with endbr64 at
+# function entries and without jump tables (which IBT would reach with `notrack jmp`). The flags
+# go in RUSTFLAGS, not after `--`, so the build-std crates (core, alloc, compiler_builtins) get
+# them too. build.rs refuses an IBT build without them. With "never" nothing changes.
+KERNEL_CONFIG_TOML:=$(firstword $(wildcard $(SOURCE)config.toml) $(SOURCE)config.toml.example)
+ifeq ($(ARCH),x86_64)
+ifneq ($(shell grep -Es '^[[:space:]]*ibt[[:space:]]*=[[:space:]]*"(always|auto)"' "$(KERNEL_CONFIG_TOML)"),)
+KERNEL_RUSTFLAGS_ENV=RUSTFLAGS="$(strip $(RUSTFLAGS) -Zcf-protection=branch -Cjump-tables=no)"
+endif
+endif
+
 $(BUILD):
 	mkdir -p "$@"
 
 $(BUILD)/kernel.all: $(LD_SCRIPT) $(LOCKFILE) $(MANIFEST) $(TARGET_SPEC) $(shell find $(SOURCE) -name "*.rs" -type f) | $(BUILD)
-	cargo rustc \
+	$(KERNEL_RUSTFLAGS_ENV) cargo rustc \
 		--bin kernel \
 		--manifest-path "$(MANIFEST)" \
 		--target "$(TARGET_SPEC)" \
@@ -69,7 +81,7 @@ $(BUILD)/kernel: $(BUILD)/kernel.all
 KERNEL_CHECK_FEATURES?=
 
 check:
-	cargo check \
+	$(KERNEL_RUSTFLAGS_ENV) cargo check \
 		--bin kernel \
 		--manifest-path "$(MANIFEST)" \
 		--target "$(TARGET_SPEC)" \

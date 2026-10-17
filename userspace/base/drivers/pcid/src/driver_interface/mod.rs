@@ -243,6 +243,10 @@ pub enum PcidClientRequest {
     SetFeatureInfo(SetFeatureInfo),
     ReadConfig(u16),
     WriteConfig(u16, u32),
+    /// Ferric Oxide: ask for a DMA domain holding this function (kernel iommu scheme). On
+    /// `DmaDomain` the domain's descriptor is then fetched with a descriptor-passing read of
+    /// the channel; see [`PciFunctionHandle::get_dma_domain`].
+    GetDmaDomain,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +254,8 @@ pub enum PcidClientRequest {
 pub enum PcidServerResponseError {
     NonexistentFeature(PciFeature),
     InvalidBitPattern,
+    /// Ferric Oxide: no DMA domain (no kernel iommu scheme, or attaching failed).
+    NoDmaDomain,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,6 +272,8 @@ pub enum PcidClientResponse {
     SetFeatureInfo(PciFeature),
     ReadConfig(u32),
     WriteConfig,
+    /// Ferric Oxide: a DMA domain is ready to be fetched from the channel.
+    DmaDomain,
 }
 
 pub struct MappedBar {
@@ -456,6 +464,85 @@ impl PciFunctionHandle {
             }
         }
     }
+    /// Ferric Oxide: asks pcid for a DMA domain that holds this function and the requester
+    /// IDs its DMA can carry, and returns the domain's descriptor (close-on-exec), or `None`
+    /// when pcid has none to give (the kernel has no iommu scheme, or attaching failed).
+    /// Drivers started by pcid-spawner do not need this: [`pci_daemon`] calls
+    /// [`PciFunctionHandle::use_dma_domain`], which does it and binds the domain. pcid gives
+    /// each channel one domain.
+    ///
+    /// # Errors
+    ///
+    /// [`DmaDomainError::Receive`] when pcid created a domain but passing its descriptor
+    /// failed.
+    pub fn get_dma_domain(&mut self) -> Result<Option<libredox::Fd>, DmaDomainError> {
+        self.send(&PcidClientRequest::GetDmaDomain);
+        match self.recv() {
+            PcidClientResponse::DmaDomain => {}
+            PcidClientResponse::Error(PcidServerResponseError::NoDmaDomain) => return Ok(None),
+            other => {
+                log::error!("received wrong pcid response: {other:?}");
+                process::exit(1);
+            }
+        }
+        // usize::MAX asks the kernel to pick the descriptor number.
+        let mut fd = usize::MAX.to_ne_bytes();
+        libredox::call::call_ro(
+            self.channel.as_raw_fd() as usize,
+            &mut fd,
+            syscall::CallFlags::FD,
+            &[],
+        )
+        .map_err(DmaDomainError::Receive)?;
+        let domain = libredox::Fd::new(usize::from_ne_bytes(fd));
+        // Children the driver spawns (xhcid's class drivers, say) must not keep its domain
+        // open, and with it the device's mappings, after the driver exits.
+        let cloexec = libredox::flag::O_CLOEXEC as usize;
+        if let Err(err) = domain.fcntl(libredox::flag::F_SETFD as usize, cloexec) {
+            log::warn!(
+                "pcid_interface: cannot make the DMA domain descriptor close-on-exec: {err}"
+            );
+        }
+        Ok(Some(domain))
+    }
+
+    /// Ferric Oxide: makes the calling process do its DMA for this function through a DMA
+    /// domain (kernel iommu scheme), before it translates any DMA address. The first function a
+    /// process uses gets its domain from pcid and binds it, so from then on
+    /// `memory:translation` (and so [`common::dma::Dma`]) answers with IOVAs in it. A later
+    /// function's domain is joined into that one, so a driver of several functions has one
+    /// domain and one IOVA space. When pcid has no domain to give (no IOMMU, or a kernel built
+    /// with `kernel.iommu = "never"`), DMA addresses stay physical, as upstream.
+    ///
+    /// [`pci_daemon`] calls this for the function it connects to; a driver that opens more
+    /// functions with [`PciFunctionHandle::connect_by_path`] calls it for each of them.
+    ///
+    /// A forked child does not inherit the binding: it has an address space of its own, so
+    /// under `kernel.iommu = "enforce"` its translations fail with `EACCES`, and under
+    /// `"auto"` it gets physical addresses, which its parent's device cannot reach.
+    ///
+    /// # Errors
+    ///
+    /// [`DmaDomainError::Receive`], [`DmaDomainError::Bind`] or [`DmaDomainError::Join`] when
+    /// that step fails. The function's device then cannot DMA: pcid has already moved it out
+    /// of the identity mapping.
+    pub fn use_dma_domain(&mut self) -> Result<DmaDomainUse, DmaDomainError> {
+        let Some(domain) = self.get_dma_domain()? else {
+            return Ok(DmaDomainUse::Physical);
+        };
+        let mut bound = PROCESS_DMA_DOMAIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bound.is_some() {
+            call_iommu(&domain, ferric_iommu::abi::Request::Join).map_err(DmaDomainError::Join)?;
+            // The domain is empty now; dropping it closes it.
+            return Ok(DmaDomainUse::Joined);
+        }
+        bind_dma_domain(&domain).map_err(DmaDomainError::Bind)?;
+        *bound = Some(domain);
+        Ok(DmaDomainUse::Bound)
+    }
+
     pub unsafe fn map_bar(&mut self, bir: u8, memory_type: MemoryType) -> &MappedBar {
         let mapped_bar = &mut self.mapped_bars[bir as usize];
         if let Some(mapped_bar) = mapped_bar {
@@ -490,10 +577,99 @@ impl PciFunctionHandle {
     }
 }
 
+/// Ferric Oxide: the DMA domain this process has bound, kept open for as long as the process
+/// lives: closing it would block the devices in it.
+static PROCESS_DMA_DOMAIN: std::sync::Mutex<Option<libredox::Fd>> = std::sync::Mutex::new(None);
+
+/// Ferric Oxide: what [`PciFunctionHandle::use_dma_domain`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DmaDomainUse {
+    /// pcid had no domain to give, so DMA addresses are physical, as upstream.
+    Physical,
+    /// The function's domain is now the process's domain.
+    Bound,
+    /// The process had a domain already; the function was moved into it.
+    Joined,
+}
+
+/// Ferric Oxide: why [`PciFunctionHandle::use_dma_domain`] could not put a function in the
+/// process's DMA domain.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DmaDomainError {
+    /// pcid created a domain, but receiving its descriptor over the channel failed.
+    Receive(libredox::error::Error),
+    /// The kernel refused to bind the domain.
+    Bind(libredox::error::Error),
+    /// The kernel refused to move the function into the process's domain.
+    Join(libredox::error::Error),
+}
+
+impl fmt::Display for DmaDomainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Receive(_) => "cannot receive the DMA domain from pcid",
+            Self::Bind(_) => "cannot bind the DMA domain",
+            Self::Join(_) => "cannot move the function into the process's DMA domain",
+        })
+    }
+}
+
+impl std::error::Error for DmaDomainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Receive(err) | Self::Bind(err) | Self::Join(err) => Some(err),
+        }
+    }
+}
+
+/// Makes a call to the kernel's iommu scheme on `domain`.
+fn call_iommu(
+    domain: &libredox::Fd,
+    request: ferric_iommu::abi::Request,
+) -> libredox::error::Result<usize> {
+    let (words, len) = request.encode();
+    domain.call_ro(&mut [], syscall::CallFlags::empty(), &words[..len])
+}
+
+/// Ferric Oxide: makes `domain` (from [`PciFunctionHandle::get_dma_domain`]) the calling
+/// process's DMA domain. A process binds at most one domain. Drivers normally leave this to
+/// [`PciFunctionHandle::use_dma_domain`], which also keeps the domain open.
+///
+/// # Errors
+///
+/// The kernel's errno: `EBUSY` when the process or another one has bound a domain already,
+/// `EINVAL` under `kernel.iommu = "enforce"` when no device is attached to the domain.
+pub fn bind_dma_domain(domain: &libredox::Fd) -> libredox::error::Result<()> {
+    call_iommu(domain, ferric_iommu::abi::Request::Bind)?;
+    Ok(())
+}
+
+/// Ferric Oxide: [`PciFunctionHandle::use_dma_domain`], reporting a failure. A failure is not
+/// fatal here: the driver's first DMA allocation then fails with the kernel's reason. The
+/// kernel logs every bind and join, so success needs no message.
+fn use_dma_domain_logged(handle: &mut PciFunctionHandle) {
+    let addr = handle.config.func.addr;
+    let Err(err) = handle.use_dma_domain() else {
+        return;
+    };
+    let source = std::error::Error::source(&err).map(ToString::to_string);
+    let source = source.unwrap_or_default();
+    if log::max_level() == log::LevelFilter::Off {
+        // Drivers set up their logger only after connecting, so nothing would record it.
+        eprintln!("pcid_interface: {addr}: {err}: {source}");
+    } else {
+        log::error!("pcid_interface: {addr}: {err}: {source}");
+    }
+}
+
 pub fn pci_daemon<F: FnOnce(Daemon, PciFunctionHandle) -> !>(f: F) -> ! {
     Daemon::new(|daemon| {
         common::init();
-        let pcid_handle = PciFunctionHandle::connect_default();
+        let mut pcid_handle = PciFunctionHandle::connect_default();
+        // Ferric Oxide: before the driver translates any DMA address.
+        use_dma_domain_logged(&mut pcid_handle);
         f(daemon, pcid_handle)
     })
 }

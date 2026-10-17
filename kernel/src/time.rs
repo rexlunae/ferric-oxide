@@ -1,9 +1,26 @@
 use crate::{
     sync::{CleanLockToken, Mutex, RwLock, L1},
-    syscall::error::{Error, Result, EINVAL},
+    syscall::{
+        data::TimeSpec,
+        error::{Error, Result, EINVAL},
+    },
 };
 
 pub const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// Ferric Oxide: checks that a user-supplied time has a non-negative second
+/// count and nanoseconds in `0..NANOS_PER_SEC`, so `TimeSpec::to_nanos` does
+/// not turn a negative value into a time that never arrives.
+///
+/// # Errors
+///
+/// Returns `EINVAL` for any other value.
+pub fn check_timespec(time: &TimeSpec) -> Result<()> {
+    if time.tv_sec < 0 || time.tv_nsec < 0 || time.tv_nsec as u128 >= NANOS_PER_SEC {
+        return Err(Error::new(EINVAL));
+    }
+    Ok(())
+}
 
 // TODO: seqlock?
 /// Kernel start time, measured in nanoseconds since Unix epoch

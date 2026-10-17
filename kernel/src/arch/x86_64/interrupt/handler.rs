@@ -264,6 +264,182 @@ macro_rules! pop_preserved {
     "
     };
 }
+// Ferric Oxide: kernel page-table isolation (KPTI, see arch/x86_64/kpti.rs). All of these are
+// patched in by the "kpti" alternative and skipped otherwise. They use the PCR offsets below,
+// which every naked function that expands them passes as `const` operands.
+
+/// PCR offset of the KPTI scratch slot.
+pub const KPTI_SCRATCH: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_scratch);
+/// PCR offset of the top of the per-CPU entry stack.
+pub const KPTI_ENTRY_TOP: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_entry_top);
+/// PCR offset of the top of the current context's kernel stack.
+pub const KPTI_KERNEL_RSP: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kernel_rsp);
+/// PCR offset of the bits ORed into CR3 to load a table without flushing (bit 63 with PCID).
+pub const KPTI_CR3_NOFLUSH: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_cr3_noflush);
+/// PCR offset of the bits ORed into a kernel-table CR3 to load its shadow.
+pub const KPTI_CR3_USER: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_cr3_user);
+
+// Wraps KPTI code in the "kpti" alternative, with a jump over the padding when it is off.
+macro_rules! kpti_alternative {
+    ($code:expr_2021) => {
+        concat!(
+            alternative!(feature: "kpti", then: [$code], default: ["jmp 69f"]),
+            "\n69:\n"
+        )
+    };
+}
+
+// First thing on interrupt entry, before any other stack use. $err is 8 when the CPU (or the
+// stub) pushed an error code, else 0. From user space: switch to the kernel table and, when the
+// CPU put the frame on the entry stack, move it to the kernel stack. GS is left as it was, so the
+// usual SWAPGS logic that follows still applies. From the kernel ($fix = 1): if the shadow is
+// loaded (an exception between switching tables and leaving the kernel), load the kernel table.
+//
+// Loading the kernel table clears the shadow bit (12) and the user PCID bit (11, never set
+// without PCID) and, from user space, ORs in the no-flush bit from the PCR. The kernel-mode fix
+// may run with the user's GS (a fault on IRETQ), so it cannot read the PCR and lets the write
+// flush the kernel PCID instead, which is always correct.
+macro_rules! kpti_enter {
+    ($err:literal, $fix:literal) => {
+        kpti_alternative!(concat!(
+            "
+        test QWORD PTR [rsp + 8 + ",
+            $err,
+            "], 3
+        jz 74f
+        swapgs
+        mov gs:[{KPTI_SCRATCH}], rax
+        mov rax, cr3
+        and rax, -0x1801
+        or rax, gs:[{KPTI_CR3_NOFLUSH}]
+        mov cr3, rax
+        lea rax, [rsp + 40 + ",
+            $err,
+            "]
+        cmp rax, gs:[{KPTI_ENTRY_TOP}]
+        jne 73f
+        mov rax, rsp
+        mov rsp, gs:[{KPTI_KERNEL_RSP}]
+        push QWORD PTR [rax + 32 + ",
+            $err,
+            "]
+        push QWORD PTR [rax + 24 + ",
+            $err,
+            "]
+        push QWORD PTR [rax + 16 + ",
+            $err,
+            "]
+        push QWORD PTR [rax + 8 + ",
+            $err,
+            "]
+        push QWORD PTR [rax + ",
+            $err,
+            "]
+        .if ",
+            $err,
+            "
+        push QWORD PTR [rax]
+        .endif
+    73:
+        mov rax, gs:[{KPTI_SCRATCH}]
+        swapgs
+        jmp 75f
+    74:
+        .if ",
+            $fix,
+            "
+        push rax
+        mov rax, cr3
+        btr rax, 12
+        jnc 76f
+        and rax, -0x801
+        mov cr3, rax
+    76:
+        pop rax
+        .endif
+    75:
+    "
+        ))
+    };
+}
+
+// Last thing before IRETQ (or SYSRETQ), with the five-word interrupt frame at RSP. Returning to
+// user space: copy the frame to the entry stack and load the shadow table, by ORing the PCR's
+// `kpti_cr3_user` into CR3 (the shadow bit, plus the user PCID and no-flush bit with PCID). $gs_user
+// is 1 when SWAPGS has already restored the user GS, 0 when GS is still the kernel's.
+macro_rules! kpti_exit {
+    ($gs_user:literal) => {
+        kpti_alternative!(concat!(
+            "
+        test QWORD PTR [rsp + 8], 3
+        jz 77f
+        .if ",
+            $gs_user,
+            "
+        swapgs
+        .endif
+        mov gs:[{KPTI_SCRATCH}], rax
+        mov rax, rsp
+        mov rsp, gs:[{KPTI_ENTRY_TOP}]
+        push QWORD PTR [rax + 32]
+        push QWORD PTR [rax + 24]
+        push QWORD PTR [rax + 16]
+        push QWORD PTR [rax + 8]
+        push QWORD PTR [rax]
+        mov rax, cr3
+        or rax, gs:[{KPTI_CR3_USER}]
+        mov cr3, rax
+        mov rax, gs:[{KPTI_SCRATCH}]
+        .if ",
+            $gs_user,
+            "
+        swapgs
+        .endif
+    77:
+    "
+        ))
+    };
+}
+
+// Paranoid handlers (NMI, #MC, #DB) can interrupt the entry or exit code with either table
+// loaded. Save CR3 in R12 (callee-saved, and already pushed) and load the kernel table; restore
+// the saved one on the way out. Both run with the kernel GS, so both switch without flushing when
+// PCID is on: TLB invalidations never wait for a flush on a later switch (see kpti.rs).
+macro_rules! kpti_paranoid_save {
+    () => {
+        kpti_alternative!(
+            "
+        mov r12, cr3
+        bt r12, 12
+        jnc 78f
+        mov rax, r12
+        and rax, -0x1801
+        or rax, gs:[{KPTI_CR3_NOFLUSH}]
+        mov cr3, rax
+    78:
+    "
+        )
+    };
+}
+macro_rules! kpti_paranoid_restore {
+    () => {
+        kpti_alternative!(
+            "
+        bt r12, 12
+        jnc 79f
+        or r12, gs:[{KPTI_CR3_NOFLUSH}]
+        mov cr3, r12
+    79:
+    "
+        )
+    };
+}
+
 macro_rules! swapgs_iff_ring3_fast {
     // TODO: Spectre V1: LFENCE?
     () => {
@@ -351,16 +527,20 @@ macro_rules! conditional_swapgs_paranoid {
         swapgs
         2:
         ",
+        kpti_paranoid_save!(),
     ) }
 }
 macro_rules! conditional_swapgs_back_paranoid {
     () => {
-        "
+        concat!(
+            kpti_paranoid_restore!(),
+            "
         test bl, bl
         jnz 2f
         swapgs
         2:
     "
+        )
     };
 }
 macro_rules! nop {
@@ -375,15 +555,20 @@ macro_rules! nop {
 macro_rules! interrupt_stack {
     // XXX: Apparently we cannot use $expr and check for bool exhaustiveness, so we will have to
     // use idents directly instead.
-    ($name:ident, $save1:ident!, $save2:ident!, $rstor2:ident!, $rstor1:ident!, is_paranoid: $is_paranoid:expr_2021, |$stack:ident| $code:block) => {
+    ($name:ident, $save1:ident!, $save2:ident!, $rstor2:ident!, $rstor1:ident!, is_paranoid: $is_paranoid:expr_2021, kpti_fix: $kpti_fix:literal, |$stack:ident| $code:block) => {
         #[unsafe(naked)]
         pub unsafe extern "C" fn $name() {
             unsafe extern "C" fn inner($stack: &mut $crate::arch::x86_64::interrupt::InterruptStack) {
                 $code
             }
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
+
+                // Ferric Oxide (KPTI)
+                kpti_enter!("0", $kpti_fix),
 
                 // Backup all userspace registers to stack
                 $save1!(),
@@ -406,17 +591,23 @@ macro_rules! interrupt_stack {
                 pop_scratch!(),
 
                 $rstor1!(),
+                kpti_exit!("1"),
                 "iretq",
 
                 inner = sym inner,
                 IA32_GS_BASE = const(x86::msr::IA32_GS_BASE),
+                KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
+                KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
+                KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
 
                 PCR_GDT_OFFSET = const(core::mem::offset_of!($crate::arch::gdt::ProcessorControlRegion, gdt)),
             );
         }
     };
-    ($name:ident, |$stack:ident| $code:block) => { interrupt_stack!($name, swapgs_iff_ring3_fast!, nop!, nop!, swapgs_iff_ring3_fast!, is_paranoid: false, |$stack| $code); };
-    ($name:ident, @paranoid, |$stack:ident| $code:block) => { interrupt_stack!($name, nop!, conditional_swapgs_paranoid!, conditional_swapgs_back_paranoid!, nop!, is_paranoid: true, |$stack| $code); }
+    ($name:ident, |$stack:ident| $code:block) => { interrupt_stack!($name, swapgs_iff_ring3_fast!, nop!, nop!, swapgs_iff_ring3_fast!, is_paranoid: false, kpti_fix: "1", |$stack| $code); };
+    ($name:ident, @paranoid, |$stack:ident| $code:block) => { interrupt_stack!($name, nop!, conditional_swapgs_paranoid!, conditional_swapgs_back_paranoid!, nop!, is_paranoid: true, kpti_fix: "0", |$stack| $code); }
 }
 
 #[macro_export]
@@ -429,8 +620,13 @@ macro_rules! interrupt {
             }
 
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
+
+                // Ferric Oxide (KPTI)
+                kpti_enter!("0", "1"),
 
                 // Backup all userspace registers to stack
                 swapgs_iff_ring3_fast!(),
@@ -444,9 +640,15 @@ macro_rules! interrupt {
                 pop_scratch!(),
 
                 swapgs_iff_ring3_fast!(),
+                kpti_exit!("1"),
                 "iretq",
 
                 inner = sym inner,
+                KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
+                KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
+                KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
             );
         }
     };
@@ -462,8 +664,13 @@ macro_rules! interrupt_error {
             }
 
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
+
+                // Ferric Oxide (KPTI)
+                kpti_enter!("8", "1"),
 
                 swapgs_iff_ring3_fast_errorcode!(),
 
@@ -489,9 +696,15 @@ macro_rules! interrupt_error {
 
                 // The error code has already been popped, so use the regular macro.
                 swapgs_iff_ring3_fast!(),
+                kpti_exit!("1"),
                 "iretq;",
 
                 inner = sym inner,
+                KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
+                KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
+                KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
                 rax_offset = const(size_of::<$crate::arch::interrupt::handler::PreservedRegisters>() + size_of::<$crate::arch::interrupt::handler::ScratchRegisters>() - 8),
             );
         }

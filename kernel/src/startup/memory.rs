@@ -562,17 +562,39 @@ unsafe fn map_memory<A: Arch>(
     }
 }
 
+/// Ferric Oxide: one past the highest end of the boot memory map's areas whose kind `keep`
+/// accepts.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "kaslr", iommu_enabled, shstk_compiled)
+))]
+fn map_end(keep: impl Fn(BootloaderMemoryKind) -> bool) -> usize {
+    // SAFETY: the memory map is only written while the BSP registers regions during early
+    // boot, before this is called.
+    unsafe { &*MEMORY_MAP.get() }
+        .iter()
+        .filter(|entry| keep(entry.kind))
+        .map(|entry| entry.end)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Ferric Oxide: one past the highest address of RAM (free, reclaimable, kernel and boot-time
+/// identity-mapped areas), for the IOMMU's identity map. Reserved ranges are left out because
+/// firmware reports MMIO holes far above RAM (QEMU's at 1 TiB on AMD hosts, for one). Also bounds
+/// the kernel stacks' physical addresses for the shadow-stack window.
+#[cfg(all(target_arch = "x86_64", any(iommu_enabled, shstk_compiled)))]
+pub fn ram_end() -> usize {
+    use BootloaderMemoryKind::{Free, IdentityMap, Kernel, Reclaim};
+    map_end(|kind| matches!(kind, Free | Reclaim | Kernel | IdentityMap))
+}
+
 /// Where the kernel's page table maps physical memory: a random place with the `kaslr` feature on
 /// x86_64 when the CPU can provide randomness, the bootloader's place otherwise.
 fn choose_phys_offset() -> usize {
     #[cfg(all(target_arch = "x86_64", feature = "kaslr"))]
     {
-        let phys_end = unsafe { &*MEMORY_MAP.get() }
-            .iter()
-            .filter(|entry| entry.kind != Null)
-            .map(|entry| entry.end)
-            .max()
-            .unwrap_or(0);
+        let phys_end = map_end(|kind| kind != Null);
         match crate::arch::kaslr::choose_phys_offset(phys_end) {
             Some(offset) => {
                 info!(

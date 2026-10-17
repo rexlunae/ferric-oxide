@@ -9,6 +9,8 @@ pub struct PageMapper<A, F> {
     table_kind: TableKind,
     table_addr: PhysicalAddress,
     allocator: F,
+    // Ferric Oxide (KPTI): see `new_with_user_shadow`.
+    user_shadow: bool,
     _phantom: PhantomData<fn() -> A>,
 }
 
@@ -18,8 +20,28 @@ impl<A: Arch, F> PageMapper<A, F> {
             table_kind,
             table_addr,
             allocator,
+            user_shadow: false,
             _phantom: PhantomData,
         }
+    }
+
+    /// Ferric Oxide (KPTI): a mapper for a top-level table that is followed, in the next page, by
+    /// a shadow table loaded while user space runs. Every change to the user half of the table is
+    /// made to the shadow too, so the two always map the same user memory.
+    ///
+    /// # Safety
+    ///
+    /// `table_addr` and the page after it must both be top-level tables of this address space,
+    /// and the shadow's user half must start out identical to the table's.
+    pub unsafe fn new_with_user_shadow(
+        table_kind: TableKind,
+        table_addr: PhysicalAddress,
+        allocator: F,
+    ) -> Self {
+        // SAFETY: the caller upholds `new`'s requirements and the shadow's.
+        let mut this = unsafe { Self::new(table_kind, table_addr, allocator) };
+        this.user_shadow = true;
+        this
     }
 
     pub unsafe fn current(table_kind: TableKind, allocator: F) -> Self {
@@ -42,7 +64,10 @@ impl<A: Arch, F> PageMapper<A, F> {
     pub fn table(&self) -> PageTable<A> {
         // SAFETY: The only way to initialize a PageMapper is via new(), and we assume it upholds
         // all necessary invariants for this to be safe.
-        unsafe { PageTable::new(VirtualAddress::new(0), self.table_addr, A::PAGE_LEVELS - 1) }
+        unsafe {
+            PageTable::new(VirtualAddress::new(0), self.table_addr, A::PAGE_LEVELS - 1)
+                .with_user_shadow(self.user_shadow)
+        }
     }
 
     pub fn allocator(&self) -> &F {

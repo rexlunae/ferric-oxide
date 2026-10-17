@@ -889,6 +889,11 @@ impl<'a, D: Disk> Transaction<'a, D> {
         name: &str,
         node_ptr: TreePtr<Node>,
     ) -> Result<()> {
+        // Ferric Oxide: not every caller (the scheme's link handler) goes
+        // through check_name, and DirEntry::new panics on a name that does
+        // not fit.
+        check_name_len(name)?;
+
         let mut parent = self.read_tree(parent_ptr)?;
         let mut node = self.read_tree(node_ptr)?;
 
@@ -1522,9 +1527,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             return Err(Error::new(EINVAL));
         }
 
-        if name.len() > DIR_ENTRY_MAX_LENGTH {
-            return Err(Error::new(EINVAL));
-        }
+        check_name_len(name)?;
 
         // TODO: Can this be removed if link_node satisfies this check itself?
         if self.find_node(*parent_ptr, name).is_ok() {
@@ -2053,4 +2056,12 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
         Ok(buf.len())
     }
+}
+
+/// Ferric Oxide: rejects a name too long for a directory entry with `EINVAL`.
+fn check_name_len(name: &str) -> Result<()> {
+    if name.len() > DIR_ENTRY_MAX_LENGTH {
+        return Err(Error::new(EINVAL));
+    }
+    Ok(())
 }

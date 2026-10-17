@@ -183,6 +183,9 @@ impl KernelScheme for TimeScheme {
 
         for current_chunk in buf.in_exact_chunks(size_of::<TimeSpec>()) {
             let time = unsafe { current_chunk.read_exact::<TimeSpec>()? };
+            // Ferric Oxide: a negative time would become a deadline that never
+            // arrives, as with futex and nanosleep.
+            time::check_timespec(&time)?;
 
             match (handle.clock, handle.kind.clone()) {
                 (_, TimeSchemeKind::Default | TimeSchemeKind::Timer) => {

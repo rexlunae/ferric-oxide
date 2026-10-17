@@ -1,0 +1,22 @@
+# Ferric Oxide nightly fuzzing image
+#
+# The smoke-test image (ferric-smoke.toml), with a console script that runs
+# the system call fuzzer for a long time with a random seed instead of the
+# short smoke tests. The nightly image workflow builds and boots it; the seed
+# is printed on the serial console so a failure can be replayed.
+
+include = ["ferric-smoke.toml"]
+
+# Files from this config are written after the included ones, so this script
+# replaces the smoke-test one.
+[[files]]
+path = "/usr/lib/ferric-smoke.ion"
+data = """
+#!/usr/bin/env ion
+echo FERRIC_SMOKE_BEGIN
+uname -a
+cat /scheme/sys/cpu
+ferric-syscall-fuzz --seed random --seconds 1200 --procs 8 --calls 20000 || echo FERRIC_TEST_FAIL fuzz exited with an error
+echo FERRIC_SMOKE_OK
+shutdown
+"""

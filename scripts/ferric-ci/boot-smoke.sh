@@ -4,6 +4,8 @@
 #
 # Usage: boot-smoke.sh IMAGE [LOG] [CPU]
 #   CPU defaults to "host" with KVM, or "max" under TCG when /dev/kvm is missing.
+#   BOOT_IOMMU=vtd adds an emulated Intel VT-d IOMMU (DMA remapping only, no
+#   interrupt remapping), for kernels built with kernel.iommu = "auto" or "enforce".
 set -euo pipefail
 
 image="$1"
@@ -30,6 +32,33 @@ else
     if [ -z "$cpu" ] || [ "$cpu" = host ]; then cpu=max; fi
 fi
 
+# QEMU's intel-iommu needs the q35 machine and, under KVM, an irqchip split
+# between KVM and QEMU, and it must come before the devices it translates for.
+machine=q35
+iommu=()
+case "${BOOT_IOMMU:-none}" in
+    none) ;;
+    vtd)
+        machine=q35,kernel-irqchip=split
+        iommu=(-device intel-iommu,intremap=off)
+        ;;
+    *)
+        echo "boot-smoke: unknown BOOT_IOMMU=$BOOT_IOMMU (expected none or vtd)" >&2
+        exit 2
+        ;;
+esac
+
+# QEMU's edu device can DMA between its own buffer and memory, which
+# ferric-iommu-test (recipes/tests) drives to test DMA remapping. Its default
+# 28-bit DMA mask would clamp addresses; let it reach all of memory. A fixed
+# slot gives it a known requester ID, 00:10.0.
+edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
+
+# The disk and network controllers sit at fixed slots too, so check-iommu-log.sh can
+# find the DMA domains of their drivers by requester ID.
+disk_dev=(-device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0)
+net_dev=(-device e1000,netdev=net0,addr=5.0)
+
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
@@ -39,10 +68,12 @@ trap 'rm -f "$disk"' EXIT
 # ends the run at once instead of waiting for the timeout.
 : > "$log"
 qemu-system-x86_64 \
-    "${accel[@]}" -cpu "$cpu" -machine q35 -smp 4 -m 2048 \
+    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp 4 -m 2048 \
     -bios "$firmware" \
-    -drive file="$disk",format=raw,if=none,id=drv0 -device nvme,drive=drv0,serial=NVME_SERIAL \
-    -netdev user,id=net0 -device e1000,netdev=net0 \
+    "${iommu[@]}" \
+    -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
+    -netdev user,id=net0 "${net_dev[@]}" \
+    "${edu[@]}" \
     -nographic -vga none -no-reboot \
     -serial mon:stdio < /dev/null > "$log" 2>&1 &
 qemu_pid=$!
@@ -94,7 +125,7 @@ if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$markers"; then
     exit 1
 fi
 if grep -q '^FERRIC_SMOKE_OK' <<< "$markers"; then
-    echo "boot-smoke: PASS (cpu=$cpu, qemu exit $status)"
+    echo "boot-smoke: PASS (cpu=$cpu, iommu=${BOOT_IOMMU:-none}, qemu exit $status)"
     exit 0
 fi
 if [ "$status" = 124 ]; then

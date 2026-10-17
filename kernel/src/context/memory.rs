@@ -265,6 +265,14 @@ impl AddrSpaceWrapper {
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
+        // Ferric Oxide: a device loses write access along with the process, before the call
+        // returns and while the address space is locked (scheme/iommu.rs). Done first, so it
+        // also holds when a later grant fails.
+        #[cfg(iommu_enabled)]
+        if !flags.contains(MapFlags::PROT_WRITE) {
+            crate::scheme::iommu::narrow(self, requested_span);
+        }
+
         let mapper = &mut guard.table.utable;
         let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
 
@@ -338,13 +346,17 @@ impl AddrSpaceWrapper {
         let guard = &mut *guard;
 
         let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
-        AddrSpace::munmap_inner(
+        let result = AddrSpace::munmap_inner(
             &mut guard.grants,
             &mut guard.table.utable,
             &mut flusher,
             requested_span,
             unpin,
-        )
+        );
+        // Ferric Oxide: take down DMA mappings of the unmapped memory (scheme/iommu.rs).
+        #[cfg(iommu_enabled)]
+        crate::scheme::iommu::release(self, requested_span);
+        result
     }
     pub fn r#move(
         &self,
@@ -360,6 +372,10 @@ impl AddrSpaceWrapper {
         // SAFETY: This is moving data between two AddrSpace. Caller ensures the two is a different AddrSpace
         let mut dst = unsafe { dst_lock.acquire_rewrite(token) };
         let dst = &mut *dst;
+
+        // Ferric Oxide: the moved memory leaves its DMA mappings behind (scheme/iommu.rs).
+        #[cfg(iommu_enabled)]
+        let src_owner: &AddrSpaceWrapper = src_opt.as_ref().map_or(dst_lock, |(aw, _)| *aw);
 
         let mut src_flusher;
         let mut src_opt = match src_opt {
@@ -393,6 +409,9 @@ impl AddrSpaceWrapper {
                     PageSpan::new(base, new_page_count),
                     unpin,
                 )?;
+                // Ferric Oxide: see `munmap`.
+                #[cfg(iommu_enabled)]
+                crate::scheme::iommu::release(dst_lock, PageSpan::new(base, new_page_count));
                 if let Some(notify_files_out) = notify_files_out.as_mut() {
                     notify_files_out.extend(notify_files);
                 }
@@ -427,6 +446,8 @@ impl AddrSpaceWrapper {
         if PageSpan::new(dst_base, new_page_count).intersects(src_span) {
             return Err(Error::new(EBUSY));
         }
+        #[cfg(iommu_enabled)]
+        crate::scheme::iommu::release(src_owner, src_span);
 
         if new_page_count < src_span.count {
             let unpin = false;
@@ -593,17 +614,29 @@ impl AddrSpace {
     }
 
     pub fn new() -> Result<Self> {
-        let utable = unsafe {
-            PageMapper::create(
-                TableKind::User,
-                crate::memory::TheFrameAllocator(NumaMemoryPolicy::NodeLocalLeniant),
-            )
-            .ok_or(Error::new(ENOMEM))?
+        // Ferric Oxide: with KPTI, the table is a pair with a shadow loaded in user space.
+        #[cfg(target_arch = "x86_64")]
+        let kpti = crate::arch::kpti::enabled();
+        #[cfg(not(target_arch = "x86_64"))]
+        let kpti = false;
+        #[cfg(target_arch = "x86_64")]
+        let paired = kpti.then(crate::arch::kpti::new_user_table);
+        #[cfg(not(target_arch = "x86_64"))]
+        let paired: Option<Option<PageMapper>> = None;
+        let utable = match paired {
+            Some(utable) => utable.ok_or(Error::new(ENOMEM))?,
+            None => unsafe {
+                PageMapper::create(
+                    TableKind::User,
+                    crate::memory::TheFrameAllocator(NumaMemoryPolicy::NodeLocalLeniant),
+                )
+                .ok_or(Error::new(ENOMEM))?
+            },
         };
 
         Ok(Self {
             grants: UserGrants::new(),
-            table: Table { utable },
+            table: Table { utable, kpti },
             mmap_min: MMAP_MIN_DEFAULT,
         })
     }
@@ -737,6 +770,9 @@ impl AddrSpace {
                         requested_span,
                         unpin,
                     )?;
+                    // Ferric Oxide: see `AddrSpaceWrapper::munmap`.
+                    #[cfg(iommu_enabled)]
+                    crate::scheme::iommu::release(dst_lock, requested_span);
                     if let Some(notify_files_out) = notify_files_out {
                         notify_files_out.append(&mut notify_files);
                     }
@@ -2454,6 +2490,8 @@ pub const DANGLING: usize = 1 << (usize::BITS - 2);
 #[derive(Debug)]
 pub struct Table {
     pub utable: PageMapper,
+    /// Ferric Oxide: the table is a KPTI pair (see `arch::x86_64::kpti`).
+    kpti: bool,
 }
 
 impl Drop for AddrSpace {
@@ -2477,6 +2515,12 @@ impl Drop for Table {
             unsafe {
                 RmmA::set_table(TableKind::User, super::empty_cr3());
             }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.kpti {
+            // SAFETY: the table was switched away from above and the grants are gone.
+            unsafe { crate::arch::kpti::free_user_table(self.utable.table().phys()) };
+            return;
         }
         unsafe {
             deallocate_frame(Frame::containing(self.utable.table().phys()));

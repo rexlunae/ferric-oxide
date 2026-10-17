@@ -1,4 +1,4 @@
-use core::{cell::SyncUnsafeCell, mem};
+use core::cell::SyncUnsafeCell;
 
 use alloc::boxed::Box;
 
@@ -9,6 +9,7 @@ use x86::{
 
 use crate::{
     arch::{
+        gdt::ProcessorControlRegion,
         interrupt::{
             irq::{__generic_interrupts_end, __generic_interrupts_start},
             *,
@@ -19,7 +20,9 @@ use crate::{
     cpu_set::LogicalCpuId,
 };
 
-#[repr(C)]
+// Ferric Oxide: page-aligned, so KPTI can map an IDT into user page tables without exposing
+// whatever else would share its pages.
+#[repr(C, align(4096))]
 pub struct Idt {
     pub(crate) entries: [IdtEntry; 256],
     // TODO: track reservations in userspace instead, with a daemon that sends various capabilities
@@ -44,7 +47,10 @@ impl Idt {
 
     #[inline]
     pub(crate) fn set_reserved(&mut self, index: u8, reserved: bool) {
-        let bit = 1 << (index % 32);
+        // Ferric Oxide: this used to shift twice (`1 << (1 << (index % 32))`), so the IPI
+        // vectors 0x40-0x43 were left free for user IRQ handles while unrelated
+        // vectors were marked reserved.
+        let bit = index % 32;
         let word = &mut self.reservations[usize::from(index / 32)];
 
         if reserved {
@@ -118,7 +124,14 @@ fn set_exceptions(idt: &mut [IdtEntry]) {
     idt[18].set_func(exception::machine_check);
     idt[19].set_func(exception::simd);
     idt[20].set_func(exception::virtualization);
-    // 21 through 29 reserved
+    // Ferric Oxide (IBT): control protection exception, only possible with IBT built in.
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::ibt::COMPILED
+        && let Some(entry) = idt.get_mut(21)
+    {
+        entry.set_func(exception::control_protection);
+    }
+    // 22 through 29 reserved
     idt[30].set_func(exception::security);
     // 31 reserved
 }
@@ -135,24 +148,34 @@ pub unsafe fn init_bsp_before_mem() {
 #[cold]
 pub unsafe fn init_bsp_after_mem() {
     let kstack = Kstack::new().expect("failed to allocate backup stack");
-    let stack_end = kstack.initial_top();
-    core::mem::forget(kstack);
 
+    // SAFETY: on the BSP during boot, so `pcr()` is the BSP's PCR, the CPU that loads this IDT;
+    // the stack is forgotten below.
     unsafe {
-        install_backup_stack(&mut *INIT_BSP_IDT.get(), stack_end as usize);
+        install_backup_stack(&mut *INIT_BSP_IDT.get(), crate::arch::gdt::pcr(), &kstack);
     }
+    core::mem::forget(kstack);
 }
 
-pub fn allocate_and_init_idt(cpu_id: LogicalCpuId) -> *mut Idt {
+// Ferric Oxide: takes the AP's PCR, so its backup stack goes in the AP's TSS rather than the
+// running CPU's.
+pub fn allocate_and_init_idt(cpu_id: LogicalCpuId, pcr: *mut ProcessorControlRegion) -> *mut Idt {
     let idt = Box::leak(Box::new(Idt::new()));
 
     let backup_stack = Kstack::new().expect("failed to allocate AP's backup interrupt stack");
     let backup_stack_end = backup_stack.initial_top() as usize;
-    core::mem::forget(backup_stack);
 
     init_generic(cpu_id, idt);
+    // SAFETY: the caller passes the PCR of the AP that will load this IDT, which has not started
+    // yet; the stack is forgotten below.
     unsafe {
-        install_backup_stack(idt, backup_stack_end);
+        install_backup_stack(idt, pcr, &backup_stack);
+    }
+    core::mem::forget(backup_stack);
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::kpti::map_idt(idt as *mut Idt as usize);
+        crate::arch::kpti::map_stack(backup_stack_end);
     }
 
     idt
@@ -166,18 +189,17 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
 
     set_exceptions(current_idt);
 
+    // Ferric Oxide: the stub size depends on IBT (see irq.rs).
     assert_eq!(
         __generic_interrupts_end as *const () as usize
             - __generic_interrupts_start as *const () as usize,
-        224 * 8
+        224 * irq::GENERIC_INTERRUPT_STUB_SIZE
     );
 
     for i in 0..224 {
-        current_idt[i + 32].set_func(unsafe {
-            mem::transmute::<usize, unsafe extern "C" fn()>(
-                __generic_interrupts_start as *const () as usize + i * 8,
-            )
-        });
+        current_idt[i + 32].set_addr(
+            __generic_interrupts_start as *const () as usize + i * irq::GENERIC_INTERRUPT_STUB_SIZE,
+        );
     }
 
     // reserve bits 31:0, i.e. the first 32 interrupts, which are reserved for exceptions
@@ -206,6 +228,18 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
 
         // reserve bits 49:32, which are for the standard IRQs, and for the local apic timer and error.
         current_reservations[1] |= 0x0003_FFFF;
+
+        // Ferric Oxide: the VT-d fault event interrupt (arch/x86_64/iommu.rs).
+        #[cfg(all(target_arch = "x86_64", iommu_enabled))]
+        {
+            use crate::arch::iommu::{fault_interrupt, FAULT_VECTOR};
+            if let Some(entry) = current_idt.get_mut(usize::from(FAULT_VECTOR)) {
+                entry.set_func(fault_interrupt);
+            }
+            if let Some(word) = current_reservations.get_mut(usize::from(FAULT_VECTOR / 32)) {
+                *word |= 1 << (FAULT_VECTOR % 32);
+            }
+        }
     } else {
         // TODO: use_default_irqs! but also the legacy IRQs that are only needed on one CPU
         current_idt[49].set_func(irq::lapic_error);
@@ -261,8 +295,19 @@ pub unsafe fn install_idt(idt_ptr: *mut Idt, cpu_id: LogicalCpuId) {
         *idt_guard = Some(unsafe { &mut *idt_ptr });
     }
 }
+/// Gives NMIs, double faults and machine checks the backup stack `backup` (IST 1), in `idt` and
+/// in the TSS of `pcr`.
+///
+/// # Safety
+///
+/// `pcr` must point to the processor control region of the CPU that will load `idt`, and no
+/// other CPU may be using it. `backup` must never be freed (callers forget it).
 #[cold]
-pub unsafe fn install_backup_stack(idt: &mut Idt, backup_stack_end: usize) {
+pub unsafe fn install_backup_stack(
+    idt: &mut Idt,
+    pcr: *mut ProcessorControlRegion,
+    backup: &Kstack,
+) {
     // We give Non-Maskable Interrupts, Double Fault, and Machine Check exceptions separate
     // stacks, since these (unless we are going to set up NMI watchdogs like Linux does) are
     // considered the most fatal, especially Double Faults which are caused by errors __when
@@ -274,9 +319,19 @@ pub unsafe fn install_backup_stack(idt: &mut Idt, backup_stack_end: usize) {
     idt.entries[8].set_ist(BACKUP_IST);
     idt.entries[18].set_ist(BACKUP_IST);
 
+    // Ferric Oxide: the IST goes in `pcr`, which upstream took to be the running CPU's even when
+    // setting up an AP. With shadow stacks, IST 1's entry in the interrupt SSP table too.
     #[cfg(target_arch = "x86_64")] // TODO: x86
+    // SAFETY: the caller guarantees `pcr` is the PCR of the CPU loading `idt` and unused
+    // elsewhere.
     unsafe {
-        (*crate::arch::gdt::pcr()).tss.ist[usize::from(BACKUP_IST - 1)] = backup_stack_end as u64;
+        (*pcr).tss.ist[usize::from(BACKUP_IST - 1)] = backup.initial_top() as u64;
+        #[cfg(shstk_compiled)]
+        crate::arch::shstk::set_ist_ssp(
+            &mut (*pcr).shstk_ist_ssp,
+            BACKUP_IST,
+            backup.shadow_stack(),
+        );
     }
 }
 
@@ -348,10 +403,13 @@ impl IdtEntry {
 
     // A function to set the offset more easily
     pub fn set_func(&mut self, func: unsafe extern "C" fn()) {
+        self.set_addr(func as usize);
+    }
+
+    /// Ferric Oxide: points a present ring-0 interrupt gate at the kernel code address `addr`,
+    /// for entry stubs that are not Rust functions (such as the generic interrupt stubs).
+    pub fn set_addr(&mut self, addr: usize) {
         self.set_flags(IdtFlags::PRESENT | IdtFlags::RING_0 | IdtFlags::INTERRUPT);
-        self.set_offset(
-            (crate::arch::gdt::GDT_KERNEL_CODE as u16) << 3,
-            func as usize,
-        );
+        self.set_offset((crate::arch::gdt::GDT_KERNEL_CODE as u16) << 3, addr);
     }
 }
