@@ -168,6 +168,11 @@ pub struct ProcessorControlRegion {
     // shadow's: the shadow bit, plus the user PCID and the no-flush bit with PCID.
     pub kpti_cr3_noflush: usize,
     pub kpti_cr3_user: usize,
+    // Ferric Oxide (shadow stacks): this CPU's interrupt SSP table, which
+    // IA32_INTERRUPT_SSP_TABLE_ADDR points at (see arch/x86_64/shstk.rs). In the PCR because the
+    // CPU reads it while delivering an interrupt, and the PCR is mapped wherever that can happen.
+    #[cfg(shstk_compiled)]
+    pub shstk_ist_ssp: crate::arch::shstk::InterruptSspTable,
     // The GDT *must* be stored in the PCR! The paranoid interrupt handler, lacking a reliable way
     // to correctly obtain GSBASE, uses SGDT to calculate the PCR offset.
     pub gdt: [GdtEntry; SEGMENT_COUNT],
@@ -201,6 +206,8 @@ impl ProcessorControlRegion {
             kpti_scratch: 0,
             kpti_cr3_noflush: 0,
             kpti_cr3_user: 0,
+            #[cfg(shstk_compiled)]
+            shstk_ist_ssp: [0; ferric_cet::shstk::INTERRUPT_SSP_TABLE_ENTRIES],
             gdt: BASE_GDT,
             percpu: PercpuBlock::init(cpu_id),
             _rsvd: Align([0; 2]),

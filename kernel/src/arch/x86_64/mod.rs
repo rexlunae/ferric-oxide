@@ -28,7 +28,7 @@ pub mod kpti;
 /// Ferric Oxide: kernel indirect branch tracking (CET IBT)
 pub mod ibt;
 
-/// Ferric Oxide: kernel shadow stacks (CET SS), detection and policy only so far
+/// Ferric Oxide: kernel shadow stacks (CET SS), allocated and kept consistent but not yet enabled
 pub mod shstk;
 
 /// Ferric Oxide: Intel VT-d DMA remapping

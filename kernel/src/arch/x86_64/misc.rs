@@ -37,6 +37,11 @@ pub unsafe fn init(cpu_id: LogicalCpuId) {
         {
             x86::controlregs::cr4_write(x86::controlregs::cr4() | Cr4::CR4_ENABLE_PPMC);
         }
+
+        // Ferric Oxide (shadow stacks): this CPU's SSP MSRs. The PCR is installed (see
+        // `gdt::install_pcr`) and outlives the CPU's use of its interrupt SSP table.
+        #[cfg(shstk_compiled)]
+        super::shstk::init_cpu(&(*super::gdt::pcr()).shstk_ist_ssp);
     }
 
     // Ferric Oxide: kernel indirect branch tracking. Last, because `cr4()` above drops CR4.CET.

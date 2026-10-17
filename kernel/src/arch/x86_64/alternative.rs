@@ -242,6 +242,9 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
                 "xsaveopt" => enable.contains(KcpuFeatures::XSAVEOPT),
                 "avx512" => enable.contains(KcpuFeatures::AVX512),
                 "kpti" => enable.contains(KcpuFeatures::KPTI),
+                // Ferric Oxide: must be listed, or the catch-all below would patch in the
+                // shadow-stack switch, which raises #UD while CET is off.
+                "shstk" => enable.contains(KcpuFeatures::SHSTK),
                 //_ => panic!("unknown altcode relocation: {}", name),
                 _ => true,
             };
@@ -321,6 +324,9 @@ bitflags! {
         const XSAVEOPT = 8;
         const AVX512 = 16;
         const KPTI = 32;
+        /// Ferric Oxide: kernel shadow stacks are on (CR4.CET and IA32_S_CET.SH_STK_EN). Never
+        /// set yet; see arch/x86_64/shstk.rs.
+        const SHSTK = 64;
     }
 }
 

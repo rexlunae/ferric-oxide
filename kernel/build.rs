@@ -77,12 +77,17 @@ fn parse_kconfig(arch: &str) -> Option<()> {
 
         println!("cargo:rustc-cfg=cpu_feature_{choice}=\"{name}\"");
 
-        // Ferric Oxide (shadow stacks): only detected and reported so far, so "always" would
+        // Ferric Oxide (shadow stacks): allocated but not yet turned on, so "always" would
         // promise something the kernel does not do.
         assert!(
             !(name == "shstk" && choice == "always"),
             "arch.x86_64.features.shstk must be \"auto\" or \"never\""
         );
+        // Ferric Oxide (shadow stacks): one cfg for "the build has shadow-stack support", so the
+        // code outside arch/x86_64/shstk.rs needs no feature-choice logic.
+        if name == "shstk" && choice != "never" {
+            println!("cargo:rustc-cfg=shstk_compiled");
+        }
 
         // Ferric Oxide (IBT): hand-written entry points get endbr64 from this cfg, but the
         // compiler only adds it to Rust functions (in every crate, core and alloc included) when
@@ -114,6 +119,8 @@ fn main() {
     // Ferric Oxide: set by parse_kconfig from arch.x86_64.iommu.
     println!("cargo::rustc-check-cfg=cfg(iommu, values(\"auto\", \"enforce\", \"never\"))");
     println!("cargo::rustc-check-cfg=cfg(iommu_enabled)");
+    // Ferric Oxide: set by parse_kconfig unless arch.x86_64.features.shstk is "never".
+    println!("cargo::rustc-check-cfg=cfg(shstk_compiled)");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let arch_str = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
