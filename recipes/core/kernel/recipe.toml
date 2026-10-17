@@ -1,7 +1,7 @@
 [source]
 # Ferric Oxide kernel fork (tracks upstream gitlab.redox-os.org/redox-os/kernel)
 git = "https://github.com/rexlunae/kernel.git"
-branch = "avx512-xstate" # TEMP: switch back to main once the kernel change merges
+branch = "phase1-integration" # TEMP: back to main once rexlunae/kernel#1 and the cpu-level PR merge
 
 [build]
 template = "custom"
