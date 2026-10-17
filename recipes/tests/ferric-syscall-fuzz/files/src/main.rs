@@ -760,6 +760,8 @@ struct Tally {
     exited: usize,
     signaled: usize,
     timed_out: usize,
+    /// Seeds of the children that timed out, replayed with tracing at the end.
+    hung: Vec<u64>,
 }
 
 /// A child that has not been reaped yet.
@@ -826,6 +828,58 @@ fn spawn(exe: &str, dir: &str, seed: u64, calls: usize) -> std::io::Result<Child
         .spawn()
 }
 
+/// How many trailing trace lines a replay prints.
+const REPLAY_LINES: usize = 3;
+
+/// Runs a hung child's seed again with tracing on and prints the last calls
+/// it made, the final one being the call it was stuck in. Replays are close
+/// but not exact (descriptor numbers and addresses can differ), so a replay
+/// that finishes is reported as such.
+fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
+    let child_dir = format!("{dir}/replay-{seed}");
+    let trace = format!("{dir}/replay-{seed}.trace");
+    let spawned = std::fs::create_dir_all(&child_dir).and_then(|()| {
+        Command::new(exe)
+            .args(["--child", &seed.to_string(), &calls.to_string()])
+            .env("FERRIC_FUZZ_VERBOSE", "1")
+            .current_dir(&child_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&trace)?)
+            .spawn()
+    });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            println!("fuzz: replay of seed {seed} failed to start: {e}");
+            return;
+        }
+    };
+    let started = Instant::now();
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if started.elapsed() > CHILD_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break false,
+        }
+    };
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(REPLAY_LINES)..];
+    let outcome = if finished { "finished" } else { "hung again" };
+    println!("fuzz: replay of seed {seed} {outcome}; last calls:");
+    for line in tail {
+        println!("fuzz:   {line}");
+    }
+    let _ = std::fs::remove_dir_all(&child_dir);
+    let _ = std::fs::remove_file(&trace);
+}
+
 /// Reaps finished children and kills ones past the timeout.
 ///
 /// # Errors
@@ -846,6 +900,7 @@ fn reap(running: &mut Vec<Running>, tally: &mut Tally) -> Result<(), String> {
                 println!("fuzz: child seed {} timed out, killing it", r.seed);
                 let _ = r.child.kill();
                 tally.timed_out += 1;
+                tally.hung.push(r.seed);
                 r.child.wait().map_err(|e| format!("wait failed: {e}"))?
             }
             None => {
@@ -914,6 +969,9 @@ fn run_children(opts: &Options, dir: &str, running: &mut Vec<Running>) -> Result
             continue;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    for &seed in &tally.hung {
+        replay(&exe, dir, seed, opts.calls);
     }
     Ok(tally)
 }
