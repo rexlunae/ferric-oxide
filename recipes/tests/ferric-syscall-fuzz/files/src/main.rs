@@ -710,6 +710,9 @@ impl Fuzzer {
             0x3,
             0,
         ];
+        if self.verbose {
+            eprintln!("regression {:#x} {args:x?}", sys::MREMAP);
+        }
         // SAFETY: the kernel must refuse this; if it does not, only this
         // process's mapping is affected.
         let _ = unsafe { sys::call(sys::MREMAP, args) };
@@ -830,6 +833,10 @@ fn spawn(exe: &str, dir: &str, seed: u64, calls: usize) -> std::io::Result<Child
 
 /// How many trailing trace lines a replay prints.
 const REPLAY_LINES: usize = 3;
+
+/// How many hung seeds are replayed, so many hangs cannot run past the boot
+/// timeout before the fuzzer reports.
+const MAX_REPLAYS: usize = 3;
 
 /// Runs a hung child's seed again with tracing on and prints the last calls
 /// it made, the final one being the call it was stuck in. Replays are close
@@ -970,7 +977,7 @@ fn run_children(opts: &Options, dir: &str, running: &mut Vec<Running>) -> Result
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    for &seed in &tally.hung {
+    for &seed in tally.hung.iter().take(MAX_REPLAYS) {
         replay(&exe, dir, seed, opts.calls);
     }
     Ok(tally)
