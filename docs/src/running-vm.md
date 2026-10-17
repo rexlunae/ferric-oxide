@@ -31,6 +31,8 @@ Even if the `desktop` and `server` variants doesn't work, use the daily images b
 If you want to test the latest Redox changes you can use our bootable images created each day by opening the [build server images](https://static.redox-os.org/img) and downloading your preferred variant.
 Once the download is complete, check the [SHA256 sum](https://static.redox-os.org/img/x86_64/SHA256SUM).
 
+Note: for ARM64 and RISC-V, download the `livedisk` image.
+
 (Sometimes our daily images can be one week old or more because of breaking changes)
 
 ## Decompression
@@ -156,6 +158,8 @@ sudo apt-get install qemu-system-arm qemu-kvm
 sudo apt-get install qemu-system-riscv
 ```
 
+**Nix / NixOS**: use `nix-shell -p qemu qemu_kvm` (or add these packages to your profile or system configuration)
+
 Use one of the following commands to run QEMU with a Redox-compatible configuration:
 
 > 💡 **Tip:** if you encounter an error with the file name, verify that the name passed into the previous command (i.e., `$HOME/Downloads/redox_demo_x86_64_*_harddrive.img`) matches the file you downloaded.
@@ -193,8 +197,10 @@ SDL_VIDEO_X11_DGAMOUSE=0 qemu-system-aarch64 -d cpu_reset,guest_errors -smp 4 -m
     -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug \
     -bios /usr/share/AAVMF/AAVMF_CODE.fd -machine virt -cpu max -vga none -device ramfb -netdev user,id=net0 \
     -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci \
-    -drive file=`echo $HOME/Downloads/redox_demo_aarch64_*_harddrive.img`,format=raw
+    -drive file=`echo $HOME/Downloads/redox_demo_aarch64_*_livedisk.iso`,format=raw
 ```
+
+**Nix / NixOS**: use `$(dirname $(realpath $(which qemu-system-aarch64)))/../share/qemu/edk2-aarch64-code.fd` for the `-bios` parameter
 
 #### RISC-V image
 
@@ -223,8 +229,10 @@ SDL_VIDEO_X11_DGAMOUSE=0 qemu-system-riscv64 -d cpu_reset,guest_errors -smp 4 -m
     -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug \
     -drive if=pflash,format=raw,unit=0,file=/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd,readonly=on -drive if=pflash,format=raw,unit=1,file=/usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd -machine virt,acpi=off -cpu max -vga none -device ramfb -audio none -netdev user,id=net0 \
     -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci \
-    -drive file=`echo $HOME/Downloads/redox_demo_riscv64gc_*_harddrive.img`,format=raw
+    -drive file=`echo $HOME/Downloads/redox_demo_riscv64gc_*_livedisk.iso`,format=raw
 ```
+
+**Nix / NixOS**: use `$(dirname $(realpath $(which qemu-system-riscv64)))/../share/qemu/edk2-riscv-code.fd` for the UEFI path, and make a writable copy of UEFI variables at `edk2-riscv-vars.fd` in the same folder.
 
 ### Redox
 
@@ -246,6 +254,58 @@ qemu-system-x86_64 -nographic -vga none -m 512 -machine q35 -cpu Broadwell,-pcid
 
 ```
 qemu-system-x86_64 -display gtk -vga std -m 1024 -machine q35 -cpu Broadwell,-pcid,-x2apic,-tsc-deadline,-hle,-rtm,-invpcid -drive file=Downloads/redox_desktop_x86_64_*_harddrive.img,format=raw,if=virtio
+```
+
+### macOS
+
+Install QEMU using Homebrew:
+
+```
+brew install qemu
+```
+
+Then use one of the following commands to run QEMU with a Redox-compatible configuration:
+
+#### x86-64 image
+
+```
+qemu-system-x86_64 -d cpu_reset,guest_errors -smp 4 -m 2048 \
+    -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug \
+    -machine q35 -device ich9-intel-hda -device hda-duplex -netdev user,id=net0 \
+    -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci \
+    -display cocoa,zoom-to-fit=on \
+    -drive file=`echo $HOME/Downloads/redox_demo_x86_64_*_harddrive.img`,format=raw
+```
+
+#### ARM64 image
+
+```
+qemu-system-aarch64 -d cpu_reset,guest_errors -smp 4 -m 2048 \
+    -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug \
+    -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd -machine virt -cpu max -vga none -device ramfb -netdev user,id=net0 \
+    -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci \
+    -display cocoa,zoom-to-fit=on \
+    -drive file=`echo $HOME/Downloads/redox_demo_aarch64_*_livedisk.iso`,format=raw
+```
+
+#### RISC-V image
+
+Prepare a copy of UEFI variables (once):
+
+```
+cp /opt/homebrew/share/qemu/edk2-riscv-vars.fd uefi-vars.fd
+chmod +w uefi-vars.fd
+```
+
+Run QEMU:
+
+```
+qemu-system-riscv64 -d cpu_reset,guest_errors -smp 4 -m 2048 \
+    -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug \
+    -drive if=pflash,format=raw,unit=0,file=/opt/homebrew/share/qemu/edk2-riscv-code.fd,readonly=on -drive if=pflash,format=raw,unit=1,file=uefi-vars.fd -machine virt,acpi=off -cpu max -vga none -device ramfb -audio none -netdev user,id=net0 \
+    -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci \
+    -display cocoa,zoom-to-fit=on \
+    -drive file=`echo $HOME/Downloads/redox_demo_riscv64gc_*_livedisk.iso`,format=raw
 ```
 
 ### Windows
@@ -279,7 +339,7 @@ TODO: test
 -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug
 -machine pc -cpu host -device ich9-intel-hda -device hda-duplex -netdev user,id=net0
 -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci -device usb-tablet
--drive file=redox_demo_x86_64_2024-09-07_1225_harddrive.img,format=raw
+-drive file=redox_demo_x86_64_*_harddrive.img,format=raw
 ```
 
 #### ARM64 image
@@ -291,10 +351,10 @@ TODO: test
 ```
 "C:\Program Files\qemu\qemu-system-aarch64.exe" -d cpu_reset,guest_errors -smp 4 -m 2048
 -chardev stdio,id=debug,signal=off,mux=on,"" -serial chardev:debug -mon chardev=debug
--drive -bios "C:\Program Files\qemu\share\edk2-aarch64-code.fd" 
+-drive -bios "C:\Program Files\qemu\share\edk2-aarch64-code.fd"
 -machine virt -cpu max -vga none -device ramfb -netdev user,id=net0
 -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci -device usb-tablet
--drive file=redox_demo_aarch64_*_harddrive.img,format=raw
+-drive file=redox_demo_aarch64_*_livedisk.iso,format=raw
 ```
 
 #### RISC-V image
@@ -309,10 +369,10 @@ TODO: test
 -drive -bios "C:\Program Files\qemu\share\edk2-riscv-code.fd"
 -machine virt,acpi=off -cpu max -vga none -device ramfb -audio none -netdev riscv,id=net0
 -device e1000,netdev=net0 -device nec-usb-xhci,id=xhci -device usb-tablet
--drive file=redox_demo_riscv64gc_*_harddrive.img,format=raw
+-drive file=redox_demo_riscv64gc_*_livedisk.iso,format=raw
 ```
 
-> 💡 **Tip:** if you get a filename error, change `redox_demo_x86_64_*_harddrive.img` to the name of the file you downloaded.
+> 💡 **Tip:** if you get a filename error, change `redox_demo_x86_64_*_livedisk.iso` to the name of the file you downloaded.
 
 > 💡 **Tip:** if necessary, change `"C:\Program Files\qemu\qemu-system-x86_64.exe"` to reflect where **QEMU** was installed. The quotes are needed if the path contains spaces.
 
