@@ -63,8 +63,9 @@ if [ "$stubs" != "$expected" ]; then
 fi
 
 # A sample of compiled functions from the kernel and from build-std's core and alloc, which
-# only get endbr64 if RUSTFLAGS reached them.
-expect_endbr kernel::startup::kmain
+# only get endbr64 if RUSTFLAGS reached them. Only functions whose address is taken or that
+# are exported qualify: LLVM leaves endbr64 off local functions that are only called directly
+# (such as kmain), which IBT never checks.
 expect_endbr kernel::context::switch::switch_finish_hook
 expect_endbr core::fmt::write
 expect_endbr memcpy
