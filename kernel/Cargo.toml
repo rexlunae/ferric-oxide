@@ -16,6 +16,7 @@ arrayvec = { version = "0.7.4", default-features = false }
 bitfield = "0.13.2"
 bitflags = "2"
 fdt = { git = "https://github.com/repnop/fdt.git", rev = "2fb1409edd1877c714a0aa36b6a7c5351004be54", features = ["pretty-printing"] }
+ferric-nospec = { path = "../crates/nospec" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
 linked_list_allocator = "0.9.0"
 redox_syscall = { path = "syscall" }
@@ -38,7 +39,7 @@ default-features = false
 # userspace applications, and it is only checked in debug builds
 # TODO: address occurrences and then deny
 arithmetic_side_effects = "warn"
-cast_ptr_alignment = "warn" # TODO: address occurrences and then deny
+cast_ptr_alignment = "deny"
 identity_op = "allow" # Used to allow stuff like 1 << 0 and 1 * 1024 * 1024
 if_same_then_else = "allow" # Useful for adding comments about different branches
 # Indexing a slice can cause panics and that is something we always want to avoid
