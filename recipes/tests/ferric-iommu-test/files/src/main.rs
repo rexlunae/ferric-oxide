@@ -723,8 +723,12 @@ impl Vector {
 fn bsp() -> Result<u32, Failure> {
     let mut buf = [0_u8; 8];
     let len = File::open("/scheme/irq/bsp")?.read(&mut buf)?;
+    // The kernel writes a 32-bit number and may report a usize-sized read, as
+    // `pcid_interface::irq_helpers::read_bsp_apic_id` allows.
     match buf.get(..len) {
-        Some([a, b, c, d]) => Ok(u32::from_le_bytes([*a, *b, *c, *d])),
+        Some([a, b, c, d]) | Some([a, b, c, d, 0, 0, 0, 0]) => {
+            Ok(u32::from_le_bytes([*a, *b, *c, *d]))
+        }
         Some(bytes) => Err(Failure::Response(bytes.to_vec())),
         None => Err(Failure::NotRun),
     }

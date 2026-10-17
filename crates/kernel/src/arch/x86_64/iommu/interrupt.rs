@@ -347,8 +347,9 @@ pub fn alloc_msi(
     if kernel_vector(vector) {
         return Err(IrqError::Vector { vector });
     }
-    let apic_id = apic_id(cpu)?;
+    // Without a unit for the device the answer is ENODEV, whatever the CPU.
     let index = domain::unit_index(device).map_err(IrqError::Unit)?;
+    let apic_id = apic_id(cpu)?;
     let entry = alloc_entry(index, source, apic_id, vector)?;
     let in_use = in_use();
     info!(
