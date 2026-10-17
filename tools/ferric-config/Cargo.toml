@@ -6,16 +6,10 @@ description = "menuconfig-style feature configuration for the Ferric Oxide build
 license = "MIT"
 publish = false
 
-# Standalone so it builds without the cookbook's git dependencies.
-[workspace]
-
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 ratatui = "0.30"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 toml = "1"
 toml_edit = "0.25"
-
-[profile.release]
-opt-level = 2

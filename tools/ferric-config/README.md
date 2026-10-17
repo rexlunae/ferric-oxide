@@ -103,7 +103,7 @@ $T check                       # exit status 1 on errors
 | --- | --- |
 | Make variables (`ARCH`, `CONFIG_NAME`, `PODMAN_BUILD`, `REPO_*`, `QEMU_*`, ...) | `build/ferric/config.mk`, included near the top of `mk/config.mk`. Values use `?=`, so `.config` and the command line still win; `check` warns when `.config` shadows one. |
 | Image contents | `build/ferric/filesystem.toml` includes the base `config/…/<name>.toml` and adds packages, `"ignore"` entries and `[general]` overrides. It becomes `FILESYSTEM_CONFIG`. |
-| Processor baseline and extra flags | `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS`, appended by the cookbook prescript (`src/cook/script.rs`) for every package built for the target, except the recipes in `cpu.flags_exclude` (the kernel and bootloader). C, C++, CMake, Meson and the `cc` crate all read `CPPFLAGS`. |
+| Processor baseline and extra flags | `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS`, appended by the cookbook prescript (`tools/cookbook/src/cook/script.rs`) for every package built for the target, except the recipes in `cpu.flags_exclude` (the kernel and bootloader). C, C++, CMake, Meson and the `cc` crate all read `CPPFLAGS`. |
 | Kernel Cargo features | `FERRIC_KERNEL_FEATURES`, passed by `recipes/core/kernel/recipe.toml` as `KERNEL_CARGO_FEATURES` together with `--no-default-features`, so turning a default feature off works. |
 | Kernel CPU feature policy | `build/ferric/kernel-config.toml`, copied into the kernel source as `config.toml`, which the kernel's `build.rs` reads (`always`/`auto`/`never` for SMAP, FSGSBASE, XSAVE, XSAVEOPT). |
 

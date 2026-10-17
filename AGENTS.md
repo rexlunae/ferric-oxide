@@ -13,7 +13,7 @@ The repository is moving to the layout below. Parts of it do not exist yet; put 
 | Path | What it is | Cargo workspace |
 | --- | --- | --- |
 | `Cargo.toml` (root) | Host workspace: build tools that run on the developer machine | host |
-| `tools/cookbook/` | The recipe engine and `repo` binary (today still in `src/`) | host |
+| `tools/cookbook/` | The recipe engine and `repo` binary | host |
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxfs-host/` | Image installer and host-side RedoxFS tools | host |
 | `kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
@@ -114,7 +114,7 @@ cargo test
 cargo doc --no-deps   # must build without warnings
 ```
 
-For `tools/ferric-config`, CI runs `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings` with `--manifest-path tools/ferric-config/Cargo.toml`. Changes that affect the image (kernel, drivers, recipes, config) also need `make all` and a boot with `make qemu` where your environment allows it; say in the PR if you could not.
+For the host workspace, CI (`.github/workflows/host-tools.yml`) runs `cargo fmt --all --check`, `cargo test --locked --workspace` and `cargo clippy --locked --all-targets -p ferric-config -- -D warnings` from the repository root. The cookbook is upstream code with many existing lint warnings, so clippy is not yet denied for it. If gitlab.redox-os.org is unreachable (as in cloud sessions), `git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/` plus `CARGO_NET_GIT_FETCH_WITH_CLI=true` lets Cargo fetch the cookbook's git dependencies from the GitHub mirrors. Changes that affect the image (kernel, drivers, recipes, config) also need `make all` and a boot with `make qemu` where your environment allows it; say in the PR if you could not.
 
 Then:
 
