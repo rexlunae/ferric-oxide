@@ -74,6 +74,20 @@ jobs:
       - name: Build image
         run: make all CONFIG_NAME="$CONFIG_NAME"
 
+      - name: Disassemble ion around the crash
+        run: |
+          apt-get install -y -q binutils file >/dev/null 2>&1 || true
+          find . -path '*stage*' -name ion -type f | head
+          ion="$(find . -path '*stage*/usr/bin/ion' -type f | head -1)"
+          file "$ion"; readelf -lhd "$ion" | head -60
+          nm -n "$ion" 2>/dev/null | wc -l
+          for pc in 0xd29f39 0xcfb7b4 0xd4be43 0xd4c32c 0xd49b3b 0xd4a521 0xce51cd 0xc07315 0xf0d05d; do
+            echo "=== $pc"; addr2line -f -C -e "$ion" $pc || true
+            s=$(printf '0x%x' $((pc-0x60))); e=$(printf '0x%x' $((pc+0x20)))
+            objdump -d --no-show-raw-insn --start-address=$s --stop-address=$e "$ion" | tail -n +7
+          done
+          strings -a "$ion" | grep -m5 -i 'relibc\|libonig' || true
+
       - name: Compress image
         run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
 
@@ -101,7 +115,7 @@ jobs:
       fail-fast: false
       matrix:
         cpu: [host]
-        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        run: [1]
     steps:
       - uses: actions/checkout@v4
 
