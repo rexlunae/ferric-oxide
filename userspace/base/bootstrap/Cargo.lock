@@ -20,6 +20,7 @@ version = "0.0.0"
 dependencies = [
  "arrayvec",
  "ferric-iommu",
+ "ferric-regbuf",
  "hashbrown",
  "libredox",
  "linked_list_allocator",
@@ -35,6 +36,10 @@ dependencies = [
 
 [[package]]
 name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]

@@ -375,6 +375,25 @@ rebuild = ["kernel"]
 help = "Parse SRAT and keep per-node memory information. Experimental upstream."
 
 [[option]]
+id = "kernel.regbuf"
+menu = "kernel"
+type = "bool"
+title = "Registered buffers and zero-copy grants"
+default = false
+kernel_feature = "regbuf"
+rebuild = ["kernel"]
+help = """
+Provide the kernel.regbuf scheme (Phase 2.2). An application registers a range
+of its memory once into a region, which pins the pages, then hands a scheme a
+grant: a read-only or read-write, revocable right to part of the region, as a
+file descriptor. The scheme maps the grant and reads or writes the
+application's pages directly instead of copying them. Revoking a grant, or
+closing the region, unmaps it from every process that mapped it, with a TLB
+shootdown, before the call returns. Non-root users may pin 16 MiB each, and
+everyone together a quarter of memory. Off by default; without it the kernel
+has no such scheme, as upstream."""
+
+[[option]]
 id = "kernel.self_modifying"
 menu = "kernel"
 type = "bool"
