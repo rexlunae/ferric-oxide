@@ -24,12 +24,52 @@
 //! NMIs, machine checks and debug exceptions can arrive at any point, so they save and restore
 //! CR3 themselves.
 //!
-//! Global pages are turned off while KPTI is on, so a table switch flushes the kernel's TLB
-//! entries. PCID, which would avoid flushing on every switch, is not used yet.
+//! Global pages are turned off while KPTI is on: a global kernel entry would be visible to user
+//! space under any table. Without PCID every table switch therefore flushes the whole TLB, twice
+//! per system call or interrupt.
 //!
 //! The `kpti` CPU feature (`arch.x86_64.features.kpti` in the kernel config, `kernel.cpu.kpti` in
 //! `ferric.toml`) chooses: `never` builds it out, `always` turns it on, `auto` turns it on for
 //! Intel CPUs that do not report `RDCL_NO` in `IA32_ARCH_CAPABILITIES`. AMD CPUs are not affected.
+//!
+//! # PCID
+//!
+//! With process-context identifiers (CR4.PCIDE), TLB entries are tagged with the PCID in
+//! CR3[11:0], and a CR3 write with bit 63 set keeps them. KPTI then uses one fixed pair of PCIDs
+//! on every CPU: 0 for every kernel table and [`rmm::x86_64::USER_PCID`] (`0x800`) for every
+//! shadow. The entry and exit code switch between the two with bit 63 set, so system calls and
+//! interrupts no longer flush the TLB. The CR3 bits they OR in come from the PCR
+//! (`kpti_cr3_noflush`, `kpti_cr3_user`), which [`setup_pcr`] fills in, so the same code runs with
+//! or without PCID.
+//!
+//! Keeping the user PCID's entries is only correct if every invalidation reaches them too, since
+//! `invlpg` and a CR3 write only act on the current PCID, which in the kernel is always 0.
+//! `rmm`'s `X8664Arch` does this when [`rmm::x86_64::X8664Arch::set_user_pcid`] is on:
+//!
+//! - `invalidate` (one page, every `PageFlush::flush`) adds `INVPCID` type 0 for the user PCID.
+//! - `set_table` (address-space switches, and `invalidate_all`, which every `PageFlushAll`, the
+//!   kernel's `Flusher` and the TLB shootdown IPI handler use) adds `INVPCID` type 1, a flush of
+//!   the whole user PCID.
+//!
+//! The kernel never writes CR3 or runs `invlpg` other than through those two functions (the AP
+//! trampoline, [`init_cpu`] and the entry code aside, none of which needs to invalidate), so no
+//! flush site is missed and no flush is ever deferred. The paranoid NMI, #MC and #DB paths can
+//! therefore also switch back without flushing. Since `INVPCID` with a non-zero PCID faults
+//! while CR4.PCIDE is clear, an AP runs [`init_cpu`] before anything that could invalidate.
+//!
+//! Address-space switches still flush, both PCIDs, because every address space shares the same
+//! pair. This is the simple design: Linux instead gives each CPU a small cache of PCID pairs with
+//! a generation counter, so switching back to a recently run process keeps its entries. That
+//! needs per-CPU tracking of which address spaces' pairs are stale, reached from every flush
+//! site and the shootdown code, and gets wrong-PCID bugs that are security holes. A fixed pair
+//! gives the main gain, no flushes on entry and exit within a process, with no extra state: a
+//! switch flushes exactly what it did before. Per-address-space PCIDs can come later, with
+//! benchmarks to justify them.
+//!
+//! The `pcid` CPU feature (`arch.x86_64.features.pcid`, `kernel.cpu.pcid`) chooses: `never` keeps
+//! the flushing switches, `auto` uses PCID when KPTI is on and the CPU reports both PCID
+//! (CPUID.1:ECX\[17\]) and INVPCID (CPUID.(7,0):EBX\[10\]), and `always` also panics at boot when
+//! KPTI is on and the CPU lacks them.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -53,6 +93,15 @@ pub const TABLE_PAIR_ORDER: u32 = 1;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Whether KPTI uses PCIDs; decided in [`init_bsp`].
+static PCID: AtomicBool = AtomicBool::new(false);
+
+/// CR3 bit 63 with CR4.PCIDE: keep the TLB entries of the PCID being loaded.
+const CR3_NOFLUSH: usize = 1 << 63;
+
+/// The PCID bits of CR3.
+const CR3_PCID_MASK: usize = 0xFFF;
+
 /// The kernel half shared by all shadows: a top-level table whose upper entries every shadow
 /// copies. Its lower half is unused.
 static SHADOW: Mutex<Option<PageMapper>> = Mutex::new(None);
@@ -68,6 +117,42 @@ const fn compiled() -> bool {
 #[inline]
 pub fn enabled() -> bool {
     compiled() && ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether KPTI with PCID was compiled in.
+const fn pcid_compiled() -> bool {
+    cfg!(cpu_feature_always = "pcid") || cfg!(cpu_feature_auto = "pcid")
+}
+
+/// Whether KPTI uses PCIDs, so entry and exit switch tables without flushing.
+#[inline]
+pub fn pcid_enabled() -> bool {
+    pcid_compiled() && PCID.load(Ordering::Relaxed)
+}
+
+/// Whether this CPU has PCID (CPUID.1:ECX\[17\]) and INVPCID (CPUID.(7,0):EBX\[10\]).
+fn cpu_has_pcid() -> bool {
+    crate::arch::cpuid::feature_info().has_pcid()
+        && crate::arch::cpuid::has_ext_feat(|f| f.has_invpcid())
+}
+
+/// Decides whether KPTI uses PCIDs, on the BSP once KPTI is known to be on.
+///
+/// # Panics
+///
+/// When the `pcid` feature is `always` and the CPU lacks PCID or INVPCID.
+fn decide_pcid() -> bool {
+    if !pcid_compiled() {
+        return false;
+    }
+    let has = cpu_has_pcid();
+    if cfg!(cpu_feature_always = "pcid") && !has {
+        panic!(
+            "KPTI: the CPU lacks PCID or INVPCID; rebuild with kernel.cpu.pcid = \"auto\" or \"never\""
+        );
+    }
+    PCID.store(has, Ordering::Relaxed);
+    has
 }
 
 /// Whether this CPU can leak kernel memory to user space through Meltdown: Intel CPUs, unless
@@ -109,6 +194,7 @@ pub unsafe fn init_bsp() {
     if !enabled() {
         return;
     }
+    let pcid = decide_pcid();
     // Pre-allocates every kernel-half table, so all shadows can share them.
     // SAFETY: a fresh table, not loaded anywhere until a shadow uses its kernel half.
     let mapper = unsafe {
@@ -124,7 +210,7 @@ pub unsafe fn init_bsp() {
     map(__text_start(), __text_end(), PageFlags::new().execute(true));
 
     // SAFETY: the caller guarantees the BSP's PCR and IDT are installed, so `pcr()` and SIDT
-    // describe live structures.
+    // describe live structures; see below for the user PCID.
     unsafe {
         let pcr = crate::arch::gdt::pcr();
         setup_pcr(pcr);
@@ -142,25 +228,55 @@ pub unsafe fn init_bsp() {
             }
         }
         init_cpu();
+        // `init_cpu` just set CR4.PCIDE on the BSP, which has INVPCID, and every AP sets it in
+        // `init_cpu` before it can invalidate a TLB entry.
+        if pcid {
+            RmmA::set_user_pcid(true);
+        }
     }
     info!("KPTI: user page tables isolated from the kernel");
+    if pcid {
+        info!("KPTI: PCID enabled, no-flush CR3 switches");
+    }
 }
 
 /// Per-CPU part of the setup: turns off global pages so a switch to the shadow flushes kernel
-/// TLB entries. Runs on every CPU.
+/// TLB entries and, with PCID, sets CR4.PCIDE. Runs on every CPU.
 ///
 /// # Safety
 ///
-/// Must run on the CPU being set up, before it enters user space.
+/// Must run on the CPU being set up, before it enters user space, before it invalidates any TLB
+/// entry once the BSP has turned PCID on (an AP runs it right after installing its GDT and IDT),
+/// and before CR4.CET is set (`x86::controlregs::cr4` drops that bit; see `misc::init`).
+///
+/// # Panics
+///
+/// When KPTI uses PCID and this CPU, unlike the BSP, lacks PCID or INVPCID.
 pub unsafe fn init_cpu() {
     if !enabled() {
         return;
     }
+    let pcid = pcid_enabled();
+    assert!(
+        !pcid || cpu_has_pcid(),
+        "KPTI: this CPU lacks PCID or INVPCID, unlike the BSP"
+    );
+    use x86::controlregs::{cr3, cr3_write, cr4, cr4_write, Cr4};
     // SAFETY: global pages are only an optimization; clearing PGE also flushes all global TLB
-    // entries, which is what isolation needs.
+    // entries, which is what isolation needs. CR4.PCIDE may only be set while CR3[11:0] is 0: the
+    // kernel table's PCID bits are 0, but clear them first in case firmware left PWT/PCD set
+    // (directly, since `RmmA::set_table` may already use INVPCID). Every TLB entry so far is
+    // tagged PCID 0, the kernel's, so nothing stale survives into the user PCID.
     unsafe {
-        let cr4 = x86::controlregs::cr4();
-        x86::controlregs::cr4_write(cr4.difference(x86::controlregs::Cr4::CR4_ENABLE_GLOBAL_PAGES));
+        let cr4 = cr4().difference(Cr4::CR4_ENABLE_GLOBAL_PAGES);
+        cr4_write(cr4);
+        if pcid {
+            let table = cr3();
+            if table & CR3_PCID_MASK as u64 != 0 {
+                cr3_write(table & !(CR3_PCID_MASK as u64));
+            }
+            cr4_write(cr4 | Cr4::CR4_ENABLE_PCID);
+        }
     }
 }
 
@@ -177,8 +293,15 @@ pub unsafe fn setup_pcr(pcr: *mut ProcessorControlRegion) {
     let top = stack.initial_top() as usize;
     core::mem::forget(stack);
     map_stack(top);
+    let (noflush, user_pcid) = if pcid_enabled() {
+        (CR3_NOFLUSH, rmm::x86_64::USER_PCID)
+    } else {
+        (0, 0)
+    };
     // SAFETY: the caller guarantees `pcr` is valid and not yet used by another CPU.
     unsafe {
+        (*pcr).kpti_cr3_noflush = noflush;
+        (*pcr).kpti_cr3_user = SHADOW_CR3_BIT | user_pcid | noflush;
         (*pcr).kpti_entry_top = top;
         core::ptr::addr_of_mut!((*pcr).tss.rsp[0]).write_unaligned(top as u64);
     }

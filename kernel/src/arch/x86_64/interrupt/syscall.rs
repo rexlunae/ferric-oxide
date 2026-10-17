@@ -96,10 +96,12 @@ pub unsafe extern "C" fn syscall_instruction() {
     // Yes, this is magic. No, you don't need to understand
     "swapgs;",                    // Swap KGSBASE with GSBASE, allowing fast TSS access.
     "mov gs:[{sp}], rsp;",        // Save userspace stack pointer
-    // Ferric Oxide (KPTI): load the kernel page table, using RSP as the scratch register.
+    // Ferric Oxide (KPTI): load the kernel page table, using RSP as the scratch register. This
+    // clears the shadow and user PCID bits and adds the no-flush bit with PCID (see handler.rs).
     kpti_alternative!("
         mov rsp, cr3
-        btr rsp, 12
+        and rsp, -0x1801
+        or rsp, gs:[{KPTI_CR3_NOFLUSH}]
         mov cr3, rsp
     "),
     "mov rsp, gs:[{ksp}];",       // Load kernel stack pointer
@@ -191,6 +193,8 @@ __syscall_instruction_end:
     cs_sel = const(SegmentSelector::new(gdt::GDT_USER_CODE as u16, x86::Ring::Ring3).bits()),
     KPTI_SCRATCH = const(super::handler::KPTI_SCRATCH),
     KPTI_ENTRY_TOP = const(super::handler::KPTI_ENTRY_TOP),
+    KPTI_CR3_NOFLUSH = const(super::handler::KPTI_CR3_NOFLUSH),
+    KPTI_CR3_USER = const(super::handler::KPTI_CR3_USER),
     );
 }
 unsafe extern "C" {

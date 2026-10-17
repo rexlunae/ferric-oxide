@@ -38,9 +38,13 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         .keys()
         .map(|feat| format!(", {feat:?}"))
         .collect::<String>();
-    // Ferric Oxide: the code checks for "ibt" even when an older config.toml does not list it.
+    // Ferric Oxide: the code checks for "ibt" and "pcid" even when an older config.toml does not
+    // list them.
     if !altfeatures.contains_key("ibt") {
         features_list.push_str(", \"ibt\"");
+    }
+    if !altfeatures.contains_key("pcid") {
+        features_list.push_str(", \"pcid\"");
     }
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_always, values(\"\"{features_list}))");
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_auto, values(\"\"{features_list}))");
