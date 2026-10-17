@@ -95,6 +95,19 @@ impl IoApic {
     pub fn map(&self, idx: u8, info: MapInfo) {
         self.regs.lock().write_ioredtbl(idx, info.as_raw())
     }
+    /// Ferric Oxide: the number of redirection table entries (pins).
+    pub fn entries(&self) -> u8 {
+        self.count.saturating_add(1).min(24)
+    }
+    /// Ferric Oxide: reads the raw redirection table entry of `pin`.
+    pub fn read_entry(&self, pin: u8) -> u64 {
+        self.regs.lock().read_ioredtbl(pin)
+    }
+    /// Ferric Oxide: writes the raw redirection table entry of `pin`, for entries in
+    /// interrupt-remapping format, which `MapInfo` does not encode.
+    pub fn write_entry(&self, pin: u8, value: u64) {
+        self.regs.lock().write_ioredtbl(pin, value)
+    }
     pub fn set_mask(&self, gsi: u32, mask: bool) {
         let idx = (gsi - self.gsi_start) as u8;
         let mut guard = self.regs.lock();

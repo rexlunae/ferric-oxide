@@ -78,7 +78,7 @@ fn get_int_method(pcid_handle: &mut PciFunctionHandle) -> (Option<File>, Interru
 
             let destination_id = read_bsp_apic_id().expect("xhcid: failed to read BSP apic id");
             let (msg_addr_and_data, interrupt_handle) =
-                allocate_single_interrupt_vector_for_msi(destination_id);
+                allocate_single_interrupt_vector_for_msi(&pcid_handle.channel(), destination_id);
             table_entry_pointer.write_addr_and_data(msg_addr_and_data);
             table_entry_pointer.unmask();
 

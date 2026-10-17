@@ -282,6 +282,9 @@ impl<'a> DriverHandler<'a> {
             PcidClientRequest::GetDmaDomain => {
                 PcidClientResponse::Error(PcidServerResponseError::NoDmaDomain)
             }
+            PcidClientRequest::MsiMessage { .. } => {
+                PcidClientResponse::Error(PcidServerResponseError::NoMsiMessage)
+            }
             _ => unreachable!(),
         }
     }

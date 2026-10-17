@@ -17,17 +17,19 @@
 //! - [`invalidation`] encodes context-cache, IOTLB and interrupt entry cache invalidations,
 //!   as queued-invalidation descriptors or register writes, and models the invalidation
 //!   queue's head and tail.
+//! - [`interrupt`] encodes interrupt remapping table entries, remappable-format MSI and I/O
+//!   APIC messages and the IRTA register, and decides whether a unit can remap interrupts.
 //! - `iova` (with the `alloc` feature, on by default) allocates naturally aligned IOVA ranges
 //!   for a domain and hands out domain IDs.
 //!
-//! The kernel side (`kernel/src/arch/x86_64/iommu.rs`) maps the registers, allocates the table
+//! The kernel side (`crates/kernel/src/arch/x86_64/iommu.rs`) maps the registers, allocates the table
 //! pages and performs the enable sequence. See `io/iommu-design.md` in the project files for
 //! the plan this is the first step of.
 //!
 //! Specification: Intel Virtualization Technology for Directed I/O, Architecture
 //! Specification (order number D51397). Section numbers below are those of revisions 3.x and
 //! 4.x: chapter 8 (DMAR ACPI structures), chapter 9 (translation structure formats), chapter 10
-//! (register descriptions), section 6.5 (invalidation), chapter 7 and appendix A (faults).
+//! (register descriptions), section 6.5 (invalidation), chapter 7 and appendix A (faults), chapter 5 and section 9.10 (interrupt remapping).
 //! Revision 4 renamed "second-level" to "second-stage"; the formats are unchanged.
 //!
 //! # Examples
@@ -59,6 +61,7 @@ extern crate alloc;
 
 pub mod dmar;
 pub mod fault;
+pub mod interrupt;
 pub mod invalidation;
 #[cfg(feature = "alloc")]
 pub mod iova;

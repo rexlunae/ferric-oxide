@@ -1,8 +1,9 @@
 //! The `iommu` scheme's name, paths and call encoding.
 //!
-//! Every call is a `SYS_CALL` without payload. Its first metadata word is the [`Verb`], and
-//! the words after it carry the arguments; [`Request::encode`] and [`Request::decode`] are
-//! the one place that layout is written down.
+//! Every call is a `SYS_CALL`, without payload except [`Request::AllocIrte`]. Its first metadata
+//! word is the [`Verb`], and the words after it carry the arguments; [`Request::encode`] and
+//! [`Request::decode`] are the one place that layout is written down. The kernel reads at most
+//! three metadata words.
 //!
 //! | Request | File descriptors | Metadata |
 //! | --- | --- | --- |
@@ -11,6 +12,11 @@
 //! | [`Request::Bridge`] | attach capability | verb, bridge address, bus range |
 //! | [`Request::Bind`] | domain | verb |
 //! | [`Request::Join`] | domain | verb |
+//! | [`Request::AllocIrte`] | attach capability | verb, [`PciDevice::encode`] with [`SourceCheck::encode`] in bits 32 to 55, CPU and vector |
+//! | [`Request::FreeIrte`] | attach capability | verb, entry ID |
+//!
+//! [`Request::AllocIrte`] also takes a payload of [`MsiMessage::BYTES`] bytes, which the kernel
+//! fills with the message the device must send.
 
 use core::fmt;
 
@@ -130,6 +136,99 @@ impl Bridge {
     }
 }
 
+/// Which requester IDs may raise an interrupt through an interrupt remapping entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SourceCheck {
+    /// Only the function's own requester ID.
+    Exact,
+    /// Any requester ID on buses `first` to `last`: for a function behind a PCI Express to PCI
+    /// bridge, whose requests can carry the bridge's IDs (see `alias`).
+    Bus {
+        /// The lowest bus number.
+        first: u8,
+        /// The highest bus number.
+        last: u8,
+    },
+}
+
+impl SourceCheck {
+    /// 24 bits: 0 for [`SourceCheck::Exact`]; 1, with the first bus in bits 8 to 15 and the
+    /// last in bits 16 to 23, for [`SourceCheck::Bus`].
+    pub const fn encode(self) -> u64 {
+        match self {
+            Self::Exact => 0,
+            Self::Bus { first, last } => 1 | ((first as u64) << 8) | ((last as u64) << 16),
+        }
+    }
+
+    /// The check [`SourceCheck::encode`] wrote into `word`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Reserved`] for an unknown kind or a reserved bit, and
+    /// [`DecodeError::BusRange`] when the last bus is below the first.
+    pub const fn decode(word: u64) -> Result<Self, DecodeError> {
+        match word & 0xff {
+            0 if word == 0 => Ok(Self::Exact),
+            1 if word >> 24 == 0 => {
+                let (first, last) = ((word >> 8) as u8, (word >> 16) as u8);
+                if last < first {
+                    return Err(DecodeError::BusRange);
+                }
+                Ok(Self::Bus { first, last })
+            }
+            _ => Err(DecodeError::Reserved),
+        }
+    }
+}
+
+/// What an interrupt remapping entry delivers, and for which function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiRoute {
+    /// The function that raises the interrupt.
+    pub device: PciDevice,
+    /// Which requester IDs the entry accepts.
+    pub source: SourceCheck,
+    /// The logical CPU (as the `irq` scheme numbers them, `irq:cpu-<n>`) to deliver to.
+    pub cpu: u32,
+    /// The interrupt vector on that CPU.
+    pub vector: u8,
+}
+
+/// An MSI address and data pair, as [`Request::AllocIrte`] returns it in its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiMessage {
+    /// The message address.
+    pub address: u64,
+    /// The message data.
+    pub data: u32,
+}
+
+impl MsiMessage {
+    /// The payload size: the address then the data, little-endian.
+    pub const BYTES: usize = 12;
+
+    /// The payload bytes.
+    pub fn to_bytes(self) -> [u8; Self::BYTES] {
+        let mut bytes = [0; Self::BYTES];
+        let (address, data) = bytes.split_at_mut(8);
+        address.copy_from_slice(&self.address.to_le_bytes());
+        data.copy_from_slice(&self.data.to_le_bytes());
+        bytes
+    }
+
+    /// The message in a payload, or `None` when `bytes` is not [`MsiMessage::BYTES`] long.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::BYTES] = bytes.try_into().ok()?;
+        let (address, data) = bytes.split_at(8);
+        Some(Self {
+            address: u64::from_le_bytes(address.try_into().ok()?),
+            data: u32::from_le_bytes(data.try_into().ok()?),
+        })
+    }
+}
+
 /// The first metadata word of a call: what it asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -145,6 +244,10 @@ pub enum Verb {
     Bridge = 4,
     /// Move a domain's devices into the calling process's bound domain.
     Join = 5,
+    /// Set up an interrupt remapping entry for a function's MSI or MSI-X vector.
+    AllocIrte = 6,
+    /// Free an interrupt remapping entry.
+    FreeIrte = 7,
 }
 
 impl Verb {
@@ -156,6 +259,8 @@ impl Verb {
             3 => Self::Bind,
             4 => Self::Bridge,
             5 => Self::Join,
+            6 => Self::AllocIrte,
+            7 => Self::FreeIrte,
             _ => return None,
         })
     }
@@ -182,6 +287,15 @@ pub enum Request {
     /// it keeps one domain and one IOVA space. Holding the domain's descriptor is the
     /// authority: pcid gave it only to the driver of those functions.
     Join,
+    /// Set up an interrupt remapping entry that delivers the route's vector to its CPU, for
+    /// requests from the route's function only, and write the remappable-format MSI address
+    /// and data that name it into the payload ([`MsiMessage`]). Returns an ID for the entry
+    /// (a 32-bit number with no meaning to user space), which [`Request::FreeIrte`] takes.
+    /// pcid makes this call for a driver that asks it for an MSI message, so a driver never
+    /// chooses a compatibility-format address itself.
+    AllocIrte(MsiRoute),
+    /// Free the interrupt remapping entry with this ID: requests that name it fault.
+    FreeIrte(u32),
 }
 
 impl Request {
@@ -203,6 +317,15 @@ impl Request {
                 ],
                 3,
             ),
+            Self::AllocIrte(route) => (
+                [
+                    Verb::AllocIrte as u64,
+                    route.device.encode() | (route.source.encode() << 32),
+                    route.cpu as u64 | ((route.vector as u64) << 32),
+                ],
+                3,
+            ),
+            Self::FreeIrte(index) => ([Verb::FreeIrte as u64, index as u64, 0], 2),
         }
     }
 
@@ -235,6 +358,20 @@ impl Request {
                 }
                 Ok(Self::Bridge(bridge))
             }
+            (Verb::AllocIrte, &[device, target]) => {
+                if target >> 40 != 0 {
+                    return Err(DecodeError::Reserved);
+                }
+                Ok(Self::AllocIrte(MsiRoute {
+                    device: PciDevice::decode(device & 0xffff_ffff)?,
+                    source: SourceCheck::decode(device >> 32)?,
+                    cpu: target as u32,
+                    vector: (target >> 32) as u8,
+                }))
+            }
+            (Verb::FreeIrte, &[index]) => u32::try_from(index)
+                .map(Self::FreeIrte)
+                .map_err(|_| DecodeError::Reserved),
             _ => Err(DecodeError::Length),
         }
     }
@@ -312,6 +449,19 @@ mod tests {
             Request::Bind,
             Request::Bridge(bridge),
             Request::Join,
+            Request::AllocIrte(MsiRoute {
+                device: dev(0, 0, 4, 0),
+                source: SourceCheck::Exact,
+                cpu: 3,
+                vector: 0x31,
+            }),
+            Request::AllocIrte(MsiRoute {
+                device: dev(1, 5, 2, 0),
+                source: SourceCheck::Bus { first: 4, last: 5 },
+                cpu: u32::MAX,
+                vector: 0xfe,
+            }),
+            Request::FreeIrte(0x0001_0fff),
         ] {
             let (words, len) = request.encode();
             assert_eq!(Request::decode(&words[..len]), Ok(request));
@@ -332,6 +482,39 @@ mod tests {
             Err(DecodeError::Reserved)
         );
         assert_eq!(Request::decode(&[4, 0, 0x0203]), Err(DecodeError::BusRange));
+        assert_eq!(Request::decode(&[6, 0]), Err(DecodeError::Length));
+        assert_eq!(
+            Request::decode(&[6, 0, 1 << 40]),
+            Err(DecodeError::Reserved)
+        );
+        assert_eq!(
+            Request::decode(&[6, 2 << 32, 0]),
+            Err(DecodeError::Reserved)
+        );
+        assert_eq!(
+            Request::decode(&[6, ((1 << 24) | 1) << 32, 0]),
+            Err(DecodeError::Reserved)
+        );
+        assert_eq!(
+            Request::decode(&[6, (1 | (5 << 8) | (4 << 16)) << 32, 0]),
+            Err(DecodeError::BusRange)
+        );
+        assert_eq!(Request::decode(&[7, 1 << 32]), Err(DecodeError::Reserved));
+    }
+
+    #[test]
+    fn msi_message_payload() {
+        let msg = MsiMessage {
+            address: 0xfee0_0074,
+            data: 0x1234_5678,
+        };
+        let bytes = msg.to_bytes();
+        assert_eq!(
+            bytes,
+            [0x74, 0, 0xe0, 0xfe, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12]
+        );
+        assert_eq!(MsiMessage::from_bytes(&bytes), Some(msg));
+        assert_eq!(MsiMessage::from_bytes(&bytes[..11]), None);
     }
 
     #[test]
