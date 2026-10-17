@@ -1,0 +1,9 @@
+[package]
+name = "ferric-aslr-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Address space layout randomization test for Ferric Oxide"
+
+[profile.release]
+debug = false

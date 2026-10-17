@@ -91,6 +91,10 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
 
 [[package]]
+name = "ferric-hwrand"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
@@ -149,6 +153,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cc",
  "fdt",
+ "ferric-hwrand",
  "ferric-nospec",
  "hashbrown 0.14.5",
  "linked_list_allocator",

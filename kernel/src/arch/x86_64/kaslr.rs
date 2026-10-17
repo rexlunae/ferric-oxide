@@ -41,7 +41,7 @@ pub fn choose_phys_offset(phys_end: usize) -> Option<usize> {
         return None;
     }
     let slots = slot_count(low, high);
-    let random = usize::try_from(crate::random::hw_u64()?).ok()?;
+    let random = usize::try_from(ferric_hwrand::u64()?).ok()?;
     low.checked_add(random.checked_rem(slots)?.checked_mul(ALIGN)?)
 }
 

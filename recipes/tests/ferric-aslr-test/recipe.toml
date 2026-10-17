@@ -1,0 +1,8 @@
+# Ferric Oxide: checks that two runs of the same program get different stack,
+# heap and mmap addresses (ASLR). Source lives in files/; as a path source
+# (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-aslr-test/files"
+
+[build]
+template = "cargo"

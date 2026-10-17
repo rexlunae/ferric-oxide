@@ -61,3 +61,10 @@ pub const AT_REDOX_CWD_FD: usize = 44;
 
 #[cfg(target_os = "redox")]
 pub const AT_REDOX_FILETABLE_FD: usize = 45;
+
+// Ferric Oxide: numbers from 0x4600 up are the fork's own, clear of upstream's.
+
+/// Ferric Oxide: top of the main thread's stack, which exec places at a random address when
+/// built with ASLR. The stack is `redox_rt::arch::STACK_SIZE` bytes below it.
+#[cfg(target_os = "redox")]
+pub const AT_FERRIC_STACK_TOP: usize = 0x4600;

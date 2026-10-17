@@ -1,0 +1,8 @@
+[package]
+name = "ferric-hwrand"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Hardware random numbers (RDRAND) for memory layout randomization"
+
+[dependencies]

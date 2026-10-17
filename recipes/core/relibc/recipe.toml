@@ -17,10 +17,32 @@ if command -v rustup >/dev/null 2>&1; then
 fi
 fi
 
+# Shared Ferric Oxide crates are path dependencies at ../crates from relibc/
+# (redox-rt uses crates/hwrand). The cookbook builds a copy of relibc/ in this
+# recipe's source/, so give that copy the same neighbour.
+ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../crates"
+
+# Ferric Oxide: Cargo features from ferric.toml (make menuconfig), such as
+# aslr. Unset without ferric.toml, which keeps upstream's build. The relibc
+# Makefile passes FEATURE_MATH to cargo when it builds the library.
+RELIBC_MAKE_ARGS=()
+if [ -n "${FERRIC_RELIBC_FEATURES}" ]
+then
+    RELIBC_MAKE_ARGS+=("FEATURE_MATH=--features math_libm,${FERRIC_RELIBC_FEATURES// /,}")
+fi
+# The Makefile only tracks sources, so rebuild when the features change.
+ferric_stamp="${FERRIC_RELIBC_FEATURES-upstream}"
+if [ "$(cat "${COOKBOOK_BUILD}/ferric.stamp" 2>/dev/null)" != "${ferric_stamp}" ]
+then
+    touch "${COOKBOOK_SOURCE}/Cargo.toml"
+fi
+
 export CARGO=${CARGO:-env -u CARGO cargo}
 "${COOKBOOK_MAKE}" \
     -C "${COOKBOOK_SOURCE}" \
     -j"${COOKBOOK_MAKE_JOBS}" \
     DESTDIR="${COOKBOOK_STAGE}/usr" \
+    "${RELIBC_MAKE_ARGS[@]}" \
     install
+printf '%s' "${ferric_stamp}" > "${COOKBOOK_BUILD}/ferric.stamp"
 """

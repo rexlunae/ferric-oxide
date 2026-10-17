@@ -240,6 +240,14 @@ pub unsafe extern "C" fn relibc_start_v1(
         }
     }
 
+    // Ferric Oxide: exec may have put the stack somewhere random (ASLR); tell pthread where.
+    #[cfg(target_os = "redox")]
+    if let Some(top) = unsafe {
+        crate::platform::get_auxv_raw(sp.auxv().cast(), redox_rt::auxv_defs::AT_FERRIC_STACK_TOP)
+    } {
+        unsafe { crate::pthread::set_main_stack_top(top) };
+    }
+
     // (It would technically have been equally valid to just allow the option to be set to "1".)
     if let Some(opt) = envp
         .iter()
