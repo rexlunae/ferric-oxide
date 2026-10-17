@@ -1,0 +1,26 @@
+[package]
+name = "driver-block"
+description = "Shared storage driver code"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+daemon = { path = "../../../daemon" }
+executor = { path = "../../executor" }
+partitionlib = { path = "../partitionlib" }
+common = { path = "../../common" }
+
+libredox.workspace = true
+log.workspace = true
+futures = { version = "0.3.28", features = ["executor"] }
+
+redox_syscall = { workspace = true, features = ["std"] }
+redox_event.workspace = true
+redox-scheme.workspace = true
+scheme-utils = { path = "../../../scheme-utils" }
+redox-rings.workspace = true
+
+zerocopy = "0.8.55"
+
+[lints]
+workspace = true

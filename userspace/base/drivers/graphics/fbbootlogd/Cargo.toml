@@ -1,0 +1,20 @@
+[package]
+name = "fbbootlogd"
+description = "Boot log drawing daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc.workspace = true
+orbclient.workspace = true
+redox_event.workspace = true
+redox_syscall.workspace = true
+
+console-draw = { path = "../console-draw" }
+daemon = { path = "../../../daemon" }
+graphics-ipc = { path = "../graphics-ipc" }
+inputd = { path = "../../inputd" }
+libredox.workspace = true
+
+[lints]
+workspace = true
