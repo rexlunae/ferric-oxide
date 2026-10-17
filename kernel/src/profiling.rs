@@ -297,7 +297,7 @@ unsafe fn walk_kstack(mut bp: usize, buf: &mut [usize; 32], len: &mut usize) {
 
         if ip >= start && ip <= end {
             let stack = unsafe {
-                &*((*crate::arch::x86_64::gdt::pcr()).tss.rsp[0] as *const InterruptStack).sub(1)
+                &*((*crate::arch::x86_64::gdt::pcr()).kernel_rsp as *const InterruptStack).sub(1)
             };
             if *len >= buf.len() {
                 break;

@@ -19,7 +19,9 @@ use crate::{
     cpu_set::LogicalCpuId,
 };
 
-#[repr(C)]
+// Ferric Oxide: page-aligned, so KPTI can map an IDT into user page tables without exposing
+// whatever else would share its pages.
+#[repr(C, align(4096))]
 pub struct Idt {
     pub(crate) entries: [IdtEntry; 256],
     // TODO: track reservations in userspace instead, with a daemon that sends various capabilities
@@ -153,6 +155,11 @@ pub fn allocate_and_init_idt(cpu_id: LogicalCpuId) -> *mut Idt {
     init_generic(cpu_id, idt);
     unsafe {
         install_backup_stack(idt, backup_stack_end);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::kpti::map_idt(idt as *mut Idt as usize);
+        crate::arch::kpti::map_stack(backup_stack_end);
     }
 
     idt

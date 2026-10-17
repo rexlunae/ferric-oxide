@@ -10,5 +10,8 @@ xsave = "auto"
 xsaveopt = "auto"
 # AVX-512 register state (opmask, zmm upper halves, zmm16-31). Needs xsave.
 avx512 = "never"
+# Ferric Oxide: kernel page-table isolation against Meltdown. "auto" turns it on
+# for Intel CPUs without RDCL_NO.
+kpti = "never"
 
 # vim: ft=toml

@@ -593,17 +593,29 @@ impl AddrSpace {
     }
 
     pub fn new() -> Result<Self> {
-        let utable = unsafe {
-            PageMapper::create(
-                TableKind::User,
-                crate::memory::TheFrameAllocator(NumaMemoryPolicy::NodeLocalLeniant),
-            )
-            .ok_or(Error::new(ENOMEM))?
+        // Ferric Oxide: with KPTI, the table is a pair with a shadow loaded in user space.
+        #[cfg(target_arch = "x86_64")]
+        let kpti = crate::arch::kpti::enabled();
+        #[cfg(not(target_arch = "x86_64"))]
+        let kpti = false;
+        #[cfg(target_arch = "x86_64")]
+        let paired = kpti.then(crate::arch::kpti::new_user_table);
+        #[cfg(not(target_arch = "x86_64"))]
+        let paired: Option<Option<PageMapper>> = None;
+        let utable = match paired {
+            Some(utable) => utable.ok_or(Error::new(ENOMEM))?,
+            None => unsafe {
+                PageMapper::create(
+                    TableKind::User,
+                    crate::memory::TheFrameAllocator(NumaMemoryPolicy::NodeLocalLeniant),
+                )
+                .ok_or(Error::new(ENOMEM))?
+            },
         };
 
         Ok(Self {
             grants: UserGrants::new(),
-            table: Table { utable },
+            table: Table { utable, kpti },
             mmap_min: MMAP_MIN_DEFAULT,
         })
     }
@@ -2454,6 +2466,8 @@ pub const DANGLING: usize = 1 << (usize::BITS - 2);
 #[derive(Debug)]
 pub struct Table {
     pub utable: PageMapper,
+    /// Ferric Oxide: the table is a KPTI pair (see `arch::x86_64::kpti`).
+    kpti: bool,
 }
 
 impl Drop for AddrSpace {
@@ -2477,6 +2491,12 @@ impl Drop for Table {
             unsafe {
                 RmmA::set_table(TableKind::User, super::empty_cr3());
             }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.kpti {
+            // SAFETY: the table was switched away from above and the grants are gone.
+            unsafe { crate::arch::kpti::free_user_table(self.utable.table().phys()) };
+            return;
         }
         unsafe {
             deallocate_frame(Frame::containing(self.utable.table().phys()));
