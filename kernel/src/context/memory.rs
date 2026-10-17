@@ -2589,7 +2589,18 @@ fn correct_inner<'l>(
     let mut flusher = Flusher::with_cpu_set(&addr_space_lock.used_by, &addr_space_lock.tlb_ack);
 
     let Some((grant_base, grant_info)) = addr_space.grants.contains(faulting_page) else {
-        debug!("Lacks grant");
+        warn!(
+            "PF-DEBUG lacks grant: page {:#x} access {:?} rec {} grants {:#x?}",
+            faulting_page.start_address().data(),
+            access,
+            recursion_level,
+            addr_space
+                .grants
+                .iter()
+                .map(|(b, i)| (b.start_address().data(), i.page_count()))
+                .filter(|(b, n)| b.abs_diff(faulting_page.start_address().data()) < 0x200000 + n * 4096)
+                .collect::<alloc::vec::Vec<_>>()
+        );
         return Err(PfError::Segv);
     };
 
@@ -2601,7 +2612,7 @@ fn correct_inner<'l>(
         AccessMode::Read => (),
 
         AccessMode::Write if !grant_flags.has_write() => {
-            debug!("Write, but grant was not PROT_WRITE.");
+            warn!("PF-DEBUG write to non-writable grant at {:#x}", faulting_page.start_address().data());
             return Err(PfError::Segv);
         }
         AccessMode::InstrFetch if !grant_flags.has_execute() => {
