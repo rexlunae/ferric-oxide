@@ -105,6 +105,7 @@ jobs:
       fail-fast: false
       matrix:
         cpu: [host]
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@v4
 
@@ -136,6 +137,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: serial-log-${{ matrix.cpu }}
+          name: serial-log-${{ matrix.cpu }}-${{ matrix.run }}
           path: serial-${{ matrix.cpu }}.log
           retention-days: 14
