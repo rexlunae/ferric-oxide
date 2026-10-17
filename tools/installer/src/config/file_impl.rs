@@ -142,6 +142,69 @@ mod tests {
     }
 
     #[test]
+    fn public_directory_installation_creates_an_absent_root() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path().join("new/image");
+        let config = crate::Config {
+            files: vec![FileConfig::new_file(
+                "/etc/hostname".into(),
+                "ferric".into(),
+            )],
+            ..Default::default()
+        };
+        crate::install_dir(config, &root, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("etc/hostname")).unwrap(),
+            "ferric"
+        );
+    }
+
+    #[test]
+    fn no_mount_installation_creates_and_archives_a_new_output_tree() {
+        let sandbox = TestDirectory::new();
+        let image = sandbox.path().join("image.bin");
+        File::create(&image)
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        let output = sandbox.path().join("new-root");
+        let config = crate::Config {
+            files: vec![FileConfig::new_file(
+                "/etc/hostname".into(),
+                "ferric".into(),
+            )],
+            ..Default::default()
+        };
+        let disk = redoxfs::DiskFile::open(&image).unwrap();
+        crate::with_redoxfs(disk, None, |filesystem| {
+            crate::with_redoxfs_ar(filesystem, Some(&output), |root| {
+                crate::install_dir(config, root, None)
+            })
+        })
+        .unwrap();
+        assert!(!output.exists());
+        assert!(
+            redoxfs::FileSystem::open(redoxfs::DiskFile::open(&image).unwrap(), None, None, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn public_directory_installation_rejects_a_symlink_root_before_writing() {
+        let sandbox = TestDirectory::new();
+        let outside = sandbox.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let root = sandbox.path().join("image");
+        symlink(&outside, &root).unwrap();
+        let config = crate::Config {
+            files: vec![FileConfig::new_file("/etc/hostname".into(), "bad".into())],
+            ..Default::default()
+        };
+        assert!(crate::install_dir(config, &root, None).is_err());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
     fn traversal_is_rejected_before_any_write() {
         let sandbox = TestDirectory::new();
         let root = sandbox.path().join("image");

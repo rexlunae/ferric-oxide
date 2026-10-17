@@ -151,10 +151,11 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     Ok(())
 }
 
-/// Install configured files, packages and accounts into a directory.
+/// Install configured files, packages and accounts, creating the output directory if needed.
 ///
 /// # Errors
-/// Returns package, filesystem, account or configuration errors.
+/// Returns package, filesystem, account or configuration errors, including
+/// rejection of a symbolic-link output root.
 ///
 /// # Panics
 /// May panic when the random source fails during password salt generation.
@@ -164,8 +165,18 @@ pub fn install_dir(
     cookbook: Option<&str>,
 ) -> Result<()> {
     let output_dir = output_dir.as_ref();
-
-    let output_dir = output_dir.to_owned();
+    // Check the root before creating it: create_dir_all follows existing links.
+    match fs::symlink_metadata(output_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(crate::ImagePathError::Symlink(output_dir.to_path_buf()).into());
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(output_dir)?;
+        }
+        Err(source) => return Err(source.into()),
+    }
+    let output_dir = crate::image_path(output_dir, Path::new(""))?;
 
     for file in &config.files {
         if !file.postinstall {
