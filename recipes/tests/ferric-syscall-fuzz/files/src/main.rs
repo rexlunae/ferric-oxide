@@ -75,6 +75,9 @@ mod sys {
     pub const NANOSLEEP: usize = 162;
     pub const YIELD: usize = 158;
 
+    pub const FUTEX_WAIT: usize = 0;
+    pub const EINVAL: usize = 22;
+
     pub const O_RDONLY: usize = 0x0001_0000;
     pub const O_RDWR: usize = 0x0003_0000;
     pub const O_NONBLOCK: usize = 0x0004_0000;
@@ -718,6 +721,24 @@ impl Fuzzer {
         // SAFETY: the kernel must refuse this; if it does not, only this
         // process's mapping is affected.
         let _ = unsafe { sys::call(sys::MREMAP, args) };
+
+        // FUTEX_WAIT on a matching word with a negative timeout slept forever,
+        // because the deadline wrapped to a huge value (fixed by rejecting it
+        // with EINVAL). If it comes back, this child hangs and the run fails.
+        self.buf[..8].copy_from_slice(&(-1i64).to_ne_bytes());
+        self.buf[8..16].fill(0);
+        self.buf[64..68].fill(0);
+        let base = self.buf.as_ptr() as usize;
+        let args = [base + 64, sys::FUTEX_WAIT, 0, base, 0, 0];
+        if self.verbose {
+            eprintln!("regression {:#x} {args:x?}", sys::FUTEX);
+        }
+        // SAFETY: both pointers name this process's buffer, which the kernel
+        // only reads.
+        let ret = unsafe { sys::call(sys::FUTEX, args) };
+        if ret != sys::EINVAL.wrapping_neg() {
+            eprintln!("fuzz: negative futex timeout returned {ret:#x}, not EINVAL");
+        }
     }
 
     /// Drops the descriptors a `SYS_CALL` with `CONSUME` was given from the
