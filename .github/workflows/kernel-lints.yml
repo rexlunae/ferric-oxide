@@ -86,13 +86,16 @@ jobs:
   # binary: the switch/SYSCALL alternatives and the per-CPU enable sequence.
   shstk:
     runs-on: ubuntu-24.04
+    env:
+      # The kernel source tree; the only place this job names it.
+      KERNEL_DIR: kernel
     steps:
       - uses: actions/checkout@v4
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
         run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$KERNEL_DIR/rust-toolchain.toml")"
           rustup toolchain install "$toolchain" --profile minimal --component rust-src
       - uses: actions/cache@v4
         with:
@@ -100,8 +103,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            kernel/target
-          key: kernel-shstk-${{ hashFiles('kernel/Cargo.lock', 'kernel/rust-toolchain.toml', 'Cargo.lock') }}
+            ${{ env.KERNEL_DIR }}/target
+          key: kernel-shstk-${{ hashFiles(format('{0}/Cargo.lock', env.KERNEL_DIR), format('{0}/rust-toolchain.toml', env.KERNEL_DIR), 'Cargo.lock') }}
           restore-keys: kernel-shstk-
       # shstk "auto" needs the self_modifying kernel feature, which the catalog
       # defaults include; take the feature list from ferric-config as image.yml does.
@@ -112,13 +115,13 @@ jobs:
           printf '[kernel.cpu]\nshstk = "auto"\nibt = "auto"\n' > "$out/ferric.toml"
           cargo run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          cp "$out/kernel-config.toml" kernel/config.toml
-          cat kernel/config.toml
+          cp "$out/kernel-config.toml" "$KERNEL_DIR/config.toml"
+          cat "$KERNEL_DIR/config.toml"
           features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
           echo "Kernel features: $features"
           echo "KERNEL_CARGO_FEATURES=$features" >> "$GITHUB_ENV"
       - name: Build the kernel
-        run: make -C kernel BUILD="$RUNNER_TEMP/kernel-shstk" OBJCOPY=objcopy KERNEL_CARGO_FEATURES="$KERNEL_CARGO_FEATURES" all
+        run: make -C "$KERNEL_DIR" BUILD="$RUNNER_TEMP/kernel-shstk" OBJCOPY=objcopy KERNEL_CARGO_FEATURES="$KERNEL_CARGO_FEATURES" all
       - name: Check the shadow-stack sequences
         run: scripts/ferric-ci/check-kernel-shstk.sh "$RUNNER_TEMP/kernel-shstk/kernel.all"
       - name: Check endbr64 at entry points
