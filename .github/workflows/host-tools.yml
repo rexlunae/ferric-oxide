@@ -9,6 +9,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "mk/fstools.mk"
       - "tools/**"
       - "crates/**"
       - "features.toml"
@@ -36,7 +37,7 @@ jobs:
         run: cargo doc --locked --no-deps -p ferric-nospec
         env:
           RUSTDOCFLAGS: -D warnings
-      # The cookbook is upstream code with many existing lint warnings, so
+      # Imported host tools have existing upstream lint warnings, so
       # warnings are only denied for Ferric Oxide's own tools.
       - name: Clippy
         run: cargo clippy --locked --all-targets -p ferric-config -p ferric-nospec -- -D warnings

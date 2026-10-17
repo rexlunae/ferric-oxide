@@ -30,7 +30,7 @@ pub enum SourceRecipe {
     },
     /// A git repository source
     Git {
-        /// The URL for the git repository, such as https://gitlab.redox-os.org/redox-os/ion.git
+        /// The URL for the git repository, such as <https://gitlab.redox-os.org/redox-os/ion.git>
         git: String,
         /// The URL for an upstream repository
         upstream: Option<String>,

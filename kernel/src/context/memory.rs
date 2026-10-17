@@ -819,6 +819,9 @@ pub struct UserGrants {
     holes_by_addr: BTreeMap<VirtualAddress, usize>,
     // Holes ordered by size then start address for fast allocations
     holes_by_size: BTreeSet<(usize, VirtualAddress)>,
+    // Ferric Oxide (ASLR): where mmaps without an address start looking, chosen at random for
+    // each address space. Zero keeps upstream's lowest-fit placement.
+    aslr_base: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -918,6 +921,25 @@ impl Debug for PageSpan {
     }
 }
 
+/// Lowest address the random mmap base can take.
+#[cfg(feature = "aslr")]
+const ASLR_BASE_MIN: usize = 1 << 32;
+/// Size of the range the random mmap base is drawn from: 16 TiB, 32 bits of page-granular
+/// randomness, leaving most of the 128 TiB user half for the mappings themselves.
+#[cfg(feature = "aslr")]
+const ASLR_BASE_RANGE: usize = 1 << 44;
+
+/// Ferric Oxide (ASLR): a random, page-aligned start for the mmap search of a new address space,
+/// or 0 (upstream placement) without the `aslr` feature or hardware randomness.
+fn aslr_base() -> usize {
+    #[cfg(feature = "aslr")]
+    if let Some(random) = crate::random::hw_u64().and_then(|r| usize::try_from(r).ok()) {
+        let offset = (random % ASLR_BASE_RANGE) & !(PAGE_SIZE - 1);
+        return ASLR_BASE_MIN.saturating_add(offset);
+    }
+    0
+}
+
 impl UserGrants {
     pub fn new() -> Self {
         let mut holes_by_addr = BTreeMap::new();
@@ -933,6 +955,7 @@ impl UserGrants {
             inner: BTreeMap::new(),
             holes_by_addr,
             holes_by_size,
+            aslr_base: aslr_base(),
         }
     }
     /// Internal helper to keep the two hole maps in sync
@@ -1035,6 +1058,13 @@ impl UserGrants {
         ))
     }
     pub fn find_free(&self, min: usize, page_count: usize) -> Option<PageSpan> {
+        // Ferric Oxide (ASLR): prefer the random base, and fall back to the whole space when
+        // nothing above it fits.
+        if self.aslr_base > min
+            && let Some(span) = self.find_free_near(self.aslr_base, page_count, None)
+        {
+            return Some(span);
+        }
         self.find_free_near(min, page_count, None)
     }
     fn reserve(&mut self, base: Page, page_count: usize) {

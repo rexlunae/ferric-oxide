@@ -1,5 +1,8 @@
 [source]
-same_as = "../../core/installer"
+# The host workspace imports only the installer CLI/library. Keep the GUI
+# on the complete upstream tree, including its parent library dependency.
+git = "https://gitlab.redox-os.org/redox-os/installer.git"
+rev = "b5a11310e1ac915494efea6d18e242966da74f3f"
 
 [build]
 template = "custom"

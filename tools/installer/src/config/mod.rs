@@ -1,0 +1,158 @@
+//! Installer TOML configuration loading and precedence across included files.
+
+use std::collections::BTreeMap;
+use std::fmt::Display;
+use std::fs;
+use std::mem;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+
+use crate::PackageConfig;
+
+/// File and directory declarations.
+pub mod file;
+#[cfg(feature = "installer")]
+/// Host filesystem operations for file declarations.
+pub mod file_impl;
+/// Image-wide installation settings.
+pub mod general;
+/// Package selection and source overrides.
+pub mod package;
+/// User and group account declarations.
+pub mod user;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// An image configuration with ordered includes and installation declarations.
+///
+/// # Examples
+/// ```
+/// let config = redox_installer::Config::default();
+/// assert!(config.packages.is_empty());
+/// ```
+pub struct Config {
+    #[serde(default)]
+    /// Configurations to load relative to this file before applying its overrides.
+    pub include: Vec<PathBuf>,
+    #[serde(default)]
+    /// Image-wide installation settings.
+    pub general: general::GeneralConfig,
+    #[serde(default)]
+    /// Packages selected for installation, keyed by package name.
+    pub packages: BTreeMap<String, package::PackageConfig>,
+    #[serde(default)]
+    /// Files and directories to create in declaration order.
+    pub files: Vec<file::FileConfig>,
+    #[serde(default)]
+    /// User accounts, keyed by login name.
+    pub users: BTreeMap<String, user::UserConfig>,
+    #[serde(default)]
+    /// Groups, keyed by group name.
+    pub groups: BTreeMap<String, user::GroupConfig>,
+}
+
+impl Config {
+    /// Load installer config from a TOML path
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let mut config: Config = match fs::read_to_string(&path) {
+            Ok(config_data) => match toml::from_str(&config_data) {
+                Ok(config) => config,
+                Err(err) => {
+                    bail!("failed to decode '{}': {}", path.display(), err);
+                }
+            },
+            Err(err) => {
+                bail!("failed to read '{}': {}", path.display(), err);
+            }
+        };
+
+        let config_dir = path.parent().unwrap();
+
+        let mut configs = mem::take(&mut config.include)
+            .into_iter()
+            .map(|path| {
+                Config::from_file(&config_dir.join(&path))
+                    .with_context(|| format!("Importing from {}", path.display()))
+            })
+            .collect::<Result<Vec<Config>>>()?;
+        configs.push(config); // Put ourself last to ensure that it overwrites anything else.
+
+        config = configs.remove(0);
+
+        for other_config in configs {
+            config.merge(other_config);
+        }
+
+        Ok(config)
+    }
+
+    /// Load hardcoded install config to fetch bootloaders
+    pub fn bootloader_config() -> Self {
+        let mut bootloader_config = Config::default();
+        // TODO: This is unused
+        bootloader_config.files.push(file::FileConfig {
+            path: "/etc/pkg.d/50_redox".to_string(),
+            data: "https://static.redox-os.org/pkg".to_string(),
+            ..Default::default()
+        });
+        bootloader_config
+            .packages
+            .insert("bootloader".to_string(), PackageConfig::default());
+        bootloader_config
+    }
+
+    /// Merge another resolved configuration, preferring its settings and appending files.
+    ///
+    /// # Panics
+    /// Panics if either configuration still has unresolved includes.
+    pub fn merge(&mut self, other: Config) {
+        assert!(self.include.is_empty());
+        assert!(other.include.is_empty());
+
+        let Config {
+            include: _,
+            general: other_general,
+            packages: other_packages,
+            files: other_files,
+            users: other_users,
+            groups: other_groups,
+        } = other;
+
+        self.general.merge(other_general);
+
+        for (package, package_config) in other_packages {
+            self.packages.insert(package, package_config);
+        }
+
+        self.files.extend(other_files);
+
+        for (user, user_config) in other_users {
+            self.users.insert(user, user_config);
+        }
+
+        for (group, group_config) in other_groups {
+            self.groups.insert(group, group_config);
+        }
+    }
+}
+
+impl Display for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "files:")?;
+        for file in &self.files {
+            writeln!(f, "- {}", file)?;
+        }
+        writeln!(f, "users:")?;
+        for (name, user) in &self.users {
+            writeln!(f, "- {}:{}", name, user)?;
+        }
+        write!(f, "packages: ")?;
+        for name in self.packages.keys() {
+            write!(f, " {}", name)?;
+        }
+        writeln!(f, "")?;
+        Ok(())
+    }
+}

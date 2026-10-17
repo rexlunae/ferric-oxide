@@ -1,0 +1,213 @@
+//! Cross-compilation environments and VM execution for Redox programs.
+//!
+//! Cookbook uses the environment helpers without default features. The
+//! `cli-pkg` and `cli-exec` features enable package and VM commands.
+
+#![deny(missing_docs, unsafe_op_in_unsafe_fn)]
+
+use std::{env::VarError, io, path, process};
+
+pub(crate) use self::toolchain::toolchain;
+
+mod cargo;
+mod env;
+#[cfg(feature = "cli-exec")]
+mod exec;
+#[cfg(feature = "cli-pkg")]
+mod pkg;
+#[cfg(feature = "cli-exec")]
+mod redoxfs;
+mod toolchain;
+mod writer;
+
+const SUPPORTED_TARGETS: &[&str] = &[
+    "x86_64-unknown-redox",
+    "aarch64-unknown-redox",
+    "i586-unknown-redox",
+    "i686-unknown-redox",
+    "riscv64gc-unknown-redox",
+    "x86_64-unknown-linux-relibc",
+    "aarch64-unknown-linux-relibc",
+];
+
+fn redoxer_dir() -> path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or(path::PathBuf::from("."))
+        .join(".redoxer")
+        .join(target())
+}
+
+fn status_error(status: process::ExitStatus) -> io::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{status}")))
+    }
+}
+
+fn usage() {
+    eprintln!("redoxer ar - run AR GNU compiler with Redox target");
+    eprintln!("redoxer bench - cargo bench with Redox target in Redox VM");
+    eprintln!("redoxer build - cargo build with Redox target");
+    eprintln!("redoxer cc - run C GNU compiler with Redox target");
+    eprintln!("redoxer check - cargo check with Redox target");
+    eprintln!("redoxer clippy - cargo clippy with Redox target");
+    eprintln!("redoxer cxx - run C++ GNU compiler with Redox target");
+    eprintln!("redoxer doc - cargo doc with Redox target");
+    eprintln!("redoxer env - execute a command in cross-compilation environment");
+    eprintln!("redoxer exec - execute a command in Redox VM");
+    eprintln!("redoxer fetch - cargo fetch with Redox target");
+    eprintln!("redoxer install - cargo install with Redox target");
+    eprintln!("redoxer pkg - install sysroot for native dependencies");
+    eprintln!("redoxer run - cargo run with Redox target in Redox VM");
+    eprintln!("redoxer rustc - cargo rustc with Redox target");
+    eprintln!("redoxer test - cargo test with Redox target in Redox VM");
+    eprintln!("redoxer write-exec - write redoxer exec test configuration");
+    eprintln!("redoxer toolchain - install toolchain");
+    eprintln!();
+    eprintln!("Visit https://crates.io/crates/redoxer for more help");
+    process::exit(1);
+}
+
+/// Return the supported target selected by `TARGET`, defaulting to x86_64 Redox.
+///
+/// # Panics
+/// Panics on an unsupported host OS or architecture.
+///
+/// # Examples
+/// ```
+/// assert!(!redoxer::target().is_empty());
+/// ```
+pub fn target() -> &'static str {
+    let target_from_env = std::env::var("TARGET").unwrap_or_default();
+
+    // Allow compilation for host if explicitly requested
+    if target_from_env == host_target() {
+        return host_target();
+    }
+
+    let index = if SUPPORTED_TARGETS.contains(&&*target_from_env) {
+        SUPPORTED_TARGETS
+            .iter()
+            .position(|t| **t == target_from_env)
+            .unwrap()
+    } else {
+        0usize
+    };
+
+    SUPPORTED_TARGETS[index]
+}
+
+/// Return the GNU toolchain spelling of the selected Rust target.
+///
+/// # Panics
+/// Panics on an unsupported host OS or architecture.
+pub fn gnu_target() -> &'static str {
+    match target() {
+        "riscv64gc-unknown-redox" => "riscv64-unknown-redox",
+        "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
+        "x86_64-unknown-linux-gnu" => "x86_64-linux-gnu",
+        "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
+        "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
+        "aarch64-unknown-linux-relibc" => "aarch64-linux-relibc",
+        "x86_64-unknown-linux-relibc" => "x86_64-linux-relibc",
+        rust_target => rust_target,
+    }
+}
+
+/// Return the compiled host target triple.
+///
+/// # Panics
+/// Panics on unsupported host OS and architecture combinations.
+pub fn host_target() -> &'static str {
+    let os = if cfg!(target_os = "linux") {
+        if cfg!(target_env = "musl") {
+            "linux-musl"
+        } else {
+            "linux-gnu"
+        }
+    } else if cfg!(target_os = "redox") {
+        "redox"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        ""
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        ""
+    };
+    match (arch, os) {
+        ("x86_64", "linux-gnu") => "x86_64-unknown-linux-gnu",
+        ("aarch64", "linux-gnu") => "aarch64-unknown-linux-gnu",
+        // these are listed so just compilation targeting the host works
+        // it doesn't have the official cross compiler toolchain bundled
+        ("x86_64", "redox") => "x86_64-unknown-redox",
+        ("aarch64", "redox") => "aarch64-unknown-redox",
+        ("x86_64", "linux-musl") => "x86_64-unknown-linux-musl",
+        ("aarch64", "linux-musl") => "aarch64-unknown-linux-musl",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        ("x86_64", "freebsd") => "x86_64-unknown-freebsd",
+        ("aarch64", "freebsd") => "aarch64-unknown-freebsd",
+        _ => panic!("Unsupported host OS/ARCH!"),
+    }
+}
+
+/// Read `REDOXER_USE_CLANG`, defaulting to false.
+///
+/// # Panics
+/// Panics for a non-UTF-8 value or a value other than true, false, 1 or 0.
+pub fn is_use_clang() -> bool {
+    parse_bool_env("REDOXER_USE_CLANG").unwrap_or(false)
+}
+
+/// Read `REDOXER_USE_LTO`, defaulting to false.
+///
+/// # Panics
+/// Panics for a non-UTF-8 value or a value other than true, false, 1 or 0.
+pub fn is_use_lto() -> bool {
+    parse_bool_env("REDOXER_USE_LTO").unwrap_or(false)
+}
+
+pub(crate) fn parse_bool_env(name: &str) -> Option<bool> {
+    match std::env::var(name).as_deref() {
+        Ok("true" | "1") => Some(true),
+        Ok("false" | "0") => Some(false),
+        Ok(arg) => panic!("invalid argument {arg} for {name}"),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => panic!("non-utf8 argument for {name}"),
+    }
+}
+
+/// Dispatch a Redoxer command, terminating the process on completion or error.
+///
+/// # Panics
+/// Panics for commands whose required Cargo features are disabled, invalid
+/// environment settings, unsupported hosts or failed internal command invariants.
+pub fn main(args: &[String]) {
+    match args.get(1) {
+        Some(arg) => match arg.as_str() {
+            "bench" | "build" | "check" | "clippy" | "doc" => cargo::main(args),
+            "fetch" | "install" | "run" | "rustc" | "test" => cargo::main(args),
+            "ar" | "cc" | "cxx" | "env" => env::main(args),
+            #[cfg(feature = "cli-exec")]
+            "exec" => exec::main(args),
+            #[cfg(not(feature = "cli-exec"))]
+            "exec" => panic!("feature 'cli-exec' is not compiled"),
+            #[cfg(feature = "cli-pkg")]
+            "pkg" => pkg::main(args),
+            #[cfg(not(feature = "cli-pkg"))]
+            "pkg" => panic!("feature 'cli-pkg' is not compiled"),
+            "toolchain" => toolchain::main(args),
+            "write-exec" => writer::main(args),
+            _ => usage(),
+        },
+        None => usage(),
+    }
+}
