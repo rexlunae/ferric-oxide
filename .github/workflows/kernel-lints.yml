@@ -10,7 +10,6 @@ on:
     branches: [main, "ci/**"]
   pull_request:
     paths:
-      - "kernel/**"
       - "crates/**"
       - "ci/kernel-lints.json"
       - "scripts/ferric-ci/kernel-lint-ratchet.sh"
@@ -29,15 +28,15 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
         run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component rust-src,clippy
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            kernel/target
-          key: kernel-lints-${{ hashFiles('kernel/Cargo.lock', 'kernel/rust-toolchain.toml') }}
+            crates/kernel/target
+          key: kernel-lints-${{ hashFiles('crates/kernel/Cargo.lock', 'crates/kernel/rust-toolchain.toml') }}
           restore-keys: kernel-lints-
       - name: Lint ratchet
         run: scripts/ferric-ci/kernel-lint-ratchet.sh
@@ -52,7 +51,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
         run: |
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component rust-src
       - uses: actions/cache@v4
         with:
@@ -60,8 +59,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            kernel/target
-          key: kernel-ibt-${{ hashFiles('kernel/Cargo.lock', 'kernel/rust-toolchain.toml', 'Cargo.lock') }}
+            crates/kernel/target
+          key: kernel-ibt-${{ hashFiles('crates/kernel/Cargo.lock', 'crates/kernel/rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: kernel-ibt-
       # The same path a ferric.toml takes: ferric-config writes the kernel's
       # config.toml, as recipes/core/kernel copies it.
@@ -72,9 +71,9 @@ jobs:
           printf '[kernel.cpu]\nibt = "always"\n' > "$out/ferric.toml"
           cargo run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          cp "$out/kernel-config.toml" kernel/config.toml
-          cat kernel/config.toml
+          cp "$out/kernel-config.toml" crates/kernel/config.toml
+          cat crates/kernel/config.toml
       - name: Build the kernel
-        run: make -C kernel BUILD="$RUNNER_TEMP/kernel-ibt" OBJCOPY=objcopy all
+        run: make -C crates/kernel BUILD="$RUNNER_TEMP/kernel-ibt" OBJCOPY=objcopy all
       - name: Check endbr64 at entry points
         run: scripts/ferric-ci/check-kernel-ibt.sh "$RUNNER_TEMP/kernel-ibt/kernel.all"

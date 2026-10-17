@@ -22,7 +22,7 @@
 //! - `iova` (with the `alloc` feature, on by default) allocates naturally aligned IOVA ranges
 //!   for a domain and hands out domain IDs.
 //!
-//! The kernel side (`kernel/src/arch/x86_64/iommu.rs`) maps the registers, allocates the table
+//! The kernel side (`crates/kernel/src/arch/x86_64/iommu.rs`) maps the registers, allocates the table
 //! pages and performs the enable sequence. See `io/iommu-design.md` in the project files for
 //! the plan this is the first step of.
 //!

@@ -1,7 +1,7 @@
 //! The interface between the Ferric Oxide kernel's `iommu` scheme and its user-space clients,
 //! and the PCI rules that decide which requester IDs a device's DMA can carry.
 //!
-//! The kernel's `iommu` scheme (`kernel/src/scheme/iommu.rs`, built with `kernel.iommu` set to
+//! The kernel's `iommu` scheme (`crates/kernel/src/scheme/iommu.rs`, built with `kernel.iommu` set to
 //! `auto` or `enforce`) hands out DMA domains. pcid opens the scheme's root as root, which gives
 //! it the *attach capability*. Opening [`abi::DOMAIN_PATH`] from that capability creates a domain
 //! with empty translation tables, so every DMA from a device in it faults. pcid then moves

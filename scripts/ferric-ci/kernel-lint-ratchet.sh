@@ -20,7 +20,7 @@ if [ "${1-}" = "--update" ]; then
     update=true
 fi
 
-# Lints that are not in kernel/Cargo.toml but are tracked here, so unsafe code
+# Lints that are not in crates/kernel/Cargo.toml but are tracked here, so unsafe code
 # without a SAFETY comment is counted too.
 extra_lints=(-W clippy::undocumented_unsafe_blocks)
 
@@ -28,7 +28,7 @@ messages="$(mktemp)"
 trap 'rm -f "$messages"' EXIT
 
 (
-    cd kernel
+    cd crates/kernel
     RUST_TARGET_PATH="$PWD/targets" cargo clippy \
         --bin kernel \
         --target targets/x86_64-unknown-kernel.json \
@@ -56,7 +56,7 @@ current="$(
 )"
 
 # Count of `unsafe` blocks, functions, impls and traits in kernel sources.
-unsafe_count="$(grep -rEo '\bunsafe\b' kernel/src --include='*.rs' | wc -l)"
+unsafe_count="$(grep -rEo '\bunsafe\b' crates/kernel/src --include='*.rs' | wc -l)"
 current="$(jq --argjson n "$unsafe_count" '. + { "unsafe keyword": $n }' <<< "$current")"
 
 if $update; then

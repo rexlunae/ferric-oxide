@@ -2,7 +2,7 @@
 # Checks that a kernel built with kernel.cpu.ibt on (arch.x86_64.features.ibt in the kernel's
 # config.toml) is ready for Intel CET indirect branch tracking: every place the CPU or an
 # indirect branch enters starts with endbr64, and nothing uses `notrack`. A miss is a #CP at
-# boot on CET hardware, which CI cannot run (see kernel/src/arch/x86_64/ibt.rs).
+# boot on CET hardware, which CI cannot run (see crates/kernel/src/arch/x86_64/ibt.rs).
 #
 # Usage: scripts/ferric-ci/check-kernel-ibt.sh path/to/kernel.all
 set -euo pipefail
