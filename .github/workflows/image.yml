@@ -212,6 +212,14 @@ jobs:
         run: |
           grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
 
+      # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
+      - name: Check registered buffers
+        run: |
+          for step in register grant-rw grant-ro pinned revoke unmap close; do
+            grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
+          done
+          echo "::notice::ferric-regbuf-test passed all 7 steps"
+
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and
         # that the disk, network and AHCI drivers each DMA through a domain they bound.
