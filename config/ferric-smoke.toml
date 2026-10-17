@@ -24,6 +24,8 @@ ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
 # DMA domain from pcid and has the device DMA through it.
 ferric-iommu-test = "source"
+# Registers a buffer and grants it to a test scheme (kernel.regbuf, which CI turns on).
+ferric-regbuf-test = "source"
 
 [[files]]
 path = "/usr/lib/init.d/30_console"
@@ -45,6 +47,7 @@ ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
 ferric-aslr-test || echo FERRIC_TEST_FAIL aslr exited with an error
 ferric-guard-test || echo FERRIC_TEST_FAIL guard exited with an error
 ferric-tlb-test || echo FERRIC_TEST_FAIL tlb exited with an error
+ferric-regbuf-test || echo FERRIC_TEST_FAIL regbuf exited with an error
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error
 echo FERRIC_SMOKE_OK

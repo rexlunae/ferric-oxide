@@ -81,7 +81,8 @@ jobs:
           # and logs that there is no DMAR table on the other.
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
+          # Registered buffers are off by default; turn them on so ferric-regbuf-test runs.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel and relibc features,
