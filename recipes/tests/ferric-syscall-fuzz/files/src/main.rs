@@ -28,7 +28,9 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader};
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -832,19 +834,20 @@ fn spawn(exe: &str, dir: &str, seed: u64, calls: usize) -> std::io::Result<Child
 }
 
 /// How many trailing trace lines a replay prints.
-const REPLAY_LINES: usize = 3;
+const REPLAY_LINES: usize = 12;
 
 /// How many hung seeds are replayed, so many hangs cannot run past the boot
 /// timeout before the fuzzer reports.
 const MAX_REPLAYS: usize = 3;
 
 /// Runs a hung child's seed again with tracing on and prints the last calls
-/// it made, the final one being the call it was stuck in. Replays are close
-/// but not exact (descriptor numbers and addresses can differ), so a replay
-/// that finishes is reported as such.
+/// it made, the final one being the call it was stuck in. The trace goes
+/// through a pipe the parent drains, so writing it cannot block on a file
+/// system the child may have wedged. Replays are close but not exact
+/// (descriptor numbers and addresses can differ), so a replay that finishes
+/// is reported as such.
 fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
     let child_dir = format!("{dir}/replay-{seed}");
-    let trace = format!("{dir}/replay-{seed}.trace");
     let spawned = std::fs::create_dir_all(&child_dir).and_then(|()| {
         Command::new(exe)
             .args(["--child", &seed.to_string(), &calls.to_string()])
@@ -852,7 +855,7 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
             .current_dir(&child_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(&trace)?)
+            .stderr(Stdio::piped())
             .spawn()
     });
     let mut child = match spawned {
@@ -862,6 +865,18 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
             return;
         }
     };
+    let reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut tail = VecDeque::with_capacity(REPLAY_LINES);
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tail.len() == REPLAY_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            tail
+        })
+    });
     let started = Instant::now();
     let finished = loop {
         match child.try_wait() {
@@ -875,16 +890,14 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
             Err(_) => break false,
         }
     };
-    let text = std::fs::read_to_string(&trace).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    let tail = &lines[lines.len().saturating_sub(REPLAY_LINES)..];
+    // The pipe reaches end of file once the child is gone.
+    let tail = reader.and_then(|r| r.join().ok()).unwrap_or_default();
     let outcome = if finished { "finished" } else { "hung again" };
     println!("fuzz: replay of seed {seed} {outcome}; last calls:");
     for line in tail {
         println!("fuzz:   {line}");
     }
     let _ = std::fs::remove_dir_all(&child_dir);
-    let _ = std::fs::remove_file(&trace);
 }
 
 /// Reaps finished children and kills ones past the timeout.
