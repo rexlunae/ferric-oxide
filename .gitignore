@@ -26,3 +26,6 @@ wget-log
 
 # Ferric Oxide feature configuration (make menuconfig)
 /ferric.toml
+
+# Link to crates/ made by recipes whose source has ../crates path dependencies
+/recipes/core/kernel/crates
