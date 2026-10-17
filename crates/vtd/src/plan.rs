@@ -8,11 +8,18 @@
 //!
 //! [`plan_unit`] checks a unit's registers against what the kernel code can drive and returns
 //! a [`UnitPlan`], or a [`SkipReason`] the kernel logs.
+//!
+//! Devices can also be moved out of the identity domain into DMA domains of their own.
+//! [`domain_layout`] picks the table layout such domains use so that every enabled unit can
+//! walk them, and [`unit_coverage`] with [`select_unit`] find the unit that translates a
+//! device's requests (section 8.3, "DMA Remapping Hardware Unit Definition Structure").
 
 use core::fmt;
 
+use crate::Bdf;
+use crate::dmar::{Drhd, ScopeKind};
 use crate::regs::{Capability, ExtendedCapability, global};
-use crate::table::{Agaw, PageSize};
+use crate::table::{Agaw, LargePages, PageSize};
 
 /// The domain ID of the identity domain. Domain 0 is avoided because units in caching mode
 /// reserve it.
@@ -31,6 +38,8 @@ pub struct UnitPlan {
     pub flush_cpu_caches: bool,
     /// The write buffer must be flushed after table updates (CAP.RWBF).
     pub flush_write_buffer: bool,
+    /// Invalidate through the invalidation queue (ECAP.QI) rather than the registers.
+    pub queued_invalidation: bool,
 }
 
 /// Why the kernel leaves a unit alone.
@@ -142,7 +151,176 @@ pub fn plan_unit(
         top,
         flush_cpu_caches: !ecap.coherent(),
         flush_write_buffer: cap.required_write_buffer_flush(),
+        queued_invalidation: ecap.queued_invalidation(),
     })
+}
+
+/// The domain ID the first DMA domain gets; IDs below it are [`IDENTITY_DOMAIN`] and the ID 0
+/// that caching-mode units reserve.
+pub const FIRST_DMA_DOMAIN: u16 = IDENTITY_DOMAIN + 1;
+
+/// How DMA domains are laid out so that every enabled unit can use them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainLayout {
+    /// The table width: the smallest one every unit supports.
+    pub agaw: Agaw,
+    /// The leaf sizes every unit supports.
+    pub large_pages: LargePages,
+    /// One past the highest IOVA every unit translates: the table width, capped by the
+    /// smallest MGAW.
+    pub iova_limit: u64,
+    /// One past the highest domain ID every unit supports (the smallest CAP.ND count).
+    pub domain_id_limit: u32,
+    /// Some unit does not snoop CPU caches on page walks (ECAP.C clear), so table updates
+    /// must be flushed with `clflush`.
+    pub flush_cpu_caches: bool,
+}
+
+/// The layout for DMA domains over units with these capabilities, or `None` when there are
+/// no units or they share no table width.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_vtd::plan::domain_layout;
+/// use ferric_vtd::regs::{Capability, ExtendedCapability};
+/// use ferric_vtd::table::{Agaw, LargePages};
+///
+/// let qemu = (Capability(0x00d2_008c_2226_0206), ExtendedCapability(0xf42));
+/// let layout = domain_layout([qemu]).expect("one unit");
+/// assert_eq!(layout.agaw, Agaw::Bits39);
+/// assert_eq!(layout.large_pages, LargePages::Up1G);
+/// assert_eq!(layout.iova_limit, 1 << 39);
+/// ```
+pub fn domain_layout(
+    units: impl IntoIterator<Item = (Capability, ExtendedCapability)>,
+) -> Option<DomainLayout> {
+    let mut sagaw = 0x1f;
+    let mut mgaw = u8::MAX;
+    let mut large_pages = LargePages::Up1G;
+    let mut domain_id_limit = u32::MAX;
+    let mut flush_cpu_caches = false;
+    let mut any = false;
+    for (cap, ecap) in units {
+        any = true;
+        sagaw &= cap.supported_agaws();
+        mgaw = mgaw.min(cap.max_guest_address_width());
+        large_pages = large_pages.min(LargePages::from_capability(cap));
+        domain_id_limit = domain_id_limit.min(cap.domain_count());
+        flush_cpu_caches |= !ecap.coherent();
+    }
+    let agaw = Agaw::ALL
+        .into_iter()
+        .find(|a| any && a.supported_by(sagaw))?;
+    // A unit translates at most MGAW bits even when its tables have more levels.
+    let iova_limit = agaw
+        .limit()
+        .min(1u64.checked_shl(u32::from(mgaw)).unwrap_or(u64::MAX));
+    Some(DomainLayout {
+        agaw,
+        large_pages,
+        iova_limit,
+        domain_id_limit,
+        flush_cpu_caches,
+    })
+}
+
+/// How a DRHD relates to one device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// A device scope names the device directly.
+    Listed,
+    /// The unit has INCLUDE_PCI_ALL for the device's segment: it serves the device unless
+    /// another unit lists it.
+    IncludeAll,
+    /// The unit has scopes that need configuration-space reads to resolve (bridges, or paths
+    /// of more than one hop), so it may serve the device.
+    Unknown,
+    /// The unit does not serve the device.
+    No,
+}
+
+/// Whether the unit `drhd` describes serves `bdf` in PCI segment `segment`.
+pub fn unit_coverage(drhd: &Drhd<'_>, segment: u16, bdf: Bdf) -> Coverage {
+    if drhd.segment != segment {
+        return Coverage::No;
+    }
+    let mut unknown = false;
+    for scope in drhd.scopes.iter() {
+        let Ok(scope) = scope else {
+            unknown = true;
+            break;
+        };
+        match (scope.kind, scope.direct_bdf()) {
+            (ScopeKind::PciEndpoint, Some(listed)) if listed == bdf => return Coverage::Listed,
+            (ScopeKind::PciEndpoint, Some(_)) => {}
+            (ScopeKind::PciEndpoint | ScopeKind::PciSubHierarchy, _) => unknown = true,
+            _ => {}
+        }
+    }
+    if drhd.include_pci_all() {
+        Coverage::IncludeAll
+    } else if unknown {
+        Coverage::Unknown
+    } else {
+        Coverage::No
+    }
+}
+
+/// Why no unit could be picked for a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectError {
+    /// No unit serves the device: its DMA is not remapped.
+    NotCovered,
+    /// A unit with bridge scopes might serve the device, which only configuration-space reads
+    /// can settle.
+    Ambiguous,
+}
+
+impl fmt::Display for SelectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotCovered => "no remapping unit serves the device",
+            Self::Ambiguous => "a remapping unit's bridge scopes may cover the device",
+        })
+    }
+}
+
+impl core::error::Error for SelectError {}
+
+/// Picks the unit that serves a device, from each unit's [`Coverage`] in DMAR order: the unit
+/// that lists it, else the INCLUDE_PCI_ALL unit, unless some unit's scopes cannot be resolved.
+/// Returns the index of the unit.
+///
+/// # Errors
+///
+/// [`SelectError::NotCovered`] when no unit serves the device, [`SelectError::Ambiguous`] when
+/// one that cannot be resolved might.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_vtd::plan::{select_unit, Coverage};
+/// assert_eq!(select_unit([Coverage::No, Coverage::IncludeAll]), Ok(1));
+/// assert_eq!(select_unit([Coverage::IncludeAll, Coverage::Listed]), Ok(1));
+/// ```
+pub fn select_unit(coverage: impl IntoIterator<Item = Coverage>) -> Result<usize, SelectError> {
+    let mut include_all = None;
+    let mut unknown = false;
+    for (i, c) in coverage.into_iter().enumerate() {
+        match c {
+            Coverage::Listed => return Ok(i),
+            Coverage::IncludeAll => include_all = include_all.or(Some(i)),
+            Coverage::Unknown => unknown = true,
+            Coverage::No => {}
+        }
+    }
+    match (unknown, include_all) {
+        (true, _) => Err(SelectError::Ambiguous),
+        (false, Some(i)) => Ok(i),
+        (false, None) => Err(SelectError::NotCovered),
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +346,7 @@ mod tests {
         assert_eq!(p.top, 0x8020_0000);
         assert!(p.flush_cpu_caches);
         assert!(!p.flush_write_buffer);
+        assert!(p.queued_invalidation);
     }
 
     #[test]
@@ -209,5 +388,71 @@ mod tests {
         assert_eq!(p.page_size, PageSize::Size4K);
         assert!(!p.flush_cpu_caches);
         assert!(p.flush_write_buffer);
+    }
+
+    #[test]
+    fn layout_takes_the_common_subset() {
+        let qemu = (QEMU_CAP, QEMU_ECAP);
+        // A 48/57-bit unit with 2 MiB pages only, coherent walks, 256 domain IDs and MGAW 48.
+        let other = (
+            Capability((0b1100 << 8) | (47 << 16) | (1 << 34) | 2),
+            ExtendedCapability(1),
+        );
+        let l = domain_layout([other]).unwrap();
+        assert_eq!(l.agaw, Agaw::Bits48);
+        assert_eq!(l.large_pages, LargePages::Up2M);
+        assert_eq!(l.iova_limit, 1 << 48);
+        assert_eq!(l.domain_id_limit, 256);
+        assert!(!l.flush_cpu_caches);
+        // QEMU's 39-bit-only unit shares no width with it.
+        assert_eq!(domain_layout([qemu, other]), None);
+        let wide = (Capability((0b110 << 8) | (40 << 16)), ExtendedCapability(1));
+        let l = domain_layout([qemu, wide]).unwrap();
+        assert_eq!(l.agaw, Agaw::Bits39);
+        assert_eq!(l.large_pages, LargePages::None);
+        assert_eq!(l.domain_id_limit, 16);
+        assert!(l.flush_cpu_caches);
+        // MGAW below the table width caps the IOVA space.
+        let narrow = (Capability((0b100 << 8) | (41 << 16)), ExtendedCapability(1));
+        assert_eq!(domain_layout([narrow]).unwrap().iova_limit, 1 << 42);
+        assert_eq!(domain_layout([]), None);
+    }
+
+    #[test]
+    fn coverage_from_qemu_dmar() {
+        use crate::dmar::{Dmar, Structure};
+        let bytes = include_bytes!("../tests/fixtures/qemu-8.2-q35-intremap-off.dmar");
+        let dmar = Dmar::parse(bytes).unwrap();
+        let drhd = dmar
+            .structures()
+            .find_map(|s| match s {
+                Ok(Structure::Drhd(d)) => Some(d),
+                _ => None,
+            })
+            .unwrap();
+        // QEMU lists each device on bus 0 rather than setting INCLUDE_PCI_ALL.
+        let nic = Bdf::new(0, 2, 0);
+        assert_eq!(unit_coverage(&drhd, 0, nic), Coverage::Listed);
+        assert_eq!(unit_coverage(&drhd, 1, nic), Coverage::No);
+        assert_eq!(select_unit([unit_coverage(&drhd, 0, nic)]), Ok(0));
+        let empty_slot = Bdf::new(0, 0x1e, 0);
+        assert_eq!(unit_coverage(&drhd, 0, empty_slot), Coverage::No);
+        assert_eq!(
+            select_unit([unit_coverage(&drhd, 0, empty_slot)]),
+            Err(SelectError::NotCovered)
+        );
+    }
+
+    #[test]
+    fn unit_selection() {
+        use Coverage::*;
+        assert_eq!(select_unit([Listed, IncludeAll]), Ok(0));
+        assert_eq!(select_unit([Unknown, Listed]), Ok(1));
+        assert_eq!(
+            select_unit([Unknown, IncludeAll]),
+            Err(SelectError::Ambiguous)
+        );
+        assert_eq!(select_unit([No, No]), Err(SelectError::NotCovered));
+        assert_eq!(select_unit([]), Err(SelectError::NotCovered));
     }
 }

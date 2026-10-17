@@ -67,9 +67,43 @@ impl ContextEntry {
         Self([lo, hi])
     }
 
+    /// A not-present entry: requests from the device are blocked and fault (section 7.1.3,
+    /// fault reason 0x2). Used for devices taken out of a domain.
+    pub const BLOCKED: Self = Self([0, 0]);
+
     /// The domain ID, bits 87:72.
     pub const fn domain_id(self) -> u16 {
         (self.0[1] >> 8) as u16
+    }
+
+    /// The present bit, bit 0.
+    pub const fn is_present(self) -> bool {
+        self.0[0] & PRESENT != 0
+    }
+
+    /// The physical address of the second-stage page-table root, bits 63:12.
+    pub const fn table(self) -> u64 {
+        self.0[0] & ADDR_MASK
+    }
+
+    /// The translation type, bits 3:2, or `None` for the reserved value 11.
+    pub const fn translation_type(self) -> Option<TranslationType> {
+        match (self.0[0] >> 2) & 3 {
+            0 => Some(TranslationType::Untranslated),
+            1 => Some(TranslationType::All),
+            2 => Some(TranslationType::PassThrough),
+            _ => None,
+        }
+    }
+
+    /// The address width, from the AW field (bits 66:64), or `None` for a value no width uses.
+    pub const fn agaw(self) -> Option<Agaw> {
+        match self.0[1] & 7 {
+            1 => Some(Agaw::Bits39),
+            2 => Some(Agaw::Bits48),
+            3 => Some(Agaw::Bits57),
+            _ => None,
+        }
     }
 }
 
@@ -380,6 +414,360 @@ pub fn map_identity<M: TableMemory>(
     Ok(())
 }
 
+/// Why [`unmap`] could not remove a mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnmapError {
+    /// Nothing is mapped at the IOVA.
+    NotMapped {
+        /// The IOVA.
+        iova: u64,
+    },
+    /// The IOVA lies inside a large page but is not its first byte; large pages are only
+    /// removed whole.
+    InsideLargePage {
+        /// The IOVA.
+        iova: u64,
+        /// The size of the page that covers it.
+        size: PageSize,
+    },
+    /// The IOVA is beyond the tables' address width.
+    OutOfRange {
+        /// The IOVA.
+        iova: u64,
+    },
+    /// A range to unmap ends inside a large page.
+    PartialPage {
+        /// The first IOVA of that page.
+        iova: u64,
+        /// Its size.
+        size: PageSize,
+    },
+}
+
+impl fmt::Display for UnmapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotMapped { iova } => write!(f, "nothing is mapped at IOVA {iova:#x}"),
+            Self::InsideLargePage { iova, size } => {
+                write!(
+                    f,
+                    "IOVA {iova:#x} is inside a {:#x}-byte page",
+                    size.bytes()
+                )
+            }
+            Self::OutOfRange { iova } => write!(f, "IOVA {iova:#x} is out of range"),
+            Self::PartialPage { iova, size } => write!(
+                f,
+                "the range ends inside the {:#x}-byte page at IOVA {iova:#x}",
+                size.bytes()
+            ),
+        }
+    }
+}
+
+impl core::error::Error for UnmapError {}
+
+/// The table pages an [`unmap`] emptied and unlinked from their parents, lowest level first.
+/// The root table is never among them.
+///
+/// The unit may still hold the unlinked entries in its paging-structure caches, so the caller
+/// frees these pages only after an IOTLB invalidation that covers them (one with
+/// [`Request::IotlbPage::leaf_only`](crate::invalidation::Request::IotlbPage) clear, or a
+/// domain-selective one) has completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct EmptiedTables {
+    pages: [u64; 4],
+    len: usize,
+}
+
+impl EmptiedTables {
+    /// The physical addresses of the emptied pages.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.pages[..self.len]
+    }
+
+    /// Whether no table page was emptied.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, phys: u64) {
+        // Only tables below the root are pushed, and there are at most four levels below a
+        // five-level root.
+        self.pages[self.len] = phys;
+        self.len += 1;
+    }
+}
+
+/// One mapping that [`unmap`] removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unmapped {
+    /// The physical address the page mapped.
+    pub phys: u64,
+    /// The page's size.
+    pub size: PageSize,
+    /// The access it granted.
+    pub access: Access,
+    /// The table pages left empty, for the caller to free after invalidating.
+    pub emptied: EmptiedTables,
+}
+
+/// Removes the page mapped at `iova` (the first byte of a 4 KiB, 2 MiB or 1 GiB page) from
+/// the tables rooted at `root`. Every table that is left with no present entry is unlinked
+/// from its parent and reported in [`Unmapped::emptied`], so the caller can free it once the
+/// IOTLB has been invalidated.
+///
+/// # Errors
+///
+/// [`UnmapError::OutOfRange`] when `iova` is beyond `agaw`, [`UnmapError::NotMapped`] when no
+/// page covers it, and [`UnmapError::InsideLargePage`] when it falls inside a large page
+/// without being that page's first byte. Nothing is changed on error.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_vtd::table::{map, translate, unmap, Access, Agaw, MapError, PageSize, Table, TableMemory};
+///
+/// struct Vec4k(Vec<Box<Table>>);
+/// impl TableMemory for Vec4k {
+///     type Error = core::convert::Infallible;
+///     fn alloc_table(&mut self) -> Result<u64, Self::Error> {
+///         self.0.push(Box::new([0; 512]));
+///         Ok(self.0.len() as u64 * 4096)
+///     }
+///     fn table(&mut self, phys: u64) -> &mut Table {
+///         &mut self.0[phys as usize / 4096 - 1]
+///     }
+/// }
+///
+/// let mut mem = Vec4k(Vec::new());
+/// let root = mem.alloc_table().map_err(MapError::Alloc)?;
+/// map(&mut mem, root, Agaw::Bits39, 0x5000, 0x9000, PageSize::Size4K, Access::Read)?;
+/// let gone = unmap(&mut mem, root, Agaw::Bits39, 0x5000).expect("mapped above");
+/// assert_eq!((gone.phys, gone.size), (0x9000, PageSize::Size4K));
+/// // The level-2 and level-1 tables are empty now; only the root is left in use.
+/// assert_eq!(gone.emptied.as_slice(), [3 * 4096, 2 * 4096]);
+/// assert_eq!(translate(&mut mem, root, Agaw::Bits39, 0x5000), None);
+/// # Ok::<(), ferric_vtd::table::MapError<core::convert::Infallible>>(())
+/// ```
+pub fn unmap<M: TableMemory>(
+    mem: &mut M,
+    root: u64,
+    agaw: Agaw,
+    iova: u64,
+) -> Result<Unmapped, UnmapError> {
+    if iova >= agaw.limit() {
+        return Err(UnmapError::OutOfRange { iova });
+    }
+    // The tables walked through, from the root down: (table, index of the entry used).
+    let mut path = [(0u64, 0usize); 5];
+    let mut depth = 0;
+    let mut table = root;
+    let mut level = agaw.levels();
+    let (leaf, size) = loop {
+        let i = index(iova, level);
+        path[depth] = (table, i);
+        depth += 1;
+        let entry = mem.table(table)[i];
+        if entry & (SL_R | SL_W) == 0 {
+            return Err(UnmapError::NotMapped { iova });
+        }
+        let size = match level {
+            1 => Some(PageSize::Size4K),
+            2 if entry & SL_PS != 0 => Some(PageSize::Size2M),
+            3 if entry & SL_PS != 0 => Some(PageSize::Size1G),
+            _ => None,
+        };
+        if let Some(size) = size {
+            break (entry, size);
+        }
+        table = entry & ADDR_MASK;
+        level -= 1;
+    };
+    if iova & (size.bytes() - 1) != 0 {
+        return Err(UnmapError::InsideLargePage { iova, size });
+    }
+    let access = match leaf & (SL_R | SL_W) {
+        SL_R => Access::Read,
+        SL_W => Access::Write,
+        _ => Access::ReadWrite,
+    };
+    let mut emptied = EmptiedTables::default();
+    // Clear the leaf, then walk back up while the table just changed is empty, unlinking it
+    // from its parent. The root (path[0]) is never unlinked.
+    for d in (0..depth).rev() {
+        let (table, i) = path[d];
+        mem.table(table)[i] = 0;
+        if d == 0 || mem.table(table).iter().any(|&e| e & (SL_R | SL_W) != 0) {
+            break;
+        }
+        // The next pass clears the parent's entry that pointed to this table.
+        emptied.push(table);
+    }
+    Ok(Unmapped {
+        phys: leaf & ADDR_MASK,
+        size,
+        access,
+        emptied,
+    })
+}
+
+/// Which leaf sizes [`map_range`] may use, from the unit's CAP.SLLPS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LargePages {
+    /// 4 KiB pages only.
+    None,
+    /// 4 KiB and 2 MiB pages.
+    Up2M,
+    /// 4 KiB, 2 MiB and 1 GiB pages.
+    Up1G,
+}
+
+impl LargePages {
+    /// What a unit with these capabilities supports.
+    pub const fn from_capability(cap: crate::regs::Capability) -> Self {
+        match (cap.large_pages_2m(), cap.large_pages_1g()) {
+            (true, true) => Self::Up1G,
+            (true, false) => Self::Up2M,
+            _ => Self::None,
+        }
+    }
+
+    /// The largest page of at most `len` bytes that `iova` and `phys` are both aligned to.
+    fn page_for(self, iova: u64, phys: u64, len: u64, agaw: Agaw) -> PageSize {
+        let fits = |size: PageSize| {
+            let mask = size.bytes() - 1;
+            iova & mask == 0
+                && phys & mask == 0
+                && len >= size.bytes()
+                && size.level() <= agaw.levels()
+        };
+        if self >= Self::Up1G && fits(PageSize::Size1G) {
+            PageSize::Size1G
+        } else if self >= Self::Up2M && fits(PageSize::Size2M) {
+            PageSize::Size2M
+        } else {
+            PageSize::Size4K
+        }
+    }
+}
+
+/// A range operation that stopped part-way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeError<E> {
+    /// Bytes from the start of the range that were processed before the failure. For
+    /// [`map_range`] those stay mapped; for [`unmap_range`] they are unmapped.
+    pub done: u64,
+    /// What failed.
+    pub error: E,
+}
+
+impl<E: fmt::Display> fmt::Display for RangeError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "after {:#x} bytes: {}", self.done, self.error)
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for RangeError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Maps `len` bytes from `iova` to `phys` with `access`, using the largest pages `large`
+/// allows wherever both addresses are aligned to them.
+///
+/// # Errors
+///
+/// [`MapError::Misaligned`] when `iova`, `phys` or `len` is not a multiple of 4 KiB, and
+/// otherwise as [`map`] for the first page that fails. The pages before it stay mapped;
+/// [`RangeError::done`] says how many bytes that is, so the caller can unmap them.
+#[allow(clippy::too_many_arguments)]
+pub fn map_range<M: TableMemory>(
+    mem: &mut M,
+    root: u64,
+    agaw: Agaw,
+    iova: u64,
+    phys: u64,
+    len: u64,
+    access: Access,
+    large: LargePages,
+) -> Result<(), RangeError<MapError<M::Error>>> {
+    if (iova | phys | len) & 0xfff != 0 {
+        return Err(RangeError {
+            done: 0,
+            error: MapError::Misaligned { iova, phys },
+        });
+    }
+    let mut done = 0;
+    while done < len {
+        let (va, pa) = (iova.wrapping_add(done), phys.wrapping_add(done));
+        let size = large.page_for(va, pa, len - done, agaw);
+        map(mem, root, agaw, va, pa, size, access).map_err(|error| RangeError { done, error })?;
+        done += size.bytes();
+    }
+    Ok(())
+}
+
+/// Unmaps every page in `len` bytes from `iova`, calling `emptied` with each table page that
+/// is left empty (see [`unmap`]; free them only after invalidating the IOTLB).
+///
+/// # Errors
+///
+/// As [`unmap`] for the first page that fails, and [`UnmapError::PartialPage`] when the range
+/// ends inside a large page, which is then left mapped. The pages before it are unmapped;
+/// [`RangeError::done`] says how many bytes that is.
+pub fn unmap_range<M: TableMemory>(
+    mem: &mut M,
+    root: u64,
+    agaw: Agaw,
+    iova: u64,
+    len: u64,
+    mut emptied: impl FnMut(u64),
+) -> Result<(), RangeError<UnmapError>> {
+    let mut done = 0;
+    while done < len {
+        let va = iova.wrapping_add(done);
+        let fail = |error| RangeError { done, error };
+        let size =
+            leaf_size(mem, root, agaw, va).ok_or(fail(UnmapError::NotMapped { iova: va }))?;
+        if size.bytes() > len - done {
+            return Err(fail(UnmapError::PartialPage { iova: va, size }));
+        }
+        let gone = unmap(mem, root, agaw, va).map_err(fail)?;
+        gone.emptied
+            .as_slice()
+            .iter()
+            .for_each(|&page| emptied(page));
+        done += gone.size.bytes();
+    }
+    Ok(())
+}
+
+/// The size of the leaf that maps `iova`, if any.
+fn leaf_size<M: TableMemory>(mem: &mut M, root: u64, agaw: Agaw, iova: u64) -> Option<PageSize> {
+    if iova >= agaw.limit() {
+        return None;
+    }
+    let mut table = root;
+    let mut level = agaw.levels();
+    loop {
+        let entry = mem.table(table)[index(iova, level)];
+        if entry & (SL_R | SL_W) == 0 {
+            return None;
+        }
+        match level {
+            1 => return Some(PageSize::Size4K),
+            2 if entry & SL_PS != 0 => return Some(PageSize::Size2M),
+            3 if entry & SL_PS != 0 => return Some(PageSize::Size1G),
+            _ => {}
+        }
+        table = entry & ADDR_MASK;
+        level -= 1;
+    }
+}
+
 /// Walks the tables rooted at `root` for `iova`, returning the physical address and access
 /// a device would get, or `None` when nothing is mapped.
 pub fn translate<M: TableMemory>(
@@ -612,6 +1000,308 @@ pub(crate) mod tests {
         assert_eq!(
             translate(&mut mem, root, a, 0x20_0000),
             Some((0x20_0000, Access::Read))
+        );
+    }
+
+    /// The number of present entries in a table page.
+    fn present(mem: &mut VecMemory, table: u64) -> usize {
+        mem.table(table)
+            .iter()
+            .filter(|&&e| e & (SL_R | SL_W) != 0)
+            .count()
+    }
+
+    #[test]
+    fn context_entry_decoding() {
+        let ce = ContextEntry::new(0x7_7000, Agaw::Bits48, 42, TranslationType::Untranslated);
+        assert!(ce.is_present());
+        assert_eq!(ce.table(), 0x7_7000);
+        assert_eq!(ce.agaw(), Some(Agaw::Bits48));
+        assert_eq!(ce.translation_type(), Some(TranslationType::Untranslated));
+        assert_eq!(ce.domain_id(), 42);
+        assert!(!ContextEntry::BLOCKED.is_present());
+        assert_eq!(ContextEntry::BLOCKED.agaw(), None);
+        assert_eq!(ContextEntry([0xc | 1, 0]).translation_type(), None);
+        let pt = ContextEntry::new(0, Agaw::Bits39, 1, TranslationType::PassThrough);
+        assert_eq!(pt.translation_type(), Some(TranslationType::PassThrough));
+    }
+
+    #[test]
+    fn unmap_frees_emptied_tables_bottom_up() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits48;
+        map(
+            &mut mem,
+            root,
+            a,
+            0x1000,
+            0xa000,
+            PageSize::Size4K,
+            Access::Read,
+        )
+        .unwrap();
+        map(
+            &mut mem,
+            root,
+            a,
+            0x2000,
+            0xb000,
+            PageSize::Size4K,
+            Access::Write,
+        )
+        .unwrap();
+        // Root, then one table at each of levels 3, 2 and 1.
+        assert_eq!(mem.pages.len(), 4);
+        let first = unmap(&mut mem, root, a, 0x1000).unwrap();
+        assert_eq!(
+            (first.phys, first.size, first.access),
+            (0xa000, PageSize::Size4K, Access::Read)
+        );
+        // The level-1 table still holds 0x2000.
+        assert!(first.emptied.is_empty());
+        assert_eq!(
+            translate(&mut mem, root, a, 0x2000),
+            Some((0xb000, Access::Write))
+        );
+        let second = unmap(&mut mem, root, a, 0x2000).unwrap();
+        // Level 1, 2 and 3 tables, lowest first.
+        assert_eq!(second.emptied.as_slice(), [4 * 4096, 3 * 4096, 2 * 4096]);
+        assert_eq!(present(&mut mem, root), 0);
+        assert_eq!(
+            unmap(&mut mem, root, a, 0x2000),
+            Err(UnmapError::NotMapped { iova: 0x2000 })
+        );
+    }
+
+    #[test]
+    fn unmap_stops_at_shared_tables() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits39;
+        // Two level-1 tables under one level-2 table.
+        map(
+            &mut mem,
+            root,
+            a,
+            0x0000_1000,
+            0x1000,
+            PageSize::Size4K,
+            Access::ReadWrite,
+        )
+        .unwrap();
+        map(
+            &mut mem,
+            root,
+            a,
+            0x0020_0000,
+            0x2000,
+            PageSize::Size4K,
+            Access::ReadWrite,
+        )
+        .unwrap();
+        let gone = unmap(&mut mem, root, a, 0x0020_0000).unwrap();
+        // Only the second level-1 table is empty; the level-2 table still points at the first.
+        assert_eq!(gone.emptied.as_slice(), [4 * 4096]);
+        let l2 = mem.table(root)[0] & ADDR_MASK;
+        assert_eq!(present(&mut mem, l2), 1);
+        assert_eq!(
+            translate(&mut mem, root, a, 0x1000),
+            Some((0x1000, Access::ReadWrite))
+        );
+    }
+
+    #[test]
+    fn unmap_large_pages() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits39;
+        map(
+            &mut mem,
+            root,
+            a,
+            0x4000_0000,
+            0x8000_0000,
+            PageSize::Size1G,
+            Access::Read,
+        )
+        .unwrap();
+        map(
+            &mut mem,
+            root,
+            a,
+            0x20_0000,
+            0x60_0000,
+            PageSize::Size2M,
+            Access::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(
+            unmap(&mut mem, root, a, 0x20_1000),
+            Err(UnmapError::InsideLargePage {
+                iova: 0x20_1000,
+                size: PageSize::Size2M
+            })
+        );
+        assert_eq!(
+            unmap(&mut mem, root, a, 1 << 39),
+            Err(UnmapError::OutOfRange { iova: 1 << 39 })
+        );
+        let big = unmap(&mut mem, root, a, 0x4000_0000).unwrap();
+        assert_eq!((big.phys, big.size), (0x8000_0000, PageSize::Size1G));
+        assert!(big.emptied.is_empty());
+        let two = unmap(&mut mem, root, a, 0x20_0000).unwrap();
+        assert_eq!((two.phys, two.size), (0x60_0000, PageSize::Size2M));
+        assert_eq!(two.emptied.as_slice(), [2 * 4096]);
+        assert_eq!(present(&mut mem, root), 0);
+    }
+
+    #[test]
+    fn map_range_picks_large_pages() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits39;
+        // 4 KiB short of 2 MiB-aligned at the start, so: one 4 KiB page, one 2 MiB page, one
+        // 4 KiB page.
+        let (iova, phys, len) = (0x1f_f000, 0x7f_f000, 0x20_2000);
+        map_range(
+            &mut mem,
+            root,
+            a,
+            iova,
+            phys,
+            len,
+            Access::ReadWrite,
+            LargePages::Up2M,
+        )
+        .unwrap();
+        assert_eq!(
+            leaf_size(&mut mem, root, a, 0x1f_f000),
+            Some(PageSize::Size4K)
+        );
+        assert_eq!(
+            leaf_size(&mut mem, root, a, 0x20_0000),
+            Some(PageSize::Size2M)
+        );
+        assert_eq!(
+            leaf_size(&mut mem, root, a, 0x40_0000),
+            Some(PageSize::Size4K)
+        );
+        assert_eq!(leaf_size(&mut mem, root, a, 0x40_1000), None);
+        for off in [0, 0x1000, 0x10_0123, len - 1] {
+            assert_eq!(
+                translate(&mut mem, root, a, iova + off),
+                Some((phys + off, Access::ReadWrite))
+            );
+        }
+        // Without large pages, the same range takes 4 KiB pages only.
+        let root2 = mem.alloc_table().unwrap();
+        map_range(
+            &mut mem,
+            root2,
+            a,
+            iova,
+            phys,
+            len,
+            Access::Read,
+            LargePages::None,
+        )
+        .unwrap();
+        assert_eq!(
+            leaf_size(&mut mem, root2, a, 0x20_0000),
+            Some(PageSize::Size4K)
+        );
+
+        let mut freed = std::vec::Vec::new();
+        unmap_range(&mut mem, root, a, iova, len, |p| freed.push(p)).unwrap();
+        assert_eq!(present(&mut mem, root), 0);
+        // The level-2 table and the two level-1 tables.
+        freed.sort_unstable();
+        assert_eq!(freed.len(), 3);
+    }
+
+    #[test]
+    fn map_range_one_gig_and_errors() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits48;
+        map_range(
+            &mut mem,
+            root,
+            a,
+            1 << 30,
+            1 << 31,
+            1 << 30,
+            Access::Read,
+            LargePages::Up1G,
+        )
+        .unwrap();
+        assert_eq!(
+            leaf_size(&mut mem, root, a, 1 << 30),
+            Some(PageSize::Size1G)
+        );
+        assert_eq!(
+            map_range(
+                &mut mem,
+                root,
+                a,
+                0x1800,
+                0,
+                0x1000,
+                Access::Read,
+                LargePages::None
+            ),
+            Err(RangeError {
+                done: 0,
+                error: MapError::Misaligned {
+                    iova: 0x1800,
+                    phys: 0
+                }
+            })
+        );
+        // The second page collides with the 1 GiB page.
+        assert_eq!(
+            map_range(
+                &mut mem,
+                root,
+                a,
+                (1 << 30) - 0x1000,
+                0,
+                0x2000,
+                Access::Read,
+                LargePages::None
+            ),
+            Err(RangeError {
+                done: 0x1000,
+                error: MapError::AlreadyMapped { iova: 1 << 30 }
+            })
+        );
+        // Ending inside the 1 GiB page leaves it mapped.
+        assert_eq!(
+            unmap_range(&mut mem, root, a, (1 << 30) - 0x1000, 0x2000, |_| {}),
+            Err(RangeError {
+                done: 0x1000,
+                error: UnmapError::PartialPage {
+                    iova: 1 << 30,
+                    size: PageSize::Size1G
+                }
+            })
+        );
+        assert!(translate(&mut mem, root, a, 1 << 30).is_some());
+        assert_eq!(
+            unmap_range(&mut mem, root, a, 0x5000, 0x1000, |_| {}),
+            Err(RangeError {
+                done: 0,
+                error: UnmapError::NotMapped { iova: 0x5000 }
+            })
+        );
+        assert_eq!(
+            LargePages::from_capability(crate::regs::tests::QEMU_CAP),
+            LargePages::Up1G
+        );
+        assert_eq!(
+            LargePages::from_capability(crate::regs::Capability(1 << 34)),
+            LargePages::Up2M
         );
     }
 }

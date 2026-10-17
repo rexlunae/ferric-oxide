@@ -319,8 +319,10 @@ drivers work as before, but translation, invalidation and fault reporting run
 on the hardware; DMA faults are logged on the console. Firmware's reserved
 memory regions (RMRRs) stay mapped. "auto" enables every unit that the kernel
 can drive and logs why it skips the others; "never" leaves VT-d off, as
-upstream does. Per-driver DMA domains, interrupt remapping and AMD-Vi come
-later."""
+upstream does. Units with queued invalidation use it. "auto" also runs a short
+boot self-test of DMA domains (map, unmap, attach and detach of a device that
+does no DMA) and logs the result. Handing domains to drivers, interrupt
+remapping and AMD-Vi come later."""
 choices = ["auto", "never"]
 
 [[option]]

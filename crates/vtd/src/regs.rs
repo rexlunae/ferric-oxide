@@ -258,6 +258,21 @@ pub mod ccmd {
     pub const fn global() -> u64 {
         ICC | GLOBAL
     }
+
+    /// The command for a domain-selective context-cache invalidation (DID in bits 15:0).
+    pub const fn domain(did: u16) -> u64 {
+        ICC | DOMAIN | did as u64
+    }
+
+    /// The command for a device-selective context-cache invalidation: SID in bits 31:16, FM
+    /// (function mask, 2 bits) in bits 33:32, and the domain ID the entry held before the
+    /// change in bits 15:0.
+    pub const fn device(did: u16, source_id: u16, function_mask: u8) -> u64 {
+        ICC | DEVICE
+            | (((function_mask & 3) as u64) << 32)
+            | ((source_id as u64) << 16)
+            | did as u64
+    }
 }
 
 /// IOTLB invalidate register (10.4.8.1).
@@ -294,6 +309,12 @@ pub mod iotlb {
     pub const fn domain(cap: Capability, did: u16) -> u64 {
         (global(cap) & !GLOBAL) | DOMAIN | ((did as u64) << 32)
     }
+
+    /// The command for a page-selective IOTLB invalidation in domain `did`. The pages are
+    /// named by the invalidate address register (IVA), written first.
+    pub const fn page(cap: Capability, did: u16) -> u64 {
+        (global(cap) & !GLOBAL) | PAGE | ((did as u64) << 32)
+    }
 }
 
 /// Fault event control register (10.4.10).
@@ -326,7 +347,7 @@ pub fn register_span(cap: Capability, ecap: ExtendedCapability, drhd_pages: u32)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// CAP and ECAP read from QEMU 8.2.2's intel-iommu with `intremap=off` (39-bit width).
