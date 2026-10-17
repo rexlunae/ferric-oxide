@@ -266,6 +266,20 @@ libraries and file mappings. Fixed mappings, such as non-PIE executables, are
 not moved. Without RDRAND, mappings are placed as upstream places them."""
 
 [[option]]
+id = "kernel.prot_none"
+menu = "kernel"
+type = "bool"
+title = "Enforce PROT_NONE mappings (guard pages)"
+default = true
+kernel_feature = "prot_none"
+rebuild = ["kernel"]
+help = """
+Make PROT_NONE memory inaccessible from user space, so the guard page below
+each thread stack catches overflows. Upstream maps PROT_NONE pages readable,
+which turns guard pages into ordinary memory. The kernel itself can still read
+such pages on behalf of a system call."""
+
+[[option]]
 id = "kernel.kaslr"
 menu = "kernel"
 type = "bool"

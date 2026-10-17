@@ -38,12 +38,23 @@ pub const MMAP_MIN_DEFAULT: usize = PAGE_SIZE;
 
 pub fn page_flags(flags: MapFlags) -> PageFlags<RmmA> {
     PageFlags::new()
-        .user(true)
+        .user(user_accessible(flags))
         .execute(flags.contains(MapFlags::PROT_EXEC))
         .write(flags.contains(MapFlags::PROT_WRITE))
     //TODO: PROT_READ
 }
+/// Whether pages mapped with `flags` may be touched from user mode.
+///
+/// Ferric Oxide: with the `prot_none` feature, PROT_NONE pages are mapped without the user bit,
+/// so any user access faults and the fault is never resolved. Upstream maps them readable.
+fn user_accessible(flags: MapFlags) -> bool {
+    !cfg!(feature = "prot_none")
+        || flags.intersects(MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::PROT_EXEC)
+}
 pub fn map_flags(page_flags: PageFlags<RmmA>) -> MapFlags {
+    if !page_flags.has_user() {
+        return MapFlags::empty();
+    }
     let mut flags = MapFlags::PROT_READ;
     if page_flags.has_write() {
         flags |= MapFlags::PROT_WRITE;
@@ -302,6 +313,7 @@ impl AddrSpaceWrapper {
                 .info
                 .flags()
                 // TODO: Require a capability in order to map executable memory?
+                .user(user_accessible(flags))
                 .execute(flags.contains(MapFlags::PROT_EXEC))
                 .write(flags.contains(MapFlags::PROT_WRITE));
 
@@ -2626,6 +2638,10 @@ fn correct_inner<'l>(
     let pages_from_grant_start = faulting_page.offset_from(grant_base);
 
     let grant_flags = grant_info.flags();
+    // PROT_NONE (see `user_accessible`): no access is ever allowed, so don't map anything.
+    if !grant_flags.has_user() {
+        return Err(PfError::Segv);
+    }
     match access {
         // TODO: has_read
         AccessMode::Read => (),
@@ -3154,6 +3170,7 @@ bitflags::bitflags! {
 impl TlbShootdownActions {
     pub fn change_of_flags(old: PageFlags<RmmA>, new: PageFlags<RmmA>) -> Self {
         let mut this = Self::empty();
+        this.set(Self::REVOKE_READ, old.has_user() && !new.has_user());
         this.set(Self::REVOKE_WRITE, old.has_write() && !new.has_write());
         this.set(Self::REVOKE_EXEC, old.has_execute() && !new.has_execute());
         this
