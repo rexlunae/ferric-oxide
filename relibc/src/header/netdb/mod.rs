@@ -402,8 +402,28 @@ pub unsafe extern "C" fn gethostbyaddr(
 #[unsafe(no_mangle)]
 #[deprecated]
 pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut hostent {
-    let name_cstr = unsafe {
-        CStr::from_nullable_ptr(name).expect("gethostbyname() called with a NULL pointer")
+    #[expect(deprecated)]
+    unsafe {
+        gethostbyname2(name, AF_INET)
+    }
+}
+
+/// Non-POSIX, see <https://man7.org/linux/man-pages/man3/gethostbyname.3.html>.
+/// Resolve host information by name or IP address using AF_INET or AF_INET6.
+///
+/// # Deprecation
+/// New code should use [`getaddrinfo`] instead.
+#[unsafe(no_mangle)]
+#[deprecated]
+pub unsafe extern "C" fn gethostbyname2(name: *const c_char, af: c_int) -> *mut hostent {
+    if af != AF_INET {
+        // TODO: AF_INET6 support
+        H_ERRNO.set(NO_RECOVERY);
+        return ptr::null_mut();
+    };
+    let Some(name_cstr) = (unsafe { CStr::from_nullable_ptr(name) }) else {
+        H_ERRNO.set(NO_RECOVERY);
+        return ptr::null_mut();
     };
     let Ok(name_str) = str::from_utf8(name_cstr.to_bytes()) else {
         H_ERRNO.set(NO_RECOVERY);

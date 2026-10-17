@@ -49,7 +49,7 @@ pub use crate::header::stdio::ctermid;
 pub use crate::header::stdio::cuserid;
 
 use super::{
-    errno::{E2BIG, EINVAL, ENOMEM},
+    errno::{E2BIG, EINTR, EINVAL, EIO, ENOMEM},
     stdio::snprintf,
 };
 
@@ -563,10 +563,28 @@ pub extern "C" fn getegid() -> gid_t {
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getentropy.html>.
-// #[unsafe(no_mangle)]
-#[expect(unused_variables, reason = "function not yet implemented")]
+#[unsafe(no_mangle)]
 pub extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
-    unimplemented!();
+    if length
+        > usize::try_from(limits::GETENTROPY_MAX.cast_unsigned())
+            .expect("GETENTROPY_MAX is within usize")
+    {
+        // required by posix, also by linux to guarantee assert satisfied
+        return Err(Errno(EINVAL)).or_minus_one_errno();
+    }
+    let buf = unsafe { slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+    // A read may return fewer bytes than asked for, so keep reading until the
+    // buffer is full instead of asserting across the C ABI.
+    let mut filled = 0;
+    while filled < length {
+        match Sys::getrandom(&mut buf[filled..], 0) {
+            Ok(0) => return Err(Errno(EIO)).or_minus_one_errno(),
+            Ok(n) => filled += n,
+            Err(e) if e.0 == EINTR => {}
+            Err(e) => return Err(e).or_minus_one_errno(),
+        }
+    }
+    0
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/geteuid.html>.

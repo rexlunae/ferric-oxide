@@ -69,6 +69,18 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if [ "$PREFIX" = kernel ]; then
+            # Upstream code may change the kernel warning counts. Move the
+            # lint ratchet baseline with it so the next fork PR is measured
+            # against upstream's new state, not blamed for it.
+            toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
+            rustup toolchain install "$toolchain" --profile minimal --component rust-src,clippy
+            scripts/ferric-ci/kernel-lint-ratchet.sh --update
+            if ! git diff --quiet -- ci/kernel-lints.json; then
+              git commit -m "Update kernel lint baseline for upstream ${upstream}" -- ci/kernel-lints.json
+            fi
+          fi
           git push --force origin "HEAD:refs/heads/${branch}"
           {
             echo "changed=true"

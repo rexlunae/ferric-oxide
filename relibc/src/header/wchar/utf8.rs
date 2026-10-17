@@ -57,15 +57,12 @@ pub unsafe fn mbrtowc(pwc: *mut wchar_t, s: *const c_char, n: usize, _ps: *mut m
     }
 
     let slice = unsafe { slice::from_raw_parts(s.cast::<u8>(), size) };
-    let decoded = str::from_utf8(slice);
-    if decoded.is_err() {
+    let Ok(wc) = str::from_utf8(slice) else {
         platform::ERRNO.set(errno::EILSEQ);
         return (-1isize).cast_unsigned();
-    }
+    };
 
-    let wc = decoded.unwrap();
-
-    let result: wchar_t = wc.chars().next().unwrap() as wchar_t;
+    let result: wchar_t = wc.chars().next().expect("wc should not be empty") as wchar_t;
 
     if !pwc.is_null() {
         unsafe { *pwc = result };

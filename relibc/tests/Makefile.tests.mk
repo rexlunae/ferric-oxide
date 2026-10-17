@@ -21,8 +21,6 @@ FAILING_TESTS += sys_socket/unixpeername
 FAILING_TESTS += sys_socket/unixscmrights
 # Task failed successfully?
 FAILING_TESTS += signals/pthread_kill-child
-# Not implemented, crashing anyway
-FAILING_TESTS += signals/sigsegv
 # Got EBADF
 FAILING_TESTS += unistd/isatty
 # Got EINVAL
@@ -93,7 +91,7 @@ EXPECT_NAMES=\
 	stdio/fseek \
 	stdio/fwrite \
 	stdio/getc_unget \
-  	stdio/getline \
+	stdio/getline \
 	stdio/mutex \
 	stdio/popen \
 	stdio/printf \
@@ -161,6 +159,7 @@ EXPECT_NAMES=\
 	sys_stat/umask \
 	sys_stat/utimensat \
 	sys_syslog/syslog \
+	sys_uio/basic \
 	time/asctime \
 	time/constants \
 	time/gmtime \
@@ -236,6 +235,7 @@ VARIED_NAMES=\
 	includes \
 	kill-waitpid \
 	limits \
+	limits_cpp \
 	pthread/timedwait \
 	pty/forkpty \
 	psignal \
@@ -284,6 +284,7 @@ VARIED_NAMES=\
 	signals/sigrelse-1 \
 	signals/sigrelse-2 \
 	signals/sigrelse-3 \
+	signals/sigsegv \
 	signals/sigset-1 \
 	signals/sigset-10 \
 	signals/sigset-2 \
@@ -291,6 +292,7 @@ VARIED_NAMES=\
 	signals/sigset-4 \
 	signals/sigset-5 \
 	signals/sigset-9 \
+	signals/stackoverflow \
 	stdio/ctermid \
 	stdio/tempnam \
 	stdio/tmpnam \

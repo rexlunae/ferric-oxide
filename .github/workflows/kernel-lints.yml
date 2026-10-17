@@ -1,0 +1,38 @@
+name: kernel-lints
+
+# Holds kernel Clippy warnings and `unsafe` uses at or below the baseline in
+# ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh).
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+    paths:
+      - "kernel/**"
+      - "crates/**"
+      - "ci/kernel-lints.json"
+      - "scripts/ferric-ci/kernel-lint-ratchet.sh"
+      - ".github/workflows/kernel-lints.yml"
+
+jobs:
+  ratchet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The kernel's build script assembles the AP trampoline with nasm.
+      - name: Install nasm
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
+      - name: Install the kernel toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src,clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+          key: kernel-lints-${{ hashFiles('kernel/Cargo.lock', 'kernel/rust-toolchain.toml') }}
+          restore-keys: kernel-lints-
+      - name: Lint ratchet
+        run: scripts/ferric-ci/kernel-lint-ratchet.sh

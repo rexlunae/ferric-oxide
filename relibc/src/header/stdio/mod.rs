@@ -598,7 +598,7 @@ pub unsafe extern "C" fn fgets(
     }
 
     let mut out = original;
-    let max = max as usize;
+    let max = usize::try_from(max).expect("max should be positive");
     let mut left = max.saturating_sub(1); // Make space for the terminating NUL-byte
     let mut wrote = false;
 
@@ -804,7 +804,7 @@ pub unsafe extern "C" fn freopen(
                 fcntl::fcntl(
                     *stream.file,
                     fcntl::F_SETFD,
-                    fcntl::FD_CLOEXEC as c_ulonglong,
+                    c_ulonglong::try_from(fcntl::FD_CLOEXEC).expect("FD_CLOEXEC within bounds"),
                 )
             };
         }
@@ -821,7 +821,8 @@ pub unsafe extern "C" fn freopen(
             unsafe { fclose(stream) };
             return ptr::null_mut();
         }
-        let new = unsafe { &mut *new }; // Should be safe, new is not null
+        // SAFETY: Should be safe, new is not null
+        let new = unsafe { &mut *new };
         if *new.file == *stream.file {
             new.file.fd = -1;
         } else if Sys::dup2(*new.file, *stream.file).or_minus_one_errno() == -1

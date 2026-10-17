@@ -1111,6 +1111,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         self.root
             .as_deref()?
             .get(handle, self.root_shift())?
@@ -1121,6 +1124,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         let shift = self.root_shift();
         self.root.as_deref_mut()?.get_mut(handle, shift)?.as_mut()
     }
@@ -1129,6 +1135,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         self.root.as_deref()?.get(handle, self.root_shift())
     }
 
@@ -1136,6 +1145,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         let shift = self.root_shift();
         self.root.as_deref_mut()?.get_mut(handle, shift)
     }
@@ -1149,6 +1161,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         let shift = self.root_shift();
         self.root
             .as_deref_mut()?
@@ -1160,6 +1175,9 @@ impl RadixFdTbl {
         if handle >= self.allocated_size {
             return None;
         }
+        // Ferric Oxide: keep a mispredicted bounds check from walking the
+        // table with an attacker-chosen index (Spectre v1).
+        let handle = ferric_nospec::clamp(handle, self.allocated_size);
         let shift = self.root_shift();
         self.root.as_deref_mut()?.get_mut(handle, shift)?.take()
     }

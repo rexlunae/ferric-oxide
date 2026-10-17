@@ -3,9 +3,10 @@
 # other targets and lives in separate workspaces, built through the cookbook.
 [workspace]
 resolver = "3"
-# Keep the build system's default build limited to its original tools.
-default-members = ["tools/cookbook", "tools/ferric-config"]
+# Keep default builds on the build-system tools and shared host-testable crates.
+default-members = ["crates/nospec", "tools/cookbook", "tools/ferric-config"]
 members = [
+    "crates/nospec",
     "tools/cookbook",
     "tools/ferric-config",
     "tools/installer",
