@@ -13,6 +13,7 @@ filesystem_size = 256
 [packages]
 kernel = "source"
 relibc = "source"
+bootloader = "source"
 ferric-xstate-test = "source"
 
 [[files]]

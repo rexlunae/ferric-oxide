@@ -1,5 +1,7 @@
 [source]
-git = "https://gitlab.redox-os.org/redox-os/bootloader.git"
+# The bootloader lives in this repository at bootloader/, a git subtree of
+# gitlab.redox-os.org/redox-os/bootloader (see .github/workflows/subtree-sync.yml).
+path = "bootloader"
 
 [build]
 template = "custom"

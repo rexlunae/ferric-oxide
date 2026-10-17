@@ -32,6 +32,9 @@ jobs:
           - prefix: relibc
             url: https://gitlab.redox-os.org/redox-os/relibc.git
             ref: master
+          - prefix: bootloader
+            url: https://gitlab.redox-os.org/redox-os/bootloader.git
+            ref: master
     steps:
       - uses: actions/checkout@v4
         with:
