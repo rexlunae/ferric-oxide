@@ -1,0 +1,78 @@
+[package]
+name = "redox_installer"
+version = "0.2.42"
+description = "A Redox filesystem builder"
+license = "MIT"
+authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+repository = "https://gitlab.redox-os.org/redox-os/installer"
+default-run = "redox_installer"
+edition = "2021"
+exclude = [
+    "/gui",
+    "/config",
+]
+
+[[bin]]
+name = "redox_installer"
+path = "src/bin/installer.rs"
+required-features = ["installer"]
+
+[[bin]]
+name = "redox_installer_tui"
+path = "src/bin/installer_tui.rs"
+required-features = ["installer"]
+
+[lib]
+name = "redox_installer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+arg_parser = "0.1.0"
+fatfs = { version = "0.3.0", optional = true }
+fscommon = { version = "0.1.1", optional = true }
+gpt = { version = "3.0.0", optional = true }
+libc = { version = "0.2.70", optional = true }
+pkgar = { version = "0.2.3", optional = true }
+pkgar-core = { version = "0.2.3", optional = true }
+pkgar-keys = { version = "0.2.3", optional = true }
+rand = { version = "0.9", optional = true }
+redox-pkg = { version = "0.3.2", features = ["indicatif"], optional = true }
+redox_syscall = { version = "0.9", optional = true }
+redoxfs = { version = "0.9.1", optional = true, default-features = false, features = ["std", "log"] }
+rust-argon2 = { version = "3", optional = true }
+serde = "1"
+serde_derive = "1.0"
+termion = { version = "4", optional = true }
+toml = "0.8"
+uuid = { version = "1.4", features = ["v4"], optional = true }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = { version = "0.1", optional = true }
+ring = { version = "=0.17.8", optional = true }
+
+[features]
+default = ["installer", "fuse"]
+installer = [
+    "fatfs",
+    "fscommon",
+    "gpt",
+    "libc",
+    "libredox",
+    "pkgar",
+    "pkgar-core",
+    "pkgar-keys",
+    "rand",
+    "redox-pkg",
+    "redox_syscall",
+    "redoxfs",
+    "ring",
+    "rust-argon2",
+    "termion",
+    "uuid",
+]
+fuse = ["redoxfs/fuse"]
+
+[patch.crates-io]
+# https://github.com/briansmith/ring/issues/1999
+ring = { git = "https://gitlab.redox-os.org/redox-os/ring.git", branch = "redox-0.17.8" }

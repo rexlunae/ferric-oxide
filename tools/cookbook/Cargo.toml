@@ -43,8 +43,8 @@ pkgar = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
 pkgar-core = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
 pkgar-keys = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
 redox-pkg = { git = "https://gitlab.redox-os.org/redox-os/pkgutils.git", default-features = false }
-redox_installer = { git = "https://gitlab.redox-os.org/redox-os/installer.git", default-features = false }
-redoxer = { git = "https://gitlab.redox-os.org/redox-os/redoxer.git", default-features = false }
+redox_installer.workspace = true
+redoxer = { workspace = true, default-features = false }
 regex = "1.11"
 serde.workspace = true
 termion = "4"

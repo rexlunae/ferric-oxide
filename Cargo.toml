@@ -3,9 +3,13 @@
 # other targets and lives in separate workspaces, built through the cookbook.
 [workspace]
 resolver = "3"
+# Keep the build system's default build limited to its original tools.
+default-members = ["tools/cookbook", "tools/ferric-config"]
 members = [
     "tools/cookbook",
     "tools/ferric-config",
+    "tools/installer",
+    "tools/redoxer",
 ]
 # Recipe sources are checked out under recipes/ and build as their own
 # packages; build output and the toolchain prefix are not crates either.
@@ -14,6 +18,7 @@ members = [
 exclude = [
     "bootloader",
     "userspace",
+    "tools/redoxer/example",
     "recipes",
     "build",
     "prefix",
@@ -23,6 +28,8 @@ exclude = [
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+redox_installer = { path = "tools/installer", default-features = false }
+redoxer = { path = "tools/redoxer", default-features = false }
 
 [profile.release.package.ferric-config]
 opt-level = 2

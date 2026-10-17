@@ -1,6 +1,6 @@
 # Ferric Oxide
 
-**Ferric Oxide** is a full-featured, Rust-based operating system focused on performance. It is a community fork of [Redox OS](https://www.redox-os.org), and this repository is its **build system**: the configuration, recipes and tooling that assemble the kernel, drivers, libraries and applications into a bootable image.
+**Ferric Oxide** is a full-featured, Rust-based operating system focused on performance. It is a community fork of [Redox OS](https://www.redox-os.org), and this repository brings its build tools and core OS components together in a monorepo. Separate Cargo workspaces keep host tools, kernel, bootloader and user space on their own targets.
 
 > Ferric Oxide is an independent project. It is not affiliated with, endorsed by, or sponsored by the Redox OS nonprofit. "Redox OS" is a trademark of the Redox OS nonprofit; see [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md).
 
@@ -48,11 +48,11 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [AI Contribution Policy](A
 
 ## Components
 
-The system is assembled from many repositories. These are currently pulled from upstream Redox; Ferric Oxide forks of them will be listed here as they are created.
+The kernel, bootloader, relibc, base, RedoxFS and book are imported upstream trees. Host tools live under `tools/` and share the root Cargo workspace. Other packages still come from upstream recipes.
 
 | Component | Upstream repository |
 |-----------|---------------------|
-| Kernel | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
+| Kernel ([local](kernel/)) | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
 | Base (essential system components and drivers) | [redox-os/base](https://gitlab.redox-os.org/redox-os/base) |
 | RedoxFS (default file system) | [redox-os/redoxfs](https://gitlab.redox-os.org/redox-os/redoxfs) |
 | relibc (C POSIX library written in Rust) | [redox-os/relibc](https://gitlab.redox-os.org/redox-os/relibc) |
@@ -60,8 +60,37 @@ The system is assembled from many repositories. These are currently pulled from 
 | Ion (default shell) | [redox-os/ion](https://gitlab.redox-os.org/redox-os/ion) |
 | pkgutils (package manager) | [redox-os/pkgutils](https://gitlab.redox-os.org/redox-os/pkgutils) |
 | Orbital (display server and window manager) | [redox-os/orbital](https://gitlab.redox-os.org/redox-os/orbital) |
-| Redoxer (development tool for Linux hosts) | [redox-os/redoxer](https://gitlab.redox-os.org/redox-os/redoxer) |
+| Redoxer ([local host tool](tools/redoxer/)) | [redox-os/redoxer](https://gitlab.redox-os.org/redox-os/redoxer) |
+| Installer ([local host and target source](tools/installer/)) | [redox-os/installer](https://gitlab.redox-os.org/redox-os/installer) |
 | Book | [redox-os/book](https://gitlab.redox-os.org/redox-os/book) |
+
+### Host workspace imports
+
+The root workspace contains cookbook, ferric-config, installer and Redoxer.
+Cookbook uses the local installer and Redoxer libraries; `make fstools` installs
+from `tools/installer`, and the installer recipe copies that same source for
+Redox target builds. RedoxFS stays under `userspace/redoxfs` and builds separately
+for each target.
+
+The new sources are MIT-licensed snapshots of the revisions already pinned by
+cookbook, preserving their copyright notices:
+
+| Directory | Upstream revision |
+| --- | --- |
+| `tools/installer` | `b5a11310e1ac915494efea6d18e242966da74f3f` |
+| `tools/redoxer` | `f50e0d7f490b60110ee6494a06d9b2f9981f8a5a` |
+
+These two snapshots are not yet registered with the subtree-sync workflow.
+Keep fork changes local so their upstream history can be attached when the
+imports are committed. The root lockfile controls host builds; the installer's
+upstream lockfile and ring patch remain for the separate target recipe build.
+Its upstream dependency versions also remain standalone for that recipe.
+Redoxer's nested toolchain file is removed so host members use the root toolchain.
+The installer GUI is omitted from this host-tool import; Redoxer's example
+remains standalone and is excluded from the host workspace.
+
+Validate host changes with `cargo test --locked --workspace`. A build of the
+installer recipe and a QEMU boot additionally validate the target path.
 
 ## Credits
 
