@@ -1,11 +1,16 @@
 //! Ferric Oxide: DMA domains (io/iommu-design.md, step 2).
 //!
-//! A [`Domain`] is a set of second-stage tables with its own domain ID and IOVA space.
-//! Devices are moved into it with [`Domain::attach`] and out of it with [`Domain::detach`],
-//! which leaves them *blocked*: their context entry is not present, so every DMA they issue
-//! faults. Devices that were never attached stay in the identity domain.
+//! A [`Domain`] is a set of I/O page tables with its own domain ID and IOVA space, for
+//! whichever IOMMU the machine has: VT-d (second-stage tables, context entries) or AMD-Vi
+//! (host page tables, device table entries, `amdvi.rs`). The tables are built by the same
+//! walker, `ferric_iommu::table`, with each vendor's entry encoding; callers do not see which
+//! one is in use. Devices are moved into a domain with [`Domain::attach`] and out of it with
+//! [`Domain::detach`], which leaves them *blocked*: every DMA they issue faults (on VT-d their
+//! context entry is not present; on AMD-Vi their device table entry translates through an
+//! empty table with reads and writes refused). Devices that were never attached stay in the
+//! identity domain.
 //!
-//! Every context-entry change follows the VT-d specification's invalidation rules (section
+//! On VT-d, every context-entry change follows the VT-d specification's invalidation rules (section
 //! 6.5.3, "Guidance to Software for Invalidations"): a present entry is first made not
 //! present, then the context cache is invalidated for that device (device-selective, with
 //! the old domain ID) and the IOTLB for the old domain (domain-selective). Only then is the
@@ -14,8 +19,11 @@
 //! (page-selective where possible) and waited on, and only then are emptied table pages
 //! freed.
 //!
-//! A device that an RMRR names gets that reserved memory mapped one-to-one in the domain
-//! before it is attached, so the firmware's DMA to it keeps working. Device scopes that name
+//! AMD-Vi device table entries change in the same order (`amdvi::set_device`).
+//!
+//! A device that an RMRR (VT-d) or a unity or exclusion IVMD (AMD-Vi) names gets that
+//! reserved memory mapped one-to-one in the domain before it is attached, so the firmware's
+//! DMA to it keeps working. Device scopes that name
 //! bridges (in DRHDs and RMRRs) are resolved with the bus ranges pcid reports through
 //! [`report_bridge`].
 //!
@@ -29,7 +37,7 @@ use ferric_vtd::{
     dmar::{BusRange, Structure},
     invalidation::{iotlb_flush_for, Request},
     iova::{IovaAllocator, IovaError, IovaRange},
-    plan::{select_unit, unit_coverage_with, DomainLayout, SelectError, IDENTITY_DOMAIN},
+    plan::{select_unit, unit_coverage_with, SelectError, IDENTITY_DOMAIN},
     table::{
         self, Access, ContextEntry, MapError, RangeError, RootEntry, TableMemory, TranslationType,
         UnmapError, ENTRIES,
@@ -39,7 +47,9 @@ use ferric_vtd::{
 
 use spin::Mutex;
 
-use super::{Error, KernelTables, NoMemory, Unit, UnitState, DMAR, DOMAIN_IDS, LAYOUT, UNITS};
+use super::{
+    amdvi, Error, KernelTables, NoMemory, Unit, UnitState, DMAR, DOMAIN_IDS, LAYOUT, UNITS,
+};
 
 /// The bus ranges of the PCI-to-PCI bridges pcid has reported, by segment and requester ID.
 static BRIDGES: Mutex<BTreeMap<(u16, u16), BusRange>> = Mutex::new(BTreeMap::new());
@@ -47,7 +57,7 @@ static BRIDGES: Mutex<BTreeMap<(u16, u16), BusRange>> = Mutex::new(BTreeMap::new
 /// Why a domain operation failed.
 #[derive(Debug)]
 pub enum DomainError {
-    /// No VT-d unit is enabled, or the units share no table layout.
+    /// No IOMMU is enabled, or the units share no table layout.
     NotEnabled,
     /// Every domain ID is in use.
     NoDomainIds,
@@ -63,7 +73,7 @@ pub enum DomainError {
     Protect(RangeError<UnmapError>),
     /// No unit, or no single unit, serves the device.
     Select(SelectError),
-    /// The unit that serves the device was skipped at boot.
+    /// The IOMMU that serves the device was skipped at boot.
     UnitNotEnabled {
         /// The unit's register base.
         base: u64,
@@ -84,7 +94,7 @@ pub enum DomainError {
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotEnabled => f.write_str("no usable VT-d unit"),
+            Self::NotEnabled => f.write_str("no usable IOMMU"),
             Self::NoDomainIds => f.write_str("out of domain IDs"),
             Self::NoMemory => f.write_str("out of memory for translation tables"),
             Self::Iova(err) => write!(f, "{err}"),
@@ -92,7 +102,7 @@ impl fmt::Display for DomainError {
             Self::Unmap(err) => write!(f, "unmap: {err}"),
             Self::Protect(err) => write!(f, "protect: {err}"),
             Self::Select(err) => write!(f, "{err}"),
-            Self::UnitNotEnabled { base } => write!(f, "VT-d unit {base:#x} is not enabled"),
+            Self::UnitNotEnabled { base } => write!(f, "IOMMU unit {base:#x} is not enabled"),
             Self::Busy { did } => write!(f, "the device is in domain {did}"),
             Self::AlreadyAttached => f.write_str("the device is already attached"),
             Self::NotAttached => f.write_str("the device is not attached"),
@@ -116,16 +126,62 @@ pub struct Device {
     pub bdf: Bdf,
 }
 
-/// A DMA domain: second-stage tables, a domain ID and an IOVA allocator.
+/// Which IOMMU a domain's tables are for, and their layout.
+#[derive(Clone, Copy, Debug)]
+enum Vendor {
+    /// VT-d second-stage tables.
+    Vtd(ferric_vtd::plan::DomainLayout),
+    /// AMD-Vi host page tables.
+    AmdVi(ferric_amdvi::plan::DomainLayout),
+}
+
+impl Vendor {
+    /// The vendor of the enabled IOMMUs, when DMA domains are available.
+    fn current() -> Option<Self> {
+        LAYOUT
+            .get()
+            .map(|&layout| Self::Vtd(layout))
+            .or_else(|| amdvi::layout().map(Self::AmdVi))
+    }
+
+    /// One past the largest IOVA.
+    fn iova_limit(self) -> u64 {
+        match self {
+            Self::Vtd(layout) => layout.iova_limit,
+            Self::AmdVi(layout) => layout.iova_limit,
+        }
+    }
+}
+
+/// How a device is attached, read back from its context or device table entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Attachment {
+    /// In the identity domain: DMA is not translated.
+    Identity,
+    /// Blocked: every DMA faults.
+    Blocked,
+    /// Translated through the tables at `root`, tagged with domain ID `id`.
+    Domain {
+        /// The domain ID.
+        id: u16,
+        /// The root table.
+        root: u64,
+    },
+    /// Something this kernel does not write.
+    Other,
+}
+
+/// A DMA domain: I/O page tables, a domain ID and an IOVA allocator.
 pub struct Domain {
     did: u16,
-    layout: DomainLayout,
+    vendor: Vendor,
     root: u64,
     tables: KernelTables,
     iova: IovaAllocator,
-    /// The attached devices and the index in `UNITS` of the unit that serves each.
+    /// The attached devices and the index of the unit that serves each, in `UNITS` or in
+    /// `amdvi`'s units.
     attached: Vec<(Device, usize)>,
-    /// The RMRRs mapped one-to-one for attached devices.
+    /// The RMRRs or IVMDs mapped one-to-one for attached devices.
     reserved: Vec<Range<u64>>,
     /// Set by [`Domain::close`]: whether the domain was torn down cleanly.
     closed: Option<bool>,
@@ -136,10 +192,10 @@ impl Domain {
     ///
     /// # Errors
     ///
-    /// [`DomainError::NotEnabled`] when VT-d is off, [`DomainError::NoDomainIds`] and
+    /// [`DomainError::NotEnabled`] when no IOMMU is on, [`DomainError::NoDomainIds`] and
     /// [`DomainError::NoMemory`] when out of resources.
     pub fn new() -> Result<Self, DomainError> {
-        let layout = *LAYOUT.get().ok_or(DomainError::NotEnabled)?;
+        let vendor = Vendor::current().ok_or(DomainError::NotEnabled)?;
         let did = DOMAIN_IDS
             .lock()
             .as_mut()
@@ -153,20 +209,23 @@ impl Domain {
                 return Err(DomainError::NoMemory);
             }
         };
-        // RMRRs are left out of every domain's IOVA space, so they can later be mapped
-        // one-to-one for the devices that use them.
-        let reserved = DMAR
-            .get()
-            .into_iter()
-            .flat_map(super::rmrrs)
-            .filter_map(|rmrr| Some(rmrr.base..rmrr.end()?))
-            .collect::<Vec<_>>();
+        // RMRRs and IVMDs are left out of every domain's IOVA space, so they can later be
+        // mapped one-to-one for the devices that use them.
+        let reserved = match vendor {
+            Vendor::Vtd(_) => DMAR
+                .get()
+                .into_iter()
+                .flat_map(super::rmrrs)
+                .filter_map(|rmrr| Some(rmrr.base..rmrr.end()?))
+                .collect::<Vec<_>>(),
+            Vendor::AmdVi(_) => amdvi::reserved_iova(),
+        };
         Ok(Self {
             did,
-            layout,
+            vendor,
             root,
             tables,
-            iova: IovaAllocator::new(layout.iova_limit, reserved),
+            iova: IovaAllocator::new(vendor.iova_limit(), reserved),
             attached: Vec::new(),
             reserved: Vec::new(),
             closed: None,
@@ -178,7 +237,7 @@ impl Domain {
         self.did
     }
 
-    /// The physical address of the second-stage root table.
+    /// The physical address of the root table.
     pub fn root_table(&self) -> u64 {
         self.root
     }
@@ -225,18 +284,28 @@ impl Domain {
         len: u64,
         access: Access,
     ) -> Result<(), DomainError> {
-        let large = self.layout.large_pages;
-        let agaw = self.layout.agaw;
-        let mapped = table::map_range(
-            &mut self.tables,
-            self.root,
-            agaw,
-            iova,
-            phys,
-            len,
-            access,
-            large,
-        );
+        let mapped = match self.vendor {
+            Vendor::Vtd(layout) => table::map_range(
+                &mut self.tables,
+                self.root,
+                layout.agaw,
+                iova,
+                phys,
+                len,
+                access,
+                layout.large_pages,
+            ),
+            Vendor::AmdVi(layout) => ferric_amdvi::table::map_range(
+                &mut self.tables,
+                self.root,
+                layout.levels,
+                iova,
+                phys,
+                len,
+                access,
+                layout.large_pages,
+            ),
+        };
         if let Err(err) = mapped {
             if err.done > 0 {
                 self.unmap(iova, err.done)?;
@@ -244,8 +313,9 @@ impl Domain {
             return Err(DomainError::Map(err));
         }
         self.flush_tables();
-        // Units in caching mode may cache not-present entries, so making entries present
-        // needs an invalidation there (CAP.CM, section 6.1).
+        // VT-d units in caching mode may cache not-present entries, so making entries present
+        // needs an invalidation there (CAP.CM, section 6.1). AMD-Vi gives no such guarantee
+        // either way, so its pages are always invalidated.
         self.flush_iotlb(iova, len, false, |unit| unit.regs.cap.caching_mode())
     }
 
@@ -259,11 +329,21 @@ impl Domain {
     /// [`DomainError::Hardware`] when an invalidation fails; the emptied pages are then kept,
     /// since a unit may still use them.
     pub fn unmap(&mut self, iova: u64, len: u64) -> Result<(), DomainError> {
-        let agaw = self.layout.agaw;
         let mut emptied = Vec::new();
-        let result = table::unmap_range(&mut self.tables, self.root, agaw, iova, len, |page| {
-            emptied.push(page)
-        });
+        let collect = |page| emptied.push(page);
+        let result = match self.vendor {
+            Vendor::Vtd(layout) => {
+                table::unmap_range(&mut self.tables, self.root, layout.agaw, iova, len, collect)
+            }
+            Vendor::AmdVi(layout) => ferric_amdvi::table::unmap_range(
+                &mut self.tables,
+                self.root,
+                layout.levels,
+                iova,
+                len,
+                collect,
+            ),
+        };
         let done = match &result {
             Ok(()) => len,
             Err(err) => err.done,
@@ -288,8 +368,19 @@ impl Domain {
     /// inside a large page (the part before that is changed and invalidated), and
     /// [`DomainError::Hardware`] when an invalidation fails.
     pub fn protect(&mut self, iova: u64, len: u64, access: Access) -> Result<(), DomainError> {
-        let agaw = self.layout.agaw;
-        let result = table::protect_range(&mut self.tables, self.root, agaw, iova, len, access);
+        let result = match self.vendor {
+            Vendor::Vtd(layout) => {
+                table::protect_range(&mut self.tables, self.root, layout.agaw, iova, len, access)
+            }
+            Vendor::AmdVi(layout) => ferric_amdvi::table::protect_range(
+                &mut self.tables,
+                self.root,
+                layout.levels,
+                iova,
+                len,
+                access,
+            ),
+        };
         let done = match &result {
             Ok(()) => len,
             Err(err) => err.done,
@@ -309,37 +400,54 @@ impl Domain {
     /// The physical address and access a device in this domain gets for `iova`, read back
     /// from the tables.
     pub fn translate(&mut self, iova: u64) -> Option<(u64, Access)> {
-        table::translate(&mut self.tables, self.root, self.layout.agaw, iova)
+        match self.vendor {
+            Vendor::Vtd(layout) => table::translate(&mut self.tables, self.root, layout.agaw, iova),
+            Vendor::AmdVi(layout) => {
+                ferric_amdvi::table::translate(&mut self.tables, self.root, layout.levels, iova)
+            }
+        }
     }
 
     /// Moves `device` from the identity domain (or the blocked state) into this domain,
-    /// after mapping the reserved memory of every RMRR that names it one-to-one.
+    /// after mapping the reserved memory of every RMRR or IVMD that names it one-to-one.
     ///
     /// # Errors
     ///
     /// [`DomainError::Select`] or [`DomainError::UnitNotEnabled`] when no enabled unit
-    /// serves the device, [`DomainError::Map`] when an RMRR cannot be mapped,
+    /// serves the device, [`DomainError::Map`] when reserved memory cannot be mapped,
     /// [`DomainError::Busy`] when it is in another domain, [`DomainError::AlreadyAttached`],
-    /// and [`DomainError::Hardware`] when an invalidation fails. On error the RMRRs mapped for
-    /// this call are unmapped again.
+    /// and [`DomainError::Hardware`] when an invalidation fails. On error the reserved memory
+    /// mapped for this call is unmapped again.
     pub fn attach(&mut self, device: Device) -> Result<(), DomainError> {
         if self.attached.iter().any(|&(d, _)| d == device) {
             return Err(DomainError::AlreadyAttached);
         }
         let index = unit_for(device)?;
         let mapped = self.map_reserved(device)?;
-        let entry = ContextEntry::new(
-            self.root,
-            self.layout.agaw,
-            self.did,
-            TranslationType::Untranslated,
-        );
-        let result = set_context(index, device.bdf, Target::Entry(entry), |old| {
-            match old.is_present().then(|| old.domain_id()) {
-                Some(did) if did != IDENTITY_DOMAIN => Err(DomainError::Busy { did }),
-                _ => Ok(()),
+        let result = match self.vendor {
+            Vendor::Vtd(layout) => {
+                let entry = ContextEntry::new(
+                    self.root,
+                    layout.agaw,
+                    self.did,
+                    TranslationType::Untranslated,
+                );
+                set_context(index, device.bdf, Target::Entry(entry), |old| {
+                    match old.is_present().then(|| old.domain_id()) {
+                        Some(did) if did != IDENTITY_DOMAIN => Err(DomainError::Busy { did }),
+                        _ => Ok(()),
+                    }
+                })
+                .map(drop)
             }
-        });
+            Vendor::AmdVi(_) => {
+                let target = amdvi::Target::Translated {
+                    root: self.root,
+                    domain: self.did,
+                };
+                amdvi::set_device(index, device, target, amdvi::refuse_busy)
+            }
+        };
         if let Err(err) = result {
             self.unmap_reserved(mapped);
             return Err(err);
@@ -348,15 +456,16 @@ impl Domain {
         Ok(())
     }
 
-    /// Maps the RMRRs that name `device` and are not mapped yet one-to-one, and returns them.
+    /// Maps the reserved memory that names `device` and is not mapped yet one-to-one, and
+    /// returns it.
     fn map_reserved(&mut self, device: Device) -> Result<Vec<Range<u64>>, DomainError> {
         let mut mapped = Vec::new();
-        for range in rmrr_ranges(device) {
+        for (range, access) in reserved_ranges(device) {
             if self.reserved.contains(&range) {
                 continue;
             }
             let len = range.end.saturating_sub(range.start);
-            if let Err(err) = self.map(range.start, range.start, len, Access::ReadWrite) {
+            if let Err(err) = self.map(range.start, range.start, len, access) {
                 self.unmap_reserved(mapped);
                 return Err(err);
             }
@@ -366,14 +475,14 @@ impl Domain {
         Ok(mapped)
     }
 
-    /// Unmaps RMRRs that [`Domain::map_reserved`] mapped, after a failed attach.
+    /// Unmaps reserved memory that [`Domain::map_reserved`] mapped, after a failed attach.
     fn unmap_reserved(&mut self, ranges: Vec<Range<u64>>) {
         for range in ranges {
             self.reserved.retain(|r| *r != range);
             let len = range.end.saturating_sub(range.start);
             if let Err(err) = self.unmap(range.start, len) {
                 warn!(
-                    "IOMMU: cannot unmap RMRR {:#x}-{:#x} from domain {}: {err}",
+                    "IOMMU: cannot unmap reserved memory {:#x}-{:#x} from domain {}: {err}",
                     range.start, range.end, self.did
                 );
             }
@@ -398,19 +507,21 @@ impl Domain {
             .get(position)
             .map(|&(_, index)| index)
             .ok_or(DomainError::NotAttached)?;
-        set_context(index, device.bdf, Target::Blocked, |_| Ok(()))?;
+        block(self.vendor, index, device)?;
         self.attached.swap_remove(position);
         Ok(())
     }
 
-    /// Writes the domain's changed tables out of the CPU caches, for units that need it.
+    /// Writes the domain's changed tables out of the CPU caches, for VT-d units that need it.
+    /// AMD-Vi page-table reads are coherent.
     fn flush_tables(&self) {
-        if self.layout.flush_cpu_caches {
+        if matches!(self.vendor, Vendor::Vtd(layout) if layout.flush_cpu_caches) {
             self.tables.flush_cpu_caches();
         }
     }
 
-    /// Invalidates the IOTLB for `[iova, iova + len)` on each attached unit `filter` accepts.
+    /// Invalidates the IOTLB for `[iova, iova + len)` on each attached unit; on VT-d only on
+    /// those `filter` accepts.
     fn flush_iotlb(
         &self,
         iova: u64,
@@ -418,8 +529,17 @@ impl Domain {
         freed_tables: bool,
         filter: impl Fn(&Unit) -> bool,
     ) -> Result<(), DomainError> {
-        let units = units();
         let mut done: Vec<usize> = Vec::new();
+        if let Vendor::AmdVi(_) = self.vendor {
+            for &(_, index) in &self.attached {
+                if !done.contains(&index) {
+                    amdvi::flush_pages(index, self.did, iova, len)?;
+                    done.push(index);
+                }
+            }
+            return Ok(());
+        }
+        let units = units();
         for &(_, index) in &self.attached {
             let Some(unit) = units.get(index).filter(|u| filter(u)) else {
                 continue;
@@ -448,7 +568,7 @@ impl Domain {
         }
         let mut clean = true;
         for (device, index) in core::mem::take(&mut self.attached) {
-            if let Err(err) = set_context(index, device.bdf, Target::Blocked, |_| Ok(())) {
+            if let Err(err) = block(self.vendor, index, device) {
                 error!(
                     "IOMMU: cannot detach {:04x}:{} from domain {}: {err}; leaking its tables",
                     device.segment, device.bdf, self.did
@@ -479,13 +599,29 @@ fn release_did(did: u16) {
     }
 }
 
-/// The enabled units.
+/// Blocks `device` on unit `index` of `vendor`.
+fn block(vendor: Vendor, index: usize, device: Device) -> Result<(), DomainError> {
+    match vendor {
+        Vendor::Vtd(_) => set_context(index, device.bdf, Target::Blocked, |_| Ok(())).map(drop),
+        Vendor::AmdVi(_) => amdvi::set_device(index, device, amdvi::Target::Blocked, |_| Ok(())),
+    }
+}
+
+/// The enabled VT-d units.
 fn units() -> &'static [Unit] {
     UNITS.get().map_or(&[], Vec::as_slice)
 }
 
-/// The index in `UNITS` of the enabled unit that serves `device`.
+/// The index of the enabled unit that serves `device`, in `UNITS` or in `amdvi`'s units.
 fn unit_for(device: Device) -> Result<usize, DomainError> {
+    match Vendor::current() {
+        Some(Vendor::AmdVi(_)) => amdvi::unit_for(device),
+        _ => vtd_unit_for(device),
+    }
+}
+
+/// The index in `UNITS` of the enabled VT-d unit that serves `device`.
+fn vtd_unit_for(device: Device) -> Result<usize, DomainError> {
     let dmar = DMAR.get().ok_or(DomainError::NotEnabled)?;
     let drhds = dmar
         .structures()
@@ -521,6 +657,18 @@ fn bridge_buses(segment: u16, bridge: Bdf) -> Option<BusRange> {
     BRIDGES.lock().get(&(segment, bridge.source_id())).copied()
 }
 
+/// The reserved memory `device` must reach one-to-one, and how: every RMRR (VT-d) or unity or
+/// exclusion IVMD (AMD-Vi) that names it.
+fn reserved_ranges(device: Device) -> Vec<(Range<u64>, Access)> {
+    match Vendor::current() {
+        Some(Vendor::AmdVi(_)) => amdvi::reserved_ranges(device),
+        _ => rmrr_ranges(device)
+            .into_iter()
+            .map(|range| (range, Access::ReadWrite))
+            .collect(),
+    }
+}
+
 /// The memory of every RMRR that names `device`. Scopes that pass through bridges pcid has
 /// not reported do not match.
 fn rmrr_ranges(device: Device) -> Vec<Range<u64>> {
@@ -539,9 +687,9 @@ fn rmrr_ranges(device: Device) -> Vec<Range<u64>> {
         .collect()
 }
 
-/// Whether an RMRR names `device`.
-pub(super) fn has_rmrr(device: Device) -> bool {
-    !rmrr_ranges(device).is_empty()
+/// Whether reserved memory (an RMRR or an IVMD) names `device`.
+pub(super) fn has_reserved_memory(device: Device) -> bool {
+    !reserved_ranges(device).is_empty()
 }
 
 /// What a device's context entry becomes.
@@ -605,8 +753,29 @@ fn set_context(
     Ok(old)
 }
 
-/// `bdf`'s context entry on unit `index`, read back from the tables.
-pub(super) fn context_entry(index: usize, bdf: Bdf) -> Result<ContextEntry, DomainError> {
+/// How `device` is attached, read back from its context or device table entry.
+pub(super) fn attachment(device: Device) -> Result<Attachment, DomainError> {
+    let index = unit_for(device)?;
+    if let Some(Vendor::AmdVi(_)) = Vendor::current() {
+        return amdvi::attachment(index, device);
+    }
+    let entry = context_entry(index, device.bdf)?;
+    Ok(if !entry.is_present() {
+        Attachment::Blocked
+    } else if entry.domain_id() == IDENTITY_DOMAIN {
+        Attachment::Identity
+    } else if entry.translation_type() == Some(TranslationType::Untranslated) {
+        Attachment::Domain {
+            id: entry.domain_id(),
+            root: entry.table(),
+        }
+    } else {
+        Attachment::Other
+    })
+}
+
+/// `bdf`'s context entry on VT-d unit `index`, read back from the tables.
+fn context_entry(index: usize, bdf: Bdf) -> Result<ContextEntry, DomainError> {
     let unit = units().get(index).ok_or(DomainError::NotEnabled)?;
     let mut state = unit.state.lock();
     let table = state
@@ -621,6 +790,9 @@ pub(super) fn context_entry(index: usize, bdf: Bdf) -> Result<ContextEntry, Doma
 /// which attaches a device nothing uses and must leave it as it was.
 pub(super) fn restore_identity(device: Device) -> Result<(), DomainError> {
     let index = unit_for(device)?;
+    if let Some(Vendor::AmdVi(_)) = Vendor::current() {
+        return amdvi::set_device(index, device, amdvi::Target::Identity, amdvi::refuse_busy);
+    }
     set_context(index, device.bdf, Target::Identity, |old| {
         if old.is_present() && old.domain_id() != IDENTITY_DOMAIN {
             Err(DomainError::Busy {
@@ -633,9 +805,14 @@ pub(super) fn restore_identity(device: Device) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// The index in `UNITS` of the unit that serves `device`, for the self-test.
+/// The index of the unit that serves `device`, for the self-test.
 pub(super) fn unit_index(device: Device) -> Result<usize, DomainError> {
     unit_for(device)
+}
+
+/// The index in `UNITS` of the VT-d unit that serves `device`, for interrupt remapping.
+pub(super) fn vtd_unit_index(device: Device) -> Result<usize, DomainError> {
+    vtd_unit_for(device)
 }
 
 /// The context table for `bus` on `unit`, giving the bus a table of its own first if it
