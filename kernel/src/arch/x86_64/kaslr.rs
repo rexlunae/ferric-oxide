@@ -41,7 +41,7 @@ pub fn choose_phys_offset(phys_end: usize) -> Option<usize> {
         return None;
     }
     let slots = slot_count(low, high);
-    let random = usize::try_from(random_u64()?).ok()?;
+    let random = usize::try_from(crate::random::hw_u64()?).ok()?;
     low.checked_add(random.checked_rem(slots)?.checked_mul(ALIGN)?)
 }
 
@@ -62,34 +62,4 @@ pub fn entropy_bits(phys_end: usize) -> u32 {
         (Some(low), Some(high)) if high > low => slot_count(low, high).ilog2(),
         _ => 0,
     }
-}
-
-/// Reads a random number from RDRAND, or `None` if the CPU has no RDRAND or it keeps failing.
-fn random_u64() -> Option<u64> {
-    let has_rdrand = raw_cpuid::CpuId::new()
-        .get_feature_info()
-        .is_some_and(|f| f.has_rdrand());
-    if !has_rdrand {
-        return None;
-    }
-    // Intel's DRNG guide recommends retrying up to 10 times before giving up.
-    for _ in 0..10 {
-        let value: u64;
-        let ok: u8;
-        // SAFETY: RDRAND is present (checked above) and only writes the two output registers
-        // and the flags.
-        unsafe {
-            core::arch::asm!(
-                "rdrand {value}",
-                "setc {ok}",
-                value = out(reg) value,
-                ok = out(reg_byte) ok,
-                options(nomem, nostack),
-            );
-        }
-        if ok != 0 {
-            return Some(value);
-        }
-    }
-    None
 }
