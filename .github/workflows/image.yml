@@ -74,21 +74,11 @@ jobs:
       - name: Build image
         run: make all CONFIG_NAME="$CONFIG_NAME"
 
-      - name: Disassemble ld.so around the crash
+      - name: Find where libc.so was loaded at the crash
         run: |
-          apt-get install -y -q binutils file >/dev/null 2>&1 || true
-          find . -path '*stage*' \( -name 'ld64.so*' -o -name 'libc.so*' \) | head
-          ld="$(find . -path '*relibc*stage*' -name 'ld64.so.1' | head -1)"
-          file "$ld"; readelf -lh "$ld" | grep -E 'Entry|LOAD' -A1
-          entry=$(readelf -h "$ld" | awk '/Entry/ {print $4}')
-          base=$(( ((0xf0d05d - entry + 0x800) / 0x1000) * 0x1000 ))
-          printf 'guessed base %#x\n' $base
-          for pc in 0xd29f39 0xcfb7b4 0xd4be43 0xd4c32c 0xd49b3b 0xd4a521 0xce51cd 0xc07315 0xf0d05d; do
-            off=$((pc - base)); printf '=== %s off %#x\n' $pc $off
-            addr2line -f -C -e "$ld" $(printf '%#x' $off) || true
-            s=$(printf '0x%x' $((off-0x80))); e=$(printf '0x%x' $((off+0x20)))
-            objdump -d -C --no-show-raw-insn --start-address=$s --stop-address=$e "$ld" | tail -n +7
-          done
+          apt-get install -y -q binutils python3 >/dev/null 2>&1 || true
+          lib=recipes/core/relibc/target/x86_64-unknown-redox/stage/usr/lib/libc.so
+          python3 scripts/ferric-ci/find-base.py "$lib" 0xd29f39,0xcfb7b4,0xd4be43,0xd4c32c,0xd49b3b,0xd4a521,0xce51cd,0xc07315
 
       - name: Compress image
         run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
