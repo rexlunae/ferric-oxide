@@ -29,5 +29,8 @@ pcid = "never"
 # "never" makes the Makefile build with -Z cf-protection=branch. "auto" turns it
 # on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.
 ibt = "never"
+# Ferric Oxide: kernel shadow stacks (Intel CET SS), "auto" or "never". So far
+# "auto" only logs whether the CPU supports them; nothing is enabled yet.
+shstk = "never"
 
 # vim: ft=toml

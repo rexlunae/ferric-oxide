@@ -1,5 +1,5 @@
-//! Intel Control-flow Enforcement Technology (CET) indirect branch tracking (IBT) for the
-//! Ferric Oxide kernel.
+//! Intel Control-flow Enforcement Technology (CET) for the Ferric Oxide kernel: indirect branch
+//! tracking (IBT) and, in preparation, supervisor shadow stacks.
 //!
 //! With IBT on, every indirect `call` or `jmp`, and every entry through the IDT or `SYSCALL`,
 //! must land on an `endbr64` instruction, or the CPU raises a control-protection exception
@@ -7,13 +7,15 @@
 //!
 //! This crate holds the parts that do not need the hardware, so they can be tested on the host:
 //!
-//! - [`has_ibt`] reads the CPUID feature bit.
-//! - [`decide`] applies the build's [`Policy`] (`kernel.cpu.ibt` in `ferric.toml`) to it.
+//! - [`has_ibt`] and [`has_shstk`] read the CPUID feature bits.
+//! - [`decide`] applies the build's [`Policy`] for one [`Feature`] (`kernel.cpu.ibt` or
+//!   `kernel.cpu.shstk` in `ferric.toml`) to them.
 //! - [`ControlProtectionError`] decodes the #CP error code for the panic message.
 //! - The constants name the CPUID bit, the MSRs and the control-register bits the kernel writes.
 //!
-//! The kernel side (`kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4. Shadow stacks and
-//! user-mode CET are not covered here.
+//! The kernel side (`kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4 for IBT. Shadow
+//! stacks are only detected and reported so far (`kernel/src/arch/x86_64/shstk.rs`); nothing
+//! turns them on yet. User-mode CET is not covered here.
 //!
 //! Specification: Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 1,
 //! chapter 17 ("Control-flow Enforcement Technology"); Volume 2, `CPUID` leaf 07H; Volume 3A,
@@ -23,12 +25,18 @@
 //! # Examples
 //!
 //! ```
-//! use ferric_cet::{decide, has_ibt, Policy, CPUID_7_0_EDX_CET_IBT};
+//! use ferric_cet::{
+//!     decide, has_ibt, has_shstk, Feature, Policy, CPUID_7_0_ECX_CET_SS, CPUID_7_0_EDX_CET_IBT,
+//! };
 //!
 //! let edx = CPUID_7_0_EDX_CET_IBT;
-//! assert_eq!(decide(Policy::Auto, has_ibt(edx)), Ok(true));
-//! assert_eq!(decide(Policy::Auto, has_ibt(0)), Ok(false));
-//! assert!(decide(Policy::Always, has_ibt(0)).is_err());
+//! assert_eq!(decide(Feature::Ibt, Policy::Auto, has_ibt(edx)), Ok(true));
+//! assert_eq!(decide(Feature::Ibt, Policy::Auto, has_ibt(0)), Ok(false));
+//! assert!(decide(Feature::Ibt, Policy::Always, has_ibt(0)).is_err());
+//!
+//! let ecx = CPUID_7_0_ECX_CET_SS;
+//! assert_eq!(decide(Feature::ShadowStack, Policy::Auto, has_shstk(ecx)), Ok(true));
+//! assert_eq!(decide(Feature::ShadowStack, Policy::Never, has_shstk(ecx)), Ok(false));
 //! ```
 
 #![no_std]
@@ -39,6 +47,9 @@ use core::fmt;
 
 /// `CPUID.(EAX=7,ECX=0):EDX[20]`: the CPU supports CET indirect branch tracking.
 pub const CPUID_7_0_EDX_CET_IBT: u32 = 1 << 20;
+
+/// `CPUID.(EAX=7,ECX=0):ECX[7]`: the CPU supports CET shadow stacks.
+pub const CPUID_7_0_ECX_CET_SS: u32 = 1 << 7;
 
 /// `IA32_U_CET`: CET configuration for user mode. The kernel leaves it at zero.
 pub const IA32_U_CET: u32 = 0x6A0;
@@ -80,52 +91,123 @@ pub const fn has_ibt(cpuid_7_0_edx: u32) -> bool {
     cpuid_7_0_edx & CPUID_7_0_EDX_CET_IBT != 0
 }
 
-/// The build-time IBT policy, the value of `kernel.cpu.ibt`.
+/// Whether the CPU supports shadow stacks, from `CPUID.(EAX=7,ECX=0):ECX`.
+///
+/// The caller must make sure leaf 7 exists (the maximum basic leaf is at least 7); on CPUs
+/// without it, pass 0.
+#[inline]
+pub const fn has_shstk(cpuid_7_0_ecx: u32) -> bool {
+    cpuid_7_0_ecx & CPUID_7_0_ECX_CET_SS != 0
+}
+
+/// A CET feature the kernel can be configured to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Feature {
+    /// Indirect branch tracking (`kernel.cpu.ibt`, `CPUID.(EAX=7,ECX=0):EDX[20]`).
+    Ibt,
+    /// Supervisor shadow stacks (`kernel.cpu.shstk`, `CPUID.(EAX=7,ECX=0):ECX[7]`).
+    ShadowStack,
+}
+
+impl Feature {
+    /// The `ferric.toml` option that sets this feature's [`Policy`].
+    pub const fn option(self) -> &'static str {
+        match self {
+            Self::Ibt => "kernel.cpu.ibt",
+            Self::ShadowStack => "kernel.cpu.shstk",
+        }
+    }
+
+    /// The feature's name in messages.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Ibt => "CET indirect branch tracking",
+            Self::ShadowStack => "CET shadow stacks",
+        }
+    }
+
+    /// The CPUID bit that reports the feature.
+    pub const fn cpuid_bit(self) -> &'static str {
+        match self {
+            Self::Ibt => "CPUID.(EAX=7,ECX=0):EDX[20]",
+            Self::ShadowStack => "CPUID.(EAX=7,ECX=0):ECX[7]",
+        }
+    }
+}
+
+/// The build-time policy for one CET [`Feature`], the value of `kernel.cpu.ibt` or
+/// `kernel.cpu.shstk`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Policy {
-    /// Require IBT; booting on a CPU without it is an error.
+    /// Require the feature; booting on a CPU without it is an error.
     Always,
-    /// Use IBT when the CPU has it.
+    /// Use the feature when the CPU has it.
     Auto,
-    /// Never use IBT (the kernel is built without `endbr64`).
+    /// Never use the feature (for IBT, the kernel is built without `endbr64`).
     Never,
 }
 
-/// Why IBT could not be turned on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum IbtError {
-    /// The policy is [`Policy::Always`] but the CPU does not report `CET_IBT`.
-    Unsupported,
+impl Policy {
+    /// The option value as written in `ferric.toml` and the kernel's `config.toml`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Auto => "auto",
+            Self::Never => "never",
+        }
+    }
 }
 
-impl fmt::Display for IbtError {
+impl fmt::Display for Policy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a CET feature could not be turned on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CetError {
+    /// The policy is [`Policy::Always`] but the CPU does not report the feature.
+    Unsupported(Feature),
+}
+
+impl fmt::Display for CetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unsupported => f.write_str(
-                "kernel.cpu.ibt is \"always\" but this CPU does not support CET indirect branch \
-                 tracking (CPUID.(EAX=7,ECX=0):EDX[20] is clear)",
+            Self::Unsupported(feature) => write!(
+                f,
+                "{} is \"always\" but this CPU does not support {} ({} is clear)",
+                feature.option(),
+                feature.description(),
+                feature.cpuid_bit(),
             ),
         }
     }
 }
 
-impl core::error::Error for IbtError {}
+impl core::error::Error for CetError {}
 
-/// Decides whether to turn IBT on for a CPU.
+/// Decides whether to turn `feature` on for a CPU.
 ///
-/// Returns `Ok(true)` to enable it and `Ok(false)` to leave it off.
+/// Returns `Ok(true)` to enable it and `Ok(false)` to leave it off. The rule is the same for
+/// every feature; `feature` names it in the error.
 ///
 /// # Errors
 ///
-/// [`IbtError::Unsupported`] when `policy` is [`Policy::Always`] and `cpu_has_ibt` is false.
-pub const fn decide(policy: Policy, cpu_has_ibt: bool) -> Result<bool, IbtError> {
+/// [`CetError::Unsupported`] when `policy` is [`Policy::Always`] and `cpu_has_feature` is false.
+pub const fn decide(
+    feature: Feature,
+    policy: Policy,
+    cpu_has_feature: bool,
+) -> Result<bool, CetError> {
     match policy {
         Policy::Never => Ok(false),
-        Policy::Auto => Ok(cpu_has_ibt),
-        Policy::Always if cpu_has_ibt => Ok(true),
-        Policy::Always => Err(IbtError::Unsupported),
+        Policy::Auto => Ok(cpu_has_feature),
+        Policy::Always if cpu_has_feature => Ok(true),
+        Policy::Always => Err(CetError::Unsupported(feature)),
     }
 }
 
@@ -212,13 +294,36 @@ mod tests {
     }
 
     #[test]
+    fn shstk_bit_is_ecx_7() {
+        assert!(!has_shstk(0));
+        assert!(has_shstk(1 << 7));
+        assert!(has_shstk(u32::MAX));
+        assert!(!has_shstk(!(1 << 7)));
+        // CET_IBT is in EDX[20]; ECX[20] alone must not count.
+        assert!(!has_shstk(1 << 20));
+        assert_eq!(CPUID_7_0_ECX_CET_SS, 0x80);
+    }
+
+    #[test]
     fn policy() {
-        assert_eq!(decide(Policy::Never, true), Ok(false));
-        assert_eq!(decide(Policy::Never, false), Ok(false));
-        assert_eq!(decide(Policy::Auto, true), Ok(true));
-        assert_eq!(decide(Policy::Auto, false), Ok(false));
-        assert_eq!(decide(Policy::Always, true), Ok(true));
-        assert_eq!(decide(Policy::Always, false), Err(IbtError::Unsupported));
+        for feature in [Feature::Ibt, Feature::ShadowStack] {
+            assert_eq!(decide(feature, Policy::Never, true), Ok(false));
+            assert_eq!(decide(feature, Policy::Never, false), Ok(false));
+            assert_eq!(decide(feature, Policy::Auto, true), Ok(true));
+            assert_eq!(decide(feature, Policy::Auto, false), Ok(false));
+            assert_eq!(decide(feature, Policy::Always, true), Ok(true));
+            assert_eq!(
+                decide(feature, Policy::Always, false),
+                Err(CetError::Unsupported(feature))
+            );
+        }
+    }
+
+    #[test]
+    fn policy_names() {
+        assert_eq!(Policy::Always.to_string(), "always");
+        assert_eq!(Policy::Auto.to_string(), "auto");
+        assert_eq!(Policy::Never.to_string(), "never");
     }
 
     #[test]
@@ -251,6 +356,16 @@ mod tests {
 
     #[test]
     fn unsupported_message_names_the_option() {
-        assert!(IbtError::Unsupported.to_string().contains("kernel.cpu.ibt"));
+        // Unchanged from before shadow-stack support, so IBT boot panics read the same.
+        assert_eq!(
+            CetError::Unsupported(Feature::Ibt).to_string(),
+            "kernel.cpu.ibt is \"always\" but this CPU does not support CET indirect branch \
+             tracking (CPUID.(EAX=7,ECX=0):EDX[20] is clear)"
+        );
+        assert_eq!(
+            CetError::Unsupported(Feature::ShadowStack).to_string(),
+            "kernel.cpu.shstk is \"always\" but this CPU does not support CET shadow stacks \
+             (CPUID.(EAX=7,ECX=0):ECX[7] is clear)"
+        );
     }
 }

@@ -27,7 +27,9 @@
 //!
 //! The CPUID, MSR and #CP decoding logic lives in the host-tested `ferric-cet` crate.
 
-use ferric_cet::Policy;
+use core::arch::x86_64::CpuidResult;
+
+use ferric_cet::{Feature, Policy};
 
 /// Whether the kernel was built for IBT, i.e. hand-written entry points start with `endbr64`.
 pub const COMPILED: bool = cfg!(cpu_feature_always = "ibt") || cfg!(cpu_feature_auto = "ibt");
@@ -41,11 +43,16 @@ const POLICY: Policy = if cfg!(cpu_feature_always = "ibt") {
     Policy::Never
 };
 
-/// Whether this CPU supports IBT.
-fn cpu_has_ibt() -> bool {
+/// `CPUID.(EAX=7,ECX=0)`, where the CET feature bits are, or `None` on CPUs without leaf 7.
+pub(super) fn cpuid_7_0() -> Option<CpuidResult> {
     // Leaf 7 only exists when the maximum basic leaf reaches it.
     let max_leaf = core::arch::x86_64::__cpuid(0).eax;
-    max_leaf >= 7 && ferric_cet::has_ibt(core::arch::x86_64::__cpuid_count(7, 0).edx)
+    (max_leaf >= 7).then(|| core::arch::x86_64::__cpuid_count(7, 0))
+}
+
+/// Whether this CPU supports IBT.
+fn cpu_has_ibt() -> bool {
+    cpuid_7_0().is_some_and(|leaf| ferric_cet::has_ibt(leaf.edx))
 }
 
 /// Decides whether to enable IBT on the current CPU.
@@ -57,7 +64,7 @@ fn decide() -> bool {
     if !COMPILED {
         return false;
     }
-    match ferric_cet::decide(POLICY, cpu_has_ibt()) {
+    match ferric_cet::decide(Feature::Ibt, POLICY, cpu_has_ibt()) {
         Ok(on) => on,
         Err(err) => {
             panic!("IBT: {err}; rebuild with kernel.cpu.ibt = \"auto\" or \"never\"")
