@@ -887,7 +887,11 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
                 break false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => break false,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
         }
     };
     // The pipe reaches end of file once the child is gone.
