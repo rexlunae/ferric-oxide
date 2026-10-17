@@ -251,6 +251,22 @@ rebuild = ["kernel"]
 help = "Bring up application processors. Turning this off gives a single-CPU kernel, useful when bisecting races."
 
 [[option]]
+id = "kernel.kaslr"
+menu = "kernel"
+type = "bool"
+title = "Randomize the kernel memory layout (KASLR)"
+default = true
+depends = "target.arch == 'x86_64'"
+kernel_feature = "kaslr"
+rebuild = ["kernel"]
+help = """
+Place the kernel's map of physical memory at a random 1 GiB-aligned address at
+each boot (about 17 bits of randomness, from RDRAND), so a physical address no
+longer gives away its kernel virtual address. Without RDRAND the map stays at
+its usual place and the boot log says so. Randomizing the kernel image itself
+comes later."""
+
+[[option]]
 id = "kernel.numa"
 menu = "kernel"
 type = "bool"

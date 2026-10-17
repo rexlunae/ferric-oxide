@@ -55,6 +55,15 @@ pub trait Arch: Clone + Copy {
 
     const PHYS_OFFSET: usize;
 
+    /// Where the linear map of physical memory starts right now.
+    ///
+    /// This is [`Self::PHYS_OFFSET`] unless the architecture lets the kernel move the map at
+    /// boot (Ferric Oxide KASLR on x86_64).
+    #[inline(always)]
+    fn phys_offset() -> usize {
+        Self::PHYS_OFFSET
+    }
+
     const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;
     const PAGE_OFFSET_MASK: usize = Self::PAGE_SIZE - 1;
     const PAGE_ADDRESS_SHIFT: usize = Self::PAGE_LEVELS * Self::PAGE_ENTRY_SHIFT + Self::PAGE_SHIFT;
@@ -93,14 +102,14 @@ pub trait Arch: Clone + Copy {
     #[inline(always)]
     fn phys_to_virt(phys: PhysicalAddress) -> VirtualAddress {
         #[cfg(not(target_pointer_width = "32"))]
-        match phys.data().checked_add(Self::PHYS_OFFSET) {
+        match phys.data().checked_add(Self::phys_offset()) {
             Some(some) => VirtualAddress::new(some),
             None => panic!("phys_to_virt({:#x}) overflow", phys.data()),
         }
         // FIXME: Overflow on purpose
         #[cfg(target_pointer_width = "32")]
         {
-            VirtualAddress::new(phys.data() + Self::PHYS_OFFSET)
+            VirtualAddress::new(phys.data() + Self::phys_offset())
         }
     }
 

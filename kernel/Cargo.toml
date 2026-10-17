@@ -92,6 +92,8 @@ default = [
 self_modifying = []
 
 acpi = []
+# Ferric Oxide: randomize the base of the physical memory map at boot (x86_64).
+kaslr = []
 lpss_debug = []
 multi_core = ["acpi"]
 numa = ["multi_core"]
