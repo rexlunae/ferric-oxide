@@ -8,6 +8,10 @@
 //! - `--probe guard`: the page below the stack, which must die with SIGSEGV;
 //! - `--probe stack`: the lowest page of the stack, which must exit normally.
 //!   That shows the address is right and the guard is what faults.
+//! - `--probe main-guard`: the page below the main thread's stack, which exec
+//!   maps `PROT_NONE`, and which must also die with SIGSEGV. relibc only knows
+//!   where the main stack is when exec reports it (the ASLR build), so this
+//!   part is skipped when the main stack's base is unknown.
 //!
 //! The layout checked is relibc's; glibc reports thread stacks differently, so
 //! the test only means something on Ferric Oxide.
@@ -56,6 +60,13 @@ fn own_stack() -> Result<(usize, usize), String> {
 /// Child mode: read one byte of the guard page or of the page above it, from a
 /// new thread.
 fn probe(which: &str) -> ExitCode {
+    if which == "main-guard" {
+        let (base, _) = own_stack().expect("stack bounds");
+        // SAFETY: deliberately touches the guard page; a fault is the point.
+        let byte = unsafe { std::ptr::read_volatile((base - PAGE_SIZE) as *const u8) };
+        std::hint::black_box(byte);
+        return ExitCode::SUCCESS;
+    }
     let which = which.to_owned();
     let handle = std::thread::spawn(move || {
         let (base, _) = own_stack().expect("stack bounds");
@@ -111,7 +122,7 @@ fn main() -> ExitCode {
     match (guard, stack) {
         (Ok(g), Ok(s)) if g.signal() == Some(SIGSEGV) && s.success() => {
             println!("FERRIC_TEST_PASS guard stack={base:#x}+{size:#x}, guard page faults");
-            ExitCode::SUCCESS
+            main_guard(&exe)
         }
         (Ok(g), Ok(s)) => {
             println!(
@@ -121,6 +132,31 @@ fn main() -> ExitCode {
         }
         (Err(e), _) | (_, Err(e)) => {
             println!("FERRIC_TEST_FAIL guard {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Checks the guard page below the main thread's stack, when its base is known.
+fn main_guard(exe: &str) -> ExitCode {
+    let base = match own_stack() {
+        Ok((base, _)) if base > PAGE_SIZE => base,
+        _ => {
+            println!("FERRIC_TEST_SKIP guard-main main stack base unknown");
+            return ExitCode::SUCCESS;
+        }
+    };
+    match run_probe(exe, "main-guard") {
+        Ok(g) if g.signal() == Some(SIGSEGV) => {
+            println!("FERRIC_TEST_PASS guard-main stack base={base:#x}, guard page faults");
+            ExitCode::SUCCESS
+        }
+        Ok(g) => {
+            println!("FERRIC_TEST_FAIL guard-main stack base={base:#x} guard read: {g}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            println!("FERRIC_TEST_FAIL guard-main {e}");
             ExitCode::FAILURE
         }
     }

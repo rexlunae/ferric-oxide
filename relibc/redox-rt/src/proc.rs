@@ -280,6 +280,16 @@ pub fn fexec_impl(
         STACK_SIZE,
         MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_FIXED_NOREPLACE,
     )?;
+    // Ferric Oxide: reserve an inaccessible guard page below the main thread's stack, so an
+    // overflow faults instead of running into whatever is mapped below. Best effort: if the page
+    // is already taken, exec goes ahead without the guard.
+    let _ = mmap_anon_remote(
+        &grants_fd,
+        0,
+        stack_top - STACK_SIZE - PAGE_SIZE,
+        PAGE_SIZE,
+        MapFlags::PROT_NONE | MapFlags::MAP_FIXED_NOREPLACE,
+    );
 
     let mut sp = stack_top;
     let mut stack_page = Option::<MmapGuard>::None;
