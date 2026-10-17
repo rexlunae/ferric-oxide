@@ -5,7 +5,7 @@ name: image
 # The build runs in Redox's own CI container with prebuilt packages
 # (REPO_BINARY=1); only the packages marked "source" in
 # config/ferric-smoke.toml are compiled, from the trees in this repository
-# (kernel/) or from their recipes' sources.
+# (crates/kernel/) or from their recipes' sources.
 
 on:
   push:
