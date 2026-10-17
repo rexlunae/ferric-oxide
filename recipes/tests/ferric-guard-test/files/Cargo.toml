@@ -1,0 +1,9 @@
+[package]
+name = "ferric-guard-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Thread stack guard page test for Ferric Oxide"
+
+[profile.release]
+debug = false

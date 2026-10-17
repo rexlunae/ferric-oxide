@@ -1,0 +1,8 @@
+# Ferric Oxide: checks that thread stacks have a PROT_NONE guard page below
+# them. Source lives in files/; as a path source (relative to the repository
+# root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-guard-test/files"
+
+[build]
+template = "cargo"

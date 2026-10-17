@@ -17,6 +17,7 @@ bootloader = "source"
 redoxfs = "source"
 base = "source"
 ferric-xstate-test = "source"
+ferric-guard-test = "source"
 
 [[files]]
 path = "/usr/lib/init.d/30_console"
@@ -35,6 +36,7 @@ cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
 ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
+ferric-guard-test || echo FERRIC_TEST_FAIL guard exited with an error
 echo FERRIC_SMOKE_OK
 shutdown
 """

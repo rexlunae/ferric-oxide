@@ -44,6 +44,7 @@ pub unsafe fn init() {
         // TODO: set these values on Linux as well
         stack_base,
         stack_size,
+        guard_size: 0,
 
         tcb_selfref: UnsafeCell::new(core::ptr::null_mut()),
 
@@ -81,6 +82,9 @@ pub struct Pthread {
 
     pub(crate) stack_base: *mut c_void,
     pub(crate) stack_size: usize,
+    /// Ferric Oxide: bytes of `PROT_NONE` guard mapped directly below `stack_base`, part of the
+    /// same mapping. Zero for the main thread and for caller-provided stacks.
+    pub(crate) guard_size: usize,
 
     pub(crate) tcb_selfref: UnsafeCell<*mut Tcb>,
 
@@ -132,13 +136,18 @@ pub(crate) unsafe fn create(
 
     let stack_size = attrs.stacksize.next_multiple_of(Sys::getpagesize());
 
-    let stack_base = if attrs.stack != 0 {
-        attrs.stack as *mut c_void
+    // Ferric Oxide: allocated stacks get guardsize bytes of PROT_NONE below them, so an overflow
+    // faults instead of running into whatever is mapped below. A caller-provided stack gets no
+    // guard, as POSIX says.
+    let (stack_base, guard_size) = if attrs.stack != 0 {
+        (attrs.stack as *mut c_void, 0)
     } else {
+        let guard_size = attrs.guardsize.next_multiple_of(Sys::getpagesize());
+        let total_size = stack_size.checked_add(guard_size).ok_or(Errno(EINVAL))?;
         let ret = unsafe {
             sys_mman::mmap(
                 core::ptr::null_mut(),
-                stack_size,
+                total_size,
                 sys_mman::PROT_READ | sys_mman::PROT_WRITE,
                 sys_mman::MAP_PRIVATE | sys_mman::MAP_ANONYMOUS,
                 -1,
@@ -149,7 +158,13 @@ pub(crate) unsafe fn create(
             // "Insufficient resources"
             return Err(Errno(EAGAIN));
         }
-        ret
+        if guard_size > 0
+            && unsafe { sys_mman::mprotect(ret, guard_size, sys_mman::PROT_NONE) } != 0
+        {
+            let _ = unsafe { Sys::munmap(ret, total_size) };
+            return Err(Errno(EAGAIN));
+        }
+        (unsafe { ret.byte_add(guard_size) }, guard_size)
     };
 
     let mut flags = PthreadFlags::empty();
@@ -161,8 +176,8 @@ pub(crate) unsafe fn create(
     }
 
     let stack_raii = MmapGuard {
-        page_start: stack_base,
-        mmap_size: stack_size,
+        page_start: unsafe { stack_base.byte_sub(guard_size) },
+        mmap_size: stack_size + guard_size,
     };
 
     let current_tcb = unsafe { Tcb::current() }.expect("no TCB!");
@@ -170,6 +185,7 @@ pub(crate) unsafe fn create(
     new_tcb.pthread.flags = flags.bits().into();
     new_tcb.pthread.stack_base = stack_base;
     new_tcb.pthread.stack_size = stack_size;
+    new_tcb.pthread.guard_size = guard_size;
 
     new_tcb.masters_ptr = current_tcb.masters_ptr;
     new_tcb.masters_len = current_tcb.masters_len;
@@ -307,8 +323,9 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
     unsafe { header::tls::run_all_destructors() };
 
     let this = current_thread().expect("failed to obtain current thread when exiting");
-    let stack_base = this.stack_base;
-    let stack_size = this.stack_size;
+    // Unmap the guard below the stack together with it.
+    let stack_base = unsafe { this.stack_base.byte_sub(this.guard_size) };
+    let stack_size = this.stack_size + this.guard_size;
 
     // dealloc_thread() or waitval.post() might unmaps the tcb so extract the thread_fd now
     #[cfg(target_os = "redox")]

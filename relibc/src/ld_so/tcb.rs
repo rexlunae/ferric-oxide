@@ -103,6 +103,7 @@ impl Tcb {
                     has_queued_cancelation: AtomicBool::new(false),
                     stack_base: core::ptr::null_mut(),
                     stack_size: 0,
+                    guard_size: 0,
                     os_tid: UnsafeCell::new(OsTid::default()),
                     tcb_selfref: UnsafeCell::new(tcb_ptr),
                 },
