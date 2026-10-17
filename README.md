@@ -1,62 +1,64 @@
-<p align="center">
-<img alt="Redox" width="346" src="https://gitlab.redox-os.org/redox-os/assets/raw/master/logos/redox/logo.png">
-</p>
+# Ferric Oxide
 
-This repository is the **Build System** for Redox OS.
+**Ferric Oxide** is a full-featured, Rust-based operating system focused on performance. It is a community fork of [Redox OS](https://www.redox-os.org), and this repository is its **build system**: the configuration, recipes and tooling that assemble the kernel, drivers, libraries and applications into a bootable image.
 
-Redox is under active development by a vibrant community, you can see the key links below:
-
-- [The **main website** for Redox OS](https://www.redox-os.org).
-- [The Redox Book](https://doc.redox-os.org/book/) and [Build Instructions](https://doc.redox-os.org/book/podman-build.html).
-- [Redox Chat and Support](https://matrix.to/#/#redox-join:matrix.org).
-- [Patreon](https://www.patreon.com/redox_os), [Donate](https://redox-os.org/donate/) and [Merch](https://redox-os.creator-spring.com/).
-- Scroll down for a list of key Redox components and their repositories.
-
-[Redox](https://www.redox-os.org) is an open-source operating system written in Rust, a language with focus on safety, efficiency and high performance. Redox uses a microkernel architecture, and aims to be reliable, secure, usable, correct, and free. Redox is inspired by previous operating systems, such as seL4, MINIX, Plan 9, Linux and BSD.
-
-Redox _is not_ just a kernel, it's a **full-featured operating system**, providing components (file system, display server, core utilities, etc.) that together make up a functional and convenient operating system. Redox uses the COSMIC desktop apps, and provides source code compatibility with many Rust, Linux and BSD programs.
+> Ferric Oxide is an independent project. It is not affiliated with, endorsed by, or sponsored by the Redox OS nonprofit. "Redox OS" is a trademark of the Redox OS nonprofit; see [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md).
 
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-## More Links
+## What it is
 
-- [Book](https://doc.redox-os.org/book/)
-- [Contribute](CONTRIBUTING.md)
-- [Hardware Compatibility](https://doc.redox-os.org/book/hardware-support.html)
-- Run Redox in a [Virtual Machine](https://doc.redox-os.org/book/running-vm.html) or on [Real Hardware](https://doc.redox-os.org/book/real-hardware.html)
-- [Trying Out Redox](https://doc.redox-os.org/book/trying-out-redox.html)
-- [Building Redox](https://doc.redox-os.org/book/podman-build.html)
-- [Build System Documentation](https://doc.redox-os.org/book/build-system-reference.html)
+Ferric Oxide inherits Redox's design: a microkernel operating system written in Rust, built to be reliable, secure, usable and free, and drawing on ideas from seL4, MINIX, Plan 9, Linux and BSD. It is a complete operating system rather than just a kernel, with its own file system, display server, core utilities and C library, and source compatibility with many Rust, Linux and BSD programs.
+
+What Ferric Oxide adds on top of that foundation:
+
+- **Performance first.** Kernel, scheduler, file system and network stack changes are judged by measured results, and regressions are treated as bugs.
+- **AI-assisted development is welcome.** Contributions written with the help of AI tools are accepted under the same review bar as any other. Read the [AI Contribution Policy](AI_POLICY.md).
+- **Developed on GitHub.** Issues, pull requests and discussion happen in this repository.
+
+## Getting started
+
+Ferric Oxide currently builds the same way as upstream Redox. The bootstrap script sets up a Podman-based build environment:
+
+```sh
+git clone https://github.com/rexlunae/ferric-oxide
+cd ferric-oxide
+./podman_bootstrap.sh
+make all
+```
+
+If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot the result in a virtual machine, run `make qemu`.
+
+Until Ferric Oxide has its own book, the upstream Redox documentation is the reference for building and running the system:
+
+- [Building with Podman](https://doc.redox-os.org/book/podman-build.html)
+- [Build System Reference](https://doc.redox-os.org/book/build-system-reference.html)
+- [Running in a Virtual Machine](https://doc.redox-os.org/book/running-vm.html) and on [Real Hardware](https://doc.redox-os.org/book/real-hardware.html)
 - [Developer FAQ](https://doc.redox-os.org/book/developer-faq.html)
-- [Chat/Discussions/Help](https://doc.redox-os.org/book/chat.html)
 
-## Ecosystem
+Internal names such as the `x86_64-unknown-redox` target, `relibc`, `RedoxFS` and the `redox` paths in the build system are unchanged for now, so that the fork keeps building and can keep pulling fixes from upstream.
 
-Some of the key repositories on the Redox GitLab:
+## Contributing
 
-| Essential Repositories                                                               | Maintainer
-|-------------------------------------------------------------------------------------------------------------|---------------------------
-| [Kernel](https://gitlab.redox-os.org/redox-os/kernel)                                                       | **@jackpot51**
-| [Base (essential system components and drivers)](https://gitlab.redox-os.org/redox-os/base)                             | **@jackpot51**
-| [RedoxFS (default filesystem)](https://gitlab.redox-os.org/redox-os/redoxfs)                                | **@jackpot51**
-| [relibc (C POSIX library written in Rust)](https://gitlab.redox-os.org/redox-os/relibc)                     | **@jackpot51**
-| [Ion (defauilt shell)](https://gitlab.redox-os.org/redox-os/ion)                                            | **@jackpot51**
-| [Termion (terminal library)](https://gitlab.redox-os.org/redox-os/termion)                                  | **@jackpot51**
-| [pkgutils (current package manager)](https://gitlab.redox-os.org/redox-os/pkgutils)                         | **@jackpot51**
-| [Orbital (display server and window manager)](https://gitlab.redox-os.org/redox-os/orbital)                 | **@jackpot51**
-| This repo - the root of the Build System                                                                    | **@jackpot51** **@hatred_45**
-| [Redoxer (tool for easy Redox development on Linux)](https://gitlab.redox-os.org/redox-os/redoxer)          | **@jackpot51**
-| [The Redox Book](https://gitlab.redox-os.org/redox-os/book)                                                 | **@jackpot51** **@hatred_45**
-| [Website](https://gitlab.redox-os.org/redox-os/website)                                                     | **@jackpot51** **@hatred_45**
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [AI Contribution Policy](AI_POLICY.md). Hardware test reports go in [HARDWARE.md](HARDWARE.md).
 
-## What it looks like
+## Components
 
-See [Redox in Action](https://www.redox-os.org/screens/) for photos and videos.
+The system is assembled from many repositories. These are currently pulled from upstream Redox; Ferric Oxide forks of them will be listed here as they are created.
 
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/orbital-visual.png">
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-programs.png">
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-term-screenfetch.png">
+| Component | Upstream repository |
+|-----------|---------------------|
+| Kernel | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
+| Base (essential system components and drivers) | [redox-os/base](https://gitlab.redox-os.org/redox-os/base) |
+| RedoxFS (default file system) | [redox-os/redoxfs](https://gitlab.redox-os.org/redox-os/redoxfs) |
+| relibc (C POSIX library written in Rust) | [redox-os/relibc](https://gitlab.redox-os.org/redox-os/relibc) |
+| Bootloader | [redox-os/bootloader](https://gitlab.redox-os.org/redox-os/bootloader) |
+| Ion (default shell) | [redox-os/ion](https://gitlab.redox-os.org/redox-os/ion) |
+| pkgutils (package manager) | [redox-os/pkgutils](https://gitlab.redox-os.org/redox-os/pkgutils) |
+| Orbital (display server and window manager) | [redox-os/orbital](https://gitlab.redox-os.org/redox-os/orbital) |
+| Redoxer (development tool for Linux hosts) | [redox-os/redoxer](https://gitlab.redox-os.org/redox-os/redoxer) |
+| Book | [redox-os/book](https://gitlab.redox-os.org/redox-os/book) |
 
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-edit-redox.png">
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/image-viewer.png">
-<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/assets/raw/master/screenshots/Boot.png">
+## Credits
+
+Ferric Oxide exists because of the years of work by the Redox OS developers and community, led by Jeremy Soller (@jackpot51). All upstream code remains under its original MIT license and copyright. If you want to support the operating system this project is built on, consider [donating to Redox OS](https://www.redox-os.org/donate/).
