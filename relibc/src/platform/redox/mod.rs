@@ -47,6 +47,7 @@ use crate::{
         sys_stat::{S_ISGID, S_ISUID, S_ISVTX, stat},
         sys_statvfs::statvfs,
         sys_time::timezone,
+        sys_uio::{gather, iovec, scatter},
         sys_utsname::{UTSLENGTH, utsname},
         time::{CLOCK_MONOTONIC, CLOCK_REALTIME, TIMER_ABSTIME, itimerspec, timespec},
         unistd::{F_OK, R_OK, SEEK_CUR, SEEK_SET, W_OK, X_OK},
@@ -1101,6 +1102,19 @@ impl Pal for Sys {
         }
     }
 
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let mut vec = unsafe { gather(iovs) };
+
+        let n = Self::read(fildes, &mut vec)?;
+
+        unsafe { scatter(iovs, &vec) };
+
+        Ok(n)
+    }
+
     fn fpath(fildes: c_int, out: &mut [u8]) -> Result<usize> {
         // Since this is used by realpath, it converts from the old format to the new one for
         // compatibility reasons
@@ -1857,6 +1871,15 @@ impl Pal for Sys {
                 !0,
             )?)
         }
+    }
+
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let vec = unsafe { gather(iovs) };
+
+        Self::write(fildes, &vec)
     }
 
     fn verify() -> bool {

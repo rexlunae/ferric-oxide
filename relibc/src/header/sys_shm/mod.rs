@@ -100,7 +100,7 @@ pub unsafe extern "C" fn shmat(
     if unsafe { fstat(shmid, &raw mut stat) } < 0 {
         return SHM_FAILED;
     }
-    let size = stat.st_size as usize;
+    let size = usize::try_from(stat.st_size).expect("should be positive");
     let mut prot = PROT_READ;
     if shmflg & SHM_RDONLY == 0 {
         prot |= PROT_WRITE;
