@@ -8,7 +8,9 @@
 //! devices into the domain with [`abi::Request::Attach`] calls and passes the domain's file
 //! descriptor to the driver, which records it as its own with [`abi::Request::Bind`]. From then
 //! on `memory:translation` answers the driver with IOVAs in the domain, so its device can reach
-//! only memory the driver translated. When the last descriptor of a domain is closed its
+//! only memory the driver translated. A driver of several functions gets a domain for each and
+//! moves the later ones' devices into the first with [`abi::Request::Join`], so a process has
+//! one domain. When the last descriptor of a domain is closed its
 //! devices are blocked: their DMA faults until pcid attaches them to a new domain.
 //!
 //! - [`abi`] has the scheme's name and number, its paths, and the encoding of each call in the

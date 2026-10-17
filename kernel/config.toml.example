@@ -6,9 +6,9 @@
 # all devices in one identity domain (DMA addresses unchanged) and runs a DMA-domain
 # self-test at boot; "never" leaves them off. "auto" and "enforce" also provide the
 # kernel.iommu scheme (DMA domains for drivers; memory:translation answers with IOVAs
-# in a driver's bound domain). "enforce" also refuses memory:translation to drivers
-# without a bound domain, lets a driver bind only a domain with a device attached, and
-# blocks DMA from devices in no domain.
+# in a driver's bound domain; pcid drivers bind one when they start). "enforce" also
+# refuses memory:translation to drivers without a bound domain, lets a driver bind only
+# a domain with a device attached, and blocks DMA from devices in no domain.
 iommu = "never"
 
 [arch.x86_64.features]

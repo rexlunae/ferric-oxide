@@ -13,6 +13,9 @@
 //!   [`DmaMappings::add_user`]), so that when the process unmaps memory
 //!   ([`DmaMappings::release`]) the mappings no longer reachable from any of its virtual
 //!   memory are handed back for the kernel to unmap, invalidate and unpin;
+//! - when the process takes write access away from memory (`mprotect`), the writable
+//!   mappings that memory reaches are found ([`DmaMappings::writable_reached_by`]) for the
+//!   kernel to make read-only for the device too;
 //! - closing the domain hands back everything ([`DmaMappings::drain`]).
 //!
 //! The type only does the bookkeeping. The kernel owns the IOVA allocator, the translation
@@ -115,6 +118,11 @@ impl<T> Mapping<T> {
     /// Records that the device may now write the range too.
     pub fn set_writable(&mut self) {
         self.writable = true;
+    }
+
+    /// Records that the device may now only read the range.
+    pub fn set_read_only(&mut self) {
+        self.writable = false;
     }
 
     /// The virtual ranges of the process that reach the mapping. While there is at least one,
@@ -275,6 +283,21 @@ impl<T> DmaMappings<T> {
             .collect()
     }
 
+    /// The physical start of every writable mapping that a virtual range sharing an address
+    /// with `span` reaches, lowest first.
+    ///
+    /// A mapping is one IOVA block with one access, so it is listed even when only part of it
+    /// is reached, and even when another virtual range that reaches it keeps write access:
+    /// the kernel narrows the whole mapping, and a later translation of a page that is still
+    /// writable widens it again.
+    pub fn writable_reached_by(&self, span: Span) -> Vec<u64> {
+        self.by_phys
+            .iter()
+            .filter(|(_, m)| m.writable && m.users.iter().any(|u| u.intersects(&span)))
+            .map(|(&start, _)| start)
+            .collect()
+    }
+
     /// Removes and returns every mapping.
     pub fn drain(&mut self) -> impl Iterator<Item = Mapping<T>> + use<T> {
         core::mem::take(&mut self.by_phys).into_values()
@@ -382,6 +405,66 @@ mod tests {
         gone.sort_unstable();
         assert_eq!(gone, [0x1000, 0x2000]);
         assert_eq!(maps.len(), 1);
+    }
+
+    #[test]
+    fn write_removal_finds_the_writable_mappings_reached() {
+        let mut maps = DmaMappings::new();
+        // Writable, reached from two virtual ranges.
+        maps.insert(map(
+            0x10_0000,
+            0x2000,
+            0x1000,
+            Span::new(0x7000_0000, 0x2000),
+        ))
+        .unwrap();
+        assert!(maps.add_user(0x10_0000, Span::new(0x7100_0000, 0x2000)));
+        // Read-only already.
+        maps.insert(Mapping::new(
+            0x20_0000,
+            0x1000,
+            0x3000,
+            false,
+            Span::new(0x7000_2000, 0x1000),
+            0,
+        ))
+        .unwrap();
+        // Writable, but out of reach of the ranges below.
+        maps.insert(map(
+            0x30_0000,
+            0x1000,
+            0x4000,
+            Span::new(0x7200_0000, 0x1000),
+        ))
+        .unwrap();
+
+        // Part of the first user, and all of the read-only mapping's.
+        assert_eq!(
+            maps.writable_reached_by(Span::new(0x7000_1000, 0x2000)),
+            [0x10_0000]
+        );
+        // Through the second user only.
+        assert_eq!(
+            maps.writable_reached_by(Span::new(0x7100_0000, 0x1000)),
+            [0x10_0000]
+        );
+        assert!(
+            maps.writable_reached_by(Span::new(0x7300_0000, 0x1000))
+                .is_empty()
+        );
+        assert_eq!(
+            maps.writable_reached_by(Span::new(0x7000_0000, 0x0300_0000)),
+            [0x10_0000, 0x30_0000]
+        );
+
+        // Once read-only, it is not listed again, and nothing is released.
+        maps.get_mut(0x10_0000).unwrap().set_read_only();
+        assert!(!maps.get(0x10_0000).unwrap().writable());
+        assert!(
+            maps.writable_reached_by(Span::new(0x7000_0000, 0x2000))
+                .is_empty()
+        );
+        assert_eq!(maps.len(), 3);
     }
 
     #[test]

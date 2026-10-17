@@ -745,27 +745,104 @@ pub fn unmap_range<M: TableMemory>(
     Ok(())
 }
 
-/// The size of the leaf that maps `iova`, if any.
-fn leaf_size<M: TableMemory>(mem: &mut M, root: u64, agaw: Agaw, iova: u64) -> Option<PageSize> {
+/// Where the leaf that maps `iova` sits: its table, its index in that table and its size.
+fn leaf<M: TableMemory>(
+    mem: &mut M,
+    root: u64,
+    agaw: Agaw,
+    iova: u64,
+) -> Option<(u64, usize, PageSize)> {
     if iova >= agaw.limit() {
         return None;
     }
     let mut table = root;
     let mut level = agaw.levels();
     loop {
-        let entry = mem.table(table)[index(iova, level)];
+        let i = index(iova, level);
+        let entry = mem.table(table)[i];
         if entry & (SL_R | SL_W) == 0 {
             return None;
         }
         match level {
-            1 => return Some(PageSize::Size4K),
-            2 if entry & SL_PS != 0 => return Some(PageSize::Size2M),
-            3 if entry & SL_PS != 0 => return Some(PageSize::Size1G),
+            1 => return Some((table, i, PageSize::Size4K)),
+            2 if entry & SL_PS != 0 => return Some((table, i, PageSize::Size2M)),
+            3 if entry & SL_PS != 0 => return Some((table, i, PageSize::Size1G)),
             _ => {}
         }
         table = entry & ADDR_MASK;
         level -= 1;
     }
+}
+
+/// The size of the leaf that maps `iova`, if any.
+fn leaf_size<M: TableMemory>(mem: &mut M, root: u64, agaw: Agaw, iova: u64) -> Option<PageSize> {
+    leaf(mem, root, agaw, iova).map(|(_, _, size)| size)
+}
+
+/// Changes the access of every page mapped in `len` bytes from `iova` to `access`, keeping
+/// the addresses they map. Narrowing access (read-write to read-only, say) takes effect for a
+/// unit only after an IOTLB invalidation that covers the range, since the unit may cache the
+/// old entries; so does widening it, since a cached read-only entry makes a write fault.
+///
+/// # Errors
+///
+/// [`UnmapError::OutOfRange`] or [`UnmapError::NotMapped`] for the first address in the range
+/// that no page maps, [`UnmapError::InsideLargePage`] when the range starts inside a large
+/// page, and [`UnmapError::PartialPage`] when it ends inside one. The pages before it are
+/// changed; [`RangeError::done`] says how many bytes that is.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_vtd::table::{map, protect_range, translate, Access, Agaw, MapError, PageSize, Table, TableMemory};
+///
+/// struct Vec4k(Vec<Box<Table>>);
+/// impl TableMemory for Vec4k {
+///     type Error = core::convert::Infallible;
+///     fn alloc_table(&mut self) -> Result<u64, Self::Error> {
+///         self.0.push(Box::new([0; 512]));
+///         Ok(self.0.len() as u64 * 4096)
+///     }
+///     fn table(&mut self, phys: u64) -> &mut Table {
+///         &mut self.0[phys as usize / 4096 - 1]
+///     }
+/// }
+///
+/// let mut mem = Vec4k(Vec::new());
+/// let root = mem.alloc_table().map_err(MapError::Alloc)?;
+/// map(&mut mem, root, Agaw::Bits39, 0x5000, 0x9000, PageSize::Size4K, Access::ReadWrite)?;
+/// protect_range(&mut mem, root, Agaw::Bits39, 0x5000, 0x1000, Access::Read).expect("mapped above");
+/// assert_eq!(translate(&mut mem, root, Agaw::Bits39, 0x5000), Some((0x9000, Access::Read)));
+/// # Ok::<(), ferric_vtd::table::MapError<core::convert::Infallible>>(())
+/// ```
+pub fn protect_range<M: TableMemory>(
+    mem: &mut M,
+    root: u64,
+    agaw: Agaw,
+    iova: u64,
+    len: u64,
+    access: Access,
+) -> Result<(), RangeError<UnmapError>> {
+    let mut done = 0;
+    while done < len {
+        let va = iova.wrapping_add(done);
+        let fail = |error| RangeError { done, error };
+        if va >= agaw.limit() {
+            return Err(fail(UnmapError::OutOfRange { iova: va }));
+        }
+        let (table, i, size) =
+            leaf(mem, root, agaw, va).ok_or(fail(UnmapError::NotMapped { iova: va }))?;
+        if va & (size.bytes() - 1) != 0 {
+            return Err(fail(UnmapError::InsideLargePage { iova: va, size }));
+        }
+        if size.bytes() > len - done {
+            return Err(fail(UnmapError::PartialPage { iova: va, size }));
+        }
+        let entry = &mut mem.table(table)[i];
+        *entry = (*entry & !(SL_R | SL_W)) | access.bits();
+        done += size.bytes();
+    }
+    Ok(())
 }
 
 /// Walks the tables rooted at `root` for `iova`, returning the physical address and access
@@ -1302,6 +1379,108 @@ pub(crate) mod tests {
         assert_eq!(
             LargePages::from_capability(crate::regs::Capability(1 << 34)),
             LargePages::Up2M
+        );
+    }
+
+    #[test]
+    fn protect_range_changes_access_only() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits39;
+        // One 4 KiB page, one 2 MiB page, one 4 KiB page, as in `map_range_picks_large_pages`.
+        let (iova, phys, len) = (0x1f_f000, 0x7f_f000, 0x20_2000);
+        map_range(
+            &mut mem,
+            root,
+            a,
+            iova,
+            phys,
+            len,
+            Access::ReadWrite,
+            LargePages::Up2M,
+        )
+        .unwrap();
+        let tables = mem.pages.len();
+        protect_range(&mut mem, root, a, iova, len, Access::Read).unwrap();
+        for off in [0, 0x1000, 0x10_0123, len - 1] {
+            assert_eq!(
+                translate(&mut mem, root, a, iova + off),
+                Some((phys + off, Access::Read))
+            );
+        }
+        // Only leaves change: no table is allocated or freed, sizes stay.
+        assert_eq!(mem.pages.len(), tables);
+        assert_eq!(
+            leaf_size(&mut mem, root, a, 0x20_0000),
+            Some(PageSize::Size2M)
+        );
+        // Widening back, one 4 KiB page at a time.
+        protect_range(&mut mem, root, a, 0x40_0000, 0x1000, Access::ReadWrite).unwrap();
+        assert_eq!(
+            translate(&mut mem, root, a, 0x40_0000),
+            Some((phys + 0x20_1000, Access::ReadWrite))
+        );
+        assert_eq!(
+            translate(&mut mem, root, a, 0x3f_f000),
+            Some((phys + 0x20_0000, Access::Read))
+        );
+    }
+
+    #[test]
+    fn protect_range_errors() {
+        let mut mem = VecMemory::new();
+        let root = mem.alloc_table().unwrap();
+        let a = Agaw::Bits39;
+        map_range(
+            &mut mem,
+            root,
+            a,
+            0x20_0000,
+            0x40_0000,
+            0x20_0000,
+            Access::ReadWrite,
+            LargePages::Up2M,
+        )
+        .unwrap();
+        // Starting inside the 2 MiB page, ending inside it, and running past it.
+        assert_eq!(
+            protect_range(&mut mem, root, a, 0x20_1000, 0x1000, Access::Read),
+            Err(RangeError {
+                done: 0,
+                error: UnmapError::InsideLargePage {
+                    iova: 0x20_1000,
+                    size: PageSize::Size2M
+                }
+            })
+        );
+        assert_eq!(
+            protect_range(&mut mem, root, a, 0x20_0000, 0x1000, Access::Read),
+            Err(RangeError {
+                done: 0,
+                error: UnmapError::PartialPage {
+                    iova: 0x20_0000,
+                    size: PageSize::Size2M
+                }
+            })
+        );
+        assert_eq!(
+            protect_range(&mut mem, root, a, 0x20_0000, 0x20_1000, Access::Read),
+            Err(RangeError {
+                done: 0x20_0000,
+                error: UnmapError::NotMapped { iova: 0x40_0000 }
+            })
+        );
+        // The page before the failure was changed.
+        assert_eq!(
+            translate(&mut mem, root, a, 0x20_0000),
+            Some((0x40_0000, Access::Read))
+        );
+        assert_eq!(
+            protect_range(&mut mem, root, a, a.limit(), 0x1000, Access::Read),
+            Err(RangeError {
+                done: 0,
+                error: UnmapError::OutOfRange { iova: a.limit() }
+            })
         );
     }
 }
