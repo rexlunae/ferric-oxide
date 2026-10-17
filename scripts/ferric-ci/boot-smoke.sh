@@ -47,6 +47,12 @@ set -e
 
 # The console mixes in CRs and escape sequences; normalize before matching.
 clean="$(tr -d '\r' < "$log")"
+# Test programs report FERRIC_TEST_PASS/SKIP/FAIL lines; any FAIL fails the run.
+grep '^FERRIC_TEST_' <<< "$clean" || true
+if grep -q '^FERRIC_TEST_FAIL' <<< "$clean"; then
+    echo "boot-smoke: FAIL, a test reported failure" >&2
+    exit 1
+fi
 if grep -q '^FERRIC_SMOKE_OK' <<< "$clean"; then
     echo "boot-smoke: PASS (cpu=$cpu, qemu exit $status)"
     exit 0

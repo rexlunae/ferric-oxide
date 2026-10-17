@@ -12,6 +12,7 @@ filesystem_size = 256
 
 [packages]
 kernel = "source"
+ferric-xstate-test = "source"
 
 [[files]]
 path = "/usr/lib/init.d/30_console"
@@ -29,6 +30,7 @@ uname -a
 cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
+ferric-xstate-test
 echo FERRIC_SMOKE_OK
 shutdown
 """

@@ -1,0 +1,8 @@
+# Ferric Oxide: checks that the kernel preserves AVX-512 register state across
+# preemption and never leaks it between contexts. Source lives in files/.
+[build]
+template = "custom"
+script = """
+COOKBOOK_SOURCE="${COOKBOOK_RECIPE}/files"
+cookbook_cargo
+"""
