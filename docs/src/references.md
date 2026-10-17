@@ -1,0 +1,89 @@
+# References
+
+This page contain a list of references for Rust programming, OS development, ideas, porting and computer science to help developers.
+
+The sections are ordered by knowledge importance.
+
+### Computer Science
+
+- [Putting the "You" in CPU](https://cpu.land/) - This website explains how a program works, from a Linux system call until the CPU.
+- [GeeksforGeeks](https://www.geeksforgeeks.org/) - A computer science portal with many articles for several areas and tasks.
+- [computer-science](https://github.com/ossu/computer-science) - A list for computer science education.
+- [freeCodeCamp: Harvard CS50](https://www.youtube.com/watch?v=8mAITcNt710)
+- [Developer Roadmaps - Computer Science](https://roadmap.sh/computer-science) - A guide to learn computer science.
+- [Minix](https://minix3.org/) - You can find great papers and articles about the microkernel architecture and reliable systems.
+- [Plan 9](https://plan9.io/plan9/) - You can find papers and documentation about distributed systems.
+- [seL4](https://sel4.systems/) - You can find papers and documentation about a secure and fast microkernel design.
+- [The Coded Message - Computing/Programming articles](https://www.thecodedmessage.com/tags/computers)
+
+### OS development
+
+- [OSDev Wiki](https://wiki.osdev.org/Expanded_Main_Page) - The best wiki about OS development of the world.
+- [Writing an OS in Rust](https://os.phil-opp.com/) - Blog series about writing an operating system in Rust.
+- [Rust OSDev](https://rust-osdev.com/) - Monthly reports with updates on the Rust low-level ecosystem libraries and operating systems.
+
+### Rust
+
+- [Learn Rust](https://rust-lang.org/learn/) - The official ways to learn the Rust programming language.
+- [Rust Playground](https://play.rust-lang.org/) - Test your Rust code in the web browser.
+- [Awesome Rust](https://github.com/rust-unofficial/awesome-rust) - Curated list of Rust programs, libraries and resources.
+- [rust-learning](https://github.com/ctjhoa/rust-learning) - A list with articles and videos to learn Rust.
+- [Learn Rust With Entirely Too Many Linked Lists](https://rust-unofficial.github.io/too-many-lists/) - How to implement a linked list in Rust.
+- [Rust Design Patterns](https://rust-unofficial.github.io/patterns/intro.html) - About idioms, design patterns, and anti-pattern in Rust.
+- [Rust 101 - Exercises](https://101-rs.tweede.golf/) - A Rust university course (but lacking answers for exercises).
+- [teach-rs](https://teach-rs.tweede.golf/) - A university course to learn Rust.
+- [Rust Security Handbook](https://yevh.github.io/rust-security-handbook/) - Helpful security related practices when coding in Rust.
+- [Developer Roadmaps - Rust](https://roadmap.sh/rust) - A guide to learn Rust.
+- [No Boilerplate - Rust playlist](https://www.youtube.com/playlist?list=PLZaoyhMXgBzoM9bfb5pyUOT3zjnaDdSEP) - Short documentaries about special things on Rust.
+- [This Week in Rust](https://this-week-in-rust.org/) - Weekly updates on the Rust ecosystem, it covers the programming language improvements, organization updates, library/application updates and articles.
+- [The Coded Message - Rust articles](https://www.thecodedmessage.com/tags/rust/)
+- [fasterthanlime - Rust articles](https://fasterthanli.me/tags/rust)
+
+### Porting
+
+If you don't know how to port some program or library, you can see the build system documentation or software ports of other operating systems.
+
+- [GNU Make](https://www.gnu.org/software/make/) - GNU command runner, the most used build system in the world.
+- [GNU Autotools](https://www.gnu.org/software/automake/) - GNU build system, used by most old POSIX/Linux programs.
+- [CMake](https://cmake.org/) - The second most used build system in the world.
+- [Meson](https://mesonbuild.com/) - A build system used by many POSIX/Linux programs.
+- [Cargo](https://doc.rust-lang.org/cargo/) - The project and dependency manager of the Rust programming language.
+- [FreeBSD - Software Ports (cgit)](https://cgit.freebsd.org/ports/) - The official web interface for the software ports of FreeBSD.
+- [FreeBSD - Software Ports (GitHub mirror)](https://github.com/freebsd/freebsd-ports) - GitHub mirror for the software ports of FreeBSD.
+- [NetBSD - Software Ports (GitHub mirror)](https://github.com/NetBSD/pkgsrc) - GitHub mirror for the software ports of NetBSD.
+- [Gentoo Packages](https://packages.gentoo.org/) - It contains advanced information about the port configuration.
+- [Nix Packages](https://github.com/NixOS/nixpkgs)
+- [Guix Packages](https://git.savannah.gnu.org/cgit/guix.git)
+
+### Manual Pages
+
+- [Unix Manual Sections](https://en.wikipedia.org/wiki/Man_page#Manual_sections)
+- [FreeBSD Manual Pages](https://man.freebsd.org/cgi/man.cgi) - Powerful source for Unix/BSD documentation.
+- [Linux Manual Pages (man7)](https://www.man7.org/linux/man-pages/) - Very popular source for Linux documentation.
+- [Linux Manual Pages (die.net)](https://linux.die.net/man/) - Another popular source for Linux documentation.
+- [OpenGroup Specification (POSIX and C Standard Library)](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/contents.html) - This is important to improve the support for Linux/BSD programs written in C/C++.
+- [POSIX errors](https://en.wikipedia.org/wiki/Errno.h#POSIX_errors)
+- [Linux FHS Directory Structure](https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard#Directory_structure)
+
+### Source Code
+
+If you want to implement something (drivers, hardware interfaces, fix bugs, etc) but the documentation is not good or not available, you can verify the implementation of other operating systems.
+
+- [Linux - cgit](https://git.kernel.org/) - Official web interface for the Linux kernel source code.
+- [Linux - GitHub mirror](https://github.com/torvalds/linux) - GitHub mirror for the Linux kernel source code, it contain more features to read the files.
+- [FreeBSD - cgit](https://cgit.freebsd.org/) - Official web interface for the FreeBSD source code.
+- [FreeBSD - GitHub mirror](https://github.com/freebsd/freebsd-src)
+- [NetBSD - CVSWeb](http://cvsweb.netbsd.org/) - Official web interface for the NetBSD source code.
+- [NetBSD - GitHub mirror](https://github.com/NetBSD/src)
+- [OpenBSD - CVSWeb](https://cvsweb.openbsd.org/) - Official web interface for the OpenBSD source code.
+- [OpenBSD - GitHub mirror](https://github.com/openbsd/src)
+- [Minix](https://git.minix3.org/index.cgi?p=minix.git) - Official web interface for the Minix source code.
+- [seL4](https://github.com/seL4/seL4)
+
+### Ideas
+
+- [Linux](https://www.kernel.org/) - The Linux kernel contains lots of ideas that improved the Unix design (POSIX) and system engineering.
+- [Android](https://developer.android.com/) - Android created many ideas to improve the system security and power efficiency.
+- [FreeBSD - Ideas](https://wiki.freebsd.org/IdeasPage) - The future ideas of FreeBSD.
+- [FreeBSD - Documentation](https://docs.freebsd.org/en/)
+- [Fedora - Change Proposals](https://fedoraproject.org/wiki/Changes) - For years the Fedora Linux distribution tested and implemented new technologies for the Linux ecosystem.
