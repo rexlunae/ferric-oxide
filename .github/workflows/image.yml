@@ -79,7 +79,8 @@ jobs:
           # the runners are not, so force it on to test the entry code on every run.
           # The IOMMU is off by default; "auto" enables VT-d on the boot that has one
           # and logs that there is no DMAR table on the other.
-          printf '[kernel.cpu]\nkpti = "always"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
+          # Shadow stacks are off by default; "auto" only logs what the CPU reports so far.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
@@ -170,6 +171,12 @@ jobs:
             echo "::warning::runner CPU lacks PCID or INVPCID; KPTI ran without PCID"
             if grep -aF "KPTI: PCID enabled" "$LOG"; then exit 1; fi
           fi
+
+      # kernel.cpu.shstk = "auto" only detects shadow stacks so far. Whether KVM passes CET_SS
+      # through depends on the runner, so accept either answer but require the line.
+      - name: Check shadow-stack detection
+        run: |
+          grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
 
       - name: Check the IOMMU
         run: |

@@ -41,6 +41,10 @@ pub unsafe fn init(cpu_id: LogicalCpuId) {
 
     // Ferric Oxide: kernel indirect branch tracking. Last, because `cr4()` above drops CR4.CET.
     super::ibt::init_cpu(cpu_id == LogicalCpuId::BSP);
+    // Ferric Oxide: report shadow-stack support and policy (nothing is enabled yet).
+    if cpu_id == LogicalCpuId::BSP {
+        super::shstk::report();
+    }
 }
 
 unsafe extern "C" {

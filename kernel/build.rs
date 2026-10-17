@@ -54,13 +54,12 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         .keys()
         .map(|feat| format!(", {feat:?}"))
         .collect::<String>();
-    // Ferric Oxide: the code checks for "ibt" and "pcid" even when an older config.toml does not
-    // list them.
-    if !altfeatures.contains_key("ibt") {
-        features_list.push_str(", \"ibt\"");
-    }
-    if !altfeatures.contains_key("pcid") {
-        features_list.push_str(", \"pcid\"");
+    // Ferric Oxide: the code checks for "ibt", "pcid" and "shstk" even when an older config.toml
+    // does not list them.
+    for feat in ["ibt", "pcid", "shstk"] {
+        if !altfeatures.contains_key(feat) {
+            features_list.push_str(&format!(", {feat:?}"));
+        }
     }
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_always, values(\"\"{features_list}))");
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_auto, values(\"\"{features_list}))");
@@ -77,6 +76,13 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         }
 
         println!("cargo:rustc-cfg=cpu_feature_{choice}=\"{name}\"");
+
+        // Ferric Oxide (shadow stacks): only detected and reported so far, so "always" would
+        // promise something the kernel does not do.
+        assert!(
+            !(name == "shstk" && choice == "always"),
+            "arch.x86_64.features.shstk must be \"auto\" or \"never\""
+        );
 
         // Ferric Oxide (IBT): hand-written entry points get endbr64 from this cfg, but the
         // compiler only adds it to Rust functions (in every crate, core and alloc included) when
