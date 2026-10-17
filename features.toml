@@ -536,6 +536,27 @@ and recent Intel ones are not affected and pay nothing. It costs two page-table
 switches and TLB flushes per system call and interrupt on affected CPUs."""
 choices = ["always", "auto", "never"]
 
+[[option]]
+id = "kernel.cpu.ibt"
+menu = "kernel.cpu"
+type = "choice"
+title = "Indirect branch tracking (CET IBT) in the kernel"
+default = "never"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.ibt"
+rebuild = ["kernel"]
+help = """
+Build the kernel (and its core and alloc) with endbr64 at every function entry
+and turn on Intel CET indirect branch tracking in supervisor mode, so an
+indirect call or jump that lands anywhere other than an endbr64 stops the
+kernel with a control-protection fault (#CP) instead of running a gadget.
+"auto" turns it on when the CPU reports CET_IBT (Intel Tiger Lake, Sapphire
+Rapids and newer); "always" panics at boot on CPUs without it. User-mode CET
+and kernel shadow stacks stay off. Costs four bytes per function and no jump
+tables. Off by default because CI cannot test it: KVM on the runners does not
+expose CET and QEMU's emulator does not implement it."""
+choices = ["always", "auto", "never"]
+
 # ---------------------------------------------------------------- image
 
 [[option]]
@@ -734,7 +755,7 @@ message = "Prebuilt packages are compiled for baseline x86-64; only packages you
 
 [[rule]]
 level = "warn"
-when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto')"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto' || kernel.cpu.ibt == 'auto')"
 message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
 
 [[rule]]

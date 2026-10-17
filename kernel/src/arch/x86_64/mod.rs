@@ -25,6 +25,9 @@ pub mod misc;
 /// Ferric Oxide: kernel page-table isolation
 pub mod kpti;
 
+/// Ferric Oxide: kernel indirect branch tracking (CET IBT)
+pub mod ibt;
+
 // TODO: Maybe support rewriting relocations (using LD's --emit-relocs) when working with entire
 // functions?
 #[unsafe(naked)]

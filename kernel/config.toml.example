@@ -13,5 +13,9 @@ avx512 = "never"
 # Ferric Oxide: kernel page-table isolation against Meltdown. "auto" turns it on
 # for Intel CPUs without RDCL_NO.
 kpti = "never"
+# Ferric Oxide: kernel indirect branch tracking (Intel CET IBT). Anything but
+# "never" makes the Makefile build with -Z cf-protection=branch. "auto" turns it
+# on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.
+ibt = "never"
 
 # vim: ft=toml

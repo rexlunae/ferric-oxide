@@ -316,3 +316,28 @@ interrupt_error!(security, |stack, _code| {
         }
     }
 });
+
+// Ferric Oxide (IBT, see arch/x86_64/ibt.rs): with kernel indirect branch tracking on, an
+// indirect branch that misses `endbr64` lands here. User-mode CET is never enabled, so a #CP from
+// user space is unexpected; it is handled like other faults there.
+#[cfg(target_arch = "x86_64")]
+interrupt_error!(control_protection, |stack, code| {
+    let fault = ferric_cet::ControlProtectionError::from_error_code(code as u64);
+    if stack.iret.cs & 3 == 3 {
+        println!("Control protection fault in user space: {}", fault);
+        stack.trace();
+        excp_handler(Exception {
+            kind: 21,
+            code,
+            ..Default::default()
+        });
+        return;
+    }
+    println!("Control protection fault code={:#x}", code);
+    stack.trace();
+    // RIP is the branch target that lacks `endbr64`; the trace above shows who branched there.
+    panic!(
+        "IBT: control protection fault (#CP) in the kernel at {:#x}: {}",
+        stack.iret.rip, fault
+    );
+});

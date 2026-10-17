@@ -544,6 +544,8 @@ macro_rules! interrupt_stack {
                 $code
             }
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 
@@ -598,6 +600,8 @@ macro_rules! interrupt {
             }
 
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 
@@ -638,6 +642,8 @@ macro_rules! interrupt_error {
             }
 
             core::arch::naked_asm!(
+                // Ferric Oxide (IBT): the IDT is an indirect branch target.
+                ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 

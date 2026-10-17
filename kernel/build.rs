@@ -34,10 +34,14 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         .unwrap();
 
     #[expect(clippy::format_collect)] // TODO: remove once version is bumped
-    let features_list = altfeatures
+    let mut features_list = altfeatures
         .keys()
         .map(|feat| format!(", {feat:?}"))
         .collect::<String>();
+    // Ferric Oxide: the code checks for "ibt" even when an older config.toml does not list it.
+    if !altfeatures.contains_key("ibt") {
+        features_list.push_str(", \"ibt\"");
+    }
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_always, values(\"\"{features_list}))");
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_auto, values(\"\"{features_list}))");
     println!("cargo::rustc-check-cfg=cfg(cpu_feature_never, values(\"\"{features_list}))");
@@ -53,6 +57,26 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         }
 
         println!("cargo:rustc-cfg=cpu_feature_{choice}=\"{name}\"");
+
+        // Ferric Oxide (IBT): hand-written entry points get endbr64 from this cfg, but the
+        // compiler only adds it to Rust functions (in every crate, core and alloc included) when
+        // RUSTFLAGS carries the flags the kernel Makefile adds. Without them the kernel would
+        // take a #CP on the first indirect call on CET hardware, so refuse to build.
+        if name == "ibt" && choice != "never" {
+            println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+            println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+            let flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+            let flags: Vec<&str> = flags.split('\x1f').collect();
+            let has = |opt: &str, val: &str| {
+                flags.windows(2).any(|w| w == [opt, val])
+                    || flags.contains(&format!("{opt}{val}").as_str())
+            };
+            assert!(
+                has("-Z", "cf-protection=branch") && has("-C", "jump-tables=no"),
+                "arch.x86_64.features.ibt is \"{choice}\" but RUSTFLAGS lacks \
+                 `-Zcf-protection=branch -Cjump-tables=no`; build with the kernel Makefile"
+            );
+        }
     }
 
     Some(())

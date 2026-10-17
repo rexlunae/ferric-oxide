@@ -1,4 +1,4 @@
-use core::{cell::SyncUnsafeCell, mem};
+use core::cell::SyncUnsafeCell;
 
 use alloc::boxed::Box;
 
@@ -120,7 +120,14 @@ fn set_exceptions(idt: &mut [IdtEntry]) {
     idt[18].set_func(exception::machine_check);
     idt[19].set_func(exception::simd);
     idt[20].set_func(exception::virtualization);
-    // 21 through 29 reserved
+    // Ferric Oxide (IBT): control protection exception, only possible with IBT built in.
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::ibt::COMPILED
+        && let Some(entry) = idt.get_mut(21)
+    {
+        entry.set_func(exception::control_protection);
+    }
+    // 22 through 29 reserved
     idt[30].set_func(exception::security);
     // 31 reserved
 }
@@ -173,18 +180,17 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
 
     set_exceptions(current_idt);
 
+    // Ferric Oxide: the stub size depends on IBT (see irq.rs).
     assert_eq!(
         __generic_interrupts_end as *const () as usize
             - __generic_interrupts_start as *const () as usize,
-        224 * 8
+        224 * irq::GENERIC_INTERRUPT_STUB_SIZE
     );
 
     for i in 0..224 {
-        current_idt[i + 32].set_func(unsafe {
-            mem::transmute::<usize, unsafe extern "C" fn()>(
-                __generic_interrupts_start as *const () as usize + i * 8,
-            )
-        });
+        current_idt[i + 32].set_addr(
+            __generic_interrupts_start as *const () as usize + i * irq::GENERIC_INTERRUPT_STUB_SIZE,
+        );
     }
 
     // reserve bits 31:0, i.e. the first 32 interrupts, which are reserved for exceptions
@@ -355,10 +361,13 @@ impl IdtEntry {
 
     // A function to set the offset more easily
     pub fn set_func(&mut self, func: unsafe extern "C" fn()) {
+        self.set_addr(func as usize);
+    }
+
+    /// Ferric Oxide: points a present ring-0 interrupt gate at the kernel code address `addr`,
+    /// for entry stubs that are not Rust functions (such as the generic interrupt stubs).
+    pub fn set_addr(&mut self, addr: usize) {
         self.set_flags(IdtFlags::PRESENT | IdtFlags::RING_0 | IdtFlags::INTERRUPT);
-        self.set_offset(
-            (crate::arch::gdt::GDT_KERNEL_CODE as u16) << 3,
-            func as usize,
-        );
+        self.set_offset((crate::arch::gdt::GDT_KERNEL_CODE as u16) << 3, addr);
     }
 }
