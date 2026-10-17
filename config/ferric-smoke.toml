@@ -34,7 +34,7 @@ uname -a
 cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
-ferric-xstate-test
+ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
 echo FERRIC_SMOKE_OK
 shutdown
 """

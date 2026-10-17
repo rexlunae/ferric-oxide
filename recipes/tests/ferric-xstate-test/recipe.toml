@@ -1,8 +1,8 @@
 # Ferric Oxide: checks that the kernel preserves AVX-512 register state across
-# preemption and never leaks it between contexts. Source lives in files/.
+# preemption and never leaks it between contexts. Source lives in files/;
+# as a path source (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-xstate-test/files"
+
 [build]
-template = "custom"
-script = """
-COOKBOOK_SOURCE="${COOKBOOK_RECIPE}/files"
-cookbook_cargo
-"""
+template = "cargo"
