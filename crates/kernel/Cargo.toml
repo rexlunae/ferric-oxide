@@ -16,11 +16,11 @@ arrayvec = { version = "0.7.4", default-features = false }
 bitfield = "0.13.2"
 bitflags = "2"
 fdt = { git = "https://github.com/repnop/fdt.git", rev = "2fb1409edd1877c714a0aa36b6a7c5351004be54", features = ["pretty-printing"] }
-ferric-cet = { path = "../crates/cet" }
-ferric-hwrand = { path = "../crates/hwrand", optional = true }
-ferric-iommu = { path = "../crates/iommu", features = ["alloc"] }
-ferric-nospec = { path = "../crates/nospec" }
-ferric-vtd = { path = "../crates/vtd" }
+ferric-cet = { path = "../cet" }
+ferric-hwrand = { path = "../hwrand", optional = true }
+ferric-iommu = { path = "../iommu", features = ["alloc"] }
+ferric-nospec = { path = "../nospec" }
+ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
 linked_list_allocator = "0.9.0"
 redox_syscall = { path = "syscall" }

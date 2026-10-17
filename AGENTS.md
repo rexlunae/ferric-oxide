@@ -16,16 +16,16 @@ The repository is moving to the layout below. Parts of it do not exist yet; put 
 | `tools/cookbook/` | The recipe engine and `repo` binary | host |
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxfs-host/` | Image installer and host-side RedoxFS tools | host |
-| `kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
-| `bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
-| `relibc/` | C library. Upstream subtree | relibc |
+| `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
+| `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
+| `crates/relibc/` | C library. Upstream subtree | relibc |
+| `crates/` (others) | Shared libraries used by several workspaces (`ferric-nospec`, `ferric-hwrand`, later `ferric-abi`, …), `no_std` where possible | pulled in by path |
 | `userspace/` | Daemons, drivers, file system, new Ferric Oxide services. `base/` and `redoxfs/` are upstream subtrees | userspace |
-| `crates/` | Shared libraries used by several workspaces (`redox_syscall`, `ferric-abi`, …), `no_std` where possible | pulled in by path |
 | `recipes/`, `config/`, `mk/` | Package recipes, image configs, Makefile fragments | — |
 | `features.toml` | Catalog of build-time feature options | — |
 | `docs/` | The book. Upstream subtree | — |
 
-Each target (host, kernel, UEFI, `x86_64-unknown-redox`) has its own workspace because a Cargo workspace has one target, one lockfile and one set of profiles. Code shared between workspaces goes in `crates/` and is depended on by path. Do not merge the workspaces into one.
+Each target (host, kernel, UEFI, `x86_64-unknown-redox`) has its own workspace because a Cargo workspace has one target, one lockfile and one set of profiles. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
 
 ## Non-negotiable project rules
 
@@ -33,7 +33,7 @@ Each target (host, kernel, UEFI, `x86_64-unknown-redox`) has its own workspace b
 - **Clean-room Linux compatibility.** Linux file systems (ext4, XFS, LVM, LUKS) and other Linux-compatible features are written from published format specifications and documentation, never ported or translated from GPL source. Do not read Linux kernel source while implementing them, and say which specification you used in the module docs.
 - **Keep internal Redox names.** The `redox` target triple, `relibc`, `RedoxFS`, `redox_syscall`, scheme names and existing paths stay as they are so upstream changes keep merging. The rebrand is user-facing only. Do not use the Redox name or logo for the fork itself (see [TRADEMARK.md](TRADEMARK.md)).
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
-- **Respect upstream subtrees.** `kernel/`, `bootloader/`, `relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/` are synced from upstream with `git subtree`. Do not move or rename files inside them, and keep changes there small and local. Put fork-only functionality in new crates under `crates/` or `userspace/` and call into it from the upstream tree.
+- **Respect upstream subtrees.** `crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/` are synced from upstream with `git subtree`. Do not move or rename files inside them, and keep changes there small and local. Put fork-only functionality in new crates under `crates/` or `userspace/` and call into it from the upstream tree.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
 

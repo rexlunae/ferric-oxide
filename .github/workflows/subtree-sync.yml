@@ -26,13 +26,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - prefix: kernel
+          - prefix: crates/kernel
             url: https://gitlab.redox-os.org/redox-os/kernel.git
             ref: master
-          - prefix: relibc
+          - prefix: crates/relibc
             url: https://gitlab.redox-os.org/redox-os/relibc.git
             ref: master
-          - prefix: bootloader
+          - prefix: crates/bootloader
             url: https://gitlab.redox-os.org/redox-os/bootloader.git
             ref: master
           - prefix: userspace/redoxfs
@@ -69,11 +69,11 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "$PREFIX" = kernel ]; then
+          if [ "$PREFIX" = crates/kernel ]; then
             # Upstream code may change the kernel warning counts. Move the
             # lint ratchet baseline with it so the next fork PR is measured
             # against upstream's new state, not blamed for it.
-            toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+            toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
             sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
             rustup toolchain install "$toolchain" --profile minimal --component rust-src,clippy
             scripts/ferric-ci/kernel-lint-ratchet.sh --update

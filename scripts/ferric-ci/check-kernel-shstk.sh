@@ -2,7 +2,7 @@
 # Checks that a kernel built with kernel.cpu.shstk on (arch.x86_64.features.shstk "auto"/"always"
 # in the kernel's config.toml, plus the self_modifying feature) carries the Intel CET supervisor
 # shadow-stack machinery the boot code patches in. CI cannot run CET hardware, so this is a static
-# check of the compiled kernel; see kernel/src/arch/x86_64/shstk.rs.
+# check of the compiled kernel; see crates/kernel/src/arch/x86_64/shstk.rs.
 #
 # It verifies:
 #   - the alternative code pool (.rodata, __altcode_start..__altcode_end) holds the context-switch

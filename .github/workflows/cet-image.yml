@@ -3,14 +3,14 @@ name: cet-image
 # Builds a bootable x86_64 image with kernel shadow stacks and indirect branch
 # tracking on ("auto"), for booting on CET hardware by hand: the runners have no
 # CET, so the boot job here only checks that the image boots and logs that it
-# skips (see kernel/src/arch/x86_64/shstk.rs and ibt.rs). The image is uploaded
-# as the "ferric-cet-image" artifact (harddrive.img.zst).
+# skips (see crates/kernel/src/arch/x86_64/shstk.rs and ibt.rs). The image is
+# uploaded as the "ferric-cet-image" artifact (harddrive.img.zst).
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "kernel/**"
+      - "crates/kernel/**"
       - "crates/cet/**"
       - "features.toml"
       - "tools/ferric-config/**"
