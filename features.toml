@@ -123,7 +123,8 @@ psABI microarchitecture level for all userspace code.
       Haswell / Excavator / Zen and newer.
   v4  + AVX-512 F/BW/CD/DQ/VL. Skylake-SP, Ice Lake, Zen 4 and newer.
 
-An image built for a level will not boot userspace on an older CPU.
+An image built for a level will not boot on an older CPU: the kernel
+checks at boot and halts with a list of the missing features.
 `make qemu` picks a matching emulated CPU when KVM is off.
 
 v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
@@ -138,6 +139,12 @@ choices = [
 [[option.effect]]
 when = "value == 'v1'"
 make = { QEMU_CPU = "core2duo" }
+
+# The kernel checks the CPU against the level at boot and halts with a list of
+# missing features, instead of user space dying later with an invalid opcode.
+[[option.effect]]
+when = "value != 'v1'"
+kernel_config = { "arch.x86_64.level" = "{value}" }
 
 [[option.effect]]
 when = "value == 'v2'"
