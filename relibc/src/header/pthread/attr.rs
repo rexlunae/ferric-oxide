@@ -500,6 +500,7 @@ pub unsafe extern "C" fn pthread_getattr_np(thread: pthread_t, attr: *mut pthrea
     }
     attr.stack = thread.stack_base as usize;
     attr.stacksize = thread.stack_size;
+    attr.guardsize = thread.guard_size;
     //TODO: more values?
     0
 }
