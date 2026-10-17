@@ -141,6 +141,48 @@ pub fn fetch_offline(recipe: &CookRecipe, logger: &PtyOut) -> Result<FetchResult
     result.apply_info(recipe)
 }
 
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PathSourceState {
+    original: PathBuf,
+    // Track source membership rather than snapshot timestamps: builds can
+    // create newer files in the snapshot, and deletions can share a clock tick.
+    entries: BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+}
+
+fn refresh_path_source(original: &Path, snapshot: &Path, rule: &str) -> Result<bool> {
+    if snapshot.is_dir() && rule == "local" {
+        return Ok(true);
+    }
+    let mut entries = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(original) {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let relative = entry
+            .path()
+            .strip_prefix(original)
+            .expect("WalkDir entries are descendants of its root")
+            .to_path_buf();
+        let modified = metadata
+            .modified()
+            .map_err(wrap_io_err!(entry.path(), "Reading source timestamp"))?;
+        entries.insert(relative, (metadata.len(), modified));
+    }
+    let state = PathSourceState {
+        original: original.to_path_buf(),
+        entries,
+    };
+    let state_dir = snapshot.parent().unwrap_or(Path::new(".")).join("target");
+    let state_path = state_dir.join("path-source.toml");
+    if snapshot.is_dir() && read_toml::<PathSourceState>(&state_path).ok().as_ref() == Some(&state)
+    {
+        return Ok(true);
+    }
+    replace_dir_all(original, snapshot)?;
+    create_dir(&state_dir)?;
+    serialize_and_write(&state_path, &state)?;
+    Ok(false)
+}
+
 pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result<FetchResult> {
     let recipe_dir = &recipe.dir;
     let source_dir = recipe_dir.join("source");
@@ -176,19 +218,14 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
         }
         Some(SourceRecipe::Path { path }) => {
             let path = Path::new(&path);
-            let cached = source_dir.is_dir() && modified_dir(path)? <= modified_dir(&source_dir)?;
+            let cached = refresh_path_source(path, &source_dir, &recipe.rule)?;
             if !cached {
                 log_to_pty!(
                     logger,
-                    "[DEBUG]: {:?} is newer than {:?}",
-                    path.display(),
-                    source_dir.display()
+                    "[DEBUG]: refreshed {:?} from {:?}",
+                    source_dir.display(),
+                    path.display()
                 );
-                copy_dir_all(path, &source_dir).map_err(wrap_io_err!(
-                    path,
-                    source_dir,
-                    "Copying source"
-                ))?;
             }
             FetchResult::new(
                 source_dir,
@@ -885,4 +922,43 @@ pub fn fetch_get_source_info(recipe: &CookRecipe) -> Result<SourceIdentifier> {
     let target_dir = recipe.target_dir();
     let source_toml_path = target_dir.join("source_info.toml");
     read_toml(&source_toml_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_nested_source_files_invalidate_fetch_without_overwriting_local_edits() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let snapshot = temporary.path().join("source");
+        fs::create_dir_all(original.join("src/bin")).unwrap();
+        fs::write(original.join("src/bin/deleted.rs"), "old source").unwrap();
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
+        assert!(refresh_path_source(&original, &snapshot, "source").unwrap());
+        fs::write(snapshot.join("generated-by-build"), "generated").unwrap();
+        assert!(refresh_path_source(&original, &snapshot, "source").unwrap());
+        fs::remove_file(original.join("src/bin/deleted.rs")).unwrap();
+        assert!(refresh_path_source(&original, &snapshot, "local").unwrap());
+        assert!(snapshot.join("src/bin/deleted.rs").exists());
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
+        assert!(!snapshot.join("src/bin/deleted.rs").exists());
+    }
+
+    #[test]
+    fn gui_installer_fetches_the_complete_upstream_source() {
+        let recipe: crate::recipe::Recipe = toml::from_str(include_str!(
+            "../../../../recipes/gui/installer-gui/recipe.toml"
+        ))
+        .unwrap();
+        let Some(SourceRecipe::Git { git, rev, .. }) = recipe.source else {
+            panic!("GUI installer must fetch its complete independent source");
+        };
+        assert_eq!(git, "https://gitlab.redox-os.org/redox-os/installer.git");
+        assert_eq!(
+            rev.as_deref(),
+            Some("b5a11310e1ac915494efea6d18e242966da74f3f")
+        );
+    }
 }

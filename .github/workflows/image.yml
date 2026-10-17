@@ -55,7 +55,7 @@ jobs:
             prefix
             build/fstools
             target
-          key: redox-host-${{ hashFiles('Cargo.lock', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
+          key: redox-host-${{ hashFiles('Cargo.lock', 'tools/installer/**', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
           restore-keys: redox-host-
 
       # Build the kernel and relibc with the feature catalog's defaults

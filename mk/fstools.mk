@@ -5,6 +5,7 @@ fstools: $(FSTOOLS_TAG) $(FSTOOLS)
 GOING_TO_PODMAN_AGAIN?=0
 
 # These tools run inside Podman if it is used, or on the host if Podman is not used
+$(FSTOOLS): $(shell find tools/installer -type f -o -type d) Cargo.lock
 $(FSTOOLS): | prefix $(CONTAINER_TAG) $(FSTOOLS_TAG)
 ifeq ($(PODMAN_BUILD),1)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
@@ -21,7 +22,7 @@ else
 	# Compile installer and redoxfs for host (may be outside of podman container)
 	cd $@.partial && \
 		export CARGO_TARGET_DIR=../$@-target && \
-		$(HOST_CARGO) install --root . --path recipes/core/installer/source --locked $(INSTALLER_FEATURES) && \
+		$(HOST_CARGO) install --root . --path $(ROOT)/tools/installer --locked $(INSTALLER_FEATURES) && \
 		$(HOST_CARGO) install --root . --path recipes/core/redoxfs/source --locked $(REDOXFS_FEATURES)
 
 	mv $@.partial $@
@@ -32,7 +33,7 @@ fstools_fetch: $(FSTOOLS_TAG) FORCE
 ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
-	$(REPO_BIN) fetch host:installer host:redoxfs
+	$(REPO_BIN) fetch host:redoxfs
 endif
 
 CARGO_OFFLINE_FLAG=

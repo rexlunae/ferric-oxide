@@ -47,18 +47,57 @@ pub fn create_target_dir(recipe_dir: &Path, target: &'static str) -> Result<Path
     Ok(target_dir)
 }
 
+/// Copy into a new snapshot without following source or destination symlinks.
+///
+/// Existing regular files are not overwritten; callers refresh through a clean
+/// temporary directory. Preserve symlinks as links, as a Git checkout would.
+///
+/// # Errors
+/// Returns an I/O error for an existing destination file or link, or failed I/O.
 pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(&dst)?;
+    let dst = dst.as_ref();
+    if fs::symlink_metadata(dst).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot destination is a symbolic link",
+        ));
+    }
+    fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        let target = dst.join(entry.file_name());
+        if ty.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, target)?;
+        } else if ty.is_dir() {
+            copy_dir_all(entry.path(), target)?;
         } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            // create_new refuses links and existing files instead of opening
+            // their targets. Use the returned descriptor for data and modes.
+            let mut source = fs::File::open(entry.path())?;
+            let mut destination = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            io::copy(&mut source, &mut destination)?;
+            destination.set_permissions(source.metadata()?.permissions())?;
         }
     }
     Ok(())
+}
+
+/// Replace a path-source snapshot, propagating deleted files and directories.
+///
+/// # Errors
+/// Returns an I/O error if the snapshot cannot be removed, created or copied.
+pub(crate) fn replace_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    let temporary = dst.with_extension("tmp");
+    create_dir_clean(&temporary)?;
+    copy_dir_all(src, &temporary).map_err(wrap_io_err!(src, temporary, "Copying source"))?;
+    if fs::symlink_metadata(dst).is_ok() {
+        remove_all(dst)?;
+    }
+    rename(&temporary, dst)
 }
 
 pub fn move_dir_all_fn<'a>(
@@ -159,9 +198,7 @@ fn modified_dir_inner<F: FnMut(&DirEntry) -> bool>(dir: &Path, filter: F) -> Res
     for entry_res in WalkDir::new(dir).into_iter().filter_entry(filter) {
         let entry = entry_res?;
         let meta = entry.metadata()?;
-        if meta.is_dir() {
-            continue;
-        }
+        // Directory timestamps detect deletions, including in nested directories.
         let modified = modified_inner(entry.path(), meta)?;
         if modified > newest {
             newest = modified;
@@ -629,4 +666,94 @@ pub fn get_git_rev_before_date(dir: &PathBuf, date: &str) -> Result<String> {
         )));
     }
     Ok(rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_links_are_preserved_and_snapshot_links_cannot_overwrite_host_files() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let snapshot = temporary.path().join("source");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&snapshot).unwrap();
+        fs::write(&outside, "host data").unwrap();
+        fs::write(original.join("regular"), "source data").unwrap();
+        symlink(&outside, original.join("link")).unwrap();
+        symlink(&outside, snapshot.join("regular")).unwrap();
+        assert!(copy_dir_all(&original, &snapshot).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "host data");
+        replace_dir_all(&original, &snapshot).unwrap();
+        assert_eq!(
+            fs::read_to_string(snapshot.join("regular")).unwrap(),
+            "source data"
+        );
+        assert!(
+            fs::symlink_metadata(snapshot.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(snapshot.join("link")).unwrap(), outside);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "host data");
+    }
+
+    #[test]
+    fn snapshot_root_symlinks_are_not_followed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let outside = temporary.path().join("outside");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(original.join("file"), "source data").unwrap();
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+        assert!(copy_dir_all(&original, &destination).is_err());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_snapshot_copy_preserves_existing_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("source");
+        fs::create_dir(&snapshot).unwrap();
+        fs::write(snapshot.join("keep.rs"), "existing source").unwrap();
+        assert!(replace_dir_all(&temporary.path().join("missing"), &snapshot).is_err());
+        assert_eq!(
+            fs::read_to_string(snapshot.join("keep.rs")).unwrap(),
+            "existing source"
+        );
+    }
+
+    #[test]
+    fn replacing_path_source_removes_deleted_files() {
+        let root =
+            std::env::temp_dir().join(format!("cookbook-path-source-{}", std::process::id()));
+        create_dir_clean(&root).unwrap();
+        let original = root.join("original");
+        let snapshot = root.join("source");
+        fs::create_dir_all(original.join("src")).unwrap();
+        fs::write(original.join("src/removed.rs"), "old module").unwrap();
+        fs::write(original.join("Cargo.toml"), "manifest").unwrap();
+        copy_dir_all(&original, &snapshot).unwrap();
+        fs::remove_file(original.join("src/removed.rs")).unwrap();
+        // A nested directory can be newer even when no remaining file changed.
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::open(original.join("src"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        assert!(modified_dir(&original).unwrap() > modified_dir(&snapshot).unwrap());
+        replace_dir_all(&original, &snapshot).unwrap();
+        assert!(!snapshot.join("src/removed.rs").exists());
+        assert_eq!(
+            fs::read_to_string(snapshot.join("Cargo.toml")).unwrap(),
+            "manifest"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

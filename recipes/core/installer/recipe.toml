@@ -1,5 +1,6 @@
 [source]
-git = "https://gitlab.redox-os.org/redox-os/installer.git"
+# Host and target installer share the in-tree source.
+path = "tools/installer"
 
 [build]
 template = "cargo"
