@@ -1,0 +1,9 @@
+[unit]
+description = "/scheme/$INSTANCE ramfs"
+default_dependencies = false
+requires_weak = ["00_ipcd.service", "00_randd.service"]
+
+[service]
+cmd = "ramfs"
+args = ["$INSTANCE"]
+type = { scheme = "$INSTANCE" }

@@ -1,0 +1,11 @@
+[package]
+name = "getty"
+version = "0.1.0"
+edition = "2024"
+description = "Used by `init(8)` to open and initialize the TTY line, read a login name and invoke `login(1)`."
+
+[dependencies]
+clap = "4"
+libc = "0.2"
+mio = { version = "1.2.3", features = ["os-poll", "os-ext"] }
+termion = "4"

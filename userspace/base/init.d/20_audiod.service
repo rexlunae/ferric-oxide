@@ -1,0 +1,10 @@
+[unit]
+description = "Audio multiplexer"
+requires_weak = [
+    "00_base.target",
+]
+
+[service]
+cmd = "audiod"
+type = { scheme = "audio" }
+priority = -20
