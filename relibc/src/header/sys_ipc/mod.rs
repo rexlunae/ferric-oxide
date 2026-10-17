@@ -68,5 +68,7 @@ pub unsafe extern "C" fn ftok(path: *const c_char, id: c_int) -> key_t {
     }
 
     // Borrowed from musl
-    (stat.st_ino & 0xffff) as key_t | ((stat.st_dev & 0xff) << 16) as key_t | ((id & 0xff) << 24)
+    key_t::try_from(stat.st_ino & 0xffff).expect("within bounds")
+        | key_t::try_from((stat.st_dev & 0xff) << 16).expect("within bounds")
+        | ((id & 0xff) << 24)
 }

@@ -12,6 +12,7 @@ use crate::{
         sys_stat::stat,
         sys_statvfs::statvfs,
         sys_time::timezone,
+        sys_uio::iovec,
         sys_utsname::utsname,
         time::{itimerspec, timespec},
     },
@@ -381,6 +382,9 @@ pub trait Pal {
     /// Platform implementation of [`pread()`](crate::header::unistd::pread) from [`unistd.h`](crate::header::unistd).
     fn pread(fildes: c_int, buf: &mut [u8], offset: off_t) -> Result<usize>;
 
+    /// Platform implementation of [`readv()`](crate::header::sys_uio::readv) from [`sys/uio.h`](crate::header::sys_uio).
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize>;
+
     /// Platform implementation of [`readlink()`](crate::header::unistd::readlink) from [`unistd.h`](crate::header::unistd).
     fn readlink(pathname: CStr, out: &mut [u8]) -> Result<usize> {
         Self::readlinkat(AT_FDCWD, pathname, out)
@@ -493,6 +497,9 @@ pub trait Pal {
 
     /// Platform implementation of [`pwrite()`](crate::header::unistd::pwrite) from [`unistd.h`](crate::header::unistd).
     fn pwrite(fildes: c_int, buf: &[u8], offset: off_t) -> Result<usize>;
+
+    /// Platform implementation of [`writev()`](crate::header::sys_uio::writev) from [`sys/uio.h`](crate::header::sys_uio).
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize>;
 
     fn verify() -> bool;
 }

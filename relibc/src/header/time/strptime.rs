@@ -148,7 +148,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 };
                 unsafe {
-                    (*tm).tm_mday = val as c_int;
+                    (*tm).tm_mday = val;
                     // Day of month is limited to [1,31] according to the standard
                     if (*tm).tm_mday < 1 || (*tm).tm_mday > 31 {
                         return ptr::null_mut();
@@ -165,7 +165,7 @@ pub unsafe extern "C" fn strptime(
                 };
                 // tm_mon is 0-based (0 = Jan, 1 = Feb,...)
                 unsafe {
-                    (*tm).tm_mon = (val as c_int) - 1;
+                    (*tm).tm_mon = val - 1;
                     if (*tm).tm_mon < 0 || (*tm).tm_mon > 11 {
                         return ptr::null_mut();
                     }
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn strptime(
                 // but the standard says: "values in [69..99] refer to 1969..1999, [00..68] => 2000..2068"
                 let fullyear = if val >= 69 { val + 1900 } else { val + 2000 };
                 unsafe {
-                    (*tm).tm_year = (fullyear - 1900) as c_int;
+                    (*tm).tm_year = fullyear - 1900;
                 }
                 index_in_input += len;
             }
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 };
                 unsafe {
-                    (*tm).tm_year = (val as c_int) - 1900;
+                    (*tm).tm_year = val - 1900;
                 }
                 index_in_input += len;
             }
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 }
                 unsafe {
-                    (*tm).tm_hour = val as c_int;
+                    (*tm).tm_hour = val;
                 }
                 index_in_input += len;
             }
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 }
                 unsafe {
-                    (*tm).tm_hour = val as c_int;
+                    (*tm).tm_hour = val;
                 }
                 // We’ll interpret AM/PM with %p if it appears later
                 index_in_input += len;
@@ -239,7 +239,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 }
                 unsafe {
-                    (*tm).tm_min = val as c_int;
+                    (*tm).tm_min = val;
                 }
                 index_in_input += len;
             }
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn strptime(
                     return ptr::null_mut();
                 }
                 unsafe {
-                    (*tm).tm_sec = val as c_int;
+                    (*tm).tm_sec = val;
                 }
                 index_in_input += len;
             }
@@ -292,7 +292,7 @@ pub unsafe extern "C" fn strptime(
                 let parsed_len = match parse_weekday(leftover, true) {
                     Some((wday, used)) => {
                         unsafe {
-                            (*tm).tm_wday = wday as c_int;
+                            (*tm).tm_wday = c_int::try_from(wday).expect("within bounds");
                         }
                         used
                     }
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn strptime(
                 let parsed_len = match parse_weekday(leftover, false) {
                     Some((wday, used)) => {
                         unsafe {
-                            (*tm).tm_wday = wday as c_int;
+                            (*tm).tm_wday = c_int::try_from(wday).expect("within bounds");
                         }
                         used
                     }
@@ -322,7 +322,7 @@ pub unsafe extern "C" fn strptime(
                 let parsed_len = match parse_month(leftover, true) {
                     Some((mon, used)) => {
                         unsafe {
-                            (*tm).tm_mon = mon as c_int;
+                            (*tm).tm_mon = c_int::try_from(mon).expect("within bounds");
                         }
                         used
                     }
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn strptime(
                 let parsed_len = match parse_month(leftover, false) {
                     Some((mon, used)) => {
                         unsafe {
-                            (*tm).tm_mon = mon as c_int;
+                            (*tm).tm_mon = c_int::try_from(mon).expect("within bounds");
                         }
                         used
                     }
@@ -356,7 +356,7 @@ pub unsafe extern "C" fn strptime(
                 }
                 // store in tm_yday
                 unsafe {
-                    (*tm).tm_yday = (val - 1) as c_int;
+                    (*tm).tm_yday = val - 1;
                 }
                 index_in_input += len;
             }

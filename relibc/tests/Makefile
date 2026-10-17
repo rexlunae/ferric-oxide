@@ -159,6 +159,10 @@ $(BUILD)/bins_expect_input/%: %.c %.exp $(DEPS)
 	@$(CC) "$<" -o "$@" $(FLAGS) $(STATIC_FLAGS)
 	cp "$*.exp" $(addsuffix .exp,"$@")
 
+$(BUILD)/bins_dynamic/%_cpp.so: %.cpp $(DEPS)
+	mkdir -p "$$(dirname "$@")"
+	@$(CC) -x c++ "$<" -x none -o "$@" -shared -fpic $(FLAGS) $(DYNAMIC_FLAGS)
+
 $(BUILD)/bins_dynamic/%.so: %.c $(DEPS)
 	mkdir -p "$$(dirname "$@")"
 	@$(CC) "$<" -o "$@" -shared -fpic $(FLAGS) $(DYNAMIC_FLAGS)
@@ -168,7 +172,7 @@ $(BUILD)/bins_dynamic/libfoobar.so: libfoobar.c $(BUILD)/bins_dynamic/libfoo.so 
 	mkdir -p "$$(dirname "$@")"
 	@$(CC) "$<" -o "$@" -shared -fpic $(FLAGS) $(DYNAMIC_FLAGS) -L $(BUILD)/bins_dynamic -lfoo
 
-$(BUILD)/bins_dynamic/dlfcn: dlfcn.c $(BUILD)/bins_dynamic/sharedlib.so $(DEPS)
+$(BUILD)/bins_dynamic/dlfcn: dlfcn.c $(BUILD)/bins_dynamic/sharedlib.so $(BUILD)/bins_dynamic/sharedlib_cpp.so $(DEPS)
 	mkdir -p "$$(dirname "$@")"
 	@$(CC) "$<" -o "$@" $(FLAGS) $(DYNAMIC_FLAGS)
 

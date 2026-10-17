@@ -2,13 +2,12 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_uio.h.html>.
 
-use core::slice;
-
 use crate::{
-    header::{errno, limits::IOV_MAX, unistd},
+    error::ResultExt,
+    header::{errno, limits::IOV_MAX},
     platform::{
-        self,
-        types::{c_int, c_void, ssize_t},
+        self, Pal, Sys,
+        types::{c_int, ssize_t},
     },
 };
 
@@ -28,15 +27,9 @@ pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> s
         return -1;
     }
 
-    let iovs =
-        unsafe { slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive")) };
-    let mut vec = unsafe { gather(iovs) };
-
-    let ret = unsafe { unistd::read(fd, vec.as_mut_ptr().cast::<c_void>(), vec.len()) };
-
-    unsafe { scatter(iovs, &vec) };
-
-    ret
+    unsafe { Sys::readv(fd, iov, iovcnt) }
+        .map(|n| n as ssize_t)
+        .or_minus_one_errno()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/writev.html>.
@@ -54,9 +47,7 @@ pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> 
         return -1;
     }
 
-    let iovs =
-        unsafe { slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive")) };
-    let vec = unsafe { gather(iovs) };
-
-    unsafe { unistd::write(fd, vec.as_ptr().cast::<c_void>(), vec.len()) }
+    unsafe { Sys::writev(fd, iov, iovcnt) }
+        .map(|n| n as ssize_t)
+        .or_minus_one_errno()
 }

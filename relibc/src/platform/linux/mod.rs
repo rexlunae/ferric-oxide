@@ -14,6 +14,7 @@ use crate::{
         sys_stat::{S_IFIFO, stat},
         sys_statvfs::statvfs,
         sys_time::timezone,
+        sys_uio::iovec,
         sys_utsname::utsname,
         time::{itimerspec, timespec},
         unistd::{SEEK_CUR, SEEK_SET},
@@ -695,6 +696,10 @@ impl Pal for Sys {
         e_raw(unsafe { syscall!(PREAD64, fildes, buf.as_mut_ptr(), buf.len(), off) })
     }
 
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        e_raw(unsafe { syscall!(READV, fildes, iov, iovcnt) })
+    }
+
     fn readlinkat(dirfd: c_int, pathname: CStr, out: &mut [u8]) -> Result<usize> {
         e_raw(unsafe {
             syscall!(
@@ -838,6 +843,10 @@ impl Pal for Sys {
     }
     fn pwrite(fildes: c_int, buf: &[u8], off: off_t) -> Result<usize> {
         e_raw(unsafe { syscall!(PWRITE64, fildes, buf.as_ptr(), buf.len(), off) })
+    }
+
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        e_raw(unsafe { syscall!(WRITEV, fildes, iov, iovcnt) })
     }
 
     fn verify() -> bool {

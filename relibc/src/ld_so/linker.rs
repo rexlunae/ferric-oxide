@@ -93,7 +93,10 @@ impl MmapFile {
         let mut stat = crate::header::sys_stat::stat::default();
         Sys::fstat(fd, Out::from_mut(&mut stat))?;
 
-        Self::from_fd(fd, stat.st_size as usize)
+        Self::from_fd(
+            fd,
+            usize::try_from(stat.st_size).expect("st_size should be a positive value"),
+        )
     }
 
     fn from_fd(fd: i32, size: usize) -> core::result::Result<Self, Errno> {
@@ -605,10 +608,6 @@ impl Linker {
             scope,
         )?;
 
-        for (i, obj) in new_objects.iter().enumerate() {
-            obj.relocate(objects_data[i].as_deref(), resolve).unwrap();
-        }
-
         unsafe {
             if !dlopened {
                 #[cfg(target_os = "redox")]
@@ -721,6 +720,10 @@ impl Linker {
             }
         }
 
+        for (i, obj) in new_objects.iter().enumerate() {
+            obj.relocate(objects_data[i].as_deref(), resolve).unwrap();
+        }
+
         for obj in new_objects.into_iter() {
             // SAFETY: `obj` and its dependencies have been successfuly loaded.
             unsafe {
@@ -772,9 +775,9 @@ impl Linker {
         if let Some(id) = self.name_to_object_id_map.get(name) {
             if let Some(obj) = self.objects.get(id) {
                 if let Some(scope) = dependent_scope {
-                    match scope_kind {
-                        ScopeKind::Local => scope.add(obj),
-                        ScopeKind::Global => GLOBAL_SCOPE.write().add(obj),
+                    scope.add(obj);
+                    if scope_kind == ScopeKind::Global {
+                        GLOBAL_SCOPE.write().add(obj);
                     }
                 } else if scope_kind == ScopeKind::Global {
                     GLOBAL_SCOPE.write().add(obj);
@@ -783,9 +786,9 @@ impl Linker {
             }
         } else if let Some(obj) = new_objects.iter().find(|o| o.name == name) {
             if let Some(scope) = dependent_scope {
-                match scope_kind {
-                    ScopeKind::Local => scope.add(obj),
-                    ScopeKind::Global => GLOBAL_SCOPE.write().add(obj),
+                scope.add(obj);
+                if scope_kind == ScopeKind::Global {
+                    GLOBAL_SCOPE.write().add(obj);
                 }
             } else if scope_kind == ScopeKind::Global {
                 GLOBAL_SCOPE.write().add(obj);
@@ -888,9 +891,9 @@ impl Linker {
         let mut scope = Scope::local();
 
         if let Some(dependent_scope) = dependent_scope {
-            match scope_kind {
-                ScopeKind::Local => dependent_scope.add(&obj),
-                ScopeKind::Global => GLOBAL_SCOPE.write().add(&obj),
+            dependent_scope.add(&obj);
+            if scope_kind == ScopeKind::Global {
+                GLOBAL_SCOPE.write().add(&obj);
             }
         } else if let ScopeKind::Global = scope_kind {
             GLOBAL_SCOPE.write().add(&obj);
@@ -929,7 +932,7 @@ impl Linker {
             eprintln!("[ld.so]: looking for '{}'", name);
         }
 
-        if name.contains('/') && accessible(&name, F_OK).is_ok() {
+        if name.contains('/') && accessible(name, F_OK).is_ok() {
             if debug {
                 eprintln!("[ld.so]: found at '{}'!", name);
             }

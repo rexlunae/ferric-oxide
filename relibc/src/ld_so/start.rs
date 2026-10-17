@@ -205,8 +205,8 @@ pub unsafe extern "C" fn relibc_ld_so_start(
     };
 
     let ehdr = unsafe { &*(self_base as *const FileHeader) };
-    let ph_off = ehdr.e_phoff(NativeEndian) as usize;
-    let ph_num = ehdr.e_phnum(NativeEndian) as usize;
+    let ph_off = usize::try_from(ehdr.e_phoff(NativeEndian)).expect("within bounds");
+    let ph_num = usize::from(ehdr.e_phnum(NativeEndian));
 
     let my_phdrs = unsafe {
         slice::from_raw_parts(
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn relibc_ld_so_start(
     let mut rel_len = None;
     loop {
         let entry = unsafe { &*dynamic.add(i) };
-        let val = entry.d_val(NativeEndian);
+        let val = usize::try_from(entry.d_val(NativeEndian)).expect("within bounds");
         let ptr = val as *const u8;
         #[cfg(target_pointer_width = "32")]
         let d_tag = entry.d_tag(NativeEndian);
@@ -247,19 +247,19 @@ pub unsafe extern "C" fn relibc_ld_so_start(
         match d_tag {
             elf::DT_NULL => break,
             elf::DT_RELA => rela_ptr = Some(ptr.cast::<Rela>()),
-            elf::DT_RELASZ => rela_len = Some(val as usize / size_of::<Rela>()),
+            elf::DT_RELASZ => rela_len = Some(val / size_of::<Rela>()),
             elf::DT_RELAENT => {
-                assert_eq!(val as usize, size_of::<Rela>(),);
+                assert_eq!(val, size_of::<Rela>());
             }
             elf::DT_REL => rel_ptr = Some(ptr.cast::<Rel>()),
-            elf::DT_RELSZ => rel_len = Some(val as usize / size_of::<Rel>()),
+            elf::DT_RELSZ => rel_len = Some(val / size_of::<Rel>()),
             elf::DT_RELENT => {
-                assert_eq!(val as usize, size_of::<Rel>());
+                assert_eq!(val, size_of::<Rel>());
             }
             DT_RELR => relr_ptr = Some(ptr.cast::<Relr>()),
-            DT_RELRSZ => relr_len = Some(val as usize / size_of::<Relr>()),
+            DT_RELRSZ => relr_len = Some(val / size_of::<Relr>()),
             DT_RELRENT => {
-                assert_eq!(val as usize, size_of::<Relr>());
+                assert_eq!(val, size_of::<Relr>());
             }
             _ => {}
         }
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn relibc_ld_so_start(
                     phdrs
                         .as_ptr()
                         .cast::<u8>()
-                        .sub(ph.p_vaddr(NativeEndian) as usize)
+                        .sub(usize::try_from(ph.p_vaddr(NativeEndian)).expect("within bounds"))
                 } as usize);
             }
         }
