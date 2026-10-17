@@ -24,12 +24,22 @@ then
     # The kernel Makefile splices this into --features=..., so the flag rides along.
     KERNEL_MAKE_ARGS+=("KERNEL_CARGO_FEATURES=${FERRIC_KERNEL_FEATURES} --no-default-features")
 fi
+# Ferric Oxide: extra linker arguments, such as --emit-relocs for kernel image KASLR.
+if [ -n "${FERRIC_KERNEL_LINK_ARGS}" ]
+then
+    link_args=""
+    for arg in ${FERRIC_KERNEL_LINK_ARGS}
+    do
+        link_args+=" -C link-arg=${arg}"
+    done
+    KERNEL_MAKE_ARGS+=("KERNEL_LINK_ARGS=${link_args}")
+fi
 if [ -n "${FERRIC_KERNEL_CONFIG}" ] && ! cmp -s "${FERRIC_KERNEL_CONFIG}" config.toml
 then
     cp -v "${FERRIC_KERNEL_CONFIG}" config.toml
 fi
 # The kernel Makefile only tracks *.rs, so relink when features or config change.
-ferric_stamp="$(printf '%s\\n' "${FERRIC_KERNEL_FEATURES-upstream}"; cat config.toml 2>/dev/null || true)"
+ferric_stamp="$(printf '%s\\n' "${FERRIC_KERNEL_FEATURES-upstream}" "${FERRIC_KERNEL_LINK_ARGS}"; cat config.toml 2>/dev/null || true)"
 if [ "$(cat "${COOKBOOK_BUILD}/ferric.stamp" 2>/dev/null)" != "${ferric_stamp}" ]
 then
     rm -f "${COOKBOOK_BUILD}/kernel.all"

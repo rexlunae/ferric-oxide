@@ -32,6 +32,9 @@ MANIFEST=$(SOURCE)/Cargo.toml
 TARGET_SPEC=$(RUST_TARGET_PATH)/$(ARCH)-unknown-kernel.json
 
 KERNEL_CARGO_FEATURES?=
+# Ferric Oxide: extra rustc arguments for the final link, such as
+# -C link-arg=--emit-relocs for kernel image KASLR.
+KERNEL_LINK_ARGS?=
 
 # Ferric Oxide: kernel indirect branch tracking (arch.x86_64.features.ibt in config.toml, set by
 # kernel.cpu.ibt in ferric.toml). Unless it is "never", every crate is built with endbr64 at
@@ -60,6 +63,7 @@ $(BUILD)/kernel.all: $(LD_SCRIPT) $(LOCKFILE) $(MANIFEST) $(TARGET_SPEC) $(shell
 		-- \
 		-C link-arg=-T -Clink-arg="$(LD_SCRIPT)" \
 		-C link-arg=-z -Clink-arg=max-page-size=0x1000 \
+		$(KERNEL_LINK_ARGS) \
 		--emit link="$(BUILD)/kernel.all"
 
 $(BUILD)/kernel.sym: $(BUILD)/kernel.all

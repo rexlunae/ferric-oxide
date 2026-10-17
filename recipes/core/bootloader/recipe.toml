@@ -9,11 +9,35 @@ script = """
 OUTDIR="${COOKBOOK_BUILD}"
 mkdir -pv "${COOKBOOK_STAGE}/usr/lib/boot"
 
+# Ferric Oxide: the bootloader uses the shared crates beside it in crates/ as
+# ../<name> path dependencies (kaslr uses ../elfreloc and ../hwrand). The
+# cookbook builds a copy of crates/bootloader/ in this recipe's source/, so
+# give that copy the same neighbours.
+for dep in "${COOKBOOK_ROOT}"/crates/*/
+do
+    name="$(basename "${dep}")"
+    [ "${name}" = bootloader ] || ln -sfn "${dep%/}" "${COOKBOOK_SOURCE}/../${name}"
+done
+# Cargo features from ferric.toml (kaslr for kernel image KASLR). The
+# Makefile only tracks sources, so rebuild when they change.
+if [ "$(cat "${OUTDIR}/ferric.stamp" 2>/dev/null)" != "${FERRIC_BOOTLOADER_FEATURES}" ]
+then
+    rm -f "${OUTDIR}"/*.efi "${OUTDIR}"/*.bin
+fi
+printf '%s' "${FERRIC_BOOTLOADER_FEATURES}" > "${OUTDIR}/ferric.stamp"
+
+# Features apply to UEFI builds only: Ferric Oxide adds no BIOS boot paths, so
+# the BIOS bootloader keeps its upstream feature set.
 function bootloader {
     export TARGET="$1"
     src="$2"
     dst="$3"
-    "${COOKBOOK_MAKE}" -j "${COOKBOOK_MAKE_JOBS}" -f "${COOKBOOK_SOURCE}/Makefile" -C "${OUTDIR}" "${OUTDIR}/${src}"
+    features=""
+    case "${TARGET}" in
+        *-unknown-uefi) features="${FERRIC_BOOTLOADER_FEATURES}" ;;
+    esac
+    "${COOKBOOK_MAKE}" -j "${COOKBOOK_MAKE_JOBS}" -f "${COOKBOOK_SOURCE}/Makefile" -C "${OUTDIR}" \\
+        BOOTLOADER_FEATURES="${features}" "${OUTDIR}/${src}"
     cp -v "${OUTDIR}/${src}" "${COOKBOOK_STAGE}/usr/lib/boot/${dst}"
 }
 

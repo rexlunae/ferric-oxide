@@ -1,0 +1,8 @@
+[package]
+name = "ferric-elfreloc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Moves a statically linked x86_64 ELF image to a new base using its link-time relocations"
+
+[dependencies]
