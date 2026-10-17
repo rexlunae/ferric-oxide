@@ -4,8 +4,8 @@
 #
 # Usage: boot-smoke.sh IMAGE [LOG] [CPU]
 #   CPU defaults to "host" with KVM, or "max" under TCG when /dev/kvm is missing.
-#   BOOT_IOMMU=vtd adds an emulated Intel VT-d IOMMU (DMA remapping only, no
-#   interrupt remapping), for kernels built with kernel.iommu = "auto" or "enforce".
+#   BOOT_IOMMU=vtd adds an emulated Intel VT-d IOMMU (DMA and interrupt
+#   remapping), for kernels built with kernel.iommu = "auto" or "enforce".
 set -euo pipefail
 
 image="$1"
@@ -40,7 +40,9 @@ case "${BOOT_IOMMU:-none}" in
     none) ;;
     vtd)
         machine=q35,kernel-irqchip=split
-        iommu=(-device intel-iommu,intremap=off)
+        # Interrupt remapping needs the split irqchip, so QEMU's I/O APIC sends its
+        # interrupts through the IOMMU.
+        iommu=(-device intel-iommu,intremap=on)
         ;;
     *)
         echo "boot-smoke: unknown BOOT_IOMMU=$BOOT_IOMMU (expected none or vtd)" >&2

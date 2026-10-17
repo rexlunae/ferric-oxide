@@ -346,6 +346,67 @@ impl Drhd<'_> {
     }
 }
 
+impl<'a> Drhd<'a> {
+    /// The I/O APICs and HPETs whose interrupt requests the unit remaps, with the requester
+    /// ID each one's requests carry (its source-id). A scope whose path passes through a
+    /// bridge, or that is malformed, is left out: platforms place these devices directly on a
+    /// bus, usually a pseudo-bus no PCI device uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_vtd::{Bdf, dmar::{Dmar, InterruptSource, InterruptSourceKind, Structure}};
+    ///
+    /// // QEMU's q35 lists its I/O APIC (APIC ID 0) at ff:00.0.
+    /// let bytes = include_bytes!("../tests/fixtures/qemu-8.2-q35-intremap-off.dmar");
+    /// let dmar = Dmar::parse(bytes)?;
+    /// let Some(Ok(Structure::Drhd(drhd))) = dmar.structures().next() else { panic!() };
+    /// let sources = drhd.interrupt_sources().collect::<Vec<_>>();
+    /// assert_eq!(
+    ///     sources,
+    ///     [InterruptSource { kind: InterruptSourceKind::IoApic, id: 0, source: Bdf::new(0xff, 0, 0) }],
+    /// );
+    /// # Ok::<(), ferric_vtd::dmar::DmarError>(())
+    /// ```
+    pub fn interrupt_sources(&self) -> impl Iterator<Item = InterruptSource> + use<'a> {
+        self.scopes
+            .iter()
+            .map_while(Result::ok)
+            .filter_map(|scope| {
+                let kind = match scope.kind {
+                    ScopeKind::IoApic => InterruptSourceKind::IoApic,
+                    ScopeKind::Hpet => InterruptSourceKind::Hpet,
+                    _ => return None,
+                };
+                Some(InterruptSource {
+                    kind,
+                    id: scope.enumeration_id,
+                    source: scope.direct_bdf()?,
+                })
+            })
+    }
+}
+
+/// What kind of interrupt source an [`InterruptSource`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptSourceKind {
+    /// An I/O APIC; the ID is its APIC ID (the MADT's I/O APIC ID).
+    IoApic,
+    /// An HPET block; the ID is its HPET number (the HPET table's sequence number).
+    Hpet,
+}
+
+/// An I/O APIC or HPET named by a unit's device scopes (section 8.3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptSource {
+    /// I/O APIC or HPET.
+    pub kind: InterruptSourceKind,
+    /// The scope's enumeration ID: the APIC ID or the HPET number.
+    pub id: u8,
+    /// The requester ID its interrupt requests carry.
+    pub source: Bdf,
+}
+
 /// Reserved Memory Region Reporting structure (section 8.4): memory that the listed devices
 /// may DMA into at any time (USB legacy emulation buffers, integrated graphics stolen memory),
 /// so it must stay identity-mapped for them.
@@ -771,6 +832,23 @@ mod tests {
         assert_eq!(all_pci.register_pages(), 2);
         let kinds: Vec<_> = all_pci.scopes.iter().map(|s| s.unwrap().kind).collect();
         assert_eq!(kinds, [ScopeKind::IoApic, ScopeKind::Hpet]);
+        let sources: Vec<_> = all_pci.interrupt_sources().collect();
+        assert_eq!(
+            sources,
+            [
+                InterruptSource {
+                    kind: InterruptSourceKind::IoApic,
+                    id: 2,
+                    source: Bdf::new(0xf0, 0x1f, 0),
+                },
+                InterruptSource {
+                    kind: InterruptSourceKind::Hpet,
+                    id: 0,
+                    source: Bdf::new(0, 0x1f, 0),
+                },
+            ]
+        );
+        assert_eq!(gfx.interrupt_sources().count(), 0);
 
         let Structure::Rmrr(usb) = s[2] else { panic!() };
         assert_eq!((usb.base, usb.end()), (0x7c80_0000, Some(0x7c82_0000)));

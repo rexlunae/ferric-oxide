@@ -247,6 +247,15 @@ pub enum PcidClientRequest {
     /// `DmaDomain` the domain's descriptor is then fetched with a descriptor-passing read of
     /// the channel; see [`PciFunctionHandle::get_dma_domain`].
     GetDmaDomain,
+    /// Ferric Oxide: the MSI address and data that deliver `vector` to logical CPU `cpu` (the
+    /// `irq:cpu-<n>` numbering). With interrupt remapping, pcid has the kernel make an entry
+    /// for this function and answers with its remappable-format message; without, it answers
+    /// with the compatibility-format message upstream drivers computed themselves. See
+    /// [`PciFunctionHandle::msi_message`].
+    MsiMessage {
+        cpu: u32,
+        vector: u8,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,6 +265,9 @@ pub enum PcidServerResponseError {
     InvalidBitPattern,
     /// Ferric Oxide: no DMA domain (no kernel iommu scheme, or attaching failed).
     NoDmaDomain,
+    /// Ferric Oxide: no MSI message for that CPU and vector (the kernel refused an interrupt
+    /// remapping entry, or the CPU needs interrupt remapping and there is none).
+    NoMsiMessage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -274,6 +286,8 @@ pub enum PcidClientResponse {
     WriteConfig,
     /// Ferric Oxide: a DMA domain is ready to be fetched from the channel.
     DmaDomain,
+    /// Ferric Oxide: the answer to `MsiMessage`.
+    MsiMessage(msi::MsiAddrAndData),
 }
 
 pub struct MappedBar {
@@ -282,9 +296,49 @@ pub struct MappedBar {
     pub memory_type: MemoryType,
 }
 
+/// Ferric Oxide: a function's pcid channel, shared so that [`irq_helpers::Msix`] can ask pcid for
+/// MSI-X messages after the driver has handed its [`PciFunctionHandle`] elsewhere. Each request
+/// and its response happen under the lock.
+#[derive(Clone)]
+pub struct PcidChannel(std::sync::Arc<std::sync::Mutex<File>>);
+
+impl PcidChannel {
+    fn lock(&self) -> std::sync::MutexGuard<'_, File> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sends `req` and returns pcid's response.
+    fn request(&self, req: &PcidClientRequest) -> PcidClientResponse {
+        let mut channel = self.lock();
+        send(&mut channel, req);
+        recv(&mut channel)
+    }
+
+    /// The MSI message for `vector` on logical CPU `cpu`; see
+    /// [`PciFunctionHandle::msi_message`].
+    ///
+    /// # Panics
+    ///
+    /// When `cpu` does not fit in 32 bits.
+    pub fn msi_message(&self, cpu: usize, vector: u8) -> Option<msi::MsiAddrAndData> {
+        let cpu = u32::try_from(cpu).expect("pcid_interface: CPU number above 32 bits");
+        match self.request(&PcidClientRequest::MsiMessage { cpu, vector }) {
+            PcidClientResponse::MsiMessage(message) => Some(message),
+            PcidClientResponse::Error(PcidServerResponseError::NoMsiMessage) => None,
+            other => {
+                log::error!("received wrong pcid response: {other:?}");
+                process::exit(1);
+            }
+        }
+    }
+}
+
 /// A handle from a `pcid` client (e.g. `ahcid`) to `pcid`.
 pub struct PciFunctionHandle {
-    channel: File,
+    // Ferric Oxide: shared with MSI-X allocators (was a `File`).
+    channel: PcidChannel,
     config: SubdriverArguments,
     mapped_bars: [Option<MappedBar>; 6],
 }
@@ -360,21 +414,43 @@ impl PciFunctionHandle {
         };
 
         Self {
-            channel,
+            channel: PcidChannel(std::sync::Arc::new(std::sync::Mutex::new(channel))),
             config,
             mapped_bars: [const { None }; 6],
         }
     }
 
+    /// # Panics
+    ///
+    /// Ferric Oxide: when an [`irq_helpers::Msix`] still shares the channel.
     pub fn into_inner_fd(self) -> RawFd {
-        self.channel.into_raw_fd()
+        match std::sync::Arc::try_unwrap(self.channel.0) {
+            Ok(channel) => channel
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .into_raw_fd(),
+            Err(_) => panic!("pcid_interface: the channel is still shared with an MSI-X table"),
+        }
     }
 
-    fn send(&mut self, req: &PcidClientRequest) {
-        send(&mut self.channel, req)
+    /// Ferric Oxide: sends `req` and returns pcid's response, under the channel's lock.
+    fn request(&mut self, req: &PcidClientRequest) -> PcidClientResponse {
+        self.channel.request(req)
     }
-    fn recv(&mut self) -> PcidClientResponse {
-        recv(&mut self.channel)
+
+    /// Ferric Oxide: the channel, for asking pcid for MSI messages later.
+    pub fn channel(&self) -> PcidChannel {
+        self.channel.clone()
+    }
+
+    /// Ferric Oxide: the MSI address and data that deliver `vector` to logical CPU `cpu`, from
+    /// pcid. With interrupt remapping (`kernel.iommu = "auto"` or `"enforce"` on hardware that
+    /// has it) the message names an interrupt remapping entry the kernel made for this
+    /// function only, and the unit blocks compatibility-format messages; otherwise it is the
+    /// compatibility-format message for `cpu` as an APIC ID, as upstream. `None` when pcid has
+    /// no message to give.
+    pub fn msi_message(&mut self, cpu: usize, vector: u8) -> Option<msi::MsiAddrAndData> {
+        self.channel.msi_message(cpu, vector)
     }
 
     pub fn config(&self) -> SubdriverArguments {
@@ -382,8 +458,7 @@ impl PciFunctionHandle {
     }
 
     pub fn enable_device(&mut self) {
-        self.send(&PcidClientRequest::EnableDevice);
-        match self.recv() {
+        match self.request(&PcidClientRequest::EnableDevice) {
             PcidClientResponse::EnabledDevice => {}
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -393,8 +468,7 @@ impl PciFunctionHandle {
     }
 
     pub fn get_vendor_capabilities(&mut self) -> Vec<VendorSpecificCapability> {
-        self.send(&PcidClientRequest::RequestVendorCapabilities);
-        match self.recv() {
+        match self.request(&PcidClientRequest::RequestVendorCapabilities) {
             PcidClientResponse::VendorCapabilities(a) => a,
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -405,8 +479,7 @@ impl PciFunctionHandle {
 
     // FIXME turn into struct with bool fields
     pub fn fetch_all_features(&mut self) -> Vec<PciFeature> {
-        self.send(&PcidClientRequest::RequestFeatures);
-        match self.recv() {
+        match self.request(&PcidClientRequest::RequestFeatures) {
             PcidClientResponse::AllFeatures(a) => a,
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -415,8 +488,7 @@ impl PciFunctionHandle {
         }
     }
     pub fn enable_feature(&mut self, feature: PciFeature) {
-        self.send(&PcidClientRequest::EnableFeature(feature));
-        match self.recv() {
+        match self.request(&PcidClientRequest::EnableFeature(feature)) {
             PcidClientResponse::FeatureEnabled(feat) if feat == feature => {}
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -425,8 +497,7 @@ impl PciFunctionHandle {
         }
     }
     pub fn feature_info(&mut self, feature: PciFeature) -> PciFeatureInfo {
-        self.send(&PcidClientRequest::FeatureInfo(feature));
-        match self.recv() {
+        match self.request(&PcidClientRequest::FeatureInfo(feature)) {
             PcidClientResponse::FeatureInfo(feat, info) if feat == feature => info,
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -435,8 +506,7 @@ impl PciFunctionHandle {
         }
     }
     pub fn set_feature_info(&mut self, info: SetFeatureInfo) {
-        self.send(&PcidClientRequest::SetFeatureInfo(info));
-        match self.recv() {
+        match self.request(&PcidClientRequest::SetFeatureInfo(info)) {
             PcidClientResponse::SetFeatureInfo(_) => {}
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -445,8 +515,7 @@ impl PciFunctionHandle {
         }
     }
     pub unsafe fn read_config(&mut self, offset: u16) -> u32 {
-        self.send(&PcidClientRequest::ReadConfig(offset));
-        match self.recv() {
+        match self.request(&PcidClientRequest::ReadConfig(offset)) {
             PcidClientResponse::ReadConfig(value) => value,
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -455,8 +524,7 @@ impl PciFunctionHandle {
         }
     }
     pub unsafe fn write_config(&mut self, offset: u16, value: u32) {
-        self.send(&PcidClientRequest::WriteConfig(offset, value));
-        match self.recv() {
+        match self.request(&PcidClientRequest::WriteConfig(offset, value)) {
             PcidClientResponse::WriteConfig => {}
             other => {
                 log::error!("received wrong pcid response: {other:?}");
@@ -476,8 +544,7 @@ impl PciFunctionHandle {
     /// [`DmaDomainError::Receive`] when pcid created a domain but passing its descriptor
     /// failed.
     pub fn get_dma_domain(&mut self) -> Result<Option<libredox::Fd>, DmaDomainError> {
-        self.send(&PcidClientRequest::GetDmaDomain);
-        match self.recv() {
+        match self.request(&PcidClientRequest::GetDmaDomain) {
             PcidClientResponse::DmaDomain => {}
             PcidClientResponse::Error(PcidServerResponseError::NoDmaDomain) => return Ok(None),
             other => {
@@ -488,7 +555,7 @@ impl PciFunctionHandle {
         // usize::MAX asks the kernel to pick the descriptor number.
         let mut fd = usize::MAX.to_ne_bytes();
         libredox::call::call_ro(
-            self.channel.as_raw_fd() as usize,
+            self.channel.lock().as_raw_fd() as usize,
             &mut fd,
             syscall::CallFlags::FD,
             &[],
@@ -557,7 +624,7 @@ impl PciFunctionHandle {
                     length: bar_size,
                     prot: PROT_READ | PROT_WRITE,
                     flags: MAP_SHARED,
-                    fd: self.channel.as_raw_fd() as usize,
+                    fd: self.channel.lock().as_raw_fd() as usize,
                     offset: u64::from(bir) << (64 - 3) | (memory_type as u64) << (64 - 3 - 2) | 0,
                 })
             } {

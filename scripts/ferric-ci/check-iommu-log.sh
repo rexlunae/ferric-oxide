@@ -13,6 +13,11 @@
 # driver bound. ferric-iommu-test drives QEMU's edu device (00:10.0) and announces the DMA
 # faults it causes; the kernel must log exactly those and no others. boot-smoke.sh places the
 # devices at these addresses.
+#
+# With VT-d the unit also remaps interrupts: the I/O APIC's timer pin is checked through a
+# remappable entry, the NVMe controller's MSI-X and edu's MSI go through entries pcid had the
+# kernel make for them, and ferric-iommu-test forges an MSI naming the I/O APIC's entry, which
+# must fault (source-id check) and be the only interrupt remapping fault.
 set -euo pipefail
 
 mode="$1"
@@ -59,6 +64,23 @@ check_faults() {
     [ "$expected" = "$logged" ] || fail "the kernel's DMA faults differ from the ones the test caused"
 }
 
+# Every interrupt remapping fault the kernel logged must be the one ferric-iommu-test
+# announced: its forged MSI naming the I/O APIC's entry, refused by the source-id check.
+check_irq_faults() {
+    local expected logged
+    expected="$(grep -ao 'FERRIC_IOMMU_EXPECT_IRQ_FAULT [0-9]*' <<< "$clean" \
+        | awk '{ print "00:10.0 interrupt index " $2 ": source-id check failed" }' | sort -u)"
+    logged="$(grep -ao 'IOMMU: interrupt remapping fault at unit 0x[0-9a-f]*: .*' <<< "$clean" \
+        | sed -E 's/^IOMMU: interrupt remapping fault at unit 0x[0-9a-f]*: ([0-9a-f:.]+ interrupt index [0-9]+: [^:]*):.*/\1/' \
+        | sort -u || true)"
+    echo "expected interrupt remapping faults:"; echo "$expected"
+    echo "logged interrupt remapping faults:"; echo "$logged"
+    [ "$(wc -l <<< "$expected")" -eq 1 ] && [ -n "$expected" ] \
+        || fail "the interrupt test did not announce its fault"
+    [ "$expected" = "$logged" ] \
+        || fail "the kernel's interrupt remapping faults differ from the one the test caused"
+}
+
 case "$mode" in
     none)
         need "IOMMU: no DMAR table, VT-d not enabled"
@@ -69,6 +91,13 @@ case "$mode" in
         if grep -aF "IOMMU: DMA fault" <<< "$clean"; then
             fail "a DMA fault without an IOMMU"
         fi
+        # pcid answers MsiMessage with the compatibility-format message, which still works.
+        need "FERRIC_TEST_PASS iommu-msi: .*\(compatibility format, no interrupt remapping\)"
+        need "FERRIC_TEST_SKIP iommu-irq-fault"
+        if grep -aF "IOMMU: interrupt remapping" <<< "$clean"; then
+            fail "interrupt remapping without an IOMMU"
+        fi
+        echo "::notice title=check-iommu-log ($mode)::OK; no IOMMU, compatibility-format MSI delivered"
         exit 0
         ;;
     auto)
@@ -93,6 +122,26 @@ need "IOMMU: unit 0xfed90000 uses queued invalidation"
 # The boot self-test of DMA domains attaches QEMU's host bridge, which a DRHD scope lists and
 # which never initiates DMA.
 need "IOMMU: domain self-test passed \(attach/map/unmap/detach\)"
+
+# Interrupt remapping: the table is set up and compatibility-format interrupts are blocked
+# (CFI clear) under both auto and enforce.
+need "IOMMU: interrupt remapping enabled at unit 0xfed90000: 4096 entries, .* destinations, compatibility-format interrupts blocked"
+# The I/O APIC the DMAR scope names is remapped, and its timer pin delivers through entry 0.
+need "IOMMU: I/O APIC [0-9]+ \(source-id [0-9a-f:.]+\) remapped by unit 0xfed90000"
+need "IOMMU: I/O APIC [0-9]+ pin [0-9]+ \(ISA IRQ 0\) routed through interrupt remapping entry 0 for a check"
+need "IOMMU: I/O APIC [0-9]+ pin [0-9]+ delivered [0-9]+ timer interrupt\(s\) through interrupt remapping entry 0"
+# MSI-X (nvmed, which must work for the boot to reach the marker) and MSI (edu) go through
+# entries made for their own requester IDs.
+need "IOMMU: interrupt remapping entry [0-9]+ for 0000:00:04\.0: vector"
+need "IOMMU: interrupt remapping entry [0-9]+ for 0000:00:10\.0: vector"
+need "FERRIC_TEST_PASS iommu-msi: .*\(remappable format\)"
+need "FERRIC_TEST_PASS iommu-irq-fault"
+if grep -aE "IOMMU: (interrupt remapping not enabled|enforce mode: unit .* cannot remap interrupts|cannot check I/O APIC)" <<< "$clean"; then
+    fail "interrupt remapping was not set up"
+fi
+if grep -aE "pcid: no interrupt remapping entry" <<< "$clean"; then
+    fail "pcid could not get an interrupt remapping entry"
+fi
 
 echo "DMA domains bound:"
 grep -aoE "IOMMU: domain [0-9]+ \([0-9]+ device\(s\)\) bound by .*" <<< "$clean" || true
@@ -130,11 +179,16 @@ if grep -aE "IOMMU: .* tried to bind domain" <<< "$clean"; then
     fail "a driver tried to bind an empty domain"
 fi
 check_faults
+check_irq_faults
 if grep -aE "IOMMU: (VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" <<< "$clean"; then
     fail "the IOMMU lost faults, failed its self-test or skipped a unit"
 fi
 # A notice annotation, so the result can be read without the job log.
 bound="$(grep -aoE "IOMMU: domain [0-9]+ \([0-9]+ device\(s\)\) bound by [^ ]*" <<< "$clean" \
     | sed -E 's/^IOMMU: //' | paste -sd ';' -)"
-echo "::notice title=check-iommu-log ($mode)::OK; $bound"
+irtes="$(grep -aoE "IOMMU: interrupt remapping entry [0-9]+ for [0-9a-f:.]+: vector 0x[0-9a-f]+" <<< "$clean" \
+    | sed -E 's/^IOMMU: interrupt remapping entry ([0-9]+) for 0000:([0-9a-f:.]+): vector (0x[0-9a-f]+)/\2 entry \1 vector \3/' \
+    | paste -sd ',' -)"
+allocated="$(grep -aoE "[0-9]+ IRTE\(s\) allocated" <<< "$clean" | tail -n 1)"
+echo "::notice title=check-iommu-log ($mode)::OK; $bound; interrupt remapping: $allocated at most recent allocation ($irtes); I/O APIC timer pin and forged-MSI fault checked"
 echo "check-iommu-log: $mode OK"

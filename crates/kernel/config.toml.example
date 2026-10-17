@@ -8,7 +8,10 @@
 # kernel.iommu scheme (DMA domains for drivers; memory:translation answers with IOVAs
 # in a driver's bound domain; pcid drivers bind one when they start). "enforce" also
 # refuses memory:translation to drivers without a bound domain, lets a driver bind only
-# a domain with a device attached, and blocks DMA from devices in no domain.
+# a domain with a device attached, and blocks DMA from devices in no domain. On units
+# with interrupt remapping, "auto" and "enforce" also remap interrupts (MSI/MSI-X
+# entries made through pcid, checked by requester ID) and block compatibility-format
+# interrupts.
 iommu = "never"
 
 [arch.x86_64.features]

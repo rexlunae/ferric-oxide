@@ -327,7 +327,7 @@ make_append = { FERRIC_KERNEL_LINK_ARGS = "--emit-relocs", FERRIC_BOOTLOADER_FEA
 id = "kernel.iommu"
 menu = "kernel"
 type = "choice"
-title = "IOMMU DMA remapping (Intel VT-d)"
+title = "IOMMU DMA and interrupt remapping (Intel VT-d)"
 default = "never"
 depends = "target.arch == 'x86_64'"
 kernel_config = "arch.x86_64.iommu"
@@ -353,7 +353,14 @@ domain with a device attached before memory:translation answers at all (EACCES
 otherwise; a forked child starts unbound), and devices that no driver attached
 to a domain are blocked rather than identity-mapped. Processes that use DMA
 memory without a PCI device (lived, nbdd and usbscsid ring buffers) cannot get
-DMA addresses under "enforce". Interrupt remapping and AMD-Vi come later."""
+DMA addresses under "enforce". On units with interrupt remapping (and queued
+invalidation), "auto" and "enforce" also remap interrupts: each unit gets a
+4096-entry table (32-bit x2APIC destinations when the kernel uses x2APIC),
+pcid asks the kernel for an entry for every MSI and MSI-X vector a driver
+requests, so the entry checks the device's requester ID, and the I/O APIC is
+checked through a remappable entry at boot. Under both, the unit blocks
+compatibility-format interrupts, so a device cannot send an interrupt pcid did
+not set up. AMD-Vi comes later."""
 choices = ["auto", "enforce", "never"]
 
 [[option]]

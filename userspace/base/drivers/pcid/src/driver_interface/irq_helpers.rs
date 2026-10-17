@@ -13,8 +13,7 @@ use crate::msi::{MsiAddrAndData, MsixTableEntry};
 use crate::PciFunctionHandle;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::{
-    msi::{x86 as x86_msix, MappedMsixRegs},
-    MsiSetFeatureInfo, PciFeature, PciFeatureInfo, SetFeatureInfo,
+    msi::MappedMsixRegs, MsiSetFeatureInfo, PciFeature, PciFeatureInfo, PcidChannel, SetFeatureInfo,
 };
 
 /// Read the local APIC ID of the bootstrap processor.
@@ -186,26 +185,27 @@ pub fn allocate_single_interrupt_vector(cpu_id: usize) -> io::Result<Option<(u8,
     Ok(Some((base, files.pop().unwrap())))
 }
 
+/// Allocates a vector on logical CPU `cpu_id` and returns the MSI message that delivers it.
+///
+/// Ferric Oxide: the message comes from pcid over `channel` (an interrupt remapping entry when
+/// the IOMMU remaps interrupts) instead of being computed here.
+///
+/// # Panics
+///
+/// When no vector is free on that CPU, or pcid has no message for it.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn allocate_single_interrupt_vector_for_msi(cpu_id: usize) -> (MsiAddrAndData, File) {
-    // FIXME for cpu_id >255 we need to use the IOMMU to use IRQ remapping
-    let lapic_id = u8::try_from(cpu_id).expect("CPU id couldn't fit inside u8");
-    let rh = false;
-    let dm = false;
-    let addr = x86_msix::message_address(lapic_id, rh, dm);
-
+pub fn allocate_single_interrupt_vector_for_msi(
+    channel: &PcidChannel,
+    cpu_id: usize,
+) -> (MsiAddrAndData, File) {
     let (vector, interrupt_handle) = allocate_single_interrupt_vector(cpu_id)
         .expect("failed to allocate interrupt vector")
         .expect("no interrupt vectors left");
-    let msg_data = x86_msix::message_data_edge_triggered(x86_msix::DeliveryMode::Fixed, vector);
+    let message = channel
+        .msi_message(cpu_id, vector)
+        .unwrap_or_else(|| panic!("pcid has no MSI message for vector {vector} on CPU {cpu_id}"));
 
-    (
-        MsiAddrAndData {
-            addr,
-            data: msg_data,
-        },
-        interrupt_handle,
-    )
+    (message, interrupt_handle)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -214,7 +214,7 @@ pub fn allocate_first_msi_interrupt_on_bsp(pcid_handle: &mut PciFunctionHandle) 
 
     let destination_id = read_bsp_apic_id().expect("failed to read BSP apic id");
     let (msg_addr_and_data, interrupt_handle) =
-        allocate_single_interrupt_vector_for_msi(destination_id);
+        allocate_single_interrupt_vector_for_msi(&pcid_handle.channel(), destination_id);
 
     let set_feature_info = MsiSetFeatureInfo {
         multi_message_enable: Some(0),
@@ -246,6 +246,8 @@ pub struct Msix {
     next: u16,
     bsp: usize,
     handles: Vec<File>,
+    // Ferric Oxide: for asking pcid for each entry's message.
+    channel: PcidChannel,
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -272,6 +274,7 @@ impl Msix {
             next: 0,
             bsp,
             handles: Vec::new(),
+            channel: pcid_handle.channel(),
         }
     }
 
@@ -281,7 +284,7 @@ impl Msix {
             self.next += 1;
 
             let (msg_addr_and_data, irq_handle) =
-                allocate_single_interrupt_vector_for_msi(self.bsp);
+                allocate_single_interrupt_vector_for_msi(&self.channel, self.bsp);
             let entry = self.mapped.table_entry_pointer(index as usize);
             entry.write_addr_and_data(msg_addr_and_data);
             entry.unmask();

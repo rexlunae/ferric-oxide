@@ -18,11 +18,16 @@
 //! (6.5.1, 10.4.7, 10.4.8). Faults raise the fault event interrupt (`FAULT_VECTOR` on the
 //! BSP), whose handler logs and clears the fault records (7.3, 10.4.14).
 //!
+//! Units that support it also remap interrupts ([`interrupt`], step 5): MSI and MSI-X get
+//! remappable-format messages through the `iommu` scheme, and compatibility-format interrupt
+//! requests are blocked.
+//!
 //! The DMAR parsing, register decoding, table and descriptor encoding and the IOVA allocator
 //! are in the host-tested `ferric-vtd` crate (`crates/vtd`).
 
 pub mod dma;
 pub mod domain;
+pub mod interrupt;
 mod selftest;
 
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -32,7 +37,7 @@ use core::{
 };
 
 use ferric_vtd::{
-    dmar::{Dmar, Drhd, Structure},
+    dmar::{Dmar, DmarFlags, Drhd, Structure},
     fault::{self, FaultRecord, FaultStatus},
     invalidation::{Descriptor, Queue, QueueError, QueueFull, QueueSize, RegisterCommand, Request},
     iova::DomainIds,
@@ -176,6 +181,8 @@ struct UnitState {
     /// Buses with a context table of their own, and that table.
     split_buses: BTreeMap<u8, u64>,
     invalidator: Invalidator,
+    /// The interrupt remapping table, when the unit remaps interrupts.
+    interrupts: Option<interrupt::RemapTable>,
 }
 
 impl Unit {
@@ -316,6 +323,9 @@ pub enum Step {
     InvalidationWait,
     TranslationEnable,
     ProtectedMemoryDisable,
+    InterruptTablePointer,
+    InterruptRemappingEnable,
+    CompatibilityBlock,
 }
 
 /// Why a unit was not enabled, or an invalidation failed.
@@ -565,7 +575,12 @@ fn log_faults(regs: &Regs) {
     if status.pending() {
         for rec in fault::records(regs.cap, status) {
             if let Some(record) = FaultRecord::decode(regs.read(rec.low), regs.read(rec.high)) {
-                error!("IOMMU: DMA fault at unit {:#x}: {record}", regs.base);
+                let what = if record.reason.is_interrupt_remapping() {
+                    "interrupt remapping"
+                } else {
+                    "DMA"
+                };
+                error!("IOMMU: {what} fault at unit {:#x}: {record}", regs.base);
                 // Writing F back as 1 frees the record; the other bits are read-only.
                 regs.write(rec.f_dword, fault::RECORD_F_DWORD);
             }
@@ -589,6 +604,7 @@ interrupt!(fault_interrupt, || {
     for unit in UNITS.get().into_iter().flatten() {
         log_faults(&unit.regs);
     }
+    interrupt::on_fault_vector();
     // SAFETY: this runs in an interrupt delivered through the local APIC.
     unsafe { local_apic::the_local_apic().eoi() };
 });
@@ -625,6 +641,7 @@ fn identity_top(dmar: &Dmar<'_>) -> u64 {
 /// Sets up one unit, reusing matching identity tables from `identities` or building them.
 fn init_unit(
     drhd: &Drhd<'_>,
+    flags: DmarFlags,
     top: u64,
     identities: &mut Vec<IdentityTables>,
     tables: &mut KernelTables,
@@ -653,7 +670,8 @@ fn init_unit(
         tables.flush_cpu_caches();
         own.flush_cpu_caches();
     }
-    let invalidator = enable(&regs, &plan, root_table)?;
+    let mut invalidator = enable(&regs, &plan, root_table)?;
+    let interrupts = interrupt::enable(&regs, &mut invalidator, flags);
     let how = match invalidator {
         Invalidator::Queued(_) => "queued",
         Invalidator::Registers => "register",
@@ -681,6 +699,7 @@ fn init_unit(
             identity: identity.entry,
             split_buses: BTreeMap::new(),
             invalidator,
+            interrupts,
         }),
     })
 }
@@ -714,7 +733,7 @@ pub fn init() {
     for structure in dmar.structures() {
         match structure {
             Ok(Structure::Drhd(drhd)) => {
-                match init_unit(&drhd, top, &mut identities, &mut tables) {
+                match init_unit(&drhd, dmar.flags(), top, &mut identities, &mut tables) {
                     Ok(unit) => units.push(unit),
                     Err(err) => {
                         warn!(
@@ -736,6 +755,7 @@ pub fn init() {
     for unit in units {
         enable_fault_interrupt(&unit.regs);
     }
+    interrupt::setup_ioapics();
     if let Some(layout) = plan::domain_layout(units.iter().map(|u| (u.regs.cap, u.regs.ecap))) {
         LAYOUT.call_once(|| layout);
         *DOMAIN_IDS.lock() = Some(DomainIds::new(FIRST_DMA_DOMAIN, layout.domain_id_limit));
