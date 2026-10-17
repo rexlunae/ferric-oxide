@@ -889,6 +889,13 @@ impl<'a, D: Disk> Transaction<'a, D> {
         name: &str,
         node_ptr: TreePtr<Node>,
     ) -> Result<()> {
+        // Ferric Oxide: reject over-long names here, because not every caller
+        // (the scheme's link handler) goes through check_name, and
+        // DirEntry::new panics on a name that does not fit.
+        if name.len() > DIR_ENTRY_MAX_LENGTH {
+            return Err(Error::new(EINVAL));
+        }
+
         let mut parent = self.read_tree(parent_ptr)?;
         let mut node = self.read_tree(node_ptr)?;
 
