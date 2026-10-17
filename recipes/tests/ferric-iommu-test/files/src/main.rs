@@ -33,13 +33,28 @@
 //!    kernel must have unmapped (strictly: entries cleared, IOTLB invalidated) when the memory
 //!    went away; the kernel logs a release and a second DMA fault (`iommu-release`).
 //!
-//! For each fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`;
-//! the vtd boot CI job checks the kernel logged exactly those faults, from this device. When
-//! the program exits the domain closes and the kernel blocks the device.
+//! Between steps 2 and 3 it tests interrupts (section 3 of the design), with or without a
+//! domain:
+//!
+//! - it reserves a vector on the BSP in the `irq` scheme, asks pcid for the MSI message that
+//!   delivers it (`MsiMessage`), programs and enables the device's MSI capability through pcid,
+//!   and has the device raise an interrupt, which must arrive (`iommu-msi`). With interrupt
+//!   remapping the message is in remappable format and names an entry the kernel made for this
+//!   device only; without it, it is the compatibility-format message;
+//! - with a remappable message, it then programs the device with a forged one naming entry 0,
+//!   which the kernel made for the I/O APIC's timer pin and which checks the I/O APIC's
+//!   source-id, and has the device raise an interrupt again: the remapping unit must block it
+//!   and log a source-id fault, and the vector must not fire (`iommu-irq-fault`).
+//!
+//! For each DMA fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`,
+//! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
+//! checks the kernel logged exactly those faults, from this device. When the program exits the
+//! domain closes and the kernel blocks the device, and pcid frees its interrupt remapping
+//! entries.
 //!
 //! Each test prints `FERRIC_TEST_PASS <name>`, `FERRIC_TEST_FAIL <name>`, or
 //! `FERRIC_TEST_SKIP <name>` when pcid has no domain to give (no IOMMU, or a kernel built with
-//! `kernel.iommu = "never"`).
+//! `kernel.iommu = "never"`), or, for `iommu-irq-fault`, when there is no interrupt remapping.
 //!
 //! The channel speaks bincode-encoded `pcid_interface` enums. This program has no
 //! dependencies, so it writes the few messages it needs by hand: bincode encodes an enum
@@ -55,16 +70,35 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// `PcidClientRequest::EnableFeature(PciFeature)`.
+const ENABLE_FEATURE: u32 = 4;
+/// `PcidClientRequest::SetFeatureInfo(SetFeatureInfo)`.
+const SET_FEATURE_INFO: u32 = 6;
 /// `PcidClientRequest::ReadConfig(u16)`.
 const READ_CONFIG: u32 = 7;
 /// `PcidClientRequest::GetDmaDomain`.
 const GET_DMA_DOMAIN: u32 = 9;
+/// `PcidClientRequest::MsiMessage { cpu: u32, vector: u8 }`.
+const MSI_MESSAGE: u32 = 10;
+/// `PcidClientResponse::FeatureEnabled(PciFeature)`.
+const RESPONSE_FEATURE_ENABLED: u32 = 4;
 /// `PcidClientResponse::Error`.
 const RESPONSE_ERROR: u32 = 6;
+/// `PcidClientResponse::SetFeatureInfo(PciFeature)`.
+const RESPONSE_SET_FEATURE_INFO: u32 = 8;
 /// `PcidClientResponse::ReadConfig(u32)`.
 const RESPONSE_READ_CONFIG: u32 = 9;
 /// `PcidClientResponse::DmaDomain`.
 const RESPONSE_DMA_DOMAIN: u32 = 11;
+/// `PcidClientResponse::MsiMessage(MsiAddrAndData)`.
+const RESPONSE_MSI_MESSAGE: u32 = 12;
+/// `PciFeature::Msi`, and `SetFeatureInfo::Msi`.
+const FEATURE_MSI: u32 = 0;
+
+/// MSI address bit 4: the remappable format (VT-d, "Interrupt Requests in Remappable Format").
+const MSI_REMAPPABLE: u64 = 1 << 4;
+/// A remappable-format MSI address naming interrupt remapping entry 0, with no subhandle.
+const MSI_ENTRY_0: u64 = 0xfee0_0000 | MSI_REMAPPABLE;
 
 /// `ferric_iommu::abi::Verb::Bind`.
 const VERB_BIND: u64 = 3;
@@ -100,6 +134,13 @@ const EDU_CMD_RUN: u64 = 1;
 const EDU_CMD_TO_RAM: u64 = 2;
 /// Where the device's DMA buffer sits in its own address space.
 const EDU_BUFFER: u64 = 0x4_0000;
+/// `edu` interrupt registers: raise (sets status bits, sends the MSI) and acknowledge.
+const EDU_IRQ_RAISE: usize = 0x60;
+const EDU_IRQ_ACK: usize = 0x64;
+/// How long to wait for an interrupt.
+const IRQ_WAIT: Duration = Duration::from_secs(2);
+/// How long to wait before deciding a blocked interrupt did not arrive.
+const IRQ_BLOCKED_WAIT: Duration = Duration::from_millis(500);
 
 /// The byte the victim page is filled with.
 const CANARY: u8 = 0xa5;
@@ -128,6 +169,14 @@ enum Failure {
     Child(&'static str),
     /// Memory did not hold what the test expected after a transfer.
     Data(&'static str, usize, u8),
+    /// No interrupt vector was free on the CPU.
+    NoVector(u32),
+    /// pcid had no MSI message for the vector.
+    NoMsiMessage(u8),
+    /// The device's interrupt did not arrive.
+    NoInterrupt(u8),
+    /// The forged interrupt arrived.
+    ForgedDelivered(u8, usize),
     /// The test did not run because an earlier step failed.
     NotRun,
 }
@@ -150,6 +199,20 @@ impl fmt::Display for Failure {
             Self::Data(what, offset, byte) => {
                 write!(f, "{what}: byte {offset:#x} is {byte:#04x}")
             }
+            Self::NoVector(cpu) => write!(f, "no interrupt vector is free on CPU {cpu}"),
+            Self::NoMsiMessage(vector) => {
+                write!(f, "pcid has no MSI message for vector {vector:#x}")
+            }
+            Self::NoInterrupt(vector) => {
+                write!(
+                    f,
+                    "the device's interrupt did not arrive on vector {vector:#x}"
+                )
+            }
+            Self::ForgedDelivered(vector, count) => write!(
+                f,
+                "the forged interrupt was delivered: vector {vector:#x} fired {count} time(s)"
+            ),
             Self::NotRun => f.write_str("not run: an earlier step failed"),
         }
     }
@@ -374,6 +437,66 @@ impl Channel {
         .map_err(|errno| Failure::Call("receiving the domain descriptor", errno))?;
         Ok(Some(usize::from_ne_bytes(fd)))
     }
+
+    /// Sends `request` and checks the response is exactly `expected`.
+    fn expect(&mut self, request: &[u8], expected: &[u8]) -> Result<(), Failure> {
+        let response = self.transact(request)?;
+        if response == expected {
+            Ok(())
+        } else {
+            Err(Failure::Response(response))
+        }
+    }
+
+    /// The MSI address and data that deliver `vector` to logical CPU `cpu`; `None` when pcid
+    /// has none.
+    fn msi_message(&mut self, cpu: u32, vector: u8) -> Result<Option<(u64, u32)>, Failure> {
+        let mut request = MSI_MESSAGE.to_le_bytes().to_vec();
+        request.extend_from_slice(&cpu.to_le_bytes());
+        request.push(vector);
+        let response = self.transact(&request)?;
+        let (tag, rest) = response.split_at_checked(4).ok_or(Failure::NotRun)?;
+        if tag == RESPONSE_ERROR.to_le_bytes() {
+            return Ok(None);
+        }
+        match (
+            tag == RESPONSE_MSI_MESSAGE.to_le_bytes(),
+            rest.split_at_checked(8),
+        ) {
+            (true, Some((addr, data))) if data.len() == 4 => {
+                let addr = u64::from_le_bytes(addr.try_into().map_err(|_| Failure::NotRun)?);
+                let data = u32::from_le_bytes(data.try_into().map_err(|_| Failure::NotRun)?);
+                Ok(Some((addr, data)))
+            }
+            _ => Err(Failure::Response(response)),
+        }
+    }
+
+    /// Programs the MSI capability with one vector and message `(addr, data)`.
+    fn set_msi(&mut self, (addr, data): (u64, u32)) -> Result<(), Failure> {
+        let mut request = SET_FEATURE_INFO.to_le_bytes().to_vec();
+        request.extend_from_slice(&FEATURE_MSI.to_le_bytes());
+        // multi_message_enable: Some(0), one vector.
+        request.extend_from_slice(&[1, 0]);
+        // message_address_and_data: Some(MsiAddrAndData { addr, data }).
+        request.push(1);
+        request.extend_from_slice(&addr.to_le_bytes());
+        request.extend_from_slice(&data.to_le_bytes());
+        // mask_bits: None.
+        request.push(0);
+        let mut expected = RESPONSE_SET_FEATURE_INFO.to_le_bytes().to_vec();
+        expected.extend_from_slice(&FEATURE_MSI.to_le_bytes());
+        self.expect(&request, &expected)
+    }
+
+    /// Enables MSI.
+    fn enable_msi(&mut self) -> Result<(), Failure> {
+        let mut request = ENABLE_FEATURE.to_le_bytes().to_vec();
+        request.extend_from_slice(&FEATURE_MSI.to_le_bytes());
+        let mut expected = RESPONSE_FEATURE_ENABLED.to_le_bytes().to_vec();
+        expected.extend_from_slice(&FEATURE_MSI.to_le_bytes());
+        self.expect(&request, &expected)
+    }
 }
 
 /// A mapping of memory or registers.
@@ -455,6 +578,22 @@ impl Edu {
         unsafe { std::ptr::read_volatile(self.regs.ptr.add(offset).cast::<u32>()) }
     }
 
+    /// Writes the 32-bit register at `offset`.
+    fn write32(&self, offset: usize, value: u32) {
+        // SAFETY: as in `read32`.
+        unsafe { std::ptr::write_volatile(self.regs.ptr.add(offset).cast::<u32>(), value) }
+    }
+
+    /// Has the device raise its interrupt (an MSI once MSI is enabled).
+    fn raise_interrupt(&self) {
+        self.write32(EDU_IRQ_RAISE, 1);
+    }
+
+    /// Clears the device's interrupt status.
+    fn ack_interrupt(&self) {
+        self.write32(EDU_IRQ_ACK, 1);
+    }
+
     /// Reads the 64-bit register at `offset`.
     fn read64(&self, offset: usize) -> u64 {
         // SAFETY: as in `read32`; the DMA registers take 64-bit accesses.
@@ -510,6 +649,184 @@ impl Translator {
         )
         .map_err(|errno| Failure::Call("translation", errno))?;
         Ok(usize::from_ne_bytes(buf))
+    }
+}
+
+/// An interrupt vector reserved in the `irq` scheme.
+struct Vector {
+    file: File,
+    /// The logical CPU.
+    cpu: u32,
+    vector: u8,
+}
+
+impl Vector {
+    /// Reserves a free vector on logical CPU `cpu`, as `pcid_interface::irq_helpers` does.
+    fn reserve(cpu: u32) -> Result<Self, Failure> {
+        let dir = format!("/scheme/irq/cpu-{cpu:02x}");
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let Some(irq) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            // IRQs 0 to 15 are the legacy ones, which are not reserved.
+            if irq < 16 {
+                continue;
+            }
+            match File::create(format!("{dir}/{irq}")) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file,
+                        cpu,
+                        vector: irq + 32,
+                    });
+                }
+                // Taken by another driver meanwhile.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(Failure::NoVector(cpu))
+    }
+
+    /// How many interrupts arrived and are not acknowledged yet (0 when none).
+    fn pending(&mut self) -> Result<usize, Failure> {
+        let mut count = [0_u8; 8];
+        match self.file.read(&mut count)? {
+            0 => Ok(0),
+            _ => Ok(usize::from_ne_bytes(count)),
+        }
+    }
+
+    /// Waits up to `wait` for an interrupt, acknowledges what arrived, and returns its count.
+    fn wait(&mut self, wait: Duration) -> Result<usize, Failure> {
+        let start = std::time::Instant::now();
+        loop {
+            let count = self.pending()?;
+            if count != 0 {
+                self.file.write_all(&count.to_ne_bytes())?;
+                return Ok(count);
+            }
+            if start.elapsed() >= wait {
+                return Ok(0);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// The logical CPU number of the BSP.
+fn bsp() -> Result<u32, Failure> {
+    let mut buf = [0_u8; 8];
+    let len = File::open("/scheme/irq/bsp")?.read(&mut buf)?;
+    match buf.get(..len) {
+        Some([a, b, c, d]) => Ok(u32::from_le_bytes([*a, *b, *c, *d])),
+        Some(bytes) => Err(Failure::Response(bytes.to_vec())),
+        None => Err(Failure::NotRun),
+    }
+}
+
+/// The interrupt remapping entry a remappable-format MSI address names.
+fn entry_of(addr: u64) -> u64 {
+    ((addr >> 5) & 0x7fff) | (((addr >> 2) & 1) << 15)
+}
+
+/// The device's MSI, set up from pcid's message, and the message.
+struct Msi {
+    vector: Vector,
+    message: (u64, u32),
+}
+
+/// Sets up and enables the device's MSI with pcid's message for a fresh vector on the BSP,
+/// raises an interrupt and checks it arrives.
+fn msi_delivered(setup: &mut Setup) -> Result<Msi, Failure> {
+    let mut vector = Vector::reserve(bsp()?)?;
+    let message = setup
+        .channel
+        .msi_message(vector.cpu, vector.vector)?
+        .ok_or(Failure::NoMsiMessage(vector.vector))?;
+    setup.channel.set_msi(message)?;
+    setup.channel.enable_msi()?;
+    setup.edu.raise_interrupt();
+    let count = vector.wait(IRQ_WAIT);
+    setup.edu.ack_interrupt();
+    if count? == 0 {
+        return Err(Failure::NoInterrupt(vector.vector));
+    }
+    Ok(Msi { vector, message })
+}
+
+/// What [`msi_delivered`] reports when it passes.
+fn msi_detail(msi: &Msi) -> String {
+    let (addr, _) = msi.message;
+    let (vector, cpu) = (msi.vector.vector, msi.vector.cpu);
+    if addr & MSI_REMAPPABLE != 0 {
+        format!(
+            "the device's MSI reached vector {vector:#x} on CPU {cpu} through interrupt remapping entry {} (remappable format)",
+            entry_of(addr)
+        )
+    } else {
+        format!(
+            "the device's MSI reached vector {vector:#x} on CPU {cpu} (compatibility format, no interrupt remapping)"
+        )
+    }
+}
+
+/// Programs the device with a remappable message naming entry 0, which the I/O APIC owns, and
+/// checks the unit blocks the interrupt; then restores pcid's message.
+fn forged_msi_blocked(setup: &mut Setup, msi: &mut Msi) -> Result<(), Failure> {
+    setup.channel.set_msi((MSI_ENTRY_0, 0))?;
+    println!("FERRIC_IOMMU_EXPECT_IRQ_FAULT {}", entry_of(MSI_ENTRY_0));
+    setup.edu.raise_interrupt();
+    let count = msi.vector.wait(IRQ_BLOCKED_WAIT);
+    setup.edu.ack_interrupt();
+    setup.channel.set_msi(msi.message)?;
+    match count? {
+        0 => Ok(()),
+        count => Err(Failure::ForgedDelivered(msi.vector.vector, count)),
+    }
+}
+
+/// The outcome of the interrupt tests.
+struct MsiOutcome {
+    msi: Result<String, Failure>,
+    /// `Ok(None)` when skipped: the message was in compatibility format.
+    forged: Result<Option<()>, Failure>,
+}
+
+impl MsiOutcome {
+    /// Neither test ran.
+    fn not_run() -> Self {
+        Self {
+            msi: Err(Failure::NotRun),
+            forged: Err(Failure::NotRun),
+        }
+    }
+}
+
+/// Runs the interrupt tests.
+fn msi_tests(setup: &mut Setup) -> MsiOutcome {
+    let mut msi = match msi_delivered(setup) {
+        Ok(msi) => msi,
+        Err(err) => {
+            return MsiOutcome {
+                msi: Err(err),
+                ..MsiOutcome::not_run()
+            };
+        }
+    };
+    let forged = if msi.message.0 & MSI_REMAPPABLE != 0 {
+        forged_msi_blocked(setup, &mut msi).map(Some)
+    } else {
+        Ok(None)
+    };
+    MsiOutcome {
+        msi: Ok(msi_detail(&msi)),
+        forged,
     }
 }
 
@@ -784,27 +1101,31 @@ fn dma_after_release(setup: Setup, iova: usize) -> Result<(), Failure> {
     edu.dma((iova + PAGE) as u64, false)
 }
 
-/// Runs the tests after setup; `None` when pcid had no domain to give.
-fn run(mut setup: Setup) -> Option<Outcome> {
+/// Runs the tests after setup: the DMA tests, `None` when pcid had no domain to give, and the
+/// interrupt tests.
+fn run(mut setup: Setup) -> (Option<Outcome>, MsiOutcome) {
     let unbound = Ok(if setup.buffer_phys.is_some() {
         "translation without a domain gives a physical address"
     } else {
         "translation without a domain is refused (EACCES)"
     });
-    match bind(&mut setup) {
+    let bound = bind(&mut setup);
+    let msi = msi_tests(&mut setup);
+    match bound {
         Ok(true) => {}
-        Ok(false) => return None,
-        Err(err) => return Some(Outcome::all_failed(err)),
+        Ok(false) => return (None, msi),
+        Err(err) => return (Some(Outcome::all_failed(err)), msi),
     }
     let iova = match translate_in_domain(&setup) {
         Ok(iova) => iova,
         Err(err) => {
-            return Some(Outcome {
+            let outcome = Outcome {
                 unbound,
                 domain: Ok(()),
                 dma: Err(err),
                 ..Outcome::all_failed(Failure::NotRun)
-            });
+            };
+            return (Some(outcome), msi);
         }
     };
     let dma = dma_round_trip(&mut setup, iova);
@@ -812,7 +1133,7 @@ fn run(mut setup: Setup) -> Option<Outcome> {
     let readonly = dma_after_write_removed(&mut setup);
     let fork = forked_child_unbound(&setup);
     let release = dma_after_release(setup, iova);
-    Some(Outcome {
+    let outcome = Outcome {
         unbound,
         domain: Ok(()),
         dma,
@@ -820,14 +1141,15 @@ fn run(mut setup: Setup) -> Option<Outcome> {
         readonly,
         fork,
         release,
-    })
+    };
+    (Some(outcome), msi)
 }
 
 /// Prints one test's result line, with the detail a passing test gave; returns whether it
 /// passed.
-fn report_with(name: &str, result: Result<&'static str, Failure>) -> bool {
+fn report_with(name: &str, result: Result<impl AsRef<str>, Failure>) -> bool {
     match result {
-        Ok(detail) => report(name, Ok(()), detail),
+        Ok(detail) => report(name, Ok(()), detail.as_ref()),
         Err(err) => report(name, Err(err), ""),
     }
 }
@@ -846,6 +1168,24 @@ fn report(name: &str, result: Result<(), Failure>, pass: &str) -> bool {
     }
 }
 
+/// Prints the interrupt tests' result lines; returns whether neither failed.
+fn report_msi(msi: MsiOutcome) -> bool {
+    let delivered = report_with("iommu-msi", msi.msi);
+    let forged = match msi.forged {
+        Ok(None) => {
+            println!("FERRIC_TEST_SKIP iommu-irq-fault: no interrupt remapping for the device");
+            true
+        }
+        Ok(Some(())) => report(
+            "iommu-irq-fault",
+            Ok(()),
+            "a forged MSI naming the I/O APIC's interrupt remapping entry 0 was blocked (the kernel logs a source-id fault)",
+        ),
+        Err(err) => report("iommu-irq-fault", Err(err), ""),
+    };
+    delivered && forged
+}
+
 fn main() -> ExitCode {
     let fds = env_fd("PCID_CLIENT_CHANNEL").and_then(|c| Ok((c, env_fd("INIT_NOTIFY")?)));
     let (channel_fd, notify_fd) = match fds {
@@ -861,18 +1201,22 @@ fn main() -> ExitCode {
     };
     // SAFETY: as above.
     let mut notify = unsafe { File::from_raw_fd(notify_fd) };
-    let outcome = setup(channel).map(run);
+    let (outcome, msi) = match setup(channel) {
+        Ok(setup) => run(setup),
+        Err(err) => (Some(Outcome::all_failed(err)), MsiOutcome::not_run()),
+    };
     // pcid-spawner waits for this before it starts the next driver.
     let _ = notify.write_all(&[0]);
-    let outcome = match outcome {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => {
-            for name in TESTS {
-                println!("FERRIC_TEST_SKIP {name}: pcid has no DMA domain for the device");
-            }
-            return ExitCode::SUCCESS;
+    let msi_ok = report_msi(msi);
+    let Some(outcome) = outcome else {
+        for name in TESTS {
+            println!("FERRIC_TEST_SKIP {name}: pcid has no DMA domain for the device");
         }
-        Err(err) => Outcome::all_failed(err),
+        return if msi_ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     };
     let results = [
         report_with(TESTS[0], outcome.unbound),
@@ -903,7 +1247,7 @@ fn main() -> ExitCode {
             "the device read the buffer's old IOVA after the unmap (the kernel logs the fault)",
         ),
     ];
-    if results.iter().all(|&ok| ok) {
+    if msi_ok && results.iter().all(|&ok| ok) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

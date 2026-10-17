@@ -227,17 +227,18 @@ impl SchemeSync for PciScheme {
         }
 
         match handle.inner {
-            // Ferric Oxide: GetDmaDomain needs the iommu state, so it is answered here.
-            Handle::Channel { addr, ref mut st }
-                if matches!(
-                    bincode::deserialize(buf),
-                    Ok(pcid_interface::PcidClientRequest::GetDmaDomain)
-                ) =>
-            {
+            // Ferric Oxide: GetDmaDomain and MsiMessage need the iommu state, so they are
+            // answered here.
+            Handle::Channel { addr, ref mut st } if Self::is_iommu_request(buf) => {
                 if !matches!(st, ChannelState::AwaitingData) {
                     return Err(Error::new(EINVAL));
                 }
-                let response = self.iommu.get_dma_domain(id, addr);
+                let response = match bincode::deserialize(buf) {
+                    Ok(pcid_interface::PcidClientRequest::MsiMessage { cpu, vector }) => {
+                        self.iommu.msi_message(id, addr, cpu, vector)
+                    }
+                    _ => self.iommu.get_dma_domain(id, addr),
+                };
                 *st = ChannelState::AwaitingResponseRead(Self::response_bytes(&response)?.into());
                 Ok(buf.len())
             }
@@ -403,6 +404,15 @@ impl PciScheme {
             tree: BTreeMap::new(),
             iommu: Default::default(),
         }
+    }
+
+    /// Ferric Oxide: whether `buf` is a channel request that the iommu state answers.
+    fn is_iommu_request(buf: &[u8]) -> bool {
+        matches!(
+            bincode::deserialize(buf),
+            Ok(pcid_interface::PcidClientRequest::GetDmaDomain
+                | pcid_interface::PcidClientRequest::MsiMessage { .. })
+        )
     }
 
     /// Ferric Oxide: a channel response as `write_channel` frames it: its length, then the

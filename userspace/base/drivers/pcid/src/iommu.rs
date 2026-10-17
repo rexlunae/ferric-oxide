@@ -9,17 +9,28 @@
 //! it to the driver). The domain then lives as long as the driver keeps the descriptor; when it
 //! is closed (the driver exits or crashes) the kernel blocks the devices.
 //!
-//! Without the scheme (`kernel.iommu = "never"`, upstream's behaviour) none of this runs and
-//! `GetDmaDomain` answers `NoDmaDomain`.
+//! A driver's `MsiMessage` request is answered here too. When the kernel remaps interrupts,
+//! pcid asks it for an interrupt remapping entry (`AllocIrte`) that delivers the vector to the
+//! CPU and accepts requests only from the function (or, behind a PCI Express to PCI bridge, from
+//! the buses its aliases are on), and answers with the remappable-format message naming it. The
+//! entries are freed when the channel closes. A driver therefore never writes a
+//! compatibility-format message, which the kernel has the remapping unit block.
+//!
+//! Without the scheme (`kernel.iommu = "never"`, upstream's behaviour) none of this runs:
+//! `GetDmaDomain` answers `NoDmaDomain`, and `MsiMessage` answers the compatibility-format
+//! message upstream drivers computed themselves.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
 
-use ferric_iommu::abi::{Bridge, PciDevice, Request, DOMAIN_PATH, SCHEME_NAME};
+use ferric_iommu::abi::{
+    Bridge, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH, SCHEME_NAME,
+};
 use ferric_iommu::alias::{requester_ids, BridgeKind, UpstreamBridge};
 use log::{debug, info, warn};
 use pci_types::{ConfigRegionAccess, PciAddress, PciPciBridgeHeader};
+use pcid_interface::msi::MsiAddrAndData;
 use pcid_interface::{PcidClientResponse, PcidServerResponseError};
 use redox_scheme::{OpenResult, RecvFdRequest, Socket};
 use syscall::error::{Error, Result, EINVAL, ENOENT};
@@ -41,6 +52,8 @@ pub struct Iommu {
     pending: BTreeMap<usize, libredox::Fd>,
     /// Channels that already got a domain.
     given: BTreeSet<usize>,
+    /// The interrupt remapping entries made for each channel, by channel handle.
+    irtes: BTreeMap<usize, Vec<u32>>,
     /// The scheme socket, which moves descriptors to a client.
     pub socket: Option<Rc<Socket>>,
 }
@@ -81,6 +94,23 @@ fn device(addr: PciAddress) -> Option<PciDevice> {
 fn call(fds: &[usize], request: Request) -> libredox::error::Result<usize> {
     let (words, len) = request.encode();
     libredox::call::call_ro(fds, &mut [], CallFlags::empty(), &words[..len])
+}
+
+/// The compatibility-format message for `vector` on the CPU whose APIC ID is `cpu`, as upstream
+/// drivers computed it: fixed delivery, edge-triggered, physical destination.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn compatibility_message(cpu: u32, vector: u8) -> Option<MsiAddrAndData> {
+    use pcid_interface::msi::x86::{message_address, message_data_edge_triggered, DeliveryMode};
+    let apic = u8::try_from(cpu).ok()?;
+    Some(MsiAddrAndData {
+        addr: message_address(apic, false, false),
+        data: message_data_edge_triggered(DeliveryMode::Fixed, vector),
+    })
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn compatibility_message(_cpu: u32, _vector: u8) -> Option<MsiAddrAndData> {
+    None
 }
 
 /// The device/port type in the PCI Express capability of `addr`, if it has one.
@@ -247,9 +277,103 @@ impl Iommu {
         Ok(OpenResult::OtherSchemeMultiple { num_fds: 1 })
     }
 
-    /// Forgets channel `id`, closing a domain the driver never fetched.
+    /// Which requester IDs an interrupt remapping entry for `function` accepts: its own, or
+    /// the buses of all its aliases when a bridge adds some.
+    fn source_check(&self, function: PciDevice) -> SourceCheck {
+        let ids = requester_ids(function, &self.upstream(function.bus()));
+        if ids.iter().all(|&id| id == function) {
+            return SourceCheck::Exact;
+        }
+        let buses = ids.iter().map(|id| id.bus());
+        SourceCheck::Bus {
+            first: buses.clone().min().unwrap_or(function.bus()),
+            last: buses.max().unwrap_or(function.bus()),
+        }
+    }
+
+    /// Has the kernel make an interrupt remapping entry for `vector` on `cpu` for `function`.
+    fn alloc_irte(
+        &self,
+        function: PciDevice,
+        cpu: u32,
+        vector: u8,
+    ) -> libredox::error::Result<(u32, MsiMessage)> {
+        let cap = self
+            .cap
+            .as_ref()
+            .ok_or(libredox::error::Error::new(libredox::errno::ENODEV))?;
+        let route = MsiRoute {
+            device: function,
+            source: self.source_check(function),
+            cpu,
+            vector,
+        };
+        let (words, len) = Request::AllocIrte(route).encode();
+        let mut payload = [0_u8; MsiMessage::BYTES];
+        let id = libredox::call::call_ro(
+            &[cap.raw()][..],
+            &mut payload,
+            CallFlags::empty(),
+            &words[..len],
+        )?;
+        let message = MsiMessage::from_bytes(&payload)
+            .ok_or(libredox::error::Error::new(libredox::errno::EIO))?;
+        // The kernel's entry IDs are 32-bit.
+        let id =
+            u32::try_from(id).map_err(|_| libredox::error::Error::new(libredox::errno::EIO))?;
+        Ok((id, message))
+    }
+
+    /// Answers `MsiMessage` on channel `id` for function `addr`: a remappable-format message
+    /// when the kernel remaps the function's interrupts, otherwise the compatibility-format one.
+    pub fn msi_message(
+        &mut self,
+        id: usize,
+        addr: PciAddress,
+        cpu: u32,
+        vector: u8,
+    ) -> PcidClientResponse {
+        let no_message = PcidClientResponse::Error(PcidServerResponseError::NoMsiMessage);
+        let Some(function) = device(addr) else {
+            return no_message;
+        };
+        match self.alloc_irte(function, cpu, vector) {
+            Ok((entry, message)) => {
+                self.irtes.entry(id).or_default().push(entry);
+                debug!("pcid: {function} vector {vector} on CPU {cpu} through interrupt remapping entry {entry:#x}");
+                PcidClientResponse::MsiMessage(MsiAddrAndData {
+                    addr: message.address,
+                    data: message.data,
+                })
+            }
+            // No remapping unit remaps this function's interrupts, so the compatibility format
+            // reaches the CPU as upstream.
+            Err(err) if err.errno() == libredox::errno::ENODEV => {
+                compatibility_message(cpu, vector)
+                    .map_or(no_message, PcidClientResponse::MsiMessage)
+            }
+            Err(err) => {
+                warn!("pcid: no interrupt remapping entry for {function} vector {vector} on CPU {cpu}: {err}");
+                no_message
+            }
+        }
+    }
+
+    /// Forgets channel `id`, closing a domain the driver never fetched and freeing its
+    /// interrupt remapping entries.
     pub fn on_close(&mut self, id: usize) {
         self.pending.remove(&id);
         self.given.remove(&id);
+        let Some(entries) = self.irtes.remove(&id) else {
+            return;
+        };
+        let Some(cap) = &self.cap else {
+            return;
+        };
+        for entry in entries {
+            if let Err(err) = call(&[cap.raw()], Request::FreeIrte(entry)) {
+                warn!("pcid: cannot free interrupt remapping entry {entry:#x}: {err}");
+            }
+        }
     }
 }

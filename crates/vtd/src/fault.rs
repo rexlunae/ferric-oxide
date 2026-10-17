@@ -4,6 +4,10 @@
 //! registers, sets the fault status register and, unless masked, sends the fault event
 //! interrupt programmed in FEDATA/FEADDR. Software reads each record whose F bit is set,
 //! writes F back to clear it, and clears the overflow bits in the status register.
+//!
+//! Interrupt requests that interrupt remapping blocks ([`crate::interrupt`]) are recorded in
+//! the same registers, with reasons 20h to 26h; the record then names the interrupt index
+//! instead of an address ([`FaultRecord::interrupt_index`]).
 
 use core::fmt;
 
@@ -123,7 +127,8 @@ pub enum FaultReason {
     PageTableReserved,
     /// 0x0d: the context entry's translation type blocks this request type.
     BlockedByTranslationType,
-    /// 0x20-0x26: an interrupt remapping fault.
+    /// 0x20-0x26: an interrupt remapping fault; [`FaultReason::interrupt_remapping_cause`]
+    /// says which.
     InterruptRemapping(u8),
     /// Another code (scalable-mode and newer reasons).
     Other(u8),
@@ -150,6 +155,29 @@ impl FaultReason {
             c => Self::Other(c),
         }
     }
+
+    /// Whether this is an interrupt remapping fault rather than a DMA fault.
+    pub const fn is_interrupt_remapping(self) -> bool {
+        matches!(self, Self::InterruptRemapping(_))
+    }
+
+    /// What an interrupt remapping fault code means (appendix A, interrupt remapping fault
+    /// conditions), or `None` for other reasons.
+    pub const fn interrupt_remapping_cause(self) -> Option<&'static str> {
+        let Self::InterruptRemapping(code) = self else {
+            return None;
+        };
+        Some(match code {
+            0x20 => "reserved bit set in the interrupt request",
+            0x21 => "interrupt index beyond the table",
+            0x22 => "interrupt remapping entry not present",
+            0x23 => "cannot read the interrupt remapping table",
+            0x24 => "reserved bit set in the interrupt remapping entry",
+            0x25 => "compatibility-format interrupt blocked",
+            0x26 => "source-id check failed: the entry belongs to another requester",
+            _ => "interrupt remapping fault",
+        })
+    }
 }
 
 impl fmt::Display for FaultReason {
@@ -168,7 +196,12 @@ impl fmt::Display for FaultReason {
             Self::ContextReserved => "reserved bit set in context entry",
             Self::PageTableReserved => "reserved bit set in a page-table entry",
             Self::BlockedByTranslationType => "request type blocked by the context entry",
-            Self::InterruptRemapping(c) => return write!(f, "interrupt remapping fault {c:#04x}"),
+            Self::InterruptRemapping(c) => {
+                let cause = self
+                    .interrupt_remapping_cause()
+                    .unwrap_or("interrupt remapping fault");
+                return write!(f, "{cause} ({c:#04x})");
+            }
             Self::Other(c) => return write!(f, "fault reason {c:#04x}"),
         };
         f.write_str(s)
@@ -219,8 +252,28 @@ impl FaultRecord {
     }
 }
 
+impl FaultRecord {
+    /// For an interrupt remapping fault, the interrupt index the request named (the record's
+    /// bits 63:48; section 10.4.14). Meaningless for a compatibility-format request (reason
+    /// 25h), which names no index.
+    pub const fn interrupt_index(&self) -> Option<u16> {
+        if self.reason.is_interrupt_remapping() {
+            Some((self.address >> 48) as u16)
+        } else {
+            None
+        }
+    }
+}
+
 impl fmt::Display for FaultRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(index) = self.interrupt_index() {
+            return write!(
+                f,
+                "{} interrupt index {index}: {}",
+                self.source, self.reason
+            );
+        }
         let kind = match self.kind {
             RequestKind::Write => "write",
             RequestKind::Read => "read",
@@ -296,6 +349,31 @@ mod tests {
         let other = FaultRecord::decode(0, RECORD_F | (1 << 28) | (0x22 << 32)).unwrap();
         assert_eq!(other.kind, RequestKind::Other);
         assert_eq!(other.reason, FaultReason::InterruptRemapping(0x22));
+        assert_eq!(rec.interrupt_index(), None);
         assert_eq!(FaultReason::from_code(0x30), FaultReason::Other(0x30));
+    }
+
+    #[test]
+    fn decode_interrupt_remapping_records() {
+        // QEMU's record for an MSI from 00:10.0 naming entry 0, which only ff:00.0 may use:
+        // index in bits 63:48 of the low word, reason 26h.
+        let rec = FaultRecord::decode(0, RECORD_F | (0x26 << 32) | 0x0080).unwrap();
+        assert!(rec.reason.is_interrupt_remapping());
+        assert_eq!(rec.interrupt_index(), Some(0));
+        assert_eq!(
+            rec.to_string(),
+            "00:10.0 interrupt index 0: source-id check failed: the entry belongs to another \
+             requester (0x26)"
+        );
+        let rec = FaultRecord::decode(4095 << 48, RECORD_F | (0x22 << 32) | 0x0020).unwrap();
+        assert_eq!(rec.interrupt_index(), Some(4095));
+        assert!(rec.to_string().contains("entry not present (0x22)"));
+        let compat = FaultReason::from_code(0x25);
+        assert_eq!(
+            compat.interrupt_remapping_cause(),
+            Some("compatibility-format interrupt blocked")
+        );
+        assert_eq!(FaultReason::WriteDenied.interrupt_remapping_cause(), None);
+        assert!(!FaultReason::WriteDenied.is_interrupt_remapping());
     }
 }

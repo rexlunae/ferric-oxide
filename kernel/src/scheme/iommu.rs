@@ -24,6 +24,12 @@
 //!   strictly. When it takes write access away (`mprotect`), the address-space code calls
 //!   [`narrow`], which makes the mappings that memory reaches read-only for the device. A
 //!   process without a bound domain gets physical addresses, or `EACCES` under `enforce`.
+//! - [`Request::AllocIrte`] on the attach capability makes an interrupt remapping entry that
+//!   delivers a vector to a CPU for one function's MSI or MSI-X requests, and writes the
+//!   remappable-format message that names it into the payload; [`Request::FreeIrte`] frees it
+//!   (`arch/x86_64/iommu/interrupt.rs`). pcid makes these calls when a driver asks it for an MSI
+//!   message, and frees the entries when the driver's channel closes. `ENODEV` means the unit
+//!   does not remap interrupts, so compatibility-format messages still work.
 //! - Closing the last descriptor of a domain blocks its devices (DMA faults), frees its
 //!   tables and unpins every frame mapped in it. Domain descriptors cannot be duplicated into
 //!   new descriptions, so the scheme's close is the last close.
@@ -34,13 +40,13 @@
 use alloc::{collections::BTreeMap, sync::Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use ferric_iommu::abi::{PciDevice, Request, DOMAIN_PATH};
-use ferric_vtd::{dmar::BusRange, plan::SelectError, Bdf};
+use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
+use ferric_vtd::{dmar::BusRange, interrupt::SourceValidation, plan::SelectError, Bdf};
 use spin::Mutex;
 use syscall::{
     error::{
         Error, Result, EACCES, EBADF, EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, ENOSPC,
-        ENXIO,
+        ENXIO, EPERM,
     },
     flag::CallFlags,
 };
@@ -50,6 +56,7 @@ use crate::{
     arch::iommu::{
         dma::{DmaError, DmaSpace},
         domain::{self, Device, Domain, DomainError},
+        interrupt::{self, IrqError},
     },
     context::{
         self,
@@ -122,6 +129,21 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::FreeFrame { .. } | DmaError::Overlap(_) => Error::new(EIO),
         DmaError::Domain(err) => errno(err),
     }
+}
+
+/// The errno a failed interrupt remapping call returns to user space. `ENODEV` tells pcid
+/// that the device's interrupts are not remapped, so a compatibility-format message works.
+fn irq_errno(err: &IrqError) -> Error {
+    Error::new(match err {
+        IrqError::Skip(_) | IrqError::NotEnabled => ENODEV,
+        IrqError::Unit(err) => return errno(err),
+        IrqError::NoMemory => ENOMEM,
+        IrqError::Full => ENOSPC,
+        IrqError::NoCpu { .. } | IrqError::Destination { .. } => EINVAL,
+        IrqError::Vector { .. } => EPERM,
+        IrqError::Hardware(_) => EIO,
+        IrqError::NotAllocated(_) | IrqError::BadId { .. } => ENOENT,
+    })
 }
 
 /// The kernel's form of a device address.
@@ -199,7 +221,7 @@ impl KernelScheme for IommuScheme {
     fn kcall(
         &self,
         fds: &[usize],
-        _payload: UserSliceRw,
+        payload: UserSliceRw,
         _flags: CallFlags,
         metadata: &[u64],
         token: &mut CleanLockToken,
@@ -223,9 +245,61 @@ impl KernelScheme for IommuScheme {
             }
             (Request::Bind, &[domain]) => bind(domain, token).map(|()| 0),
             (Request::Join, &[domain]) => join(domain, token),
+            (Request::AllocIrte(route), &[cap]) => {
+                require_cap(cap)?;
+                alloc_irte(route, payload)
+            }
+            (Request::FreeIrte(id), &[cap]) => {
+                require_cap(cap)?;
+                interrupt::free(id).map_err(|err| irq_errno(&err))?;
+                Ok(0)
+            }
             _ => Err(Error::new(EINVAL)),
         }
     }
+}
+
+/// Makes an interrupt remapping entry for `route`, writes its message into `payload` and
+/// returns its ID.
+///
+/// # Errors
+///
+/// `EINVAL` when the payload is not [`MsiMessage::BYTES`] long or a bus range leaves out the
+/// device's bus, the errno of a failed allocation ([`irq_errno`]), and that of a failed copy
+/// (the entry is freed again).
+fn alloc_irte(route: MsiRoute, payload: UserSliceRw) -> Result<usize> {
+    if payload.len() != MsiMessage::BYTES {
+        return Err(Error::new(EINVAL));
+    }
+    let dev = device(route.device);
+    let source = match route.source {
+        SourceCheck::Exact => SourceValidation::RequesterId {
+            source_id: dev.bdf.source_id(),
+            ignore_function_bits: 0,
+        },
+        SourceCheck::Bus { first, last } if (first..=last).contains(&dev.bdf.bus) => {
+            SourceValidation::Bus { first, last }
+        }
+        _ => return Err(Error::new(EINVAL)),
+    };
+    let entry = interrupt::alloc_msi(dev, source, route.cpu, route.vector).map_err(|err| {
+        if !matches!(err, IrqError::NotEnabled | IrqError::Skip(_)) {
+            warn!(
+                "IOMMU: cannot make an interrupt remapping entry for {:04x}:{}: {err}",
+                dev.segment, dev.bdf
+            );
+        }
+        irq_errno(&err)
+    })?;
+    let message = MsiMessage {
+        address: entry.message.address,
+        data: entry.message.data,
+    };
+    if let Err(err) = payload.copy_exactly(&message.to_bytes()) {
+        let _ = interrupt::free(entry.id);
+        return Err(err);
+    }
+    Ok(entry.id as usize)
 }
 
 /// Fails unless `cap` is the attach capability.
