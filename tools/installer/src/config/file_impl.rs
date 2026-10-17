@@ -162,16 +162,92 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("file"), "original").unwrap();
-        symlink(&outside, root.join("link")).unwrap();
+        symlink("../outside", root.join("link")).unwrap();
         let through_parent = FileConfig::new_file("/link/file".into(), "bad".into());
         assert!(through_parent.create(&root).is_err());
-        symlink(outside.join("file"), root.join("file")).unwrap();
+        symlink("../outside/file", root.join("file")).unwrap();
         let through_target = FileConfig::new_file("/file".into(), "bad".into());
         assert!(through_target.create(&root).is_err());
         assert_eq!(
             fs::read_to_string(outside.join("file")).unwrap(),
             "original"
         );
+    }
+
+    #[test]
+    fn internal_image_links_support_writes_and_artifact_reads() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path();
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        symlink("usr/bin", root.join("bin")).unwrap();
+        symlink("../usr/bin", root.join("nested/bin")).unwrap();
+        symlink("/usr/bin", root.join("absolute-bin")).unwrap();
+        for path in ["/bin/app", "/nested/bin/app", "/absolute-bin/app"] {
+            FileConfig::new_file(path.into(), "application".into())
+                .create(root)
+                .unwrap();
+            let artifact = crate::image_path(root, Path::new(path)).unwrap();
+            assert_eq!(artifact, root.join("usr/bin/app"));
+            assert_eq!(fs::read_to_string(artifact).unwrap(), "application");
+        }
+        assert_eq!(
+            crate::image_path(root, Path::new("/bin")).unwrap(),
+            root.join("usr/bin")
+        );
+    }
+
+    #[test]
+    fn image_root_symlinks_and_escaping_relative_links_are_rejected() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path().join("image");
+        let outside = sandbox.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+        let file = FileConfig::new_file("/file".into(), "bad".into());
+        assert!(file.create(&root).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        symlink("../outside", root.join("escape")).unwrap();
+        assert!(
+            FileConfig::new_file("/escape/file".into(), "bad".into())
+                .create(&root)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn absolute_image_links_never_write_to_the_host_root() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path().join("image");
+        let outside = sandbox.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), "host data").unwrap();
+        symlink(&outside, root.join("absolute")).unwrap();
+        FileConfig::new_file("/absolute/file".into(), "guest data".into())
+            .create(&root)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "host data"
+        );
+        let resolved = crate::image_path(&root, Path::new("absolute/file")).unwrap();
+        assert!(resolved.starts_with(&root));
+        assert_eq!(fs::read_to_string(resolved).unwrap(), "guest data");
+    }
+
+    #[test]
+    fn image_symlink_cycles_are_bounded() {
+        let sandbox = TestDirectory::new();
+        symlink("b", sandbox.path().join("a")).unwrap();
+        symlink("a", sandbox.path().join("b")).unwrap();
+        assert!(matches!(
+            crate::image_path(sandbox.path(), Path::new("a/file")),
+            Err(crate::ImagePathError::SymlinkLoop)
+        ));
     }
 
     #[test]

@@ -141,11 +141,46 @@ pub fn fetch_offline(recipe: &CookRecipe, logger: &PtyOut) -> Result<FetchResult
     result.apply_info(recipe)
 }
 
-fn path_source_cached(original: &Path, snapshot: &Path, rule: &str) -> Result<bool> {
-    Ok(
-        snapshot.is_dir()
-            && (rule == "local" || modified_dir(original)? <= modified_dir(snapshot)?),
-    )
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PathSourceState {
+    original: PathBuf,
+    // Track source membership rather than snapshot timestamps: builds can
+    // create newer files in the snapshot, and deletions can share a clock tick.
+    entries: BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+}
+
+fn refresh_path_source(original: &Path, snapshot: &Path, rule: &str) -> Result<bool> {
+    if snapshot.is_dir() && rule == "local" {
+        return Ok(true);
+    }
+    let mut entries = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(original) {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let relative = entry
+            .path()
+            .strip_prefix(original)
+            .expect("WalkDir entries are descendants of its root")
+            .to_path_buf();
+        let modified = metadata
+            .modified()
+            .map_err(wrap_io_err!(entry.path(), "Reading source timestamp"))?;
+        entries.insert(relative, (metadata.len(), modified));
+    }
+    let state = PathSourceState {
+        original: original.to_path_buf(),
+        entries,
+    };
+    let state_dir = snapshot.parent().unwrap_or(Path::new(".")).join("target");
+    let state_path = state_dir.join("path-source.toml");
+    if snapshot.is_dir() && read_toml::<PathSourceState>(&state_path).ok().as_ref() == Some(&state)
+    {
+        return Ok(true);
+    }
+    replace_dir_all(original, snapshot)?;
+    create_dir(&state_dir)?;
+    serialize_and_write(&state_path, &state)?;
+    Ok(false)
 }
 
 pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result<FetchResult> {
@@ -183,16 +218,14 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
         }
         Some(SourceRecipe::Path { path }) => {
             let path = Path::new(&path);
-            let cached = path_source_cached(path, &source_dir, &recipe.rule)?;
+            let cached = refresh_path_source(path, &source_dir, &recipe.rule)?;
             if !cached {
                 log_to_pty!(
                     logger,
-                    "[DEBUG]: {:?} is newer than {:?}",
-                    path.display(),
-                    source_dir.display()
+                    "[DEBUG]: refreshed {:?} from {:?}",
+                    source_dir.display(),
+                    path.display()
                 );
-                // Replace the snapshot so deleted files cannot survive a rebuild.
-                replace_dir_all(path, &source_dir)?;
             }
             FetchResult::new(
                 source_dir,
@@ -902,17 +935,14 @@ mod tests {
         let snapshot = temporary.path().join("source");
         fs::create_dir_all(original.join("src/bin")).unwrap();
         fs::write(original.join("src/bin/deleted.rs"), "old source").unwrap();
-        replace_dir_all(&original, &snapshot).unwrap();
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
+        assert!(refresh_path_source(&original, &snapshot, "source").unwrap());
+        fs::write(snapshot.join("generated-by-build"), "generated").unwrap();
+        assert!(refresh_path_source(&original, &snapshot, "source").unwrap());
         fs::remove_file(original.join("src/bin/deleted.rs")).unwrap();
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        fs::File::open(original.join("src/bin"))
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(future))
-            .unwrap();
-        assert!(!path_source_cached(&original, &snapshot, "source").unwrap());
-        assert!(path_source_cached(&original, &snapshot, "local").unwrap());
+        assert!(refresh_path_source(&original, &snapshot, "local").unwrap());
         assert!(snapshot.join("src/bin/deleted.rs").exists());
-        replace_dir_all(&original, &snapshot).unwrap();
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
         assert!(!snapshot.join("src/bin/deleted.rs").exists());
     }
 
