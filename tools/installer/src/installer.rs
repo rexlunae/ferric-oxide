@@ -1,13 +1,15 @@
+//! Package, account and disk installation orchestrated around RedoxFS callbacks.
+
 use anyhow::Context;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use pkg::Library;
-use rand::{rngs::OsRng, TryRngCore};
-use redoxfs::{unmount_path, Disk, DiskIo, FileSystem, BLOCK_SIZE};
+use rand::{TryRngCore, rngs::OsRng};
+use redoxfs::{BLOCK_SIZE, Disk, DiskIo, FileSystem, unmount_path};
 use termion::input::TermRead;
 
+use crate::config::Config;
 use crate::config::file::FileConfig;
 use crate::config::package::PackageConfig;
-use crate::config::Config;
 use crate::disk_wrapper::DiskWrapper;
 
 use std::{
@@ -23,15 +25,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Disk layout, encryption and bootloader inputs for image creation.
 pub struct DiskOption<'a> {
+    /// Legacy bootloader bytes; an empty slice omits them.
     pub bootloader_bios: &'a [u8],
+    /// UEFI bootloader bytes to place in the EFI system partition.
     pub bootloader_efi: &'a [u8],
+    /// Optional password for filesystem encryption.
     pub password_opt: Option<&'a [u8]>,
+    /// Optional EFI partition size in MiB.
     pub efi_partition_size: Option<u32>, //MiB
+    /// Optional existing EFI partition path.
     pub efi_partition_path: Option<&'a str>,
+    /// Treat the disk as a filesystem partition without creating a partition table.
     pub skip_partitions: bool,
 }
 
+/// Return the installation target from `TARGET`, or the architecture default.
 pub fn get_target() -> String {
     // TODO: Configurable from filesystem config?
     env::var("TARGET").unwrap_or_else(|_| {
@@ -66,6 +76,10 @@ fn syscall_error(err: syscall::Error) -> io::Error {
 }
 
 /// Returns a password collected from the user (plaintext)
+/// Read a password twice, returning `None` for an empty password.
+///
+/// # Errors
+/// Returns terminal I/O errors; mismatched passwords prompt again.
 pub fn prompt_password(prompt: &str, confirm_prompt: &str) -> Result<Option<String>> {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -137,6 +151,13 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     Ok(())
 }
 
+/// Install configured files, packages and accounts into a directory.
+///
+/// # Errors
+/// Returns package, filesystem, account or configuration errors.
+///
+/// # Panics
+/// May panic when the random source fails during password salt generation.
 pub fn install_dir(
     config: Config,
     output_dir: impl AsRef<Path>,
@@ -346,6 +367,10 @@ fn copy_dir_all(
     Ok(())
 }
 
+/// Create a RedoxFS filesystem and pass ownership to a callback.
+///
+/// # Errors
+/// Returns clock, filesystem creation or callback errors.
 pub fn with_redoxfs<D, T, F>(disk: D, password_opt: Option<&[u8]>, callback: F) -> Result<T>
 where
     D: Disk + Send + 'static,
@@ -368,6 +393,13 @@ fn decide_mount_path(mount_path: Option<&Path>) -> PathBuf {
     mount_path
 }
 
+/// Mount a filesystem for a callback, then unmount and remove the mount point.
+///
+/// # Errors
+/// Returns mount, callback, channel or filesystem cleanup errors.
+///
+/// # Panics
+/// Panics if the mount path is not UTF-8 or the mount thread panics.
 pub fn with_redoxfs_mount<D, T, F>(
     fs: FileSystem<D>,
     mount_path: Option<&Path>,
@@ -409,7 +441,7 @@ where
                 io::ErrorKind::NotConnected,
                 "redoxfs thread did not send a result",
             )
-            .into())
+            .into());
         }
     };
 
@@ -424,6 +456,10 @@ where
     res
 }
 
+/// Run a callback in a directory and archive its successful output into RedoxFS.
+///
+/// # Errors
+/// Returns callback, filesystem archive or cleanup errors.
 pub fn with_redoxfs_ar<D, T, F>(
     mut fs: FileSystem<D>,
     mount_path: Option<&Path>,
@@ -485,6 +521,10 @@ where
     res
 }
 
+/// Fetch BIOS and UEFI bootloader bytes using the selected package configuration.
+///
+/// # Errors
+/// Returns package installation or temporary-directory I/O errors.
 pub fn fetch_bootloaders(
     config: &Config,
     cookbook: Option<&str>,
@@ -532,6 +572,13 @@ pub fn fetch_bootloaders(
 }
 
 //TODO: make bootloaders use Option, dynamically create BIOS and EFI partitions
+/// Partition and format a disk, then invoke a callback on its RedoxFS partition.
+///
+/// # Errors
+/// Returns disk, partition-table, formatting, bootloader or callback errors.
+///
+/// # Panics
+/// Panics if required partition entries are absent or the disk layout cannot fit.
 pub fn with_whole_disk<P, F, T>(disk_path: P, disk_option: &DiskOption, callback: F) -> Result<T>
 where
     P: AsRef<Path>,
@@ -703,6 +750,10 @@ where
     with_redoxfs(disk_redoxfs, disk_option.password_opt, callback)
 }
 
+/// Return the UEFI fallback bootloader filename for the installation target.
+///
+/// # Errors
+/// Returns an error if the selected target has no supported UEFI filename.
 pub fn bootloader_efi_name() -> Result<&'static str> {
     let target = get_target();
     let name = match target.as_str() {
@@ -750,6 +801,10 @@ fn format_and_install_efi<T: fatfs::ReadWriteSeek>(
 }
 
 #[cfg(not(target_os = "redox"))]
+/// Attempt to copy a live filesystem, returning false when unavailable.
+///
+/// # Errors
+/// Returns live-memory mapping, disk copy or filesystem update errors on Redox.
 pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
     _fs: &mut redoxfs::FileSystem<D>,
     _progress: F,
@@ -759,6 +814,10 @@ pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
 
 /// Try fast install using live disk memory
 #[cfg(target_os = "redox")]
+/// Attempt to copy a live filesystem, returning false when unavailable.
+///
+/// # Errors
+/// Returns live-memory mapping, disk copy or filesystem update errors on Redox.
 pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
     fs: &mut redoxfs::FileSystem<D>,
     mut progress: F,
@@ -912,6 +971,12 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
 
 /// Install RedoxFS into a new disk file, or a sysroot directory.
 /// This function assumes all interactive prompts resolved by the caller.
+///
+/// # Errors
+/// Returns package, configuration, disk formatting or filesystem errors.
+///
+/// # Panics
+/// May panic for invalid disk layouts or random-source failure during account setup.
 pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
     install_inner(config, output.as_ref())
 }

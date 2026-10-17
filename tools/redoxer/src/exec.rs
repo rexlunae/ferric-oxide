@@ -394,7 +394,7 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
             for (sysroot, folder) in config.folders.iter() {
                 eprintln!("redoxer: copying '{folder}' to '/{sysroot}'");
 
-                let dst_dir = dest_dir.join(sysroot);
+                let dst_dir = redox_installer::image_path(&dest_dir, Path::new(sysroot))?;
                 if !dst_dir.is_dir() {
                     fs::create_dir_all(&dst_dir)
                         .context("unable to create destination directory")?;
@@ -502,7 +502,10 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
             }
             Command::new("rsync")
                 .arg("--archive")
-                .arg(format!("{}/", dest_dir.join(sysroot).display()))
+                .arg(format!(
+                    "{}/",
+                    redox_installer::image_path(&dest_dir, Path::new(sysroot))?.display()
+                ))
                 .arg(dst_dir)
                 .status()
                 .and_then(status_error)
@@ -548,6 +551,7 @@ pub struct RedoxerExecConfig {
     // Installer config
     pub config_name: String,
     pub config_toml: String,
+    pub install_config: Option<PathBuf>,
     // Folders to copy (host -> qemu)
     pub folders: HashMap<String, String>,
     // Folders to extract (qemu -> host)
@@ -567,26 +571,22 @@ impl RedoxerExecConfig {
             folder: String,
             argname: &str,
         ) -> anyhow::Result<()> {
-            let (dir, sysroot): (String, String) = match folder
-                .chars()
-                .filter(|c| *c == ':')
-                .count()
-            {
-                0 => (folder, "/root".to_string()),
-                1 => {
-                    let mut split = folder.split(":");
-                    let r = (
-                        split.next().unwrap().to_string(),
-                        split.next().unwrap().to_string(),
-                    );
-                    if !r.1.starts_with("/") {
-                        bail!("path on {argname} with format 'directory:path' must be an absolute path (starting with '/')");
-                    }
-                    r
+            let (dir, sysroot) = if let Some((dir, destination)) = folder.split_once(':') {
+                if destination.contains(':') {
+                    bail!("{argname} can be 'directory' or 'directory:path'");
                 }
-                _ => bail!("{argname} can be 'directory' or 'directory:path'"),
+                if !destination.starts_with('/') {
+                    bail!("path on {argname} with format 'directory:path' must be an absolute path (starting with '/')");
+                }
+                (dir.to_string(), destination.to_string())
+            } else {
+                (folder, "/root".to_string())
             };
-            if map.insert(sysroot[1..].to_string(), dir).is_some() {
+            let sysroot = redox_installer::image_relative_path(Path::new(&sysroot))?;
+            if map
+                .insert(sysroot.to_string_lossy().into_owned(), dir)
+                .is_some()
+            {
                 bail!(
                     "path {:?} on {argname} with format 'directory:path' must be unique",
                     sysroot
@@ -622,17 +622,22 @@ impl RedoxerExecConfig {
                 ("-g" | "--gui", true) => {
                     config.config_name = "gui".into();
                     config.config_toml = GUI_TOML.into();
+                    config.install_config = None;
                 }
                 ("-i" | "--install-config", true) => match args.next() {
                     Some(file) => {
                         let path = Path::new(&file);
-                        config.config_name =
-                            path.file_stem().unwrap().to_string_lossy().to_string();
+                        config.config_name = path
+                            .file_stem()
+                            .ok_or_else(|| anyhow::anyhow!("--install-config requires a filename"))?
+                            .to_string_lossy()
+                            .to_string();
                         if &config.config_name == "base" || &config.config_name == "gui" {
                             bail!("--install-config file path cannot be 'base' or 'gui'");
                         }
-                        config.config_toml =
-                            fs::read_to_string(path).expect("unable to read --install-config file");
+                        config.config_toml = fs::read_to_string(path)
+                            .context("unable to read --install-config file")?;
+                        config.install_config = Some(fs::canonicalize(path)?);
                     }
                     None => bail!("--output requires a path to a directory"),
                 },
@@ -692,7 +697,10 @@ impl RedoxerExecConfig {
             args.push(format!("{host_dir}:/{sysroot}"));
         }
 
-        if self.config_name == "gui" {
+        if let Some(path) = &self.install_config {
+            args.push("--install-config".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        } else if self.config_name == "gui" {
             args.push("--gui".to_string());
         }
 
@@ -733,5 +741,21 @@ pub fn main(args: &[String]) {
             eprintln!("redoxer exec: {err:#}");
             process::exit(3);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_destinations_reject_traversal() {
+        for path in ["src:/../../outside", "src:/etc/../outside"] {
+            assert!(RedoxerExecConfig::new(["--folder".into(), path.into()].into_iter()).is_err());
+        }
+        let config =
+            RedoxerExecConfig::new(["--folder".into(), "src:/etc/./data".into()].into_iter())
+                .unwrap();
+        assert_eq!(config.folders.get("etc/data"), Some(&"src".to_string()));
     }
 }

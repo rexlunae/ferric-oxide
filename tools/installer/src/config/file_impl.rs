@@ -1,3 +1,5 @@
+//! Create configured image entries without traversing paths outside the image root.
+
 use anyhow::{Context, Result};
 use libc::{gid_t, uid_t};
 
@@ -5,18 +7,19 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Error, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
 fn chown<P: AsRef<Path>>(path: P, uid: uid_t, gid: gid_t, recursive: bool) -> Result<()> {
     let path = path.as_ref();
 
-    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: c_path is NUL-terminated and valid for the duration of lchown.
+    if unsafe { libc::lchown(c_path.as_ptr(), uid, gid) } != 0 {
         return Err(Error::last_os_error().into());
     }
 
-    if recursive && path.is_dir() {
+    if recursive && fs::symlink_metadata(path)?.is_dir() {
         for entry_res in fs::read_dir(path)? {
             let entry = entry_res?;
             chown(entry.path(), uid, gid, recursive)?;
@@ -29,8 +32,20 @@ fn chown<P: AsRef<Path>>(path: P, uid: uid_t, gid: gid_t, recursive: bool) -> Re
 // TODO: Rewrite impls
 impl crate::FileConfig {
     pub(crate) fn create<P: AsRef<Path>>(&self, prefix: P) -> Result<()> {
-        let path = self.path.trim_start_matches('/');
-        let target_file = prefix.as_ref().join(path);
+        let relative = crate::image_relative_path(Path::new(&self.path))?;
+        let target_file = if self.symlink {
+            // Replacing the link itself is safe; only its parent is traversed.
+            let parent =
+                crate::image_path(prefix.as_ref(), relative.parent().unwrap_or(Path::new("")))?;
+            parent.join(relative.file_name().ok_or_else(|| {
+                Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symlink requires a filename",
+                )
+            })?)
+        } else {
+            crate::image_path(prefix.as_ref(), &relative)?
+        };
 
         if self.directory {
             println!("Create directory {}", target_file.display());
@@ -94,5 +109,91 @@ impl crate::FileConfig {
         // chown
         chown(path, uid, gid, self.recursive_chown)
             .with_context(|| format!("failed to chown {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FileConfig;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("installer-test-{}-{nonce}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn traversal_is_rejected_before_any_write() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path().join("image");
+        fs::create_dir(&root).unwrap();
+        for path in ["../outside", "/../../outside", "/etc/../outside"] {
+            let file = FileConfig::new_file(path.into(), "overwrite".into());
+            assert!(file.create(&root).is_err());
+        }
+        assert!(!sandbox.path().join("outside").exists());
+        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn symlink_ancestors_and_targets_cannot_redirect_writes() {
+        let sandbox = TestDirectory::new();
+        let root = sandbox.path().join("image");
+        let outside = sandbox.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), "original").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        let through_parent = FileConfig::new_file("/link/file".into(), "bad".into());
+        assert!(through_parent.create(&root).is_err());
+        symlink(outside.join("file"), root.join("file")).unwrap();
+        let through_target = FileConfig::new_file("/file".into(), "bad".into());
+        assert!(through_target.create(&root).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn valid_files_and_link_replacement_stay_inside_image() {
+        let sandbox = TestDirectory::new();
+        let file = FileConfig::new_file("/etc/example".into(), "contents".into());
+        file.create(sandbox.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.path().join("etc/example")).unwrap(),
+            "contents"
+        );
+        let link = FileConfig {
+            path: "/etc/link".into(),
+            data: "example".into(),
+            symlink: true,
+            ..Default::default()
+        };
+        link.create(sandbox.path()).unwrap();
+        link.create(sandbox.path()).unwrap();
+        assert_eq!(
+            fs::read_link(sandbox.path().join("etc/link")).unwrap(),
+            Path::new("example")
+        );
     }
 }

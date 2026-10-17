@@ -28,6 +28,7 @@ exclude = [
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3.20"
 redox_installer = { path = "tools/installer", default-features = false }
 redoxer = { path = "tools/redoxer", default-features = false }
 

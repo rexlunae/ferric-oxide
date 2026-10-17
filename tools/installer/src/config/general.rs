@@ -1,4 +1,7 @@
+//! Global filesystem, encryption and bootloader installation settings.
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// Image-wide settings shared by package and disk installation.
 pub struct GeneralConfig {
     /// Specify a path where cookbook exists, all packages will be installed locally
     pub cookbook: Option<String>,

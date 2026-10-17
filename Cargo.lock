@@ -2271,6 +2271,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strip-ansi-escapes",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "walkdir",

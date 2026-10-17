@@ -1,3 +1,5 @@
+//! Block-aligned buffered access to disk files and devices.
+
 use std::{
     cmp,
     convert::TryInto,
@@ -7,6 +9,7 @@ use std::{
 };
 
 #[derive(Debug)]
+/// Buffered disk access with a fixed logical block size.
 pub struct DiskWrapper {
     disk: File,
     size: u64,
@@ -20,6 +23,10 @@ enum Buffer<'a> {
 }
 
 impl DiskWrapper {
+    /// Open a disk or image for reading and writing.
+    ///
+    /// # Errors
+    /// Returns open, metadata or size-detection I/O errors.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut disk = OpenOptions::new().read(true).write(true).open(path)?;
         let metadata = disk.metadata()?;
@@ -42,10 +49,12 @@ impl DiskWrapper {
         })
     }
 
+    /// Return the logical block size in bytes.
     pub fn block_size(&self) -> usize {
         self.block.len()
     }
 
+    /// Return the detected disk size in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }

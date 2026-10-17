@@ -1,13 +1,13 @@
-use anyhow::{anyhow, bail, Result};
-use pkgar::{ext::EntryExt, PackageHead};
+use anyhow::{Result, anyhow, bail};
+use pkgar::{PackageHead, ext::EntryExt};
 use pkgar_core::PackageSrc;
 use pkgar_keys::PublicKeyFile;
-use redox_installer::{try_fast_install, with_redoxfs_mount, with_whole_disk, Config, DiskOption};
+use redox_installer::{Config, DiskOption, try_fast_install, with_redoxfs_mount, with_whole_disk};
 use std::{
     ffi::OsStr,
     fs,
     io::{self, Read, Write},
-    os::unix::fs::{symlink, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, symlink},
     path::{Path, PathBuf},
     process,
 };
@@ -207,7 +207,9 @@ fn choose_disk() -> PathBuf {
 
         if paths.is_empty() {
             eprintln!("redox_installer_tui: no RedoxFS partition found");
-            eprintln!("redox_installer_tui: this tool is used to overwrite unmounted RedoxFS disk in Redox OS");
+            eprintln!(
+                "redox_installer_tui: this tool is used to overwrite unmounted RedoxFS disk in Redox OS"
+            );
             process::exit(1);
         } else {
             eprint!("Select a drive from 1 to {}: ", paths.len());

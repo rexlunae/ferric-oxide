@@ -84,9 +84,11 @@ These two snapshots are not yet registered with the subtree-sync workflow.
 Keep fork changes local so their upstream history can be attached when the
 imports are committed. The root lockfile controls host builds; the installer's
 upstream lockfile and ring patch remain for the separate target recipe build.
-Its upstream dependency versions also remain standalone for that recipe.
+Its dependency versions also remain standalone for that recipe. The imported
+installer uses Rust 2024, and both host libraries enforce public API documentation.
 Redoxer's nested toolchain file is removed so host members use the root toolchain.
-The installer GUI is omitted from this host-tool import; Redoxer's example
+The installer GUI recipe independently fetches the complete pinned upstream
+installer tree; the GUI is omitted from this host-tool import; Redoxer's example
 remains standalone and is excluded from the host workspace.
 
 Validate host changes with `cargo test --locked --workspace`. A build of the

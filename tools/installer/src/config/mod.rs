@@ -1,35 +1,55 @@
+//! Installer TOML configuration loading and precedence across included files.
+
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 
 use crate::PackageConfig;
 
+/// File and directory declarations.
 pub mod file;
 #[cfg(feature = "installer")]
+/// Host filesystem operations for file declarations.
 pub mod file_impl;
+/// Image-wide installation settings.
 pub mod general;
+/// Package selection and source overrides.
 pub mod package;
+/// User and group account declarations.
 pub mod user;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// An image configuration with ordered includes and installation declarations.
+///
+/// # Examples
+/// ```
+/// let config = redox_installer::Config::default();
+/// assert!(config.packages.is_empty());
+/// ```
 pub struct Config {
     #[serde(default)]
+    /// Configurations to load relative to this file before applying its overrides.
     pub include: Vec<PathBuf>,
     #[serde(default)]
+    /// Image-wide installation settings.
     pub general: general::GeneralConfig,
     #[serde(default)]
+    /// Packages selected for installation, keyed by package name.
     pub packages: BTreeMap<String, package::PackageConfig>,
     #[serde(default)]
+    /// Files and directories to create in declaration order.
     pub files: Vec<file::FileConfig>,
     #[serde(default)]
+    /// User accounts, keyed by login name.
     pub users: BTreeMap<String, user::UserConfig>,
     #[serde(default)]
+    /// Groups, keyed by group name.
     pub groups: BTreeMap<String, user::GroupConfig>,
 }
 
@@ -83,6 +103,10 @@ impl Config {
         bootloader_config
     }
 
+    /// Merge another resolved configuration, preferring its settings and appending files.
+    ///
+    /// # Panics
+    /// Panics if either configuration still has unresolved includes.
     pub fn merge(&mut self, other: Config) {
         assert!(self.include.is_empty());
         assert!(other.include.is_empty());

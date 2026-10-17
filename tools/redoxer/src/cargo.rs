@@ -8,25 +8,17 @@ fn inner<I: Iterator<Item = String>>(mut args: I) -> anyhow::Result<()> {
 
     #[cfg(feature = "cli-exec")]
     let (runner, arguments) = {
-        use anyhow::Context;
-        use std::fs;
-        let mut runner_config = crate::exec::RedoxerExecConfig::new(args)
-            .context("Unable to parse exec configuration")?;
-        let arguments = runner_config.arguments.clone();
-        runner_config.arguments = Vec::new();
-        runner_config.folders.insert(
-            "root".to_string(),
-            format!("{}/", fs::canonicalize(".")?.display()),
-        );
-
-        let mut runner = vec![command, "exec".to_string()];
-        runner.extend(runner_config.to_args().into_iter().map(|s| {
-            if s.contains([' ', '"', '\'', '\n']) {
-                format!("{s:?}")
-            } else {
-                s
-            }
-        }));
+        let (runner, arguments) = runner_args(command, args)?;
+        let runner = runner
+            .into_iter()
+            .map(|s| {
+                if s.contains([' ', '"', '\'', '\n']) {
+                    format!("{s:?}")
+                } else {
+                    s
+                }
+            })
+            .collect::<Vec<_>>();
         (runner.join(" "), arguments)
     };
     #[cfg(not(feature = "cli-exec"))]
@@ -74,5 +66,53 @@ pub fn main(args: &[String]) {
             eprintln!("redoxer cargo: {err}");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(feature = "cli-exec")]
+fn runner_args(
+    command: String,
+    args: impl Iterator<Item = String>,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    use anyhow::Context;
+    let mut config =
+        crate::exec::RedoxerExecConfig::new(args).context("Unable to parse exec configuration")?;
+    let arguments = std::mem::take(&mut config.arguments);
+    config.folders.insert(
+        "root".into(),
+        format!("{}/", std::fs::canonicalize(".")?.display()),
+    );
+    let mut runner = vec![command, "exec".to_string()];
+    runner.extend(config.to_args());
+    Ok((runner, arguments))
+}
+
+#[cfg(all(test, feature = "cli-exec"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_runner_preserves_custom_install_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("custom image.toml");
+        std::fs::write(&path, "[general]\nfilesystem_size = 512\n").unwrap();
+        let (runner, cargo_args) = runner_args(
+            "redoxer".into(),
+            [
+                "--install-config".into(),
+                path.to_string_lossy().into_owned(),
+                "--".into(),
+                "--release".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(cargo_args, ["--release"]);
+        let reconstructed =
+            crate::exec::RedoxerExecConfig::new(runner.into_iter().skip(2)).unwrap();
+        assert_eq!(reconstructed.install_config, Some(path));
+        assert_eq!(reconstructed.config_name, "custom image");
+        assert!(reconstructed.config_toml.contains("512"));
+        assert!(reconstructed.arguments.is_empty());
     }
 }

@@ -61,6 +61,20 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<
     Ok(())
 }
 
+/// Replace a path-source snapshot, propagating deleted files and directories.
+///
+/// # Errors
+/// Returns an I/O error if the snapshot cannot be removed, created or copied.
+pub(crate) fn replace_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    let temporary = dst.with_extension("tmp");
+    create_dir_clean(&temporary)?;
+    copy_dir_all(src, &temporary).map_err(wrap_io_err!(src, temporary, "Copying source"))?;
+    if dst.exists() {
+        remove_all(dst)?;
+    }
+    rename(&temporary, dst)
+}
+
 pub fn move_dir_all_fn<'a>(
     src: impl AsRef<Path>,
     mv: &'a Box<impl Fn(PathBuf) -> Option<&'a Path>>,
@@ -159,9 +173,7 @@ fn modified_dir_inner<F: FnMut(&DirEntry) -> bool>(dir: &Path, filter: F) -> Res
     for entry_res in WalkDir::new(dir).into_iter().filter_entry(filter) {
         let entry = entry_res?;
         let meta = entry.metadata()?;
-        if meta.is_dir() {
-            continue;
-        }
+        // Directory timestamps detect deletions, including in nested directories.
         let modified = modified_inner(entry.path(), meta)?;
         if modified > newest {
             newest = modified;
@@ -629,4 +641,50 @@ pub fn get_git_rev_before_date(dir: &PathBuf, date: &str) -> Result<String> {
         )));
     }
     Ok(rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_snapshot_copy_preserves_existing_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("source");
+        fs::create_dir(&snapshot).unwrap();
+        fs::write(snapshot.join("keep.rs"), "existing source").unwrap();
+        assert!(replace_dir_all(&temporary.path().join("missing"), &snapshot).is_err());
+        assert_eq!(
+            fs::read_to_string(snapshot.join("keep.rs")).unwrap(),
+            "existing source"
+        );
+    }
+
+    #[test]
+    fn replacing_path_source_removes_deleted_files() {
+        let root =
+            std::env::temp_dir().join(format!("cookbook-path-source-{}", std::process::id()));
+        create_dir_clean(&root).unwrap();
+        let original = root.join("original");
+        let snapshot = root.join("source");
+        fs::create_dir_all(original.join("src")).unwrap();
+        fs::write(original.join("src/removed.rs"), "old module").unwrap();
+        fs::write(original.join("Cargo.toml"), "manifest").unwrap();
+        copy_dir_all(&original, &snapshot).unwrap();
+        fs::remove_file(original.join("src/removed.rs")).unwrap();
+        // A nested directory can be newer even when no remaining file changed.
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::open(original.join("src"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        assert!(modified_dir(&original).unwrap() > modified_dir(&snapshot).unwrap());
+        replace_dir_all(&original, &snapshot).unwrap();
+        assert!(!snapshot.join("src/removed.rs").exists());
+        assert_eq!(
+            fs::read_to_string(snapshot.join("Cargo.toml")).unwrap(),
+            "manifest"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

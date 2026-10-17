@@ -3,6 +3,8 @@
 //! Cookbook uses the environment helpers without default features. The
 //! `cli-pkg` and `cli-exec` features enable package and VM commands.
 
+#![deny(missing_docs, unsafe_op_in_unsafe_fn)]
+
 use std::{env::VarError, io, path, process};
 
 pub(crate) use self::toolchain::toolchain;
@@ -67,6 +69,15 @@ fn usage() {
     process::exit(1);
 }
 
+/// Return the supported target selected by `TARGET`, defaulting to x86_64 Redox.
+///
+/// # Panics
+/// Panics on an unsupported host OS or architecture.
+///
+/// # Examples
+/// ```
+/// assert!(!redoxer::target().is_empty());
+/// ```
 pub fn target() -> &'static str {
     let target_from_env = std::env::var("TARGET").unwrap_or_default();
 
@@ -87,6 +98,10 @@ pub fn target() -> &'static str {
     SUPPORTED_TARGETS[index]
 }
 
+/// Return the GNU toolchain spelling of the selected Rust target.
+///
+/// # Panics
+/// Panics on an unsupported host OS or architecture.
 pub fn gnu_target() -> &'static str {
     match target() {
         "riscv64gc-unknown-redox" => "riscv64-unknown-redox",
@@ -100,6 +115,10 @@ pub fn gnu_target() -> &'static str {
     }
 }
 
+/// Return the compiled host target triple.
+///
+/// # Panics
+/// Panics on unsupported host OS and architecture combinations.
 pub fn host_target() -> &'static str {
     let os = if cfg!(target_os = "linux") {
         if cfg!(target_env = "musl") {
@@ -140,10 +159,18 @@ pub fn host_target() -> &'static str {
     }
 }
 
+/// Read `REDOXER_USE_CLANG`, defaulting to false.
+///
+/// # Panics
+/// Panics for a non-UTF-8 value or a value other than true, false, 1 or 0.
 pub fn is_use_clang() -> bool {
     parse_bool_env("REDOXER_USE_CLANG").unwrap_or(false)
 }
 
+/// Read `REDOXER_USE_LTO`, defaulting to false.
+///
+/// # Panics
+/// Panics for a non-UTF-8 value or a value other than true, false, 1 or 0.
 pub fn is_use_lto() -> bool {
     parse_bool_env("REDOXER_USE_LTO").unwrap_or(false)
 }
@@ -158,6 +185,11 @@ pub(crate) fn parse_bool_env(name: &str) -> Option<bool> {
     }
 }
 
+/// Dispatch a Redoxer command, terminating the process on completion or error.
+///
+/// # Panics
+/// Panics for commands whose required Cargo features are disabled, invalid
+/// environment settings, unsupported hosts or failed internal command invariants.
 pub fn main(args: &[String]) {
     match args.get(1) {
         Some(arg) => match arg.as_str() {
