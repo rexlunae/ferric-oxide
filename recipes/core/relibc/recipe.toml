@@ -24,11 +24,18 @@ ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../crates"
 
 # Ferric Oxide: Cargo features from ferric.toml (make menuconfig), such as
 # aslr. Unset without ferric.toml, which keeps upstream's build. The relibc
-# Makefile passes FEATURE_MATH to cargo when it builds the library.
+# Makefile passes FEATURE_MATH to cargo when it builds the library; it holds
+# math_libm only with USE_RUST_LIBM (otherwise openlibm provides libm), so
+# keep that choice when overriding it.
 RELIBC_MAKE_ARGS=()
 if [ -n "${FERRIC_RELIBC_FEATURES}" ]
 then
-    RELIBC_MAKE_ARGS+=("FEATURE_MATH=--features math_libm,${FERRIC_RELIBC_FEATURES// /,}")
+    relibc_features="${FERRIC_RELIBC_FEATURES// /,}"
+    if [ -n "${USE_RUST_LIBM}" ]
+    then
+        relibc_features="math_libm,${relibc_features}"
+    fi
+    RELIBC_MAKE_ARGS+=("FEATURE_MATH=--features ${relibc_features}")
 fi
 # The Makefile only tracks sources, so rebuild when the features change.
 ferric_stamp="${FERRIC_RELIBC_FEATURES-upstream}"
