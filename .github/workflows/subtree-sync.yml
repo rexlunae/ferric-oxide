@@ -74,6 +74,7 @@ jobs:
             # lint ratchet baseline with it so the next fork PR is measured
             # against upstream's new state, not blamed for it.
             toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
             rustup toolchain install "$toolchain" --profile minimal --component rust-src,clippy
             scripts/ferric-ci/kernel-lint-ratchet.sh --update
             if ! git diff --quiet -- ci/kernel-lints.json; then

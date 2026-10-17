@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # The kernel's build script assembles the AP trampoline with nasm.
+      - name: Install nasm
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' kernel/rust-toolchain.toml)"
