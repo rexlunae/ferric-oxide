@@ -562,17 +562,26 @@ unsafe fn map_memory<A: Arch>(
     }
 }
 
+/// Ferric Oxide: one past the highest address in the boot memory map (RAM and the firmware's
+/// reserved ranges), for KASLR's span and the IOMMU's identity map.
+#[cfg(all(target_arch = "x86_64", any(feature = "kaslr", iommu = "auto")))]
+pub fn phys_end() -> usize {
+    // SAFETY: the memory map is only written while the BSP registers regions during early
+    // boot, before this is called.
+    unsafe { &*MEMORY_MAP.get() }
+        .iter()
+        .filter(|entry| entry.kind != Null)
+        .map(|entry| entry.end)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Where the kernel's page table maps physical memory: a random place with the `kaslr` feature on
 /// x86_64 when the CPU can provide randomness, the bootloader's place otherwise.
 fn choose_phys_offset() -> usize {
     #[cfg(all(target_arch = "x86_64", feature = "kaslr"))]
     {
-        let phys_end = unsafe { &*MEMORY_MAP.get() }
-            .iter()
-            .filter(|entry| entry.kind != Null)
-            .map(|entry| entry.end)
-            .max()
-            .unwrap_or(0);
+        let phys_end = phys_end();
         match crate::arch::kaslr::choose_phys_offset(phys_end) {
             Some(offset) => {
                 info!(

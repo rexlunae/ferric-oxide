@@ -976,6 +976,10 @@ name = "ferric-nospec"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-vtd"
+version = "0.1.0"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

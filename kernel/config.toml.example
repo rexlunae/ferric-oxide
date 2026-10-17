@@ -2,6 +2,9 @@
 # Minimum x86-64 microarchitecture level (v1-v4). The kernel halts at boot with a
 # list of missing features on CPUs below it. Unset means no check.
 #level = "v3"
+# Ferric Oxide: Intel VT-d DMA remapping. "auto" enables every unit in the DMAR table with
+# all devices in one identity domain (DMA addresses unchanged); "never" leaves them off.
+iommu = "never"
 
 [arch.x86_64.features]
 smap = "auto"
