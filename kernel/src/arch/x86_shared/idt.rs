@@ -46,7 +46,10 @@ impl Idt {
 
     #[inline]
     pub(crate) fn set_reserved(&mut self, index: u8, reserved: bool) {
-        let bit = 1 << (index % 32);
+        // Ferric Oxide: this used to shift twice (`1 << (1 << (index % 32))`), so the IPI
+        // vectors 0x40-0x43 were left free for user IRQ handles while unrelated
+        // vectors were marked reserved.
+        let bit = index % 32;
         let word = &mut self.reservations[usize::from(index / 32)];
 
         if reserved {
