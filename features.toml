@@ -669,8 +669,8 @@ message = "Kernel CPU features set to \"auto\" act as \"never\" without self-mod
 
 [[rule]]
 level = "error"
-when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && kernel.cpu.avx512 == 'never'"
-message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\"."
+when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && (kernel.cpu.avx512 == 'never' || (kernel.cpu.avx512 == 'auto' && !kernel.self_modifying))"
+message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\", or \"auto\" without kernel.self_modifying."
 
 [[rule]]
 level = "error"
