@@ -14,6 +14,11 @@
 //!   in memory provided through the [`table::TableMemory`] trait.
 //! - [`fault`] decodes the fault status and fault recording registers.
 //! - [`plan`] decides, from a unit's registers, whether and how the kernel can enable it.
+//! - [`invalidation`] encodes context-cache, IOTLB and interrupt entry cache invalidations,
+//!   as queued-invalidation descriptors or register writes, and models the invalidation
+//!   queue's head and tail.
+//! - `iova` (with the `alloc` feature, on by default) allocates naturally aligned IOVA ranges
+//!   for a domain and hands out domain IDs.
 //!
 //! The kernel side (`kernel/src/arch/x86_64/iommu.rs`) maps the registers, allocates the table
 //! pages and performs the enable sequence. See `io/iommu-design.md` in the project files for
@@ -49,8 +54,14 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub mod dmar;
 pub mod fault;
+pub mod invalidation;
+#[cfg(feature = "alloc")]
+pub mod iova;
 pub mod plan;
 pub mod regs;
 pub mod table;

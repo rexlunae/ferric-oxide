@@ -3,7 +3,8 @@
 # list of missing features on CPUs below it. Unset means no check.
 #level = "v3"
 # Ferric Oxide: Intel VT-d DMA remapping. "auto" enables every unit in the DMAR table with
-# all devices in one identity domain (DMA addresses unchanged); "never" leaves them off.
+# all devices in one identity domain (DMA addresses unchanged) and runs a DMA-domain
+# self-test at boot; "never" leaves them off.
 iommu = "never"
 
 [arch.x86_64.features]

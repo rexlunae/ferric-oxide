@@ -43,6 +43,10 @@ jobs:
       # warnings are only denied for Ferric Oxide's own tools.
       - name: Clippy
         run: cargo clippy --locked --all-targets -p ferric-config -p ferric-cet -p ferric-hwrand -p ferric-nospec -p ferric-vtd -- -D warnings
+      # ferric-vtd's allocators sit behind its default `alloc` feature; check the
+      # crate builds without them too.
+      - name: Clippy (ferric-vtd without alloc)
+        run: cargo clippy --locked -p ferric-vtd --no-default-features -- -D warnings
 
   redoxfs:
     runs-on: ubuntu-24.04

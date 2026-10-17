@@ -125,7 +125,8 @@ jobs:
       matrix:
         cpu: [host]
         # "vtd" boots the same image with an emulated Intel IOMMU, so the NVMe and
-        # e1000 DMA run through the kernel's identity-domain page tables.
+        # e1000 DMA run through the kernel's identity-domain page tables, and the
+        # kernel's DMA-domain self-test runs.
         iommu: [none, vtd]
     env:
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}.log
@@ -174,11 +175,16 @@ jobs:
         run: |
           if [ "${{ matrix.iommu }}" = vtd ]; then
             grep -aF "IOMMU: VT-d unit at 0xfed90000 enabled (identity domain)" "$LOG"
+            # QEMU's intel-iommu has ECAP.QI, so the unit must use the invalidation queue.
+            grep -aF "IOMMU: unit 0xfed90000 uses queued invalidation" "$LOG"
+            # The boot self-test of DMA domains attaches QEMU's host bridge, which a DRHD
+            # scope lists and which never initiates DMA.
+            grep -aF "IOMMU: domain self-test passed (attach/map/unmap/detach)" "$LOG"
           else
             grep -aF "IOMMU: no DMAR table, VT-d not enabled" "$LOG"
           fi
-          if grep -aE "IOMMU: (DMA fault|VT-d unit .* skipped|.*lost faults)" "$LOG"; then
-            echo "::error::the IOMMU reported a fault or skipped a unit"
+          if grep -aE "IOMMU: (DMA fault|VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" "$LOG"; then
+            echo "::error::the IOMMU reported a fault, a failed self-test or skipped a unit"
             exit 1
           fi
 
