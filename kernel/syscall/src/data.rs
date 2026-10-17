@@ -461,6 +461,8 @@ pub enum GlobalSchemes {
     Proc = 9,
     Acpi = 10,
     Dtb = 11,
+    /// Ferric Oxide: `kernel.iommu`, DMA domains (ferric-iommu's `abi::SCHEME_ID`).
+    Iommu = 12,
 }
 impl GlobalSchemes {
     pub fn try_from_raw(raw: u8) -> Option<Self> {
@@ -476,6 +478,7 @@ impl GlobalSchemes {
             9 => Some(Self::Proc),
             10 => Some(Self::Acpi),
             11 => Some(Self::Dtb),
+            12 => Some(Self::Iommu),
             _ => None,
         }
     }
@@ -492,6 +495,7 @@ impl GlobalSchemes {
             Self::Proc => "kernel.proc",
             Self::Acpi => "kernel.acpi",
             Self::Dtb => "kernel.dtb",
+            Self::Iommu => "kernel.iommu",
         }
     }
 }

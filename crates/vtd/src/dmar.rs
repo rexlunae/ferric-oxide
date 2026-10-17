@@ -555,6 +555,47 @@ impl DeviceScope<'_> {
         }
         None
     }
+
+    /// Whether this scope names `bdf`, once the bridges on its path are resolved through
+    /// `bridge_buses`, which gives a bridge's secondary and subordinate bus numbers (from its
+    /// configuration space; `None` when unknown). An endpoint scope names the device its path
+    /// leads to; a sub-hierarchy scope names that bridge and every device on the buses behind
+    /// it (section 8.3.1). Scopes of other kinds name no PCI device.
+    ///
+    /// Returns `None` when the answer needs a bridge that `bridge_buses` does not know.
+    pub fn covers(&self, bdf: Bdf, bridge_buses: impl Fn(Bdf) -> Option<BusRange>) -> Option<bool> {
+        if !matches!(
+            self.kind,
+            ScopeKind::PciEndpoint | ScopeKind::PciSubHierarchy
+        ) {
+            return Some(false);
+        }
+        let target = self.resolve(|bridge| bridge_buses(bridge).map(|r| r.secondary))?;
+        if target == bdf {
+            return Some(true);
+        }
+        match self.kind {
+            ScopeKind::PciSubHierarchy => bridge_buses(target).map(|r| r.contains(bdf.bus)),
+            _ => Some(false),
+        }
+    }
+}
+
+/// The buses behind a PCI-to-PCI bridge: its secondary bus number up to its subordinate bus
+/// number (configuration offsets 0x19 and 0x1A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusRange {
+    /// The bus directly behind the bridge.
+    pub secondary: u8,
+    /// The highest bus behind the bridge.
+    pub subordinate: u8,
+}
+
+impl BusRange {
+    /// Whether `bus` is behind the bridge.
+    pub const fn contains(&self, bus: u8) -> bool {
+        self.secondary <= bus && bus <= self.subordinate
+    }
 }
 
 #[cfg(test)]
@@ -860,5 +901,48 @@ mod tests {
             );
             assert!(it.next().is_none());
         }
+    }
+
+    #[test]
+    fn scope_coverage_through_bridges() {
+        // Root port 00:1c.0 has buses 2-4 behind it; a switch port 02:00.0 has bus 3.
+        let buses = |b: Bdf| match (b.bus, b.device, b.function) {
+            (0, 0x1c, 0) => Some(BusRange {
+                secondary: 2,
+                subordinate: 4,
+            }),
+            (2, 0, 0) => Some(BusRange {
+                secondary: 3,
+                subordinate: 3,
+            }),
+            _ => None,
+        };
+        fn parse(bytes: &[u8]) -> DeviceScope<'_> {
+            DeviceScopes::new(bytes).iter().next().unwrap().unwrap()
+        }
+
+        let deep = scope(1, 0, 0, &[(0x1c, 0), (0, 0), (0, 1)]);
+        let deep = parse(&deep);
+        assert_eq!(deep.covers(Bdf::new(3, 0, 1), buses), Some(true));
+        assert_eq!(deep.covers(Bdf::new(3, 0, 0), buses), Some(false));
+        assert_eq!(deep.covers(Bdf::new(3, 0, 1), |_| None), None);
+
+        let port = scope(2, 0, 0, &[(0x1c, 0)]);
+        let port = parse(&port);
+        assert_eq!(port.covers(Bdf::new(0, 0x1c, 0), |_| None), Some(true));
+        assert_eq!(port.covers(Bdf::new(4, 7, 0), buses), Some(true));
+        assert_eq!(port.covers(Bdf::new(5, 0, 0), buses), Some(false));
+        assert_eq!(port.covers(Bdf::new(4, 7, 0), |_| None), None);
+
+        let direct = scope(1, 0, 0, &[(2, 0)]);
+        let direct = parse(&direct);
+        assert_eq!(direct.covers(Bdf::new(0, 2, 0), |_| None), Some(true));
+        assert_eq!(direct.covers(Bdf::new(0, 3, 0), |_| None), Some(false));
+
+        let ioapic = scope(3, 2, 0xf0, &[(0x1f, 0)]);
+        assert_eq!(
+            parse(&ioapic).covers(Bdf::new(0xf0, 0x1f, 0), buses),
+            Some(false)
+        );
     }
 }

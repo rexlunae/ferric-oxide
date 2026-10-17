@@ -12,12 +12,13 @@
 //! Devices can also be moved out of the identity domain into DMA domains of their own.
 //! [`domain_layout`] picks the table layout such domains use so that every enabled unit can
 //! walk them, and [`unit_coverage`] with [`select_unit`] find the unit that translates a
-//! device's requests (section 8.3, "DMA Remapping Hardware Unit Definition Structure").
+//! device's requests (section 8.3, "DMA Remapping Hardware Unit Definition Structure");
+//! [`unit_coverage_with`] also resolves scopes that name bridges.
 
 use core::fmt;
 
 use crate::Bdf;
-use crate::dmar::{Drhd, ScopeKind};
+use crate::dmar::{BusRange, Drhd};
 use crate::regs::{Capability, ExtendedCapability, global};
 use crate::table::{Agaw, LargePages, PageSize};
 
@@ -240,8 +241,21 @@ pub enum Coverage {
     No,
 }
 
-/// Whether the unit `drhd` describes serves `bdf` in PCI segment `segment`.
+/// Whether the unit `drhd` describes serves `bdf` in PCI segment `segment`, without knowing
+/// any bridge: scopes whose paths pass through bridges, and sub-hierarchy scopes, make the
+/// answer [`Coverage::Unknown`] unless they name `bdf` itself.
 pub fn unit_coverage(drhd: &Drhd<'_>, segment: u16, bdf: Bdf) -> Coverage {
+    unit_coverage_with(drhd, segment, bdf, |_| None)
+}
+
+/// Whether the unit `drhd` describes serves `bdf` in PCI segment `segment`, resolving the
+/// bridges in its scopes through `bridge_buses` (see [`DeviceScope::covers`](crate::dmar::DeviceScope::covers)).
+pub fn unit_coverage_with(
+    drhd: &Drhd<'_>,
+    segment: u16,
+    bdf: Bdf,
+    bridge_buses: impl Fn(Bdf) -> Option<BusRange>,
+) -> Coverage {
     if drhd.segment != segment {
         return Coverage::No;
     }
@@ -251,11 +265,10 @@ pub fn unit_coverage(drhd: &Drhd<'_>, segment: u16, bdf: Bdf) -> Coverage {
             unknown = true;
             break;
         };
-        match (scope.kind, scope.direct_bdf()) {
-            (ScopeKind::PciEndpoint, Some(listed)) if listed == bdf => return Coverage::Listed,
-            (ScopeKind::PciEndpoint, Some(_)) => {}
-            (ScopeKind::PciEndpoint | ScopeKind::PciSubHierarchy, _) => unknown = true,
-            _ => {}
+        match scope.covers(bdf, &bridge_buses) {
+            Some(true) => return Coverage::Listed,
+            Some(false) => {}
+            None => unknown = true,
         }
     }
     if drhd.include_pci_all() {

@@ -180,8 +180,22 @@ jobs:
             # The boot self-test of DMA domains attaches QEMU's host bridge, which a DRHD
             # scope lists and which never initiates DMA.
             grep -aF "IOMMU: domain self-test passed (attach/map/unmap/detach)" "$LOG"
+            # pcid-spawner starts ferric-iommu-test (recipes/tests) as the host bridge's
+            # driver. It asks pcid for a DMA domain, so pcid creates one through the kernel's
+            # iommu scheme and attaches the host bridge; the driver receives the domain's
+            # descriptor over its channel and binds it; its exit closes the domain.
+            grep -aE "IOMMU: 0000:00:00\.0 attached to domain [0-9]+" "$LOG"
+            grep -aE "IOMMU: domain [0-9]+ \(1 device\(s\)\) bound by" "$LOG"
+            grep -aE "IOMMU: domain [0-9]+ closed, 1 device\(s\) blocked" "$LOG"
+            grep -aF "FERRIC_TEST_PASS iommu-domain" "$LOG"
+            if grep -aE "IOMMU: cannot (attach|create a domain)" "$LOG"; then
+              echo "::error::the iommu scheme refused a domain or an attach"
+              exit 1
+            fi
           else
             grep -aF "IOMMU: no DMAR table, VT-d not enabled" "$LOG"
+            # Without an IOMMU pcid has no domain to give the test driver.
+            grep -aF "FERRIC_TEST_SKIP iommu-domain" "$LOG"
           fi
           if grep -aE "IOMMU: (DMA fault|VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" "$LOG"; then
             echo "::error::the IOMMU reported a fault, a failed self-test or skipped a unit"

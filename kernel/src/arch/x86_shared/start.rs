@@ -216,7 +216,7 @@ fn continue_after_kmain_stack(
                 crate::acpi::init_after_mem();
                 device::init_after_acpi();
                 // Ferric Oxide: VT-d, before any user-space driver can start DMA.
-                #[cfg(all(target_arch = "x86_64", iommu = "auto"))]
+                #[cfg(all(target_arch = "x86_64", iommu_enabled))]
                 crate::arch::iommu::init();
             }
             crate::profiling::init();

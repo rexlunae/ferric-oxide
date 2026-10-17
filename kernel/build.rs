@@ -28,16 +28,20 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         println!("cargo:rustc-cfg=x86_64_level=\"{level}\"");
     }
 
-    // Ferric Oxide: VT-d DMA remapping (src/arch/x86_64/iommu.rs).
+    // Ferric Oxide: VT-d DMA remapping (src/arch/x86_64/iommu.rs) and the iommu scheme
+    // (src/scheme/iommu.rs), both built for "auto" and "enforce".
     if arch == "x86_64" {
         let iommu = arch_table
             .get("iommu")
             .map_or("never", |v| v.as_str().unwrap());
         assert!(
-            matches!(iommu, "auto" | "never"),
-            "arch.x86_64.iommu must be \"auto\" or \"never\""
+            matches!(iommu, "auto" | "enforce" | "never"),
+            "arch.x86_64.iommu must be \"auto\", \"enforce\" or \"never\""
         );
         println!("cargo:rustc-cfg=iommu=\"{iommu}\"");
+        if iommu != "never" {
+            println!("cargo:rustc-cfg=iommu_enabled");
+        }
     }
 
     let altfeatures = arch_table
@@ -102,7 +106,8 @@ fn main() {
     println!("cargo::rustc-env=TARGET={}", env::var("TARGET").unwrap());
     println!("cargo::rustc-check-cfg=cfg(dtb)");
     // Ferric Oxide: set by parse_kconfig from arch.x86_64.iommu.
-    println!("cargo::rustc-check-cfg=cfg(iommu, values(\"auto\", \"never\"))");
+    println!("cargo::rustc-check-cfg=cfg(iommu, values(\"auto\", \"enforce\", \"never\"))");
+    println!("cargo::rustc-check-cfg=cfg(iommu_enabled)");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let arch_str = env::var("CARGO_CFG_TARGET_ARCH").unwrap();

@@ -99,6 +99,10 @@ name = "ferric-hwrand"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
@@ -163,6 +167,7 @@ dependencies = [
  "fdt",
  "ferric-cet",
  "ferric-hwrand",
+ "ferric-iommu",
  "ferric-nospec",
  "ferric-vtd",
  "hashbrown 0.14.5",

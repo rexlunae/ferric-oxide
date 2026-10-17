@@ -243,6 +243,10 @@ pub enum PcidClientRequest {
     SetFeatureInfo(SetFeatureInfo),
     ReadConfig(u16),
     WriteConfig(u16, u32),
+    /// Ferric Oxide: ask for a DMA domain holding this function (kernel iommu scheme). On
+    /// `DmaDomain` the domain's descriptor is then fetched with a descriptor-passing read of
+    /// the channel; see [`PciFunctionHandle::get_dma_domain`].
+    GetDmaDomain,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +254,8 @@ pub enum PcidClientRequest {
 pub enum PcidServerResponseError {
     NonexistentFeature(PciFeature),
     InvalidBitPattern,
+    /// Ferric Oxide: no DMA domain (no kernel iommu scheme, or attaching failed).
+    NoDmaDomain,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,6 +272,8 @@ pub enum PcidClientResponse {
     SetFeatureInfo(PciFeature),
     ReadConfig(u32),
     WriteConfig,
+    /// Ferric Oxide: a DMA domain is ready to be fetched from the channel.
+    DmaDomain,
 }
 
 pub struct MappedBar {
@@ -456,6 +464,36 @@ impl PciFunctionHandle {
             }
         }
     }
+    /// Ferric Oxide: asks pcid for a DMA domain that holds this function and the requester
+    /// IDs its DMA can carry, and returns the domain's descriptor, or `None` when pcid has none
+    /// to give (the kernel was built without the iommu scheme, or attaching failed). Call
+    /// [`bind_dma_domain`] on it to make it this process's domain. Until the kernel returns
+    /// DMA addresses in that domain, the device's DMA faults while the descriptor is open, so
+    /// only drivers whose devices do no DMA can use this yet.
+    pub fn get_dma_domain(&mut self) -> Option<libredox::Fd> {
+        self.send(&PcidClientRequest::GetDmaDomain);
+        match self.recv() {
+            PcidClientResponse::DmaDomain => {}
+            PcidClientResponse::Error(PcidServerResponseError::NoDmaDomain) => return None,
+            other => {
+                log::error!("received wrong pcid response: {other:?}");
+                process::exit(1);
+            }
+        }
+        // usize::MAX asks the kernel to pick the descriptor number.
+        let mut fd = usize::MAX.to_ne_bytes();
+        if let Err(err) = libredox::call::call_ro(
+            self.channel.as_raw_fd() as usize,
+            &mut fd,
+            syscall::CallFlags::FD,
+            &[],
+        ) {
+            log::error!("fetching the DMA domain from pcid failed: {err}");
+            return None;
+        }
+        Some(libredox::Fd::new(usize::from_ne_bytes(fd)))
+    }
+
     pub unsafe fn map_bar(&mut self, bir: u8, memory_type: MemoryType) -> &MappedBar {
         let mapped_bar = &mut self.mapped_bars[bir as usize];
         if let Some(mapped_bar) = mapped_bar {
@@ -488,6 +526,14 @@ impl PciFunctionHandle {
             })
         }
     }
+}
+
+/// Ferric Oxide: makes `domain` (from [`PciFunctionHandle::get_dma_domain`]) the calling
+/// process's DMA domain. A process binds at most one domain.
+pub fn bind_dma_domain(domain: &libredox::Fd) -> libredox::error::Result<()> {
+    let (words, len) = ferric_iommu::abi::Request::Bind.encode();
+    domain.call_ro(&mut [], syscall::CallFlags::empty(), &words[..len])?;
+    Ok(())
 }
 
 pub fn pci_daemon<F: FnOnce(Daemon, PciFunctionHandle) -> !>(f: F) -> ! {

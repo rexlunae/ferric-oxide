@@ -192,6 +192,10 @@ pub fn main() -> ! {
             for (scheme, fd) in kernel_schemes.0.into_iter() {
                 schemes.insert(scheme.as_str().to_string(), Arc::new(fd));
             }
+            // Ferric Oxide: kernel schemes known only by name (see KernelSchemeMap).
+            for (name, fd) in kernel_schemes.1 {
+                schemes.insert(name.to_string(), Arc::new(fd));
+            }
             schemes.insert(
                 "proc".to_string(),
                 // A bit dirty, but necessary as the parent process still needs access to it. Rust

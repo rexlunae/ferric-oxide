@@ -30,3 +30,4 @@ wget-log
 # Link to crates/ made by recipes whose source has ../crates path dependencies
 /recipes/core/kernel/crates
 /recipes/core/relibc/crates
+/recipes/core/crates

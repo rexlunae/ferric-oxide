@@ -1,0 +1,7 @@
+# Ferric Oxide test image only: run the DMA domain test driver for the host
+# bridge, which does no DMA, so blocking its DMA afterwards is harmless.
+[[drivers]]
+name = "Ferric Oxide DMA domain test"
+class = 0x06
+subclass = 0x00
+command = ["/usr/bin/ferric-iommu-test"]
