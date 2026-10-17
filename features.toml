@@ -304,6 +304,26 @@ its usual place and the boot log says so. Randomizing the kernel image itself
 comes later."""
 
 [[option]]
+id = "kernel.iommu"
+menu = "kernel"
+type = "choice"
+title = "IOMMU DMA remapping (Intel VT-d)"
+default = "never"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.iommu"
+rebuild = ["kernel"]
+help = """
+Turn on the Intel VT-d units the firmware's DMAR table lists. This first step
+puts every device in one identity domain, so DMA addresses do not change and
+drivers work as before, but translation, invalidation and fault reporting run
+on the hardware; DMA faults are logged on the console. Firmware's reserved
+memory regions (RMRRs) stay mapped. "auto" enables every unit that the kernel
+can drive and logs why it skips the others; "never" leaves VT-d off, as
+upstream does. Per-driver DMA domains, interrupt remapping and AMD-Vi come
+later."""
+choices = ["auto", "never"]
+
+[[option]]
 id = "kernel.numa"
 menu = "kernel"
 type = "bool"

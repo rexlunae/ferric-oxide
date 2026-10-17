@@ -219,6 +219,18 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
 
         // reserve bits 49:32, which are for the standard IRQs, and for the local apic timer and error.
         current_reservations[1] |= 0x0003_FFFF;
+
+        // Ferric Oxide: the VT-d fault event interrupt (arch/x86_64/iommu.rs).
+        #[cfg(all(target_arch = "x86_64", iommu = "auto"))]
+        {
+            use crate::arch::iommu::{fault_interrupt, FAULT_VECTOR};
+            if let Some(entry) = current_idt.get_mut(usize::from(FAULT_VECTOR)) {
+                entry.set_func(fault_interrupt);
+            }
+            if let Some(word) = current_reservations.get_mut(usize::from(FAULT_VECTOR / 32)) {
+                *word |= 1 << (FAULT_VECTOR % 32);
+            }
+        }
     } else {
         // TODO: use_default_irqs! but also the legacy IRQs that are only needed on one CPU
         current_idt[49].set_func(irq::lapic_error);
