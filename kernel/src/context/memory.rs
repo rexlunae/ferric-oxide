@@ -265,6 +265,14 @@ impl AddrSpaceWrapper {
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
+        // Ferric Oxide: a device loses write access along with the process, before the call
+        // returns and while the address space is locked (scheme/iommu.rs). Done first, so it
+        // also holds when a later grant fails.
+        #[cfg(iommu_enabled)]
+        if !flags.contains(MapFlags::PROT_WRITE) {
+            crate::scheme::iommu::narrow(self, requested_span);
+        }
+
         let mapper = &mut guard.table.utable;
         let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
 

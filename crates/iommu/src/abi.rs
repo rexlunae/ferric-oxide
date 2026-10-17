@@ -10,6 +10,7 @@
 //! | [`Request::Detach`] | attach capability, domain | verb, [`PciDevice::encode`] |
 //! | [`Request::Bridge`] | attach capability | verb, bridge address, bus range |
 //! | [`Request::Bind`] | domain | verb |
+//! | [`Request::Join`] | domain | verb |
 
 use core::fmt;
 
@@ -142,6 +143,8 @@ pub enum Verb {
     Bind = 3,
     /// Report a bridge's bus range, so device scopes that name bridges can be resolved.
     Bridge = 4,
+    /// Move a domain's devices into the calling process's bound domain.
+    Join = 5,
 }
 
 impl Verb {
@@ -152,6 +155,7 @@ impl Verb {
             2 => Self::Detach,
             3 => Self::Bind,
             4 => Self::Bridge,
+            5 => Self::Join,
             _ => return None,
         })
     }
@@ -172,6 +176,12 @@ pub enum Request {
     Bind,
     /// Report a bridge.
     Bridge(Bridge),
+    /// Move every device attached to the domain (and the RMRRs they need) into the domain the
+    /// calling process has bound, leaving this one empty. A driver that drives several
+    /// functions gets a domain from pcid for each and joins the later ones into the first, so
+    /// it keeps one domain and one IOVA space. Holding the domain's descriptor is the
+    /// authority: pcid gave it only to the driver of those functions.
+    Join,
 }
 
 impl Request {
@@ -184,6 +194,7 @@ impl Request {
             Self::Attach(device) => ([Verb::Attach as u64, device.encode(), 0], 2),
             Self::Detach(device) => ([Verb::Detach as u64, device.encode(), 0], 2),
             Self::Bind => ([Verb::Bind as u64, 0, 0], 1),
+            Self::Join => ([Verb::Join as u64, 0, 0], 1),
             Self::Bridge(bridge) => (
                 [
                     Verb::Bridge as u64,
@@ -209,6 +220,7 @@ impl Request {
             (Verb::Attach, &[device]) => Ok(Self::Attach(PciDevice::decode(device)?)),
             (Verb::Detach, &[device]) => Ok(Self::Detach(PciDevice::decode(device)?)),
             (Verb::Bind, &[]) => Ok(Self::Bind),
+            (Verb::Join, &[]) => Ok(Self::Join),
             (Verb::Bridge, &[address, buses]) => {
                 if buses >> 16 != 0 {
                     return Err(DecodeError::Reserved);
@@ -299,6 +311,7 @@ mod tests {
             Request::Detach(dev(1, 0x80, 2, 1)),
             Request::Bind,
             Request::Bridge(bridge),
+            Request::Join,
         ] {
             let (words, len) = request.encode();
             assert_eq!(Request::decode(&words[..len]), Ok(request));
@@ -312,6 +325,7 @@ mod tests {
         assert_eq!(Request::decode(&[99, 0]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[1]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[3, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[5, 0]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[1, 1 << 40]), Err(DecodeError::Reserved));
         assert_eq!(
             Request::decode(&[4, 0, 1 << 16]),

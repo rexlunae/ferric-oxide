@@ -59,6 +59,8 @@ pub enum DomainError {
     Map(RangeError<MapError<NoMemory>>),
     /// Unmapping failed part-way.
     Unmap(RangeError<UnmapError>),
+    /// Changing the access of a mapped range failed part-way.
+    Protect(RangeError<UnmapError>),
     /// No unit, or no single unit, serves the device.
     Select(SelectError),
     /// The unit that serves the device was skipped at boot.
@@ -88,6 +90,7 @@ impl fmt::Display for DomainError {
             Self::Iova(err) => write!(f, "{err}"),
             Self::Map(err) => write!(f, "map: {err}"),
             Self::Unmap(err) => write!(f, "unmap: {err}"),
+            Self::Protect(err) => write!(f, "protect: {err}"),
             Self::Select(err) => write!(f, "{err}"),
             Self::UnitNotEnabled { base } => write!(f, "VT-d unit {base:#x} is not enabled"),
             Self::Busy { did } => write!(f, "the device is in domain {did}"),
@@ -273,6 +276,34 @@ impl Domain {
             self.tables.free(page);
         }
         result.map_err(DomainError::Unmap)
+    }
+
+    /// Changes the device's access to the `len` bytes mapped at `iova` to `access`, then
+    /// invalidates the IOTLB of every unit the domain is attached to and waits for that, so
+    /// when it returns no device can use the old access any more.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Protect`] when part of the range is not mapped or it starts or ends
+    /// inside a large page (the part before that is changed and invalidated), and
+    /// [`DomainError::Hardware`] when an invalidation fails.
+    pub fn protect(&mut self, iova: u64, len: u64, access: Access) -> Result<(), DomainError> {
+        let agaw = self.layout.agaw;
+        let result = table::protect_range(&mut self.tables, self.root, agaw, iova, len, access);
+        let done = match &result {
+            Ok(()) => len,
+            Err(err) => err.done,
+        };
+        self.flush_tables();
+        if done > 0 {
+            self.flush_iotlb(iova, done, false, |_| true)?;
+        }
+        result.map_err(DomainError::Protect)
+    }
+
+    /// The attached devices.
+    pub fn devices(&self) -> impl Iterator<Item = Device> + '_ {
+        self.attached.iter().map(|&(device, _)| device)
     }
 
     /// The physical address and access a device in this domain gets for `iova`, read back

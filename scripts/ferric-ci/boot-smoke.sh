@@ -5,7 +5,7 @@
 # Usage: boot-smoke.sh IMAGE [LOG] [CPU]
 #   CPU defaults to "host" with KVM, or "max" under TCG when /dev/kvm is missing.
 #   BOOT_IOMMU=vtd adds an emulated Intel VT-d IOMMU (DMA remapping only, no
-#   interrupt remapping), for kernels built with kernel.iommu = "auto".
+#   interrupt remapping), for kernels built with kernel.iommu = "auto" or "enforce".
 set -euo pipefail
 
 image="$1"
@@ -54,6 +54,11 @@ esac
 # slot gives it a known requester ID, 00:10.0.
 edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
 
+# The disk and network controllers sit at fixed slots too, so check-iommu-log.sh can
+# find the DMA domains of their drivers by requester ID.
+disk_dev=(-device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0)
+net_dev=(-device e1000,netdev=net0,addr=5.0)
+
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
@@ -66,8 +71,8 @@ qemu-system-x86_64 \
     "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp 4 -m 2048 \
     -bios "$firmware" \
     "${iommu[@]}" \
-    -drive file="$disk",format=raw,if=none,id=drv0 -device nvme,drive=drv0,serial=NVME_SERIAL \
-    -netdev user,id=net0 -device e1000,netdev=net0 \
+    -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
+    -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
     -nographic -vga none -no-reboot \
     -serial mon:stdio < /dev/null > "$log" 2>&1 &

@@ -12,12 +12,18 @@
 //! - [`Request::Bind`] on a domain makes it the calling process's own: a process (an address
 //!   space) binds at most one domain, and a domain is bound by at most one process. Under
 //!   `kernel.iommu = "enforce"` only a domain with a device attached can be bound.
+//! - [`Request::Join`] on a domain moves its devices into the domain the calling process has
+//!   bound, so a driver of several functions keeps one domain: pcid gives it a domain for each
+//!   function, it binds the first and joins the others into it. A forked child has an address
+//!   space of its own, so it starts with no bound domain (`EACCES` from translation under
+//!   `enforce`), and it cannot bind its parent's domain while the parent has it bound.
 //! - Once a process has bound a domain, `memory:translation` ([`translate`]) answers with IOVAs
 //!   in it: the frames are pinned and mapped with the page's protection, and repeat
 //!   translations return the same IOVA (`arch/x86_64/iommu/dma.rs`). When the process unmaps
 //!   that memory, the address-space code calls [`release`], which takes the mappings down
-//!   strictly. A process without a bound domain gets physical addresses, or `EACCES` under
-//!   `enforce`.
+//!   strictly. When it takes write access away (`mprotect`), the address-space code calls
+//!   [`narrow`], which makes the mappings that memory reaches read-only for the device. A
+//!   process without a bound domain gets physical addresses, or `EACCES` under `enforce`.
 //! - Closing the last descriptor of a domain blocks its devices (DMA faults), frees its
 //!   tables and unpins every frame mapped in it. Domain descriptors cannot be duplicated into
 //!   new descriptions, so the scheme's close is the last close.
@@ -100,7 +106,10 @@ fn errno(err: &DomainError) -> Error {
         DomainError::Busy { .. } => EBUSY,
         DomainError::AlreadyAttached => EEXIST,
         DomainError::NotAttached => ENOENT,
-        DomainError::Map(_) | DomainError::Unmap(_) | DomainError::Hardware(_) => EIO,
+        DomainError::Map(_)
+        | DomainError::Unmap(_)
+        | DomainError::Protect(_)
+        | DomainError::Hardware(_) => EIO,
     })
 }
 
@@ -213,6 +222,7 @@ impl KernelScheme for IommuScheme {
                 Ok(0)
             }
             (Request::Bind, &[domain]) => bind(domain, token).map(|()| 0),
+            (Request::Join, &[domain]) => join(domain, token),
             _ => Err(Error::new(EINVAL)),
         }
     }
@@ -309,6 +319,91 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
     })
 }
 
+/// Moves every device of domain `id` into the domain the calling process has bound, and
+/// returns how many there were.
+///
+/// # Errors
+///
+/// `EINVAL` when the process has bound no domain or `id` is that domain, `EBUSY` when another
+/// live process has bound `id`, `EBADF` when `id` is not open, and the errno of a failed
+/// detach or attach; a device whose attach fails is put back into `id`.
+fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
+    let addr_space = AddrSpace::current()?;
+    let name = context::current().read(token.token()).name;
+    let owner = alloc::sync::Arc::as_ptr(&addr_space);
+    let mut handles = HANDLES.lock();
+    let target = handles
+        .iter()
+        .find_map(|(&handle, h)| match h {
+            Handle::Domain { bound: Some(w), .. }
+                if w.strong_count() > 0 && core::ptr::eq(w.as_ptr(), owner) =>
+            {
+                Some(handle)
+            }
+            _ => None,
+        })
+        .ok_or(Error::new(EINVAL))?;
+    if target == id {
+        return Err(Error::new(EINVAL));
+    }
+    let devices = with_domain(&mut handles, id, |space, bound| {
+        if bound.as_ref().is_some_and(|w| w.strong_count() > 0) {
+            return Err(Error::new(EBUSY));
+        }
+        Ok(space.domain().devices().collect::<alloc::vec::Vec<_>>())
+    })?;
+    for &device in &devices {
+        let (from, into) = move_device(&mut handles, device, id, target)?;
+        info!(
+            "IOMMU: {:04x}:{} moved from domain {from} into domain {into} (bound by {name})",
+            device.segment, device.bdf
+        );
+    }
+    Ok(devices.len())
+}
+
+/// Moves `device` from domain handle `from` to domain handle `into`, and returns their
+/// domain IDs. When the attach fails, the device goes back into `from`.
+fn move_device(
+    handles: &mut BTreeMap<usize, Handle>,
+    device: Device,
+    from: usize,
+    into: usize,
+) -> Result<(u16, u16)> {
+    let from_did = with_domain(handles, from, |space, _| {
+        space.domain().detach(device).map_err(|err| errno(&err))?;
+        Ok(space.id())
+    })?;
+    let attached = with_domain(handles, into, |space, _| {
+        let domain = space.domain();
+        domain.attach(device).map_err(|err| {
+            warn!(
+                "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
+                device.segment,
+                device.bdf,
+                domain.id()
+            );
+            errno(&err)
+        })?;
+        Ok(domain.id())
+    });
+    match attached {
+        Ok(into_did) => Ok((from_did, into_did)),
+        Err(err) => {
+            let back = with_domain(handles, from, |space, _| {
+                space.domain().attach(device).map_err(|e| errno(&e))
+            });
+            if back.is_err() {
+                warn!(
+                    "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {from_did}",
+                    device.segment, device.bdf
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
 /// The domain bound by the address space at `owner`, if any.
 fn bound_to<'a>(
     handles: &'a mut BTreeMap<usize, Handle>,
@@ -367,6 +462,23 @@ pub fn translate(virt: VirtualAddress, token: &mut CleanLockToken) -> Result<Opt
         dma_errno(&err)
     })?;
     usize::try_from(iova).map(Some).map_err(|_| Error::new(EIO))
+}
+
+/// The write-removal hook: the address space at `owner` took write access away from `span`
+/// (`mprotect`), so the device loses it too for every DMA mapping that memory reaches. Called
+/// with the address space locked, so no translation can map the memory again in between.
+/// Cheap when no domain is bound.
+pub fn narrow(owner: &AddrSpaceWrapper, span: PageSpan) {
+    if BOUND.load(Ordering::Relaxed) == 0 || span.is_empty() {
+        return;
+    }
+    let mut handles = HANDLES.lock();
+    if let Some(space) = bound_to(&mut handles, owner) {
+        space.narrow(
+            span.base.start_address().data(),
+            span.count.saturating_mul(PAGE_SIZE),
+        );
+    }
 }
 
 /// The release hook: the address space at `owner` unmapped (or moved away) `span`, so the DMA

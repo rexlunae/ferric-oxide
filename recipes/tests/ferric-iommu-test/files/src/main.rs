@@ -8,7 +8,8 @@
 //!
 //! 1. it maps the device's registers and allocates a two-page DMA buffer and one *victim* page,
 //!    and translates them while it has no domain: `memory:translation` gives physical
-//!    addresses;
+//!    addresses under `kernel.iommu = "auto"` and refuses with `EACCES` under `"enforce"`
+//!    (`iommu-unbound`);
 //! 2. it sends `GetDmaDomain` on the channel; pcid creates a domain in the kernel's `iommu`
 //!    scheme and attaches the device to it. The program receives the domain's descriptor and
 //!    binds it, and checks that a second bind is refused (`iommu-domain`);
@@ -18,8 +19,17 @@
 //!    second page, both at their IOVAs, and checks the copy (`iommu-dma`);
 //! 5. it has the device write to the victim page's *physical* address, which it never
 //!    translated in the domain, and checks the victim is unchanged (`iommu-fault`); the kernel
-//!    logs a DMA fault for that address;
-//! 6. it unmaps the buffer and has the device read the old IOVA of its second page, which the
+//!    logs a DMA fault for that address. Under `enforce` there is no physical address to
+//!    use, so the device writes [`UNMAPPED_IOVA`], which the domain never maps, instead;
+//! 6. it translates the victim, has the device write it at its IOVA (which works), then
+//!    takes write access away with `mprotect` and has the device write it again: the kernel
+//!    must have made the mapping read-only for the device and invalidated the IOTLB, so the
+//!    write faults and the victim keeps what the CPU wrote (`iommu-readonly`);
+//! 7. it forks; the child has an address space of its own, so it has no bound domain: its
+//!    translation fails with `EACCES` under `enforce` (and gives a physical address under
+//!    `auto`), and binding the domain descriptor it inherited is refused while the parent has
+//!    it bound (`iommu-fork`);
+//! 8. it unmaps the buffer and has the device read the old IOVA of its second page, which the
 //!    kernel must have unmapped (strictly: entries cleared, IOTLB invalidated) when the memory
 //!    went away; the kernel logs a release and a second DMA fault (`iommu-release`).
 //!
@@ -65,8 +75,13 @@ const CALL_WRITE: usize = 1 << 9;
 const CALL_READ: usize = 1 << 10;
 const CALL_FD: usize = 1 << 11;
 
-/// `EBUSY`.
+/// `EBUSY` and `EACCES`.
 const EBUSY: usize = 16;
+const EACCES: usize = 13;
+
+/// An IOVA the test's domain never maps: the allocator hands out the lowest free block, and the
+/// domain holds a few pages.
+const UNMAPPED_IOVA: usize = 0x8000_0000;
 
 /// The page size.
 const PAGE: usize = 4096;
@@ -109,6 +124,8 @@ enum Failure {
     Translation(&'static str, usize, usize),
     /// A device transfer did not finish.
     DmaTimeout,
+    /// The forked child reported this.
+    Child(&'static str),
     /// Memory did not hold what the test expected after a transfer.
     Data(&'static str, usize, u8),
     /// The test did not run because an earlier step failed.
@@ -129,6 +146,7 @@ impl fmt::Display for Failure {
                 write!(f, "{what}: got {got:#x}, compared with {other:#x}")
             }
             Self::DmaTimeout => f.write_str("the device did not finish a transfer"),
+            Self::Child(what) => write!(f, "in the forked child: {what}"),
             Self::Data(what, offset, byte) => {
                 write!(f, "{what}: byte {offset:#x} is {byte:#04x}")
             }
@@ -159,10 +177,15 @@ mod sys {
         ) -> usize;
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn fork() -> i32;
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn _exit(status: i32) -> !;
     }
 
-    /// relibc's `PROT_READ | PROT_WRITE`.
-    const PROT_RW: i32 = 0x4 | 0x2;
+    /// relibc's `PROT_READ`, and `PROT_READ | PROT_WRITE`.
+    const PROT_READ: i32 = 0x4;
+    const PROT_RW: i32 = PROT_READ | 0x2;
     /// relibc's `MAP_SHARED` and `MAP_PRIVATE`.
     pub const MAP_SHARED: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
@@ -217,6 +240,55 @@ mod sys {
         }
     }
 
+    /// Makes a mapping from [`map`] read-only.
+    #[cfg(target_os = "redox")]
+    pub fn protect_read_only(ptr: *mut u8, len: usize) -> std::io::Result<()> {
+        // SAFETY: the caller gives a mapping from `map`; taking write access away changes no
+        // memory, and the caller stops writing it.
+        if unsafe { mprotect(ptr, len, PROT_READ) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Runs `child` in a forked child, which exits with the code it returns, and returns that
+    /// code.
+    #[cfg(target_os = "redox")]
+    pub fn in_child(child: impl FnOnce() -> i32) -> std::io::Result<i32> {
+        // SAFETY: the program is single-threaded, so the child is a consistent copy; it only
+        // makes system calls and exits without running the parent's destructors.
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            let code = child();
+            // SAFETY: ends the child at once, as `fork` requires.
+            unsafe { _exit(code) }
+        }
+        let mut status = 0;
+        // SAFETY: `status` is a live integer for the call to fill in.
+        if unsafe { waitpid(pid, &mut status, 0) } != pid {
+            return Err(std::io::Error::last_os_error());
+        }
+        // WIFEXITED and WEXITSTATUS.
+        if status & 0x7f != 0 {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        Ok((status >> 8) & 0xff)
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    pub fn protect_read_only(_ptr: *mut u8, _len: usize) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    pub fn in_child(_child: impl FnOnce() -> i32) -> std::io::Result<i32> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
     #[cfg(not(target_os = "redox"))]
     pub fn call(
         _fd: usize,
@@ -229,7 +301,7 @@ mod sys {
 
     #[cfg(not(target_os = "redox"))]
     pub fn map(_fd: i32, _len: usize, _flags: i32, _offset: u64) -> std::io::Result<*mut u8> {
-        let _ = PROT_RW;
+        let _ = (PROT_RW, PROT_READ);
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
@@ -345,6 +417,18 @@ impl Mapped {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
+    /// The mapped bytes, to read only.
+    fn view(&self) -> &[u8] {
+        // SAFETY: `ptr` maps `len` readable bytes of memory this value owns.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Takes write access away; only [`Mapped::view`] may be used afterwards.
+    fn make_read_only(&mut self) -> Result<(), Failure> {
+        sys::protect_read_only(self.ptr, self.len)?;
+        Ok(())
+    }
+
     /// Unmaps the memory.
     fn unmap(self) -> Result<(), Failure> {
         sys::unmap(self.ptr, self.len)?;
@@ -444,9 +528,12 @@ fn pattern(i: usize) -> u8 {
 
 /// The outcome of the tests that need a domain.
 struct Outcome {
+    unbound: Result<&'static str, Failure>,
     domain: Result<(), Failure>,
     dma: Result<(), Failure>,
     fault: Result<(), Failure>,
+    readonly: Result<(), Failure>,
+    fork: Result<&'static str, Failure>,
     release: Result<(), Failure>,
 }
 
@@ -454,13 +541,27 @@ impl Outcome {
     /// Every test failed because of `err`, at a step before the first of them.
     fn all_failed(err: Failure) -> Self {
         Self {
+            unbound: Err(Failure::NotRun),
             domain: Err(err),
             dma: Err(Failure::NotRun),
             fault: Err(Failure::NotRun),
+            readonly: Err(Failure::NotRun),
+            fork: Err(Failure::NotRun),
             release: Err(Failure::NotRun),
         }
     }
 }
+
+/// The test names, in the order they are reported.
+const TESTS: [&str; 7] = [
+    "iommu-unbound",
+    "iommu-domain",
+    "iommu-dma",
+    "iommu-fault",
+    "iommu-readonly",
+    "iommu-fork",
+    "iommu-release",
+];
 
 /// The device and memory the tests use, set up before the domain exists.
 struct Setup {
@@ -469,8 +570,22 @@ struct Setup {
     translator: Translator,
     buffer: Mapped,
     victim: Mapped,
-    buffer_phys: usize,
-    victim_phys: usize,
+    /// The physical addresses, when translation answers without a domain (not under
+    /// `enforce`).
+    buffer_phys: Option<usize>,
+    victim_phys: Option<usize>,
+    /// The domain's descriptor, once bound.
+    domain: usize,
+}
+
+/// What translating without a domain gave: the physical address, or `None` when the kernel
+/// refused (`EACCES`, `kernel.iommu = "enforce"`).
+fn translate_unbound(t: &Translator, virt: usize) -> Result<Option<usize>, Failure> {
+    match t.translate(virt) {
+        Ok(phys) => Ok(Some(phys)),
+        Err(Failure::Call(_, EACCES)) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Finds and maps the device, allocates the buffers and translates them without a domain.
@@ -504,8 +619,8 @@ fn setup(mut channel: Channel) -> Result<Setup, Failure> {
     let buffer = Mapped::dma(2 * PAGE)?;
     let mut victim = Mapped::dma(PAGE)?;
     victim.bytes().fill(CANARY);
-    let buffer_phys = translator.translate(buffer.addr(0))?;
-    let victim_phys = translator.translate(victim.addr(0))?;
+    let buffer_phys = translate_unbound(&translator, buffer.addr(0))?;
+    let victim_phys = translate_unbound(&translator, victim.addr(0))?;
     Ok(Setup {
         channel,
         edu,
@@ -514,6 +629,7 @@ fn setup(mut channel: Channel) -> Result<Setup, Failure> {
         victim,
         buffer_phys,
         victim_phys,
+        domain: usize::MAX,
     })
 }
 
@@ -523,6 +639,7 @@ fn bind(setup: &mut Setup) -> Result<bool, Failure> {
         return Ok(false);
     };
     sys::call(domain, &mut [], 0, &[VERB_BIND]).map_err(|errno| Failure::Call("bind", errno))?;
+    setup.domain = domain;
     match sys::call(domain, &mut [], 0, &[VERB_BIND]) {
         Err(EBUSY) => Ok(true),
         Err(errno) => Err(Failure::Call("the second bind", errno)),
@@ -534,11 +651,11 @@ fn bind(setup: &mut Setup) -> Result<bool, Failure> {
 fn translate_in_domain(setup: &Setup) -> Result<usize, Failure> {
     let t = &setup.translator;
     let iova = t.translate(setup.buffer.addr(0))?;
-    if iova == setup.buffer_phys {
+    if let Some(phys) = setup.buffer_phys.filter(|&phys| phys == iova) {
         return Err(Failure::Translation(
             "the IOVA equals the physical address",
             iova,
-            setup.buffer_phys,
+            phys,
         ));
     }
     let second = t.translate(setup.buffer.addr(PAGE))?;
@@ -559,10 +676,11 @@ fn translate_in_domain(setup: &Setup) -> Result<usize, Failure> {
     }
     // The victim must lie outside what the domain maps for the buffer, or the fault test
     // would write the buffer instead.
-    if (iova..iova + 2 * PAGE).contains(&setup.victim_phys) {
+    let target = setup.victim_phys.unwrap_or(UNMAPPED_IOVA);
+    if (iova..iova + 2 * PAGE).contains(&target) {
         return Err(Failure::Translation(
-            "the victim overlaps the buffer's IOVAs",
-            setup.victim_phys,
+            "the fault target overlaps the buffer's IOVAs",
+            target,
             iova,
         ));
     }
@@ -586,11 +704,75 @@ fn dma_round_trip(setup: &mut Setup, iova: usize) -> Result<(), Failure> {
     )
 }
 
-/// Has the device write the victim's physical address, which the domain does not map.
+/// Has the device write the victim's physical address (or, without one, an IOVA the domain
+/// never maps), which the domain does not map.
 fn dma_to_ungranted(setup: &mut Setup) -> Result<(), Failure> {
-    println!("FERRIC_IOMMU_EXPECT_FAULT write {:#x}", setup.victim_phys);
-    setup.edu.dma(setup.victim_phys as u64, true)?;
-    check("the victim page", setup.victim.bytes(), |_| CANARY)
+    let target = setup.victim_phys.unwrap_or(UNMAPPED_IOVA);
+    println!("FERRIC_IOMMU_EXPECT_FAULT write {target:#x}");
+    setup.edu.dma(target as u64, true)?;
+    check("the victim page", setup.victim.view(), |_| CANARY)
+}
+
+/// Has the device write the victim at its IOVA, then again after `mprotect` took write access
+/// away: the second write must fault. The device's buffer holds [`pattern`] from the round
+/// trip.
+fn dma_after_write_removed(setup: &mut Setup) -> Result<(), Failure> {
+    let iova = setup.translator.translate(setup.victim.addr(0))?;
+    setup.edu.dma(iova as u64, true)?;
+    check(
+        "the victim after a granted write",
+        setup.victim.view(),
+        pattern,
+    )?;
+    setup.victim.bytes().fill(CANARY);
+    setup.victim.make_read_only()?;
+    println!("FERRIC_IOMMU_EXPECT_FAULT write {iova:#x}");
+    setup.edu.dma(iova as u64, true)?;
+    check("the read-only victim", setup.victim.view(), |_| CANARY)
+}
+
+/// What the forked child reports, as its exit code.
+const CHILD_REFUSED: i32 = 0;
+const CHILD_PHYSICAL: i32 = 1;
+const CHILD_TRANSLATE_FAILED: i32 = 2;
+const CHILD_BIND_ALLOWED: i32 = 3;
+const CHILD_BIND_FAILED: i32 = 4;
+
+/// The forked child's checks: its translation of fresh DMA memory, and a bind of the domain
+/// descriptor it inherited, which must be refused while the parent has the domain bound.
+fn child_checks(translator: &Translator, domain: usize) -> i32 {
+    match sys::call(domain, &mut [], 0, &[VERB_BIND]) {
+        Err(EBUSY) => {}
+        Err(_) => return CHILD_BIND_FAILED,
+        Ok(_) => return CHILD_BIND_ALLOWED,
+    }
+    // Physically contiguous memory is not kept across a fork, so the child needs its own.
+    let Ok(page) = Mapped::dma(PAGE) else {
+        return CHILD_TRANSLATE_FAILED;
+    };
+    match translator.translate(page.addr(0)) {
+        Err(Failure::Call(_, EACCES)) => CHILD_REFUSED,
+        Ok(_) => CHILD_PHYSICAL,
+        Err(_) => CHILD_TRANSLATE_FAILED,
+    }
+}
+
+/// Forks, and checks that the child has no bound domain.
+fn forked_child_unbound(setup: &Setup) -> Result<&'static str, Failure> {
+    let code = sys::in_child(|| child_checks(&setup.translator, setup.domain))?;
+    match code {
+        CHILD_REFUSED => Ok(
+            "the forked child is unbound: translation refused (EACCES), the inherited domain cannot be bound",
+        ),
+        CHILD_PHYSICAL => Ok(
+            "the forked child is unbound: translation gives a physical address, the inherited domain cannot be bound",
+        ),
+        CHILD_BIND_ALLOWED => Err(Failure::Child("binding the parent's domain was allowed")),
+        CHILD_BIND_FAILED => Err(Failure::Child(
+            "binding the parent's domain failed, not with EBUSY",
+        )),
+        _ => Err(Failure::Child("translation failed, not with EACCES")),
+    }
 }
 
 /// Unmaps the buffer, then has the device read its second page's old IOVA. A read, so a
@@ -604,6 +786,11 @@ fn dma_after_release(setup: Setup, iova: usize) -> Result<(), Failure> {
 
 /// Runs the tests after setup; `None` when pcid had no domain to give.
 fn run(mut setup: Setup) -> Option<Outcome> {
+    let unbound = Ok(if setup.buffer_phys.is_some() {
+        "translation without a domain gives a physical address"
+    } else {
+        "translation without a domain is refused (EACCES)"
+    });
     match bind(&mut setup) {
         Ok(true) => {}
         Ok(false) => return None,
@@ -613,22 +800,36 @@ fn run(mut setup: Setup) -> Option<Outcome> {
         Ok(iova) => iova,
         Err(err) => {
             return Some(Outcome {
+                unbound,
                 domain: Ok(()),
                 dma: Err(err),
-                fault: Err(Failure::NotRun),
-                release: Err(Failure::NotRun),
+                ..Outcome::all_failed(Failure::NotRun)
             });
         }
     };
     let dma = dma_round_trip(&mut setup, iova);
     let fault = dma_to_ungranted(&mut setup);
+    let readonly = dma_after_write_removed(&mut setup);
+    let fork = forked_child_unbound(&setup);
     let release = dma_after_release(setup, iova);
     Some(Outcome {
+        unbound,
         domain: Ok(()),
         dma,
         fault,
+        readonly,
+        fork,
         release,
     })
+}
+
+/// Prints one test's result line, with the detail a passing test gave; returns whether it
+/// passed.
+fn report_with(name: &str, result: Result<&'static str, Failure>) -> bool {
+    match result {
+        Ok(detail) => report(name, Ok(()), detail),
+        Err(err) => report(name, Err(err), ""),
+    }
 }
 
 /// Prints one test's result line; returns whether it passed.
@@ -666,7 +867,7 @@ fn main() -> ExitCode {
     let outcome = match outcome {
         Ok(Some(outcome)) => outcome,
         Ok(None) => {
-            for name in ["iommu-domain", "iommu-dma", "iommu-fault", "iommu-release"] {
+            for name in TESTS {
                 println!("FERRIC_TEST_SKIP {name}: pcid has no DMA domain for the device");
             }
             return ExitCode::SUCCESS;
@@ -674,6 +875,7 @@ fn main() -> ExitCode {
         Err(err) => Outcome::all_failed(err),
     };
     let results = [
+        report_with(TESTS[0], outcome.unbound),
         report(
             "iommu-domain",
             outcome.domain,
@@ -689,6 +891,12 @@ fn main() -> ExitCode {
             outcome.fault,
             "DMA to an ungranted physical address left the memory unchanged",
         ),
+        report(
+            "iommu-readonly",
+            outcome.readonly,
+            "after mprotect took write access away, the device's write faulted",
+        ),
+        report_with(TESTS[5], outcome.fork),
         report(
             "iommu-release",
             outcome.release,

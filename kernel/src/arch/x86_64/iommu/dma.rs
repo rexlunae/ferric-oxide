@@ -17,6 +17,11 @@
 //!
 //! The answer, like the physical address it replaces, is the address of the page's start.
 //!
+//! When the process takes write access away from translated memory (`mprotect`), the mappings
+//! it reaches become read-only for the device as well, with the IOTLB invalidated before the
+//! call returns ([`DmaSpace::narrow`]); a later translation of a writable page widens them
+//! again.
+//!
 //! Mappings are taken down strictly (clear the entries, invalidate the IOTLB through the
 //! invalidation queue and wait, then unpin) when the process unmaps the memory
 //! ([`DmaSpace::release`], called from the address-space code) or when the domain closes. On
@@ -316,23 +321,16 @@ impl DmaSpace {
         if !writable || mapping.writable() {
             return Ok(());
         }
-        let (iova, range) = (mapping.iova(), mapping.phys());
-        // A failed unmap leaves the mapping as it was (read-only); its frames stay pinned.
-        self.domain.unmap(iova, range.len)?;
-        if let Err(err) = self
-            .domain
-            .map(iova, range.start, range.len, Access::ReadWrite)
-        {
-            // `map` undid its part; put the read-only entries back, or drop the mapping (its
-            // users must translate again).
-            if self
-                .domain
-                .map(iova, range.start, range.len, Access::Read)
-                .is_err()
-            {
-                if let Some(gone) = self.mappings.remove(phys) {
-                    self.give_back(gone.data.block, gone.data.pins);
-                }
+        let (iova, len) = (mapping.iova(), mapping.phys().len);
+        if let Err(err) = self.domain.protect(iova, len, Access::ReadWrite) {
+            // Part of it may be writable now. Make it read-only again, as the bookkeeping
+            // says, or take it down (its users must translate again).
+            let gone = match self.domain.protect(iova, len, Access::Read) {
+                Ok(()) => None,
+                Err(_) => self.mappings.remove(phys),
+            };
+            if let Some(gone) = gone {
+                self.tear_down(gone);
             }
             return Err(err.into());
         }
@@ -340,6 +338,50 @@ impl DmaSpace {
             mapping.set_writable();
         }
         Ok(())
+    }
+
+    /// The process took write access away from `len` bytes of its memory from virtual
+    /// address `start` (`mprotect`): makes every writable mapping that memory reaches
+    /// read-only for the device too, with the IOTLB invalidated before this returns.
+    ///
+    /// A mapping is narrowed whole, even when only part of it lost write access or another
+    /// virtual range that reaches it is still writable; translating a page that is still
+    /// writable widens it again. A mapping whose access cannot be changed is taken down
+    /// instead, so its users must translate again.
+    pub fn narrow(&mut self, start: usize, len: usize) {
+        let reached = self
+            .mappings
+            .writable_reached_by(Span::new(start as u64, len as u64));
+        if reached.is_empty() {
+            return;
+        }
+        info!(
+            "IOMMU: domain {}: {} DMA mapping(s) made read-only after write access was removed",
+            self.domain.id(),
+            reached.len()
+        );
+        for phys in reached {
+            let Some(mapping) = self.mappings.get(phys) else {
+                continue;
+            };
+            let (iova, len) = (mapping.iova(), mapping.phys().len);
+            match self.domain.protect(iova, len, Access::Read) {
+                Ok(()) => {
+                    if let Some(mapping) = self.mappings.get_mut(phys) {
+                        mapping.set_read_only();
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "IOMMU: domain {}: cannot make IOVA {iova:#x}+{len:#x} read-only: {err}; unmapping it",
+                        self.domain.id()
+                    );
+                    if let Some(gone) = self.mappings.remove(phys) {
+                        self.tear_down(gone);
+                    }
+                }
+            }
+        }
     }
 
     /// The process unmapped `len` bytes of its memory from virtual address `start`: tears down
