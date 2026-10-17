@@ -1,5 +1,7 @@
 [source]
-git = "https://gitlab.redox-os.org/redox-os/kernel.git"
+# Ferric Oxide kernel fork (tracks upstream gitlab.redox-os.org/redox-os/kernel)
+git = "https://github.com/rexlunae/kernel.git"
+branch = "main"
 
 [build]
 template = "custom"

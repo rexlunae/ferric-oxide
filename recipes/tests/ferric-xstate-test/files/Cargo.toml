@@ -1,0 +1,9 @@
+[package]
+name = "ferric-xstate-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "AVX-512 context-switch state test for Ferric Oxide"
+
+[profile.release]
+debug = false

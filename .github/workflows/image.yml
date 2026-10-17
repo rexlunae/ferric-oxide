@@ -1,0 +1,128 @@
+name: image
+
+# Phase 0: build a bootable image and boot it in QEMU/KVM.
+#
+# The build runs in Redox's own CI container with prebuilt packages
+# (REPO_BINARY=1); only the packages marked "source" in
+# config/ferric-smoke.toml are compiled, from the Ferric Oxide forks.
+
+on:
+  push:
+    # ci/** branches are for trying CI changes without opening a PR.
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel git URL to build instead of the recipe's (optional)"
+        required: false
+        default: ""
+      kernel_ref:
+        description: "Kernel branch, tag or commit to build (with kernel_repo)"
+        required: false
+        default: ""
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONFIG_NAME: ferric-smoke
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: docker.io/redoxos/redox-base-x86_64:latest
+    env:
+      PODMAN_BUILD: "0"
+      SKIP_CHECK_TOOLS: "1"
+      REPO_BINARY: "1"
+      FSTOOLS_NO_MOUNT: "1"
+      COOKBOOK_VERBOSE: "false"
+      CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Use a different kernel source
+        if: ${{ inputs.kernel_repo != '' }}
+        env:
+          KERNEL_REPO: ${{ inputs.kernel_repo }}
+          KERNEL_REF: ${{ inputs.kernel_ref }}
+        run: scripts/ferric-ci/use-local-source.sh kernel "$KERNEL_REPO" "$KERNEL_REF"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            prefix
+            build/fstools
+            target
+          key: redox-host-${{ hashFiles('Cargo.lock', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
+          restore-keys: redox-host-
+
+      - name: Build image
+        run: make all CONFIG_NAME="$CONFIG_NAME"
+
+      - name: Compress image
+        run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferric-smoke-image
+          path: harddrive.img.zst
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs
+          path: |
+            recipes/**/target/*/build/*.log
+            recipes/**/target/*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  boot:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [host]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf zstd
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-smoke-image
+
+      - name: Boot smoke test
+        run: |
+          zstd -d harddrive.img.zst -o harddrive.img
+          scripts/ferric-ci/boot-smoke.sh harddrive.img serial-${{ matrix.cpu }}.log ${{ matrix.cpu }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-log-${{ matrix.cpu }}
+          path: serial-${{ matrix.cpu }}.log
+          retention-days: 14

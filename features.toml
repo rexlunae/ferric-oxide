@@ -123,21 +123,28 @@ psABI microarchitecture level for all userspace code.
       Haswell / Excavator / Zen and newer.
   v4  + AVX-512 F/BW/CD/DQ/VL. Skylake-SP, Ice Lake, Zen 4 and newer.
 
-An image built for a level will not boot userspace on an older CPU.
+An image built for a level will not boot on an older CPU: the kernel
+checks at boot and halts with a list of the missing features.
 `make qemu` picks a matching emulated CPU when KVM is off.
 
-v4 is not usable yet: the kernel only enables AVX state in XCR0, so
-AVX-512 instructions fault until it also saves opmask and ZMM state."""
+v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
+v4 turns on by default."""
 choices = [
   { value = "v1", title = "v1 (baseline)" },
   { value = "v2", title = "v2" },
   { value = "v3", title = "v3 (AVX2)" },
-  { value = "v4", title = "v4 (AVX-512, needs kernel work)" },
+  { value = "v4", title = "v4 (AVX-512)" },
 ]
 
 [[option.effect]]
 when = "value == 'v1'"
 make = { QEMU_CPU = "core2duo" }
+
+# The kernel checks the CPU against the level at boot and halts with a list of
+# missing features, instead of user space dying later with an invalid opcode.
+[[option.effect]]
+when = "value != 'v1'"
+kernel_config = { "arch.x86_64.level" = "{value}" }
 
 [[option.effect]]
 when = "value == 'v2'"
@@ -440,6 +447,25 @@ rebuild = ["kernel"]
 help = "Skip saving unmodified register state. Present on every v3 and v4 CPU."
 choices = ["always", "auto", "never"]
 
+[[option]]
+id = "kernel.cpu.avx512"
+menu = "kernel.cpu"
+type = "choice"
+title = "AVX-512 register state"
+default = "auto"
+defaults = [
+  { when = "kernel.cpu.xsave == 'never'", value = "never" },
+  { when = "cpu.x86_64_level == 'v4'", value = "always" },
+]
+kernel_config = "arch.x86_64.features.avx512"
+rebuild = ["kernel"]
+help = """
+Enable the AVX-512 opmask and ZMM state components in XCR0 so user space
+can run AVX-512 code, and save them on context switch. "auto" enables them
+when the CPU has AVX512F; level v4 requires them. Costs about 1.7 KB more
+XSAVE area per thread on AVX-512 CPUs, and nothing elsewhere."""
+choices = ["always", "auto", "never"]
+
 # ---------------------------------------------------------------- image
 
 [[option]]
@@ -638,13 +664,18 @@ message = "Prebuilt packages are compiled for baseline x86-64; only packages you
 
 [[rule]]
 level = "warn"
-when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto')"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto')"
 message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
 
 [[rule]]
-level = "warn"
-when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4'"
-message = "The kernel does not enable AVX-512 state in XCR0 yet, so v4 userspace will fault on AVX-512 instructions."
+level = "error"
+when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && kernel.cpu.avx512 == 'never'"
+message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\"."
+
+[[rule]]
+level = "error"
+when = "target.arch == 'x86_64' && kernel.cpu.avx512 != 'never' && kernel.cpu.xsave == 'never'"
+message = "AVX-512 state is saved with XSAVE; kernel.cpu.avx512 needs kernel.cpu.xsave."
 
 [[rule]]
 level = "warn"
