@@ -564,7 +564,10 @@ unsafe fn map_memory<A: Arch>(
 
 /// Ferric Oxide: one past the highest end of the boot memory map's areas whose kind `keep`
 /// accepts.
-#[cfg(all(target_arch = "x86_64", any(feature = "kaslr", iommu_enabled)))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "kaslr", iommu_enabled, shstk_compiled)
+))]
 fn map_end(keep: impl Fn(BootloaderMemoryKind) -> bool) -> usize {
     // SAFETY: the memory map is only written while the BSP registers regions during early
     // boot, before this is called.
@@ -578,8 +581,9 @@ fn map_end(keep: impl Fn(BootloaderMemoryKind) -> bool) -> usize {
 
 /// Ferric Oxide: one past the highest address of RAM (free, reclaimable, kernel and boot-time
 /// identity-mapped areas), for the IOMMU's identity map. Reserved ranges are left out because
-/// firmware reports MMIO holes far above RAM (QEMU's at 1 TiB on AMD hosts, for one).
-#[cfg(all(target_arch = "x86_64", iommu_enabled))]
+/// firmware reports MMIO holes far above RAM (QEMU's at 1 TiB on AMD hosts, for one). Also bounds
+/// the kernel stacks' physical addresses for the shadow-stack window.
+#[cfg(all(target_arch = "x86_64", any(iommu_enabled, shstk_compiled)))]
 pub fn ram_end() -> usize {
     use BootloaderMemoryKind::{Free, IdentityMap, Kernel, Reclaim};
     map_end(|kind| matches!(kind, Free | Reclaim | Kernel | IdentityMap))

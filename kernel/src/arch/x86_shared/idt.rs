@@ -320,12 +320,18 @@ pub unsafe fn install_backup_stack(
     idt.entries[18].set_ist(BACKUP_IST);
 
     // Ferric Oxide: the IST goes in `pcr`, which upstream took to be the running CPU's even when
-    // setting up an AP.
+    // setting up an AP. With shadow stacks, IST 1's entry in the interrupt SSP table too.
     #[cfg(target_arch = "x86_64")] // TODO: x86
     // SAFETY: the caller guarantees `pcr` is the PCR of the CPU loading `idt` and unused
     // elsewhere.
     unsafe {
         (*pcr).tss.ist[usize::from(BACKUP_IST - 1)] = backup.initial_top() as u64;
+        #[cfg(shstk_compiled)]
+        crate::arch::shstk::set_ist_ssp(
+            &mut (*pcr).shstk_ist_ssp,
+            BACKUP_IST,
+            backup.shadow_stack(),
+        );
     }
 }
 

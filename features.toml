@@ -612,7 +612,7 @@ choices = ["always", "auto", "never"]
 id = "kernel.cpu.shstk"
 menu = "kernel.cpu"
 type = "choice"
-title = "Shadow stacks (CET SS) in the kernel: detection only"
+title = "Shadow stacks (CET SS) in the kernel: prepared, not yet enabled"
 default = "never"
 depends = "target.arch == 'x86_64'"
 kernel_config = "arch.x86_64.features.shstk"
@@ -620,11 +620,13 @@ rebuild = ["kernel"]
 help = """
 Intel CET supervisor shadow stacks keep a second, write-protected copy of every
 return address and stop the kernel with a control-protection fault (#CP) when a
-`ret` does not match it, which defeats return-oriented gadget chains. This first
-step only detects them: "auto" logs at boot whether the CPU reports CET_SS
-(Intel Tiger Lake, AMD Zen 3 and newer) and what the policy decided, and turns
-nothing on. Like the other "auto" CPU options it acts as "never" without
-kernel.self_modifying. "always" will be added once the kernel can enable them."""
+`ret` does not match it, which defeats return-oriented gadget chains. They are
+not turned on yet: "auto" logs at boot whether the CPU reports CET_SS (Intel
+Tiger Lake, AMD Zen 3 and newer) and what the policy decided, and on such CPUs
+allocates a shadow stack for every kernel stack and keeps the shadow-stack
+pointer registers up to date, with CET itself left off. Like the other "auto"
+CPU options it acts as "never" without kernel.self_modifying. "always" will be
+added once the kernel can enable them."""
 choices = ["auto", "never"]
 
 # ---------------------------------------------------------------- image

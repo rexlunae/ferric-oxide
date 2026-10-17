@@ -598,13 +598,33 @@ impl Drop for BorrowedHtBuf {
 pub struct Kstack {
     /// naturally aligned, order 4
     base: Frame,
+    /// Ferric Oxide: the stack's supervisor shadow stack, when this boot uses them.
+    #[cfg(shstk_compiled)]
+    shadow: Option<crate::arch::shstk::ShadowStack>,
 }
 impl Kstack {
     pub fn new() -> Result<Self, Enomem> {
         let must_be_zero = true;
-        Ok(Self {
+        #[cfg_attr(not(shstk_compiled), expect(unused_mut))]
+        let mut this = Self {
             base: allocate_p2frame(4, must_be_zero).ok_or(Enomem)?,
-        })
+            #[cfg(shstk_compiled)]
+            shadow: None,
+        };
+        // Ferric Oxide (shadow stacks): on failure `this` drops and frees the stack.
+        #[cfg(shstk_compiled)]
+        {
+            this.shadow = crate::arch::shstk::ShadowStack::for_kstack(this.base.base())
+                .inspect_err(|err| {
+                    warn!("CET: no shadow stack for a kernel stack: {err}");
+                })?;
+        }
+        Ok(this)
+    }
+    /// Ferric Oxide: the stack's supervisor shadow stack, if this boot uses them.
+    #[cfg(shstk_compiled)]
+    pub fn shadow_stack(&self) -> Option<&crate::arch::shstk::ShadowStack> {
+        self.shadow.as_ref()
     }
     pub fn initial_top(&self) -> *mut u8 {
         unsafe { (RmmA::phys_to_virt(self.base.base()).data() as *mut u8).add(PAGE_SIZE << 4) }

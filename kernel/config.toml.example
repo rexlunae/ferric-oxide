@@ -30,7 +30,8 @@ pcid = "never"
 # on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.
 ibt = "never"
 # Ferric Oxide: kernel shadow stacks (Intel CET SS), "auto" or "never". So far
-# "auto" only logs whether the CPU supports them; nothing is enabled yet.
+# "auto" logs whether the CPU supports them and, if it does, allocates them for
+# every kernel stack, but does not turn CET on yet.
 shstk = "never"
 
 # vim: ft=toml

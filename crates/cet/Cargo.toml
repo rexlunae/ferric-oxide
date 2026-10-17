@@ -3,6 +3,6 @@ name = "ferric-cet"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Intel CET (indirect branch tracking, shadow-stack detection): CPUID, MSR and #CP decoding for the kernel"
+description = "Intel CET (indirect branch tracking, supervisor shadow stacks): CPUID, MSR, layout and #CP decoding for the kernel"
 
 [dependencies]

@@ -12,10 +12,13 @@
 //!   `kernel.cpu.shstk` in `ferric.toml`) to them.
 //! - [`ControlProtectionError`] decodes the #CP error code for the panic message.
 //! - The constants name the CPUID bit, the MSRs and the control-register bits the kernel writes.
+//! - [`shstk`] holds the shadow-stack layout arithmetic: the shadow-stack page encoding, the
+//!   supervisor and restore tokens, a new context's initial shadow stack and the slot window the
+//!   kernel maps shadow stacks in.
 //!
-//! The kernel side (`kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4 for IBT. Shadow
-//! stacks are only detected and reported so far (`kernel/src/arch/x86_64/shstk.rs`); nothing
-//! turns them on yet. User-mode CET is not covered here.
+//! The kernel side (`kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4 for IBT. For shadow
+//! stacks, `kernel/src/arch/x86_64/shstk.rs` allocates and maps them and keeps the SSP MSRs and
+//! context switches ready, but nothing turns them on yet. User-mode CET is not covered here.
 //!
 //! Specification: Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 1,
 //! chapter 17 ("Control-flow Enforcement Technology"); Volume 2, `CPUID` leaf 07H; Volume 3A,
@@ -44,6 +47,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+
+pub mod shstk;
 
 /// `CPUID.(EAX=7,ECX=0):EDX[20]`: the CPU supports CET indirect branch tracking.
 pub const CPUID_7_0_EDX_CET_IBT: u32 = 1 << 20;
