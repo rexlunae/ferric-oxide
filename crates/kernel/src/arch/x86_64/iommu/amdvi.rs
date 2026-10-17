@@ -36,7 +36,6 @@ use alloc::vec::Vec;
 use core::{
     fmt,
     ops::Range,
-    ptr::{read_volatile, write_volatile},
     sync::atomic::{fence, Ordering},
 };
 
@@ -57,10 +56,11 @@ use spin::{Mutex, Once};
 
 use super::{
     domain::{Attachment, Device, DomainError},
-    map_registers, pci_config_read, pci_config_write, Error, Step, DOMAIN_IDS, FAULT_VECTOR,
-    POLL_LIMIT,
+    pci_config_read, pci_config_write,
+    volatile::Volatile,
+    Error, Step, DOMAIN_IDS, FAULT_VECTOR, POLL_LIMIT,
 };
-use crate::memory::{allocate_p2frame, PhysicalAddress, RmmA, RmmArch, PAGE_SIZE};
+use crate::memory::{allocate_p2frame, PhysicalAddress, PAGE_SIZE};
 
 /// The device table's frames as a power of two: 2 MiB.
 const DEVICE_TABLE_ORDER: u32 = 9;
@@ -113,27 +113,23 @@ impl Block {
         })
     }
 
-    /// The block's 64-bit word `index`, or `None` past its end.
-    fn word(self, index: usize) -> Option<*mut u64> {
-        let virt = RmmA::phys_to_virt(PhysicalAddress::new(self.phys as usize)).data();
-        (index < self.words).then(|| (virt as *mut u64).wrapping_add(index))
+    /// The block's memory. Its frames are never freed, so it stays mapped.
+    fn memory(self) -> Volatile {
+        Volatile::frames(self.phys, self.words.saturating_mul(8))
     }
 
     /// Reads word `index` (0 past the end). Volatile: the IOMMU writes the block.
     fn read(self, index: usize) -> u64 {
-        self.word(index).map_or(0, |word| {
-            // SAFETY: `word` is inside frames `alloc` took for this block, which are never
-            // freed and are reached through the physical memory map; it is 8-byte aligned.
-            unsafe { read_volatile(word) }
-        })
+        index
+            .checked_mul(8)
+            .map_or(0, |offset| self.memory().read(offset))
     }
 
-    /// Writes word `index` (nothing past the end). Volatile: the IOMMU reads the block.
+    /// Writes word `index` (nothing past the end). Volatile: the IOMMU reads the block. Every
+    /// block is written only with its unit's state lock held (or before the unit is shared).
     fn write(self, index: usize, value: u64) {
-        if let Some(word) = self.word(index) {
-            // SAFETY: as in `read`. Every block is written only with its unit's state lock
-            // held (or before the unit is shared), so stores never race.
-            unsafe { write_volatile(word, value) }
+        if let Some(offset) = index.checked_mul(8) {
+            self.memory().write(offset, value);
         }
     }
 }
@@ -141,21 +137,18 @@ impl Block {
 /// A mapped AMD-Vi register set ([`regs::MMIO_SPAN`] bytes).
 struct Regs {
     base: u64,
-    virt: usize,
+    mmio: Volatile,
 }
 
 impl Regs {
     /// Reads the 64-bit register at `offset`.
     fn read(&self, offset: usize) -> u64 {
-        // SAFETY: `virt` maps `MMIO_SPAN` bytes of the IOMMU's registers as device memory and
-        // every offset used is an aligned 64-bit register inside them.
-        unsafe { read_volatile(self.virt.wrapping_add(offset) as *const u64) }
+        self.mmio.read(offset)
     }
 
     /// Writes the 64-bit register at `offset`.
     fn write(&self, offset: usize, value: u64) {
-        // SAFETY: as in `read`.
-        unsafe { write_volatile(self.virt.wrapping_add(offset) as *mut u64, value) }
+        self.mmio.write(offset, value);
     }
 }
 
@@ -662,7 +655,7 @@ fn fill_device_table(ivhd: &Ivhd<'_>, state: &mut UnitState) {
 fn init_unit(ivhd: Ivhd<'static>) -> Result<Unit, Error> {
     let regs = Regs {
         base: ivhd.base,
-        virt: map_registers(PhysicalAddress::new(ivhd.base as usize), regs::MMIO_SPAN),
+        mmio: Volatile::registers(PhysicalAddress::new(ivhd.base as usize), regs::MMIO_SPAN),
     };
     let current = regs.read(regs::CONTROL);
     let efr = ExtendedFeatures(regs.read(regs::EXTENDED_FEATURES));

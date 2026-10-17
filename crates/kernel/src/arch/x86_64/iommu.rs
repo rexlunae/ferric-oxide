@@ -35,12 +35,10 @@ pub mod dma;
 pub mod domain;
 pub mod interrupt;
 mod selftest;
+mod volatile;
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use core::{
-    ptr::{read_volatile, write_volatile},
-    sync::atomic::{fence, Ordering},
-};
+use core::sync::atomic::{fence, Ordering};
 
 use ferric_vtd::{
     dmar::{Dmar, DmarFlags, Drhd, Structure},
@@ -53,6 +51,8 @@ use ferric_vtd::{
     Bdf,
 };
 use spin::{Mutex, Once};
+
+use self::volatile::{Volatile, Word};
 
 use crate::{
     arch::device::local_apic,
@@ -83,32 +83,24 @@ static DOMAIN_IDS: Mutex<Option<DomainIds>> = Mutex::new(None);
 /// A mapped VT-d register set.
 struct Regs {
     base: u64,
-    virt: usize,
+    mmio: Volatile,
     cap: Capability,
     ecap: ExtendedCapability,
 }
 
 impl Regs {
     /// Reads a 32- or 64-bit register.
-    fn read<T: Copy>(&self, offset: usize) -> T {
-        // SAFETY: `virt` maps the unit's whole register span as device memory (see `map_unit`)
-        // and every offset used is a register inside it, aligned to its width.
-        unsafe { read_volatile((self.virt as *const u8).wrapping_add(offset).cast::<T>()) }
+    fn read<T: Word>(&self, offset: usize) -> T {
+        self.mmio.read(offset)
     }
 
     /// Writes a 32- or 64-bit register.
-    fn write<T: Copy>(&self, offset: usize, value: T) {
-        // SAFETY: as in `read`.
-        unsafe {
-            write_volatile(
-                (self.virt as *mut u8).wrapping_add(offset).cast::<T>(),
-                value,
-            )
-        }
+    fn write<T: Word>(&self, offset: usize, value: T) {
+        self.mmio.write(offset, value);
     }
 
     /// Waits until `done` returns true for the value of the 32- or 64-bit register at `offset`.
-    fn wait<T: Copy>(
+    fn wait<T: Word>(
         &self,
         offset: usize,
         step: Step,
@@ -299,11 +291,10 @@ impl QueuedInvalidation {
 
     /// Polls the status word until the wait descriptor has written it.
     fn wait_status(&mut self, regs: &Regs) -> Result<(), Error> {
-        let status = self.pages.table(self.status).as_ptr();
+        // The status word is the first of a table page this queue owns; hardware writes it.
+        let status = Volatile::frames(self.status, 8);
         for _ in 0..POLL_LIMIT {
-            // SAFETY: `status` points at the first word of a table page this queue owns,
-            // which stays allocated and mapped; hardware writes it, so the read is volatile.
-            let word = unsafe { read_volatile(status) };
+            let word: u64 = status.read(0);
             if word as u32 == self.sequence {
                 return Ok(());
             }
@@ -510,10 +501,9 @@ fn map_registers(phys: PhysicalAddress, len: usize) -> usize {
 /// Maps a unit's registers and reads its capabilities.
 fn map_unit(drhd: &Drhd<'_>) -> Regs {
     let base = drhd.register_base;
-    let virt = map_registers(PhysicalAddress::new(base as usize), PAGE_SIZE);
     let mut regs = Regs {
         base,
-        virt,
+        mmio: Volatile::registers(PhysicalAddress::new(base as usize), PAGE_SIZE),
         cap: Capability(0),
         ecap: ExtendedCapability(0),
     };
@@ -522,6 +512,7 @@ fn map_unit(drhd: &Drhd<'_>) -> Regs {
     let span = regs::register_span(regs.cap, regs.ecap, drhd.register_pages());
     if let Some(rest) = span.checked_sub(PAGE_SIZE).filter(|&rest| rest > 0) {
         map_registers(PhysicalAddress::new(base as usize).add(PAGE_SIZE), rest);
+        regs.mmio = regs.mmio.with_len(span);
     }
     regs
 }

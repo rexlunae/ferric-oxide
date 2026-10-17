@@ -479,10 +479,10 @@ fn move_device(
 }
 
 /// The domain bound by the address space at `owner`, if any.
-fn bound_to<'a>(
-    handles: &'a mut BTreeMap<usize, Handle>,
+fn bound_to(
+    handles: &mut BTreeMap<usize, Handle>,
     owner: *const AddrSpaceWrapper,
-) -> Option<&'a mut DmaSpace> {
+) -> Option<&mut DmaSpace> {
     handles.values_mut().find_map(|h| match h {
         Handle::Domain {
             space,
