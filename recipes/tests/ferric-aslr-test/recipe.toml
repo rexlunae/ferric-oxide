@@ -1,0 +1,16 @@
+# Ferric Oxide: checks that two runs of the same program get different stack,
+# heap and mmap addresses (ASLR). Source lives in files/; as a path source
+# (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-aslr-test/files"
+
+[build]
+template = "custom"
+# Link against this repository's relibc, not the toolchain's prebuilt copy:
+# what the test checks lives in relibc, and statically linked programs carry
+# their libc with them.
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

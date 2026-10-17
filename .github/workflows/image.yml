@@ -58,9 +58,10 @@ jobs:
           key: redox-host-${{ hashFiles('Cargo.lock', 'tools/installer/**', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
           restore-keys: redox-host-
 
-      # Build the kernel with the feature catalog's defaults (features.toml), so
-      # CI boots what a Ferric Oxide build ships rather than upstream's set.
-      - name: Kernel features from the catalog defaults
+      # Build the kernel and relibc with the feature catalog's defaults
+      # (features.toml), so CI boots what a Ferric Oxide build ships rather
+      # than upstream's set.
+      - name: Features from the catalog defaults
         run: |
           out="$RUNNER_TEMP/ferric-defaults"
           mkdir -p "$out"
@@ -70,6 +71,9 @@ jobs:
           features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
           echo "Kernel features: $features"
           echo "FERRIC_KERNEL_FEATURES=$features" >> "$GITHUB_ENV"
+          relibc="$(sed -n 's/^export FERRIC_RELIBC_FEATURES:=//p' "$out/config.mk")"
+          echo "relibc features: $relibc"
+          echo "FERRIC_RELIBC_FEATURES=$relibc" >> "$GITHUB_ENV"
 
       - name: Build image
         run: make all CONFIG_NAME="$CONFIG_NAME"

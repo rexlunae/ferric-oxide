@@ -272,15 +272,16 @@ pub fn fexec_impl(
         }));
     }
 
+    let stack_top = stack_top();
     mmap_anon_remote(
         &grants_fd,
         0,
-        STACK_TOP - STACK_SIZE,
+        stack_top - STACK_SIZE,
         STACK_SIZE,
         MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_FIXED_NOREPLACE,
     )?;
 
-    let mut sp = STACK_TOP;
+    let mut sp = stack_top;
     let mut stack_page = Option::<MmapGuard>::None;
 
     let mut push = |word: usize| -> Result<()> {
@@ -348,6 +349,8 @@ pub fn fexec_impl(
             .map_or(header.e_phentsize as usize, |o| o.at_phent),
     )?;
     push(AT_PHENT)?;
+    push(stack_top)?;
+    push(AT_FERRIC_STACK_TOP)?;
 
     let total_args_envs_auxvpointee_size = args.iter().map(|arg| arg.len() + 1).sum::<usize>()
         + envs.iter().map(|env| env.len() + 1).sum::<usize>()
@@ -574,6 +577,24 @@ pub fn mmap_remote(
         ],
     )
 }
+/// Ferric Oxide pages of randomness in the stack top: 2^22 pages, 16 GiB, the same range Linux
+/// uses on x86_64.
+#[cfg(feature = "aslr")]
+const STACK_RANDOM_PAGE_BITS: u32 = 22;
+
+/// Where a new program's stack ends: [`STACK_TOP`], or with the `aslr` feature a random
+/// page-aligned address up to 16 GiB below it, so a stack address in one process says nothing
+/// about the next. Without a hardware random source it stays at [`STACK_TOP`].
+fn stack_top() -> usize {
+    #[cfg(feature = "aslr")]
+    if let Some(pages) = ferric_hwrand::bits(STACK_RANDOM_PAGE_BITS) {
+        // Below 2^22 by construction, so it fits and the product stays under 2^34.
+        let pages = usize::try_from(pages).unwrap_or(0);
+        return STACK_TOP - pages * PAGE_SIZE;
+    }
+    STACK_TOP
+}
+
 pub fn mmap_anon_remote(
     addrspace_fd: &FdGuardUpper,
     offset: usize,

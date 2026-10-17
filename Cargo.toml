@@ -6,6 +6,7 @@ resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
 default-members = ["crates/nospec", "tools/cookbook", "tools/ferric-config"]
 members = [
+    "crates/hwrand",
     "crates/nospec",
     "tools/cookbook",
     "tools/ferric-config",

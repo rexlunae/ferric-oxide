@@ -82,10 +82,6 @@ mod ptrace;
 /// Performance profiling of the kernel
 mod profiling;
 
-/// Ferric Oxide: hardware random numbers for layout randomization
-#[cfg(any(feature = "kaslr", feature = "aslr"))]
-mod random;
-
 /// Schemes, filesystem handlers
 mod scheme;
 
