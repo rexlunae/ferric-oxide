@@ -29,6 +29,10 @@ make all
 
 If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot the result in a virtual machine, run `make qemu`.
 
+### Choosing features
+
+`make menuconfig` opens a menu, much like the Linux kernel's, for choosing the target, the processor baseline (x86-64-v3 by default), kernel features, image contents and build settings. Your choices are saved in `ferric.toml`, a short TOML file that you or an agent can also edit directly or change with `ferric-config set`; every option is described in [`features.toml`](features.toml). Without a `ferric.toml` the build behaves exactly like upstream. See [tools/ferric-config](tools/ferric-config/README.md).
+
 Until Ferric Oxide has its own book, the upstream Redox documentation is the reference for building and running the system:
 
 - [Building with Podman](https://doc.redox-os.org/book/podman-build.html)

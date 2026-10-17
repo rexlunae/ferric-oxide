@@ -5,5 +5,24 @@ git = "https://gitlab.redox-os.org/redox-os/kernel.git"
 template = "custom"
 script = """
 cd "${COOKBOOK_SOURCE}"
-make install BUILD="${COOKBOOK_BUILD}" DESTDIR="${COOKBOOK_STAGE}"
+KERNEL_MAKE_ARGS=()
+# Ferric Oxide: kernel features and CPU feature policy from ferric.toml
+# (make menuconfig). Unset without ferric.toml, which keeps upstream defaults.
+if [ -n "${FERRIC_KERNEL_FEATURES+set}" ]
+then
+    # The kernel Makefile splices this into --features=..., so the flag rides along.
+    KERNEL_MAKE_ARGS+=("KERNEL_CARGO_FEATURES=${FERRIC_KERNEL_FEATURES} --no-default-features")
+fi
+if [ -n "${FERRIC_KERNEL_CONFIG}" ] && ! cmp -s "${FERRIC_KERNEL_CONFIG}" config.toml
+then
+    cp -v "${FERRIC_KERNEL_CONFIG}" config.toml
+fi
+# The kernel Makefile only tracks *.rs, so relink when features or config change.
+ferric_stamp="$(printf '%s\\n' "${FERRIC_KERNEL_FEATURES-upstream}"; cat config.toml 2>/dev/null || true)"
+if [ "$(cat "${COOKBOOK_BUILD}/ferric.stamp" 2>/dev/null)" != "${ferric_stamp}" ]
+then
+    rm -f "${COOKBOOK_BUILD}/kernel.all"
+fi
+make install BUILD="${COOKBOOK_BUILD}" DESTDIR="${COOKBOOK_STAGE}" "${KERNEL_MAKE_ARGS[@]}"
+printf '%s' "${ferric_stamp}" > "${COOKBOOK_BUILD}/ferric.stamp"
 """

@@ -2,6 +2,16 @@
 
 -include .config
 
+## Ferric Oxide feature configuration. ferric.toml holds the options chosen with
+## `make menuconfig` (or edited by hand; features.toml describes them all) and is
+## turned into build/ferric/config.mk, which sets the variables below with ?=.
+## Without ferric.toml nothing changes. See tools/ferric-config/README.md.
+FERRIC_CONFIG?=ferric.toml
+FERRIC_OUT=build/ferric
+ifneq ($(wildcard $(FERRIC_CONFIG)),)
+include $(FERRIC_OUT)/config.mk
+endif
+
 HOST_ARCH?=$(shell uname -m)
 
 # Configuration

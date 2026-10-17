@@ -23,3 +23,6 @@ source.tar
 source.tar.tmp
 target
 wget-log
+
+# Ferric Oxide feature configuration (make menuconfig)
+/ferric.toml
