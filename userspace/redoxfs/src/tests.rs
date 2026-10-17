@@ -131,6 +131,23 @@ fn empty_dir() {
     })
 }
 
+/// Ferric Oxide: hard-linking under a name longer than a directory entry can
+/// hold must fail with EINVAL, not panic (found by ferric-syscall-fuzz).
+#[test]
+fn link_with_overlong_name_fails() {
+    with_redoxfs(|mut fs| {
+        let root_ptr = TreePtr::root();
+        let file = fs
+            .tx(|tx| tx.create_node(root_ptr, "file", Node::MODE_FILE, 1, 0))
+            .unwrap();
+
+        let long_name = "x".repeat(crate::DIR_ENTRY_MAX_LENGTH + 1);
+        let error = fs.tx(|tx| tx.link_node(root_ptr, &long_name, file.ptr()));
+        assert_eq!(error.unwrap_err().errno, syscall::error::EINVAL);
+        assert!(fs.tx(|tx| tx.find_node(root_ptr, &long_name)).is_err());
+    })
+}
+
 //
 // MARK: H-Tree tests
 //
