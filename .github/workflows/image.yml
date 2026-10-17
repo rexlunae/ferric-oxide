@@ -13,13 +13,23 @@ on:
     branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      config:
+        description: Image config to build and boot
+        type: choice
+        options: [ferric-smoke, ferric-fuzz]
+        default: ferric-smoke
+  # Nightly: a long system call fuzzing run (config/ferric-fuzz.toml).
+  schedule:
+    - cron: "17 3 * * *"
 
 concurrency:
-  group: image-${{ github.ref }}
+  # Kept apart by event, so the nightly run never cancels a push run on main.
+  group: image-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
-  CONFIG_NAME: ferric-smoke
+  CONFIG_NAME: ${{ github.event_name == 'schedule' && 'ferric-fuzz' || inputs.config || 'ferric-smoke' }}
 
 jobs:
   build:
@@ -107,7 +117,7 @@ jobs:
   boot:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -132,6 +142,9 @@ jobs:
           name: ferric-smoke-image
 
       - name: Boot smoke test
+        env:
+          # The fuzzing image runs for 20 minutes before it shuts down.
+          BOOT_TIMEOUT: ${{ env.CONFIG_NAME == 'ferric-fuzz' && '1800' || '300' }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
           scripts/ferric-ci/boot-smoke.sh harddrive.img serial-${{ matrix.cpu }}.log ${{ matrix.cpu }}
