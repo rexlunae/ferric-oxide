@@ -9,6 +9,7 @@ use x86::{
 
 use crate::{
     arch::{
+        gdt::ProcessorControlRegion,
         interrupt::{
             irq::{__generic_interrupts_end, __generic_interrupts_start},
             *,
@@ -147,25 +148,30 @@ pub unsafe fn init_bsp_before_mem() {
 #[cold]
 pub unsafe fn init_bsp_after_mem() {
     let kstack = Kstack::new().expect("failed to allocate backup stack");
-    let stack_end = kstack.initial_top();
-    core::mem::forget(kstack);
 
+    // SAFETY: on the BSP during boot, so `pcr()` is the BSP's PCR, the CPU that loads this IDT;
+    // the stack is forgotten below.
     unsafe {
-        install_backup_stack(&mut *INIT_BSP_IDT.get(), stack_end as usize);
+        install_backup_stack(&mut *INIT_BSP_IDT.get(), crate::arch::gdt::pcr(), &kstack);
     }
+    core::mem::forget(kstack);
 }
 
-pub fn allocate_and_init_idt(cpu_id: LogicalCpuId) -> *mut Idt {
+// Ferric Oxide: takes the AP's PCR, so its backup stack goes in the AP's TSS rather than the
+// running CPU's.
+pub fn allocate_and_init_idt(cpu_id: LogicalCpuId, pcr: *mut ProcessorControlRegion) -> *mut Idt {
     let idt = Box::leak(Box::new(Idt::new()));
 
     let backup_stack = Kstack::new().expect("failed to allocate AP's backup interrupt stack");
     let backup_stack_end = backup_stack.initial_top() as usize;
-    core::mem::forget(backup_stack);
 
     init_generic(cpu_id, idt);
+    // SAFETY: the caller passes the PCR of the AP that will load this IDT, which has not started
+    // yet; the stack is forgotten below.
     unsafe {
-        install_backup_stack(idt, backup_stack_end);
+        install_backup_stack(idt, pcr, &backup_stack);
     }
+    core::mem::forget(backup_stack);
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::kpti::map_idt(idt as *mut Idt as usize);
@@ -289,8 +295,19 @@ pub unsafe fn install_idt(idt_ptr: *mut Idt, cpu_id: LogicalCpuId) {
         *idt_guard = Some(unsafe { &mut *idt_ptr });
     }
 }
+/// Gives NMIs, double faults and machine checks the backup stack `backup` (IST 1), in `idt` and
+/// in the TSS of `pcr`.
+///
+/// # Safety
+///
+/// `pcr` must point to the processor control region of the CPU that will load `idt`, and no
+/// other CPU may be using it. `backup` must never be freed (callers forget it).
 #[cold]
-pub unsafe fn install_backup_stack(idt: &mut Idt, backup_stack_end: usize) {
+pub unsafe fn install_backup_stack(
+    idt: &mut Idt,
+    pcr: *mut ProcessorControlRegion,
+    backup: &Kstack,
+) {
     // We give Non-Maskable Interrupts, Double Fault, and Machine Check exceptions separate
     // stacks, since these (unless we are going to set up NMI watchdogs like Linux does) are
     // considered the most fatal, especially Double Faults which are caused by errors __when
@@ -302,9 +319,13 @@ pub unsafe fn install_backup_stack(idt: &mut Idt, backup_stack_end: usize) {
     idt.entries[8].set_ist(BACKUP_IST);
     idt.entries[18].set_ist(BACKUP_IST);
 
+    // Ferric Oxide: the IST goes in `pcr`, which upstream took to be the running CPU's even when
+    // setting up an AP.
     #[cfg(target_arch = "x86_64")] // TODO: x86
+    // SAFETY: the caller guarantees `pcr` is the PCR of the CPU loading `idt` and unused
+    // elsewhere.
     unsafe {
-        (*crate::arch::gdt::pcr()).tss.ist[usize::from(BACKUP_IST - 1)] = backup_stack_end as u64;
+        (*pcr).tss.ist[usize::from(BACKUP_IST - 1)] = backup.initial_top() as u64;
     }
 }
 
