@@ -21,6 +21,10 @@ log = "0.4.17"
 redox_syscall = "0.5"
 spin = "0.9.5"
 
+# Ferric Oxide: kernel image KASLR (the `kaslr` feature).
+ferric-elfreloc = { path = "../elfreloc", optional = true }
+ferric-hwrand = { path = "../hwrand", optional = true }
+
 [dependencies.redoxfs]
 version = "0.8"
 default-features = false
@@ -48,5 +52,7 @@ fdt = { git = "https://github.com/repnop/fdt.git", rev = "2fb1409edd1877c714a0aa
 [features]
 default = []
 live = []
+# Ferric Oxide: load the kernel at a random address (kernel image KASLR).
+kaslr = ["dep:ferric-elfreloc", "dep:ferric-hwrand"]
 serial_debug = []
 

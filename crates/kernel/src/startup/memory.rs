@@ -658,6 +658,11 @@ pub unsafe fn init(
         let mut bump_allocator = BumpAllocator::<CurrentRmmArch>::new(areas, 0);
 
         let phys_offset = choose_phys_offset();
+        // Ferric Oxide: the bootloader may have moved the kernel image (kernel image KASLR); say
+        // so beside the physical-map KASLR line.
+        if crate::kernel_image_slide() != 0 {
+            info!("KASLR: kernel image randomized");
+        }
         map_memory(args, areas, &mut bump_allocator, phys_offset);
         // The new table is active, so phys_to_virt can follow it now.
         #[cfg(all(target_arch = "x86_64", feature = "kaslr"))]

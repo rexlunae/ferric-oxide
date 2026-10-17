@@ -69,11 +69,13 @@ jobs:
           printf '[kernel.cpu]\nshstk = "auto"\nibt = "auto"\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
-          echo "Kernel features: $features"
-          echo "FERRIC_KERNEL_FEATURES=$features" >> "$GITHUB_ENV"
-          relibc="$(sed -n 's/^export FERRIC_RELIBC_FEATURES:=//p' "$out/config.mk")"
-          echo "FERRIC_RELIBC_FEATURES=$relibc" >> "$GITHUB_ENV"
+          # Pass the recipe-facing settings (kernel and relibc features,
+          # kernel link arguments, bootloader features) on to the build, as
+          # image.yml does.
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES; do
+            value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
+            echo "$var=$value" | tee -a "$GITHUB_ENV"
+          done
           cat "$out/kernel-config.toml"
           echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
 
