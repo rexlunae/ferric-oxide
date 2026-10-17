@@ -1,7 +1,8 @@
 [source]
-# Ferric Oxide kernel fork (tracks upstream gitlab.redox-os.org/redox-os/kernel)
-git = "https://github.com/rexlunae/kernel.git"
-branch = "main"
+# The kernel lives in this repository at kernel/, a git subtree of
+# gitlab.redox-os.org/redox-os/kernel (see .github/workflows/subtree-sync.yml).
+# The path is relative to the repository root, where the cookbook runs.
+path = "kernel"
 
 [build]
 template = "custom"

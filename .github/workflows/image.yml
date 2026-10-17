@@ -4,7 +4,8 @@ name: image
 #
 # The build runs in Redox's own CI container with prebuilt packages
 # (REPO_BINARY=1); only the packages marked "source" in
-# config/ferric-smoke.toml are compiled, from the Ferric Oxide forks.
+# config/ferric-smoke.toml are compiled, from the trees in this repository
+# (kernel/) or from their recipes' sources.
 
 on:
   push:
@@ -12,15 +13,6 @@ on:
     branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
-    inputs:
-      kernel_repo:
-        description: "Kernel git URL to build instead of the recipe's (optional)"
-        required: false
-        default: ""
-      kernel_ref:
-        description: "Kernel branch, tag or commit to build (with kernel_repo)"
-        required: false
-        default: ""
 
 concurrency:
   group: image-${{ github.ref }}
@@ -49,13 +41,6 @@ jobs:
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Use a different kernel source
-        if: ${{ inputs.kernel_repo != '' }}
-        env:
-          KERNEL_REPO: ${{ inputs.kernel_repo }}
-          KERNEL_REF: ${{ inputs.kernel_ref }}
-        run: scripts/ferric-ci/use-local-source.sh kernel "$KERNEL_REPO" "$KERNEL_REF"
 
       - uses: actions/cache@v4
         with:
