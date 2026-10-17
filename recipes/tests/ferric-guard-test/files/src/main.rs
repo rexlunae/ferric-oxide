@@ -59,10 +59,12 @@ fn probe(which: &str) -> ExitCode {
     let which = which.to_owned();
     let handle = std::thread::spawn(move || {
         let (base, _) = own_stack().expect("stack bounds");
+        // `pthread_getattr_np` reports the usable stack, so the guard is the
+        // page just below it.
         let addr = if which == "guard" {
-            base
+            base - PAGE_SIZE
         } else {
-            base + PAGE_SIZE
+            base
         };
         // SAFETY: deliberately touches the guard page; a fault is the point.
         let byte = unsafe { std::ptr::read_volatile(addr as *const u8) };
