@@ -141,6 +141,8 @@ redox_protocols.workspace = true
 default = ["check_against_libc_crate", "no_trace"]
 check_against_libc_crate = ["__libc_only_for_layout_checks"]
 math_libm = []
+# Ferric Oxide: randomize the stack of programs this libc starts (ASLR).
+aslr = ["redox-rt/aslr"]
 no_trace = ["log/release_max_level_debug"]
 # for very verbose activity beyond trace level
 trace_tls = []

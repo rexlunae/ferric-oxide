@@ -18,10 +18,14 @@ redox-path.workspace = true
 redox_protocols.workspace = true
 
 generic-rt = { path = "../generic-rt" }
+# Ferric Oxide: shared crate from the monorepo's crates/ (see recipes/core/relibc).
+ferric-hwrand = { path = "../../crates/hwrand", optional = true }
 
 [features]
 proc = []
 default = ["proc"]
+# Ferric Oxide: start each new program's stack at a random address.
+aslr = ["dep:ferric-hwrand"]
 
 [lints]
 workspace = true

@@ -58,6 +58,23 @@ pub unsafe fn init() {
     }
 }
 
+/// Ferric Oxide: records that the main thread's stack ends at `top`, as exec reported in
+/// `AT_FERRIC_STACK_TOP`, instead of the fixed [`STACK_TOP`] that [`init`] assumes.
+///
+/// # Safety
+///
+/// Must only be called by the main thread, after [`init`], before any other thread exists.
+#[cfg(target_os = "redox")]
+pub unsafe fn set_main_stack_top(top: usize) {
+    let Some(base) = top.checked_sub(STACK_SIZE) else {
+        return;
+    };
+    if let Some(tcb) = unsafe { Tcb::current() } {
+        tcb.pthread.stack_base = base as *mut c_void;
+        tcb.pthread.stack_size = STACK_SIZE;
+    }
+}
+
 //static NEXT_INDEX: AtomicU32 = AtomicU32::new(FIRST_THREAD_IDX + 1);
 //const FIRST_THREAD_IDX: usize = 1;
 

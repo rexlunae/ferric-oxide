@@ -945,7 +945,7 @@ const ASLR_BASE_RANGE: usize = 1 << 44;
 /// or 0 (upstream placement) without the `aslr` feature or hardware randomness.
 fn aslr_base() -> usize {
     #[cfg(feature = "aslr")]
-    if let Some(random) = crate::random::hw_u64().and_then(|r| usize::try_from(r).ok()) {
+    if let Some(random) = ferric_hwrand::u64().and_then(|r| usize::try_from(r).ok()) {
         let offset = (random % ASLR_BASE_RANGE) & !(PAGE_SIZE - 1);
         return ASLR_BASE_MIN.saturating_add(offset);
     }

@@ -254,16 +254,24 @@ help = "Bring up application processors. Turning this off gives a single-CPU ker
 id = "kernel.aslr"
 menu = "kernel"
 type = "bool"
-title = "Randomize user-space mmap addresses (ASLR)"
+title = "Randomize user-space addresses (ASLR)"
 default = true
 depends = "target.arch == 'x86_64'"
 kernel_feature = "aslr"
-rebuild = ["kernel"]
+rebuild = ["kernel", "relibc"]
 help = """
 Give every new address space a random starting point (32 bits, from RDRAND)
-for mappings that do not ask for a fixed address: heaps, thread stacks, shared
-libraries and file mappings. Fixed mappings, such as non-PIE executables, are
-not moved. Without RDRAND, mappings are placed as upstream places them."""
+for mappings that do not ask for a fixed address: PIE executables, heaps,
+thread stacks, shared libraries and file mappings. relibc's exec also puts
+each program's main stack at a random page up to 16 GiB below the top of user
+space (22 bits). Fixed mappings, such as non-PIE executables, are not moved.
+Without RDRAND, everything is placed as upstream places it."""
+
+# exec runs in the parent process, in relibc, so the stack part is a relibc
+# feature.
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_RELIBC_FEATURES = "aslr" }
 
 [[option]]
 id = "kernel.prot_none"
