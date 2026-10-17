@@ -275,8 +275,8 @@ unsafe fn walk_kstack(mut bp: usize, buf: &mut [usize; 32], len: &mut usize) {
     // Runs inside an NMI handler!
 
     for i in *len..32 {
-        if bp < CurrentRmmArch::PHYS_OFFSET
-            || bp.saturating_add(16) >= CurrentRmmArch::PHYS_OFFSET + crate::PML4_SIZE
+        if bp < CurrentRmmArch::phys_offset()
+            || bp.saturating_add(16) >= CurrentRmmArch::phys_offset() + crate::PML4_SIZE
         {
             break;
         }

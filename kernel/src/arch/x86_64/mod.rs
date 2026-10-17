@@ -11,6 +11,10 @@ pub mod macros;
 /// Constants like memory locations
 pub mod consts;
 
+/// Ferric Oxide: randomized kernel memory layout
+#[cfg(feature = "kaslr")]
+pub mod kaslr;
+
 /// Interrupt instructions
 #[macro_use]
 pub mod interrupt;

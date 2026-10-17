@@ -1,4 +1,8 @@
-use core::{arch::asm, num::NonZeroU8};
+use core::{
+    arch::asm,
+    num::NonZeroU8,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{Arch, PhysicalAddress, TableKind, VirtualAddress};
 
@@ -42,6 +46,11 @@ impl Arch for X8664Arch {
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1) as usize; // PML4 slot 256 and onwards
 
     #[inline(always)]
+    fn phys_offset() -> usize {
+        PHYS_OFFSET_CURRENT.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
     fn invalidate(address: VirtualAddress) {
         unsafe { asm!("invlpg [{0}]", in(reg) address.data()) };
     }
@@ -70,6 +79,23 @@ impl Arch for X8664Arch {
         let masked = address.data() & 0xFFFF_8000_0000_0000;
         // TODO: 5-level paging
         masked == 0xFFFF_8000_0000_0000 || masked == 0
+    }
+}
+
+/// Ferric Oxide: the current base of the physical memory map, which the kernel may move once at
+/// boot to randomize it (KASLR). Starts at [`Arch::PHYS_OFFSET`], where the bootloader puts it.
+static PHYS_OFFSET_CURRENT: AtomicUsize = AtomicUsize::new(X8664Arch::PHYS_OFFSET);
+
+impl X8664Arch {
+    /// Moves the physical memory map to `offset`.
+    ///
+    /// # Safety
+    ///
+    /// The active page table must map all physical memory that will be reached through
+    /// [`Arch::phys_to_virt`] at `offset`, and no CPU may be using addresses derived from the old
+    /// offset that are not also still mapped.
+    pub unsafe fn set_phys_offset(offset: usize) {
+        PHYS_OFFSET_CURRENT.store(offset, Ordering::Relaxed);
     }
 }
 

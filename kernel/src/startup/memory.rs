@@ -422,11 +422,23 @@ unsafe fn map_phys_contiguous_inactive<A: Arch>(
     assert_eq!(page_count, 0);
 }
 
+/// Builds the kernel's page table and switches to it. Physical memory is mapped linearly at
+/// `phys_offset`, which can differ from the bootloader's (KASLR); the boot stack stays where the
+/// bootloader mapped it, because this code runs on it.
 unsafe fn map_memory<A: Arch>(
     args: &KernelArgs,
     areas: &[MemoryArea],
     bump_allocator: &mut BumpAllocator<A>,
+    phys_offset: usize,
 ) {
+    let phys_to_new_virt = |phys: PhysicalAddress| {
+        VirtualAddress::new(
+            phys.data()
+                .checked_add(phys_offset)
+                .expect("physical address beyond the end of the physical memory map"),
+        )
+    };
+
     unsafe {
         let mut mapper = PageMapper::<A, _>::create(TableKind::Kernel, &mut *bump_allocator)
             .expect("failed to create Mapper");
@@ -445,7 +457,7 @@ unsafe fn map_memory<A: Arch>(
             if area.size % PAGE_SIZE != 0 || area.base.data() % PAGE_SIZE != 0 {
                 error!("Unaligned area: {area:?}");
             }
-            let virt_base = A::phys_to_virt(area.base);
+            let virt_base = phys_to_new_virt(area.base);
 
             map_phys_contiguous_inactive(
                 &mut mapper,
@@ -499,7 +511,7 @@ unsafe fn map_memory<A: Arch>(
             let size = area.end.saturating_sub(area.start);
             for i in 0..size / PAGE_SIZE {
                 let phys = PhysicalAddress::new(base + i * PAGE_SIZE);
-                let virt = A::phys_to_virt(phys);
+                let virt = phys_to_new_virt(phys);
                 let flags = kernel_page_flags::<A>(virt);
                 let flush = mapper
                     .map_phys(virt, phys, flags, 0)
@@ -514,7 +526,7 @@ unsafe fn map_memory<A: Arch>(
             let size = area.end.saturating_sub(area.start);
             for i in 0..size / PAGE_SIZE {
                 let phys = PhysicalAddress::new(base + i * PAGE_SIZE);
-                let virt = A::phys_to_virt(phys);
+                let virt = phys_to_new_virt(phys);
                 let flags = kernel_page_flags::<A>(virt).device_memory(true);
                 let flush = mapper
                     .map_phys(virt, phys, flags, 0)
@@ -548,6 +560,33 @@ unsafe fn map_memory<A: Arch>(
         // Use the new table
         mapper.make_current();
     }
+}
+
+/// Where the kernel's page table maps physical memory: a random place with the `kaslr` feature on
+/// x86_64 when the CPU can provide randomness, the bootloader's place otherwise.
+fn choose_phys_offset() -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "kaslr"))]
+    {
+        let phys_end = unsafe { &*MEMORY_MAP.get() }
+            .iter()
+            .filter(|entry| entry.kind != Null)
+            .map(|entry| entry.end)
+            .max()
+            .unwrap_or(0);
+        match crate::arch::kaslr::choose_phys_offset(phys_end) {
+            Some(offset) => {
+                info!(
+                    "KASLR: physical memory map randomized ({} bits)",
+                    crate::arch::kaslr::entropy_bits(phys_end)
+                );
+                return offset;
+            }
+            None => {
+                warn!("KASLR: no hardware randomness or room; physical memory map not moved");
+            }
+        }
+    }
+    CurrentRmmArch::phys_offset()
 }
 
 pub unsafe fn init(
@@ -596,7 +635,11 @@ pub unsafe fn init(
         // Create a basic allocator for the first pages
         let mut bump_allocator = BumpAllocator::<CurrentRmmArch>::new(areas, 0);
 
-        map_memory(args, areas, &mut bump_allocator);
+        let phys_offset = choose_phys_offset();
+        map_memory(args, areas, &mut bump_allocator, phys_offset);
+        // The new table is active, so phys_to_virt can follow it now.
+        #[cfg(all(target_arch = "x86_64", feature = "kaslr"))]
+        CurrentRmmArch::set_phys_offset(phys_offset);
 
         // Create the physical memory map
         let offset = bump_allocator.offset();
