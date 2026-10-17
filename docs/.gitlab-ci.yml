@@ -1,0 +1,28 @@
+stages:
+  - build
+  - test
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "redox-os"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+
+mdbook:
+  stage: build
+  image:
+    name: peaceiris/mdbook:latest
+    entrypoint: [""] # force an empty entrypoint
+  script:
+  - ./unused_pages.sh
+  - mdbook build
+  artifacts:
+    paths:
+      - book
+
+lychee:
+  stage: test
+  image:
+    name: lycheeverse/lychee:latest-alpine
+    entrypoint: [""] # force an empty entrypoint
+  script:
+  - lychee --no-progress --offline --root-dir $(pwd)/book ./book

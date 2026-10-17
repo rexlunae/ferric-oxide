@@ -38,6 +38,9 @@ jobs:
           - prefix: userspace/redoxfs
             url: https://gitlab.redox-os.org/redox-os/redoxfs.git
             ref: master
+          - prefix: docs
+            url: https://gitlab.redox-os.org/redox-os/book.git
+            ref: master
     steps:
       - uses: actions/checkout@v4
         with:

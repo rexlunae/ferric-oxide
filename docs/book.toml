@@ -1,0 +1,21 @@
+[book]
+title = "The Redox Operating System"
+authors = ["The RedoxOS Developers"]
+description = "This book carefully describes the design, implementation, direction, and structure of Redox, the operating system."
+src = "src"
+
+[output.html]
+theme = "./theme"
+
+# Optional PDF output
+[output.compress]
+highlight = "no-node"
+optional = true
+theme = "./theme"
+
+# Disabled until issues can be fixed
+# [output.linkcheck]
+# # web links can spuriously fail on CI
+# follow-web-links = false
+# # do not require to build book
+# optional = true
