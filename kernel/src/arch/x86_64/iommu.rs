@@ -3,8 +3,8 @@
 //! Every VT-d unit the DMAR table lists is switched on with every device in one identity
 //! domain, so IOVA equals physical address and DMA behaves as before (io/iommu-design.md in
 //! the project files, step 1). [`domain`] adds DMA domains with their own tables that
-//! devices can be moved into and out of (step 2); nothing outside the boot self-test
-//! ([`selftest`]) uses them yet.
+//! devices can be moved into and out of (step 2), which the boot self-test ([`selftest`])
+//! checks and user space gets through the `iommu` scheme (`scheme/iommu.rs`, step 3).
 //!
 //! For each unit the kernel maps the register set, reads CAP/ECAP, builds (once per address
 //! width) second-stage tables that identity-map all of physical memory, the reserved ranges
@@ -728,6 +728,10 @@ pub fn init() {
         LAYOUT.call_once(|| layout);
         *DOMAIN_IDS.lock() = Some(DomainIds::new(FIRST_DMA_DOMAIN, layout.domain_id_limit));
         selftest::run();
+        if cfg!(iommu = "enforce") {
+            // Until `memory:translation` returns IOVAs, enforce only adds the bind check.
+            info!("IOMMU: enforce mode: a driver can bind only a domain with a device attached");
+        }
     } else if !units.is_empty() {
         warn!("IOMMU: the units share no table layout; DMA domains are unavailable");
     }

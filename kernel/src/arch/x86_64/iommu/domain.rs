@@ -14,16 +14,22 @@
 //! (page-selective where possible) and waited on, and only then are emptied table pages
 //! freed.
 //!
-//! Nothing in user space can create a domain yet; the `iommu` scheme comes next.
+//! A device that an RMRR names gets that reserved memory mapped one-to-one in the domain
+//! before it is attached, so the firmware's DMA to it keeps working. Device scopes that name
+//! bridges (in DRHDs and RMRRs) are resolved with the bus ranges pcid reports through
+//! [`report_bridge`].
+//!
+//! User space creates domains and attaches devices through the `iommu` scheme
+//! (`scheme/iommu.rs`).
 
-use alloc::vec::Vec;
-use core::fmt;
+use alloc::{collections::BTreeMap, vec::Vec};
+use core::{fmt, ops::Range};
 
 use ferric_vtd::{
-    dmar::Structure,
+    dmar::{BusRange, Structure},
     invalidation::{iotlb_flush_for, Request},
     iova::{IovaAllocator, IovaError, IovaRange},
-    plan::{select_unit, unit_coverage, DomainLayout, SelectError, IDENTITY_DOMAIN},
+    plan::{select_unit, unit_coverage_with, DomainLayout, SelectError, IDENTITY_DOMAIN},
     table::{
         self, Access, ContextEntry, MapError, RangeError, RootEntry, TableMemory, TranslationType,
         UnmapError, ENTRIES,
@@ -31,7 +37,12 @@ use ferric_vtd::{
     Bdf,
 };
 
+use spin::Mutex;
+
 use super::{Error, KernelTables, NoMemory, Unit, UnitState, DMAR, DOMAIN_IDS, LAYOUT, UNITS};
+
+/// The bus ranges of the PCI-to-PCI bridges pcid has reported, by segment and requester ID.
+static BRIDGES: Mutex<BTreeMap<(u16, u16), BusRange>> = Mutex::new(BTreeMap::new());
 
 /// Why a domain operation failed.
 #[derive(Debug)]
@@ -55,8 +66,6 @@ pub enum DomainError {
         /// The unit's register base.
         base: u64,
     },
-    /// An RMRR names the device; mapping its reserved memory in a domain is not done yet.
-    ReservedMemory,
     /// The device belongs to another domain.
     Busy {
         /// That domain's ID.
@@ -81,7 +90,6 @@ impl fmt::Display for DomainError {
             Self::Unmap(err) => write!(f, "unmap: {err}"),
             Self::Select(err) => write!(f, "{err}"),
             Self::UnitNotEnabled { base } => write!(f, "VT-d unit {base:#x} is not enabled"),
-            Self::ReservedMemory => f.write_str("the device has reserved memory (RMRR)"),
             Self::Busy { did } => write!(f, "the device is in domain {did}"),
             Self::AlreadyAttached => f.write_str("the device is already attached"),
             Self::NotAttached => f.write_str("the device is not attached"),
@@ -114,6 +122,8 @@ pub struct Domain {
     iova: IovaAllocator,
     /// The attached devices and the index in `UNITS` of the unit that serves each.
     attached: Vec<(Device, usize)>,
+    /// The RMRRs mapped one-to-one for attached devices.
+    reserved: Vec<Range<u64>>,
 }
 
 impl Domain {
@@ -153,6 +163,7 @@ impl Domain {
             tables,
             iova: IovaAllocator::new(layout.iova_limit, reserved),
             attached: Vec::new(),
+            reserved: Vec::new(),
         })
     }
 
@@ -164,6 +175,11 @@ impl Domain {
     /// The physical address of the second-stage root table.
     pub fn root_table(&self) -> u64 {
         self.root
+    }
+
+    /// How many devices are attached.
+    pub fn device_count(&self) -> usize {
+        self.attached.len()
     }
 
     /// How many table pages the domain holds, the root included.
@@ -262,36 +278,72 @@ impl Domain {
         table::translate(&mut self.tables, self.root, self.layout.agaw, iova)
     }
 
-    /// Moves `device` from the identity domain (or the blocked state) into this domain.
+    /// Moves `device` from the identity domain (or the blocked state) into this domain,
+    /// after mapping the reserved memory of every RMRR that names it one-to-one.
     ///
     /// # Errors
     ///
     /// [`DomainError::Select`] or [`DomainError::UnitNotEnabled`] when no enabled unit
-    /// serves the device, [`DomainError::ReservedMemory`] when an RMRR names it,
+    /// serves the device, [`DomainError::Map`] when an RMRR cannot be mapped,
     /// [`DomainError::Busy`] when it is in another domain, [`DomainError::AlreadyAttached`],
-    /// and [`DomainError::Hardware`] when an invalidation fails.
+    /// and [`DomainError::Hardware`] when an invalidation fails. On error the RMRRs mapped for
+    /// this call are unmapped again.
     pub fn attach(&mut self, device: Device) -> Result<(), DomainError> {
         if self.attached.iter().any(|&(d, _)| d == device) {
             return Err(DomainError::AlreadyAttached);
         }
-        if has_rmrr(device) {
-            return Err(DomainError::ReservedMemory);
-        }
         let index = unit_for(device)?;
+        let mapped = self.map_reserved(device)?;
         let entry = ContextEntry::new(
             self.root,
             self.layout.agaw,
             self.did,
             TranslationType::Untranslated,
         );
-        set_context(index, device.bdf, Target::Entry(entry), |old| {
+        let result = set_context(index, device.bdf, Target::Entry(entry), |old| {
             match old.is_present().then(|| old.domain_id()) {
                 Some(did) if did != IDENTITY_DOMAIN => Err(DomainError::Busy { did }),
                 _ => Ok(()),
             }
-        })?;
+        });
+        if let Err(err) = result {
+            self.unmap_reserved(mapped);
+            return Err(err);
+        }
         self.attached.push((device, index));
         Ok(())
+    }
+
+    /// Maps the RMRRs that name `device` and are not mapped yet one-to-one, and returns them.
+    fn map_reserved(&mut self, device: Device) -> Result<Vec<Range<u64>>, DomainError> {
+        let mut mapped = Vec::new();
+        for range in rmrr_ranges(device) {
+            if self.reserved.contains(&range) {
+                continue;
+            }
+            let len = range.end.saturating_sub(range.start);
+            if let Err(err) = self.map(range.start, range.start, len, Access::ReadWrite) {
+                self.unmap_reserved(mapped);
+                return Err(err);
+            }
+            self.reserved.push(range.clone());
+            mapped.push(range);
+        }
+        Ok(mapped)
+    }
+
+    /// Unmaps RMRRs that [`Domain::map_reserved`] mapped, after a failed attach.
+    fn unmap_reserved(&mut self, ranges: Vec<Range<u64>>) {
+        for range in ranges {
+            self.reserved.retain(|r| *r != range);
+            let len = range.end.saturating_sub(range.start);
+            if let Err(err) = self.unmap(range.start, len) {
+                warn!(
+                    "IOMMU: cannot unmap RMRR {:#x}-{:#x} from domain {}: {err}",
+                    range.start, range.end, self.did
+                );
+            }
+        }
     }
 
     /// Takes `device` out of this domain and blocks it: its DMA faults until it is attached
@@ -389,11 +441,11 @@ fn unit_for(device: Device) -> Result<usize, DomainError> {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let chosen = select_unit(
-        drhds
-            .iter()
-            .map(|d| unit_coverage(d, device.segment, device.bdf)),
-    )
+    let chosen = select_unit(drhds.iter().map(|d| {
+        unit_coverage_with(d, device.segment, device.bdf, |bridge| {
+            bridge_buses(device.segment, bridge)
+        })
+    }))
     .map_err(DomainError::Select)?;
     let base = drhds
         .get(chosen)
@@ -405,18 +457,38 @@ fn unit_for(device: Device) -> Result<usize, DomainError> {
         .ok_or(DomainError::UnitNotEnabled { base })
 }
 
-/// Whether an RMRR names `device` directly.
-pub(super) fn has_rmrr(device: Device) -> bool {
-    DMAR.get().is_some_and(|dmar| {
-        super::rmrrs(dmar)
-            .filter(|rmrr| rmrr.segment == device.segment)
-            .any(|rmrr| {
-                rmrr.scopes
-                    .iter()
-                    .flatten()
-                    .any(|scope| scope.direct_bdf() == Some(device.bdf))
+/// Records the bus range behind the bridge at `bridge` in `segment`, as pcid read it from the
+/// bridge's configuration space, so that device scopes naming the bridge can be resolved.
+pub fn report_bridge(segment: u16, bridge: Bdf, buses: BusRange) {
+    BRIDGES.lock().insert((segment, bridge.source_id()), buses);
+}
+
+/// The bus range behind `bridge` in `segment`, if pcid reported it.
+fn bridge_buses(segment: u16, bridge: Bdf) -> Option<BusRange> {
+    BRIDGES.lock().get(&(segment, bridge.source_id())).copied()
+}
+
+/// The memory of every RMRR that names `device`. Scopes that pass through bridges pcid has
+/// not reported do not match.
+fn rmrr_ranges(device: Device) -> Vec<Range<u64>> {
+    let Some(dmar) = DMAR.get() else {
+        return Vec::new();
+    };
+    super::rmrrs(dmar)
+        .filter(|rmrr| rmrr.segment == device.segment)
+        .filter(|rmrr| {
+            rmrr.scopes.iter().flatten().any(|scope| {
+                scope.covers(device.bdf, |bridge| bridge_buses(device.segment, bridge))
+                    == Some(true)
             })
-    })
+        })
+        .filter_map(|rmrr| Some(rmrr.base..rmrr.end()?))
+        .collect()
+}
+
+/// Whether an RMRR names `device`.
+pub(super) fn has_rmrr(device: Device) -> bool {
+    !rmrr_ranges(device).is_empty()
 }
 
 /// What a device's context entry becomes.

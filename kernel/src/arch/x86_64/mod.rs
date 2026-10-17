@@ -29,7 +29,7 @@ pub mod kpti;
 pub mod ibt;
 
 /// Ferric Oxide: Intel VT-d DMA remapping
-#[cfg(iommu = "auto")]
+#[cfg(iommu_enabled)]
 pub mod iommu;
 
 // TODO: Maybe support rewriting relocations (using LD's --emit-relocs) when working with entire

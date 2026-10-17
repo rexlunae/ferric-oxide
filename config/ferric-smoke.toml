@@ -21,6 +21,8 @@ ferric-aslr-test = "source"
 ferric-guard-test = "source"
 ferric-tlb-test = "source"
 ferric-syscall-fuzz = "source"
+# pcid-spawner starts it for the host bridge: it gets a DMA domain from pcid.
+ferric-iommu-test = "source"
 
 [[files]]
 path = "/usr/lib/init.d/30_console"

@@ -224,7 +224,7 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
         current_reservations[1] |= 0x0003_FFFF;
 
         // Ferric Oxide: the VT-d fault event interrupt (arch/x86_64/iommu.rs).
-        #[cfg(all(target_arch = "x86_64", iommu = "auto"))]
+        #[cfg(all(target_arch = "x86_64", iommu_enabled))]
         {
             use crate::arch::iommu::{fault_interrupt, FAULT_VECTOR};
             if let Some(entry) = current_idt.get_mut(usize::from(FAULT_VECTOR)) {
