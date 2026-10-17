@@ -30,7 +30,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -75,7 +75,9 @@ mod sys {
     pub const NANOSLEEP: usize = 162;
     pub const YIELD: usize = 158;
 
+    /// `FUTEX_WAIT`: block while a 32-bit word holds the given value.
     pub const FUTEX_WAIT: usize = 0;
+    /// `EINVAL`, returned negated in the result register.
     pub const EINVAL: usize = 22;
 
     pub const O_RDONLY: usize = 0x0001_0000;
@@ -155,6 +157,9 @@ const MAX_MAPS: usize = 64;
 const MAX_FDS: usize = 48;
 /// Time a child may run before the parent kills it.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Exit code of a child whose fixed-bug check at start-up failed, so the
+/// parent can fail the run even though children's stderr is discarded.
+const REGRESSED_EXIT: i32 = 3;
 
 /// xorshift64*: small, fast and good enough to pick arguments.
 struct Rng(u64);
@@ -738,6 +743,21 @@ impl Fuzzer {
         let ret = unsafe { sys::call(sys::FUTEX, args) };
         if ret != sys::EINVAL.wrapping_neg() {
             eprintln!("fuzz: negative futex timeout returned {ret:#x}, not EINVAL");
+            std::process::exit(REGRESSED_EXIT);
+        }
+
+        // A timer write with a negative time registered a deadline that never
+        // arrives; it now fails with EINVAL. Clock 4 is CLOCK_MONOTONIC.
+        let mut time = [0u8; 16];
+        time[..8].copy_from_slice(&(-1i64).to_ne_bytes());
+        let result = OpenOptions::new()
+            .write(true)
+            .open("/scheme/time/4/timer")
+            .and_then(|mut timer| timer.write(&time));
+        if result.as_ref().err().and_then(std::io::Error::raw_os_error) != Some(sys::EINVAL as i32)
+        {
+            eprintln!("fuzz: negative timer write returned {result:?}, not EINVAL");
+            std::process::exit(REGRESSED_EXIT);
         }
     }
 
@@ -785,6 +805,7 @@ struct Tally {
     children: usize,
     exited: usize,
     signaled: usize,
+    regressed: usize,
     timed_out: usize,
     /// Seeds of the children that timed out, replayed with tracing at the end.
     hung: Vec<u64>,
@@ -955,6 +976,8 @@ fn reap(running: &mut Vec<Running>, tally: &mut Tally) -> Result<(), String> {
         };
         if status.signal().is_some() {
             tally.signaled += 1;
+        } else if status.code() == Some(REGRESSED_EXIT) {
+            tally.regressed += 1;
         } else {
             tally.exited += 1;
         }
@@ -1047,6 +1070,15 @@ fn main() -> ExitCode {
             println!(
                 "FERRIC_TEST_FAIL fuzz seed={} {} of {} children hung (seeds printed above)",
                 opts.seed, t.timed_out, t.children
+            );
+            ExitCode::FAILURE
+        }
+        Ok(t) if t.regressed > 0 => {
+            // Every child runs the same checks, so one seed reproduces it with
+            // FERRIC_FUZZ_VERBOSE=1 to see which check failed.
+            println!(
+                "FERRIC_TEST_FAIL fuzz seed={} {} of {} children failed a regression check",
+                opts.seed, t.regressed, t.children
             );
             ExitCode::FAILURE
         }
