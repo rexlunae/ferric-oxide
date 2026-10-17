@@ -26,7 +26,8 @@ if [ -w /dev/kvm ]; then
     cpu="${cpu:-host}"
 else
     echo "boot-smoke: /dev/kvm not writable, falling back to TCG" >&2
-    cpu="${cpu:-max}"
+    # TCG cannot emulate "host"; "max" is the closest it has.
+    if [ -z "$cpu" ] || [ "$cpu" = host ]; then cpu=max; fi
 fi
 
 # Work on a copy so the artifact stays pristine.
@@ -48,6 +49,7 @@ qemu_pid=$!
 tail -n +1 -f "$log" --pid="$qemu_pid" &
 tail_pid=$!
 
+crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
 status=""
 crash=""
 for ((i = 0; i < timeout_secs; i++)); do
@@ -56,7 +58,7 @@ for ((i = 0; i < timeout_secs; i++)); do
         wait "$qemu_pid" || status=$?
         break
     fi
-    if grep -qaE 'UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at' "$log"; then
+    if grep -qaE "$crash_pattern" "$log"; then
         crash=1
         sleep 2 # let the rest of the backtrace reach the log
         break
@@ -78,13 +80,21 @@ if grep -q '^FERRIC_TEST_FAIL' <<< "$clean"; then
     echo "boot-smoke: FAIL, a test reported failure" >&2
     exit 1
 fi
+# A crash after the marker (during shutdown, say) still fails the run, even
+# when QEMU exited before the watch loop saw it.
+if [ -n "$crash" ] || grep -qaE "$crash_pattern" <<< "$clean"; then
+    echo "boot-smoke: FAIL, crash on the console (see above)" >&2
+    exit 1
+fi
+if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$clean"; then
+    echo "boot-smoke: FAIL, no test reported a result" >&2
+    exit 1
+fi
 if grep -q '^FERRIC_SMOKE_OK' <<< "$clean"; then
     echo "boot-smoke: PASS (cpu=$cpu, qemu exit $status)"
     exit 0
 fi
-if [ -n "$crash" ]; then
-    echo "boot-smoke: FAIL, crash on the console (see above)" >&2
-elif [ "$status" = 124 ]; then
+if [ "$status" = 124 ]; then
     echo "boot-smoke: FAIL, timed out after ${timeout_secs}s without the marker" >&2
 else
     echo "boot-smoke: FAIL, QEMU exited with $status without the marker" >&2

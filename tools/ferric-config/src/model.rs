@@ -465,6 +465,26 @@ mod tests {
     }
 
     #[test]
+    fn v4_needs_avx512_patched_in() {
+        let s = real_schema();
+        let r = resolve(
+            &s,
+            &user(&[
+                ("cpu.x86_64_level", Value::Str("v4".into())),
+                ("kernel.cpu.avx512", Value::Str("auto".into())),
+                ("kernel.self_modifying", Value::Bool(false)),
+            ]),
+        );
+        assert!(
+            r.diags
+                .iter()
+                .any(|d| d.level == Level::Error && d.message.contains("kernel.cpu.avx512")),
+            "{:?}",
+            r.diags
+        );
+    }
+
+    #[test]
     fn edit_preserves_comments() {
         let s = real_schema();
         let dir = std::env::temp_dir().join(format!("ferric-config-test-{}", std::process::id()));
