@@ -5,6 +5,10 @@ export RUST_TARGET_PATH?=$(SOURCE)/targets
 CARGO_ARGS=--release --locked --target $(TARGET) \
 			-Z build-std=core,alloc \
 			-Z build-std-features=compiler-builtins-mem
+# Ferric Oxide: extra Cargo features, such as kaslr (kernel image KASLR).
+ifneq ($(BOOTLOADER_FEATURES),)
+CARGO_ARGS+=--features $(BOOTLOADER_FEATURES)
+endif
 
 include $(SOURCE)/mk/$(TARGET).mk
 

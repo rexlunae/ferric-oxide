@@ -84,12 +84,12 @@ jobs:
           printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
-          echo "Kernel features: $features"
-          echo "FERRIC_KERNEL_FEATURES=$features" >> "$GITHUB_ENV"
-          relibc="$(sed -n 's/^export FERRIC_RELIBC_FEATURES:=//p' "$out/config.mk")"
-          echo "relibc features: $relibc"
-          echo "FERRIC_RELIBC_FEATURES=$relibc" >> "$GITHUB_ENV"
+          # Pass the recipe-facing settings (kernel and relibc features,
+          # kernel link arguments, bootloader features) on to the build.
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES; do
+            value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
+            echo "$var=$value" | tee -a "$GITHUB_ENV"
+          done
           # CPU feature policy for the kernel's config.toml (recipes/core/kernel).
           if [ -f "$out/kernel-config.toml" ]; then
             cat "$out/kernel-config.toml"
@@ -193,7 +193,8 @@ jobs:
 
       - name: Check KASLR, KPTI and PCID ran
         run: |
-          grep -F "KASLR: physical memory map randomized" "$LOG"
+          grep -aF "KASLR: physical memory map randomized" "$LOG"
+          grep -aF "KASLR: kernel image randomized" "$LOG"
           grep -aF "KPTI: user page tables isolated from the kernel" "$LOG"
           # kernel.cpu.pcid defaults to "auto": with -cpu host the guest gets PCID and INVPCID
           # whenever the runner has them, and then KPTI must use them.

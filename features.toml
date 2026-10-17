@@ -304,6 +304,26 @@ its usual place and the boot log says so. Randomizing the kernel image itself
 comes later."""
 
 [[option]]
+id = "kernel.kaslr_image"
+menu = "kernel"
+type = "bool"
+title = "Load the kernel at a random address (kernel image KASLR)"
+default = true
+depends = "target.arch == 'x86_64'"
+rebuild = ["kernel", "bootloader"]
+help = """
+Have the bootloader map the kernel at a random page inside the 1 GiB window
+reserved for it (about 18 bits of randomness, from RDRAND) instead of at its
+link address. The kernel is linked with --emit-relocs so the bootloader can
+fix up its absolute addresses for the new place first. Kernel stack traces
+print link addresses, which match kernel.sym. Without RDRAND, or with a
+kernel that has no relocations, the kernel loads at its link address."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_KERNEL_LINK_ARGS = "--emit-relocs", FERRIC_BOOTLOADER_FEATURES = "kaslr" }
+
+[[option]]
 id = "kernel.iommu"
 menu = "kernel"
 type = "choice"

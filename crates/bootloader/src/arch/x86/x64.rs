@@ -68,16 +68,19 @@ pub unsafe fn paging_create(os: &impl Os, kernel_phys: u64, kernel_size: u64) ->
             pdp[510] = pd.as_ptr() as u64 | WRITABLE | PRESENT;
 
             // Map kernel_size bytes to kernel offset, i.e. to the start of the PD.
+            // Ferric Oxide: or `slide` bytes into it, with kernel image KASLR.
+            let slide = crate::kaslr::slide();
 
             let mut kernel_mapped = 0;
 
-            let mut pd_idx = 0;
+            let mut pd_idx = (slide >> 21) as usize;
+            let mut first_pt_idx = ((slide >> 12) as usize) % PAGE_ENTRIES;
             while kernel_mapped < kernel_size && pd_idx < pd.len() {
                 let pt = paging_allocate(os)?;
                 pd[pd_idx] = pt.as_ptr() as u64 | WRITABLE | PRESENT;
                 pd_idx += 1;
 
-                let mut pt_idx = 0;
+                let mut pt_idx = core::mem::take(&mut first_pt_idx);
                 while kernel_mapped < kernel_size && pt_idx < pt.len() {
                     let addr = kernel_phys + kernel_mapped;
                     pt[pt_idx] = addr | WRITABLE | PRESENT;

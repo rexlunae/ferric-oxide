@@ -28,10 +28,13 @@ wget-log
 /ferric.toml
 
 # Links to the shared crates made by recipes whose source has path
-# dependencies on them (see recipes/core/{kernel,relibc,base}). Only
-# recipe.toml is tracked in the kernel and relibc recipe directories.
+# dependencies on them (see recipes/core/{kernel,relibc,bootloader,base}).
+# Only recipe.toml is tracked in the kernel, relibc and bootloader recipe
+# directories.
 /recipes/core/kernel/*
 !/recipes/core/kernel/recipe.toml
+/recipes/core/bootloader/*
+!/recipes/core/bootloader/recipe.toml
 /recipes/core/relibc/*
 !/recipes/core/relibc/recipe.toml
 /recipes/core/crates

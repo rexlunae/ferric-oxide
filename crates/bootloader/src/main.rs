@@ -23,6 +23,7 @@ mod os;
 
 mod arch;
 mod editor;
+mod kaslr;
 mod logger;
 mod serial_16550;
 
@@ -538,6 +539,9 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         unsafe {
             KERNEL_64BIT = kernel_64bit;
         }
+        // Ferric Oxide: kernel image KASLR moves the entry point with the image.
+        #[cfg(feature = "kaslr")]
+        let kernel_entry = kernel_entry + kaslr::randomize(kernel, kernel_64bit);
         (kernel, kernel_entry)
     };
 
