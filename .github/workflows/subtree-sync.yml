@@ -38,6 +38,9 @@ jobs:
           - prefix: userspace/redoxfs
             url: https://gitlab.redox-os.org/redox-os/redoxfs.git
             ref: master
+          - prefix: userspace/base
+            url: https://gitlab.redox-os.org/redox-os/base.git
+            ref: main
           - prefix: docs
             url: https://gitlab.redox-os.org/redox-os/book.git
             ref: master

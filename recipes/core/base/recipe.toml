@@ -1,5 +1,7 @@
 [source]
-git = "https://gitlab.redox-os.org/redox-os/base.git"
+# base lives in this repository at userspace/base/, a git subtree of
+# gitlab.redox-os.org/redox-os/base (see .github/workflows/subtree-sync.yml).
+path = "userspace/base"
 
 [build]
 template = "custom"

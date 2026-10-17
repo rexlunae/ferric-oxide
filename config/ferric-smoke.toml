@@ -15,6 +15,7 @@ kernel = "source"
 relibc = "source"
 bootloader = "source"
 redoxfs = "source"
+base = "source"
 ferric-xstate-test = "source"
 
 [[files]]
