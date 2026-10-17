@@ -94,18 +94,23 @@ pub fn plan_unit(control: u64, efr: ExtendedFeatures) -> Result<UnitPlan, SkipRe
 pub struct DomainLayout {
     /// The tables' depth.
     pub levels: Levels,
-    /// The leaf sizes mappings may use: the default page sizes of levels 2 and 3, which every
-    /// IOMMU supports.
+    /// The leaf sizes mappings may use. [`domain_layout`] picks 4 KiB pages only (see there).
     pub large_pages: LargePages,
     /// One past the largest IOVA.
     pub iova_limit: u64,
 }
 
 /// The layout DMA domains use on IOMMUs with these plans, or `None` when there are none.
+///
+/// Mappings use 4 KiB pages only. Larger leaves (a PTE with Next Level 0 in a level-2 or
+/// level-3 table, which the specification gives that level's default page size) are encoded
+/// by [`crate::table`], but QEMU 10.2's `amd-iommu` translates such a 2 MiB leaf correctly
+/// only in its first 4 KiB, sending DMA at any other offset to the wrong memory without
+/// a fault. They stay off until they are tested on hardware.
 pub fn domain_layout(plans: impl IntoIterator<Item = UnitPlan>) -> Option<DomainLayout> {
     plans.into_iter().next().map(|_| DomainLayout {
         levels: DOMAIN_LEVELS,
-        large_pages: LargePages::Up1G,
+        large_pages: LargePages::None,
         iova_limit: DOMAIN_LEVELS.limit(),
     })
 }
@@ -123,6 +128,7 @@ mod tests {
         let layout = domain_layout([plan]).unwrap();
         assert_eq!(layout.levels, Levels::Four);
         assert_eq!(layout.iova_limit, 1 << 48);
+        assert_eq!(layout.large_pages, LargePages::None);
         assert!(HT_RESERVED.end <= layout.iova_limit);
         assert_eq!(domain_layout([]), None);
     }
