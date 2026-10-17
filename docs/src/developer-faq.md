@@ -11,6 +11,7 @@ The [General FAQ](https://www.redox-os.org/faq/) have questions and answers of/f
     - [Why Redox prefer to port software from source instead of binary compatibility?](#why-redox-prefer-to-port-software-from-source-instead-of-binary-compatibility)
     - [When relibc ABI breaks?](#when-relibc-abi-breaks)
     - [What are the CPU requirements of Redox?](#what-are-the-cpu-requirements-of-redox)
+    - [Why Redox have its own build system?](#why-redox-have-its-own-build-system)
     - [How can I port a program?](#how-can-i-port-a-program)
     - [How can I write a driver?](#how-can-i-write-a-driver)
     - [How can I debug?](#how-can-i-debug)
@@ -172,6 +173,12 @@ When statically linked, the kernel ABI can't break.
 ### What are the CPU requirements of Redox?
 
 Read [this](./hardware-support.md#cpu-requirements) section.
+
+### Why Redox have its own build system?
+
+The Redox build system (mostly Cookbook) was created to be fully adapted to easy/fast Redox development, cross-compilation and porting. Not easily or not available in other build systems.
+
+There's a minimal variant of the build system (Redoxer) focused on quick system/application/CI testing without complex C/C++ dependency, QEMU and development configuration.
 
 ### How can I port a program?
 
