@@ -59,7 +59,9 @@ const RESPONSE_DMA_DOMAIN: u32 = 11;
 /// `ferric_iommu::abi::Verb::Bind`.
 const VERB_BIND: u64 = 3;
 
-/// `CallFlags::READ` and `CallFlags::FD` from `redox_syscall`.
+/// `CallFlags::WRITE`, `CallFlags::READ` and `CallFlags::FD` from `redox_syscall`. relibc
+/// passes the payload to the kernel only with READ, WRITE or both set.
+const CALL_WRITE: usize = 1 << 9;
 const CALL_READ: usize = 1 << 10;
 const CALL_FD: usize = 1 << 11;
 
@@ -415,8 +417,14 @@ impl Translator {
     /// The DMA address `memory:translation` gives the page at `virt`.
     fn translate(&self, virt: usize) -> Result<usize, Failure> {
         let mut buf = virt.to_ne_bytes();
-        sys::call(self.file.as_raw_fd() as usize, &mut buf, 0, &[])
-            .map_err(|errno| Failure::Call("translation", errno))?;
+        // The kernel reads the virtual address from the payload and writes the answer back.
+        sys::call(
+            self.file.as_raw_fd() as usize,
+            &mut buf,
+            CALL_READ | CALL_WRITE,
+            &[],
+        )
+        .map_err(|errno| Failure::Call("translation", errno))?;
         Ok(usize::from_ne_bytes(buf))
     }
 }
