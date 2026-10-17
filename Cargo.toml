@@ -9,10 +9,11 @@ members = [
 ]
 # Recipe sources are checked out under recipes/ and build as their own
 # packages; build output and the toolchain prefix are not crates either.
-# The bootloader is its own target workspace but has no [workspace] table
-# upstream, so it is excluded here to build standalone.
+# The bootloader and user space build for other targets but have no
+# [workspace] table upstream, so they are excluded here to build standalone.
 exclude = [
     "bootloader",
+    "userspace",
     "recipes",
     "build",
     "prefix",

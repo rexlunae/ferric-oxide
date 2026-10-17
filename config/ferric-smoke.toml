@@ -14,6 +14,7 @@ filesystem_size = 256
 kernel = "source"
 relibc = "source"
 bootloader = "source"
+redoxfs = "source"
 ferric-xstate-test = "source"
 
 [[files]]

@@ -35,6 +35,9 @@ jobs:
           - prefix: bootloader
             url: https://gitlab.redox-os.org/redox-os/bootloader.git
             ref: master
+          - prefix: userspace/redoxfs
+            url: https://gitlab.redox-os.org/redox-os/redoxfs.git
+            ref: master
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,7 +52,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          branch="subtree-sync/${PREFIX}"
+          branch="subtree-sync/${PREFIX//\//-}"
           before="$(git rev-parse HEAD)"
           git fetch --quiet "$URL" "$REF"
           upstream="$(git rev-parse --short FETCH_HEAD)"
