@@ -74,9 +74,12 @@ kill "$tail_pid" 2>/dev/null || true
 
 # The console mixes in CRs and escape sequences; normalize before matching.
 clean="$(tr -d '\r' < "$log")"
+# Markers can share a line with other console output (the login prompt, say),
+# so match them wherever they start, one per line.
+markers="$(grep -ao 'FERRIC_\(TEST_[A-Z]*\|SMOKE_[A-Z]*\).*' <<< "$clean" || true)"
 # Test programs report FERRIC_TEST_PASS/SKIP/FAIL lines; any FAIL fails the run.
-grep '^FERRIC_TEST_' <<< "$clean" || true
-if grep -q '^FERRIC_TEST_FAIL' <<< "$clean"; then
+grep '^FERRIC_TEST_' <<< "$markers" || true
+if grep -q '^FERRIC_TEST_FAIL' <<< "$markers"; then
     echo "boot-smoke: FAIL, a test reported failure" >&2
     exit 1
 fi
@@ -86,11 +89,11 @@ if [ -n "$crash" ] || grep -qaE "$crash_pattern" <<< "$clean"; then
     echo "boot-smoke: FAIL, crash on the console (see above)" >&2
     exit 1
 fi
-if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$clean"; then
+if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$markers"; then
     echo "boot-smoke: FAIL, no test reported a result" >&2
     exit 1
 fi
-if grep -q '^FERRIC_SMOKE_OK' <<< "$clean"; then
+if grep -q '^FERRIC_SMOKE_OK' <<< "$markers"; then
     echo "boot-smoke: PASS (cpu=$cpu, qemu exit $status)"
     exit 0
 fi
