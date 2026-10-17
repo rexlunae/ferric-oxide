@@ -163,6 +163,11 @@ pub struct ProcessorControlRegion {
     pub kpti_entry_top: usize,
     // Ferric Oxide (KPTI): scratch slot for the entry and exit code, which has no free register.
     pub kpti_scratch: usize,
+    // Ferric Oxide (KPTI): bits ORed into CR3 by the entry and exit code. `kpti_cr3_noflush` is
+    // the no-flush bit (63) with PCID, else 0; `kpti_cr3_user` turns a kernel-table CR3 into its
+    // shadow's: the shadow bit, plus the user PCID and the no-flush bit with PCID.
+    pub kpti_cr3_noflush: usize,
+    pub kpti_cr3_user: usize,
     // The GDT *must* be stored in the PCR! The paranoid interrupt handler, lacking a reliable way
     // to correctly obtain GSBASE, uses SGDT to calculate the PCR offset.
     pub gdt: [GdtEntry; SEGMENT_COUNT],
@@ -194,6 +199,8 @@ impl ProcessorControlRegion {
             kernel_rsp: 0,
             kpti_entry_top: 0,
             kpti_scratch: 0,
+            kpti_cr3_noflush: 0,
+            kpti_cr3_user: 0,
             gdt: BASE_GDT,
             percpu: PercpuBlock::init(cpu_id),
             _rsvd: Align([0; 2]),

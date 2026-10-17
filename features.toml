@@ -533,7 +533,27 @@ Give each process a second page table that maps almost none of the kernel and
 is loaded while user code runs, so Meltdown (CVE-2017-5754) cannot read kernel
 memory. "auto" turns it on for Intel CPUs that do not report RDCL_NO; AMD CPUs
 and recent Intel ones are not affected and pay nothing. It costs two page-table
-switches and TLB flushes per system call and interrupt on affected CPUs."""
+switches and TLB flushes per system call and interrupt on affected CPUs; see
+kernel.cpu.pcid for avoiding the flushes."""
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.pcid"
+menu = "kernel.cpu"
+type = "choice"
+title = "PCIDs for KPTI (no-flush page-table switches)"
+default = "auto"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.pcid"
+rebuild = ["kernel"]
+help = """
+When KPTI is on, tag the kernel and user page tables with two process-context
+identifiers (PCIDs), so the page-table switches on every system call and
+interrupt keep the TLB instead of flushing it. Unmap, mprotect and TLB
+shootdowns also invalidate the user PCID with INVPCID; switching between
+processes still flushes. "auto" uses it when the CPU reports PCID and INVPCID
+(Intel Haswell, AMD Zen 3 and newer); "always" panics at boot when KPTI is on
+and the CPU lacks them. Has no effect while KPTI is off."""
 choices = ["always", "auto", "never"]
 
 [[option]]
@@ -755,8 +775,13 @@ message = "Prebuilt packages are compiled for baseline x86-64; only packages you
 
 [[rule]]
 level = "warn"
-when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto' || kernel.cpu.ibt == 'auto')"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto' || kernel.cpu.pcid == 'auto' || kernel.cpu.ibt == 'auto')"
 message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && kernel.cpu.pcid == 'always' && kernel.cpu.kpti == 'never'"
+message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" it does nothing."
 
 [[rule]]
 level = "error"

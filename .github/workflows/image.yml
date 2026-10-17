@@ -149,10 +149,18 @@ jobs:
           zstd -d harddrive.img.zst -o harddrive.img
           scripts/ferric-ci/boot-smoke.sh harddrive.img serial-${{ matrix.cpu }}.log ${{ matrix.cpu }}
 
-      - name: Check KASLR and KPTI ran
+      - name: Check KASLR, KPTI and PCID ran
         run: |
           grep -F "KASLR: physical memory map randomized" serial-${{ matrix.cpu }}.log
           grep -aF "KPTI: user page tables isolated from the kernel" serial-${{ matrix.cpu }}.log
+          # kernel.cpu.pcid defaults to "auto": with -cpu host the guest gets PCID and INVPCID
+          # whenever the runner has them, and then KPTI must use them.
+          if grep -qw pcid /proc/cpuinfo && grep -qw invpcid /proc/cpuinfo; then
+            grep -aF "KPTI: PCID enabled, no-flush CR3 switches" serial-${{ matrix.cpu }}.log
+          else
+            echo "::warning::runner CPU lacks PCID or INVPCID; KPTI ran without PCID"
+            if grep -aF "KPTI: PCID enabled" serial-${{ matrix.cpu }}.log; then exit 1; fi
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()

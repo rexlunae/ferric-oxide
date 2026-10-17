@@ -284,6 +284,11 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
             // Set up IDT
             idt::install_idt(args.idt_ptr, args.cpu_id);
 
+            // Ferric Oxide (KPTI): before anything that could invalidate a TLB entry, since with
+            // PCID every invalidation also uses INVPCID, which faults until CR4.PCIDE is set.
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::kpti::init_cpu();
+
             // Initialize paging
             paging::init();
 
@@ -291,8 +296,6 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
 
             #[cfg(target_arch = "x86_64")]
             crate::arch::alternative::early_init(false);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::kpti::init_cpu();
 
             // Set up syscall instruction
             interrupt::syscall::init();

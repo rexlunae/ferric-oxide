@@ -277,6 +277,12 @@ pub const KPTI_ENTRY_TOP: usize =
 /// PCR offset of the top of the current context's kernel stack.
 pub const KPTI_KERNEL_RSP: usize =
     core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kernel_rsp);
+/// PCR offset of the bits ORed into CR3 to load a table without flushing (bit 63 with PCID).
+pub const KPTI_CR3_NOFLUSH: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_cr3_noflush);
+/// PCR offset of the bits ORed into a kernel-table CR3 to load its shadow.
+pub const KPTI_CR3_USER: usize =
+    core::mem::offset_of!(crate::arch::gdt::ProcessorControlRegion, kpti_cr3_user);
 
 // Wraps KPTI code in the "kpti" alternative, with a jump over the padding when it is off.
 macro_rules! kpti_alternative {
@@ -293,6 +299,11 @@ macro_rules! kpti_alternative {
 // CPU put the frame on the entry stack, move it to the kernel stack. GS is left as it was, so the
 // usual SWAPGS logic that follows still applies. From the kernel ($fix = 1): if the shadow is
 // loaded (an exception between switching tables and leaving the kernel), load the kernel table.
+//
+// Loading the kernel table clears the shadow bit (12) and the user PCID bit (11, never set
+// without PCID) and, from user space, ORs in the no-flush bit from the PCR. The kernel-mode fix
+// may run with the user's GS (a fault on IRETQ), so it cannot read the PCR and lets the write
+// flush the kernel PCID instead, which is always correct.
 macro_rules! kpti_enter {
     ($err:literal, $fix:literal) => {
         kpti_alternative!(concat!(
@@ -304,7 +315,8 @@ macro_rules! kpti_enter {
         swapgs
         mov gs:[{KPTI_SCRATCH}], rax
         mov rax, cr3
-        btr rax, 12
+        and rax, -0x1801
+        or rax, gs:[{KPTI_CR3_NOFLUSH}]
         mov cr3, rax
         lea rax, [rsp + 40 + ",
             $err,
@@ -345,6 +357,7 @@ macro_rules! kpti_enter {
         mov rax, cr3
         btr rax, 12
         jnc 76f
+        and rax, -0x801
         mov cr3, rax
     76:
         pop rax
@@ -356,8 +369,9 @@ macro_rules! kpti_enter {
 }
 
 // Last thing before IRETQ (or SYSRETQ), with the five-word interrupt frame at RSP. Returning to
-// user space: copy the frame to the entry stack and load the shadow table. $gs_user is 1 when
-// SWAPGS has already restored the user GS, 0 when GS is still the kernel's.
+// user space: copy the frame to the entry stack and load the shadow table, by ORing the PCR's
+// `kpti_cr3_user` into CR3 (the shadow bit, plus the user PCID and no-flush bit with PCID). $gs_user
+// is 1 when SWAPGS has already restored the user GS, 0 when GS is still the kernel's.
 macro_rules! kpti_exit {
     ($gs_user:literal) => {
         kpti_alternative!(concat!(
@@ -378,7 +392,7 @@ macro_rules! kpti_exit {
         push QWORD PTR [rax + 8]
         push QWORD PTR [rax]
         mov rax, cr3
-        bts rax, 12
+        or rax, gs:[{KPTI_CR3_USER}]
         mov cr3, rax
         mov rax, gs:[{KPTI_SCRATCH}]
         .if ",
@@ -394,15 +408,18 @@ macro_rules! kpti_exit {
 
 // Paranoid handlers (NMI, #MC, #DB) can interrupt the entry or exit code with either table
 // loaded. Save CR3 in R12 (callee-saved, and already pushed) and load the kernel table; restore
-// the saved one on the way out.
+// the saved one on the way out. Both run with the kernel GS, so both switch without flushing when
+// PCID is on: TLB invalidations never wait for a flush on a later switch (see kpti.rs).
 macro_rules! kpti_paranoid_save {
     () => {
         kpti_alternative!(
             "
         mov r12, cr3
-        mov rax, r12
-        btr rax, 12
+        bt r12, 12
         jnc 78f
+        mov rax, r12
+        and rax, -0x1801
+        or rax, gs:[{KPTI_CR3_NOFLUSH}]
         mov cr3, rax
     78:
     "
@@ -415,6 +432,7 @@ macro_rules! kpti_paranoid_restore {
             "
         bt r12, 12
         jnc 79f
+        or r12, gs:[{KPTI_CR3_NOFLUSH}]
         mov cr3, r12
     79:
     "
@@ -581,6 +599,8 @@ macro_rules! interrupt_stack {
                 KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
                 KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
                 KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
 
                 PCR_GDT_OFFSET = const(core::mem::offset_of!($crate::arch::gdt::ProcessorControlRegion, gdt)),
             );
@@ -627,6 +647,8 @@ macro_rules! interrupt {
                 KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
                 KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
                 KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
             );
         }
     };
@@ -681,6 +703,8 @@ macro_rules! interrupt_error {
                 KPTI_SCRATCH = const($crate::arch::interrupt::handler::KPTI_SCRATCH),
                 KPTI_ENTRY_TOP = const($crate::arch::interrupt::handler::KPTI_ENTRY_TOP),
                 KPTI_KERNEL_RSP = const($crate::arch::interrupt::handler::KPTI_KERNEL_RSP),
+                KPTI_CR3_NOFLUSH = const($crate::arch::interrupt::handler::KPTI_CR3_NOFLUSH),
+                KPTI_CR3_USER = const($crate::arch::interrupt::handler::KPTI_CR3_USER),
                 rax_offset = const(size_of::<$crate::arch::interrupt::handler::PreservedRegisters>() + size_of::<$crate::arch::interrupt::handler::ScratchRegisters>() - 8),
             );
         }
