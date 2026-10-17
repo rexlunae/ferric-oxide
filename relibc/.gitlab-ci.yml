@@ -1,0 +1,91 @@
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+workflow:
+  rules:
+    - if: '$CI_PROJECT_NAMESPACE == "redox-os"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+
+stages:
+    - build
+    - cross-build
+    - test
+before_script:
+    cargo install cbindgen
+
+fmt:
+    stage: build
+    needs: []
+    script:
+        - redoxer env cargo fmt -- --check
+
+clippy:
+    stage: build
+    needs: []
+    script:
+        - ./check.sh --clippy
+
+linux:
+    stage: build
+    script:
+        - rustup component add clippy
+        - ./check.sh --host
+        - ./check.sh --host --clippy
+
+x86_64:
+    stage: build
+    script:
+        - ./check.sh --arch=x86_64
+
+i586:
+    stage: cross-build
+    image: "registry.redox-os.org/redox-os/redoxer:i586"
+    script:
+        - ./check.sh --arch=i586
+        - ./check.sh --arch=i586 --clippy
+
+aarch64:
+    stage: cross-build
+    image: "registry.redox-os.org/redox-os/redoxer:aarch64"
+    script:
+        - ./check.sh --arch=aarch64
+        - ./check.sh --arch=aarch64 --clippy
+
+riscv64gc:
+    stage: cross-build
+    script:
+        - ./check.sh --arch=riscv64gc
+        - ./check.sh --arch=riscv64gc --clippy
+
+test:linux:
+    stage: test
+    needs: [linux]
+    script:
+        - ./check.sh --host --test
+
+test:x86_64:
+    stage: test
+    needs: [x86_64]
+    script:
+        - timeout -s KILL 9m ./check.sh --arch=x86_64 --test
+
+test:aarch64:
+    stage: test
+    needs: [aarch64]
+    image: "registry.redox-os.org/redox-os/redoxer:aarch64"
+    # many issues that not exist in x86_64, and lack of interest to fix so far
+    allow_failure: true
+    when: manual
+    script:
+        - timeout -s KILL 9m ./check.sh --arch=aarch64 --test
+
+test:i586:
+    stage: test
+    needs: [i586]
+    image: "registry.redox-os.org/redox-os/redoxer:i586"
+    allow_failure: true
+    when: manual
+    script:
+        - timeout -s KILL 9m ./check.sh --arch=i586 --test
+
+#TODO: Enable more arch once dynamic linker working

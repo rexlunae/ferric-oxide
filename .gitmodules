@@ -1,0 +1,10 @@
+# Submodules of the upstream subtrees. The subtrees keep upstream's own
+# .gitmodules, but git only reads this file, so each nested submodule is
+# listed here with its path in this repository.
+[submodule "relibc/openlibm"]
+	path = relibc/openlibm
+	url = https://gitlab.redox-os.org/redox-os/openlibm.git
+	branch = master
+[submodule "relibc/dlmalloc-rs"]
+	path = relibc/dlmalloc-rs
+	url = https://gitlab.redox-os.org/redox-os/dlmalloc-rs.git

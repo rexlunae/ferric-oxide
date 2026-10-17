@@ -1,0 +1,7 @@
+[submodule "openlibm"]
+	path = openlibm
+	url = https://gitlab.redox-os.org/redox-os/openlibm.git
+	branch = master
+[submodule "src/dlmalloc-rs"]
+	path = dlmalloc-rs
+	url = https://gitlab.redox-os.org/redox-os/dlmalloc-rs.git

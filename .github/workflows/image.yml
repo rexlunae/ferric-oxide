@@ -36,11 +36,18 @@ jobs:
       CI: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Building relibc from source regenerates its C headers with cbindgen,
+      # which the container does not ship.
+      - name: Install cbindgen
+        run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
       - uses: actions/cache@v4
         with:

@@ -29,6 +29,9 @@ jobs:
           - prefix: kernel
             url: https://gitlab.redox-os.org/redox-os/kernel.git
             ref: master
+          - prefix: relibc
+            url: https://gitlab.redox-os.org/redox-os/relibc.git
+            ref: master
     steps:
       - uses: actions/checkout@v4
         with:

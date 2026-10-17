@@ -1,5 +1,8 @@
 [source]
-git = "https://gitlab.redox-os.org/redox-os/relibc.git"
+# relibc lives in this repository at relibc/, a git subtree of
+# gitlab.redox-os.org/redox-os/relibc (see .github/workflows/subtree-sync.yml).
+# Its openlibm and dlmalloc-rs submodules are listed in the root .gitmodules.
+path = "relibc"
 
 [build]
 template = "custom"

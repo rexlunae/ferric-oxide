@@ -1,0 +1,76 @@
+use core::mem::size_of;
+
+use syscall::Result;
+
+use crate::{RtTcb, arch::*, proc::*, static_proc_info};
+
+/// Spawns a new context sharing the same address space as the current one (i.e. a new thread).
+pub unsafe fn rlct_clone_impl(stack: *mut usize, tcb: &RtTcb) -> Result<usize> {
+    let proc_info = static_proc_info();
+    let cur_proc_fd = proc_info.proc_fd.as_ref().unwrap();
+
+    let cur_thr_fd = RtTcb::current().thread_fd();
+    let new_thr_fd = cur_proc_fd.dup_into_upper(b"new-thread")?;
+
+    // Inherit existing address space
+    {
+        let cur_addr_space_fd = cur_thr_fd.dup_into_upper(b"addrspace")?;
+        let new_addr_space_sel_fd = new_thr_fd.dup_into_upper(b"current-addrspace")?;
+
+        let buf = create_set_addr_space_buf(
+            cur_addr_space_fd.as_raw_fd(),
+            __relibc_internal_rlct_clone_ret as *const () as usize,
+            stack as usize,
+        );
+        new_addr_space_sel_fd.write(&buf)?;
+    }
+
+    // Inherit reference to file table
+    {
+        let cur_filetable_fd = cur_thr_fd.dup_into_upper(b"filetable")?;
+        let new_filetable_sel_fd = new_thr_fd.dup_into_upper(b"current-filetable")?;
+
+        new_filetable_sel_fd.write(&usize::to_ne_bytes(cur_filetable_fd.as_raw_fd()))?;
+    }
+
+    // Since the signal handler is not yet initialized, signals specifically targeting the thread
+    // (relibc is only required to implement thread-specific signals that already originate from
+    // the same process) will be discarded. Process-specific signals will ignore this new thread,
+    // until it has initialized its own signal handler.
+
+    let start_fd = new_thr_fd.dup_into_upper(b"start")?;
+
+    let fd = new_thr_fd.as_raw_fd();
+    unsafe {
+        tcb.thr_fd.get().write(Some(new_thr_fd));
+    }
+
+    // Unblock context.
+    start_fd.write(&[0])?;
+
+    Ok(fd)
+}
+
+pub unsafe fn exit_this_thread(stack_base: *mut (), stack_size: usize) -> ! {
+    let _guard = crate::signal::tmp_disable_signals();
+    let thread_fd = RtTcb::current().thread_fd();
+
+    // TODO: modify interface so it writes directly to the thread fd?
+    let status_fd = thread_fd.dup_into_upper(b"status").unwrap();
+    unsafe { exit_this_thread_inner(stack_base, stack_size, status_fd) }
+}
+
+/// exit_this_thread, but current thread_fd might has disappear
+pub unsafe fn exit_this_thread_inner(
+    stack_base: *mut (),
+    stack_size: usize,
+    status_fd: FdGuard<true>,
+) -> ! {
+    let mut buf = [0; size_of::<usize>() * 3];
+    plain::slice_from_mut_bytes(&mut buf)
+        .unwrap()
+        .copy_from_slice(&[usize::MAX, stack_base as usize, stack_size]);
+    // TODO: SYS_CALL w/CONSUME
+    status_fd.write(&buf).unwrap();
+    unreachable!()
+}

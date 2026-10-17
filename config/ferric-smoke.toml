@@ -3,7 +3,7 @@
 # Boots the minimal system, prints a few facts about the machine on the serial
 # console between two markers, and shuts down. CI builds this image with
 # REPO_BINARY=1, so every package comes prebuilt from the Redox package server
-# except the ones marked "source" below, which come from the Ferric Oxide forks.
+# except the ones marked "source" below, which are built from this repository.
 
 include = ["minimal.toml"]
 
@@ -12,6 +12,7 @@ filesystem_size = 256
 
 [packages]
 kernel = "source"
+relibc = "source"
 ferric-xstate-test = "source"
 
 [[files]]
