@@ -15,5 +15,10 @@ exclude = [
     "prefix",
 ]
 
+# Versions shared by more than one host tool.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [profile.release.package.ferric-config]
 opt-level = 2
