@@ -79,6 +79,10 @@ interrupt_stack!(breakpoint, |stack| {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // Ferric Oxide (shadow stacks): this rewrites the saved RIP but is only reached from a
+        // ring-3 int3, whose return goes through IRETQ with an SSP the CPU reloaded from
+        // IA32_PL0_SSP, so the shadow-stack copy is not involved and needs no sync. A future
+        // in-kernel breakpoint would need the shadow frame updated too (see arch/x86_64/shstk.rs).
         stack.iret.rip -= 1;
     }
 
@@ -183,6 +187,14 @@ interrupt_error!(protection, |stack, code| {
 
         if was_failing_msr {
             // 0F 30 (WRMSR) or 0F 32 (RDMSR)
+            // Ferric Oxide (shadow stacks): this advances the saved RIP past the faulting MSR
+            // instruction inside the ring-0 rdmsr_safe/wrmsr_safe wrappers, then returns via
+            // IRETQ. With CET shadow stacks on, the ring-0 #GP pushed a shadow frame whose LIP
+            // still points at the faulting instruction, so this IRETQ would raise #CP unless the
+            // shadow copy is advanced too (which is left for a later step; the frame layout is not
+            // verified here). This path is only reached from the privileged ACPI/MSR scheme
+            // (rdmsr_safe/wrmsr_safe have no in-kernel callers), so boot and the shadow-stack
+            // self-test never hit it; see arch/x86_64/shstk.rs.
             stack.iret.rip += 2;
             stack.scratch.rsi = usize::MAX;
         }
@@ -317,9 +329,11 @@ interrupt_error!(security, |stack, _code| {
     }
 });
 
-// Ferric Oxide (IBT, see arch/x86_64/ibt.rs): with kernel indirect branch tracking on, an
-// indirect branch that misses `endbr64` lands here. User-mode CET is never enabled, so a #CP from
-// user space is unexpected; it is handled like other faults there.
+// Ferric Oxide (CET, see arch/x86_64/ibt.rs and shstk.rs): with kernel indirect branch tracking
+// on, an indirect branch that misses `endbr64` lands here; with kernel shadow stacks on, so does a
+// `ret`/`iretq` whose return address differs from the shadow-stack copy, or a bad SSP token.
+// User-mode CET is never enabled, so a #CP from user space is unexpected; it is handled like other
+// faults there.
 #[cfg(target_arch = "x86_64")]
 interrupt_error!(control_protection, |stack, code| {
     let fault = ferric_cet::ControlProtectionError::from_error_code(code as u64);
@@ -335,9 +349,10 @@ interrupt_error!(control_protection, |stack, code| {
     }
     println!("Control protection fault code={:#x}", code);
     stack.trace();
-    // RIP is the branch target that lacks `endbr64`; the trace above shows who branched there.
+    // For an IBT fault RIP is the branch target that lacks `endbr64`; for a shadow-stack fault it
+    // is the `ret`/`iretq` or token instruction. The trace above shows how execution got there.
     panic!(
-        "IBT: control protection fault (#CP) in the kernel at {:#x}: {}",
+        "CET: control protection fault (#CP) in the kernel at {:#x}: {}",
         stack.iret.rip, fault
     );
 });

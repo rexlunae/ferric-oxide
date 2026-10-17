@@ -77,12 +77,6 @@ fn parse_kconfig(arch: &str) -> Option<()> {
 
         println!("cargo:rustc-cfg=cpu_feature_{choice}=\"{name}\"");
 
-        // Ferric Oxide (shadow stacks): allocated but not yet turned on, so "always" would
-        // promise something the kernel does not do.
-        assert!(
-            !(name == "shstk" && choice == "always"),
-            "arch.x86_64.features.shstk must be \"auto\" or \"never\""
-        );
         // Ferric Oxide (shadow stacks): one cfg for "the build has shadow-stack support", so the
         // code outside arch/x86_64/shstk.rs needs no feature-choice logic.
         if name == "shstk" && choice != "never" {

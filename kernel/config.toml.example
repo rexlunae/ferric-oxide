@@ -29,9 +29,12 @@ pcid = "never"
 # "never" makes the Makefile build with -Z cf-protection=branch. "auto" turns it
 # on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.
 ibt = "never"
-# Ferric Oxide: kernel shadow stacks (Intel CET SS), "auto" or "never". So far
-# "auto" logs whether the CPU supports them and, if it does, allocates them for
-# every kernel stack, but does not turn CET on yet.
+# Ferric Oxide: kernel shadow stacks (Intel CET SS), "always", "auto" or
+# "never". "auto" turns CET on where the CPU reports CET_SS and KPTI is off;
+# "always" requires it and panics at boot on a CPU without it (and is rejected
+# at config time unless kpti = "never", since shadow stacks alongside KPTI are
+# not yet supported). On a Meltdown-affected Intel CPU with kpti = "auto" the
+# stacks are allocated but left off.
 shstk = "never"
 
 # vim: ft=toml

@@ -78,6 +78,38 @@ pub const CET_NO_TRACK_EN: u64 = 1 << 4;
 /// The `IA32_S_CET` value for kernel IBT: `endbr64` checks only, no shadow stack, no `notrack`.
 pub const S_CET_KERNEL_IBT: u64 = CET_ENDBR_EN;
 
+/// The `IA32_S_CET` bits for kernel shadow stacks: shadow stacks enabled, plus `WRSS` so the
+/// kernel can repair the live shadow stack when it rewrites a saved return address (the #GP
+/// `rdmsr`/`wrmsr` resume, `recover_and_efault`, `ptrace` and breakpoint fixups). `notrack` stays
+/// off. The shadow-stack and `WRSS` bits are set on the kernel's own (supervisor) shadow stack
+/// only; user mode (`IA32_U_CET`) keeps its reset value of zero.
+pub const S_CET_KERNEL_SHSTK: u64 = CET_SH_STK_EN | CET_WR_SHSTK_EN;
+
+/// The `IA32_S_CET` value the kernel writes, given whether indirect branch tracking and shadow
+/// stacks are each on for this CPU. Zero when neither is, so the caller can skip `CR4.CET`.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_cet::{s_cet_value, S_CET_KERNEL_IBT, S_CET_KERNEL_SHSTK};
+///
+/// assert_eq!(s_cet_value(false, false), 0);
+/// assert_eq!(s_cet_value(true, false), S_CET_KERNEL_IBT);
+/// assert_eq!(s_cet_value(false, true), S_CET_KERNEL_SHSTK);
+/// assert_eq!(s_cet_value(true, true), S_CET_KERNEL_IBT | S_CET_KERNEL_SHSTK);
+/// ```
+#[inline]
+pub const fn s_cet_value(ibt: bool, shstk: bool) -> u64 {
+    let mut value = 0;
+    if ibt {
+        value |= S_CET_KERNEL_IBT;
+    }
+    if shstk {
+        value |= S_CET_KERNEL_SHSTK;
+    }
+    value
+}
+
 /// CR4 bit 23 (CR4.CET): master enable for CET. It can only be set while CR0.WP is set.
 pub const CR4_CET_BIT: u8 = 23;
 
@@ -338,6 +370,20 @@ mod tests {
         assert_eq!(S_CET_KERNEL_IBT & CET_NO_TRACK_EN, 0);
         assert_eq!(IA32_S_CET, 0x6A2);
         assert_eq!(1u64 << CR4_CET_BIT, 0x80_0000);
+    }
+
+    #[test]
+    fn s_cet_combinations() {
+        // The IBT-only value is unchanged, so an IBT-only build writes exactly what it did before
+        // shadow stacks existed.
+        assert_eq!(s_cet_value(true, false), S_CET_KERNEL_IBT);
+        assert_eq!(s_cet_value(true, false), 0b100);
+        // Shadow stacks add SH_STK_EN (bit 0) and WR_SHSTK_EN (bit 1); never NO_TRACK_EN or
+        // user-mode bits.
+        assert_eq!(s_cet_value(false, true), 0b011);
+        assert_eq!(s_cet_value(false, true) & CET_NO_TRACK_EN, 0);
+        assert_eq!(s_cet_value(true, true), 0b111);
+        assert_eq!(s_cet_value(false, false), 0);
     }
 
     #[test]

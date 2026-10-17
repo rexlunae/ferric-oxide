@@ -6,17 +6,19 @@
 //! chains.
 //!
 //! The `shstk` CPU feature (`arch.x86_64.features.shstk` in the kernel config, `kernel.cpu.shstk`
-//! in `ferric.toml`) is either `never` (the default, which builds all of this out and logs
-//! nothing) or `auto`. Like every `auto` CPU feature it needs the `self_modifying` kernel feature
-//! (build.rs turns it into `never` otherwise); the build then sets `cfg(shstk_compiled)`. At boot
+//! in `ferric.toml`) is `never` (the default, which builds all of this out and logs nothing),
+//! `auto` (enable where the CPU supports it) or `always` (require it; boot panics if the CPU
+//! lacks it). Both `auto` and `always` need the `self_modifying` kernel feature (build.rs turns
+//! an `auto` into `never` otherwise); the build then sets `cfg(shstk_compiled)`. At boot
 //! [`decision`] applies the policy to `CPUID.(EAX=7,ECX=0):ECX[7]` on the bootstrap processor,
 //! and [`report`] logs the result.
 //!
-//! # What this step does, and what it does not
+//! # What this step does
 //!
-//! The shadow stacks exist and are kept consistent, but CR4.CET and `IA32_S_CET.SH_STK_EN` stay
-//! clear, so the CPU never uses them yet; the switch code below is patched in only once a later
-//! step turns them on. When the decision is on:
+//! The shadow stacks are allocated and kept consistent (see below), and CR4.CET with
+//! `IA32_S_CET.SH_STK_EN` is turned on per-CPU once SSP is loaded, at a point with no pending
+//! returns ([`enable_params`]/[`confirm_enabled`], called from the startup path right before the
+//! diverging `kmain`/`kmain_ap` calls). When the decision is on:
 //!
 //! - **Allocation.** Every [`Kstack`](crate::context::context::Kstack) gets a [`ShadowStack`]:
 //!   each context's kernel stack, the bootstrap processor's kmain stack, each application
@@ -53,7 +55,8 @@
 //!   address of the incoming context's own `call` into the switch, which `switch_finish_hook`'s
 //!   `ret` pops along with the normal stack's copy. These instructions raise #UD while CET is
 //!   off, so the sequence is an `alternative!` for the `shstk` feature, which
-//!   `alternative::early_init` never selects yet; until then the slot holds NOPs.
+//!   `alternative::early_init` selects once [`enabled_for_cpu`] is true; otherwise the slot
+//!   holds NOPs.
 //! - **New contexts.** `setup_initial_call` builds a new context's kernel stack by hand, with
 //!   `func` and, for user contexts, `enter_usermode` as return addresses no `call` pushed. It
 //!   writes the matching shadow stack ([`ShadowStack::install_initial`],
@@ -62,9 +65,37 @@
 //!   first switch to it then lands on `func`, `func`'s `ret` on `enter_usermode`, and `SSP` is
 //!   back at the supervisor token when the context leaves for user space.
 //!
-//! Turning the CPU on (CR4.CET and `IA32_S_CET.SH_STK_EN`), the `SYSCALL` path, the other
-//! non-local returns (`recover_and_efault`, `rdmsr_safe`/`wrmsr_safe`) and the interaction with
-//! KPTI, whose user-mode page tables do not map the shadow stacks, are left for the next step.
+//! - **`SYSCALL` path.** Hardware interrupts from ring 3 reload `SSP` from `IA32_PL0_SSP` (or the
+//!   IST SSP table) automatically, but `SYSCALL` does not. The entry stub marks the supervisor
+//!   token busy with `SETSSBSY` after switching to the kernel stack, and the `enter_usermode`
+//!   exit path clears it with `RDSSPQ`/`CLRSSBSY` before returning to ring 3, both as
+//!   `alternative!`s for the `shstk` feature.
+//! - **Non-local returns.** `recover_and_efault` restarts the faulting `rep movsb` as a no-op
+//!   (`rcx = 0`) and returns normally, keeping both stacks consistent instead of editing a saved
+//!   RIP, so the usercopy fault path works with CET on. (The `rdmsr_safe`/`wrmsr_safe` #GP
+//!   recovery, which advances a saved ring-0 RIP, is a deferred limitation; see below.)
+//! - **Separate IST stacks.** The NMI, double-fault and machine-check handlers run on their own
+//!   IST stacks, each with its own shadow stack and SSP-table entry, so a fault while the normal
+//!   shadow stack is inconsistent still has a valid shadow stack to switch to.
+//!
+//! # What this step does not do (deferred, hardware-unvalidated)
+//!
+//! - **KPTI.** KPTI's user-mode page tables do not map the kernel shadow stacks, and switching
+//!   SSP alongside RSP on the KPTI entry trampoline is not implemented. Shadow stacks are
+//!   therefore left off whenever KPTI is on ([`enabled_for_cpu`] is `decision() && !kpti`), so on
+//!   a Meltdown-affected Intel CPU with `kpti = "auto"` the stacks are allocated but CET stays
+//!   off. `shstk = "always"` with KPTI not `never` is rejected at config time and panics at boot.
+//! - **`SYSCALL` single-step IRETQ fallback.** The rare single-step-over-`SYSRET` path returns
+//!   with `IRETQ` without building a shadow frame; it predates shadow stacks and is left as-is.
+//! - **Saved-RIP edits.** Handlers that rewrite a saved RIP do not yet sync the shadow-stack
+//!   copy, because the interrupt shadow-frame layout is not verified here:
+//!   - The breakpoint/ptrace path (`exception.rs`) is only reached from a ring-3 `int3`, whose
+//!     return goes through `IRETQ` with a hardware-reloaded SSP, so it does not fault today; a
+//!     future in-kernel breakpoint would need the sync.
+//!   - The `#GP` rdmsr/wrmsr recovery advances a *ring-0* RIP and returns by `IRETQ` into that
+//!     frame, so with CET on it would raise #CP. It is only reachable from the privileged
+//!     ACPI/MSR scheme (`rdmsr_safe`/`wrmsr_safe` have no in-kernel callers), so boot and the
+//!     self-test never hit it; syncing its shadow frame (via `WRSS`) is left for a later step.
 //!
 //! The CPUID, policy, page-encoding and token logic lives in the host-tested `ferric-cet` crate.
 
@@ -76,8 +107,10 @@ use self::stacks::window_covers_ram;
 #[cfg(shstk_compiled)]
 pub use self::stacks::*;
 
-/// The configured policy. build.rs refuses `always`.
-const POLICY: Policy = if cfg!(cpu_feature_auto = "shstk") {
+/// The configured policy.
+const POLICY: Policy = if cfg!(cpu_feature_always = "shstk") {
+    Policy::Always
+} else if cfg!(cpu_feature_auto = "shstk") {
     Policy::Auto
 } else {
     Policy::Never
@@ -101,11 +134,44 @@ pub fn decision() -> bool {
     if POLICY == Policy::Never {
         return false;
     }
-    // `decide` only fails for `always`, which this build cannot have; `report` says so.
     *DECISION.call_once(|| {
-        ferric_cet::decide(Feature::ShadowStack, POLICY, cpu_has_shstk()).unwrap_or(false)
-            && window_covers_ram()
+        match ferric_cet::decide(Feature::ShadowStack, POLICY, cpu_has_shstk()) {
+            // `always` on a CPU without shadow stacks: stop with a clear message, like IBT.
+            Err(err) => panic!("CET: {err}; rebuild with kernel.cpu.shstk = \"auto\" or \"never\""),
+            Ok(on) => on && window_covers_ram(),
+        }
     })
+}
+
+/// Whether this CPU actually turns CET shadow stacks on, as opposed to only allocating them. It
+/// is [`decision`] minus the one combination this step does not yet support: KPTI, whose
+/// user-mode page tables do not map the kernel shadow stacks, so an interrupt from user space
+/// could not reach its supervisor token (see the module docs). The shadow stacks are still
+/// allocated and kept consistent in that case; the CPU just never uses them.
+///
+/// # Panics
+///
+/// When the policy is `always` but KPTI is on, so the requirement cannot be met.
+#[cfg(shstk_compiled)]
+pub fn enabled_for_cpu() -> bool {
+    if !decision() {
+        return false;
+    }
+    if crate::arch::kpti::enabled() {
+        assert!(
+            POLICY != Policy::Always,
+            "CET: kernel.cpu.shstk = \"always\" cannot be met with KPTI on; this step does not \
+             yet enable shadow stacks alongside KPTI. Use \"auto\", or kernel.cpu.kpti = \"never\""
+        );
+        return false;
+    }
+    true
+}
+
+/// Without shadow-stack support the CPU never turns them on.
+#[cfg(not(shstk_compiled))]
+pub fn enabled_for_cpu() -> bool {
+    false
 }
 
 /// Without shadow-stack support there is no window; [`decision`] never gets this far.
@@ -115,25 +181,32 @@ fn window_covers_ram() -> bool {
 }
 
 /// Logs whether the CPU supports shadow stacks and what the policy decided. Called once, on the
-/// BSP. Does nothing when the policy is `never`.
+/// BSP, before [`enable_cpu`] turns them on. Does nothing when the policy is `never`.
 pub fn report() {
     if POLICY == Policy::Never {
         return;
     }
     let supported = cpu_has_shstk();
-    if let Err(err) = ferric_cet::decide(Feature::ShadowStack, POLICY, supported) {
-        warn!("CET: {err}");
-    }
     let on = decision();
     if supported && !on && !window_covers_ram() {
         warn!("CET: RAM extends beyond the shadow-stack window (1 TiB); shadow stacks stay off");
     }
     let decision = if on { "on" } else { "off" };
-    info!(
-        "CET: shadow stacks supported={supported} policy={POLICY} decision={decision} (not yet enabled)"
-    );
-    if on {
-        info!("CET: supervisor shadow stacks allocated for every kernel stack; CR4.CET stays off");
+    info!("CET: shadow stacks supported={supported} policy={POLICY} decision={decision}");
+    if !on {
+        // The skip case, including CI on CPUs without CET_SS: nothing is enabled, behaviour
+        // matches a build without shadow stacks.
+        info!("CET: shadow stacks not enabled on this boot");
+        return;
+    }
+    // `enabled_for_cpu` panics here for `always` + KPTI; `auto` + KPTI falls through to the log.
+    if !enabled_for_cpu() {
+        info!(
+            "CET: supervisor shadow stacks allocated but left off (KPTI is on; enabling shadow \
+             stacks alongside KPTI is not yet supported)"
+        );
+    } else {
+        info!("CET: supervisor shadow stacks allocated for every kernel stack; enabling CET");
     }
 }
 
@@ -300,7 +373,23 @@ mod stacks {
             for (addr, &value) in (ssp..).step_by(ENTRY_BYTES as usize).zip(image.entries()) {
                 self.write_entry(addr, value);
             }
+            // The supervisor token is written busy, so the context's first return to user space
+            // (through `enter_usermode`, which runs `CLRSSBSY`) finds it busy, as it would after a
+            // `SYSCALL` entry's `SETSSBSY`. For a context entered by `SETSSBSY` or by hardware
+            // interrupt delivery, the token is busy the same way; between the two, it is clear.
+            self.write_entry(
+                self.supervisor_token(),
+                shstk::supervisor_token(self.supervisor_token() as u64)?
+                    | shstk::SUPERVISOR_TOKEN_BUSY,
+            );
             Ok(ssp)
+        }
+
+        /// The mapped shadow-stack range, `base..top`: the lowest mapped address and the
+        /// exclusive top (where the supervisor token sits at `top - 8`). Used by the boot
+        /// self-test to check `SSP` lands inside the running stack's shadow.
+        pub fn region(&self) -> core::ops::Range<usize> {
+            self.base..self.top
         }
 
         /// Writes one entry through the physical memory map, whose alias of the frame is
@@ -366,6 +455,15 @@ mod stacks {
 
     impl Drop for ShadowStack {
         fn drop(&mut self) {
+            // Mirror `Kstack`'s running-stack assertion: never free the shadow stack the CPU is
+            // currently using as `SSP`, which would corrupt in-flight returns. `current_ssp`
+            // returns `None` while CET is off, so this does nothing on the allocated-but-off path.
+            if let Some(ssp) = current_ssp() {
+                assert!(
+                    !self.region().contains(&ssp),
+                    "freeing the shadow stack the CPU is running on (SSP {ssp:#x} in {self:?})"
+                );
+            }
             self.unmap();
             // SAFETY: allocated with this order in `for_kstack`, and unmapped above.
             unsafe { deallocate_p2frame(self.frame, ORDER) };
@@ -456,5 +554,107 @@ mod stacks {
         write_ssp_msr(SspMsr::Pl0, 0);
         write_ssp_msr(SspMsr::Pl1, 0);
         write_ssp_msr(SspMsr::Pl2, 0);
+    }
+
+    /// Set once a CPU has turned CET shadow stacks on, so [`current_ssp`] only runs `RDSSPQ`
+    /// (which raises #UD while CET is off) after that point. It stays set for the rest of the
+    /// boot; a CPU never drops a `Kstack` between the bootstrap processor enabling CET and that
+    /// CPU reaching its own [enable][crate::arch::shstk] point.
+    static SHSTK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Whether CET shadow stacks are turned on and in use on this boot, set once the first CPU
+    /// enables them. Lets paths like `recover_and_efault` pick the shadow-stack-safe fixup only
+    /// when it is needed, and stay byte-for-byte unchanged otherwise.
+    pub fn live() -> bool {
+        SHSTK_LIVE.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reads the current shadow-stack pointer, or `None` while CET is off (so `RDSSPQ` would
+    /// #UD). Used by the self-test and the drop assertion.
+    pub fn current_ssp() -> Option<usize> {
+        if !SHSTK_LIVE.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let ssp: usize;
+        // SAFETY: `SHSTK_LIVE` is only set after CET shadow stacks are on, so `RDSSPQ` is legal.
+        // It reads `SSP` into a register and has no other effect.
+        unsafe {
+            core::arch::asm!("rdsspq {}", out(reg) ssp, options(nomem, nostack, preserves_flags))
+        };
+        Some(ssp)
+    }
+
+    /// Whether indirect branch tracking is on for the current CPU, so the combined `IA32_S_CET`
+    /// value keeps IBT's `ENDBR_EN` bit set.
+    fn ibt_on() -> bool {
+        crate::arch::ibt::enabled_on_this_cpu()
+    }
+
+    /// The `IA32_PL0_SSP` token and the `IA32_S_CET` value to turn CET shadow stacks on for the
+    /// stack `kstack`, or `None` when this boot does not enable them on this CPU
+    /// ([`enabled_for_cpu`](super::enabled_for_cpu)) or the stack has no shadow stack.
+    ///
+    /// Computed in Rust (ordinary calls, run while CET is still off) so the enabling asm in
+    /// `start.rs` need only do the MSR and `CR4` writes and `SETSSBSY`, with no call or `ret`
+    /// between setting `CR4.CET` and `SETSSBSY`.
+    pub fn enable_params(kstack: &crate::context::context::Kstack) -> Option<(usize, u64)> {
+        if !super::enabled_for_cpu() {
+            return None;
+        }
+        let token = kstack.shadow_stack()?.supervisor_token();
+        Some((token, ferric_cet::s_cet_value(ibt_on(), true)))
+    }
+
+    /// Records that CET shadow stacks are now live and confirms them with a self-test, logging
+    /// `CET: shadow stacks enabled, self-test passed` on the bootstrap processor. Call right
+    /// after the enabling asm, on the stack whose shadow stack is now active.
+    ///
+    /// The test checks that `SSP` is non-zero and inside `shadow`'s mapped region, then runs a
+    /// multi-level call/return round trip and confirms `SSP` is restored exactly. A control-flow
+    /// mismatch anywhere raises #CP here, at a known point, rather than silently later. Every
+    /// step only reads `SSP` and makes balanced `call`/`ret` pairs, so it cannot leave the live
+    /// shadow stack misaligned. The context-switch path (`RSTORSSP`/`SAVEPREVSSP` in
+    /// `switch_to_inner`) is exercised by the scheduler's first switch, which faults loudly if it
+    /// is wrong.
+    ///
+    /// # Panics
+    ///
+    /// When `SSP` is zero, lies outside `shadow`, or the round trip does not restore it.
+    pub fn confirm_enabled(shadow: &ShadowStack, bsp: bool) {
+        SHSTK_LIVE.store(true, core::sync::atomic::Ordering::Release);
+
+        let ssp = current_ssp().expect("CET: SSP unreadable just after enabling");
+        assert!(ssp != 0, "CET: SSP is zero after SETSSBSY");
+        assert!(
+            shadow.region().contains(&ssp),
+            "CET: SSP {ssp:#x} is outside the running stack's shadow {shadow:?}"
+        );
+
+        // A `call` pushes its return address to the shadow stack and `ret` pops and verifies it;
+        // recurse a few levels so the shadow stack grows and shrinks as it does across any call
+        // chain. `ssp` must be identical afterwards.
+        let before = ssp;
+        shstk_selftest_depth(4);
+        let after = current_ssp().expect("CET: SSP unreadable after the call round trip");
+        assert_eq!(
+            before, after,
+            "CET: SSP not restored after a call/return round trip ({before:#x} -> {after:#x})"
+        );
+
+        if bsp {
+            info!("CET: shadow stacks enabled, self-test passed");
+        } else {
+            debug!("CET: shadow stacks enabled on this CPU, self-test passed");
+        }
+    }
+
+    /// Recurses `depth` levels, each a real `call`/`ret`, for the self-test's call round trip.
+    #[inline(never)]
+    fn shstk_selftest_depth(depth: u32) {
+        if depth > 0 {
+            shstk_selftest_depth(depth - 1);
+        }
+        // Keep the recursion from being folded into a loop, so each level is a real call frame.
+        core::hint::black_box(depth);
     }
 }

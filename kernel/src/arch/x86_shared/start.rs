@@ -17,6 +17,50 @@ use crate::{
 
 use crate::numa;
 
+// Ferric Oxide (shadow stacks): turn CET shadow stacks on for the current CPU. Expanded inline
+// (a macro, not a function) at the two points with no pending returns — just before the final
+// `call kmain`/`call kmain_ap`, both of which diverge — so there is no `ret` between `SETSSBSY`
+// (which resets SSP to the top of this stack's shadow stack) and the balanced call chain that
+// follows. `token` is the running stack's supervisor shadow-stack token and `scet` the
+// `IA32_S_CET` value (see `shstk::enable_params`), both computed while CET is still off. The
+// write order matters: set `IA32_PL0_SSP` and `IA32_S_CET` first (shadow stacks are inert while
+// CR4.CET is clear), then set CR4.CET, then `SETSSBSY` with nothing between. CR4 is written raw
+// because `x86::controlregs::cr4` drops bit 23; this runs after every other CR4 write on the CPU
+// (CR0.WP is already set by paging and, when IBT is on, asserted by `ibt::init_cpu`).
+#[cfg(all(target_arch = "x86_64", shstk_compiled))]
+macro_rules! shstk_enable {
+    ($token:expr, $scet:expr) => {
+        core::arch::asm!(
+            // IA32_PL0_SSP = token
+            "mov ecx, {pl0}",
+            "mov eax, {token:e}",
+            "mov rdx, {token}",
+            "shr rdx, 32",
+            "wrmsr",
+            // IA32_S_CET = scet
+            "mov ecx, {scet}",
+            "mov eax, {scet_val:e}",
+            "mov rdx, {scet_val}",
+            "shr rdx, 32",
+            "wrmsr",
+            // CR4.CET (bit 23): master enable for CET.
+            "mov rax, cr4",
+            "bts rax, {cet_bit}",
+            "mov cr4, rax",
+            // SSP <- IA32_PL0_SSP, mark the supervisor token busy.
+            "setssbsy",
+            token = in(reg) $token,
+            scet_val = in(reg) $scet,
+            pl0 = const ferric_cet::shstk::IA32_PL0_SSP,
+            scet = const ferric_cet::IA32_S_CET,
+            cet_bit = const ferric_cet::CR4_CET_BIT,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+        );
+    };
+}
+
 /// Test of zero values in BSS.
 static BSS_TEST_ZERO: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
 /// Test of non-zero values in data.
@@ -229,6 +273,19 @@ fn continue_after_kmain_stack(
 
         let kstack = kstack_slot.take().expect("kstack_slot must be Some");
 
+        // Ferric Oxide (shadow stacks): last, after every CR4 write, with no return between
+        // SETSSBSY and the diverging `kmain` below.
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        if let Some((token, scet)) = crate::arch::shstk::enable_params(&kstack) {
+            shstk_enable!(token, scet);
+            crate::arch::shstk::confirm_enabled(
+                kstack
+                    .shadow_stack()
+                    .expect("enable_params confirmed a shadow stack"),
+                true,
+            );
+        }
+
         crate::startup::kmain(bootstrap, kstack);
     }
 }
@@ -316,6 +373,18 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
             .kstack
             .take()
             .expect("AP kmain stack must be Some");
+
+        // Ferric Oxide (shadow stacks): same as the BSP, before the diverging `kmain_ap`.
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        if let Some((token, scet)) = crate::arch::shstk::enable_params(&kstack) {
+            shstk_enable!(token, scet);
+            crate::arch::shstk::confirm_enabled(
+                kstack
+                    .shadow_stack()
+                    .expect("enable_params confirmed a shadow stack"),
+                false,
+            );
+        }
 
         crate::startup::kmain_ap(cpu_id, kstack);
     }

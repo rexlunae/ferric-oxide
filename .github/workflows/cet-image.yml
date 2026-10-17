@@ -1,0 +1,149 @@
+name: cet-image
+
+# Builds a bootable x86_64 image with kernel shadow stacks and indirect branch
+# tracking on ("auto"), for booting on CET hardware by hand: the runners have no
+# CET, so the boot job here only checks that the image boots and logs that it
+# skips (see kernel/src/arch/x86_64/shstk.rs and ibt.rs). The image is uploaded
+# as the "ferric-cet-image" artifact (harddrive.img.zst).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "kernel/**"
+      - "crates/cet/**"
+      - "features.toml"
+      - "tools/ferric-config/**"
+      - "scripts/ferric-ci/boot-smoke.sh"
+      - ".github/workflows/cet-image.yml"
+
+concurrency:
+  group: cet-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONFIG_NAME: ferric-smoke
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: docker.io/redoxos/redox-base-x86_64:latest
+    env:
+      PODMAN_BUILD: "0"
+      SKIP_CHECK_TOOLS: "1"
+      REPO_BINARY: "1"
+      FSTOOLS_NO_MOUNT: "1"
+      COOKBOOK_VERBOSE: "false"
+      CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cbindgen
+        run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            prefix
+            build/fstools
+            target
+          key: redox-host-${{ hashFiles('Cargo.lock', 'tools/installer/**', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
+          restore-keys: redox-host-
+
+      # Everything else stays at the catalog defaults, including kpti = "auto",
+      # which is off on CPUs that are not Meltdown-affected (Tiger Lake and later,
+      # Zen 3 and later), so shadow stacks turn on there.
+      - name: Features with CET on
+        run: |
+          out="$RUNNER_TEMP/ferric-cet"
+          mkdir -p "$out"
+          printf '[kernel.cpu]\nshstk = "auto"\nibt = "auto"\n' > "$out/ferric.toml"
+          "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
+          echo "Kernel features: $features"
+          echo "FERRIC_KERNEL_FEATURES=$features" >> "$GITHUB_ENV"
+          relibc="$(sed -n 's/^export FERRIC_RELIBC_FEATURES:=//p' "$out/config.mk")"
+          echo "FERRIC_RELIBC_FEATURES=$relibc" >> "$GITHUB_ENV"
+          cat "$out/kernel-config.toml"
+          echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: make all CONFIG_NAME="$CONFIG_NAME"
+
+      - name: Compress image
+        run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferric-cet-image
+          path: harddrive.img.zst
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cet-build-logs
+          path: |
+            recipes/**/target/*/build/*.log
+            recipes/**/target/*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The runners' KVM has no CET, so this proves the CET image still boots where
+  # CET is missing and that the kernel says it is skipping.
+  boot:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LOG: serial-cet.log
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf zstd
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-cet-image
+
+      - name: Boot smoke test
+        run: |
+          zstd -d harddrive.img.zst -o harddrive.img
+          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" host
+
+      - name: Check CET reporting
+        run: |
+          grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off)" "$LOG"
+          if grep -aF "CET: shadow stacks supported=true" "$LOG"; then
+            # A runner with CET passed through: then the self-test must have passed.
+            grep -aF "CET: shadow stacks enabled, self-test passed" "$LOG" \
+              || grep -aF "CET: supervisor shadow stacks allocated but left off (KPTI is on" "$LOG"
+          else
+            grep -aF "CET: shadow stacks not enabled on this boot" "$LOG"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-log-cet
+          path: ${{ env.LOG }}
+          retention-days: 14

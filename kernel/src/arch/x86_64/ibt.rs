@@ -72,6 +72,14 @@ fn decide() -> bool {
     }
 }
 
+/// Whether indirect branch tracking is on for the current CPU. Shadow-stack enabling reads this
+/// so the combined `IA32_S_CET` value keeps `ENDBR_EN` set when IBT is also on (see
+/// `shstk::enable_params`). Cheap: it re-reads CPUID, and [`init_cpu`] has already applied the
+/// same decision, so `always`-on-an-unsupported-CPU has already panicked by the time this runs.
+pub fn enabled_on_this_cpu() -> bool {
+    decide()
+}
+
 /// Stops early with a clear message when the build requires IBT and the CPU lacks it. Called on
 /// the BSP right after the serial console comes up.
 ///
