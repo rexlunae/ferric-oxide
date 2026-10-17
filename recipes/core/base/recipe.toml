@@ -9,6 +9,11 @@ dependencies = [
   "redoxfs",
 ]
 script = """
+# Ferric Oxide: shared crates are path dependencies at ../../crates from
+# userspace/base/ (pcid and bootstrap use crates/iommu). The cookbook builds a
+# copy of userspace/base/ in this recipe's source/, so give that copy the same
+# relative path to them.
+ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
 cd "${COOKBOOK_SOURCE}" && make install-base \
     SRC_DIR="${COOKBOOK_SOURCE}" SYSROOT="${COOKBOOK_SYSROOT}" \
     LINKER="${GNU_TARGET}-ld" CARGO="${COOKBOOK_CARGO}" \

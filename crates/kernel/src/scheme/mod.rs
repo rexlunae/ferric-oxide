@@ -59,6 +59,10 @@ pub mod debug;
 /// `event:` - allows reading of `Event`s which are registered using `fevent`
 pub mod event;
 
+/// Ferric Oxide: `kernel.iommu` - DMA domains for user-space drivers (`kernel.iommu`)
+#[cfg(iommu_enabled)]
+pub mod iommu;
+
 /// `irq:` - allows userspace handling of IRQs
 pub mod irq;
 
@@ -196,6 +200,11 @@ fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
 
         if cfg!(dtb) {
             insert_globals(&[Dtb]);
+        }
+
+        // Ferric Oxide: the iommu scheme exists only when VT-d support is built.
+        if cfg!(iommu_enabled) {
+            insert_globals(&[Iommu]);
         }
     }
     let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -526,6 +535,9 @@ pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
     GlobalSchemes::Acpi,
     #[cfg(dtb)]
     GlobalSchemes::Dtb,
+    // Ferric Oxide: see `iommu`.
+    #[cfg(iommu_enabled)]
+    GlobalSchemes::Iommu,
 ];
 
 pub const MAX_GLOBAL_SCHEMES: usize = 16;
@@ -555,6 +567,11 @@ impl SchemeExt for GlobalSchemes {
             Self::Dtb => &DtbScheme,
             #[cfg(not(dtb))]
             Self::Dtb => &AcpiScheme, // technically unreachable
+            // Ferric Oxide: the iommu scheme.
+            #[cfg(iommu_enabled)]
+            Self::Iommu => &iommu::IommuScheme,
+            #[cfg(not(iommu_enabled))]
+            Self::Iommu => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
         }
     }
     fn scheme_id(self) -> SchemeId {

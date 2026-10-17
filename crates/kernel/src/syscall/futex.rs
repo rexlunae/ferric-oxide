@@ -114,6 +114,11 @@ pub fn futex(
                 .none_if_null()
                 .map(|buf| unsafe { buf.read_exact::<TimeSpec>() })
                 .transpose()?;
+            // Ferric Oxide: a negative timeout used to become a deadline that
+            // never arrives (found by ferric-syscall-fuzz).
+            if let Some(timeout) = &timeout_opt {
+                crate::time::check_timespec(timeout)?;
+            }
 
             {
                 let context_lock = context::current();

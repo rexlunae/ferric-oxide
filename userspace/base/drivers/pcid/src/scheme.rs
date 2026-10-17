@@ -18,6 +18,8 @@ pub struct PciScheme {
     handles: HandleMap<HandleWrapper>,
     pub pcie: Pcie,
     pub tree: BTreeMap<PciAddress, crate::Func>,
+    /// Ferric Oxide: DMA domains for drivers.
+    pub iommu: crate::iommu::Iommu,
 }
 enum Handle {
     TopLevel { entries: Vec<String> },
@@ -225,6 +227,20 @@ impl SchemeSync for PciScheme {
         }
 
         match handle.inner {
+            // Ferric Oxide: GetDmaDomain needs the iommu state, so it is answered here.
+            Handle::Channel { addr, ref mut st }
+                if matches!(
+                    bincode::deserialize(buf),
+                    Ok(pcid_interface::PcidClientRequest::GetDmaDomain)
+                ) =>
+            {
+                if !matches!(st, ChannelState::AwaitingData) {
+                    return Err(Error::new(EINVAL));
+                }
+                let response = self.iommu.get_dma_domain(id, addr);
+                *st = ChannelState::AwaitingResponseRead(Self::response_bytes(&response)?.into());
+                Ok(buf.len())
+            }
             Handle::Channel { addr, ref mut st } => {
                 Self::write_channel(&self.pcie, &mut self.tree, addr, st, buf)
             }
@@ -354,7 +370,16 @@ impl SchemeSync for PciScheme {
         Ok(unsafe { ptr.byte_add((offset << 5 >> 5) as usize) }.expose_provenance())
     }
 
+    // Ferric Oxide: hands a driver the DMA domain GetDmaDomain made for its channel.
+    fn on_recvfd(&mut self, recvfd_request: &redox_scheme::RecvFdRequest) -> Result<OpenResult> {
+        match self.handles.get(recvfd_request.id())?.inner {
+            Handle::Channel { .. } => self.iommu.on_recvfd(recvfd_request),
+            _ => Err(Error::new(EBADF)),
+        }
+    }
+
     fn on_close(&mut self, id: usize) {
+        self.iommu.on_close(id); // Ferric Oxide
         match self.handles.remove(id) {
             Some(HandleWrapper {
                 inner: Handle::Channel { addr, .. },
@@ -376,7 +401,18 @@ impl PciScheme {
             handles: HandleMap::new(),
             pcie,
             tree: BTreeMap::new(),
+            iommu: Default::default(),
         }
+    }
+
+    /// Ferric Oxide: a channel response as `write_channel` frames it: its length, then the
+    /// bincode encoding.
+    fn response_bytes(response: &pcid_interface::PcidClientResponse) -> Result<Vec<u8>> {
+        let mut output_bytes = vec![0_u8; 8];
+        bincode::serialize_into(&mut output_bytes, response).map_err(|_| Error::new(EIO))?;
+        let len = output_bytes.len() - 8;
+        output_bytes[..8].copy_from_slice(&u64::to_le_bytes(len as u64));
+        Ok(output_bytes)
     }
     fn parse_after_pci_addr(&mut self, addr: PciAddress, after: &str) -> Result<Handle> {
         if after.chars().next().map_or(false, |c| c != '/') {

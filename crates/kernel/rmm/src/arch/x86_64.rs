@@ -1,7 +1,7 @@
 use core::{
     arch::asm,
     num::NonZeroU8,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::{Arch, PhysicalAddress, TableKind, VirtualAddress};
@@ -53,6 +53,11 @@ impl Arch for X8664Arch {
     #[inline(always)]
     fn invalidate(address: VirtualAddress) {
         unsafe { asm!("invlpg [{0}]", in(reg) address.data()) };
+        // Ferric Oxide (KPTI with PCID): `invlpg` only reaches the current PCID, the kernel's.
+        if USER_PCID_ACTIVE.load(Ordering::Relaxed) {
+            // SAFETY: `set_user_pcid` requires CR4.PCIDE on every CPU that gets here.
+            unsafe { invpcid(INVPCID_ADDRESS, USER_PCID, address.data()) };
+        }
     }
 
     #[inline(always)]
@@ -70,6 +75,12 @@ impl Arch for X8664Arch {
     #[inline(always)]
     unsafe fn set_table(_table_kind: TableKind, address: PhysicalAddress) {
         unsafe { asm!("mov cr3, {0}", in(reg) address.data()) };
+        // Ferric Oxide (KPTI with PCID): the CR3 write flushed the kernel's PCID only; the user
+        // PCID still holds the previous table's shadow translations.
+        if USER_PCID_ACTIVE.load(Ordering::Relaxed) {
+            // SAFETY: `set_user_pcid` requires CR4.PCIDE on every CPU that gets here.
+            unsafe { invpcid(INVPCID_SINGLE_CONTEXT, USER_PCID, 0) };
+        }
     }
 
     fn virt_is_valid(address: VirtualAddress) -> bool {
@@ -96,6 +107,52 @@ impl X8664Arch {
     /// offset that are not also still mapped.
     pub unsafe fn set_phys_offset(offset: usize) {
         PHYS_OFFSET_CURRENT.store(offset, Ordering::Relaxed);
+    }
+}
+
+/// Ferric Oxide (KPTI with PCID): the PCID of every KPTI shadow table, the one loaded while user
+/// space runs. Kernel tables keep PCID 0, so CR3 reads and writes in the kernel are unchanged.
+pub const USER_PCID: usize = 0x800;
+
+/// Ferric Oxide: set once every CPU runs, or will run before it next invalidates a TLB entry, with
+/// CR4.PCIDE and KPTI shadows tagged [`USER_PCID`]. Every invalidation then also reaches that PCID.
+static USER_PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// `INVPCID` type 0: one linear address in one PCID.
+const INVPCID_ADDRESS: usize = 0;
+/// `INVPCID` type 1: every non-global translation in one PCID.
+const INVPCID_SINGLE_CONTEXT: usize = 1;
+
+/// Invalidates TLB and paging-structure cache entries for `pcid` with `INVPCID`.
+///
+/// # Safety
+///
+/// The CPU must support `INVPCID` and, since `pcid` is not 0, have CR4.PCIDE set.
+#[inline(always)]
+unsafe fn invpcid(kind: usize, pcid: usize, address: usize) {
+    let descriptor: [usize; 2] = [pcid, address];
+    // SAFETY: the caller guarantees the instruction exists and PCIDs are on; the descriptor is a
+    // live 16-byte value on the stack.
+    unsafe {
+        asm!(
+            "invpcid {0}, [{1}]",
+            in(reg) kind,
+            in(reg) &descriptor,
+            options(nostack),
+        )
+    };
+}
+
+impl X8664Arch {
+    /// Ferric Oxide (KPTI with PCID): makes every TLB invalidation also invalidate
+    /// [`USER_PCID`], with `INVPCID`, or stops doing so.
+    ///
+    /// # Safety
+    ///
+    /// When `active`, the CPU must support `INVPCID` and every CPU that invalidates TLB entries
+    /// from now on must have CR4.PCIDE set before it does.
+    pub unsafe fn set_user_pcid(active: bool) {
+        USER_PCID_ACTIVE.store(active, Ordering::Relaxed);
     }
 }
 

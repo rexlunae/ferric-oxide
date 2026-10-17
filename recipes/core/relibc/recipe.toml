@@ -17,10 +17,14 @@ if command -v rustup >/dev/null 2>&1; then
 fi
 fi
 
-# redox-rt uses crates/hwrand, beside relibc in crates/, as a path dependency.
-# The cookbook builds a copy of crates/relibc/ in this recipe's source/, so
-# give that copy the same neighbour.
-ln -sfn "${COOKBOOK_ROOT}/crates/hwrand" "${COOKBOOK_SOURCE}/../hwrand"
+# relibc uses the shared crates beside it in crates/ as path dependencies
+# (redox-rt uses ../../hwrand). The cookbook builds a copy of crates/relibc/
+# in this recipe's source/, so give that copy the same neighbours.
+for dep in "${COOKBOOK_ROOT}"/crates/*/
+do
+    name="$(basename "${dep}")"
+    [ "${name}" = relibc ] || ln -sfn "${dep%/}" "${COOKBOOK_SOURCE}/../${name}"
+done
 
 # Ferric Oxide: Cargo features from ferric.toml (make menuconfig), such as
 # aslr. Unset without ferric.toml, which keeps upstream's build. The relibc

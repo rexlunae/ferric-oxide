@@ -1853,6 +1853,12 @@ impl KernelScheme for UserScheme {
         Err(Error::new(EBADFD))
     }
     fn kfstat(&self, file: usize, stat: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        // Ferric Oxide: redox-scheme asserts that the buffer holds a whole Stat, so a short
+        // buffer from any process would panic the daemon serving the file (the root file system,
+        // say). Refuse it here, where every user scheme is covered.
+        if stat.len() < size_of::<syscall::Stat>() {
+            return Err(Error::new(EINVAL));
+        }
         let ctx = { context::current().read(token.token()).caller_ctx() };
         let mut address = self.inner.capture_user(stat, token)?;
         let result = self
@@ -1953,13 +1959,18 @@ impl KernelScheme for UserScheme {
     fn kstdfscall(
         &self,
         fds: &[usize],
-        _kind: StdFsCallKind,
+        kind: StdFsCallKind,
         desc: Arc<LockedFileDescription>,
         payload: UserSliceRw,
         flags: CallFlags,
         metadata: StdFsCallMeta,
         token: &mut CleanLockToken,
     ) -> Result<usize> {
+        // Ferric Oxide: redox-scheme asserts that a GetLock payload is two u64s, so check it
+        // here rather than let any caller panic the daemon (see kfstat).
+        if kind == StdFsCallKind::GetLock && payload.len() != size_of::<[u64; 2]>() {
+            return Err(Error::new(EINVAL));
+        }
         let allow_direct_switch =
             flags.contains(CallFlags::ALLOW_DIRECT_SWITCH) || DEF_ALLOW_DIRECT_SWITCH;
 

@@ -304,6 +304,39 @@ its usual place and the boot log says so. Randomizing the kernel image itself
 comes later."""
 
 [[option]]
+id = "kernel.iommu"
+menu = "kernel"
+type = "choice"
+title = "IOMMU DMA remapping (Intel VT-d)"
+default = "never"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.iommu"
+rebuild = ["kernel"]
+help = """
+Turn on the Intel VT-d units the firmware's DMAR table lists. Devices start in
+one identity domain, so DMA addresses do not change and drivers work as before,
+but translation, invalidation and fault reporting run on the hardware; DMA
+faults are logged on the console. Firmware's reserved memory regions (RMRRs)
+stay mapped. Units with queued invalidation use it. "auto" enables every unit
+that the kernel can drive and logs why it skips the others; "never" leaves
+VT-d off, as upstream does. "auto" and "enforce" also run a short boot
+self-test of DMA domains and provide the kernel.iommu scheme: pcid uses it to
+give each PCI driver a DMA domain of its own with the driver's device, its
+requester-ID aliases and its RMRRs in it, and every driver started through
+pcid_interface binds it before its first DMA allocation (a driver of several
+functions keeps one domain). Once bound, memory:translation answers with
+addresses in it: each buffer is pinned and mapped on its first translation,
+made read-only for the device when the driver takes write access away, and
+unmapped when the driver unmaps it or exits, so the device can reach only
+memory its driver translated. "enforce" goes further: a process must bind a
+domain with a device attached before memory:translation answers at all (EACCES
+otherwise; a forked child starts unbound), and devices that no driver attached
+to a domain are blocked rather than identity-mapped. Processes that use DMA
+memory without a PCI device (lived, nbdd and usbscsid ring buffers) cannot get
+DMA addresses under "enforce". Interrupt remapping and AMD-Vi come later."""
+choices = ["auto", "enforce", "never"]
+
+[[option]]
 id = "kernel.numa"
 menu = "kernel"
 type = "bool"
@@ -519,6 +552,85 @@ when the CPU has AVX512F; level v4 requires them. Costs about 1.7 KB more
 XSAVE area per thread on AVX-512 CPUs, and nothing elsewhere."""
 choices = ["always", "auto", "never"]
 
+[[option]]
+id = "kernel.cpu.kpti"
+menu = "kernel.cpu"
+type = "choice"
+title = "Kernel page-table isolation (Meltdown)"
+default = "auto"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.kpti"
+rebuild = ["kernel"]
+help = """
+Give each process a second page table that maps almost none of the kernel and
+is loaded while user code runs, so Meltdown (CVE-2017-5754) cannot read kernel
+memory. "auto" turns it on for Intel CPUs that do not report RDCL_NO; AMD CPUs
+and recent Intel ones are not affected and pay nothing. It costs two page-table
+switches and TLB flushes per system call and interrupt on affected CPUs; see
+kernel.cpu.pcid for avoiding the flushes."""
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.pcid"
+menu = "kernel.cpu"
+type = "choice"
+title = "PCIDs for KPTI (no-flush page-table switches)"
+default = "auto"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.pcid"
+rebuild = ["kernel"]
+help = """
+When KPTI is on, tag the kernel and user page tables with two process-context
+identifiers (PCIDs), so the page-table switches on every system call and
+interrupt keep the TLB instead of flushing it. Unmap, mprotect and TLB
+shootdowns also invalidate the user PCID with INVPCID; switching between
+processes still flushes. "auto" uses it when the CPU reports PCID and INVPCID
+(Intel Haswell, AMD Zen 3 and newer); "always" panics at boot when KPTI is on
+and the CPU lacks them. Has no effect while KPTI is off."""
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.ibt"
+menu = "kernel.cpu"
+type = "choice"
+title = "Indirect branch tracking (CET IBT) in the kernel"
+default = "never"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.ibt"
+rebuild = ["kernel"]
+help = """
+Build the kernel (and its core and alloc) with endbr64 at every function entry
+and turn on Intel CET indirect branch tracking in supervisor mode, so an
+indirect call or jump that lands anywhere other than an endbr64 stops the
+kernel with a control-protection fault (#CP) instead of running a gadget.
+"auto" turns it on when the CPU reports CET_IBT (Intel Tiger Lake, Sapphire
+Rapids and newer); "always" panics at boot on CPUs without it. User-mode CET
+and kernel shadow stacks stay off. Costs four bytes per function and no jump
+tables. Off by default because CI cannot test it: KVM on the runners does not
+expose CET and QEMU's emulator does not implement it."""
+choices = ["always", "auto", "never"]
+
+[[option]]
+id = "kernel.cpu.shstk"
+menu = "kernel.cpu"
+type = "choice"
+title = "Shadow stacks (CET SS) in the kernel: prepared, not yet enabled"
+default = "never"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.shstk"
+rebuild = ["kernel"]
+help = """
+Intel CET supervisor shadow stacks keep a second, write-protected copy of every
+return address and stop the kernel with a control-protection fault (#CP) when a
+`ret` does not match it, which defeats return-oriented gadget chains. They are
+not turned on yet: "auto" logs at boot whether the CPU reports CET_SS (Intel
+Tiger Lake, AMD Zen 3 and newer) and what the policy decided, and on such CPUs
+allocates a shadow stack for every kernel stack and keeps the shadow-stack
+pointer registers up to date, with CET itself left off. Like the other "auto"
+CPU options it acts as "never" without kernel.self_modifying. "always" will be
+added once the kernel can enable them."""
+choices = ["auto", "never"]
+
 # ---------------------------------------------------------------- image
 
 [[option]]
@@ -717,8 +829,13 @@ message = "Prebuilt packages are compiled for baseline x86-64; only packages you
 
 [[rule]]
 level = "warn"
-when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto')"
+when = "!kernel.self_modifying && (kernel.cpu.smap == 'auto' || kernel.cpu.fsgsbase == 'auto' || kernel.cpu.xsave == 'auto' || kernel.cpu.xsaveopt == 'auto' || kernel.cpu.avx512 == 'auto' || kernel.cpu.kpti == 'auto' || kernel.cpu.pcid == 'auto' || kernel.cpu.ibt == 'auto' || kernel.cpu.shstk == 'auto')"
 message = "Kernel CPU features set to \"auto\" act as \"never\" without self-modifying code."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && kernel.cpu.pcid == 'always' && kernel.cpu.kpti == 'never'"
+message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" it does nothing."
 
 [[rule]]
 level = "error"

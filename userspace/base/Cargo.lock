@@ -877,6 +877,10 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=059bb23#059bb2383873f8001959456e36ec123228f67642"
 
 [[package]]
+name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1701,6 +1705,7 @@ dependencies = [
  "common",
  "daemon",
  "fdt 0.1.5",
+ "ferric-iommu",
  "libc",
  "libredox",
  "log",

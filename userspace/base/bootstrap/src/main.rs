@@ -135,16 +135,25 @@ unsafe impl alloc::alloc::GlobalAlloc for Allocator {
     }
 }
 
-pub struct KernelSchemeMap(BTreeMap<GlobalSchemes, FdGuard>);
+/// The kernel schemes by number, and (Ferric Oxide) the kernel schemes this crate's
+/// `redox_syscall` has no `GlobalSchemes` variant for, by name.
+pub struct KernelSchemeMap(
+    BTreeMap<GlobalSchemes, FdGuard>,
+    alloc::vec::Vec<(&'static str, FdGuard)>,
+);
 impl KernelSchemeMap {
     fn new(kernel_scheme_infos: &[KernelSchemeInfo]) -> Self {
         let mut map = BTreeMap::new();
+        let mut ferric = alloc::vec::Vec::new();
         for info in kernel_scheme_infos {
             if let Some(scheme_id) = GlobalSchemes::try_from_raw(info.scheme_id) {
                 map.insert(scheme_id, FdGuard::new(info.fd));
+            } else if info.scheme_id == ferric_iommu::abi::SCHEME_ID {
+                // Ferric Oxide: the kernel's iommu scheme (kernel.iommu = "auto"/"enforce").
+                ferric.push((ferric_iommu::abi::SCHEME_NAME, FdGuard::new(info.fd)));
             }
         }
-        Self(map)
+        Self(map, ferric)
     }
     fn get(&self, scheme: GlobalSchemes) -> Option<&FdGuard> {
         self.0.get(&scheme)

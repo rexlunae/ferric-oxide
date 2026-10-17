@@ -81,7 +81,7 @@ pub(super) fn init(madt: Madt) {
 
                 let pcr_ptr = crate::arch::gdt::allocate_and_init_pcr(cpu_id, stack_end);
 
-                let idt_ptr = crate::arch::idt::allocate_and_init_idt(cpu_id);
+                let idt_ptr = crate::arch::idt::allocate_and_init_idt(cpu_id, pcr_ptr);
 
                 let mut args = KernelArgsAp {
                     stack_end: stack_end as *mut u8,

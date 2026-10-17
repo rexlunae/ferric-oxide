@@ -278,6 +278,10 @@ impl<'a> DriverHandler<'a> {
                 }
                 return PcidClientResponse::WriteConfig;
             }
+            // Ferric Oxide: answered by the scheme, which holds the iommu state.
+            PcidClientRequest::GetDmaDomain => {
+                PcidClientResponse::Error(PcidServerResponseError::NoDmaDomain)
+            }
             _ => unreachable!(),
         }
     }

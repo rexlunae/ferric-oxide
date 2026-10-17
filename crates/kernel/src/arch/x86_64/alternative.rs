@@ -171,6 +171,11 @@ pub unsafe fn early_init(bsp: bool) {
             return;
         }
 
+        // Ferric Oxide: kernel page-table isolation, decided once for all CPUs.
+        if super::kpti::decide() {
+            enable |= KcpuFeatures::KPTI;
+        }
+
         overwrite(relocs, enable);
 
         if cfg!(not(feature = "self_modifying")) {
@@ -180,6 +185,7 @@ pub unsafe fn early_init(bsp: bool) {
                     && cfg!(not(cpu_feature_auto = "xsave"))
                     && cfg!(not(cpu_feature_auto = "xsaveopt"))
                     && cfg!(not(cpu_feature_auto = "avx512"))
+                    && cfg!(not(cpu_feature_auto = "kpti"))
             );
         }
 
@@ -235,6 +241,10 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
                 "xsave" => enable.contains(KcpuFeatures::XSAVE),
                 "xsaveopt" => enable.contains(KcpuFeatures::XSAVEOPT),
                 "avx512" => enable.contains(KcpuFeatures::AVX512),
+                "kpti" => enable.contains(KcpuFeatures::KPTI),
+                // Ferric Oxide: must be listed, or the catch-all below would patch in the
+                // shadow-stack switch, which raises #UD while CET is off.
+                "shstk" => enable.contains(KcpuFeatures::SHSTK),
                 //_ => panic!("unknown altcode relocation: {}", name),
                 _ => true,
             };
@@ -313,6 +323,10 @@ bitflags! {
         const XSAVE = 4;
         const XSAVEOPT = 8;
         const AVX512 = 16;
+        const KPTI = 32;
+        /// Ferric Oxide: kernel shadow stacks are on (CR4.CET and IA32_S_CET.SH_STK_EN). Never
+        /// set yet; see arch/x86_64/shstk.rs.
+        const SHSTK = 64;
     }
 }
 

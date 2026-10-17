@@ -1,0 +1,8 @@
+# Ferric Oxide test image only: run the DMA remapping test driver for QEMU's
+# edu device, which CI adds to its QEMU command line. The driver makes the
+# device DMA into memory it granted and memory it did not.
+[[drivers]]
+name = "Ferric Oxide DMA remapping test (QEMU edu)"
+vendor = 0x1234
+device = 0x11e8
+command = ["/usr/bin/ferric-iommu-test"]

@@ -331,20 +331,34 @@ interrupt_error!(generic_irq, |_stack, code| {
     unsafe { lapic_eoi() };
 });
 
+// Ferric Oxide (IBT, see arch/x86_64/ibt.rs): each stub is an IDT target, so with indirect
+// branch tracking it starts with `endbr64` and the stubs are 16 bytes apart instead of 8.
+#[cfg(target_arch = "x86_64")]
+const STUB_ENDBR: bool = crate::arch::ibt::COMPILED;
+#[cfg(not(target_arch = "x86_64"))]
+const STUB_ENDBR: bool = false;
+
+/// Ferric Oxide: distance between the generic interrupt stubs (`push imm8; jmp rel32`, plus
+/// `endbr64` with IBT).
+pub const GENERIC_INTERRUPT_STUB_SIZE: usize = if STUB_ENDBR { 16 } else { 8 };
+
 core::arch::global_asm!("
     .globl __generic_interrupts_start
     .globl __generic_interrupts_end
-    .p2align 3
+    .balign {stub_size}
 __generic_interrupts_start:
     n = 0
     .rept 224
+    .if {endbr}
+    endbr64
+    .endif
     push (n - 128)
     jmp {}
-    .p2align 3
+    .balign {stub_size}
     n = n + 1
     .endr
 __generic_interrupts_end:
-", sym generic_irq);
+", sym generic_irq, stub_size = const GENERIC_INTERRUPT_STUB_SIZE, endbr = const STUB_ENDBR as u8);
 
 unsafe extern "C" {
     pub fn __generic_interrupts_start();

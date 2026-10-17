@@ -1,0 +1,9 @@
+[package]
+name = "ferric-iommu-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "DMA domain test driver for Ferric Oxide"
+
+[profile.release]
+debug = false

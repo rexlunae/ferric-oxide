@@ -2,6 +2,14 @@
 # Minimum x86-64 microarchitecture level (v1-v4). The kernel halts at boot with a
 # list of missing features on CPUs below it. Unset means no check.
 #level = "v3"
+# Ferric Oxide: Intel VT-d DMA remapping. "auto" enables every unit in the DMAR table with
+# all devices in one identity domain (DMA addresses unchanged) and runs a DMA-domain
+# self-test at boot; "never" leaves them off. "auto" and "enforce" also provide the
+# kernel.iommu scheme (DMA domains for drivers; memory:translation answers with IOVAs
+# in a driver's bound domain; pcid drivers bind one when they start). "enforce" also
+# refuses memory:translation to drivers without a bound domain, lets a driver bind only
+# a domain with a device attached, and blocks DMA from devices in no domain.
+iommu = "never"
 
 [arch.x86_64.features]
 smap = "auto"
@@ -10,5 +18,20 @@ xsave = "auto"
 xsaveopt = "auto"
 # AVX-512 register state (opmask, zmm upper halves, zmm16-31). Needs xsave.
 avx512 = "never"
+# Ferric Oxide: kernel page-table isolation against Meltdown. "auto" turns it on
+# for Intel CPUs without RDCL_NO.
+kpti = "never"
+# Ferric Oxide: PCIDs for KPTI, so system calls and interrupts switch page tables
+# without flushing the TLB. "auto" uses them when KPTI is on and the CPU has
+# PCID and INVPCID; "always" panics at boot when KPTI is on and it lacks them.
+pcid = "never"
+# Ferric Oxide: kernel indirect branch tracking (Intel CET IBT). Anything but
+# "never" makes the Makefile build with -Z cf-protection=branch. "auto" turns it
+# on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.
+ibt = "never"
+# Ferric Oxide: kernel shadow stacks (Intel CET SS), "auto" or "never". So far
+# "auto" logs whether the CPU supports them and, if it does, allocates them for
+# every kernel stack, but does not turn CET on yet.
+shstk = "never"
 
 # vim: ft=toml

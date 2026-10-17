@@ -17,6 +17,8 @@ use crate::cfg_access::Pcie;
 
 mod cfg_access;
 mod driver_handler;
+// Ferric Oxide: DMA domains for drivers (kernel iommu scheme).
+mod iommu;
 mod scheme;
 
 pub struct Func {
@@ -251,7 +253,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
 
     let mut scheme = scheme::PciScheme::new(pcie);
     let socket = redox_scheme::Socket::create().expect("failed to open pci scheme socket");
-    let handler = Blocking::new(Box::new(socket), 16);
+    // Ferric Oxide: shared with the iommu state, which moves domain descriptors to drivers.
+    let socket = std::rc::Rc::new(socket);
+    scheme.iommu = iommu::Iommu::open();
+    scheme.iommu.socket = Some(socket.clone());
+    let handler = Blocking::new(socket, 16);
 
     {
         match libredox::Fd::open("/scheme/acpi/register_pci", libredox::flag::O_WRONLY, 0) {
@@ -299,10 +305,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
                 &mut bus_nums,
                 bus_num,
                 dev_num,
+                &mut scheme.iommu,
             );
         }
     }
     debug!("Enumeration complete, now starting pci scheme");
+    // Ferric Oxide: let the kernel resolve DMAR scopes that name bridges.
+    scheme.iommu.report_bridges();
 
     register_sync_scheme(handler.socket(), "pci", &mut scheme)
         .expect("failed to register pci scheme to namespace");
@@ -320,6 +329,7 @@ fn scan_device(
     bus_nums: &mut Vec<u8>,
     bus_num: u8,
     dev_num: u8,
+    iommu: &mut iommu::Iommu,
 ) {
     for func_num in 0..8 {
         let header = TyPciHeader::new(PciAddress::new(0, bus_num, dev_num, func_num));
@@ -360,6 +370,7 @@ fn scan_device(
             HeaderType::PciPciBridge => {
                 let bridge_header = PciPciBridgeHeader::from_header(header, pcie).unwrap();
                 bus_nums.push(bridge_header.secondary_bus_number(pcie));
+                iommu.record_bridge(pcie, &bridge_header); // Ferric Oxide
             }
             ty => {
                 warn!("pcid: unknown header type: {ty:?}");

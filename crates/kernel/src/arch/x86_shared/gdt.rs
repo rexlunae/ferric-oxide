@@ -154,6 +154,25 @@ pub struct ProcessorControlRegion {
     pub self_ref: *mut ProcessorControlRegion,
 
     pub user_rsp_tmp: usize,
+    // Ferric Oxide (KPTI): top of the current context's kernel stack. With KPTI the TSS points
+    // interrupts from user space at a small per-CPU entry stack instead (`kpti_entry_top`), and the
+    // entry code moves the interrupt frame here once it has switched to the kernel page table.
+    // Without KPTI this always equals `tss.rsp[0]`.
+    pub kernel_rsp: usize,
+    // Ferric Oxide (KPTI): top of the per-CPU entry stack, which stays mapped in user page tables.
+    pub kpti_entry_top: usize,
+    // Ferric Oxide (KPTI): scratch slot for the entry and exit code, which has no free register.
+    pub kpti_scratch: usize,
+    // Ferric Oxide (KPTI): bits ORed into CR3 by the entry and exit code. `kpti_cr3_noflush` is
+    // the no-flush bit (63) with PCID, else 0; `kpti_cr3_user` turns a kernel-table CR3 into its
+    // shadow's: the shadow bit, plus the user PCID and the no-flush bit with PCID.
+    pub kpti_cr3_noflush: usize,
+    pub kpti_cr3_user: usize,
+    // Ferric Oxide (shadow stacks): this CPU's interrupt SSP table, which
+    // IA32_INTERRUPT_SSP_TABLE_ADDR points at (see arch/x86_64/shstk.rs). In the PCR because the
+    // CPU reads it while delivering an interrupt, and the PCR is mapped wherever that can happen.
+    #[cfg(shstk_compiled)]
+    pub shstk_ist_ssp: crate::arch::shstk::InterruptSspTable,
     // The GDT *must* be stored in the PCR! The paranoid interrupt handler, lacking a reliable way
     // to correctly obtain GSBASE, uses SGDT to calculate the PCR offset.
     pub gdt: [GdtEntry; SEGMENT_COUNT],
@@ -182,6 +201,13 @@ impl ProcessorControlRegion {
         Self {
             self_ref: ptr::null_mut(),
             user_rsp_tmp: 0,
+            kernel_rsp: 0,
+            kpti_entry_top: 0,
+            kpti_scratch: 0,
+            kpti_cr3_noflush: 0,
+            kpti_cr3_user: 0,
+            #[cfg(shstk_compiled)]
+            shstk_ist_ssp: [0; ferric_cet::shstk::INTERRUPT_SSP_TABLE_ENTRIES],
             gdt: BASE_GDT,
             percpu: PercpuBlock::init(cpu_id),
             _rsvd: Align([0; 2]),
@@ -218,8 +244,12 @@ pub unsafe fn set_tss_stack(pcr: *mut ProcessorControlRegion, stack: usize) {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        // TODO: If this increases performance, read gs:[offset] directly
-        core::ptr::addr_of_mut!((*pcr).tss.rsp[0]).write_unaligned(stack as u64);
+        core::ptr::addr_of_mut!((*pcr).kernel_rsp).write(stack);
+        // Ferric Oxide: with KPTI the TSS keeps pointing at the per-CPU entry stack.
+        if !crate::arch::kpti::enabled() {
+            // TODO: If this increases performance, read gs:[offset] directly
+            core::ptr::addr_of_mut!((*pcr).tss.rsp[0]).write_unaligned(stack as u64);
+        }
     }
 }
 
@@ -373,6 +403,11 @@ pub fn allocate_and_init_pcr(
     unsafe { core::ptr::write(pcr_ptr, ProcessorControlRegion::new_partial_init(cpu_id)) };
 
     init_pcr(unsafe { &mut *pcr_ptr }, stack_end);
+    // SAFETY: the PCR was just allocated and initialized, and no CPU uses it yet.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::arch::kpti::setup_pcr(pcr_ptr)
+    };
 
     pcr_ptr
 }

@@ -78,3 +78,19 @@ macro_rules! alternative_auto(
         ",
     ) }
 );
+
+// Ferric Oxide (IBT, see arch/x86_64/ibt.rs): `endbr64` for the start of a hand-written entry
+// point that the CPU (IDT, SYSCALL) or an indirect branch reaches, when the kernel is built for
+// indirect branch tracking; nothing otherwise, so the default build's code is unchanged.
+#[cfg(any(cpu_feature_always = "ibt", cpu_feature_auto = "ibt"))]
+macro_rules! ibt_endbr {
+    () => {
+        "endbr64\n"
+    };
+}
+#[cfg(not(any(cpu_feature_always = "ibt", cpu_feature_auto = "ibt")))]
+macro_rules! ibt_endbr {
+    () => {
+        ""
+    };
+}

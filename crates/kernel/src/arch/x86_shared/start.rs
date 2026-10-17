@@ -51,6 +51,9 @@ extern "C" fn kstart() {
         jmp eax
     ",
 
+        // Ferric Oxide (IBT): the bootloader jumps here indirectly.
+        #[cfg(target_arch = "x86_64")]
+        ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // BSS should already be zero
@@ -95,6 +98,9 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
         // Stop early with a clear message on CPUs below the configured baseline.
         #[cfg(target_arch = "x86_64")]
         crate::arch::cpu_level::check();
+        // Ferric Oxide: stop here if the build requires IBT and this CPU lacks it.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::ibt::check();
 
         // Set up GDT
         gdt::init_bsp(stack_end);
@@ -183,6 +189,8 @@ fn continue_after_kmain_stack(
         let bootstrap = {
             #[cfg(target_arch = "x86_64")]
             crate::arch::alternative::early_init(true);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::kpti::init_bsp();
 
             // Set up syscall instruction
             interrupt::syscall::init();
@@ -207,6 +215,9 @@ fn continue_after_kmain_stack(
             if cfg!(feature = "acpi") {
                 crate::acpi::init_after_mem();
                 device::init_after_acpi();
+                // Ferric Oxide: VT-d, before any user-space driver can start DMA.
+                #[cfg(all(target_arch = "x86_64", iommu_enabled))]
+                crate::arch::iommu::init();
             }
             crate::profiling::init();
 
@@ -243,6 +254,9 @@ pub extern "C" fn kstart_ap() {
         jmp {start_ap}
     ",
 
+        // Ferric Oxide (IBT): the AP trampoline jumps here indirectly (`jmp rax`).
+        #[cfg(target_arch = "x86_64")]
+        ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // Note: The System V ABI requires the stack to be aligned to 16 bytes
@@ -272,6 +286,11 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
 
             // Set up IDT
             idt::install_idt(args.idt_ptr, args.cpu_id);
+
+            // Ferric Oxide (KPTI): before anything that could invalidate a TLB entry, since with
+            // PCID every invalidation also uses INVPCID, which faults until CR4.PCIDE is set.
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::kpti::init_cpu();
 
             // Initialize paging
             paging::init();

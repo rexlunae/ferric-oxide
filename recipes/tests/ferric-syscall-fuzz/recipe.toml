@@ -1,0 +1,15 @@
+# Ferric Oxide: feeds the kernel's system calls random and boundary arguments
+# from child processes and checks that the system survives. Source lives in
+# files/; as a path source (relative to the repository root) edits there
+# rebuild it.
+[source]
+path = "recipes/tests/ferric-syscall-fuzz/files"
+
+[build]
+template = "custom"
+# Link against this repository's relibc, like the other ferric tests.
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

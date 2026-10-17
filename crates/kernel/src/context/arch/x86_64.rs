@@ -51,6 +51,10 @@ pub struct Context {
     /// need to!), and thus it must be re-read from the register before copying this struct.
     pub(crate) gsbase: usize,
     userspace_io_allowed: bool,
+    /// Ferric Oxide: shadow-stack pointer, the address of the restore token `switch_to_inner`
+    /// switches back to (see arch/x86_64/shstk.rs).
+    #[cfg(shstk_compiled)]
+    pub(crate) ssp: usize,
 }
 
 impl Context {
@@ -60,6 +64,8 @@ impl Context {
             fsbase: 0,
             gsbase: 0,
             userspace_io_allowed: false,
+            #[cfg(shstk_compiled)]
+            ssp: 0,
         }
     }
 
@@ -101,6 +107,22 @@ impl Context {
         }
 
         self.set_stack(stack_top as usize);
+
+        // Ferric Oxide (shadow stacks): the same returns, func then enter_usermode, on the
+        // shadow stack, so the first switch to this context matches once CET is on.
+        #[cfg(shstk_compiled)]
+        if let Some(shadow) = stack.shadow_stack() {
+            let enter_usermode = crate::arch::interrupt::syscall::enter_usermode as *const ();
+            let returns = [func as usize as u64, enter_usermode as usize as u64];
+            let returns = if userspace_allowed {
+                &returns[..]
+            } else {
+                &returns[..1]
+            };
+            self.ssp = shadow
+                .install_initial(returns)
+                .expect("two return addresses and an aligned stack top always fit");
+        }
     }
 }
 impl super::Context {
@@ -229,6 +251,10 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
 
         crate::arch::gdt::set_tss_stack(pcr, next.kstack.initial_top() as usize);
         crate::arch::gdt::set_userspace_io_allowed(pcr, next.arch.userspace_io_allowed);
+        // Ferric Oxide (shadow stacks): interrupts from user space take their shadow-stack
+        // pointer from IA32_PL0_SSP, which therefore follows the context like the TSS stack.
+        #[cfg(shstk_compiled)]
+        crate::arch::shstk::set_entry_ssp(next.kstack.shadow_stack());
 
         // The syscall ABI allows the kernel to clobber the xmm/ymm/zmm registers. Hence, if the
         // kernel is later going to zero those registers when switching back, there's no need to
@@ -421,6 +447,34 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
     }
 }
 
+// Ferric Oxide (shadow stacks): switches SSP from `prev` (rdi) to `next` (rsi) with the token
+// protocol, before the RSP switch; see arch/x86_64/shstk.rs. RSTORSSP and SAVEPREVSSP raise #UD
+// while CET is off, so this is an alternative that alternative::early_init only selects once
+// shadow stacks are turned on; until then it is NOPs. Only rax is clobbered.
+#[cfg(shstk_compiled)]
+macro_rules! shstk_switch {
+    () => {
+        alternative!(
+            feature: "shstk",
+            then: ["
+            rdsspq rax
+            sub rax, 8
+            mov [rdi + {off_ssp}], rax
+            mov rax, [rsi + {off_ssp}]
+            rstorssp [rax]
+            saveprevssp
+            "],
+            default: [""]
+        )
+    };
+}
+#[cfg(not(shstk_compiled))]
+macro_rules! shstk_switch {
+    () => {
+        ""
+    };
+}
+
 // Check disassembly!
 #[unsafe(naked)]
 unsafe extern "sysv64" fn switch_to_inner(
@@ -455,7 +509,9 @@ unsafe extern "sysv64" fn switch_to_inner(
 
         mov [rdx + {off_rbp}], rbp
         mov rbp, [rcx + {off_rbp}]
-
+        "),
+        shstk_switch!(),
+        concat!("
         mov [rdi + {off_rsp}], rsp
         mov rsp, [rsi + {off_rsp}]
 
@@ -475,6 +531,8 @@ unsafe extern "sysv64" fn switch_to_inner(
         off_r15 = const offset_of!(InFxsaveAvailable, r15),
         off_rbp = const offset_of!(InFxsaveAvailable, rbp),
         off_rsp = const offset_of!(Context, rsp),
+        #[cfg(shstk_compiled)]
+        off_ssp = const offset_of!(Context, ssp),
 
         switch_hook = sym crate::context::switch_finish_hook,
     );

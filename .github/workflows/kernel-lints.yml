@@ -1,7 +1,9 @@
 name: kernel-lints
 
 # Holds kernel Clippy warnings and `unsafe` uses at or below the baseline in
-# ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh).
+# ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh), and
+# checks that a kernel built with indirect branch tracking (kernel.cpu.ibt) has
+# endbr64 at its entry points (scripts/ferric-ci/check-kernel-ibt.sh).
 
 on:
   push:
@@ -11,6 +13,9 @@ on:
       - "crates/**"
       - "ci/kernel-lints.json"
       - "scripts/ferric-ci/kernel-lint-ratchet.sh"
+      - "scripts/ferric-ci/check-kernel-ibt.sh"
+      - "features.toml"
+      - "tools/ferric-config/**"
       - ".github/workflows/kernel-lints.yml"
 
 jobs:
@@ -35,3 +40,40 @@ jobs:
           restore-keys: kernel-lints-
       - name: Lint ratchet
         run: scripts/ferric-ci/kernel-lint-ratchet.sh
+
+  # Neither KVM on the runners nor QEMU's emulator provides CET, so IBT cannot
+  # be booted here; check the binary instead.
+  ibt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nasm
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
+      - name: Install the kernel toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            crates/kernel/target
+          key: kernel-ibt-${{ hashFiles('crates/kernel/Cargo.lock', 'crates/kernel/rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: kernel-ibt-
+      # The same path a ferric.toml takes: ferric-config writes the kernel's
+      # config.toml, as recipes/core/kernel copies it.
+      - name: Kernel config with IBT on
+        run: |
+          out="$RUNNER_TEMP/ferric-ibt"
+          mkdir -p "$out"
+          printf '[kernel.cpu]\nibt = "always"\n' > "$out/ferric.toml"
+          cargo run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          cp "$out/kernel-config.toml" crates/kernel/config.toml
+          cat crates/kernel/config.toml
+      - name: Build the kernel
+        run: make -C crates/kernel BUILD="$RUNNER_TEMP/kernel-ibt" OBJCOPY=objcopy all
+      - name: Check endbr64 at entry points
+        run: scripts/ferric-ci/check-kernel-ibt.sh "$RUNNER_TEMP/kernel-ibt/kernel.all"

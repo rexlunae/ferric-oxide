@@ -29,9 +29,7 @@ pub fn nanosleep(
 ) -> Result<()> {
     let req = unsafe { req_buf.read_exact::<TimeSpec>()? };
 
-    if req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= time::NANOS_PER_SEC as i32 {
-        return Err(Error::new(EINVAL));
-    }
+    time::check_timespec(&req)?;
 
     let start = time::monotonic(token);
     let end = start + req.to_nanos();

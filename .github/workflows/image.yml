@@ -13,13 +13,23 @@ on:
     branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      config:
+        description: Image config to build and boot
+        type: choice
+        options: [ferric-smoke, ferric-fuzz]
+        default: ferric-smoke
+  # Nightly: a long system call fuzzing run (config/ferric-fuzz.toml).
+  schedule:
+    - cron: "17 3 * * *"
 
 concurrency:
-  group: image-${{ github.ref }}
+  # Kept apart by event, so the nightly run never cancels a push run on main.
+  group: image-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
-  CONFIG_NAME: ferric-smoke
+  CONFIG_NAME: ${{ github.event_name == 'schedule' && 'ferric-fuzz' || inputs.config || 'ferric-smoke' }}
 
 jobs:
   build:
@@ -65,7 +75,13 @@ jobs:
         run: |
           out="$RUNNER_TEMP/ferric-defaults"
           mkdir -p "$out"
-          : > "$out/ferric.toml"
+          # KPTI only switches on by itself on Meltdown-affected Intel CPUs, which
+          # the runners are not, so force it on to test the entry code on every run.
+          # The IOMMU is off by default; "auto" enables VT-d on the boot that has one
+          # and logs that there is no DMAR table on the other.
+          # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
+          # hardware, allocates them without turning CET on.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
@@ -74,6 +90,11 @@ jobs:
           relibc="$(sed -n 's/^export FERRIC_RELIBC_FEATURES:=//p' "$out/config.mk")"
           echo "relibc features: $relibc"
           echo "FERRIC_RELIBC_FEATURES=$relibc" >> "$GITHUB_ENV"
+          # CPU feature policy for the kernel's config.toml (recipes/core/kernel).
+          if [ -f "$out/kernel-config.toml" ]; then
+            cat "$out/kernel-config.toml"
+            echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
+          fi
 
       - name: Build image
         run: make all CONFIG_NAME="$CONFIG_NAME"
@@ -85,6 +106,32 @@ jobs:
         with:
           name: ferric-smoke-image
           path: harddrive.img.zst
+          retention-days: 7
+
+      # The same image with a kernel built with kernel.iommu = "enforce": only the kernel is
+      # rebuilt, then the image is made again from the packages already built.
+      - name: Build the enforce image
+        run: |
+          out="$RUNNER_TEMP/ferric-enforce"
+          mkdir -p "$out"
+          # The catalog-defaults config above, with the IOMMU switched to "enforce".
+          sed 's/^iommu = "auto"$/iommu = "enforce"/' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
+          cat "$out/ferric.toml"
+          "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          cat "$out/kernel-config.toml"
+          grep -q '^iommu = "enforce"' "$out/kernel-config.toml"
+          export FERRIC_KERNEL_CONFIG="$out/kernel-config.toml"
+          make cr.kernel CONFIG_NAME="$CONFIG_NAME"
+          rm -f "build/x86_64/$CONFIG_NAME/harddrive.img"
+          make all CONFIG_NAME="$CONFIG_NAME"
+          mkdir -p enforce
+          zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o enforce/harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferric-smoke-image-enforce
+          path: enforce/harddrive.img.zst
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -100,11 +147,22 @@ jobs:
   boot:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         cpu: [host]
+        # "vtd" boots the same image with an emulated Intel IOMMU: every PCI driver
+        # (nvmed, e1000d, ahcid) binds a DMA domain of its own when it connects to
+        # pcid, the kernel's DMA-domain self-test runs, and ferric-iommu-test drives
+        # QEMU's edu device through its domain. "enforce" boots the image whose kernel
+        # has kernel.iommu = "enforce" on the same machine: drivers without a bound
+        # domain get no DMA addresses and unattached devices are blocked, so reaching
+        # the smoke-test marker from disk shows the real drivers DMA through their
+        # domains.
+        iommu: [none, vtd, enforce]
+    env:
+      LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}.log
     steps:
       - uses: actions/checkout@v4
 
@@ -122,20 +180,44 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ferric-smoke-image
+          name: ${{ matrix.iommu == 'enforce' && 'ferric-smoke-image-enforce' || 'ferric-smoke-image' }}
 
       - name: Boot smoke test
+        env:
+          # The fuzzing image runs for 20 minutes before it shuts down.
+          BOOT_TIMEOUT: ${{ env.CONFIG_NAME == 'ferric-fuzz' && '1800' || '300' }}
+          BOOT_IOMMU: ${{ matrix.iommu == 'enforce' && 'vtd' || matrix.iommu }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
-          scripts/ferric-ci/boot-smoke.sh harddrive.img serial-${{ matrix.cpu }}.log ${{ matrix.cpu }}
+          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" ${{ matrix.cpu }}
 
-      - name: Check KASLR ran
+      - name: Check KASLR, KPTI and PCID ran
         run: |
-          grep -F "KASLR: physical memory map randomized" serial-${{ matrix.cpu }}.log
+          grep -F "KASLR: physical memory map randomized" "$LOG"
+          grep -aF "KPTI: user page tables isolated from the kernel" "$LOG"
+          # kernel.cpu.pcid defaults to "auto": with -cpu host the guest gets PCID and INVPCID
+          # whenever the runner has them, and then KPTI must use them.
+          if grep -qw pcid /proc/cpuinfo && grep -qw invpcid /proc/cpuinfo; then
+            grep -aF "KPTI: PCID enabled, no-flush CR3 switches" "$LOG"
+          else
+            echo "::warning::runner CPU lacks PCID or INVPCID; KPTI ran without PCID"
+            if grep -aF "KPTI: PCID enabled" "$LOG"; then exit 1; fi
+          fi
+
+      # kernel.cpu.shstk = "auto" does not enable shadow stacks yet. Whether KVM passes CET_SS
+      # through depends on the runner, so accept either answer but require the line.
+      - name: Check shadow-stack detection
+        run: |
+          grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
+
+      - name: Check the IOMMU
+        # The kernel's attach, bind, fault and release lines, the test driver's results, and
+        # that the disk, network and AHCI drivers each DMA through a domain they bound.
+        run: scripts/ferric-ci/check-iommu-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: serial-log-${{ matrix.cpu }}
-          path: serial-${{ matrix.cpu }}.log
+          name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}
+          path: ${{ env.LOG }}
           retention-days: 14

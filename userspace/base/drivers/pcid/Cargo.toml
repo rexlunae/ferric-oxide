@@ -26,6 +26,8 @@ redox_syscall.workspace = true
 serde.workspace = true
 
 common = { path = "../common" }
+# Ferric Oxide: the kernel iommu scheme's interface and requester-ID aliases.
+ferric-iommu = { workspace = true, features = ["alloc"] }
 daemon = { path = "../../daemon" }
 libredox.workspace = true
 

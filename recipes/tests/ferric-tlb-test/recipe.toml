@@ -1,0 +1,15 @@
+# Ferric Oxide: checks that unmap, mprotect and MAP_FIXED replacement reach
+# every thread's TLB (stale entries after KPTI's no-flush PCID switches would
+# show up here), and prints a system call round-trip timing. Source lives in
+# files/; as a path source (relative to the repository root) edits there
+# rebuild it.
+[source]
+path = "recipes/tests/ferric-tlb-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

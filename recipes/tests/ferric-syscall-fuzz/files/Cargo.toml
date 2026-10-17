@@ -1,0 +1,9 @@
+[package]
+name = "ferric-syscall-fuzz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "System call fuzzer for the Ferric Oxide kernel"
+
+[profile.release]
+debug = false
