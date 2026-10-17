@@ -322,11 +322,16 @@ that the kernel can drive and logs why it skips the others; "never" leaves
 VT-d off, as upstream does. "auto" and "enforce" also run a short boot
 self-test of DMA domains and provide the kernel.iommu scheme: pcid uses it to
 give a driver that asks (GetDmaDomain) a DMA domain of its own with the
-driver's device, its requester-ID aliases and its RMRRs in it; the device's
-DMA faults once the driver exits. "enforce" is "auto" plus a check that a
-driver binds only a domain with a device attached. Returning DMA addresses in
-the driver's domain from memory:translation (and refusing physical addresses
-under "enforce"), interrupt remapping and AMD-Vi come later."""
+driver's device, its requester-ID aliases and its RMRRs in it. Once the driver
+binds the domain, memory:translation answers with addresses in it: each buffer
+is pinned and mapped on its first translation and unmapped when the driver
+unmaps it or exits, so the device can reach only memory its driver translated.
+"enforce" goes further: a driver must bind a domain with a device attached
+before memory:translation answers at all (EACCES otherwise), and devices that
+no driver attached to a domain are blocked rather than identity-mapped. No
+in-tree driver asks for a domain yet, so "enforce" stops the disk and network
+drivers from doing DMA; use it only on systems whose DMA drivers all bind a
+domain. Interrupt remapping and AMD-Vi come later."""
 choices = ["auto", "enforce", "never"]
 
 [[option]]

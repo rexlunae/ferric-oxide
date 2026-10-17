@@ -285,6 +285,12 @@ impl KernelScheme for MemoryScheme {
         match handle_ty {
             HandleTy::Translation => {
                 let virt = VirtualAddress::new(payload.read_usize()?);
+                // Ferric Oxide: an IOVA in the caller's bound DMA domain (scheme/iommu.rs).
+                #[cfg(iommu_enabled)]
+                if let Some(iova) = super::iommu::translate(virt, token)? {
+                    payload.write_usize(iova)?;
+                    return Ok(0);
+                }
                 let mut token = token.token();
                 let addr = AddrSpace::current()?;
                 let addr = addr.acquire_read(token.downgrade());

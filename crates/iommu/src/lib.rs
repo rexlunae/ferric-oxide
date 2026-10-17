@@ -6,14 +6,18 @@
 //! it the *attach capability*. Opening [`abi::DOMAIN_PATH`] from that capability creates a domain
 //! with empty translation tables, so every DMA from a device in it faults. pcid then moves
 //! devices into the domain with [`abi::Request::Attach`] calls and passes the domain's file
-//! descriptor to the driver, which records it as its own with [`abi::Request::Bind`]. When the
-//! last descriptor of a domain is closed its devices are blocked: their DMA faults until pcid
-//! attaches them to a new domain.
+//! descriptor to the driver, which records it as its own with [`abi::Request::Bind`]. From then
+//! on `memory:translation` answers the driver with IOVAs in the domain, so its device can reach
+//! only memory the driver translated. When the last descriptor of a domain is closed its
+//! devices are blocked: their DMA faults until pcid attaches them to a new domain.
 //!
 //! - [`abi`] has the scheme's name and number, its paths, and the encoding of each call in the
 //!   call metadata words.
 //! - `alias` (with the `alloc` feature) works out the requester IDs a function's DMA can carry
 //!   once it has passed the bridges above it, so all of them can be attached together.
+//! - `dma` (with the `alloc` feature) is the kernel's bookkeeping for the IOVA mappings that
+//!   `memory:translation` makes in a bound domain: one IOVA per frame range, kept while some
+//!   virtual mapping of the driver still reaches it.
 //!
 //! Specifications: PCI Express Base Specification (requester IDs, ports and the PCI Express
 //! capability's device/port type field), and the PCI Express to PCI/PCI-X Bridge Specification
@@ -40,3 +44,5 @@ extern crate alloc;
 pub mod abi;
 #[cfg(feature = "alloc")]
 pub mod alias;
+#[cfg(feature = "alloc")]
+pub mod dma;

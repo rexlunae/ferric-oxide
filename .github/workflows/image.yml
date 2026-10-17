@@ -125,8 +125,9 @@ jobs:
       matrix:
         cpu: [host]
         # "vtd" boots the same image with an emulated Intel IOMMU, so the NVMe and
-        # e1000 DMA run through the kernel's identity-domain page tables, and the
-        # kernel's DMA-domain self-test runs.
+        # e1000 DMA run through the kernel's identity-domain page tables, the
+        # kernel's DMA-domain self-test runs, and ferric-iommu-test drives QEMU's edu
+        # device through a DMA domain of its own.
         iommu: [none, vtd]
     env:
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}.log
@@ -180,25 +181,58 @@ jobs:
             # The boot self-test of DMA domains attaches QEMU's host bridge, which a DRHD
             # scope lists and which never initiates DMA.
             grep -aF "IOMMU: domain self-test passed (attach/map/unmap/detach)" "$LOG"
-            # pcid-spawner starts ferric-iommu-test (recipes/tests) as the host bridge's
-            # driver. It asks pcid for a DMA domain, so pcid creates one through the kernel's
-            # iommu scheme and attaches the host bridge; the driver receives the domain's
-            # descriptor over its channel and binds it; its exit closes the domain.
-            grep -aE "IOMMU: 0000:00:00\.0 attached to domain [0-9]+" "$LOG"
+            # pcid-spawner starts ferric-iommu-test (recipes/tests) as the driver of QEMU's
+            # edu device (boot-smoke.sh adds it at 00:10.0). It asks pcid for a DMA domain, so
+            # pcid creates one through the kernel's iommu scheme and attaches the device; the
+            # driver receives the domain's descriptor over its channel and binds it; its exit
+            # closes the domain.
+            grep -aE "IOMMU: 0000:00:10\.0 attached to domain [0-9]+" "$LOG"
             grep -aE "IOMMU: domain [0-9]+ \(1 device\(s\)\) bound by" "$LOG"
             grep -aE "IOMMU: domain [0-9]+ closed, 1 device\(s\) blocked" "$LOG"
             grep -aF "FERRIC_TEST_PASS iommu-domain" "$LOG"
-            if grep -aE "IOMMU: cannot (attach|create a domain)" "$LOG"; then
-              echo "::error::the iommu scheme refused a domain or an attach"
+            # With the domain bound, memory:translation returns IOVAs, and the device copies a
+            # buffer through them.
+            grep -aF "FERRIC_TEST_PASS iommu-dma" "$LOG"
+            # Fault injection: the device writes a physical address the driver never translated
+            # in its domain. The memory must be unchanged and the kernel must log the fault.
+            grep -aF "FERRIC_TEST_PASS iommu-fault" "$LOG"
+            # Unmapping the buffer takes its IOVAs down (release hook, strict unmap), so the
+            # device's read of the old IOVA faults too.
+            grep -aE "IOMMU: domain [0-9]+: 1 DMA mapping\(s\) released after an unmap" "$LOG"
+            grep -aF "FERRIC_TEST_PASS iommu-release" "$LOG"
+            if grep -aE "IOMMU: cannot (attach|create a domain|map|unmap)" "$LOG"; then
+              echo "::error::the iommu scheme refused a domain, an attach or a mapping"
+              exit 1
+            fi
+            # Exactly the faults the test announced, each from the edu device, and no others.
+            tr -d '\r' < "$LOG" | grep -ao 'FERRIC_IOMMU_EXPECT_FAULT [a-z]* 0x[0-9a-f]*' \
+              | awk '{ print "00:10.0 " $2 " at " $3 ":" }' | sort -u > expected-faults
+            tr -d '\r' < "$LOG" | grep -ao 'IOMMU: DMA fault at unit 0x[0-9a-f]*: .*' \
+              | sed -E 's/^IOMMU: DMA fault at unit 0x[0-9a-f]*: ([0-9a-f:.]+ [a-z]+ at 0x[0-9a-f]+:).*/\1/' \
+              | sort -u > logged-faults
+            echo "expected faults:"; cat expected-faults
+            echo "logged faults:"; cat logged-faults
+            if [ "$(wc -l < expected-faults)" -ne 2 ]; then
+              echo "::error::the DMA test did not announce its two faults"
+              exit 1
+            fi
+            if ! diff expected-faults logged-faults; then
+              echo "::error::the kernel's DMA faults differ from the ones the test caused"
               exit 1
             fi
           else
             grep -aF "IOMMU: no DMAR table, VT-d not enabled" "$LOG"
             # Without an IOMMU pcid has no domain to give the test driver.
-            grep -aF "FERRIC_TEST_SKIP iommu-domain" "$LOG"
+            for t in iommu-domain iommu-dma iommu-fault iommu-release; do
+              grep -aF "FERRIC_TEST_SKIP $t" "$LOG"
+            done
+            if grep -aF "IOMMU: DMA fault" "$LOG"; then
+              echo "::error::a DMA fault without an IOMMU"
+              exit 1
+            fi
           fi
-          if grep -aE "IOMMU: (DMA fault|VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" "$LOG"; then
-            echo "::error::the IOMMU reported a fault, a failed self-test or skipped a unit"
+          if grep -aE "IOMMU: (VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" "$LOG"; then
+            echo "::error::the IOMMU lost faults, failed its self-test or skipped a unit"
             exit 1
           fi
 

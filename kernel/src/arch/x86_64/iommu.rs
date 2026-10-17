@@ -21,6 +21,7 @@
 //! The DMAR parsing, register decoding, table and descriptor encoding and the IOVA allocator
 //! are in the host-tested `ferric-vtd` crate (`crates/vtd`).
 
+pub mod dma;
 pub mod domain;
 mod selftest;
 
@@ -446,12 +447,18 @@ fn build_identity(plan: &UnitPlan, tables: &mut KernelTables) -> Result<Identity
     table::map_identity(tables, slpt, plan.agaw, 0, plan.top, plan.page_size)
         .map_err(Error::Map)?;
 
-    let entry = ContextEntry::new(
-        slpt,
-        plan.agaw,
-        IDENTITY_DOMAIN,
-        table::TranslationType::Untranslated,
-    );
+    // Under `enforce`, devices no driver has attached to a domain of its own are blocked
+    // instead: their context entries stay not present, so all their DMA faults.
+    let entry = if cfg!(iommu = "enforce") {
+        ContextEntry::BLOCKED
+    } else {
+        ContextEntry::new(
+            slpt,
+            plan.agaw,
+            IDENTITY_DOMAIN,
+            table::TranslationType::Untranslated,
+        )
+    };
     let context_table = tables.alloc_table().map_err(|_| Error::NoMemory)?;
     for pair in tables.table(context_table).chunks_exact_mut(2) {
         pair.copy_from_slice(&entry.0);
@@ -651,8 +658,13 @@ fn init_unit(
         Invalidator::Queued(_) => "queued",
         Invalidator::Registers => "register",
     };
+    let unattached = if cfg!(iommu = "enforce") {
+        "unattached devices blocked"
+    } else {
+        "identity domain"
+    };
     info!(
-        "IOMMU: VT-d unit at {:#x} enabled (identity domain)",
+        "IOMMU: VT-d unit at {:#x} enabled ({unattached})",
         drhd.register_base
     );
     info!(
@@ -729,8 +741,9 @@ pub fn init() {
         *DOMAIN_IDS.lock() = Some(DomainIds::new(FIRST_DMA_DOMAIN, layout.domain_id_limit));
         selftest::run();
         if cfg!(iommu = "enforce") {
-            // Until `memory:translation` returns IOVAs, enforce only adds the bind check.
-            info!("IOMMU: enforce mode: a driver can bind only a domain with a device attached");
+            info!(
+                "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses, and only devices attached to a domain can DMA"
+            );
         }
     } else if !units.is_empty() {
         warn!("IOMMU: the units share no table layout; DMA domains are unavailable");
