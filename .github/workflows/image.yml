@@ -126,7 +126,8 @@ jobs:
           scripts/ferric-ci/boot-smoke.sh harddrive.img serial-${{ matrix.cpu }}.log ${{ matrix.cpu }}
 
       - name: Check KASLR ran
-        run: grep -F "KASLR: physical memory map randomized" serial-${{ matrix.cpu }}.log
+        run: |
+          grep -F "KASLR: physical memory map randomized" serial-${{ matrix.cpu }}.log
 
       - uses: actions/upload-artifact@v4
         if: always()
