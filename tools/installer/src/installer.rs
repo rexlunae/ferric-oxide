@@ -148,6 +148,33 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     library.install(packages)?;
     library.apply()?;
 
+    // Ferric Oxide: an image that ships fox (features.toml packages.manager)
+    // must trust the key that signed its packages, or fox cannot verify or
+    // adopt them on first boot.
+    if let Some(cookbook) = cookbook {
+        let fox = pkg::PackageName::new("fox")?;
+        if library.get_installed_packages()?.contains(&fox) {
+            install_fox_key(Path::new(cookbook), dest)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Where the trusted key for the cookbook's packages goes, relative to the
+/// image root. fox trusts every key file in `etc/fox/keys/`, by file name.
+const FOX_COOKBOOK_KEY: &str = "etc/fox/keys/cookbook.toml";
+
+/// Copies the public key the cookbook signs packages with
+/// (`build/id_ed25519.pub.toml`) into the image as a key fox trusts.
+fn install_fox_key(cookbook: &Path, dest: &Path) -> anyhow::Result<()> {
+    let key = cookbook.join("build/id_ed25519.pub.toml");
+    let target = dest.join(FOX_COOKBOOK_KEY);
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    fs::copy(&key, &target)
+        .with_context(|| format!("copying {} to {}", key.display(), target.display()))?;
     Ok(())
 }
 
@@ -990,4 +1017,42 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
 /// May panic for invalid disk layouts or random-source failure during account setup.
 pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
     install_inner(config, output.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = env::temp_dir().join(format!("installer-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fox_key_comes_from_the_cookbook() {
+        let cookbook = TempDir::new("fox-cookbook");
+        let dest = TempDir::new("fox-dest");
+        fs::create_dir_all(cookbook.0.join("build")).unwrap();
+        fs::write(cookbook.0.join("build/id_ed25519.pub.toml"), "pkey = []\n").unwrap();
+        install_fox_key(&cookbook.0, &dest.0).unwrap();
+        let installed = fs::read_to_string(dest.0.join(FOX_COOKBOOK_KEY)).unwrap();
+        assert_eq!(installed, "pkey = []\n");
+
+        // Without a cookbook key there is nothing to trust: that is an error.
+        let empty = TempDir::new("fox-empty");
+        assert!(install_fox_key(&empty.0, &dest.0).is_err());
+    }
 }

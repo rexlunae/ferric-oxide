@@ -1,0 +1,24 @@
+# Ferric Oxide: fox, the package manager (tools/fox), for the target. The
+# image ships it instead of pkgutils when features.toml packages.manager is
+# "fox" (the default with ferric.toml). docs/src/ferric-packaging.md
+# describes it.
+#
+# The path source makes the cookbook rebuild fox when tools/fox changes;
+# changes only under crates/fox-* need `make cr.fox`.
+[source]
+path = "tools/fox"
+
+[build]
+template = "custom"
+script = """
+# fox is a member of the host workspace at the repository root: it takes its
+# dependency versions and lockfile from there, and its libraries are
+# ../../crates/fox-* path dependencies. The cookbook's copy of tools/fox in
+# source/ has neither, so build the in-tree crate instead, into this
+# recipe's build directory.
+export CARGO_TARGET_DIR="${COOKBOOK_BUILD}/target"
+COOKBOOK_SOURCE="${COOKBOOK_ROOT}/tools/fox" cookbook_cargo
+# On first boot, record the packages the installer put in the image.
+mkdir -pv "${COOKBOOK_STAGE}/usr/lib/init.d"
+cp -v "${COOKBOOK_RECIPE}/05_fox-adopt.service" "${COOKBOOK_STAGE}/usr/lib/init.d/"
+"""

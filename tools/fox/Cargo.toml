@@ -17,4 +17,6 @@ thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
+pkgar = { workspace = true }
+pkgar-keys = { workspace = true }
 tempfile.workspace = true

@@ -15,6 +15,11 @@
 //!   installed files long after the archive is gone;
 //! - `var/lib/fox/lock`: held while the database is changed.
 //!
+//! [`Store::adopt_pkg`] records the packages upstream `pkg` installed (an
+//! image built by the installer, or a system that used `pkg`) from the
+//! signed heads it keeps, so `fox` can take over a root without
+//! reinstalling anything.
+//!
 //! Install rules:
 //!
 //! - archives must already be verified ([`Archive::open`]);
@@ -67,6 +72,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod adopt;
 mod db;
 mod fsutil;
 
@@ -81,6 +87,9 @@ use fox_core::keys::TRUSTED_KEYS_DIR;
 use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
 
+pub use adopt::{
+    AdoptOptions, AdoptReport, AdoptedPackage, PKG_HEADS_DIR, PKG_STATE, SkipReason, SkippedPackage,
+};
 use db::Database;
 pub use db::{InstalledPackage, MetadataKind, PackageState};
 use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
@@ -159,6 +168,15 @@ pub enum StoreError {
     #[error("installed-package database {} is invalid", path.display())]
     Database {
         /// The database file.
+        path: PathBuf,
+        /// The parse error.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// `pkg`'s installed-package state is not valid.
+    #[error("pkg state {} is invalid", path.display())]
+    PkgState {
+        /// The state file.
         path: PathBuf,
         /// The parse error.
         #[source]
@@ -792,7 +810,7 @@ fn record(archive: &Archive) -> InstalledPackage {
         version: manifest.version.clone(),
         target: manifest.target.clone(),
         depends: manifest.depends.clone(),
-        archive_blake3: archive.blake3(),
+        archive_blake3: Some(archive.blake3()),
         entries_blake3: archive.head().entries_blake3(),
         signer: signer.key,
         signer_label: signer.label.clone(),

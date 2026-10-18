@@ -1,0 +1,10 @@
+[unit]
+description = "Adopt the packages the installer put in the image into fox's database"
+
+# Runs once per root (fox records that it did) and changes no file. Packages
+# without a signed manifest are adopted under the names pkg's state gives
+# them, which the installer wrote from the image configuration.
+[service]
+cmd = "fox"
+args = ["adopt-pkg", "--allow-unsigned-metadata"]
+type = "oneshot"

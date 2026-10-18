@@ -9,7 +9,9 @@ use fox_core::archive::{Archive, ArchiveError, MetadataSource};
 use fox_core::keys::{KeyError, load_key_file, trusted_keys_for_root};
 use fox_core::{NameError, PackageName, TrustedKeys};
 use fox_sbom::{PackageSbom, SbomError};
-use fox_store::{InstallOptions, PackageState, ProblemKind, Store, StoreError};
+use fox_store::{
+    AdoptOptions, InstallOptions, MetadataKind, PackageState, ProblemKind, Store, StoreError,
+};
 use serde::Serialize;
 
 use crate::{Cli, Command, SbomFormat};
@@ -63,6 +65,16 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
             },
         ),
         Command::List => list(cli),
+        Command::AdoptPkg {
+            allow_unsigned_metadata,
+            again,
+        } => adopt_pkg(
+            cli,
+            AdoptOptions {
+                allow_unsigned_metadata: *allow_unsigned_metadata,
+                again: *again,
+            },
+        ),
         Command::Remove { force, names } => remove(cli, names, *force),
     }
 }
@@ -407,11 +419,22 @@ struct ListJson {
     version: String,
     target: Option<String>,
     depends: Vec<String>,
-    archive_blake3: String,
+    archive_blake3: Option<String>,
     signer: String,
     signer_label: String,
+    metadata: &'static str,
     files: usize,
     removal_incomplete: bool,
+}
+
+/// How a package's identity was established, for output.
+fn metadata_name(kind: MetadataKind) -> &'static str {
+    match kind {
+        MetadataKind::Embedded => "embedded",
+        MetadataKind::Sidecar => "sidecar",
+        MetadataKind::Legacy => "legacy",
+        _ => "unknown",
+    }
 }
 
 fn list(cli: &Cli) -> Result<ExitCode, CliError> {
@@ -425,9 +448,10 @@ fn list(cli: &Cli) -> Result<ExitCode, CliError> {
                 version: p.version,
                 target: p.target,
                 depends: p.depends.iter().map(ToString::to_string).collect(),
-                archive_blake3: p.archive_blake3.to_string(),
+                archive_blake3: p.archive_blake3.map(|digest| digest.to_string()),
                 signer: p.signer.to_string(),
                 signer_label: p.signer_label,
+                metadata: metadata_name(p.metadata),
                 files: p.files.len(),
                 removal_incomplete: p.state == PackageState::Removing,
             })
@@ -435,11 +459,17 @@ fn list(cli: &Cli) -> Result<ExitCode, CliError> {
         print_json(&rows)?;
     } else {
         for p in packages {
-            let note = if p.state == PackageState::Removing {
+            let unsigned = if p.metadata == MetadataKind::Embedded {
+                ""
+            } else {
+                ", unsigned name"
+            };
+            let removing = if p.state == PackageState::Removing {
                 ", removal incomplete"
             } else {
                 ""
             };
+            let note = format!("{unsigned}{removing}");
             println!(
                 "{} {} ({} files, signed by {}{note})",
                 p.name,
@@ -450,6 +480,75 @@ fn list(cli: &Cli) -> Result<ExitCode, CliError> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct AdoptJson {
+    already_adopted: bool,
+    adopted: Vec<AdoptedJson>,
+    skipped: Vec<SkippedJson>,
+}
+
+#[derive(Serialize)]
+struct AdoptedJson {
+    name: String,
+    version: String,
+    metadata: &'static str,
+    files: usize,
+}
+
+#[derive(Serialize)]
+struct SkippedJson {
+    name: String,
+    reason: String,
+}
+
+fn adopt_pkg(cli: &Cli, options: AdoptOptions) -> Result<ExitCode, CliError> {
+    let store = Store::open(&cli.root)?;
+    let keys = trusted_keys_in(cli, store.root())?;
+    let report = store.adopt_pkg(&keys, options)?;
+    let out = AdoptJson {
+        already_adopted: report.already_adopted,
+        adopted: report
+            .adopted
+            .iter()
+            .map(|p| AdoptedJson {
+                name: p.name.to_string(),
+                version: p.version.clone(),
+                metadata: metadata_name(p.metadata),
+                files: p.files,
+            })
+            .collect(),
+        skipped: report
+            .skipped
+            .iter()
+            .map(|p| SkippedJson {
+                name: p.name.clone(),
+                reason: chain(&p.reason),
+            })
+            .collect(),
+    };
+    if cli.json {
+        print_json(&out)?;
+    } else if out.already_adopted {
+        println!("pkg's packages were already adopted");
+    } else {
+        for p in &out.adopted {
+            println!(
+                "adopted {} {} ({} files, {})",
+                p.name, p.version, p.files, p.metadata
+            );
+        }
+        for p in &out.skipped {
+            println!("skipped {}: {}", p.name, p.reason);
+        }
+        println!(
+            "adopted {} of {} packages",
+            out.adopted.len(),
+            out.adopted.len() + out.skipped.len()
+        );
+    }
+    Ok(exit_code(out.skipped.is_empty()))
 }
 
 #[derive(Serialize)]

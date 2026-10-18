@@ -1,10 +1,11 @@
 # Package tooling: fox
 
-`fox` currently operates on local `.pkgar` archives and an in-place install
-root. The OS image build still uses cookbook and the installer, and inherited
-images may include upstream `pkgutils`. `fox` has no recipe or default image
-integration in this checkout; its command and libraries are host-workspace
-members.
+`fox` operates on local `.pkgar` archives and an in-place install root. Its
+command and libraries are host-workspace members, and `recipes/core/fox`
+builds the same command for the target. With `ferric.toml`, images ship
+`fox` instead of upstream `pkgutils` by default (see
+[Target images](#target-images)). The image build itself still uses the
+cookbook and the installer.
 
 ## Components and trust
 
@@ -51,7 +52,10 @@ names; they do not express version constraints or implement resolution. Install
 reports missing dependencies but does not fetch them or refuse installation
 solely because they are absent.
 
-Current cookbook archives do not embed this manifest. For those, the reader
+The cookbook packs this manifest into every target package when
+`FERRIC_FOX_MANIFEST=1` (`packages.signed_manifests`, on by default with
+`ferric.toml`; see [Target images](#target-images)). Archives built without
+it, and upstream ones, do not embed it. For those, the reader
 can load `<name>.toml` beside the archive and check that its `blake3` value
 matches the signed entry-table hash. That binds the sidecar to the archive
 but does **not** authenticate its name, version or other metadata. Verification
@@ -74,6 +78,7 @@ fox --root ./image-root --key ./signer.pub install ./hello.pkgar
 fox --root ./image-root --json list
 fox --root ./image-root --key ./signer.pub verify --installed
 fox --root ./image-root remove hello
+fox --root ./image-root adopt-pkg
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify --installed`
@@ -81,7 +86,8 @@ accepts optional package names; without them it checks all installed packages.
 `install` and `remove` accept multiple inputs. Verification failures produce
 a failing exit status. `install --force` permits replacement of otherwise
 conflicting unowned files; `remove --force` bypasses dependent-package refusal.
-Neither flag makes an untrusted signature acceptable.
+Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
+under [Adopting pkg's packages](#adopting-pkgs-packages).
 
 ## Store behavior and persistence
 
@@ -90,6 +96,7 @@ Neither flag makes an untrusted signature acceptable.
 | `var/lib/fox/installed.toml` | `fox-installed/1` database: package metadata, signer/hash information, file records and removal state |
 | `var/lib/fox/heads/<name>.pkgar_head` | Retained signed header and entry table for installed verification |
 | `var/lib/fox/lock` | Writer lock for database changes |
+| `etc/pkg/packages.toml`, `var/lib/packages/` | `pkg`'s state, read by `adopt-pkg` and never written by `fox` |
 | `etc/fox/keys/` | Trusted signer public keys |
 
 Files are extracted into the root. Paths owned by another package conflict;
@@ -109,6 +116,60 @@ multi-package command atomic.
 Installed verification checks the retained signed head against currently
 trusted keys and compares installed files with the signed entry records. The
 database supplies management state, not a replacement trust root.
+
+## Adopting pkg's packages
+
+`fox adopt-pkg` (`Store::adopt_pkg`) takes over a root that upstream `pkg`
+populated: the installer writes such roots, and older systems used `pkg`.
+`pkg` lists its packages in `etc/pkg/packages.toml` and keeps each one's
+signed head in `var/lib/packages/<name>.pkgar_head`. For every listed
+package, adoption:
+
+- verifies the head against the trusted keys, exactly as installed
+  verification does, and records its signed entries as the package's files;
+- takes the identity from the signed manifest when the head lists one and
+  the installed copy still hashes to it. Otherwise only `pkg`'s state names
+  the package. That is accepted only with `--allow-unsigned-metadata`, and
+  the package is recorded with `legacy` metadata and version `unknown`;
+- skips packages that are already recorded, would own a reserved path, or
+  have files that already belong to another package, and lists why.
+
+Adoption changes no installed file and does not hash them: run
+`fox verify --installed` afterwards. It runs once per root. The database
+records that it ran, so `pkg`'s stale state cannot bring back a package
+removed with `fox` later; `--again` overrides this. A package that skips
+exits with a failing status.
+
+## Target images
+
+| Setting (`features.toml`) | Default with `ferric.toml` | Effect |
+| --- | --- | --- |
+| `packages.manager` | `fox` | `fox`: the image gets the `fox` package, built from source even with `REPO_BINARY`, and no `pkgutils`. `pkgutils`: upstream `pkg` as before |
+| `packages.signed_manifests` | on | Sets `FERRIC_FOX_MANIFEST=1`: the cookbook writes `usr/share/fox/manifest/<name>.toml` into each target package's stage before packing it, so the signature covers the name, version, target, dependencies and git source. Changing it repacks every package |
+
+Without `ferric.toml` neither applies, and the build matches upstream.
+
+Remote (`REPO_BINARY`) packages are unpacked and signed again with the
+cookbook's key, so they get manifests too. Packages already packed keep
+what they had until they are repacked.
+
+When an image includes `fox`, the installer copies the cookbook's public
+key (`build/id_ed25519.pub.toml`) to `/etc/fox/keys/cookbook.toml`, so the
+target trusts the key that signed its packages. The installer still places
+packages with `pkg`'s library. On first boot, `fox`'s
+`/usr/lib/init.d/05_fox-adopt.service` runs
+`fox adopt-pkg --allow-unsigned-metadata`. The unsigned names it accepts are
+the ones the installer took from the image configuration. After that,
+`fox list`, `fox verify --installed`, `fox install` and `fox remove` cover the
+whole system.
+
+On the target, `fox` installs local `.pkgar` files only. It does not fetch
+from package servers or resolve dependencies, which `pkg` does. Choose
+`packages.manager = "pkgutils"` for that.
+
+The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
+requires every package to have been adopted with a signed manifest, then
+runs `fox verify --installed`.
 
 ## SBOM scope and unfinished packaging work
 
