@@ -161,6 +161,11 @@ fn spawn(ring: &Arc<Ring>, token: &mut CleanLockToken) -> Result<()> {
         let mut context = context_lock.write(token.token());
         context.name.clear();
         let _ = context.name.try_push_str("[ring worker]");
+        // The scheduler puts only contexts marked `userspace` on its run queues (the others
+        // are the per-CPU idle contexts), so a kernel context that is to be scheduled must be
+        // marked too, though the worker never enters user mode: `context::spawn` gave it no
+        // return to user mode, and it ends in `exit_this_context`.
+        context.userspace = true;
         context.status = Status::Runnable;
         context.cpu_id
     };
