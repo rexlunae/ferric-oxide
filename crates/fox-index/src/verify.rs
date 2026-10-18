@@ -8,7 +8,8 @@
 //!    by a threshold of both the trusted root's and its own root keys, and
 //!    carry version `N`. The newest root must not have expired.
 //! 2. **Timestamp.** Signed by the root's timestamp role, not older than the
-//!    trusted version, not expired.
+//!    trusted version, not expired, and byte-for-byte identical when it is
+//!    the version the client already trusts.
 //! 3. **Snapshot.** Its length and BLAKE3 match the timestamp; signed by the
 //!    snapshot role; version as the timestamp says, not older than trusted;
 //!    no file it lists is older than in the trusted snapshot; not expired.
@@ -22,14 +23,16 @@
 //! checking their length and BLAKE3 against the targets metadata (top-level
 //! first, then the delegation that covers the path). Files that no metadata
 //! lists cannot be read. A package may disappear from a newer snapshot; its
-//! file then simply stops being readable.
+//! file then simply stops being readable. A package's owners must also be
+//! the keys its delegation grants, so tag authority cannot diverge from
+//! update authority.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use fox_core::PackageName;
+use fox_core::{KeyId, PackageName};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -171,6 +174,18 @@ pub enum VerifyError {
     /// The client state file is invalid.
     #[error("invalid client state")]
     State(#[source] serde_json::Error),
+    /// Signed metadata changed without a version bump.
+    #[error("{file} changed at the same version; refusing an equivocation")]
+    Equivocation {
+        /// The file.
+        file: String,
+    },
+    /// A package's owners do not match the keys of its delegation.
+    #[error("package {package} has owners that do not match its delegation keys")]
+    OwnerMismatch {
+        /// The package.
+        package: String,
+    },
 }
 
 /// What a client remembers about a registry between updates.
@@ -185,6 +200,10 @@ pub struct ClientState {
     pub snapshot: u64,
     /// Versions of the files the trusted snapshot listed.
     pub meta: BTreeMap<String, u64>,
+    /// The length and BLAKE3 of the trusted timestamp, so a same-version
+    /// replacement is refused instead of accepted as fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_file: Option<FileMeta>,
 }
 
 impl ClientState {
@@ -202,6 +221,7 @@ impl ClientState {
             timestamp: 0,
             snapshot: 0,
             meta: BTreeMap::new(),
+            timestamp_file: None,
         })
     }
 
@@ -230,6 +250,7 @@ pub struct VerifiedRegistry {
     dir: PathBuf,
     root: Root,
     files: BTreeMap<String, FileMeta>,
+    delegations: BTreeMap<String, RoleKeys>,
 }
 
 /// Verifies the checkout at `dir` against `state` at time `now`, and
@@ -248,9 +269,20 @@ pub fn update(
     check_expiry(&root.signed, "root", now)?;
     let roles = &root.signed;
 
-    let timestamp: Signed<Timestamp> = load(dir, TIMESTAMP_FILE)?.1;
+    let (timestamp_bytes, timestamp): (Vec<u8>, Signed<Timestamp>) = load(dir, TIMESTAMP_FILE)?;
     verify_role(&timestamp, roles, RoleName::Timestamp, TIMESTAMP_FILE)?;
     not_older(TIMESTAMP_FILE, state.timestamp, timestamp.signed.version)?;
+    // The timestamp pins the whole chain below it by hash, so accepting a
+    // same-version timestamp with different bytes would let a signer feed a
+    // client a different snapshot, targets and packages without a bump.
+    if timestamp.signed.version == state.timestamp
+        && let Some(trusted) = state.timestamp_file
+        && !trusted.matches(&timestamp_bytes)
+    {
+        return Err(VerifyError::Equivocation {
+            file: TIMESTAMP_FILE.to_owned(),
+        });
+    }
     check_expiry(&timestamp.signed, TIMESTAMP_FILE, now)?;
 
     let snapshot: Signed<Snapshot> =
@@ -264,11 +296,12 @@ pub fn update(
     }
     check_expiry(&snapshot.signed, SNAPSHOT_FILE, now)?;
 
-    let files = verify_targets(dir, roles, &snapshot.signed, now)?;
+    let (files, delegations) = verify_targets(dir, roles, &snapshot.signed, now)?;
     let registry = VerifiedRegistry {
         dir: dir.to_path_buf(),
         root: root.signed.clone(),
         files,
+        delegations,
     };
     *state = ClientState {
         root,
@@ -280,6 +313,7 @@ pub fn update(
             .iter()
             .map(|(file, meta)| (file.clone(), meta.version))
             .collect(),
+        timestamp_file: Some(FileMeta::of(&timestamp_bytes)),
     };
     Ok(registry)
 }
@@ -313,13 +347,16 @@ fn update_root(dir: &Path, trusted: &Signed<Root>) -> Result<Signed<Root>, Verif
     }
 }
 
+/// The signed files and the delegation keys of a verified targets tree.
+type VerifiedTargets = (BTreeMap<String, FileMeta>, BTreeMap<String, RoleKeys>);
+
 /// Verifies targets and delegations, and returns every signed file.
 fn verify_targets(
     dir: &Path,
     roles: &Root,
     snapshot: &Snapshot,
     now: OffsetDateTime,
-) -> Result<BTreeMap<String, FileMeta>, VerifyError> {
+) -> Result<VerifiedTargets, VerifyError> {
     let targets_file = format!("{METADATA_DIR}/{TARGETS_FILE}");
     let targets: Signed<Targets> =
         load_described(dir, &targets_file, meta(snapshot, TARGETS_FILE)?)?;
@@ -330,6 +367,7 @@ fn verify_targets(
         check_path(path)?;
         files.insert(path.clone(), *file);
     }
+    let mut delegations = BTreeMap::new();
     for delegation in &targets.signed.delegations {
         let name = format!("delegations/{}.json", delegation.name);
         // The name becomes a filesystem path below; a delegation whose name
@@ -351,8 +389,9 @@ fn verify_targets(
             // Top-level targets take precedence, as in TUF's search order.
             files.entry(path.clone()).or_insert(*meta);
         }
+        delegations.insert(delegation.name.clone(), delegation.keys.clone());
     }
-    Ok(files)
+    Ok((files, delegations))
 }
 
 fn meta<'a>(snapshot: &'a Snapshot, name: &str) -> Result<&'a VersionMeta, VerifyError> {
@@ -590,20 +629,37 @@ impl VerifiedRegistry {
     ///
     /// # Errors
     ///
-    /// As [`VerifiedRegistry::read`], and [`VerifyError::Layout`] if it is
-    /// invalid.
+    /// As [`VerifiedRegistry::read`], [`VerifyError::Layout`] if it is
+    /// invalid, and [`VerifyError::OwnerMismatch`] if its owners disagree
+    /// with the keys its delegation grants.
     pub fn package(&self, name: &PackageName) -> Result<Option<PackageEntry>, VerifyError> {
         let path = package_path(name);
         if !self.files.contains_key(&path) {
             return Ok(None);
         }
         let text = self.read_text(&path)?;
-        PackageEntry::from_toml(&text, &path)
-            .map(Some)
-            .map_err(|source| VerifyError::Layout {
+        let entry =
+            PackageEntry::from_toml(&text, &path).map_err(|source| VerifyError::Layout {
                 path,
                 source: Box::new(source),
-            })
+            })?;
+        // The owners an installer checks release tags against must be the
+        // same keys the targets metadata delegates update authority to, or a
+        // package edit could claim owners whose tags the delegation would
+        // never authorize.
+        if let Some(keys) = self.delegations.get(name.as_str()) {
+            let owners: BTreeSet<KeyId> = entry
+                .owners
+                .iter()
+                .map(|owner| owner.delegation_key())
+                .collect();
+            if owners != keys.keyids {
+                return Err(VerifyError::OwnerMismatch {
+                    package: name.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(Some(entry))
     }
 
     /// The artifact list of `name` `version`, if there is one.

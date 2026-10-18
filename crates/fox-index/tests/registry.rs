@@ -7,7 +7,7 @@ use std::path::Path;
 use fox_core::trust::AuthorKey;
 use fox_core::{Blake3Digest, KeyId, PackageName};
 use fox_index::edit::{EditError, Keyring, Registry, SignOptions, single_key_roles};
-use fox_index::layout::{PackageEntry, Release};
+use fox_index::layout::{Owner, PackageEntry, Release};
 use fox_index::metadata::{
     FileMeta, RoleKeys, RoleName, Root, Signed, Snapshot, Targets, Timestamp,
 };
@@ -574,5 +574,59 @@ fn a_root_without_every_role_is_refused() {
     assert!(matches!(
         Registry::open(dir.path()),
         Err(EditError::MissingRole { role: "targets" })
+    ));
+}
+
+#[test]
+fn package_owners_must_match_the_delegation_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let mut state = client(&registry);
+
+    // A package edit adds an owner the maintainer's delegation did not
+    // authorize; a client must not treat its tags as trusted.
+    let mut entry = registry.package(&ripgrep()).unwrap().unwrap();
+    entry.owners.push(Owner {
+        id: "other".to_owned(),
+        key: owner_key(8),
+    });
+    registry.write_package(&entry).unwrap();
+    registry
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert!(matches!(
+        verified.package(&ripgrep()),
+        Err(VerifyError::OwnerMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_same_version_timestamp_cannot_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = admitted(dir.path());
+    let mut state = client(&registry);
+    verify::update(dir.path(), &mut state, now()).unwrap();
+
+    // Re-signing the timestamp at the same version with different content
+    // is an equivocation the client must detect.
+    let mut timestamp: Signed<Timestamp> = read(dir.path(), "metadata/timestamp.json");
+    timestamp.signed.snapshot.file = FileMeta::of(b"different");
+    timestamp.signatures.clear();
+    timestamp.sign(&secret(MAINTAINER)).unwrap();
+    fs::write(
+        dir.path().join("metadata/timestamp.json"),
+        timestamp.to_json().unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        verify::update(dir.path(), &mut state, now()),
+        Err(VerifyError::Equivocation { .. })
     ));
 }
