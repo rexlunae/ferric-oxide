@@ -616,9 +616,16 @@ RustSec database (`crates/<crate>/*.md`, Markdown with TOML front matter).
 Package advisories match installed package names and versions; crate
 advisories match the crates listed in each package's build SBOM, so a
 vulnerable crate is reported in every package that links it, marked
-`build only` when it ran only at build time. The SBOM is read from the path
-the package itself installed, and only if it still has the hash recorded at
-install time. `audit` fails when anything matches; `--json` gives the
+`build only` when it ran only at build time. Only crates whose
+`fox:registry` is crates.io are matched against RustSec; crates from other
+registries share the `pkg:cargo` purl type but not crates.io's names. The
+SBOM is read from the path the package itself installed, never through a
+symbolic link and no further than its recorded size (at most 64 MiB), and
+only if it still has the hash recorded at install time. Packages whose
+removal did not finish are left out. Package advisories match by name and
+version alone: the installed-package database does not record which
+registry a package came from, so with two registries publishing the same
+name, both registries' advisories apply. `audit` fails when anything matches; `--json` gives the
 findings, the packages whose versions are not semver (`unchecked`) and the
 number of advisories checked. Installing a registry release that an
 advisory affects prints a warning.
@@ -633,7 +640,8 @@ package its files and the crates from its build SBOM (their `bom-ref`s
 prefixed with `<package>/`). The dependency graph links the system to its
 packages, packages to the installed packages they depend on and to their
 root crates, and keeps each build's crate graph. Like the package SBOM it
-is reproducible. Run against an image root (`--root`), it is that image's
+is reproducible; its serial number derives from everything the document
+lists, so a re-signed or changed package gives a new serial. Run against an image root (`--root`), it is that image's
 SBOM; packages adopted from `pkg` have no build SBOM, so they list files but
 no crates.
 

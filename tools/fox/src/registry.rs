@@ -314,7 +314,13 @@ pub(crate) fn open(
         return update(root, entry, now);
     }
     let mut client = saved.client;
-    verify::update(&dir.join(TREE_DIR), &mut client, now).map_err(verify_error(&entry.name))
+    match verify::update(&dir.join(TREE_DIR), &mut client, now) {
+        // The checkout is recent but its metadata expired (the timestamp
+        // was signed well before the last update): fetch newer metadata,
+        // which still has to verify.
+        Err(VerifyError::Expired { .. }) => update(root, entry, now),
+        result => result.map_err(verify_error(&entry.name)),
+    }
 }
 
 /// Finds `spec`'s package in the configured registries.
