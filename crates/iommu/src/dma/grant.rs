@@ -4,6 +4,7 @@
 //! must retain their domain resources and be published to their grant before returning an
 //! error. These rules are independent of VT-d or AMD-Vi register encodings.
 
+use alloc::collections::BTreeMap;
 use core::fmt;
 
 /// Work for the hardware backend while installing a grant's physical runs.
@@ -27,6 +28,7 @@ pub enum MapStep {
 
 /// Why installation of a grant's runs failed.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MapRunsError<E> {
     /// The combined length is zero or exceeds `u64`; no backend operation ran.
     InvalidLength,
@@ -139,6 +141,45 @@ pub fn map_runs<E>(
         done = done.saturating_add(len);
     }
     Ok(())
+}
+
+/// Records installed or uncertain resources in the domain before producing a grant attempt.
+///
+/// Call for a freshly reserved `iova`, holding the domain lock. `mapping` owns its pins and
+/// reservation. `mark_failed` must make uncertain teardown terminal until confirmed device
+/// blocking. Feed the returned attempt to grant-link and region publication before returning
+/// its result to user space. This is the same path for first-run and later-run failures.
+///
+/// # Errors
+///
+/// A fully rolled-back installation returns its error and owned resources without inserting
+/// a record. Only then may the caller release them. Uncertain failures remain recorded and
+/// return an attempt whose error may be reported only after grant publication.
+pub fn record_installation<T, E>(
+    mappings: &mut BTreeMap<u64, T>,
+    iova: u64,
+    mut mapping: T,
+    outcome: Result<(), MapRunsError<E>>,
+    mark_failed: impl FnOnce(&mut T),
+) -> Result<MapAttempt<u64, MapRunsError<E>>, (MapRunsError<E>, T)> {
+    let error = match outcome {
+        Ok(()) => None,
+        Err(error @ (MapRunsError::Clean(_) | MapRunsError::InvalidLength)) => {
+            return Err((error, mapping));
+        }
+        Err(error) => {
+            mark_failed(&mut mapping);
+            Some(error)
+        }
+    };
+    mappings.insert(iova, mapping);
+    Ok(match error {
+        Some(error) => MapAttempt::Retained {
+            record: iova,
+            error,
+        },
+        None => MapAttempt::Mapped(iova),
+    })
 }
 
 /// An installed mapping that must be published before reporting its result to the caller.

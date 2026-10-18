@@ -46,7 +46,7 @@ use core::fmt;
 #[cfg(feature = "regbuf")]
 use ferric_iommu::dma::{
     complete_unmap,
-    grant::{map_runs, MapAttempt, MapRunsError, MapStep},
+    grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
     UnmapFailure, UnmapState,
 };
 use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Span};
@@ -563,36 +563,25 @@ impl DmaSpace {
             },
             |err| matches!(err, DomainError::Map(_)),
         );
-        let error = match mapped {
-            Ok(()) => None,
-            Err(MapRunsError::Clean(error)) => {
-                self.give_back(block, pins);
-                return Err(error.into());
-            }
-            Err(MapRunsError::InvalidLength) => {
-                self.give_back(block, pins);
-                return Err(DmaError::GrantSize);
-            }
-            Err(error @ MapRunsError::Retained { .. }) => Some(DmaError::GrantMap(error)),
-        };
         let held = GrantHeld {
             block,
             len,
             pins,
             ticket,
-            unmap: if error.is_some() {
-                UnmapState::failed()
-            } else {
-                UnmapState::default()
-            },
+            unmap: UnmapState::default(),
         };
-        self.grants.insert(block.start, held);
-        Ok(match error {
-            Some(error) => MapAttempt::Retained {
-                record: block.start,
-                error,
-            },
-            None => MapAttempt::Mapped(block.start),
+        record_installation(&mut self.grants, block.start, held, mapped, |held| {
+            held.unmap = UnmapState::failed();
+        })
+        .map(|attempt| attempt.map_error(DmaError::GrantMap))
+        .map_err(|(error, held)| {
+            // Only a confirmed rollback returns ownership instead of publishing a record.
+            self.give_back(held.block, held.pins);
+            match error {
+                MapRunsError::Clean(error) => error.into(),
+                MapRunsError::InvalidLength => DmaError::GrantSize,
+                error => DmaError::GrantMap(error),
+            }
         })
     }
 
