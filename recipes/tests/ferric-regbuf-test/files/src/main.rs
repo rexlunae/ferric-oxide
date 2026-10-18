@@ -39,6 +39,10 @@
 //!   granted bytes (zeros elsewhere), writes the wholly granted page in place, and after the
 //!   revoke exactly the granted bytes hold its writes. A read-only grant of 0x20 bytes inside
 //!   one page shows just those.
+//! - `regbuf-bounce-newer`: two writable grants of bytes inside one page, one untouched and one
+//!   the scheme fills; the application then writes the page. After revoking both, the page
+//!   holds the application's writes except where the scheme wrote: a bounce page copies back
+//!   only the bytes its holder changed.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.regbuf` scheme (a kernel built

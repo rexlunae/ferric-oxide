@@ -18,9 +18,10 @@
 //!   `munmap`, `mprotect` or `mremap` it (`EBUSY`), cannot share it onward (`EPERM`, see
 //!   `context/reshare.rs`), a fork of the holder does not inherit it, and the grant records
 //!   every mapping. A window page the grant covers only in part is a bounce page holding just
-//!   the granted bytes ([`Bounce`]), copied back into the region when a writable mapping is
-//!   taken down. The holder drops a mapping with [`Request::Unmap`]; closing the grant drops
-//!   all of them.
+//!   the granted bytes ([`Bounce`]). When a writable mapping is taken down, the bytes its holder
+//!   changed are copied back into the region, and only those (`ferric_regbuf::bounce`), so
+//!   newer writes of the owner or of other grants to the other bytes survive. The holder drops
+//!   a mapping with [`Request::Unmap`]; closing the grant drops all of them.
 //! - [`Request::Revoke`] on the region, or closing the region, marks grants revoked (mapping
 //!   them again fails with `ECANCELED`) and unmaps every recorded mapping, with a TLB shootdown,
 //!   before it returns. Closing the region also unpins its frames and refunds the charge.
@@ -121,8 +122,11 @@ impl Mapping {
 
 /// A window page the grant covers only in part: a fresh frame mapped in its place, holding the
 /// granted bytes and zeros elsewhere, so the holder never sees the rest of the region page.
+/// It keeps the granted bytes as they were when it was filled, so that taking it down copies
+/// back only what the holder changed ([`Bounce::write_back`]).
 struct Bounce {
     frame: RaiiFrame,
+    snapshot: Vec<u8>,
     page: PartialPage,
 }
 
@@ -135,15 +139,25 @@ impl Bounce {
             .bytes()
             .get(granted.clone())
             .ok_or(Error::new(EINVAL))?;
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(src.len())
+            .map_err(|_| Error::new(ENOMEM))?;
+        snapshot.extend_from_slice(src);
         frame
             .bytes_mut()
             .get_mut(granted)
             .ok_or(Error::new(EINVAL))?
             .copy_from_slice(src);
-        Ok(Self { frame, page })
+        Ok(Self {
+            frame,
+            snapshot,
+            page,
+        })
     }
 
-    /// Copies the granted bytes back into the region's frames. The mapping must be gone.
+    /// Copies the granted bytes the holder changed back into the region's frames, leaving the
+    /// others as the region has them now. The mapping must be gone.
     fn write_back(&self, frames: &mut [RaiiFrame]) {
         let granted = self.page.start..self.page.end;
         let src = self.frame.bytes().get(granted.clone());
@@ -151,7 +165,7 @@ impl Bounce {
             .get_mut(self.page.region_page)
             .and_then(|frame| frame.bytes_mut().get_mut(granted));
         if let (Some(src), Some(dst)) = (src, dst) {
-            dst.copy_from_slice(src);
+            ferric_regbuf::bounce::copy_changed(dst, src, &self.snapshot);
         }
     }
 }

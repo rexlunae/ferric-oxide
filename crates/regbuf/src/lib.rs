@@ -16,6 +16,8 @@
 //!   the one definition the kernel, bootstrap and clients share.
 //! - `table` (with the `alloc` feature) is the kernel's per-region bookkeeping of grants and the
 //!   mappings each one has made.
+//! - [`bounce`] is the rule by which the kernel copies a writable bounce page back: only the
+//!   bytes its holder changed.
 //! - `budget` (with the `alloc` feature) is the kernel's accounting of pinned pages per user.
 //!
 //! # Examples
@@ -41,6 +43,7 @@
 extern crate alloc;
 
 pub mod abi;
+pub mod bounce;
 #[cfg(feature = "alloc")]
 pub mod budget;
 #[cfg(feature = "alloc")]
