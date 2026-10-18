@@ -3,9 +3,10 @@
 //! `io/registered-buffers-design.md` in the project files).
 //!
 //! An application opens a *region* ([`abi::REGION_PATH`]) and registers a page-aligned range of
-//! its private anonymous memory into it once ([`abi::Request::Register`]); the kernel pins the
-//! pages. From the region it opens *grants* ([`abi::GrantSpec`]): a read-only or read-write
-//! right to a page range of the region, as a file descriptor of its own. It passes a grant fd to
+//! its anonymous memory (private or `MAP_SHARED`) into it once ([`abi::Request::Register`]);
+//! the kernel pins the pages. From the region it opens *grants* ([`abi::GrantSpec`]): a
+//! read-only or read-write right to a byte range of the region, as a file descriptor of its
+//! own. It passes a grant fd to
 //! the scheme serving a request, which maps it with `mmap` and reads (and, for a read-write
 //! grant, writes) the application's pages directly. The region fd is the owner's capability:
 //! [`abi::Request::Revoke`] or closing it takes every mapping of the grant down, with a TLB
@@ -22,7 +23,7 @@
 //! ```
 //! use ferric_regbuf::abi::{Access, GrantId, GrantSpec, Request};
 //!
-//! let spec = GrantSpec::new(Access::ReadWrite, 0x1000, 0x4000).expect("page-aligned");
+//! let spec = GrantSpec::new(Access::ReadWrite, 0x1000, 0x4000).expect("non-empty");
 //! let mut buf = [0; GrantSpec::PATH_MAX];
 //! let path = spec.encode_path(&mut buf);
 //! assert_eq!(path, "grant/rw/1000/4000");

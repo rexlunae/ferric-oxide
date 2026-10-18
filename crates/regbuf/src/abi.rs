@@ -11,11 +11,24 @@
 //! | [`Request::Usage`] | the scheme root | metadata `[verb]`, payload [`Usage::BYTES`] |
 //! | map a grant | a grant | `mmap(grant, offset, len, PROT_READ[\|PROT_WRITE], MAP_SHARED)` |
 //!
+//! Grants are byte-granular: a [`GrantSpec`] names any byte range of the region. A holder maps
+//! its *window*, the pages the range touches ([`GrantSpec::window_offset`],
+//! [`GrantSpec::window_len`]); `mmap` offsets count from the window's first page, and the
+//! granted bytes start [`GrantSpec::lead`] bytes into it. Pages wholly inside the range are the
+//! region's own pages. A first or last page the range covers only in part is a bounce page:
+//! the kernel copies the granted bytes into a fresh page when the window is mapped (the rest of
+//! that page reads as zero), and, for a writable mapping, copies them back into the region when
+//! the mapping is taken down (`Unmap`, closing the grant, `Revoke`, closing the region), so the
+//! application sees the scheme's writes to those bytes once it has revoked the grant. Bytes of
+//! the region outside the range never reach the holder.
+//!
 //! [`Request::encode`] and [`Request::decode`] are the one place the metadata layout is written
 //! down. The kernel reads at most three metadata words.
 //!
 //! Errors the kernel returns: `EINVAL` for a bad range or alignment, `EEXIST` when a region is
-//! already registered, `EPERM` for memory that is not private anonymous read-write memory,
+//! already registered, `EPERM` for memory that is not anonymous read-write memory (private or
+//! `MAP_SHARED`) or that the caller only borrows from another process (a grant mapping or a
+//! scheme request's buffer),
 //! `EACCES` for a write mapping of a read-only grant, `ECANCELED` once a grant is revoked,
 //! `ENOENT` for an unknown grant ID or mapping, and `EDQUOT` when pinning would exceed the
 //! caller's limit.
@@ -33,7 +46,7 @@ pub const SCHEME_NAME: &str = "kernel.regbuf";
 /// The path that, opened from the scheme root, creates an empty region.
 pub const REGION_PATH: &str = "region";
 
-/// The granularity of regions, grants and mappings, in bytes.
+/// The granularity of regions and mappings, in bytes. Grants are byte-granular.
 pub const PAGE_SIZE: u64 = 4096;
 
 /// What a grant lets its holder do with the pages.
@@ -106,18 +119,15 @@ impl fmt::Display for GrantId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SpecError {
-    /// The offset or the length is not a multiple of [`PAGE_SIZE`].
-    Unaligned,
     /// The length is zero.
     Empty,
-    /// The range ends beyond `u64::MAX`.
+    /// The range, rounded out to whole pages, ends beyond `u64::MAX`.
     Overflow,
 }
 
 impl fmt::Display for SpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Unaligned => "grant offset or length is not page-aligned",
             Self::Empty => "grant length is zero",
             Self::Overflow => "grant range overflows",
         })
@@ -166,7 +176,7 @@ impl From<SpecError> for PathError {
     }
 }
 
-/// The access and page range, relative to the start of the region, of a grant.
+/// The access and byte range, relative to the start of the region, of a grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GrantSpec {
     access: Access,
@@ -178,21 +188,20 @@ impl GrantSpec {
     /// The longest path [`GrantSpec::encode_path`] writes.
     pub const PATH_MAX: usize = 48;
 
-    /// `len` bytes from `offset` with `access`.
+    /// `len` bytes from `offset` with `access`. Neither needs to be page-aligned.
     ///
     /// # Errors
     ///
-    /// [`SpecError::Unaligned`] unless both are multiples of [`PAGE_SIZE`],
-    /// [`SpecError::Empty`] for a zero length and [`SpecError::Overflow`] when the range ends
-    /// beyond `u64::MAX`.
+    /// [`SpecError::Empty`] for a zero length and [`SpecError::Overflow`] when the range,
+    /// rounded out to whole pages, ends beyond `u64::MAX`.
     pub const fn new(access: Access, offset: u64, len: u64) -> Result<Self, SpecError> {
-        if !offset.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) {
-            return Err(SpecError::Unaligned);
-        }
         if len == 0 {
             return Err(SpecError::Empty);
         }
-        if offset.checked_add(len).is_none() {
+        let Some(end) = offset.checked_add(len) else {
+            return Err(SpecError::Overflow);
+        };
+        if end.checked_next_multiple_of(PAGE_SIZE).is_none() {
             return Err(SpecError::Overflow);
         }
         Ok(Self {
@@ -217,7 +226,7 @@ impl GrantSpec {
         self.len
     }
 
-    /// Always false: a grant spans at least one page.
+    /// Always false: a grant spans at least one byte.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -231,6 +240,32 @@ impl GrantSpec {
     /// Whether the range lies inside a region of `region_len` bytes.
     pub const fn fits(&self, region_len: u64) -> bool {
         self.end() <= region_len
+    }
+
+    /// Whether the range starts and ends on page boundaries, so its window has no bounce
+    /// pages.
+    pub const fn is_page_aligned(&self) -> bool {
+        self.offset.is_multiple_of(PAGE_SIZE) && self.len.is_multiple_of(PAGE_SIZE)
+    }
+
+    /// The first byte of the grant's window (its first page), from the start of the region.
+    pub const fn window_offset(&self) -> u64 {
+        self.offset - self.offset % PAGE_SIZE
+    }
+
+    /// The length of the grant's window: the whole pages the range touches.
+    /// [`GrantSpec::new`] checked rounding up does not overflow.
+    pub const fn window_len(&self) -> u64 {
+        let end = match self.end().checked_next_multiple_of(PAGE_SIZE) {
+            Some(end) => end,
+            None => u64::MAX - u64::MAX % PAGE_SIZE,
+        };
+        end - self.window_offset()
+    }
+
+    /// How far into the window the granted bytes start: the offset within its first page.
+    pub const fn lead(&self) -> u64 {
+        self.offset % PAGE_SIZE
     }
 
     /// Writes the path that opens this grant from a region into `buf` and returns it:
@@ -345,7 +380,9 @@ impl Verb {
 #[non_exhaustive]
 pub enum Request {
     /// On an empty region: pin `len` bytes of the caller's memory from virtual address `addr`
-    /// (both page-aligned) into it. The memory must be private anonymous read-write memory.
+    /// (both page-aligned) into it. The memory must be anonymous read-write memory, private or
+    /// `MAP_SHARED`, of the caller's own: pages it only borrows from another process (a grant
+    /// mapping, a scheme request's buffer) are refused with `EPERM`.
     Register {
         /// The first byte.
         addr: u64,
@@ -570,17 +607,14 @@ mod tests {
 
     #[test]
     fn spec_checks_ranges() {
-        assert_eq!(
-            GrantSpec::new(Access::Read, 1, PAGE_SIZE),
-            Err(SpecError::Unaligned)
-        );
-        assert_eq!(
-            GrantSpec::new(Access::Read, 0, 100),
-            Err(SpecError::Unaligned)
-        );
         assert_eq!(GrantSpec::new(Access::Read, 0, 0), Err(SpecError::Empty));
         assert_eq!(
             GrantSpec::new(Access::Read, u64::MAX - 4095, PAGE_SIZE * 2),
+            Err(SpecError::Overflow)
+        );
+        // Ends inside the last page of the address range, which cannot be rounded up.
+        assert_eq!(
+            GrantSpec::new(Access::Read, u64::MAX - 10, 5),
             Err(SpecError::Overflow)
         );
         let s = spec(Access::ReadWrite, PAGE_SIZE, 2 * PAGE_SIZE);
@@ -588,6 +622,33 @@ mod tests {
         assert!(s.fits(3 * PAGE_SIZE));
         assert!(!s.fits(2 * PAGE_SIZE));
         assert!(!s.is_empty());
+        assert!(s.is_page_aligned());
+        assert_eq!(
+            (s.window_offset(), s.window_len(), s.lead()),
+            (PAGE_SIZE, 2 * PAGE_SIZE, 0)
+        );
+    }
+
+    #[test]
+    fn byte_granular_windows() {
+        // Unaligned at both ends: three pages, starting 0x100 into the first.
+        let s = spec(Access::ReadWrite, PAGE_SIZE + 0x100, 2 * PAGE_SIZE);
+        assert!(!s.is_page_aligned());
+        assert_eq!(s.window_offset(), PAGE_SIZE);
+        assert_eq!(s.window_len(), 3 * PAGE_SIZE);
+        assert_eq!(s.lead(), 0x100);
+        // A few bytes inside one page.
+        let s = spec(Access::Read, 0x10, 0x20);
+        assert_eq!(
+            (s.window_offset(), s.window_len(), s.lead()),
+            (0, PAGE_SIZE, 0x10)
+        );
+        // Ends exactly on a page boundary.
+        let s = spec(Access::Read, 0x800, 0x800);
+        assert_eq!((s.window_offset(), s.window_len()), (0, PAGE_SIZE));
+        // Near the top of the address range: the window ends at its last page.
+        let s = spec(Access::Read, u64::MAX - 12287, PAGE_SIZE + 1);
+        assert_eq!(s.window_len(), 2 * PAGE_SIZE);
     }
 
     #[test]
@@ -606,6 +667,7 @@ mod tests {
             spec(Access::ReadWrite, 0xabc000, 0x10000),
             spec(Access::ReadWrite, 0, u64::MAX - 4095),
             spec(Access::Read, u64::MAX - 8191, PAGE_SIZE),
+            spec(Access::ReadWrite, 0x123, 0x4567),
         ] {
             let path = s.encode_path(&mut buf);
             assert!(path.starts_with("grant/"));
@@ -633,7 +695,10 @@ mod tests {
             (b"grant/r/0/10000000000000000", PathError::Number),
             (b"grant/r/0x0/1000", PathError::Number),
             (b"grant/r/0/0", PathError::Spec(SpecError::Empty)),
-            (b"grant/r/10/1000", PathError::Spec(SpecError::Unaligned)),
+            (
+                b"grant/r/fffffffffffffff0/8",
+                PathError::Spec(SpecError::Overflow),
+            ),
         ] {
             assert_eq!(GrantSpec::parse_path(path), Err(err), "{path:?}");
         }
