@@ -34,7 +34,7 @@
 //! ring.push(kernel::SYSCALL_EXIT.id(), 150, &[20, 7]).expect("room");
 //!
 //! let mut buf = [0u8; 512];
-//! let len = ring.read(&mut buf);
+//! let len = ring.read(&mut buf).expect("512 bytes hold any record");
 //! let names: Vec<&str> = Records::new(&buf[..len])
 //!     .map(|r| kernel::CATALOG.get(r.expect("valid").event()).expect("known").name())
 //!     .collect();

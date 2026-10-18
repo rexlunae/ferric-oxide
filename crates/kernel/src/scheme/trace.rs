@@ -5,7 +5,9 @@
 //!   `enable <selection>` or `disable <selection>` turns events on or off, patching their
 //!   tracepoints live (`arch::static_key`).
 //! - `stats`: one line per CPU with the words waiting in its ring and the records it lost.
-//! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty.
+//! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
+//!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
+//!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
 //!
 //! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
@@ -19,12 +21,12 @@ use core::{
 
 use ferric_trace::abi::{Command, EventLine, Path, StatsLine};
 use spin::Mutex;
-use syscall::error::{Error, Result, EACCES, EBADF, EINVAL, ENOENT, EOPNOTSUPP};
+use syscall::error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP};
 
 use super::{CallerCtx, KernelScheme, OpenResult, StrOrBytes};
 use crate::{
     context::file::InternalFlags,
-    cpu_set::LogicalCpuId,
+    cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
     sync::CleanLockToken,
     syscall::usercopy::{UserSliceRo, UserSliceWo},
     trace::{self, ControlError, Mode},
@@ -67,8 +69,9 @@ static HANDLES: Mutex<BTreeMap<usize, Handle>> = Mutex::new(BTreeMap::new());
 /// The next handle number.
 static NEXT_ID: AtomicUsize = AtomicUsize::new(ROOT + 1);
 
-/// Serializes the rings' consumers: each ring has one reader at a time.
-static READER: Mutex<()> = Mutex::new(());
+/// Each ring's consumer: one reader at a time, held from the copy to the commit.
+static READERS: [Mutex<()>; MAX_CPU_COUNT as usize] =
+    [const { Mutex::new(()) }; MAX_CPU_COUNT as usize];
 
 /// The contents of `text` now.
 fn render(text: Text) -> Arc<[u8]> {
@@ -184,11 +187,18 @@ impl KernelScheme for TraceScheme {
                     return Ok(0);
                 };
                 let mut records = vec![0u8; buf.len().min(MAX_READ)];
-                let len = {
-                    let _reader = READER.lock();
-                    ring.read(&mut records)
-                };
-                buf.copy_common_bytes_from_slice(records.get(..len).unwrap_or(&[]))
+                // One reader at a time, from the copy to the commit. The records are consumed
+                // only once they reached the caller, so a failed copy loses none. The copy can
+                // fault and block, so a second reader gets EAGAIN instead of spinning.
+                let _reader = READERS
+                    .get(cpu.get() as usize)
+                    .and_then(Mutex::try_lock)
+                    .ok_or(Error::new(EAGAIN))?;
+                let peek = ring.peek(&mut records).map_err(|_| Error::new(EINVAL))?;
+                let len =
+                    buf.copy_common_bytes_from_slice(records.get(..peek.len()).unwrap_or(&[]))?;
+                ring.commit(peek);
+                Ok(len)
             }
         }
     }

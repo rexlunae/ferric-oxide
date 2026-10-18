@@ -14,6 +14,7 @@ descriptions may differ from this checkout.
 | Build an image, choose features or change a recipe | [Build and configuration](ferric-build.md) |
 | Change CPU state, address spaces or kernel hardening | [Memory and CPU protection](ferric-memory.md) |
 | Work on drivers, DMA or shared buffers | [Registered buffers and IOMMUs](ferric-io.md) |
+| Trace system calls and scheduling, or add a tracepoint | [Kernel tracing](ferric-tracing.md) |
 | Verify or install a local package, or generate its SBOM | [Package tooling](ferric-packaging.md) |
 | Find tests, reproduce a boot failure or understand CI | [Validation and debugging](ferric-testing.md) |
 
@@ -37,6 +38,7 @@ passed, or that a feature is enabled in every image.
 | CET | Optional supervisor indirect branch tracking (IBT), plus shadow-stack allocation and bookkeeping | Shadow-stack enforcement and user-mode CET are not enabled |
 | DMA isolation | Intel VT-d and AMD-Vi DMA domains, driver binding, IOVA translation, revocation and an enforce policy | IOMMU defaults to `never`; AMD interrupt remapping is not implemented |
 | Registered buffers | Anonymous-memory registration, byte grants, sub-grants, CPU mappings and page-aligned DMA grants | Off by default; partial pages use bounce buffers; existing production I/O is not automatically converted |
+| Kernel tracing | Typed tracepoints as static keys (`syscall.enter`/`exit`, `sched.switch`), per-CPU rings, boot-time and live enable, a root-only `kernel.trace` scheme | Off by default; x86_64 only; no scheme-request tracepoints, ring mapping, export or overhead budget yet |
 | `fox` | Local signed archives, installed-file verification, in-place install/remove, CycloneDX SBOMs | No repository downloader, dependency solver or generation/rollback store; not the image build's package installer |
 | Validation | Host unit/integration tests, kernel lint ratchet, binary checks, image boot and syscall fuzz workflows | Configured checks are not evidence of a successful run; hardware coverage depends on reports |
 

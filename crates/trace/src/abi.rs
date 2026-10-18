@@ -31,7 +31,15 @@ pub const EVENTS_PATH: &str = "events";
 pub const STATS_PATH: &str = "stats";
 
 /// The directory of per-CPU record files, `cpu/<n>`.
+///
+/// A read of `cpu/<n>` returns whole records ([`crate::record`]) and consumes them; 0 bytes means
+/// the ring is empty. A buffer too small for the next record gets `EINVAL` and the record stays:
+/// a buffer of [`READ_MIN`] bytes always holds one. While another reader is reading the same
+/// CPU, a read gets `EAGAIN`.
 pub const CPU_DIR: &str = "cpu";
+
+/// The smallest buffer a read of `cpu/<n>` always succeeds with: the longest record.
+pub const READ_MIN: usize = crate::record::MAX_RECORD_WORDS * crate::record::WORD_BYTES;
 
 /// A path in the scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
