@@ -123,7 +123,17 @@ previous run (`build/ferric/state.toml`) and touches the `recipe.toml` of each
 recipe the option names in `rebuild` (only the timestamp changes). Options
 with `rebuild = ["*"]`, such as the processor baseline, mark every recipe, so
 the next `make` rebuilds everything that is in the image. Kernel options only
-rebuild the kernel. Pass `--no-touch` to `generate` to skip this.
+rebuild the kernel. Pass `--no-touch` to `generate` to write outputs without
+touching recipes or recording new rebuild fingerprints. Repeated uses preserve
+pending rebuilds; a later ordinary generation marks them stale. Use a fresh
+`--out` directory for previews that should also leave generated build settings
+unchanged. After `--no-touch` in the normal output directory, run
+`make config-generate` before building to apply pending rebuilds.
+
+If opening a selected recipe or updating its timestamp fails, generation reports
+the recipe path and filesystem error without recording new fingerprints. Fix
+the reported problem and rerun `make config-generate`; all pending recipes are
+retried, including any already touched before the failure.
 
 ## Processor baselines
 

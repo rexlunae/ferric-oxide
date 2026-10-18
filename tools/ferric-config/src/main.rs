@@ -70,7 +70,7 @@ enum Cmd {
     Check,
     /// Write build/ferric/*: config.mk, filesystem.toml, kernel-config.toml
     Generate {
-        /// Do not mark recipes stale when their options changed
+        /// Write outputs without marking recipes stale or committing rebuild fingerprints
         #[arg(long)]
         no_touch: bool,
         #[arg(long, short)]
@@ -108,6 +108,18 @@ fn print_diags(diags: &[Diag]) {
         };
         eprintln!("ferric-config: {tag}: {}", d.message);
     }
+}
+
+/// Renders an error and its source chain for CLI and TUI diagnostics.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn source_name(s: &Source) -> String {
@@ -329,7 +341,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             if diags.iter().any(|d| d.level == Level::Error) {
                 return Ok(ExitCode::FAILURE);
             }
-            let applied = generate::apply(&ctx.root, &ctx.out, &plan, !no_touch)?;
+            let applied = match generate::apply(&ctx.root, &ctx.out, &plan, !no_touch) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    eprintln!("ferric-config: error: {}", error_chain(&error));
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
             if !quiet {
                 for p in &applied.written {
                     eprintln!("ferric-config: wrote {}", p.display());

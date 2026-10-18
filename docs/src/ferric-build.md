@@ -78,11 +78,14 @@ preview_dir=$(mktemp -d)
 cargo run -q -p ferric-config -- --out "$preview_dir" generate --no-touch
 ```
 
-Inspect the generated files under `$preview_dir`. `--no-touch` suppresses
-recipe timestamp changes, but still writes `state.toml` in the output directory.
-Using the normal `build/ferric/` output for a preview can consume changed
-fingerprints without marking recipes for rebuild, so the temporary output
-directory is required to preserve the real build's state.
+Inspect the generated files under `$preview_dir`. `--no-touch` writes generated
+outputs without changing recipe timestamps or committing `state.toml` rebuild
+fingerprints. Repeated previews therefore leave pending rebuilds for the next
+ordinary generation, including the first generation into a new output directory.
+A temporary directory also keeps the real generated configuration unchanged.
+If you use `--no-touch` in `build/ferric/`, run `make config-generate` before
+building to apply pending rebuilds; Make may otherwise see the generated files
+as already current.
 The tool's own usage guide is `tools/ferric-config/README.md`.
 
 A small configuration enabling the implemented buffer and DMA interfaces is:
@@ -141,6 +144,10 @@ Cookbook detects recipe/source timestamps rather than arbitrary environment
 changes. Configuration generation compares fingerprints in `state.toml` and
 touches the `recipe.toml` files named by each changed option's `rebuild` scope.
 `["*"]` marks all recipes; kernel-only options usually mark the kernel. The
-kernel, bootloader and relibc recipes also maintain feature stamps for their
+fingerprints are saved only after all selected recipe timestamps are updated.
+If a recipe cannot be opened or touched, generation fails with its path and
+underlying error, retaining the prior rebuild state. Correct the filesystem
+problem and rerun `make config-generate` to retry pending rebuilds. The kernel,
+bootloader and relibc recipes also maintain feature stamps for their
 Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
 stay uncommitted.
