@@ -173,11 +173,19 @@ it) works as follows:
 - Any other error, or a CPU that stays busy, stops the capture with a message
   naming the file.
 
-The capture is written to a hidden sibling directory and renamed to `<dir>`
-only when it is complete. `<dir>` must be new or empty, so an earlier capture
-is never overwritten, and it must not overlap the scheme path. A read drains a
-ring, so each record lands in exactly one file. `--scheme <path>` reads another
-scheme path.
+A read drains a ring, so each record lands in exactly one file and nothing
+drained is ever deleted:
+
+- `<dir>` is created by the command and must not exist yet, so an earlier
+  capture is never overwritten. It must not overlap the scheme path.
+- An `INCOMPLETE` file is written into it first and removed only after
+  `stats.end` is saved.
+- If the capture fails or is killed, everything drained so far stays in
+  `<dir>` with the marker, and the command says the capture is partial.
+  `text` and `perfetto` refuse such a directory unless they are given
+  `--partial`, because CPUs may be missing or cut short.
+
+`--scheme <path>` reads another scheme path.
 
 Each ring holds 64 KiB, and a full ring drops new records. For each CPU the
 command prints the records lost before the capture started and those lost
@@ -238,8 +246,10 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   `--tsc-mhz` values, runs the binary on a capture directory, and runs
   `capture` against a stand-in scheme directory (CPU list from `stats`,
   `EAGAIN` and `EINTR` retries, a CPU that stays busy, other errors, start and
-  end snapshots and losses during the capture, refusing a non-empty or
-  overlapping output, and leaving the output untouched when a capture fails).
+  end snapshots and losses during the capture, refusing an existing or
+  overlapping output, keeping what was drained with the `INCOMPLETE` marker
+  when a capture fails, and loaders refusing such a capture without
+  `--partial`).
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the

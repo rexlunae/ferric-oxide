@@ -164,7 +164,7 @@ fn captures_a_scheme_directory() {
         .expect("runs");
     assert!(!again.status.success());
     let err = String::from_utf8(again.stderr).expect("utf-8");
-    assert!(err.contains("already exists and is not empty"), "{err}");
+    assert!(err.contains("already exists"), "{err}");
 
     let missing = ferric_trace()
         .args(["capture", "--scheme"])
@@ -174,5 +174,34 @@ fn captures_a_scheme_directory() {
         .expect("runs");
     assert!(!missing.status.success());
     let err = String::from_utf8(missing.stderr).expect("utf-8");
-    assert!(err.starts_with("ferric-trace: capture failed: "), "{err}");
+    assert!(
+        err.starts_with("ferric-trace: capture failed: the capture in ")
+            && err.contains("is partial (marked INCOMPLETE)"),
+        "{err}"
+    );
+
+    // The partial capture is refused unless --partial is given.
+    let other = saved.path().join("other");
+    assert!(other.join("INCOMPLETE").is_file());
+    fs::write(other.join("cpu0"), bytes(&[(&SYSCALL_EXIT, 5, &[1, 2])])).expect("write");
+    let refused = ferric_trace()
+        .arg("text")
+        .arg(&other)
+        .output()
+        .expect("runs");
+    assert!(!refused.status.success());
+    let err = String::from_utf8(refused.stderr).expect("utf-8");
+    assert!(err.contains("pass --partial"), "{err}");
+    let read = ferric_trace()
+        .args(["text", "--partial"])
+        .arg(&other)
+        .output()
+        .expect("runs");
+    assert!(read.status.success(), "{read:?}");
+    let json = ferric_trace()
+        .args(["perfetto", "--partial"])
+        .arg(other.join("cpu0"))
+        .output()
+        .expect("runs");
+    assert!(json.status.success(), "{json:?}");
 }

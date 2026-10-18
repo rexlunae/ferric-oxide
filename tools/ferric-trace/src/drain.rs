@@ -8,9 +8,13 @@
 //! draining the same CPU; that read is retried after a short wait, up to [`AGAIN_RETRIES`]
 //! times in a row. Any other error stops the capture, naming the file.
 //!
-//! The capture is written to a hidden sibling of the output directory and renamed into place
-//! only once every CPU has been drained, so a failed capture leaves nothing behind. The output
-//! directory must not exist yet or be empty, and must not overlap the scheme path.
+//! Ring reads are destructive, so nothing drained is ever deleted. The output directory is
+//! created with exclusive creation (it must not exist), an `INCOMPLETE` marker
+//! ([`crate::capture::INCOMPLETE`]) is written into it first, and the marker is removed only
+//! after `stats.end` is saved. If the capture fails or is killed, everything drained so far
+//! stays in the directory with the marker, and [`Capture::load`](crate::capture::Capture::load)
+//! refuses it unless it is asked to accept a partial capture. The output must not overlap the
+//! scheme path.
 //!
 //! The scheme's interface is [`ferric_trace::abi`].
 
@@ -21,6 +25,8 @@ use std::thread;
 use std::time::Duration;
 
 use ferric_trace::abi::{self, LineError, StatsLine};
+
+use crate::capture::INCOMPLETE;
 
 /// How many `EAGAIN` reads in a row a CPU file may give before the capture fails.
 pub const AGAIN_RETRIES: u32 = 200;
@@ -69,11 +75,21 @@ pub enum DrainError {
         /// The CPU file.
         path: PathBuf,
     },
-    /// The output directory exists and is not empty, so it may hold an earlier capture.
-    #[error("{}: already exists and is not empty", path.display())]
-    OutputNotEmpty {
+    /// The output directory already exists; it may hold an earlier capture.
+    #[error("{}: already exists; give a new directory", path.display())]
+    OutputExists {
         /// The output directory.
         path: PathBuf,
+    },
+    /// The capture failed after the output directory was created. What was drained before
+    /// the failure is kept there, marked `INCOMPLETE`, since the rings no longer hold it.
+    #[error("the capture in {} is partial (marked INCOMPLETE)", out.display())]
+    Partial {
+        /// The output directory.
+        out: PathBuf,
+        /// What failed.
+        #[source]
+        source: Box<DrainError>,
     },
     /// The output directory is inside the scheme path, or holds it.
     #[error("{} overlaps the scheme path {}", out.display(), scheme.display())]
@@ -99,47 +115,35 @@ pub struct CpuDrained {
 }
 
 /// Drains every CPU of the trace scheme at `scheme` (normally `/scheme/kernel.trace`) into
-/// directory `out`, which must not exist yet or be empty.
+/// directory `out`, which this creates and which must not exist yet.
 ///
 /// # Errors
 ///
-/// [`DrainError::OutputNotEmpty`] or [`DrainError::Overlap`] for an unusable `out`,
-/// [`DrainError::Io`] for a file that cannot be read or written, [`DrainError::Stats`] for a
-/// `stats` line that does not parse, and [`DrainError::Busy`] for a CPU file that another
-/// reader holds for too long. On any error `out` is left as it was.
+/// [`DrainError::OutputExists`] or [`DrainError::Overlap`] for an unusable `out`, and
+/// [`DrainError::Io`] if it cannot be created; nothing has been read then. Any later failure is
+/// [`DrainError::Partial`], whose source is a [`DrainError::Io`] for a file that cannot be read
+/// or written, a [`DrainError::Stats`] for a `stats` line that does not parse, or a
+/// [`DrainError::Busy`] for a CPU file that another reader holds for too long. A partial
+/// capture keeps everything drained before the failure and its `INCOMPLETE` marker.
 pub fn drain_scheme(scheme: &Path, out: &Path) -> Result<Vec<CpuDrained>, DrainError> {
-    check_output(scheme, out)?;
-    let partial = partial_dir(out);
-    // A leftover from a capture that was killed: nothing else writes there.
-    let _ = fs::remove_dir_all(&partial);
-    fs::create_dir_all(&partial).map_err(io_error(&partial))?;
-    let result = drain_into(scheme, &partial).and_then(|drained| {
-        // A rename cannot replace a directory everywhere, so an empty `out` goes first.
-        if out.exists() {
-            fs::remove_dir(out).map_err(io_error(out))?;
+    check_overlap(scheme, out)?;
+    fs::create_dir(out).map_err(|source| {
+        if source.kind() == ErrorKind::AlreadyExists {
+            DrainError::OutputExists {
+                path: out.to_owned(),
+            }
+        } else {
+            io_error(out)(source)
         }
-        fs::rename(&partial, out).map_err(io_error(out))?;
-        Ok(drained)
-    });
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&partial);
-    }
-    result
+    })?;
+    drain_into(scheme, out).map_err(|source| DrainError::Partial {
+        out: out.to_owned(),
+        source: Box::new(source),
+    })
 }
 
-/// Refuses an `out` that holds files or overlaps `scheme`.
-fn check_output(scheme: &Path, out: &Path) -> Result<(), DrainError> {
-    if let Ok(mut entries) = fs::read_dir(out) {
-        if entries.next().is_some() {
-            return Err(DrainError::OutputNotEmpty {
-                path: out.to_owned(),
-            });
-        }
-    } else if out.exists() {
-        return Err(DrainError::OutputNotEmpty {
-            path: out.to_owned(),
-        });
-    }
+/// Refuses an `out` inside `scheme` or holding it.
+fn check_overlap(scheme: &Path, out: &Path) -> Result<(), DrainError> {
     let (out_abs, scheme_abs) = (absolute(out), absolute(scheme));
     if out_abs.starts_with(&scheme_abs) || scheme_abs.starts_with(&out_abs) {
         return Err(DrainError::Overlap {
@@ -162,16 +166,11 @@ fn absolute(path: &Path) -> PathBuf {
     }
 }
 
-/// The hidden sibling of `out` that a capture is written to first.
-fn partial_dir(out: &Path) -> PathBuf {
-    let name = out
-        .file_name()
-        .map_or_else(|| "capture".into(), |n| n.to_string_lossy().into_owned());
-    out.with_file_name(format!(".{name}.partial"))
-}
-
-/// Saves the start snapshot, every CPU and the end snapshot into `dir`.
+/// Marks `dir` incomplete, saves the start snapshot, every CPU and the end snapshot into it,
+/// and removes the mark.
 fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> {
+    let marker = dir.join(INCOMPLETE);
+    fs::write(&marker, "ferric-trace capture did not finish\n").map_err(io_error(&marker))?;
     let start = snapshot(scheme, &dir.join(STATS_START))?;
     let mut drained = Vec::with_capacity(start.len());
     for line in &start {
@@ -189,6 +188,7 @@ fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> 
     }
     let end = snapshot(scheme, &dir.join(STATS_END))?;
     count_losses(&mut drained, &end);
+    fs::remove_file(&marker).map_err(io_error(&marker))?;
     Ok(drained)
 }
 
@@ -364,38 +364,62 @@ mod tests {
         assert_eq!(capture.cpus(), [0, 2]);
         assert_eq!(capture.entries().len(), 2);
         assert!(saved.join(STATS_START).is_file() && saved.join(STATS_END).is_file());
-        assert!(!partial_dir(&saved).exists());
-
-        // An empty directory may be the output; a non-empty one, such as the last capture,
-        // may not.
-        let empty = out.path().join("empty");
-        fs::create_dir(&empty).expect("mkdir");
-        drain_scheme(scheme.path(), &empty).expect("drains into an empty directory");
-        assert!(matches!(
-            drain_scheme(scheme.path(), &saved),
-            Err(DrainError::OutputNotEmpty { .. })
-        ));
+        assert!(!saved.join(INCOMPLETE).exists());
     }
 
     #[test]
-    fn a_failed_capture_leaves_the_output_alone() {
+    fn never_writes_into_an_existing_directory() {
+        let scheme = stand_in_scheme();
+        let out = tempfile::tempdir().expect("temp dir");
+        // An earlier capture, and an empty directory: both are left alone.
+        let earlier = out.path().join("earlier");
+        fs::create_dir(&earlier).expect("mkdir");
+        fs::write(earlier.join("cpu0"), b"old").expect("write");
+        let empty = out.path().join("empty");
+        fs::create_dir(&empty).expect("mkdir");
+        for dir in [&earlier, &empty] {
+            assert!(matches!(
+                drain_scheme(scheme.path(), dir),
+                Err(DrainError::OutputExists { .. })
+            ));
+        }
+        assert_eq!(fs::read(earlier.join("cpu0")).expect("kept"), b"old");
+        assert_eq!(fs::read_dir(&empty).expect("dir").count(), 0);
+        // Nothing was drained: the stand-in's files are untouched.
+        assert!(scheme.path().join("cpu/0").is_file());
+    }
+
+    #[test]
+    fn a_failed_capture_keeps_what_it_drained() {
         let scheme = stand_in_scheme();
         let out = tempfile::tempdir().expect("temp dir");
         let saved = out.path().join("capture");
         fs::remove_file(scheme.path().join("cpu/2")).expect("remove");
+        let err = drain_scheme(scheme.path(), &saved).expect_err("CPU 2 is missing");
+        let DrainError::Partial { out: at, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(at, &saved);
+        assert!(matches!(&**source, DrainError::Io { path, .. } if path.ends_with("cpu/2")));
+        // CPU 0 was drained and is kept, with the marker, so the loader refuses it.
+        assert_eq!(fs::read(saved.join("cpu0")).expect("kept").len(), 56);
+        assert!(saved.join(INCOMPLETE).is_file());
+        assert!(saved.join(STATS_START).is_file());
+        assert!(!saved.join(STATS_END).exists());
         assert!(matches!(
-            drain_scheme(scheme.path(), &saved),
-            Err(DrainError::Io { path, .. }) if path.ends_with("cpu/2")
+            Capture::load(std::slice::from_ref(&saved)),
+            Err(crate::capture::CaptureError::Incomplete { .. })
         ));
-        assert!(!saved.exists());
-        assert!(!partial_dir(&saved).exists());
+        let partial = Capture::load_partial(std::slice::from_ref(&saved)).expect("loads");
+        assert_eq!(partial.cpus(), [0]);
 
+        let bad = out.path().join("bad-stats");
         fs::write(scheme.path().join("stats"), "cpu zero\n").expect("write");
         assert!(matches!(
-            drain_scheme(scheme.path(), &saved),
-            Err(DrainError::Stats { .. })
+            drain_scheme(scheme.path(), &bad),
+            Err(DrainError::Partial { source, .. }) if matches!(*source, DrainError::Stats { .. })
         ));
-        assert!(!saved.exists());
+        assert!(bad.join(INCOMPLETE).is_file());
     }
 
     #[test]
@@ -405,26 +429,21 @@ mod tests {
             scheme.path().to_owned(),
             scheme.path().join("cpu"),
             scheme.path().join("new"),
+            scheme.path().join("cpu/new"),
             scheme.path().parent().expect("a parent").to_owned(),
         ] {
             assert!(
                 matches!(
-                    check_output(scheme.path(), &out),
-                    Err(DrainError::Overlap { .. } | DrainError::OutputNotEmpty { .. })
+                    drain_scheme(scheme.path(), &out),
+                    Err(DrainError::Overlap { .. })
                 ),
                 "{}",
                 out.display()
             );
         }
-        // Not existing yet, so only the overlap can refuse them.
-        for out in [scheme.path().join("new"), scheme.path().join("cpu/new")] {
-            assert!(matches!(
-                check_output(scheme.path(), &out),
-                Err(DrainError::Overlap { .. })
-            ));
-        }
+        assert!(!scheme.path().join("new").exists());
         let elsewhere = tempfile::tempdir().expect("temp dir");
-        check_output(scheme.path(), &elsewhere.path().join("capture")).expect("usable");
+        check_overlap(scheme.path(), &elsewhere.path().join("capture")).expect("usable");
     }
 
     #[test]

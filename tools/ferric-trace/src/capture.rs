@@ -72,7 +72,18 @@ pub enum CaptureError {
     /// The inputs held no capture files.
     #[error("no cpu<n> capture files in the inputs")]
     Empty,
+    /// A capture directory holds the [`INCOMPLETE`] marker: the capture failed or was killed,
+    /// so CPUs may be missing or cut short.
+    #[error("{} is a partial capture (it holds {INCOMPLETE}); pass --partial to read it anyway", path.display())]
+    Incomplete {
+        /// The capture directory.
+        path: PathBuf,
+    },
 }
+
+/// The file `ferric-trace capture` writes into a capture directory before draining and removes
+/// once the capture is complete.
+pub const INCOMPLETE: &str = "INCOMPLETE";
 
 /// One decoded record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,14 +188,39 @@ impl Capture {
     ///
     /// [`CaptureError::Io`] when a path cannot be read, [`CaptureError::Name`] for a file not
     /// named after its CPU, [`CaptureError::DuplicateCpu`], [`CaptureError::Empty`] when no
-    /// files were found, and the errors of [`CpuCapture::decode`].
+    /// files were found, [`CaptureError::Incomplete`] for a directory (or a file in one) that a
+    /// failed capture left, and the errors of [`CpuCapture::decode`].
     pub fn load(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
+        Self::load_inner(inputs, false)
+    }
+
+    /// Loads like [`Capture::load`], but also reads a partial capture (one marked
+    /// [`INCOMPLETE`]), whose CPUs may be missing or cut short.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Capture::load`] except [`CaptureError::Incomplete`].
+    pub fn load_partial(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
+        Self::load_inner(inputs, true)
+    }
+
+    fn load_inner(inputs: &[PathBuf], partial: bool) -> Result<Self, CaptureError> {
         let mut files = Vec::new();
         for input in inputs {
             let meta = fs::metadata(input).map_err(|source| CaptureError::Io {
                 path: input.clone(),
                 source,
             })?;
+            let dir = if meta.is_dir() {
+                Some(input.as_path())
+            } else {
+                input.parent()
+            };
+            if let Some(dir) = dir.filter(|d| !partial && d.join(INCOMPLETE).exists()) {
+                return Err(CaptureError::Incomplete {
+                    path: dir.to_owned(),
+                });
+            }
             if meta.is_dir() {
                 files.extend(dir_files(input)?);
             } else {
@@ -356,6 +392,26 @@ pub(crate) mod tests {
             "CPU 5: record 0 (syscall.exit) has 3 arguments, the event has 2"
         );
         assert!(CpuCapture::decode(0, &raw(&SYSCALL_EXIT, &[1, 2])).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_killed_capture_unless_partial() {
+        // What a capture killed after draining CPU 0 leaves: the marker and one CPU file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join(INCOMPLETE), "").expect("write");
+        fs::write(
+            dir.path().join("cpu0"),
+            bytes(&[(&SYSCALL_EXIT, 5, &[1, 2])]),
+        )
+        .expect("write");
+        for input in [dir.path().to_owned(), dir.path().join("cpu0")] {
+            assert!(matches!(
+                Capture::load(std::slice::from_ref(&input)),
+                Err(CaptureError::Incomplete { path }) if path == dir.path()
+            ));
+            let partial = Capture::load_partial(&[input]).expect("loads");
+            assert_eq!(partial.entries().len(), 1);
+        }
     }
 
     #[test]

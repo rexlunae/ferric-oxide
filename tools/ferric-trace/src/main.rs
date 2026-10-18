@@ -22,7 +22,7 @@ struct Cli {
 enum Cmd {
     /// On the target, as root: drain every CPU's trace ring into a capture directory
     Capture {
-        /// The directory to save the capture in: new, or empty
+        /// The directory to save the capture in; it must not exist yet
         out: PathBuf,
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
@@ -33,12 +33,18 @@ enum Cmd {
         /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
+        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
+        #[arg(long)]
+        partial: bool,
     },
     /// Write Chrome trace event JSON, which ui.perfetto.dev and chrome://tracing open
     Perfetto {
         /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
+        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
+        #[arg(long)]
+        partial: bool,
         /// Where to write the JSON (default: standard output)
         #[arg(long, short)]
         output: Option<PathBuf>,
@@ -83,8 +89,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Cmd::Text { inputs } => {
-            let capture = Capture::load(&inputs)?;
+        Cmd::Text { inputs, partial } => {
+            let capture = load(&inputs, partial)?;
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
             text::write(&capture, &mut out)
@@ -96,10 +102,11 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Cmd::Perfetto {
             inputs,
+            partial,
             output,
             tsc_mhz,
         } => {
-            let capture = Capture::load(&inputs)?;
+            let capture = load(&inputs, partial)?;
             let json = perfetto::to_json(&capture, tsc_mhz);
             match output {
                 Some(path) => {
@@ -114,6 +121,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
     }
+}
+
+/// Loads `inputs`, accepting a partial capture when `partial` is set.
+fn load(inputs: &[PathBuf], partial: bool) -> Result<Capture, CliError> {
+    Ok(if partial {
+        Capture::load_partial(inputs)?
+    } else {
+        Capture::load(inputs)?
+    })
 }
 
 fn main() -> ExitCode {
