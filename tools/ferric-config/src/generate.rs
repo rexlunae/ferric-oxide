@@ -361,6 +361,38 @@ pub struct Applied {
     pub touched: usize,
 }
 
+/// A filesystem failure while applying generated configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// The output directory could not be created.
+    #[error("cannot create configuration directory {}", path.display())]
+    CreateOutput {
+        /// Directory that could not be created.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A generated configuration file could not be written.
+    #[error("cannot write generated configuration {}", path.display())]
+    WriteOutput {
+        /// File that could not be written.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Applied rebuild fingerprints could not be recorded.
+    #[error("cannot write rebuild state {}", path.display())]
+    WriteState {
+        /// State file that could not be written.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 fn read_state(path: &Path) -> Option<BTreeMap<String, String>> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: toml::Table = toml::from_str(&text).ok()?;
@@ -404,15 +436,28 @@ fn recipe_files(root: &Path) -> BTreeMap<String, Vec<PathBuf>> {
 
 /// Writes the plan, marks recipes whose options changed as stale by
 /// touching their recipe.toml (the cookbook rebuilds a recipe whose
-/// recipe.toml is newer than its stage), and records new fingerprints.
-pub fn apply(root: &Path, out_dir: &Path, plan: &Plan, touch: bool) -> Result<Applied, String> {
+/// recipe.toml is newer than its stage), and records applied fingerprints.
+/// With `touch` false, generated files are still written, but recipe timestamps
+/// and rebuild state remain unchanged so a later application can mark them stale.
+///
+/// # Errors
+///
+/// Returns [`ApplyError`] if output creation, a generated write or a rebuild-state
+/// write fails, preserving the path and underlying filesystem error.
+pub fn apply(root: &Path, out_dir: &Path, plan: &Plan, touch: bool) -> Result<Applied, ApplyError> {
     let abs_out = root.join(out_dir);
-    std::fs::create_dir_all(&abs_out).map_err(|e| format!("{}: {e}", abs_out.display()))?;
+    std::fs::create_dir_all(&abs_out).map_err(|source| ApplyError::CreateOutput {
+        path: abs_out.clone(),
+        source,
+    })?;
     let mut written = Vec::new();
     for (p, content) in &plan.files {
         let abs = root.join(p);
         if std::fs::read_to_string(&abs).ok().as_deref() != Some(content.as_str()) {
-            std::fs::write(&abs, content).map_err(|e| format!("{}: {e}", abs.display()))?;
+            std::fs::write(&abs, content).map_err(|source| ApplyError::WriteOutput {
+                path: abs.clone(),
+                source,
+            })?;
             written.push(p.clone());
         }
     }
@@ -453,12 +498,20 @@ pub fn apply(root: &Path, out_dir: &Path, plan: &Plan, touch: bool) -> Result<Ap
         }
     }
 
-    let mut state =
-        String::from("# ferric-config bookkeeping: option fingerprints per recipe.\n[recipes]\n");
-    for (k, v) in &plan.fingerprints {
-        state.push_str(&format!("{} = \"{v}\"\n", toml_key(k)));
+    // Generated output is not proof that recipes were marked for rebuild. Keep
+    // the applied baseline intact when a caller deliberately skips that step.
+    if touch {
+        let mut state = String::from(
+            "# ferric-config bookkeeping: option fingerprints per recipe.\n[recipes]\n",
+        );
+        for (k, v) in &plan.fingerprints {
+            state.push_str(&format!("{} = \"{v}\"\n", toml_key(k)));
+        }
+        std::fs::write(&state_path, state).map_err(|source| ApplyError::WriteState {
+            path: state_path,
+            source,
+        })?;
     }
-    std::fs::write(&state_path, state).map_err(|e| format!("{}: {e}", state_path.display()))?;
 
     Ok(Applied {
         written,
@@ -635,5 +688,120 @@ mod tests {
             relative(Path::new("config"), Path::new("config/desktop.toml")),
             PathBuf::from("desktop.toml")
         );
+    }
+
+    fn rebuild_fixture(scope: &str, fingerprint: &str) -> Plan {
+        Plan {
+            files: vec![(PathBuf::from("build/ferric/config.mk"), fingerprint.into())],
+            remove: Vec::new(),
+            fingerprints: BTreeMap::from([(scope.into(), fingerprint.into())]),
+        }
+    }
+
+    fn fixture_recipes(root: &Path) -> Vec<PathBuf> {
+        ["kernel", "app"]
+            .into_iter()
+            .map(|name| {
+                let path = root.join("recipes/core").join(name).join("recipe.toml");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "[build]\n").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_touch_preserves_pending_recipe_and_global_rebuilds() {
+        for scope in ["kernel", "*"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let recipes = fixture_recipes(root);
+            let out = Path::new("build/ferric");
+            apply(root, out, &rebuild_fixture(scope, "old"), true).unwrap();
+            let state_path = root.join(out).join("state.toml");
+            let old_state = std::fs::read(&state_path).unwrap();
+            let timestamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+            for recipe in &recipes {
+                std::fs::File::options()
+                    .write(true)
+                    .open(recipe)
+                    .unwrap()
+                    .set_modified(timestamp)
+                    .unwrap();
+            }
+
+            let changed = rebuild_fixture(scope, "new");
+            for _ in 0..2 {
+                let preview = apply(root, out, &changed, false).unwrap();
+                assert_eq!(preview.touched, 0);
+                assert_eq!(preview.stale, [scope]);
+                assert_eq!(std::fs::read(&state_path).unwrap(), old_state);
+                assert_eq!(
+                    std::fs::read_to_string(root.join(out).join("config.mk")).unwrap(),
+                    "new"
+                );
+                for recipe in &recipes {
+                    assert_eq!(recipe.metadata().unwrap().modified().unwrap(), timestamp);
+                }
+            }
+
+            let generated = apply(root, out, &changed, true).unwrap();
+            assert_eq!(generated.stale, [scope]);
+            assert_eq!(generated.touched, if scope == "*" { 2 } else { 1 });
+            assert!(recipes[0].metadata().unwrap().modified().unwrap() > timestamp);
+            if scope == "kernel" {
+                assert_eq!(
+                    recipes[1].metadata().unwrap().modified().unwrap(),
+                    timestamp
+                );
+            }
+            assert_ne!(std::fs::read(&state_path).unwrap(), old_state);
+            let repeated = apply(root, out, &changed, true).unwrap();
+            assert_eq!(repeated.touched, 0);
+            assert!(repeated.stale.is_empty());
+        }
+    }
+
+    #[test]
+    fn no_touch_first_generation_leaves_rebuild_state_uncommitted() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_recipes(dir.path());
+        let out = Path::new("build/ferric");
+        let plan = rebuild_fixture("kernel", "first");
+        let preview = apply(dir.path(), out, &plan, false).unwrap();
+        assert_eq!(preview.touched, 0);
+        assert!(!dir.path().join(out).join("state.toml").exists());
+        assert!(dir.path().join(out).join("config.mk").is_file());
+
+        let generated = apply(dir.path(), out, &plan, true).unwrap();
+        assert_eq!(generated.stale, ["kernel"]);
+        assert_eq!(generated.touched, 1);
+        assert!(dir.path().join(out).join("state.toml").is_file());
+    }
+
+    #[test]
+    fn output_failure_preserves_rebuild_state_and_error_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fixture_recipes(root);
+        let out = Path::new("build/ferric");
+        apply(root, out, &rebuild_fixture("kernel", "old"), true).unwrap();
+        let state = root.join(out).join("state.toml");
+        let before = std::fs::read(&state).unwrap();
+        let output = root.join(out).join("config.mk");
+        std::fs::remove_file(&output).unwrap();
+        std::fs::create_dir(&output).unwrap();
+
+        let error = apply(root, out, &rebuild_fixture("kernel", "new"), true)
+            .err()
+            .unwrap();
+        assert!(matches!(&error, ApplyError::WriteOutput { path, .. } if path == &output));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), before);
     }
 }
