@@ -487,7 +487,9 @@ to its threshold, so a scheduled run holding one of two keys leaves the
 still-valid metadata in place. A new root is complete only when its own
 root keys meet their threshold and, separately, the previous root's root
 keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
-amended by `set-role` rather than followed by another version.
+amended by `set-role` rather than followed by another version. Amending it
+drops every signature it already has, by old and new root keys alike, so
+each key set has to approve the content it actually signs.
 `sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the
 snapshot key, and CI adds snapshot and timestamp after the merge.

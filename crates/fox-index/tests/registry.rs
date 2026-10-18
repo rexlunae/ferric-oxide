@@ -763,3 +763,48 @@ fn lowering_the_root_threshold_still_needs_the_old_threshold() {
     assert!(!rotate_root(dir.path(), lowered.clone(), &[MAINTAINER]));
     assert!(rotate_root(dir.path(), lowered, &[MAINTAINER, SECOND]));
 }
+
+#[test]
+fn editing_a_pending_root_drops_every_signature_on_it() {
+    const SECOND: u8 = 12;
+    const TARGETS: u8 = 13;
+    let dir = tempfile::tempdir().unwrap();
+    admitted(dir.path());
+    let options = SignOptions::default();
+    let both = RoleKeys::new([key(MAINTAINER), key(SECOND)], 2);
+    // Only the new key approves the pending root: 1 of 2 new, 0 of 1 old.
+    assert!(!rotate_root(dir.path(), both, &[SECOND]));
+    let pending: Signed<Root> = read(dir.path(), "metadata/root/2.json");
+    assert_eq!(pending.signatures.len(), 1);
+
+    // Any edit to the pending root changes what was approved, so neither
+    // key set's signatures survive it.
+    let mut registry = Registry::open(dir.path()).unwrap();
+    registry
+        .set_role(
+            RoleName::Targets,
+            RoleKeys::new([key(TARGETS)], 1),
+            now(),
+            &options.lifetimes,
+        )
+        .unwrap();
+    let edited: Signed<Root> = read(dir.path(), "metadata/root/2.json");
+    assert!(edited.signatures.is_empty());
+
+    // The old key, also a new root key, cannot complete the edited root on
+    // the strength of the new key's earlier approval.
+    let report = registry
+        .sign(&keyring(&[MAINTAINER, TARGETS]), now(), &options)
+        .unwrap();
+    let root = &report.files[0];
+    assert_eq!((root.valid, root.threshold), (1, 2));
+    assert!(!root.complete());
+    let mut state = ClientState::trust_root(read(dir.path(), "metadata/root/1.json")).unwrap();
+    assert!(verify::update(dir.path(), &mut state, now()).is_err());
+
+    // The new key has to approve the edited content itself.
+    let report = registry
+        .sign(&keyring(&[SECOND, TARGETS]), now(), &options)
+        .unwrap();
+    assert!(report.files[0].complete(), "{report:?}");
+}

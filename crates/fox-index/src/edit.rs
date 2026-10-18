@@ -676,10 +676,12 @@ impl Registry {
     }
 
     /// Starts a new root version that gives `role` these keys, or changes
-    /// the newest root in place while it has no signatures. The new root
-    /// has no signatures until [`Registry::sign`] adds them; clients accept
-    /// it only when a threshold of both the old and the new root keys have
-    /// signed.
+    /// the newest root in place while clients would not yet accept it.
+    /// Either way the root has no signatures until [`Registry::sign`] adds
+    /// them: an in-place edit drops every signature already on it, by the
+    /// new and the previous root keys alike, since they approved other
+    /// bytes. Clients accept it only when a threshold of both the old and
+    /// the new root keys have signed.
     ///
     /// # Errors
     ///
@@ -701,8 +703,8 @@ impl Registry {
             self.root.signed.roles.insert(role, keys);
             self.root.signed.expires = Expiry::days_after(now, lifetimes.root);
             // Changing the roles changes the bytes a signature covers, so
-            // signatures already collected for the pending root no longer
-            // apply to it.
+            // no signature collected for the pending root, from either key
+            // set, may count towards the edited one.
             self.root.signatures.clear();
         } else {
             let mut next = self.next_root(now, lifetimes)?;
