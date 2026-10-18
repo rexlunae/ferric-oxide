@@ -552,12 +552,42 @@ impl<M> GrantTable<M> {
     ///
     /// [`TableError::Unknown`] when the grant is not open and [`TableError::NoMapping`] when no
     /// mapping matches.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from the `matches` predicate.
     pub fn take_mapping(
         &mut self,
         id: GrantId,
         matches: impl FnMut(&M) -> bool,
     ) -> Result<Taken<M>, TableError> {
-        let entry = self.entry_mut(id)?;
+        self.entry(id)?;
+        self.take_teardown_mapping(id, matches)
+    }
+
+    /// Takes a recorded mapping for teardown, including from a closed grant.
+    ///
+    /// This lets a completed hardware teardown retire a failed mapping whose descriptor
+    /// closed earlier. Match the complete mapping identity, including its ticket, so a late
+    /// completion cannot retire another mapping that reused its address. Finish the returned
+    /// mapping only after confirmed teardown; restore it if teardown failed.
+    /// Ordinary user operations must keep using [`Self::take_mapping`], which rejects closed
+    /// grants. Taking this record still counts it in flight until it is finished or restored.
+    ///
+    /// # Errors
+    ///
+    /// [`TableError::Unknown`] when no entry remains for `id`, and [`TableError::NoMapping`]
+    /// when none of its recorded mappings matches. Neither error changes the table.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from the `matches` predicate.
+    pub fn take_teardown_mapping(
+        &mut self,
+        id: GrantId,
+        matches: impl FnMut(&M) -> bool,
+    ) -> Result<Taken<M>, TableError> {
+        let entry = self.grants.get_mut(&id).ok_or(TableError::Unknown(id))?;
         let index = entry
             .mappings
             .iter()
@@ -661,6 +691,36 @@ impl<M> GrantTable<M> {
         if let Some(entry) = self.grants.get_mut(&grant) {
             entry.mappings.push(mapping);
         }
+    }
+
+    /// Publishes teardown, accepting independently confirmed recovery on failure.
+    ///
+    /// Hold the region lock while calling this and checking `recovered`. That check must
+    /// establish that the mapping is now unreachable, such as a DMA domain successfully
+    /// blocked after its unmap failed. It closes the race with completion that could not
+    /// find this mapping while it was in flight. Returns the finished mapping to its owner.
+    ///
+    /// # Errors
+    ///
+    /// The original operation error when recovery is not confirmed. The mapping is restored
+    /// before returning the error, so the region cannot release its frames prematurely.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `recovered` on failed teardown, leaving it counted in flight.
+    pub fn complete_teardown<E>(
+        &mut self,
+        taken: Taken<M>,
+        outcome: Result<(), E>,
+        recovered: impl FnOnce(&M) -> bool,
+    ) -> Result<M, E> {
+        if let Err(error) = outcome
+            && !recovered(&taken.mapping)
+        {
+            self.restore(taken);
+            return Err(error);
+        }
+        Ok(self.finish(taken))
     }
 
     /// Counts one teardown of grant `id` as done.
@@ -1193,5 +1253,118 @@ mod tests {
         // Nothing of the grant is left, so the table forgot it.
         assert!(t.settled(g));
         assert_eq!(t.mapping_count(g), 0);
+    }
+
+    #[test]
+    fn domain_close_can_finish_a_failed_mapping_of_a_closed_region() {
+        let mut t = table(1);
+        let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+        t.add_mapping(g, 42).unwrap();
+        let failed = t.close().pop().unwrap();
+        t.restore(failed);
+        assert!(t.is_closed());
+        assert!(!t.drained());
+        // The domain has now been blocked; its link forgets the restored record.
+        let blocked = t.take_teardown_mapping(g, |record| *record == 42).unwrap();
+        assert!(!t.drained());
+        assert_eq!(t.finish(blocked), 42);
+        assert!(t.drained());
+        assert!(t.settled(g));
+        assert_eq!(t.mapping_count(g), 0);
+        assert!(t.take_mapping(g, |_| true).is_err());
+    }
+
+    #[test]
+    fn domain_close_can_finish_a_failed_mapping_of_a_closed_grant() {
+        for close_region in [false, true] {
+            let mut t = table(1);
+            let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+            t.add_mapping(g, 42).unwrap();
+            let failed = t.remove(g).pop().unwrap();
+            t.restore(failed);
+            if close_region {
+                let failed_again = t.close().pop().unwrap();
+                t.restore(failed_again);
+            }
+            assert_eq!(t.take_mapping(g, |_| true), Err(TableError::Unknown(g)));
+            assert_eq!(
+                t.take_teardown_mapping(g, |record| *record == 41),
+                Err(TableError::NoMapping(g))
+            );
+            assert_eq!(t.mapping_count(g), 1);
+            let blocked = t.take_teardown_mapping(g, |record| *record == 42).unwrap();
+            assert_eq!(t.finish(blocked), 42);
+            assert!(t.drained());
+            assert!(t.settled(g));
+            assert_eq!(t.mapping_count(g), 0);
+            assert_eq!(
+                t.take_teardown_mapping(g, |_| true),
+                Err(TableError::Unknown(g))
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_domain_close_before_failed_teardown_publication() {
+        extern crate std;
+        use std::sync::{Barrier, Mutex};
+        use std::thread;
+
+        for blocked_successfully in [false, true] {
+            let mut t = table(1);
+            let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+            t.add_mapping(g, 42).unwrap();
+            let taken = t.remove(g).pop().unwrap();
+            assert!(t.close().is_empty());
+            let region = Mutex::new(t);
+            let domain_closed = Mutex::new(false);
+            let unmap_failed = Barrier::new(2);
+            let close_finished = Barrier::new(2);
+            thread::scope(|scope| {
+                let refs = (&region, &domain_closed, &unmap_failed, &close_finished);
+                let teardown = scope.spawn(move || {
+                    refs.2.wait();
+                    refs.3.wait();
+                    // Same region-before-domain locking as the kernel's outcome publication.
+                    refs.0
+                        .lock()
+                        .unwrap()
+                        .complete_teardown(taken, Err(1_u8), |_| *refs.1.lock().unwrap())
+                });
+                unmap_failed.wait();
+                *domain_closed.lock().unwrap() = blocked_successfully;
+                if blocked_successfully {
+                    // The domain link cannot find the record still owned by the revoker.
+                    let mut guard = region.lock().unwrap();
+                    assert_eq!(
+                        guard.take_teardown_mapping(g, |record| *record == 42),
+                        Err(TableError::NoMapping(g))
+                    );
+                    assert!(!guard.drained());
+                }
+                close_finished.wait();
+                assert_eq!(
+                    teardown.join().unwrap(),
+                    if blocked_successfully { Ok(42) } else { Err(1) }
+                );
+            });
+            let guard = region.lock().unwrap();
+            assert_eq!(guard.drained(), blocked_successfully);
+            assert_eq!(guard.settled(g), blocked_successfully);
+            assert_eq!(guard.mapping_count(g), usize::from(!blocked_successfully));
+        }
+    }
+
+    #[test]
+    fn successful_teardown_does_not_need_recovery() {
+        let mut t = table(1);
+        let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+        t.add_mapping(g, 42).unwrap();
+        let taken = t.close().pop().unwrap();
+        assert_eq!(
+            t.complete_teardown(taken, Ok::<(), u8>(()), |_| panic!("already complete")),
+            Ok(42)
+        );
+        assert!(t.drained());
     }
 }

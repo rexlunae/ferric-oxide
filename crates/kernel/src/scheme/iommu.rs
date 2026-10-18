@@ -53,6 +53,8 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
+#[cfg(feature = "regbuf")]
+use ferric_iommu::dma::links::DomainLinks;
 use ferric_vtd::{dmar::BusRange, interrupt::SourceValidation, plan::SelectError, Bdf};
 use spin::Mutex;
 use syscall::{
@@ -147,6 +149,8 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::NoGrantMapping { .. } => Error::new(ENOENT),
         #[cfg(feature = "regbuf")]
         DmaError::GrantSize => Error::new(EINVAL),
+        #[cfg(feature = "regbuf")]
+        DmaError::FailedUnmap { .. } => Error::new(EIO),
     }
 }
 
@@ -220,20 +224,44 @@ impl KernelScheme for IommuScheme {
     }
 
     fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
-        // Dropping a domain blocks its devices and frees its tables; do that outside the lock.
-        let handle = HANDLES.lock().remove(&id);
-        if let Some(Handle::Domain { space, bound }) = &handle {
-            if bound.is_some() {
-                BOUND.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "regbuf")]
+        let mut forgotten = Vec::new();
+        let handle = {
+            let mut handles = HANDLES.lock();
+            if let Some(Handle::Domain { space, bound }) = handles.get_mut(&id) {
+                let devices = space.device_count();
+                let mappings = space.mapping_count();
+                // Serialize blocking with revocation: a missing handle must never be
+                // observed before the hardware result and failure marker are published.
+                let clean = space.domain().close();
+                #[cfg(feature = "regbuf")]
+                {
+                    forgotten = GRANT_LINKS.lock().close(id, clean);
+                }
+                if bound.is_some() {
+                    BOUND.fetch_sub(1, Ordering::Relaxed);
+                }
+                if clean {
+                    info!(
+                        "IOMMU: domain {} closed, {devices} device(s) blocked, {mappings} DMA mapping(s) unpinned",
+                        space.id()
+                    );
+                } else {
+                    warn!(
+                        "IOMMU: domain {} close failed; its frames stay pinned",
+                        space.id()
+                    );
+                }
             }
-            info!(
-                "IOMMU: domain {} closed, {} device(s) blocked, {} DMA mapping(s) unpinned",
-                space.id(),
-                space.device_count(),
-                space.mapping_count()
-            );
-        }
+            handles.remove(&id)
+        };
+        // Pins and grant records are released without the handle-table lock. In
+        // particular, forgetting records takes region locks, which must precede it.
         drop(handle);
+        #[cfg(feature = "regbuf")]
+        for (link, record) in forgotten {
+            link.forget(record);
+        }
         Ok(())
     }
 
@@ -652,8 +680,8 @@ static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 /// grant's record. Taken after the region lock and the handle table, and never held while
 /// taking either.
 #[cfg(feature = "regbuf")]
-static GRANT_LINKS: Mutex<BTreeMap<u64, (super::regbuf::DmaLink, super::regbuf::DmaRecord)>> =
-    Mutex::new(BTreeMap::new());
+static GRANT_LINKS: Mutex<DomainLinks<(super::regbuf::DmaLink, super::regbuf::DmaRecord)>> =
+    Mutex::new(DomainLinks::new());
 
 /// The domain with handle number `id`, if the address space at `owner` has bound it.
 ///
@@ -716,7 +744,7 @@ fn map_grant(id: usize, grant_fd: u64, token: &mut CleanLockToken) -> Result<usi
             iova,
             ticket,
         };
-        GRANT_LINKS.lock().insert(ticket, (link, record));
+        GRANT_LINKS.lock().insert(ticket, id, (link, record));
         Ok(record)
     })?;
     usize::try_from(record.iova).map_err(|_| Error::new(EIO))
@@ -772,16 +800,36 @@ fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
 ///
 /// # Errors
 ///
-/// `EIO` when the unmap or its IOTLB invalidation failed. The domain has forgotten the
-/// mapping then (a retry could not unmap it again), but its frames stay pinned for good, so
-/// the device can reach nothing but the application's own buffer.
+/// `EIO` when the unmap or its IOTLB invalidation failed, including later retries of that
+/// failed mapping. The domain retains its pins and IOVA until confirmed domain blocking.
 #[cfg(feature = "regbuf")]
 pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
-    // Dropped at once: the guard must not be held with the handle table.
+    unmap_grant_record(record)?;
     let _ = GRANT_LINKS.lock().remove(&record.ticket);
+    Ok(())
+}
+
+/// Whether a grant's domain was removed after confirmed device blocking.
+///
+/// Called with the region locked before restoring a failed teardown. The region-before-
+/// handle order serializes this with closure: either its link finds the restored record,
+/// or this check finishes the still-in-flight record after the domain was blocked.
+#[cfg(feature = "regbuf")]
+pub(crate) fn grant_domain_closed(record: super::regbuf::DmaRecord) -> bool {
+    let handles = HANDLES.lock();
+    !handles.contains_key(&record.domain) && !GRANT_LINKS.lock().closed_failed(record.domain)
+}
+
+/// Performs the hardware teardown without forgetting its link on failure.
+#[cfg(feature = "regbuf")]
+fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
     let mut handles = HANDLES.lock();
     let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
-        return Ok(());
+        return if GRANT_LINKS.lock().closed_failed(record.domain) {
+            Err(Error::new(EIO))
+        } else {
+            Ok(())
+        };
     };
     match space.unmap_grant(record.iova, Some(record.ticket)) {
         Ok(_) => {

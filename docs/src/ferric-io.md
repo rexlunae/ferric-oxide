@@ -147,20 +147,27 @@ DMA mapping and waits for invalidation. The
 interface never hands out physical addresses of another process's buffer as
 a fallback. Drivers needing a fallback must manage their own bounce buffers.
 
-Domain closure removes its handle and drops the DMA-space object outside the
-handle lock, blocking devices and retiring mappings through that object's
-destructor. Grant links are tracked separately in the scheme; there is no
-per-domain link-retirement registry in this revision. Closing a domain does
-not proactively reconcile all of its grant records or release a closed region
-that was waiting on those records.
+Domain closure blocks its devices before removing the handle and records
+whether that blocking succeeded. On success, it retires the domain's grant
+links and completes their matching region records, including restored records
+on closed grants. Closed regions release their frames and pin charges when
+the last mapping completes. Region records are reconciled outside the handle
+lock to preserve the region-before-handle lock order.
 
-Failed DMA-grant unmapping keeps frame references pinned, but removes the
-mapping from the DMA-space bookkeeping. A later retry can therefore find it
-missing and treat it as complete without retrying the hardware invalidation.
-Likewise, revocation treats an absent domain handle as already closed, without
-retaining the hardware-close result there. These paths need lifecycle
-hardening before successful retries can be taken as proof of completed DMA
-revocation after an earlier failure. See `scheme/iommu.rs` and
+When a failed unmap is still in flight during domain closure, the link may
+reach its region before the revoker publishes that failure. Before restoring
+the record, teardown rechecks confirmed domain closure under the region lock.
+It completes an already blocked mapping instead of stranding a restored record
+after its link was removed. Failed device blocking still requires retention.
+
+Failed DMA-grant unmapping retains its mapping record, grant link, frame
+references and allocated IOVA. Once hardware unmapping fails, later attempts
+return `EIO` rather than treating cleared page-table entries as proof of
+completed invalidation. Resources are retired only after confirmed unmapping
+or a safely blocked domain. If device blocking fails during domain close,
+its failure marker remains after handle removal: later revocation returns
+`EIO`, and the grant records and pinned frames remain retained. Concurrent
+close and revocation retire a mapping only once. See `scheme/iommu.rs` and
 `arch/x86_64/iommu/dma.rs` in the kernel.
 
 These are available primitives and tested integration paths. They do not

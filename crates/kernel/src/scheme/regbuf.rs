@@ -247,6 +247,22 @@ fn unpin((frames, uid): (Vec<RaiiFrame>, u32)) {
     BUDGET.lock().refund(uid, pages);
 }
 
+/// Updates retry ownership and releases a closed region once its last teardown finishes.
+/// Called with the region locked; returned pins must be released after dropping that lock.
+fn finish_region_teardown(
+    region: &Arc<Mutex<Region>>,
+    guard: &mut Region,
+) -> Option<(Vec<RaiiFrame>, u32)> {
+    if guard.grants.is_closed() {
+        let mut stuck = STUCK.lock();
+        stuck.retain(|r| !Arc::ptr_eq(r, region));
+        if guard.grants.idle() && !guard.grants.drained() {
+            stuck.push(Arc::clone(region));
+        }
+    }
+    guard.release()
+}
+
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
@@ -370,30 +386,27 @@ fn take_down(
     let released = {
         let mut guard = region.lock();
         for (taken, outcome) in outcomes {
+            let outcome = guard.grants.complete_teardown(taken, outcome, |mapping| {
+                #[cfg(iommu_enabled)]
+                if let Some(record) = mapping.dma {
+                    return super::iommu::grant_domain_closed(record);
+                }
+                #[cfg(not(iommu_enabled))]
+                let _ = mapping;
+                false
+            });
             match outcome {
                 // A closed region keeps its frames until this last teardown, and the owner may
                 // still have the memory mapped, so the holder's last writes land there.
-                Ok(()) => {
-                    let region = &mut *guard;
-                    region.grants.finish(taken).write_back(&mut region.frames);
+                Ok(mapping) => {
+                    mapping.write_back(&mut guard.frames);
                 }
                 Err(err) => {
-                    guard.grants.restore(taken);
                     failed.get_or_insert(err);
                 }
             }
         }
-        if guard.grants.is_closed() {
-            // Under the region lock, so the list agrees with the table. A region is on it
-            // while only restored mappings are left; a teardown still in flight decides when it
-            // finishes, and the one that drains the region takes it off.
-            let mut stuck = STUCK.lock();
-            stuck.retain(|r| !Arc::ptr_eq(r, region));
-            if guard.grants.idle() && !guard.grants.drained() {
-                stuck.push(Arc::clone(region));
-            }
-        }
-        guard.release()
+        finish_region_teardown(region, &mut guard)
     };
     TEARDOWN.notify(token);
     if let Some(released) = released {
@@ -921,17 +934,26 @@ impl DmaLink {
     /// Forgets the grant's record of `record`, a mapping the driver took down itself, so the
     /// grant does not keep it until it is revoked or closed. Nothing when the grant is gone,
     /// or a teardown of the grant has the record in hand already (it then finds the mapping
-    /// gone, which counts as done).
+    /// gone, which counts as done). A closed region releases and refunds its frames once
+    /// this removes its last mapping and no other teardown is in flight.
     pub fn forget(&self, record: DmaRecord) {
         let Some(region) = self.region.upgrade() else {
             return;
         };
-        let mut guard = region.lock();
-        if let Ok(taken) = guard
-            .grants
-            .take_mapping(self.id, |m| m.dma == Some(record))
-        {
-            drop(guard.grants.finish(taken));
+        let released = {
+            let mut guard = region.lock();
+            if let Ok(taken) = guard
+                .grants
+                .take_teardown_mapping(self.id, |m| m.dma == Some(record))
+            {
+                drop(guard.grants.finish(taken));
+            }
+            finish_region_teardown(&region, &mut guard)
+        };
+        // Taking and finishing the record share the region lock, so no waiter can
+        // observe this teardown in flight. Other teardowns notify when they finish.
+        if let Some(released) = released {
+            unpin(released);
         }
     }
 }
