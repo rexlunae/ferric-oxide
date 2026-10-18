@@ -431,6 +431,10 @@ fn cookbook_recipes_become_recipe_packages() {
         &env.key("timestamp")
     ]));
     env.ok(&["verify"]);
+    // Without releases there is nothing to check against the (unreachable)
+    // repository, so check passes without fetching it.
+    let checked = env.ok(&["check"]);
+    assert!(checked.contains("hello: no releases"), "{checked}");
     // Importing again admits nothing new.
     assert!(env.ok(&import).contains("admitted 0 recipes (2 already"));
 }

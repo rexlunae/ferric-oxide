@@ -534,15 +534,8 @@ impl Registry {
     /// [`EditError::Layout`] if the entry is invalid, and [`EditError::Io`]
     /// if it cannot be written.
     pub fn write_package(&self, entry: &PackageEntry) -> Result<(), EditError> {
-        let path = package_path(&entry.name);
-        let layout = |source| EditError::Layout {
-            path: path.clone(),
-            source: Box::new(source),
-        };
-        let text = entry.to_toml().map_err(layout)?;
-        // Write only what a client would accept.
-        PackageEntry::from_toml(&text, &path).map_err(layout)?;
-        write_file(&self.dir.join(&path), text.as_bytes())
+        let (path, text) = package_text(entry)?;
+        write_file(&self.dir.join(path), text.as_bytes())
     }
 
     /// Adds a package: writes its file and delegates that file to its
@@ -559,7 +552,8 @@ impl Registry {
 
     /// Admits several packages, as [`Registry::admit`] does for each, but
     /// writes `targets.json` once. Nothing is written unless every package
-    /// is new.
+    /// is new and valid, and if a write fails the package files already
+    /// written are removed again, so a failed batch can be retried as is.
     ///
     /// # Errors
     ///
@@ -581,43 +575,67 @@ impl Registry {
         if entries.is_empty() {
             return Ok(());
         }
+        // Everything that can fail without touching the disk is done
+        // first: each package file is serialized and checked, and the new
+        // targets metadata is built and serialized aside.
+        let files = entries
+            .iter()
+            .map(package_text)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut targets = self.targets.clone();
         for entry in entries {
-            let name = entry.name.as_str().to_owned();
-            self.write_package(entry)?;
-            self.targets.signed.delegations.push(Delegation {
-                name: name.clone(),
+            targets.signed.delegations.push(Delegation {
+                name: entry.name.as_str().to_owned(),
                 keys: RoleKeys::new(entry.owners.iter().map(|owner| owner.delegation_key()), 1),
                 paths: BTreeSet::from([package_path(&entry.name)]),
             });
-            self.delegations.insert(
-                name,
-                Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
-            );
         }
-        self.targets
+        targets
             .signed
             .delegations
             .sort_by(|a, b| a.name.cmp(&b.name));
         // The delegations must survive until the next `sign`, which may run
         // in another process.
-        if !self.targets.signatures.is_empty() {
-            self.targets.signed.version =
-                self.targets.signed.version.checked_add(1).ok_or_else(|| {
-                    EditError::VersionOverflow {
-                        file: metadata_file(TARGETS_FILE),
-                    }
-                })?;
-            self.targets.signatures.clear();
+        if !targets.signatures.is_empty() {
+            targets.signed.version = targets.signed.version.checked_add(1).ok_or_else(|| {
+                EditError::VersionOverflow {
+                    file: metadata_file(TARGETS_FILE),
+                }
+            })?;
+            targets.signatures.clear();
         }
         let file = metadata_file(TARGETS_FILE);
-        let bytes = self
-            .targets
-            .to_json()
-            .map_err(|source| EditError::Metadata {
-                file: file.clone(),
-                source,
-            })?;
-        write_file(&self.dir.join(file), &bytes)
+        let bytes = targets.to_json().map_err(|source| EditError::Metadata {
+            file: file.clone(),
+            source,
+        })?;
+
+        // Then the writes, undone if one fails, so that a failed batch can
+        // simply be retried.
+        let mut written = Vec::new();
+        let result = files
+            .iter()
+            .try_for_each(|(path, text)| {
+                let full = self.dir.join(path);
+                write_file(&full, text.as_bytes())?;
+                written.push(full);
+                Ok(())
+            })
+            .and_then(|()| write_file(&self.dir.join(&file), &bytes));
+        if let Err(error) = result {
+            for path in &written {
+                remove_new_file(path);
+            }
+            return Err(error);
+        }
+        self.targets = targets;
+        for entry in entries {
+            self.delegations.insert(
+                entry.name.as_str().to_owned(),
+                Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
+            );
+        }
+        Ok(())
     }
 
     /// Records a release in a package file.
@@ -1201,6 +1219,30 @@ fn create_dir(path: &Path) -> Result<(), EditError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// A package file's path and text, checked to be what a client accepts.
+fn package_text(entry: &PackageEntry) -> Result<(String, String), EditError> {
+    let path = package_path(&entry.name);
+    let layout = |source| EditError::Layout {
+        path: path.clone(),
+        source: Box::new(source),
+    };
+    let text = entry.to_toml().map_err(layout)?;
+    // Write only what a client would accept.
+    PackageEntry::from_toml(&text, &path).map_err(layout)?;
+    Ok((path, text))
+}
+
+/// Best-effort removal of a file written by a batch that failed, and of
+/// its directory if that is now empty. A file that cannot be removed is
+/// reported by the batch's retry as already admitted.
+fn remove_new_file(path: &Path) {
+    if fs::remove_file(path).is_ok()
+        && let Some(parent) = path.parent()
+    {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), EditError> {

@@ -844,3 +844,42 @@ fn packages_are_admitted_together_or_not_at_all() {
     let verified = verify::update(dir.path(), &mut state, now()).unwrap();
     assert_eq!(verified.package_names().len(), 3);
 }
+
+#[test]
+fn a_failed_batch_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let other = |name: &str| {
+        let mut entry = entry();
+        entry.name = PackageName::new(name).unwrap();
+        entry
+    };
+    let fd = dir.path().join("packages/fd/fd.toml");
+    let targets = fs::read(dir.path().join("metadata/targets.json")).unwrap();
+
+    // A later entry that is invalid stops the batch before any write.
+    let mut ownerless = other("bat");
+    ownerless.owners.clear();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), ownerless]),
+        Err(EditError::Layout { .. })
+    ));
+    assert!(!fd.exists());
+
+    // A later write that fails takes the earlier files back out.
+    fs::write(dir.path().join("packages/ba"), "in the way").unwrap();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("bat")]),
+        Err(EditError::Io { .. })
+    ));
+    assert!(!fd.exists());
+    assert_eq!(
+        fs::read(dir.path().join("metadata/targets.json")).unwrap(),
+        targets
+    );
+
+    // So the same batch can be retried.
+    fs::remove_file(dir.path().join("packages/ba")).unwrap();
+    registry.admit_all(&[other("fd"), other("bat")]).unwrap();
+    assert!(fd.exists());
+}

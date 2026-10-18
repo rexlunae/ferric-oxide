@@ -847,6 +847,13 @@ fn check(dir: &Path, names: &[String], cache: Option<&Path>) -> Result<(), CliEr
             eprintln!("{name}: owners differ from the delegation's keys");
             failed += 1;
         }
+        // Nothing to compare against the repository yet (an imported recipe
+        // has no releases until its first tag is recorded), so don't make
+        // the check depend on reaching it.
+        if entry.releases.is_empty() {
+            println!("{name}: no releases");
+            continue;
+        }
         let repo = match source::fetch(&entry, &cache) {
             Ok(repo) => repo,
             Err(error) => {
