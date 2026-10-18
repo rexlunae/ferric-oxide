@@ -24,6 +24,7 @@ on:
       - "features.toml"
       - "tools/ferric-config/**"
       - ".github/workflows/kernel-lints.yml"
+      - ".github/actions/prepare-cargo-git/**"
 
 jobs:
   docs:
@@ -33,6 +34,7 @@ jobs:
         iommu: [never, auto]
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
@@ -70,6 +72,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       # The kernel's build script assembles the AP trampoline with nasm.
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
@@ -96,6 +99,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
@@ -143,6 +147,7 @@ jobs:
       KERNEL_DIR: crates/kernel
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain

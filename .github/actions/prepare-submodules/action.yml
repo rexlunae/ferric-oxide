@@ -36,3 +36,5 @@ runs:
         path: .git/modules
         key: ${{ steps.submodules.outputs.key }}
 
+    - uses: ./.github/actions/prepare-cargo-git
+

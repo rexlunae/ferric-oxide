@@ -17,12 +17,14 @@ on:
       - "config/**"
       - "userspace/redoxfs/**"
       - ".github/workflows/host-tools.yml"
+      - ".github/actions/prepare-cargo-git/**"
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |
@@ -90,6 +92,7 @@ jobs:
         working-directory: userspace/redoxfs
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |

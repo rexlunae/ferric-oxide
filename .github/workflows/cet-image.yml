@@ -18,6 +18,7 @@ on:
       - "scripts/ferric-ci/boot-cet.sh"
       - ".github/workflows/cet-image.yml"
       - ".github/actions/prepare-submodules/**"
+      - ".github/actions/prepare-cargo-git/**"
 
 concurrency:
   group: cet-image-${{ github.ref }}

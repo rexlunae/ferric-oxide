@@ -31,6 +31,12 @@ including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test.
 
+Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
+running Cargo. It enables Git's fetch client and rewrites upstream Redox GitLab
+URLs to the GitHub mirrors, retaining the lockfiles' exact commit IDs. This also
+covers Cargo dependency resolution during feature generation; successful
+submodule checkout alone does not establish that Cargo can reach GitLab.
+
 `cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
