@@ -139,8 +139,8 @@ partial-page bounce views cannot expose those pages directly to a device.
 
 `MapGrant` and `UnmapGrant` both require the caller's address space to be bound
 to the supplied domain. Possessing its descriptor does not grant permission
-to remove another address space's mappings. An unbound caller receives
-`ENODEV`; a caller bound to a different domain receives `EACCES`. A mapping
+to remove another address space's mappings. A caller that has not bound this
+domain, including one bound to a different domain, receives `ENODEV`. A mapping
 ticket distinguishes successive uses of an IOVA so a delayed revocation
 cannot remove a newer mapping. The normal grant-revocation path removes the
 DMA mapping and waits for invalidation. The
