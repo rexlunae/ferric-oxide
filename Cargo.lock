@@ -1046,6 +1046,13 @@ name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-ring"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.10.0",
+]
+
+[[package]]
 name = "ferric-trace"
 version = "0.1.0"
 

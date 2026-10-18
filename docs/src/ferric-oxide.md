@@ -13,7 +13,7 @@ descriptions may differ from this checkout.
 | Understand the components, workspaces and boot sequence | [Architecture](ferric-architecture.md) |
 | Build an image, choose features or change a recipe | [Build and configuration](ferric-build.md) |
 | Change CPU state, address spaces or kernel hardening | [Memory and CPU protection](ferric-memory.md) |
-| Work on drivers, DMA or shared buffers | [Registered buffers and IOMMUs](ferric-io.md) |
+| Work on drivers, DMA, shared buffers or rings | [Registered buffers, IOMMUs and rings](ferric-io.md) |
 | Trace system calls and scheduling, or add a tracepoint | [Kernel tracing](ferric-tracing.md) |
 | Verify or install a local package, generate its SBOM, or see how images adopt `pkg`'s packages | [Package tooling](ferric-packaging.md) |
 | Find tests, reproduce a boot failure or understand CI | [Validation and debugging](ferric-testing.md) |

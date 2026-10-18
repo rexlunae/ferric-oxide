@@ -21,6 +21,7 @@ dependencies = [
  "arrayvec",
  "ferric-iommu",
  "ferric-regbuf",
+ "ferric-ring",
  "ferric-trace",
  "hashbrown",
  "libredox",
@@ -42,6 +43,13 @@ version = "0.1.0"
 [[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-ring"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "ferric-trace"
