@@ -191,6 +191,17 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Serializes the tests that write a script and run it: a process
+    /// another test forks while a script is still open for writing holds
+    /// that descriptor until it execs, and running the script meanwhile
+    /// fails with `ETXTBSY`.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A fake `fox` that logs its arguments and fails on `fail_on`.
     fn fake_fox(dir: &Path, fail_on: &str) -> PathBuf {
         let path = dir.join("fox");
@@ -225,6 +236,7 @@ mod tests {
 
     #[test]
     fn without_a_package_set_the_image_is_only_adopted() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let fox = image(fake_fox(dir.path(), "none"));
         fox.run(Path::new("/image")).unwrap();
@@ -236,6 +248,7 @@ mod tests {
 
     #[test]
     fn a_package_set_is_synced_for_the_image_target_then_described() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let fox = FoxImage {
             packages: Some("config/packages.toml".into()),
@@ -255,6 +268,7 @@ mod tests {
 
     #[test]
     fn a_failed_step_stops_the_build() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let fox = FoxImage {
             packages: Some("packages.toml".into()),
