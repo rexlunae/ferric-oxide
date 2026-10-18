@@ -1040,6 +1040,19 @@ fn try_direct_switch_back(
     // False by the above ptr_eq check
     let next_is_current_context = false;
 
+    // A directly switched handler need not be on any run queue. Track its timed wait
+    // here even if its caller cannot resume, before the scheduler falls back to idle.
+    if prev_guard.status.is_soft_blocked()
+        && let Some(wake) = prev_guard.wake
+    {
+        percpu.switch_internals.run_queue.lock().timers.insert((
+            wake,
+            WeakContextRef(Arc::downgrade(ArcContextLockWriteGuard::rwlock(
+                &prev_guard,
+            ))),
+        ));
+    }
+
     if !matches!(
         update_runnable(
             &mut next_guard,
