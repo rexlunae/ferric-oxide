@@ -557,7 +557,33 @@ impl<M> GrantTable<M> {
         id: GrantId,
         matches: impl FnMut(&M) -> bool,
     ) -> Result<Taken<M>, TableError> {
-        let entry = self.entry_mut(id)?;
+        self.entry(id)?;
+        self.take_teardown_mapping(id, matches)
+    }
+
+    /// Takes a recorded mapping for teardown, including from a closed grant.
+    ///
+    /// This lets a completed hardware teardown retire a failed mapping whose descriptor
+    /// closed earlier. Match the complete mapping identity, including its ticket, so a late
+    /// completion cannot retire another mapping that reused its address. Finish the returned
+    /// mapping only after confirmed teardown; restore it if teardown failed.
+    /// Ordinary user operations must keep using [`Self::take_mapping`], which rejects closed
+    /// grants. Taking this record still counts it in flight until it is finished or restored.
+    ///
+    /// # Errors
+    ///
+    /// [`TableError::Unknown`] when no entry remains for `id`, and [`TableError::NoMapping`]
+    /// when none of its recorded mappings matches. Neither error changes the table.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from the `matches` predicate.
+    pub fn take_teardown_mapping(
+        &mut self,
+        id: GrantId,
+        matches: impl FnMut(&M) -> bool,
+    ) -> Result<Taken<M>, TableError> {
+        let entry = self.grants.get_mut(&id).ok_or(TableError::Unknown(id))?;
         let index = entry
             .mappings
             .iter()
@@ -1212,5 +1238,35 @@ mod tests {
         assert!(t.settled(g));
         assert_eq!(t.mapping_count(g), 0);
         assert!(t.take_mapping(g, |_| true).is_err());
+    }
+
+    #[test]
+    fn domain_close_can_finish_a_failed_mapping_of_a_closed_grant() {
+        for close_region in [false, true] {
+            let mut t = table(1);
+            let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+            t.add_mapping(g, 42).unwrap();
+            let failed = t.remove(g).pop().unwrap();
+            t.restore(failed);
+            if close_region {
+                let failed_again = t.close().pop().unwrap();
+                t.restore(failed_again);
+            }
+            assert_eq!(t.take_mapping(g, |_| true), Err(TableError::Unknown(g)));
+            assert_eq!(
+                t.take_teardown_mapping(g, |record| *record == 41),
+                Err(TableError::NoMapping(g))
+            );
+            assert_eq!(t.mapping_count(g), 1);
+            let blocked = t.take_teardown_mapping(g, |record| *record == 42).unwrap();
+            assert_eq!(t.finish(blocked), 42);
+            assert!(t.drained());
+            assert!(t.settled(g));
+            assert_eq!(t.mapping_count(g), 0);
+            assert_eq!(
+                t.take_teardown_mapping(g, |_| true),
+                Err(TableError::Unknown(g))
+            );
+        }
     }
 }

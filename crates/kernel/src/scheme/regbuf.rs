@@ -937,7 +937,7 @@ impl DmaLink {
             let mut guard = region.lock();
             if let Ok(taken) = guard
                 .grants
-                .take_mapping(self.id, |m| m.dma == Some(record))
+                .take_teardown_mapping(self.id, |m| m.dma == Some(record))
             {
                 drop(guard.grants.finish(taken));
             }
