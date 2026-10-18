@@ -22,8 +22,10 @@
 #   kernel_feature      add a kernel Cargo feature when the bool is on
 #   kernel_config       set a key in the kernel's config.toml
 #   [[option.effect]]   anything else: make, make_append, packages,
-#                       ignore_packages, packages_from_value,
-#                       ignore_from_value, general, kernel_features
+#                       ignore_packages, source_packages (added as
+#                       "source", so they build even with REPO_BINARY),
+#                       packages_from_value, ignore_from_value, general,
+#                       kernel_features
 #   rebuild             recipes to mark stale when the value changes
 #                       ("*" means every recipe)
 # "{value}" in a string is replaced by the option's value.
@@ -78,6 +80,11 @@ help = "Build-time options of the user-space drivers in the base package."
 id = "image"
 title = "Image contents"
 help = "Which filesystem configuration the image starts from, and changes on top of it."
+
+[[menu]]
+id = "packages"
+title = "Package management"
+help = "Which package manager the image ships and what packages say about themselves."
 
 [[menu]]
 id = "build"
@@ -896,6 +903,52 @@ help = "Pass --encrypt to redoxfs-mkfs. The image build asks for a password."
 
 [[option.effect]]
 make = { REDOXFS_MKFS_FLAGS = "--encrypt" }
+
+# ---------------------------------------------------------------- packages
+
+[[option]]
+id = "packages.manager"
+menu = "packages"
+type = "choice"
+title = "Package manager"
+default = "fox"
+help = """
+The package manager on the target.
+
+  fox       Ferric Oxide's fox (tools/fox), built from this repository.
+            It verifies every archive against the keys in /etc/fox/keys
+            (the installer puts the key that signed the image's packages
+            there), and on first boot adopts the packages the installer
+            put in the image (fox adopt-pkg), so fox list, fox verify
+            --installed and fox remove cover the whole system.
+            fox installs local .pkgar files; it does not fetch from
+            package servers.
+  pkgutils  upstream Redox's pkg, which can fetch from package servers."""
+choices = [
+  { value = "fox", title = "fox: verify, install and remove signed local packages" },
+  { value = "pkgutils", title = "pkgutils: upstream pkg" },
+]
+
+[[option.effect]]
+when = "value == 'fox'"
+source_packages = ["fox"]
+ignore_packages = ["pkgutils"]
+
+[[option]]
+id = "packages.signed_manifests"
+menu = "packages"
+type = "bool"
+title = "Signed package manifests"
+default = true
+make_var = "FERRIC_FOX_MANIFEST"
+rebuild = ["*"]
+help = """
+Put a fox manifest (usr/share/fox/manifest/<name>.toml: name, version,
+target, dependencies, source) into every package the cookbook packs, so
+the archive signature covers the package's identity. Without it fox only
+has the unsigned metadata file beside each archive and needs
+--allow-unsigned-metadata. Sets FERRIC_FOX_MANIFEST; changing it repacks
+every package."""
 
 # ---------------------------------------------------------------- build
 

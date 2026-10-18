@@ -69,6 +69,10 @@ pub struct Effect {
     pub packages: Vec<String>,
     #[serde(default)]
     pub ignore_packages: Vec<String>,
+    /// Packages to add built from source even under REPO_BINARY, for
+    /// recipes that exist only in this repository.
+    #[serde(default)]
+    pub source_packages: Vec<String>,
     #[serde(default)]
     pub packages_from_value: bool,
     #[serde(default)]

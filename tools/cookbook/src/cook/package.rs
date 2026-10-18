@@ -11,7 +11,7 @@ use pkgar_keys::PublicKeyFile;
 use crate::{
     Error, Result,
     config::CookConfig,
-    cook::{cook_build::BuildResult, fetch, fs::*, pty::PtyOut},
+    cook::{cook_build::BuildResult, fetch, fox_manifest, fs::*, pty::PtyOut},
     log_to_pty,
     recipe::{BuildKind, CookRecipe, OptionalPackageRecipe},
     wrap_io_err,
@@ -51,6 +51,15 @@ pub fn package(
     }
 
     let packages = recipe.recipe.get_packages_list();
+    // Ferric Oxide: signed fox manifests for target packages (fox_manifest.rs).
+    let fox_manifests = fox_manifest::enabled() && !name.is_host();
+    // The commit is optional in a manifest: prebuilt (remote) packages and
+    // path sources may have no source info.
+    let source_ident = if fox_manifests {
+        fetch::fetch_get_source_info(recipe).ok()
+    } else {
+        None
+    };
 
     for package in packages {
         let (stage_dir, package_file, package_meta) = package_stage_paths(package, target_dir);
@@ -63,7 +72,53 @@ pub fn package(
             }
         }
 
+        let deps = if package.is_some() {
+            BTreeSet::from([name.with_prefix(PackagePrefix::Any)])
+        } else {
+            auto_deps.clone()
+        };
+        let package_name = match package {
+            Some(p) => PackageName::new(format!("{}.{}", name.name(), p.name))?,
+            None => name.clone(),
+        };
+        let package_deps: Vec<PackageName> = match package {
+            Some(p) => p
+                .dependencies
+                .iter()
+                .map(|dep| {
+                    if dep.name().is_empty() {
+                        package_name.with_suffix(dep.suffix())
+                    } else {
+                        dep.clone()
+                    }
+                })
+                .collect(),
+            None => recipe.recipe.package.dependencies.clone(),
+        };
+
         if !package_file.is_file() {
+            if !name.is_host() {
+                let version = recipe.guess_version();
+                let merged = merge_deps(package_deps.clone(), &deps);
+                let full_name = get_package_name(recipe.name.without_prefix(), package);
+                let git = match &recipe.recipe.source {
+                    Some(crate::recipe::SourceRecipe::Git { git, .. }) => Some(git.as_str()),
+                    _ => None,
+                };
+                let info = fox_manifest::PackageInfo {
+                    name: &full_name,
+                    version: version.as_deref(),
+                    target: recipe.target,
+                    depends: merged.iter().map(|d| d.without_prefix()).collect(),
+                    source: git.map(|git| {
+                        let commit = source_ident.as_ref().map(|i| i.source_identifier.as_str());
+                        (git, commit)
+                    }),
+                };
+                if let Some(path) = fox_manifest::update_stage(&stage_dir, &info, fox_manifests)? {
+                    log_to_pty!(logger, "DEBUG: wrote fox manifest '{}'", path.display());
+                }
+            }
             pkgar::create_with_flags(
                 secret_path,
                 package_file.to_str().unwrap(),
@@ -78,31 +133,7 @@ pub fn package(
             )?;
         }
 
-        let deps = if package.is_some() {
-            BTreeSet::from([name.with_prefix(PackagePrefix::Any)])
-        } else {
-            auto_deps.clone()
-        };
-
         if !package_meta.is_file() {
-            let name = match package {
-                Some(p) => PackageName::new(format!("{}.{}", name.name(), p.name))?,
-                None => name.clone(),
-            };
-            let package_deps = match package {
-                Some(p) => p
-                    .dependencies
-                    .iter()
-                    .map(|dep| {
-                        if dep.name().is_empty() {
-                            name.with_suffix(dep.suffix())
-                        } else {
-                            dep.clone()
-                        }
-                    })
-                    .collect(),
-                None => recipe.recipe.package.dependencies.clone(),
-            };
             package_toml(
                 package_meta,
                 recipe,
@@ -117,19 +148,29 @@ pub fn package(
     Ok(())
 }
 
+/// The recipe's declared dependencies followed by the automatic ones it
+/// does not already list.
+fn merge_deps(
+    mut package_deps: Vec<PackageName>,
+    auto_deps: &BTreeSet<PackageName>,
+) -> Vec<PackageName> {
+    for dep in auto_deps {
+        if !package_deps.contains(dep) {
+            package_deps.push(dep.clone());
+        }
+    }
+    package_deps
+}
+
 pub fn package_toml(
     toml_path: PathBuf,
     recipe: &CookRecipe,
     package_file: Option<(&Path, &PathBuf)>,
     package_suffix: Option<&OptionalPackageRecipe>,
-    mut package_deps: Vec<PackageName>,
+    package_deps: Vec<PackageName>,
     auto_deps: &BTreeSet<PackageName>,
 ) -> Result<()> {
-    for dep in auto_deps.iter() {
-        if !package_deps.contains(dep) {
-            package_deps.push(dep.clone());
-        }
-    }
+    let package_deps = merge_deps(package_deps, auto_deps);
 
     let (hash, network_size, storage_size) = if let Some((pkey_path, archive_path)) = package_file {
         use pkgar_core::PackageSrc;
