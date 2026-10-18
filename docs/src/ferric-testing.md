@@ -91,19 +91,38 @@ prebuilt/source image. Dedicated local baseline builds are a separate check.
 
 ## Reproducing a boot
 
-For a local image build with the desired features saved in `ferric.toml`:
+For a local smoke image with the desired features saved in `ferric.toml`,
+keep the saved target/image name and override only its filesystem contents:
 
 ```sh
-make all CONFIG_NAME=ferric-smoke
-make qemu CONFIG_NAME=ferric-smoke
+make config-check
+make rebuild FILESYSTEM_CONFIG=config/ferric-smoke.toml
+make qemu FILESYSTEM_CONFIG=config/ferric-smoke.toml
 ```
 
-For the scripted Linux CI-style boot, after creating an image:
+`ferric-smoke` is not currently an accepted `image.config` choice. Overriding
+`CONFIG_NAME=ferric-smoke` while the saved choice is `desktop` makes the
+generated target guard omit the saved image, CPU and kernel settings. Keep
+`ARCH`, `BOARD` and `CONFIG_NAME` consistent with `ferric.toml` instead.
+
+The filesystem override above uses the smoke config directly, bypassing the
+generated package/general image overrides, while retaining the matching
+target's CPU and kernel settings. `rebuild` recreates the selected image and
+recipe-selection stamp after switching filesystem configs. The output
+directory keeps the saved image
+name: with the default `image.config = "desktop"`, the smoke image is
+`build/x86_64/desktop/harddrive.img`. CI's explicit recipe-setting exports in
+`.github/workflows/image.yml` let it use `CONFIG_NAME=ferric-smoke` separately.
+
+For the scripted Linux CI-style boot, after creating an image, set `image` to
+its actual path (the default local example above uses `desktop`; CI uses
+`ferric-smoke`):
 
 ```sh
-scripts/ferric-ci/boot-smoke.sh build/x86_64/ferric-smoke/harddrive.img serial.log
-BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh build/x86_64/ferric-smoke/harddrive.img serial-vtd.log
-BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh build/x86_64/ferric-smoke/harddrive.img serial-amdvi.log
+image=build/x86_64/desktop/harddrive.img
+scripts/ferric-ci/boot-smoke.sh "$image" serial.log
+BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh "$image" serial-vtd.log
+BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log
 ```
 
 The script expects QEMU, OVMF and Linux utilities. It uses a copy of the image,

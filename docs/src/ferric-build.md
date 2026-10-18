@@ -70,8 +70,19 @@ make config-generate
 
 The CLI also accepts `--root`, `--schema`, `--config` and `--out` for explicit
 inputs and destinations. `schema` emits the catalog as JSON; `list --changed`
-shows explicitly chosen values. To inspect generated settings without changing
-recipe timestamps, use `generate --no-touch` and a temporary output directory.
+shows explicitly chosen values. To preview generated settings, use a fresh
+temporary output directory:
+
+```sh
+preview_dir=$(mktemp -d)
+cargo run -q -p ferric-config -- --out "$preview_dir" generate --no-touch
+```
+
+Inspect the generated files under `$preview_dir`. `--no-touch` suppresses
+recipe timestamp changes, but still writes `state.toml` in the output directory.
+Using the normal `build/ferric/` output for a preview can consume changed
+fingerprints without marking recipes for rebuild, so the temporary output
+directory is required to preserve the real build's state.
 The tool's own usage guide is `tools/ferric-config/README.md`.
 
 A small configuration enabling the implemented buffer and DMA interfaces is:
