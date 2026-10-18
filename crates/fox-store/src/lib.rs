@@ -347,6 +347,20 @@ pub enum ProblemKind {
     },
 }
 
+impl core::fmt::Display for ProblemKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("missing"),
+            Self::Modified => f.write_str("modified"),
+            Self::WrongType => f.write_str("wrong file type"),
+            Self::SymlinkInPath => f.write_str("symlink in path"),
+            Self::Mode { expected, found } => {
+                write!(f, "mode {found:o}, expected {expected:o}")
+            }
+        }
+    }
+}
+
 /// What [`Store::verify`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
@@ -533,6 +547,9 @@ impl Store {
             .filter(|dep| db.get(dep).is_none() && **dep != manifest.name)
             .cloned()
             .collect();
+        // fox owns the name now: pkg's stale entry for it must not be
+        // retried by adoption, even after this package is removed.
+        db.legacy_pending.remove(manifest.name.as_str());
         db.packages.push(record(archive));
         db.save(&db_path)?;
 

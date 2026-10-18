@@ -140,7 +140,11 @@ records that it ran, so `pkg`'s stale state cannot bring back a package
 removed with `fox` later; `--again` overrides this. The packages it skipped
 are recorded as pending, and a later `fox adopt-pkg` retries those alone
 (after their head is restored or their signer is trusted, say), so the
-first-boot service picks them up on the next boot. A package that is skipped
+first-boot service picks them up on the next boot. Because the root may have
+changed in between, a retry hashes the package's files as installed
+verification does and leaves the package pending unless they all match. A
+package installed with `fox` under a pending name is no longer pending, so
+removing it later is not undone by a retry. A package that is skipped
 makes the command exit with a failing status.
 
 ## Target images

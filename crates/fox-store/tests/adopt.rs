@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use fox_core::fixtures::{FixtureEntry, FixtureKey, build_package};
 use fox_core::{Manifest, PackageName, TrustedKeys};
 use fox_store::{
-    AdoptOptions, InstallOptions, MetadataKind, PKG_HEADS_DIR, PKG_STATE, SkipReason, Store,
+    AdoptOptions, InstallOptions, MetadataKind, PKG_HEADS_DIR, PKG_STATE, ProblemKind, SkipReason,
+    Store,
 };
 
 struct Env {
@@ -320,5 +321,89 @@ fn skipped_packages_are_retried_without_reviving_removed_ones() {
     assert_eq!(names, vec![name("late")]);
 
     // Nothing is pending any more.
+    assert!(env.adopt(&key.trusted(), false).already_adopted);
+}
+
+#[test]
+fn installing_a_pending_name_retires_it() {
+    let mut env = Env::new();
+    let hello = env.archive(
+        &env.key,
+        "hello",
+        true,
+        &[FixtureEntry::file("usr/bin/hello", b"hello", 0o755)],
+    );
+    let key = env.key.clone();
+    env.pkg_install(&key, "hello", &hello, &[]);
+    let head = env.root().join(PKG_HEADS_DIR).join("hello.pkgar_head");
+    let aside = env.work.path().join("hello.pkgar_head");
+    fs::rename(&head, &aside).unwrap();
+    let report = env.adopt(&key.trusted(), true);
+    assert!(matches!(report.skipped[0].reason, SkipReason::NoHead));
+
+    // fox takes the name over, then the operator removes it.
+    let archive = fox_core::archive::Archive::open(&hello, &key.trusted()).unwrap();
+    env.store
+        .install(&archive, InstallOptions::default())
+        .unwrap();
+    env.store.remove(&name("hello"), false).unwrap();
+
+    // pkg's old head coming back does not undo the removal.
+    fs::rename(&aside, &head).unwrap();
+    assert!(env.adopt(&key.trusted(), true).already_adopted);
+    assert!(env.store.list().unwrap().is_empty());
+}
+
+#[test]
+fn retry_checks_files_left_by_a_removed_owner() {
+    let mut env = Env::new();
+    let owner = env.archive(
+        &env.key,
+        "owner",
+        true,
+        &[FixtureEntry::file("usr/bin/shared", b"s", 0o755)],
+    );
+    let archive = fox_core::archive::Archive::open(&owner, &env.key.trusted()).unwrap();
+    env.store
+        .install(&archive, InstallOptions::default())
+        .unwrap();
+    let bar = env.archive(
+        &env.key,
+        "bar",
+        true,
+        &[FixtureEntry::file("usr/bin/shared", b"s", 0o755)],
+    );
+    let key = env.key.clone();
+    env.pkg_install(&key, "bar", &bar, &[]);
+    let report = env.adopt(&key.trusted(), false);
+    assert!(matches!(
+        report.skipped[0].reason,
+        SkipReason::FileConflict { .. }
+    ));
+
+    // Removing the owner deletes the shared file, so bar's signed entry no
+    // longer matches what is installed: it stays pending.
+    env.store.remove(&name("owner"), false).unwrap();
+    assert!(!env.root().join("usr/bin/shared").exists());
+    for _ in 0..2 {
+        let report = env.adopt(&key.trusted(), false);
+        assert!(report.adopted.is_empty());
+        let reason = &report.skipped[0].reason;
+        assert!(
+            matches!(reason, SkipReason::Changed { path, problem: ProblemKind::Missing } if path == "usr/bin/shared"),
+            "{reason:?}"
+        );
+    }
+
+    // Once the file is back as signed, the retry adopts bar.
+    pkgar::extract(&key.public_path, &bar, env.root()).unwrap();
+    signed_modes(
+        env.root(),
+        &env.root().join(PKG_HEADS_DIR).join("bar.pkgar_head"),
+        &key,
+    );
+    let report = env.adopt(&key.trusted(), false);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.adopted[0].name, name("bar"));
     assert!(env.adopt(&key.trusted(), false).already_adopted);
 }

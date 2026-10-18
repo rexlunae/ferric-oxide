@@ -22,7 +22,11 @@
 //! root: the database remembers it, so packages removed with `fox` later
 //! are not brought back by `pkg`'s stale state. Packages it skipped are
 //! remembered as pending, and a later adoption retries those alone (once
-//! their head is restored or their signer trusted, say).
+//! their head is restored or their signer trusted, say). A retry happens
+//! after the root has changed under `fox`, so it hashes the package's files
+//! as [`Store::verify`] does and leaves the package pending unless they
+//! all still match. Installing a package of the same name with `fox`
+//! retires its pending entry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -37,7 +41,7 @@ use serde::Deserialize;
 
 use crate::db::{Database, InstalledPackage, MetadataKind, PackageState};
 use crate::fsutil::symlinked_parent;
-use crate::{Store, StoreError, reserved_dir};
+use crate::{ProblemKind, Store, StoreError, reserved_dir};
 
 /// `pkg`'s installed-package state, relative to the root.
 pub const PKG_STATE: &str = "etc/pkg/packages.toml";
@@ -131,6 +135,15 @@ pub enum SkipReason {
         /// The reserved directory.
         reserved: &'static str,
     },
+    /// On a retry, an installed file no longer matches its signed entry
+    /// (removing a conflicting package took it, say).
+    #[error("{path} no longer matches its signed entry: {problem}")]
+    Changed {
+        /// The package path.
+        path: String,
+        /// How it differs.
+        problem: ProblemKind,
+    },
     /// A file is already recorded for another package.
     #[error("{path} already belongs to package {owner}")]
     FileConflict {
@@ -200,7 +213,7 @@ impl Store {
         // state has nothing left to adopt.
         let mut pending = BTreeSet::new();
         for (name, installed) in state {
-            match self.adopt_one(&db, &name, &installed, keys, options)? {
+            match self.adopt_one(&db, &name, &installed, keys, options, retry_only)? {
                 Ok((package, head)) => {
                     let head_path = self.head_path(&package.name);
                     write_atomic(&head_path, &head)?;
@@ -237,6 +250,7 @@ impl Store {
         installed: &PkgInstalled,
         keys: &TrustedKeys,
         options: AdoptOptions,
+        retry: bool,
     ) -> Result<Result<(InstalledPackage, Vec<u8>), SkipReason>, StoreError> {
         let name = match PackageName::new(name) {
             Ok(name) => name,
@@ -261,6 +275,9 @@ impl Store {
             Err(error) => return Ok(Err(SkipReason::Head(error))),
         };
         if let Some(reason) = placement_problem(db, &head) {
+            return Ok(Err(reason));
+        }
+        if retry && let Some(reason) = self.changed_file(&head)? {
             return Ok(Err(reason));
         }
         let identity = match self.signed_identity(&name, &head)? {
@@ -351,6 +368,22 @@ impl Store {
             depends: manifest.depends,
             metadata: MetadataKind::Embedded,
         })))
+    }
+
+    /// The first of the head's files that no longer matches its signed
+    /// entry, checked as [`Store::verify`] checks it.
+    fn changed_file(&self, head: &VerifiedHead) -> Result<Option<SkipReason>, StoreError> {
+        for entry in head.entries() {
+            if let Some(problem) =
+                self.check_file(entry.path, entry.kind, entry.mode, entry.blake3)?
+            {
+                return Ok(Some(SkipReason::Changed {
+                    path: entry.path.to_owned(),
+                    problem,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// The size of an installed file (a symlink's target length), or 0 if
