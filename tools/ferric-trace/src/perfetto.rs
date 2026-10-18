@@ -9,18 +9,24 @@
 //! - **Context tracks.** Each process (by kernel pid) has one thread per context (by its debug
 //!   id). System calls are slices on the context that made them: `syscall.enter` begins one
 //!   and the matching `syscall.exit` ends it, even when the context moved to another CPU in
-//!   between. Records are attributed to the context `sched.switch` last put on their CPU; before
-//!   the first switch of a CPU they go to that CPU's "context unknown" thread.
+//!   between. Records are attributed to the context `sched.switch` last put on their CPU.
+//!   Records from before a CPU's first switch go to that CPU's "context unknown" thread until
+//!   the switch names the context it switches out; they then move to that context, with its
+//!   open system calls and requests, so a call it began there still ends when it finishes on
+//!   another CPU.
 //! - **Scheme requests** are async slices (`b`/`e`, category `scheme`) from `scheme.request` to
 //!   the `scheme.response` with the same scheme id and tag, on the caller's track, with the
-//!   responder's pid in the end event's arguments. A `scheme.cancel` is an async instant (`n`)
-//!   on the same slice.
+//!   responder's pid in the end event's arguments. A `scheme.cancel` does not end the
+//!   request (the scheme still answers it): it is an async instant (`n`) on the same slice.
 //! - A record that has no matching start (its start was not captured) is an instant (`i`).
 //!
 //! Timestamps are microseconds since the first record, from TSC cycles and the TSC frequency
-//! the caller gives.
+//! the caller gives as a [`TscMhz`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::num::ParseFloatError;
+use std::str::FromStr;
 
 use ferric_trace::Event;
 use ferric_trace::kernel::{
@@ -37,6 +43,59 @@ pub const CPU_PID: u64 = 1 << 32;
 
 /// The pid of the process holding each CPU's "context unknown" thread.
 pub const UNKNOWN_PID: u64 = (1 << 32) + 1;
+
+/// A TSC frequency in MHz: finite and greater than zero, so cycles convert to a real time.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct TscMhz(f64);
+
+/// Why a TSC frequency was refused.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TscMhzError {
+    /// The value is zero, negative, infinite or not a number.
+    #[error("TSC frequency {value} MHz is not a finite number greater than 0")]
+    OutOfRange {
+        /// The value given.
+        value: f64,
+    },
+    /// The text is not a number.
+    #[error("TSC frequency is not a number")]
+    Parse(#[from] ParseFloatError),
+}
+
+impl TscMhz {
+    /// `mhz` as a TSC frequency.
+    ///
+    /// # Errors
+    ///
+    /// [`TscMhzError::OutOfRange`] unless `mhz` is finite and greater than 0.
+    pub fn new(mhz: f64) -> Result<Self, TscMhzError> {
+        if mhz.is_finite() && mhz > 0.0 {
+            Ok(Self(mhz))
+        } else {
+            Err(TscMhzError::OutOfRange { value: mhz })
+        }
+    }
+
+    /// The frequency in MHz.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl FromStr for TscMhz {
+    type Err = TscMhzError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text.trim().parse()?)
+    }
+}
+
+impl fmt::Display for TscMhz {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// One trace event of the JSON format.
 #[derive(Debug, Serialize)]
@@ -69,7 +128,7 @@ struct OpenRequest {
 /// The conversion state.
 struct Converter {
     base: u64,
-    tsc_mhz: f64,
+    tsc_mhz: TscMhz,
     events: Vec<TraceEvent>,
     /// The context `sched.switch` last put on each CPU.
     running: HashMap<u32, Track>,
@@ -86,7 +145,7 @@ struct Converter {
 
 impl Converter {
     fn ts(&self, timestamp: u64) -> f64 {
-        timestamp.saturating_sub(self.base) as f64 / self.tsc_mhz
+        timestamp.saturating_sub(self.base) as f64 / self.tsc_mhz.get()
     }
 
     fn push(&mut self, entry: &Entry, ph: &'static str, name: String, track: Track) -> usize {
@@ -149,6 +208,10 @@ impl Converter {
     }
 
     fn switch(&mut self, entry: &Entry) {
+        if !self.running.contains_key(&entry.cpu) {
+            // The CPU's first switch names the context that ran there until now.
+            self.reattribute(entry.cpu, (entry.arg(0), entry.arg(2)));
+        }
         let cpu_track = (CPU_PID, u64::from(entry.cpu));
         if self.cpu_open.insert(entry.cpu, true) == Some(true) {
             self.push(entry, "E", String::new(), cpu_track);
@@ -163,6 +226,34 @@ impl Converter {
         self.with_args(i, entry).cat = Some("sched");
         self.running.insert(entry.cpu, (next_pid, next_id));
         self.contexts.insert((next_pid, next_id));
+    }
+
+    /// Moves everything recorded on CPU `cpu`'s "context unknown" track to `context`: the
+    /// events already written, the system calls still open and the requests still waiting.
+    fn reattribute(&mut self, cpu: u32, context: Track) {
+        let unknown = (UNKNOWN_PID, u64::from(cpu));
+        let mut moved = false;
+        for event in &mut self.events {
+            if (event.pid, event.tid) == unknown {
+                (event.pid, event.tid) = context;
+                moved = true;
+            }
+        }
+        for request in self.requests.values_mut() {
+            if request.track == unknown {
+                request.track = context;
+                moved = true;
+            }
+        }
+        if let Some(open) = self.syscalls.remove(&unknown) {
+            moved |= !open.is_empty();
+            // Calls the context made elsewhere before it came here are older, so these go on
+            // top of them.
+            self.syscalls.entry(context).or_default().extend(open);
+        }
+        if moved {
+            self.contexts.insert(context);
+        }
     }
 
     fn syscall_exit(&mut self, entry: &Entry) {
@@ -298,11 +389,11 @@ fn name_event(kind: &str, name: &str, track: Track) -> TraceEvent {
     event
 }
 
-/// The JSON document for `capture`, with the TSC running at `tsc_mhz` MHz.
-pub fn to_json(capture: &Capture, tsc_mhz: f64) -> String {
+/// The JSON document for `capture`, with the TSC running at `tsc_mhz`.
+pub fn to_json(capture: &Capture, tsc_mhz: TscMhz) -> String {
     let mut converter = Converter {
         base: capture.entries().first().map_or(0, |e| e.timestamp),
-        tsc_mhz: if tsc_mhz > 0.0 { tsc_mhz } else { 1.0 },
+        tsc_mhz,
         events: Vec::new(),
         running: HashMap::new(),
         cpu_open: HashMap::new(),
@@ -322,6 +413,10 @@ pub fn to_json(capture: &Capture, tsc_mhz: f64) -> String {
 mod tests {
     use super::*;
     use crate::capture::{CpuCapture, tests::bytes};
+
+    fn mhz(value: f64) -> TscMhz {
+        TscMhz::new(value).expect("a valid frequency")
+    }
 
     fn events(json: &str) -> Vec<Value> {
         let doc: Value = serde_json::from_str(json).expect("valid JSON");
@@ -350,7 +445,7 @@ mod tests {
             CpuCapture::decode(0, &cpu0).expect("valid"),
             CpuCapture::decode(1, &cpu1).expect("valid"),
         ]);
-        let all = events(&to_json(&capture, 10.0));
+        let all = events(&to_json(&capture, mhz(10.0)));
 
         let begin = phases(&all, "B")
             .into_iter()
@@ -414,7 +509,7 @@ mod tests {
             CpuCapture::decode(0, &cpu0).expect("valid"),
             CpuCapture::decode(1, &cpu1).expect("valid"),
         ]);
-        let all = events(&to_json(&capture, 1000.0));
+        let all = events(&to_json(&capture, mhz(1000.0)));
         let begins = phases(&all, "b");
         assert_eq!(begins.len(), 2);
         assert_eq!(begins[0]["name"], "scheme 2 Write");
@@ -437,5 +532,102 @@ mod tests {
                 .iter()
                 .any(|e| e["name"] == "scheme.response")
         );
+    }
+    #[test]
+    fn tsc_frequency_must_be_finite_and_positive() {
+        for bad in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(
+                matches!(TscMhz::new(bad), Err(TscMhzError::OutOfRange { .. })),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            "0".parse::<TscMhz>(),
+            Err(TscMhzError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            "inf".parse::<TscMhz>(),
+            Err(TscMhzError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            "fast".parse::<TscMhz>(),
+            Err(TscMhzError::Parse(_))
+        ));
+        assert_eq!(
+            " 2400.5 ".parse::<TscMhz>().map(TscMhz::get).ok(),
+            Some(2400.5)
+        );
+    }
+
+    #[test]
+    fn records_before_the_first_switch_move_to_the_outgoing_context() {
+        // CPU 0: pid 3 context 7 enters write and makes a request before any switch was
+        // captured, then is switched out (to pid 0 context 1) and migrates to CPU 1, where the
+        // call returns.
+        let cpu0 = bytes(&[
+            (&SYSCALL_ENTER, 10, &[4, 9, 0, 16, 0]),
+            (&SCHEME_REQUEST, 15, &[2, 5, 6, 3, 1, 16]),
+            (&SCHED_SWITCH, 20, &[3, 0, 7, 1]),
+        ]);
+        let cpu1 = bytes(&[
+            (&SCHED_SWITCH, 25, &[0, 3, 2, 7]),
+            (&SCHEME_RESPONSE, 28, &[2, 5, 16, 12]),
+            (&SYSCALL_EXIT, 30, &[4, 16]),
+        ]);
+        let capture = Capture::from_cpus(vec![
+            CpuCapture::decode(0, &cpu0).expect("valid"),
+            CpuCapture::decode(1, &cpu1).expect("valid"),
+        ]);
+        let all = events(&to_json(&capture, mhz(1.0)));
+        let on_context = |e: &&Value| e["pid"] == 3 && e["tid"] == 7;
+
+        let begin = phases(&all, "B")
+            .into_iter()
+            .find(|e| e["cat"] == "syscall")
+            .expect("the syscall begin");
+        assert!(on_context(&begin), "{begin}");
+        assert_eq!(begin["ts"], 0.0);
+        let end = phases(&all, "E")
+            .into_iter()
+            .find(on_context)
+            .expect("its end, on the same context");
+        assert_eq!(end["ts"], 20.0);
+        assert!(
+            !phases(&all, "i")
+                .iter()
+                .any(|e| e["name"] == "syscall 0x4 exit"),
+            "the exit matched its begin"
+        );
+
+        let request = phases(&all, "b");
+        assert_eq!(request.len(), 1);
+        assert!(on_context(&request[0]), "{}", request[0]);
+        let response = phases(&all, "e");
+        assert_eq!(response.len(), 1);
+        assert!(on_context(&response[0]), "{}", response[0]);
+
+        // Nothing but the track names is left on the unknown context.
+        assert!(
+            all.iter()
+                .filter(|e| e["ph"] != "M")
+                .all(|e| e["pid"] != UNKNOWN_PID)
+        );
+    }
+
+    #[test]
+    fn a_cancel_does_not_end_the_request() {
+        let cpu0 = bytes(&[
+            (&SCHEME_REQUEST, 0, &[2, 5, 6, 3, 1, 16]),
+            (&SCHEME_CANCEL, 10, &[2, 5]),
+            (&SCHEME_CANCEL, 11, &[2, 5]),
+            (&SCHEME_RESPONSE, 20, &[2, 5, (-4i64) as u64, 12]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &cpu0).expect("valid")]);
+        let all = events(&to_json(&capture, mhz(1.0)));
+        let begin = phases(&all, "b");
+        let end = phases(&all, "e");
+        assert_eq!((begin.len(), end.len(), phases(&all, "n").len()), (1, 1, 2));
+        assert_eq!(end[0]["id"], begin[0]["id"]);
+        assert_eq!(end[0]["ts"], 20.0);
     }
 }

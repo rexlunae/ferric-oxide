@@ -27,7 +27,8 @@
 //! }
 //! let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &bytes).expect("valid")]);
 //! assert_eq!(capture.entries().len(), 2);
-//! let json = ferric_trace_cli::perfetto::to_json(&capture, 1000.0);
+//! let tsc = ferric_trace_cli::perfetto::TscMhz::new(1000.0).expect("a valid frequency");
+//! let json = ferric_trace_cli::perfetto::to_json(&capture, tsc);
 //! assert!(json.contains("\"ph\":\"B\""));
 //! ```
 

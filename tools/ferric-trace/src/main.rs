@@ -34,9 +34,10 @@ enum Cmd {
         /// Where to write the JSON (default: standard output)
         #[arg(long, short)]
         output: Option<PathBuf>,
-        /// The TSC frequency of the traced machine in MHz, to turn cycles into time
-        #[arg(long, default_value_t = 1000.0)]
-        tsc_mhz: f64,
+        /// The TSC frequency of the traced machine in MHz, to turn cycles into time (finite
+        /// and greater than 0)
+        #[arg(long, default_value = "1000")]
+        tsc_mhz: perfetto::TscMhz,
     },
 }
 

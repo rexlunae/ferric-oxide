@@ -54,6 +54,21 @@ pub enum CaptureError {
         /// The event id.
         event: EventId,
     },
+    /// A record has a different number of arguments than its catalog event names, so its
+    /// fields cannot be trusted.
+    #[error("CPU {cpu}: record {index} ({}) has {found} arguments, the event has {expected}", event.name())]
+    ArgCount {
+        /// The CPU.
+        cpu: u32,
+        /// How many records decoded before it.
+        index: usize,
+        /// The record's event.
+        event: &'static Event,
+        /// The arguments the catalog event names.
+        expected: usize,
+        /// The arguments the record has.
+        found: usize,
+    },
     /// The inputs held no capture files.
     #[error("no cpu<n> capture files in the inputs")]
     Empty,
@@ -91,8 +106,9 @@ impl CpuCapture {
     ///
     /// # Errors
     ///
-    /// [`CaptureError::Decode`] when the bytes are not whole records, and
-    /// [`CaptureError::UnknownEvent`] for an event the kernel catalog does not have.
+    /// [`CaptureError::Decode`] when the bytes are not whole records,
+    /// [`CaptureError::UnknownEvent`] for an event the kernel catalog does not have, and
+    /// [`CaptureError::ArgCount`] for a record with more or fewer arguments than its event.
     pub fn decode(cpu: u32, bytes: &[u8]) -> Result<Self, CaptureError> {
         let mut entries = Vec::new();
         for (index, record) in Records::new(bytes).enumerate() {
@@ -104,6 +120,17 @@ impl CpuCapture {
                     index,
                     event: record.event(),
                 })?;
+            // A wrong count would make missing fields read as 0, which the exporters would
+            // take for real ids.
+            if record.arg_count() != event.args().len() {
+                return Err(CaptureError::ArgCount {
+                    cpu,
+                    index,
+                    event,
+                    expected: event.args().len(),
+                    found: record.arg_count(),
+                });
+            }
             entries.push(Entry {
                 cpu,
                 timestamp: record.timestamp(),
@@ -289,6 +316,46 @@ pub(crate) mod tests {
             CpuCapture::decode(0, &unknown),
             Err(CaptureError::UnknownEvent { index: 0, .. })
         ));
+    }
+
+    /// The bytes of one `event` record with `args`, whatever the catalog says.
+    fn raw(event: &Event, args: &[u64]) -> Vec<u8> {
+        let mut words = [0u64; MAX_RECORD_WORDS];
+        let n = encode(&mut words, event.id(), 1, args).expect("valid record");
+        words[..n].iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn wrong_argument_counts_are_errors() {
+        let mut short = bytes(&[(&SYSCALL_EXIT, 0, &[1, 2])]);
+        short.extend(raw(&SCHED_SWITCH, &[3, 7]));
+        assert!(matches!(
+            CpuCapture::decode(0, &short),
+            Err(CaptureError::ArgCount {
+                cpu: 0,
+                index: 1,
+                expected: 4,
+                found: 2,
+                ..
+            })
+        ));
+        let long = raw(&SYSCALL_EXIT, &[1, 2, 3]);
+        let err = CpuCapture::decode(5, &long).expect_err("too many arguments");
+        assert!(matches!(
+            err,
+            CaptureError::ArgCount {
+                cpu: 5,
+                index: 0,
+                expected: 2,
+                found: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "CPU 5: record 0 (syscall.exit) has 3 arguments, the event has 2"
+        );
+        assert!(CpuCapture::decode(0, &raw(&SYSCALL_EXIT, &[1, 2])).is_ok());
     }
 
     #[test]

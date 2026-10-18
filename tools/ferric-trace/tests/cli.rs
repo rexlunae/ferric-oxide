@@ -109,3 +109,20 @@ fn reports_bad_input_with_its_cause() {
         "{err}"
     );
 }
+
+#[test]
+fn refuses_a_bad_tsc_frequency() {
+    let dir = capture();
+    for bad in ["0", "-5", "inf", "NaN", "fast"] {
+        let output = ferric_trace()
+            .arg("perfetto")
+            .arg(format!("--tsc-mhz={bad}"))
+            .arg(dir.path())
+            .output()
+            .expect("runs");
+        assert!(!output.status.success(), "{bad}");
+        assert!(output.stdout.is_empty(), "{bad}: wrote output");
+        let err = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(err.contains("--tsc-mhz"), "{bad}: {err}");
+    }
+}

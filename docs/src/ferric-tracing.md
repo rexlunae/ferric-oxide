@@ -155,14 +155,24 @@ are not compiled in gives `EOPNOTSUPP`.
 To capture a trace on the target, run as root:
 
 ```sh
+cat /scheme/kernel.trace/stats > stats.before
 echo "enable syscall scheme" > /scheme/kernel.trace/events
 # ... run the workload ...
 echo "disable syscall scheme" > /scheme/kernel.trace/events
+cat /scheme/kernel.trace/stats > stats.after
 for n in 0 1 2 3; do cat /scheme/kernel.trace/cpu/$n > cpu$n; done
 ```
 
 `stats` lists the CPUs. A read drains a ring, so each record lands in exactly
-one file. Copy the `cpu<n>` files to the host and use the `ferric-trace` tool
+one file.
+
+Each ring holds 64 KiB, and a full ring drops new records. If any CPU's
+`lost` count in `stats.after` is higher than in `stats.before`, the capture is
+missing records, and slices may be cut short or left unmatched. For a long
+or busy workload, drain the `cpu/<n>` files while it runs, for example with a
+loop that appends each read to `cpu<n>`, or capture a shorter window.
+
+Copy the `cpu<n>` files to the host and use the `ferric-trace` tool
 (`tools/ferric-trace/`) on them:
 
 ```sh
@@ -180,15 +190,18 @@ or in `chrome://tracing`.
   context ran when.
 - **Context tracks.** Each context has a track (a process per kernel pid, a
   thread per context). It shows that context's system calls as slices, even
-  when the context moved to another CPU while it was blocked.
+  when the context moved to another CPU while it was blocked. Records from
+  before a CPU's first captured switch belong to the context that switch takes
+  off the CPU, and are shown on its track.
 - **Scheme requests.** Each request is an async slice on the caller's track,
   from `scheme.request` to the `scheme.response` with the same scheme and tag.
   The slice is named with the scheme id and opcode, and the end carries the
-  responder's pid.
+  responder's pid. A `scheme.cancel` is an instant on the slice, not its end.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
 `--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
-frequency; the default, 1000, shows one cycle as one nanosecond. The format and
+frequency; the default, 1000, shows one cycle as one nanosecond. A value that
+is not a finite number greater than 0 is refused. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
 ## Validation
@@ -199,10 +212,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   - ring wrap-around, loss counting, too-small buffers and uncommitted reads;
   - a two-thread test with a million records.
 - **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
-  (including bad and unknown records and duplicate CPUs), checks the text
-  lines, checks the JSON mapping (slices on the right context across CPUs,
-  async request slices matched by tag, instants for unmatched records), and
-  runs the binary on a capture directory.
+  (including bad and unknown records, records with too few or too many
+  arguments, and duplicate CPUs), checks the text lines, checks the JSON
+  mapping (slices on the right context across CPUs, records from before a
+  CPU's first switch moved to the outgoing context, async request slices
+  matched by tag through cancels, instants for unmatched records), refuses bad
+  `--tsc-mhz` values, and runs the binary on a capture directory.
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
