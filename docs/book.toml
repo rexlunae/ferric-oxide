@@ -1,7 +1,7 @@
 [book]
-title = "The Redox Operating System"
-authors = ["The RedoxOS Developers"]
-description = "This book carefully describes the design, implementation, direction, and structure of Redox, the operating system."
+title = "Ferric Oxide System"
+authors = ["The RedoxOS Developers", "Ferric Oxide contributors"]
+description = "The implemented Ferric Oxide operating system, with inherited Redox design and development documentation."
 src = "src"
 
 [output.html]

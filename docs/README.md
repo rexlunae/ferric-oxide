@@ -1,4 +1,17 @@
-# The Redox Book
+# Ferric Oxide system documentation
+
+The [implemented-system guide](src/ferric-oxide.md) documents this repository's
+architecture, build/configuration flow, memory protection, registered buffers,
+DMA isolation, package tooling and validation. Its chapters are included in
+the mdBook [table of contents](src/SUMMARY.md).
+
+This directory is also the imported Redox book subtree. The inherited chapters
+below provide background and keep their upstream identity; prefer the Ferric
+chapters and current source for fork behavior and paths. Keep additions local
+and update the relevant chapter alongside implementation changes. Contributor
+rules and a task-based document map are in [AGENTS.md](../AGENTS.md).
+
+## The inherited Redox Book
 
 This is the **Redox OS** book, which explain (almost) everything about Redox: design, philosophy, how it works, how you can contribute, how to deploy Redox, and much more.
 
