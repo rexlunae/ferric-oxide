@@ -20,6 +20,9 @@ pub struct Output {
     pub kernel_features: BTreeSet<String>,
     pub kernel_config: BTreeMap<String, String>,
     pub packages: BTreeSet<String>,
+    /// Packages written as `"source"`, so they build from their recipe
+    /// even when REPO_BINARY fetches the rest.
+    pub source_packages: BTreeSet<String>,
     pub ignore: BTreeSet<String>,
     pub general: BTreeMap<String, toml::Value>,
     pub fingerprints: BTreeMap<String, String>,
@@ -116,6 +119,8 @@ pub fn collect(schema: &Schema, r: &Resolved) -> Result<Output, Vec<Diag>> {
             }
             out.packages.extend(d.packages.iter().cloned());
             out.ignore.extend(d.ignore_packages.iter().cloned());
+            out.source_packages
+                .extend(d.source_packages.iter().cloned());
             if let Value::List(items) = v {
                 if d.packages_from_value {
                     out.packages.extend(items.iter().cloned());
@@ -134,6 +139,12 @@ pub fn collect(schema: &Schema, r: &Resolved) -> Result<Output, Vec<Diag>> {
             }
         }
     }
+    for both in out.source_packages.intersection(&out.ignore) {
+        errors.push(Diag::error(format!(
+            "package {both} is both added and removed"
+        )));
+    }
+    out.packages.retain(|p| !out.source_packages.contains(p));
     for both in out.packages.intersection(&out.ignore) {
         errors.push(Diag::error(format!(
             "package {both} is both added and removed"
@@ -236,10 +247,13 @@ pub fn plan(schema: &Schema, r: &Resolved, root: &Path, out_dir: &Path) -> Resul
             fs.push_str(&format!("{k} = {v}\n"));
         }
     }
-    if !out.packages.is_empty() || !out.ignore.is_empty() {
+    if !out.packages.is_empty() || !out.source_packages.is_empty() || !out.ignore.is_empty() {
         fs.push_str("\n[packages]\n");
         for p in &out.packages {
             fs.push_str(&format!("{} = {{}}\n", toml_key(p)));
+        }
+        for p in &out.source_packages {
+            fs.push_str(&format!("{} = \"source\"\n", toml_key(p)));
         }
         for p in &out.ignore {
             fs.push_str(&format!("{} = \"ignore\"\n", toml_key(p)));
@@ -603,6 +617,47 @@ mod tests {
         assert!(kc.contains("[arch.x86_64.features]"), "{kc}");
         assert!(kc.contains("xsave = \"always\""), "{kc}");
         assert!(kc.contains("smap = \"auto\""), "{kc}");
+    }
+
+    #[test]
+    fn package_manager_choice() {
+        let s = real_schema();
+        let r = resolve(&s, &BTreeMap::new());
+        let plan_default = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let fs = file(&plan_default, "filesystem.toml");
+        // fox exists only here, so it builds from source even with REPO_BINARY.
+        assert!(fs.contains("fox = \"source\"\n"), "{fs}");
+        assert!(fs.contains("pkgutils = \"ignore\"\n"), "{fs}");
+        let mk = file(&plan_default, "config.mk");
+        assert!(mk.contains("export FERRIC_FOX_MANIFEST:=1\n"), "{mk}");
+
+        let user: BTreeMap<String, Value> = [
+            ("packages.manager", Value::Str("pkgutils".into())),
+            ("packages.signed_manifests", Value::Bool(false)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let r = resolve(&s, &user);
+        let plan_pkg = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let fs = file(&plan_pkg, "filesystem.toml");
+        assert!(!fs.contains("fox"), "{fs}");
+        assert!(!fs.contains("pkgutils"), "{fs}");
+        let mk = file(&plan_pkg, "config.mk");
+        assert!(mk.contains("export FERRIC_FOX_MANIFEST:=0\n"), "{mk}");
+
+        // Asking for fox by hand as well still writes it once, from source.
+        let user: BTreeMap<String, Value> = [(
+            "image.packages_add".to_owned(),
+            Value::List(vec!["fox".into()]),
+        )]
+        .into_iter()
+        .collect();
+        let r = resolve(&s, &user);
+        let plan_twice = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let fs = file(&plan_twice, "filesystem.toml");
+        assert_eq!(fs.matches("fox =").count(), 1, "{fs}");
+        assert!(fs.contains("fox = \"source\"\n"), "{fs}");
     }
 
     #[test]

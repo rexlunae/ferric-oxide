@@ -31,11 +31,17 @@ ferric-regbuf-test = "source"
 ferric-trace-test = "source"
 # The trace tool: the smoke script saves a capture with it and reads it back.
 ferric-trace = "source"
+# fox replaces pkg, as features.toml packages.manager = "fox" does: it adopts
+# the image's packages on first boot (05_fox-adopt.service) and the script
+# below checks them against their signatures.
+fox = "source"
+pkgutils = "ignore"
 
 [[files]]
 path = "/usr/lib/init.d/30_console"
 data = """
 requires_weak 10_net.target
+requires_weak 05_fox-adopt.service
 ion /usr/lib/ferric-smoke.ion
 """
 
@@ -58,6 +64,9 @@ ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
 ferric-trace capture /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error
+# Every package the installer put in the image, re-checked against its signed head.
+fox list
+fox verify --installed && echo FERRIC_TEST_PASS fox-verify || echo FERRIC_TEST_FAIL fox verify --installed failed
 echo FERRIC_SMOKE_OK
 shutdown
 """

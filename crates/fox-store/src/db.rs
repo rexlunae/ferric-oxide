@@ -23,6 +23,7 @@
 //! The file is rewritten whole on every change, through a temporary file
 //! and a rename, so a crash leaves either the old or the new version.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -49,6 +50,11 @@ pub enum MetadataKind {
     Embedded,
     /// The cookbook's unsigned metadata file next to the archive.
     Sidecar,
+    /// Adopted from `pkg`'s installed-package state, which names the
+    /// package but signs nothing about it (see [`Store::adopt_pkg`]).
+    ///
+    /// [`Store::adopt_pkg`]: crate::Store::adopt_pkg
+    Legacy,
 }
 
 /// Whether a package is fully installed.
@@ -84,8 +90,10 @@ pub struct InstalledPackage {
     /// Runtime dependencies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends: Vec<PackageName>,
-    /// BLAKE3 of the archive it was installed from.
-    pub archive_blake3: Blake3Digest,
+    /// BLAKE3 of the archive it was installed from. Unknown for packages
+    /// adopted from `pkg`, which keeps only the signed head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_blake3: Option<Blake3Digest>,
     /// BLAKE3 of the archive's signed entry table.
     pub entries_blake3: Blake3Digest,
     /// Key that signed the archive.
@@ -106,8 +114,22 @@ pub struct InstalledPackage {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Database {
     format: Format,
+    /// Set once `pkg`'s state has been adopted, so a later adoption does
+    /// not bring back packages removed since.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) legacy_adopted: bool,
+    /// Packages from `pkg`'s state that the last adoption skipped. A later
+    /// adoption retries these, and only these.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) legacy_pending: BTreeSet<String>,
     #[serde(default, rename = "package")]
     pub(crate) packages: Vec<InstalledPackage>,
+}
+
+// serde's skip_serializing_if passes a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Database {
@@ -172,7 +194,7 @@ mod tests {
             version: "1.0".into(),
             target: None,
             depends: vec![PackageName::new("relibc").unwrap()],
-            archive_blake3: Blake3Digest::of(b"a"),
+            archive_blake3: Some(Blake3Digest::of(b"a")),
             entries_blake3: Blake3Digest::of(b"e"),
             signer: KeyId::from_bytes([9; 32]),
             signer_label: "ci".into(),

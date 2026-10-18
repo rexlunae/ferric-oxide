@@ -510,6 +510,17 @@ impl<D: Disk> Resource<D> for FileResource {
         }
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
             if !fmap_info.base.is_null() {
+                // Ferric Oxide: the mapped buffer is page-sized and zeroed past
+                // EOF, so a cached read must stop at the file size. Without this
+                // a read near the end returned the zeroed tail, and files that
+                // were mapped (dynamically linked programs, shared libraries)
+                // read back longer than they are.
+                let file_size = tx.read_tree(self.node_ptr)?.data().size();
+                if offset >= file_size {
+                    return Ok(0);
+                }
+                let buf_len = (file_size - offset).min(buf.len() as u64) as usize;
+                let buf = &mut buf[..buf_len];
                 let requested_end = offset + buf.len() as u64;
                 let mut next_offset = offset;
                 let mut cacheable = true;

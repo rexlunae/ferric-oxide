@@ -50,6 +50,13 @@ pub enum Error {
     Pkgar(pkgar::Error),
     Options(String),
     Other(String),
+    /// Ferric Oxide: a package or dependency name `fox` cannot use.
+    FoxName {
+        name: String,
+        source: fox_core::NameError,
+    },
+    /// Ferric Oxide: a `fox` manifest could not be serialized.
+    FoxManifest(fox_core::ManifestError),
 }
 
 impl Error {
@@ -104,6 +111,10 @@ impl Display for Error {
             Error::Other(context) | Error::Options(context) => {
                 write!(f, "{context}")
             }
+            Error::FoxName { name, source } => {
+                write!(f, "Package name {name:?} is not valid for fox: {source}")
+            }
+            Error::FoxManifest(error) => write!(f, "Cannot write fox manifest: {error}"),
         }
     }
 }
