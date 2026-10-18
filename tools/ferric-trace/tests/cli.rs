@@ -113,7 +113,7 @@ fn reports_bad_input_with_its_cause() {
 #[test]
 fn refuses_a_bad_tsc_frequency() {
     let dir = capture();
-    for bad in ["0", "-5", "inf", "NaN", "fast"] {
+    for bad in ["0", "-5", "inf", "NaN", "fast", "5e-324", "0.5"] {
         let output = ferric_trace()
             .arg("perfetto")
             .arg(format!("--tsc-mhz={bad}"))

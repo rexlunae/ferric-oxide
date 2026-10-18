@@ -160,10 +160,13 @@ echo "enable syscall scheme" > /scheme/kernel.trace/events
 # ... run the workload ...
 echo "disable syscall scheme" > /scheme/kernel.trace/events
 cat /scheme/kernel.trace/stats > stats.after
-for n in 0 1 2 3; do cat /scheme/kernel.trace/cpu/$n > cpu$n; done
+for n in $(awk '{ print $2 }' stats.after); do
+    cat /scheme/kernel.trace/cpu/$n > cpu$n
+done
 ```
 
-`stats` lists the CPUs. A read drains a ring, so each record lands in exactly
+`stats` has one `cpu <n> ...` line per CPU, and the loop drains each one it
+lists. A read drains a ring, so each record lands in exactly
 one file.
 
 Each ring holds 64 KiB, and a full ring drops new records. If any CPU's
@@ -187,7 +190,8 @@ since the first record, the event and its named arguments.
 or in `chrome://tracing`.
 
 - **CPU tracks.** With `sched.switch` captured, each CPU track shows which
-  context ran when.
+  context ran when, including the context that ran from the CPU's first
+  record up to its first captured switch.
 - **Context tracks.** Each context has a track (a process per kernel pid, a
   thread per context). It shows that context's system calls as slices, even
   when the context moved to another CPU while it was blocked. Records from
@@ -200,8 +204,9 @@ or in `chrome://tracing`.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
 `--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
-frequency; the default, 1000, shows one cycle as one nanosecond. A value that
-is not a finite number greater than 0 is refused. The format and
+frequency; the default, 1000, shows one cycle as one nanosecond. A value below
+1 MHz, or not a finite number, is refused: real TSCs run at hundreds of MHz or
+more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
 ## Validation
@@ -215,8 +220,9 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   (including bad and unknown records, records with too few or too many
   arguments, and duplicate CPUs), checks the text lines, checks the JSON
   mapping (slices on the right context across CPUs, records from before a
-  CPU's first switch moved to the outgoing context, async request slices
-  matched by tag through cancels, instants for unmatched records), refuses bad
+  CPU's first switch moved to the outgoing context with its CPU slice, async
+  request slices matched by tag through cancels, instants for unmatched
+  records, finite timestamps at the frequency limits), refuses bad
   `--tsc-mhz` values, and runs the binary on a capture directory.
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.

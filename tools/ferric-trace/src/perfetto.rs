@@ -5,7 +5,8 @@
 //!
 //! - **CPU tracks.** Process "CPUs" has one thread per CPU. With `sched.switch` captured, each
 //!   CPU's thread has one slice per context that ran there (`B`/`E`), named after the process
-//!   and context.
+//!   and context. The context a CPU's first switch takes off it gets a slice from that CPU's
+//!   first record to the switch.
 //! - **Context tracks.** Each process (by kernel pid) has one thread per context (by its debug
 //!   id). System calls are slices on the context that made them: `syscall.enter` begins one
 //!   and the matching `syscall.exit` ends it, even when the context moved to another CPU in
@@ -44,7 +45,8 @@ pub const CPU_PID: u64 = 1 << 32;
 /// The pid of the process holding each CPU's "context unknown" thread.
 pub const UNKNOWN_PID: u64 = (1 << 32) + 1;
 
-/// A TSC frequency in MHz: finite and greater than zero, so cycles convert to a real time.
+/// A TSC frequency in MHz: finite and at least [`TscMhz::MIN`], so every cycle count converts
+/// to a finite time.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct TscMhz(f64);
 
@@ -52,8 +54,8 @@ pub struct TscMhz(f64);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TscMhzError {
-    /// The value is zero, negative, infinite or not a number.
-    #[error("TSC frequency {value} MHz is not a finite number greater than 0")]
+    /// The value is below [`TscMhz::MIN`], infinite or not a number.
+    #[error("TSC frequency {value} MHz is not a finite number of at least {} MHz", TscMhz::MIN.0)]
     OutOfRange {
         /// The value given.
         value: f64,
@@ -64,13 +66,19 @@ pub enum TscMhzError {
 }
 
 impl TscMhz {
+    /// The lowest frequency accepted, 1 MHz. Real TSCs run at hundreds of MHz or more, so this
+    /// refuses nothing real. Dividing any `u64` cycle count by at least 1 gives a finite
+    /// result, while a tiny frequency such as `5e-324` overflows timestamps to infinity, which
+    /// JSON cannot represent.
+    pub const MIN: Self = Self(1.0);
+
     /// `mhz` as a TSC frequency.
     ///
     /// # Errors
     ///
-    /// [`TscMhzError::OutOfRange`] unless `mhz` is finite and greater than 0.
+    /// [`TscMhzError::OutOfRange`] unless `mhz` is finite and at least [`TscMhz::MIN`].
     pub fn new(mhz: f64) -> Result<Self, TscMhzError> {
-        if mhz.is_finite() && mhz > 0.0 {
+        if mhz.is_finite() && mhz >= Self::MIN.0 {
             Ok(Self(mhz))
         } else {
             Err(TscMhzError::OutOfRange { value: mhz })
@@ -134,6 +142,8 @@ struct Converter {
     running: HashMap<u32, Track>,
     /// Whether each CPU's track has an open slice.
     cpu_open: HashMap<u32, bool>,
+    /// The timestamp of each CPU's first record.
+    first_seen: HashMap<u32, u64>,
     /// The system call numbers each context has entered and not left.
     syscalls: HashMap<Track, Vec<u64>>,
     /// Scheme requests by (scheme, tag).
@@ -186,6 +196,7 @@ impl Converter {
     }
 
     fn entry(&mut self, entry: &Entry) {
+        self.first_seen.entry(entry.cpu).or_insert(entry.timestamp);
         let event: &Event = entry.event;
         if event.id() == SCHED_SWITCH.id() {
             self.switch(entry);
@@ -208,11 +219,26 @@ impl Converter {
     }
 
     fn switch(&mut self, entry: &Entry) {
-        if !self.running.contains_key(&entry.cpu) {
-            // The CPU's first switch names the context that ran there until now.
-            self.reattribute(entry.cpu, (entry.arg(0), entry.arg(2)));
-        }
         let cpu_track = (CPU_PID, u64::from(entry.cpu));
+        if !self.running.contains_key(&entry.cpu) {
+            // The CPU's first switch names the context that ran there until now: move its
+            // records to it, and give it the CPU slice from the CPU's first record.
+            let prev = (entry.arg(0), entry.arg(2));
+            self.reattribute(entry.cpu, prev);
+            let first = self.first_seen.get(&entry.cpu).copied();
+            if let Some(first) = first.filter(|&t| t < entry.timestamp) {
+                let mut begin = meta_event(
+                    "B",
+                    format!("pid {} ctx {}", prev.0, prev.1),
+                    self.ts(first),
+                    cpu_track,
+                );
+                begin.cat = Some("sched");
+                self.events.push(begin);
+                self.cpu_open.insert(entry.cpu, true);
+                self.contexts.insert(prev);
+            }
+        }
         if self.cpu_open.insert(entry.cpu, true) == Some(true) {
             self.push(entry, "E", String::new(), cpu_track);
         }
@@ -397,6 +423,7 @@ pub fn to_json(capture: &Capture, tsc_mhz: TscMhz) -> String {
         events: Vec::new(),
         running: HashMap::new(),
         cpu_open: HashMap::new(),
+        first_seen: HashMap::new(),
         syscalls: HashMap::new(),
         requests: HashMap::new(),
         next_request: 0,
@@ -535,7 +562,16 @@ mod tests {
     }
     #[test]
     fn tsc_frequency_must_be_finite_and_positive() {
-        for bad in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        for bad in [
+            0.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            5e-324,
+            f64::MIN_POSITIVE,
+            0.999,
+        ] {
             assert!(
                 matches!(TscMhz::new(bad), Err(TscMhzError::OutOfRange { .. })),
                 "{bad}"
@@ -557,6 +593,26 @@ mod tests {
             " 2400.5 ".parse::<TscMhz>().map(TscMhz::get).ok(),
             Some(2400.5)
         );
+        assert_eq!(TscMhz::new(1.0).ok(), Some(TscMhz::MIN));
+    }
+
+    #[test]
+    fn timestamps_stay_finite_at_the_extremes() {
+        // The widest possible span of cycles, at the lowest and highest frequencies accepted.
+        let cpu0 = bytes(&[
+            (&SYSCALL_EXIT, 0, &[1, 0]),
+            (&SYSCALL_EXIT, u64::MAX, &[1, 0]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &cpu0).expect("valid")]);
+        for tsc in [TscMhz::MIN, mhz(f64::MAX)] {
+            let all = events(&to_json(&capture, tsc));
+            let stamps: Vec<_> = phases(&all, "i").iter().map(|e| e["ts"].as_f64()).collect();
+            assert_eq!(stamps.len(), 2);
+            assert!(
+                stamps.iter().all(|t| t.is_some_and(f64::is_finite)),
+                "{tsc}: {stamps:?}"
+            );
+        }
     }
 
     #[test]
@@ -612,6 +668,47 @@ mod tests {
                 .filter(|e| e["ph"] != "M")
                 .all(|e| e["pid"] != UNKNOWN_PID)
         );
+    }
+
+    #[test]
+    fn the_first_switch_gives_the_outgoing_context_its_cpu_slice() {
+        // CPU 0's first record is a system call at 10; the first switch, at 20, takes pid 3
+        // context 7 off for pid 4 context 8.
+        let cpu0 = bytes(&[
+            (&SYSCALL_ENTER, 10, &[4, 9, 0, 16, 0]),
+            (&SCHED_SWITCH, 20, &[3, 4, 7, 8]),
+            (&SYSCALL_EXIT, 30, &[5, 0]),
+        ]);
+        // CPU 1's first record is its switch, so there is no earlier interval to show.
+        let cpu1 = bytes(&[(&SCHED_SWITCH, 15, &[0, 3, 1, 7])]);
+        let capture = Capture::from_cpus(vec![
+            CpuCapture::decode(0, &cpu0).expect("valid"),
+            CpuCapture::decode(1, &cpu1).expect("valid"),
+        ]);
+        let all = events(&to_json(&capture, mhz(1.0)));
+        let on_cpu = |cpu: u64, ph: &str| -> Vec<(String, f64)> {
+            phases(&all, ph)
+                .into_iter()
+                .filter(|e| e["pid"] == CPU_PID && e["tid"] == cpu)
+                .map(|e| {
+                    (
+                        e["name"].as_str().unwrap_or_default().to_owned(),
+                        e["ts"].as_f64().unwrap_or(f64::NAN),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            on_cpu(0, "B"),
+            [
+                ("pid 3 ctx 7".to_owned(), 0.0),
+                ("pid 4 ctx 8".to_owned(), 10.0)
+            ]
+        );
+        // The first slice ends at the switch, the second at the last record.
+        let ends: Vec<f64> = on_cpu(0, "E").into_iter().map(|(_, t)| t).collect();
+        assert_eq!(ends, [10.0, 20.0]);
+        assert_eq!(on_cpu(1, "B"), [("pid 3 ctx 7".to_owned(), 5.0)]);
     }
 
     #[test]
