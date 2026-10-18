@@ -71,4 +71,4 @@ pub mod queue;
 pub use abi::{Layout, NotifyMode};
 pub use chain::SqReader;
 pub use entry::{Cqe, Entry, Op, Sqe, SqeFlags};
-pub use queue::{Consumer, Memory, Producer};
+pub use queue::{Consumer, Memory, Producer, Reserving};

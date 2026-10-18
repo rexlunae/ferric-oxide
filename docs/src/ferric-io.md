@@ -311,11 +311,22 @@ full slot is refused with `EBUSY`; slots past the table and ring descriptors
 (a ring may not hold a ring open) with `EINVAL`; the descriptors of a
 refused call are closed. An empty slot completes with `EBADF`.
 
-Registered-buffer grants as SQE buffers, waiting for completions in
-`Enter`, polled (`SqPoll`) and `UMWAIT` notification, and rings served
-natively by user schemes come later (see the design in
+A chain whose first SQE has `SqeFlags::ASYNC` runs on the ring's worker, a
+kernel context the ring starts on first use. `Enter` takes the chain, sets
+aside room in the CQ for its completions, looks up the files it names, and
+returns without waiting; the worker runs asynchronous chains in order, with
+the submitter's address space and credentials, and posts each chain's CQEs
+together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+min_complete }` waits after submitting until the CQ holds `min_complete`
+completions or nothing submitted is still running (`EINTR` on a signal,
+`EINVAL` above the CQ's size). Closing the ring interrupts the chain running
+and cancels the queued ones with `ECANCELED`.
+
+Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
+notification, and rings served natively by user schemes come later (see the design in
 `io/rings-design.md` in the project files). Their flags and modes already
 have encodings and return `EOPNOTSUPP` today. `ferric-ring-test` covers the
 calls, chains across RedoxFS, the pipe scheme and the null scheme, the file
-table, `Fstat`, the refusals, back-pressure and a corrupt tail, and prints
-ring versus system call timings, by descriptor and by slot.
+table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
+blocked, the refusals, back-pressure and a corrupt tail, and prints ring
+versus system call timings, by descriptor, by slot and on the worker.

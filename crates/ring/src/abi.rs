@@ -10,7 +10,7 @@
 //! | Call | Encoding |
 //! | --- | --- |
 //! | [`Request::Setup`] | `SYS_CALL` on the ring, metadata `[1 \| notify << 8, sq_entries, cq_entries]` |
-//! | [`Request::Enter`] | `SYS_CALL` on the ring, metadata `[2, to_submit]`; returns the SQEs consumed |
+//! | [`Request::Enter`] | `SYS_CALL` on the ring, metadata `[2, to_submit, min_complete]`; returns the SQEs consumed |
 //! | [`Request::RegisterFiles`] | `SYS_CALL` on the ring with `CallFlags::FD` (and `FD_CLONE` to keep them), the descriptors as `usize`s in the payload, metadata `[3, first]`; returns how many were registered |
 //! | [`Request::UnregisterFiles`] | `SYS_CALL` on the ring, metadata `[4, first, count]`; returns how many slots held a file |
 //! | `mmap` | `MAP_SHARED`, offset 0, length [`Layout::map_len`] |
@@ -22,6 +22,19 @@
 //! line of their own ([`header`]). The SQ's slots start at page 1, the CQ's at the next page
 //! after the SQ ([`Layout`]). Both sides compute the layout from the entry counts, so neither
 //! reads it back from memory the other side can write.
+//!
+//! # Asynchronous chains
+//!
+//! A chain whose first SQE has [`SqeFlags::ASYNC`](crate::SqeFlags::ASYNC) is handed to the
+//! ring's worker, a kernel thread the ring starts on first use: `Enter` takes it from the SQ,
+//! sets aside room in the CQ for its completions, and returns without waiting for it. The
+//! worker runs asynchronous chains one after another, in the order they were taken, and posts
+//! each chain's CQEs together. The files an asynchronous chain names are looked up when
+//! `Enter` takes it, so closing a descriptor afterwards does not affect it, and its buffers
+//! are in the address space of the thread that called `Enter`. The submitter waits for the
+//! completions with `fevent` or with `Enter`'s `min_complete`. Closing the ring completes the
+//! chains still waiting with `ECANCELED` without running them, and interrupts the one running
+//! as a signal would.
 //!
 //! # File table
 //!
@@ -39,8 +52,12 @@
 //! built without, `ENOMEM` when the memory cannot be allocated. `mmap`: `EINVAL` before
 //! `Setup`, for an offset other than 0, a length other than [`Layout::map_len`], or a mapping
 //! that is not `MAP_SHARED`. `Enter`: `EINVAL` before `Setup` or when the ring's indices are
-//! corrupt, `EBUSY` when another `Enter` on the ring is running or when the CQ has no room for
-//! the next chain's completions and nothing was consumed. `RegisterFiles`: `EINVAL` for slots
+//! corrupt, or for a `min_complete` above the CQ's entries, `EBUSY` when another `Enter` on the
+//! ring is running or when the CQ has no room for the next chain's completions and nothing was
+//! consumed, `EINTR` when a signal ends the wait for completions and nothing was consumed (when
+//! something was, `Enter` returns the count; the SQEs consumed run and complete either way),
+//! `ENOMEM` as the result of an `ASYNC` chain's SQEs when the ring's worker
+//! cannot be started. `RegisterFiles`: `EINVAL` for slots
 //! past [`MAX_FIXED_FILES`] or a ring descriptor (a ring may not hold itself or another ring
 //! open), `EBUSY` when a slot already holds a file; nothing is registered then, and the
 //! descriptors sent are closed. `UnregisterFiles`: `EINVAL` for slots past
@@ -166,10 +183,16 @@ pub enum Request {
         /// How the sides wake each other.
         notify: NotifyMode,
     },
-    /// Consume up to `to_submit` SQEs, run them, and post their CQEs.
+    /// Consume up to `to_submit` SQEs, run them (chains marked
+    /// [`SqeFlags::ASYNC`](crate::SqeFlags::ASYNC) on the ring's worker, after `Enter`
+    /// returns), and post their CQEs; then wait until the CQ holds at least `min_complete`
+    /// completions or no submitted SQE is still running.
     Enter {
         /// The most SQEs to consume.
         to_submit: u32,
+        /// The completions to wait for, at most the CQ's entries; 0 does not wait. With
+        /// `to_submit` 0, `Enter` only waits, and need not be the only one running.
+        min_complete: u32,
     },
     /// Put the descriptors sent with the call into the file table, from slot `first` on.
     ///
@@ -237,7 +260,13 @@ impl Request {
                 ],
                 3,
             ),
-            Self::Enter { to_submit } => ([VERB_ENTER, u64::from(to_submit), 0], 2),
+            Self::Enter {
+                to_submit,
+                min_complete,
+            } => (
+                [VERB_ENTER, u64::from(to_submit), u64::from(min_complete)],
+                3,
+            ),
             Self::RegisterFiles { first } => ([VERB_REGISTER_FILES, u64::from(first), 0], 2),
             Self::UnregisterFiles { first, count } => (
                 [VERB_UNREGISTER_FILES, u64::from(first), u64::from(count)],
@@ -265,6 +294,7 @@ impl Request {
             }
             VERB_ENTER => Ok(Self::Enter {
                 to_submit: entries(1)?,
+                min_complete: entries(2)?,
             }),
             VERB_REGISTER_FILES => Ok(Self::RegisterFiles { first: entries(1)? }),
             VERB_UNREGISTER_FILES => Ok(Self::UnregisterFiles {
@@ -473,7 +503,10 @@ mod tests {
                 cq_entries: 8192,
                 notify: NotifyMode::Umwait,
             },
-            Request::Enter { to_submit: 7 },
+            Request::Enter {
+                to_submit: 7,
+                min_complete: 3,
+            },
             Request::RegisterFiles { first: 5 },
             Request::UnregisterFiles {
                 first: 1,
@@ -481,6 +514,7 @@ mod tests {
             },
             Request::Enter {
                 to_submit: u32::MAX,
+                min_complete: 0,
             },
         ] {
             let (words, len) = request.encode();
@@ -501,7 +535,21 @@ mod tests {
             Err(DecodeError::Entries(u64::from(u32::MAX) + 1))
         );
         // Missing words are zero, as the kernel passes them.
-        assert_eq!(Request::decode(&[2]), Ok(Request::Enter { to_submit: 0 }));
+        assert_eq!(
+            Request::decode(&[2]),
+            Ok(Request::Enter {
+                to_submit: 0,
+                min_complete: 0
+            })
+        );
+        // A two-word Enter, as #90's clients send it, does not wait.
+        assert_eq!(
+            Request::decode(&[2, 5]),
+            Ok(Request::Enter {
+                to_submit: 5,
+                min_complete: 0
+            })
+        );
     }
 
     #[test]

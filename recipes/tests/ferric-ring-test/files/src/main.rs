@@ -32,9 +32,17 @@
 //!   with `EBADF`.
 //! - `ring-fstat`: `Fstat` gives the same `Stat` as `fstat`, `st_dev` included, and `Fsize`
 //!   the file's length.
+//! - `ring-async`: an `ASYNC` read of an empty pipe leaves `Enter` without a completion and
+//!   without an event, keeps working after its descriptor is closed, and completes once the
+//!   pipe has data, which `Enter` with `min_complete` waits for and an event queue sees; an
+//!   asynchronous chain across write, fsync and read, and one broken by a closed descriptor,
+//!   complete by the chain rules; `min_complete` above the CQ is refused, and with nothing
+//!   running does not wait.
+//! - `ring-async-close`: closing a ring whose worker is blocked in a pipe read returns, and
+//!   rings keep working.
 //! - `ring-bench`: times 64-byte writes to the null scheme and 4 KiB reads of a file, as
-//!   system calls and as ring batches of 32, and the reads again through a file table slot,
-//!   and prints `FERRIC_BENCH` lines.
+//!   system calls and as ring batches of 32, the reads again through a file table slot and
+//!   the writes again on the ring's worker, and prints `FERRIC_BENCH` lines.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.ring` scheme (a kernel built without

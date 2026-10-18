@@ -232,7 +232,19 @@ impl Ring {
 
     /// `Enter` for up to `n` SQEs, as a result or minus the errno.
     fn enter(&self, n: u32) -> i64 {
-        outcome(call(&self.fd, Request::Enter { to_submit: n }))
+        self.enter_wait(n, 0)
+    }
+
+    /// `Enter` for up to `n` SQEs that then waits for `min_complete` completions, as a result
+    /// or minus the errno.
+    fn enter_wait(&self, n: u32, min_complete: u32) -> i64 {
+        outcome(call(
+            &self.fd,
+            Request::Enter {
+                to_submit: n,
+                min_complete,
+            },
+        ))
     }
 
     /// Takes every completion from the CQ.
@@ -315,7 +327,13 @@ fn refuse_setup() -> Result<(), Failure> {
     expect(
         "Enter before Setup",
         neg(EINVAL),
-        outcome(call(&fd, Request::Enter { to_submit: 1 })),
+        outcome(call(
+            &fd,
+            Request::Enter {
+                to_submit: 1,
+                min_complete: 0,
+            },
+        )),
     )?;
     expect(
         "mmap before Setup",
@@ -396,11 +414,7 @@ fn file() -> Result<(), Failure> {
 fn chain() -> Result<(), Failure> {
     let mut ring = Ring::new(8, 16)?;
     let (file, data) = scratch_file("chain", PAGE)?;
-    let mut fds = [0 as c_int; 2];
-    // SAFETY: `fds` has room for the two descriptors pipe() writes.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return io("pipe", Err(std::io::Error::last_os_error()));
-    }
+    let fds = pipe()?;
     let null = io(
         "open the null scheme",
         OpenOptions::new().write(true).open("/scheme/null"),
@@ -426,11 +440,8 @@ fn chain() -> Result<(), Failure> {
     let mut piped = vec![0u8; PAGE];
     // SAFETY: the read end from pipe(), and a buffer of `PAGE` bytes.
     let n = unsafe { libc::read(fds[0], piped.as_mut_ptr().cast(), PAGE) };
-    // SAFETY: both descriptors came from pipe() and are not used again.
-    unsafe {
-        libc::close(fds[0]);
-        libc::close(fds[1]);
-    }
+    close_fd(fds[0]);
+    close_fd(fds[1]);
     expect("bytes in the pipe", PAGE as i64, n as i64)?;
     if piped != data {
         return Err(Failure::Mismatch {
@@ -678,6 +689,140 @@ fn fstat() -> Result<(), Failure> {
     expect("st_dev", direct.st_dev as i64, via_ring.st_dev as i64)
 }
 
+/// A pipe's read and write ends.
+fn pipe() -> Result<[c_int; 2], Failure> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe() writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return io("pipe", Err(std::io::Error::last_os_error()));
+    }
+    Ok(fds)
+}
+
+/// Closes a descriptor from [`pipe`].
+fn close_fd(fd: c_int) {
+    // SAFETY: a descriptor this test opened and does not use again.
+    unsafe { libc::close(fd) };
+}
+
+fn async_chains() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let queue = ctx(
+        "open an event queue",
+        Fd::open("/scheme/event", O_RDWR | O_CLOEXEC | O_NONBLOCK, 0),
+    )?;
+    let watch = syscall::data::Event {
+        id: ring.fd.raw(),
+        flags: EVENT_READ,
+        data: 7,
+    };
+    ctx("watch the ring", queue.write(&watch))?;
+
+    // A read of an empty pipe blocks on the worker; Enter returns without its completion.
+    let [rd, wr] = pipe()?;
+    let mut buf = [0u8; 16];
+    ring.submit(&[
+        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 1).run_async(),
+    ])?;
+    expect("Enter of an asynchronous read", 1, ring.enter(1))?;
+    expect(
+        "completions before the pipe has data",
+        0,
+        ring.reap()?.len() as i64,
+    )?;
+    let mut got = syscall::data::Event::default();
+    expect(
+        "an event before the completion",
+        neg(EAGAIN),
+        outcome(queue.read(&mut got)),
+    )?;
+    // The read was looked up when it was submitted: closing the descriptor does not stop it.
+    close_fd(rd);
+    let data = *b"ferric-ring-asyn";
+    // SAFETY: the pipe's write end and a buffer of 16 bytes.
+    let n = unsafe { libc::write(wr, data.as_ptr().cast(), data.len()) };
+    expect("write to the pipe", 16, n as i64)?;
+    expect("Enter waiting for one completion", 0, ring.enter_wait(0, 1))?;
+    check_cqes("the asynchronous read", &ring.reap()?, &[(1, 16)])?;
+    if buf != data {
+        return Err(Failure::Mismatch {
+            what: "the bytes the asynchronous read got",
+        });
+    }
+    expect(
+        "an event after the completion",
+        size_of::<syscall::data::Event>() as i64,
+        outcome(queue.read(&mut got)),
+    )?;
+    close_fd(wr);
+
+    // An asynchronous chain runs by the same rules, in one go.
+    let (file, _) = scratch_file("async", 0)?;
+    let fd = file.as_raw_fd() as u32;
+    let page: Vec<u8> = (0..PAGE).map(|i| (i % 253) as u8).collect();
+    let mut back = vec![0u8; PAGE];
+    ring.submit(&[
+        Sqe::write(fd, 0, page.as_ptr() as u64, PAGE as u32, 2)
+            .run_async()
+            .linked(),
+        Sqe::fsync(fd, 3).linked(),
+        Sqe::read(fd, 0, back.as_mut_ptr() as u64, PAGE as u32, 4),
+        Sqe::read(9999, 0, back.as_mut_ptr() as u64, 8, 5)
+            .run_async()
+            .linked(),
+        Sqe::nop(6),
+    ])?;
+    expect("Enter of two asynchronous chains", 5, ring.enter_wait(5, 5))?;
+    check_cqes(
+        "asynchronous chains",
+        &ring.reap()?,
+        &[
+            (2, PAGE as i64),
+            (3, 0),
+            (4, PAGE as i64),
+            (5, neg(EBADF)),
+            (6, neg(ECANCELED)),
+        ],
+    )?;
+    if back != page {
+        return Err(Failure::Mismatch {
+            what: "the page an asynchronous chain read back",
+        });
+    }
+
+    expect(
+        "min_complete above the CQ",
+        neg(EINVAL),
+        ring.enter_wait(0, 17),
+    )?;
+    // Nothing is running, so there is nothing to wait for.
+    expect(
+        "min_complete with nothing running",
+        0,
+        ring.enter_wait(0, 4),
+    )?;
+    Ok(())
+}
+
+fn async_close() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let [rd, wr] = pipe()?;
+    let mut buf = [0u8; 16];
+    ring.submit(&[
+        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 1).run_async(),
+        Sqe::nop(2).run_async(),
+    ])?;
+    expect("Enter of a blocked read and a Nop", 2, ring.enter(2))?;
+    // Closing the ring interrupts the read and cancels the Nop; it must not wait for the pipe.
+    drop(ring);
+    let mut other = Ring::new(8, 16)?;
+    let cqes = other.run(&[Sqe::nop(3)])?;
+    check_cqes("a new ring after the close", &cqes, &[(3, 0)])?;
+    close_fd(rd);
+    close_fd(wr);
+    Ok(())
+}
+
 /// Operations per benchmark.
 const BENCH_OPS: usize = 20_000;
 /// SQEs per `Enter` in the ring benchmarks.
@@ -720,6 +865,7 @@ fn bench() -> Result<(), Failure> {
         0,
     );
     let ring_ns = bench_ring(&mut ring, sqe, 64)?;
+    let (syscall_null_ns, ring_null_ns) = (syscall_ns, ring_ns);
     println!(
         "FERRIC_BENCH ring null-write-64: write {syscall_ns:.0} ns/op, ring (batch {BENCH_BATCH}) {ring_ns:.0} ns/op, {:.2}x",
         syscall_ns / ring_ns
@@ -757,6 +903,35 @@ fn bench() -> Result<(), Failure> {
         "FERRIC_BENCH ring file-read-4k-fixed: ring pread by descriptor {ring_ns:.0} ns/op, by slot {fixed_ns:.0} ns/op, {:.2}x",
         ring_ns / fixed_ns
     );
+
+    // The null writes again on the worker: Enter hands each over and waits for the batch.
+    let batch = vec![
+        Sqe::write(
+            null.as_raw_fd() as u32,
+            CURRENT_POSITION,
+            small.as_ptr() as u64,
+            64,
+            0
+        )
+        .run_async();
+        BENCH_BATCH
+    ];
+    let start = Instant::now();
+    for _ in 0..BENCH_OPS / BENCH_BATCH {
+        ring.submit(&batch)?;
+        expect(
+            "Enter of an asynchronous batch",
+            BENCH_BATCH as i64,
+            ring.enter_wait(BENCH_BATCH as u32, BENCH_BATCH as u32),
+        )?;
+        for cqe in ring.reap()? {
+            expect("an asynchronous benchmark completion", 64, cqe.result)?;
+        }
+    }
+    let async_ns = ns_per_op(start, BENCH_OPS / BENCH_BATCH * BENCH_BATCH);
+    println!(
+        "FERRIC_BENCH ring null-write-64-async: write {syscall_null_ns:.0} ns/op, ring in Enter {ring_null_ns:.0} ns/op, ring on the worker {async_ns:.0} ns/op"
+    );
     Ok(())
 }
 
@@ -779,7 +954,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 14] = [
+    let steps: [(&str, Step); 16] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -793,6 +968,8 @@ pub fn main() -> ExitCode {
         ("ring-event", event),
         ("ring-fixed", fixed),
         ("ring-fstat", fstat),
+        ("ring-async", async_chains),
+        ("ring-async-close", async_close),
         ("ring-bench", bench),
     ];
     for (name, step) in steps {

@@ -93,6 +93,9 @@ bitflags! {
         const FIXED_FILE = 1 << 1;
         /// `addr` names a grant slot and an offset in it ([`Buffer::Grant`]).
         const BUF_GRANT = 1 << 2;
+        /// On the first SQE of a chain: the chain runs on the ring's worker, after `Enter`
+        /// returns ([`abi`](crate::abi#asynchronous-chains)). Elsewhere it has no effect.
+        const ASYNC = 1 << 3;
     }
 }
 
@@ -217,6 +220,20 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The file the operation runs on, if it has one.
+    pub const fn file(&self) -> Option<FileRef> {
+        match *self {
+            Self::Nop => None,
+            Self::Read { file, .. }
+            | Self::Write { file, .. }
+            | Self::Fsize { file }
+            | Self::Fstat { file, .. }
+            | Self::Fsync { file } => Some(file),
+        }
+    }
+}
+
 /// Why an SQE is not a valid request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -304,6 +321,13 @@ impl Sqe {
     /// This SQE with [`SqeFlags::FIXED_FILE`]: `fd` is a slot of the ring's file table.
     pub const fn fixed(mut self) -> Self {
         self.flags = self.flags.union(SqeFlags::FIXED_FILE);
+        self
+    }
+
+    /// This SQE with [`SqeFlags::ASYNC`]: on a chain's first SQE, the chain runs on the ring's
+    /// worker.
+    pub const fn run_async(mut self) -> Self {
+        self.flags = self.flags.union(SqeFlags::ASYNC);
         self
     }
 
@@ -599,6 +623,16 @@ mod tests {
         assert_eq!(fstat.op(), Err(SqeError::Reserved));
         assert!(!Opcode::Fstat.transfers());
         assert!(Sqe::nop(1).fixed().flags.contains(SqeFlags::FIXED_FILE));
+        assert_eq!(Sqe::nop(1).run_async().op(), Ok(Op::Nop));
+        assert_eq!(Op::Nop.file(), None);
+        assert_eq!(
+            Sqe::fsize(3, 1).fixed().op().map(|op| op.file()),
+            Ok(Some(FileRef::Fixed(3)))
+        );
+        assert_eq!(
+            Sqe::write(4, 0, 0x1000, 8, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(4)))
+        );
     }
 
     #[test]
