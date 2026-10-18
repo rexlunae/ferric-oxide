@@ -45,42 +45,71 @@ if [ "${#out_logs[@]}" -eq 0 ] || [ "${#in_logs[@]}" -eq 0 ]; then
     exit 2
 fi
 
-# The median over LOGS of each log's min_ns for WORKLOAD in STATE, or nothing.
+# Sets `result` to the median over LOGS of each log's first min_ns for WORKLOAD
+# in STATE, and `missing` to the logs that have no such line. `result` is empty
+# when any log is missing one, so a workload is never judged on fewer boots
+# than the job ran. It runs in the current shell, not in a command
+# substitution, so a log without a match is reported instead of ending the
+# script under `set -e` and `pipefail`.
 best() {
-    local workload="$1" state="$2" log
+    local workload="$1" state="$2" log value values=()
     shift 2
+    missing=()
     for log in "$@"; do
-        tr -d '\r' < "$log" \
-            | grep -ao "FERRIC_BENCH $workload $state min_ns=[0-9.]*" \
-            | sed 's/.*min_ns=//' | head -n 1
-    done | sort -g | awk '{ v[NR] = $1 } END {
-        if (NR == 0) exit
-        if (NR % 2) print v[(NR + 1) / 2]; else printf "%.1f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
-    }'
+        value="$(tr -d '\r' < "$log" \
+            | { grep -ao "FERRIC_BENCH $workload $state min_ns=[0-9.]*" || true; } \
+            | sed 's/.*min_ns=//' | head -n 1)"
+        if [ -n "$value" ]; then
+            values+=("$value")
+        else
+            missing+=("$log")
+        fi
+    done
+    result=""
+    if [ "${#missing[@]}" -eq 0 ]; then
+        result="$(printf '%s\n' "${values[@]}" | sort -g | awk '{ v[NR] = $1 } END {
+            if (NR % 2) print v[(NR + 1) / 2]; else printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
+        }')"
+    fi
+}
+
+# True when MEASURED is more than BUDGET percent above BASE. It compares the
+# unrounded values: the percentages printed in the summary are rounded to three
+# places, and an increase just over a budget must not pass once rounded.
+over_budget() {
+    awk -v m="$1" -v base="$2" -v b="$3" 'BEGIN { exit !(m > base * (1 + b / 100)) }'
 }
 
 status=0
 for workload in io syscall; do
-    out="$(best "$workload" out "${out_logs[@]}")"
-    off="$(best "$workload" off "${in_logs[@]}")"
-    pairoff="$(best "$workload" pairoff "${in_logs[@]}")"
-    on="$(best "$workload" on "${in_logs[@]}")"
-    if [ -z "$out" ] || [ -z "$off" ] || [ -z "$pairoff" ] || [ -z "$on" ]; then
-        echo "::error title=trace overhead::missing $workload results (out='$out' off='$off' pairoff='$pairoff' on='$on')"
+    complete=1
+    for state in out off pairoff on; do
+        if [ "$state" = out ]; then
+            best "$workload" "$state" "${out_logs[@]}"
+        else
+            best "$workload" "$state" "${in_logs[@]}"
+        fi
+        printf -v "$state" '%s' "$result"
+        if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=trace overhead::missing $workload $state results in ${missing[*]}"
+            complete=0
+        fi
+    done
+    if [ "$complete" -eq 0 ]; then
         status=1
         continue
     fi
     read -r off_pct on_pct < <(awk -v out="$out" -v off="$off" -v pairoff="$pairoff" -v on="$on" \
-        'BEGIN { printf "%.2f %.2f\n", (off / out - 1) * 100, (on / pairoff - 1) * 100 }')
+        'BEGIN { printf "%.3f %.3f\n", (off / out - 1) * 100, (on / pairoff - 1) * 100 }')
     summary="$workload (median of ${#out_logs[@]}+${#in_logs[@]} boots' fastest rounds): out ${out} ns, off ${off} ns (${off_pct}% vs out), pairoff ${pairoff} ns, on ${on} ns (${on_pct}% vs pairoff)"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
     if [ "$workload" = io ]; then
-        if awk -v p="$off_pct" -v b="$off_budget" 'BEGIN { exit !(p > b) }'; then
+        if over_budget "$off" "$out" "$off_budget"; then
             echo "::error title=trace overhead::io with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%): $summary"
             status=1
         fi
-        if awk -v p="$on_pct" -v b="$on_budget" 'BEGIN { exit !(p > b) }'; then
+        if over_budget "$on" "$pairoff" "$on_budget"; then
             echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
             status=1
         fi
@@ -88,7 +117,7 @@ for workload in io syscall; do
 done
 # A full ring drops records, which is cheaper than writing them, so losses make "on" look
 # better than it is.
-lost="$(tr -d '\r' < <(cat "${in_logs[@]}") | grep -ao 'FERRIC_BENCH lost records=[0-9]*' \
+lost="$(cat "${in_logs[@]}" | tr -d '\r' | { grep -ao 'FERRIC_BENCH lost records=[0-9]*' || true; } \
     | sed 's/.*=//' | awk '{ s += $1 } END { print s + 0 }')"
 if [ "$lost" -gt 0 ]; then
     echo "::warning title=trace overhead::$lost records were dropped during the on rounds; the on figure is low"

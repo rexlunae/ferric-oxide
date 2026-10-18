@@ -23,6 +23,9 @@
 //! compares these across boots of kernels built with and without tracing. It then prints
 //! `FERRIC_TEST_PASS trace-bench`, or `FERRIC_TEST_FAIL trace-bench: <why>` and exits non-zero.
 
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+
 #[cfg(target_os = "redox")]
 mod redox;
 
