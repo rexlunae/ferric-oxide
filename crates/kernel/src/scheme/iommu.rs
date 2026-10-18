@@ -37,7 +37,7 @@
 //! The call encoding is in the shared `ferric-iommu` crate (`crates/iommu`), which pcid uses
 //! too.
 
-use alloc::{collections::BTreeMap, sync::Weak};
+use alloc::{collections::BTreeMap, sync::Weak, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
@@ -400,7 +400,7 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
 ///
 /// `EINVAL` when the process has bound no domain or `id` is that domain, `EBUSY` when another
 /// live process has bound `id`, `EBADF` when `id` is not open, and the errno of a failed
-/// detach or attach; then every device is put back into `id`.
+/// detach or attach; the devices are then put back into `id` (see [`move_devices`]).
 fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     let addr_space = AddrSpace::current()?;
     let name = context::current().read(token.token()).name;
@@ -441,7 +441,8 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
 /// `into`: a function and its alias are attached separately, and on AMD-Vi the alias's entry
 /// stays with `from` while any of its users is still there, so moving them one at a time
 /// would find it busy. When an attach fails, the devices already in `into` are detached and
-/// the whole set goes back into `from`.
+/// go back into `from` with the rest. A device that cannot be detached from `into` stays
+/// there, and that is logged; the attach error is returned either way.
 fn move_devices(
     handles: &mut BTreeMap<usize, Handle>,
     devices: &[Device],
@@ -479,8 +480,11 @@ fn move_devices(
         Ok(into_did) => return Ok((from_did, into_did)),
         Err(err) => err,
     };
-    let undone = with_domain(handles, into, |space, _| {
-        for &device in devices.get(..moved).unwrap_or_default() {
+    let moved = devices.get(..moved).unwrap_or_default();
+    // The devices that cannot leave `into` again stay there; only the rest go back.
+    let stuck = with_domain(handles, into, |space, _| {
+        let mut stuck = Vec::new();
+        for &device in moved {
             if let Err(e) = space.domain().detach(device) {
                 warn!(
                     "IOMMU: {:04x}:{} cannot leave domain {}: {e}",
@@ -488,15 +492,26 @@ fn move_devices(
                     device.bdf,
                     space.id()
                 );
+                stuck.push(device);
             }
         }
+        Ok(stuck)
+    })
+    .unwrap_or_else(|_| moved.to_vec());
+    let back: Vec<Device> = devices
+        .iter()
+        .copied()
+        .filter(|device| !stuck.contains(device))
+        .collect();
+    let _ = with_domain(handles, from, |space, _| {
+        reattach(space.domain(), &back);
         Ok(())
     });
-    if undone.is_ok() {
-        let _ = with_domain(handles, from, |space, _| {
-            reattach(space.domain(), devices);
-            Ok(())
-        });
+    if !stuck.is_empty() {
+        warn!(
+            "IOMMU: join into domain handle {into} failed and was not fully undone: {} device(s) stay in it",
+            stuck.len()
+        );
     }
     Err(err)
 }
