@@ -8,7 +8,7 @@
 use std::fmt;
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Exchanges in each run, with a yield after each worker reply to vary the race timing.
 const ROUNDS: usize = 2_000;
@@ -21,6 +21,7 @@ enum Failure {
     TimedOut { turn: usize },
     Stopped,
     WorkerPanicked,
+    TimeoutDidNotExpire,
 }
 
 impl fmt::Display for Failure {
@@ -30,6 +31,7 @@ impl fmt::Display for Failure {
             Self::TimedOut { turn } => write!(f, "lost wake waiting for turn {turn}"),
             Self::Stopped => f.write_str("peer stopped after a failed exchange"),
             Self::WorkerPanicked => f.write_str("worker panicked"),
+            Self::TimeoutDidNotExpire => f.write_str("initial timed wait never expired"),
         }
     }
 }
@@ -95,8 +97,31 @@ fn exchange(shared: &Shared) -> Result<(), Failure> {
     Ok(())
 }
 
+fn expire_waiter(shared: &Arc<Shared>) -> Result<(), Failure> {
+    let peer = Arc::clone(shared);
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        let mut state = peer.state.lock().map_err(|_| Failure::Poisoned)?;
+        while Instant::now() < deadline {
+            let (next, timeout) = peer
+                .changed
+                .wait_timeout(state, Duration::from_millis(1))
+                .map_err(|_| Failure::Poisoned)?;
+            state = next;
+            if timeout.timed_out() {
+                return Ok(());
+            }
+        }
+        Err(Failure::TimeoutDidNotExpire)
+    });
+    thread.join().map_err(|_| Failure::WorkerPanicked)?
+}
+
 fn run() -> Result<(), Failure> {
     let shared = Arc::new(Shared::default());
+    // A timed-out thread must leave no waiter behind to consume a later notify_one
+    // meant for one of the live handshake threads on the same condition variable.
+    expire_waiter(&shared)?;
     let peer = Arc::clone(&shared);
     let thread = std::thread::spawn(move || worker(&peer));
     let result = exchange(&shared);
