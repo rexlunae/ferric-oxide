@@ -3020,7 +3020,9 @@ fn correct_inner<'l>(
                 .request_fmap(scheme_number, offset, 1, flags, &mut token)
                 .unwrap();
 
-            let context_lock = crate::context::current();
+            // The fault blocks on the scheme: release the per-CPU current-context borrow
+            // before switching, while keeping this context alive until the reply arrives.
+            let context_lock = Arc::clone(&crate::context::current());
             context_lock
                 .write(token.token())
                 .hard_block(HardBlockedReason::AwaitingMmap { file_ref });
