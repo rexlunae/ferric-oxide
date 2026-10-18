@@ -21,6 +21,7 @@ dependencies = [
  "arrayvec",
  "ferric-iommu",
  "ferric-regbuf",
+ "ferric-trace",
  "hashbrown",
  "libredox",
  "linked_list_allocator",
@@ -40,6 +41,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ferric-regbuf"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-trace"
 version = "0.1.0"
 
 [[package]]

@@ -25,6 +25,8 @@ arrayvec = { version = "0.7.6", default-features = false }
 ferric-iommu = { path = "../../../crates/iommu" }
 # Ferric Oxide: the kernel regbuf scheme's number and name.
 ferric-regbuf = { path = "../../../crates/regbuf" }
+# Ferric Oxide: the kernel trace scheme's number and name.
+ferric-trace = { path = "../../../crates/trace" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 redox-rt = { git = "https://gitlab.redox-os.org/redox-os/relibc.git", default-features = false }
