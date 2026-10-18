@@ -21,11 +21,23 @@
 //!   the granted bytes ([`Bounce`]), copied back into the region when a writable mapping is
 //!   taken down. The holder drops a mapping with [`Request::Unmap`]; closing the grant drops
 //!   all of them.
+//! - Opening a sub-grant path (`GrantSpec::encode_sub_path`) from a grant gives a *sub-grant*:
+//!   a grant of part of the parent's range, with the parent's access or less, that the holder
+//!   can pass on (a file system to its disk driver). It is a grant like any other, and revoking
+//!   its parent, or any grant above it, revokes it as well (`ferric_regbuf::table`).
+//! - With an IOMMU, a driver maps a page-aligned grant into the DMA domain it has bound with
+//!   `MapGrant` on the domain's descriptor (`scheme/iommu.rs`, [`DmaGrant`]): the region's
+//!   frames at consecutive IOVAs. The grant records that mapping like a CPU mapping
+//!   ([`Mapping::Dma`]), and taking it down unmaps it from the domain with the IOTLB
+//!   invalidated and waited on.
 //! - [`Request::Revoke`] on the region, or closing the region, marks grants revoked (mapping
-//!   them again fails with `ECANCELED`) and unmaps every recorded mapping, with a TLB shootdown,
-//!   before it returns. Closing the region also unpins its frames and refunds the charge.
+//!   them again fails with `ECANCELED`), with every grant derived from them, and unmaps every
+//!   recorded mapping, CPU mappings with a TLB shootdown and IOMMU mappings with an IOTLB
+//!   invalidation, before it returns. A device's DMA to a revoked grant's old IOVA faults at
+//!   the IOMMU. Closing the region also unpins its frames and refunds the charge.
 //!
-//! Locks: a region's lock is taken before an address space's lock (mapping), never after.
+//! Locks: a region's lock is taken before an address space's lock (mapping) and before the
+//! `iommu` scheme's handle table (`MapGrant`), never after.
 //! Revocation takes the mappings out of the region under its lock, unmaps them after releasing
 //! it, and takes it again to copy bounce pages back. The grant table and budget logic is the host-tested `ferric-regbuf` crate
 //! (`crates/regbuf`), which also has the call encoding clients use.
@@ -54,7 +66,14 @@ use syscall::{
     flag::{CallFlags, MapFlags},
 };
 
+#[cfg(iommu_enabled)]
+use super::FileHandle;
 use super::{CallerCtx, KernelScheme, OpenResult, StrOrBytes};
+#[cfg(iommu_enabled)]
+use crate::{
+    context::{self, file::KernelSchemeRef},
+    syscall::data::GlobalSchemes,
+};
 use crate::{
     context::{
         file::InternalFlags,
@@ -73,8 +92,30 @@ const ROOT: usize = 0;
 /// The scheme.
 pub struct RegBufScheme;
 
-/// A mapping a grant has made: the span of an address space its pages occupy.
-struct Mapping {
+/// A mapping a grant has made.
+enum Mapping {
+    /// A mapping into an address space.
+    Cpu(CpuMapping),
+    /// A mapping into an IOMMU domain (`MapGrant`).
+    #[cfg(iommu_enabled)]
+    Dma(DmaRecord),
+}
+
+/// Where a grant is mapped in an IOMMU domain: the `iommu` scheme's handle number of the domain
+/// (never reused), the IOVA, and the ticket that names this mapping there.
+#[cfg(iommu_enabled)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaRecord {
+    /// The domain's handle number in the `iommu` scheme.
+    pub domain: usize,
+    /// The IOVA of the grant's first byte.
+    pub iova: u64,
+    /// The mapping's ticket, unique among all grant mappings.
+    pub ticket: u64,
+}
+
+/// A CPU mapping a grant has made: the span of an address space its pages occupy.
+struct CpuMapping {
     space: Weak<AddrSpaceWrapper>,
     span: PageSpan,
     /// The bounce pages among them.
@@ -188,11 +229,21 @@ fn path_errno(err: &PathError) -> Error {
 }
 
 /// Takes down `mappings` and returns the bounce pages to copy back into the region: those of
-/// writable mappings that are gone. A mapping whose address space has gone needs no unmap.
+/// writable mappings that are gone. A mapping whose address space has gone needs no unmap. An
+/// IOMMU mapping is unmapped with the IOTLB invalidated and waited on before this returns.
 #[must_use = "bounce pages of writable mappings must be copied back"]
+#[cfg_attr(not(iommu_enabled), allow(clippy::infallible_destructuring_match))]
 fn unmap_all(mappings: Vec<Mapping>, token: &mut CleanLockToken) -> Vec<Bounce> {
     let mut back = Vec::new();
     for mapping in mappings {
+        let mapping = match mapping {
+            Mapping::Cpu(mapping) => mapping,
+            #[cfg(iommu_enabled)]
+            Mapping::Dma(record) => {
+                super::iommu::revoke_grant_mapping(record);
+                continue;
+            }
+        };
         if let Some(space) = mapping.space.upgrade() {
             // Unpinning is what lets the pinned borrows go; the holder could not have removed
             // or replaced them, so the span still holds exactly this mapping.
@@ -267,7 +318,15 @@ impl KernelScheme for RegBufScheme {
                     .map_err(|err| table_errno(&err))?;
                 Handle::Grant { region, id }
             }
-            Handle::Grant { .. } => return Err(Error::new(EACCES)),
+            Handle::Grant { region, id } => {
+                let spec = GrantSpec::parse_sub_path(path).map_err(|err| path_errno(&err))?;
+                let sub = region
+                    .lock()
+                    .grants
+                    .create_sub(id, spec)
+                    .map_err(|err| table_errno(&err))?;
+                Handle::Grant { region, id: sub }
+            }
         };
         Ok(OpenResult::SchemeLocal(
             insert(handle),
@@ -305,13 +364,18 @@ impl KernelScheme for RegBufScheme {
                 register(&region, addr, len, token)
             }
             (Request::Revoke(id), Handle::Region(region)) => {
-                let gone = region
-                    .lock()
-                    .grants
-                    .revoke(id)
-                    .map_err(|err| table_errno(&err))?;
+                let (gone, grants) = {
+                    let mut region = region.lock();
+                    let grants = region.grants.subtree_len(id);
+                    let gone = region.grants.revoke(id).map_err(|err| table_errno(&err))?;
+                    (gone, grants)
+                };
                 if !gone.is_empty() {
-                    info!("regbuf: {id} revoked, unmapping {} mapping(s)", gone.len());
+                    info!(
+                        "regbuf: {id} revoked with {} grant(s) under it, unmapping {} mapping(s)",
+                        grants.saturating_sub(1),
+                        gone.len()
+                    );
                 }
                 take_down(&region, gone, token);
                 Ok(0)
@@ -365,12 +429,12 @@ impl KernelScheme for RegBufScheme {
         let (frames, bounces) = plan_frames(&guard.frames, &plan)?;
         let prot = map.flags & (MapFlags::PROT_READ | MapFlags::PROT_WRITE);
         let span = map_frames(addr_space, &frames, prot, token)?;
-        let mapping = Mapping {
+        let mapping = Mapping::Cpu(CpuMapping {
             space: Arc::downgrade(addr_space),
             span,
             bounces,
             writable: write,
-        };
+        });
         if let Err((err, mapping)) = guard.grants.add_mapping(id, mapping) {
             // Not reached: the region stayed locked since check_map.
             drop(guard);
@@ -550,12 +614,12 @@ fn map_frames(
     if mapped != frames.len() {
         // The page tables ran out part way.
         let none = unmap_all(
-            alloc::vec![Mapping {
+            alloc::vec![Mapping::Cpu(CpuMapping {
                 space: Arc::downgrade(space),
                 span,
                 bounces: Vec::new(),
                 writable: false,
-            }],
+            })],
             token,
         );
         debug_assert!(none.is_empty());
@@ -577,10 +641,117 @@ fn unmap(
     let mapping = region
         .lock()
         .grants
-        .take_mapping(id, |m| {
-            m.span.base == base && core::ptr::eq(m.space.as_ptr(), Arc::as_ptr(&space))
+        .take_mapping(id, |m| match m {
+            Mapping::Cpu(m) => {
+                m.span.base == base && core::ptr::eq(m.space.as_ptr(), Arc::as_ptr(&space))
+            }
+            #[cfg(iommu_enabled)]
+            Mapping::Dma(_) => false,
         })
         .map_err(|err| table_errno(&err))?;
     take_down(region, alloc::vec![mapping], token);
     Ok(0)
+}
+
+/// A grant a driver named by descriptor in `MapGrant`, resolved to its region.
+#[cfg(iommu_enabled)]
+pub struct DmaGrant {
+    region: Arc<Mutex<Region>>,
+    id: GrantId,
+}
+
+#[cfg(iommu_enabled)]
+impl DmaGrant {
+    /// The grant behind the calling process's descriptor `fd`.
+    ///
+    /// # Errors
+    ///
+    /// `EBADF` when `fd` is not open and `EINVAL` when it is not a grant of this scheme.
+    pub fn from_fd(fd: usize, token: &mut CleanLockToken) -> Result<Self> {
+        let (scheme, number) = {
+            let current = context::current();
+            let mut current = current.read(token.token());
+            let (context, mut token) = current.token_split();
+            let file = context
+                .get_file(FileHandle::from(fd), &mut token)
+                .ok_or(Error::new(EBADF))?;
+            let desc = file.description.read(token.token());
+            (desc.scheme_ref.clone(), desc.number)
+        };
+        if !matches!(scheme, KernelSchemeRef::Global(GlobalSchemes::RegBuf)) {
+            return Err(Error::new(EINVAL));
+        }
+        match handle(number)? {
+            Handle::Grant { region, id } => Ok(Self { region, id }),
+            Handle::Root { .. } | Handle::Region(_) => Err(Error::new(EINVAL)),
+        }
+    }
+
+    /// The grant's ID.
+    pub fn id(&self) -> GrantId {
+        self.id
+    }
+
+    /// The link from a mapping of this grant back to it.
+    pub fn link(&self) -> DmaLink {
+        DmaLink {
+            region: Arc::downgrade(&self.region),
+            id: self.id,
+        }
+    }
+
+    /// Maps the grant into a domain: `map` gets the grant's frames in order and whether the
+    /// device may write them, maps them and returns where; the grant then records the mapping,
+    /// so revoking or closing it takes the mapping down. The region stays locked throughout,
+    /// so a revocation either comes first (and the grant is refused) or finds the mapping.
+    ///
+    /// # Errors
+    ///
+    /// `ECANCELED` once the grant is revoked, `EINVAL` when it is not page-aligned, `ENOENT`
+    /// when it is closed, and `map`'s error.
+    pub fn map(&self, map: impl FnOnce(&[Frame], bool) -> Result<DmaRecord>) -> Result<DmaRecord> {
+        let mut region = self.region.lock();
+        let (pages, access) = region
+            .grants
+            .check_dma(self.id)
+            .map_err(|err| table_errno(&err))?;
+        let frames = pages
+            .first
+            .checked_add(pages.count)
+            .and_then(|end| region.frames.get(pages.first..end))
+            .ok_or(Error::new(EINVAL))?
+            .iter()
+            .map(RaiiFrame::get)
+            .collect::<Vec<_>>();
+        let record = map(&frames, access.allows_write())?;
+        if let Err((err, _)) = region.grants.add_mapping(self.id, Mapping::Dma(record)) {
+            // Not reached: the region stayed locked since check_dma.
+            drop(region);
+            super::iommu::revoke_grant_mapping(record);
+            return Err(table_errno(&err));
+        }
+        Ok(record)
+    }
+}
+
+/// The way back from an IOMMU mapping to the grant that records it, so a driver's own
+/// `UnmapGrant` can drop the record too.
+#[cfg(iommu_enabled)]
+pub struct DmaLink {
+    region: Weak<Mutex<Region>>,
+    id: GrantId,
+}
+
+#[cfg(iommu_enabled)]
+impl DmaLink {
+    /// Forgets the grant's record of `record`, a mapping the driver took down itself, so the
+    /// grant does not keep it until it is revoked or closed. Nothing when the grant is gone.
+    pub fn forget(&self, record: DmaRecord) {
+        if let Some(region) = self.region.upgrade() {
+            let _ = region
+                .lock()
+                .grants
+                .take_mapping(self.id, |m| matches!(m, Mapping::Dma(r) if *r == record));
+        }
+    }
 }
