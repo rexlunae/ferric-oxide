@@ -4,13 +4,31 @@
 //! The table knows nothing about address spaces: a mapping is whatever `M` the kernel records
 //! (the address space and the span it mapped), and the table hands mappings back when they must
 //! be taken down: on [`GrantTable::revoke`], [`GrantTable::remove`] (the grant's descriptor was
-//! closed) and [`GrantTable::revoke_all`] (the region's was). It never hands back the same
-//! mapping twice, and once a grant is revoked it refuses new mappings, so taking down what it
-//! returned leaves nothing of the grant mapped.
+//! closed), [`GrantTable::take_mapping`] (the holder dropped one) and [`GrantTable::close`] (the
+//! region's descriptor was). It never hands back the same mapping twice, and once a grant is
+//! revoked it refuses new mappings, so taking down what it returned leaves nothing of the grant
+//! mapped.
 //!
 //! Grants are byte-granular. [`GrantTable::check_map`] plans a mapping of a grant's window
 //! ([`MapPlan`]): which region pages it maps, and which of them the grant covers only in part
 //! ([`PartialPage`]), which the kernel maps as bounce pages instead of the region's own.
+//!
+//! # Teardowns
+//!
+//! The kernel unmaps without holding the region's lock, so a mapping the table handed back
+//! ([`Taken`]) is *in flight* until the kernel reports the outcome: [`GrantTable::finish`] once
+//! it is unmapped, or [`GrantTable::restore`] when unmapping failed, which records the mapping
+//! again (a revoked or closed grant still refuses new mappings, so it stays blocked) for the
+//! next [`GrantTable::revoke`] to retry. The table counts in-flight teardowns per grant, so:
+//!
+//! - [`GrantTable::revoke`] of a grant whose descriptor is closing still finds it, and
+//!   [`GrantTable::settled`] says when every mapping of it is gone, whoever took it down. The
+//!   kernel's `Revoke` waits for that before it returns.
+//! - [`GrantTable::idle`] says when no teardown is in flight at all, so a closed region keeps
+//!   its frames until the last one finishes.
+//! - Once [`GrantTable::close`] has run, [`GrantTable::register`] and [`GrantTable::create`]
+//!   fail with [`TableError::Closed`], so a registration racing the close cannot install
+//!   frames nobody will release.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::fmt;
@@ -40,6 +58,8 @@ pub enum TableError {
     NoMapping(GrantId),
     /// Every grant ID has been used.
     IdsExhausted,
+    /// The region's descriptor has closed.
+    Closed,
 }
 
 impl fmt::Display for TableError {
@@ -54,6 +74,7 @@ impl fmt::Display for TableError {
             Self::Access(id) => write!(f, "{id} is read-only"),
             Self::NoMapping(id) => write!(f, "{id} has no such mapping"),
             Self::IdsExhausted => f.write_str("grant IDs exhausted"),
+            Self::Closed => f.write_str("region is closed"),
         }
     }
 }
@@ -122,12 +143,34 @@ fn partial_window_pages(spec: &GrantSpec) -> [Option<(u64, u64, u64)>; 2] {
     [head, back]
 }
 
+/// A mapping the table handed back to be taken down, with the grant it belongs to. It stays in
+/// flight until the caller passes it to [`GrantTable::finish`] or [`GrantTable::restore`].
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a taken mapping must be finished or restored"]
+pub struct Taken<M> {
+    /// The grant that made the mapping.
+    pub grant: GrantId,
+    /// The mapping.
+    pub mapping: M,
+}
+
 /// One grant.
 #[derive(Debug)]
 struct Entry<M> {
     spec: GrantSpec,
     revoked: bool,
+    /// The grant's descriptor has closed; the entry stays until its teardowns are done.
+    closed: bool,
     mappings: Vec<M>,
+    /// Mappings handed back and not yet finished or restored.
+    in_flight: usize,
+}
+
+impl<M> Entry<M> {
+    /// Whether nothing of the grant is mapped or being unmapped.
+    fn settled(&self) -> bool {
+        self.in_flight == 0 && self.mappings.is_empty()
+    }
 }
 
 /// The grants of one region, with the mappings each has made.
@@ -135,6 +178,9 @@ struct Entry<M> {
 pub struct GrantTable<M> {
     region_len: u64,
     next_id: u64,
+    closed: bool,
+    /// The sum of every entry's `in_flight`.
+    in_flight: usize,
     grants: BTreeMap<GrantId, Entry<M>>,
 }
 
@@ -150,6 +196,8 @@ impl<M> GrantTable<M> {
         Self {
             region_len: 0,
             next_id: 1,
+            closed: false,
+            in_flight: 0,
             grants: BTreeMap::new(),
         }
     }
@@ -158,9 +206,13 @@ impl<M> GrantTable<M> {
     ///
     /// # Errors
     ///
-    /// [`TableError::AlreadyRegistered`] when memory is registered already and
-    /// [`TableError::Unaligned`] when `len` is zero or not a multiple of [`PAGE_SIZE`].
+    /// [`TableError::Closed`] once the region has closed, [`TableError::AlreadyRegistered`]
+    /// when memory is registered already and [`TableError::Unaligned`] when `len` is zero or
+    /// not a multiple of [`PAGE_SIZE`].
     pub fn register(&mut self, len: u64) -> Result<(), TableError> {
+        if self.closed {
+            return Err(TableError::Closed);
+        }
         if self.region_len != 0 {
             return Err(TableError::AlreadyRegistered);
         }
@@ -178,22 +230,42 @@ impl<M> GrantTable<M> {
 
     /// How many grants are open (revoked ones included, until their descriptors close).
     pub fn len(&self) -> usize {
-        self.grants.len()
+        self.grants.values().filter(|e| !e.closed).count()
     }
 
     /// Whether no grant is open.
     pub fn is_empty(&self) -> bool {
-        self.grants.is_empty()
+        self.len() == 0
+    }
+
+    /// Whether [`GrantTable::close`] has run.
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether no teardown is in flight: every [`Taken`] mapping has been finished or
+    /// restored.
+    pub const fn idle(&self) -> bool {
+        self.in_flight == 0
+    }
+
+    /// Whether nothing of grant `id` is mapped or being unmapped any more: true for a grant
+    /// that is gone, or was never made.
+    pub fn settled(&self, id: GrantId) -> bool {
+        self.grants.get(&id).is_none_or(Entry::settled)
     }
 
     /// Makes a grant and returns its ID.
     ///
     /// # Errors
     ///
-    /// [`TableError::NotRegistered`] before registration, [`TableError::OutOfRange`] when the
-    /// range does not lie inside the region and [`TableError::IdsExhausted`] after `u64::MAX`
-    /// grants.
+    /// [`TableError::Closed`] once the region has closed, [`TableError::NotRegistered`] before
+    /// registration, [`TableError::OutOfRange`] when the range does not lie inside the region
+    /// and [`TableError::IdsExhausted`] after `u64::MAX` grants.
     pub fn create(&mut self, spec: GrantSpec) -> Result<GrantId, TableError> {
+        if self.closed {
+            return Err(TableError::Closed);
+        }
         if self.region_len == 0 {
             return Err(TableError::NotRegistered);
         }
@@ -210,7 +282,9 @@ impl<M> GrantTable<M> {
             Entry {
                 spec,
                 revoked: false,
+                closed: false,
                 mappings: Vec::new(),
+                in_flight: 0,
             },
         );
         Ok(id)
@@ -221,12 +295,44 @@ impl<M> GrantTable<M> {
         id.get() != 0 && id.get() < self.next_id
     }
 
+    /// The entry of open grant `id`; one whose descriptor has closed is not open.
     fn entry(&self, id: GrantId) -> Result<&Entry<M>, TableError> {
-        self.grants.get(&id).ok_or(TableError::Unknown(id))
+        self.grants
+            .get(&id)
+            .filter(|e| !e.closed)
+            .ok_or(TableError::Unknown(id))
     }
 
     fn entry_mut(&mut self, id: GrantId) -> Result<&mut Entry<M>, TableError> {
-        self.grants.get_mut(&id).ok_or(TableError::Unknown(id))
+        self.grants
+            .get_mut(&id)
+            .filter(|e| !e.closed)
+            .ok_or(TableError::Unknown(id))
+    }
+
+    /// Hands `mappings` of grant `id` back for teardown, counting them in flight.
+    fn hand_out(
+        in_flight: &mut usize,
+        id: GrantId,
+        entry: &mut Entry<M>,
+    ) -> impl Iterator<Item = Taken<M>> {
+        let mappings = core::mem::take(&mut entry.mappings);
+        entry.in_flight = entry.in_flight.saturating_add(mappings.len());
+        *in_flight = in_flight.saturating_add(mappings.len());
+        mappings
+            .into_iter()
+            .map(move |mapping| Taken { grant: id, mapping })
+    }
+
+    /// Forgets grant `id` if its descriptor has closed and nothing of it is left.
+    fn drop_if_done(&mut self, id: GrantId) {
+        if self
+            .grants
+            .get(&id)
+            .is_some_and(|e| e.closed && e.settled())
+        {
+            self.grants.remove(&id);
+        }
     }
 
     /// What [`crate::abi::Request::Info`] reports about grant `id`.
@@ -243,7 +349,8 @@ impl<M> GrantTable<M> {
         })
     }
 
-    /// How many mappings grant `id` has, or zero when it is not open.
+    /// How many mappings grant `id` has recorded (not counting those in flight), or zero when
+    /// it is gone.
     pub fn mapping_count(&self, id: GrantId) -> usize {
         self.grants.get(&id).map_or(0, |e| e.mappings.len())
     }
@@ -324,7 +431,7 @@ impl<M> GrantTable<M> {
         Ok(())
     }
 
-    /// Removes and returns the first mapping of grant `id` that `matches`.
+    /// Removes and returns the first mapping of grant `id` that `matches`, in flight.
     ///
     /// # Errors
     ///
@@ -334,54 +441,97 @@ impl<M> GrantTable<M> {
         &mut self,
         id: GrantId,
         matches: impl FnMut(&M) -> bool,
-    ) -> Result<M, TableError> {
+    ) -> Result<Taken<M>, TableError> {
         let entry = self.entry_mut(id)?;
         let index = entry
             .mappings
             .iter()
             .position(matches)
             .ok_or(TableError::NoMapping(id))?;
-        Ok(entry.mappings.swap_remove(index))
+        let mapping = entry.mappings.swap_remove(index);
+        entry.in_flight = entry.in_flight.saturating_add(1);
+        self.in_flight = self.in_flight.saturating_add(1);
+        Ok(Taken { grant: id, mapping })
     }
 
-    /// Revokes grant `id` and returns its mappings, which the caller must take down. A grant
-    /// whose descriptor has closed is gone already, so revoking it returns nothing; so does
-    /// revoking a revoked grant.
+    /// Revokes grant `id` and returns its recorded mappings, in flight, which the caller must
+    /// take down. A grant whose descriptor is closing is revoked too, and returns what a failed
+    /// teardown restored; one that is gone, or revoked already, returns nothing. Either way the
+    /// caller then waits for [`GrantTable::settled`], since another caller may still be
+    /// unmapping mappings of the grant.
     ///
     /// # Errors
     ///
     /// [`TableError::Unknown`] when no grant with this ID was ever made from the region.
-    pub fn revoke(&mut self, id: GrantId) -> Result<Vec<M>, TableError> {
+    pub fn revoke(&mut self, id: GrantId) -> Result<Vec<Taken<M>>, TableError> {
         let issued = self.issued(id);
         match self.grants.get_mut(&id) {
             Some(entry) => {
                 entry.revoked = true;
-                Ok(core::mem::take(&mut entry.mappings))
+                Ok(Self::hand_out(&mut self.in_flight, id, entry).collect())
             }
             None if issued => Ok(Vec::new()),
             None => Err(TableError::Unknown(id)),
         }
     }
 
-    /// Forgets grant `id`, whose descriptor has closed, and returns its mappings, which the
-    /// caller must take down. Nothing when it is not open.
-    pub fn remove(&mut self, id: GrantId) -> Vec<M> {
-        self.grants
-            .remove(&id)
-            .map(|e| e.mappings)
-            .unwrap_or_default()
+    /// Closes grant `id`, whose descriptor has closed, and returns its mappings, in flight,
+    /// which the caller must take down. The table forgets the grant once nothing of it is left.
+    /// Nothing when it is not open.
+    pub fn remove(&mut self, id: GrantId) -> Vec<Taken<M>> {
+        let taken = match self.grants.get_mut(&id) {
+            Some(entry) if !entry.closed => {
+                entry.closed = true;
+                Self::hand_out(&mut self.in_flight, id, entry).collect()
+            }
+            _ => return Vec::new(),
+        };
+        self.drop_if_done(id);
+        taken
     }
 
-    /// Revokes every grant (the region's descriptor has closed) and returns all their
-    /// mappings, which the caller must take down. Grants stay in the table, revoked, until
+    /// Closes the region (its descriptor has closed): revokes every grant and returns all their
+    /// mappings, in flight, which the caller must take down. Registering and making grants
+    /// fail with [`TableError::Closed`] from now on. Grants stay in the table, revoked, until
     /// their own descriptors close.
-    pub fn revoke_all(&mut self) -> Vec<M> {
+    pub fn close(&mut self) -> Vec<Taken<M>> {
+        self.closed = true;
         let mut all = Vec::new();
-        for entry in self.grants.values_mut() {
+        for (&id, entry) in &mut self.grants {
             entry.revoked = true;
-            all.append(&mut entry.mappings);
+            all.extend(Self::hand_out(&mut self.in_flight, id, entry));
         }
         all
+    }
+
+    /// Ends the teardown of `taken`: its mapping is unmapped. Returns the mapping, so the
+    /// caller can finish with it (copy data back, drop it) under the same lock.
+    pub fn finish(&mut self, taken: Taken<M>) -> M {
+        let Taken { grant, mapping } = taken;
+        self.end_teardown(grant);
+        self.drop_if_done(grant);
+        mapping
+    }
+
+    /// Ends the teardown of `taken` without success: its mapping is still there, so it is
+    /// recorded again. The grant was revoked or closed, so it stays blocked from new mappings,
+    /// and the next [`GrantTable::revoke`] hands the mapping back for another try.
+    pub fn restore(&mut self, taken: Taken<M>) {
+        let Taken { grant, mapping } = taken;
+        self.end_teardown(grant);
+        if let Some(entry) = self.grants.get_mut(&grant) {
+            entry.mappings.push(mapping);
+        }
+    }
+
+    /// Counts one teardown of grant `id` as done.
+    fn end_teardown(&mut self, id: GrantId) {
+        if let Some(entry) = self.grants.get_mut(&id)
+            && entry.in_flight > 0
+        {
+            entry.in_flight -= 1;
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -460,6 +610,13 @@ mod tests {
             t.check_map(missing, 0, P, false),
             Err(TableError::Unknown(missing))
         );
+    }
+
+    /// Finishes every taken mapping and returns the mappings, sorted.
+    fn finish_all(t: &mut GrantTable<u32>, taken: Vec<Taken<u32>>) -> Vec<u32> {
+        let mut done: Vec<u32> = taken.into_iter().map(|taken| t.finish(taken)).collect();
+        done.sort_unstable();
+        done
     }
 
     #[test]
@@ -548,9 +705,13 @@ mod tests {
         t.add_mapping(g, 10).expect("live");
         t.add_mapping(g, 11).expect("live");
         assert_eq!(t.mapping_count(g), 2);
-        let mut gone = t.revoke(g).expect("issued");
-        gone.sort_unstable();
-        assert_eq!(gone, [10, 11]);
+        let gone = t.revoke(g).expect("issued");
+        assert!(gone.iter().all(|taken| taken.grant == g));
+        assert!(!t.settled(g));
+        assert!(!t.idle());
+        assert_eq!(finish_all(&mut t, gone), [10, 11]);
+        assert!(t.settled(g));
+        assert!(t.idle());
         assert_eq!(t.revoke(g), Ok(Vec::new()));
         assert_eq!(t.check_map(g, 0, P, false), Err(TableError::Revoked(g)));
         assert_eq!(t.add_mapping(g, 12), Err((TableError::Revoked(g), 12)));
@@ -563,10 +724,12 @@ mod tests {
         let mut t = table(1);
         let g = t.create(spec(Access::Read, 0, P)).expect("fits");
         t.add_mapping(g, 1).expect("live");
-        assert_eq!(t.remove(g), [1]);
+        let taken = t.remove(g);
         assert!(t.is_empty());
+        assert_eq!(finish_all(&mut t, taken), [1]);
+        assert!(t.settled(g));
         assert_eq!(t.revoke(g), Ok(Vec::new()));
-        assert_eq!(t.remove(g), Vec::<u32>::new());
+        assert!(t.remove(g).is_empty());
         let never = GrantId::new(2);
         assert_eq!(t.revoke(never), Err(TableError::Unknown(never)));
         assert_eq!(
@@ -581,28 +744,129 @@ mod tests {
         let g = t.create(spec(Access::Read, 0, P)).expect("fits");
         t.add_mapping(g, 5).expect("live");
         t.add_mapping(g, 6).expect("live");
-        assert_eq!(t.take_mapping(g, |&m| m == 6), Ok(6));
+        let taken = t.take_mapping(g, |&m| m == 6).expect("recorded");
+        assert_eq!(
+            taken,
+            Taken {
+                grant: g,
+                mapping: 6
+            }
+        );
         assert_eq!(
             t.take_mapping(g, |&m| m == 6),
             Err(TableError::NoMapping(g))
         );
         assert_eq!(t.mapping_count(g), 1);
+        assert!(!t.idle());
+        assert_eq!(t.finish(taken), 6);
+        assert!(t.idle());
     }
 
     #[test]
-    fn revoke_all_covers_every_grant() {
+    fn close_covers_every_grant_and_refuses_new_ones() {
         let mut t = table(4);
         let a = t.create(spec(Access::Read, 0, P)).expect("fits");
         let b = t.create(spec(Access::ReadWrite, P, P)).expect("fits");
         t.add_mapping(a, 1).expect("live");
         t.add_mapping(b, 2).expect("live");
         t.add_mapping(b, 3).expect("live");
-        let mut all = t.revoke_all();
-        all.sort_unstable();
-        assert_eq!(all, [1, 2, 3]);
+        let all = t.close();
+        assert!(t.is_closed());
+        assert_eq!(finish_all(&mut t, all), [1, 2, 3]);
         assert_eq!(t.check_map(a, 0, P, false), Err(TableError::Revoked(a)));
         assert_eq!(t.check_map(b, 0, P, false), Err(TableError::Revoked(b)));
-        assert!(t.revoke_all().is_empty());
+        assert!(t.close().is_empty());
         assert_eq!(t.len(), 2);
+        assert_eq!(t.create(spec(Access::Read, 0, P)), Err(TableError::Closed));
+    }
+
+    /// Finding: a registration that loses the race with the region's close must not install
+    /// its frames (their charge would never be refunded).
+    #[test]
+    fn register_after_close_fails() {
+        let mut t = GrantTable::<u32>::new();
+        assert!(t.close().is_empty());
+        assert_eq!(t.register(P), Err(TableError::Closed));
+        assert_eq!(t.region_len(), 0);
+        assert!(t.idle());
+    }
+
+    /// Finding: `Revoke` of a grant whose descriptor is closing must not report success while
+    /// the close is still unmapping.
+    #[test]
+    fn revoke_waits_for_a_closing_grant() {
+        let mut t = table(2);
+        let g = t.create(spec(Access::ReadWrite, 0, 2 * P)).expect("fits");
+        t.add_mapping(g, 7).expect("live");
+        // The grant's descriptor closes; its close is unmapping 7, unlocked.
+        let closing = t.remove(g);
+        assert!(t.is_empty());
+        // Revoke still knows the grant, has nothing of its own to unmap, and is not settled.
+        assert_eq!(t.revoke(g), Ok(Vec::new()));
+        assert!(!t.settled(g));
+        assert_eq!(t.check_map(g, 0, P, false), Err(TableError::Unknown(g)));
+        assert_eq!(finish_all(&mut t, closing), [7]);
+        assert!(t.settled(g));
+        // Nothing of the grant is left, so the table forgot it.
+        assert_eq!(t.mapping_count(g), 0);
+        assert_eq!(t.revoke(g), Ok(Vec::new()));
+    }
+
+    /// Finding: an unmap that fails must leave the mapping recorded and the grant blocked, so
+    /// `Revoke` can report the failure and a later one retries.
+    #[test]
+    fn restore_keeps_a_failed_mapping_blocked_and_retryable() {
+        let mut t = table(2);
+        let g = t.create(spec(Access::ReadWrite, 0, 2 * P)).expect("fits");
+        t.add_mapping(g, 1).expect("live");
+        t.add_mapping(g, 2).expect("live");
+        let mut taken = t.revoke(g).expect("issued");
+        taken.sort_unstable_by_key(|taken| taken.mapping);
+        let failed = taken.pop().expect("two taken");
+        assert_eq!(finish_all(&mut t, taken), [1]);
+        t.restore(failed);
+        assert!(t.idle());
+        assert!(!t.settled(g));
+        assert_eq!(t.mapping_count(g), 1);
+        assert_eq!(t.check_map(g, 0, P, false), Err(TableError::Revoked(g)));
+        assert_eq!(t.add_mapping(g, 3), Err((TableError::Revoked(g), 3)));
+        // The next Revoke hands it back for another try.
+        let retry = t.revoke(g).expect("issued");
+        assert_eq!(finish_all(&mut t, retry), [2]);
+        assert!(t.settled(g));
+    }
+
+    #[test]
+    fn restore_on_a_closed_grant_keeps_it_until_revoked() {
+        let mut t = table(1);
+        let g = t.create(spec(Access::Read, 0, P)).expect("fits");
+        t.add_mapping(g, 4).expect("live");
+        let mut closing = t.remove(g);
+        t.restore(closing.pop().expect("one taken"));
+        // Closed, but still holding the mapping: not forgotten, not open, not settled.
+        assert!(t.is_empty());
+        assert!(!t.settled(g));
+        assert_eq!(t.info(g), Err(TableError::Unknown(g)));
+        let retry = t.revoke(g).expect("issued");
+        assert_eq!(finish_all(&mut t, retry), [4]);
+        assert!(t.settled(g));
+    }
+
+    #[test]
+    fn idle_counts_teardowns_across_grants() {
+        let mut t = table(2);
+        let a = t.create(spec(Access::Read, 0, P)).expect("fits");
+        let b = t.create(spec(Access::Read, P, P)).expect("fits");
+        t.add_mapping(a, 1).expect("live");
+        t.add_mapping(b, 2).expect("live");
+        let from_a = t.take_mapping(a, |_| true).expect("recorded");
+        let from_b = t.remove(b);
+        // The region closes while both teardowns are in flight: it must not be idle.
+        assert!(t.close().is_empty());
+        assert!(!t.idle());
+        assert_eq!(t.finish(from_a), 1);
+        assert!(!t.idle());
+        assert_eq!(finish_all(&mut t, from_b), [2]);
+        assert!(t.idle());
     }
 }

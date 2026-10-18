@@ -674,7 +674,9 @@ impl UserInner {
                 None,
                 |dst_page, page_flags, mapper, flusher| {
                     let is_pinned = true;
-                    Grant::allocated_shared(&frames, dst_page, page_flags, mapper, flusher, is_pinned)
+                    Grant::allocated_shared(
+                        &frames, dst_page, page_flags, mapper, flusher, is_pinned,
+                    )
                 },
             )?;
         } else if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {

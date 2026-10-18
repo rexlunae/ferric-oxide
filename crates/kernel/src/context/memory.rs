@@ -562,22 +562,52 @@ impl AddrSpaceWrapper {
         page: Page,
         token: &mut CleanLockToken,
     ) -> Result<RaiiFrame> {
-        // Ferric Oxide: the private-memory case of `borrow_frame_enforce_rw`.
-        self.borrow_frame_enforce_rw(page, false, token)
+        // Ferric Oxide: the body is `borrow_frame_enforce_rw_with`, shared with
+        // `borrow_frame_enforce_rw_anonymous`.
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| matches!(provider, Provider::Allocated { .. }),
+            token,
+        )
     }
-    /// Ferric Oxide: borrows a read/write page of anonymous user memory, as
-    /// `borrow_frame_enforce_rw_allocated` does; with `shared`, `MAP_SHARED` anonymous memory
-    /// is accepted too (regbuf regions). Pages the process only borrows from another (pinned
-    /// borrows, context/reshare.rs) never are.
+    /// Ferric Oxide: borrows a read/write page of anonymous user memory, private or
+    /// `MAP_SHARED`, as `borrow_frame_enforce_rw_allocated` does, but refusing private mappings
+    /// of a file, physically contiguous allocations and pages the process only borrows from
+    /// another (pinned borrows, context/reshare.rs): regbuf registration, which must pin plain
+    /// anonymous memory of the caller's own.
     ///
     /// # Errors
     ///
-    /// `EINVAL` when the page is not mapped, `EPERM` when it is not read/write memory of an
-    /// accepted kind, `ENOMEM` when memory runs out.
-    pub fn borrow_frame_enforce_rw(
+    /// `EINVAL` when the page is not mapped, `EPERM` when it is not read/write anonymous
+    /// memory of the caller's own, `ENOMEM` when memory runs out.
+    #[cfg(feature = "regbuf")]
+    pub fn borrow_frame_enforce_rw_anonymous(
         self: &Arc<Self>,
         page: Page,
-        shared: bool,
+        token: &mut CleanLockToken,
+    ) -> Result<RaiiFrame> {
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| {
+                matches!(
+                    provider,
+                    Provider::Allocated {
+                        cow_file_ref: None,
+                        phys_contiguous: false,
+                    } | Provider::AllocatedShared {
+                        is_pinned_userscheme_borrow: false,
+                    }
+                )
+            },
+            token,
+        )
+    }
+    /// Ferric Oxide: borrows a read/write page whose grant provider `accepts`
+    /// (`borrow_frame_enforce_rw_allocated` and `borrow_frame_enforce_rw_anonymous`).
+    fn borrow_frame_enforce_rw_with(
+        self: &Arc<Self>,
+        page: Page,
+        accepts: impl FnOnce(&Provider) -> bool,
         token: &mut CleanLockToken,
     ) -> Result<RaiiFrame> {
         let mut lock_token = token.token();
@@ -588,14 +618,7 @@ impl AddrSpaceWrapper {
         if !info.can_have_flags(MapFlags::PROT_READ | MapFlags::PROT_WRITE) {
             return Err(Error::new(EPERM));
         }
-        let accepted = match info.provider {
-            Provider::Allocated { .. } => true,
-            Provider::AllocatedShared {
-                is_pinned_userscheme_borrow: false,
-            } => shared,
-            _ => false,
-        };
-        if !accepted {
+        if !accepts(&info.provider) {
             return Err(Error::new(EPERM));
         }
 
@@ -1405,7 +1428,10 @@ impl Grant {
             return Err(Error::new(EINVAL));
         }
         let mut mapped: usize = 0;
-        for ((frame, info), page) in infos.flatten().zip(PageSpan::new(base, frames.len()).pages()) {
+        for ((frame, info), page) in infos
+            .flatten()
+            .zip(PageSpan::new(base, frames.len()).pages())
+        {
             // Semantically, the page will be shared between the "context struct" and
             // whatever else.
             if info.add_ref(RefKind::Shared).is_err() {

@@ -325,8 +325,9 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 13] = [
+    let steps: [(&str, Step); 14] = [
         ("regbuf-register", register),
+        ("regbuf-file-backed", file_backed),
         ("regbuf-grant-rw", grant_rw),
         ("regbuf-grant-ro", grant_ro),
         ("regbuf-pinned", pinned_mapping),
@@ -412,6 +413,75 @@ fn register(t: &mut Test) -> Result<(), Failure> {
         });
     }
     t.region = Some(region);
+    Ok(())
+}
+
+/// A private writable mapping of a file cannot be registered (`EPERM`), even with its page
+/// populated: only anonymous memory can.
+fn file_backed(t: &mut Test) -> Result<(), Failure> {
+    let path = std::env::temp_dir().join("ferric-regbuf-test.bin");
+    let io = |what: &'static str| {
+        move |err: std::io::Error| Failure::Errno {
+            what,
+            errno: err
+                .raw_os_error()
+                .and_then(|e| usize::try_from(e).ok())
+                .unwrap_or(errno::EIO),
+        }
+    };
+    std::fs::write(&path, vec![0x77; PAGE_SIZE as usize]).map_err(io("write the file"))?;
+    let file = std::fs::File::open(&path).map_err(io("open the file"))?;
+    // SAFETY: a fresh private mapping of the file at an address the kernel chooses.
+    let ptr = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGE_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(Failure::Errno {
+            what: "mmap the file",
+            errno: super::last_errno(),
+        });
+    }
+    // SAFETY: the page is mapped readable and writable until the munmap below; writing it
+    // gives the mapping a private copy, which is still not anonymous memory.
+    unsafe { ptr.cast::<u8>().write_volatile(0x78) };
+    let region = ctx(
+        "open a region",
+        Fd::open(&region_path(), O_RDWR | O_CLOEXEC, 0),
+    );
+    let result = region.and_then(|region| {
+        expect_errno(
+            "Register of a file-backed private mapping",
+            errno::EPERM,
+            call(
+                &region,
+                "Register",
+                Request::Register {
+                    addr: ptr as u64,
+                    len: PAGE_SIZE,
+                },
+            ),
+        )
+    });
+    // SAFETY: unmaps the mapping made above, which nothing uses afterwards.
+    unsafe { libc::munmap(ptr, PAGE_SIZE as usize) };
+    let _ = std::fs::remove_file(&path);
+    result?;
+    let expected = t.pinned_before + PAGES as u64;
+    let got = pinned(&t.root)?;
+    if got != expected {
+        return Err(Failure::Pinned {
+            what: "after a refused Register",
+            expected,
+            got,
+        });
+    }
     Ok(())
 }
 
