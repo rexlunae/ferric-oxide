@@ -624,7 +624,8 @@ refuses one configured with another URL or pin), writes `[policy]` if
 present, installs every package and then writes the lock file, `fox.lock`
 beside the set unless `--lock` names another. The lock (`fox-lock/1`)
 records each package's version, its registry or its git URL and commit, a
-digest of its build request and the BLAKE3 of the archive installed:
+digest of its build request, the target the archive was built for and the
+BLAKE3 of the archive installed:
 
 ```toml
 format = "fox-lock/1"
@@ -634,6 +635,7 @@ name = "nginx"
 version = "1.27.3"
 registry = "ferric"
 request-blake3 = "<BLAKE3 of the build request>"
+target = "x86_64-unknown-redox"
 pkgar-blake3 = "<BLAKE3 of the archive>"
 ```
 
@@ -642,12 +644,15 @@ normalized URL (a local directory becomes the `file://` URL of its
 canonical path, so the same checkout always has the same identity), the
 revision (`rev`, or a `#` fragment of the URL; the two must agree if both
 are given), `path`, `package`, the features (sorted, without repeats),
-`default-features` and the target (the entry's, else `--target`'s, else the
-host of the toolchain rustup selects, from `rustc -vV`, which can differ
-from the target `fox` itself was built for; `fox`'s own target only if no
-toolchain runs). Sync passes that target to the build and the prebuilt
-choice explicitly, so the lock records what was built, and locks from
-different hosts do not share pins. A git
+`default-features` and the target asked for (the entry's, else
+`--target`'s, else none). Without one, the target an archive gets depends
+on the host: the toolchain the source's `rust-toolchain.toml` selects for a
+build, `fox`'s own target for a prebuilt. So it cannot be known before the
+build and is not part of the request. The lock instead records the
+target the archive was actually built for, and when a locked package
+has to be installed again, an archive for another target is refused
+(name a target, or use `--update`), as a different commit or archive is.
+A git
 source that is neither a git URL nor an existing directory is an error,
 not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
 on any incompatible change to its fields.
