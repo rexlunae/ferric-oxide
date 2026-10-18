@@ -114,6 +114,11 @@ impl UnmapState {
     /// [`UnmapFailure::Backend`] on the first backend failure, and
     /// [`UnmapFailure::PreviouslyFailed`] on every later attempt after that failure.
     ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `unmap`; callers must use a non-panicking backend so its
+    /// invalidation outcome is recorded.
+    ///
     /// # Examples
     ///
     /// ```
@@ -154,6 +159,10 @@ impl UnmapState {
 /// # Errors
 ///
 /// Returns the error from `unmap` without removing or dropping the mapping entry.
+///
+/// # Panics
+///
+/// Propagates a panic from `unmap`, leaving the entry in `mappings`.
 pub fn complete_unmap<T, E>(
     mappings: &mut BTreeMap<u64, T>,
     iova: u64,
