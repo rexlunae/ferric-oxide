@@ -1,0 +1,9 @@
+[package]
+name = "ferric-amdvi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "AMD-Vi (AMD IOMMU): IVRS table parsing, device table entries, host page tables, command buffer and event log encoding"
+
+[dependencies]
+ferric-iommu = { path = "../iommu" }

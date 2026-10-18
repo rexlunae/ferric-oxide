@@ -10,22 +10,21 @@
 //! address width ([`Agaw`]). Entries are built with [`sl_table`] and [`sl_page`]; [`map`]
 //! installs a mapping in tables held by a [`TableMemory`], and [`translate`] walks them.
 //!
+//! The walk itself is the radix-table code in `ferric_iommu::table`, which AMD-Vi shares;
+//! [`SecondStage`] is the VT-d entry encoding it is given, and the functions here fix it and
+//! take the address width as an [`Agaw`].
+//!
 //! Scalable mode (PASID tables, first-stage tables) is not used.
 
-use core::fmt;
-
-/// Entries in one 4 KiB table.
-pub const ENTRIES: usize = 512;
-
-/// One 4 KiB table of root, context (two words per entry) or page-table entries.
-pub type Table = [u64; ENTRIES];
+use ferric_iommu::table::{self as radix, EntryFormat, Levels};
+pub use ferric_iommu::table::{
+    ADDR_MASK, Access, ENTRIES, EmptiedTables, LargePages, MapError, PageSize, RangeError, Table,
+    TableMemory, UnmapError, Unmapped,
+};
 
 /// The low bit of root, context and page-table entries that marks them present (for page
 /// tables: readable).
 const PRESENT: u64 = 1;
-
-/// Bits 63:12 of a table entry: a 4 KiB-aligned physical address.
-pub const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// A legacy-mode root entry (section 9.1): bits 63:12 of the low word point to the bus's
 /// context table, bit 0 marks it present. The high word is reserved.
@@ -168,65 +167,21 @@ impl Agaw {
     }
 }
 
-/// The size of a second-stage leaf mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PageSize {
-    /// 4 KiB, a level-1 entry.
-    Size4K,
-    /// 2 MiB, a level-2 entry with PS set (needs CAP.SLLPS bit 0).
-    Size2M,
-    /// 1 GiB, a level-3 entry with PS set (needs CAP.SLLPS bit 1).
-    Size1G,
-}
-
-impl PageSize {
-    /// Size in bytes.
-    pub const fn bytes(self) -> u64 {
-        1 << self.shift()
-    }
-    const fn shift(self) -> u32 {
-        match self {
-            Self::Size4K => 12,
-            Self::Size2M => 21,
-            Self::Size1G => 30,
-        }
-    }
-    const fn level(self) -> u8 {
-        match self {
-            Self::Size4K => 1,
-            Self::Size2M => 2,
-            Self::Size1G => 3,
-        }
-    }
-}
-
-/// Access a second-stage leaf entry grants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    /// DMA reads only.
-    Read,
-    /// DMA writes only.
-    Write,
-    /// Reads and writes.
-    ReadWrite,
-}
-
-impl Access {
-    const fn bits(self) -> u64 {
-        match self {
-            Self::Read => SL_R,
-            Self::Write => SL_W,
-            Self::ReadWrite => SL_R | SL_W,
-        }
-    }
-}
-
 /// Second-stage entry bit 0: read allowed (and, for non-leaf entries, present).
 pub const SL_R: u64 = 1 << 0;
 /// Second-stage entry bit 1: write allowed.
 pub const SL_W: u64 = 1 << 1;
 /// Second-stage entry bit 7: this level-2 or level-3 entry maps a large page.
 pub const SL_PS: u64 = 1 << 7;
+
+/// The R and W bits for `access`.
+const fn access_bits(access: Access) -> u64 {
+    match access {
+        Access::Read => SL_R,
+        Access::Write => SL_W,
+        Access::ReadWrite => SL_R | SL_W,
+    }
+}
 
 /// A non-leaf second-stage entry (section 9.8) pointing to the next-level table. Read and
 /// write are both set so the leaf alone decides access.
@@ -242,77 +197,58 @@ pub const fn sl_page(phys: u64, size: PageSize, access: Access) -> u64 {
         PageSize::Size4K => 0,
         _ => SL_PS,
     };
-    (phys & ADDR_MASK) | ps | access.bits()
+    (phys & ADDR_MASK) | ps | access_bits(access)
 }
 
-/// Memory for translation tables: the kernel hands out zeroed physical pages and access to
-/// them; tests use a vector.
-pub trait TableMemory {
-    /// Why a table page could not be allocated.
-    type Error;
-
-    /// Allocates a zeroed, 4 KiB-aligned table page and returns its physical address.
-    ///
-    /// # Errors
-    ///
-    /// When no memory is available.
-    fn alloc_table(&mut self) -> Result<u64, Self::Error>;
-
-    /// The table at physical address `phys`, which [`TableMemory::alloc_table`] returned.
-    fn table(&mut self, phys: u64) -> &mut Table;
-}
-
-/// Why [`map`] could not install a mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MapError<E> {
-    /// A table page could not be allocated.
-    Alloc(E),
-    /// The IOVA or physical address is not aligned to the page size.
-    Misaligned {
-        /// The IOVA.
-        iova: u64,
-        /// The physical address.
-        phys: u64,
-    },
-    /// The IOVA is beyond the tables' address width, or the page size needs more levels than
-    /// the tables have.
-    OutOfRange {
-        /// The IOVA.
-        iova: u64,
-    },
-    /// Something is already mapped at the IOVA.
-    AlreadyMapped {
-        /// The IOVA.
-        iova: u64,
-    },
-}
-
-impl<E: fmt::Display> fmt::Display for MapError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Alloc(e) => write!(f, "cannot allocate a translation table: {e}"),
-            Self::Misaligned { iova, phys } => {
-                write!(f, "IOVA {iova:#x} or address {phys:#x} is misaligned")
-            }
-            Self::OutOfRange { iova } => write!(f, "IOVA {iova:#x} is out of range"),
-            Self::AlreadyMapped { iova } => write!(f, "IOVA {iova:#x} is already mapped"),
-        }
+/// The leaf sizes a unit with these capabilities supports (CAP.SLLPS).
+pub const fn large_pages(cap: crate::regs::Capability) -> LargePages {
+    match (cap.large_pages_2m(), cap.large_pages_1g()) {
+        (true, true) => LargePages::Up1G,
+        (true, false) => LargePages::Up2M,
+        _ => LargePages::None,
     }
 }
 
-impl<E: core::error::Error + 'static> core::error::Error for MapError<E> {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Alloc(e) => Some(e),
-            _ => None,
-        }
+/// The second-stage entry encoding (section 9.8): an entry is present when it allows a read
+/// or a write, and a level-2 or level-3 entry with PS set is a leaf.
+#[derive(Clone, Copy, Debug)]
+pub struct SecondStage;
+
+impl EntryFormat for SecondStage {
+    fn is_present(entry: u64) -> bool {
+        entry & (SL_R | SL_W) != 0
+    }
+
+    fn table_entry(next: u64, _level: u8) -> u64 {
+        sl_table(next)
+    }
+
+    fn leaf_entry(phys: u64, size: PageSize, access: Access) -> u64 {
+        sl_page(phys, size, access)
+    }
+
+    fn is_leaf(entry: u64, level: u8) -> bool {
+        level == 1 || (matches!(level, 2 | 3) && entry & SL_PS != 0)
+    }
+
+    fn access(entry: u64) -> Option<Access> {
+        Access::from_bits(entry & SL_R != 0, entry & SL_W != 0)
+    }
+
+    fn with_access(entry: u64, access: Access) -> u64 {
+        (entry & !(SL_R | SL_W)) | access_bits(access)
     }
 }
 
-/// The index into a level-`level` table for `iova` (level 1 holds 4 KiB leaves).
-const fn index(iova: u64, level: u8) -> usize {
-    ((iova >> (12 + 9 * (level as u32 - 1))) & 0x1ff) as usize
+impl Agaw {
+    /// The table depth for this width.
+    pub const fn table_levels(self) -> Levels {
+        match self {
+            Self::Bits39 => Levels::Three,
+            Self::Bits48 => Levels::Four,
+            Self::Bits57 => Levels::Five,
+        }
+    }
 }
 
 /// Maps one page of `size` at `iova` to `phys` in the tables rooted at `root`, allocating
@@ -357,35 +293,7 @@ pub fn map<M: TableMemory>(
     size: PageSize,
     access: Access,
 ) -> Result<(), MapError<M::Error>> {
-    let mask = size.bytes() - 1;
-    if iova & mask != 0 || phys & mask != 0 {
-        return Err(MapError::Misaligned { iova, phys });
-    }
-    if iova >= agaw.limit() || size.level() > agaw.levels() {
-        return Err(MapError::OutOfRange { iova });
-    }
-    let mut table = root;
-    let mut level = agaw.levels();
-    while level > size.level() {
-        let i = index(iova, level);
-        let entry = mem.table(table)[i];
-        table = if entry & (SL_R | SL_W) == 0 {
-            let next = mem.alloc_table().map_err(MapError::Alloc)?;
-            mem.table(table)[i] = sl_table(next);
-            next
-        } else if entry & SL_PS != 0 {
-            return Err(MapError::AlreadyMapped { iova });
-        } else {
-            entry & ADDR_MASK
-        };
-        level -= 1;
-    }
-    let slot = &mut mem.table(table)[index(iova, level)];
-    if *slot & (SL_R | SL_W) != 0 {
-        return Err(MapError::AlreadyMapped { iova });
-    }
-    *slot = sl_page(phys, size, access);
-    Ok(())
+    radix::map::<SecondStage, M>(mem, root, agaw.table_levels(), iova, phys, size, access)
 }
 
 /// Maps `[start, end)` one-to-one (IOVA equal to physical address) with read-write pages of
@@ -402,121 +310,15 @@ pub fn map_identity<M: TableMemory>(
     end: u64,
     size: PageSize,
 ) -> Result<(), MapError<M::Error>> {
-    let step = size.bytes();
-    let mut addr = start & !(step - 1);
-    while addr < end {
-        map(mem, root, agaw, addr, addr, size, Access::ReadWrite)?;
-        addr = match addr.checked_add(step) {
-            Some(next) => next,
-            None => break,
-        };
-    }
-    Ok(())
-}
-
-/// Why [`unmap`] could not remove a mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum UnmapError {
-    /// Nothing is mapped at the IOVA.
-    NotMapped {
-        /// The IOVA.
-        iova: u64,
-    },
-    /// The IOVA lies inside a large page but is not its first byte; large pages are only
-    /// removed whole.
-    InsideLargePage {
-        /// The IOVA.
-        iova: u64,
-        /// The size of the page that covers it.
-        size: PageSize,
-    },
-    /// The IOVA is beyond the tables' address width.
-    OutOfRange {
-        /// The IOVA.
-        iova: u64,
-    },
-    /// A range to unmap ends inside a large page.
-    PartialPage {
-        /// The first IOVA of that page.
-        iova: u64,
-        /// Its size.
-        size: PageSize,
-    },
-}
-
-impl fmt::Display for UnmapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotMapped { iova } => write!(f, "nothing is mapped at IOVA {iova:#x}"),
-            Self::InsideLargePage { iova, size } => {
-                write!(
-                    f,
-                    "IOVA {iova:#x} is inside a {:#x}-byte page",
-                    size.bytes()
-                )
-            }
-            Self::OutOfRange { iova } => write!(f, "IOVA {iova:#x} is out of range"),
-            Self::PartialPage { iova, size } => write!(
-                f,
-                "the range ends inside the {:#x}-byte page at IOVA {iova:#x}",
-                size.bytes()
-            ),
-        }
-    }
-}
-
-impl core::error::Error for UnmapError {}
-
-/// The table pages an [`unmap`] emptied and unlinked from their parents, lowest level first.
-/// The root table is never among them.
-///
-/// The unit may still hold the unlinked entries in its paging-structure caches, so the caller
-/// frees these pages only after an IOTLB invalidation that covers them (one with
-/// [`Request::IotlbPage::leaf_only`](crate::invalidation::Request::IotlbPage) clear, or a
-/// domain-selective one) has completed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct EmptiedTables {
-    pages: [u64; 4],
-    len: usize,
-}
-
-impl EmptiedTables {
-    /// The physical addresses of the emptied pages.
-    pub fn as_slice(&self) -> &[u64] {
-        &self.pages[..self.len]
-    }
-
-    /// Whether no table page was emptied.
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn push(&mut self, phys: u64) {
-        // Only tables below the root are pushed, and there are at most four levels below a
-        // five-level root.
-        self.pages[self.len] = phys;
-        self.len += 1;
-    }
-}
-
-/// One mapping that [`unmap`] removed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Unmapped {
-    /// The physical address the page mapped.
-    pub phys: u64,
-    /// The page's size.
-    pub size: PageSize,
-    /// The access it granted.
-    pub access: Access,
-    /// The table pages left empty, for the caller to free after invalidating.
-    pub emptied: EmptiedTables,
+    radix::map_identity::<SecondStage, M>(mem, root, agaw.table_levels(), start, end, size)
 }
 
 /// Removes the page mapped at `iova` (the first byte of a 4 KiB, 2 MiB or 1 GiB page) from
 /// the tables rooted at `root`. Every table that is left with no present entry is unlinked
 /// from its parent and reported in [`Unmapped::emptied`], so the caller can free it once the
-/// IOTLB has been invalidated.
+/// IOTLB has been invalidated (with an invalidation that covers the paging-structure caches:
+/// [`Request::IotlbPage::leaf_only`](crate::invalidation::Request::IotlbPage) clear, or a
+/// domain-selective one).
 ///
 /// # Errors
 ///
@@ -557,122 +359,7 @@ pub fn unmap<M: TableMemory>(
     agaw: Agaw,
     iova: u64,
 ) -> Result<Unmapped, UnmapError> {
-    if iova >= agaw.limit() {
-        return Err(UnmapError::OutOfRange { iova });
-    }
-    // The tables walked through, from the root down: (table, index of the entry used).
-    let mut path = [(0u64, 0usize); 5];
-    let mut depth = 0;
-    let mut table = root;
-    let mut level = agaw.levels();
-    let (leaf, size) = loop {
-        let i = index(iova, level);
-        path[depth] = (table, i);
-        depth += 1;
-        let entry = mem.table(table)[i];
-        if entry & (SL_R | SL_W) == 0 {
-            return Err(UnmapError::NotMapped { iova });
-        }
-        let size = match level {
-            1 => Some(PageSize::Size4K),
-            2 if entry & SL_PS != 0 => Some(PageSize::Size2M),
-            3 if entry & SL_PS != 0 => Some(PageSize::Size1G),
-            _ => None,
-        };
-        if let Some(size) = size {
-            break (entry, size);
-        }
-        table = entry & ADDR_MASK;
-        level -= 1;
-    };
-    if iova & (size.bytes() - 1) != 0 {
-        return Err(UnmapError::InsideLargePage { iova, size });
-    }
-    let access = match leaf & (SL_R | SL_W) {
-        SL_R => Access::Read,
-        SL_W => Access::Write,
-        _ => Access::ReadWrite,
-    };
-    let mut emptied = EmptiedTables::default();
-    // Clear the leaf, then walk back up while the table just changed is empty, unlinking it
-    // from its parent. The root (path[0]) is never unlinked.
-    for d in (0..depth).rev() {
-        let (table, i) = path[d];
-        mem.table(table)[i] = 0;
-        if d == 0 || mem.table(table).iter().any(|&e| e & (SL_R | SL_W) != 0) {
-            break;
-        }
-        // The next pass clears the parent's entry that pointed to this table.
-        emptied.push(table);
-    }
-    Ok(Unmapped {
-        phys: leaf & ADDR_MASK,
-        size,
-        access,
-        emptied,
-    })
-}
-
-/// Which leaf sizes [`map_range`] may use, from the unit's CAP.SLLPS.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LargePages {
-    /// 4 KiB pages only.
-    None,
-    /// 4 KiB and 2 MiB pages.
-    Up2M,
-    /// 4 KiB, 2 MiB and 1 GiB pages.
-    Up1G,
-}
-
-impl LargePages {
-    /// What a unit with these capabilities supports.
-    pub const fn from_capability(cap: crate::regs::Capability) -> Self {
-        match (cap.large_pages_2m(), cap.large_pages_1g()) {
-            (true, true) => Self::Up1G,
-            (true, false) => Self::Up2M,
-            _ => Self::None,
-        }
-    }
-
-    /// The largest page of at most `len` bytes that `iova` and `phys` are both aligned to.
-    fn page_for(self, iova: u64, phys: u64, len: u64, agaw: Agaw) -> PageSize {
-        let fits = |size: PageSize| {
-            let mask = size.bytes() - 1;
-            iova & mask == 0
-                && phys & mask == 0
-                && len >= size.bytes()
-                && size.level() <= agaw.levels()
-        };
-        if self >= Self::Up1G && fits(PageSize::Size1G) {
-            PageSize::Size1G
-        } else if self >= Self::Up2M && fits(PageSize::Size2M) {
-            PageSize::Size2M
-        } else {
-            PageSize::Size4K
-        }
-    }
-}
-
-/// A range operation that stopped part-way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RangeError<E> {
-    /// Bytes from the start of the range that were processed before the failure. For
-    /// [`map_range`] those stay mapped; for [`unmap_range`] they are unmapped.
-    pub done: u64,
-    /// What failed.
-    pub error: E,
-}
-
-impl<E: fmt::Display> fmt::Display for RangeError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "after {:#x} bytes: {}", self.done, self.error)
-    }
-}
-
-impl<E: core::error::Error + 'static> core::error::Error for RangeError<E> {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        Some(&self.error)
-    }
+    radix::unmap::<SecondStage, M>(mem, root, agaw.table_levels(), iova)
 }
 
 /// Maps `len` bytes from `iova` to `phys` with `access`, using the largest pages `large`
@@ -694,20 +381,16 @@ pub fn map_range<M: TableMemory>(
     access: Access,
     large: LargePages,
 ) -> Result<(), RangeError<MapError<M::Error>>> {
-    if (iova | phys | len) & 0xfff != 0 {
-        return Err(RangeError {
-            done: 0,
-            error: MapError::Misaligned { iova, phys },
-        });
-    }
-    let mut done = 0;
-    while done < len {
-        let (va, pa) = (iova.wrapping_add(done), phys.wrapping_add(done));
-        let size = large.page_for(va, pa, len - done, agaw);
-        map(mem, root, agaw, va, pa, size, access).map_err(|error| RangeError { done, error })?;
-        done += size.bytes();
-    }
-    Ok(())
+    radix::map_range::<SecondStage, M>(
+        mem,
+        root,
+        agaw.table_levels(),
+        iova,
+        phys,
+        len,
+        access,
+        large,
+    )
 }
 
 /// Unmaps every page in `len` bytes from `iova`, calling `emptied` with each table page that
@@ -724,59 +407,9 @@ pub fn unmap_range<M: TableMemory>(
     agaw: Agaw,
     iova: u64,
     len: u64,
-    mut emptied: impl FnMut(u64),
+    emptied: impl FnMut(u64),
 ) -> Result<(), RangeError<UnmapError>> {
-    let mut done = 0;
-    while done < len {
-        let va = iova.wrapping_add(done);
-        let fail = |error| RangeError { done, error };
-        let size =
-            leaf_size(mem, root, agaw, va).ok_or(fail(UnmapError::NotMapped { iova: va }))?;
-        if size.bytes() > len - done {
-            return Err(fail(UnmapError::PartialPage { iova: va, size }));
-        }
-        let gone = unmap(mem, root, agaw, va).map_err(fail)?;
-        gone.emptied
-            .as_slice()
-            .iter()
-            .for_each(|&page| emptied(page));
-        done += gone.size.bytes();
-    }
-    Ok(())
-}
-
-/// Where the leaf that maps `iova` sits: its table, its index in that table and its size.
-fn leaf<M: TableMemory>(
-    mem: &mut M,
-    root: u64,
-    agaw: Agaw,
-    iova: u64,
-) -> Option<(u64, usize, PageSize)> {
-    if iova >= agaw.limit() {
-        return None;
-    }
-    let mut table = root;
-    let mut level = agaw.levels();
-    loop {
-        let i = index(iova, level);
-        let entry = mem.table(table)[i];
-        if entry & (SL_R | SL_W) == 0 {
-            return None;
-        }
-        match level {
-            1 => return Some((table, i, PageSize::Size4K)),
-            2 if entry & SL_PS != 0 => return Some((table, i, PageSize::Size2M)),
-            3 if entry & SL_PS != 0 => return Some((table, i, PageSize::Size1G)),
-            _ => {}
-        }
-        table = entry & ADDR_MASK;
-        level -= 1;
-    }
-}
-
-/// The size of the leaf that maps `iova`, if any.
-fn leaf_size<M: TableMemory>(mem: &mut M, root: u64, agaw: Agaw, iova: u64) -> Option<PageSize> {
-    leaf(mem, root, agaw, iova).map(|(_, _, size)| size)
+    radix::unmap_range::<SecondStage, M>(mem, root, agaw.table_levels(), iova, len, emptied)
 }
 
 /// Changes the access of every page mapped in `len` bytes from `iova` to `access`, keeping
@@ -823,26 +456,7 @@ pub fn protect_range<M: TableMemory>(
     len: u64,
     access: Access,
 ) -> Result<(), RangeError<UnmapError>> {
-    let mut done = 0;
-    while done < len {
-        let va = iova.wrapping_add(done);
-        let fail = |error| RangeError { done, error };
-        if va >= agaw.limit() {
-            return Err(fail(UnmapError::OutOfRange { iova: va }));
-        }
-        let (table, i, size) =
-            leaf(mem, root, agaw, va).ok_or(fail(UnmapError::NotMapped { iova: va }))?;
-        if va & (size.bytes() - 1) != 0 {
-            return Err(fail(UnmapError::InsideLargePage { iova: va, size }));
-        }
-        if size.bytes() > len - done {
-            return Err(fail(UnmapError::PartialPage { iova: va, size }));
-        }
-        let entry = &mut mem.table(table)[i];
-        *entry = (*entry & !(SL_R | SL_W)) | access.bits();
-        done += size.bytes();
-    }
-    Ok(())
+    radix::protect_range::<SecondStage, M>(mem, root, agaw.table_levels(), iova, len, access)
 }
 
 /// Walks the tables rooted at `root` for `iova`, returning the physical address and access
@@ -853,26 +467,7 @@ pub fn translate<M: TableMemory>(
     agaw: Agaw,
     iova: u64,
 ) -> Option<(u64, Access)> {
-    if iova >= agaw.limit() {
-        return None;
-    }
-    let mut table = root;
-    let mut level = agaw.levels();
-    loop {
-        let entry = mem.table(table)[index(iova, level)];
-        let access = match entry & (SL_R | SL_W) {
-            0 => return None,
-            SL_R => Access::Read,
-            SL_W => Access::Write,
-            _ => Access::ReadWrite,
-        };
-        if level == 1 || entry & SL_PS != 0 {
-            let offset = iova & ((1 << (12 + 9 * (u32::from(level) - 1))) - 1);
-            return Some(((entry & ADDR_MASK) | offset, access));
-        }
-        table = entry & ADDR_MASK;
-        level -= 1;
-    }
+    radix::translate::<SecondStage, M>(mem, root, agaw.table_levels(), iova)
 }
 
 #[cfg(test)]
@@ -882,6 +477,10 @@ pub(crate) mod tests {
     use std::vec::Vec;
 
     use super::*;
+
+    fn leaf_size(mem: &mut VecMemory, root: u64, agaw: Agaw, iova: u64) -> Option<PageSize> {
+        radix::leaf_size::<SecondStage, _>(mem, root, agaw.table_levels(), iova)
+    }
 
     /// Table pages in a vector; physical address `n * 4096` is page `n - 1`. Fails after
     /// `limit` pages.
@@ -1133,7 +732,7 @@ pub(crate) mod tests {
         let first = unmap(&mut mem, root, a, 0x1000).unwrap();
         assert_eq!(
             (first.phys, first.size, first.access),
-            (0xa000, PageSize::Size4K, Access::Read)
+            (0xa000, PageSize::Size4K, Some(Access::Read))
         );
         // The level-1 table still holds 0x2000.
         assert!(first.emptied.is_empty());
@@ -1372,12 +971,9 @@ pub(crate) mod tests {
                 error: UnmapError::NotMapped { iova: 0x5000 }
             })
         );
+        assert_eq!(large_pages(crate::regs::tests::QEMU_CAP), LargePages::Up1G);
         assert_eq!(
-            LargePages::from_capability(crate::regs::tests::QEMU_CAP),
-            LargePages::Up1G
-        );
-        assert_eq!(
-            LargePages::from_capability(crate::regs::Capability(1 << 34)),
+            large_pages(crate::regs::Capability(1 << 34)),
             LargePages::Up2M
         );
     }
