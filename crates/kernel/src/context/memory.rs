@@ -1652,6 +1652,37 @@ impl Grant {
             let mut guard = src.addr_space_guard;
             // Ferric Oxide: a scheme cannot hand out pages it only borrows (context/reshare.rs).
             super::reshare::check_span(&guard, PageSpan::new(src.src_base, span.count))?;
+            if matches!(src.mode, MmapMode::Cow) {
+                // Private file mappings own COW references, while retaining their file
+                // origin. A write must copy the frame rather than request a lazy mmap.
+                for page in PageSpan::new(src.src_base, span.count).pages() {
+                    if guard.table.utable.translate(page.start_address()).is_none() {
+                        let (_, flush, new_guard) =
+                            correct_inner(src.addr_space_lock, guard, page, AccessMode::Read, 0)
+                                .map_err(|_| Error::new(EIO))?;
+                        flush.flush();
+                        guard = new_guard;
+                    }
+                }
+                let mut src_flusher = Flusher::with_cpu_set(
+                    &src.addr_space_lock.used_by,
+                    &src.addr_space_lock.tlb_ack,
+                );
+                return Self::copy_mappings(
+                    src.src_base,
+                    span.base,
+                    span.count,
+                    new_flags,
+                    &mut guard.table.utable,
+                    mapper,
+                    &mut src_flusher,
+                    flusher,
+                    CopyMappingsMode::Owned {
+                        cow_file_ref: Some(file_ref),
+                    },
+                )
+                .map_err(|_| Error::new(ENOMEM));
+            }
             let mut src_addrspace = &mut *guard;
             let mut src_flusher_state =
                 Flusher::with_cpu_set(&src.addr_space_lock.used_by, &src.addr_space_lock.tlb_ack)
@@ -1659,69 +1690,32 @@ impl Grant {
             for dst_page in span.pages() {
                 let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
-                let (frame, page_flags, is_cow) = match src.mode {
-                    MmapMode::Shared => {
-                        // TODO: Error code for "scheme responded with unmapped page"?
-                        let (frame, page_flags) = match src_addrspace
+                // TODO: Error code for "scheme responded with unmapped page"?
+                let (frame, page_flags) = match src_addrspace
+                    .table
+                    .utable
+                    .translate(src_page.start_address())
+                {
+                    Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
+                    // TODO: ensure the correct context is hardblocked, if necessary
+                    None => {
+                        let (frame, _, new_guard) = correct_inner(
+                            src.addr_space_lock,
+                            guard,
+                            src_page,
+                            AccessMode::Read,
+                            0,
+                        )
+                        .map_err(|_| Error::new(EIO))?;
+                        let page_flags = new_guard
                             .table
                             .utable
                             .translate(src_page.start_address())
-                        {
-                            Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
-                            // TODO: ensure the correct context is hardblocked, if necessary
-                            None => {
-                                let (frame, _, new_guard) = correct_inner(
-                                    src.addr_space_lock,
-                                    guard,
-                                    src_page,
-                                    AccessMode::Read,
-                                    0,
-                                )
-                                .map_err(|_| Error::new(EIO))?;
-                                let page_flags = new_guard
-                                    .table
-                                    .utable
-                                    .translate(src_page.start_address())
-                                    .unwrap()
-                                    .1;
-                                guard = new_guard;
-                                (frame, page_flags)
-                            }
-                        };
-
-                        (frame, page_flags, false)
+                            .unwrap()
+                            .1;
+                        guard = new_guard;
+                        (frame, page_flags)
                     }
-                    MmapMode::Cow => unsafe {
-                        let (frame, page_flags) = match guard
-                            .table
-                            .utable
-                            .remap_with(src_page.start_address(), |flags| flags.write(false))
-                        {
-                            Some((page_flags, phys, _)) => (Frame::containing(phys), page_flags),
-                            // TODO: ensure the correct context is hardblocked, if necessary
-                            None => {
-                                let (frame, _, new_guard) = correct_inner(
-                                    src.addr_space_lock,
-                                    guard,
-                                    src_page,
-                                    AccessMode::Read,
-                                    0,
-                                )
-                                .map_err(|_| Error::new(EIO))?;
-                                // FIXME correct_inner should read the page flags instead
-                                let page_flags = new_guard
-                                    .table
-                                    .utable
-                                    .translate(src_page.start_address())
-                                    .unwrap()
-                                    .1;
-                                guard = new_guard;
-                                (frame, page_flags)
-                            }
-                        };
-
-                        (frame, page_flags, true)
-                    },
                 };
                 src_addrspace = &mut *guard;
 
@@ -1781,7 +1775,6 @@ impl Grant {
                             dst_page.start_address(),
                             frame.base(),
                             new_flags
-                                .write(new_flags.has_write() && !is_cow)
                                 // FIXME make sure this stays in sync with the MemoryType flags
                                 .uncacheable(page_flags.has_flag(RmmA::ENTRY_FLAG_UNCACHEABLE))
                                 .device_memory(page_flags.has_flag(RmmA::ENTRY_FLAG_DEVICE_MEMORY))
