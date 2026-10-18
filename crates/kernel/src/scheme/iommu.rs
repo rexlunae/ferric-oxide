@@ -227,6 +227,8 @@ impl KernelScheme for IommuScheme {
         let handle = {
             let mut handles = HANDLES.lock();
             if let Some(Handle::Domain { space, bound }) = handles.get_mut(&id) {
+                let devices = space.device_count();
+                let mappings = space.mapping_count();
                 // Serialize blocking with revocation: a missing handle must never be
                 // observed before the hardware result and failure marker are published.
                 let clean = space.domain().close();
@@ -237,11 +239,17 @@ impl KernelScheme for IommuScheme {
                 if bound.is_some() {
                     BOUND.fetch_sub(1, Ordering::Relaxed);
                 }
-                info!(
-                    "IOMMU: domain {} closed, devices blocked={clean}, {} DMA mapping(s)",
-                    space.id(),
-                    space.mapping_count()
-                );
+                if clean {
+                    info!(
+                        "IOMMU: domain {} closed, {devices} device(s) blocked, {mappings} DMA mapping(s) unpinned",
+                        space.id()
+                    );
+                } else {
+                    warn!(
+                        "IOMMU: domain {} close failed; its frames stay pinned",
+                        space.id()
+                    );
+                }
             }
             handles.remove(&id)
         };
