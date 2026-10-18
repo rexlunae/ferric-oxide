@@ -136,7 +136,8 @@ static BUDGET: Mutex<Budget> = Mutex::new(Budget::new());
 
 /// Closed regions a failed unmap left with a mapping, so with their frames still pinned and
 /// charged. Nobody holds a descriptor to them any more, so [`retry_stuck`] tries again on the
-/// scheme's next close or `Revoke`.
+/// scheme's next close or `Revoke`. Changed only under the region's lock, which is taken
+/// before this one, never after.
 static STUCK: Mutex<Vec<Arc<Mutex<Region>>>> = Mutex::new(Vec::new());
 
 /// Notified whenever teardowns finish, for `Revoke`s waiting on another thread's teardown of
@@ -224,26 +225,29 @@ fn take_down(
         })
         .collect();
     let mut failed = None;
-    let (released, stuck) = {
-        let mut region = region.lock();
+    let released = {
+        let mut guard = region.lock();
         for (taken, outcome) in outcomes {
             match outcome {
-                Ok(()) => drop(region.grants.finish(taken)),
+                Ok(()) => drop(guard.grants.finish(taken)),
                 Err(err) => {
-                    region.grants.restore(taken);
+                    guard.grants.restore(taken);
                     failed.get_or_insert(err);
                 }
             }
         }
-        let stuck = failed.is_some() && region.grants.is_closed() && !region.grants.drained();
-        (region.release(), stuck)
-    };
-    if stuck {
-        let mut list = STUCK.lock();
-        if !list.iter().any(|r| Arc::ptr_eq(r, region)) {
-            list.push(Arc::clone(region));
+        if guard.grants.is_closed() {
+            // Under the region lock, so the list agrees with the table. A region is on it
+            // while only restored mappings are left; a teardown still in flight decides when it
+            // finishes, and the one that drains the region takes it off.
+            let mut stuck = STUCK.lock();
+            stuck.retain(|r| !Arc::ptr_eq(r, region));
+            if guard.grants.idle() && !guard.grants.drained() {
+                stuck.push(Arc::clone(region));
+            }
         }
-    }
+        guard.release()
+    };
     TEARDOWN.notify(token);
     if let Some(released) = released {
         unpin(released);
