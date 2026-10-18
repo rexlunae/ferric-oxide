@@ -774,27 +774,29 @@ fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
 /// failed mapping. The domain retains its pins and IOVA until confirmed domain blocking.
 #[cfg(feature = "regbuf")]
 pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
-    let result = {
-        let mut handles = HANDLES.lock();
-        if let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) {
-            match space.unmap_grant(record.iova, Some(record.ticket)) {
-                Ok(_) => {
-                    info!(
-                        "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
-                        space.id(),
-                        record.iova
-                    );
-                    Ok(())
-                }
-                Err(DmaError::NoGrantMapping { .. }) => Ok(()),
-                // Keep the link on failure, just as the region keeps its record.
-                Err(_) => Err(Error::new(EIO)),
-            }
-        } else {
-            Ok(())
-        }
-    };
-    result?;
+    unmap_grant_record(record)?;
     let _ = GRANT_LINKS.lock().remove(&record.ticket);
     Ok(())
+}
+
+/// Performs the hardware teardown without forgetting its link on failure.
+#[cfg(feature = "regbuf")]
+fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
+    let mut handles = HANDLES.lock();
+    let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
+        return Ok(());
+    };
+    match space.unmap_grant(record.iova, Some(record.ticket)) {
+        Ok(_) => {
+            info!(
+                "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
+                space.id(),
+                record.iova
+            );
+            Ok(())
+        }
+        Err(DmaError::NoGrantMapping { .. }) => Ok(()),
+        // unmap_grant logged it; the frames stay pinned.
+        Err(_) => Err(Error::new(EIO)),
+    }
 }
