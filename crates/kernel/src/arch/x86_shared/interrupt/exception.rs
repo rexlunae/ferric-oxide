@@ -62,6 +62,14 @@ interrupt_stack!(non_maskable, @paranoid, |stack| {
 });
 
 interrupt_stack!(breakpoint, |stack| {
+    // Ferric Oxide: an int3 a tracepoint site holds while it is patched live resumes after the
+    // site (arch/x86_64/static_key.rs).
+    #[cfg(all(feature = "trace", target_arch = "x86_64"))]
+    if let Some(resume) = crate::arch::static_key::breakpoint(stack.iret.rip, stack.iret.cs) {
+        stack.iret.rip = resume;
+        return;
+    }
+
     // The processor lets EIP/RIP point to the instruction *after* int3, so
     // unhandled breakpoint interrupt don't go in an infinite loop. But we
     // throw SIGTRAP anyway, so that's not a problem.

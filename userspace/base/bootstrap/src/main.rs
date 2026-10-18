@@ -154,6 +154,9 @@ impl KernelSchemeMap {
             } else if info.scheme_id == ferric_regbuf::abi::SCHEME_ID {
                 // Ferric Oxide: the kernel's regbuf scheme (kernel.regbuf).
                 ferric.push((ferric_regbuf::abi::SCHEME_NAME, FdGuard::new(info.fd)));
+            } else if info.scheme_id == ferric_trace::abi::SCHEME_ID {
+                // Ferric Oxide: the kernel's trace scheme (kernel.trace = true).
+                ferric.push((ferric_trace::abi::SCHEME_NAME, FdGuard::new(info.fd)));
             }
         }
         Self(map, ferric)

@@ -63,6 +63,13 @@ the code (needs Kernel > Self-modifying code; without it "auto" acts like
 "never"). Defaults follow the processor baseline."""
 
 [[menu]]
+id = "kernel.tracing"
+parent = "kernel"
+title = "Tracing"
+depends = "target.arch == 'x86_64'"
+help = "Kernel tracepoints (Phase T): which are compiled in, and which are on from boot."
+
+[[menu]]
 id = "drivers"
 title = "Drivers"
 help = "Build-time options of the user-space drivers in the base package."
@@ -535,6 +542,93 @@ rebuild = ["kernel"]
 help = "Sample kernel execution for the profiling tools."
 
 [[option]]
+id = "kernel.trace"
+menu = "kernel.tracing"
+type = "bool"
+title = "Kernel tracepoints"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "trace"
+rebuild = ["kernel"]
+help = """
+Compile typed tracepoints into the kernel (Phase T). Each one is a 5-byte NOP
+until its event is turned on, when the kernel patches it into a jump to code
+that writes a compact binary record (no text) to a 64 KiB ring of the CPU it
+runs on. Events are turned on at boot (kernel.trace_boot, or FERRIC_TRACE=
+in the boot environment) or at run time through the kernel.trace scheme,
+which also hands out the records: `echo "enable syscall" >
+/scheme/kernel.trace/events`, then read /scheme/kernel.trace/cpu/<n> and
+decode with ferric-trace. The scheme is root-only for now. Off by default;
+without it the kernel has no tracepoints and no such scheme, as upstream.
+The options below choose which tracepoints are compiled in."""
+
+[[option]]
+id = "kernel.trace_syscall"
+menu = "kernel.tracing"
+type = "bool"
+title = "System call tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_syscall"
+rebuild = ["kernel"]
+help = "Compile in syscall.enter (number and first four arguments) and syscall.exit (number and return value)."
+
+[[option]]
+id = "kernel.trace_sched"
+menu = "kernel.tracing"
+type = "bool"
+title = "Scheduler tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_sched"
+rebuild = ["kernel"]
+help = "Compile in sched.switch (previous and next process and context) at every context switch."
+
+[[option]]
+id = "kernel.trace_max_level"
+menu = "kernel.tracing"
+type = "choice"
+title = "Most verbose tracepoint level compiled in"
+default = "info"
+depends = "kernel.trace"
+rebuild = ["kernel"]
+help = """
+Tracepoints above this level are left out of the build entirely, as with the
+tracing crate's max_level features. System calls and context switches are
+"info"; finer events of later subsystems use "debug" and "trace"."""
+choices = ["error", "warn", "info", "debug", "trace"]
+
+[[option.effect]]
+when = "value == 'warn'"
+kernel_features = ["trace_level_warn"]
+
+[[option.effect]]
+when = "value == 'info'"
+kernel_features = ["trace_level_info"]
+
+[[option.effect]]
+when = "value == 'debug'"
+kernel_features = ["trace_level_debug"]
+
+[[option.effect]]
+when = "value == 'trace'"
+kernel_features = ["trace_level_trace"]
+
+[[option]]
+id = "kernel.trace_boot"
+menu = "kernel.tracing"
+type = "string"
+title = "Events on from boot"
+default = ""
+depends = "kernel.trace"
+kernel_config = "trace.boot"
+rebuild = ["kernel"]
+help = """
+Events to turn on before the other CPUs start: a list of "all", subsystem
+names (syscall, sched) or event names (sched.switch), separated by commas.
+FERRIC_TRACE= in the boot environment (press e in the bootloader) adds to it."""
+
+[[option]]
 id = "kernel.sys_fdstat"
 menu = "kernel"
 type = "bool"
@@ -925,6 +1019,11 @@ message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" i
 level = "error"
 when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && (kernel.cpu.avx512 == 'never' || (kernel.cpu.avx512 == 'auto' && !kernel.self_modifying))"
 message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\", or \"auto\" without kernel.self_modifying."
+
+[[rule]]
+level = "error"
+when = "kernel.trace && kernel.profiling"
+message = "kernel.trace cannot be combined with kernel.profiling yet: the profiler's CPU would not answer the interrupt live tracepoint patching waits for."
 
 [[rule]]
 level = "error"

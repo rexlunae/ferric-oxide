@@ -81,9 +81,10 @@ jobs:
           # and logs that there is no DMAR table on the other.
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
-          # Registered buffers are off by default; turn them on so ferric-regbuf-test runs, and
+          # Registered buffers and kernel tracing are off by default; turn them on so
+          # ferric-regbuf-test and ferric-trace-test run, with sched.switch on from boot, and
           # nvmed's grant DMA (also off by default) so ferric-blkgrant-test does.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\ntrace = true\ntrace_boot = "sched"\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -246,6 +247,14 @@ jobs:
       # read benchmark, which the step repeats as a notice.
       - name: Check storage DMA into registered buffers
         run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
+      # The image has kernel.trace on, so ferric-trace-test must run every step, not skip.
+      - name: Check kernel tracing
+        run: |
+          grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
+          for step in boot enable decode order write read yield sched disable; do
+            grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
+          done
+          echo "::notice::ferric-trace-test passed all 9 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

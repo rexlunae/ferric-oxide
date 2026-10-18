@@ -1046,6 +1046,10 @@ name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-trace"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-vtd"
 version = "0.1.0"
 dependencies = [
