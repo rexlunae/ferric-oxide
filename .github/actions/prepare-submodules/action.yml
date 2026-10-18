@@ -1,0 +1,38 @@
+name: Prepare image submodules
+description: Restore pinned submodule Git data and retry unavailable upstream fetches.
+runs:
+  using: composite
+  steps:
+    - name: Submodule cache key
+      id: submodules
+      shell: bash
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        echo "key=submodules-$(git ls-files -s | awk '$1 == 160000 { print $2 }' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore submodules
+      id: submodule-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/modules
+        key: ${{ steps.submodules.outputs.key }}
+
+    - name: Fetch submodules
+      shell: bash
+      run: |
+        for attempt in 1 2 3; do
+          git submodule update --init --recursive && exit 0
+          echo "::warning title=Submodule fetch failed::GitLab attempt $attempt of 3"
+          sleep 60
+        done
+        echo "::warning title=Submodule fetch failed::trying the GitHub mirrors"
+        git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/
+        git submodule update --init --recursive
+
+    - name: Save submodules
+      if: steps.submodule-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: .git/modules
+        key: ${{ steps.submodules.outputs.key }}
+

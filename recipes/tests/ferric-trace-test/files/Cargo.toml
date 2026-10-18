@@ -1,0 +1,18 @@
+[package]
+name = "ferric-trace-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Kernel tracing test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-trace = { path = "../../../../crates/trace" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall = "0.9.5"
+
+[profile.release]
+debug = false

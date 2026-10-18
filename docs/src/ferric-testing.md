@@ -13,6 +13,8 @@ From the repository root:
 cargo fmt --all --check
 cargo test --locked --workspace
 cargo test --locked -p ferric-regbuf --all-features
+cargo test --locked -p ferric-blkgrant --all-features
+cargo test --locked -p ferric-trace --all-features
 cargo test --locked -p ferric-iommu --all-features
 ```
 
@@ -63,14 +65,14 @@ run the ratchet with `--update` and commit the lower baseline. The workflow
 contains the exact preparation for an IBT-configured binary.
 
 The workflow also builds kernel Rustdoc with warnings denied and `regbuf`
-enabled, for both `kernel.iommu = "never"` and `"auto"`. This covers common
+and the tracing features enabled, for both `kernel.iommu = "never"` and `"auto"`. This covers common
 kernel documentation and the optional DMA-grant APIs. After generating and
 copying the desired kernel configuration, reproduce the check from
 `crates/kernel/`:
 
 ```sh
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
-  cargo doc --locked --no-deps --features regbuf \
+  cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -91,6 +93,8 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
+| `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
@@ -99,13 +103,17 @@ test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
-enables IOMMU `auto`, shadow-stack policy `auto` and registered buffers,
+enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
+`nvmed` grant DMA (`drivers.grant_dma`) and kernel tracing (with
+`sched.switch` on from boot),
 and builds a second kernel/image with IOMMU `enforce`. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
-registered-buffer result markers, KASLR/KPTI logs, shadow-stack detection and
+registered-buffer and tracing result markers, the trace boot log line,
+KASLR/KPTI logs, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
-IOMMU mode. Read that script for the exact required marker set.
+IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
+posts the benchmark as a notice. Read that script for the exact required marker set.
 
 The workflow exports recipe-facing kernel/relibc/bootloader settings from its
 temporary generated config. It does not install a root `ferric.toml` or

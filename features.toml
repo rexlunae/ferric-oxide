@@ -22,8 +22,10 @@
 #   kernel_feature      add a kernel Cargo feature when the bool is on
 #   kernel_config       set a key in the kernel's config.toml
 #   [[option.effect]]   anything else: make, make_append, packages,
-#                       ignore_packages, packages_from_value,
-#                       ignore_from_value, general, kernel_features
+#                       ignore_packages, source_packages (added as
+#                       "source", so they build even with REPO_BINARY),
+#                       packages_from_value, ignore_from_value, general,
+#                       kernel_features
 #   rebuild             recipes to mark stale when the value changes
 #                       ("*" means every recipe)
 # "{value}" in a string is replaced by the option's value.
@@ -63,9 +65,26 @@ the code (needs Kernel > Self-modifying code; without it "auto" acts like
 "never"). Defaults follow the processor baseline."""
 
 [[menu]]
+id = "kernel.tracing"
+parent = "kernel"
+title = "Tracing"
+depends = "target.arch == 'x86_64'"
+help = "Kernel tracepoints (Phase T): which are compiled in, and which are on from boot."
+
+[[menu]]
+id = "drivers"
+title = "Drivers"
+help = "Build-time options of the user-space drivers in the base package."
+
+[[menu]]
 id = "image"
 title = "Image contents"
 help = "Which filesystem configuration the image starts from, and changes on top of it."
+
+[[menu]]
+id = "packages"
+title = "Package management"
+help = "Which package manager the image ships and what packages say about themselves."
 
 [[menu]]
 id = "build"
@@ -396,6 +415,32 @@ everyone together a quarter of memory. Off by default; without it the kernel
 has no such scheme, as upstream."""
 
 [[option]]
+id = "drivers.grant_dma"
+menu = "drivers"
+type = "bool"
+title = "Storage DMA into registered buffers (NVMe)"
+default = false
+depends = "kernel.regbuf && kernel.iommu != 'never'"
+rebuild = ["base"]
+help = """
+Let applications attach a registered-buffer grant (Kernel > Registered buffers)
+to a disk or partition descriptor of nvmed's disk scheme, then read and write
+blocks straight between the disk and their own pages: the driver maps the grant
+into its IOMMU DMA domain once (MapGrant) and points the controller at it, with
+no bounce buffer, no copy and no per-request mapping. The device can reach the
+granted pages and nothing else of the application, and revoking the grant
+stops it before Revoke returns. Needs an IOMMU (VT-d or AMD-Vi) with
+kernel.iommu "auto" or "enforce"; without a DMA domain attaching fails with
+ENODEV. Also lets nvmed's zero-copy transfers (RedoxFS's ring included) use
+PRP lists up to the controller's maximum transfer size instead of two pages.
+Builds nvmed with its grant-dma Cargo feature. Off by default; without it the
+disk schemes refuse grants, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/grant-dma" }
+
+[[option]]
 id = "kernel.self_modifying"
 menu = "kernel"
 type = "bool"
@@ -502,6 +547,109 @@ default = false
 kernel_feature = "profiling"
 rebuild = ["kernel"]
 help = "Sample kernel execution for the profiling tools."
+
+[[option]]
+id = "kernel.trace"
+menu = "kernel.tracing"
+type = "bool"
+title = "Kernel tracepoints"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "trace"
+rebuild = ["kernel"]
+help = """
+Compile typed tracepoints into the kernel (Phase T). Each one is a 5-byte NOP
+until its event is turned on, when the kernel patches it into a jump to code
+that writes a compact binary record (no text) to a 64 KiB ring of the CPU it
+runs on. Events are turned on at boot (kernel.trace_boot, or FERRIC_TRACE=
+in the boot environment) or at run time through the kernel.trace scheme,
+which also hands out the records: `echo "enable syscall" >
+/scheme/kernel.trace/events`, then read /scheme/kernel.trace/cpu/<n> and
+decode with ferric-trace. The scheme is root-only for now. Off by default;
+without it the kernel has no tracepoints and no such scheme, as upstream.
+The options below choose which tracepoints are compiled in."""
+
+[[option]]
+id = "kernel.trace_syscall"
+menu = "kernel.tracing"
+type = "bool"
+title = "System call tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_syscall"
+rebuild = ["kernel"]
+help = "Compile in syscall.enter (number and first four arguments) and syscall.exit (number and return value)."
+
+[[option]]
+id = "kernel.trace_sched"
+menu = "kernel.tracing"
+type = "bool"
+title = "Scheduler tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_sched"
+rebuild = ["kernel"]
+help = "Compile in sched.switch (previous and next process and context) at every context switch."
+
+[[option]]
+id = "kernel.trace_scheme"
+menu = "kernel.tracing"
+type = "bool"
+title = "Scheme request tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_scheme"
+rebuild = ["kernel"]
+help = """Compile in scheme.request, scheme.response and scheme.cancel for requests
+to user-space schemes. Each record carries the scheme id and the request's
+ring SQE/CQE tag, so a request can be matched with its response, and the
+caller's and responder's pids, so a request a daemon makes while serving
+another can be followed (an application's read through RedoxFS to the disk
+driver)."""
+
+[[option]]
+id = "kernel.trace_max_level"
+menu = "kernel.tracing"
+type = "choice"
+title = "Most verbose tracepoint level compiled in"
+default = "info"
+depends = "kernel.trace"
+rebuild = ["kernel"]
+help = """
+Tracepoints above this level are left out of the build entirely, as with the
+tracing crate's max_level features. System calls and context switches are
+"info"; finer events of later subsystems use "debug" and "trace"."""
+choices = ["error", "warn", "info", "debug", "trace"]
+
+[[option.effect]]
+when = "value == 'warn'"
+kernel_features = ["trace_level_warn"]
+
+[[option.effect]]
+when = "value == 'info'"
+kernel_features = ["trace_level_info"]
+
+[[option.effect]]
+when = "value == 'debug'"
+kernel_features = ["trace_level_debug"]
+
+[[option.effect]]
+when = "value == 'trace'"
+kernel_features = ["trace_level_trace"]
+
+[[option]]
+id = "kernel.trace_boot"
+menu = "kernel.tracing"
+type = "string"
+title = "Events on from boot"
+default = ""
+depends = "kernel.trace"
+kernel_config = "trace.boot"
+rebuild = ["kernel"]
+help = """
+Events to turn on before the other CPUs start: a list of "all", subsystem
+names (syscall, sched) or event names (sched.switch), separated by commas.
+FERRIC_TRACE= in the boot environment (press e in the bootloader) adds to it."""
 
 [[option]]
 id = "kernel.sys_fdstat"
@@ -762,6 +910,52 @@ help = "Pass --encrypt to redoxfs-mkfs. The image build asks for a password."
 [[option.effect]]
 make = { REDOXFS_MKFS_FLAGS = "--encrypt" }
 
+# ---------------------------------------------------------------- packages
+
+[[option]]
+id = "packages.manager"
+menu = "packages"
+type = "choice"
+title = "Package manager"
+default = "fox"
+help = """
+The package manager on the target.
+
+  fox       Ferric Oxide's fox (tools/fox), built from this repository.
+            It verifies every archive against the keys in /etc/fox/keys
+            (the installer puts the key that signed the image's packages
+            there), and on first boot adopts the packages the installer
+            put in the image (fox adopt-pkg), so fox list, fox verify
+            --installed and fox remove cover the whole system.
+            fox installs local .pkgar files; it does not fetch from
+            package servers.
+  pkgutils  upstream Redox's pkg, which can fetch from package servers."""
+choices = [
+  { value = "fox", title = "fox: verify, install and remove signed local packages" },
+  { value = "pkgutils", title = "pkgutils: upstream pkg" },
+]
+
+[[option.effect]]
+when = "value == 'fox'"
+source_packages = ["fox"]
+ignore_packages = ["pkgutils"]
+
+[[option]]
+id = "packages.signed_manifests"
+menu = "packages"
+type = "bool"
+title = "Signed package manifests"
+default = true
+make_var = "FERRIC_FOX_MANIFEST"
+rebuild = ["*"]
+help = """
+Put a fox manifest (usr/share/fox/manifest/<name>.toml: name, version,
+target, dependencies, source) into every package the cookbook packs, so
+the archive signature covers the package's identity. Without it fox only
+has the unsigned metadata file beside each archive and needs
+--allow-unsigned-metadata. Sets FERRIC_FOX_MANIFEST; changing it repacks
+every package."""
+
 # ---------------------------------------------------------------- build
 
 [[option]]
@@ -910,6 +1104,11 @@ message = "With kernel.cpu.kpti = \"auto\" (on for Meltdown-affected Intel CPUs)
 level = "error"
 when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && (kernel.cpu.avx512 == 'never' || (kernel.cpu.avx512 == 'auto' && !kernel.self_modifying))"
 message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\", or \"auto\" without kernel.self_modifying."
+
+[[rule]]
+level = "error"
+when = "kernel.trace && kernel.profiling"
+message = "kernel.trace cannot be combined with kernel.profiling yet: the profiler's CPU would not answer the interrupt live tracepoint patching waits for."
 
 [[rule]]
 level = "error"

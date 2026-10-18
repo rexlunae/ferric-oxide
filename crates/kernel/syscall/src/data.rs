@@ -465,6 +465,9 @@ pub enum GlobalSchemes {
     Iommu = 12,
     /// Ferric Oxide: `kernel.regbuf`, registered buffers (ferric-regbuf's `abi::SCHEME_ID`).
     RegBuf = 13,
+    /// Ferric Oxide: `kernel.trace`, tracepoint control and trace rings (ferric-trace's
+    /// `abi::SCHEME_ID`).
+    Trace = 14,
 }
 impl GlobalSchemes {
     pub fn try_from_raw(raw: u8) -> Option<Self> {
@@ -482,6 +485,7 @@ impl GlobalSchemes {
             11 => Some(Self::Dtb),
             12 => Some(Self::Iommu),
             13 => Some(Self::RegBuf),
+            14 => Some(Self::Trace),
             _ => None,
         }
     }
@@ -500,6 +504,7 @@ impl GlobalSchemes {
             Self::Dtb => "kernel.dtb",
             Self::Iommu => "kernel.iommu",
             Self::RegBuf => "kernel.regbuf",
+            Self::Trace => "kernel.trace",
         }
     }
 }

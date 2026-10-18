@@ -17,6 +17,7 @@ on:
       - "scripts/ferric-ci/boot-smoke.sh"
       - "scripts/ferric-ci/boot-cet.sh"
       - ".github/workflows/cet-image.yml"
+      - ".github/actions/prepare-submodules/**"
 
 concurrency:
   group: cet-image-${{ github.ref }}
@@ -40,8 +41,8 @@ jobs:
       CI: "1"
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - uses: ./.github/actions/prepare-submodules
 
       - name: Install Rust
         run: |

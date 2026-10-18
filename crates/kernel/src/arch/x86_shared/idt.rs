@@ -269,6 +269,17 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
     idt.set_reserved(IpiKind::Switch as u8, true);
     idt.set_reserved(IpiKind::Tlb as u8, true);
     idt.set_reserved(IpiKind::Pit as u8, true);
+    // Ferric Oxide: see arch/x86_64/static_key.rs.
+    #[cfg(all(feature = "trace", target_arch = "x86_64"))]
+    {
+        // The sync IPI must not take over the IOMMU's fault vector on the BSP.
+        #[cfg(iommu_enabled)]
+        const _: () = assert!(IpiKind::TraceSync as u8 != crate::arch::iommu::FAULT_VECTOR);
+        if let Some(entry) = idt.entries.get_mut(IpiKind::TraceSync as usize) {
+            entry.set_func(crate::arch::static_key::sync_ipi);
+        }
+        idt.set_reserved(IpiKind::TraceSync as u8, true);
+    }
 
     #[cfg(target_arch = "x86")]
     {

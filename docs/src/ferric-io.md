@@ -143,7 +143,12 @@ to remove another address space's mappings. A caller that has not bound this
 domain, including one bound to a different domain, receives `ENODEV`. A mapping
 ticket distinguishes successive uses of an IOVA so a delayed revocation
 cannot remove a newer mapping. The normal grant-revocation path removes the
-DMA mapping and waits for invalidation. The
+DMA mapping and waits for invalidation. Revocation does not free the
+mapping's IOVA range: the kernel *retires* it, and it stays reserved until the
+driver's `UnmapGrant` of that IOVA (which then succeeds) or the domain's close.
+A driver that still has a command queued for the revoked grant can only make
+the device fault, never reach a buffer mapped later at a reused IOVA. `UnmapGrant`
+answers `ENOENT` for an IOVA that is neither mapped nor reserved. The
 interface never hands out physical addresses of another process's buffer as
 a fallback. Drivers needing a fallback must manage their own bounce buffers.
 
@@ -184,8 +189,72 @@ those installation and rollback failures, grant and region closure, and IOVA
 retention and release. Hardware boot tests exercise the normal mapping path;
 they do not inject invalidation failures into a real IOMMU.
 
-These are available primitives and tested integration paths. They do not
-automatically make the filesystem, network stack or all drivers use an
-end-to-end registered-buffer protocol. The dedicated image tests exercise CPU
+## Storage DMA into registered buffers
+
+`drivers.grant_dma = true` (Drivers menu, default `false`) lets an application
+have `nvmed` move disk blocks straight between the NVMe device and its
+registered buffer: no bounce buffer, no copy and no per-request mapping. It
+depends on `kernel.regbuf` and on `kernel.iommu` other than `never`, and sets
+`FERRIC_INITFS_FEATURES=nvmed/grant-dma`, which `userspace/base/Makefile`
+passes to the initfs build. Without the option, `nvmed` behaves as upstream.
+The call ABI is defined once in `crates/blkgrant/src/abi.rs`; the driver side is
+`userspace/base/drivers/storage/driver-block/src/grant.rs` (feature
+`grant-dma`) and `nvmed`'s `PcidGrantDma`.
+
+On an `nvmed` disk or partition descriptor:
+
+1. **Attach.** The application passes a whole, page-aligned grant descriptor
+   with `SYS_CALL` and `CallFlags::FD`, one metadata word naming a slot
+   (0 to 63). The driver checks the grant is not revoked, maps it once with
+   `MapGrant` in its bound domain, and keeps the descriptor. Attaching to an
+   occupied slot replaces its grant. Errors: `EINVAL` for a bad slot or a
+   descriptor that is not a grant, `ECANCELED` for a revoked grant, `ENODEV`
+   without an IOMMU domain, and `EOPNOTSUPP` from drivers that do not map grants.
+2. **Read and Write.** A `SYS_CALL` with `Request::Read` or `Request::Write`
+   moves `len` bytes between block `lba` of the descriptor (relative to the
+   partition) and the slot's grant at `offset`, and returns `len`. Errors:
+   `ENOENT` for an empty slot, `EINVAL` for a length that is not whole blocks
+   or a range outside the grant, `EACCES` for a read into a read-only grant,
+   `ECANCELED` once the grant is revoked, and `EOVERFLOW` past the partition.
+3. **Detach.** `Request::Detach` empties a slot. Closing the descriptor
+   detaches every slot.
+
+The kernel passes a scheme exactly three metadata words for a call on one
+descriptor, and fills any the caller did not send with zeros. A request
+therefore packs into three words. Word 0 holds the verb (bits 0 to 7), the slot
+(bits 8 to 15) and the offset in the grant in whole 4 KiB pages (bits 16 to
+63); words 1 and 2 are the LBA and the length. Offsets in a grant are
+therefore page-granular, and `Request::encode` refuses an unaligned offset or
+a zero length; `decode` reads missing words as zero.
+
+Before each transfer the driver asks the kernel (`Info`) whether the grant was
+revoked and refuses it with `ECANCELED`, so the device is normally never
+pointed at an unmapped IOVA. A revocation that races a running command makes
+the device fault at the IOMMU instead, because the retired IOVA stays reserved
+until the driver unmaps it. The driver unmaps only once nothing uses the IOVA:
+each transfer holds a lease on its grant until the device completes it, and a
+detached, replaced or closed grant is unmapped when its last lease is dropped
+(`crates/blkgrant/src/slots.rs`). With the option on, `nvmed` also builds PRP
+lists for zero-copy commands, so a command carries up to the controller's
+MDTS (one list page; 512 KiB on QEMU) instead of two pages; larger transfers
+are split into several commands.
+
+This is a direct-call path on `nvmed` descriptors only. RedoxFS does not
+forward grants yet, the ring interface (`redox-rings` SQEs) has no grant slots,
+and `ahcid` and `virtio-blkd` do not map grants.
+
+`ferric-blkgrant-test` covers attach, reads and writes compared with `pread`
+(writes go only to the BIOS boot partition and are restored), the refusals
+above, revocation (`ECANCELED`, buffer untouched), detach releasing the retired
+IOVA, and a copy versus grant read benchmark. Without an IOMMU its grant steps
+skip, and it still prints the copy benchmark.
+`scripts/ferric-ci/check-blkgrant-log.sh` checks those markers and the kernel's
+map, unmap and IOVA-release lines in each IOMMU boot variant. Host tests in
+`crates/blkgrant` cover the encoding, the slot checks, PRP layout and the lease
+rule, including a revocation and detach while a transfer is in flight.
+
+These are available primitives and tested integration paths. Apart from the
+`nvmed` path above, they do not make the filesystem, network stack or other
+drivers use an end-to-end registered-buffer protocol. The dedicated image tests exercise CPU
 grants, forwarding, sub-grants, device DMA and revocation; see
 [Validation and debugging](ferric-testing.md).

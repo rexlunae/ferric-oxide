@@ -144,8 +144,9 @@ unsafe fn pic_eoi(irq: u8) {
     }
 }
 
-unsafe fn lapic_eoi() {
-    unsafe { local_apic::the_local_apic().eoi() }
+// Ferric Oxide: through the safe EOI.
+fn lapic_eoi() {
+    local_apic::eoi()
 }
 
 unsafe fn pic_unmask(irq: usize) {
@@ -305,11 +306,11 @@ interrupt!(ata2, || {
 
 interrupt!(lapic_timer, || {
     println!("Local apic timer interrupt");
-    unsafe { lapic_eoi() };
+    lapic_eoi();
 });
 #[cfg(feature = "profiling")]
 interrupt!(aux_timer, || {
-    unsafe { lapic_eoi() };
+    lapic_eoi();
     crate::ipi::ipi(IpiKind::Profile, IpiTarget::Other);
 });
 
@@ -317,7 +318,7 @@ interrupt!(lapic_error, || {
     error!("Local apic internal error: ESR={:#0x}", unsafe {
         local_apic::the_local_apic().esr()
     });
-    unsafe { lapic_eoi() };
+    lapic_eoi();
 });
 
 interrupt_error!(generic_irq, |_stack, code| {
@@ -328,7 +329,7 @@ interrupt_error!(generic_irq, |_stack, code| {
     // (containing lots of useless NOPs).
     irq_trigger((code as i32).wrapping_add(128) as u8, &mut token);
 
-    unsafe { lapic_eoi() };
+    lapic_eoi();
 });
 
 // Ferric Oxide (IBT, see arch/x86_64/ibt.rs): each stub is an IDT target, so with indirect

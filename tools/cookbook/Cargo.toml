@@ -35,6 +35,8 @@ tui = ["ratatui", "ansi-to-tui", "strip-ansi-escapes"]
 
 [dependencies]
 blake3 = "1"
+# Ferric Oxide: signed package manifests (src/cook/fox_manifest.rs).
+fox-core = { path = "../../crates/fox-core" }
 globset = "0.4"
 libc = "0.2"
 ignore = "0.4"

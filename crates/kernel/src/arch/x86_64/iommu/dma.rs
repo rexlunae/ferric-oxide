@@ -39,6 +39,13 @@
 //! revocation that arrives late (after the driver unmapped it and the IOVA was reused) cannot
 //! take down a newer mapping. They are taken down strictly too: [`DmaSpace::unmap_grant`]
 //! returns only after the IOTLB invalidation completed.
+//!
+//! A revocation (the grant revoked or closed under the driver) unpins the frames at once but
+//! *retires* the IOVA block instead of freeing it: the driver may still hold the IOVA in a
+//! queued request, so the block is not handed out again until the driver's own `UnmapGrant`
+//! of it ([`DmaSpace::release_retired`]) or the domain's close. Until then DMA to it faults,
+//! and can never reach memory that a later mapping put there (io/registered-buffers-design.md,
+//! PR 4 decisions).
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -310,6 +317,9 @@ pub struct DmaSpace {
     /// Grant mappings by IOVA.
     #[cfg(feature = "regbuf")]
     grants: alloc::collections::BTreeMap<u64, GrantHeld>,
+    /// IOVA blocks of revoked grant mappings, by IOVA, reserved until the driver unmaps them.
+    #[cfg(feature = "regbuf")]
+    retired: alloc::collections::BTreeMap<u64, IovaRange>,
 }
 
 impl DmaSpace {
@@ -320,6 +330,8 @@ impl DmaSpace {
             mappings: DmaMappings::new(),
             #[cfg(feature = "regbuf")]
             grants: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "regbuf")]
+            retired: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -586,8 +598,10 @@ impl DmaSpace {
     }
 
     /// Takes the grant mapping at `iova` down strictly (entries cleared, IOTLB invalidated and
-    /// waited on), then frees its block and unpins its frames. With `ticket`, only the mapping
-    /// that ticket names; returns the ticket of the mapping taken down.
+    /// waited on), then unpins its frames. Without `ticket` (the driver's own `UnmapGrant`) the
+    /// block is freed. With `ticket` (a revocation) only the mapping that ticket names is taken
+    /// down, and its block is retired rather than freed, until [`DmaSpace::release_retired`].
+    /// Returns the ticket of the mapping taken down.
     ///
     /// # Errors
     ///
@@ -616,8 +630,31 @@ impl DmaSpace {
                 })
         })?
         .ok_or(DmaError::NoGrantMapping { iova })?;
-        self.give_back(held.block, held.pins);
+        if ticket.is_some() {
+            held.pins.release();
+            self.retired.insert(iova, held.block);
+        } else {
+            self.give_back(held.block, held.pins);
+        }
         Ok(held.ticket)
+    }
+
+    /// Frees the block of the revoked grant mapping that was at `iova`, now that the driver
+    /// has unmapped it. Whether there was one.
+    #[cfg(feature = "regbuf")]
+    pub fn release_retired(&mut self, iova: u64) -> bool {
+        let Some(block) = self.retired.remove(&iova) else {
+            return false;
+        };
+        if let Err(err) = self.domain.free_iova(block) {
+            warn!(
+                "IOMMU: domain {}: cannot free IOVA block {:#x}+{:#x}: {err}",
+                self.domain.id(),
+                block.start,
+                block.len
+            );
+        }
+        true
     }
 
     /// How many grant mappings the domain holds.

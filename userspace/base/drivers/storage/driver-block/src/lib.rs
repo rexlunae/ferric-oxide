@@ -1,3 +1,6 @@
+// Ferric Oxide: registered-buffer grants on disk descriptors.
+#[cfg(feature = "grant-dma")]
+mod grant;
 mod ring;
 
 use std::cmp;
@@ -21,6 +24,8 @@ use syscall::{
     EOVERFLOW, EWOULDBLOCK, MODE_DIR, MODE_FILE, O_DIRECTORY, O_STAT,
 };
 
+#[cfg(feature = "grant-dma")]
+pub use crate::grant::GrantDma;
 pub use crate::ring::*;
 
 /// Split the read operation into a series of block reads.

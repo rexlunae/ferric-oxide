@@ -22,6 +22,7 @@ ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-nospec = { path = "../nospec" }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
+ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
 linked_list_allocator = "0.9.0"
@@ -107,6 +108,17 @@ prot_none = []
 aslr = ["dep:ferric-hwrand"]
 # Ferric Oxide: the kernel.regbuf scheme, registered buffers and zero-copy grants.
 regbuf = ["dep:ferric-regbuf"]
+# Ferric Oxide: tracepoints, per-CPU trace rings and the kernel.trace scheme (x86_64).
+trace = ["dep:ferric-trace"]
+# Ferric Oxide: the subsystems whose tracepoints are compiled in.
+trace_syscall = ["trace"]
+trace_sched = ["trace"]
+trace_scheme = ["trace"]
+# Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
+trace_level_warn = ["trace"]
+trace_level_info = ["trace_level_warn"]
+trace_level_debug = ["trace_level_info"]
+trace_level_trace = ["trace_level_debug"]
 lpss_debug = []
 multi_core = ["acpi"]
 numa = ["multi_core"]

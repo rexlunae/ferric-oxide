@@ -245,6 +245,10 @@ fn continue_after_kmain_stack(
             // Activate memory logging
             crate::log::init();
 
+            // Ferric Oxide: tracepoints enabled from boot, before the other CPUs start.
+            #[cfg(feature = "trace")]
+            crate::trace::init_boot(args.env());
+
             // Initialize miscellaneous processor features
             #[cfg(target_arch = "x86_64")]
             crate::arch::misc::init(LogicalCpuId::BSP);

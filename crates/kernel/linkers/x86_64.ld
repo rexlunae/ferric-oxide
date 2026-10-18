@@ -44,6 +44,11 @@ SECTIONS {
         __altfeatures_start = .;
         KEEP(*(.altfeatures*))
         __altfeatures_end = .;
+        /* Ferric Oxide: tracepoint sites (src/arch/x86_64/static_key.rs). */
+        . = ALIGN(8);
+        __ferric_trace_keys_start = .;
+        KEEP(*(.ferric_trace_keys*))
+        __ferric_trace_keys_end = .;
     }
 
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_LINK_BASE) {

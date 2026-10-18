@@ -13,6 +13,20 @@ fn parse_kconfig(arch: &str) -> Option<()> {
     let config_str = std::fs::read_to_string("config.toml").unwrap();
     let root: Table = toml::from_str(&config_str).unwrap();
 
+    // Ferric Oxide: events the `trace` feature turns on at boot, besides those the boot
+    // environment's FERRIC_TRACE names (src/trace/imp.rs), from `trace.boot`.
+    if let Some(boot) = root
+        .get("trace")
+        .and_then(|t| t.as_table().unwrap().get("boot"))
+    {
+        let boot = boot.as_str().unwrap();
+        assert!(
+            !boot.contains(['\n', '\r']),
+            "trace.boot must be one line"
+        );
+        println!("cargo:rustc-env=FERRIC_TRACE_BOOT={boot}");
+    }
+
     let arch_table = root.get("arch")?.as_table().unwrap().get(arch)?.as_table().unwrap();
 
     // Minimum microarchitecture level, checked at boot (src/arch/x86_64/cpu_level.rs).

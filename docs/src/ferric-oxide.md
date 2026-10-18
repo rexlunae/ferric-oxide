@@ -14,7 +14,8 @@ descriptions may differ from this checkout.
 | Build an image, choose features or change a recipe | [Build and configuration](ferric-build.md) |
 | Change CPU state, address spaces or kernel hardening | [Memory and CPU protection](ferric-memory.md) |
 | Work on drivers, DMA or shared buffers | [Registered buffers and IOMMUs](ferric-io.md) |
-| Verify or install a local package, or generate its SBOM | [Package tooling](ferric-packaging.md) |
+| Trace system calls and scheduling, or add a tracepoint | [Kernel tracing](ferric-tracing.md) |
+| Verify or install a local package, generate its SBOM, or see how images adopt `pkg`'s packages | [Package tooling](ferric-packaging.md) |
 | Find tests, reproduce a boot failure or understand CI | [Validation and debugging](ferric-testing.md) |
 
 Source paths in these chapters are relative to the repository root. Rustdoc
@@ -36,8 +37,9 @@ passed, or that a feature is enabled in every image.
 | Memory protection | Physical-map and kernel-image KASLR, user ASLR, `PROT_NONE` guards, KPTI and PCID support | Address randomization uses RDRAND with a fixed-layout fallback; fixed user mappings are not relocated |
 | CET | Optional supervisor IBT and shadow-stack enforcement with private frame pools | Shadow stacks require KPTI off; fresh CET hardware validation is pending (#78); user-mode CET remains off |
 | DMA isolation | Intel VT-d and AMD-Vi DMA domains, driver binding, IOVA translation, revocation and an enforce policy | IOMMU defaults to `never`; AMD interrupt remapping is not implemented |
-| Registered buffers | Anonymous-memory registration, byte grants, sub-grants, CPU mappings and page-aligned DMA grants | Off by default; partial pages use bounce buffers; existing production I/O is not automatically converted |
-| `fox` | Local signed archives, installed-file verification, in-place install/remove, CycloneDX SBOMs | No repository downloader, dependency solver or generation/rollback store; not the image build's package installer |
+| Registered buffers | Anonymous-memory registration, byte grants, sub-grants, CPU mappings, page-aligned DMA grants with IOVA retirement on revoke, and `nvmed` DMA into an attached grant (`drivers.grant_dma`) | Off by default; partial pages use bounce buffers; disk grants are direct calls on `nvmed` descriptors, with no RedoxFS or ring support; other I/O is not converted |
+| Kernel tracing | Typed tracepoints as static keys (`syscall.enter`/`exit`, `sched.switch`, `scheme.request`/`response`/`cancel` with SQE tags), per-CPU rings, boot-time and live enable, a root-only `kernel.trace` scheme | Off by default; x86_64 only; no fault, IRQ or IOMMU tracepoints, ring mapping, export or overhead budget yet |
+| `fox` | Local signed archives, installed-file verification, in-place install/remove, CycloneDX SBOMs; replaces `pkg` on the target by default (`packages.manager`), with signed manifests packed by the cookbook and first-boot adoption of the installed packages | No repository downloader, dependency solver or generation/rollback store; the installer still installs images with `pkg`'s library, and `fox` adopts them on first boot |
 | Validation | Host unit/integration tests, kernel lint ratchet, binary checks, image boot and syscall fuzz workflows | Configured checks are not evidence of a successful run; hardware coverage depends on reports |
 
 The focus of new Ferric development is modern x86-64 hardware and UEFI. Older

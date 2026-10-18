@@ -713,6 +713,80 @@ pub fn bind_dma_domain(domain: &libredox::Fd) -> libredox::error::Result<()> {
     Ok(())
 }
 
+/// Ferric Oxide: maps the registered-buffer grant behind `grant` (a `kernel.regbuf` grant
+/// descriptor an application passed to the driver) into the process's bound DMA domain
+/// (`MapGrant`), and returns the IOVA of its first byte. The device then reaches the grant's
+/// pages at one contiguous IOVA range. Give it back with [`unmap_dma_grant`], also after the
+/// application revoked the grant: until then the IOVA stays reserved.
+///
+/// # Errors
+///
+/// [`DmaGrantError::NoDomain`] when the process has bound no domain (no IOMMU, or a kernel
+/// built with `kernel.iommu = "never"`), and [`DmaGrantError::Kernel`] with the kernel's errno
+/// otherwise (`ferric_iommu::abi` lists them).
+pub fn map_dma_grant(grant: &libredox::Fd) -> Result<u64, DmaGrantError> {
+    // Descriptor numbers and IOVAs are 64-bit on every target with an IOMMU scheme.
+    let grant_fd = grant.raw() as u64;
+    let iova = with_process_dma_domain(|domain| {
+        call_iommu(domain, ferric_iommu::abi::Request::MapGrant { grant_fd })
+    })?;
+    Ok(iova as u64)
+}
+
+/// Ferric Oxide: takes the grant mapping at `iova` (from [`map_dma_grant`]) out of the
+/// process's DMA domain, strictly: when this returns the device can no longer reach it. After
+/// the application revoked the grant, this gives the reserved IOVA back.
+///
+/// # Errors
+///
+/// [`DmaGrantError::NoDomain`] when the process has bound no domain, and
+/// [`DmaGrantError::Kernel`] with the kernel's errno otherwise.
+pub fn unmap_dma_grant(iova: u64) -> Result<(), DmaGrantError> {
+    with_process_dma_domain(|domain| {
+        call_iommu(domain, ferric_iommu::abi::Request::UnmapGrant { iova })
+    })?;
+    Ok(())
+}
+
+/// Runs `call` on the process's bound DMA domain.
+fn with_process_dma_domain(
+    call: impl FnOnce(&libredox::Fd) -> libredox::error::Result<usize>,
+) -> Result<usize, DmaGrantError> {
+    let bound = PROCESS_DMA_DOMAIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let domain = bound.as_ref().ok_or(DmaGrantError::NoDomain)?;
+    call(domain).map_err(DmaGrantError::Kernel)
+}
+
+/// Ferric Oxide: why [`map_dma_grant`] or [`unmap_dma_grant`] failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DmaGrantError {
+    /// The process has bound no DMA domain.
+    NoDomain,
+    /// The kernel refused the call.
+    Kernel(libredox::error::Error),
+}
+
+impl fmt::Display for DmaGrantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoDomain => "the process has bound no DMA domain",
+            Self::Kernel(_) => "the kernel refused the grant mapping call",
+        })
+    }
+}
+
+impl std::error::Error for DmaGrantError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoDomain => None,
+            Self::Kernel(err) => Some(err),
+        }
+    }
+}
+
 /// Ferric Oxide: [`PciFunctionHandle::use_dma_domain`], reporting a failure. A failure is not
 /// fatal here: the driver's first DMA allocation then fails with the kernel's reason. The
 /// kernel logs every bind and join, so success needs no message.
