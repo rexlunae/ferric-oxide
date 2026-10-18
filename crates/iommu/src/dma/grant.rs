@@ -94,6 +94,11 @@ impl<E: core::error::Error + 'static> core::error::Error for MapRunsError<E> {
 /// [`MapRunsError::Clean`] only after complete rollback; [`MapRunsError::Retained`] when
 /// installation or rollback cannot establish that every installed translation is gone.
 ///
+/// # Panics
+///
+/// Propagates a panic from `change` or `clean_failure`. Backends must not panic, because
+/// unwinding cannot establish whether installed entries remain reachable.
+///
 /// # Examples
 ///
 /// ```
@@ -155,6 +160,11 @@ pub fn map_runs<E>(
 /// A fully rolled-back installation returns its error and owned resources without inserting
 /// a record. Only then may the caller release them. Uncertain failures remain recorded and
 /// return an attempt whose error may be reported only after grant publication.
+///
+/// # Panics
+///
+/// Propagates a panic from `mark_failed` before the uncertain mapping is recorded. Use a
+/// non-panicking state update so ownership of reachable resources is retained.
 pub fn record_installation<T, E>(
     mappings: &mut BTreeMap<u64, T>,
     iova: u64,
@@ -199,6 +209,10 @@ pub enum MapAttempt<R, E> {
 
 impl<R, E> MapAttempt<R, E> {
     /// Converts the record of either outcome, including an uncertain mapping's record.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `map`; use a non-panicking conversion to retain the record.
     pub fn map_record<S>(self, map: impl FnOnce(R) -> S) -> MapAttempt<S, E> {
         match self {
             Self::Mapped(record) => MapAttempt::Mapped(map(record)),
@@ -210,6 +224,11 @@ impl<R, E> MapAttempt<R, E> {
     }
 
     /// Converts an uncertain mapping's error at an API boundary, preserving its record.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `map` for a retained attempt. Use a non-panicking conversion
+    /// so the mapping can still be published to its grant.
     pub fn map_error<F>(self, map: impl FnOnce(E) -> F) -> MapAttempt<R, F> {
         match self {
             Self::Mapped(record) => MapAttempt::Mapped(record),
@@ -229,6 +248,11 @@ impl<R, E> MapAttempt<R, E> {
     ///
     /// An uncertain installation's error after its record is published, or a publication
     /// error. Successful publication does not make an uncertain mapping safe to release.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `publish`. Use a non-panicking callback so grant bookkeeping
+    /// retains every reachable mapping.
     ///
     /// # Examples
     ///
