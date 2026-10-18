@@ -362,6 +362,14 @@ fn sync_installs_locks_and_removes_a_package_set() {
         &env.fox(&["sync", "--locked", "--config", set_arg]),
         "not pinned",
     );
+    // ...before it adds a registry or writes the policy.
+    assert!(!env.root.path().join("etc/fox/policy.toml").exists());
+    assert!(
+        json(&env.fox(&["--json", "registry", "list"]))
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let first = json(&env.fox(&["--json", "sync", "--config", set_arg]));
     assert_eq!(first[0]["action"], "installed");
     assert!(env.root.path().join("etc/fox/policy.toml").exists());
@@ -380,6 +388,32 @@ fn sync_installs_locks_and_removes_a_package_set() {
     let list = json(&env.fox(&["--json", "list"]));
     assert!(list.as_array().unwrap().is_empty());
     assert!(!fs::read_to_string(&lock).unwrap().contains("tiny"));
+
+    // A package replaced by hand after the sync is not sync's to remove.
+    fs::write(
+        &set,
+        format!("{registry}[packages]\ntiny = {{ version = \"^0.3\" }}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        json(&env.fox(&["--json", "sync", "--config", set_arg]))[0]["action"],
+        "installed"
+    );
+    fs::write(env.src.path().join("NOTES"), "by hand\n").unwrap();
+    git(env.src.path(), &["add", "NOTES"]);
+    git(env.src.path(), &["commit", "-q", "-m", "by hand"]);
+    git(env.src.path(), &["branch", "by-hand"]);
+    let by_hand = env.fox(&[
+        "install",
+        "--allow-unsigned",
+        &format!("{}#by-hand", env.src()),
+    ]);
+    assert!(by_hand.status.success(), "{}", stderr(&by_hand));
+    fs::write(&set, format!("{registry}[packages]\n")).unwrap();
+    let kept = json(&env.fox(&["--json", "sync", "--config", set_arg]));
+    assert_eq!(kept[0]["action"], "kept");
+    assert_eq!(json(&env.fox(&["--json", "list"]))[0]["name"], "tiny");
+    assert!(env.fox(&["remove", "tiny"]).status.success());
 
     // The same package from git is pinned to its commit.
     fs::write(

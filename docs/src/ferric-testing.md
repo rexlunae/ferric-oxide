@@ -58,8 +58,12 @@ and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
 registry builder, unlisted and then listed in `registry.toml`, publishes
 an advisory, and imports a small recipe tree (a git recipe, a tarball recipe
 with a description, and an invalid name). `fox sync` is tested end to end with a registry package (installed,
-locked, unchanged under `--locked`, removed when the set drops it) and a git
-package pinned to its commit (a moved tag fails until `--update`).
+locked, unchanged under `--locked`, removed when the set drops it, kept when
+it was replaced by hand, and a refused `--locked` sync leaving the registries
+and policy untouched) and a git package pinned to its commit (a moved tag
+fails until `--update`); unit tests check that changing `rev`, features,
+`default-features`, target, `path` or `package` invalidates a pin and that
+local git sources lock by their canonical `file://` URL.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning and a changed SBOM), and in unit tests
 against a RustSec-layout directory of advisories for crates inside build

@@ -23,15 +23,21 @@
 //!
 //! The lock file (`fox-lock/1`, default `fox.lock` beside the package set)
 //! records each package's version, where it came from and the BLAKE3 of the
-//! archive installed. A registry package is pinned to its version and
-//! archive hash; a git package to its commit (archives built locally are
-//! signed with the root's own builder key, so their hash is recorded but
-//! not compared). Sync keeps a locked package while the lock still
-//! satisfies the set, skips it when the installed archive is the locked
-//! one, and removes packages the previous lock had that the set no longer
-//! lists; packages installed by hand are left alone. `--locked` refuses to
-//! resolve anything the lock does not already pin, and `--update`
-//! re-resolves every package.
+//! archive installed, plus `request-blake3`: a digest of the build request
+//! (the normalized git source, `rev`, `path`, `package`, the sorted
+//! features, `default-features` and the effective target). A registry
+//! package is pinned to its version and archive hash; a git package to its
+//! commit (archives built locally are signed with the root's own builder
+//! key, so their hash is recorded but not compared). Sync keeps a locked
+//! package while the lock still satisfies the set: the version requirement
+//! and registry still match and the build request is unchanged, so editing
+//! a package's `rev`, features or target resolves it again. It skips a
+//! package whose installed archive is the locked one, and removes packages
+//! the previous lock had that the set no longer lists, but only while the
+//! installed archive is still the locked one; packages installed or
+//! replaced by hand are left alone. `--locked` refuses to resolve anything
+//! the lock does not already pin, and checks every package before it adds
+//! a registry or writes the policy; `--update` re-resolves every package.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -48,6 +54,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{self, CliError, print_json};
+use crate::source::{SourceError, SourceSpec};
 use crate::{Cli, SourceArgs};
 
 /// Largest package set or lock file read.
@@ -78,6 +85,12 @@ pub(crate) enum SyncError {
     },
     #[error("package {name} names both a git source and a registry or version")]
     MixedSource { name: PackageName },
+    #[error("package {name} has an invalid git source")]
+    GitSource {
+        name: PackageName,
+        #[source]
+        source: Box<SourceError>,
+    },
     #[error("registry {name} is configured with another URL or root pin than the package set's")]
     RegistryConflict { name: PackageName },
     #[error("{name} is not pinned in the lock file, and --locked forbids resolving it")]
@@ -153,6 +166,21 @@ fn yes() -> bool {
     true
 }
 
+/// Feeds an optional field to `hasher`, length-prefixed so that no two
+/// requests hash the same bytes.
+fn hash_field(hasher: &mut blake3::Hasher, field: Option<&[u8]>) {
+    match field {
+        Some(bytes) => {
+            hasher.update(&[1]);
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
 /// The lock file format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) enum LockFormat {
@@ -186,8 +214,19 @@ pub(crate) struct Locked {
     /// The commit it was built from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) commit: Option<String>,
+    /// The digest of the build request it was resolved for.
+    pub(crate) request_blake3: Blake3Digest,
     /// The archive installed.
     pub(crate) pkgar_blake3: Blake3Digest,
+}
+
+/// A want's normalized build request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Request {
+    /// The git source's identity, for a git package.
+    git: Option<GitUrl>,
+    /// The digest of everything that changes what is built.
+    digest: Blake3Digest,
 }
 
 impl Lock {
@@ -204,14 +243,58 @@ impl Want {
         Ok(())
     }
 
-    /// Whether `locked` is still a resolution of this want.
-    fn accepts(&self, locked: &Locked) -> bool {
-        match &self.git {
-            Some(git) => {
-                locked.git.as_ref().map(GitUrl::as_str)
-                    == GitUrl::new(git).ok().as_ref().map(GitUrl::as_str)
-                    && locked.commit.is_some()
-            }
+    /// Normalizes this want's build request, as built with `base`.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::GitSource`] if the git source is not a git URL or an
+    /// existing directory.
+    fn request(&self, name: &PackageName, base: &SourceArgs) -> Result<Request, SyncError> {
+        let git = match &self.git {
+            Some(git) => Some(
+                SourceSpec::parse(git)
+                    .map_err(|source| SyncError::GitSource {
+                        name: name.clone(),
+                        source: Box::new(source),
+                    })?
+                    .git()
+                    .clone(),
+            ),
+            None => None,
+        };
+        let mut features: Vec<&str> = self.features.iter().map(String::as_str).collect();
+        features.sort_unstable();
+        features.dedup();
+        let mut hasher = blake3::Hasher::new();
+        hash_field(&mut hasher, git.as_ref().map(|git| git.as_str().as_bytes()));
+        hash_field(&mut hasher, self.rev.as_deref().map(str::as_bytes));
+        hash_field(
+            &mut hasher,
+            self.path
+                .as_deref()
+                .map(|path| path.as_os_str().as_encoded_bytes()),
+        );
+        hash_field(&mut hasher, self.package.as_deref().map(str::as_bytes));
+        hasher.update(&(features.len() as u64).to_le_bytes());
+        for feature in features {
+            hash_field(&mut hasher, Some(feature.as_bytes()));
+        }
+        hasher.update(&[u8::from(self.default_features)]);
+        let target = self.target.as_deref().or(base.target.as_deref());
+        hash_field(&mut hasher, target.map(str::as_bytes));
+        Ok(Request {
+            git,
+            digest: hasher.finalize().into(),
+        })
+    }
+
+    /// Whether `locked` is still a resolution of this want's `request`.
+    fn accepts(&self, locked: &Locked, request: &Request) -> bool {
+        if locked.request_blake3 != request.digest {
+            return false;
+        }
+        match &request.git {
+            Some(git) => locked.git.as_ref() == Some(git) && locked.commit.is_some(),
             None => {
                 let version_ok = locked.version.parse::<Version>().is_ok_and(|version| {
                     self.version
@@ -315,6 +398,19 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
     } else {
         Lock::default()
     };
+    let mut chosen = BTreeMap::new();
+    for (name, want) in &set.packages {
+        let request = want.request(name, options.source)?;
+        let locked = previous
+            .get(name)
+            .filter(|locked| !options.update && want.accepts(locked, &request));
+        // Checked before anything changes, so a refused --locked sync
+        // leaves the root as it was.
+        if options.locked && locked.is_none() {
+            return Err(SyncError::NotLocked { name: name.clone() }.into());
+        }
+        chosen.insert(name, (request, locked));
+    }
     let store = Store::open(&cli.root)?;
     let root = store.root().to_path_buf();
     add_registries(cli, &root, &set.registries)?;
@@ -330,12 +426,8 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
     let mut lock = Lock::default();
     let mut actions = Vec::new();
     for (name, want) in &set.packages {
-        let locked = previous
-            .get(name)
-            .filter(|locked| !options.update && want.accepts(locked));
-        if options.locked && locked.is_none() {
-            return Err(SyncError::NotLocked { name: name.clone() }.into());
-        }
+        let (request, locked) = &chosen[name];
+        let locked = *locked;
         let installed = store.get(name)?;
         if let (Some(locked), Some(installed)) = (locked, &installed)
             && installed.archive_blake3 == Some(locked.pkgar_blake3)
@@ -353,7 +445,7 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         let (pending, registry) = commands::prepare(&root, &target, &args, &policy)?;
         let keys = commands::trusted_keys_for(cli, &root)?;
         let archive = commands::open_pending(pending, &keys)?;
-        let entry = lock_entry(name, want, &archive, registry, locked)?;
+        let entry = lock_entry(name, request, &archive, registry, locked)?;
         commands::install_archive(cli, &store, &archive, InstallOptions::default())?;
         actions.push(ActionJson {
             name: name.to_string(),
@@ -367,17 +459,30 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         lock.packages.push(entry);
     }
     for old in &previous.packages {
-        if set.packages.contains_key(&old.name) || store.get(&old.name)?.is_none() {
+        if set.packages.contains_key(&old.name) {
             continue;
         }
-        store.remove(&old.name, false)?;
+        let Some(installed) = store.get(&old.name)? else {
+            continue;
+        };
+        // A package replaced by hand since the last sync is no longer the
+        // one the lock installed, so it is not sync's to remove.
+        let action = if installed.archive_blake3 == Some(old.pkgar_blake3) {
+            store.remove(&old.name, false)?;
+            "removed"
+        } else {
+            "kept"
+        };
         if !cli.json {
-            println!("removed {} {}", old.name, old.version);
+            match action {
+                "removed" => println!("removed {} {}", old.name, old.version),
+                _ => println!("kept {}: it was replaced after the last sync", old.name),
+            }
         }
         actions.push(ActionJson {
             name: old.name.to_string(),
-            action: "removed",
-            version: old.version.clone(),
+            action,
+            version: installed.version.clone(),
         });
     }
     fox_core::config::save_toml(&lock_path, &lock).map_err(|source| SyncError::Write {
@@ -430,7 +535,7 @@ fn add_registries(cli: &Cli, root: &Path, wanted: &[RegistryEntry]) -> Result<()
 /// The lock entry for `archive`, checked against the previous pin.
 fn lock_entry(
     name: &PackageName,
-    want: &Want,
+    request: &Request,
     archive: &Archive,
     registry: Option<PackageName>,
     locked: Option<&Locked>,
@@ -446,13 +551,14 @@ fn lock_entry(
         .source
         .as_ref()
         .and_then(|source| source.commit.clone());
-    let entry = match &want.git {
+    let entry = match &request.git {
         Some(git) => Locked {
             name: name.clone(),
             version: manifest.version.clone(),
             registry: None,
-            git: GitUrl::new(git).ok(),
+            git: Some(git.clone()),
             commit,
+            request_blake3: request.digest,
             pkgar_blake3: archive.blake3(),
         },
         None => Locked {
@@ -461,11 +567,12 @@ fn lock_entry(
             registry,
             git: None,
             commit: None,
+            request_blake3: request.digest,
             pkgar_blake3: archive.blake3(),
         },
     };
     if let Some(locked) = locked {
-        if want.git.is_some() {
+        if request.git.is_some() {
             if locked.commit != entry.commit {
                 return Err(SyncError::LockedCommit {
                     name: name.clone(),
@@ -488,14 +595,28 @@ fn lock_entry(
 mod tests {
     use super::*;
 
-    fn locked(version: &str, registry: Option<&str>, git: Option<&str>) -> Locked {
+    fn locked(version: &str, registry: Option<&str>, request: &Request) -> Locked {
         Locked {
             name: PackageName::new("tiny").unwrap(),
             version: version.to_owned(),
             registry: registry.map(|name| PackageName::new(name).unwrap()),
-            git: git.map(|url| GitUrl::new(url).unwrap()),
-            commit: git.map(|_| "c0ffee".to_owned()),
+            git: request.git.clone(),
+            commit: request.git.as_ref().map(|_| "c0ffee".to_owned()),
+            request_blake3: request.digest,
             pkgar_blake3: Blake3Digest::of(b"archive"),
+        }
+    }
+
+    fn base() -> SourceArgs {
+        SourceArgs {
+            trust_new_key: false,
+            allow_unsigned: false,
+            target: None,
+            package: None,
+            path: None,
+            features: Vec::new(),
+            no_default_features: false,
+            work_dir: None,
         }
     }
 
@@ -530,24 +651,27 @@ mod tests {
             version: Some("^0.3".parse().unwrap()),
             ..Want::default()
         };
-        let pinned = locked("0.3.1", Some("test"), None);
-        assert!(want.accepts(&pinned));
+        let request = want.request(&name, &base()).unwrap();
+        let pinned = locked("0.3.1", Some("test"), &request);
+        assert!(want.accepts(&pinned, &request));
         assert_eq!(want.target(&name, Some(&pinned)), "test/tiny@=0.3.1");
         assert_eq!(want.target(&name, None), "tiny@^0.3");
-        assert!(!want.accepts(&locked("0.4.0", Some("test"), None)));
+        assert!(!want.accepts(&locked("0.4.0", Some("test"), &request), &request));
         let other_registry = Want {
             registry: Some(PackageName::new("other").unwrap()),
             ..Want::default()
         };
-        assert!(!other_registry.accepts(&pinned));
+        let other_request = other_registry.request(&name, &base()).unwrap();
+        assert!(!other_registry.accepts(&pinned, &other_request));
 
         let git = Want {
             git: Some("https://example.com/tiny".into()),
             ..Want::default()
         };
-        let built = locked("0.3.0", None, Some("https://example.com/tiny"));
-        assert!(git.accepts(&built));
-        assert!(!git.accepts(&pinned));
+        let git_request = git.request(&name, &base()).unwrap();
+        let built = locked("0.3.0", None, &git_request);
+        assert!(git.accepts(&built, &git_request));
+        assert!(!git.accepts(&pinned, &git_request));
         assert_eq!(
             git.target(&name, Some(&built)),
             "https://example.com/tiny#c0ffee"
@@ -559,6 +683,96 @@ mod tests {
         };
         let text = toml::to_string(&lock).unwrap();
         assert!(text.contains("format = \"fox-lock/1\""), "{text}");
+        assert!(text.contains("request-blake3 = "), "{text}");
         assert_eq!(toml::from_str::<Lock>(&text).unwrap(), lock);
+    }
+
+    #[test]
+    fn changing_what_is_built_invalidates_the_lock() {
+        let name = PackageName::new("tiny").unwrap();
+        let want = Want {
+            git: Some("https://example.com/tiny".into()),
+            rev: Some("v1.0.0".into()),
+            features: vec!["b".into(), "a".into()],
+            default_features: true,
+            ..Want::default()
+        };
+        let request = want.request(&name, &base()).unwrap();
+        let pinned = locked("1.0.0", None, &request);
+        assert!(want.accepts(&pinned, &request));
+
+        // Feature order and repeats do not change the request.
+        let reordered = Want {
+            features: vec!["a".into(), "b".into(), "a".into()],
+            ..want.clone()
+        };
+        assert_eq!(reordered.request(&name, &base()).unwrap(), request);
+
+        let changes = [
+            Want {
+                rev: Some("v1.1.0".into()),
+                ..want.clone()
+            },
+            Want {
+                features: vec!["a".into()],
+                ..want.clone()
+            },
+            Want {
+                default_features: false,
+                ..want.clone()
+            },
+            Want {
+                target: Some("x86_64-unknown-redox".into()),
+                ..want.clone()
+            },
+            Want {
+                path: Some("crates/tiny".into()),
+                ..want.clone()
+            },
+            Want {
+                package: Some("tiny-cli".into()),
+                ..want.clone()
+            },
+        ];
+        for changed in changes {
+            let changed_request = changed.request(&name, &base()).unwrap();
+            assert!(!changed.accepts(&pinned, &changed_request), "{changed:?}");
+        }
+        // So does the command line's target, when the set names none.
+        let mut cross = base();
+        cross.target = Some("x86_64-unknown-redox".into());
+        let cross_request = want.request(&name, &cross).unwrap();
+        assert!(!want.accepts(&pinned, &cross_request));
+    }
+
+    #[test]
+    fn local_git_sources_lock_by_their_canonical_url() {
+        let name = PackageName::new("tiny").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let want = Want {
+            git: Some(dir.path().to_str().unwrap().to_owned()),
+            ..Want::default()
+        };
+        let request = want.request(&name, &base()).unwrap();
+        let git = request.git.as_ref().unwrap();
+        assert!(git.as_str().starts_with("file://"), "{}", git.as_str());
+
+        // Another directory is another source, even with the same request.
+        let other = tempfile::tempdir().unwrap();
+        let moved = Want {
+            git: Some(other.path().to_str().unwrap().to_owned()),
+            ..Want::default()
+        };
+        let moved_request = moved.request(&name, &base()).unwrap();
+        assert!(!moved.accepts(&locked("0.1.0", None, &request), &moved_request));
+
+        let missing = Want {
+            git: Some(dir.path().join("missing").to_str().unwrap().to_owned()),
+            ..Want::default()
+        };
+        assert!(matches!(
+            missing.request(&name, &base()),
+            Err(SyncError::GitSource { .. })
+        ));
     }
 }

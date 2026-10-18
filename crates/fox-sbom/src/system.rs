@@ -54,7 +54,9 @@ pub struct CargoCrate {
 }
 
 /// The crates.io crates in a build SBOM: its library components with a
-/// `pkg:cargo` purl. Git and path crates have no purl and are left out.
+/// `pkg:cargo` purl whose `fox:registry` is crates.io. Git and path crates
+/// have no purl, and crates from other registries share the purl type but
+/// not crates.io's names, so all three are left out.
 pub fn cargo_crates(bom: &Bom) -> Vec<CargoCrate> {
     let Some(components) = &bom.components else {
         return Vec::new();
@@ -67,6 +69,7 @@ pub fn cargo_crates(bom: &Bom) -> Vec<CargoCrate> {
                 .purl
                 .as_ref()
                 .is_some_and(|purl| purl.as_ref().starts_with("pkg:cargo/"))
+                && from_crates_io(component)
         })
         .map(|component| CargoCrate {
             name: component.name.to_string(),
@@ -78,6 +81,20 @@ pub fn cargo_crates(bom: &Bom) -> Vec<CargoCrate> {
             build_only: component.scope == Some(Scope::Excluded),
         })
         .collect()
+}
+
+/// The index URLs Cargo records for crates.io (git and sparse).
+const CRATES_IO_INDEXES: [&str; 2] = [
+    "https://github.com/rust-lang/crates.io-index",
+    "https://index.crates.io/",
+];
+
+fn from_crates_io(component: &cyclonedx_bom::models::component::Component) -> bool {
+    component.properties.as_ref().is_some_and(|properties| {
+        properties.0.iter().any(|property| {
+            property.name == "fox:registry" && CRATES_IO_INDEXES.contains(&property.value.as_ref())
+        })
+    })
 }
 
 /// One installed package.
@@ -165,19 +182,41 @@ impl<'a> SystemSbom<'a> {
             .map_err(SbomError::Write)
     }
 
+    /// Hashes every input that appears in the document, so two documents
+    /// with different contents never share a serial number. Build SBOMs
+    /// are covered through the hash in their file record.
     fn identity(&self) -> Blake3Digest {
         let mut hasher = blake3::Hasher::new();
         hasher.update(SERIAL_CONTEXT);
-        for part in core::iter::once(self.name).chain(
-            self.packages
-                .iter()
-                .flat_map(|package| [package.name.as_str(), package.version]),
-        ) {
+        let text = |hasher: &mut blake3::Hasher, part: &str| {
             hasher.update(&(part.len() as u64).to_le_bytes());
             hasher.update(part.as_bytes());
-        }
+        };
+        text(&mut hasher, self.name);
+        hasher.update(&(self.packages.len() as u64).to_le_bytes());
         for package in &self.packages {
+            text(&mut hasher, package.name.as_str());
+            text(&mut hasher, package.version);
+            text(&mut hasher, package.target.unwrap_or(""));
+            hasher.update(&[u8::from(package.archive_blake3.is_some())]);
+            if let Some(archive) = package.archive_blake3 {
+                hasher.update(archive.as_bytes());
+            }
             hasher.update(package.entries_blake3.as_bytes());
+            hasher.update(package.signer.as_bytes());
+            text(&mut hasher, package.signer_label);
+            hasher.update(&(package.depends.len() as u64).to_le_bytes());
+            for depend in package.depends {
+                text(&mut hasher, depend.as_str());
+            }
+            hasher.update(&(package.files.len() as u64).to_le_bytes());
+            for file in package.files {
+                text(&mut hasher, &file.path);
+                hasher.update(&[u8::from(file.kind == fox_core::FileKind::Symlink)]);
+                hasher.update(&file.mode.to_le_bytes());
+                hasher.update(&file.size.to_le_bytes());
+                hasher.update(file.blake3.as_bytes());
+            }
         }
         hasher.finalize().into()
     }
@@ -337,7 +376,19 @@ mod tests {
                     checksum: None,
                 },
                 build_only: false,
-                depends: vec!["cc 1.0.0".into()],
+                depends: vec!["cc 1.0.0".into(), "private 1.0.0".into()],
+            },
+            CrateDependency {
+                id: "private 1.0.0".into(),
+                name: "private".into(),
+                version: "1.0.0".into(),
+                license: None,
+                source: CrateSource::Registry {
+                    url: "https://crates.example.com/index".into(),
+                    checksum: None,
+                },
+                build_only: false,
+                depends: Vec::new(),
             },
             CrateDependency {
                 id: "cc 1.0.0".into(),
@@ -379,7 +430,9 @@ mod tests {
         let hello_files = [file("usr/bin/hello")];
         let bom = build_sbom(&manifest, &hello_files);
         let crates = cargo_crates(&bom);
+        // The crate from another registry is not a crates.io crate.
         assert_eq!(crates.len(), 2);
+        assert!(!crates.iter().any(|c| c.name == "private"));
         assert!(crates.iter().any(|c| c.name == "cc" && c.build_only));
 
         let depends = [base.clone(), PackageName::new("absent").unwrap()];
@@ -438,6 +491,19 @@ mod tests {
             hello_deps["dependsOn"],
             serde_json::json!(["pkg:base", "hello/smallcrate 0.3.1"])
         );
+
+        // A package re-signed with the same entries is another document.
+        let mut resigned = packages.clone();
+        resigned[1].signer = KeyId::from_bytes([3; 32]);
+        let serial = |packages: Vec<SystemPackage<'_>>| {
+            SystemSbom::new("image", packages)
+                .to_bom()
+                .unwrap()
+                .serial_number
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(serial(resigned), serial(packages.clone()));
 
         // The same packages in another order give the same document.
         let mut reversed = packages;

@@ -164,6 +164,7 @@ fn source_mismatch(
             GitUrl::new(&source.git).ok().as_ref() == Some(&entry.git),
             "repository",
         ),
+        (attestation.package.name == entry.name, "package name"),
         (source.commit == release.commit, "commit"),
         (source.tree_blake3 == release.tree_blake3, "tree"),
         (source.path == entry.path, "package directory"),
@@ -190,7 +191,7 @@ fn source_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fox_core::Blake3Digest;
+    use fox_core::{Blake3Digest, PackageName};
 
     fn artifact(target: &str, default_features: bool, features: &[&str]) -> Artifact {
         let h = Blake3Digest::of(b"x");
@@ -205,6 +206,74 @@ mod tests {
             sbom_blake3: h,
             attestations: Vec::new(),
         }
+    }
+
+    fn attested(name: &str) -> fox_core::Attestation {
+        use fox_core::{
+            AttestationFormat, AttestedPackage, BuildRecord, KeyId, OutputRecord, Profile,
+            SourceRecord,
+        };
+        let h = Blake3Digest::of(b"x");
+        let key = KeyId::from_bytes([1; 32]);
+        fox_core::Attestation {
+            format: AttestationFormat::V1,
+            package: AttestedPackage {
+                name: PackageName::new(name).unwrap(),
+                version: "1.0.0".into(),
+            },
+            source: SourceRecord {
+                git: "https://example.com/tools".into(),
+                commit: "ab".repeat(20),
+                tree_blake3: h,
+                cargo_lock_blake3: h,
+                path: None,
+            },
+            build: BuildRecord {
+                target: "x86_64-unknown-redox".into(),
+                cpu_level: None,
+                features: Vec::new(),
+                feature_set_hash: h,
+                toolchain_id: "rust".into(),
+                profile: Profile::Release,
+                auditable: false,
+                builder: "ci".into(),
+                builder_key: key,
+                built_at: "2026-10-17T02:00:00Z".parse().unwrap(),
+            },
+            output: OutputRecord {
+                pkgar_blake3: h,
+                pkgar_size: 1,
+                pkgar_header_signer: key,
+                entries_blake3: h,
+                sbom_blake3: h,
+            },
+        }
+    }
+
+    #[test]
+    fn an_artifact_of_another_package_from_the_same_source_is_refused() {
+        let pair = ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]);
+        let owner = ssh_key::PublicKey::from(pair.public).to_openssh().unwrap();
+        let text = format!(
+            "name = \"cli\"\nkind = \"app\"\ngit = \"https://example.com/tools\"\n\n\
+             [[owners]]\nid = \"me\"\nkey = \"{owner}\"\n"
+        );
+        let entry = PackageEntry::from_toml(&text, "packages/cl/cli.toml").unwrap();
+        let release = Release {
+            version: semver::Version::new(1, 0, 0),
+            tag: "v1.0.0".into(),
+            commit: "ab".repeat(20),
+            tree_blake3: Blake3Digest::of(b"x"),
+            yanked: false,
+        };
+        let same = attested("cli");
+        let artifact = Artifact::from_attestation(&same, true, Vec::new());
+        assert_eq!(source_mismatch(&same, &entry, &release, &artifact), None);
+        let other = attested("daemon");
+        assert_eq!(
+            source_mismatch(&other, &entry, &release, &artifact),
+            Some("package name")
+        );
     }
 
     #[test]

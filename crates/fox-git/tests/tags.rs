@@ -161,6 +161,19 @@ fn fetches_into_a_bare_cache_and_updates_it() {
         origin.tree_blake3(&second).unwrap()
     );
 
+    // The remote switches its default branch; the cache's HEAD follows.
+    git(upstream.path(), &["checkout", "-q", "-b", "trunk"]);
+    git(
+        upstream.path(),
+        &["commit", "-q", "--allow-empty", "-m", "three"],
+    );
+    let third = Repository::open(upstream.path())
+        .unwrap()
+        .resolve("HEAD")
+        .unwrap();
+    let cached = fetch(&url, &cache).unwrap();
+    assert_eq!(cached.resolve("HEAD").unwrap(), third);
+
     assert!(matches!(
         fetch(
             &format!("file://{}/missing", upstream.path().display()),

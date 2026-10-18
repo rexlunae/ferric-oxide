@@ -455,6 +455,17 @@ paths it was given. Files are read only through the verified registry, which
 checks each against its signed length and hash; a file no metadata lists
 cannot be read. Top-level targets win over a delegation for the same path.
 
+The client also refuses a delegation whose name is not a single path
+component, any read that would leave the checkout (including through a
+symbolic link), a metadata length above 16 MiB whatever the signed
+descriptor claims, and a `registry.toml` whose `name` differs from the
+signed root's. It pins the BLAKE3 of the trusted timestamp's signed payload
+in its saved state (`timestamp_payload`), so a timestamp with the trusted
+version but different content is refused as an equivocation, while
+signatures re-made over the same payload are accepted. A package file supplied by its
+delegation must list as owners exactly the delegation's keys, so tag
+authority cannot drift from update authority.
+
 ### Running a registry
 
 ```sh
@@ -474,7 +485,15 @@ content changed a new version and expiry, and signs with whichever `--key`
 files the role lists. A version nobody has signed yet is updated in place.
 A role that has used up half its lifetime is renewed when its key is given,
 so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
-fresh. `sign --complete` fails if any file is short of its threshold, which
+fresh. A role is only renewed when the given keys can sign the replacement
+to its threshold, so a scheduled run holding one of two keys leaves the
+still-valid metadata in place. A new root is complete only when its own
+root keys meet their threshold and, separately, the previous root's root
+keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
+amended by `set-role` rather than followed by another version. Amending it
+drops every signature it already has, by old and new root keys alike, so
+each key set has to approve the content it actually signs.
+`sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the
 snapshot key, and CI adds snapshot and timestamp after the merge.
 
@@ -496,7 +515,7 @@ copy only while signing.
 | `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
 
 | `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
-| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline, signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, `--work-dir` optional) |
+| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, also decides which artifacts count as present; `--work-dir` optional) |
 | `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
 
 `release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
@@ -524,9 +543,17 @@ repository, refuses it unless `metadata/root/1.json` has the pinned hash,
 and verifies it. Each registry keeps `var/lib/fox/registries/<name>/`: a
 bare mirror in `git/`, the verified checkout in `tree/`, and `state.json`
 with the trusted root, the metadata versions seen and the time of the last
-update. An update exports the new head to `tree.new/` and replaces `tree/`
-and the state only once it verifies, so a failed update keeps the last good
-checkout and the rollback protection.
+update. An update exports the head of the registry's default branch (the
+mirror's `HEAD` follows the remote's, so a renamed default branch is picked
+up) to `tree.new/`. Once that verifies, it writes the new state to
+`state.json.new`, moves `tree/` aside to `tree.old/` and the new tree into
+place, and then renames `state.json.new` over `state.json`, the commit
+point. A failure, or an interruption found by the next open, before the
+commit puts the old tree back and drops the new state; after it, only
+`tree.old/` is removed, and failing to remove it is a warning, not a
+failed update (the next open or update tries again). So the checkout and its state always stay a
+verified pair, and a failed update keeps the last good checkout and the
+rollback protection.
 
 Installing by name looks the package up in every configured registry (or
 the named one), updating any whose checkout is older than
@@ -538,11 +565,14 @@ requirement (any version if none is given; yanked releases only with
    target and feature set, downloads its archive, attestation and signature
    by hash from the registry's `artifact-base-urls`, and installs it when
    enough distinct builders listed in `registry.toml` signed attestations of
-   that exact archive, built from the release's commit and tree;
+   that exact archive, naming the requested package and version and built
+   from the release's commit and tree;
 2. otherwise, unless `build = "never"`, fetches the package's repository,
    checks that the release tag is SSH-signed by one of the owners the
    registry lists and still names the recorded commit and tree, and builds
-   it as a [git source](#git-sources). The owners come from the signed
+   it as a [git source](#git-sources). The Cargo package built is the one
+   the registry names (so a workspace root can hold others), and the build
+   fails if its manifest names another package. The owners come from the signed
    registry, so there is no trust-on-first-use prompt.
 
 `fox verify --installed` accepts the registries' builder keys (labelled
@@ -593,8 +623,8 @@ A package entry takes `version` and `registry`, or `git` with an optional
 refuses one configured with another URL or pin), writes `[policy]` if
 present, installs every package and then writes the lock file, `fox.lock`
 beside the set unless `--lock` names another. The lock (`fox-lock/1`)
-records each package's version, its registry or its git URL and commit, and
-the BLAKE3 of the archive installed:
+records each package's version, its registry or its git URL and commit, a
+digest of its build request and the BLAKE3 of the archive installed:
 
 ```toml
 format = "fox-lock/1"
@@ -603,18 +633,32 @@ format = "fox-lock/1"
 name = "nginx"
 version = "1.27.3"
 registry = "ferric"
+request-blake3 = "<BLAKE3 of the build request>"
 pkgar-blake3 = "<BLAKE3 of the archive>"
 ```
 
+The build request is what changes the archive built: the git source's
+normalized URL (a local directory becomes the `file://` URL of its
+canonical path, so the same checkout always has the same identity), `rev`,
+`path`, `package`, the features (sorted, without repeats),
+`default-features` and the target (the entry's, else `--target`'s). A git
+source that is neither a git URL nor an existing directory is an error,
+not an unpinned entry.
+
 On the next sync a locked package is kept while the lock still satisfies
-the set (same source, version still matching): it is skipped if the
+the set (same source and build request, version still matching), so
+changing a package's `rev`, features, target, `path` or `package` resolves
+it again; a kept package is skipped if the
 installed archive is the locked one, and otherwise installed again at the
 locked version, which for a registry package must be the locked archive.
 Git packages are pinned to their commit instead, since an archive built
 locally is signed with that root's own builder key and so differs between
 roots. Packages that the previous lock listed and the set no longer does
-are removed; packages installed by hand are left alone. `--locked` fails
-on any package the lock does not pin (for reproducible image builds), and
+are removed if the installed archive is still the locked one; packages
+installed by hand, or replaced by hand since the last sync, are left alone
+(reported as `kept`). `--locked` fails on any package the lock does not pin
+(for reproducible image builds), and checks every package before it adds a
+registry or writes the policy, so a refused sync changes nothing;
 `--update` resolves every package again.
 
 ### Advisories and `fox audit`
@@ -648,9 +692,16 @@ RustSec database (`crates/<crate>/*.md`, Markdown with TOML front matter).
 Package advisories match installed package names and versions; crate
 advisories match the crates listed in each package's build SBOM, so a
 vulnerable crate is reported in every package that links it, marked
-`build only` when it ran only at build time. The SBOM is read from the path
-the package itself installed, and only if it still has the hash recorded at
-install time. `audit` fails when anything matches; `--json` gives the
+`build only` when it ran only at build time. Only crates whose
+`fox:registry` is crates.io are matched against RustSec; crates from other
+registries share the `pkg:cargo` purl type but not crates.io's names. The
+SBOM is read from the path the package itself installed, never through a
+symbolic link and no further than its recorded size (at most 64 MiB), and
+only if it still has the hash recorded at install time. Packages whose
+removal did not finish are left out. Package advisories match by name and
+version alone: the installed-package database does not record which
+registry a package came from, so with two registries publishing the same
+name, both registries' advisories apply. `audit` fails when anything matches; `--json` gives the
 findings, the packages whose versions are not semver (`unchecked`) and the
 number of advisories checked. Installing a registry release that an
 advisory affects prints a warning.
@@ -665,7 +716,8 @@ package its files and the crates from its build SBOM (their `bom-ref`s
 prefixed with `<package>/`). The dependency graph links the system to its
 packages, packages to the installed packages they depend on and to their
 root crates, and keeps each build's crate graph. Like the package SBOM it
-is reproducible. Run against an image root (`--root`), it is that image's
+is reproducible; its serial number derives from everything the document
+lists, so a re-signed or changed package gives a new serial. Run against an image root (`--root`), it is that image's
 SBOM; packages adopted from `pkg` have no build SBOM, so they list files but
 no crates.
 

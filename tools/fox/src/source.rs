@@ -80,6 +80,11 @@ pub(crate) enum SourceError {
         tag_version: String,
         version: String,
     },
+    #[error("the registry names package {expected}, but the build produced {found}")]
+    PackageMismatch {
+        expected: fox_core::PackageName,
+        found: fox_core::PackageName,
+    },
 }
 
 impl From<BuildError> for SourceError {
@@ -153,6 +158,12 @@ impl SourceSpec {
             rev,
         })
     }
+
+    /// The source's identity: its normalized URL, with a local directory
+    /// turned into a `file://` URL of its canonical path.
+    pub(crate) fn git(&self) -> &GitUrl {
+        &self.git
+    }
 }
 
 /// A fetched source at the commit chosen for it.
@@ -165,6 +176,9 @@ pub(crate) struct Resolved {
     tag: Option<Tag>,
     /// The package's directory inside the repository.
     path: Option<PathBuf>,
+    /// For a registry release, the package the registry names: the Cargo
+    /// package that is built, whose manifest must carry this name.
+    package: Option<fox_core::PackageName>,
 }
 
 fn cache_dir(root: &Path, git: &GitUrl) -> PathBuf {
@@ -209,6 +223,7 @@ pub(crate) fn resolve(
         commit,
         tag,
         path: args.path.clone(),
+        package: None,
     })
 }
 
@@ -241,6 +256,7 @@ pub(crate) fn resolve_release(
         commit,
         tag: Some(tag),
         path: entry.path.as_ref().map(PathBuf::from),
+        package: Some(entry.name.clone()),
     })
 }
 
@@ -349,7 +365,12 @@ pub(crate) fn build(
     request.rev = resolved.commit.id();
     request.git_url = Some(resolved.git.to_string());
     request.package_dir = resolved.path.clone().unwrap_or_default();
-    request.package = args.package.clone();
+    // A registry names the package; a workspace root may hold another one.
+    request.package = resolved
+        .package
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| args.package.clone());
     request.target = args.target.clone();
     request.features = FeatureSelection {
         default_features: !args.no_default_features,
@@ -362,6 +383,14 @@ pub(crate) fn build(
     )?;
     let built = fox_build::build(&request)?;
     check_version(resolved, &built.manifest.version)?;
+    if let Some(expected) = &resolved.package
+        && &built.manifest.name != expected
+    {
+        return Err(SourceError::PackageMismatch {
+            expected: expected.clone(),
+            found: built.manifest.name.clone(),
+        });
+    }
     Ok(fox_build::package(&built, &signer, &out)?)
 }
 
