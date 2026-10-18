@@ -45,6 +45,117 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
+/// Completion state of a strict DMA unmap.
+///
+/// A failed operation may have cleared page-table entries without completing invalidation.
+/// Repeating the clear cannot prove that cached translations are gone, so failure remains
+/// terminal until the owning domain is successfully blocked and its mappings are discarded.
+#[derive(Debug, Default)]
+pub struct UnmapState {
+    status: UnmapStatus,
+}
+
+#[derive(Debug, Default)]
+enum UnmapStatus {
+    #[default]
+    Mapped,
+    Failed,
+    Unmapped,
+}
+
+/// A strict unmap failed to establish that DMA can no longer reach the mapping.
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnmapFailure<E> {
+    /// The backend failed while clearing entries or invalidating cached translations.
+    Backend(E),
+    /// An earlier attempt failed; only confirmed domain blocking can retire this mapping.
+    PreviouslyFailed,
+}
+
+impl<E: fmt::Display> fmt::Display for UnmapFailure<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "strict DMA unmap failed: {error}"),
+            Self::PreviouslyFailed => f.write_str("strict DMA unmap previously failed"),
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for UnmapFailure<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::PreviouslyFailed => None,
+        }
+    }
+}
+
+impl UnmapState {
+    /// Runs `unmap` once, recording whether its strict invalidation completed.
+    ///
+    /// Keep the mapping's IOVA and frame pins owned until this returns `Ok`, or until
+    /// successful domain blocking makes the entire mapping unreachable. Completed unmaps
+    /// are idempotent; failed unmaps keep failing without rerunning a partially completed
+    /// backend operation. The caller must serialize this state with its mapping table.
+    ///
+    /// # Errors
+    ///
+    /// [`UnmapFailure::Backend`] on the first backend failure, and
+    /// [`UnmapFailure::PreviouslyFailed`] on every later attempt after that failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_iommu::dma::{UnmapFailure, UnmapState};
+    /// let mut state = UnmapState::default();
+    /// assert_eq!(state.attempt(|| Err("invalidation timeout")),
+    ///     Err(UnmapFailure::Backend("invalidation timeout")));
+    /// assert_eq!(state.attempt(|| Ok::<(), &str>(())),
+    ///     Err(UnmapFailure::PreviouslyFailed));
+    /// ```
+    pub fn attempt<E>(
+        &mut self,
+        unmap: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), UnmapFailure<E>> {
+        match self.status {
+            UnmapStatus::Failed => Err(UnmapFailure::PreviouslyFailed),
+            UnmapStatus::Unmapped => Ok(()),
+            UnmapStatus::Mapped => match unmap() {
+                Ok(()) => {
+                    self.status = UnmapStatus::Unmapped;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.status = UnmapStatus::Failed;
+                    Err(UnmapFailure::Backend(error))
+                }
+            },
+        }
+    }
+}
+
+/// Completes a DMA mapping's teardown before removing its owned resources from `mappings`.
+///
+/// Returns `None` for a missing IOVA. On success the caller receives the entry and may free
+/// its IOVA and frame pins. On failure the entry remains in place, including any failure
+/// state recorded by `unmap`. Hold the owning domain's lock throughout this operation.
+///
+/// # Errors
+///
+/// Returns the error from `unmap` without removing or dropping the mapping entry.
+pub fn complete_unmap<T, E>(
+    mappings: &mut BTreeMap<u64, T>,
+    iova: u64,
+    unmap: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<Option<T>, E> {
+    let Some(mapping) = mappings.get_mut(&iova) else {
+        return Ok(None);
+    };
+    unmap(mapping)?;
+    Ok(mappings.remove(&iova))
+}
+
 /// A range of addresses: `len` bytes from `start`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
@@ -306,7 +417,113 @@ impl<T> DmaMappings<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn concurrent_unmap_and_revoke_keep_a_failed_mapping_recorded() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Barrier, Mutex};
+        use std::thread;
+
+        let mappings = Mutex::new(BTreeMap::from([(0x1000, UnmapState::default())]));
+        let invalidations = AtomicUsize::new(0);
+        let start = Barrier::new(3);
+        thread::scope(|scope| {
+            let attempt = || {
+                start.wait();
+                let mut mappings = mappings.lock().unwrap();
+                complete_unmap(&mut mappings, 0x1000, |state| {
+                    state.attempt(|| {
+                        invalidations.fetch_add(1, Ordering::Relaxed);
+                        Err("IOTLB timeout")
+                    })
+                })
+            };
+            let unmap = scope.spawn(attempt);
+            let revoke = scope.spawn(attempt);
+            start.wait();
+            assert!(unmap.join().unwrap().is_err());
+            assert!(revoke.join().unwrap().is_err());
+        });
+        assert_eq!(invalidations.load(Ordering::Relaxed), 1);
+        assert_eq!(mappings.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_invalidation_never_becomes_success_on_retry() {
+        let mut state = UnmapState::default();
+        let mut entries_present = true;
+        let mut invalidations = 0;
+        assert_eq!(
+            state.attempt(|| {
+                entries_present = false;
+                invalidations += 1;
+                Err("IOTLB timeout")
+            }),
+            Err(UnmapFailure::Backend("IOTLB timeout"))
+        );
+        assert!(!entries_present);
+        for _ in 0..3 {
+            assert_eq!(
+                state.attempt(|| {
+                    invalidations += 1;
+                    Ok::<(), &str>(())
+                }),
+                Err(UnmapFailure::PreviouslyFailed)
+            );
+        }
+        assert_eq!(invalidations, 1);
+    }
+
+    #[test]
+    fn failed_teardown_does_not_allow_iova_reuse() {
+        use crate::iova::IovaAllocator;
+        let mut allocator = IovaAllocator::new(0x10_000, []);
+        let block = allocator.alloc(0x1000).unwrap();
+        let mut held = BTreeMap::from([(block.start, (block, UnmapState::default()))]);
+        assert!(
+            complete_unmap(&mut held, block.start, |(_, state)| {
+                state.attempt(|| Err("timeout"))
+            })
+            .is_err()
+        );
+        // The kernel keeps this entry and its pins on error rather than returning its block.
+        assert_ne!(allocator.alloc(0x1000).unwrap().start, block.start);
+        let retry = complete_unmap(&mut held, block.start, |(_, state)| {
+            state.attempt(|| Ok::<(), &str>(()))
+        });
+        assert!(matches!(retry, Err(UnmapFailure::PreviouslyFailed)));
+        assert_eq!(held.len(), 1);
+        // Only confirmed domain blocking permits the owner to discard the failed entry.
+        let (blocked, _) = held.remove(&block.start).unwrap();
+        allocator.free(blocked).unwrap();
+        assert_eq!(allocator.alloc(0x1000).unwrap().start, block.start);
+    }
+
+    #[test]
+    fn completed_unmap_does_not_invalidate_a_reused_iova() {
+        let mut state = UnmapState::default();
+        state.attempt(|| Ok::<(), &str>(())).unwrap();
+        assert_eq!(state.attempt(|| Err("must not run twice")), Ok(()));
+    }
+
+    #[test]
+    fn completed_teardown_returns_resources_once() {
+        let mut held = BTreeMap::from([(0x1000, UnmapState::default())]);
+        let taken = complete_unmap(&mut held, 0x1000, |state| {
+            state.attempt(|| Ok::<(), &str>(()))
+        })
+        .unwrap();
+        assert!(taken.is_some());
+        assert!(held.is_empty());
+        assert!(
+            complete_unmap(&mut held, 0x1000, |_| Err("must not run"))
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn map(phys: u64, len: u64, iova: u64, user: Span) -> Mapping<u32> {
         Mapping::new(phys, len, iova, true, user, 0)

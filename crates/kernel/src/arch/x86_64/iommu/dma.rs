@@ -43,6 +43,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(feature = "regbuf")]
+use ferric_iommu::dma::{complete_unmap, UnmapFailure, UnmapState};
 use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Span};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
@@ -91,6 +93,12 @@ pub enum DmaError {
     /// A grant mapping has no pages, or too many to address.
     #[cfg(feature = "regbuf")]
     GrantSize,
+    /// A previous strict grant unmap failed; the domain must be blocked before release.
+    #[cfg(feature = "regbuf")]
+    FailedUnmap {
+        /// The IOVA whose teardown failed.
+        iova: u64,
+    },
 }
 
 impl fmt::Display for DmaError {
@@ -106,6 +114,10 @@ impl fmt::Display for DmaError {
             Self::NoGrantMapping { iova } => write!(f, "no grant is mapped at IOVA {iova:#x}"),
             #[cfg(feature = "regbuf")]
             Self::GrantSize => f.write_str("a grant mapping must have between 1 and 2^52 pages"),
+            #[cfg(feature = "regbuf")]
+            Self::FailedUnmap { iova } => {
+                write!(f, "unmap of grant IOVA {iova:#x} previously failed")
+            }
         }
     }
 }
@@ -262,6 +274,7 @@ struct GrantHeld {
     len: u64,
     pins: Pins,
     ticket: u64,
+    unmap: UnmapState,
 }
 
 /// The runs of physically consecutive frames in `frames`: each run's first frame's physical
@@ -545,6 +558,7 @@ impl DmaSpace {
             len,
             pins,
             ticket,
+            unmap: UnmapState::default(),
         };
         self.grants.insert(block.start, held);
         Ok(block.start)
@@ -557,34 +571,32 @@ impl DmaSpace {
     /// # Errors
     ///
     /// [`DmaError::NoGrantMapping`] when no such mapping is there, and [`DmaError::Domain`]
-    /// when the unmap or its invalidation failed: the mapping is forgotten then, but its
-    /// frames stay pinned and its block allocated, since the device may still reach them.
+    /// when the unmap or its invalidation failed. The mapping, pins and block remain owned,
+    /// and [`DmaError::FailedUnmap`] is returned on later attempts until domain closure.
     #[cfg(feature = "regbuf")]
     pub fn unmap_grant(&mut self, iova: u64, ticket: Option<u64>) -> Result<u64, DmaError> {
-        let held = self
-            .grants
-            .remove(&iova)
-            .ok_or(DmaError::NoGrantMapping { iova })?;
-        if ticket.is_some_and(|t| t != held.ticket) {
-            self.grants.insert(iova, held);
-            return Err(DmaError::NoGrantMapping { iova });
-        }
-        match self.domain.unmap(iova, held.len) {
-            Ok(()) => {
-                self.give_back(held.block, held.pins);
-                Ok(held.ticket)
+        let domain = &mut self.domain;
+        let held = complete_unmap(&mut self.grants, iova, |held| {
+            if ticket.is_some_and(|t| t != held.ticket) {
+                return Err(DmaError::NoGrantMapping { iova });
             }
-            Err(err) => {
-                error!(
-                    "IOMMU: cannot unmap grant IOVA {iova:#x}+{:#x} from domain {}: {err}; its frames stay pinned",
-                    held.len,
-                    self.domain.id()
-                );
-                // Dropping the pins without releasing them keeps the frames referenced.
-                drop(held.pins);
-                Err(err.into())
-            }
-        }
+            held.unmap
+                .attempt(|| domain.unmap(iova, held.len))
+                .map_err(|err| {
+                    error!(
+                        "IOMMU: cannot unmap grant IOVA {iova:#x}+{:#x} from domain {}: {err}; its frames stay pinned",
+                        held.len,
+                        domain.id()
+                    );
+                    match err {
+                        UnmapFailure::Backend(error) => error.into(),
+                        _ => DmaError::FailedUnmap { iova },
+                    }
+                })
+        })?
+        .ok_or(DmaError::NoGrantMapping { iova })?;
+        self.give_back(held.block, held.pins);
+        Ok(held.ticket)
     }
 
     /// How many grant mappings the domain holds.

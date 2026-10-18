@@ -147,6 +147,8 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::NoGrantMapping { .. } => Error::new(ENOENT),
         #[cfg(feature = "regbuf")]
         DmaError::GrantSize => Error::new(EINVAL),
+        #[cfg(feature = "regbuf")]
+        DmaError::FailedUnmap { .. } => Error::new(EIO),
     }
 }
 
@@ -768,28 +770,31 @@ fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
 ///
 /// # Errors
 ///
-/// `EIO` when the unmap or its IOTLB invalidation failed. The domain has forgotten the
-/// mapping then (a retry could not unmap it again), but its frames stay pinned for good, so
-/// the device can reach nothing but the application's own buffer.
+/// `EIO` when the unmap or its IOTLB invalidation failed, including later retries of that
+/// failed mapping. The domain retains its pins and IOVA until confirmed domain blocking.
 #[cfg(feature = "regbuf")]
 pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
-    // Dropped at once: the guard must not be held with the handle table.
-    let _ = GRANT_LINKS.lock().remove(&record.ticket);
-    let mut handles = HANDLES.lock();
-    let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
-        return Ok(());
-    };
-    match space.unmap_grant(record.iova, Some(record.ticket)) {
-        Ok(_) => {
-            info!(
-                "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
-                space.id(),
-                record.iova
-            );
+    let result = {
+        let mut handles = HANDLES.lock();
+        if let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) {
+            match space.unmap_grant(record.iova, Some(record.ticket)) {
+                Ok(_) => {
+                    info!(
+                        "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
+                        space.id(),
+                        record.iova
+                    );
+                    Ok(())
+                }
+                Err(DmaError::NoGrantMapping { .. }) => Ok(()),
+                // Keep the link on failure, just as the region keeps its record.
+                Err(_) => Err(Error::new(EIO)),
+            }
+        } else {
             Ok(())
         }
-        Err(DmaError::NoGrantMapping { .. }) => Ok(()),
-        // unmap_grant logged it; the frames stay pinned.
-        Err(_) => Err(Error::new(EIO)),
-    }
+    };
+    result?;
+    let _ = GRANT_LINKS.lock().remove(&record.ticket);
+    Ok(())
 }
