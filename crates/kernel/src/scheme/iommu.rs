@@ -37,7 +37,7 @@
 //! The call encoding is in the shared `ferric-iommu` crate (`crates/iommu`), which pcid uses
 //! too.
 
-use alloc::{collections::BTreeMap, sync::Weak};
+use alloc::{collections::BTreeMap, sync::Weak, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
@@ -400,7 +400,7 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
 ///
 /// `EINVAL` when the process has bound no domain or `id` is that domain, `EBUSY` when another
 /// live process has bound `id`, `EBADF` when `id` is not open, and the errno of a failed
-/// detach or attach; a device whose attach fails is put back into `id`.
+/// detach or attach; the devices are then put back into `id` (see [`move_devices`]).
 fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     let addr_space = AddrSpace::current()?;
     let name = context::current().read(token.token()).name;
@@ -426,8 +426,8 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
         }
         Ok(space.domain().devices().collect::<alloc::vec::Vec<_>>())
     })?;
-    for &device in &devices {
-        let (from, into) = move_device(&mut handles, device, id, target)?;
+    let (from, into) = move_devices(&mut handles, &devices, id, target)?;
+    for device in &devices {
         info!(
             "IOMMU: {:04x}:{} moved from domain {from} into domain {into} (bound by {name})",
             device.segment, device.bdf
@@ -436,53 +436,106 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     Ok(devices.len())
 }
 
-/// Moves `device` from domain handle `from` to domain handle `into`, and returns their
-/// domain IDs. When the attach fails, the device goes back into `from`.
-fn move_device(
+/// Moves `devices`, all of domain handle `from`'s devices, into domain handle `into` as one
+/// set, and returns the two domain IDs. Every device leaves `from` before any is attached to
+/// `into`: a function and its alias are attached separately, and on AMD-Vi the alias's entry
+/// stays with `from` while any of its users is still there, so moving them one at a time
+/// would find it busy. When an attach fails, the devices already in `into` are detached and
+/// go back into `from` with the rest. A device that cannot be detached from `into` stays
+/// there, and that is logged; the attach error is returned either way.
+fn move_devices(
     handles: &mut BTreeMap<usize, Handle>,
-    device: Device,
+    devices: &[Device],
     from: usize,
     into: usize,
 ) -> Result<(u16, u16)> {
     let from_did = with_domain(handles, from, |space, _| {
-        space.domain().detach(device).map_err(|err| errno(&err))?;
+        let domain = space.domain();
+        for (i, &device) in devices.iter().enumerate() {
+            if let Err(err) = domain.detach(device) {
+                reattach(domain, devices.get(..i).unwrap_or_default());
+                return Err(errno(&err));
+            }
+        }
         Ok(space.id())
     })?;
+    let mut moved: usize = 0;
     let attached = with_domain(handles, into, |space, _| {
         let domain = space.domain();
-        domain.attach(device).map_err(|err| {
+        for &device in devices {
+            domain.attach(device).map_err(|err| {
+                warn!(
+                    "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
+                    device.segment,
+                    device.bdf,
+                    domain.id()
+                );
+                errno(&err)
+            })?;
+            moved = moved.saturating_add(1);
+        }
+        Ok(domain.id())
+    });
+    let err = match attached {
+        Ok(into_did) => return Ok((from_did, into_did)),
+        Err(err) => err,
+    };
+    let moved = devices.get(..moved).unwrap_or_default();
+    // The devices that cannot leave `into` again stay there; only the rest go back.
+    let stuck = with_domain(handles, into, |space, _| {
+        let mut stuck = Vec::new();
+        for &device in moved {
+            if let Err(e) = space.domain().detach(device) {
+                warn!(
+                    "IOMMU: {:04x}:{} cannot leave domain {}: {e}",
+                    device.segment,
+                    device.bdf,
+                    space.id()
+                );
+                stuck.push(device);
+            }
+        }
+        Ok(stuck)
+    })
+    .unwrap_or_else(|_| moved.to_vec());
+    let back: Vec<Device> = devices
+        .iter()
+        .copied()
+        .filter(|device| !stuck.contains(device))
+        .collect();
+    let _ = with_domain(handles, from, |space, _| {
+        reattach(space.domain(), &back);
+        Ok(())
+    });
+    if !stuck.is_empty() {
+        warn!(
+            "IOMMU: join into domain handle {into} failed and was not fully undone: {} device(s) stay in it",
+            stuck.len()
+        );
+    }
+    Err(err)
+}
+
+/// Attaches `devices` back to `domain` after a failed move, warning about any that cannot go
+/// back (they stay blocked).
+fn reattach(domain: &mut Domain, devices: &[Device]) {
+    for &device in devices {
+        if let Err(err) = domain.attach(device) {
             warn!(
-                "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
+                "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {}: {err}",
                 device.segment,
                 device.bdf,
                 domain.id()
             );
-            errno(&err)
-        })?;
-        Ok(domain.id())
-    });
-    match attached {
-        Ok(into_did) => Ok((from_did, into_did)),
-        Err(err) => {
-            let back = with_domain(handles, from, |space, _| {
-                space.domain().attach(device).map_err(|e| errno(&e))
-            });
-            if back.is_err() {
-                warn!(
-                    "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {from_did}",
-                    device.segment, device.bdf
-                );
-            }
-            Err(err)
         }
     }
 }
 
 /// The domain bound by the address space at `owner`, if any.
-fn bound_to<'a>(
-    handles: &'a mut BTreeMap<usize, Handle>,
+fn bound_to(
+    handles: &mut BTreeMap<usize, Handle>,
     owner: *const AddrSpaceWrapper,
-) -> Option<&'a mut DmaSpace> {
+) -> Option<&mut DmaSpace> {
     handles.values_mut().find_map(|h| match h {
         Handle::Domain {
             space,

@@ -1,23 +1,26 @@
-//! Ferric Oxide: the boot self-test of DMA domains, run when VT-d is enabled.
+//! Ferric Oxide: the boot self-test of DMA domains, run when VT-d or AMD-Vi is enabled.
 //!
-//! It creates a [`Domain`], maps and unmaps a few IOVA ranges and checks the tables through
-//! `ferric-vtd`'s decoding, then attaches a device that cannot be doing DMA, checks its
-//! context entry, maps and unmaps while it is attached (so the unit really receives the
+//! It creates a [`Domain`], maps and unmaps a few IOVA ranges and checks the tables by
+//! walking them, then attaches a device that cannot be doing DMA, checks its context or
+//! device table entry, maps and unmaps while it is attached (so the unit really receives the
 //! IOTLB invalidations), detaches it, and puts it back in the identity domain. It logs one
 //! line with the outcome, which the boot CI checks.
 //!
 //! The device is one with nothing at its address, or else a host bridge, which never
-//! initiates DMA. Neither may be named by an RMRR.
+//! initiates DMA. Neither may be named by reserved memory (an RMRR or an IVMD).
 
 use core::fmt;
 
 use ferric_vtd::{
     dmar::{ScopeKind, Structure},
-    table::{Access, TranslationType},
+    table::Access,
     Bdf,
 };
 
-use super::domain::{self, Device, Domain, DomainError};
+use super::{
+    domain::{self, Attachment, Device, Domain, DomainError},
+    pci_config_read,
+};
 
 /// What went wrong.
 #[derive(Debug)]
@@ -115,19 +118,18 @@ fn map_unmap(domain: &mut Domain) -> Result<(), TestError> {
     Ok(())
 }
 
-/// Attaches `device`, checks its context entry, maps and unmaps while attached, detaches it
-/// and restores its identity entry.
+/// Attaches `device`, checks its entry, maps and unmaps while attached, detaches it and
+/// restores its identity entry.
 fn attach_detach(domain: &mut Domain, device: Device) -> Result<(), TestError> {
-    let index = domain::unit_index(device)?;
-    let before = domain::context_entry(index, device.bdf)?;
+    let before = domain::attachment(device)?;
     domain.attach(device)?;
-    let entry = domain::context_entry(index, device.bdf)?;
     expect(
-        entry.is_present()
-            && entry.domain_id() == domain.id()
-            && entry.table() == domain.root_table()
-            && entry.translation_type() == Some(TranslationType::Untranslated),
-        "the attached context entry",
+        domain::attachment(device)?
+            == Attachment::Domain {
+                id: domain.id(),
+                root: domain.root_table(),
+            },
+        "the attached device's entry",
     )?;
     let range = domain.alloc_iova(0x8000)?;
     domain.map(range.start, 0x3000_0000, range.len, Access::ReadWrite)?;
@@ -135,46 +137,39 @@ fn attach_detach(domain: &mut Domain, device: Device) -> Result<(), TestError> {
     domain.free_iova(range)?;
     domain.detach(device)?;
     expect(
-        !domain::context_entry(index, device.bdf)?.is_present(),
-        "the blocked context entry",
+        domain::attachment(device)? == Attachment::Blocked,
+        "the blocked device's entry",
     )?;
     domain::restore_identity(device)?;
     expect(
-        domain::context_entry(index, device.bdf)? == before,
-        "the restored context entry",
+        domain::attachment(device)? == before,
+        "the restored device's entry",
     )?;
     Ok(())
 }
 
-/// Reads a 32-bit register of `bdf`'s configuration space through the legacy configuration
-/// mechanism (ports 0xCF8/0xCFC), which reaches segment 0.
-fn config_read(bdf: Bdf, offset: u8) -> u32 {
-    let address = 0x8000_0000 | (u32::from(bdf.source_id()) << 8) | u32::from(offset & 0xfc);
-    // SAFETY: this runs at boot on the BSP before user space, so nothing else uses the
-    // configuration ports; reading the vendor or class register has no side effects.
-    unsafe {
-        x86::io::outl(0xcf8, address);
-        x86::io::inl(0xcfc)
-    }
-}
-
-/// Whether `device` can be attached by the test: a unit serves it, no RMRR names it, and it
-/// is absent or a host bridge.
+/// Whether `device` can be attached by the test: a unit serves it, no reserved memory names
+/// it, and it is absent or a host bridge.
 fn usable(device: Device, want_absent: bool) -> bool {
-    if device.segment != 0 || domain::has_rmrr(device) || domain::unit_index(device).is_err() {
+    if device.segment != 0
+        || domain::has_reserved_memory(device)
+        || domain::unit_index(device).is_err()
+    {
         return false;
     }
-    let id = config_read(device.bdf, 0);
+    // Reading the vendor or class register has no side effects.
+    let id = pci_config_read(device.bdf, 0);
     if want_absent {
         return id & 0xffff == 0xffff;
     }
     // Class 06h, subclass 00h: host bridge.
-    id & 0xffff != 0xffff && config_read(device.bdf, 8) >> 16 == 0x0600
+    id & 0xffff != 0xffff && pci_config_read(device.bdf, 8) >> 16 == 0x0600
 }
 
 /// A device the test can attach without disturbing anything: an empty slot on bus 0 that a
-/// unit serves (units with INCLUDE_PCI_ALL serve every slot), or else a host bridge a unit
-/// lists (QEMU lists each device).
+/// unit serves (VT-d units with INCLUDE_PCI_ALL and AMD-Vi IVHDs with an "all" entry serve
+/// every slot), or else a host bridge a DRHD lists (QEMU lists each device), or else any
+/// host bridge on bus 0 a unit serves.
 fn idle_device() -> Option<Device> {
     let empty = (1..32u8)
         .rev()
@@ -183,24 +178,33 @@ fn idle_device() -> Option<Device> {
             bdf: Bdf::new(0, dev, 0),
         })
         .find(|&d| usable(d, true));
-    empty.or_else(|| {
-        let dmar = super::DMAR.get()?;
-        dmar.structures()
-            .filter_map(|s| match s {
-                Ok(Structure::Drhd(drhd)) => Some(drhd),
-                _ => None,
-            })
-            .flat_map(|drhd| {
-                drhd.scopes
-                    .iter()
-                    .flatten()
-                    .filter(|scope| scope.kind == ScopeKind::PciEndpoint)
-                    .filter_map(|scope| scope.direct_bdf())
-                    .map(move |bdf| Device {
-                        segment: drhd.segment,
-                        bdf,
-                    })
-            })
-            .find(|&d| usable(d, false))
-    })
+    empty
+        .or_else(|| {
+            let dmar = super::DMAR.get()?;
+            dmar.structures()
+                .filter_map(|s| match s {
+                    Ok(Structure::Drhd(drhd)) => Some(drhd),
+                    _ => None,
+                })
+                .flat_map(|drhd| {
+                    drhd.scopes
+                        .iter()
+                        .flatten()
+                        .filter(|scope| scope.kind == ScopeKind::PciEndpoint)
+                        .filter_map(|scope| scope.direct_bdf())
+                        .map(move |bdf| Device {
+                            segment: drhd.segment,
+                            bdf,
+                        })
+                })
+                .find(|&d| usable(d, false))
+        })
+        .or_else(|| {
+            (0..32u8)
+                .map(|dev| Device {
+                    segment: 0,
+                    bdf: Bdf::new(0, dev, 0),
+                })
+                .find(|&d| usable(d, false))
+        })
 }

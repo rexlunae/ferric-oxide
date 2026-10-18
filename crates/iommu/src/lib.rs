@@ -17,6 +17,13 @@
 //!   call metadata words.
 //! - `alias` (with the `alloc` feature) works out the requester IDs a function's DMA can carry
 //!   once it has passed the bridges above it, so all of them can be attached together.
+//! - [`table`] walks and edits radix I/O page tables (VT-d second-stage and AMD-Vi host
+//!   tables), with the entry encoding supplied by the vendor crate (`ferric-vtd`,
+//!   `ferric-amdvi`).
+//! - [`ring`] keeps the producer side of a ring of entries hardware consumes (VT-d's
+//!   invalidation queue, AMD-Vi's command buffer).
+//! - `iova` (with the `alloc` feature) allocates naturally aligned IOVA ranges for a domain and
+//!   hands out domain IDs, for either vendor.
 //! - `dma` (with the `alloc` feature) is the kernel's bookkeeping for the IOVA mappings that
 //!   `memory:translation` makes in a bound domain: one IOVA per frame range, kept while some
 //!   virtual mapping of the driver still reaches it.
@@ -24,7 +31,9 @@
 //! Specifications: PCI Express Base Specification (requester IDs, ports and the PCI Express
 //! capability's device/port type field), and the PCI Express to PCI/PCI-X Bridge Specification
 //! revision 1.0, section 2.3 (the requester ID a bridge gives to transactions it forwards
-//! upstream for devices on its conventional PCI side).
+//! upstream for devices on its conventional PCI side). The page-table layout is that of the
+//! Intel VT-d Architecture Specification (D51397), section 9.8, and the AMD I/O
+//! Virtualization Technology (IOMMU) Specification (#48882), section 2.2.3.
 //!
 //! # Examples
 //!
@@ -48,3 +57,7 @@ pub mod abi;
 pub mod alias;
 #[cfg(feature = "alloc")]
 pub mod dma;
+#[cfg(feature = "alloc")]
+pub mod iova;
+pub mod ring;
+pub mod table;
