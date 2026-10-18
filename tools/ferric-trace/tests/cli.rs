@@ -130,7 +130,7 @@ fn refuses_a_bad_tsc_frequency() {
 #[test]
 fn captures_a_scheme_directory() {
     let scheme = tempfile::tempdir().expect("temp dir");
-    fs::write(scheme.path().join("stats"), "cpu 0 pending 0 lost 0\n").expect("write");
+    fs::write(scheme.path().join("stats"), "cpu 0 pending 4 lost 0\n").expect("write");
     fs::create_dir(scheme.path().join("cpu")).expect("mkdir");
     fs::write(
         scheme.path().join("cpu/0"),

@@ -166,7 +166,12 @@ ferric-trace capture capture/
 it) works as follows:
 
 - It reads `stats` for the list of CPUs and saves it as `<dir>/stats.start`.
-- It drains each CPU's ring into `<dir>/cpu<n>` until a read returns 0 bytes.
+- It drains each CPU's ring into `<dir>/cpu<n>`, stopping once it has the
+  bytes `stats.start` listed as pending for that CPU, or earlier if a read
+  returns 0 bytes. The capture is a snapshot of what was pending when it
+  started. Draining until the ring is empty would never end while tracing is
+  on, because the capture's own writes are traced and refill the ring as fast
+  as it is read.
   A read that fails with `EAGAIN`, because another reader is draining the same
   CPU, is retried after a short wait.
 - It reads `stats` again into `<dir>/stats.end`.

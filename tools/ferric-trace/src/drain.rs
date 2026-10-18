@@ -2,9 +2,14 @@
 //! a directory that [`Capture::load`](crate::capture::Capture::load) reads back.
 //!
 //! [`drain_scheme`] reads the scheme's `stats` file for the list of CPUs and saves it as
-//! `stats.start`, drains each `cpu/<n>` file into `cpu<n>` until a read returns 0 bytes (the
-//! ring is empty), then reads `stats` again and saves it as `stats.end`, so records dropped
-//! while the capture ran are counted too. A read fails with `EAGAIN` while another reader is
+//! `stats.start`, drains each `cpu/<n>` file into `cpu<n>`, then reads `stats` again and saves
+//! it as `stats.end`, so records dropped while the capture ran are counted too.
+//!
+//! The capture is a snapshot: a CPU is drained until it has given the bytes `stats.start`
+//! listed as pending for it, or until a read returns 0 bytes (the ring is empty), whichever
+//! comes first. Draining until empty alone never ends while tracing is on, because saving a
+//! capture makes events of its own (every write to the output is a scheme request), so the
+//! ring refills as fast as it is read and the output grows until the disk is full. A read fails with `EAGAIN` while another reader is
 //! draining the same CPU; that read is retried after a short wait, up to [`AGAIN_RETRIES`]
 //! times in a row. Any other error stops the capture, naming the file.
 //!
@@ -25,6 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use ferric_trace::abi::{self, LineError, StatsLine};
+use ferric_trace::record::WORD_BYTES;
 
 use crate::capture::INCOMPLETE;
 
@@ -183,7 +189,8 @@ fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> 
         let to = dir.join(format!("cpu{}", line.cpu));
         let mut source = File::open(&from).map_err(io_error(&from))?;
         let mut sink = File::create(&to).map_err(io_error(&to))?;
-        let bytes = drain(&mut source, &from, &mut sink, &to, AGAIN_WAIT)?;
+        let budget = line.pending.saturating_mul(WORD_BYTES as u64);
+        let bytes = drain(&mut source, &from, &mut sink, &to, budget, AGAIN_WAIT)?;
         drained.push(CpuDrained {
             cpu: line.cpu,
             bytes,
@@ -224,20 +231,27 @@ fn snapshot(scheme: &Path, to: &Path) -> Result<Vec<StatsLine>, DrainError> {
     Ok(lines)
 }
 
-/// Copies `source` (at `from`) to `sink` (at `to`) until a read returns 0 bytes, retrying
-/// `EAGAIN` and `EINTR` reads, and returns the bytes copied.
+/// Copies `source` (at `from`) to `sink` (at `to`) until `budget` bytes have been copied or a
+/// read returns 0 bytes, retrying `EAGAIN` and `EINTR` reads, and returns the bytes copied.
+///
+/// Reads ask for no more than the bytes left in the budget, but never for less than
+/// [`abi::READ_MIN`] (a ring read returns whole records and refuses a buffer too small for
+/// the largest one), so the copy can end up to one record past the budget.
 fn drain(
     source: &mut impl Read,
     from: &Path,
     sink: &mut impl Write,
     to: &Path,
+    budget: u64,
     wait: Duration,
 ) -> Result<u64, DrainError> {
     let mut buf = vec![0u8; READ_BYTES];
     let mut total = 0u64;
     let mut busy = 0u32;
-    loop {
-        match source.read(&mut buf) {
+    while total < budget {
+        let left = usize::try_from(budget - total).unwrap_or(usize::MAX);
+        let want = left.clamp(abi::READ_MIN, READ_BYTES);
+        match source.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => {
                 busy = 0;
@@ -294,15 +308,76 @@ mod tests {
     }
 
     fn run(script: Vec<io::Result<Vec<u8>>>) -> Result<(u64, Vec<u8>), DrainError> {
+        run_with(&mut Script(script), u64::MAX)
+    }
+
+    fn run_with(source: &mut impl Read, budget: u64) -> Result<(u64, Vec<u8>), DrainError> {
         let mut sink = Vec::new();
         let n = drain(
-            &mut Script(script),
+            source,
             Path::new("cpu/0"),
             &mut sink,
             Path::new("cpu0"),
+            budget,
             Duration::ZERO,
         )?;
         Ok((n, sink))
+    }
+
+    /// A ring that refills as fast as it is read, as one does while the capture's own writes
+    /// are traced: every read gives one 8-byte word, and it never runs empty.
+    struct Refilling {
+        reads: u32,
+        largest: usize,
+        smallest: usize,
+    }
+
+    impl Read for Refilling {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.largest = self.largest.max(buf.len());
+            self.smallest = self.smallest.min(buf.len());
+            buf[..WORD_BYTES].fill(0xab);
+            Ok(WORD_BYTES)
+        }
+    }
+
+    #[test]
+    fn stops_at_the_pending_bytes_of_a_ring_that_never_empties() {
+        let mut ring = Refilling {
+            reads: 0,
+            largest: 0,
+            smallest: usize::MAX,
+        };
+        let (n, sink) = run_with(&mut ring, 10 * WORD_BYTES as u64).expect("drains");
+        assert_eq!(n, 80);
+        assert_eq!(sink.len(), 80);
+        assert_eq!(ring.reads, 10);
+        // Reads shrink with the budget left, but never below what a ring read needs.
+        assert_eq!(ring.largest, abi::READ_MIN);
+        assert_eq!(ring.smallest, abi::READ_MIN);
+    }
+
+    #[test]
+    fn a_ring_with_nothing_pending_is_not_read() {
+        let mut ring = Refilling {
+            reads: 0,
+            largest: 0,
+            smallest: usize::MAX,
+        };
+        assert_eq!(run_with(&mut ring, 0).expect("drains"), (0, Vec::new()));
+        assert_eq!(ring.reads, 0);
+    }
+
+    #[test]
+    fn reads_a_large_budget_in_full_size_reads() {
+        let mut ring = Refilling {
+            reads: 0,
+            largest: 0,
+            smallest: usize::MAX,
+        };
+        run_with(&mut ring, 1 << 20).expect("drains");
+        assert_eq!(ring.largest, READ_BYTES);
     }
 
     #[test]
