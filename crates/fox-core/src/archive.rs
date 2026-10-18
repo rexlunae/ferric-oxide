@@ -520,9 +520,22 @@ fn read_sidecar(
     manifest.depends = package
         .depends
         .iter()
-        .map(|dep| sidecar_name(sidecar, dep.as_str()))
+        .map(|dep| sidecar_name(sidecar, &resolve_relative(&manifest.name, dep.as_str())))
         .collect::<Result<_, _>>()?;
     Ok(manifest)
+}
+
+/// Resolves a cookbook dependency written relative to its own recipe:
+/// `.runtime` in `llvm21.dev` names `llvm21.runtime`, as the cookbook's
+/// `PackageName::with_suffix` does. Other names are returned unchanged.
+fn resolve_relative(package: &PackageName, dep: &str) -> String {
+    match dep.strip_prefix('.') {
+        Some(suffix) => {
+            let base = package.as_str().split('.').next().unwrap_or_default();
+            format!("{base}.{suffix}")
+        }
+        None => dep.to_owned(),
+    }
 }
 
 fn sidecar_name(sidecar: &Path, name: &str) -> Result<PackageName, ArchiveError> {
@@ -536,6 +549,15 @@ fn sidecar_name(sidecar: &Path, name: &str) -> Result<PackageName, ArchiveError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_dependencies() {
+        let dev = PackageName::new("llvm21.dev").unwrap();
+        assert_eq!(resolve_relative(&dev, ".runtime"), "llvm21.runtime");
+        assert_eq!(resolve_relative(&dev, "zlib"), "zlib");
+        let plain = PackageName::new("llvm21").unwrap();
+        assert_eq!(resolve_relative(&plain, ".runtime"), "llvm21.runtime");
+    }
 
     #[test]
     fn manifest_paths() {

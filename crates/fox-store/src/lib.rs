@@ -22,11 +22,21 @@
 //! - an existing path owned by no package is replaced only when its content
 //!   already matches, or with [`InstallOptions::force`];
 //! - nothing is written through a symlink inside the root, so a package
-//!   cannot redirect another's files outside it;
+//!   cannot redirect another's files outside it, and the root itself may
+//!   not be a symlink;
+//! - no package may write into, replace or redirect [`RESERVED_DIRS`]:
+//!   the store state and the trusted keys, so a package cannot rewrite
+//!   the database or enroll a signer;
+//! - an archive without a signed manifest has an unsigned name, so it is
+//!   installed only with [`InstallOptions::allow_unsigned_metadata`], and
+//!   never over a package that had a signed manifest;
+//! - each file gets exactly its signed mode, whatever the umask;
 //! - reinstalling or upgrading a package removes files the new version no
 //!   longer has, unless they were changed locally;
 //! - removing a package keeps locally changed files, and refuses while
-//!   another package depends on it unless forced.
+//!   another package depends on it unless forced. It is marked as being
+//!   removed before any file is touched, so an interrupted removal shows
+//!   in the database and can be run again.
 //!
 //! # Examples
 //!
@@ -63,18 +73,28 @@ mod fsutil;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fox_core::archive::{Archive, ArchiveError, MetadataSource};
-use fox_core::{FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
+use fox_core::keys::TRUSTED_KEYS_DIR;
+use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
 
 use db::Database;
-pub use db::{InstalledPackage, MetadataKind};
+pub use db::{InstalledPackage, MetadataKind, PackageState};
 use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
 
 /// Directory, relative to the root, of the store's own state.
 pub const STATE_DIR: &str = "var/lib/fox";
+
+/// Directories no package may write into, replace or redirect: the
+/// store's own state and the trusted signer keys.
+pub const RESERVED_DIRS: [&str; 2] = [STATE_DIR, TRUSTED_KEYS_DIR];
+
+/// Mode bits the store sets and checks on installed files (permissions,
+/// setuid, setgid and sticky), the bits pkgar signs.
+const MODE_BITS: u32 = 0o7777;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +105,46 @@ pub enum StoreError {
     RootNotDir {
         /// The root.
         path: PathBuf,
+    },
+    /// The root is a symlink. Following it would install outside the
+    /// path that was named.
+    #[error("install root {} is a symlink", path.display())]
+    RootIsSymlink {
+        /// The root.
+        path: PathBuf,
+    },
+    /// A package path is inside, or is a parent of, a directory only
+    /// `fox` itself may write ([`RESERVED_DIRS`]).
+    #[error("{path} is reserved: packages may not write to {reserved}")]
+    ReservedPath {
+        /// The package path.
+        path: String,
+        /// The reserved directory it touches.
+        reserved: &'static str,
+    },
+    /// The archive has no signed manifest, so its name and version come
+    /// from an unsigned file next to it.
+    #[error(
+        "package {name} has no signed manifest; its name is unsigned (use --allow-unsigned-metadata to install it)"
+    )]
+    UnsignedMetadata {
+        /// The name the unsigned metadata claims.
+        name: PackageName,
+    },
+    /// An archive with unsigned metadata would replace a package that was
+    /// installed with a signed manifest.
+    #[error(
+        "package {name} was installed with a signed manifest; an unsigned name cannot replace it"
+    )]
+    UnsignedReplacesSigned {
+        /// The installed package.
+        name: PackageName,
+    },
+    /// An earlier removal of the package did not finish.
+    #[error("removal of package {name} did not finish; run the removal again")]
+    RemovalIncomplete {
+        /// The package.
+        name: PackageName,
     },
     /// A file-system operation failed.
     #[error("I/O error on {}", path.display())]
@@ -198,6 +258,11 @@ pub struct InstallOptions {
     /// Replace existing files that belong to no package even when their
     /// content differs.
     pub force: bool,
+    /// Accept an archive without a signed manifest, whose name, version
+    /// and dependencies come from the unsigned cookbook metadata file.
+    /// Even then it cannot replace a package installed with a signed
+    /// manifest.
+    pub allow_unsigned_metadata: bool,
 }
 
 /// What [`Store::install`] did.
@@ -255,6 +320,13 @@ pub enum ProblemKind {
     WrongType,
     /// A parent directory was replaced by a symlink.
     SymlinkInPath,
+    /// The file's mode bits differ from the signed ones.
+    Mode {
+        /// The signed mode bits.
+        expected: u32,
+        /// The mode bits on disk.
+        found: u32,
+    },
 }
 
 /// What [`Store::verify`] found.
@@ -280,18 +352,36 @@ struct Lock(#[allow(dead_code, reason = "held for its Drop")] Option<File>);
 impl Store {
     /// Opens the store for the install root `root`, which must exist.
     ///
+    /// The root is canonicalized, so every later path is absolute and
+    /// stays the same if the working directory or a parent link changes.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::RootNotDir`] if `root` is not a directory.
+    /// - [`StoreError::RootIsSymlink`] if `root` itself is a symlink;
+    /// - [`StoreError::RootNotDir`] if `root` is not a directory;
+    /// - [`StoreError::Io`] if it cannot be inspected or canonicalized.
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        if !root.is_dir() {
+        let meta = match fs::symlink_metadata(root) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::RootNotDir {
+                    path: root.to_path_buf(),
+                });
+            }
+            Err(source) => return Err(StoreError::io(root, source)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(StoreError::RootIsSymlink {
+                path: root.to_path_buf(),
+            });
+        }
+        if !meta.is_dir() {
             return Err(StoreError::RootNotDir {
                 path: root.to_path_buf(),
             });
         }
-        Ok(Self {
-            root: root.to_path_buf(),
-        })
+        let root = fs::canonicalize(root).map_err(|e| StoreError::io(root, e))?;
+        Ok(Self { root })
     }
 
     /// The install root.
@@ -353,9 +443,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// - [`StoreError::FileConflict`], [`StoreError::UnownedFile`],
-    ///   [`StoreError::NotAFile`] or [`StoreError::SymlinkInPath`] if a
-    ///   file cannot be placed (nothing is written in that case);
+    /// - [`StoreError::UnsignedMetadata`] or
+    ///   [`StoreError::UnsignedReplacesSigned`] if the archive has no
+    ///   signed manifest and that is not allowed;
+    /// - [`StoreError::ReservedPath`], [`StoreError::FileConflict`],
+    ///   [`StoreError::UnownedFile`], [`StoreError::NotAFile`] or
+    ///   [`StoreError::SymlinkInPath`] if a file cannot be placed (nothing
+    ///   is written in that case);
     /// - [`StoreError::Archive`] if the archive changed since it was
     ///   verified;
     /// - [`StoreError::Extract`] if extraction fails;
@@ -371,6 +465,7 @@ impl Store {
         let mut db = Database::load(&db_path)?;
         let manifest = archive.manifest();
         let previous = db.take(&manifest.name);
+        check_identity(archive, previous.as_ref(), options)?;
         self.check_placement(archive, &db, previous.as_ref(), options)?;
 
         let mut package = archive
@@ -392,6 +487,7 @@ impl Store {
             return Err(extract_error(error));
         }
         transaction.commit().map_err(extract_error)?;
+        self.apply_modes(archive)?;
 
         let new_paths: BTreeSet<&str> = archive.files().iter().map(|f| f.path.as_str()).collect();
         let (mut removed, mut kept) = (0, Vec::new());
@@ -452,6 +548,12 @@ impl Store {
             .flat_map(|p| p.files.iter().map(|f| f.path.as_str()))
             .collect();
         for file in archive.files() {
+            if let Some(reserved) = reserved_dir(&file.path) {
+                return Err(StoreError::ReservedPath {
+                    path: file.path.clone(),
+                    reserved,
+                });
+            }
             if let Some(owner) = owners.get(file.path.as_str()) {
                 return Err(StoreError::FileConflict {
                     path: file.path.clone(),
@@ -484,10 +586,26 @@ impl Store {
         Ok(())
     }
 
+    /// Sets every installed regular file to its signed mode bits. pkgar
+    /// creates files through the process umask, which can drop bits.
+    fn apply_modes(&self, archive: &Archive) -> Result<(), StoreError> {
+        for file in archive.files().iter().filter(|f| f.kind == FileKind::File) {
+            let path = self.root.join(&file.path);
+            let permissions = fs::Permissions::from_mode(file.mode & MODE_BITS);
+            fs::set_permissions(&path, permissions).map_err(|e| StoreError::io(&path, e))?;
+        }
+        Ok(())
+    }
+
     /// Removes an installed package's files and its database entry.
     ///
     /// Files changed since installation are kept and listed in the report.
     /// With `force`, the package is removed even if others depend on it.
+    ///
+    /// The package is marked [`PackageState::Removing`] in the database
+    /// before any file is touched and dropped from it only after the last
+    /// one, so an error part way leaves a record that says so. Running the
+    /// removal again finishes it; files already gone count as missing.
     ///
     /// # Errors
     ///
@@ -501,19 +619,27 @@ impl Store {
         let db_path = self.db_path();
         let mut db = Database::load(&db_path)?;
         let package = db
-            .take(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| StoreError::NotInstalled(name.clone()))?;
-        let dependents: Vec<PackageName> = db
-            .packages
-            .iter()
-            .filter(|p| p.depends.contains(name))
-            .map(|p| p.name.clone())
-            .collect();
-        if !dependents.is_empty() && !force {
-            return Err(StoreError::RequiredBy {
-                name: name.clone(),
-                dependents,
-            });
+        // A removal that already started was already allowed.
+        if package.state == PackageState::Installed {
+            let dependents: Vec<PackageName> = db
+                .packages
+                .iter()
+                .filter(|p| &p.name != name && p.depends.contains(name))
+                .map(|p| p.name.clone())
+                .collect();
+            if !dependents.is_empty() && !force {
+                return Err(StoreError::RequiredBy {
+                    name: name.clone(),
+                    dependents,
+                });
+            }
+            if let Some(record) = db.get_mut(name) {
+                record.state = PackageState::Removing;
+            }
+            db.save(&db_path)?;
         }
         let mut report = RemoveReport {
             name: name.clone(),
@@ -535,6 +661,7 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(StoreError::io(&head, source)),
         }
+        db.take(name);
         db.save(&db_path)?;
         Ok(report)
     }
@@ -546,6 +673,8 @@ impl Store {
     /// # Errors
     ///
     /// - [`StoreError::NotInstalled`] if `name` is not installed;
+    /// - [`StoreError::RemovalIncomplete`] if a removal of it did not
+    ///   finish;
     /// - [`StoreError::Head`] if the stored head fails verification (for
     ///   example because its signer is no longer trusted);
     /// - [`StoreError::HeadMismatch`] if the head and database disagree;
@@ -558,6 +687,9 @@ impl Store {
         let package = self
             .get(name)?
             .ok_or_else(|| StoreError::NotInstalled(name.clone()))?;
+        if package.state == PackageState::Removing {
+            return Err(StoreError::RemovalIncomplete { name: name.clone() });
+        }
         let head_path = self.head_path(name);
         let bytes = fs::read(&head_path).map_err(|e| StoreError::io(&head_path, e))?;
         let head = verify_head(&bytes, keys).map_err(|source| StoreError::Head {
@@ -574,7 +706,7 @@ impl Store {
         };
         for entry in head.entries() {
             report.checked += 1;
-            if let Some(kind) = self.check_file(entry.path, entry.kind, entry.blake3)? {
+            if let Some(kind) = self.check_file(entry.path, entry.kind, entry.mode, entry.blake3)? {
                 report.problems.push(FileProblem {
                     path: entry.path.to_owned(),
                     kind,
@@ -588,19 +720,67 @@ impl Store {
         &self,
         path: &str,
         kind: FileKind,
-        blake3: fox_core::Blake3Digest,
+        mode: u32,
+        blake3: Blake3Digest,
     ) -> Result<Option<ProblemKind>, StoreError> {
         if symlinked_parent(&self.root, path)?.is_some() {
             return Ok(Some(ProblemKind::SymlinkInPath));
         }
-        Ok(match inspect(&self.root.join(path))? {
+        let full = self.root.join(path);
+        Ok(match inspect(&full)? {
             OnDisk::Missing => Some(ProblemKind::Missing),
             OnDisk::Hashed(found_kind, _) if found_kind != kind => Some(ProblemKind::WrongType),
             OnDisk::Hashed(_, found) if found != blake3 => Some(ProblemKind::Modified),
+            // Symlink modes carry no meaning, so only files are compared.
+            OnDisk::Hashed(FileKind::File, _) => {
+                let found = fs::symlink_metadata(&full)
+                    .map_err(|e| StoreError::io(&full, e))?
+                    .permissions()
+                    .mode()
+                    & MODE_BITS;
+                let expected = mode & MODE_BITS;
+                (found != expected).then_some(ProblemKind::Mode { expected, found })
+            }
             OnDisk::Hashed(..) => None,
             OnDisk::Directory | OnDisk::Other => Some(ProblemKind::WrongType),
         })
     }
+}
+
+/// The reserved directory `path` would write into, replace or redirect.
+/// A path equal to or under a reserved directory writes into it; a path
+/// that is a parent of one (a symlink entry `var/lib`, say) would redirect
+/// it.
+fn reserved_dir(path: &str) -> Option<&'static str> {
+    RESERVED_DIRS.into_iter().find(|dir| {
+        let inside = path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        let parent = dir
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'));
+        inside || parent
+    })
+}
+
+/// Refuses unsigned package identities unless they are allowed, and
+/// never lets one replace a package that had a signed one.
+fn check_identity(
+    archive: &Archive,
+    previous: Option<&InstalledPackage>,
+    options: InstallOptions,
+) -> Result<(), StoreError> {
+    if matches!(archive.metadata_source(), MetadataSource::Embedded) {
+        return Ok(());
+    }
+    let name = &archive.manifest().name;
+    if !options.allow_unsigned_metadata {
+        return Err(StoreError::UnsignedMetadata { name: name.clone() });
+    }
+    if previous.is_some_and(|p| p.metadata == MetadataKind::Embedded) {
+        return Err(StoreError::UnsignedReplacesSigned { name: name.clone() });
+    }
+    Ok(())
 }
 
 /// The database record for a verified archive.
@@ -620,6 +800,37 @@ fn record(archive: &Archive) -> InstalledPackage {
             MetadataSource::Embedded => MetadataKind::Embedded,
             _ => MetadataKind::Sidecar,
         },
+        state: PackageState::Installed,
         files: archive.files().to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_paths() {
+        for path in [
+            "var/lib/fox",
+            "var/lib/fox/installed.toml",
+            "var/lib/fox/heads/x.pkgar_head",
+            "etc/fox/keys/attacker.toml",
+            "var",
+            "var/lib",
+            "etc",
+            "etc/fox",
+        ] {
+            assert!(reserved_dir(path).is_some(), "{path}");
+        }
+        for path in [
+            "var/lib/foxglove",
+            "etc/foxrc",
+            "etc/fox/fox.toml",
+            "usr/bin/fox",
+            "var/log/x",
+        ] {
+            assert_eq!(reserved_dir(path), None, "{path}");
+        }
     }
 }

@@ -219,3 +219,51 @@ fn remove_rejects_bad_and_unknown_names() {
             .contains("not installed")
     );
 }
+
+#[test]
+fn unsigned_metadata_needs_a_flag_and_symlinked_roots_are_refused() {
+    let env = Env::new();
+    env.trust_in_root();
+    let dir = env.work.path().join("unsigned");
+    fs::create_dir_all(&dir).unwrap();
+    let entries = [FixtureEntry::file("usr/bin/tool", b"tool", 0o755)];
+    let archive = build_package(&dir, &env.key, None, &entries, false).unwrap();
+    let bytes = fs::read(&archive).unwrap();
+    let mut hash = [0; 32];
+    hash.copy_from_slice(&bytes[96..128]);
+    let blake3 = fox_core::Blake3Digest::from_bytes(hash);
+    fs::write(
+        archive.with_extension("toml"),
+        format!("name = \"tool\"\nversion = \"1\"\ntarget = \"x\"\nblake3 = \"{blake3}\"\ndepends = []\n"),
+    )
+    .unwrap();
+
+    let refused = env.fox(&["install", path_str(&archive)]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert!(stderr.contains("--allow-unsigned-metadata"), "{stderr}");
+    assert!(!env.root.path().join("usr/bin/tool").exists());
+
+    let allowed = env.fox(&["install", "--allow-unsigned-metadata", path_str(&archive)]);
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(env.root.path().join("usr/bin/tool").is_file());
+
+    let link = env.work.path().join("root-link");
+    std::os::unix::fs::symlink(env.root.path(), &link).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox"))
+        .arg("--root")
+        .arg(&link)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("is a symlink")
+    );
+}

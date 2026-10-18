@@ -8,7 +8,8 @@
 //! fox verify <file.pkgar>...            check signature and every hash
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
-//! fox install [--force] <file.pkgar>... verify, then install into --root
+//! fox install [--force] [--allow-unsigned-metadata] <file.pkgar>...
+//!                                       verify, then install into --root
 //! fox list                              installed packages
 //! fox remove [--force] <name>...        remove installed packages
 //! ```
@@ -73,6 +74,10 @@ enum Command {
         /// Replace existing files that belong to no package.
         #[arg(long)]
         force: bool,
+        /// Install archives without a signed manifest, trusting the name
+        /// and version in the unsigned cookbook metadata file beside them.
+        #[arg(long)]
+        allow_unsigned_metadata: bool,
         /// Archives to install.
         #[arg(required = true)]
         archives: Vec<PathBuf>,

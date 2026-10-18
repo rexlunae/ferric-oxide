@@ -51,6 +51,25 @@ pub enum MetadataKind {
     Sidecar,
 }
 
+/// Whether a package is fully installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum PackageState {
+    /// Installed and in use.
+    #[default]
+    Installed,
+    /// A removal started and did not finish: some of its files may be
+    /// gone. Running the removal again completes it.
+    Removing,
+}
+
+impl PackageState {
+    fn is_installed(&self) -> bool {
+        *self == Self::Installed
+    }
+}
+
 /// One installed package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -75,6 +94,9 @@ pub struct InstalledPackage {
     pub signer_label: String,
     /// Where the metadata came from.
     pub metadata: MetadataKind,
+    /// Whether a removal is in progress.
+    #[serde(default, skip_serializing_if = "PackageState::is_installed")]
+    pub state: PackageState,
     /// Every installed file.
     #[serde(default)]
     pub files: Vec<FileRecord>,
@@ -116,6 +138,11 @@ impl Database {
         fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))
     }
 
+    /// The package called `name`, mutably.
+    pub(crate) fn get_mut(&mut self, name: &PackageName) -> Option<&mut InstalledPackage> {
+        self.packages.iter_mut().find(|p| &p.name == name)
+    }
+
     /// The package called `name`.
     pub(crate) fn get(&self, name: &PackageName) -> Option<&InstalledPackage> {
         self.packages.iter().find(|p| &p.name == name)
@@ -150,6 +177,7 @@ mod tests {
             signer: KeyId::from_bytes([9; 32]),
             signer_label: "ci".into(),
             metadata: MetadataKind::Embedded,
+            state: PackageState::Removing,
             files: vec![FileRecord {
                 path: "usr/bin/hello".into(),
                 kind: FileKind::File,
@@ -161,6 +189,7 @@ mod tests {
         db.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("format = \"fox-installed/1\""));
+        assert!(text.contains("state = \"removing\""));
         let loaded = Database::load(&path).unwrap();
         assert_eq!(loaded.packages, db.packages);
         assert!(!path.with_extension("toml.tmp").exists());

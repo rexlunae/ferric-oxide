@@ -111,6 +111,10 @@ pub enum EntryPathError {
     /// The path has an empty, `.` or `..` component.
     #[error("path has an empty, '.' or '..' component")]
     BadComponent,
+    /// The path holds a control character (NUL, newline, escape, DEL and
+    /// the C1 range included) or a backslash.
+    #[error("path contains the character {0:?}")]
+    BadCharacter(char),
 }
 
 /// Why a pkgar head failed verification.
@@ -397,6 +401,11 @@ fn check_path(bytes: &[u8]) -> Result<&str, EntryPathError> {
     if path.starts_with('/') {
         return Err(EntryPathError::Absolute);
     }
+    // Control characters make paths that print or compare differently from
+    // what is on disk, and a backslash is a separator to some tools.
+    if let Some(bad) = path.chars().find(|c| c.is_control() || *c == '\\') {
+        return Err(EntryPathError::BadCharacter(bad));
+    }
     if path
         .split('/')
         .any(|component| matches!(component, "" | "." | ".."))
@@ -420,6 +429,18 @@ mod tests {
         assert_eq!(check_path(b"./bin"), Err(EntryPathError::BadComponent));
         assert_eq!(check_path(b"bin/"), Err(EntryPathError::BadComponent));
         assert_eq!(check_path(&[0xff]), Err(EntryPathError::NotUtf8));
+        for bad in ['\0', '\n', '\r', '\t', '\x1b', '\x7f', '\u{85}', '\\'] {
+            let path = alloc::format!("usr/bin/a{bad}b");
+            assert_eq!(
+                check_path(path.as_bytes()),
+                Err(EntryPathError::BadCharacter(bad)),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            check_path("usr/share/café".as_bytes()),
+            Ok("usr/share/café")
+        );
     }
 
     fn entry(path: &str, mode: u32) -> Entry {

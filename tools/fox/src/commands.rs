@@ -9,7 +9,7 @@ use fox_core::archive::{Archive, ArchiveError, MetadataSource};
 use fox_core::keys::{KeyError, load_key_file, trusted_keys_for_root};
 use fox_core::{NameError, PackageName, TrustedKeys};
 use fox_sbom::{PackageSbom, SbomError};
-use fox_store::{InstallOptions, ProblemKind, Store, StoreError};
+use fox_store::{InstallOptions, PackageState, ProblemKind, Store, StoreError};
 use serde::Serialize;
 
 use crate::{Cli, Command, SbomFormat};
@@ -50,7 +50,18 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
             format,
             output,
         } => sbom(cli, archive, *format, output.as_deref()),
-        Command::Install { force, archives } => install(cli, archives, *force),
+        Command::Install {
+            force,
+            allow_unsigned_metadata,
+            archives,
+        } => install(
+            cli,
+            archives,
+            InstallOptions {
+                force: *force,
+                allow_unsigned_metadata: *allow_unsigned_metadata,
+            },
+        ),
         Command::List => list(cli),
         Command::Remove { force, names } => remove(cli, names, *force),
     }
@@ -58,7 +69,12 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
 
 /// The keys under the root plus those given with `--key`.
 fn trusted_keys(cli: &Cli) -> Result<TrustedKeys, CliError> {
-    let mut keys = trusted_keys_for_root(&cli.root)?;
+    trusted_keys_in(cli, &cli.root)
+}
+
+/// The keys under `root` (an opened store's checked root) plus `--key`.
+fn trusted_keys_in(cli: &Cli, root: &Path) -> Result<TrustedKeys, CliError> {
+    let mut keys = trusted_keys_for_root(root)?;
     for path in &cli.keys {
         let key = load_key_file(path)?;
         keys.insert(key.label, key.key);
@@ -206,21 +222,34 @@ struct InstalledVerifyResult {
 struct ProblemJson {
     path: String,
     problem: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_mode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    found_mode: Option<u32>,
 }
 
-fn problem_name(kind: ProblemKind) -> &'static str {
-    match kind {
-        ProblemKind::Missing => "missing",
-        ProblemKind::Modified => "modified",
-        ProblemKind::WrongType => "wrong-type",
-        ProblemKind::SymlinkInPath => "symlink-in-path",
-        _ => "unknown",
+impl ProblemJson {
+    fn new(path: &str, kind: ProblemKind) -> Self {
+        let (problem, modes) = match kind {
+            ProblemKind::Missing => ("missing", None),
+            ProblemKind::Modified => ("modified", None),
+            ProblemKind::WrongType => ("wrong-type", None),
+            ProblemKind::SymlinkInPath => ("symlink-in-path", None),
+            ProblemKind::Mode { expected, found } => ("mode", Some((expected, found))),
+            _ => ("unknown", None),
+        };
+        Self {
+            path: path.to_owned(),
+            problem,
+            expected_mode: modes.map(|(expected, _)| expected),
+            found_mode: modes.map(|(_, found)| found),
+        }
     }
 }
 
 fn verify_installed(cli: &Cli, names: &[String]) -> Result<ExitCode, CliError> {
-    let keys = trusted_keys(cli)?;
     let store = Store::open(&cli.root)?;
+    let keys = trusted_keys_in(cli, store.root())?;
     let names = if names.is_empty() {
         store.list()?.into_iter().map(|p| p.name).collect()
     } else {
@@ -239,10 +268,7 @@ fn verify_installed(cli: &Cli, names: &[String]) -> Result<ExitCode, CliError> {
                 problems: report
                     .problems
                     .iter()
-                    .map(|p| ProblemJson {
-                        path: p.path.clone(),
-                        problem: problem_name(p.kind),
-                    })
+                    .map(|p| ProblemJson::new(&p.path, p.kind))
                     .collect(),
                 error: None,
             },
@@ -272,7 +298,13 @@ fn print_installed_result(result: &InstalledVerifyResult) {
         (None, false) => {
             println!("FAILED {}", result.name);
             for problem in &result.problems {
-                println!("  {}: {}", problem.path, problem.problem);
+                match (problem.expected_mode, problem.found_mode) {
+                    (Some(expected), Some(found)) => println!(
+                        "  {}: mode {found:04o}, signed {expected:04o}",
+                        problem.path
+                    ),
+                    _ => println!("  {}: {}", problem.path, problem.problem),
+                }
             }
         }
     }
@@ -322,9 +354,9 @@ struct InstallJson {
     missing_depends: Vec<String>,
 }
 
-fn install(cli: &Cli, paths: &[PathBuf], force: bool) -> Result<ExitCode, CliError> {
-    let keys = trusted_keys(cli)?;
+fn install(cli: &Cli, paths: &[PathBuf], options: InstallOptions) -> Result<ExitCode, CliError> {
     let store = Store::open(&cli.root)?;
+    let keys = trusted_keys_in(cli, store.root())?;
     // Verify everything before installing anything.
     let archives = paths
         .iter()
@@ -333,7 +365,7 @@ fn install(cli: &Cli, paths: &[PathBuf], force: bool) -> Result<ExitCode, CliErr
     let mut results = Vec::new();
     for archive in &archives {
         sidecar_warning(archive);
-        let report = store.install(archive, InstallOptions { force })?;
+        let report = store.install(archive, options)?;
         if !cli.json {
             match &report.previous {
                 Some(old) => println!("upgraded {} {old} -> {}", report.name, report.version),
@@ -379,6 +411,7 @@ struct ListJson {
     signer: String,
     signer_label: String,
     files: usize,
+    removal_incomplete: bool,
 }
 
 fn list(cli: &Cli) -> Result<ExitCode, CliError> {
@@ -396,13 +429,19 @@ fn list(cli: &Cli) -> Result<ExitCode, CliError> {
                 signer: p.signer.to_string(),
                 signer_label: p.signer_label,
                 files: p.files.len(),
+                removal_incomplete: p.state == PackageState::Removing,
             })
             .collect();
         print_json(&rows)?;
     } else {
         for p in packages {
+            let note = if p.state == PackageState::Removing {
+                ", removal incomplete"
+            } else {
+                ""
+            };
             println!(
-                "{} {} ({} files, signed by {})",
+                "{} {} ({} files, signed by {}{note})",
                 p.name,
                 p.version,
                 p.files.len(),

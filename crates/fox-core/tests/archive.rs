@@ -189,7 +189,7 @@ fn reads_cookbook_sidecar_metadata() {
         &sidecar,
         format!(
             "name = \"hello\"\nversion = \"2.0\"\ntarget = \"x86_64-unknown-redox\"\n\
-             blake3 = \"{head_blake3}\"\ndepends = [\"relibc\"]\n"
+             blake3 = \"{head_blake3}\"\ndepends = [\"relibc\", \".runtime\"]\n"
         ),
     )
     .unwrap();
@@ -201,6 +201,8 @@ fn reads_cookbook_sidecar_metadata() {
     assert_eq!(archive.manifest().name.as_str(), "hello");
     assert_eq!(archive.manifest().version, "2.0");
     assert_eq!(archive.manifest().depends[0].as_str(), "relibc");
+    // Cookbook dependencies relative to the recipe resolve against its name.
+    assert_eq!(archive.manifest().depends[1].as_str(), "hello.runtime");
 
     fs::write(
         &sidecar,
