@@ -47,17 +47,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The submodules come from gitlab.redox-os.org, which sometimes answers HTTP 500 for a
-      # few minutes, so their clone is retried instead of failing the whole build.
-      - name: Fetch submodules
+      # The submodules come from gitlab.redox-os.org, which sometimes fails for minutes or
+      # hours at a time. Their git data is cached by commit, so a build only needs GitLab
+      # when a submodule moves; a fetch is retried and then tries the redox-os mirrors on
+      # GitHub (openlibm is mirrored there, dlmalloc-rs is not).
+      - name: Submodule cache key
+        id: submodules
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          for attempt in 1 2 3 4 5; do
+          echo "key=submodules-$(git ls-files -s | awk '$1 == 160000 { print $2 }' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore submodules
+        id: submodule-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/modules
+          key: ${{ steps.submodules.outputs.key }}
+
+      - name: Fetch submodules
+        run: |
+          for attempt in 1 2 3; do
             git submodule update --init --recursive && exit 0
-            echo "::warning title=Submodule fetch failed::attempt $attempt of 5, retrying in 60s"
+            echo "::warning title=Submodule fetch failed::GitLab attempt $attempt of 3"
             sleep 60
           done
-          exit 1
+          echo "::warning title=Submodule fetch failed::trying the GitHub mirrors"
+          git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/
+          git submodule update --init --recursive
+
+      - name: Save submodules
+        if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .git/modules
+          key: ${{ steps.submodules.outputs.key }}
 
       - name: Install Rust
         run: |
