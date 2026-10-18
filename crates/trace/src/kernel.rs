@@ -38,8 +38,8 @@ crate::events! {
     /// third arguments (for reads and writes, the scheme's file number and the byte count).
     ///
     /// A tag is unique among a scheme's requests in flight and is reused afterwards, so a
-    /// request is matched with the next `scheme.response` or `scheme.cancel` of the same scheme
-    /// and tag.
+    /// request is matched with the next `scheme.response` of the same scheme and tag. A
+    /// `scheme.cancel` in between does not end the request.
     pub const SCHEME_REQUEST = 3 {
         name: "scheme.request",
         subsystem: Scheme,
@@ -47,9 +47,14 @@ crate::events! {
         args: ["scheme", "tag", "opcode", "caller", "arg0", "arg2"],
     }
 
-    /// A scheme answers a request (its CQE): the scheme's id, the tag, the raw result (a
-    /// negated errno on failure, 0 for a response that carries file descriptors) and the
-    /// responding process's pid.
+    /// The kernel accepts a scheme's answer (its CQE) to a request still waiting for one: the
+    /// scheme's id, the tag, the result and the responding process's pid. A CQE the kernel
+    /// rejects (an unknown or finished tag) is not recorded.
+    ///
+    /// The result is what the caller's system call gets, in the `Error::mux` encoding (a
+    /// negated errno on failure): the scheme's value after the kernel's normalization, which
+    /// turns `ECANCELED` into `EINTR` for a request being canceled and an `EINTR` the kernel
+    /// did not ask for into `EIO`. A response that carries file descriptors records 0.
     pub const SCHEME_RESPONSE = 4 {
         name: "scheme.response",
         subsystem: Scheme,
@@ -58,7 +63,8 @@ crate::events! {
     }
 
     /// The kernel asks a scheme to cancel a request whose caller was interrupted: the scheme's
-    /// id and the tag. The scheme still answers it.
+    /// id and the tag. This is not the end of the request: the scheme still answers it, and
+    /// that `scheme.response` (often `EINTR`) is the one to match.
     pub const SCHEME_CANCEL = 5 {
         name: "scheme.cancel",
         subsystem: Scheme,

@@ -83,16 +83,22 @@ The scheme events cover requests to user-space schemes
   - `caller` is the caller's pid.
   - `arg0` and `arg2` are the request's first and third arguments. For reads
     and writes they are the scheme's file number and the byte count.
-- `scheme.response` is recorded when the scheme's CQE answers the request.
-  - `ret` is the raw result: `-errno` on failure, and 0 for a response that
-    carries file descriptors.
+- `scheme.response` is recorded when the kernel accepts the scheme's CQE for
+  a request that is still waiting. A CQE the kernel rejects, for an unknown or
+  already answered tag, is not recorded.
+  - `ret` is the result the caller's system call gets: `-errno` on failure,
+    and 0 for a response that carries file descriptors. It is the scheme's
+    value after the kernel's normalization: `ECANCELED` becomes `EINTR` for a
+    request being cancelled, and an `EINTR` the kernel did not ask for becomes
+    `EIO`.
   - `responder` is the answering process's pid.
-- `scheme.cancel` is recorded when an interrupted caller's request is
-  cancelled.
+- `scheme.cancel` is recorded when the kernel asks the scheme to cancel an
+  interrupted caller's request. It does not end the request: the scheme still
+  answers it, usually with `EINTR`, and that answer is a `scheme.response`.
 
 A tag is unique among one scheme's requests in flight and is then reused. A
-request is therefore matched with the next response or cancel that has the same
-scheme id and tag.
+request is therefore matched with the next response that has the same scheme
+id and tag. A cancel in between is a mark on the request, not its end.
 
 The pids let you follow one I/O through several schemes. For example, an
 application's read reaches RedoxFS as a request with the application as
@@ -163,7 +169,8 @@ are not compiled in gives `EOPNOTSUPP`.
   5. drains and decodes every CPU's ring;
   6. checks the enter/exit pairs, the results, the timestamp order, that
      `sched.switch` records are present, that the null-scheme write has a
-     request and a matching response (same scheme and tag, the byte count as
+     request (the first one on its CPU after the program's own
+     `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
      result, another process as responder), and that `disable` stops the
      stream.
 

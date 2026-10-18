@@ -1015,18 +1015,6 @@ impl UserInner {
     fn respond(&self, tag: u32, mut response: Response, token: &mut CleanLockToken) -> Result<()> {
         let to_close: Vec<FileDescription>;
 
-        // Ferric Oxide: the scheme.response tracepoint (`kernel.trace`).
-        trace_event!(
-            ferric_trace::kernel::SCHEME_RESPONSE,
-            self.scheme_id.get(),
-            tag,
-            match &response {
-                Response::Regular(res, _, _) => Error::mux(*res),
-                Response::Fd(_) | Response::MultipleFds(_) => 0,
-            },
-            context::current().read(token.token()).pid,
-        );
-
         {
             let mut states_lock = self.states.lock(token.token());
             let (states, mut lock_token) = states_lock.token_split();
@@ -1065,6 +1053,20 @@ impl UserInner {
                             // syscall returns EINTR.
                             *res = Err(Error::new(EIO));
                         }
+
+                        // Ferric Oxide: the scheme.response tracepoint (`kernel.trace`), only
+                        // for a CQE answering a waiting request, with the result as normalized
+                        // above.
+                        trace_event!(
+                            ferric_trace::kernel::SCHEME_RESPONSE,
+                            self.scheme_id.get(),
+                            tag,
+                            match &response {
+                                Response::Regular(res, _, _) => Error::mux(*res),
+                                Response::Fd(_) | Response::MultipleFds(_) => 0,
+                            },
+                            crate::context::current().read(lock_token.token()).pid,
+                        );
 
                         if let Response::MultipleFds(ref mut response_fds) = response {
                             *response_fds = Some(fds);

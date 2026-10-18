@@ -220,8 +220,10 @@ struct Marks {
     read_fd: u64,
     /// The `read`'s byte count.
     read_len: u64,
-    /// The `write` buffer's address.
+    /// The `write` buffer's address, which the write to the null scheme uses too.
     write_buf: u64,
+    /// The null scheme descriptor.
+    null_fd: u64,
 }
 
 /// Makes the marker system calls.
@@ -282,6 +284,7 @@ fn mark(step: &'static str) -> Result<Marks, Failure> {
         read_fd: fd as u64,
         read_len: read_len as u64,
         write_buf: buf.as_ptr() as u64,
+        null_fd: null_fd as u64,
     })
 }
 
@@ -312,17 +315,38 @@ fn find_pair(cpus: &[Vec<Entry>], enter: &[u64], result: u64) -> Option<()> {
 /// `trace-scheme`: the write to the null scheme has a `scheme.request` (a write of
 /// [`SCHEME_MARK_LEN`] bytes) and, later and on any CPU, a `scheme.response` with the same scheme
 /// and tag, the byte count as its result, and another process as the responder.
-fn check_scheme(trace: &[Vec<Entry>]) -> Result<(), Failure> {
+///
+/// The request is found through this program's own `syscall.enter` for the write (its null
+/// scheme descriptor, buffer address and length): the kernel queues the request on the same CPU
+/// before the caller blocks, so it is the first `scheme.request` after that enter and before the
+/// CPU switches away. Another process's write of the same length cannot match.
+fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
     let step = "trace-scheme";
-    let all = || trace.iter().flatten();
-    let request = all()
-        .find(|e| {
-            e.is(&SCHEME_REQUEST)
-                && e.arg(2) == Some(Opcode::Write as u64)
-                && e.arg(5) == Some(SCHEME_MARK_LEN as u64)
+    let enter = [
+        SYS_WRITE as u64,
+        marks.null_fd,
+        marks.write_buf,
+        SCHEME_MARK_LEN as u64,
+    ];
+    let request = trace
+        .iter()
+        .find_map(|entries| {
+            let start = entries.iter().position(|e| {
+                e.is(&SYSCALL_ENTER) && enter.iter().enumerate().all(|(i, &v)| e.arg(i) == Some(v))
+            })?;
+            entries[start + 1..]
+                .iter()
+                .take_while(|e| !e.is(&SCHED_SWITCH) && !e.is(&SYSCALL_EXIT))
+                .find(|e| e.is(&SCHEME_REQUEST))
         })
         .ok_or_else(|| check(step, "no scheme.request for the write to the null scheme"))?;
+    if request.arg(2) != Some(Opcode::Write as u64)
+        || request.arg(5) != Some(SCHEME_MARK_LEN as u64)
+    {
+        return Err(check(step, format!("the write's request is {request:?}")));
+    }
     let (scheme, tag, caller) = (request.arg(0), request.arg(1), request.arg(3));
+    let all = || trace.iter().flatten();
     let response = all()
         .filter(|e| e.is(&SCHEME_RESPONSE) && e.arg(0) == scheme && e.arg(1) == tag)
         .filter(|e| e.timestamp >= request.timestamp)
@@ -440,7 +464,7 @@ fn run() -> Result<(), Failure> {
     }
     println!("FERRIC_TEST_PASS trace-sched ({switches} switches)");
 
-    check_scheme(&trace)?;
+    check_scheme(&trace, &marks)?;
     println!("FERRIC_TEST_PASS trace-scheme");
 
     // Records written before the disable finished may still be in the rings: drop them, then
