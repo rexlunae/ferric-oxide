@@ -137,13 +137,13 @@ registered frames at consecutive IOVAs with the grant's access and returns
 the starting IOVA. DMA requires a whole-page-aligned grant; byte grants using
 partial-page bounce views cannot expose those pages directly to a device.
 
-`MapGrant` checks that the caller has bound the domain. `UnmapGrant` currently
-operates on the supplied domain descriptor without repeating that binding
-check, so a domain descriptor must not be treated as a mapping-only delegated
-capability. A mapping ticket distinguishes successive uses of an IOVA so a
-delayed revocation cannot remove a newer mapping. The normal grant-revocation
-path removes the DMA mapping and waits for invalidation. Without a bound
-domain, grant mapping fails with `ENODEV`; the
+`MapGrant` and `UnmapGrant` both require the caller's address space to be bound
+to the supplied domain. Possessing its descriptor does not grant permission
+to remove another address space's mappings. An unbound caller receives
+`ENODEV`; a caller bound to a different domain receives `EACCES`. A mapping
+ticket distinguishes successive uses of an IOVA so a delayed revocation
+cannot remove a newer mapping. The normal grant-revocation path removes the
+DMA mapping and waits for invalidation. The
 interface never hands out physical addresses of another process's buffer as
 a fallback. Drivers needing a fallback must manage their own bounce buffers.
 
