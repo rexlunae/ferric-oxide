@@ -763,15 +763,21 @@ fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
 }
 
 /// Takes down a grant mapping because its grant was revoked or closed: strictly, so when this
-/// returns the device's DMA to the IOVA faults. Nothing when the domain has closed (its
+/// returns `Ok` the device's DMA to the IOVA faults. Nothing when the domain has closed (its
 /// mappings went with it) or the driver unmapped it already. Called without the region lock.
+///
+/// # Errors
+///
+/// `EIO` when the unmap or its IOTLB invalidation failed. The domain has forgotten the
+/// mapping then (a retry could not unmap it again), but its frames stay pinned for good, so
+/// the device can reach nothing but the application's own buffer.
 #[cfg(feature = "regbuf")]
-pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) {
+pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
     // Dropped at once: the guard must not be held with the handle table.
     let _ = GRANT_LINKS.lock().remove(&record.ticket);
     let mut handles = HANDLES.lock();
     let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
-        return;
+        return Ok(());
     };
     match space.unmap_grant(record.iova, Some(record.ticket)) {
         Ok(_) => {
@@ -780,9 +786,10 @@ pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) {
                 space.id(),
                 record.iova
             );
+            Ok(())
         }
-        Err(DmaError::NoGrantMapping { .. }) => {}
+        Err(DmaError::NoGrantMapping { .. }) => Ok(()),
         // unmap_grant logged it; the frames stay pinned.
-        Err(_) => {}
+        Err(_) => Err(Error::new(EIO)),
     }
 }

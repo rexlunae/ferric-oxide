@@ -26,6 +26,8 @@ const SLOT_RESHARE: u64 = 3;
 const SLOT_SHARED: u64 = 4;
 const SLOT_BYTES_RW: u64 = 5;
 const SLOT_BYTES_RO: u64 = 6;
+const SLOT_BOUNCE_IDLE: u64 = 7;
+const SLOT_BOUNCE_FILL: u64 = 8;
 
 /// Why a step failed.
 #[derive(Debug)]
@@ -325,8 +327,9 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 13] = [
+    let steps: [(&str, Step); 15] = [
         ("regbuf-register", register),
+        ("regbuf-file-backed", file_backed),
         ("regbuf-grant-rw", grant_rw),
         ("regbuf-grant-ro", grant_ro),
         ("regbuf-pinned", pinned_mapping),
@@ -339,6 +342,7 @@ pub fn run() -> ExitCode {
         ("regbuf-close", close),
         ("regbuf-shared", shared),
         ("regbuf-bytes", bytes),
+        ("regbuf-bounce-newer", bounce_newer),
     ];
     let ok = steps.iter().all(|(name, f)| step(name, f(&mut test)));
     test.scheme.stop();
@@ -412,6 +416,75 @@ fn register(t: &mut Test) -> Result<(), Failure> {
         });
     }
     t.region = Some(region);
+    Ok(())
+}
+
+/// A private writable mapping of a file cannot be registered (`EPERM`), even with its page
+/// populated: only anonymous memory can.
+fn file_backed(t: &mut Test) -> Result<(), Failure> {
+    let path = std::env::temp_dir().join("ferric-regbuf-test.bin");
+    let io = |what: &'static str| {
+        move |err: std::io::Error| Failure::Errno {
+            what,
+            errno: err
+                .raw_os_error()
+                .and_then(|e| usize::try_from(e).ok())
+                .unwrap_or(errno::EIO),
+        }
+    };
+    std::fs::write(&path, vec![0x77; PAGE_SIZE as usize]).map_err(io("write the file"))?;
+    let file = std::fs::File::open(&path).map_err(io("open the file"))?;
+    // SAFETY: a fresh private mapping of the file at an address the kernel chooses.
+    let ptr = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGE_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(Failure::Errno {
+            what: "mmap the file",
+            errno: super::last_errno(),
+        });
+    }
+    // SAFETY: the page is mapped readable and writable until the munmap below; writing it
+    // gives the mapping a private copy, which is still not anonymous memory.
+    unsafe { ptr.cast::<u8>().write_volatile(0x78) };
+    let region = ctx(
+        "open a region",
+        Fd::open(&region_path(), O_RDWR | O_CLOEXEC, 0),
+    );
+    let result = region.and_then(|region| {
+        expect_errno(
+            "Register of a file-backed private mapping",
+            errno::EPERM,
+            call(
+                &region,
+                "Register",
+                Request::Register {
+                    addr: ptr as u64,
+                    len: PAGE_SIZE,
+                },
+            ),
+        )
+    });
+    // SAFETY: unmaps the mapping made above, which nothing uses afterwards.
+    unsafe { libc::munmap(ptr, PAGE_SIZE as usize) };
+    let _ = std::fs::remove_file(&path);
+    result?;
+    let expected = t.pinned_before + PAGES as u64;
+    let got = pinned(&t.root)?;
+    if got != expected {
+        return Err(Failure::Pinned {
+            what: "after a refused Register",
+            expected,
+            got,
+        });
+    }
     Ok(())
 }
 
@@ -793,4 +866,40 @@ fn bytes(t: &mut Test) -> Result<(), Failure> {
         t.scheme.op("probe", Op::Probe, SLOT_BYTES_RO, 0),
     )?;
     unpinned(t, "after closing the byte-granular region")
+}
+
+/// A writable partial-page mapping copies back only what its holder wrote: an untouched one
+/// leaves the application's newer writes to the granted bytes alone, while one the scheme
+/// filled still lands its bytes, and neither touches bytes it did not change.
+fn bounce_newer(t: &mut Test) -> Result<(), Failure> {
+    let mut buffer = Buffer::new()?;
+    buffer.bytes().fill(0x77);
+    let region = register_region(&buffer)?;
+    // Two grants of bytes inside the first page, mapped writable through bounce pages.
+    let filled = 0x300..0x400;
+    let (fd, idle_id) = grant(&region, Access::ReadWrite, 0x100, 0x100)?;
+    t.scheme.send(fd, SLOT_BOUNCE_IDLE)?;
+    t.scheme
+        .op("map the idle window", Op::Map, SLOT_BOUNCE_IDLE, 1)?;
+    let (fd, fill_id) = grant(&region, Access::ReadWrite, 0x300, 0x100)?;
+    t.scheme.send(fd, SLOT_BOUNCE_FILL)?;
+    t.scheme
+        .op("map the filled window", Op::Map, SLOT_BOUNCE_FILL, 1)?;
+    t.scheme
+        .op("scheme writes one window", Op::Fill, SLOT_BOUNCE_FILL, 0x99)?;
+    // The application writes the whole page after both mappings took their snapshots.
+    buffer.bytes()[..PAGE].fill(0x42);
+    call(&region, "Revoke", Request::Revoke(idle_id))?;
+    call(&region, "Revoke", Request::Revoke(fill_id))?;
+    let wrong = buffer.bytes()[..PAGE].iter().enumerate().any(|(i, &b)| {
+        let want = if filled.contains(&i) { 0x99 } else { 0x42 };
+        b != want
+    });
+    if wrong {
+        return Err(Failure::Data {
+            what: "the app's newer writes after untouched and filled bounce pages are revoked",
+        });
+    }
+    drop(region);
+    unpinned(t, "after closing the bounce region")
 }

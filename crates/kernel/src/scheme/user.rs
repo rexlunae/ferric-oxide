@@ -662,9 +662,7 @@ impl UserInner {
         if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count)
             && !middle_bounce.is_empty()
         {
-            // Ferric Oxide: the copy, pinned like a borrow. Should the page tables run out part
-            // way, the rest of the span stays unmapped: the scheme faults there, and releasing
-            // the capture unmaps the whole span as usual.
+            // Ferric Oxide: the copy, pinned like a borrow.
             let frames = middle_bounce.frames();
             dst_space.mmap(
                 &dst_space_lock,
@@ -674,9 +672,28 @@ impl UserInner {
                 None,
                 |dst_page, page_flags, mapper, flusher| {
                     let is_pinned = true;
-                    Grant::allocated_shared(&frames, dst_page, page_flags, mapper, flusher, is_pinned)
+                    Grant::allocated_shared(
+                        &frames, dst_page, page_flags, mapper, flusher, is_pinned,
+                    )
                 },
             )?;
+            // `allocated_shared` maps fewer pages when the page tables run out part way. A
+            // partly mapped buffer must not reach the scheme: undo the head and what was
+            // mapped of the middle, and fail as the other mappings here do.
+            let mapped = dst_space
+                .grants
+                .contains(first_middle_dst_page)
+                .map_or(0, |(_, info)| info.page_count());
+            if mapped != middle_page_count.get() {
+                let done = first_middle_dst_page
+                    .offset_from(free_span.base)
+                    .saturating_add(mapped);
+                drop(dst_space_guard);
+                let notify =
+                    dst_space_lock.munmap(PageSpan::new(free_span.base, done), true, token)?;
+                handle_notify_files(notify, token);
+                return Err(Error::new(ENOMEM));
+            }
         } else if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {
             dst_space.mmap(
                 &dst_space_lock,
