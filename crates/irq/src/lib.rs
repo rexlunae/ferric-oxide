@@ -6,9 +6,9 @@
 //! - [`CpuId`] (a logical CPU, as the kernel numbers them and as `irq:cpu-XX` names them) and
 //!   [`ApicId`] (what an MSI message's destination field holds), kept apart by type because
 //!   mixing them misroutes interrupts on machines whose APIC ids are not `0..n`.
-//! - [`Irq`], an interrupt number as the `irq:` scheme counts them (vector minus 32), and
-//!   [`Irq::delivery_cpu`], which says whose interrupt it is: legacy IRQs belong to the BSP
-//!   wherever they arrive.
+//! - [`Irq`], an interrupt number as the `irq:` scheme counts them (vector minus 32). Which
+//!   CPU's row an interrupt is counted in is the kernel's call: the CPU it arrived on for a
+//!   vector reserved there, the BSP for one from the PIC or I/O APIC.
 //! - [`Counts`], the lock-free table of interrupt counts with one row per CPU, so a CPU
 //!   counting an interrupt touches only its own row.
 //! - [`CpuEntry`], one line of the root-only `irq:cpus` file, which maps each online logical
@@ -51,9 +51,6 @@ use core::{
 /// Interrupt numbers the `irq:` scheme counts: vectors 32 to 255 are IRQs 0 to 223.
 pub const IRQS: usize = 224;
 
-/// IRQs 0 to 15 are the legacy (PIC or I/O APIC) ones, which only the BSP takes.
-pub const LEGACY_IRQS: u8 = 16;
-
 /// A logical CPU, numbered as the kernel numbers them (the BSP is 0) and as `irq:cpu-XX` names
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,6 +89,19 @@ impl ApicId {
     pub const fn get(self) -> u32 {
         self.0
     }
+
+    /// The destination ID a compatibility-format MSI address carries for this APIC (bits 19:12,
+    /// physical destination mode), or `None` when it cannot name it: 0xFF is the broadcast
+    /// destination, and ids above it need x2APIC with interrupt remapping (Intel SDM Vol. 3,
+    /// 11.11.1 "Message Address Register Format").
+    #[must_use]
+    pub const fn compatibility_destination(self) -> Option<u8> {
+        if self.0 < 0xff {
+            Some(self.0 as u8)
+        } else {
+            None
+        }
+    }
 }
 
 /// An interrupt number as the `irq:` scheme counts them: the IDT vector minus 32.
@@ -123,24 +133,6 @@ impl Irq {
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
-    }
-
-    /// Whether this is a legacy IRQ (0 to 15).
-    #[must_use]
-    pub const fn is_legacy(self) -> bool {
-        self.0 < LEGACY_IRQS
-    }
-
-    /// The CPU this interrupt is counted for when it arrives on `arrived_on`: the BSP for a
-    /// legacy IRQ (the PIC and I/O APIC deliver those to the BSP, and `irq:N` handles for them
-    /// are the BSP's), and `arrived_on` for any other, whose vector was reserved on that CPU.
-    #[must_use]
-    pub const fn delivery_cpu(self, arrived_on: CpuId) -> CpuId {
-        if self.is_legacy() {
-            CpuId::BSP
-        } else {
-            arrived_on
-        }
     }
 }
 
@@ -322,6 +314,22 @@ pub fn parse_cpus(text: &str) -> impl Iterator<Item = Result<CpuEntry, ParseErro
         .map(str::parse)
 }
 
+/// The APIC id of logical CPU `cpu` in the text of an `irq:cpus` file, or `None` when the file
+/// does not list it.
+///
+/// # Errors
+///
+/// [`ParseError`] for the first malformed line before `cpu`'s.
+pub fn apic_of(text: &str, cpu: CpuId) -> Result<Option<ApicId>, ParseError> {
+    for entry in parse_cpus(text) {
+        let entry = entry?;
+        if entry.cpu == cpu {
+            return Ok(Some(entry.apic));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,20 +340,32 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_destinations_stop_below_broadcast() {
+        assert_eq!(ApicId::new(0).compatibility_destination(), Some(0));
+        assert_eq!(ApicId::new(0xfe).compatibility_destination(), Some(0xfe));
+        assert_eq!(ApicId::new(0xff).compatibility_destination(), None);
+        assert_eq!(ApicId::new(0x100).compatibility_destination(), None);
+    }
+
+    #[test]
+    fn apic_of_maps_sparse_ids() {
+        let text = "cpu=00 apic=0 node=-\ncpu=01 apic=4 node=-\ncpu=04 apic=1 node=0\n";
+        assert_eq!(apic_of(text, CpuId::new(1)), Ok(Some(ApicId::new(4))));
+        assert_eq!(apic_of(text, CpuId::new(4)), Ok(Some(ApicId::new(1))));
+        assert_eq!(apic_of(text, CpuId::new(2)), Ok(None));
+        assert_eq!(
+            apic_of("cpu=00 apic=0\n", CpuId::new(1)),
+            Err(ParseError::Field("node"))
+        );
+    }
+
+    #[test]
     fn irq_bounds_and_vectors() {
         assert_eq!(Irq::new(223).map(Irq::get), Some(223));
         assert_eq!(Irq::new(224), None);
         assert_eq!(Irq::from_vector(31), None);
         assert_eq!(Irq::from_vector(32), Some(irq(0)));
         assert_eq!(Irq::from_vector(255), Some(irq(223)));
-    }
-
-    #[test]
-    fn legacy_irqs_belong_to_the_bsp() {
-        assert_eq!(irq(15).delivery_cpu(CpuId::new(3)), CpuId::BSP);
-        assert_eq!(irq(16).delivery_cpu(CpuId::new(3)), CpuId::new(3));
-        assert!(irq(0).is_legacy());
-        assert!(!irq(16).is_legacy());
     }
 
     #[test]

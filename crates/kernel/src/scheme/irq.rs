@@ -58,6 +58,9 @@ const INO_PHANDLE: u64 = 0x8003_0000_0000_0000;
 // Ferric Oxide: `irq:cpus`.
 #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
 const INO_CPUS: u64 = 0x8004_0000_0000_0000;
+/// Ferric Oxide: the root `getdents` position of `cpus`, after every `cpu-XX` (`XX` is a `u8`).
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+const CPUS_DIRENT: usize = 0x101;
 
 /// Ferric Oxide (`irq-percpu`): the interrupt counts per (logical CPU, IRQ), which replace
 /// [`COUNTS`] for counting and delivery, so the same vector number reserved on two CPUs is two
@@ -66,17 +69,16 @@ const INO_CPUS: u64 = 0x8004_0000_0000_0000;
 static PERCPU_COUNTS: ferric_irq::Counts<{ crate::cpu_set::MAX_CPU_COUNT as usize }> =
     ferric_irq::Counts::new();
 
-/// Counts an interrupt of `irq` that arrived on this CPU, and returns the CPU whose handles get
+/// Counts an interrupt of `irq` for the handles on `owner`, and returns the CPU whose handles get
 /// it (Ferric Oxide: the BSP, as upstream, without `irq-percpu`).
-fn count_interrupt(irq: u8) -> LogicalCpuId {
+fn count_interrupt(irq: u8, owner: LogicalCpuId) -> LogicalCpuId {
     #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
     if let Some(number) = ferric_irq::Irq::new(irq) {
-        let arrived = ferric_irq::CpuId::new(crate::cpu_id().get());
-        let cpu = number.delivery_cpu(arrived);
         // Every online CPU has a row: there are `MAX_CPU_COUNT` of them.
-        let _ = PERCPU_COUNTS.trigger(cpu, number);
-        return LogicalCpuId::new(cpu.get());
+        let _ = PERCPU_COUNTS.trigger(ferric_irq::CpuId::new(owner.get()), number);
+        return owner;
     }
+    let _ = owner;
     if let Some(count) = COUNTS.lock().get_mut(usize::from(irq)) {
         *count = count.wrapping_add(1);
     }
@@ -112,8 +114,26 @@ fn delivers_to(handle_cpu: LogicalCpuId, cpu: LogicalCpuId) -> bool {
 }
 
 /// Add to the input queue
+///
+/// Ferric Oxide: for interrupts from the PIC or I/O APIC (and the interrupt controllers of other
+/// architectures), which belong to the BSP's `irq:N` handles wherever they are taken. A vector
+/// reserved on a CPU goes through [`vector_trigger`].
 pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
-    let cpu = count_interrupt(irq);
+    deliver(irq, LogicalCpuId::BSP, token);
+}
+
+/// Ferric Oxide: adds an interrupt that arrived through a vector reserved on the running CPU
+/// (`irq:cpu-XX/N`) to the input queue. With `irq-percpu` it belongs to that CPU's handles, even
+/// for numbers below 16, which on an AP are ordinary vectors; without it, as upstream, to every
+/// handle for the number.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn vector_trigger(irq: u8, token: &mut CleanLockToken) {
+    deliver(irq, crate::cpu_id(), token);
+}
+
+/// Counts an interrupt of `irq` for `owner` and wakes the handles that get it.
+fn deliver(irq: u8, owner: LogicalCpuId, token: &mut CleanLockToken) {
+    let cpu = count_interrupt(irq, owner);
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
             .read(token.token())
@@ -520,6 +540,18 @@ impl crate::scheme::KernelScheme for IrqScheme {
                         name: &intermediate,
                         inode: 0,
                         next_opaque_id: u64::from(*cpu_id + 1),
+                    })?;
+                }
+
+                // Ferric Oxide: `cpus` comes after the CPU directories, whose next ids are at
+                // most 256, so its own id resumes after it without repeating or skipping.
+                #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+                if opaque <= CPUS_DIRENT {
+                    buf.entry(DirEntry {
+                        inode: INO_CPUS,
+                        next_opaque_id: CPUS_DIRENT as u64 + 1,
+                        kind: DirentKind::CharDev,
+                        name: "cpus",
                     })?;
                 }
             }

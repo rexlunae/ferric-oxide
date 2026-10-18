@@ -112,13 +112,20 @@ on both handles. With `kernel.irq_percpu` (off by default, x86_64 only):
 
 - Interrupts are keyed by (logical CPU, vector). Each CPU increments its own
   row of atomic counters (`ferric_irq::Counts`), without a global lock, and
-  only handles opened for that CPU and vector are woken. Legacy IRQs 0 to 15
-  stay keyed to the BSP wherever they arrive.
+  only handles opened for that CPU and vector are woken. Interrupts from the
+  PIC or I/O APIC belong to the BSP's `irq:N` handles. On an AP, IRQ numbers
+  0 to 15 are ordinary vectors and can be reserved there.
 - The top-level listing names CPUs by logical id, the number `cpu-XX` takes.
 - The root-only file `irq:cpus` lists each online CPU as
   `cpu=<logical hex> apic=<APIC id> node=<NUMA node or ->`. `ferric-irq`
   holds the writer and parser, so user space reads it with
-  `ferric_irq::parse_cpus`.
+  `ferric_irq::parse_cpus`. The file appears in directory listings of
+  `/scheme/irq`.
+- Without interrupt remapping, pcid looks up the APIC id of the CPU a driver
+  asks for in `irq:cpus` when it builds a compatibility-format MSI message,
+  instead of using the logical id as one. It refuses a CPU whose APIC id the
+  format cannot name (0xFF or above). Without `irq:cpus`, pcid uses the
+  logical id, as upstream did.
 
 In every build, opening `cpu-XX` for a CPU that does not exist returns
 `ENOENT` instead of panicking the kernel. MSI-X allocation still puts every

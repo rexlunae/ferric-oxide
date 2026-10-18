@@ -103,6 +103,7 @@ redox_syscall = { version = "0.9.4",  features = ["std"] }
 # Ferric Oxide: shared crates of the repository (../../crates; the base recipe links them
 # next to its copy of this tree).
 ferric-iommu = { path = "../../crates/iommu" }
+ferric-irq = { path = "../../crates/irq" }
 redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", features = ["userspace", "sync"] }
 redox_termios = "0.1.4"
 ron = "0.8.1"

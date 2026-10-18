@@ -53,7 +53,8 @@
 //!   number on a CPU other than the BSP and the same number on the BSP, programs the device
 //!   with the message for the other CPU, and has it raise an interrupt: the other CPU's handle
 //!   must count it and the BSP's must not, so the kernel counts interrupts per (CPU, vector)
-//!   and not by vector number alone (`iommu-msi-percpu`).
+//!   and not by vector number alone. It then does the same with a vector below 48 on that
+//!   CPU, which on an AP is an ordinary vector and not a legacy IRQ (`iommu-msi-percpu`).
 //!
 //! For each DMA fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`,
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
@@ -710,6 +711,12 @@ struct Vector {
 impl Vector {
     /// Reserves a free vector on logical CPU `cpu`, as `pcid_interface::irq_helpers` does.
     fn reserve(cpu: u32) -> Result<Self, Failure> {
+        // IRQs 0 to 15 are the legacy ones, which are not reserved.
+        Self::reserve_where(cpu, |irq| irq >= 16)
+    }
+
+    /// Reserves the first free vector on logical CPU `cpu` whose IRQ number `accept` takes.
+    fn reserve_where(cpu: u32, accept: impl Fn(u8) -> bool) -> Result<Self, Failure> {
         let dir = format!("/scheme/irq/cpu-{cpu:02x}");
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
@@ -720,8 +727,7 @@ impl Vector {
             else {
                 continue;
             };
-            // IRQs 0 to 15 are the legacy ones, which are not reserved.
-            if irq < 16 {
+            if !accept(irq) {
                 continue;
             }
             match File::create(format!("{dir}/{irq}")) {
@@ -909,6 +915,29 @@ fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
         return Ok(None);
     };
     let (mut target, mut decoy) = Vector::reserve_pair(other, bsp)?;
+    let fired = fire(setup, &mut target);
+    let stray = decoy.wait(IRQ_BLOCKED_WAIT);
+    // On an AP, IRQs 0 to 15 are ordinary vectors: one reserved there must reach its handle,
+    // not the BSP's legacy IRQ of the same number.
+    let low = fired.and_then(|()| {
+        let mut low = Vector::reserve_where(other, |irq| irq < 16)?;
+        fire(setup, &mut low).map(|()| low.vector)
+    });
+    // Back to the message of the vector `iommu-msi` reserved, for whatever runs next.
+    setup.channel.set_msi(msi.message)?;
+    let low = low?;
+    match stray? {
+        0 => Ok(Some(format!(
+            "vector {:#x} reached CPU {other}, and the same vector held on CPU {bsp} counted nothing; low vector {low:#x} reached CPU {other}",
+            target.vector
+        ))),
+        count => Err(Failure::CrossCpu(decoy.vector, bsp, count)),
+    }
+}
+
+/// Aims the device's MSI at `target` with pcid's message for it, raises an interrupt, and
+/// checks that `target`'s handle counted it.
+fn fire(setup: &mut Setup, target: &mut Vector) -> Result<(), Failure> {
     let message = setup
         .channel
         .msi_message(target.cpu, target.vector)?
@@ -917,19 +946,10 @@ fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
     setup.edu.raise_interrupt();
     let count = target.wait(IRQ_WAIT);
     setup.edu.ack_interrupt();
-    let stray = decoy.wait(IRQ_BLOCKED_WAIT);
-    // Back to the message of the vector `iommu-msi` reserved, for whatever runs next.
-    setup.channel.set_msi(msi.message)?;
     if count? == 0 {
         return Err(Failure::NoInterrupt(target.vector));
     }
-    match stray? {
-        0 => Ok(Some(format!(
-            "vector {:#x} reached CPU {other}, and the same vector held on CPU {bsp} counted nothing",
-            target.vector
-        ))),
-        count => Err(Failure::CrossCpu(decoy.vector, bsp, count)),
-    }
+    Ok(())
 }
 
 /// The outcome of the interrupt tests.
