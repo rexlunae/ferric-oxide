@@ -32,10 +32,12 @@ runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test.
 
 Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
-running Cargo. It enables Git's fetch client and rewrites upstream Redox GitLab
-URLs to the GitHub mirrors, retaining the lockfiles' exact commit IDs. This also
-covers Cargo dependency resolution during feature generation; successful
-submodule checkout alone does not establish that Cargo can reach GitLab.
+running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
+rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining
+the lockfiles' exact commit IDs. Other mirrors can lack current commits, so their
+upstream URLs remain in use with increased retries. This also covers Cargo
+dependency resolution during feature generation; successful submodule checkout
+alone does not establish that Cargo can reach GitLab.
 
 `cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
