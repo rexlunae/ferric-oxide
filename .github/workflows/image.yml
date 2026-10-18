@@ -151,7 +151,10 @@ jobs:
             --config "$out/ferric.toml" --out "$out" generate --no-touch
           FERRIC_KERNEL_FEATURES="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
           echo "FERRIC_KERNEL_FEATURES=$FERRIC_KERNEL_FEATURES"
-          if grep -q trace <<< "$FERRIC_KERNEL_FEATURES"; then exit 1; fi
+          # The container runs steps with sh, so no bash here-strings.
+          case "$FERRIC_KERNEL_FEATURES" in
+            *trace*) echo "::error::the notrace kernel still has a trace feature"; exit 1 ;;
+          esac
           export FERRIC_KERNEL_FEATURES FERRIC_KERNEL_CONFIG="$out/kernel-config.toml"
           make cr.kernel CONFIG_NAME="$CONFIG_NAME"
           rm -f "build/x86_64/$CONFIG_NAME/harddrive.img"
