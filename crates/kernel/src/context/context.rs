@@ -526,17 +526,12 @@ impl BorrowedHtBuf {
             SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
         }
     }
+    // Ferric Oxide: the frame's bytes come from `RaiiFrame`, which regbuf bounce pages use too.
     pub fn buf(&self) -> &[u8; PAGE_SIZE] {
-        unsafe {
-            &*(RmmA::phys_to_virt(self.inner.as_ref().expect("must succeed").get().base()).data()
-                as *const [u8; PAGE_SIZE])
-        }
+        self.inner.as_ref().expect("must succeed").bytes()
     }
     pub fn buf_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
-        unsafe {
-            &mut *(RmmA::phys_to_virt(self.inner.as_mut().expect("must succeed").get().base())
-                .data() as *mut [u8; PAGE_SIZE])
-        }
+        self.inner.as_mut().expect("must succeed").bytes_mut()
     }
     pub fn frame(&self) -> Frame {
         self.inner.as_ref().expect("must succeed").get()

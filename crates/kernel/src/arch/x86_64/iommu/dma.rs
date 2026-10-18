@@ -40,7 +40,10 @@ use ferric_vtd::{iova::IovaRange, table::Access};
 
 use super::domain::{Domain, DomainError};
 use crate::{
-    context::memory::{AddrSpace, GenericFlusher, NopFlusher, Provider, TlbShootdownActions},
+    context::{
+        memory::{AddrSpace, GenericFlusher, NopFlusher, Provider, TlbShootdownActions},
+        reshare::{self, ReshareError},
+    },
     memory::{get_page_info, Frame, Page, PhysicalAddress, RefCount, RefKind, VirtualAddress},
 };
 
@@ -69,6 +72,8 @@ pub enum DmaError {
     Overlap(Overlap),
     /// Allocating the IOVA or changing the domain's tables failed.
     Domain(DomainError),
+    /// Ferric Oxide: the page is borrowed from another process (context/reshare.rs).
+    Borrowed(ReshareError),
 }
 
 impl fmt::Display for DmaError {
@@ -79,6 +84,7 @@ impl fmt::Display for DmaError {
             Self::FreeFrame { phys } => write!(f, "frame {phys:#x} is free"),
             Self::Overlap(err) => write!(f, "{err}"),
             Self::Domain(err) => write!(f, "{err}"),
+            Self::Borrowed(err) => write!(f, "{err}"),
         }
     }
 }
@@ -166,6 +172,7 @@ fn target(space: &AddrSpace, virt: VirtualAddress) -> Result<Target, DmaError> {
     let not_mapped = DmaError::NotMapped { virt: virt.data() };
     let page = Page::containing_address(virt);
     let (grant_base, info) = space.grants.contains(page).ok_or(not_mapped)?;
+    reshare::check_grant(grant_base, info).map_err(DmaError::Borrowed)?;
     let (phys, flags) = space
         .table
         .utable

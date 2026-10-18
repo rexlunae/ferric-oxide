@@ -8,7 +8,7 @@ use crate::{
         file::InternalFlags,
         memory::{handle_notify_files, AddrSpace, AddrSpaceWrapper, Grant, PageSpan, UnmapVec},
     },
-    memory::{free_frames, used_frames, Frame, VirtualAddress, PAGE_SIZE},
+    memory::{free_frames, used_frames, Frame, Page, VirtualAddress, PAGE_SIZE},
     sync::CleanLockToken,
     syscall::{
         data::{Map, StatVfs},
@@ -294,6 +294,11 @@ impl KernelScheme for MemoryScheme {
                 let mut token = token.token();
                 let addr = AddrSpace::current()?;
                 let addr = addr.acquire_read(token.downgrade());
+                // Ferric Oxide: no physical address for pages the caller only borrows, which a
+                // device could keep reaching after the borrow ends (context/reshare.rs). The
+                // IOMMU path above checks the same in `dma.rs`.
+                let page = PageSpan::new(Page::containing_address(virt), 1);
+                crate::context::reshare::check_span(&addr, page)?;
                 let (phys, _) = addr
                     .table
                     .utable

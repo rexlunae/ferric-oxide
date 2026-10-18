@@ -128,6 +128,7 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::PinOverflow { .. } => Error::new(ENOMEM),
         DmaError::FreeFrame { .. } | DmaError::Overlap(_) => Error::new(EIO),
         DmaError::Domain(err) => errno(err),
+        DmaError::Borrowed(err) => Error::from(*err),
     }
 }
 

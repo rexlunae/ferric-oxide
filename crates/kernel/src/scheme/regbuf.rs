@@ -2,26 +2,32 @@
 //! (io/registered-buffers-design.md in the project files; built with the `regbuf` feature).
 //!
 //! - Opening [`REGION_PATH`] from the scheme root gives an empty *region*.
-//!   [`Request::Register`] on it pins a page-aligned range of the caller's private anonymous
-//!   read-write memory: each frame gets a shared reference, the one user/kernel shared pages
-//!   take (`AddrSpaceWrapper::borrow_frame_enforce_rw_allocated`). If the owner forks, its child
-//!   gets copies of those frames, so the region keeps pointing at the owner's memory. The pages
-//!   are charged to the region opener's user ID ([`Budget`], `EDQUOT` over the limit) until the
-//!   region closes.
+//!   [`Request::Register`] on it pins a page-aligned range of the caller's anonymous read-write
+//!   memory, private or `MAP_SHARED`: each frame gets a shared reference, the one user/kernel
+//!   shared pages take (`AddrSpaceWrapper::borrow_frame_enforce_rw`). If the owner forks, its
+//!   child gets copies of private frames, so the region keeps pointing at the owner's memory;
+//!   `MAP_SHARED` frames stay shared with the child, as such memory always is. Pages the caller
+//!   only borrows (grant mappings, scheme request buffers) cannot be registered
+//!   (`context/reshare.rs`). The pages are charged to the region opener's user ID ([`Budget`],
+//!   `EDQUOT` over the limit) until the region closes.
 //! - Opening a grant path (`GrantSpec::encode_path`) from a region gives a *grant* descriptor:
-//!   read-only or read-write access to a page range of the region. Its holder, typically a
-//!   scheme the owner passed it to, maps it with `mmap` (`MAP_SHARED`; write access needs a
-//!   read-write grant). Each page becomes a pinned shared borrow of the region's frame, like the
-//!   per-request borrows of `user.rs`: the holder cannot `munmap`, `mprotect` or `mremap` it
-//!   (`EBUSY`), a fork of the holder does not inherit it, and the grant records every mapping.
-//!   The holder drops one with [`Request::Unmap`]; closing the grant drops all of them.
+//!   read-only or read-write access to a byte range of the region. Its holder, typically a
+//!   scheme the owner passed it to, maps the grant's window with `mmap` (`MAP_SHARED`; write
+//!   access needs a read-write grant). The mapping is one kernel grant of pinned shared borrows
+//!   of the region's frames, like the per-request borrows of `user.rs`: the holder cannot
+//!   `munmap`, `mprotect` or `mremap` it (`EBUSY`), cannot share it onward (`EPERM`, see
+//!   `context/reshare.rs`), a fork of the holder does not inherit it, and the grant records
+//!   every mapping. A window page the grant covers only in part is a bounce page holding just
+//!   the granted bytes ([`Bounce`]), copied back into the region when a writable mapping is
+//!   taken down. The holder drops a mapping with [`Request::Unmap`]; closing the grant drops
+//!   all of them.
 //! - [`Request::Revoke`] on the region, or closing the region, marks grants revoked (mapping
 //!   them again fails with `ECANCELED`) and unmaps every recorded mapping, with a TLB shootdown,
 //!   before it returns. Closing the region also unpins its frames and refunds the charge.
 //!
 //! Locks: a region's lock is taken before an address space's lock (mapping), never after.
-//! Revocation takes the mappings out of the region under its lock and unmaps them after
-//! releasing it. The grant table and budget logic is the host-tested `ferric-regbuf` crate
+//! Revocation takes the mappings out of the region under its lock, unmaps them after releasing
+//! it, and takes it again to copy bounce pages back. The grant table and budget logic is the host-tested `ferric-regbuf` crate
 //! (`crates/regbuf`), which also has the call encoding clients use.
 
 use alloc::{
@@ -37,7 +43,7 @@ use core::{
 use ferric_regbuf::{
     abi::{GrantId, GrantInfo, GrantSpec, PathError, Request, Usage, REGION_PATH},
     budget::{Budget, Limits},
-    table::{GrantTable, TableError},
+    table::{GrantTable, MapPlan, PartialPage, TableError},
 };
 use spin::Mutex;
 use syscall::{
@@ -54,7 +60,9 @@ use crate::{
         file::InternalFlags,
         memory::{handle_notify_files, AddrSpace, AddrSpaceWrapper, Grant, PageSpan},
     },
-    memory::{free_frames, get_page_info, used_frames, Page, RaiiFrame, RefCount, VirtualAddress},
+    memory::{
+        free_frames, get_page_info, used_frames, Frame, Page, RaiiFrame, RefCount, VirtualAddress,
+    },
     sync::CleanLockToken,
     syscall::{data::Map, usercopy::UserSliceRw},
 };
@@ -69,6 +77,47 @@ pub struct RegBufScheme;
 struct Mapping {
     space: Weak<AddrSpaceWrapper>,
     span: PageSpan,
+    /// The bounce pages among them.
+    bounces: Vec<Bounce>,
+    /// Whether the holder could write them, so bounce pages are copied back.
+    writable: bool,
+}
+
+/// A window page the grant covers only in part: a fresh frame mapped in its place, holding the
+/// granted bytes and zeros elsewhere, so the holder never sees the rest of the region page.
+struct Bounce {
+    frame: RaiiFrame,
+    page: PartialPage,
+}
+
+impl Bounce {
+    /// A bounce page for `page`, filled from the region's frame.
+    fn new(page: PartialPage, region_frame: &RaiiFrame) -> Result<Self> {
+        let mut frame = RaiiFrame::allocate().map_err(|_| Error::new(ENOMEM))?;
+        let granted = page.start..page.end;
+        let src = region_frame
+            .bytes()
+            .get(granted.clone())
+            .ok_or(Error::new(EINVAL))?;
+        frame
+            .bytes_mut()
+            .get_mut(granted)
+            .ok_or(Error::new(EINVAL))?
+            .copy_from_slice(src);
+        Ok(Self { frame, page })
+    }
+
+    /// Copies the granted bytes back into the region's frames. The mapping must be gone.
+    fn write_back(&self, frames: &mut [RaiiFrame]) {
+        let granted = self.page.start..self.page.end;
+        let src = self.frame.bytes().get(granted.clone());
+        let dst = frames
+            .get_mut(self.page.region_page)
+            .and_then(|frame| frame.bytes_mut().get_mut(granted));
+        if let (Some(src), Some(dst)) = (src, dst) {
+            dst.copy_from_slice(src);
+        }
+    }
 }
 
 /// A region: its owner, its pinned frames (dropping them unpins) and its grants.
@@ -138,23 +187,42 @@ fn path_errno(err: &PathError) -> Error {
     })
 }
 
-/// Takes down `mappings`. A mapping whose address space has gone needs nothing.
-fn unmap_all(mappings: Vec<Mapping>, token: &mut CleanLockToken) {
+/// Takes down `mappings` and returns the bounce pages to copy back into the region: those of
+/// writable mappings that are gone. A mapping whose address space has gone needs no unmap.
+#[must_use = "bounce pages of writable mappings must be copied back"]
+fn unmap_all(mappings: Vec<Mapping>, token: &mut CleanLockToken) -> Vec<Bounce> {
+    let mut back = Vec::new();
     for mapping in mappings {
-        let Some(space) = mapping.space.upgrade() else {
-            continue;
-        };
-        // Unpinning is what lets the pinned borrows go; the holder could not have removed or
-        // replaced them, so the span still holds exactly this mapping.
-        match space.munmap(mapping.span, true, token) {
-            Ok(notify) => handle_notify_files(notify, token),
-            Err(err) => {
-                warn!(
-                    "regbuf: cannot unmap {:#x} ({} pages): {err:?}",
-                    mapping.span.base.start_address().data(),
-                    mapping.span.count
-                );
+        if let Some(space) = mapping.space.upgrade() {
+            // Unpinning is what lets the pinned borrows go; the holder could not have removed
+            // or replaced them, so the span still holds exactly this mapping.
+            match space.munmap(mapping.span, true, token) {
+                Ok(notify) => handle_notify_files(notify, token),
+                Err(err) => {
+                    warn!(
+                        "regbuf: cannot unmap {:#x} ({} pages): {err:?}",
+                        mapping.span.base.start_address().data(),
+                        mapping.span.count
+                    );
+                    // Still mapped, so the holder may write on: nothing to copy back.
+                    continue;
+                }
             }
+        }
+        if mapping.writable {
+            back.extend(mapping.bounces);
+        }
+    }
+    back
+}
+
+/// Takes down `mappings` of `region` and copies their bounce pages back into it.
+fn take_down(region: &Mutex<Region>, mappings: Vec<Mapping>, token: &mut CleanLockToken) {
+    let back = unmap_all(mappings, token);
+    if !back.is_empty() {
+        let frames = &mut region.lock().frames;
+        for bounce in &back {
+            bounce.write_back(frames);
         }
     }
 }
@@ -213,7 +281,7 @@ impl KernelScheme for RegBufScheme {
             Some(Handle::Region(region)) => close_region(&region, token),
             Some(Handle::Grant { region, id }) => {
                 let gone = region.lock().grants.remove(id);
-                unmap_all(gone, token);
+                take_down(&region, gone, token);
             }
             Some(Handle::Root { .. }) | None => {}
         }
@@ -245,7 +313,7 @@ impl KernelScheme for RegBufScheme {
                 if !gone.is_empty() {
                     info!("regbuf: {id} revoked, unmapping {} mapping(s)", gone.len());
                 }
-                unmap_all(gone, token);
+                take_down(&region, gone, token);
                 Ok(0)
             }
             (Request::Info, Handle::Grant { region, id }) => {
@@ -289,26 +357,24 @@ impl KernelScheme for RegBufScheme {
             return Err(Error::new(EINVAL));
         }
         let write = map.flags.contains(MapFlags::PROT_WRITE);
-        let mut region = region.lock();
-        let range = region
+        let mut guard = region.lock();
+        let plan = guard
             .grants
             .check_map(id, map.offset as u64, map.size as u64, write)
             .map_err(|err| table_errno(&err))?;
-        let frames = range
-            .first
-            .checked_add(range.count)
-            .and_then(|end| region.frames.get(range.first..end))
-            .ok_or(Error::new(EINVAL))?;
+        let (frames, bounces) = plan_frames(&guard.frames, &plan)?;
         let prot = map.flags & (MapFlags::PROT_READ | MapFlags::PROT_WRITE);
-        let span = map_frames(addr_space, frames, prot, token)?;
+        let span = map_frames(addr_space, &frames, prot, token)?;
         let mapping = Mapping {
             space: Arc::downgrade(addr_space),
             span,
+            bounces,
+            writable: write,
         };
-        if let Err((err, mapping)) = region.grants.add_mapping(id, mapping) {
+        if let Err((err, mapping)) = guard.grants.add_mapping(id, mapping) {
             // Not reached: the region stayed locked since check_map.
-            drop(region);
-            unmap_all(alloc::vec![mapping], token);
+            drop(guard);
+            take_down(&region, alloc::vec![mapping], token);
             return Err(table_errno(&err));
         }
         Ok(span.base.start_address().data())
@@ -317,7 +383,7 @@ impl KernelScheme for RegBufScheme {
 
 /// Revokes every grant of `region`, unmaps their mappings, and unpins and refunds its frames.
 fn close_region(region: &Mutex<Region>, token: &mut CleanLockToken) {
-    let (gone, frames, uid) = {
+    let (gone, mut frames, uid) = {
         let mut region = region.lock();
         (
             region.grants.revoke_all(),
@@ -325,7 +391,10 @@ fn close_region(region: &Mutex<Region>, token: &mut CleanLockToken) {
             region.uid,
         )
     };
-    unmap_all(gone, token);
+    // The owner may still have the memory mapped, so the holders' last writes land there.
+    for bounce in unmap_all(gone, token) {
+        bounce.write_back(&mut frames);
+    }
     let pages = frames.len() as u64;
     // Every mapping has its own frame references, so unpinning frees only unmapped frames.
     drop(frames);
@@ -401,75 +470,98 @@ fn pin(span: PageSpan, token: &mut CleanLockToken) -> Result<Vec<RaiiFrame>> {
     frames
         .try_reserve_exact(span.count)
         .map_err(|_| Error::new(ENOMEM))?;
+    // Private or MAP_SHARED anonymous memory, never pages the caller only borrows.
+    let shared = true;
     for page in span.pages() {
-        frames.push(space.borrow_frame_enforce_rw_allocated(page, token)?);
+        frames.push(space.borrow_frame_enforce_rw(page, shared, token)?);
     }
     Ok(frames)
 }
 
-/// Maps `frames` at a free span of `space` with protection `prot`, as pinned shared borrows,
-/// and returns the span.
+/// The frames a mapping of `plan` maps, in order: the region's own, or a bounce page for each
+/// page the grant covers only in part; and those bounce pages, which the mapping keeps.
+fn plan_frames(region: &[RaiiFrame], plan: &MapPlan) -> Result<(Vec<Frame>, Vec<Bounce>)> {
+    let pages = plan
+        .pages
+        .first
+        .checked_add(plan.pages.count)
+        .and_then(|end| region.get(plan.pages.first..end))
+        .ok_or(Error::new(EINVAL))?;
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(pages.len())
+        .map_err(|_| Error::new(ENOMEM))?;
+    let mut bounces = Vec::new();
+    for (index, frame) in pages.iter().enumerate() {
+        match plan.partial_at(index) {
+            Some(partial) => {
+                let bounce = Bounce::new(partial, frame)?;
+                frames.push(bounce.frame.get());
+                bounces.push(bounce);
+            }
+            None => frames.push(frame.get()),
+        }
+    }
+    Ok((frames, bounces))
+}
+
+/// Maps `frames` at a free span of `space` with protection `prot`, as one grant of pinned
+/// shared borrows, and returns the span.
 fn map_frames(
     space: &Arc<AddrSpaceWrapper>,
-    frames: &[RaiiFrame],
+    frames: &[Frame],
     prot: MapFlags,
     token: &mut CleanLockToken,
 ) -> Result<PageSpan> {
-    let flags = prot | MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE;
+    let count = NonZeroUsize::new(frames.len()).ok_or(Error::new(EINVAL))?;
     // A shared reference cannot be added to a copy-on-write frame. The region's references are
     // shared and only its owner maps the frames privately, so this does not happen, but check
     // rather than rely on it.
-    let shareable = frames.iter().all(|frame| {
-        get_page_info(frame.get())
+    let shareable = frames.iter().all(|&frame| {
+        get_page_info(frame)
             .and_then(|info| info.refcount())
             .is_some_and(|count| !matches!(count, RefCount::Cow(_)))
     });
     if !shareable {
         return Err(Error::new(EIO));
     }
-    let mapped = {
+    let flags = prot | MapFlags::MAP_SHARED;
+    let (base, mapped) = {
         let mut lock_token = token.token();
         let mut guard = space.acquire_write(lock_token.downgrade());
-        let base = guard
+        let base = guard.mmap(
+            space,
+            None,
+            count,
+            flags,
+            None,
+            |base, f, mapper, flusher| {
+                let is_pinned = true;
+                Grant::allocated_shared(frames, base, f, mapper, flusher, is_pinned)
+            },
+        )?;
+        let mapped = guard
             .grants
-            .find_free(guard.mmap_min, frames.len())
-            .ok_or(Error::new(ENOMEM))?
-            .base;
-        let mut outcome = (frames.len(), Ok(()));
-        for (done, (frame, page)) in frames
-            .iter()
-            .zip(PageSpan::new(base, frames.len()).pages())
-            .enumerate()
-        {
-            let mapped = guard.mmap(
-                space,
-                Some(page),
-                NonZeroUsize::MIN,
-                flags,
-                None,
-                |page, f, mapper, flusher| {
-                    Grant::allocated_shared_one_page(frame.get(), page, f, mapper, flusher, true)
-                },
-            );
-            if let Err(err) = mapped {
-                outcome = (done, Err(err));
-                break;
-            }
-        }
-        (base, outcome.0, outcome.1)
+            .contains(base)
+            .map_or(0, |(_, info)| info.page_count());
+        (base, mapped)
     };
-    let (base, done, result) = mapped;
-    if let Err(err) = result {
-        unmap_all(
+    let span = PageSpan::new(base, mapped);
+    if mapped != frames.len() {
+        // The page tables ran out part way.
+        let none = unmap_all(
             alloc::vec![Mapping {
                 space: Arc::downgrade(space),
-                span: PageSpan::new(base, done),
+                span,
+                bounces: Vec::new(),
+                writable: false,
             }],
             token,
         );
-        return Err(err);
+        debug_assert!(none.is_empty());
+        return Err(Error::new(ENOMEM));
     }
-    Ok(PageSpan::new(base, done))
+    Ok(span)
 }
 
 /// [`Request::Unmap`]: drops the caller's mapping of grant `id` that starts at `addr`.
@@ -489,6 +581,6 @@ fn unmap(
             m.span.base == base && core::ptr::eq(m.space.as_ptr(), Arc::as_ptr(&space))
         })
         .map_err(|err| table_errno(&err))?;
-    unmap_all(alloc::vec![mapping], token);
+    take_down(region, alloc::vec![mapping], token);
     Ok(0)
 }
