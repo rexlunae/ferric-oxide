@@ -154,6 +154,12 @@ on closed grants. Closed regions release their frames and pin charges when
 the last mapping completes. Region records are reconciled outside the handle
 lock to preserve the region-before-handle lock order.
 
+When a failed unmap is still in flight during domain closure, the link may
+reach its region before the revoker publishes that failure. Before restoring
+the record, teardown rechecks confirmed domain closure under the region lock.
+It completes an already blocked mapping instead of stranding a restored record
+after its link was removed. Failed device blocking still requires retention.
+
 Failed DMA-grant unmapping retains its mapping record, grant link, frame
 references and allocated IOVA. Once hardware unmapping fails, later attempts
 return `EIO` rather than treating cleared page-table entries as proof of

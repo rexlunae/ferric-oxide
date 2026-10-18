@@ -386,15 +386,22 @@ fn take_down(
     let released = {
         let mut guard = region.lock();
         for (taken, outcome) in outcomes {
+            let outcome = guard.grants.complete_teardown(taken, outcome, |mapping| {
+                #[cfg(iommu_enabled)]
+                if let Some(record) = mapping.dma {
+                    return super::iommu::grant_domain_closed(record);
+                }
+                #[cfg(not(iommu_enabled))]
+                let _ = mapping;
+                false
+            });
             match outcome {
                 // A closed region keeps its frames until this last teardown, and the owner may
                 // still have the memory mapped, so the holder's last writes land there.
-                Ok(()) => {
-                    let region = &mut *guard;
-                    region.grants.finish(taken).write_back(&mut region.frames);
+                Ok(mapping) => {
+                    mapping.write_back(&mut guard.frames);
                 }
                 Err(err) => {
-                    guard.grants.restore(taken);
                     failed.get_or_insert(err);
                 }
             }
