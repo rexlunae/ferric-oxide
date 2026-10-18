@@ -137,8 +137,11 @@ package, adoption:
 Adoption changes no installed file and does not hash them: run
 `fox verify --installed` afterwards. It runs once per root. The database
 records that it ran, so `pkg`'s stale state cannot bring back a package
-removed with `fox` later; `--again` overrides this. A package that skips
-exits with a failing status.
+removed with `fox` later; `--again` overrides this. The packages it skipped
+are recorded as pending, and a later `fox adopt-pkg` retries those alone
+(after their head is restored or their signer is trusted, say), so the
+first-boot service picks them up on the next boot. A package that is skipped
+makes the command exit with a failing status.
 
 ## Target images
 

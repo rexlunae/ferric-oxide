@@ -23,6 +23,7 @@
 //! The file is rewritten whole on every change, through a temporary file
 //! and a rename, so a crash leaves either the old or the new version.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -117,6 +118,10 @@ pub(crate) struct Database {
     /// not bring back packages removed since.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) legacy_adopted: bool,
+    /// Packages from `pkg`'s state that the last adoption skipped. A later
+    /// adoption retries these, and only these.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) legacy_pending: BTreeSet<String>,
     #[serde(default, rename = "package")]
     pub(crate) packages: Vec<InstalledPackage>,
 }

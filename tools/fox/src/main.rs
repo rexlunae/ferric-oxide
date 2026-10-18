@@ -86,13 +86,15 @@ enum Command {
     /// List installed packages.
     List,
     /// Record the packages upstream `pkg` installed in the root, from the
-    /// signed heads it keeps. Runs once per root; files are not changed.
+    /// signed heads it keeps. Runs once per root, then only retries the
+    /// packages it skipped; files are not changed.
     AdoptPkg {
         /// Adopt packages without a signed manifest under the name `pkg`
         /// gives them.
         #[arg(long)]
         allow_unsigned_metadata: bool,
-        /// Adopt even if this root's pkg state was adopted before.
+        /// Adopt every package in pkg's state, even if this root's state
+        /// was adopted before.
         #[arg(long)]
         again: bool,
     },

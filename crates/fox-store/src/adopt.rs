@@ -20,7 +20,9 @@
 //! Adoption does not hash the installed files: run [`Store::verify`]
 //! afterwards to compare them with the signed entries. It runs once per
 //! root: the database remembers it, so packages removed with `fox` later
-//! are not brought back by `pkg`'s stale state.
+//! are not brought back by `pkg`'s stale state. Packages it skipped are
+//! remembered as pending, and a later adoption retries those alone (once
+//! their head is restored or their signer trusted, say).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -49,14 +51,17 @@ pub struct AdoptOptions {
     /// Adopt packages that have no signed manifest, named only by `pkg`'s
     /// state. They are recorded as [`MetadataKind::Legacy`].
     pub allow_unsigned_metadata: bool,
-    /// Adopt even if this root's `pkg` state was adopted before.
+    /// Adopt every package in `pkg`'s state, even if this root's state was
+    /// adopted before. Without it, a later adoption only retries the
+    /// packages earlier ones skipped.
     pub again: bool,
 }
 
 /// What [`Store::adopt_pkg`] did.
 #[derive(Debug, Default)]
 pub struct AdoptReport {
-    /// The root's `pkg` state had already been adopted, so nothing was done.
+    /// The root's `pkg` state had already been adopted with nothing
+    /// pending, so nothing was done.
     pub already_adopted: bool,
     /// Packages now recorded by `fox`.
     pub adopted: Vec<AdoptedPackage>,
@@ -164,7 +169,9 @@ impl Store {
     /// [`AdoptOptions::allow_unsigned_metadata`] by `pkg`'s state alone.
     /// No installed file is changed or hashed, and adoption runs once per
     /// root unless [`AdoptOptions::again`]. Packages that cannot be adopted
-    /// are listed in the report rather than failing the whole adoption.
+    /// are listed in the report rather than failing the whole adoption, and
+    /// remembered: a later adoption retries them, and only them, so
+    /// packages removed with `fox` since are not brought back.
     ///
     /// # Errors
     ///
@@ -180,11 +187,19 @@ impl Store {
         let db_path = self.db_path();
         let mut db = Database::load(&db_path)?;
         let mut report = AdoptReport::default();
-        if db.legacy_adopted && !options.again {
+        let retry_only = db.legacy_adopted && !options.again;
+        if retry_only && db.legacy_pending.is_empty() {
             report.already_adopted = true;
             return Ok(report);
         }
-        for (name, installed) in read_pkg_state(&self.root().join(PKG_STATE))? {
+        let mut state = read_pkg_state(&self.root().join(PKG_STATE))?;
+        if retry_only {
+            state.retain(|name, _| db.legacy_pending.contains(name));
+        }
+        // Rebuilt from this run's skips; a pending package that left pkg's
+        // state has nothing left to adopt.
+        let mut pending = BTreeSet::new();
+        for (name, installed) in state {
             match self.adopt_one(&db, &name, &installed, keys, options)? {
                 Ok((package, head)) => {
                     let head_path = self.head_path(&package.name);
@@ -197,10 +212,18 @@ impl Store {
                     });
                     db.packages.push(package);
                 }
-                Err(reason) => report.skipped.push(SkippedPackage { name, reason }),
+                // fox already records it, so it is accounted for.
+                Err(reason @ SkipReason::AlreadyInstalled) => {
+                    report.skipped.push(SkippedPackage { name, reason });
+                }
+                Err(reason) => {
+                    pending.insert(name.clone());
+                    report.skipped.push(SkippedPackage { name, reason });
+                }
             }
         }
         db.legacy_adopted = true;
+        db.legacy_pending = pending;
         db.save(&db_path)?;
         Ok(report)
     }

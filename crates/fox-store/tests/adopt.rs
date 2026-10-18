@@ -267,3 +267,58 @@ fn no_pkg_state_adopts_nothing() {
     assert!(report.adopted.is_empty() && report.skipped.is_empty());
     assert!(env.adopt(&env.key.trusted(), true).already_adopted);
 }
+
+#[test]
+fn skipped_packages_are_retried_without_reviving_removed_ones() {
+    let mut env = Env::new();
+    let key = FixtureKey::generate(env.work.path(), "build").unwrap();
+    let hello = env.archive(
+        &key,
+        "hello",
+        true,
+        &[FixtureEntry::file("usr/bin/hello", b"hello", 0o755)],
+    );
+    env.pkg_install(&key, "hello", &hello, &[]);
+    let late = env.archive(
+        &key,
+        "late",
+        true,
+        &[FixtureEntry::file("usr/bin/late", b"late", 0o755)],
+    );
+    env.pkg_install(&key, "late", &late, &[]);
+
+    // late's head is missing at first, so only hello is adopted.
+    let head = env.root().join(PKG_HEADS_DIR).join("late.pkgar_head");
+    let aside = env.work.path().join("late.pkgar_head");
+    fs::rename(&head, &aside).unwrap();
+    let report = env.adopt(&key.trusted(), false);
+    assert_eq!(report.adopted.len(), 1);
+    assert!(matches!(report.skipped[0].reason, SkipReason::NoHead));
+
+    // While it stays missing, retries keep it pending.
+    let report = env.adopt(&key.trusted(), false);
+    assert!(!report.already_adopted);
+    assert!(report.adopted.is_empty());
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].name, "late");
+
+    // hello is removed with fox; once late's head is back, a plain retry
+    // adopts late alone and does not bring hello back.
+    env.store.remove(&name("hello"), false).unwrap();
+    fs::rename(&aside, &head).unwrap();
+    let report = env.adopt(&key.trusted(), false);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.adopted.len(), 1);
+    assert_eq!(report.adopted[0].name, name("late"));
+    let names: Vec<_> = env
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, vec![name("late")]);
+
+    // Nothing is pending any more.
+    assert!(env.adopt(&key.trusted(), false).already_adopted);
+}
