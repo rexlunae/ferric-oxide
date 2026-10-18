@@ -1,14 +1,14 @@
-//! Ferric Oxide: IOMMU DMA remapping (`kernel.iommu`): Intel VT-d, and AMD-Vi in [`amdvi`].
+//! Ferric Oxide: IOMMU DMA remapping (`kernel.iommu`): Intel VT-d, and AMD-Vi in `amdvi`.
 //!
-//! [`init`] picks the vendor by which ACPI table firmware provides: the DMAR table means VT-d
+//! [`init`](crate::arch::iommu::init) picks the vendor by which ACPI table firmware provides: the DMAR table means VT-d
 //! (this file), the IVRS table AMD-Vi (`amdvi.rs`). Both put devices in the same kinds of
-//! domain, so [`domain`], [`dma`] and the `iommu` scheme work the same on either; only
-//! interrupt remapping ([`interrupt`]) is VT-d-only so far.
+//! domain, so [`domain`](crate::arch::iommu::domain), [`dma`](crate::arch::iommu::dma) and the `iommu` scheme work the same on either; only
+//! interrupt remapping ([`interrupt`](mod@crate::arch::iommu::interrupt)) is VT-d-only so far.
 //!
 //! Every VT-d unit the DMAR table lists is switched on with every device in one identity
 //! domain, so IOVA equals physical address and DMA behaves as before (io/iommu-design.md in
-//! the project files, step 1). [`domain`] adds DMA domains with their own tables that
-//! devices can be moved into and out of (step 2), which the boot self-test ([`selftest`])
+//! the project files, step 1). [`domain`](crate::arch::iommu::domain) adds DMA domains with their own tables that
+//! devices can be moved into and out of (step 2), which the boot self-test (`selftest`)
 //! checks and user space gets through the `iommu` scheme (`scheme/iommu.rs`, step 3).
 //!
 //! For each unit the kernel maps the register set, reads CAP/ECAP, builds (once per address
@@ -23,7 +23,7 @@
 //! (6.5.1, 10.4.7, 10.4.8). Faults raise the fault event interrupt (`FAULT_VECTOR` on the
 //! BSP), whose handler logs and clears the fault records (7.3, 10.4.14).
 //!
-//! Units that support it also remap interrupts ([`interrupt`], step 5): MSI and MSI-X get
+//! Units that support it also remap interrupts ([`interrupt`](mod@crate::arch::iommu::interrupt), step 5): MSI and MSI-X get
 //! remappable-format messages through the `iommu` scheme, and compatibility-format interrupt
 //! requests are blocked.
 //!

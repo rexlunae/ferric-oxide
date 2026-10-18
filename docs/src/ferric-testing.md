@@ -53,6 +53,20 @@ ordinary host `cargo test` is not a kernel boot test. When removing warnings,
 run the ratchet with `--update` and commit the lower baseline. The workflow
 contains the exact preparation for an IBT-configured binary.
 
+The workflow also builds kernel Rustdoc with warnings denied and `regbuf`
+enabled, for both `kernel.iommu = "never"` and `"auto"`. This covers common
+kernel documentation and the optional DMA-grant APIs. After generating and
+copying the desired kernel configuration, reproduce the check from
+`crates/kernel/`:
+
+```sh
+RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
+  cargo doc --locked --no-deps --features regbuf \
+  --target targets/x86_64-unknown-kernel.json \
+  -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+```
+
 ## Image tests
 
 `config/ferric-smoke.toml` includes the minimal image and forces local source

@@ -18,7 +18,7 @@
 //!   interrupt and exception stubs (`interrupt/handler.rs`), the generic IRQ stubs
 //!   (`x86_shared/interrupt/irq.rs`), the `SYSCALL` entry (`interrupt/syscall.rs`), and the
 //!   kernel and AP entry points (`x86_shared/start.rs`).
-//! - [`init_cpu`] writes `IA32_S_CET` with only `ENDBR_EN` and sets CR4.CET on every CPU, after
+//! - [`init_cpu`](crate::arch::ibt::init_cpu) writes `IA32_S_CET` with only `ENDBR_EN` and sets CR4.CET on every CPU, after
 //!   every other CR4 change, since `x86::controlregs::cr4` drops bits it does not know (CET
 //!   among them) and a later read-modify-write would turn IBT off again.
 //!

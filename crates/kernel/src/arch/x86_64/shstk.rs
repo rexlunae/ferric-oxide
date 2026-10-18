@@ -9,8 +9,8 @@
 //! in `ferric.toml`) is either `never` (the default, which builds all of this out and logs
 //! nothing) or `auto`. Like every `auto` CPU feature it needs the `self_modifying` kernel feature
 //! (build.rs turns it into `never` otherwise); the build then sets `cfg(shstk_compiled)`. At boot
-//! [`decision`] applies the policy to `CPUID.(EAX=7,ECX=0):ECX[7]` on the bootstrap processor,
-//! and [`report`] logs the result.
+//! [`decision`](crate::arch::shstk::decision) applies the policy to `CPUID.(EAX=7,ECX=0):ECX[7]` on the bootstrap processor,
+//! and [`report`](crate::arch::shstk::report) logs the result.
 //!
 //! # What this step does, and what it does not
 //!
@@ -18,7 +18,7 @@
 //! clear, so the CPU never uses them yet; the switch code below is patched in only once a later
 //! step turns them on. When the decision is on:
 //!
-//! - **Allocation.** Every [`Kstack`](crate::context::context::Kstack) gets a [`ShadowStack`]:
+//! - **Allocation.** Every [`Kstack`](crate::context::context::Kstack) gets a `ShadowStack`:
 //!   each context's kernel stack, the bootstrap processor's kmain stack, each application
 //!   processor's boot stack, the per-CPU backup (IST) stacks and the KPTI entry stacks, which are
 //!   all `Kstack`s. It is freed with the stack.
@@ -30,8 +30,8 @@
 //!   address ([`ferric_cet::shstk::SlotWindow`]), so no allocator is needed and slots never
 //!   collide. The 8 KiB shadow stack sits in the upper half of its slot; the lower half stays
 //!   unmapped, so an overflowing shadow stack page-faults rather than running into another one.
-//!   The window covers kernel stacks below 1 TiB of physical address: [`decision`] stays off
-//!   on machines with RAM above that, and [`ShadowStack::for_kstack`] refuses such stacks. The kernel half of the page table is shared by every address space, so the
+//!   The window covers kernel stacks below 1 TiB of physical address: [`decision`](crate::arch::shstk::decision) stays off
+//!   on machines with RAM above that, and `ShadowStack::for_kstack` refuses such stacks. The kernel half of the page table is shared by every address space, so the
 //!   mappings are visible everywhere at once.
 //! - **Tokens.** The highest entry of each shadow stack holds its supervisor shadow-stack token
 //!   (its own address, not busy), which the CPU checks when it loads `SSP` from `IA32_PL0_SSP`
@@ -39,9 +39,9 @@
 //!   physical memory map, whose alias of the frame stays writable. That is how the kernel sets up
 //!   shadow stacks without `WRSS`; it also means a kernel write primitive can still forge a
 //!   shadow stack through the alias, a limit worth removing later by unmapping the frames there.
-//! - **SSP MSRs.** [`init_cpu`] points `IA32_INTERRUPT_SSP_TABLE_ADDR` at the CPU's table in its
-//!   processor control region, whose IST 1 entry ([`set_ist_ssp`]) is the backup stack's token,
-//!   and zeroes `IA32_PL0_SSP` to `IA32_PL2_SSP`. [`set_entry_ssp`] then points `IA32_PL0_SSP` at
+//! - **SSP MSRs.** `init_cpu` points `IA32_INTERRUPT_SSP_TABLE_ADDR` at the CPU's table in its
+//!   processor control region, whose IST 1 entry (`set_ist_ssp`) is the backup stack's token,
+//!   and zeroes `IA32_PL0_SSP` to `IA32_PL2_SSP`. `set_entry_ssp` then points `IA32_PL0_SSP` at
 //!   the next context's token on every context switch, as the TSS stack follows the context. The
 //!   writes only happen when the decision is on, and have no effect until CET is enabled.
 //! - **Context switch.** `switch_to_inner` (`context/arch/x86_64.rs`) saves the outgoing
@@ -56,7 +56,7 @@
 //!   `alternative::early_init` never selects yet; until then the slot holds NOPs.
 //! - **New contexts.** `setup_initial_call` builds a new context's kernel stack by hand, with
 //!   `func` and, for user contexts, `enter_usermode` as return addresses no `call` pushed. It
-//!   writes the matching shadow stack ([`ShadowStack::install_initial`],
+//!   writes the matching shadow stack (`ShadowStack::install_initial`,
 //!   [`ferric_cet::shstk::InitialShadowStack`]): a restore token, `func`, `enter_usermode` and
 //!   the supervisor token, and saves the restore token's address as the context's `SSP`. The
 //!   first switch to it then lands on `func`, `func`'s `ret` on `enter_usermode`, and `SSP` is

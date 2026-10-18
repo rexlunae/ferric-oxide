@@ -11,7 +11,7 @@
 //! Both are *pinned borrows*: the holder cannot `munmap`, `mprotect` or `mremap` them, and a
 //! fork does not inherit them, so the kernel knows every place their frames are mapped. That
 //! only holds if the holder cannot hand the frames to anyone else, which would let them outlive
-//! the borrow and escape revocation. This module is the one rule for that: [`check_span`]
+//! the borrow and escape revocation. This module is the one rule for that: [`check_span`](crate::context::reshare::check_span)
 //! fails for any span that touches a pinned borrow, and every path that would share a
 //! process's pages with another process or a device checks it first:
 //!
@@ -23,7 +23,7 @@
 //!
 //! A user scheme that passes a borrowed buffer on in a request of its own (logd writing out a
 //! message it was sent, say) is not refused: `capture_inner` copies such a buffer into fresh
-//! pages instead of borrowing it again ([`span_has_pinned_borrow`], [`Bounce`]).
+//! pages instead of borrowing it again ([`span_has_pinned_borrow`](crate::context::reshare::span_has_pinned_borrow), [`Bounce`](crate::context::reshare::Bounce)).
 
 use alloc::vec::Vec;
 use core::fmt;
