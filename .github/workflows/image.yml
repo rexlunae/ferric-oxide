@@ -362,13 +362,18 @@ jobs:
               status=0
               scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "$log" host > /dev/null || status=$?
               tr -d '\r' < "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$log.clean" || true
-              results="$(grep -aoE 'FERRIC_(BENCH|TEST_[A-Z]+ trace-bench).*' "$log.clean" || true)"
+              results="$(grep -aoE 'FERRIC_(BENCH|TEST_[A-Z]+ trace).*' "$log.clean" || true)"
               body="$(printf 'boot exit %s\n%s' "$status" "$results" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
               echo "::notice title=$image boot $run::$body"
               if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
                 failed=1
                 tail="$(grep -av 'funmap passed' "$log.clean" | tail -n 30 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
                 echo "::error title=$image boot $run::boot exit $status, no FERRIC_TEST_PASS trace-bench. Serial tail:%0A$tail"
+              fi
+              # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
+              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then
+                failed=1
+                echo "::error title=$image boot $run::ferric-trace-test did not skip on the kernel without kernel.trace"
               fi
             done
           done

@@ -489,12 +489,23 @@ fn run() -> Result<(), Failure> {
 
 /// Runs the test.
 pub fn main() -> ExitCode {
-    let events = path(abi::EVENTS_PATH);
-    if let Err(err) = File::open(&events)
-        && err.kind() == io::ErrorKind::NotFound
-    {
-        println!("FERRIC_TEST_SKIP trace: no {} scheme", abi::SCHEME_NAME);
-        return ExitCode::SUCCESS;
+    // The /scheme listing says whether the kernel has the scheme. Opening a missing scheme's
+    // file fails with an errno that depends on the namespace manager, so it is no test.
+    let listed = std::fs::read_dir("/scheme").map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == abi::SCHEME_NAME)
+    });
+    match listed {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("FERRIC_TEST_SKIP trace: no {} scheme", abi::SCHEME_NAME);
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            println!("FERRIC_TEST_FAIL trace-boot: cannot list /scheme: {err}");
+            return ExitCode::FAILURE;
+        }
     }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
