@@ -316,7 +316,7 @@ jobs:
 
   # Tracing overhead budget (roadmap Phase T). ferric-trace-bench times RedoxFS
   # requests on the image without kernel.trace and, alternating all events off and
-  # on, on the image with it. Two boots of each, interleaved, and the fastest round
+  # on, on the image with it. Three boots of each, interleaved, and the fastest round
   # of each kind, keep boot-to-boot noise out of the comparison.
   # scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
   trace-overhead:
@@ -349,24 +349,36 @@ jobs:
           name: ferric-smoke-image-notrace
           path: notrace
 
-      - name: Boot both images twice
+      # Log downloads are not always readable, so every result and failure is an annotation.
+      - name: Boot both images three times
         run: |
           for image in notrace trace; do
-            zstd -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
+            zstd -q -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
           done
-          for run in 1 2; do
+          failed=0
+          for run in 1 2 3; do
             for image in notrace trace; do
-              scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "bench-$image-$run.log" host
-              grep -aF "FERRIC_TEST_PASS trace-bench" "bench-$image-$run.log"
-              tr -d '\r' < "bench-$image-$run.log" | grep -a '^FERRIC_BENCH'
+              log="bench-$image-$run.log"
+              status=0
+              scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "$log" host > /dev/null || status=$?
+              tr -d '\r' < "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$log.clean" || true
+              results="$(grep -aoE 'FERRIC_(BENCH|TEST_[A-Z]+ trace-bench).*' "$log.clean" || true)"
+              body="$(printf 'boot exit %s\n%s' "$status" "$results" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+              echo "::notice title=$image boot $run::$body"
+              if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
+                failed=1
+                tail="$(grep -av 'funmap passed' "$log.clean" | tail -n 30 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+                echo "::error title=$image boot $run::boot exit $status, no FERRIC_TEST_PASS trace-bench. Serial tail:%0A$tail"
+              fi
             done
           done
+          exit "$failed"
 
       - name: Check the overhead budget
         run: |
           scripts/ferric-ci/check-trace-overhead.sh \
-            --out bench-notrace-1.log bench-notrace-2.log \
-            --in bench-trace-1.log bench-trace-2.log
+            --out bench-notrace-1.log bench-notrace-2.log bench-notrace-3.log \
+            --in bench-trace-1.log bench-trace-2.log bench-trace-3.log
 
       - uses: actions/upload-artifact@v4
         if: always()

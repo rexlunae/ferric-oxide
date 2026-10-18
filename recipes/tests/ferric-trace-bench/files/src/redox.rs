@@ -24,7 +24,7 @@ const IO_OPS: u32 = 50;
 const CALLS: u32 = 400;
 
 /// Rounds per workload and state.
-const ROUNDS: usize = 40;
+const ROUNDS: usize = 200;
 
 /// A file descriptor no process has open.
 const BAD_FD: usize = 0x7e57;
@@ -94,37 +94,44 @@ fn scheme_path(file: &str) -> String {
     format!("/scheme/{}/{file}", abi::SCHEME_NAME)
 }
 
-/// Reads the `stats` file, or `None` on a kernel built without `kernel.trace`.
-fn read_stats() -> Result<Option<Vec<StatsLine>>, Failure> {
+/// Whether the kernel has the trace scheme, from the `/scheme` listing. Opening a missing
+/// scheme's files fails with an errno that depends on the namespace manager, so the listing is
+/// the reliable test.
+fn has_scheme() -> Result<bool, Failure> {
+    for entry in std::fs::read_dir("/scheme").map_err(io_failure("/scheme"))? {
+        if entry.map_err(io_failure("/scheme"))?.file_name() == abi::SCHEME_NAME {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reads the `stats` file.
+fn read_stats() -> Result<Vec<StatsLine>, Failure> {
     let path = scheme_path(abi::STATS_PATH);
     let mut text = String::new();
-    match File::open(&path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        other => other
-            .and_then(|mut f| f.read_to_string(&mut text))
-            .map_err(io_failure(&path))?,
-    };
+    File::open(&path)
+        .and_then(|mut f| f.read_to_string(&mut text))
+        .map_err(io_failure(&path))?;
     text.lines()
         .map(|line| StatsLine::parse(line).map_err(|_| Failure::Stats(line.to_owned())))
-        .collect::<Result<_, _>>()
-        .map(Some)
+        .collect()
 }
 
 impl Trace {
     /// The trace scheme, or `None` on a kernel built without `kernel.trace`.
     fn open() -> Result<Option<Self>, Failure> {
-        Ok(read_stats()?.map(|stats| Self {
-            cpus: stats.iter().map(|s| s.cpu).collect(),
+        if !has_scheme()? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            cpus: read_stats()?.iter().map(|s| s.cpu).collect(),
         }))
     }
 
     /// Records dropped so far, over every CPU.
     fn lost(&self) -> Result<u64, Failure> {
-        Ok(read_stats()?
-            .unwrap_or_default()
-            .iter()
-            .map(|s| s.lost)
-            .sum())
+        Ok(read_stats()?.iter().map(|s| s.lost).sum())
     }
 
     fn command(&self, text: &str) -> Result<(), Failure> {

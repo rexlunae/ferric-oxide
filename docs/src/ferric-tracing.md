@@ -211,10 +211,12 @@ during the `on` rounds.
 
 The image workflow builds a second smoke image whose kernel differs only in
 leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
-image twice each, interleaved, and `scripts/ferric-ci/check-trace-overhead.sh`
+image three times each, interleaved, and `scripts/ferric-ci/check-trace-overhead.sh`
 compares the fastest round of each workload and state over the boots. Taking
 the fastest round keeps scheduling noise and boot-to-boot variation out of the
-comparison. `OFF_BUDGET_PCT` and `ON_BUDGET_PCT` set the budgets, and the script
+comparison. Each boot reports every result line and any failure as a workflow
+annotation, so a failing run can be read without its logs. `OFF_BUDGET_PCT`
+and `ON_BUDGET_PCT` set the budgets, and the script
 warns when records were dropped, since a dropped record costs less than a
 written one. Every result is printed as a notice on the run.
 

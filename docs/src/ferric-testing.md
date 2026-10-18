@@ -112,8 +112,8 @@ KASLR/KPTI logs, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode. Read that script for the exact required marker set.
-The `trace-overhead` job boots the images with and without tracing twice
-each, interleaved, and runs `check-trace-overhead.sh` on the four serial logs
+The `trace-overhead` job boots the images with and without tracing three times
+each, interleaved, and runs `check-trace-overhead.sh` on the six serial logs
 (see [Kernel tracing](ferric-tracing.md#overhead-budget)).
 
 The workflow exports recipe-facing kernel/relibc/bootloader settings from its

@@ -56,7 +56,7 @@ for workload in io syscall; do
     off="$(best "$workload" off "${in_logs[@]}")"
     on="$(best "$workload" on "${in_logs[@]}")"
     if [ -z "$out" ] || [ -z "$off" ] || [ -z "$on" ]; then
-        echo "check-trace-overhead: missing $workload results (out='$out' off='$off' on='$on')" >&2
+        echo "::error title=trace overhead::missing $workload results (out='$out' off='$off' on='$on')"
         status=1
         continue
     fi
@@ -67,11 +67,11 @@ for workload in io syscall; do
     echo "::notice title=trace overhead ($workload)::$summary"
     if [ "$workload" = io ]; then
         if awk -v p="$off_pct" -v b="$off_budget" 'BEGIN { exit !(p > b) }'; then
-            echo "::error title=trace overhead::io with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%)"
+            echo "::error title=trace overhead::io with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%): $summary"
             status=1
         fi
         if awk -v p="$on_pct" -v b="$on_budget" 'BEGIN { exit !(p > b) }'; then
-            echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off (budget ${on_budget}%)"
+            echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off (budget ${on_budget}%): $summary"
             status=1
         fi
     fi
