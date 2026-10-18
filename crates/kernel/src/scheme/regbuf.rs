@@ -894,6 +894,11 @@ impl DmaGrant {
     ///
     /// `ECANCELED` once the grant is revoked, `EINVAL` when it is not page-aligned, `ENOENT`
     /// when it is closed, and `map`'s error.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `map`. The backend must not panic while installing reachable
+    /// DMA mappings, so their outcome can be recorded before returning to the caller.
     pub fn map(
         &self,
         map: impl FnOnce(&[Frame], bool) -> Result<MapAttempt<DmaRecord, Error>>,
