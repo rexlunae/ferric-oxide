@@ -105,35 +105,34 @@ prebuilt/source image. Dedicated local baseline builds are a separate check.
 
 ## Reproducing a boot
 
-For a local smoke image with the desired features saved in `ferric.toml`,
-keep the saved target/image name and override only its filesystem contents:
+For a local x86-64 smoke image with the desired CPU and kernel features saved
+in `ferric.toml`, select the profile through the configuration tool:
 
 ```sh
+cargo run -q -p ferric-config -- set image.config=ferric-smoke
 make config-check
-make rebuild FILESYSTEM_CONFIG=config/ferric-smoke.toml
-make qemu FILESYSTEM_CONFIG=config/ferric-smoke.toml
+make all
+make qemu
 ```
 
-`ferric-smoke` is not currently an accepted `image.config` choice. Overriding
-`CONFIG_NAME=ferric-smoke` while the saved choice is `desktop` makes the
-generated target guard omit the saved image, CPU and kernel settings. Keep
-`ARCH`, `BOARD` and `CONFIG_NAME` consistent with `ferric.toml` instead.
+The same choices appear in menuconfig. Select `image.config=ferric-fuzz` for
+the extended fuzzing profile; both test profiles require `target.arch=x86_64`
+because their included tests use x86-64 register-state instructions. Profile
+selection changes image contents and the output name, while preserving the
+saved CPU/kernel policy and generated package/general image overrides. It does
+not force CI's KPTI, IOMMU or registered-buffer settings: select those features
+separately when testing them.
 
-The filesystem override above uses the smoke config directly, bypassing the
-generated package/general image overrides, while retaining the matching
-target's CPU and kernel settings. `rebuild` recreates the selected image and
-recipe-selection stamp after switching filesystem configs. The output
-directory keeps the saved image
-name: with the default `image.config = "desktop"`, the smoke image is
-`build/x86_64/desktop/harddrive.img`. CI's explicit recipe-setting exports in
-`.github/workflows/image.yml` let it use `CONFIG_NAME=ferric-smoke` separately.
+Keep `ARCH`, `BOARD` and `CONFIG_NAME` overrides consistent with `ferric.toml`.
+A mismatching command-line `CONFIG_NAME` makes the generated target guard omit
+the saved image, CPU and kernel settings; selecting the profile in the catalog
+keeps them aligned.
 
 For the scripted Linux CI-style boot, after creating an image, set `image` to
-its actual path (the default local example above uses `desktop`; CI uses
-`ferric-smoke`):
+its actual path (the local example above and CI both use `ferric-smoke`):
 
 ```sh
-image=build/x86_64/desktop/harddrive.img
+image=build/x86_64/ferric-smoke/harddrive.img
 scripts/ferric-ci/boot-smoke.sh "$image" serial.log
 BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh "$image" serial-vtd.log
 BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log

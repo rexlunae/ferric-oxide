@@ -107,6 +107,13 @@ is fully enforced.
 
 ## How settings reach components
 
+`image.config` includes `ferric-smoke` and `ferric-fuzz` for local reproduction
+of the CI test profiles. Both require `target.arch = "x86_64"`; selecting an
+unsupported architecture is a configuration error before generation. These
+choices select image contents while preserving saved CPU/kernel policy and
+image overrides. CI's forced test features remain separate. See
+[Reproducing a boot](ferric-testing.md#reproducing-a-boot) for the commands.
+
 1. `mk/ferric.mk` regenerates configuration when the user file, catalog or
    configuration tool sources change; Make includes the result and restarts.
 2. `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS` reach target recipe
