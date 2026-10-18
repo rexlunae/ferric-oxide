@@ -16,7 +16,8 @@ use fox_store::{
 };
 use serde::Serialize;
 
-use crate::{Cli, Command, SbomFormat};
+use crate::source::{self, SourceError, SourceSpec};
+use crate::{Cli, Command, SbomFormat, SourceArgs};
 
 /// Why a command failed.
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +36,7 @@ pub(crate) enum CliError {
         #[source]
         source: NameError,
     },
-    #[error("cannot write {}", path.display())]
+    #[error("cannot read or write {}", path.display())]
     Output {
         path: PathBuf,
         #[source]
@@ -43,6 +44,31 @@ pub(crate) enum CliError {
     },
     #[error("cannot write JSON output")]
     Json(#[from] serde_json::Error),
+    // Boxed: a build error is large, and this enum is every command's error.
+    #[error(transparent)]
+    Source(Box<SourceError>),
+    #[error(transparent)]
+    Trust(#[from] fox_core::trust::TrustError),
+    #[error("--prebuilt needs exactly one git source to install")]
+    PrebuiltNeedsOneSource,
+    #[error("invalid git URL {url:?}")]
+    GitUrl {
+        url: String,
+        #[source]
+        source: fox_core::GitUrlError,
+    },
+    #[error("invalid author key {key:?}")]
+    AuthorKey {
+        key: String,
+        #[source]
+        source: fox_core::trust::AuthorKeyError,
+    },
+}
+
+impl From<SourceError> for CliError {
+    fn from(error: SourceError) -> Self {
+        Self::Source(Box::new(error))
+    }
 }
 
 pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
@@ -63,15 +89,21 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
         Command::Install {
             force,
             allow_unsigned_metadata,
-            archives,
+            prebuilt,
+            source,
+            targets,
         } => install(
             cli,
-            archives,
+            targets,
+            prebuilt.as_deref(),
+            source,
             InstallOptions {
                 force: *force,
                 allow_unsigned_metadata: *allow_unsigned_metadata,
             },
         ),
+        Command::Build { out, source, spec } => build(cli, spec, source, out),
+        Command::Trust { command } => crate::trust::run(cli, command),
         Command::List => list(cli),
         Command::AdoptPkg {
             allow_unsigned_metadata,
@@ -109,7 +141,7 @@ fn parse_name(name: &str) -> Result<PackageName, CliError> {
     })
 }
 
-fn print_json(value: &impl Serialize) -> Result<(), CliError> {
+pub(crate) fn print_json(value: &impl Serialize) -> Result<(), CliError> {
     let mut out = io::stdout().lock();
     serde_json::to_writer_pretty(&mut out, value)?;
     writeln!(out).map_err(|source| CliError::Output {
@@ -474,13 +506,63 @@ struct InstallJson {
     missing_depends: Vec<String>,
 }
 
-fn install(cli: &Cli, paths: &[PathBuf], options: InstallOptions) -> Result<ExitCode, CliError> {
+/// An `install` argument once its git source, if any, is built.
+enum Pending {
+    Path(PathBuf),
+    Opened(Box<Archive>),
+}
+
+fn install(
+    cli: &Cli,
+    targets: &[String],
+    prebuilt: Option<&Path>,
+    source_args: &SourceArgs,
+    options: InstallOptions,
+) -> Result<ExitCode, CliError> {
     let store = Store::open(&cli.root)?;
-    let keys = trusted_keys_in(cli, store.root())?;
-    // Verify everything before installing anything.
-    let archives = paths
-        .iter()
-        .map(|path| Archive::open(path, &keys))
+    let root = store.root().to_path_buf();
+    let mut specs = Vec::new();
+    for target in targets {
+        if Path::new(target).is_file() {
+            specs.push(Err(PathBuf::from(target)));
+        } else {
+            specs.push(Ok(SourceSpec::parse(target)?));
+        }
+    }
+    if prebuilt.is_some() && specs.iter().filter(|spec| spec.is_ok()).count() != 1 {
+        return Err(CliError::PrebuiltNeedsOneSource);
+    }
+    // Build (or check the prebuilt archive of) every git source, then
+    // verify everything, before installing anything.
+    let mut pending = Vec::new();
+    for spec in specs {
+        let spec = match spec {
+            Err(path) => {
+                pending.push(Pending::Path(path));
+                continue;
+            }
+            Ok(spec) => spec,
+        };
+        let resolved = source::resolve(&root, &spec, source_args)?;
+        match prebuilt {
+            Some(path) => {
+                let keys = trusted_keys_in(cli, &root)?;
+                let archive = source::prebuilt(&root, &resolved, source_args, path, &keys)?;
+                pending.push(Pending::Opened(Box::new(archive)));
+            }
+            None => {
+                let packaged = source::build(&root, &resolved, source_args, None)?;
+                pending.push(Pending::Path(packaged.archive));
+            }
+        }
+    }
+    let keys = trusted_keys_in(cli, &root)?;
+    let archives = pending
+        .into_iter()
+        .map(|pending| match pending {
+            Pending::Path(path) => Archive::open(&path, &keys),
+            Pending::Opened(archive) => Ok(*archive),
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut results = Vec::new();
     for archive in &archives {
@@ -517,6 +599,59 @@ fn install(cli: &Cli, paths: &[PathBuf], options: InstallOptions) -> Result<Exit
     }
     if cli.json {
         print_json(&results)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct BuildJson {
+    git: String,
+    rev: String,
+    commit: String,
+    author_key: Option<String>,
+    name: String,
+    version: String,
+    archive: PathBuf,
+    attestation: PathBuf,
+    sbom: PathBuf,
+    pkgar_blake3: String,
+}
+
+fn build(
+    cli: &Cli,
+    target: &str,
+    source_args: &SourceArgs,
+    out: &Path,
+) -> Result<ExitCode, CliError> {
+    let spec = SourceSpec::parse(target)?;
+    let resolved = source::resolve(&cli.root, &spec, source_args)?;
+    let packaged = source::build(&cli.root, &resolved, source_args, Some(out))?;
+    let package = &packaged.contents.package;
+    let result = BuildJson {
+        git: resolved.git().to_string(),
+        rev: resolved.rev().to_owned(),
+        commit: resolved.commit().id(),
+        author_key: resolved.signer(),
+        name: package.name.to_string(),
+        version: package.version.clone(),
+        archive: packaged.archive,
+        attestation: packaged.attestation,
+        sbom: packaged.sbom,
+        pkgar_blake3: packaged.contents.output.pkgar_blake3.to_string(),
+    };
+    if cli.json {
+        print_json(&result)?;
+    } else {
+        println!(
+            "built {} {} from {} {} ({})",
+            result.name,
+            result.version,
+            result.git,
+            result.rev,
+            &result.commit[..12.min(result.commit.len())]
+        );
+        println!("  archive     {}", result.archive.display());
+        println!("  attestation {}", result.attestation.display());
     }
     Ok(ExitCode::SUCCESS)
 }

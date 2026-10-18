@@ -291,6 +291,12 @@ pub enum BuildError {
         #[source]
         source: pkgar_keys::Error,
     },
+    /// A key file to be generated already exists.
+    #[error("key file {} already exists", path.display())]
+    KeyExists {
+        /// The file.
+        path: PathBuf,
+    },
     /// Packing the archive failed.
     #[error("cannot pack {}", path.display())]
     Pack {
@@ -473,6 +479,58 @@ impl Signer {
         })
     }
 
+    /// Generates an unencrypted key pair, writes the secret key to
+    /// `secret_path` (mode `0600`) and the public key to `public_path`, and
+    /// returns a signer for it.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::KeyExists`] if either file exists, [`BuildError::Io`]
+    /// if the directory cannot be created and [`BuildError::Key`] if a file
+    /// cannot be written.
+    pub fn generate(
+        secret_path: &Path,
+        public_path: &Path,
+        label: &str,
+    ) -> Result<Self, BuildError> {
+        for path in [secret_path, public_path] {
+            if path.exists() {
+                return Err(BuildError::KeyExists {
+                    path: path.to_path_buf(),
+                });
+            }
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).map_err(io_error(dir))?;
+            }
+        }
+        let (public, secret) = pkgar_keys::SecretKeyFile::new();
+        let save_error = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| BuildError::Key { path, source }
+        };
+        secret.save(secret_path).map_err(save_error(secret_path))?;
+        public.save(public_path).map_err(save_error(public_path))?;
+        Self::load(secret_path, label)
+    }
+
+    /// Loads the key at `secret_path`, first generating it (as
+    /// [`Signer::generate`]) if neither it nor `public_path` exists.
+    ///
+    /// # Errors
+    ///
+    /// As [`Signer::load`] and [`Signer::generate`].
+    pub fn load_or_generate(
+        secret_path: &Path,
+        public_path: &Path,
+        label: &str,
+    ) -> Result<Self, BuildError> {
+        if secret_path.exists() || public_path.exists() {
+            Self::load(secret_path, label)
+        } else {
+            Self::generate(secret_path, public_path, label)
+        }
+    }
+
     /// The public key.
     pub fn key(&self) -> KeyId {
         self.key
@@ -504,6 +562,16 @@ pub struct Packaged {
     pub sbom: PathBuf,
     /// The attestation's contents.
     pub contents: Attestation,
+}
+
+/// A default work directory for builds of the source named by `key` (a
+/// repository path or URL): a directory per source under the system
+/// temporary directory. Reusing it keeps Cargo's target directory and
+/// downloads between builds, and it lies outside the user's home, so no
+/// `.cargo/config.toml` above it can change the build.
+pub fn default_work_dir(key: &[u8]) -> PathBuf {
+    let digest = blake3::hash(key).to_hex();
+    std::env::temp_dir().join(format!("fox-build-{}", &digest[..16]))
 }
 
 /// Runs the hermetic build described by `request`.

@@ -2,61 +2,15 @@
 //! the `git` command.
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use fox_core::Blake3Digest;
 use fox_git::{GitError, Repository};
 
-/// Runs git in `dir` with a fixed identity and no signing, so the user's
-/// configuration cannot change the result.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args([
-            "-c",
-            "user.name=Fox Test",
-            "-c",
-            "user.email=fox@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
-            "-c",
-            "core.symlinks=true",
-        ])
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z")
-        .env("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z")
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-/// A repository with a file, an executable, a nested file and a symlink.
-fn sample_repo(dir: &Path) {
-    git(dir, &["init", "-q", "-b", "main"]);
-    fs::write(dir.join("README"), "hello\n").unwrap();
-    fs::create_dir_all(dir.join("src/bin")).unwrap();
-    fs::write(dir.join("src/bin/run.sh"), "#!/bin/sh\n").unwrap();
-    fs::set_permissions(
-        dir.join("src/bin/run.sh"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    symlink("README", dir.join("LINK")).unwrap();
-    git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-q", "-m", "first"]);
-}
+mod common;
+use common::{git, sample_repo};
 
 /// The `fox-tree/1` encoding written out independently of the crate, for
 /// the sample repository.

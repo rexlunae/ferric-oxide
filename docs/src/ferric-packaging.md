@@ -5,7 +5,9 @@ command and libraries are host-workspace members, and `recipes/core/fox`
 builds the same command for the target. Package authors use `cargo fox` to
 build a git commit hermetically into a signed archive with a build SBOM and a
 signed build attestation (see [Hermetic builds and
-attestations](#hermetic-builds-and-attestations)). With `ferric.toml`, images ship
+attestations](#hermetic-builds-and-attestations)), and `cargo fox release` to
+make the SSH-signed release tag that `fox install <git-url>` checks before it
+builds a source itself (see [Git sources](#git-sources)). With `ferric.toml`, images ship
 `fox` instead of upstream `pkgutils` by default (see
 [Target images](#target-images)). The image build itself still uses the
 cookbook and the installer.
@@ -14,13 +16,13 @@ cookbook and the installer.
 
 | Component | Responsibility |
 | --- | --- |
-| `crates/fox-core/` | Names, manifests, BLAKE3 digests, trusted Ed25519 keys, signed-head and full archive verification |
+| `crates/fox-core/` | Names, manifests, BLAKE3 digests, trusted Ed25519 keys, signed-head and full archive verification, normalized git URLs and the trust store |
 | `crates/fox-store/` | In-place file installation, ownership checks, installed database and re-verification |
 | `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, and build SBOMs with the crate graph |
-| `crates/fox-git/` | Local git repositories through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash and tree export |
+| `crates/fox-git/` | Git through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash, tree export, fetching into a bare cache, and SSH-signed release tags |
 | `crates/fox-build/` | The hermetic Cargo build, staging, pkgar packing and attestation writing |
 | `tools/fox/` | CLI and text/JSON reporting |
-| `tools/cargo-fox/` | `cargo fox build`, `package` and `keygen` for package authors |
+| `tools/cargo-fox/` | `cargo fox build`, `package`, `keygen` and `release` for package authors |
 
 The archive format is upstream pkgar. A trusted Ed25519 signature covers the
 header and its BLAKE3 entry-table hash; entries carry hashes for file content.
@@ -31,7 +33,11 @@ nested beneath another entry are rejected.
 
 The signer key carried inside an archive is not trusted merely because it
 verifies that archive. Accepted keys come from pkgar public-key files under
-`<root>/etc/fox/keys/`, plus explicit repeatable `--key <file>` arguments.
+`<root>/etc/fox/keys/`, the root's local builder key
+(`<root>/var/lib/fox/local-builder.pub.toml`, created the first time `fox`
+builds a git source), plus explicit repeatable `--key <file>` arguments.
+Packages cannot write `etc/fox/keys/`, `etc/fox/trust.toml` or
+`var/lib/fox/`.
 
 ## Signed manifests and legacy metadata
 
@@ -85,6 +91,7 @@ fox --root ./image-root --json list
 fox --root ./image-root --key ./signer.pub verify --installed
 fox --root ./image-root remove hello
 fox --root ./image-root adopt-pkg
+fox --root ./image-root install https://example.com/hello.git   # see Git sources
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify` also checks
@@ -92,7 +99,8 @@ the build attestation beside an archive (`<stem>.attest.toml` and its
 `.sig`) whenever one is present, and `verify --require-attestation` fails
 archives without one; see [Attestations](#attestations). `verify --installed`
 accepts optional package names; without them it checks all installed packages.
-`install` and `remove` accept multiple inputs. Verification failures produce
+`install` and `remove` accept multiple inputs; `install` takes git sources
+as well as archives. Verification failures produce
 a failing exit status. `install --force` permits replacement of otherwise
 conflicting unowned files; `remove --force` bypasses dependent-package refusal.
 Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
@@ -198,6 +206,7 @@ cargo fox keygen ./keys --name ci                 # ./keys/ci.toml, ./keys/ci.pu
 cargo fox build --manifest-path hello/Cargo.toml   # stage only
 cargo fox package --key ./keys/ci.toml --label ferric-ci-1 --rev v1.2.0
 fox --key ./keys/ci.pub.toml verify --require-attestation target/fox/hello-*.pkgar
+cargo fox release 1.3.0 --signing-key ~/.ssh/id_ed25519   # commit and tag v1.3.0
 ```
 
 Build options: `--rev` (default `HEAD`), `-p/--package`, `--target` (default
@@ -298,6 +307,89 @@ header signer, entry-table hash, and the BLAKE3 of the SBOM entry inside it.
 Builder keys are the same trusted keys as archive signers
 (`<root>/etc/fox/keys/` and `--key`); one CI key signs both for now.
 
+## Git sources
+
+`fox install` and `fox build` take a git URL (`https`, `http`, `ssh`, `git`,
+`file`, or scp-like `user@host:path`) or a local repository directory, each
+optionally followed by `#<tag or commit>`:
+
+```sh
+fox --root ./image-root install https://example.com/hello.git
+fox --root ./image-root install https://example.com/hello.git#v1.2.0
+fox --root ./image-root build --out ./out ../hello
+fox --root ./image-root trust list
+```
+
+1. **Fetch.** The repository is fetched into a bare cache,
+   `<root>/var/lib/fox/git/<id>`, keyed by the normalized URL (lowercase
+   scheme and host, no trailing `/` or `.git`), which is also the source's
+   identity in the trust store and in attestations. The cache mirrors the
+   remote's branches and tags; a tag deleted upstream is deleted from the
+   cache too, so a withdrawn release is not built. HTTPS uses `gix`'s reqwest transport with
+   rustls on ring and is not built for Redox, where `fox` fetches over
+   `file://`, `ssh://` (through `ssh`) and `git://` only.
+2. **Choose.** Without `#`, the newest release tag is built: the highest
+   semver-named tag (`1.2.3` or `v1.2.3`) that is not a pre-release. A name
+   after `#` is a tag if one exists, otherwise any revision. Without tags,
+   `HEAD` is built.
+3. **Check the tag.** The tag must be annotated and SSH-signed (SSHSIG,
+   namespace `git`, as `git tag -s` writes with `gpg.format = ssh`) by an
+   Ed25519 key. The tag object must name the tag it is found under and point
+   at a commit, so a signed tag cannot be replayed under another version.
+   PGP and X.509 signatures are not verified. Unsigned tags, branches and
+   commits are refused unless `--allow-unsigned` is given.
+4. **Trust on first use.** The signing key is looked up in
+   `<root>/etc/fox/trust.toml` for the repository. A pinned key must match;
+   a different key is refused, with or without flags, until
+   `fox trust remove-author <url>` drops the pin. A repository without a pin
+   gets one after the user confirms the key's `SHA256:` fingerprint at the
+   terminal, or with `--trust-new-key`; without either (for example in a
+   script) the install fails and names the fingerprint.
+5. **Build.** The commit is built as `cargo fox package` builds it (see
+   above) in a work directory per source under the system temporary
+   directory (`--work-dir` overrides it). The archive and attestation are
+   signed with the root's local builder key,
+   `<root>/var/lib/fox/local-builder.toml`, created (unencrypted, mode 0600)
+   on first use and trusted by that root. A tag that names a version must
+   name the package's version. Source options: `--target`, `-p/--package`,
+   `--path <dir>` for a package below the repository root, `--features` and
+   `--no-default-features`. `fox build --out <dir>` stops after packing.
+6. **Or a prebuilt archive.** `fox install --prebuilt <file.pkgar> <source>`
+   installs that archive instead of building, after the same fetch, choice
+   and tag check. It is accepted only when the attestation beside it is
+   signed by a `[[builder]]` in the trust store (or a key the root already
+   trusts) and names the same repository, commit, `fox-tree/1` tree hash and
+   package directory. There are no trusted builders by default, so
+   third-party prebuilts are refused until the user adds one.
+
+The trust store is `fox-trust/1` TOML (`fox_core::trust`):
+
+```toml
+format = "fox-trust/1"
+
+[[author]]
+git = "https://example.com/hello"
+key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@example.com"
+
+[[builder]]
+label = "example-ci"
+key = "<pkgar public key, 64 hex digits>"
+```
+
+`fox trust list`, `add-author <url> <key or key file>`,
+`remove-author <url>`, `add-builder <label> <pkgar public key file>` and
+`remove-builder <label>` edit it.
+
+`cargo fox release <version>` sets the version in `Cargo.toml` (or in the
+workspace's `[workspace.package]` when the package inherits it), runs
+`cargo update --workspace --offline`, commits with `git commit -a`, and
+creates the annotated tag `v<version>`. With `--signing-key <file>` it signs
+the tag itself with that unencrypted OpenSSH Ed25519 key; otherwise it runs
+`git tag -s`, which must be configured for SSH signing. It then reads the tag
+back, verifies its signature and prints the key's fingerprint, which users
+see when they first install the source. It refuses a dirty work tree or an
+existing tag, and pushes nothing.
+
 ## SBOM scope and unfinished packaging work
 
 `fox sbom` output describes the verified package, archive hash, signer,
@@ -307,9 +399,10 @@ archive hash. It is built from the archive's own metadata; the crate graph
 is in the build SBOM that `cargo fox package` packs into archives it builds.
 Reading embedded `cargo auditable` data is not implemented.
 
-`fox install <git-url>` (building from source with trust-on-first-use author
-keys), signed-tag checks and `cargo fox release` are not implemented yet.
-Repository fetching/search, a dependency solver, hermetic recipe builds,
+Git sources are built without a sandbox (see
+[Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
+only release tags are signature-checked, not individual commits.
+Package repositories and search, a dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging
 design phases and `packaging/packaging-design.md`; that design file is not

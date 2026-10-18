@@ -153,3 +153,59 @@ fn reports_errors_with_their_causes() {
     );
     assert!(stderr.contains("caused by:"), "{stderr}");
 }
+
+/// `cargo fox` with a fixed git identity and no user git configuration.
+fn cargo_fox_git(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cargo-fox"))
+        .current_dir(dir)
+        .arg("fox")
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fox Test")
+        .env("GIT_AUTHOR_EMAIL", "fox@example.com")
+        .env("GIT_COMMITTER_NAME", "Fox Test")
+        .env("GIT_COMMITTER_EMAIL", "fox@example.com")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn release_bumps_commits_and_signs_the_tag() {
+    let src = tempfile::tempdir().unwrap();
+    repo(src.path());
+    let keys = tempfile::tempdir().unwrap();
+    let key_path = keys.path().join("id_ed25519");
+    let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
+    key.write_openssh_file(&key_path, ssh_key::LineEnding::LF)
+        .unwrap();
+    let key_arg = key_path.to_str().unwrap();
+
+    let released = json(&cargo_fox_git(
+        src.path(),
+        &["release", "0.4.0", "--signing-key", key_arg, "--json"],
+    ));
+    assert_eq!(released["tag"], "v0.4.0");
+    assert_eq!(released["bumped"], true);
+    let manifest = fs::read_to_string(src.path().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.4.0\""), "{manifest}");
+    let lock = fs::read_to_string(src.path().join("Cargo.lock")).unwrap();
+    assert!(lock.contains("version = \"0.4.0\""), "{lock}");
+
+    let repo = fox_git::Repository::open(src.path()).unwrap();
+    let tag = repo.tag("v0.4.0").unwrap();
+    assert_eq!(tag.commit(), &repo.resolve("HEAD").unwrap());
+    assert_eq!(tag.commit().id(), released["commit"].as_str().unwrap());
+    let author = fox_core::trust::AuthorKey::new(key.public_key().clone()).unwrap();
+    tag.verify(&author).unwrap();
+    assert_eq!(released["signer"], author.fingerprint());
+
+    let again = cargo_fox_git(src.path(), &["release", "0.4.0", "--signing-key", key_arg]);
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("tag v0.4.0 already exists"), "{stderr}");
+
+    fs::write(src.path().join("src/main.rs"), "fn main() { }\n").unwrap();
+    let dirty = cargo_fox_git(src.path(), &["release", "0.5.0", "--signing-key", key_arg]);
+    let stderr = String::from_utf8_lossy(&dirty.stderr);
+    assert!(stderr.contains("uncommitted changes"), "{stderr}");
+}
