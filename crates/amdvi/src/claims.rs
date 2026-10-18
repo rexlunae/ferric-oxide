@@ -268,6 +268,37 @@ mod tests {
         assert_eq!(claims.check_attach(&[alias], D2), Ok(vec![alias]));
     }
 
+    /// A join moves a domain's function and the alias pcid attached for it into another
+    /// domain. One at a time it cannot work: after the function leaves, its alias still holds
+    /// the entry for the old domain. As a set, everything leaves first, then attaches.
+    #[test]
+    fn join_moves_a_function_and_its_alias_as_a_set() {
+        let mut claims = Claims::new();
+        let (f, alias) = (id(3, 1, 0), id(2, 0, 0));
+        // pcid's create_domain: the function, then the alias, into D2.
+        attach(&mut claims, f, &[alias, f], D2).unwrap();
+        attach(&mut claims, alias, &[alias], D2).unwrap();
+
+        // One device at a time: the function's attach to D1 meets the alias D2 still holds.
+        let mut one_by_one = claims.clone();
+        detach(&mut one_by_one, f, &[alias, f]);
+        assert_eq!(
+            one_by_one.check_attach(&[alias, f], D1),
+            Err(Conflict {
+                id: alias,
+                holder: D2
+            })
+        );
+
+        // As a set: both leave D2 (the last one out blocks the alias), then both attach.
+        assert_eq!(detach(&mut claims, f, &[alias, f]), [f]);
+        assert_eq!(detach(&mut claims, alias, &[alias]), [alias]);
+        assert_eq!(attach(&mut claims, f, &[alias, f], D1), Ok(vec![alias, f]));
+        assert_eq!(attach(&mut claims, alias, &[alias], D1), Ok(vec![]));
+        assert_eq!(claims.holder(alias), Some(D1));
+        assert_eq!(claims.holder(f), Some(D1));
+    }
+
     #[test]
     fn detaching_an_unattached_function_changes_nothing() {
         let mut claims = Claims::new();
