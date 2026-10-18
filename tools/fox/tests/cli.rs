@@ -267,3 +267,53 @@ fn unsigned_metadata_needs_a_flag_and_symlinked_roots_are_refused() {
             .contains("is a symlink")
     );
 }
+
+#[test]
+fn adopt_pkg_takes_over_a_pkg_root_once() {
+    let env = Env::new();
+    env.trust_in_root();
+    let archive = env.package("hello", "1.0.0");
+    let root = env.root.path();
+    // What the installer's pkg library leaves behind.
+    pkgar::extract(&env.key.public_path, &archive, root).unwrap();
+    let heads = root.join("var/lib/packages");
+    fs::create_dir_all(&heads).unwrap();
+    let pkey = pkgar_keys::PublicKeyFile::open(&env.key.public_path)
+        .unwrap()
+        .pkey;
+    pkgar::PackageFile::new(&archive, &pkey)
+        .unwrap()
+        .split(heads.join("hello.pkgar_head"), None::<&Path>)
+        .unwrap();
+    // pkgar extracts through the umask; set the signed modes so the test
+    // does not depend on the environment's umask.
+    let head_bytes = fs::read(heads.join("hello.pkgar_head")).unwrap();
+    let head = fox_core::verify_head(&head_bytes, &env.key.trusted()).unwrap();
+    for entry in head.entries() {
+        if entry.kind == fox_core::FileKind::File {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::Permissions::from_mode(entry.mode);
+            fs::set_permissions(root.join(entry.path), mode).unwrap();
+        }
+    }
+    fs::create_dir_all(root.join("etc/pkg")).unwrap();
+    fs::write(
+        root.join("etc/pkg/packages.toml"),
+        "[installed.hello]\nremote = \"local\"\nblake3 = \"\"\n",
+    )
+    .unwrap();
+
+    let adopted = env.fox(&["adopt-pkg"]);
+    assert!(adopted.status.success(), "{}", stdout(&adopted));
+    assert!(stdout(&adopted).contains("adopted hello 1.0.0 (2 files, embedded)"));
+    let listed = env.fox(&["list"]);
+    assert_eq!(
+        stdout(&listed),
+        "hello 1.0.0 (2 files, signed by ferric-ci-1)\n"
+    );
+    let json = json(&env.fox(&["--json", "list"]));
+    assert_eq!(json[0]["metadata"], "embedded");
+    assert_eq!(json[0]["archive_blake3"], serde_json::Value::Null);
+    assert!(env.fox(&["verify", "--installed"]).status.success());
+    assert!(stdout(&env.fox(&["adopt-pkg"])).contains("already adopted"));
+}

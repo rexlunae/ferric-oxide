@@ -2,6 +2,7 @@
 pub mod cook_build;
 pub mod fetch;
 pub mod fetch_repo;
+pub mod fox_manifest;
 pub mod fs;
 pub mod ident;
 pub mod package;

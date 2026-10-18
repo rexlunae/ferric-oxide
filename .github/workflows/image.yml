@@ -87,8 +87,9 @@ jobs:
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel and relibc features,
-          # kernel link arguments, bootloader features) on to the build.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES; do
+          # kernel link arguments, bootloader features, signed fox manifests)
+          # on to the build.
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_FOX_MANIFEST; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
@@ -260,6 +261,19 @@ jobs:
       - name: Check shadow-stack detection
         run: |
           grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
+
+      # fox replaced pkg (config/ferric-smoke.toml): on first boot it adopted every
+      # package the installer put in the image, each with a signed manifest the
+      # cookbook packed into it (FERRIC_FOX_MANIFEST), and re-checked them all.
+      - name: Check fox package management
+        run: |
+          grep -aE "adopted ([0-9]+) of \1 packages" "$LOG"
+          grep -aE "fox 0\.1\.0 \([0-9]+ files, signed by cookbook\)" "$LOG"
+          if grep -aF "unsigned name" "$LOG"; then
+            echo "::error::packages were adopted without a signed manifest"
+            exit 1
+          fi
+          grep -aF "FERRIC_TEST_PASS fox-verify" "$LOG"
 
       - name: Check futex wakeups
         run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
