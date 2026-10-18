@@ -486,8 +486,9 @@ A role that has used up half its lifetime is renewed when its key is given,
 so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
 fresh. A role is only renewed when the given keys can sign the replacement
 to its threshold, so a scheduled run holding one of two keys leaves the
-still-valid metadata in place. For a new root, completeness counts both the
-previous and the new root keys, and a root that is not yet complete is
+still-valid metadata in place. A new root is complete only when its own
+root keys meet their threshold and, separately, the previous root's root
+keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
 amended by `set-role` rather than followed by another version.
 `sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the
@@ -540,10 +541,13 @@ bare mirror in `git/`, the verified checkout in `tree/`, and `state.json`
 with the trusted root, the metadata versions seen and the time of the last
 update. An update exports the head of the registry's default branch (the
 mirror's `HEAD` follows the remote's, so a renamed default branch is picked
-up) to `tree.new/`. Once that verifies, it moves `tree/` aside to
-`tree.old/`, moves the new tree into place, and saves the state. If either
-step fails the old tree is put back, and the next open finishes an
-interrupted swap, so a failed update keeps the last good checkout and the
+up) to `tree.new/`. Once that verifies, it writes the new state to
+`state.json.new`, moves `tree/` aside to `tree.old/` and the new tree into
+place, and then renames `state.json.new` over `state.json`, the commit
+point. A failure, or an interruption found by the next open, before the
+commit puts the old tree back and drops the new state; after it, only
+`tree.old/` is removed. So the checkout and its state always stay a
+verified pair, and a failed update keeps the last good checkout and the
 rollback protection.
 
 Installing by name looks the package up in every configured registry (or

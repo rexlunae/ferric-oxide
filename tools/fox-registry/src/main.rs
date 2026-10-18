@@ -805,8 +805,15 @@ fn print_report(report: &SignReport) {
             "NEEDS SIGNATURES"
         };
         let bumped = if file.bumped { ", new version" } else { "" };
+        let previous = file.previous_root.map_or_else(String::new, |old| {
+            format!(
+                ", {}/{} previous root keys",
+                old.valid.min(old.threshold),
+                old.threshold
+            )
+        });
         println!(
-            "{:<40} v{:<4} {}/{} {state}{bumped}",
+            "{:<40} v{:<4} {}/{} {state}{bumped}{previous}",
             file.file,
             file.version,
             file.valid.min(file.threshold),
