@@ -198,6 +198,16 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The file the operation runs on, if it has one.
+    pub const fn file(&self) -> Option<FileRef> {
+        match *self {
+            Self::Nop => None,
+            Self::Read { file, .. } | Self::Write { file, .. } | Self::Fsync { file } => Some(file),
+        }
+    }
+}
+
 /// Why an SQE is not a valid request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -463,6 +473,19 @@ mod tests {
         sqe.flags |= SqeFlags::from_bits_retain(0x80);
         assert_eq!(Sqe::from_words(&sqe.to_words()), sqe);
         assert_eq!(sqe.to_words()[0], 6 | 0x81 << 8 | 0xabcd << 16 | 7 << 32);
+    }
+
+    #[test]
+    fn ops_name_their_file() {
+        assert_eq!(Op::Nop.file(), None);
+        assert_eq!(
+            Sqe::write(4, 0, 0x1000, 8, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(4)))
+        );
+        assert_eq!(
+            Sqe::fsync(3, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(3)))
+        );
     }
 
     #[test]

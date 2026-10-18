@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ferric_ring::abi::{RING_PATH, SCHEME_NAME, header};
 use ferric_ring::entry::{CURRENT_POSITION, SqeFlags};
@@ -565,6 +565,85 @@ fn event() -> Result<(), Failure> {
     Ok(())
 }
 
+/// A pipe's read and write ends.
+fn pipe() -> Result<[c_int; 2], Failure> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe() writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return io("pipe", Err(std::io::Error::last_os_error()));
+    }
+    Ok(fds)
+}
+
+/// Closes a descriptor from [`pipe`].
+fn close_fd(fd: c_int) {
+    // SAFETY: a descriptor this test opened and does not use again.
+    unsafe { libc::close(fd) };
+}
+
+/// Reads what is left in a pipe whose write ends are all closed.
+fn drain(fd: c_int) -> i64 {
+    let mut buf = [0u8; 64];
+    // SAFETY: a read end from pipe(), and a buffer of 64 bytes.
+    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+/// How long the other thread waits before swapping the descriptor, so that the chain has
+/// been taken and is blocked by then.
+const HOLD_DELAY: Duration = Duration::from_millis(500);
+
+fn hold() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    // The chain blocks reading `wake` until the other thread writes it.
+    let [wake_rd, wake_wr] = pipe()?;
+    // The chain's second SQE writes to `named`'s write end.
+    let [named_rd, named_wr] = pipe()?;
+    // Moved onto `named_wr`'s number while the chain is blocked.
+    let [other_rd, other_wr] = pipe()?;
+    let mut buf = [0u8; 16];
+    let addr = buf.as_mut_ptr() as u64;
+    ring.submit(&[
+        Sqe::read(wake_rd as u32, CURRENT_POSITION, addr, 16, 1).linked(),
+        Sqe::write(named_wr as u32, CURRENT_POSITION, addr, 16, 2),
+    ])?;
+    let swap = std::thread::spawn(move || {
+        std::thread::sleep(HOLD_DELAY);
+        // SAFETY: both descriptors are open; dup2 closes `named_wr`'s description in this
+        // table and puts `other_wr`'s at its number.
+        let moved = unsafe { libc::dup2(other_wr, named_wr) };
+        let bytes = [0x5a_u8; 16];
+        // SAFETY: the write end from pipe(), and a buffer of 16 bytes.
+        let woke = unsafe { libc::write(wake_wr, bytes.as_ptr().cast(), bytes.len()) };
+        (moved, woke)
+    });
+    let entered = ring.enter(2);
+    let (moved, woke) = swap.join().map_err(|_| Failure::Mismatch {
+        what: "the swapping thread",
+    })?;
+    expect(
+        "dup2 onto the chain's descriptor",
+        named_wr as i64,
+        moved as i64,
+    )?;
+    expect("waking the chain", 16, woke as i64)?;
+    expect("Enter", 2, entered)?;
+    check_cqes(
+        "a chain whose descriptor was replaced while it waited",
+        &ring.reap()?,
+        &[(1, 16), (2, 16)],
+    )?;
+    // `named_wr`'s number now holds `other`'s write end; closing it and `other_wr` leaves
+    // both pipes without writers, so the reads below return what each pipe holds.
+    for fd in [named_wr, other_wr, wake_wr, wake_rd] {
+        close_fd(fd);
+    }
+    let (named, other) = (drain(named_rd), drain(other_rd));
+    close_fd(named_rd);
+    close_fd(other_rd);
+    expect("bytes in the pipe the chain named", 16, named)?;
+    expect("bytes in the pipe moved onto its number", 0, other)
+}
+
 /// Operations per benchmark.
 const BENCH_OPS: usize = 20_000;
 /// SQEs per `Enter` in the ring benchmarks.
@@ -654,7 +733,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 12] = [
+    let steps: [(&str, Step); 13] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -666,6 +745,7 @@ pub fn main() -> ExitCode {
         ("ring-backpressure", backpressure),
         ("ring-corrupt", corrupt),
         ("ring-event", event),
+        ("ring-hold", hold),
         ("ring-bench", bench),
     ];
     for (name, step) in steps {

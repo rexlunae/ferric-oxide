@@ -25,6 +25,10 @@
 //! corrupt ring (`EINVAL`). Only one `Enter` runs on a ring at a time: it takes the ring's
 //! private indices out of their lock for the duration (`Entered`), and a second one gets
 //! `EBUSY`. No lock is held while an SQE runs, since that may block in another scheme.
+//! `Enter` looks up every file a chain names when it takes the chain, before any of it runs,
+//! and holds those descriptions until the chain is done ([`resolve_files`]), so a chain acts
+//! on the files its submitter named even if another thread closes or reuses one of the
+//! descriptors meanwhile, as a single system call would.
 //!
 //! Not yet (later PRs of the design): fixed files and grant buffers (`EOPNOTSUPP`), waiting in
 //! `Enter` for completions, the `SqPoll` and `Umwait` notify modes (`EOPNOTSUPP`), and rings
@@ -38,7 +42,7 @@ use core::{
 
 use ferric_ring::{
     abi::{header, Layout, NotifyMode, Request, PAGE_SIZE as RING_PAGE_SIZE, RING_PATH},
-    chain::{Next, SqReader},
+    chain::{Chain, Next, SqReader},
     entry::{Buffer, FileRef, Op, SqeError, CURRENT_POSITION},
     queue::{HeaderInfo, Memory, RingError},
     Consumer, Cqe, Producer, Sqe,
@@ -54,7 +58,7 @@ use syscall::{
 use super::{CallerCtx, FileHandle, KernelScheme, OpenResult, SchemeExt, StrOrBytes};
 use crate::{
     context::{
-        file::InternalFlags,
+        file::{InternalFlags, LockedFileDescription},
         memory::{handle_notify_files, AddrSpaceWrapper, Grant, PageSpan},
     },
     event,
@@ -62,7 +66,7 @@ use crate::{
     sync::CleanLockToken,
     syscall::{
         data::{GlobalSchemes, Map},
-        fs::{file_op_generic, file_op_generic_ext, sys_read, sys_write},
+        fs::{description_op, file_description, read_description, write_description},
         usercopy::{UserSlice, UserSliceRw},
     },
 };
@@ -105,6 +109,9 @@ struct Indices {
     sq: SqReader,
     cq: Producer<Cqe>,
 }
+
+/// A file an SQE runs on: a reference to its open file description.
+type Description = Arc<LockedFileDescription>;
 
 /// A ring.
 struct Ring {
@@ -227,7 +234,8 @@ fn enter(ring: &Ring, to_submit: u32, token: &mut CleanLockToken) -> Result<usiz
         if matches!(next, Next::Refused(_)) {
             chain.refuse(errno_result(EINVAL), post);
         } else {
-            chain.run(|sqe| run(sqe, token), errno_result(ECANCELED), &mut post);
+            let files = resolve_files(&chain, token);
+            run_chain(&chain, files, token, &mut post);
         }
         // The room was checked, so staging fails only if the application moved its CQ head
         // out of range meanwhile.
@@ -242,21 +250,100 @@ fn errno_result(errno: i32) -> i64 {
     i64::from(errno).saturating_neg()
 }
 
-/// Runs `sqe` and returns its CQE result.
-fn run(sqe: &Sqe, token: &mut CleanLockToken) -> i64 {
-    let result = sqe.op().map_err(sqe_errno).and_then(|op| run_op(op, token));
+/// Each SQE's file in a chain, looked up when `Enter` takes the chain: `None` for an SQE
+/// that names none.
+type ChainFiles = Vec<Option<Result<Description>>>;
+
+/// Looks up every file `chain` names and holds its description, before any of the chain
+/// runs.
+fn resolve_files(chain: &Chain, token: &mut CleanLockToken) -> ChainFiles {
+    chain
+        .entries()
+        .iter()
+        .map(|sqe| {
+            let file = sqe.op().ok().and_then(|op| op.file());
+            file.map(|file| resolve(file, token))
+        })
+        .collect()
+}
+
+/// Lets go of a description, closing it when this was the last reference, as closing a
+/// descriptor does.
+fn release(description: Description, token: &mut CleanLockToken) {
+    // `Arc::into_inner` hands the description to exactly one of the last holders, even when
+    // they let go at the same time.
+    if let Some(description) = Arc::into_inner(description) {
+        // Like a descriptor closed on exit, the ring has no one to report a failed close to.
+        let _ = description.into_inner().try_close(token);
+    }
+}
+
+/// [`release`] for every file of a chain that is still held.
+fn release_files(files: ChainFiles, token: &mut CleanLockToken) {
+    for description in files.into_iter().flatten().flatten() {
+        release(description, token);
+    }
+}
+
+/// Runs `chain` by its break rules on the files [`resolve_files`] found for it, passes each
+/// CQE to `post`, and lets go of the files.
+fn run_chain(
+    chain: &Chain,
+    mut files: ChainFiles,
+    token: &mut CleanLockToken,
+    post: impl FnMut(Cqe),
+) {
+    // `Chain::run` runs the SQEs in order, so the next slot is always the running SQE's.
+    let mut slots = files.iter_mut();
+    chain.run(
+        |sqe| {
+            let file = slots.next().and_then(Option::take);
+            run(sqe, file, token)
+        },
+        errno_result(ECANCELED),
+        post,
+    );
+    release_files(files, token);
+}
+
+/// Runs `sqe` on `file`, the file it names as `Enter` found it, and returns its CQE result.
+fn run(sqe: &Sqe, file: Option<Result<Description>>, token: &mut CleanLockToken) -> i64 {
+    let mut file = file;
+    let result = sqe
+        .op()
+        .map_err(sqe_errno)
+        .and_then(|op| run_op(op, &mut file, token));
+    if let Some(Ok(description)) = file {
+        release(description, token);
+    }
     match result {
         Ok(value) => Cqe::encode_result(Ok(value as u64)),
         Err(err) => errno_result(err.errno),
     }
 }
 
-/// The caller's descriptor `file` names.
-fn descriptor(file: FileRef) -> Result<FileHandle> {
+/// The description `file` names: the caller's descriptor's.
+///
+/// # Errors
+///
+/// `EBADF` when the descriptor is not open, `EOPNOTSUPP` for a fixed file.
+fn resolve(file: FileRef, token: &mut CleanLockToken) -> Result<Description> {
     match file {
-        FileRef::Fd(fd) => Ok(FileHandle::from(fd as usize)),
+        FileRef::Fd(fd) => file_description(FileHandle::from(fd as usize), token),
         FileRef::Fixed(_) => Err(Error::new(EOPNOTSUPP)),
     }
+}
+
+/// Runs `op` on the SQE's file, taken from `file`.
+fn with_file<T>(
+    file: &mut Option<Result<Description>>,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(Description, &mut CleanLockToken) -> Result<T>,
+) -> Result<T> {
+    let description = file.take().unwrap_or(Err(Error::new(EBADF)))?;
+    let result = op(Arc::clone(&description), token);
+    release(description, token);
+    result
 }
 
 /// The address and length of a buffer in the caller's address space.
@@ -270,34 +357,43 @@ fn user_buffer(buf: Buffer) -> Result<(usize, usize)> {
     }
 }
 
-/// Runs `op` as the system call it stands for, on the caller's descriptors and memory.
-fn run_op(op: Op, token: &mut CleanLockToken) -> Result<usize> {
+/// Runs `op` as the system call it stands for, on the caller's memory and `file`, the
+/// description of the descriptor it names.
+fn run_op(
+    op: Op,
+    file: &mut Option<Result<Description>>,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
     match op {
         Op::Nop => Ok(0),
-        Op::Read { file, offset, buf } => {
-            let fd = descriptor(file)?;
+        Op::Read { offset, buf, .. } => {
             let (addr, len) = user_buffer(buf)?;
             let buf = UserSlice::wo(addr, len)?;
-            if offset == CURRENT_POSITION {
-                return sys_read(fd, buf, token);
-            }
-            file_op_generic_ext(fd, token, |scheme, _, desc, token| {
-                scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+            with_file(file, token, |description, token| {
+                if offset == CURRENT_POSITION {
+                    return read_description(description, buf, token);
+                }
+                description_op(description, token, |scheme, _, desc, token| {
+                    scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+                })
             })
         }
-        Op::Write { file, offset, buf } => {
-            let fd = descriptor(file)?;
+        Op::Write { offset, buf, .. } => {
             let (addr, len) = user_buffer(buf)?;
             let buf = UserSlice::ro(addr, len)?;
-            if offset == CURRENT_POSITION {
-                return sys_write(fd, buf, token);
-            }
-            file_op_generic_ext(fd, token, |scheme, _, desc, token| {
-                scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+            with_file(file, token, |description, token| {
+                if offset == CURRENT_POSITION {
+                    return write_description(description, buf, token);
+                }
+                description_op(description, token, |scheme, _, desc, token| {
+                    scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+                })
             })
         }
-        Op::Fsync { file } => file_op_generic(descriptor(file)?, token, |scheme, number, token| {
-            scheme.fsync(number, token).map(|()| 0)
+        Op::Fsync { .. } => with_file(file, token, |description, token| {
+            description_op(description, token, |scheme, _, desc, token| {
+                scheme.fsync(desc.number, token).map(|()| 0)
+            })
         }),
         _ => Err(Error::new(EOPNOTSUPP)),
     }

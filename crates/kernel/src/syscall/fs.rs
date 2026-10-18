@@ -37,19 +37,37 @@ pub fn file_op_generic_ext<T>(
         &mut CleanLockToken,
     ) -> Result<T>,
 ) -> Result<T> {
-    let (file, desc) = {
-        let current_lock = context::current();
-        let mut current = current_lock.read(token.token());
-        let (context, mut token) = current.token_split();
-        let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
-        // TODO: potential unnecessary clone
-        let desc = file.description.read(token.token()).clone();
-        (file, desc)
-    };
+    description_op(file_description(fd, token)?, token, op)
+}
+/// The description behind the current context's descriptor `fd`.
+pub fn file_description(
+    fd: FileHandle,
+    token: &mut CleanLockToken,
+) -> Result<Arc<LockedFileDescription>> {
+    let current_lock = context::current();
+    let mut current = current_lock.read(token.token());
+    let (context, mut token) = current.token_split();
+    let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
+    Ok(file.description)
+}
+/// [`file_op_generic_ext`] on a description already looked up (Ferric Oxide: the ring file
+/// table holds descriptions, not descriptors).
+pub fn description_op<T>(
+    description: Arc<LockedFileDescription>,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(
+        &dyn KernelScheme,
+        Arc<LockedFileDescription>,
+        FileDescription,
+        &mut CleanLockToken,
+    ) -> Result<T>,
+) -> Result<T> {
+    // TODO: potential unnecessary clone
+    let desc = description.read(token.token()).clone();
 
     let scheme = desc.scheme_ref.upgrade()?;
 
-    op(&*scheme, file.description, desc, token)
+    op(&*scheme, description, desc, token)
 }
 pub fn copy_path_to_buf(raw_path: UserSliceRo, max_len: usize) -> Result<String> {
     let mut path_buf = vec![0_u8; max_len];
@@ -574,7 +592,15 @@ pub fn frename(fd: FileHandle, raw_path: UserSliceRo, token: &mut CleanLockToken
 
 /// File status
 pub fn fstat(fd: FileHandle, user_buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
-    file_op_generic_ext(fd, token, |scheme, _, desc, token| {
+    fstat_description(file_description(fd, token)?, user_buf, token)
+}
+/// [`fstat`] on a description.
+pub fn fstat_description(
+    description: Arc<LockedFileDescription>,
+    user_buf: UserSliceWo,
+    token: &mut CleanLockToken,
+) -> Result<()> {
+    description_op(description, token, |scheme, _, desc, token| {
         scheme.kfstat(desc.number, user_buf, token)?;
 
         // TODO: Ensure only the kernel can access the stat when st_dev is set, or use another API
@@ -746,8 +772,16 @@ pub fn lseek(fd: FileHandle, pos: i64, whence: usize, token: &mut CleanLockToken
     Ok(guard.offset as usize)
 }
 pub fn sys_read(fd: FileHandle, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
+    read_description(file_description(fd, token)?, buf, token)
+}
+/// [`sys_read`] on a description.
+pub fn read_description(
+    description: Arc<LockedFileDescription>,
+    buf: UserSliceWo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
     let (bytes_read, desc_arc, desc) =
-        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+        description_op(description, token, |scheme, desc_arc, desc, token| {
             let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
                 desc.offset
             } else {
@@ -766,8 +800,16 @@ pub fn sys_read(fd: FileHandle, buf: UserSliceWo, token: &mut CleanLockToken) ->
     Ok(bytes_read)
 }
 pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -> Result<usize> {
+    write_description(file_description(fd, token)?, buf, token)
+}
+/// [`sys_write`] on a description.
+pub fn write_description(
+    description: Arc<LockedFileDescription>,
+    buf: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
     let (bytes_written, desc_arc, desc) =
-        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+        description_op(description, token, |scheme, desc_arc, desc, token| {
             let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
                 desc.offset
             } else {

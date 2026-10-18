@@ -25,6 +25,9 @@
 //!   nothing, and the ring works again once the tail is put back.
 //! - `ring-event`: an event queue watching the ring sees `EVENT_READ` once `Enter` posts a
 //!   completion, and not before.
+//! - `ring-hold`: a chain blocked in its first SQE still writes, in its second, to the pipe
+//!   its submitter named after another thread moves a different pipe onto that descriptor
+//!   number with `dup2`: `Enter` holds a chain's files from when it takes the chain.
 //! - `ring-bench`: times 64-byte writes to the null scheme and 4 KiB reads of a file, as
 //!   system calls and as ring batches of 32, and prints `FERRIC_BENCH` lines.
 //!
