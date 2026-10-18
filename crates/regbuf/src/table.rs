@@ -24,8 +24,10 @@
 //! - [`GrantTable::revoke`] of a grant whose descriptor is closing still finds it, and
 //!   [`GrantTable::settled`] says when every mapping of it is gone, whoever took it down. The
 //!   kernel's `Revoke` waits for that before it returns.
-//! - [`GrantTable::idle`] says when no teardown is in flight at all, so a closed region keeps
-//!   its frames until the last one finishes.
+//! - [`GrantTable::drained`] says when no teardown is in flight and no failed one left a
+//!   mapping recorded, so a closed region keeps its frames, and their charge, until nothing
+//!   maps them any more. A closed region that is not drained is the kernel's to retry:
+//!   [`GrantTable::close`] again hands every recorded mapping back.
 //! - Once [`GrantTable::close`] has run, [`GrantTable::register`] and [`GrantTable::create`]
 //!   fail with [`TableError::Closed`], so a registration racing the close cannot install
 //!   frames nobody will release.
@@ -247,6 +249,13 @@ impl<M> GrantTable<M> {
     /// restored.
     pub const fn idle(&self) -> bool {
         self.in_flight == 0
+    }
+
+    /// Whether no teardown is in flight and no grant has a mapping recorded: after
+    /// [`GrantTable::close`], whether nothing of the region is mapped any more, including what
+    /// a failed teardown restored.
+    pub fn drained(&self) -> bool {
+        self.in_flight == 0 && self.grants.values().all(|e| e.mappings.is_empty())
     }
 
     /// Whether nothing of grant `id` is mapped or being unmapped any more: true for a grant
@@ -493,7 +502,8 @@ impl<M> GrantTable<M> {
     /// Closes the region (its descriptor has closed): revokes every grant and returns all their
     /// mappings, in flight, which the caller must take down. Registering and making grants
     /// fail with [`TableError::Closed`] from now on. Grants stay in the table, revoked, until
-    /// their own descriptors close.
+    /// their own descriptors close. Closing again hands back what failed teardowns restored
+    /// since, for another try.
     pub fn close(&mut self) -> Vec<Taken<M>> {
         self.closed = true;
         let mut all = Vec::new();
@@ -868,5 +878,52 @@ mod tests {
         assert!(!t.idle());
         assert_eq!(finish_all(&mut t, from_b), [2]);
         assert!(t.idle());
+    }
+
+    /// Finding: a failed unmap while the region closes must keep the region from releasing
+    /// its frames, and closing again retries it.
+    #[test]
+    fn failed_unmap_during_region_close_is_not_drained() {
+        let mut t = table(2);
+        let g = t.create(spec(Access::ReadWrite, 0, 2 * P)).expect("fits");
+        t.add_mapping(g, 1).expect("live");
+        t.add_mapping(g, 2).expect("live");
+        let mut taken = t.close();
+        taken.sort_unstable_by_key(|taken| taken.mapping);
+        let failed = taken.pop().expect("two taken");
+        assert_eq!(finish_all(&mut t, taken), [1]);
+        t.restore(failed);
+        // No teardown in flight, but 2 is still mapped: not drained.
+        assert!(t.idle());
+        assert!(!t.drained());
+        // The grant's descriptor closes too and tries again, failing again: the entry stays.
+        let mut again = t.remove(g);
+        t.restore(again.pop().expect("the restored mapping"));
+        assert!(t.is_empty());
+        assert!(!t.drained());
+        // The kernel's retry: closing again hands it back.
+        let retry = t.close();
+        assert_eq!(finish_all(&mut t, retry), [2]);
+        assert!(t.drained());
+        assert!(t.settled(g));
+    }
+
+    /// Finding: a failed unmap while a grant closes keeps the mapping for the region's close.
+    #[test]
+    fn failed_unmap_during_grant_close_is_retried_by_region_close() {
+        let mut t = table(1);
+        let g = t.create(spec(Access::Read, 0, P)).expect("fits");
+        t.add_mapping(g, 9).expect("live");
+        let mut closing = t.remove(g);
+        t.restore(closing.pop().expect("one taken"));
+        assert!(!t.drained());
+        let retry = t.close();
+        assert_eq!(retry.len(), 1);
+        assert!(!t.drained());
+        assert_eq!(finish_all(&mut t, retry), [9]);
+        assert!(t.drained());
+        // Nothing of the grant is left, so the table forgot it.
+        assert!(t.settled(g));
+        assert_eq!(t.mapping_count(g), 0);
     }
 }
