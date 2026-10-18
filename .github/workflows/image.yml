@@ -215,10 +215,12 @@ jobs:
       # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
       - name: Check registered buffers
         run: |
-          for step in register grant-rw grant-ro pinned revoke unmap close; do
+          steps="register grant-rw grant-ro pinned reshare-mmap reshare-register reshare-borrow
+            forward-borrow revoke unmap close shared bytes"
+          for step in $steps; do
             grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
           done
-          echo "::notice::ferric-regbuf-test passed all 7 steps"
+          echo "::notice::ferric-regbuf-test passed all $(wc -w <<< "$steps") steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

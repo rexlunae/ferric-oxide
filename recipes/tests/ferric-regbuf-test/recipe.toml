@@ -1,7 +1,8 @@
 # Ferric Oxide: the on-target test for registered buffers and zero-copy grants
 # (kernel.regbuf). It registers a buffer, grants it to a scheme it serves from
 # a forked child, has the scheme read and write the pages, revokes the grant
-# and checks the scheme lost access. It prints FERRIC_TEST_SKIP when the kernel
+# and checks the scheme lost access, that the scheme cannot share the pages
+# onward, and MAP_SHARED and byte-granular grants. It prints FERRIC_TEST_SKIP when the kernel
 # has no kernel.regbuf scheme. Only for test images. Source lives in files/; as
 # a path source (relative to the repository root) edits there rebuild it.
 [source]
