@@ -718,31 +718,3 @@ fn a_top_level_package_ignores_an_overlapping_delegation() {
     let found = verified.package(&ripgrep()).unwrap().unwrap();
     assert_eq!(found.owners, entry.owners);
 }
-
-#[test]
-fn states_saved_with_a_whole_file_timestamp_hash_still_update() {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = admitted(dir.path());
-    let mut state = client(&registry);
-    verify::update(dir.path(), &mut state, now()).unwrap();
-
-    // Before the payload pin, the state kept the hash of the whole
-    // timestamp file under `timestamp_file`.
-    let whole = fs::read(dir.path().join("metadata/timestamp.json")).unwrap();
-    let mut saved: serde_json::Value = serde_json::from_slice(&state.to_json().unwrap()).unwrap();
-    let object = saved.as_object_mut().unwrap();
-    assert!(object.remove("timestamp_payload").is_some());
-    object.insert(
-        "timestamp_file".to_owned(),
-        serde_json::to_value(fox_index::metadata::FileMeta::of(&whole)).unwrap(),
-    );
-    let mut legacy = ClientState::from_json(&serde_json::to_vec(&saved).unwrap()).unwrap();
-    assert_eq!(legacy.timestamp_payload, None);
-
-    // The unchanged checkout verifies, and the state is saved in the new form.
-    verify::update(dir.path(), &mut legacy, now()).unwrap();
-    assert_eq!(legacy.timestamp_payload, state.timestamp_payload);
-    let resaved: serde_json::Value = serde_json::from_slice(&legacy.to_json().unwrap()).unwrap();
-    assert!(resaved.get("timestamp_file").is_none());
-    assert!(resaved.get("timestamp_payload").is_some());
-}
