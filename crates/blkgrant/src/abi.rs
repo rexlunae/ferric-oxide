@@ -7,9 +7,12 @@
 //! | Call | Encoding |
 //! | --- | --- |
 //! | attach | `SYS_CALL` with `CallFlags::FD` on the disk descriptor: the payload is the grant's descriptor number (it moves to the scheme), the one metadata word the [`Slot`] |
-//! | [`Request::Read`] | verb 1, slot, offset in the grant, first block, length in bytes |
-//! | [`Request::Write`] | verb 2, slot, offset in the grant, first block, length in bytes |
-//! | [`Request::Detach`] | verb 3, slot |
+//! | [`Request::Read`] | verb 1, slot and offset in the grant (in pages) packed in one word; first block; length in bytes |
+//! | [`Request::Write`] | verb 2, packed as for `Read` |
+//! | [`Request::Detach`] | verb 3 and slot, packed in one word |
+//!
+//! The kernel passes a scheme at most three metadata words of a call on one descriptor, so
+//! [`Request::encode`] packs the verb, the slot and the page offset into the first word.
 //!
 //! Blocks count from the start of the descriptor's disk or partition, in the disk's block
 //! size (`fstat`'s `st_blksize`). `Read` has the device write the blocks into the grant, so it
@@ -122,20 +125,46 @@ pub enum Request {
 }
 
 impl Request {
-    /// The most metadata words a request takes.
-    pub const WORDS: usize = 5;
+    /// The most metadata words a request takes: the kernel hands a scheme at most three
+    /// metadata words of a call on one descriptor.
+    pub const WORDS: usize = 3;
 
-    /// The call's metadata words, and how many of them are used.
-    pub const fn encode(self) -> ([u64; Self::WORDS], usize) {
+    /// The call's metadata words, and how many of them are used. The first word packs the
+    /// verb (bits 0 to 7), the slot (bits 8 to 15) and, for a transfer, the offset in the grant
+    /// in [`PAGE_SIZE`] pages (bits 16 to 63); the second and third are the first block and
+    /// the length.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::Unaligned`] for a transfer offset that is not a multiple of
+    /// [`PAGE_SIZE`], and [`EncodeError::Offset`] for one of 2^48 pages or more.
+    pub const fn encode(self) -> Result<([u64; Self::WORDS], usize), EncodeError> {
         match self {
-            Self::Read(t) => (Self::transfer(Verb::Read, t), 5),
-            Self::Write(t) => (Self::transfer(Verb::Write, t), 5),
-            Self::Detach { slot } => ([Verb::Detach as u64, slot.0 as u64, 0, 0, 0], 2),
+            Self::Read(t) => match Self::transfer(Verb::Read, t) {
+                Ok(words) => Ok((words, 3)),
+                Err(err) => Err(err),
+            },
+            Self::Write(t) => match Self::transfer(Verb::Write, t) {
+                Ok(words) => Ok((words, 3)),
+                Err(err) => Err(err),
+            },
+            Self::Detach { slot } => Ok(([Self::head(Verb::Detach, slot, 0), 0, 0], 1)),
         }
     }
 
-    const fn transfer(verb: Verb, t: Transfer) -> [u64; Self::WORDS] {
-        [verb as u64, t.slot.0 as u64, t.offset, t.lba, t.len]
+    const fn head(verb: Verb, slot: Slot, pages: u64) -> u64 {
+        verb as u64 | (slot.0 as u64) << 8 | pages << 16
+    }
+
+    const fn transfer(verb: Verb, t: Transfer) -> Result<[u64; Self::WORDS], EncodeError> {
+        if !t.offset.is_multiple_of(PAGE_SIZE) {
+            return Err(EncodeError::Unaligned);
+        }
+        let pages = t.offset / PAGE_SIZE;
+        if pages >> 48 != 0 {
+            return Err(EncodeError::Offset);
+        }
+        Ok([Self::head(verb, t.slot, pages), t.lba, t.len])
     }
 
     /// The request in call metadata words.
@@ -143,16 +172,18 @@ impl Request {
     /// # Errors
     ///
     /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
-    /// number of words does not match the verb, and [`DecodeError::Slot`] for a slot of
-    /// [`MAX_SLOTS`] or more.
+    /// number of words does not match the verb (or a detach carries an offset), and
+    /// [`DecodeError::Slot`] for a slot of [`MAX_SLOTS`] or more.
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
-        let (&verb, args) = words.split_first().ok_or(DecodeError::Verb)?;
-        let slot = |raw| Slot::new(raw).ok_or(DecodeError::Slot);
-        match (Verb::from_raw(verb).ok_or(DecodeError::Verb)?, args) {
-            (verb @ (Verb::Read | Verb::Write), &[s, offset, lba, len]) => {
+        let (&head, args) = words.split_first().ok_or(DecodeError::Verb)?;
+        let verb = Verb::from_raw(head & 0xff).ok_or(DecodeError::Verb)?;
+        let slot = Slot::new((head >> 8) & 0xff).ok_or(DecodeError::Slot)?;
+        let pages = head >> 16;
+        match (verb, args) {
+            (Verb::Read | Verb::Write, &[lba, len]) => {
                 let t = Transfer {
-                    slot: slot(s)?,
-                    offset,
+                    slot,
+                    offset: pages * PAGE_SIZE,
                     lba,
                     len,
                 };
@@ -162,11 +193,32 @@ impl Request {
                     Self::Write(t)
                 })
             }
-            (Verb::Detach, &[s]) => Ok(Self::Detach { slot: slot(s)? }),
+            (Verb::Detach, &[]) if pages == 0 => Ok(Self::Detach { slot }),
             _ => Err(DecodeError::Length),
         }
     }
 }
+
+/// Why a [`Request`] cannot be encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EncodeError {
+    /// The transfer's offset in the grant is not a multiple of [`PAGE_SIZE`].
+    Unaligned,
+    /// The transfer's offset is 2^48 pages or more.
+    Offset,
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unaligned => "grant offset is not page-aligned",
+            Self::Offset => "grant offset too large to encode",
+        })
+    }
+}
+
+impl core::error::Error for EncodeError {}
 
 /// Why call metadata is not a valid [`Request`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,24 +265,51 @@ mod tests {
             Request::Write(t),
             Request::Detach { slot: slot(63) },
         ] {
-            let (words, n) = request.encode();
+            let (words, n) = request.encode().expect("encodable");
+            assert!(n <= Request::WORDS);
             assert_eq!(Request::decode(&words[..n]), Ok(request));
         }
-        assert_eq!(Request::Read(t).encode().0, [1, 3, 0x2000, 77, 0x10000]);
+        assert_eq!(
+            Request::Read(t).encode(),
+            Ok(([1 | 3 << 8 | 2 << 16, 77, 0x10000], 3))
+        );
         assert_eq!(
             Request::Detach { slot: slot(5) }.encode(),
-            ([3, 5, 0, 0, 0], 2)
+            Ok(([3 | 5 << 8, 0, 0], 1))
         );
+    }
+
+    #[test]
+    fn unencodable_offsets_are_refused() {
+        let t = |offset| Transfer {
+            slot: slot(0),
+            offset,
+            lba: 0,
+            len: 512,
+        };
+        assert_eq!(Request::Read(t(512)).encode(), Err(EncodeError::Unaligned));
+        assert_eq!(
+            Request::Write(t(PAGE_SIZE << 48)).encode(),
+            Err(EncodeError::Offset)
+        );
+        let last = Request::Read(t(((1 << 48) - 1) << 12));
+        let (words, n) = last.encode().expect("the last page encodes");
+        assert_eq!(Request::decode(&words[..n]), Ok(last));
     }
 
     #[test]
     fn bad_metadata_is_refused() {
         assert_eq!(Request::decode(&[]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[9, 0]), Err(DecodeError::Verb));
+        assert_eq!(Request::decode(&[1, 0]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[1, 0, 0, 0]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[3]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[3, 64]), Err(DecodeError::Slot));
-        assert_eq!(Request::decode(&[2, 64, 0, 0, 512]), Err(DecodeError::Slot));
+        assert_eq!(Request::decode(&[3, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[3 | 1 << 16]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[3 | 64 << 8]), Err(DecodeError::Slot));
+        assert_eq!(
+            Request::decode(&[2 | 64 << 8, 0, 512]),
+            Err(DecodeError::Slot)
+        );
     }
 
     #[test]

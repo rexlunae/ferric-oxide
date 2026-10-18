@@ -16,8 +16,8 @@
 //!
 //! let slot = Slot::new(0).expect("slot 0 exists");
 //! let read = Request::Read(Transfer { slot, offset: 0, lba: 2048, len: 128 * 1024 });
-//! let (words, len) = read.encode();
-//! assert_eq!(&words[..len], &[1, 0, 0, 2048, 128 * 1024]);
+//! let (words, len) = read.encode().expect("page-aligned offset");
+//! assert_eq!(&words[..len], &[1, 2048, 128 * 1024]);
 //! assert_eq!(Request::decode(&words[..len]), Ok(read));
 //! ```
 

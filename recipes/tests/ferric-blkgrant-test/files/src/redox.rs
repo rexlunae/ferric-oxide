@@ -7,7 +7,7 @@ use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use ferric_blkgrant::abi::{Request as DiskRequest, Slot, Transfer};
+use ferric_blkgrant::abi::{EncodeError, Request as DiskRequest, Slot, Transfer};
 use ferric_regbuf::abi::{
     Access, BytesError, GrantId, GrantInfo, GrantSpec, REGION_PATH, Request, SCHEME_NAME,
 };
@@ -50,6 +50,8 @@ enum Failure {
     Data { what: &'static str },
     /// The kernel answered with a payload the ABI crate rejects.
     Payload(BytesError),
+    /// A disk request the test built does not fit the call metadata.
+    Encode(EncodeError),
     /// The disk has no partition the test can use.
     NoPartition,
 }
@@ -65,6 +67,7 @@ impl fmt::Display for Failure {
             } => write!(f, "{what} should fail with errno {expected}, got {got}"),
             Self::Data { what } => write!(f, "{what}: wrong contents"),
             Self::Payload(err) => write!(f, "bad payload from the kernel: {err}"),
+            Self::Encode(err) => write!(f, "cannot encode a disk request: {err}"),
             Self::NoPartition => f.write_str("the NVMe disk has no partitions to test on"),
         }
     }
@@ -74,6 +77,7 @@ impl std::error::Error for Failure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Payload(err) => Some(err),
+            Self::Encode(err) => Some(err),
             _ => None,
         }
     }
@@ -234,7 +238,7 @@ impl Disk {
 
     /// A grant call.
     fn call(&self, what: &'static str, request: DiskRequest) -> Result<usize, Failure> {
-        let (words, n) = request.encode();
+        let (words, n) = request.encode().map_err(Failure::Encode)?;
         ctx(
             what,
             libredox::call::call_wo(self.raw(), &[], CallFlags::empty(), &words[..n]),
@@ -361,11 +365,6 @@ fn checks_step(t: &mut Test) -> Result<(), Failure> {
         "a read into a read-only grant",
         EACCES,
         disk.read_grant(SLOT_RO, 0, 0, page),
-    )?;
-    expect_errno(
-        "an unaligned offset in the grant",
-        EINVAL,
-        disk.read_grant(SLOT_RW, 512, 0, 512),
     )?;
     expect_errno(
         "a range past the grant",

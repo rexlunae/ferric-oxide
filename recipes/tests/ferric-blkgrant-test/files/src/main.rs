@@ -11,9 +11,10 @@
 //! - `nvme-grant-write`: blocks written through the grant (the controller reads the buffer)
 //!   read back with `pread`; the original blocks are put back afterwards. The test writes only
 //!   the BIOS boot partition, which a UEFI boot does not use.
-//! - `nvme-grant-checks`: the driver refuses a read into a read-only grant (`EACCES`), an
-//!   unaligned offset and a range past the grant (`EINVAL`), an empty slot (`ENOENT`) and a
-//!   range past the partition (`EOVERFLOW`), without touching the device.
+//! - `nvme-grant-checks`: the driver refuses a read into a read-only grant (`EACCES`), a range
+//!   past the grant (`EINVAL`), an empty slot (`ENOENT`) and a range past the partition
+//!   (`EOVERFLOW`), without touching the device. Offsets in the grant are whole pages, so an
+//!   unaligned offset cannot be encoded at all (the ABI crate's tests cover that).
 //! - `nvme-grant-revoke`: once the application revokes the grant, reads through it fail with
 //!   `ECANCELED` and the buffer keeps what the application put there.
 //! - `nvme-grant-detach`: detaching the revoked grant gives its reserved IOVA back.
