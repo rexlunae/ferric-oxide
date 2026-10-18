@@ -31,16 +31,33 @@
 //!
 //! The bookkeeping (which frames have which IOVA, and who still reaches them) is the
 //! host-tested `ferric_iommu::dma` module.
+//!
+//! With the `regbuf` feature a domain also holds *grant mappings* (`MapGrant`,
+//! io/registered-buffers-design.md, PR 3): the frames of another process's registered buffer,
+//! pinned and mapped at consecutive IOVAs of one fresh block, with the grant's access. They
+//! are kept apart from the translation mappings, by IOVA, and each carries a ticket so a
+//! revocation that arrives late (after the driver unmapped it and the IOVA was reused) cannot
+//! take down a newer mapping. They are taken down strictly too: [`DmaSpace::unmap_grant`]
+//! returns only after the IOTLB invalidation completed.
 
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(feature = "regbuf")]
+use ferric_iommu::dma::{
+    complete_unmap,
+    grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
+    UnmapFailure, UnmapState,
+};
 use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Span};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
 use super::domain::{Domain, DomainError};
 use crate::{
-    context::memory::{AddrSpace, GenericFlusher, NopFlusher, Provider, TlbShootdownActions},
+    context::{
+        memory::{AddrSpace, GenericFlusher, NopFlusher, Provider, TlbShootdownActions},
+        reshare::{self, ReshareError},
+    },
     memory::{get_page_info, Frame, Page, PhysicalAddress, RefCount, RefKind, VirtualAddress},
 };
 
@@ -69,6 +86,26 @@ pub enum DmaError {
     Overlap(Overlap),
     /// Allocating the IOVA or changing the domain's tables failed.
     Domain(DomainError),
+    /// Ferric Oxide: the page is borrowed from another process (context/reshare.rs).
+    Borrowed(ReshareError),
+    /// No grant mapping (with this ticket) starts at the IOVA.
+    #[cfg(feature = "regbuf")]
+    NoGrantMapping {
+        /// The IOVA asked for.
+        iova: u64,
+    },
+    /// A grant mapping has no pages, or too many to address.
+    #[cfg(feature = "regbuf")]
+    GrantSize,
+    /// A previous strict grant unmap failed; the domain must be blocked before release.
+    #[cfg(feature = "regbuf")]
+    FailedUnmap {
+        /// The IOVA whose teardown failed.
+        iova: u64,
+    },
+    /// Grant installation or rollback could not confirm that DMA is unreachable.
+    #[cfg(feature = "regbuf")]
+    GrantMap(MapRunsError<DomainError>),
 }
 
 impl fmt::Display for DmaError {
@@ -79,6 +116,17 @@ impl fmt::Display for DmaError {
             Self::FreeFrame { phys } => write!(f, "frame {phys:#x} is free"),
             Self::Overlap(err) => write!(f, "{err}"),
             Self::Domain(err) => write!(f, "{err}"),
+            Self::Borrowed(err) => write!(f, "{err}"),
+            #[cfg(feature = "regbuf")]
+            Self::NoGrantMapping { iova } => write!(f, "no grant is mapped at IOVA {iova:#x}"),
+            #[cfg(feature = "regbuf")]
+            Self::GrantSize => f.write_str("a grant mapping must have between 1 and 2^52 pages"),
+            #[cfg(feature = "regbuf")]
+            Self::FailedUnmap { iova } => {
+                write!(f, "unmap of grant IOVA {iova:#x} previously failed")
+            }
+            #[cfg(feature = "regbuf")]
+            Self::GrantMap(error) => write!(f, "{error}"),
         }
     }
 }
@@ -118,27 +166,46 @@ impl Pins {
             else {
                 continue;
             };
-            let Some(info) = get_page_info(frame) else {
-                continue;
-            };
-            // A private page (one reference) or a shared one gets a shared reference, so the
-            // owner keeps writing the same frame. A copy-on-write page gets a copy-on-write
-            // reference: it is mapped read-only for the device as well.
-            let kind = match info.refcount() {
-                Some(RefCount::Cow(_)) => RefKind::Cow,
-                Some(RefCount::One | RefCount::Shared(_)) => RefKind::Shared,
-                None => {
-                    pins.release();
-                    return Err(DmaError::FreeFrame { phys: addr });
-                }
-            };
-            if info.add_ref(kind).is_err() {
+            if let Err(err) = pins.pin(frame) {
                 pins.release();
-                return Err(DmaError::PinOverflow { phys: addr });
+                return Err(err);
             }
-            pins.0.push(frame);
         }
         Ok(pins)
+    }
+
+    /// Takes a reference on each of `frames`, as [`Pins::take`] does.
+    #[cfg(feature = "regbuf")]
+    fn take_frames(frames: &[Frame]) -> Result<Self, DmaError> {
+        let mut pins = Self::default();
+        for &frame in frames {
+            if let Err(err) = pins.pin(frame) {
+                pins.release();
+                return Err(err);
+            }
+        }
+        Ok(pins)
+    }
+
+    /// Takes a reference on `frame` if the allocator owns it, and records it.
+    fn pin(&mut self, frame: Frame) -> Result<(), DmaError> {
+        let Some(info) = get_page_info(frame) else {
+            return Ok(());
+        };
+        let phys = frame.base().data() as u64;
+        // A private page (one reference) or a shared one gets a shared reference, so the
+        // owner keeps writing the same frame. A copy-on-write page gets a copy-on-write
+        // reference: it is mapped read-only for the device as well.
+        let kind = match info.refcount() {
+            Some(RefCount::Cow(_)) => RefKind::Cow,
+            Some(RefCount::One | RefCount::Shared(_)) => RefKind::Shared,
+            None => return Err(DmaError::FreeFrame { phys }),
+        };
+        if info.add_ref(kind).is_err() {
+            return Err(DmaError::PinOverflow { phys });
+        }
+        self.0.push(frame);
+        Ok(())
     }
 
     /// Drops the references, freeing frames nothing else uses.
@@ -166,6 +233,7 @@ fn target(space: &AddrSpace, virt: VirtualAddress) -> Result<Target, DmaError> {
     let not_mapped = DmaError::NotMapped { virt: virt.data() };
     let page = Page::containing_address(virt);
     let (grant_base, info) = space.grants.contains(page).ok_or(not_mapped)?;
+    reshare::check_grant(grant_base, info).map_err(DmaError::Borrowed)?;
     let (phys, flags) = space
         .table
         .utable
@@ -207,10 +275,41 @@ fn access(writable: bool) -> Access {
     }
 }
 
+/// A grant mapping: a registered buffer's frames at one IOVA block.
+#[cfg(feature = "regbuf")]
+struct GrantHeld {
+    block: IovaRange,
+    /// The mapped length, from the block's start; the block may be longer (alignment).
+    len: u64,
+    pins: Pins,
+    ticket: u64,
+    unmap: UnmapState,
+}
+
+/// The runs of physically consecutive frames in `frames`: each run's first frame's physical
+/// address and its length in bytes.
+#[cfg(feature = "regbuf")]
+fn runs(frames: &[Frame]) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for frame in frames {
+        let phys = frame.base().data() as u64;
+        match runs.last_mut() {
+            Some((start, len)) if start.checked_add(*len) == Some(phys) => {
+                *len = len.saturating_add(PAGE);
+            }
+            _ => runs.push((phys, PAGE)),
+        }
+    }
+    runs
+}
+
 /// A domain and the mappings that translations made in it.
 pub struct DmaSpace {
     domain: Domain,
     mappings: DmaMappings<Held>,
+    /// Grant mappings by IOVA.
+    #[cfg(feature = "regbuf")]
+    grants: alloc::collections::BTreeMap<u64, GrantHeld>,
 }
 
 impl DmaSpace {
@@ -219,6 +318,8 @@ impl DmaSpace {
         Self {
             domain,
             mappings: DmaMappings::new(),
+            #[cfg(feature = "regbuf")]
+            grants: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -417,6 +518,114 @@ impl DmaSpace {
         }
     }
 
+    /// Pins `frames` (the pages of a grant, in order) and maps them at consecutive IOVAs of a
+    /// fresh block, writable for the device when `writable` is set; returns the IOVA of the
+    /// first. `ticket` names the mapping for [`DmaSpace::unmap_grant`].
+    ///
+    /// # Errors
+    ///
+    /// [`DmaError::GrantSize`] for no frames or too many, [`DmaError::PinOverflow`] and
+    /// [`DmaError::FreeFrame`] when a frame cannot be pinned, and [`DmaError::Domain`] when the
+    /// IOVA space is full or the tables cannot be changed. A rejected attempt is fully
+    /// rolled back. An uncertain installation returns a retained attempt: its pins, IOVA
+    /// and failed teardown state stay owned until successful domain blocking. The caller
+    /// must publish that attempt to the grant before returning its error to user space.
+    #[cfg(feature = "regbuf")]
+    pub fn map_grant(
+        &mut self,
+        frames: &[Frame],
+        writable: bool,
+        ticket: u64,
+    ) -> Result<MapAttempt<u64, DmaError>, DmaError> {
+        let len = u64::try_from(frames.len())
+            .ok()
+            .and_then(|n| n.checked_mul(PAGE))
+            .filter(|&len| len != 0)
+            .ok_or(DmaError::GrantSize)?;
+        let pins = Pins::take_frames(frames)?;
+        let block = match self.domain.alloc_iova(len) {
+            Ok(block) => block,
+            Err(err) => {
+                pins.release();
+                return Err(err.into());
+            }
+        };
+        let mapped = map_runs(
+            &runs(frames),
+            |step| match step {
+                MapStep::Map { offset, phys, len } => self.domain.map(
+                    block.start.saturating_add(offset),
+                    phys,
+                    len,
+                    access(writable),
+                ),
+                MapStep::Rollback { len } => self.domain.unmap(block.start, len),
+            },
+            |err| matches!(err, DomainError::Map(_)),
+        );
+        let held = GrantHeld {
+            block,
+            len,
+            pins,
+            ticket,
+            unmap: UnmapState::default(),
+        };
+        record_installation(&mut self.grants, block.start, held, mapped, |held| {
+            held.unmap = UnmapState::failed();
+        })
+        .map(|attempt| attempt.map_error(DmaError::GrantMap))
+        .map_err(|(error, held)| {
+            // Only a confirmed rollback returns ownership instead of publishing a record.
+            self.give_back(held.block, held.pins);
+            match error {
+                MapRunsError::Clean(error) => error.into(),
+                MapRunsError::InvalidLength => DmaError::GrantSize,
+                error => DmaError::GrantMap(error),
+            }
+        })
+    }
+
+    /// Takes the grant mapping at `iova` down strictly (entries cleared, IOTLB invalidated and
+    /// waited on), then frees its block and unpins its frames. With `ticket`, only the mapping
+    /// that ticket names; returns the ticket of the mapping taken down.
+    ///
+    /// # Errors
+    ///
+    /// [`DmaError::NoGrantMapping`] when no such mapping is there, and [`DmaError::Domain`]
+    /// when the unmap or its invalidation failed. The mapping, pins and block remain owned,
+    /// and [`DmaError::FailedUnmap`] is returned on later attempts until domain closure.
+    #[cfg(feature = "regbuf")]
+    pub fn unmap_grant(&mut self, iova: u64, ticket: Option<u64>) -> Result<u64, DmaError> {
+        let domain = &mut self.domain;
+        let held = complete_unmap(&mut self.grants, iova, |held| {
+            if ticket.is_some_and(|t| t != held.ticket) {
+                return Err(DmaError::NoGrantMapping { iova });
+            }
+            held.unmap
+                .attempt(|| domain.unmap(iova, held.len))
+                .map_err(|err| {
+                    error!(
+                        "IOMMU: cannot unmap grant IOVA {iova:#x}+{:#x} from domain {}: {err}; its frames stay pinned",
+                        held.len,
+                        domain.id()
+                    );
+                    match err {
+                        UnmapFailure::Backend(error) => error.into(),
+                        _ => DmaError::FailedUnmap { iova },
+                    }
+                })
+        })?
+        .ok_or(DmaError::NoGrantMapping { iova })?;
+        self.give_back(held.block, held.pins);
+        Ok(held.ticket)
+    }
+
+    /// How many grant mappings the domain holds.
+    #[cfg(feature = "regbuf")]
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+
     /// Frees an unmapped block and unpins its frames.
     fn give_back(&mut self, block: IovaRange, pins: Pins) {
         if let Err(err) = self.domain.free_iova(block) {
@@ -439,6 +648,12 @@ impl Drop for DmaSpace {
         for mapping in self.mappings.drain() {
             if clean {
                 mapping.data.pins.release();
+            }
+        }
+        #[cfg(feature = "regbuf")]
+        for (_, held) in core::mem::take(&mut self.grants) {
+            if clean {
+                held.pins.release();
             }
         }
     }

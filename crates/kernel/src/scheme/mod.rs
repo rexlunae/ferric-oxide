@@ -66,6 +66,10 @@ pub mod iommu;
 /// `irq:` - allows userspace handling of IRQs
 pub mod irq;
 
+/// Ferric Oxide: `kernel.regbuf` - registered buffers and revocable zero-copy grants (`regbuf`)
+#[cfg(feature = "regbuf")]
+pub mod regbuf;
+
 /// `memory:` - a scheme for accessing physical memory
 pub mod memory;
 
@@ -205,6 +209,11 @@ fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
         // Ferric Oxide: the iommu scheme exists only when VT-d support is built.
         if cfg!(iommu_enabled) {
             insert_globals(&[Iommu]);
+        }
+
+        // Ferric Oxide: the regbuf scheme exists only with the `regbuf` feature.
+        if cfg!(feature = "regbuf") {
+            insert_globals(&[RegBuf]);
         }
     }
     let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -538,6 +547,9 @@ pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
     // Ferric Oxide: see `iommu`.
     #[cfg(iommu_enabled)]
     GlobalSchemes::Iommu,
+    // Ferric Oxide: see `regbuf`.
+    #[cfg(feature = "regbuf")]
+    GlobalSchemes::RegBuf,
 ];
 
 pub const MAX_GLOBAL_SCHEMES: usize = 16;
@@ -572,6 +584,11 @@ impl SchemeExt for GlobalSchemes {
             Self::Iommu => &iommu::IommuScheme,
             #[cfg(not(iommu_enabled))]
             Self::Iommu => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
+            // Ferric Oxide: the regbuf scheme.
+            #[cfg(feature = "regbuf")]
+            Self::RegBuf => &regbuf::RegBufScheme,
+            #[cfg(not(feature = "regbuf"))]
+            Self::RegBuf => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
         }
     }
     fn scheme_id(self) -> SchemeId {

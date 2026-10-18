@@ -1,9 +1,14 @@
-//! Ferric Oxide: Intel VT-d DMA remapping (`kernel.iommu`).
+//! Ferric Oxide: IOMMU DMA remapping (`kernel.iommu`): Intel VT-d, and AMD-Vi in `amdvi`.
+//!
+//! [`init`](crate::arch::iommu::init) picks the vendor by which ACPI table firmware provides: the DMAR table means VT-d
+//! (this file), the IVRS table AMD-Vi (`amdvi.rs`). Both put devices in the same kinds of
+//! domain, so [`domain`](crate::arch::iommu::domain), [`dma`](crate::arch::iommu::dma) and the `iommu` scheme work the same on either; only
+//! interrupt remapping ([`interrupt`](mod@crate::arch::iommu::interrupt)) is VT-d-only so far.
 //!
 //! Every VT-d unit the DMAR table lists is switched on with every device in one identity
 //! domain, so IOVA equals physical address and DMA behaves as before (io/iommu-design.md in
-//! the project files, step 1). [`domain`] adds DMA domains with their own tables that
-//! devices can be moved into and out of (step 2), which the boot self-test ([`selftest`])
+//! the project files, step 1). [`domain`](crate::arch::iommu::domain) adds DMA domains with their own tables that
+//! devices can be moved into and out of (step 2), which the boot self-test (`selftest`)
 //! checks and user space gets through the `iommu` scheme (`scheme/iommu.rs`, step 3).
 //!
 //! For each unit the kernel maps the register set, reads CAP/ECAP, builds (once per address
@@ -18,23 +23,22 @@
 //! (6.5.1, 10.4.7, 10.4.8). Faults raise the fault event interrupt (`FAULT_VECTOR` on the
 //! BSP), whose handler logs and clears the fault records (7.3, 10.4.14).
 //!
-//! Units that support it also remap interrupts ([`interrupt`], step 5): MSI and MSI-X get
+//! Units that support it also remap interrupts ([`interrupt`](mod@crate::arch::iommu::interrupt), step 5): MSI and MSI-X get
 //! remappable-format messages through the `iommu` scheme, and compatibility-format interrupt
 //! requests are blocked.
 //!
 //! The DMAR parsing, register decoding, table and descriptor encoding and the IOVA allocator
 //! are in the host-tested `ferric-vtd` crate (`crates/vtd`).
 
+mod amdvi;
 pub mod dma;
 pub mod domain;
 pub mod interrupt;
 mod selftest;
+mod volatile;
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use core::{
-    ptr::{read_volatile, write_volatile},
-    sync::atomic::{fence, Ordering},
-};
+use core::sync::atomic::{fence, Ordering};
 
 use ferric_vtd::{
     dmar::{Dmar, DmarFlags, Drhd, Structure},
@@ -44,8 +48,11 @@ use ferric_vtd::{
     plan::{self, DomainLayout, SkipReason, UnitPlan, FIRST_DMA_DOMAIN, IDENTITY_DOMAIN},
     regs::{self, global, pmen, Capability, ExtendedCapability},
     table::{self, Agaw, ContextEntry, MapError, PageSize, RootEntry, Table, TableMemory},
+    Bdf,
 };
 use spin::{Mutex, Once};
+
+use self::volatile::{Volatile, Word};
 
 use crate::{
     arch::device::local_apic,
@@ -76,32 +83,24 @@ static DOMAIN_IDS: Mutex<Option<DomainIds>> = Mutex::new(None);
 /// A mapped VT-d register set.
 struct Regs {
     base: u64,
-    virt: usize,
+    mmio: Volatile,
     cap: Capability,
     ecap: ExtendedCapability,
 }
 
 impl Regs {
     /// Reads a 32- or 64-bit register.
-    fn read<T: Copy>(&self, offset: usize) -> T {
-        // SAFETY: `virt` maps the unit's whole register span as device memory (see `map_unit`)
-        // and every offset used is a register inside it, aligned to its width.
-        unsafe { read_volatile((self.virt as *const u8).wrapping_add(offset).cast::<T>()) }
+    fn read<T: Word>(&self, offset: usize) -> T {
+        self.mmio.read(offset)
     }
 
     /// Writes a 32- or 64-bit register.
-    fn write<T: Copy>(&self, offset: usize, value: T) {
-        // SAFETY: as in `read`.
-        unsafe {
-            write_volatile(
-                (self.virt as *mut u8).wrapping_add(offset).cast::<T>(),
-                value,
-            )
-        }
+    fn write<T: Word>(&self, offset: usize, value: T) {
+        self.mmio.write(offset, value);
     }
 
     /// Waits until `done` returns true for the value of the 32- or 64-bit register at `offset`.
-    fn wait<T: Copy>(
+    fn wait<T: Word>(
         &self,
         offset: usize,
         step: Step,
@@ -292,11 +291,10 @@ impl QueuedInvalidation {
 
     /// Polls the status word until the wait descriptor has written it.
     fn wait_status(&mut self, regs: &Regs) -> Result<(), Error> {
-        let status = self.pages.table(self.status).as_ptr();
+        // The status word is the first of a table page this queue owns; hardware writes it.
+        let status = Volatile::frames(self.status, 8);
         for _ in 0..POLL_LIMIT {
-            // SAFETY: `status` points at the first word of a table page this queue owns,
-            // which stays allocated and mapped; hardware writes it, so the read is volatile.
-            let word = unsafe { read_volatile(status) };
+            let word: u64 = status.read(0);
             if word as u32 == self.sequence {
                 return Ok(());
             }
@@ -326,6 +324,8 @@ pub enum Step {
     InterruptTablePointer,
     InterruptRemappingEnable,
     CompatibilityBlock,
+    /// An AMD-Vi COMPLETION_WAIT.
+    CompletionWait,
 }
 
 /// Why a unit was not enabled, or an invalidation failed.
@@ -339,6 +339,13 @@ pub enum Error {
     QueueFull(QueueFull),
     QueueBroken,
     NeedsQueue,
+    /// Why an AMD-Vi unit was not enabled.
+    AmdViSkip(ferric_amdvi::plan::SkipReason),
+    /// An AMD-Vi command buffer had too few free slots.
+    CommandsFull(ferric_iommu::ring::RingFull),
+    /// An AMD-Vi command buffer stopped (CmdBufRun clear) after an illegal command or a
+    /// hardware error; the unit takes no more commands.
+    CommandsStopped,
 }
 
 impl core::fmt::Display for Error {
@@ -352,6 +359,9 @@ impl core::fmt::Display for Error {
             Self::QueueFull(err) => write!(f, "{err}"),
             Self::QueueBroken => f.write_str("invalidation queue stopped after an error"),
             Self::NeedsQueue => f.write_str("invalidation needs queued invalidation"),
+            Self::AmdViSkip(reason) => write!(f, "{reason}"),
+            Self::CommandsFull(err) => write!(f, "command buffer: {err}"),
+            Self::CommandsStopped => f.write_str("the command buffer stopped after an error"),
         }
     }
 }
@@ -491,10 +501,9 @@ fn map_registers(phys: PhysicalAddress, len: usize) -> usize {
 /// Maps a unit's registers and reads its capabilities.
 fn map_unit(drhd: &Drhd<'_>) -> Regs {
     let base = drhd.register_base;
-    let virt = map_registers(PhysicalAddress::new(base as usize), PAGE_SIZE);
     let mut regs = Regs {
         base,
-        virt,
+        mmio: Volatile::registers(PhysicalAddress::new(base as usize), PAGE_SIZE),
         cap: Capability(0),
         ecap: ExtendedCapability(0),
     };
@@ -503,6 +512,7 @@ fn map_unit(drhd: &Drhd<'_>) -> Regs {
     let span = regs::register_span(regs.cap, regs.ecap, drhd.register_pages());
     if let Some(rest) = span.checked_sub(PAGE_SIZE).filter(|&rest| rest > 0) {
         map_registers(PhysicalAddress::new(base as usize).add(PAGE_SIZE), rest);
+        regs.mmio = regs.mmio.with_len(span);
     }
     regs
 }
@@ -537,21 +547,72 @@ fn enable(regs: &Regs, plan: &UnitPlan, root_table: u64) -> Result<Invalidator, 
     Ok(invalidator)
 }
 
-/// Routes the unit's fault event interrupt to the BSP, after clearing any old faults.
-fn enable_fault_interrupt(regs: &Regs) {
-    log_faults(regs);
-    let Some(apic_id) = crate::percpu::PercpuBlock::current()
+/// The APIC ID of the CPU this runs on (the BSP, at boot), if known.
+fn bsp_apic_id() -> Option<u32> {
+    crate::percpu::PercpuBlock::current()
         .misc_arch_info
         .apic_id_opt
         .get()
-    else {
+        .map(|id| id.get())
+}
+
+/// Reads a 32-bit register of `bdf`'s configuration space in segment 0 through the legacy
+/// configuration mechanism (ports 0xCF8/0xCFC). Only for boot, on the BSP, before user space
+/// (pcid) starts using configuration space.
+fn pci_config_read(bdf: Bdf, offset: u8) -> u32 {
+    let address = 0x8000_0000 | (u32::from(bdf.source_id()) << 8) | u32::from(offset & 0xfc);
+    // SAFETY: this runs at boot on the BSP before user space, so nothing else uses the
+    // configuration ports; callers read only registers without read side effects.
+    unsafe {
+        x86::io::outl(0xcf8, address);
+        x86::io::inl(0xcfc)
+    }
+}
+
+/// Writes a 32-bit register of `bdf`'s configuration space in segment 0, under the same
+/// conditions as [`pci_config_read`].
+fn pci_config_write(bdf: Bdf, offset: u8, value: u32) {
+    let address = 0x8000_0000 | (u32::from(bdf.source_id()) << 8) | u32::from(offset & 0xfc);
+    // SAFETY: as in `pci_config_read`; callers write only the IOMMU function's own MSI
+    // capability, which no other code programs.
+    unsafe {
+        x86::io::outl(0xcf8, address);
+        x86::io::outl(0xcfc, value);
+    }
+}
+
+/// The ACPI table with `signature`, as bytes, if firmware has one.
+fn acpi_table(signature: &str) -> Option<&'static [u8]> {
+    let sdt = crate::acpi::find_sdt(signature).into_iter().next()?;
+    // SAFETY: `get_sdt` mapped the whole table, `length` bytes from its header, and firmware
+    // tables stay mapped and unchanged for the life of the kernel.
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            (sdt as *const crate::acpi::sdt::Sdt).cast::<u8>(),
+            sdt.length as usize,
+        )
+    })
+}
+
+/// Logs what `kernel.iommu = "enforce"` means, once DMA domains are available.
+fn announce_enforce() {
+    if cfg!(iommu = "enforce") {
+        info!(
+            "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses, and only devices attached to a domain can DMA"
+        );
+    }
+}
+
+/// Routes the unit's fault event interrupt to the BSP, after clearing any old faults.
+fn enable_fault_interrupt(regs: &Regs) {
+    log_faults(regs);
+    let Some(apic_id) = bsp_apic_id() else {
         warn!(
             "IOMMU: BSP APIC ID unknown; faults at unit {:#x} are not reported",
             regs.base
         );
         return;
     };
-    let apic_id = apic_id.get();
     match u8::try_from(apic_id) {
         Ok(id) => {
             regs.write(regs::FEDATA, u32::from(FAULT_VECTOR));
@@ -604,6 +665,7 @@ interrupt!(fault_interrupt, || {
     for unit in UNITS.get().into_iter().flatten() {
         log_faults(&unit.regs);
     }
+    amdvi::on_fault_vector();
     interrupt::on_fault_vector();
     // SAFETY: this runs in an interrupt delivered through the local APIC.
     unsafe { local_apic::the_local_apic().eoi() };
@@ -704,21 +766,20 @@ fn init_unit(
     })
 }
 
-/// Finds the DMAR table and enables every VT-d unit in it. Must run after ACPI tables are
-/// parsed and before any user-space driver starts DMA.
+/// Finds the DMAR or IVRS table and enables every VT-d or AMD-Vi unit in it. Must run after
+/// ACPI tables are parsed and before any user-space driver starts DMA.
 pub fn init() {
-    let Some(sdt) = crate::acpi::find_sdt("DMAR").into_iter().next() else {
-        info!("IOMMU: no DMAR table, VT-d not enabled");
-        return;
-    };
-    // SAFETY: `get_sdt` mapped the whole table, `length` bytes from its header, and firmware
-    // tables stay mapped and unchanged for the life of the kernel.
-    let bytes: &'static [u8] = unsafe {
-        core::slice::from_raw_parts(
-            (sdt as *const crate::acpi::sdt::Sdt).cast::<u8>(),
-            sdt.length as usize,
-        )
-    };
+    if let Some(bytes) = acpi_table("DMAR") {
+        init_vtd(bytes);
+    } else if let Some(bytes) = acpi_table("IVRS") {
+        amdvi::init(bytes);
+    } else {
+        info!("IOMMU: no DMAR or IVRS table, IOMMU not enabled");
+    }
+}
+
+/// Enables every VT-d unit in the DMAR table `bytes`.
+fn init_vtd(bytes: &'static [u8]) {
     let dmar = match Dmar::parse(bytes) {
         Ok(dmar) => DMAR.call_once(|| dmar),
         Err(err) => {
@@ -760,11 +821,7 @@ pub fn init() {
         LAYOUT.call_once(|| layout);
         *DOMAIN_IDS.lock() = Some(DomainIds::new(FIRST_DMA_DOMAIN, layout.domain_id_limit));
         selftest::run();
-        if cfg!(iommu = "enforce") {
-            info!(
-                "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses, and only devices attached to a domain can DMA"
-            );
-        }
+        announce_enforce();
     } else if !units.is_empty() {
         warn!("IOMMU: the units share no table layout; DMA domains are unavailable");
     }

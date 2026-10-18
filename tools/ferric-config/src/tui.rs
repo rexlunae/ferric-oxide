@@ -160,7 +160,7 @@ impl<'a> App<'a> {
                         a.stale.join(", ")
                     ),
                     Ok(_) => format!("Saved {}.", ctx.config_path.display()),
-                    Err(e) => format!("Saved, but generating failed: {e}"),
+                    Err(e) => format!("Saved, but generating failed: {}", crate::error_chain(&e)),
                 }
             }
             Ok(_) => format!(

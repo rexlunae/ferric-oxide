@@ -1,0 +1,15 @@
+[package]
+name = "fox-sbom"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "CycloneDX SBOMs for fox packages"
+publish = false
+
+[dependencies]
+cyclonedx-bom = "0.8.1"
+fox-core = { path = "../fox-core" }
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+serde_json.workspace = true

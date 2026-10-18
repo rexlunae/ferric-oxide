@@ -151,6 +151,9 @@ impl KernelSchemeMap {
             } else if info.scheme_id == ferric_iommu::abi::SCHEME_ID {
                 // Ferric Oxide: the kernel's iommu scheme (kernel.iommu = "auto"/"enforce").
                 ferric.push((ferric_iommu::abi::SCHEME_NAME, FdGuard::new(info.fd)));
+            } else if info.scheme_id == ferric_regbuf::abi::SCHEME_ID {
+                // Ferric Oxide: the kernel's regbuf scheme (kernel.regbuf).
+                ferric.push((ferric_regbuf::abi::SCHEME_NAME, FdGuard::new(info.fd)));
             }
         }
         Self(map, ferric)

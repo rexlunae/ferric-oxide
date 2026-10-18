@@ -2,16 +2,17 @@
 # Minimum x86-64 microarchitecture level (v1-v4). The kernel halts at boot with a
 # list of missing features on CPUs below it. Unset means no check.
 #level = "v3"
-# Ferric Oxide: Intel VT-d DMA remapping. "auto" enables every unit in the DMAR table with
+# Ferric Oxide: IOMMU DMA remapping, Intel VT-d (DMAR table) or AMD-Vi (IVRS table, when
+# there is no DMAR table). "auto" enables every unit in the table with
 # all devices in one identity domain (DMA addresses unchanged) and runs a DMA-domain
 # self-test at boot; "never" leaves them off. "auto" and "enforce" also provide the
 # kernel.iommu scheme (DMA domains for drivers; memory:translation answers with IOVAs
 # in a driver's bound domain; pcid drivers bind one when they start). "enforce" also
 # refuses memory:translation to drivers without a bound domain, lets a driver bind only
-# a domain with a device attached, and blocks DMA from devices in no domain. On units
+# a domain with a device attached, and blocks DMA from devices in no domain. On VT-d units
 # with interrupt remapping, "auto" and "enforce" also remap interrupts (MSI/MSI-X
 # entries made through pcid, checked by requester ID) and block compatibility-format
-# interrupts.
+# interrupts. AMD-Vi does not remap interrupts yet.
 iommu = "never"
 
 [arch.x86_64.features]

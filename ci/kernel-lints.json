@@ -4,10 +4,10 @@
   "clippy::indexing_slicing": 171,
   "clippy::missing_safety_doc": 34,
   "clippy::undocumented_unsafe_blocks": 584,
-  "clippy::unwrap_used": 79,
+  "clippy::unwrap_used": 78,
   "dead_code": 17,
-  "unsafe keyword": 1157,
+  "unsafe keyword": 1156,
   "unused_imports": 5,
-  "unused_mut": 4,
-  "unused_variables": 2
+  "unused_mut": 3,
+  "unused_variables": 1
 }

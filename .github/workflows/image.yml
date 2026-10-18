@@ -81,7 +81,8 @@ jobs:
           # and logs that there is no DMAR table on the other.
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\n' > "$out/ferric.toml"
+          # Registered buffers are off by default; turn them on so ferric-regbuf-test runs.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel and relibc features,
@@ -159,8 +160,9 @@ jobs:
         # has kernel.iommu = "enforce" on the same machine: drivers without a bound
         # domain get no DMA addresses and unattached devices are blocked, so reaching
         # the smoke-test marker from disk shows the real drivers DMA through their
-        # domains.
-        iommu: [none, vtd, enforce]
+        # domains. "amdvi" and "amdvi-enforce" do the same with an emulated AMD IOMMU
+        # (DMA remapping only), under QEMU 10 in a container (see the boot step).
+        iommu: [none, vtd, enforce, amdvi, amdvi-enforce]
     env:
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}.log
     steps:
@@ -180,16 +182,30 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.iommu == 'enforce' && 'ferric-smoke-image-enforce' || 'ferric-smoke-image' }}
+          name: ${{ (matrix.iommu == 'enforce' || matrix.iommu == 'amdvi-enforce') && 'ferric-smoke-image-enforce' || 'ferric-smoke-image' }}
 
       - name: Boot smoke test
         env:
           # The fuzzing image runs for 20 minutes before it shuts down.
           BOOT_TIMEOUT: ${{ env.CONFIG_NAME == 'ferric-fuzz' && '1800' || '300' }}
-          BOOT_IOMMU: ${{ matrix.iommu == 'enforce' && 'vtd' || matrix.iommu }}
+          BOOT_IOMMU: ${{ matrix.iommu == 'enforce' && 'vtd' || startsWith(matrix.iommu, 'amdvi') && 'amdvi' || matrix.iommu }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
-          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" ${{ matrix.cpu }}
+          if [ "$BOOT_IOMMU" = amdvi ]; then
+            # Ubuntu 24.04's QEMU 8.2 does not translate DMA through amd-iommu (dma-remap
+            # came in QEMU 10), so the AMD-Vi boots run Ubuntu 26.04's QEMU in a container,
+            # with the runner's KVM and OVMF.
+            docker run --rm --device /dev/kvm -e BOOT_IOMMU -e BOOT_TIMEOUT \
+              -v "$PWD:/work" -w /work -v /usr/share/ovmf:/usr/share/ovmf:ro ubuntu:26.04 \
+              bash -c 'set -e
+                apt-get update -q
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+                  qemu-system-x86 ipxe-qemu > /dev/null
+                qemu-system-x86_64 --version
+                scripts/ferric-ci/boot-smoke.sh harddrive.img "$0" "$1"' "$LOG" ${{ matrix.cpu }}
+          else
+            scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" ${{ matrix.cpu }}
+          fi
 
       - name: Check KASLR, KPTI and PCID ran
         run: |
@@ -217,6 +233,19 @@ jobs:
             echo "::error::shadow stacks were enabled despite KPTI being forced on"
             exit 1
           fi
+
+      - name: Check futex wakeups
+        run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
+
+      # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
+      - name: Check registered buffers
+        run: |
+          steps="register file-backed grant-rw grant-ro pinned reshare-mmap reshare-register reshare-borrow
+            forward-borrow revoke unmap close shared bytes bounce-newer"
+          for step in $steps; do
+            grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
+          done
+          echo "::notice::ferric-regbuf-test passed all $(wc -w <<< "$steps") steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

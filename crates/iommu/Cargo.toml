@@ -3,12 +3,16 @@ name = "ferric-iommu"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "The kernel iommu scheme's interface and PCI requester-ID alias rules"
+description = "The kernel iommu scheme's interface, PCI requester-ID alias rules and the I/O page-table and IOVA code shared by the VT-d and AMD-Vi backends"
 
 [dependencies]
 
+[dev-dependencies]
+# Shared crates are also consumed through recipe symlinks outside the host workspace.
+ferric-regbuf = { path = "../regbuf", default-features = false, features = ["alloc"] }
+
 [features]
 default = []
-## Requester-ID alias computation (`alias`) and the DMA mapping bookkeeping (`dma`),
-## which need a heap.
+## Requester-ID alias computation (`alias`), the DMA mapping bookkeeping (`dma`) and the
+## IOVA and domain-ID allocators (`iova`), which need a heap.
 alloc = []

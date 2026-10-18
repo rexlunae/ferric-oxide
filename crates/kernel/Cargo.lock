@@ -91,6 +91,13 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
 
 [[package]]
+name = "ferric-amdvi"
+version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
+
+[[package]]
 name = "ferric-cet"
 version = "0.1.0"
 
@@ -107,8 +114,15 @@ name = "ferric-nospec"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-regbuf"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-vtd"
 version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -165,10 +179,12 @@ dependencies = [
  "bitflags 2.9.1",
  "cc",
  "fdt",
+ "ferric-amdvi",
  "ferric-cet",
  "ferric-hwrand",
  "ferric-iommu",
  "ferric-nospec",
+ "ferric-regbuf",
  "ferric-vtd",
  "hashbrown 0.14.5",
  "linked_list_allocator",

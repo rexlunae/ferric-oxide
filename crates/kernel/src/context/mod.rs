@@ -59,6 +59,9 @@ pub mod file;
 /// Memory struct - contains a set of pages for a context
 pub mod memory;
 
+/// Ferric Oxide: borrowed pages a process must not share onward
+pub mod reshare;
+
 /// Signal handling
 pub mod signal;
 

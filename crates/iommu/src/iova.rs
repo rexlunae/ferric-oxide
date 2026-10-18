@@ -13,9 +13,11 @@
 //!
 //! - [`INTERRUPT_RANGE`], `0xFEE0_0000..=0xFEEF_FFFF`: DMA writes there are interrupt
 //!   requests, which the unit never translates (VT-d specification section 3.14,
-//!   "Handling Requests to Interrupt Address Range").
-//! - The reserved ranges passed to [`IovaAllocator::new`]: the RMRRs that apply to the
-//!   domain's devices, which are mapped one-to-one in the domain.
+//!   "Handling Requests to Interrupt Address Range"; AMD-Vi treats the same range as
+//!   interrupts, AMD IOMMU specification #48882, section 2.3).
+//! - The reserved ranges passed to [`IovaAllocator::new`]: the VT-d RMRRs or AMD-Vi IVMD
+//!   ranges that apply to the domain's devices, which are mapped one-to-one in the domain, and
+//!   on AMD-Vi the HyperTransport reserved range.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -25,7 +27,7 @@ use core::ops::Range;
 /// The interrupt address range, `0xFEE0_0000..=0xFEEF_FFFF`.
 pub const INTERRUPT_RANGE: Range<u64> = 0xfee0_0000..0xfef0_0000;
 
-/// The largest alignment a range gets: one 2 MiB second-stage page.
+/// The largest alignment a range gets: one 2 MiB page.
 pub const MAX_ALIGN: u64 = 2 << 20;
 
 /// The lowest IOVA handed out. Page 0 stays unused so a zero DMA address always faults.
@@ -101,7 +103,7 @@ pub fn block_len(len: u64) -> Option<u64> {
 /// # Examples
 ///
 /// ```
-/// use ferric_vtd::iova::IovaAllocator;
+/// use ferric_iommu::iova::IovaAllocator;
 ///
 /// // A 39-bit space with an RMRR at 0x7c00_0000.
 /// let mut iova = IovaAllocator::new(1 << 39, Some(0x7c00_0000..0x7c80_0000));
@@ -111,7 +113,7 @@ pub fn block_len(len: u64) -> Option<u64> {
 /// assert_eq!(b.start, 0x20_0000);
 /// iova.free(a)?;
 /// assert_eq!(iova.alloc(0x1000)?.start, 0x1000);
-/// # Ok::<(), ferric_vtd::iova::IovaError>(())
+/// # Ok::<(), ferric_iommu::iova::IovaError>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct IovaAllocator {

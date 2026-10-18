@@ -12,9 +12,9 @@
 //!   (IST) and a per-CPU *entry stack*.
 //!
 //! Layout: an address space's kernel table and shadow are one 8 KiB-aligned pair, so the shadow
-//! is `CR3 | 0x1000` ([`SHADOW_CR3_BIT`]). `rmm` copies every change to the user half of the
+//! is `CR3 | 0x1000` ([`SHADOW_CR3_BIT`](crate::arch::kpti::SHADOW_CR3_BIT)). `rmm` copies every change to the user half of the
 //! kernel table into the shadow ([`rmm::PageMapper::new_with_user_shadow`]). The kernel half of
-//! every shadow points at one shared set of tables ([`SHADOW`]) built at boot.
+//! every shadow points at one shared set of tables (`SHADOW`) built at boot.
 //!
 //! Entry and exit (see `interrupt/handler.rs` and `interrupt/syscall.rs`): an interrupt from user
 //! space arrives on the entry stack (the TSS's ring-0 stack) with the shadow loaded. The entry code
@@ -35,11 +35,11 @@
 //! # PCID
 //!
 //! With process-context identifiers (CR4.PCIDE), TLB entries are tagged with the PCID in
-//! CR3[11:0], and a CR3 write with bit 63 set keeps them. KPTI then uses one fixed pair of PCIDs
+//! `CR3[11:0]`, and a CR3 write with bit 63 set keeps them. KPTI then uses one fixed pair of PCIDs
 //! on every CPU: 0 for every kernel table and [`rmm::x86_64::USER_PCID`] (`0x800`) for every
 //! shadow. The entry and exit code switch between the two with bit 63 set, so system calls and
 //! interrupts no longer flush the TLB. The CR3 bits they OR in come from the PCR
-//! (`kpti_cr3_noflush`, `kpti_cr3_user`), which [`setup_pcr`] fills in, so the same code runs with
+//! (`kpti_cr3_noflush`, `kpti_cr3_user`), which [`setup_pcr`](crate::arch::kpti::setup_pcr) fills in, so the same code runs with
 //! or without PCID.
 //!
 //! Keeping the user PCID's entries is only correct if every invalidation reaches them too, since
@@ -52,10 +52,10 @@
 //!   the whole user PCID.
 //!
 //! The kernel never writes CR3 or runs `invlpg` other than through those two functions (the AP
-//! trampoline, [`init_cpu`] and the entry code aside, none of which needs to invalidate), so no
+//! trampoline, [`init_cpu`](crate::arch::kpti::init_cpu) and the entry code aside, none of which needs to invalidate), so no
 //! flush site is missed and no flush is ever deferred. The paranoid NMI, #MC and #DB paths can
 //! therefore also switch back without flushing. Since `INVPCID` with a non-zero PCID faults
-//! while CR4.PCIDE is clear, an AP runs [`init_cpu`] before anything that could invalidate.
+//! while CR4.PCIDE is clear, an AP runs [`init_cpu`](crate::arch::kpti::init_cpu) before anything that could invalidate.
 //!
 //! Address-space switches still flush, both PCIDs, because every address space shares the same
 //! pair. This is the simple design: Linux instead gives each CPU a small cache of PCID pairs with

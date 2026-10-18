@@ -29,7 +29,10 @@
 //!    translation fails with `EACCES` under `enforce` (and gives a physical address under
 //!    `auto`), and binding the domain descriptor it inherited is refused while the parent has
 //!    it bound (`iommu-fork`);
-//! 8. it unmaps the buffer and has the device read the old IOVA of its second page, which the
+//! 8. it maps another process's registered buffer into its domain with `MapGrant` and has the
+//!    device DMA into it, then revokes the grant and checks the same DMA faults, for a grant
+//!    and a sub-grant revoked with its parent (the `iommu-grant-*` tests, [`grant`]);
+//! 9. it unmaps the buffer and has the device read the old IOVA of its second page, which the
 //!    kernel must have unmapped (strictly: entries cleared, IOTLB invalidated) when the memory
 //!    went away; the kernel logs a release and a second DMA fault (`iommu-release`).
 //!
@@ -69,6 +72,34 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::ExitCode;
 use std::time::Duration;
+
+#[cfg(target_os = "redox")]
+mod grant;
+
+/// Without Redox there is no kernel to map grants into.
+#[cfg(not(target_os = "redox"))]
+mod grant {
+    use super::{Edu, Failure, GRANT_TESTS, Translator};
+
+    pub fn run(_: &Edu, _: &Translator, _: usize) -> Result<bool, Failure> {
+        Err(Failure::NotRun)
+    }
+
+    pub fn report_not_run(err: &dyn std::fmt::Display) {
+        for name in GRANT_TESTS {
+            println!("FERRIC_TEST_FAIL {name}: not run: {err}");
+        }
+    }
+}
+
+/// The grant tests' result lines, in order ([`grant`]).
+const GRANT_TESTS: [&str; 5] = [
+    "iommu-grant-nodomain",
+    "iommu-grant-dma",
+    "iommu-grant-unmap",
+    "iommu-grant-revoke",
+    "iommu-subgrant-revoke",
+];
 
 /// `PcidClientRequest::EnableFeature(PciFeature)`.
 const ENABLE_FEATURE: u32 = 4;
@@ -855,6 +886,8 @@ struct Outcome {
     fault: Result<(), Failure>,
     readonly: Result<(), Failure>,
     fork: Result<&'static str, Failure>,
+    /// Whether every grant test passed; they print their own result lines.
+    grants: Result<bool, Failure>,
     release: Result<(), Failure>,
 }
 
@@ -868,6 +901,7 @@ impl Outcome {
             fault: Err(Failure::NotRun),
             readonly: Err(Failure::NotRun),
             fork: Err(Failure::NotRun),
+            grants: Err(Failure::NotRun),
             release: Err(Failure::NotRun),
         }
     }
@@ -1136,6 +1170,7 @@ fn run(mut setup: Setup) -> (Option<Outcome>, MsiOutcome) {
     let fault = dma_to_ungranted(&mut setup);
     let readonly = dma_after_write_removed(&mut setup);
     let fork = forked_child_unbound(&setup);
+    let grants = grant::run(&setup.edu, &setup.translator, setup.domain);
     let release = dma_after_release(setup, iova);
     let outcome = Outcome {
         unbound,
@@ -1144,6 +1179,7 @@ fn run(mut setup: Setup) -> (Option<Outcome>, MsiOutcome) {
         fault,
         readonly,
         fork,
+        grants,
         release,
     };
     (Some(outcome), msi)
@@ -1213,7 +1249,7 @@ fn main() -> ExitCode {
     let _ = notify.write_all(&[0]);
     let msi_ok = report_msi(msi);
     let Some(outcome) = outcome else {
-        for name in TESTS {
+        for name in TESTS.iter().chain(&GRANT_TESTS) {
             println!("FERRIC_TEST_SKIP {name}: pcid has no DMA domain for the device");
         }
         return if msi_ok {
@@ -1251,7 +1287,14 @@ fn main() -> ExitCode {
             "the device read the buffer's old IOVA after the unmap (the kernel logs the fault)",
         ),
     ];
-    if msi_ok && results.iter().all(|&ok| ok) {
+    let grants_ok = match outcome.grants {
+        Ok(ok) => ok,
+        Err(err) => {
+            grant::report_not_run(&err);
+            false
+        }
+    };
+    if msi_ok && grants_ok && results.iter().all(|&ok| ok) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

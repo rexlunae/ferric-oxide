@@ -3,33 +3,43 @@
 //!
 //! - Opening the scheme root (`/scheme/kernel.iommu`) as root gives the *attach capability*.
 //!   pcid opens it at boot. A later capability system replaces the root check.
-//! - Opening [`DOMAIN_PATH`] from the attach capability creates a domain with empty tables, so
+//! - Opening [`DOMAIN_PATH`](ferric_iommu::abi::DOMAIN_PATH) from the attach capability creates a domain with empty tables, so
 //!   DMA from its devices faults until something is mapped.
-//! - [`Request::Attach`] and [`Request::Detach`], called on the attach capability and a domain,
+//! - [`Request::Attach`](ferric_iommu::abi::Request::Attach) and [`Request::Detach`](ferric_iommu::abi::Request::Detach), called on the attach capability and a domain,
 //!   move a device into the domain (mapping its RMRRs one-to-one first) or block it.
-//!   [`Request::Bridge`] on the attach capability reports a bridge's bus range, which resolves
+//!   [`Request::Bridge`](ferric_iommu::abi::Request::Bridge) on the attach capability reports a bridge's bus range, which resolves
 //!   device scopes that name bridges.
-//! - [`Request::Bind`] on a domain makes it the calling process's own: a process (an address
+//! - [`Request::Bind`](ferric_iommu::abi::Request::Bind) on a domain makes it the calling process's own: a process (an address
 //!   space) binds at most one domain, and a domain is bound by at most one process. Under
 //!   `kernel.iommu = "enforce"` only a domain with a device attached can be bound.
-//! - [`Request::Join`] on a domain moves its devices into the domain the calling process has
+//! - [`Request::Join`](ferric_iommu::abi::Request::Join) on a domain moves its devices into the domain the calling process has
 //!   bound, so a driver of several functions keeps one domain: pcid gives it a domain for each
 //!   function, it binds the first and joins the others into it. A forked child has an address
 //!   space of its own, so it starts with no bound domain (`EACCES` from translation under
 //!   `enforce`), and it cannot bind its parent's domain while the parent has it bound.
-//! - Once a process has bound a domain, `memory:translation` ([`translate`]) answers with IOVAs
+//! - Once a process has bound a domain, `memory:translation` ([`translate`](crate::scheme::iommu::translate)) answers with IOVAs
 //!   in it: the frames are pinned and mapped with the page's protection, and repeat
 //!   translations return the same IOVA (`arch/x86_64/iommu/dma.rs`). When the process unmaps
-//!   that memory, the address-space code calls [`release`], which takes the mappings down
+//!   that memory, the address-space code calls [`release`](crate::scheme::iommu::release), which takes the mappings down
 //!   strictly. When it takes write access away (`mprotect`), the address-space code calls
-//!   [`narrow`], which makes the mappings that memory reaches read-only for the device. A
+//!   [`narrow`](crate::scheme::iommu::narrow), which makes the mappings that memory reaches read-only for the device. A
 //!   process without a bound domain gets physical addresses, or `EACCES` under `enforce`.
-//! - [`Request::AllocIrte`] on the attach capability makes an interrupt remapping entry that
+//! - [`Request::AllocIrte`](ferric_iommu::abi::Request::AllocIrte) on the attach capability makes an interrupt remapping entry that
 //!   delivers a vector to a CPU for one function's MSI or MSI-X requests, and writes the
-//!   remappable-format message that names it into the payload; [`Request::FreeIrte`] frees it
+//!   remappable-format message that names it into the payload; [`Request::FreeIrte`](ferric_iommu::abi::Request::FreeIrte) frees it
 //!   (`arch/x86_64/iommu/interrupt.rs`). pcid makes these calls when a driver asks it for an MSI
 //!   message, and frees the entries when the driver's channel closes. `ENODEV` means the unit
 //!   does not remap interrupts, so compatibility-format messages still work.
+//! - With the `regbuf` feature, [`Request::MapGrant`](ferric_iommu::abi::Request::MapGrant) on a domain the caller has bound maps a
+//!   page-aligned `kernel.regbuf` grant (named by the caller's descriptor number) at a fresh
+//!   contiguous IOVA range, with the grant's access, and returns the IOVA; the grant records
+//!   the mapping (`scheme/regbuf.rs`). [`Request::UnmapGrant`](ferric_iommu::abi::Request::UnmapGrant), or revoking or closing the
+//!   grant (or one it was derived from, or its region), takes it down strictly: the entries are
+//!   cleared and the IOTLB invalidated and waited on before the call returns, so the device's
+//!   DMA to the old IOVA faults. Without a bound domain `MapGrant` fails with `ENODEV`: the
+//!   driver falls back to its own bounce buffers, and a device never gets physical addresses
+//!   of another process's memory. Each grant mapping has a ticket, so a revocation cannot take
+//!   down a newer mapping that reuses the IOVA after the driver unmapped the old one.
 //! - Closing the last descriptor of a domain blocks its devices (DMA faults), frees its
 //!   tables and unpins every frame mapped in it. Domain descriptors cannot be duplicated into
 //!   new descriptions, so the scheme's close is the last close.
@@ -37,10 +47,14 @@
 //! The call encoding is in the shared `ferric-iommu` crate (`crates/iommu`), which pcid uses
 //! too.
 
-use alloc::{collections::BTreeMap, sync::Weak};
+use alloc::{collections::BTreeMap, sync::Weak, vec::Vec};
+#[cfg(feature = "regbuf")]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
+#[cfg(feature = "regbuf")]
+use ferric_iommu::dma::{grant::MapAttempt, links::DomainLinks};
 use ferric_vtd::{dmar::BusRange, interrupt::SourceValidation, plan::SelectError, Bdf};
 use spin::Mutex;
 use syscall::{
@@ -75,6 +89,8 @@ const ROOT: usize = 0;
 pub struct IommuScheme;
 
 /// An open handle.
+// There are a handful of handles (one per driver), so boxing the domain is not worth it.
+#[allow(clippy::large_enum_variant)]
 enum Handle {
     /// The attach capability.
     AttachCap,
@@ -128,6 +144,13 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::PinOverflow { .. } => Error::new(ENOMEM),
         DmaError::FreeFrame { .. } | DmaError::Overlap(_) => Error::new(EIO),
         DmaError::Domain(err) => errno(err),
+        DmaError::Borrowed(err) => Error::from(*err),
+        #[cfg(feature = "regbuf")]
+        DmaError::NoGrantMapping { .. } => Error::new(ENOENT),
+        #[cfg(feature = "regbuf")]
+        DmaError::GrantSize => Error::new(EINVAL),
+        #[cfg(feature = "regbuf")]
+        DmaError::FailedUnmap { .. } | DmaError::GrantMap(_) => Error::new(EIO),
     }
 }
 
@@ -201,20 +224,44 @@ impl KernelScheme for IommuScheme {
     }
 
     fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
-        // Dropping a domain blocks its devices and frees its tables; do that outside the lock.
-        let handle = HANDLES.lock().remove(&id);
-        if let Some(Handle::Domain { space, bound }) = &handle {
-            if bound.is_some() {
-                BOUND.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "regbuf")]
+        let mut forgotten = Vec::new();
+        let handle = {
+            let mut handles = HANDLES.lock();
+            if let Some(Handle::Domain { space, bound }) = handles.get_mut(&id) {
+                let devices = space.device_count();
+                let mappings = space.mapping_count();
+                // Serialize blocking with revocation: a missing handle must never be
+                // observed before the hardware result and failure marker are published.
+                let clean = space.domain().close();
+                #[cfg(feature = "regbuf")]
+                {
+                    forgotten = GRANT_LINKS.lock().close(id, clean);
+                }
+                if bound.is_some() {
+                    BOUND.fetch_sub(1, Ordering::Relaxed);
+                }
+                if clean {
+                    info!(
+                        "IOMMU: domain {} closed, {devices} device(s) blocked, {mappings} DMA mapping(s) unpinned",
+                        space.id()
+                    );
+                } else {
+                    warn!(
+                        "IOMMU: domain {} close failed; its frames stay pinned",
+                        space.id()
+                    );
+                }
             }
-            info!(
-                "IOMMU: domain {} closed, {} device(s) blocked, {} DMA mapping(s) unpinned",
-                space.id(),
-                space.device_count(),
-                space.mapping_count()
-            );
-        }
+            handles.remove(&id)
+        };
+        // Pins and grant records are released without the handle-table lock. In
+        // particular, forgetting records takes region locks, which must precede it.
         drop(handle);
+        #[cfg(feature = "regbuf")]
+        for (link, record) in forgotten {
+            link.forget(record);
+        }
         Ok(())
     }
 
@@ -254,6 +301,8 @@ impl KernelScheme for IommuScheme {
                 interrupt::free(id).map_err(|err| irq_errno(&err))?;
                 Ok(0)
             }
+            (Request::MapGrant { grant_fd }, &[domain]) => map_grant(domain, grant_fd, token),
+            (Request::UnmapGrant { iova }, &[domain]) => unmap_grant(domain, iova).map(|()| 0),
             _ => Err(Error::new(EINVAL)),
         }
     }
@@ -400,7 +449,7 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
 ///
 /// `EINVAL` when the process has bound no domain or `id` is that domain, `EBUSY` when another
 /// live process has bound `id`, `EBADF` when `id` is not open, and the errno of a failed
-/// detach or attach; a device whose attach fails is put back into `id`.
+/// detach or attach; the devices are then put back into `id` (see [`move_devices`]).
 fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     let addr_space = AddrSpace::current()?;
     let name = context::current().read(token.token()).name;
@@ -426,8 +475,8 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
         }
         Ok(space.domain().devices().collect::<alloc::vec::Vec<_>>())
     })?;
-    for &device in &devices {
-        let (from, into) = move_device(&mut handles, device, id, target)?;
+    let (from, into) = move_devices(&mut handles, &devices, id, target)?;
+    for device in &devices {
         info!(
             "IOMMU: {:04x}:{} moved from domain {from} into domain {into} (bound by {name})",
             device.segment, device.bdf
@@ -436,53 +485,106 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     Ok(devices.len())
 }
 
-/// Moves `device` from domain handle `from` to domain handle `into`, and returns their
-/// domain IDs. When the attach fails, the device goes back into `from`.
-fn move_device(
+/// Moves `devices`, all of domain handle `from`'s devices, into domain handle `into` as one
+/// set, and returns the two domain IDs. Every device leaves `from` before any is attached to
+/// `into`: a function and its alias are attached separately, and on AMD-Vi the alias's entry
+/// stays with `from` while any of its users is still there, so moving them one at a time
+/// would find it busy. When an attach fails, the devices already in `into` are detached and
+/// go back into `from` with the rest. A device that cannot be detached from `into` stays
+/// there, and that is logged; the attach error is returned either way.
+fn move_devices(
     handles: &mut BTreeMap<usize, Handle>,
-    device: Device,
+    devices: &[Device],
     from: usize,
     into: usize,
 ) -> Result<(u16, u16)> {
     let from_did = with_domain(handles, from, |space, _| {
-        space.domain().detach(device).map_err(|err| errno(&err))?;
+        let domain = space.domain();
+        for (i, &device) in devices.iter().enumerate() {
+            if let Err(err) = domain.detach(device) {
+                reattach(domain, devices.get(..i).unwrap_or_default());
+                return Err(errno(&err));
+            }
+        }
         Ok(space.id())
     })?;
+    let mut moved: usize = 0;
     let attached = with_domain(handles, into, |space, _| {
         let domain = space.domain();
-        domain.attach(device).map_err(|err| {
+        for &device in devices {
+            domain.attach(device).map_err(|err| {
+                warn!(
+                    "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
+                    device.segment,
+                    device.bdf,
+                    domain.id()
+                );
+                errno(&err)
+            })?;
+            moved = moved.saturating_add(1);
+        }
+        Ok(domain.id())
+    });
+    let err = match attached {
+        Ok(into_did) => return Ok((from_did, into_did)),
+        Err(err) => err,
+    };
+    let moved = devices.get(..moved).unwrap_or_default();
+    // The devices that cannot leave `into` again stay there; only the rest go back.
+    let stuck = with_domain(handles, into, |space, _| {
+        let mut stuck = Vec::new();
+        for &device in moved {
+            if let Err(e) = space.domain().detach(device) {
+                warn!(
+                    "IOMMU: {:04x}:{} cannot leave domain {}: {e}",
+                    device.segment,
+                    device.bdf,
+                    space.id()
+                );
+                stuck.push(device);
+            }
+        }
+        Ok(stuck)
+    })
+    .unwrap_or_else(|_| moved.to_vec());
+    let back: Vec<Device> = devices
+        .iter()
+        .copied()
+        .filter(|device| !stuck.contains(device))
+        .collect();
+    let _ = with_domain(handles, from, |space, _| {
+        reattach(space.domain(), &back);
+        Ok(())
+    });
+    if !stuck.is_empty() {
+        warn!(
+            "IOMMU: join into domain handle {into} failed and was not fully undone: {} device(s) stay in it",
+            stuck.len()
+        );
+    }
+    Err(err)
+}
+
+/// Attaches `devices` back to `domain` after a failed move, warning about any that cannot go
+/// back (they stay blocked).
+fn reattach(domain: &mut Domain, devices: &[Device]) {
+    for &device in devices {
+        if let Err(err) = domain.attach(device) {
             warn!(
-                "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
+                "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {}: {err}",
                 device.segment,
                 device.bdf,
                 domain.id()
             );
-            errno(&err)
-        })?;
-        Ok(domain.id())
-    });
-    match attached {
-        Ok(into_did) => Ok((from_did, into_did)),
-        Err(err) => {
-            let back = with_domain(handles, from, |space, _| {
-                space.domain().attach(device).map_err(|e| errno(&e))
-            });
-            if back.is_err() {
-                warn!(
-                    "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {from_did}",
-                    device.segment, device.bdf
-                );
-            }
-            Err(err)
         }
     }
 }
 
 /// The domain bound by the address space at `owner`, if any.
-fn bound_to<'a>(
-    handles: &'a mut BTreeMap<usize, Handle>,
+fn bound_to(
+    handles: &mut BTreeMap<usize, Handle>,
     owner: *const AddrSpaceWrapper,
-) -> Option<&'a mut DmaSpace> {
+) -> Option<&mut DmaSpace> {
     handles.values_mut().find_map(|h| match h {
         Handle::Domain {
             space,
@@ -567,5 +669,190 @@ pub fn release(owner: &AddrSpaceWrapper, span: PageSpan) {
             span.base.start_address().data(),
             span.count.saturating_mul(PAGE_SIZE),
         );
+    }
+}
+
+/// The next grant mapping's ticket.
+#[cfg(feature = "regbuf")]
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// The grant behind each grant mapping, by ticket, so [`Request::UnmapGrant`] can drop the
+/// grant's record. Taken after the region lock and the handle table, and never held while
+/// taking either.
+#[cfg(feature = "regbuf")]
+static GRANT_LINKS: Mutex<DomainLinks<(super::regbuf::DmaLink, super::regbuf::DmaRecord)>> =
+    Mutex::new(DomainLinks::new());
+
+/// The domain with handle number `id`, if the address space at `owner` has bound it.
+///
+/// # Errors
+///
+/// `ENODEV` when `owner` has not bound it, `EINVAL` when `id` is the attach capability and
+/// `EBADF` when it is not open.
+#[cfg(feature = "regbuf")]
+fn bound_domain(
+    handles: &mut BTreeMap<usize, Handle>,
+    id: usize,
+    owner: *const AddrSpaceWrapper,
+) -> Result<&mut DmaSpace> {
+    match handles.get_mut(&id) {
+        Some(Handle::Domain {
+            space,
+            bound: Some(w),
+        }) if w.strong_count() > 0 && core::ptr::eq(w.as_ptr(), owner) => Ok(space),
+        Some(Handle::Domain { .. }) => Err(Error::new(ENODEV)),
+        Some(Handle::AttachCap) => Err(Error::new(EINVAL)),
+        None => Err(Error::new(EBADF)),
+    }
+}
+
+/// [`Request::MapGrant`]: maps the grant behind the caller's descriptor `grant_fd` into domain
+/// `id`, which the caller must have bound, and returns its IOVA.
+///
+/// # Errors
+///
+/// `ENODEV` when the caller has not bound the domain, `EBADF` and `EINVAL` for a descriptor
+/// that is not an open grant, `ECANCELED` once the grant is revoked, `EINVAL` for a grant that
+/// is not page-aligned, and the errno of a failed mapping ([`dma_errno`]).
+#[cfg(feature = "regbuf")]
+fn map_grant(id: usize, grant_fd: u64, token: &mut CleanLockToken) -> Result<usize> {
+    let addr_space = AddrSpace::current()?;
+    let owner = alloc::sync::Arc::as_ptr(&addr_space);
+    let fd = usize::try_from(grant_fd).map_err(|_| Error::new(EBADF))?;
+    let grant = super::regbuf::DmaGrant::from_fd(fd, token)?;
+    let link = grant.link();
+    let grant_id = grant.id();
+    let record = grant.map(|frames, writable| {
+        let mut handles = HANDLES.lock();
+        let space = bound_domain(&mut handles, id, owner)?;
+        let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+        let attempt = space.map_grant(frames, writable, ticket).map_err(|err| {
+            warn!(
+                "IOMMU: cannot map {grant_id} in domain {}: {err}",
+                space.id()
+            );
+            dma_errno(&err)
+        })?;
+        if let MapAttempt::Mapped(iova) = &attempt {
+            info!(
+                "IOMMU: domain {}: {grant_id} mapped at IOVA {iova:#x} ({} page(s), {})",
+                space.id(),
+                frames.len(),
+                if writable { "read-write" } else { "read-only" }
+            );
+        }
+        let attempt = attempt.map_error(|err| {
+            warn!(
+                "IOMMU: retained failed mapping of {grant_id} in domain {}: {err}",
+                space.id()
+            );
+            dma_errno(&err)
+        });
+        Ok(attempt.map_record(|iova| {
+            let record = super::regbuf::DmaRecord {
+                domain: id,
+                iova,
+                ticket,
+            };
+            GRANT_LINKS.lock().insert(ticket, id, (link, record));
+            record
+        }))
+    })?;
+    usize::try_from(record.iova).map_err(|_| Error::new(EIO))
+}
+
+/// Without registered buffers there are no grants to map.
+#[cfg(not(feature = "regbuf"))]
+fn map_grant(_id: usize, _grant_fd: u64, _token: &mut CleanLockToken) -> Result<usize> {
+    Err(Error::new(EINVAL))
+}
+
+/// [`Request::UnmapGrant`]: takes the grant mapping at `iova` of domain `id` down strictly, and
+/// drops the grant's record of it.
+///
+/// # Errors
+///
+/// `ENODEV` when the caller has not bound the domain, `ENOENT` when no grant is mapped at
+/// `iova`, `EBADF` or `EINVAL` when `id` is not a domain,
+/// and `EIO` when the unmap or its invalidation failed (the frames then stay pinned).
+#[cfg(feature = "regbuf")]
+fn unmap_grant(id: usize, iova: u64) -> Result<()> {
+    let addr_space = AddrSpace::current()?;
+    let ticket = {
+        let mut handles = HANDLES.lock();
+        let space = bound_domain(&mut handles, id, alloc::sync::Arc::as_ptr(&addr_space))?;
+        let ticket = space
+            .unmap_grant(iova, None)
+            .map_err(|err| dma_errno(&err))?;
+        info!(
+            "IOMMU: domain {}: grant mapping at IOVA {iova:#x} unmapped by the driver",
+            space.id()
+        );
+        ticket
+    };
+    // The region's lock comes before the table's, so take the link out and drop the guard
+    // before forgetting the record.
+    let link = GRANT_LINKS.lock().remove(&ticket);
+    if let Some((link, record)) = link {
+        link.forget(record);
+    }
+    Ok(())
+}
+
+/// Without registered buffers no grant is mapped anywhere.
+#[cfg(not(feature = "regbuf"))]
+fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
+    Err(Error::new(ENOENT))
+}
+
+/// Takes down a grant mapping because its grant was revoked or closed: strictly, so when this
+/// returns `Ok` the device's DMA to the IOVA faults. Nothing when the domain has closed (its
+/// mappings went with it) or the driver unmapped it already. Called without the region lock.
+///
+/// # Errors
+///
+/// `EIO` when the unmap or its IOTLB invalidation failed, including later retries of that
+/// failed mapping. The domain retains its pins and IOVA until confirmed domain blocking.
+#[cfg(feature = "regbuf")]
+pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
+    unmap_grant_record(record)?;
+    let _ = GRANT_LINKS.lock().remove(&record.ticket);
+    Ok(())
+}
+
+/// Whether a grant's domain was removed after confirmed device blocking.
+///
+/// Called with the region locked before restoring a failed teardown. The region-before-
+/// handle order serializes this with closure: either its link finds the restored record,
+/// or this check finishes the still-in-flight record after the domain was blocked.
+#[cfg(feature = "regbuf")]
+pub(crate) fn grant_domain_closed(record: super::regbuf::DmaRecord) -> bool {
+    let handles = HANDLES.lock();
+    !handles.contains_key(&record.domain) && !GRANT_LINKS.lock().closed_failed(record.domain)
+}
+
+/// Performs the hardware teardown without forgetting its link on failure.
+#[cfg(feature = "regbuf")]
+fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
+    let mut handles = HANDLES.lock();
+    let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
+        return if GRANT_LINKS.lock().closed_failed(record.domain) {
+            Err(Error::new(EIO))
+        } else {
+            Ok(())
+        };
+    };
+    match space.unmap_grant(record.iova, Some(record.ticket)) {
+        Ok(_) => {
+            info!(
+                "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
+                space.id(),
+                record.iova
+            );
+            Ok(())
+        }
+        Err(DmaError::NoGrantMapping { .. }) => Ok(()),
+        // unmap_grant logged it; the frames stay pinned.
+        Err(_) => Err(Error::new(EIO)),
     }
 }
