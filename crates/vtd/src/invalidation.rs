@@ -27,6 +27,9 @@ use core::fmt;
 
 use crate::regs::{Capability, ccmd, iotlb};
 use crate::table::ADDR_MASK;
+use ferric_iommu::ring::Ring;
+/// The slots [`Queue::reserve`] handed out, in order.
+pub use ferric_iommu::ring::Slots;
 
 /// One cache invalidation, as either interface can issue it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,7 +287,7 @@ impl Descriptor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Queue {
     size: QueueSize,
-    tail: u32,
+    ring: Ring,
 }
 
 /// The queue size field (IQA.QS, bits 2:0): the queue is `2^QS` 4 KiB pages, holding
@@ -337,7 +340,12 @@ impl Queue {
     /// An empty queue of `size`. Hardware resets IQH to 0 when queued invalidation is enabled,
     /// and software writes IQT as 0 before enabling it ([`Queue::tail_register`]).
     pub const fn new(size: QueueSize) -> Self {
-        Self { size, tail: 0 }
+        let ring = match Ring::new(size.entries()) {
+            Some(ring) => ring,
+            // `QueueSize` only holds powers of two from 256 up.
+            None => panic!("queue sizes are powers of two"),
+        };
+        Self { size, ring }
     }
 
     /// The queue's size.
@@ -353,12 +361,12 @@ impl Queue {
 
     /// The slot the next descriptor goes in.
     pub const fn tail(&self) -> u32 {
-        self.tail
+        self.ring.tail()
     }
 
     /// The IQT value: the tail slot in bits 18:4.
     pub const fn tail_register(&self) -> u64 {
-        (self.tail as u64) << 4
+        (self.ring.tail() as u64) << 4
     }
 
     /// The head slot from an IQH value: bits 18:4.
@@ -368,13 +376,12 @@ impl Queue {
 
     /// How many descriptors can be added while hardware's head is at `iqh`.
     pub const fn free_slots(&self, iqh: u64) -> u32 {
-        let n = self.size.entries();
-        (self.head(iqh) + n - self.tail - 1) % n
+        self.ring.free_slots(self.head(iqh))
     }
 
     /// Whether hardware has processed every descriptor written so far.
     pub const fn is_drained(&self, iqh: u64) -> bool {
-        self.head(iqh) == self.tail
+        self.ring.is_drained(self.head(iqh))
     }
 
     /// Reserves `count` slots for a batch, moving the tail past them, and returns the slots in
@@ -397,51 +404,13 @@ impl Queue {
     /// # Ok::<(), ferric_vtd::invalidation::QueueFull>(())
     /// ```
     pub fn reserve(&mut self, iqh: u64, count: u32) -> Result<Slots, QueueFull> {
-        let free = self.free_slots(iqh);
-        if count > free {
-            return Err(QueueFull {
-                needed: count,
-                free,
-            });
-        }
-        let first = self.tail;
-        let entries = self.size.entries();
-        self.tail = (self.tail + count) % entries;
-        Ok(Slots {
-            next: first,
-            left: count,
-            entries,
+        let head = self.head(iqh);
+        self.ring.reserve(head, count).map_err(|full| QueueFull {
+            needed: full.needed,
+            free: full.free,
         })
     }
 }
-
-/// The slots [`Queue::reserve`] handed out, in order.
-#[derive(Clone, Debug)]
-pub struct Slots {
-    next: u32,
-    left: u32,
-    entries: u32,
-}
-
-impl Iterator for Slots {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<u32> {
-        if self.left == 0 {
-            return None;
-        }
-        let slot = self.next;
-        self.next = (self.next + 1) % self.entries;
-        self.left -= 1;
-        Some(slot)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left as usize, Some(self.left as usize))
-    }
-}
-
-impl ExactSizeIterator for Slots {}
 
 /// An invalidation queue error reported in the fault status register (10.4.9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

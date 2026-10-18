@@ -206,7 +206,7 @@ pub fn domain_layout(
         any = true;
         sagaw &= cap.supported_agaws();
         mgaw = mgaw.min(cap.max_guest_address_width());
-        large_pages = large_pages.min(LargePages::from_capability(cap));
+        large_pages = large_pages.min(crate::table::large_pages(cap));
         domain_id_limit = domain_id_limit.min(cap.domain_count());
         flush_cpu_caches |= !ecap.coherent();
     }

@@ -347,8 +347,13 @@ pub fn alloc_msi(
     if kernel_vector(vector) {
         return Err(IrqError::Vector { vector });
     }
-    // Without a unit for the device the answer is ENODEV, whatever the CPU.
-    let index = domain::unit_index(device).map_err(IrqError::Unit)?;
+    // Without a VT-d unit for the device the answer is ENODEV, whatever the CPU. AMD-Vi units
+    // do not remap interrupts yet, so on them pcid gets ENODEV too and programs a
+    // compatibility-format message, which they pass through unchanged.
+    let index = domain::vtd_unit_index(device).map_err(|err| match err {
+        DomainError::NotEnabled => IrqError::NotEnabled,
+        err => IrqError::Unit(err),
+    })?;
     let apic_id = apic_id(cpu)?;
     let entry = alloc_entry(index, source, apic_id, vector)?;
     let in_use = in_use();

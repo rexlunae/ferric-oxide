@@ -327,22 +327,23 @@ make_append = { FERRIC_KERNEL_LINK_ARGS = "--emit-relocs", FERRIC_BOOTLOADER_FEA
 id = "kernel.iommu"
 menu = "kernel"
 type = "choice"
-title = "IOMMU DMA and interrupt remapping (Intel VT-d)"
+title = "IOMMU DMA and interrupt remapping (Intel VT-d, AMD-Vi)"
 default = "never"
 depends = "target.arch == 'x86_64'"
 kernel_config = "arch.x86_64.iommu"
 rebuild = ["kernel"]
 help = """
-Turn on the Intel VT-d units the firmware's DMAR table lists. Devices start in
+Turn on the IOMMUs the firmware lists: the Intel VT-d units of the DMAR table,
+or, on machines with an IVRS table instead, the AMD-Vi units. Devices start in
 one identity domain, so DMA addresses do not change and drivers work as before,
 but translation, invalidation and fault reporting run on the hardware; DMA
-faults are logged on the console. Firmware's reserved memory regions (RMRRs)
-stay mapped. Units with queued invalidation use it. "auto" enables every unit
+faults are logged on the console. Firmware's reserved memory regions (RMRRs, or
+IVMDs on AMD-Vi) stay mapped. VT-d units with queued invalidation use it. "auto" enables every unit
 that the kernel can drive and logs why it skips the others; "never" leaves
-VT-d off, as upstream does. "auto" and "enforce" also run a short boot
+the IOMMU off, as upstream does. "auto" and "enforce" also run a short boot
 self-test of DMA domains and provide the kernel.iommu scheme: pcid uses it to
 give each PCI driver a DMA domain of its own with the driver's device, its
-requester-ID aliases and its RMRRs in it, and every driver started through
+requester-ID aliases and its reserved memory in it, and every driver started through
 pcid_interface binds it before its first DMA allocation (a driver of several
 functions keeps one domain). Once bound, memory:translation answers with
 addresses in it: each buffer is pinned and mapped on its first translation,
@@ -353,14 +354,15 @@ domain with a device attached before memory:translation answers at all (EACCES
 otherwise; a forked child starts unbound), and devices that no driver attached
 to a domain are blocked rather than identity-mapped. Processes that use DMA
 memory without a PCI device (lived, nbdd and usbscsid ring buffers) cannot get
-DMA addresses under "enforce". On units with interrupt remapping (and queued
+DMA addresses under "enforce". On VT-d units with interrupt remapping (and queued
 invalidation), "auto" and "enforce" also remap interrupts: each unit gets a
 4096-entry table (32-bit x2APIC destinations when the kernel uses x2APIC),
 pcid asks the kernel for an entry for every MSI and MSI-X vector a driver
 requests, so the entry checks the device's requester ID, and the I/O APIC is
 checked through a remappable entry at boot. Under both, the unit blocks
 compatibility-format interrupts, so a device cannot send an interrupt pcid did
-not set up. AMD-Vi comes later."""
+not set up. AMD-Vi units do not remap interrupts yet: they pass interrupts
+through, and pcid gives drivers compatibility-format MSI messages."""
 choices = ["auto", "enforce", "never"]
 
 [[option]]
