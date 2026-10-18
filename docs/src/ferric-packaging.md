@@ -448,6 +448,19 @@ paths it was given. Files are read only through the verified registry, which
 checks each against its signed length and hash; a file no metadata lists
 cannot be read. Top-level targets win over a delegation for the same path.
 
+The client also refuses a delegation whose name is not a single path
+component, any read that would leave the checkout (including through a
+symbolic link), a metadata length above 16 MiB whatever the signed
+descriptor claims, and a `registry.toml` whose `name` differs from the
+signed root's. It pins the BLAKE3 of the trusted timestamp's signed payload
+in its saved state (`timestamp_payload`), so a timestamp with the trusted
+version but different content is refused as an equivocation, while
+signatures re-made over the same payload are accepted. States saved before
+this pin hold a whole-file hash under `timestamp_file`; it is ignored, and
+the next successful update replaces it. A package file supplied by its
+delegation must list as owners exactly the delegation's keys, so tag
+authority cannot drift from update authority.
+
 ### Running a registry
 
 ```sh
@@ -467,7 +480,12 @@ content changed a new version and expiry, and signs with whichever `--key`
 files the role lists. A version nobody has signed yet is updated in place.
 A role that has used up half its lifetime is renewed when its key is given,
 so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
-fresh. `sign --complete` fails if any file is short of its threshold, which
+fresh. A role is only renewed when the given keys can sign the replacement
+to its threshold, so a scheduled run holding one of two keys leaves the
+still-valid metadata in place. For a new root, completeness counts both the
+previous and the new root keys, and a root that is not yet complete is
+amended by `set-role` rather than followed by another version.
+`sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the
 snapshot key, and CI adds snapshot and timestamp after the merge.
 

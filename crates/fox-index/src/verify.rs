@@ -208,7 +208,15 @@ pub struct ClientState {
     /// different content is refused instead of accepted as fresh. Re-made
     /// signatures over unchanged payload bytes are not an equivocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp_file: Option<FileMeta>,
+    pub timestamp_payload: Option<FileMeta>,
+    /// What states saved before the payload pin kept under
+    /// `timestamp_file`: the hash of the whole timestamp file, signatures
+    /// included. It is a different byte sequence from the payload, so it
+    /// is read (to accept those states) but never compared, and the
+    /// timestamp counts as unpinned until the next successful update
+    /// replaces it with `timestamp_payload`. Rollback checks still apply.
+    #[serde(default, rename = "timestamp_file", skip_serializing)]
+    legacy_timestamp_file: Option<FileMeta>,
 }
 
 impl ClientState {
@@ -226,7 +234,8 @@ impl ClientState {
             timestamp: 0,
             snapshot: 0,
             meta: BTreeMap::new(),
-            timestamp_file: None,
+            timestamp_payload: None,
+            legacy_timestamp_file: None,
         })
     }
 
@@ -286,7 +295,7 @@ pub fn update(
     // version, for example when the timestamp key rotates.
     let timestamp_payload = signed_meta(&timestamp, TIMESTAMP_FILE)?;
     if timestamp.signed.version == state.timestamp
-        && let Some(trusted) = state.timestamp_file
+        && let Some(trusted) = state.timestamp_payload
         && trusted != timestamp_payload
     {
         return Err(VerifyError::Equivocation {
@@ -323,7 +332,8 @@ pub fn update(
             .iter()
             .map(|(file, meta)| (file.clone(), meta.version))
             .collect(),
-        timestamp_file: Some(timestamp_payload),
+        timestamp_payload: Some(timestamp_payload),
+        legacy_timestamp_file: None,
     };
     Ok(registry)
 }
