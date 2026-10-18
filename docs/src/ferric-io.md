@@ -147,21 +147,22 @@ domain, grant mapping fails with `ENODEV`; the
 interface never hands out physical addresses of another process's buffer as
 a fallback. Drivers needing a fallback must manage their own bounce buffers.
 
-Domain closure removes its handle and drops the DMA-space object outside the
-handle lock, blocking devices and retiring mappings through that object's
-destructor. Grant links are tracked separately in the scheme; there is no
-per-domain link-retirement registry in this revision. Closing a domain does
-not proactively reconcile all of its grant records or release a closed region
-that was waiting on those records.
+Domain closure blocks its devices before removing the handle and records
+whether that blocking succeeded. On success, it retires the domain's grant
+links and completes their matching region records, including restored records
+on closed grants. Closed regions release their frames and pin charges when
+the last mapping completes. Region records are reconciled outside the handle
+lock to preserve the region-before-handle lock order.
 
 Failed DMA-grant unmapping retains its mapping record, grant link, frame
 references and allocated IOVA. Once hardware unmapping fails, later attempts
 return `EIO` rather than treating cleared page-table entries as proof of
 completed invalidation. Resources are retired only after confirmed unmapping
-or a safely blocked domain. An absent domain handle is still treated as
-already closed without preserving the hardware-close result; that
-domain-close limitation is separate from failed-unmap bookkeeping. See
-`scheme/iommu.rs` and `arch/x86_64/iommu/dma.rs` in the kernel.
+or a safely blocked domain. If device blocking fails during domain close,
+its failure marker remains after handle removal: later revocation returns
+`EIO`, and the grant records and pinned frames remain retained. Concurrent
+close and revocation retire a mapping only once. See `scheme/iommu.rs` and
+`arch/x86_64/iommu/dma.rs` in the kernel.
 
 These are available primitives and tested integration paths. They do not
 automatically make the filesystem, network stack or all drivers use an
