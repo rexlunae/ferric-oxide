@@ -31,8 +31,10 @@
 //!   table says the grant is settled.
 //! - An unmap that fails leaves the mapping recorded on its revoked or closed grant, so it stays
 //!   blocked from new mappings and the next `Revoke` retries it; the call reports `EIO`.
-//! - A closed region keeps its frames until its last teardown finishes, and a registration that
-//!   loses the race with the close fails and refunds its own charge.
+//! - A closed region keeps its frames, and their charge, until nothing maps them: its last
+//!   teardown has finished and no failed one left a mapping recorded. A closed region with such
+//!   a mapping goes on [`STUCK`] and is retried on the scheme's next close or `Revoke`. A
+//!   registration that loses the race with the close fails and refunds its own charge.
 //!
 //! The grant table and budget logic is the host-tested `ferric-regbuf` crate (`crates/regbuf`),
 //! which also has the call encoding clients use.
@@ -92,10 +94,11 @@ struct Region {
 }
 
 impl Region {
-    /// The frames to unpin and the user to refund, once the region has closed and no teardown
-    /// is in flight; nothing before, and nothing the second time.
+    /// The frames to unpin and the user to refund, once the region has closed and nothing maps
+    /// them (no teardown in flight, no failed one left a mapping); nothing before, and nothing
+    /// the second time.
     fn release(&mut self) -> Option<(Vec<RaiiFrame>, u32)> {
-        (self.grants.is_closed() && self.grants.idle() && !self.frames.is_empty())
+        (self.grants.is_closed() && self.grants.drained() && !self.frames.is_empty())
             .then(|| (core::mem::take(&mut self.frames), self.uid))
     }
 }
@@ -130,6 +133,11 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(ROOT + 1);
 
 /// Pinned pages by user ID.
 static BUDGET: Mutex<Budget> = Mutex::new(Budget::new());
+
+/// Closed regions a failed unmap left with a mapping, so with their frames still pinned and
+/// charged. Nobody holds a descriptor to them any more, so [`retry_stuck`] tries again on the
+/// scheme's next close or `Revoke`.
+static STUCK: Mutex<Vec<Arc<Mutex<Region>>>> = Mutex::new(Vec::new());
 
 /// Notified whenever teardowns finish, for `Revoke`s waiting on another thread's teardown of
 /// their grant. One for every region: waiters check their own grant again when woken.
@@ -204,7 +212,7 @@ fn unmap_one(mapping: &Mapping, token: &mut CleanLockToken) -> Result<()> {
 /// is recorded on its grant again, which is revoked or closed and so stays blocked, for the
 /// next `Revoke` to retry.
 fn take_down(
-    region: &Mutex<Region>,
+    region: &Arc<Mutex<Region>>,
     taken: Vec<Taken<Mapping>>,
     token: &mut CleanLockToken,
 ) -> Result<()> {
@@ -216,7 +224,7 @@ fn take_down(
         })
         .collect();
     let mut failed = None;
-    let released = {
+    let (released, stuck) = {
         let mut region = region.lock();
         for (taken, outcome) in outcomes {
             match outcome {
@@ -227,8 +235,15 @@ fn take_down(
                 }
             }
         }
-        region.release()
+        let stuck = failed.is_some() && region.grants.is_closed() && !region.grants.drained();
+        (region.release(), stuck)
     };
+    if stuck {
+        let mut list = STUCK.lock();
+        if !list.iter().any(|r| Arc::ptr_eq(r, region)) {
+            list.push(Arc::clone(region));
+        }
+    }
     TEARDOWN.notify(token);
     if let Some(released) = released {
         unpin(released);
@@ -285,6 +300,7 @@ impl KernelScheme for RegBufScheme {
     }
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        retry_stuck(token);
         let handle = HANDLES.lock().remove(&id);
         match handle {
             Some(Handle::Region(region)) => close_region(&region, token),
@@ -312,7 +328,10 @@ impl KernelScheme for RegBufScheme {
             (Request::Register { addr, len }, Handle::Region(region)) => {
                 register(&region, addr, len, token)
             }
-            (Request::Revoke(id), Handle::Region(region)) => revoke(&region, id, token),
+            (Request::Revoke(id), Handle::Region(region)) => {
+                retry_stuck(token);
+                revoke(&region, id, token)
+            }
             (Request::Info, Handle::Grant { region, id }) => {
                 let info = region
                     .lock()
@@ -388,6 +407,17 @@ impl KernelScheme for RegBufScheme {
     }
 }
 
+/// Tries the teardowns of every region on [`STUCK`] again; those that fail again go back on it.
+fn retry_stuck(token: &mut CleanLockToken) {
+    let stuck = core::mem::take(&mut *STUCK.lock());
+    for region in stuck {
+        let gone = region.lock().grants.close();
+        if take_down(&region, gone, token).is_err() {
+            warn!("regbuf: a closed region still cannot unmap a grant mapping");
+        }
+    }
+}
+
 /// Closes `region`: revokes every grant, unmaps their mappings, and unpins and refunds its
 /// frames, now or, when another thread is still tearing down a mapping of it, when that
 /// finishes.
@@ -395,7 +425,7 @@ impl KernelScheme for RegBufScheme {
 /// # Errors
 ///
 /// `EIO` when a mapping could not be unmapped; it stays recorded on its revoked grant.
-fn close_region(region: &Mutex<Region>, token: &mut CleanLockToken) -> Result<()> {
+fn close_region(region: &Arc<Mutex<Region>>, token: &mut CleanLockToken) -> Result<()> {
     let gone = region.lock().grants.close();
     take_down(region, gone, token)
 }
@@ -407,7 +437,7 @@ fn close_region(region: &Mutex<Region>, token: &mut CleanLockToken) -> Result<()
 /// `ENOENT` for a grant never made from the region, `EIO` when a mapping could not be unmapped
 /// (it stays recorded, and blocked, for another `Revoke` to retry), and `EINTR` when a signal
 /// interrupts the wait for another thread's teardown of the grant (`Revoke` again to wait on).
-fn revoke(region: &Mutex<Region>, id: GrantId, token: &mut CleanLockToken) -> Result<usize> {
+fn revoke(region: &Arc<Mutex<Region>>, id: GrantId, token: &mut CleanLockToken) -> Result<usize> {
     loop {
         let gone = region
             .lock()
@@ -587,7 +617,7 @@ fn map_frames(
 
 /// [`Request::Unmap`]: drops the caller's mapping of grant `id` that starts at `addr`.
 fn unmap(
-    region: &Mutex<Region>,
+    region: &Arc<Mutex<Region>>,
     id: GrantId,
     addr: u64,
     token: &mut CleanLockToken,
