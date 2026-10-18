@@ -489,7 +489,9 @@ to its threshold, so a scheduled run holding one of two keys leaves the
 still-valid metadata in place. A new root is complete only when its own
 root keys meet their threshold and, separately, the previous root's root
 keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
-amended by `set-role` rather than followed by another version.
+amended by `set-role` rather than followed by another version. Amending it
+drops every signature it already has, by old and new root keys alike, so
+each key set has to approve the content it actually signs.
 `sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the
 snapshot key, and CI adds snapshot and timestamp after the merge.
@@ -546,7 +548,8 @@ up) to `tree.new/`. Once that verifies, it writes the new state to
 place, and then renames `state.json.new` over `state.json`, the commit
 point. A failure, or an interruption found by the next open, before the
 commit puts the old tree back and drops the new state; after it, only
-`tree.old/` is removed. So the checkout and its state always stay a
+`tree.old/` is removed, and failing to remove it is a warning, not a
+failed update (the next open or update tries again). So the checkout and its state always stay a
 verified pair, and a failed update keeps the last good checkout and the
 rollback protection.
 
