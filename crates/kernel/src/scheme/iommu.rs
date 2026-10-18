@@ -149,6 +149,8 @@ fn dma_errno(err: &DmaError) -> Error {
         DmaError::NoGrantMapping { .. } => Error::new(ENOENT),
         #[cfg(feature = "regbuf")]
         DmaError::GrantSize => Error::new(EINVAL),
+        #[cfg(feature = "regbuf")]
+        DmaError::FailedUnmap { .. } => Error::new(EIO),
     }
 }
 
@@ -794,13 +796,18 @@ fn unmap_grant(_id: usize, _iova: u64) -> Result<()> {
 ///
 /// # Errors
 ///
-/// `EIO` when the unmap or its IOTLB invalidation failed. The domain has forgotten the
-/// mapping then (a retry could not unmap it again), but its frames stay pinned for good, so
-/// the device can reach nothing but the application's own buffer.
+/// `EIO` when the unmap or its IOTLB invalidation failed, including later retries of that
+/// failed mapping. The domain retains its pins and IOVA until confirmed domain blocking.
 #[cfg(feature = "regbuf")]
 pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
-    // Dropped at once: the guard must not be held with the handle table.
+    unmap_grant_record(record)?;
     let _ = GRANT_LINKS.lock().remove(&record.ticket);
+    Ok(())
+}
+
+/// Performs the hardware teardown without forgetting its link on failure.
+#[cfg(feature = "regbuf")]
+fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
     let mut handles = HANDLES.lock();
     let Some(Handle::Domain { space, .. }) = handles.get_mut(&record.domain) else {
         return if GRANT_LINKS.lock().closed_failed(record.domain) {
