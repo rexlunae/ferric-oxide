@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use ferric_trace_cli::capture::Capture;
+use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::{drain, perfetto, text};
 
 #[derive(Parser)]
@@ -90,7 +90,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Cmd::Text { inputs, partial } => {
-            let capture = load(&inputs, partial)?;
+            let capture = loader(partial)(&inputs)?;
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
             text::write(&capture, &mut out)
@@ -106,7 +106,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             output,
             tsc_mhz,
         } => {
-            let capture = load(&inputs, partial)?;
+            let capture = loader(partial)(&inputs)?;
             let json = perfetto::to_json(&capture, tsc_mhz);
             match output {
                 Some(path) => {
@@ -123,13 +123,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-/// Loads `inputs`, accepting a partial capture when `partial` is set.
-fn load(inputs: &[PathBuf], partial: bool) -> Result<Capture, CliError> {
-    Ok(if partial {
-        Capture::load_partial(inputs)?
+/// The capture loader the `--partial` flag picks.
+fn loader(partial: bool) -> fn(&[PathBuf]) -> Result<Capture, CaptureError> {
+    if partial {
+        Capture::load_partial
     } else {
-        Capture::load(inputs)?
-    })
+        Capture::load
+    }
 }
 
 fn main() -> ExitCode {

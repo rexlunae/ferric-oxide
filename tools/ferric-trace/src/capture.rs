@@ -81,6 +81,16 @@ pub enum CaptureError {
     },
 }
 
+/// How strictly a capture is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeMode {
+    /// Every file must be whole records, and a capture marked [`INCOMPLETE`] is refused.
+    Strict,
+    /// A capture marked [`INCOMPLETE`] is read, and a record cut off at the end of a file is
+    /// dropped.
+    Partial,
+}
+
 /// The file `ferric-trace capture` writes into a capture directory before draining and removes
 /// once the capture is complete.
 pub const INCOMPLETE: &str = "INCOMPLETE";
@@ -121,7 +131,7 @@ impl CpuCapture {
     /// [`CaptureError::UnknownEvent`] for an event the kernel catalog does not have, and
     /// [`CaptureError::ArgCount`] for a record with more or fewer arguments than its event.
     pub fn decode(cpu: u32, bytes: &[u8]) -> Result<Self, CaptureError> {
-        Self::decode_inner(cpu, bytes, false)
+        Self::decode_inner(cpu, bytes, DecodeMode::Strict)
     }
 
     /// Decodes like [`CpuCapture::decode`], but for a partial capture: a last record cut off
@@ -132,16 +142,16 @@ impl CpuCapture {
     ///
     /// Those of [`CpuCapture::decode`], except a truncated last record.
     pub fn decode_partial(cpu: u32, bytes: &[u8]) -> Result<Self, CaptureError> {
-        Self::decode_inner(cpu, bytes, true)
+        Self::decode_inner(cpu, bytes, DecodeMode::Partial)
     }
 
-    fn decode_inner(cpu: u32, bytes: &[u8], partial: bool) -> Result<Self, CaptureError> {
+    fn decode_inner(cpu: u32, bytes: &[u8], mode: DecodeMode) -> Result<Self, CaptureError> {
         let mut entries = Vec::new();
         for (index, record) in Records::new(bytes).enumerate() {
             let record = match record {
                 Ok(record) => record,
                 // Only the end of the bytes can cut a record short, so nothing follows it.
-                Err(DecodeError::Truncated { .. }) if partial => break,
+                Err(DecodeError::Truncated { .. }) if mode == DecodeMode::Partial => break,
                 Err(source) => return Err(CaptureError::Decode { cpu, index, source }),
             };
             let event = CATALOG
@@ -211,7 +221,7 @@ impl Capture {
     /// files were found, [`CaptureError::Incomplete`] for a directory (or a file in one) that a
     /// failed capture left, and the errors of [`CpuCapture::decode`].
     pub fn load(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
-        Self::load_inner(inputs, false)
+        Self::load_inner(inputs, DecodeMode::Strict)
     }
 
     /// Loads like [`Capture::load`], but also reads a partial capture (one marked
@@ -223,10 +233,10 @@ impl Capture {
     /// Those of [`Capture::load`] except [`CaptureError::Incomplete`] and a truncated last
     /// record.
     pub fn load_partial(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
-        Self::load_inner(inputs, true)
+        Self::load_inner(inputs, DecodeMode::Partial)
     }
 
-    fn load_inner(inputs: &[PathBuf], partial: bool) -> Result<Self, CaptureError> {
+    fn load_inner(inputs: &[PathBuf], mode: DecodeMode) -> Result<Self, CaptureError> {
         let mut files = Vec::new();
         for input in inputs {
             let meta = fs::metadata(input).map_err(|source| CaptureError::Io {
@@ -238,7 +248,9 @@ impl Capture {
             } else {
                 input.parent()
             };
-            if let Some(dir) = dir.filter(|d| !partial && d.join(INCOMPLETE).exists()) {
+            if let Some(dir) =
+                dir.filter(|d| mode == DecodeMode::Strict && d.join(INCOMPLETE).exists())
+            {
                 return Err(CaptureError::Incomplete {
                     path: dir.to_owned(),
                 });
@@ -263,11 +275,7 @@ impl Capture {
             .into_iter()
             .map(|(cpu, path)| {
                 let bytes = fs::read(&path).map_err(|source| CaptureError::Io { path, source })?;
-                if partial {
-                    CpuCapture::decode_partial(cpu, &bytes)
-                } else {
-                    CpuCapture::decode(cpu, &bytes)
-                }
+                CpuCapture::decode_inner(cpu, &bytes, mode)
             })
             .collect::<Result<_, _>>()?;
         Ok(Self::from_cpus(cpus))
