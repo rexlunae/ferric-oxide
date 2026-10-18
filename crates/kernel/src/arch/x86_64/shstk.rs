@@ -579,10 +579,13 @@ mod stacks {
     pub(super) fn check_pool() {
         // A key within the boot reservation can never belong to a real kernel stack, which is
         // allocated from the ordinary frame allocator. Its window slot is exclusively ours.
-        let key = private_frames::pool_region()
-            .range()
-            .start
-            .next_multiple_of(1 << KSTACK_SHIFT);
+        let Some(key) = private_frames::pool_region().isolated_key(window()) else {
+            // RAM can exceed the supported window while the auto policy leaves CET off. The
+            // boot mapping checks still cover the reservation; a window probe must not abort
+            // that fallback boot when no reserved key fits.
+            info!("CET: pool isolation window probe skipped (no reserved key fits the window)");
+            return;
+        };
         for _ in 0..2 {
             let stack = ShadowStack::allocate(PhysicalAddress::new(key as usize))
                 .unwrap_or_else(|err| panic!("CET: pool isolation self-test allocation: {err}"));

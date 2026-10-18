@@ -113,6 +113,9 @@ changing the entries. Its narrowly scoped fault recovery restarts the same
 `rep stosq` with zero count, preserving the return RIP and CET shadow frame.
 It checks clearing and reuse before enable, and repeats with real `WRSS` after
 the BSP enables CET. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
+If no complete reserved key fits the supported window, it retains the boot
+mapping checks and explicitly skips the window-dependent probe. This preserves
+the CET-disabled `auto` boot when the pool is above the 1 TiB window limit.
 
 CI checks IBT and shadow-stack binary sequences and runs the pool isolation
 self-test even on CPUs without CET. Those boots do not validate CET enforcement.

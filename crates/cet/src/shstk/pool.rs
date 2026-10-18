@@ -59,6 +59,21 @@ impl PoolRegion {
         self.base..self.end
     }
 
+    /// Selects a window key whose entire physical key block is owned by this reservation.
+    ///
+    /// Such a key cannot belong to an ordinary kernel-stack allocation, so the kernel can use
+    /// its window slot for an isolation probe. Returns `None` if the pool has no complete key
+    /// block in the window, or if the window's layout overflows.
+    pub fn isolated_key(self, window: super::SlotWindow) -> Option<u64> {
+        let key_size = 1u64.checked_shl(window.key_shift)?;
+        let key = self.base.checked_next_multiple_of(key_size)?;
+        if key.checked_add(key_size)? > self.end {
+            return None;
+        }
+        window.slot_top(key).ok()?;
+        Some(key)
+    }
+
     /// Portions of `area` outside the reservation, in address order (possibly empty).
     ///
     /// The kernel uses these exact ranges when choosing ordinary and huge physmap pages, so
@@ -186,6 +201,41 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn isolation_probe_key_must_fit_both_pool_and_window() {
+        let limit = 1u64 << 40;
+        let window = super::super::SlotWindow {
+            base: 0xFFFF_FF80_0000_0000,
+            len: 1 << 38,
+            key_shift: 16,
+            slot_shift: 14,
+        };
+        let low = StackPool::new(0x1000).unwrap().region();
+        assert_eq!(low.isolated_key(window), Some(0x1_0000));
+        let last = StackPool::new(limit - 0x1_0000).unwrap().region();
+        assert_eq!(last.isolated_key(window), Some(limit - 0x1_0000));
+        for base in [limit - 4096, limit, limit + 0x1000_0000] {
+            assert_eq!(
+                StackPool::new(base).unwrap().region().isolated_key(window),
+                None
+            );
+        }
+        assert_eq!(
+            low.isolated_key(super::super::SlotWindow {
+                key_shift: 64,
+                ..window
+            }),
+            None
+        );
+        assert_eq!(
+            low.isolated_key(super::super::SlotWindow {
+                base: u64::MAX - 4095,
+                ..window
+            }),
+            None
+        );
+    }
 
     #[test]
     fn exhaustion_never_falls_back_and_release_reuses_only_its_slot() {
