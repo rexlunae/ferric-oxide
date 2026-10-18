@@ -15,7 +15,8 @@ developed through libraries and ports; it does not make this a Linux kernel.
 | `tools/ferric-config/` | Feature selection and build configuration generation |
 | `tools/installer/` | Image configuration parsing and installation; shared by host tooling and the target installer recipe |
 | `tools/redoxer/` | Component execution/build support in a Redox environment; its example is standalone |
-| `tools/fox/` | Local package verification, installation and SBOM command |
+| `tools/fox/` | Local package verification (including build attestations), installation and SBOM command |
+| `tools/cargo-fox/` | `cargo fox`: hermetic package builds, signed archives and attestations for package authors |
 | `crates/kernel/` | Independent `no_std` kernel workspace, custom target specifications, linker scripts and its own lockfile |
 | `crates/bootloader/` | Standalone bootloader, including the UEFI target and optional kernel relocation |
 | `crates/relibc/` | C/POSIX library and `redox-rt` process/thread runtime, with its own workspace |
@@ -122,10 +123,12 @@ cannot be treated as ordinary private frames to copy.
 | `crates/iommu/` | DMA ABI, PCI requester aliases, shared table/ring logic, IOVA allocation and DMA lifecycle bookkeeping |
 | `crates/vtd/`, `crates/amdvi/` | Vendor-specific ACPI parsing, table/register formats and invalidation encodings |
 | `crates/fox-core/` | Package identity, manifests, trust and signed archive verification |
-| `crates/fox-store/`, `crates/fox-sbom/` | Installed package state and reproducible CycloneDX output |
+| `crates/fox-store/`, `crates/fox-sbom/` | Installed package state and reproducible CycloneDX output, including build SBOMs |
+| `crates/fox-git/`, `crates/fox-build/` | Git commits, `fox-tree/1` BLAKE3 tree hashes and exports; the hermetic Cargo build, packing and attestation pipeline |
 
 The low-level protection and I/O crates are `no_std`; optional `alloc` layers
 hold bookkeeping that needs allocation. `fox-core` is `no_std` with `alloc`,
-with filesystem access behind `std`; the store and SBOM layers use `std`.
+with filesystem access behind `std`; the store, SBOM, git and build layers use
+`std`.
 Hardware access stays in kernel integration modules while portable rules can
 be exercised on the host.
