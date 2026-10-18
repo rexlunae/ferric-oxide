@@ -276,3 +276,62 @@ fn installs_prebuilt_artifacts_attested_by_enough_builders() {
     .unwrap();
     fails_with(&env.fox(&["install", "tiny"]), "never to build");
 }
+
+#[test]
+fn audit_reports_advised_packages_and_system_sboms_list_them() {
+    let env = Env::new();
+    tag(env.src.path(), "v0.3.0", OWNER);
+    let reg = Reg::new(env.src.path());
+    let advisory = fox_index::advisory::Advisory::parse(
+        "[advisory]\nid = \"FOX-2026-0001\"\npackage = \"tiny\"\ndate = \"2026-10-01\"\n\
+         title = \"tiny is too small\"\n\n[versions]\npatched = [\">= 0.3.1\"]\n",
+    )
+    .unwrap();
+    Registry::open(reg.dir.path())
+        .unwrap()
+        .write_advisory(&advisory)
+        .unwrap();
+    reg.sign_and_commit();
+    add_registry(&env, &reg);
+
+    // Nothing installed, nothing found.
+    let clean = env.fox(&["audit"]);
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    let install = env.fox(&["--json", "install", "tiny"]);
+    assert!(
+        stderr(&install).contains("affected by FOX-2026-0001"),
+        "{}",
+        stderr(&install)
+    );
+    assert_eq!(json(&install)[0]["version"], "0.3.0");
+
+    let audit = env.fox(&["--json", "audit"]);
+    assert!(!audit.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(report["findings"][0]["advisory"], "FOX-2026-0001");
+    assert_eq!(report["findings"][0]["source"], "test");
+    assert_eq!(report["findings"][0]["patched"][0], ">=0.3.1");
+    assert_eq!(report["advisories"], 1);
+
+    let sbom = json(&env.fox(&["sbom", "--system", "--name", "test-image"]));
+    assert_eq!(sbom["metadata"]["component"]["name"], "test-image");
+    let tiny = &sbom["components"][0];
+    assert_eq!(tiny["name"], "tiny");
+    assert_eq!(tiny["purl"], "pkg:generic/tiny@0.3.0");
+    let nested = tiny["components"].as_array().unwrap();
+    assert!(nested.iter().any(|c| c["type"] == "file"));
+
+    // An SBOM changed after installation is not believed.
+    let path = env.root.path().join("usr/share/fox/sbom/tiny.cdx.json");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push(' ');
+    fs::write(&path, text).unwrap();
+    fails_with(&env.fox(&["sbom", "--system"]), "has changed");
+    fails_with(&env.fox(&["audit"]), "has changed");
+}
+
+#[test]
+fn audit_needs_advisories() {
+    let env = Env::new();
+    fails_with(&env.fox(&["audit"]), "no advisories");
+}

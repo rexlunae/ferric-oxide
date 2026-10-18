@@ -9,6 +9,9 @@
 //!                                       build attestation beside the archive
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
+//! fox sbom --system [--name <name>]     CycloneDX JSON for the whole root
+//! fox audit [--rustsec <dir>]           installed packages and crates that
+//!                                       an advisory names
 //! fox install [--force] [--allow-unsigned-metadata] [source options]
 //!             <file.pkgar | git-url[#ref] | dir[#ref] | [registry/]name[@req]>...
 //!                                       verify (building git sources from
@@ -57,7 +60,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod audit;
 mod commands;
+mod inventory;
 mod prebuilt;
 mod registry;
 mod source;
@@ -102,10 +107,19 @@ enum Command {
         /// Archives to check, or package names with `--installed`.
         targets: Vec<String>,
     },
-    /// Write a CycloneDX SBOM for an archive.
+    /// Write a CycloneDX SBOM for an archive, or with `--system` for every
+    /// package installed in the root.
     Sbom {
         /// The archive.
-        archive: PathBuf,
+        #[arg(required_unless_present = "system", conflicts_with = "system")]
+        archive: Option<PathBuf>,
+        /// Describe the installed system instead: every package, its files
+        /// and the crates in its build SBOM.
+        #[arg(long)]
+        system: bool,
+        /// The system's name in the SBOM.
+        #[arg(long, requires = "system", default_value = "ferric-oxide")]
+        name: String,
         /// Output format.
         #[arg(long, value_enum, default_value_t = SbomFormat::Cyclonedx)]
         format: SbomFormat,
@@ -174,6 +188,13 @@ enum Command {
     Registry {
         #[command(subcommand)]
         command: RegistryCommand,
+    },
+    /// List installed packages, and crates inside them, that a security
+    /// advisory names; fails if there are any.
+    Audit {
+        /// Also check a checkout of the RustSec advisory database.
+        #[arg(long, value_name = "DIR")]
+        rustsec: Option<PathBuf>,
     },
     /// Search the registries' package names and summaries.
     Search {

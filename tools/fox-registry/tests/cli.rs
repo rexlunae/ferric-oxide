@@ -333,3 +333,40 @@ fn a_builder_records_attested_artifacts() {
     // Nothing is left to build.
     assert!(!env.ok(&build).contains("built"));
 }
+
+#[test]
+fn advisories_are_published_and_signed() {
+    let env = Env::new();
+    let file = env.keys.path().join("advisory.toml");
+    fs::write(
+        &file,
+        "[advisory]\nid = \"FOX-2026-0001\"\npackage = \"tiny\"\ndate = \"2026-10-01\"\n\
+         title = \"tiny is too small\"\n\n[versions]\npatched = [\">= 0.2.0\"]\n",
+    )
+    .unwrap();
+    let out = env.ok(&["advise", file.to_str().unwrap()]);
+    assert!(out.contains("advisories/FOX-2026-0001.toml"), "{out}");
+    assert!(!env.sign(&[&env.key("snapshot"), &env.key("timestamp")]));
+    assert!(env.sign(&[
+        &env.key("targets"),
+        &env.key("snapshot"),
+        &env.key("timestamp")
+    ]));
+    env.ok(&["verify"]);
+    let stored =
+        fs::read_to_string(env.registry.path().join("advisories/FOX-2026-0001.toml")).unwrap();
+    assert!(stored.contains("tiny is too small"));
+
+    fs::write(
+        &file,
+        "[advisory]\nid = \"../escape\"\npackage = \"tiny\"\ndate = \"2026-10-01\"\n",
+    )
+    .unwrap();
+    let output = env.run(&["advise", file.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("may only hold"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -55,7 +55,11 @@ claiming another path, and a key rotation signed by the new keys only.
 the owner-signed tag, from a prebuilt artifact with too few and then enough
 builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
 and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
-registry builder, unlisted and then listed in `registry.toml`. Tests construct real signed pkgar fixtures
+registry builder, unlisted and then listed in `registry.toml`, and publishes
+an advisory. `fox audit` is tested end to end against a registry advisory
+(including the install warning and a changed SBOM), and in unit tests
+against a RustSec-layout directory of advisories for crates inside build
+SBOMs, with withdrawn, build-only and non-semver cases. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no

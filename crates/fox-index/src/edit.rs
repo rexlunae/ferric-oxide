@@ -35,6 +35,7 @@ use semver::Version;
 use serde::Serialize;
 use time::OffsetDateTime;
 
+use crate::advisory::{Advisory, AdvisoryError, advisory_path};
 use crate::layout::{
     ADVISORIES_DIR, ARTIFACTS_DIR, ArtifactList, LayoutError, PACKAGES_DIR, PackageEntry,
     REGISTRY_FILE, RegistryConfig, Release, artifacts_path, package_path,
@@ -221,6 +222,9 @@ pub enum EditError {
         #[source]
         source: Box<LayoutError>,
     },
+    /// An advisory is invalid or cannot be written.
+    #[error("invalid advisory")]
+    Advisory(#[source] Box<AdvisoryError>),
     /// [`Registry::init`] found an existing registry.
     #[error("{} already holds a registry", path.display())]
     Exists {
@@ -634,6 +638,20 @@ impl Registry {
             source: Box::new(source),
         })?;
         write_file(&self.dir.join(&path), text.as_bytes())
+    }
+
+    /// Writes an advisory to `advisories/<id>.toml`, replacing one with
+    /// the same id (to update or withdraw it).
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Advisory`] if its id is unusable or it cannot be
+    /// serialized, and [`EditError::Io`] if it cannot be written.
+    pub fn write_advisory(&self, advisory: &Advisory) -> Result<(), EditError> {
+        let advisory_error = |source| EditError::Advisory(Box::new(source));
+        let path = advisory_path(&advisory.advisory.id).map_err(advisory_error)?;
+        let text = advisory.to_toml().map_err(advisory_error)?;
+        write_file(&self.dir.join(path), text.as_bytes())
     }
 
     /// Starts a new root version that gives `role` these keys, or changes

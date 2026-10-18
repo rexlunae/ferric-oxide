@@ -79,6 +79,10 @@ pub(crate) enum CliError {
     NoTrustedArtifact { name: String, version: String },
     #[error("--prebuilt cannot be combined with registry package names")]
     PrebuiltWithRegistry,
+    #[error(transparent)]
+    Audit(#[from] crate::audit::AuditError),
+    #[error(transparent)]
+    Inventory(#[from] crate::inventory::InventoryError),
     #[error("invalid author key {key:?}")]
     AuthorKey {
         key: String,
@@ -111,9 +115,15 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
         } => verify_archives(cli, targets, *require_attestation),
         Command::Sbom {
             archive,
+            system,
+            name,
             format,
             output,
-        } => sbom(cli, archive, *format, output.as_deref()),
+        } => match archive {
+            Some(archive) if !*system => sbom(cli, archive, *format, output.as_deref()),
+            _ => system_sbom(cli, name, *format, output.as_deref()),
+        },
+        Command::Audit { rustsec } => crate::audit::run(cli, rustsec.as_deref()),
         Command::Install {
             force,
             allow_unsigned_metadata,
@@ -518,6 +528,32 @@ fn sbom(
     sidecar_warning(&archive);
     let sbom = PackageSbom::new(archive.manifest(), archive.blake3(), archive.files())
         .with_signer(archive.head().signer().key);
+    write_sbom(format, output, |mut writer| {
+        sbom.write_cyclonedx_json(&mut writer)
+    })
+}
+
+/// `fox sbom --system`.
+fn system_sbom(
+    cli: &Cli,
+    name: &str,
+    format: SbomFormat,
+    output: Option<&Path>,
+) -> Result<ExitCode, CliError> {
+    let store = Store::open(&cli.root)?;
+    let inventory = crate::inventory::take(&store)?;
+    let sbom = crate::inventory::system_sbom(name, &inventory);
+    write_sbom(format, output, |mut writer| {
+        sbom.write_cyclonedx_json(&mut writer)
+    })
+}
+
+/// Writes an SBOM to `output`, or to standard output with a final newline.
+fn write_sbom(
+    format: SbomFormat,
+    output: Option<&Path>,
+    write: impl Fn(&mut dyn Write) -> Result<(), SbomError>,
+) -> Result<ExitCode, CliError> {
     match format {
         SbomFormat::Cyclonedx => match output {
             Some(out) => {
@@ -525,11 +561,11 @@ fn sbom(
                     path: out.to_path_buf(),
                     source,
                 })?;
-                sbom.write_cyclonedx_json(&mut file)?;
+                write(&mut file)?;
             }
             None => {
                 let mut stdout = io::stdout().lock();
-                sbom.write_cyclonedx_json(&mut stdout)?;
+                write(&mut stdout)?;
                 writeln!(stdout).map_err(|source| CliError::Output {
                     path: PathBuf::from("<stdout>"),
                     source,
@@ -590,6 +626,7 @@ fn from_registry(
             req: spec.req.clone(),
         })?
         .clone();
+    warn_advised(&found, &release.version)?;
     if policy.build != BuildPolicy::Always {
         if let Some(archive) = trusted_prebuilt(&found, &release, args, policy)? {
             return Ok(Pending::Opened(Box::new(archive)));
@@ -604,6 +641,28 @@ fn from_registry(
     let resolved = source::resolve_release(root, &found.entry, &release)?;
     let packaged = source::build(root, &resolved, args, None)?;
     Ok(Pending::Path(packaged.archive))
+}
+
+/// Warns about the registry's active advisories that affect the release
+/// about to be installed; `fox audit` reports them once it is installed.
+fn warn_advised(found: &crate::registry::Found, version: &semver::Version) -> Result<(), CliError> {
+    let advisories = found
+        .verified
+        .advisories()
+        .map_err(crate::registry::verify_error(&found.registry.name))?;
+    for advisory in advisories.iter().filter(|advisory| {
+        let info = &advisory.advisory;
+        advisory.is_active()
+            && info.ecosystem == fox_index::advisory::Ecosystem::Fox
+            && info.package == found.entry.name.as_str()
+            && advisory.affects(version)
+    }) {
+        eprintln!(
+            "fox: warning: {} {version} is affected by {}: {}",
+            found.entry.name, advisory.advisory.id, advisory.advisory.title
+        );
+    }
+    Ok(())
 }
 
 /// The first of the release's artifacts for this target and feature set

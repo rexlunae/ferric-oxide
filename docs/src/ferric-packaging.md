@@ -20,10 +20,10 @@ cookbook and the installer.
 | --- | --- |
 | `crates/fox-core/` | Names, manifests, BLAKE3 digests, trusted Ed25519 keys, signed-head and full archive verification, normalized git URLs and the trust store |
 | `crates/fox-store/` | In-place file installation, ownership checks, installed database and re-verification |
-| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, and build SBOMs with the crate graph |
+| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, build SBOMs with the crate graph, and system SBOMs of a whole root |
 | `crates/fox-git/` | Git through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash, tree export, fetching into a bare cache, and SSH-signed release tags |
 | `crates/fox-build/` | The hermetic Cargo build, staging, pkgar packing and attestation writing |
-| `crates/fox-index/` | The registry layout, `fox-tuf/1` signed metadata, client verification and the maintainer-side editing |
+| `crates/fox-index/` | The registry layout, `fox-tuf/1` signed metadata, client verification, the maintainer-side editing, and RustSec-format advisories |
 | `tools/fox/` | CLI and text/JSON reporting |
 | `tools/cargo-fox/` | `cargo fox build`, `package`, `keygen` and `release` for package authors |
 | `tools/fox-registry/` | `fox-registry` for registry maintainers, package owners and registry CI |
@@ -100,6 +100,8 @@ fox --root ./image-root registry add ferric https://example.com/registry.git \
     --root-blake3 <hash>                                            # see Registries
 fox --root ./image-root search hello
 fox --root ./image-root install hello@^1
+fox --root ./image-root sbom --system --name my-image --output ./image.cdx.json
+fox --root ./image-root audit [--rustsec ./advisory-db]                # see Advisories
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify` also checks
@@ -485,6 +487,7 @@ copy only while signing.
 | `admit <git-url> --name N --owner ID=KEY` | Writes the package file and a delegation to the owners (`--kind`, `--summary`, `--path` optional) |
 | `release <name> <tag>` | Fetches the repository, checks the tag is SSH-signed by an owner and names a version, and records its commit and tree hash |
 | `check [name...]` | What registry CI runs on a pull request: re-checks every recorded release's tag signature, commit and tree hash, and that the owners match the delegation's keys |
+| `advise <file>` | Validates a RustSec-format advisory and stores it as `advisories/<id>.toml`, replacing one with that id (to update or withdraw it); signed by the targets key |
 | `yank <name> <version>` | Marks a release yanked (`--undo` reverses it) |
 | `set-role <role> --key K... [--threshold N]` | Writes a new root that gives the role new keys; clients accept it once the old and the new root keys have signed |
 | `sign [--key F...] [--bump ROLE...] [--complete]` | Updates and signs the metadata |
@@ -559,6 +562,58 @@ The builder threshold is the larger of the policy's and the registry's
 `min-builder-signatures`, and never less than one. `allow-unsigned-git`
 has the effect of `install --allow-unsigned` for git sources.
 
+### Advisories and `fox audit`
+
+A registry's `advisories/<id>.toml` files use the RustSec advisory format
+(the `[advisory]` and `[versions]` tables of the RustSec advisory-db
+`README.md`), with the title and description as fields:
+
+```toml
+[advisory]
+id = "FOX-2026-0001"
+package = "hello"          # a fox package; ecosystem = "crates.io" names a crate
+date = "2026-10-01"
+title = "hello prints its input unescaped"
+aliases = ["CVE-2026-0001"]
+
+[versions]
+patched = [">= 1.2.1"]
+unaffected = ["< 1.0.0"]
+```
+
+A version is affected when it matches none of the `patched` and
+`unaffected` requirements (Cargo requirements); `withdrawn` and
+`informational` advisories are ignored. The targets role signs the
+directory like every other top-level file, and clients read advisories only
+through the verified checkout.
+
+`fox audit` checks what is installed under the root against the advisories
+of every configured registry and, with `--rustsec <dir>`, a checkout of the
+RustSec database (`crates/<crate>/*.md`, Markdown with TOML front matter).
+Package advisories match installed package names and versions; crate
+advisories match the crates listed in each package's build SBOM, so a
+vulnerable crate is reported in every package that links it, marked
+`build only` when it ran only at build time. The SBOM is read from the path
+the package itself installed, and only if it still has the hash recorded at
+install time. `audit` fails when anything matches; `--json` gives the
+findings, the packages whose versions are not semver (`unchecked`) and the
+number of advisories checked. Installing a registry release that an
+advisory affects prints a warning.
+
+### System and image SBOMs
+
+`fox sbom --system [--name N]` writes one CycloneDX 1.5 document for the
+whole root: an operating-system component named `N` (default
+`ferric-oxide`), one application component per installed package with its
+archive hash, signer, target and dependencies, and nested under each
+package its files and the crates from its build SBOM (their `bom-ref`s
+prefixed with `<package>/`). The dependency graph links the system to its
+packages, packages to the installed packages they depend on and to their
+root crates, and keeps each build's crate graph. Like the package SBOM it
+is reproducible. Run against an image root (`--root`), it is that image's
+SBOM; packages adopted from `pkg` have no build SBOM, so they list files but
+no crates.
+
 ## SBOM scope and unfinished packaging work
 
 `fox sbom` output describes the verified package, archive hash, signer,
@@ -566,7 +621,10 @@ source, declared runtime dependencies and individual files/hashes. It is
 reproducible: there is no timestamp, and the serial number derives from the
 archive hash. It is built from the archive's own metadata; the crate graph
 is in the build SBOM that `cargo fox package` packs into archives it builds.
-Reading embedded `cargo auditable` data is not implemented.
+Reading embedded `cargo auditable` data, VEX statements, SPDX export, and
+listing the kernel, bootloader and initfs in the system SBOM are not
+implemented. The image build does not yet write `image.cdx.json` itself;
+that comes with images built through fox.
 
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and

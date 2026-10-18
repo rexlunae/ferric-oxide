@@ -12,6 +12,7 @@
 //!   artifact lists;
 //! - `configure` sets the artifact store and the builders in
 //!   `registry.toml`;
+//! - `advise` publishes or updates a security advisory;
 //! - `yank` marks a release yanked;
 //! - `set-role` rotates a role's keys through a new root;
 //! - `sign` brings the metadata up to date and signs what the given keys
@@ -32,6 +33,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fox_core::{GitUrl, PackageName};
+use fox_index::advisory::Advisory;
 use fox_index::edit::{EditError, Keyring, Registry, SignOptions, SignReport};
 use fox_index::layout::{Builder, Owner, PackageEntry, PackageKind};
 use fox_index::metadata::{RoleKeys, RoleName, Root, Signed};
@@ -150,6 +152,12 @@ enum Command {
         /// How many builders must attest to an artifact.
         #[arg(long)]
         min_builders: Option<u32>,
+    },
+    /// Publish or update a security advisory from a RustSec-style TOML
+    /// file; it is stored as `advisories/<id>.toml`.
+    Advise {
+        /// The advisory file.
+        file: PathBuf,
     },
     /// Mark a release yanked, so new installs skip it.
     Yank {
@@ -277,6 +285,18 @@ enum CliError {
     NoCache,
     #[error(transparent)]
     Ci(Box<ci::CiError>),
+    #[error("cannot read {}", path.display())]
+    AdvisoryFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid advisory {}", path.display())]
+    Advisory {
+        path: PathBuf,
+        #[source]
+        source: fox_index::advisory::AdvisoryError,
+    },
     #[error("--builder {value:?} is not LABEL=KEY")]
     BuilderSyntax { value: String },
     #[error("no builder {label} to remove")]
@@ -382,6 +402,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 min_builders: *min_builders,
             },
         ),
+        Command::Advise { file } => advise(dir, file),
         Command::Release { name, tag, cache } => release(dir, name, tag, cache.as_deref()),
         Command::Check { names, cache } => check(dir, names, cache.as_deref()),
         Command::Yank {
@@ -509,6 +530,22 @@ fn write_templates(dir: &Path) -> Result<(), CliError> {
         std::fs::write(&path, text).map_err(error)?;
     }
     println!("wrote README.md and .github/workflows; add the key secrets the README lists");
+    Ok(())
+}
+
+fn advise(dir: &Path, file: &Path) -> Result<(), CliError> {
+    let text = std::fs::read_to_string(file).map_err(|source| CliError::AdvisoryFile {
+        path: file.to_path_buf(),
+        source,
+    })?;
+    let invalid = |source| CliError::Advisory {
+        path: file.to_path_buf(),
+        source,
+    };
+    let advisory = Advisory::parse(&text).map_err(invalid)?;
+    let path = fox_index::advisory::advisory_path(&advisory.advisory.id).map_err(invalid)?;
+    Registry::open(dir)?.write_advisory(&advisory)?;
+    println!("wrote {path}; run `fox-registry sign` with the targets key");
     Ok(())
 }
 
