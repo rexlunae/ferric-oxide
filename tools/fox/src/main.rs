@@ -10,7 +10,7 @@
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
 //! fox install [--force] [--allow-unsigned-metadata] [source options]
-//!             <file.pkgar | git-url[#ref] | dir[#ref]>...
+//!             <file.pkgar | git-url[#ref] | dir[#ref] | [registry/]name[@req]>...
 //!                                       verify (building git sources from
 //!                                       their signed release tag), then
 //!                                       install into --root
@@ -21,6 +21,11 @@
 //!         | remove-author <git-url> | remove-builder <label>
 //!                                       pinned author keys and trusted
 //!                                       builders (etc/fox/trust.toml)
+//! fox registry add <name> <git-url> --root-blake3 <hash>
+//!            | list | update [<name>...] | remove <name>
+//!                                       configured package registries
+//! fox search <query>                    packages in the registries
+//! fox info [registry/]name              owners, releases and artifacts
 //! fox list                              installed packages
 //! fox remove [--force] <name>...        remove installed packages
 //! fox adopt-pkg [--allow-unsigned-metadata] [--again]
@@ -41,11 +46,20 @@
 //! `fox-build` and signed with the root's local builder key, or, with
 //! `--prebuilt`, a prebuilt archive of the same commit and tree from a
 //! builder listed in the trust store is installed instead.
+//!
+//! A package name is looked up in the registries of
+//! `<root>/etc/fox/registries.toml`, verified against their signed
+//! metadata. Its newest matching release is installed from a prebuilt
+//! artifact that enough of the registry's builders attest to, or built from
+//! its tag, which must be signed by one of the package's owners;
+//! `<root>/etc/fox/policy.toml` decides which.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod commands;
+mod prebuilt;
+mod registry;
 mod source;
 mod trust;
 
@@ -117,7 +131,8 @@ enum Command {
         #[command(flatten)]
         source: SourceArgs,
         /// Archives (`.pkgar` files), git URLs or local repositories, each
-        /// optionally followed by `#<tag or commit>`.
+        /// optionally followed by `#<tag or commit>`, or registry package
+        /// names, `[registry/]name[@version requirement]`.
         #[arg(required = true)]
         targets: Vec<String>,
     },
@@ -155,6 +170,21 @@ enum Command {
         #[arg(long)]
         again: bool,
     },
+    /// Manage package registries.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+    /// Search the registries' package names and summaries.
+    Search {
+        /// Text to look for.
+        query: String,
+    },
+    /// Show a registry package's owners, releases and artifacts.
+    Info {
+        /// `[registry/]name`.
+        name: String,
+    },
     /// Remove installed packages.
     Remove {
         /// Remove even if other packages depend on it.
@@ -167,7 +197,7 @@ enum Command {
 }
 
 /// How git sources are chosen, checked and built.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct SourceArgs {
     /// Accept the source's author key without asking, and pin it, when the
     /// repository has no pinned key yet.
@@ -225,6 +255,34 @@ enum TrustCommand {
     RemoveBuilder {
         /// The builder's name.
         label: String,
+    },
+}
+
+/// `fox registry` subcommands.
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    /// Add a registry, fetching and verifying it.
+    Add {
+        /// A local name for it.
+        name: String,
+        /// Its git repository.
+        git: String,
+        /// BLAKE3 of its `metadata/root/1.json`, as its maintainers
+        /// publish it.
+        #[arg(long)]
+        root_blake3: fox_core::Blake3Digest,
+    },
+    /// List the configured registries.
+    List,
+    /// Fetch and verify registries (all of them by default).
+    Update {
+        /// Registries to update.
+        names: Vec<String>,
+    },
+    /// Remove a registry and its checkout.
+    Remove {
+        /// The registry.
+        name: String,
     },
 }
 

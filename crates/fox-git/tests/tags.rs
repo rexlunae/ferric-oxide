@@ -34,6 +34,13 @@ fn signed_tags_verify_against_their_key_only() {
         Err(GitError::TagSignature { .. })
     ));
 
+    let owners = [author(2), author(1)];
+    assert_eq!(tag.verify_signed_by(&owners).unwrap(), &author(1));
+    assert!(matches!(
+        tag.verify_signed_by(&owners[..1]),
+        Err(GitError::TagSignerNotAllowed { .. })
+    ));
+
     // git accepts the object and sees the signature where it puts its own.
     let object = git(dir.path(), &["cat-file", "tag", "v1.0.0"]);
     assert!(object.starts_with(&format!("object {}\ntype commit\ntag v1.0.0\n", head.id())));

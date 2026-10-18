@@ -598,6 +598,30 @@ impl Registry {
         self.write_package(&entry)
     }
 
+    /// The artifact list of `name` `version`, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Io`] or [`EditError::Layout`] if it cannot be read.
+    pub fn artifacts(
+        &self,
+        name: &PackageName,
+        version: &Version,
+    ) -> Result<Option<ArtifactList>, EditError> {
+        let path = artifacts_path(name, version);
+        let file = self.dir.join(&path);
+        if !file.is_file() {
+            return Ok(None);
+        }
+        let text = read_text(&file)?;
+        ArtifactList::from_toml(&text, &path)
+            .map(Some)
+            .map_err(|source| EditError::Layout {
+                path,
+                source: Box::new(source),
+            })
+    }
+
     /// Writes an artifact list.
     ///
     /// # Errors

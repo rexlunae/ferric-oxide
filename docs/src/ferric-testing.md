@@ -45,12 +45,17 @@ a baseline or disabling a check.
 
 Package coverage is in `crates/fox-core/tests/archive.rs`,
 `crates/fox-store/tests/store.rs`, `tools/fox/tests/cli.rs`,
-`tools/fox/tests/git_sources.rs`, `crates/fox-git/tests/repo.rs`,
+`tools/fox/tests/git_sources.rs`, `tools/fox/tests/registry.rs`, `crates/fox-git/tests/repo.rs`,
 `crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs`,
 `tools/cargo-fox/tests/cli.rs`, `crates/fox-index/tests/registry.rs` and
 `tools/fox-registry/tests/cli.rs`. The registry tests sign metadata with
 fixed-seed keys and attack it: rollback, expiry, a changed file, a delegation
-claiming another path, and a key rotation signed by the new keys only. Tests construct real signed pkgar fixtures
+claiming another path, and a key rotation signed by the new keys only.
+`tools/fox/tests/registry.rs` installs by name from a local registry: from
+the owner-signed tag, from a prebuilt artifact with too few and then enough
+builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
+and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
+registry builder, unlisted and then listed in `registry.toml`. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no

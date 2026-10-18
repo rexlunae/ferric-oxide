@@ -121,11 +121,11 @@ fn remove_partial(partial: &Path) -> Result<(), GitError> {
 /// rustls is built without a default crypto provider (see Cargo.toml), so
 /// the HTTP transport needs ring installed as the process default.
 #[cfg(not(target_os = "redox"))]
-fn install_tls_provider() {
+pub(crate) fn install_tls_provider() {
     // An error means a provider is already installed, which is all this
     // needs.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[cfg(target_os = "redox")]
-fn install_tls_provider() {}
+pub(crate) fn install_tls_provider() {}

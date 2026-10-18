@@ -1428,15 +1428,19 @@ dependencies = [
  "fox-build",
  "fox-core",
  "fox-git",
+ "fox-index",
  "fox-sbom",
  "fox-store",
  "pkgar 0.2.4",
+ "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
+ "semver",
  "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+ "time",
 ]
 
 [[package]]
@@ -1515,6 +1519,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "fox-build",
  "fox-core",
  "fox-git",
  "fox-index",

@@ -96,6 +96,10 @@ fox --root ./image-root --key ./signer.pub verify --installed
 fox --root ./image-root remove hello
 fox --root ./image-root adopt-pkg
 fox --root ./image-root install https://example.com/hello.git   # see Git sources
+fox --root ./image-root registry add ferric https://example.com/registry.git \
+    --root-blake3 <hash>                                            # see Registries
+fox --root ./image-root search hello
+fox --root ./image-root install hello@^1
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify` also checks
@@ -104,7 +108,7 @@ the build attestation beside an archive (`<stem>.attest.toml` and its
 archives without one; see [Attestations](#attestations). `verify --installed`
 accepts optional package names; without them it checks all installed packages.
 `install` and `remove` accept multiple inputs; `install` takes git sources
-as well as archives. Verification failures produce
+and `[registry/]name[@requirement]` package names as well as archives. Verification failures produce
 a failing exit status. `install --force` permits replacement of otherwise
 conflicting unowned files; `remove --force` bypasses dependent-package refusal.
 Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
@@ -398,8 +402,8 @@ existing tag, and pushes nothing.
 
 A registry is a git repository of TOML files whose integrity comes from
 signed metadata, not from the git host. `crates/fox-index` implements both
-sides and `fox-registry` is the maintainer tool. Clients (`fox registry`,
-`fox search`, installing by name) are not wired up yet.
+sides, `fox-registry` is the maintainer and builder tool, and `fox registry`,
+`fox search`, `fox info` and `fox install <name>` are the client.
 
 ```text
 registry.toml                     name, artifact URLs, builder keys
@@ -486,8 +490,74 @@ copy only while signing.
 | `sign [--key F...] [--bump ROLE...] [--complete]` | Updates and signs the metadata |
 | `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
 
-`release` and `check` fetch into `~/.cache/fox-registry/git` (or
-`$XDG_CACHE_HOME`; `--cache` overrides it).
+| `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
+| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline, signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, `--work-dir` optional) |
+| `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
+
+`release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
+`$XDG_CACHE_HOME`; `--cache` overrides it). `build` refuses a key that
+`registry.toml` does not list under that label, and artifact lists merge:
+a second builder attesting to the same archive hash adds its attestation
+to the same artifact. No `rexlunae/ferric-registry` repository is published
+yet; `init --github` is the template for one.
+
+### Using registries
+
+```sh
+fox registry add ferric https://example.com/registry.git --root-blake3 <hash>
+fox registry list
+fox registry update [name...]
+fox search <text>
+fox info [registry/]name
+fox install [registry/]name[@requirement]
+fox registry remove ferric
+```
+
+`etc/fox/registries.toml` (`fox-registries/1`) lists each registry's name,
+git URL and the BLAKE3 of its first root. `registry add` fetches the
+repository, refuses it unless `metadata/root/1.json` has the pinned hash,
+and verifies it. Each registry keeps `var/lib/fox/registries/<name>/`: a
+bare mirror in `git/`, the verified checkout in `tree/`, and `state.json`
+with the trusted root, the metadata versions seen and the time of the last
+update. An update exports the new head to `tree.new/` and replaces `tree/`
+and the state only once it verifies, so a failed update keeps the last good
+checkout and the rollback protection.
+
+Installing by name looks the package up in every configured registry (or
+the named one), updating any whose checkout is older than
+`require-fresh-metadata`, and picks the highest release matching the
+requirement (any version if none is given; yanked releases only with
+`allow-yanked`). It then:
+
+1. unless `build = "always"`, looks for an artifact of that release for the
+   target and feature set, downloads its archive, attestation and signature
+   by hash from the registry's `artifact-base-urls`, and installs it when
+   enough distinct builders listed in `registry.toml` signed attestations of
+   that exact archive, built from the release's commit and tree;
+2. otherwise, unless `build = "never"`, fetches the package's repository,
+   checks that the release tag is SSH-signed by one of the owners the
+   registry lists and still names the recorded commit and tree, and builds
+   it as a [git source](#git-sources). The owners come from the signed
+   registry, so there is no trust-on-first-use prompt.
+
+`fox verify --installed` accepts the registries' builder keys (labelled
+`<registry>/<builder>`) for packages installed from them.
+
+#### Install policy
+
+`etc/fox/policy.toml` is optional; every key defaults as shown.
+
+```toml
+build = "auto"                # never | auto | always
+min-builder-signatures = 1    # builders an artifact needs
+allow-unsigned-git = false    # build unsigned tags and commits
+allow-yanked = false          # pick yanked releases when resolving names
+require-fresh-metadata = "24h"
+```
+
+The builder threshold is the larger of the policy's and the registry's
+`min-builder-signatures`, and never less than one. `allow-unsigned-git`
+has the effect of `install --allow-unsigned` for git sources.
 
 ## SBOM scope and unfinished packaging work
 
@@ -501,9 +571,9 @@ Reading embedded `cargo auditable` data is not implemented.
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
-The registry format and maintainer tool exist, but `fox` does not yet read
-registries, so there is no search or install by name, and no official
-registry is published. A dependency solver, hermetic recipe builds,
+No official registry is published, and `fox` resolves only the requested
+package, not its dependencies. Downloading artifacts over HTTPS is not
+built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging
 design phases and `packaging/packaging-design.md`; that design file is not
