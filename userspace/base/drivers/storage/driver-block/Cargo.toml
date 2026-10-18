@@ -22,5 +22,16 @@ redox-rings.workspace = true
 
 zerocopy = "0.8.55"
 
+# Ferric Oxide: registered-buffer grants on disk descriptors (shared crates of the repository,
+# ../../crates from userspace/base/).
+ferric-blkgrant = { path = "../../../../../crates/blkgrant", features = ["alloc"], optional = true }
+ferric-regbuf = { path = "../../../../../crates/regbuf", optional = true }
+
+[features]
+default = []
+# Ferric Oxide: lets applications attach registered-buffer grants to disk descriptors, so the
+# device DMAs straight into their buffers (features.toml: drivers.storage_grant_dma).
+grant-dma = ["dep:ferric-blkgrant", "dep:ferric-regbuf"]
+
 [lints]
 workspace = true

@@ -21,9 +21,15 @@ daemon = { path = "../../../daemon" }
 driver-block = { path = "../driver-block" }
 partitionlib = { path = "../partitionlib" }
 pcid = { path = "../../pcid" }
+# Ferric Oxide: NVMe data pointers for grant DMA (../../crates from userspace/base/).
+ferric-blkgrant = { path = "../../../../../crates/blkgrant", optional = true }
 
 [features]
 default = []
+# Ferric Oxide: DMA straight into applications' registered buffers (driver-block's grant
+# slots, mapped with MapGrant), and transfers up to the controller's MDTS with PRP lists
+# (features.toml: drivers.storage_grant_dma).
+grant-dma = ["driver-block/grant-dma", "dep:ferric-blkgrant"]
 
 [lints]
 workspace = true

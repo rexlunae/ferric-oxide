@@ -70,6 +70,32 @@ impl Disk for NvmeDisk {
     }
 }
 
+/// Ferric Oxide: maps applications' grants into the DMA domain pcid gave the driver.
+#[cfg(feature = "grant-dma")]
+struct PcidGrantDma;
+
+#[cfg(feature = "grant-dma")]
+impl PcidGrantDma {
+    /// The errno a failed grant mapping call returns to the application.
+    fn errno(err: pcid_interface::DmaGrantError) -> syscall::Error {
+        match err {
+            pcid_interface::DmaGrantError::Kernel(err) => err.into(),
+            _ => syscall::Error::new(syscall::ENODEV),
+        }
+    }
+}
+
+#[cfg(feature = "grant-dma")]
+impl driver_block::GrantDma for PcidGrantDma {
+    fn map_grant(&self, grant: &libredox::Fd) -> syscall::Result<u64> {
+        pcid_interface::map_dma_grant(grant).map_err(Self::errno)
+    }
+
+    fn unmap_grant(&self, iova: u64) -> syscall::Result<()> {
+        pcid_interface::unmap_dma_grant(iova).map_err(Self::errno)
+    }
+}
+
 fn time_arm(time_handle: &mut File, secs: i64) -> io::Result<()> {
     let mut time_buf = syscall::TimeSpec::default();
     if time_handle.read(&mut time_buf)? < time_buf.len() {
@@ -163,6 +189,10 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
             .collect(),
         executor.clone(),
     )));
+    // Ferric Oxide: applications may attach registered-buffer grants to their disk
+    // descriptors, which the controller then DMAs into directly.
+    #[cfg(feature = "grant-dma")]
+    scheme.borrow_mut().set_grant_dma(Rc::new(PcidGrantDma));
 
     let mut scheme_events = Box::pin(executor.register_external_event(
         scheme.borrow().event_handle().raw(),

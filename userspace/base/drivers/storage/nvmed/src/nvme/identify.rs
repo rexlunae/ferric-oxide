@@ -76,6 +76,16 @@ pub struct IdentifyNamespaceData {
     pub vendor_specific: [u8; 3712],
 }
 
+impl IdentifyControllerData {
+    /// Ferric Oxide: the Maximum Data Transfer Size (byte 77, a power of two in units of the
+    /// minimum memory page size; 0 for no limit). `model_no` above is 48 bytes where the
+    /// specification has 40, so `firmware_rev` covers bytes 72 to 79 and byte 77 is its sixth.
+    #[cfg(feature = "grant-dma")]
+    pub fn mdts(&self) -> u8 {
+        self.firmware_rev[5]
+    }
+}
+
 impl IdentifyNamespaceData {
     pub fn size_in_blocks(&self) -> u64 {
         self.nsze
@@ -179,6 +189,10 @@ impl Nvme {
             serial,
             firmware,
         );
+
+        // Ferric Oxide: the largest transfer one command may carry, for zero-copy DMA.
+        #[cfg(feature = "grant-dma")]
+        self.set_mdts(data.mdts());
     }
     pub async fn identify_namespace_list(&self, base: u32) -> Vec<u32> {
         // TODO: Use buffer

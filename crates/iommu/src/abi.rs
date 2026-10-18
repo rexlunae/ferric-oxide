@@ -36,12 +36,18 @@
 //! derived from, and closing the grant or the region do the same, so after any of them the
 //! device's DMA to the old IOVA faults. Closing the domain drops its grant mappings too.
 //!
+//! After a revocation the IOVA stays *reserved*: the device's DMA to it faults, and no later
+//! mapping in the domain gets it, so a request the driver still had queued can never land in
+//! memory mapped there since. The driver gives it back with [`Request::UnmapGrant`] of that
+//! IOVA (which then succeeds without anything left to unmap), so every IOVA `MapGrant`
+//! returned should end with one `UnmapGrant`; closing the domain frees the rest.
+//!
 //! Errors: `ENODEV` without an IOMMU or when the caller has not bound this domain (there is no
 //! physical-address fallback, so the driver uses its own bounce buffers instead), `EBADF` when
 //! the descriptor is not open, `EINVAL` when it is not a grant or the grant is not page-aligned,
 //! `ECANCELED` once the grant is revoked, `ENOMEM` when the IOVA space or table memory runs
 //! out, `EIO` when the unit fails an invalidation, and for [`Request::UnmapGrant`] `ENOENT` when
-//! no grant is mapped at the IOVA.
+//! no grant is mapped or reserved at the IOVA.
 
 use core::fmt;
 
