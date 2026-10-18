@@ -432,6 +432,12 @@ fn file_backed(t: &mut Test) -> Result<(), Failure> {
         Fd::open(&region_path(), O_RDWR | O_CLOEXEC, 0),
     );
     let result = region.and_then(|region| {
+        let unchanged = std::fs::read(&path).map_err(io("read the backing file"))?;
+        if unchanged.iter().any(|&byte| byte != 0x77) {
+            return Err(Failure::Data {
+                what: "a private mapping changed its backing file",
+            });
+        }
         expect_errno(
             "Register of a file-backed private mapping",
             errno::EPERM,
