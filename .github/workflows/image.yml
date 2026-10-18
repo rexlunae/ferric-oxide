@@ -315,10 +315,10 @@ jobs:
           retention-days: 14
 
   # Tracing overhead budget (roadmap Phase T). ferric-trace-bench times RedoxFS
-  # requests on the image without kernel.trace and, alternating all events off and
-  # on, on the image with it. Three boots of each, interleaved, and the fastest round
-  # of each kind, keep boot-to-boot noise out of the comparison.
-  # scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
+  # requests on the image without kernel.trace and, with all events off and then
+  # alternating off and on, on the image with it. Ten boots of each, interleaved, and
+  # the median of each boot's fastest round of each kind keep boot-to-boot noise out
+  # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
   trace-overhead:
     needs: build
     if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
@@ -350,13 +350,17 @@ jobs:
           path: notrace
 
       # Log downloads are not always readable, so every result and failure is an annotation.
-      - name: Boot both images three times
+      - name: Boot both images ten times
+        env:
+          # A boot takes about 20 seconds. The check takes the median over boots, and the
+          # spread between boots (about 3% here) is larger than the 1% budget.
+          BENCH_BOOTS: "10"
         run: |
           for image in notrace trace; do
             zstd -q -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
           done
           failed=0
-          for run in 1 2 3; do
+          for run in $(seq 1 "$BENCH_BOOTS"); do
             for image in notrace trace; do
               log="bench-$image-$run.log"
               status=0
@@ -381,9 +385,7 @@ jobs:
 
       - name: Check the overhead budget
         run: |
-          scripts/ferric-ci/check-trace-overhead.sh \
-            --out bench-notrace-1.log bench-notrace-2.log bench-notrace-3.log \
-            --in bench-trace-1.log bench-trace-2.log bench-trace-3.log
+          scripts/ferric-ci/check-trace-overhead.sh --out bench-notrace-*.log --in bench-trace-*.log
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -158,27 +158,42 @@ impl Trace {
 /// The per-operation times of each state's rounds.
 #[derive(Default)]
 struct Samples {
+    /// Compiled out: no trace scheme.
     out: Vec<f64>,
+    /// Compiled in, all off, in back-to-back rounds like `out`'s.
     off: Vec<f64>,
+    /// Compiled in, all off, each round right before an `on` round.
+    pairoff: Vec<f64>,
+    /// Every compiled-in event on.
     on: Vec<f64>,
 }
 
-/// Runs `workload` for [`ROUNDS`] rounds, alternating off and on when there is a trace scheme.
+/// Runs `workload` for [`ROUNDS`] rounds in each state.
+///
+/// Without a trace scheme every round is `out`. With one, a block of back-to-back `off` rounds
+/// comes first, run exactly as the `out` rounds are, because toggling tracepoints (live
+/// patching, its IPIs) and draining the rings disturb the caches and would add their cost to
+/// any round that follows. Then `pairoff` and `on` rounds alternate, so both sides of that
+/// comparison see the same disturbance and the same drift.
 fn measure(workload: &mut Workload<'_>, trace: Option<&Trace>) -> Result<Samples, Failure> {
     let mut samples = Samples::default();
     // A warm-up round, so the first timed one does not pay for cold caches.
     (workload.round)()?;
-    for _ in 0..ROUNDS {
-        match trace {
-            None => samples.out.push((workload.round)()?),
-            Some(trace) => {
-                samples.off.push((workload.round)()?);
-                trace.command("enable all")?;
-                samples.on.push((workload.round)()?);
-                trace.command("disable all")?;
-                trace.drain()?;
-            }
+    let Some(trace) = trace else {
+        for _ in 0..ROUNDS {
+            samples.out.push((workload.round)()?);
         }
+        return Ok(samples);
+    };
+    for _ in 0..ROUNDS {
+        samples.off.push((workload.round)()?);
+    }
+    for _ in 0..ROUNDS {
+        samples.pairoff.push((workload.round)()?);
+        trace.command("enable all")?;
+        samples.on.push((workload.round)()?);
+        trace.command("disable all")?;
+        trace.drain()?;
     }
     Ok(samples)
 }
@@ -227,6 +242,7 @@ fn run() -> Result<(), Failure> {
         let mut samples = measure(workload, trace.as_ref())?;
         report(workload.name, "out", &mut samples.out);
         report(workload.name, "off", &mut samples.off);
+        report(workload.name, "pairoff", &mut samples.pairoff);
         report(workload.name, "on", &mut samples.on);
     }
     if let (Some(trace), Some(before)) = (&trace, lost_before) {

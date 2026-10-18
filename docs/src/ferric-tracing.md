@@ -203,22 +203,31 @@ rounds:
   its time, so it is reported but not budgeted.
 
 On a kernel without `kernel.trace` every round runs as state `out`. With it,
-rounds alternate between all events off (`off`) and `enable all` (`on`), and
-the rings are drained after each `on` round. The program prints
-`FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` per
+the program runs a block of back-to-back rounds with all events off (`off`),
+exactly as the `out` rounds run. Then it alternates rounds with all off
+(`pairoff`) and with `enable all` (`on`), draining the rings after each `on`
+round. Toggling tracepoints (live patching and its IPIs) and draining disturb
+the caches of the round that follows. So `off` is compared with `out`, and `on`
+with `pairoff`, and the two are never compared across. The program prints
+`FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` for each
 workload and state, and `FERRIC_BENCH lost records=<n>` for records dropped
 during the `on` rounds.
 
 The image workflow builds a second smoke image whose kernel differs only in
 leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
-image three times each, interleaved, and `scripts/ferric-ci/check-trace-overhead.sh`
-compares the fastest round of each workload and state over the boots. Taking
-the fastest round keeps scheduling noise and boot-to-boot variation out of the
-comparison. Each boot reports every result line and any failure as a workflow
-annotation, so a failing run can be read without its logs. `OFF_BUDGET_PCT`
-and `ON_BUDGET_PCT` set the budgets, and the script
-warns when records were dropped, since a dropped record costs less than a
-written one. Every result is printed as a notice on the run.
+image ten times each, interleaved (a boot takes about 20 seconds).
+`scripts/ferric-ci/check-trace-overhead.sh` takes each boot's fastest round of
+each workload and state, and compares the medians of those over the boots.
+The fastest round keeps scheduling noise within a boot out. The median over
+boots handles the variation between boots: kernel image KASLR moves the code
+and runner load changes, and the first runs showed a spread of about 3%,
+three times the budget.
+
+Each boot reports every result line and any failure as a workflow annotation,
+so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
+`ON_BUDGET_PCT` set the budgets. The script warns when records were dropped,
+since a dropped record costs less than a written one, and prints every result
+as a notice on the run.
 
 ## Not implemented yet
 

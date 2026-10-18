@@ -9,11 +9,13 @@
 //!   call that reaches the kernel's dispatch. It shows the per-call cost of a tracepoint and is
 //!   reported, not budgeted.
 //!
-//! On a kernel without `kernel.trace` (no `kernel.trace` in the `/scheme` listing) every round runs as state
-//! `out`. With it, the program first turns every event off, then alternates: a round with all
-//! tracepoints off (`off`), `enable all`, the same round with every compiled-in event on (`on`),
-//! `disable all`, and a drain of every CPU's ring so the next `on` round writes to empty rings
-//! instead of counting drops. Alternating keeps slow drift of the machine out of the comparison.
+//! On a kernel without `kernel.trace` (no `kernel.trace` in the `/scheme` listing) every round
+//! runs as state `out`. With it, the program first turns every event off and runs a block of
+//! back-to-back rounds with all tracepoints off (`off`), exactly as the `out` rounds run. Then it
+//! alternates: a round with all off (`pairoff`), `enable all`, the same round with every
+//! compiled-in event on (`on`), `disable all`, and a drain of every CPU's ring so the next `on`
+//! round writes to empty rings instead of counting drops. Toggling and draining disturb the
+//! caches, so `off` is compared with `out` and `on` with `pairoff`, never across.
 //!
 //! For each workload and state it prints
 //! `FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>`, the nanoseconds per
