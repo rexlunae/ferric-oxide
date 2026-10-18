@@ -585,6 +585,22 @@ rebuild = ["kernel"]
 help = "Compile in sched.switch (previous and next process and context) at every context switch."
 
 [[option]]
+id = "kernel.trace_scheme"
+menu = "kernel.tracing"
+type = "bool"
+title = "Scheme request tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_scheme"
+rebuild = ["kernel"]
+help = """Compile in scheme.request, scheme.response and scheme.cancel for requests
+to user-space schemes. Each record carries the scheme id and the request's
+ring SQE/CQE tag, so a request can be matched with its response, and the
+caller's and responder's pids, so a request a daemon makes while serving
+another can be followed (an application's read through RedoxFS to the disk
+driver)."""
+
+[[option]]
 id = "kernel.trace_max_level"
 menu = "kernel.tracing"
 type = "choice"
