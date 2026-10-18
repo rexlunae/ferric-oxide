@@ -1441,6 +1441,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]

@@ -56,7 +56,10 @@ the owner-signed tag, from a prebuilt artifact with too few and then enough
 builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
 and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
 registry builder, unlisted and then listed in `registry.toml`, and publishes
-an advisory. `fox audit` is tested end to end against a registry advisory
+an advisory. `fox sync` is tested end to end with a registry package (installed,
+locked, unchanged under `--locked`, removed when the set drops it) and a git
+package pinned to its commit (a moved tag fails until `--update`).
+`fox audit` is tested end to end against a registry advisory
 (including the install warning and a changed SBOM), and in unit tests
 against a RustSec-layout directory of advisories for crates inside build
 SBOMs, with withdrawn, build-only and non-semver cases. Tests construct real signed pkgar fixtures

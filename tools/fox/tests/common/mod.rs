@@ -83,12 +83,15 @@ impl Env {
         self.src.path().to_str().unwrap()
     }
 
-    /// Runs fox on `root`, giving `install` and `build` the test's work
+    /// Runs fox on `root`, giving `install`, `build` and `sync` the test's work
     /// directory.
     pub fn fox_in(&self, root: &Path, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fox"));
         command.arg("--root").arg(root).args(args);
-        if args.iter().any(|arg| matches!(*arg, "install" | "build")) {
+        if args
+            .iter()
+            .any(|arg| matches!(*arg, "install" | "build" | "sync"))
+        {
             command.arg("--work-dir").arg(self.work.path());
         }
         command.output().unwrap()
