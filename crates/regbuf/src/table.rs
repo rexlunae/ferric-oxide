@@ -1194,4 +1194,23 @@ mod tests {
         assert!(t.settled(g));
         assert_eq!(t.mapping_count(g), 0);
     }
+
+    #[test]
+    fn domain_close_can_finish_a_failed_mapping_of_a_closed_region() {
+        let mut t = table(1);
+        let g = t.create(spec(Access::ReadWrite, 0, P)).unwrap();
+        t.add_mapping(g, 42).unwrap();
+        let failed = t.close().pop().unwrap();
+        t.restore(failed);
+        assert!(t.is_closed());
+        assert!(!t.drained());
+        // The domain has now been blocked; its link forgets the restored record.
+        let blocked = t.take_mapping(g, |record| *record == 42).unwrap();
+        assert!(!t.drained());
+        assert_eq!(t.finish(blocked), 42);
+        assert!(t.drained());
+        assert!(t.settled(g));
+        assert_eq!(t.mapping_count(g), 0);
+        assert!(t.take_mapping(g, |_| true).is_err());
+    }
 }
