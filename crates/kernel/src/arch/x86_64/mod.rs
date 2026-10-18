@@ -19,6 +19,10 @@ pub mod kaslr;
 #[macro_use]
 pub mod interrupt;
 
+/// Ferric Oxide: static keys for tracepoints (`kernel.trace`)
+#[cfg(feature = "trace")]
+pub mod static_key;
+
 /// Miscellaneous processor features
 pub mod misc;
 

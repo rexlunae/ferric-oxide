@@ -9,6 +9,7 @@
   - [Build and Configuration](./ferric-build.md)
   - [Memory and CPU Protection](./ferric-memory.md)
   - [Registered Buffers and IOMMUs](./ferric-io.md)
+  - [Kernel Tracing](./ferric-tracing.md)
   - [Package Tooling: fox](./ferric-packaging.md)
   - [Validation and Debugging](./ferric-testing.md)
 

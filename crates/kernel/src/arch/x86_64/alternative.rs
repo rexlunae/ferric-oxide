@@ -201,7 +201,6 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
 
         debug!("self-modifying features: {:?}", enable);
 
-        let mut mapper = KernelMapper::lock_rw();
         for reloc in relocs.iter().copied() {
             let name = core::str::from_utf8(core::slice::from_raw_parts(
                 reloc.name_start,
@@ -209,31 +208,6 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
             ))
             .expect("invalid feature name");
             let altcode = core::slice::from_raw_parts(reloc.altcode_start, reloc.altcode_len);
-
-            let dst_pages = PageSpan::between(
-                Page::containing_address(VirtualAddress::new(reloc.code_start as usize)),
-                Page::containing_address(VirtualAddress::new(
-                    (reloc.code_start as usize + reloc.padded_len).next_multiple_of(PAGE_SIZE),
-                )),
-            );
-            for page in dst_pages.pages() {
-                mapper
-                    .remap(
-                        page.start_address(),
-                        PageFlags::new().write(true).execute(true).global(true),
-                    )
-                    .unwrap()
-                    .flush();
-            }
-
-            let code = core::slice::from_raw_parts_mut(reloc.code_start, reloc.padded_len);
-
-            trace!(
-                "feature {} current {:x?} altcode {:x?}",
-                name,
-                code,
-                altcode
-            );
 
             let feature_is_enabled = match name {
                 "smap" => enable.contains(KcpuFeatures::SMAP),
@@ -252,65 +226,108 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
             // XXX: The `.nops` directive only works for constant lengths, and the variable `.skip -X`
             // only outputs the (slower) single-byte 0x90 NOP.
 
-            // This table is from the "Software Optimization Guide for AMD Family 19h Processors" (November
-            // 2020).
-            const NOPS_TABLE: [&[u8]; 11] = [
-                &[0x90],
-                &[0x66, 0x90],
-                &[0x0f, 0x1f, 0x00],
-                &[0x0f, 0x1f, 0x40, 0x00],
-                &[0x0f, 0x1f, 0x44, 0x00, 0x00],
-                &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
-                &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
-                &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-                &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-                &[0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-                &[
-                    0x66, 0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ],
-            ];
+            patch_text(reloc.code_start, reloc.padded_len, |code| {
+                trace!(
+                    "feature {} current {:x?} altcode {:x?}",
+                    name,
+                    code,
+                    altcode
+                );
 
-            if feature_is_enabled {
-                trace!("feature {} origcode {:x?}", name, code);
-                let (dst, dst_nops) = code.split_at_mut(altcode.len());
-                dst.copy_from_slice(altcode);
+                if feature_is_enabled {
+                    trace!("feature {} origcode {:x?}", name, code);
+                    let (dst, dst_nops) = code.split_at_mut(altcode.len());
+                    dst.copy_from_slice(altcode);
 
-                for chunk in dst_nops.chunks_mut(NOPS_TABLE.len()) {
-                    // `chunk.len() - 1` is always in bounds because we are chunking by
-                    // `NOPS_TABLE.len()`
-                    #[expect(clippy::indexing_slicing)]
-                    // `chunk.len()` will never be 0
-                    #[expect(clippy::arithmetic_side_effects)]
-                    chunk.copy_from_slice(NOPS_TABLE[chunk.len() - 1]);
+                    fill_nops(dst_nops);
+                    trace!("feature {} new {:x?} altcode {:x?}", name, code, altcode);
+                } else {
+                    trace!("feature !{} origcode {:x?}", name, code);
+                    let (_, padded) = code.split_at_mut(reloc.origcode_len);
+
+                    // Not strictly necessary, but reduces the number of instructions using longer nop
+                    // instructions.
+                    fill_nops(padded);
+
+                    trace!("feature !{} new {:x?}", name, code);
                 }
-                trace!("feature {} new {:x?} altcode {:x?}", name, code, altcode);
-            } else {
-                trace!("feature !{} origcode {:x?}", name, code);
-                let (_, padded) = code.split_at_mut(reloc.origcode_len);
+            });
+        }
+    }
+}
 
-                // Not strictly necessary, but reduces the number of instructions using longer nop
-                // instructions.
-                for chunk in padded.chunks_mut(NOPS_TABLE.len()) {
-                    // `chunk.len() - 1` is always in bounds because we are chunking by
-                    // `NOPS_TABLE.len()`
-                    #[expect(clippy::indexing_slicing)]
-                    // `chunk.len()` will never be 0
-                    #[expect(clippy::arithmetic_side_effects)]
-                    chunk.copy_from_slice(NOPS_TABLE[chunk.len() - 1]);
-                }
+// This table is from the "Software Optimization Guide for AMD Family 19h Processors" (November
+// 2020).
+// Ferric Oxide: at module level, so the tracepoint static keys (static_key.rs) use the same NOPs.
+pub(crate) const NOPS: [&[u8]; 11] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0f, 0x1f, 0x00],
+    &[0x0f, 0x1f, 0x40, 0x00],
+    &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[
+        0x66, 0x66, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+];
 
-                trace!("feature !{} new {:x?}", name, code);
-            }
+/// Fills `code` with as few NOP instructions as possible.
+fn fill_nops(code: &mut [u8]) {
+    for chunk in code.chunks_mut(NOPS.len()) {
+        // `chunk.len() - 1` is always in bounds because we are chunking by
+        // `NOPS.len()`
+        #[expect(clippy::indexing_slicing)]
+        // `chunk.len()` will never be 0
+        #[expect(clippy::arithmetic_side_effects)]
+        chunk.copy_from_slice(NOPS[chunk.len() - 1]);
+    }
+}
 
-            for page in dst_pages.pages() {
-                mapper
-                    .remap(
-                        page.start_address(),
-                        PageFlags::new().write(false).execute(true).global(true),
-                    )
-                    .unwrap()
-                    .flush();
-            }
+/// Ferric Oxide: makes the kernel code at `code_start..code_start + len` writable, hands it to
+/// `write`, and makes it read-only again. The one routine that patches kernel code: the
+/// CPU-feature alternatives above and the tracepoint static keys (static_key.rs) both use it.
+///
+/// # Safety
+///
+/// `code_start..code_start + len` must be kernel code, and what `write` leaves there must be valid
+/// for every CPU that can run it while and after it is written. The alternatives patch before the
+/// other CPUs start; the static keys keep every intermediate state a valid instruction.
+pub(crate) unsafe fn patch_text(code_start: *mut u8, len: usize, write: impl FnOnce(&mut [u8])) {
+    let mut mapper = KernelMapper::lock_rw();
+    let dst_pages = PageSpan::between(
+        Page::containing_address(VirtualAddress::new(code_start as usize)),
+        Page::containing_address(VirtualAddress::new(
+            (code_start as usize + len).next_multiple_of(PAGE_SIZE),
+        )),
+    );
+    // SAFETY: the caller guarantees the range is kernel code, so its pages are kernel text pages
+    // the kernel mapper owns; they are writable only between the two remaps, and nothing else
+    // references them as data while `write` has the slice.
+    unsafe {
+        for page in dst_pages.pages() {
+            mapper
+                .remap(
+                    page.start_address(),
+                    PageFlags::new().write(true).execute(true).global(true),
+                )
+                .unwrap()
+                .flush();
+        }
+
+        write(core::slice::from_raw_parts_mut(code_start, len));
+
+        for page in dst_pages.pages() {
+            mapper
+                .remap(
+                    page.start_address(),
+                    PageFlags::new().write(false).execute(true).global(true),
+                )
+                .unwrap()
+                .flush();
         }
     }
 }

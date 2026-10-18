@@ -51,7 +51,7 @@ and are not in that workflow's sync matrix. relibc's `openlibm` and
    kernel starts the bootstrap executable embedded with initfs.
 4. `userspace/base/bootstrap/` publishes the initial kernel schemes, exposes
    initfs and starts `init`. It recognizes the optional `kernel.iommu` and
-   `kernel.regbuf` scheme IDs through the shared ABI crates.
+   `kernel.regbuf` and `kernel.trace` scheme IDs through the shared ABI crates.
 5. `userspace/base/init/` runs the initfs configuration. Services and storage
    drivers make the root filesystem accessible; RedoxFS supplies the file
    scheme. Filesystem init scripts under `/usr/lib/init.d` start the remaining
@@ -118,6 +118,7 @@ cannot be treated as ordinary private frames to copy.
 | `crates/elfreloc/` | Safe, host-testable ELF relocation replay for kernel-image KASLR |
 | `crates/cet/` | CET capability/policy decoding and shadow-stack layout/token arithmetic |
 | `crates/regbuf/` | Registered-buffer ABI, byte-range planning, grant lifecycle, bounce copyback and pin budgets |
+| `crates/trace/` | Kernel trace event catalog, record format, per-CPU SPSC ring, event selection and `kernel.trace` scheme ABI |
 | `crates/iommu/` | DMA ABI, PCI requester aliases, shared table/ring logic, IOVA allocation and DMA lifecycle bookkeeping |
 | `crates/vtd/`, `crates/amdvi/` | Vendor-specific ACPI parsing, table/register formats and invalidation encodings |
 | `crates/fox-core/` | Package identity, manifests, trust and signed archive verification |

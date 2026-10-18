@@ -101,7 +101,8 @@ regbuf = true
 
 All other active options resolve from the catalog. In particular, configured
 x86-64 builds default to ASLR, physical-map KASLR, kernel-image KASLR and
-`PROT_NONE` protection; IOMMU and registered buffers are opt-in. Consult
+`PROT_NONE` protection; IOMMU, registered buffers and kernel tracing
+([Kernel tracing](ferric-tracing.md)) are opt-in. Consult
 `explain` or the catalog rather than assuming a menu title means the feature
 is fully enforced.
 
