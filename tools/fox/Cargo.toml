@@ -1,0 +1,20 @@
+[package]
+name = "fox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The Ferric Oxide package manager"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fox-core = { path = "../../crates/fox-core", features = ["std"] }
+fox-sbom = { path = "../../crates/fox-sbom" }
+fox-store = { path = "../../crates/fox-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
+tempfile.workspace = true

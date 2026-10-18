@@ -1,0 +1,29 @@
+[package]
+name = "fox-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Package identity, manifest, trust and verification types shared by every fox tool"
+publish = false
+
+[features]
+default = []
+# File-based archive access (opening `.pkgar` files, key files, cookbook
+# sidecar metadata). The types and byte-level checks build without it.
+std = ["dep:pkgar", "dep:pkgar-keys", "dep:pkg", "blake3/std", "serde/std", "thiserror/std", "toml/std"]
+# Builds signed fixture packages for tests in this and other fox crates.
+test-fixtures = ["std"]
+
+[dependencies]
+blake3 = { workspace = true }
+pkgar-core = { workspace = true }
+pkgar = { workspace = true, optional = true }
+pkgar-keys = { workspace = true, optional = true }
+pkg = { package = "redox-pkg", version = "0.3.3", default-features = false, optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+thiserror = { workspace = true }
+toml = { workspace = true, features = ["parse", "display", "serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+fox-core = { path = ".", features = ["test-fixtures"] }
