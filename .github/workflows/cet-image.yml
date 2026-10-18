@@ -90,13 +90,18 @@ jobs:
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          # checkout's default ref is GITHUB_SHA, including the PR merge commit. Record the
+          # immutable event SHA directly instead of masking a failed Git command in printf's
+          # command substitution, and fail if either source identifier is missing.
+          test "${#GITHUB_SHA}" -eq 40
+          test "${#PR_HEAD_SHA}" -eq 40
           cp "$FERRIC_KERNEL_CONFIG" kernel-config.toml
           symbols="$(find recipes/core/kernel/target -type f -name kernel.all -print -quit)"
           test -n "$symbols"
           cp "$symbols" kernel.all
           cp scripts/ferric-ci/boot-cet.sh scripts/ferric-ci/boot-smoke.sh .
           {
-            printf 'checkout_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'checkout_commit=%s\n' "$GITHUB_SHA"
             printf 'pr_head_commit=%s\n' "$PR_HEAD_SHA"
             printf 'run_id=%s\nrun_attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             printf 'kernel_features=%s\n' "$FERRIC_KERNEL_FEATURES"
