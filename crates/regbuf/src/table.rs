@@ -700,6 +700,10 @@ impl<M> GrantTable<M> {
     ///
     /// The original operation error when recovery is not confirmed. The mapping is restored
     /// before returning the error, so the region cannot release its frames prematurely.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `recovered` on failed teardown, leaving it counted in flight.
     pub fn complete_teardown<E>(
         &mut self,
         taken: Taken<M>,
