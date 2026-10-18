@@ -574,6 +574,8 @@ fn select_next_context(
     // New BTreeMap based walk
     let mut weight_change: u64 = 0;
     let mut contexts_to_remove: SmallVec<[ContextQueueKey; 16]> = SmallVec::new();
+    let virtual_time = contexts_data.v;
+    let RunContextData { queue, timers, .. } = &mut *contexts_data;
     for (
         ContextQueueKey {
             vd,
@@ -585,9 +587,9 @@ fn select_next_context(
             weight: context_weight,
             context_ref,
         },
-    ) in contexts_data.queue.iter()
+    ) in queue.iter()
     {
-        if *vtime > ineligible_min_vtime && *vtime > contexts_data.v {
+        if *vtime > ineligible_min_vtime && *vtime > virtual_time {
             continue;
         }
 
@@ -629,6 +631,12 @@ fn select_next_context(
             guard.rem_slice = 0;
             guard.queue_key = None;
 
+            // A directly switched scheme handler can sleep while another context owns
+            // the timeslice. Preserve its deadline before removing it from this queue.
+            if let Some(wake) = guard.wake {
+                timers.insert((wake, context_ref.clone()));
+            }
+
             contexts_to_remove.push(ContextQueueKey {
                 vd: *vd,
                 rem_slice: *rem_slice,
@@ -652,7 +660,7 @@ fn select_next_context(
             }
         }
 
-        if *vtime <= contexts_data.v {
+        if *vtime <= virtual_time {
             // Eligible
             eligible_best = Some((guard, best_addr_space));
             break;

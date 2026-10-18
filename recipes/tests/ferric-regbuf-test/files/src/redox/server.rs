@@ -151,6 +151,9 @@ impl TestScheme<'_> {
                 unmap_grant(fd, &mapping)?;
             }
             Op::Check => {
+                // A scheme handler runs by direct switch from its caller. Its timed wait
+                // must wake even when the caller still owns the scheduler's timeslice.
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let m = self.mapping(slot)?;
                 let byte = u8::try_from(arg).map_err(|_| Error::new(EINVAL))?;
                 // SAFETY: the application asks for a check only while the mapping is there;
