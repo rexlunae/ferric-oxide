@@ -393,6 +393,27 @@ fn entry_path_and_kind(entry: &Entry) -> Result<(&str, FileKind), BadEntry<'_>> 
 }
 
 /// Checks that `bytes` is a relative path made only of normal components.
+/// Checks an archive entry path against the rules [`verify_head`] applies:
+/// UTF-8, relative, no empty, `.` or `..` components, no control characters
+/// or backslashes. Tools that write archives use it so they cannot produce
+/// one the verifier refuses.
+///
+/// # Errors
+///
+/// The [`EntryPathError`] for the first rule the path breaks.
+///
+/// # Examples
+///
+/// ```
+/// use fox_core::{EntryPathError, check_entry_path};
+///
+/// assert_eq!(check_entry_path(b"usr/bin/hello"), Ok("usr/bin/hello"));
+/// assert_eq!(check_entry_path(b"/etc/passwd"), Err(EntryPathError::Absolute));
+/// ```
+pub fn check_entry_path(bytes: &[u8]) -> Result<&str, EntryPathError> {
+    check_path(bytes)
+}
+
 fn check_path(bytes: &[u8]) -> Result<&str, EntryPathError> {
     let path = core::str::from_utf8(bytes).map_err(|_| EntryPathError::NotUtf8)?;
     if path.is_empty() {

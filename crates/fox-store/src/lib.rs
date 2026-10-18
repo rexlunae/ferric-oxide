@@ -30,8 +30,8 @@
 //!   cannot redirect another's files outside it, and the root itself may
 //!   not be a symlink;
 //! - no package may write into, replace or redirect [`RESERVED_DIRS`]:
-//!   the store state and the trusted keys, so a package cannot rewrite
-//!   the database or enroll a signer;
+//!   the store state, the trusted keys and the trust store, so a package
+//!   cannot rewrite the database, enroll a signer or pin an author key;
 //! - an archive without a signed manifest has an unsigned name, so it is
 //!   installed only with [`InstallOptions::allow_unsigned_metadata`], and
 //!   never over a package that had a signed manifest;
@@ -84,6 +84,7 @@ use std::path::{Path, PathBuf};
 
 use fox_core::archive::{Archive, ArchiveError, MetadataSource};
 use fox_core::keys::TRUSTED_KEYS_DIR;
+use fox_core::trust::TRUST_FILE;
 use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
 
@@ -97,9 +98,10 @@ use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
 /// Directory, relative to the root, of the store's own state.
 pub const STATE_DIR: &str = "var/lib/fox";
 
-/// Directories no package may write into, replace or redirect: the
-/// store's own state and the trusted signer keys.
-pub const RESERVED_DIRS: [&str; 2] = [STATE_DIR, TRUSTED_KEYS_DIR];
+/// Paths no package may write into, replace or redirect: the store's own
+/// state (which also holds the local builder key), the trusted signer keys
+/// and the trust store file.
+pub const RESERVED_DIRS: [&str; 3] = [STATE_DIR, TRUSTED_KEYS_DIR, TRUST_FILE];
 
 /// Mode bits the store sets and checks on installed files (permissions,
 /// setuid, setgid and sticky), the bits pkgar signs.
@@ -851,6 +853,8 @@ mod tests {
             "var/lib/fox/installed.toml",
             "var/lib/fox/heads/x.pkgar_head",
             "etc/fox/keys/attacker.toml",
+            "etc/fox/trust.toml",
+            "var/lib/fox/local-builder.pub.toml",
             "var",
             "var/lib",
             "etc",
@@ -862,6 +866,7 @@ mod tests {
             "var/lib/foxglove",
             "etc/foxrc",
             "etc/fox/fox.toml",
+            "etc/fox/trust.toml.d",
             "usr/bin/fox",
             "var/log/x",
         ] {
