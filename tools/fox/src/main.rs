@@ -9,8 +9,18 @@
 //!                                       build attestation beside the archive
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
-//! fox install [--force] [--allow-unsigned-metadata] <file.pkgar>...
-//!                                       verify, then install into --root
+//! fox install [--force] [--allow-unsigned-metadata] [source options]
+//!             <file.pkgar | git-url[#ref] | dir[#ref]>...
+//!                                       verify (building git sources from
+//!                                       their signed release tag), then
+//!                                       install into --root
+//! fox build [source options] [--out <dir>] <git-url[#ref] | dir[#ref]>
+//!                                       build a git source into a signed
+//!                                       archive with an attestation
+//! fox trust list | add-author <git-url> <key> | add-builder <label> <key>
+//!         | remove-author <git-url> | remove-builder <label>
+//!                                       pinned author keys and trusted
+//!                                       builders (etc/fox/trust.toml)
 //! fox list                              installed packages
 //! fox remove [--force] <name>...        remove installed packages
 //! fox adopt-pkg [--allow-unsigned-metadata] [--again]
@@ -19,17 +29,30 @@
 //!
 //! Every command takes `--root <dir>` (default `/`) and `--json`. Trusted
 //! signer keys are the `pkgar-keys` public key files in
-//! `<root>/etc/fox/keys/`, plus any given with `--key`.
+//! `<root>/etc/fox/keys/`, the root's local builder key, plus any given with
+//! `--key`.
+//!
+//! A git source is fetched into `<root>/var/lib/fox/git/`, and its newest
+//! release tag (or the tag or commit after `#`) is checked: the tag must be
+//! SSH-signed by the key pinned for the repository in
+//! `<root>/etc/fox/trust.toml`. The first time a repository is seen, fox
+//! asks before pinning its key (trust on first use); `--trust-new-key`
+//! accepts it without asking. The commit is then built hermetically with
+//! `fox-build` and signed with the root's local builder key, or, with
+//! `--prebuilt`, a prebuilt archive of the same commit and tree from a
+//! builder listed in the trust store is installed instead.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod commands;
+mod source;
+mod trust;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// The Ferric Oxide package manager.
 #[derive(Debug, Parser)]
@@ -76,7 +99,8 @@ enum Command {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
-    /// Verify archives and install them into the root.
+    /// Verify archives, or build git sources, and install them into the
+    /// root.
     Install {
         /// Replace existing files that belong to no package.
         #[arg(long)]
@@ -85,9 +109,35 @@ enum Command {
         /// and version in the unsigned cookbook metadata file beside them.
         #[arg(long)]
         allow_unsigned_metadata: bool,
-        /// Archives to install.
+        /// Install this prebuilt archive of the (single) git source instead
+        /// of building it. Its attestation must be signed by a builder in
+        /// the trust store and name the same repository, commit and tree.
+        #[arg(long, value_name = "FILE")]
+        prebuilt: Option<PathBuf>,
+        #[command(flatten)]
+        source: SourceArgs,
+        /// Archives (`.pkgar` files), git URLs or local repositories, each
+        /// optionally followed by `#<tag or commit>`.
         #[arg(required = true)]
-        archives: Vec<PathBuf>,
+        targets: Vec<String>,
+    },
+    /// Build a git source into a signed archive, attestation and SBOM,
+    /// without installing it.
+    Build {
+        /// Output directory.
+        #[arg(long, default_value = ".", value_name = "DIR")]
+        out: PathBuf,
+        #[command(flatten)]
+        source: SourceArgs,
+        /// A git URL or local repository, optionally followed by
+        /// `#<tag or commit>`.
+        #[arg(value_name = "SOURCE")]
+        spec: String,
+    },
+    /// Show or change the trust store.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
     },
     /// List installed packages.
     List,
@@ -116,6 +166,68 @@ enum Command {
     },
 }
 
+/// How git sources are chosen, checked and built.
+#[derive(Debug, Args)]
+struct SourceArgs {
+    /// Accept the source's author key without asking, and pin it, when the
+    /// repository has no pinned key yet.
+    #[arg(long)]
+    trust_new_key: bool,
+    /// Build an unsigned tag, a branch or a commit (a warning is printed).
+    #[arg(long)]
+    allow_unsigned: bool,
+    /// Rust target triple (default: the toolchain's host).
+    #[arg(long)]
+    target: Option<String>,
+    /// Package to build, when the manifest holds several.
+    #[arg(long, short)]
+    package: Option<String>,
+    /// The package's directory inside the repository.
+    #[arg(long, value_name = "DIR")]
+    path: Option<PathBuf>,
+    /// Cargo features to enable (comma-separated or repeated).
+    #[arg(long, short = 'F', value_delimiter = ',')]
+    features: Vec<String>,
+    /// Do not enable the package's default features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Build work directory (default: one per source under the system
+    /// temporary directory).
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+}
+
+/// `fox trust` subcommands.
+#[derive(Debug, Subcommand)]
+enum TrustCommand {
+    /// List pinned author keys and trusted builders.
+    List,
+    /// Pin the key that signs a repository's release tags.
+    AddAuthor {
+        /// The repository URL.
+        git: String,
+        /// An OpenSSH Ed25519 public key, or a file holding one.
+        key: String,
+    },
+    /// Remove a repository's pinned author key.
+    RemoveAuthor {
+        /// The repository URL.
+        git: String,
+    },
+    /// Trust a third-party builder's prebuilt archives.
+    AddBuilder {
+        /// The builder's name.
+        label: String,
+        /// Its pkgar public key file.
+        key: PathBuf,
+    },
+    /// Stop trusting a builder.
+    RemoveBuilder {
+        /// The builder's name.
+        label: String,
+    },
+}
+
 /// SBOM output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SbomFormat {
@@ -136,5 +248,15 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        super::Cli::command().debug_assert();
     }
 }

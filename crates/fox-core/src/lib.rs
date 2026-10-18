@@ -20,12 +20,16 @@
 //!   a builder's signed statement binding a source tree, toolchain, target
 //!   and feature set to an archive and its SBOM, and its verification;
 //! - [`CpuLevel`] and [`feature_set_hash`]: parts of an artifact's
+//!   identity;
+//! - [`GitUrl`]: a repository URL in the normalized form used as a source's
 //!   identity.
 //!
 //! The crate is `no_std` with `alloc`. The `std` feature adds the `archive`
 //! module, which opens `.pkgar` files and hashes every entry's data, the
 //! `attested` module, which reads attestation files and checks them against
-//! an archive, and the `keys` module, which loads trusted keys from disk. The `test-fixtures`
+//! an archive, the `keys` module, which loads trusted keys from disk, and the
+//! `trust` module, the store of pinned repository authors and trusted
+//! third-party builders. The `test-fixtures`
 //! feature adds `fixtures`, which builds signed packages for tests.
 //!
 //! # Examples
@@ -54,11 +58,14 @@ pub mod attested;
 mod digest;
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
+mod git_url;
 #[cfg(feature = "std")]
 pub mod keys;
 mod manifest;
 mod name;
 mod record;
+#[cfg(feature = "std")]
+pub mod trust;
 mod verify;
 
 pub use attestation::{
@@ -68,6 +75,7 @@ pub use attestation::{
     VerifiedAttestation, feature_set_hash, verify_attestation,
 };
 pub use digest::{Blake3Digest, DigestParseError, KeyId};
+pub use git_url::{GitUrl, GitUrlError};
 pub use manifest::{
     MANIFEST_DIR, Manifest, ManifestError, ManifestFormat, SBOM_DIR, SourceInfo, manifest_path,
     sbom_path,

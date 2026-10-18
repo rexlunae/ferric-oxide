@@ -6,6 +6,9 @@
 //!                                           build, pack a signed .pkgar, and
 //!                                           write a signed attestation and SBOM
 //! cargo fox keygen  <dir> [--name <name>]   make an unencrypted pkgar key pair
+//! cargo fox release <version> [--signing-key <ssh-key>]
+//!                                           set the version, commit, and make
+//!                                           the SSH-signed tag v<version>
 //! ```
 //!
 //! Builds take the committed tree at `--rev` (default `HEAD`) of the git
@@ -15,14 +18,16 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::fs;
+mod release;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fox_build::{
-    Auditable, Build, BuildError, BuildRequest, FeatureSelection, Packaged, Signer, build, package,
+    Auditable, Build, BuildError, BuildRequest, FeatureSelection, Packaged, Signer, build,
+    default_work_dir, package,
 };
 use fox_core::CpuLevel;
 use fox_git::{GitError, Repository};
@@ -64,6 +69,20 @@ enum Command {
         out: Option<PathBuf>,
         #[command(flatten)]
         build: BuildArgs,
+    },
+    /// Set the package version, commit the change, and make the SSH-signed
+    /// release tag `v<version>` that `fox install <git-url>` verifies.
+    /// Nothing is pushed.
+    Release {
+        /// The new version.
+        version: semver::Version,
+        /// Path to the package's Cargo.toml.
+        #[arg(long, default_value = "Cargo.toml", value_name = "PATH")]
+        manifest_path: PathBuf,
+        /// Unencrypted OpenSSH Ed25519 private key to sign the tag with
+        /// (default: `git tag -s` with your git signing configuration).
+        #[arg(long, value_name = "FILE")]
+        signing_key: Option<PathBuf>,
     },
     /// Generate an unencrypted pkgar-keys key pair: `<dir>/<name>.toml`
     /// (secret) and `<dir>/<name>.pub.toml` (public).
@@ -138,6 +157,8 @@ enum CliError {
     Build(#[from] BuildError),
     #[error(transparent)]
     Git(#[from] GitError),
+    #[error(transparent)]
+    Release(#[from] release::ReleaseError),
     #[error("cannot find {}", path.display())]
     Manifest {
         path: PathBuf,
@@ -146,20 +167,6 @@ enum CliError {
     },
     #[error("{} is not inside the work tree of its repository", path.display())]
     OutsideRepository { path: PathBuf },
-    #[error("{} already exists", path.display())]
-    KeyExists { path: PathBuf },
-    #[error("cannot write key file {}", path.display())]
-    Key {
-        path: PathBuf,
-        #[source]
-        source: pkgar_keys::Error,
-    },
-    #[error("cannot create {}", path.display())]
-    Dir {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("cannot write JSON output")]
     Json(#[from] serde_json::Error),
 }
@@ -203,6 +210,14 @@ fn run(cli: &FoxCli) -> Result<(), CliError> {
             report_package(cli.json, &built, &packaged)
         }
         Command::Keygen { dir, name } => keygen(cli.json, dir, name),
+        Command::Release {
+            version,
+            manifest_path,
+            signing_key,
+        } => {
+            let released = release::release(manifest_path, version, signing_key.as_deref())?;
+            report_release(cli.json, &released)
+        }
     }
 }
 
@@ -232,7 +247,7 @@ fn request(args: &BuildArgs) -> Result<(BuildRequest, PathBuf), CliError> {
     let work_dir = args
         .work_dir
         .clone()
-        .unwrap_or_else(|| default_work_dir(&root));
+        .unwrap_or_else(|| default_work_dir(root.as_os_str().as_encoded_bytes()));
     let mut request = BuildRequest::new(&root, &work_dir);
     request.rev = args.rev.clone();
     request.package_dir = relative;
@@ -252,15 +267,6 @@ fn request(args: &BuildArgs) -> Result<(BuildRequest, PathBuf), CliError> {
     };
     request.toolchain = args.toolchain.clone();
     Ok((request, root))
-}
-
-/// A work directory per repository under the system temporary directory.
-/// It is kept between builds, so Cargo's target directory and downloads
-/// are reused, and it lies outside the user's home, so no `.cargo/config`
-/// above it can change the build.
-fn default_work_dir(repo_root: &Path) -> PathBuf {
-    let digest = blake3::hash(repo_root.as_os_str().as_encoded_bytes()).to_hex();
-    std::env::temp_dir().join(format!("fox-build-{}", &digest[..16]))
 }
 
 #[derive(Serialize)]
@@ -355,6 +361,33 @@ fn report_package(json: bool, built: &Build, packaged: &Packaged) -> Result<(), 
 }
 
 #[derive(Serialize)]
+struct ReleaseJson<'a> {
+    tag: &'a str,
+    commit: &'a str,
+    signer: &'a str,
+    bumped: bool,
+}
+
+fn report_release(json: bool, released: &release::Released) -> Result<(), CliError> {
+    if json {
+        return print_json(&ReleaseJson {
+            tag: &released.tag,
+            commit: &released.commit,
+            signer: &released.fingerprint,
+            bumped: released.bumped,
+        });
+    }
+    println!(
+        "tagged {} at {} (signed by {})",
+        released.tag,
+        &released.commit[..12.min(released.commit.len())],
+        released.fingerprint
+    );
+    println!("  push it with: git push origin HEAD {}", released.tag);
+    Ok(())
+}
+
+#[derive(Serialize)]
 struct KeygenJson {
     secret: PathBuf,
     public: PathBuf,
@@ -362,27 +395,10 @@ struct KeygenJson {
 }
 
 fn keygen(json: bool, dir: &Path, name: &str) -> Result<(), CliError> {
-    fs::create_dir_all(dir).map_err(|source| CliError::Dir {
-        path: dir.to_path_buf(),
-        source,
-    })?;
     let secret_path = dir.join(format!("{name}.toml"));
     let public_path = dir.join(format!("{name}.pub.toml"));
-    for path in [&secret_path, &public_path] {
-        if path.exists() {
-            return Err(CliError::KeyExists { path: path.clone() });
-        }
-    }
-    let (public, secret) = pkgar_keys::SecretKeyFile::new();
-    secret.save(&secret_path).map_err(|source| CliError::Key {
-        path: secret_path.clone(),
-        source,
-    })?;
-    public.save(&public_path).map_err(|source| CliError::Key {
-        path: public_path.clone(),
-        source,
-    })?;
-    let key = fox_core::KeyId::from_bytes(public.pkey).to_string();
+    let signer = Signer::generate(&secret_path, &public_path, name)?;
+    let key = signer.key().to_string();
     if json {
         return print_json(&KeygenJson {
             secret: secret_path,
