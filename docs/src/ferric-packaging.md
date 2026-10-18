@@ -638,9 +638,12 @@ pkgar-blake3 = "<BLAKE3 of the archive>"
 
 The build request is what changes the archive built: the git source's
 normalized URL (a local directory becomes the `file://` URL of its
-canonical path, so the same checkout always has the same identity), `rev`,
-`path`, `package`, the features (sorted, without repeats),
-`default-features` and the target (the entry's, else `--target`'s). A git
+canonical path, so the same checkout always has the same identity), the
+revision (`rev`, or a `#` fragment of the URL; the two must agree if both
+are given), `path`, `package`, the features (sorted, without repeats),
+`default-features` and the target (the entry's, else `--target`'s, else the
+host target `fox` was built for, so locks from different hosts do not
+share pins). A git
 source that is neither a git URL nor an existing directory is an error,
 not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
 on any incompatible change to its fields.

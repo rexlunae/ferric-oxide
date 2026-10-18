@@ -24,8 +24,9 @@
 //! The lock file (`fox-lock/1`, default `fox.lock` beside the package set)
 //! records each package's version, where it came from and the BLAKE3 of the
 //! archive installed, plus `request-blake3`: a digest of the build request
-//! (the normalized git source, `rev`, `path`, `package`, the sorted
-//! features, `default-features` and the effective target). A registry
+//! (the normalized git source, the revision from `rev` or the URL's `#`
+//! fragment, `path`, `package`, the sorted features, `default-features` and
+//! the effective target, which is this host's when none is given). A registry
 //! package is pinned to its version and archive hash; a git package to its
 //! commit (archives built locally are signed with the root's own builder
 //! key, so their hash is recorded but not compared). Sync keeps a locked
@@ -85,6 +86,12 @@ pub(crate) enum SyncError {
     },
     #[error("package {name} names both a git source and a registry or version")]
     MixedSource { name: PackageName },
+    #[error("package {name} names revision {fragment:?} in its git URL but rev = {rev:?}")]
+    ConflictingRev {
+        name: PackageName,
+        fragment: String,
+        rev: String,
+    },
     #[error("package {name} has an invalid git source")]
     GitSource {
         name: PackageName,
@@ -226,6 +233,8 @@ pub(crate) struct Locked {
 struct Request {
     /// The git source's identity, for a git package.
     git: Option<GitUrl>,
+    /// The git revision asked for, from `rev` or the URL's `#` fragment.
+    rev: Option<String>,
     /// The digest of everything that changes what is built.
     digest: Blake3Digest,
 }
@@ -251,24 +260,32 @@ impl Want {
     /// [`SyncError::GitSource`] if the git source is not a git URL or an
     /// existing directory.
     fn request(&self, name: &PackageName, base: &SourceArgs) -> Result<Request, SyncError> {
-        let git = match &self.git {
-            Some(git) => Some(
-                SourceSpec::parse(git)
-                    .map_err(|source| SyncError::GitSource {
-                        name: name.clone(),
-                        source: Box::new(source),
-                    })?
-                    .git()
-                    .clone(),
-            ),
-            None => None,
+        let (git, rev) = match &self.git {
+            Some(git) => {
+                let spec = SourceSpec::parse(git).map_err(|source| SyncError::GitSource {
+                    name: name.clone(),
+                    source: Box::new(source),
+                })?;
+                let rev = match (spec.rev(), self.rev.as_deref()) {
+                    (Some(fragment), Some(rev)) if fragment != rev => {
+                        return Err(SyncError::ConflictingRev {
+                            name: name.clone(),
+                            fragment: fragment.to_owned(),
+                            rev: rev.to_owned(),
+                        });
+                    }
+                    (fragment, rev) => rev.or(fragment).map(str::to_owned),
+                };
+                (Some(spec.git().clone()), rev)
+            }
+            None => (None, self.rev.clone()),
         };
         let mut features: Vec<&str> = self.features.iter().map(String::as_str).collect();
         features.sort_unstable();
         features.dedup();
         let mut hasher = blake3::Hasher::new();
         hash_field(&mut hasher, git.as_ref().map(|git| git.as_str().as_bytes()));
-        hash_field(&mut hasher, self.rev.as_deref().map(str::as_bytes));
+        hash_field(&mut hasher, rev.as_deref().map(str::as_bytes));
         hash_field(
             &mut hasher,
             self.path
@@ -281,10 +298,17 @@ impl Want {
             hash_field(&mut hasher, Some(feature.as_bytes()));
         }
         hasher.update(&[u8::from(self.default_features)]);
-        let target = self.target.as_deref().or(base.target.as_deref());
-        hash_field(&mut hasher, target.map(str::as_bytes));
+        // Without a target the build is for this host, so two hosts must
+        // not share a pin.
+        let target = self
+            .target
+            .as_deref()
+            .or(base.target.as_deref())
+            .unwrap_or(commands::HOST_TARGET);
+        hash_field(&mut hasher, Some(target.as_bytes()));
         Ok(Request {
             git,
+            rev,
             digest: hasher.finalize().into(),
         })
     }
@@ -310,15 +334,23 @@ impl Want {
     }
 
     /// The `fox install` target for this want, pinned to `locked` if given.
-    fn target(&self, name: &PackageName, locked: Option<&Locked>) -> String {
+    fn target(&self, name: &PackageName, request: &Request, locked: Option<&Locked>) -> String {
         match &self.git {
-            Some(git) => match self.rev.as_deref() {
-                Some(rev) => format!("{git}#{rev}"),
-                None => match locked.and_then(|locked| locked.commit.as_deref()) {
-                    Some(commit) => format!("{git}#{commit}"),
-                    None => git.clone(),
-                },
-            },
+            Some(git) => {
+                // The revision is the request's, so a `#` fragment is
+                // replaced rather than repeated.
+                let location = match git.rsplit_once('#') {
+                    Some((location, fragment)) if !fragment.is_empty() => location,
+                    _ => git.as_str(),
+                };
+                match request.rev.as_deref() {
+                    Some(rev) => format!("{location}#{rev}"),
+                    None => match locked.and_then(|locked| locked.commit.as_deref()) {
+                        Some(commit) => format!("{location}#{commit}"),
+                        None => location.to_owned(),
+                    },
+                }
+            }
             None => {
                 let registry = locked
                     .and_then(|locked| locked.registry.as_ref())
@@ -442,7 +474,7 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
             continue;
         }
         let args = want.source_args(&base);
-        let target = want.target(name, locked);
+        let target = want.target(name, request, locked);
         let (pending, registry) = commands::prepare(&root, &target, &args, &policy)?;
         let keys = commands::trusted_keys_for(cli, &root)?;
         let archive = commands::open_pending(pending, &keys)?;
@@ -655,8 +687,11 @@ mod tests {
         let request = want.request(&name, &base()).unwrap();
         let pinned = locked("0.3.1", Some("test"), &request);
         assert!(want.accepts(&pinned, &request));
-        assert_eq!(want.target(&name, Some(&pinned)), "test/tiny@=0.3.1");
-        assert_eq!(want.target(&name, None), "tiny@^0.3");
+        assert_eq!(
+            want.target(&name, &request, Some(&pinned)),
+            "test/tiny@=0.3.1"
+        );
+        assert_eq!(want.target(&name, &request, None), "tiny@^0.3");
         assert!(!want.accepts(&locked("0.4.0", Some("test"), &request), &request));
         let other_registry = Want {
             registry: Some(PackageName::new("other").unwrap()),
@@ -674,7 +709,7 @@ mod tests {
         assert!(git.accepts(&built, &git_request));
         assert!(!git.accepts(&pinned, &git_request));
         assert_eq!(
-            git.target(&name, Some(&built)),
+            git.target(&name, &git_request, Some(&built)),
             "https://example.com/tiny#c0ffee"
         );
 
@@ -775,5 +810,72 @@ mod tests {
             missing.request(&name, &base()),
             Err(SyncError::GitSource { .. })
         ));
+    }
+
+    #[test]
+    fn a_url_fragment_is_the_requested_revision() {
+        let name = PackageName::new("tiny").unwrap();
+        let at = |url: &str| Want {
+            git: Some(url.to_owned()),
+            ..Want::default()
+        };
+        let v1 = at("https://example.com/tiny#v1");
+        let request = v1.request(&name, &base()).unwrap();
+        assert_eq!(request.rev.as_deref(), Some("v1"));
+        let pinned = locked("1.0.0", None, &request);
+        assert!(v1.accepts(&pinned, &request));
+        assert_eq!(
+            v1.target(&name, &request, Some(&pinned)),
+            "https://example.com/tiny#v1"
+        );
+
+        // Moving the fragment to another tag invalidates the pin.
+        let v2 = at("https://example.com/tiny#v2");
+        let moved = v2.request(&name, &base()).unwrap();
+        assert_ne!(moved.digest, request.digest);
+        assert!(!v2.accepts(&pinned, &moved));
+
+        // The fragment and rev are one request when they agree...
+        let both = Want {
+            rev: Some("v1".into()),
+            ..v1.clone()
+        };
+        assert_eq!(both.request(&name, &base()).unwrap(), request);
+        let separate = Want {
+            rev: Some("v1".into()),
+            ..at("https://example.com/tiny")
+        };
+        assert_eq!(separate.request(&name, &base()).unwrap(), request);
+        // ...and an error when they do not.
+        let conflict = Want {
+            rev: Some("v2".into()),
+            ..v1
+        };
+        assert!(matches!(
+            conflict.request(&name, &base()),
+            Err(SyncError::ConflictingRev { .. })
+        ));
+    }
+
+    #[test]
+    fn the_implicit_target_is_this_host() {
+        let name = PackageName::new("tiny").unwrap();
+        let want = Want::default();
+        let implicit = want.request(&name, &base()).unwrap();
+        let host = Want {
+            target: Some(commands::HOST_TARGET.to_owned()),
+            ..Want::default()
+        };
+        assert_eq!(host.request(&name, &base()).unwrap(), implicit);
+        let other = if commands::HOST_TARGET == "x86_64-unknown-redox" {
+            "aarch64-unknown-redox"
+        } else {
+            "x86_64-unknown-redox"
+        };
+        let cross = Want {
+            target: Some(other.to_owned()),
+            ..Want::default()
+        };
+        assert_ne!(cross.request(&name, &base()).unwrap(), implicit);
     }
 }
