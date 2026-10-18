@@ -562,6 +562,54 @@ impl AddrSpaceWrapper {
         page: Page,
         token: &mut CleanLockToken,
     ) -> Result<RaiiFrame> {
+        // Ferric Oxide: the body is `borrow_frame_enforce_rw_with`, shared with
+        // `borrow_frame_enforce_rw_anonymous`.
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| matches!(provider, Provider::Allocated { .. }),
+            token,
+        )
+    }
+    /// Ferric Oxide: borrows a read/write page of anonymous user memory, private or
+    /// `MAP_SHARED`, as `borrow_frame_enforce_rw_allocated` does, but refusing private mappings
+    /// of a file, physically contiguous allocations and pages the process only borrows from
+    /// another (pinned borrows, context/reshare.rs): regbuf registration, which must pin plain
+    /// anonymous memory of the caller's own.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when the page is not mapped, `EPERM` when it is not read/write anonymous
+    /// memory of the caller's own, `ENOMEM` when memory runs out.
+    #[cfg(feature = "regbuf")]
+    pub fn borrow_frame_enforce_rw_anonymous(
+        self: &Arc<Self>,
+        page: Page,
+        token: &mut CleanLockToken,
+    ) -> Result<RaiiFrame> {
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| {
+                matches!(
+                    provider,
+                    Provider::Allocated {
+                        cow_file_ref: None,
+                        phys_contiguous: false,
+                    } | Provider::AllocatedShared {
+                        is_pinned_userscheme_borrow: false,
+                    }
+                )
+            },
+            token,
+        )
+    }
+    /// Ferric Oxide: borrows a read/write page whose grant provider `accepts`
+    /// (`borrow_frame_enforce_rw_allocated` and `borrow_frame_enforce_rw_anonymous`).
+    fn borrow_frame_enforce_rw_with(
+        self: &Arc<Self>,
+        page: Page,
+        accepts: impl FnOnce(&Provider) -> bool,
+        token: &mut CleanLockToken,
+    ) -> Result<RaiiFrame> {
         let mut lock_token = token.token();
         let guard = self.acquire_write(lock_token.downgrade());
 
@@ -570,7 +618,7 @@ impl AddrSpaceWrapper {
         if !info.can_have_flags(MapFlags::PROT_READ | MapFlags::PROT_WRITE) {
             return Err(Error::new(EPERM));
         }
-        if !matches!(info.provider, Provider::Allocated { .. }) {
+        if !accepts(&info.provider) {
             return Err(Error::new(EPERM));
         }
 
@@ -589,7 +637,7 @@ impl AddrSpaceWrapper {
         };
 
         let frame = match get_page_info(frame)
-            .expect("missing page info for Allocated grant")
+            .expect("missing page info for Allocated or AllocatedShared grant")
             .add_ref(RefKind::Shared)
         {
             Ok(_) => Ok(unsafe { RaiiFrame::new_unchecked(frame) }),
@@ -1344,34 +1392,79 @@ impl Grant {
         flusher: &mut Flusher,
         is_pinned: bool,
     ) -> Result<Grant> {
-        let info = get_page_info(frame).expect("needs page info");
+        // Ferric Oxide: one page of `allocated_shared`.
+        Self::allocated_shared(&[frame], page, flags, mapper, flusher, is_pinned)
+    }
 
-        // TODO:
-        //
-        // This may not necessarily hold, as even pinned memory can remain shared (e.g. proc:
-        // borrow), but it would probably be possible to forbid borrowing memory there as well.
-        // Maybe make it exclusive first using cow(), unless that is too expensive.
+    /// Ferric Oxide: maps `frames` at consecutive pages from `base` as one shared grant, each
+    /// frame getting a shared reference, so a multi-page mapping of borrowed frames is one
+    /// grant rather than one per page (regbuf grant mappings, bounced scheme buffers).
+    ///
+    /// The grant covers the leading frames that could be mapped: if the page tables run out
+    /// part way, it is shorter than `frames`, and the caller unmaps it and fails.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when `frames` is empty or a frame has no page info, `ENOMEM` when not even
+    /// the first frame can be mapped or referenced.
+    pub fn allocated_shared(
+        frames: &[Frame],
+        base: Page,
+        flags: PageFlags<RmmA>,
+        mapper: &mut PageMapper,
+        flusher: &mut Flusher,
+        is_pinned: bool,
+    ) -> Result<Grant> {
+        // TODO (upstream): This may not necessarily hold, as even pinned memory can remain
+        // shared (e.g. proc: borrow), but it would probably be possible to forbid borrowing
+        // memory there as well. Maybe make it exclusive first using cow(), unless that is too
+        // expensive.
         //
         // assert_eq!(info.refcount(), RefCount::One);
-
-        // Semantically, the page will be shared between the "context struct" and whatever
-        // else.
-        info.add_ref(RefKind::Shared)
-            .expect("must be possible if previously Zero");
-
-        unsafe {
-            mapper
-                .map_phys(page.start_address(), frame.base(), flags, 0)
-                .ok_or(Error::new(ENOMEM))?
-                .ignore();
-
+        let infos = frames
+            .iter()
+            .map(|&frame| get_page_info(frame).map(|info| (frame, info)));
+        if frames.is_empty() || infos.clone().any(|info| info.is_none()) {
+            return Err(Error::new(EINVAL));
+        }
+        let mut mapped: usize = 0;
+        for ((frame, info), page) in infos
+            .flatten()
+            .zip(PageSpan::new(base, frames.len()).pages())
+        {
+            // Semantically, the page will be shared between the "context struct" and
+            // whatever else.
+            if info.add_ref(RefKind::Shared).is_err() {
+                break;
+            }
+            // SAFETY: the page is inside the free span the caller's `AddrSpace::mmap` chose,
+            // the frame stays allocated while the mapping holds the reference just taken, and
+            // the flusher queued below covers the new mapping, so the flush can be skipped.
+            let mapped_now = unsafe {
+                match mapper.map_phys(page.start_address(), frame.base(), flags, 0) {
+                    Some(flush) => {
+                        flush.ignore();
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if !mapped_now {
+                // The caller holds a reference of its own, so this never frees the frame.
+                let _still_referenced = info.remove_ref();
+                break;
+            }
             flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+            mapped = mapped.saturating_add(1);
+        }
+        if mapped == 0 {
+            return Err(Error::new(ENOMEM));
         }
 
         Ok(Grant {
-            base: page,
+            base,
             info: GrantInfo {
-                page_count: 1,
+                page_count: mapped,
                 flags,
                 mapped: true,
                 provider: Provider::AllocatedShared {
@@ -1557,6 +1650,48 @@ impl Grant {
     ) -> Result<Self> {
         if let Some(src) = src {
             let mut guard = src.addr_space_guard;
+            // Ferric Oxide: a scheme cannot hand out pages it only borrows (context/reshare.rs).
+            super::reshare::check_span(&guard, PageSpan::new(src.src_base, span.count))?;
+            if matches!(src.mode, MmapMode::Cow) {
+                // Private file mappings own COW references, while retaining their file
+                // origin. A write must copy the frame rather than request a lazy mmap.
+                for page in PageSpan::new(src.src_base, span.count).pages() {
+                    if guard.table.utable.translate(page.start_address()).is_none() {
+                        let (_, flush, new_guard) =
+                            correct_inner(src.addr_space_lock, guard, page, AccessMode::Read, 0)
+                                .map_err(|_| Error::new(EIO))?;
+                        flush.flush();
+                        guard = new_guard;
+                    }
+                    let (phys, _) = guard
+                        .table
+                        .utable
+                        .translate(page.start_address())
+                        .ok_or(Error::new(EFAULT))?;
+                    // Device memory cannot acquire the allocator's COW references.
+                    if get_page_info(Frame::containing(phys)).is_none() {
+                        return Err(Error::new(EOPNOTSUPP));
+                    }
+                }
+                let mut src_flusher = Flusher::with_cpu_set(
+                    &src.addr_space_lock.used_by,
+                    &src.addr_space_lock.tlb_ack,
+                );
+                return Self::copy_mappings(
+                    src.src_base,
+                    span.base,
+                    span.count,
+                    new_flags,
+                    &mut guard.table.utable,
+                    mapper,
+                    &mut src_flusher,
+                    flusher,
+                    CopyMappingsMode::Owned {
+                        cow_file_ref: Some(file_ref),
+                    },
+                )
+                .map_err(|_| Error::new(ENOMEM));
+            }
             let mut src_addrspace = &mut *guard;
             let mut src_flusher_state =
                 Flusher::with_cpu_set(&src.addr_space_lock.used_by, &src.addr_space_lock.tlb_ack)
@@ -1564,69 +1699,32 @@ impl Grant {
             for dst_page in span.pages() {
                 let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
-                let (frame, page_flags, is_cow) = match src.mode {
-                    MmapMode::Shared => {
-                        // TODO: Error code for "scheme responded with unmapped page"?
-                        let (frame, page_flags) = match src_addrspace
+                // TODO: Error code for "scheme responded with unmapped page"?
+                let (frame, page_flags) = match src_addrspace
+                    .table
+                    .utable
+                    .translate(src_page.start_address())
+                {
+                    Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
+                    // TODO: ensure the correct context is hardblocked, if necessary
+                    None => {
+                        let (frame, _, new_guard) = correct_inner(
+                            src.addr_space_lock,
+                            guard,
+                            src_page,
+                            AccessMode::Read,
+                            0,
+                        )
+                        .map_err(|_| Error::new(EIO))?;
+                        let page_flags = new_guard
                             .table
                             .utable
                             .translate(src_page.start_address())
-                        {
-                            Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
-                            // TODO: ensure the correct context is hardblocked, if necessary
-                            None => {
-                                let (frame, _, new_guard) = correct_inner(
-                                    src.addr_space_lock,
-                                    guard,
-                                    src_page,
-                                    AccessMode::Read,
-                                    0,
-                                )
-                                .map_err(|_| Error::new(EIO))?;
-                                let page_flags = new_guard
-                                    .table
-                                    .utable
-                                    .translate(src_page.start_address())
-                                    .unwrap()
-                                    .1;
-                                guard = new_guard;
-                                (frame, page_flags)
-                            }
-                        };
-
-                        (frame, page_flags, false)
+                            .unwrap()
+                            .1;
+                        guard = new_guard;
+                        (frame, page_flags)
                     }
-                    MmapMode::Cow => unsafe {
-                        let (frame, page_flags) = match guard
-                            .table
-                            .utable
-                            .remap_with(src_page.start_address(), |flags| flags.write(false))
-                        {
-                            Some((page_flags, phys, _)) => (Frame::containing(phys), page_flags),
-                            // TODO: ensure the correct context is hardblocked, if necessary
-                            None => {
-                                let (frame, _, new_guard) = correct_inner(
-                                    src.addr_space_lock,
-                                    guard,
-                                    src_page,
-                                    AccessMode::Read,
-                                    0,
-                                )
-                                .map_err(|_| Error::new(EIO))?;
-                                // FIXME correct_inner should read the page flags instead
-                                let page_flags = new_guard
-                                    .table
-                                    .utable
-                                    .translate(src_page.start_address())
-                                    .unwrap()
-                                    .1;
-                                guard = new_guard;
-                                (frame, page_flags)
-                            }
-                        };
-
-                        (frame, page_flags, true)
-                    },
                 };
                 src_addrspace = &mut *guard;
 
@@ -1686,7 +1784,6 @@ impl Grant {
                             dst_page.start_address(),
                             frame.base(),
                             new_flags
-                                .write(new_flags.has_write() && !is_cow)
                                 // FIXME make sure this stays in sync with the MemoryType flags
                                 .uncacheable(page_flags.has_flag(RmmA::ENTRY_FLAG_UNCACHEABLE))
                                 .device_memory(page_flags.has_flag(RmmA::ENTRY_FLAG_DEVICE_MEMORY))
@@ -1740,6 +1837,10 @@ impl Grant {
 
         let src_span = PageSpan::new(src_base, page_count);
         let mut prev_span = None;
+
+        // Ferric Oxide: borrowed pages cannot be borrowed again (context/reshare.rs). Checked
+        // before the loop below pins anything.
+        super::reshare::check_span(src_address_space, src_span)?;
 
         for (src_grant_base, src_grant) in src_address_space.grants.conflicts_mut(src_span) {
             let grant_span = PageSpan::new(src_grant_base, src_grant.page_count);
@@ -2921,7 +3022,9 @@ fn correct_inner<'l>(
                 .request_fmap(scheme_number, offset, 1, flags, &mut token)
                 .unwrap();
 
-            let context_lock = crate::context::current();
+            // The fault blocks on the scheme: release the per-CPU current-context borrow
+            // before switching, while keeping this context alive until the reply arrives.
+            let context_lock = Arc::clone(&crate::context::current());
             context_lock
                 .write(token.token())
                 .hard_block(HardBlockedReason::AwaitingMmap { file_ref });

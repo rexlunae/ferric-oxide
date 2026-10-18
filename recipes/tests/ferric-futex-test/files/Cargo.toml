@@ -1,0 +1,9 @@
+[package]
+name = "ferric-futex-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Concurrent futex wake-up regression test for Ferric Oxide"
+
+[profile.release]
+debug = false

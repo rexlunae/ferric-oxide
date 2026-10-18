@@ -14,9 +14,34 @@
 //! | [`Request::Join`] | domain | verb |
 //! | [`Request::AllocIrte`] | attach capability | verb, [`PciDevice::encode`] with [`SourceCheck::encode`] in bits 32 to 55, CPU and vector |
 //! | [`Request::FreeIrte`] | attach capability | verb, entry ID |
+//! | [`Request::MapGrant`] | domain | verb, the caller's descriptor number of a `kernel.regbuf` grant |
+//! | [`Request::UnmapGrant`] | domain | verb, IOVA |
 //!
 //! [`Request::AllocIrte`] also takes a payload of [`MsiMessage::BYTES`] bytes, which the kernel
 //! fills with the message the device must send.
+//!
+//! # Grants
+//!
+//! [`Request::MapGrant`] maps a registered-buffer grant (the `kernel.regbuf` scheme, ABI in the
+//! `ferric-regbuf` crate) into the domain the caller has bound, so its device can DMA straight
+//! into another process's buffer. A domain and a grant are descriptors of two different kernel
+//! schemes, which one `SYS_CALL` cannot name together, so the grant travels as the caller's own
+//! descriptor number in the metadata: the kernel looks it up in the caller's file table, so
+//! holding the descriptor is still the authority. The call returns the IOVA of the grant's
+//! first byte. The grant's pages are mapped at consecutive IOVAs, so the device sees one
+//! contiguous buffer, with the grant's access: a read-only grant is read-only for the device.
+//!
+//! [`Request::UnmapGrant`] with that IOVA takes the mapping down strictly (entries cleared, the
+//! IOTLB invalidated and waited on) before it returns. Revoking the grant, or one it was
+//! derived from, and closing the grant or the region do the same, so after any of them the
+//! device's DMA to the old IOVA faults. Closing the domain drops its grant mappings too.
+//!
+//! Errors: `ENODEV` without an IOMMU or when the caller has not bound this domain (there is no
+//! physical-address fallback, so the driver uses its own bounce buffers instead), `EBADF` when
+//! the descriptor is not open, `EINVAL` when it is not a grant or the grant is not page-aligned,
+//! `ECANCELED` once the grant is revoked, `ENOMEM` when the IOVA space or table memory runs
+//! out, `EIO` when the unit fails an invalidation, and for [`Request::UnmapGrant`] `ENOENT` when
+//! no grant is mapped at the IOVA.
 
 use core::fmt;
 
@@ -248,6 +273,10 @@ pub enum Verb {
     AllocIrte = 6,
     /// Free an interrupt remapping entry.
     FreeIrte = 7,
+    /// Map a registered-buffer grant into the caller's bound domain.
+    MapGrant = 8,
+    /// Take a grant mapping down.
+    UnmapGrant = 9,
 }
 
 impl Verb {
@@ -261,6 +290,8 @@ impl Verb {
             5 => Self::Join,
             6 => Self::AllocIrte,
             7 => Self::FreeIrte,
+            8 => Self::MapGrant,
+            9 => Self::UnmapGrant,
             _ => return None,
         })
     }
@@ -296,6 +327,19 @@ pub enum Request {
     AllocIrte(MsiRoute),
     /// Free the interrupt remapping entry with this ID: requests that name it fault.
     FreeIrte(u32),
+    /// Map the `kernel.regbuf` grant behind the caller's descriptor `grant_fd` into the domain,
+    /// which the caller must have bound, at a fresh contiguous IOVA range, and return the IOVA
+    /// of its first byte (see the module documentation).
+    MapGrant {
+        /// The caller's descriptor number of the grant.
+        grant_fd: u64,
+    },
+    /// Take down the grant mapping that [`Request::MapGrant`] returned `iova` for, strictly:
+    /// once the call returns the device cannot reach the grant's pages any more.
+    UnmapGrant {
+        /// The IOVA [`Request::MapGrant`] returned.
+        iova: u64,
+    },
 }
 
 impl Request {
@@ -326,6 +370,8 @@ impl Request {
                 3,
             ),
             Self::FreeIrte(index) => ([Verb::FreeIrte as u64, index as u64, 0], 2),
+            Self::MapGrant { grant_fd } => ([Verb::MapGrant as u64, grant_fd, 0], 2),
+            Self::UnmapGrant { iova } => ([Verb::UnmapGrant as u64, iova, 0], 2),
         }
     }
 
@@ -372,6 +418,8 @@ impl Request {
             (Verb::FreeIrte, &[index]) => u32::try_from(index)
                 .map(Self::FreeIrte)
                 .map_err(|_| DecodeError::Reserved),
+            (Verb::MapGrant, &[grant_fd]) => Ok(Self::MapGrant { grant_fd }),
+            (Verb::UnmapGrant, &[iova]) => Ok(Self::UnmapGrant { iova }),
             _ => Err(DecodeError::Length),
         }
     }
@@ -462,6 +510,10 @@ mod tests {
                 vector: 0xfe,
             }),
             Request::FreeIrte(0x0001_0fff),
+            Request::MapGrant { grant_fd: 7 },
+            Request::UnmapGrant {
+                iova: 0x7fff_f000_0000,
+            },
         ] {
             let (words, len) = request.encode();
             assert_eq!(Request::decode(&words[..len]), Ok(request));
@@ -500,6 +552,9 @@ mod tests {
             Err(DecodeError::BusRange)
         );
         assert_eq!(Request::decode(&[7, 1 << 32]), Err(DecodeError::Reserved));
+        assert_eq!(Request::decode(&[8]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[9, 0, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[10, 0]), Err(DecodeError::Verb));
     }
 
     #[test]

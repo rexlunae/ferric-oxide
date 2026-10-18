@@ -332,6 +332,15 @@ fn schedule(
             }
         });
 
+        // A context can be locked by another CPU when its timer expires. Retry those
+        // timers next time instead of discarding them with the temporary buffer.
+        percpu
+            .switch_internals
+            .run_queue
+            .lock()
+            .timers
+            .extend(timers.drain(..));
+
         // Drain from percpu
         {
             let mut local_wake = percpu.switch_internals.local_wakeup_list.borrow_mut();
@@ -574,6 +583,8 @@ fn select_next_context(
     // New BTreeMap based walk
     let mut weight_change: u64 = 0;
     let mut contexts_to_remove: SmallVec<[ContextQueueKey; 16]> = SmallVec::new();
+    let virtual_time = contexts_data.v;
+    let RunContextData { queue, timers, .. } = &mut *contexts_data;
     for (
         ContextQueueKey {
             vd,
@@ -585,9 +596,9 @@ fn select_next_context(
             weight: context_weight,
             context_ref,
         },
-    ) in contexts_data.queue.iter()
+    ) in queue.iter()
     {
-        if *vtime > ineligible_min_vtime && *vtime > contexts_data.v {
+        if *vtime > ineligible_min_vtime && *vtime > virtual_time {
             continue;
         }
 
@@ -629,6 +640,12 @@ fn select_next_context(
             guard.rem_slice = 0;
             guard.queue_key = None;
 
+            // A directly switched scheme handler can sleep while another context owns
+            // the timeslice. Preserve its deadline before removing it from this queue.
+            if let Some(wake) = guard.wake {
+                timers.insert((wake, context_ref.clone()));
+            }
+
             contexts_to_remove.push(ContextQueueKey {
                 vd: *vd,
                 rem_slice: *rem_slice,
@@ -652,7 +669,7 @@ fn select_next_context(
             }
         }
 
-        if *vtime <= contexts_data.v {
+        if *vtime <= virtual_time {
             // Eligible
             eligible_best = Some((guard, best_addr_space));
             break;
@@ -1031,6 +1048,19 @@ fn try_direct_switch_back(
     let next_is_current_sched = true;
     // False by the above ptr_eq check
     let next_is_current_context = false;
+
+    // A directly switched handler need not be on any run queue. Track its timed wait
+    // here even if its caller cannot resume, before the scheduler falls back to idle.
+    if prev_guard.status.is_soft_blocked()
+        && let Some(wake) = prev_guard.wake
+    {
+        percpu.switch_internals.run_queue.lock().timers.insert((
+            wake,
+            WeakContextRef(Arc::downgrade(ArcContextLockWriteGuard::rwlock(
+                &prev_guard,
+            ))),
+        ));
+    }
 
     if !matches!(
         update_runnable(
