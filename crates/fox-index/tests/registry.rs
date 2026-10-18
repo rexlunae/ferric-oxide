@@ -718,3 +718,48 @@ fn a_top_level_package_ignores_an_overlapping_delegation() {
     let found = verified.package(&ripgrep()).unwrap().unwrap();
     assert_eq!(found.owners, entry.owners);
 }
+
+/// Sets the root role's keys and signs with `seeds`; returns whether the
+/// report calls the new root complete, and checks that a client agrees.
+fn rotate_root(dir: &Path, keys: RoleKeys, seeds: &[u8]) -> bool {
+    let options = SignOptions::default();
+    let mut registry = Registry::open(dir).unwrap();
+    // A client that has only ever trusted the first root.
+    let mut state = ClientState::trust_root(read(dir, "metadata/root/1.json")).unwrap();
+    registry
+        .set_role(RoleName::Root, keys, now(), &options.lifetimes)
+        .unwrap();
+    let report = registry.sign(&keyring(seeds), now(), &options).unwrap();
+    let root = report.files[0].complete();
+    assert_eq!(
+        root,
+        verify::update(dir, &mut state, now()).is_ok(),
+        "{report:?}"
+    );
+    root
+}
+
+#[test]
+fn raising_the_root_threshold_needs_each_key_set_s_own_threshold() {
+    const SECOND: u8 = 12;
+    let dir = tempfile::tempdir().unwrap();
+    admitted(dir.path());
+    let raised = RoleKeys::new([key(MAINTAINER), key(SECOND)], 2);
+    // The old threshold (1 of the maintainer key) is met, the new one is not.
+    assert!(!rotate_root(dir.path(), raised.clone(), &[MAINTAINER]));
+    // Both met: 1 of 1 old, 2 of 2 new.
+    assert!(rotate_root(dir.path(), raised, &[MAINTAINER, SECOND]));
+}
+
+#[test]
+fn lowering_the_root_threshold_still_needs_the_old_threshold() {
+    const SECOND: u8 = 12;
+    let dir = tempfile::tempdir().unwrap();
+    admitted(dir.path());
+    let both = RoleKeys::new([key(MAINTAINER), key(SECOND)], 2);
+    assert!(rotate_root(dir.path(), both, &[MAINTAINER, SECOND]));
+    let lowered = RoleKeys::new([key(MAINTAINER)], 1);
+    // The new threshold (1) is met, the old one (2 of 2) is not.
+    assert!(!rotate_root(dir.path(), lowered.clone(), &[MAINTAINER]));
+    assert!(rotate_root(dir.path(), lowered, &[MAINTAINER, SECOND]));
+}

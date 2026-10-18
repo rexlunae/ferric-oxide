@@ -480,8 +480,9 @@ A role that has used up half its lifetime is renewed when its key is given,
 so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
 fresh. A role is only renewed when the given keys can sign the replacement
 to its threshold, so a scheduled run holding one of two keys leaves the
-still-valid metadata in place. For a new root, completeness counts both the
-previous and the new root keys, and a root that is not yet complete is
+still-valid metadata in place. A new root is complete only when its own
+root keys meet their threshold and, separately, the previous root's root
+keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
 amended by `set-role` rather than followed by another version.
 `sign --complete` fails if any file is short of its threshold, which
 is a normal intermediate state: an owner signs a delegation without the

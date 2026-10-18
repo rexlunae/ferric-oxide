@@ -173,12 +173,29 @@ pub struct SignedFile {
     pub valid: u32,
     /// The role's threshold.
     pub threshold: u32,
+    /// For a root after the first: its signatures by the previous root's
+    /// root keys, which clients also require. Each key set is checked
+    /// against its own threshold.
+    pub previous_root: Option<PreviousRootSignatures>,
+}
+
+/// A new root's signatures by the root keys of the root before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviousRootSignatures {
+    /// Valid signatures by distinct previous root keys.
+    pub valid: u32,
+    /// The previous root role's threshold.
+    pub threshold: u32,
 }
 
 impl SignedFile {
-    /// Whether the file is signed by enough keys.
+    /// Whether the file is signed by enough keys: for a root, a threshold
+    /// of its own root keys and, separately, of the previous root's.
     pub fn complete(&self) -> bool {
-        self.threshold > 0 && self.valid >= self.threshold
+        let previous = self
+            .previous_root
+            .is_none_or(|old| old.threshold > 0 && old.valid >= old.threshold);
+        self.threshold > 0 && self.valid >= self.threshold && previous
     }
 }
 
@@ -842,25 +859,24 @@ impl Registry {
             })?;
         self.write_root()?;
         // A rotation is only complete when a threshold of the previous root
-        // keys signed too, so report the weaker of the two so `complete()`
-        // and `sign --complete` cannot call an untrusted root done.
+        // keys signed too; each key set is reported against its own
+        // threshold, as clients check them.
         let own = self.role_keys(RoleName::Root)?;
-        let mut threshold = own.threshold;
-        let mut valid = count_valid(&self.root, own);
-        if let Some(old) = self
+        let previous_root = self
             .previous_root
             .as_ref()
             .and_then(|previous| previous.signed.roles.get(&RoleName::Root))
-        {
-            threshold = threshold.max(old.threshold);
-            valid = valid.min(count_valid(&self.root, old));
-        }
+            .map(|old| PreviousRootSignatures {
+                valid: count_valid(&self.root, old),
+                threshold: old.threshold,
+            });
         Ok(SignedFile {
             file,
             version: self.root.signed.version,
             bumped: false,
-            valid,
-            threshold,
+            valid: count_valid(&self.root, own),
+            threshold: own.threshold,
+            previous_root,
         })
     }
 
@@ -970,6 +986,7 @@ impl Step<'_> {
                 bumped,
                 valid: count_valid(metadata, self.keys),
                 threshold: self.keys.threshold,
+                previous_root: None,
             },
             bytes,
         ))
