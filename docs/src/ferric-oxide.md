@@ -17,6 +17,7 @@ descriptions may differ from this checkout.
 | Trace system calls and scheduling, or add a tracepoint | [Kernel tracing](ferric-tracing.md) |
 | Verify or install a local package, install one from a signed git release, generate its SBOM, build, attest and release a package from git with `cargo fox`, or see how images adopt `pkg`'s packages | [Package tooling](ferric-packaging.md) |
 | Find tests, reproduce a boot failure or understand CI | [Validation and debugging](ferric-testing.md) |
+| See what is planned next and why | [Roadmap](ferric-roadmap.md) |
 
 Source paths in these chapters are relative to the repository root. Rustdoc
 beside the implementation defines the public APIs, error types and format
