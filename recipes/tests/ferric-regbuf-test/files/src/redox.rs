@@ -11,6 +11,7 @@ const SCHEME: &str = "regbuf-test";
 
 /// The errno values the test expects, as relibc numbers them.
 mod errno {
+    pub const EPERM: usize = 1;
     pub const EIO: usize = 5;
     pub const EFAULT: usize = 14;
     pub const EBUSY: usize = 16;

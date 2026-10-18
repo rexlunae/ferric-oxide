@@ -8,6 +8,8 @@
 //!
 //! - `regbuf-register`: registering pins the pages (the user's pinned count goes up); a second
 //!   registration fails with `EEXIST`, an unaligned one with `EINVAL`.
+//! - `regbuf-file-backed`: a private writable mapping of a file cannot be registered (`EPERM`),
+//!   even once written: regions take anonymous memory only, and nothing is pinned.
 //! - `regbuf-grant-rw`: the scheme maps a read-write grant, reads the application's data and
 //!   writes new data the application then sees in its own buffer: the same pages, no copy.
 //! - `regbuf-grant-ro`: a read-only grant cannot be mapped writable (`EACCES`), but can be
