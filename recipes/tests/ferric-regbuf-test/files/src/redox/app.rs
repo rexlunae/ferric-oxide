@@ -400,7 +400,13 @@ fn file_backed(t: &mut Test) -> Result<(), Failure> {
         }
     };
     std::fs::write(&path, vec![0x77; PAGE_SIZE as usize]).map_err(io("write the file"))?;
-    let file = std::fs::File::open(&path).map_err(io("open the file"))?;
+    // Read-write: RedoxFS refuses a PROT_WRITE mapping of a read-only descriptor (EBADF),
+    // even a private one.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io("open the file"))?;
     // SAFETY: a fresh private mapping of the file at an address the kernel chooses.
     let ptr = unsafe {
         libc::mmap(
