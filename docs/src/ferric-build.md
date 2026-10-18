@@ -144,6 +144,10 @@ Cookbook detects recipe/source timestamps rather than arbitrary environment
 changes. Configuration generation compares fingerprints in `state.toml` and
 touches the `recipe.toml` files named by each changed option's `rebuild` scope.
 `["*"]` marks all recipes; kernel-only options usually mark the kernel. The
-kernel, bootloader and relibc recipes also maintain feature stamps for their
+fingerprints are saved only after all selected recipe timestamps are updated.
+If a recipe cannot be opened or touched, generation fails with its path and
+underlying error, retaining the prior rebuild state. Correct the filesystem
+problem and rerun `make config-generate` to retry pending rebuilds. The kernel,
+bootloader and relibc recipes also maintain feature stamps for their
 Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
 stay uncommitted.

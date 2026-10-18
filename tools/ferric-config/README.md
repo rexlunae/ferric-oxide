@@ -130,6 +130,11 @@ pending rebuilds; a later ordinary generation marks them stale. Use a fresh
 unchanged. After `--no-touch` in the normal output directory, run
 `make config-generate` before building to apply pending rebuilds.
 
+If opening a selected recipe or updating its timestamp fails, generation reports
+the recipe path and filesystem error without recording new fingerprints. Fix
+the reported problem and rerun `make config-generate`; all pending recipes are
+retried, including any already touched before the failure.
+
 ## Processor baselines
 
 `cpu.x86_64_level` defaults to `v3` (AVX2, BMI2, FMA; Haswell, Zen and
