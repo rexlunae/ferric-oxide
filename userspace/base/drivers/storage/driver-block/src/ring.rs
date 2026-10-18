@@ -324,6 +324,8 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
             ),
             handles: HandleMap::new(),
             executor,
+            #[cfg(feature = "grant-dma")]
+            grants: None,
             shm_dir: libredox::Fd::open(&shm_dir_name, flag::O_DIRECTORY | flag::O_CLOEXEC, 0)
                 .expect("failed to open shm direcotry"),
             pipe_root: libredox::Fd::open("/scheme/pipe/scheme-root", flag::O_CLOEXEC, 0)
@@ -346,6 +348,13 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
 
     pub fn event_handle(&self) -> &Fd {
         self.inner.socket.inner()
+    }
+
+    /// Ferric Oxide: lets applications attach registered-buffer grants to their disk
+    /// descriptors (`ferric_blkgrant::abi`), mapped into the driver's DMA domain with `dma`.
+    #[cfg(feature = "grant-dma")]
+    pub fn set_grant_dma(&mut self, dma: Rc<dyn crate::grant::GrantDma>) {
+        self.inner.grants = Some(crate::grant::GrantState::new(dma));
     }
 
     /// Process pending and new requests.
@@ -376,6 +385,12 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
                         .handle_async(&mut self.inner, &mut self.state)
                         .await
                 }
+                // Ferric Oxide: a registered-buffer grant attached to a disk descriptor.
+                #[cfg(feature = "grant-dma")]
+                RequestKind::SendFd(request) => {
+                    Response::new(self.inner.on_sendfd(&request), request)
+                }
+                #[cfg(not(feature = "grant-dma"))]
                 RequestKind::SendFd(request) => Response::err(EOPNOTSUPP, request),
                 RequestKind::RecvFd(request) => {
                     Response::open_dup_like(self.inner.on_recvfd(&request), request)
@@ -408,6 +423,9 @@ struct RingDiskSchemeInner<T: Disk, Hw: Hardware> {
     disks: BTreeMap<u32, RingDiskWrapper<T>>,
     handles: HandleMap<Handle<Hw, T>>,
     executor: Rc<LocalExecutor<Hw>>,
+    /// Ferric Oxide: grants attached to disk descriptors, when the driver can map them.
+    #[cfg(feature = "grant-dma")]
+    grants: Option<crate::grant::GrantState>,
     shm_dir: Fd,
     pipe_root: Fd,
 }
@@ -445,6 +463,10 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
         let Some(handle) = self.handles.remove(id) else {
             return;
         };
+        #[cfg(feature = "grant-dma")]
+        if let Some(grants) = &mut self.grants {
+            grants.close(id);
+        }
 
         match handle {
             Handle::Ring(RingState::Active { join_handle, .. }) => {
@@ -453,6 +475,92 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
 
             _ => {}
         }
+    }
+
+    /// Ferric Oxide: attaches the grant passed on disk descriptor `request.id()` to the slot
+    /// `request.arg()` names.
+    ///
+    /// # Errors
+    ///
+    /// `EOPNOTSUPP` when the driver cannot map grants, `EBADF` when the descriptor is not a
+    /// disk or partition, `EINVAL` unless exactly one descriptor is passed, and
+    /// [`crate::grant::GrantState::attach`]'s errors.
+    #[cfg(feature = "grant-dma")]
+    fn on_sendfd(&mut self, request: &redox_scheme::SendFdRequest) -> Result<usize> {
+        let id = request.id();
+        if !matches!(self.handles.get(id)?, Handle::Disk { .. }) {
+            return Err(Error::new(EBADF));
+        }
+        let grants = self.grants.as_mut().ok_or(Error::new(EOPNOTSUPP))?;
+        if request.num_fds() != 1 {
+            return Err(Error::new(EINVAL));
+        }
+        let mut fds = [usize::MAX];
+        request.obtain_fd(&self.socket, syscall::FobtainFdFlags::empty(), &mut fds)?;
+        grants.attach(id, request.arg(), Fd::new(fds[0]))?;
+        Ok(1)
+    }
+
+    /// Ferric Oxide: a grant call (`ferric_blkgrant::abi::Request`) on disk descriptor `id`,
+    /// of disk `num` (partition `pt`).
+    ///
+    /// # Errors
+    ///
+    /// `EOPNOTSUPP` when the driver cannot map grants, `EINVAL` for bad metadata, `EOVERFLOW`
+    /// past the end of the partition, the disk's errors, and
+    /// [`crate::grant::GrantState::resolve`]'s and [`crate::grant::GrantState::detach`]'s.
+    #[cfg(feature = "grant-dma")]
+    async fn grant_call(
+        &mut self,
+        id: usize,
+        num: u32,
+        pt: Option<usize>,
+        metadata: &[u64],
+    ) -> Result<usize> {
+        use ferric_blkgrant::abi::Request;
+        use ferric_blkgrant::slots::Direction;
+
+        let grants = self.grants.as_mut().ok_or(Error::new(EOPNOTSUPP))?;
+        let request = Request::decode(metadata).map_err(|_| Error::new(EINVAL))?;
+        let (transfer, direction) = match request {
+            Request::Read(t) => (t, Direction::ToBuffer),
+            Request::Write(t) => (t, Direction::FromBuffer),
+            Request::Detach { slot } => return grants.detach(id, slot).map(|()| 0),
+            _ => return Err(Error::new(EINVAL)),
+        };
+        let disk = self.disks.get_mut(&num).ok_or(Error::new(EBADF))?;
+        let target = grants.resolve(id, &transfer, direction, disk.block_size())?;
+        let partition = match pt {
+            Some(part_num) => Some(
+                disk.pt
+                    .as_ref()
+                    .and_then(|table| table.partitions.get(part_num))
+                    .ok_or(Error::new(EBADF))?
+                    .clone(),
+            ),
+            None => None,
+        };
+        let partition = partition.as_deref();
+        let end = transfer
+            .lba
+            .checked_add(u64::from(target.blocks))
+            .ok_or(Error::new(EOVERFLOW))?;
+        let blocks_total = partition.map_or(disk.size() / u64::from(disk.block_size()), |p| p.size);
+        if end > blocks_total {
+            return Err(Error::new(EOVERFLOW));
+        }
+        let addr = PhysAddr(usize::try_from(target.iova).map_err(|_| Error::new(EINVAL))?);
+        match direction {
+            Direction::ToBuffer => {
+                disk.read_dma(partition, transfer.lba, addr, target.blocks)
+                    .await?
+            }
+            Direction::FromBuffer => {
+                disk.write_dma(partition, transfer.lba, addr, target.blocks)
+                    .await?
+            }
+        }
+        usize::try_from(transfer.len).map_err(|_| Error::new(EINVAL))
     }
 
     fn on_recvfd(&mut self, recvfd_request: &RecvFdRequest) -> Result<OpenResult> {
@@ -581,6 +689,10 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
         metadata: &[u64],
         _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
+        #[cfg(feature = "grant-dma")]
+        if let Handle::Disk { num, pt } = *self.handles.get(id)? {
+            return self.grant_call(id, num, pt, metadata).await;
+        }
         let Handle::Ring(ref mut state) = self.handles.get_mut(id)? else {
             return Err(Error::new(EOPNOTSUPP));
         };

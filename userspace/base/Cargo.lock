@@ -639,6 +639,8 @@ dependencies = [
  "common",
  "daemon",
  "executor",
+ "ferric-blkgrant",
+ "ferric-regbuf",
  "futures",
  "libredox",
  "log",
@@ -877,7 +879,15 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=059bb23#059bb2383873f8001959456e36ec123228f67642"
 
 [[package]]
+name = "ferric-blkgrant"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
@@ -1577,6 +1587,7 @@ dependencies = [
  "daemon",
  "driver-block",
  "executor",
+ "ferric-blkgrant",
  "futures",
  "libc",
  "libredox",
