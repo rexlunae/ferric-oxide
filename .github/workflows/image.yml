@@ -227,6 +227,9 @@ jobs:
         run: |
           grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
 
+      - name: Check futex wakeups
+        run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
+
       # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
       - name: Check registered buffers
         run: |
