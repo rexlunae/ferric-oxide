@@ -121,9 +121,29 @@ impl CpuCapture {
     /// [`CaptureError::UnknownEvent`] for an event the kernel catalog does not have, and
     /// [`CaptureError::ArgCount`] for a record with more or fewer arguments than its event.
     pub fn decode(cpu: u32, bytes: &[u8]) -> Result<Self, CaptureError> {
+        Self::decode_inner(cpu, bytes, false)
+    }
+
+    /// Decodes like [`CpuCapture::decode`], but for a partial capture: a last record cut off
+    /// by the end of the bytes (a capture killed mid-write) is dropped, and the whole records
+    /// before it are kept.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`CpuCapture::decode`], except a truncated last record.
+    pub fn decode_partial(cpu: u32, bytes: &[u8]) -> Result<Self, CaptureError> {
+        Self::decode_inner(cpu, bytes, true)
+    }
+
+    fn decode_inner(cpu: u32, bytes: &[u8], partial: bool) -> Result<Self, CaptureError> {
         let mut entries = Vec::new();
         for (index, record) in Records::new(bytes).enumerate() {
-            let record = record.map_err(|source| CaptureError::Decode { cpu, index, source })?;
+            let record = match record {
+                Ok(record) => record,
+                // Only the end of the bytes can cut a record short, so nothing follows it.
+                Err(DecodeError::Truncated { .. }) if partial => break,
+                Err(source) => return Err(CaptureError::Decode { cpu, index, source }),
+            };
             let event = CATALOG
                 .get(record.event())
                 .ok_or(CaptureError::UnknownEvent {
@@ -195,11 +215,13 @@ impl Capture {
     }
 
     /// Loads like [`Capture::load`], but also reads a partial capture (one marked
-    /// [`INCOMPLETE`]), whose CPUs may be missing or cut short.
+    /// [`INCOMPLETE`]), whose CPUs may be missing or cut short: each file is decoded with
+    /// [`CpuCapture::decode_partial`].
     ///
     /// # Errors
     ///
-    /// Those of [`Capture::load`] except [`CaptureError::Incomplete`].
+    /// Those of [`Capture::load`] except [`CaptureError::Incomplete`] and a truncated last
+    /// record.
     pub fn load_partial(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
         Self::load_inner(inputs, true)
     }
@@ -241,7 +263,11 @@ impl Capture {
             .into_iter()
             .map(|(cpu, path)| {
                 let bytes = fs::read(&path).map_err(|source| CaptureError::Io { path, source })?;
-                CpuCapture::decode(cpu, &bytes)
+                if partial {
+                    CpuCapture::decode_partial(cpu, &bytes)
+                } else {
+                    CpuCapture::decode(cpu, &bytes)
+                }
             })
             .collect::<Result<_, _>>()?;
         Ok(Self::from_cpus(cpus))
@@ -412,6 +438,48 @@ pub(crate) mod tests {
             let partial = Capture::load_partial(&[input]).expect("loads");
             assert_eq!(partial.entries().len(), 1);
         }
+    }
+
+    #[test]
+    fn partial_loads_keep_records_before_a_cut_off_one() {
+        let mut cut = bytes(&[
+            (&SYSCALL_ENTER, 10, &[1, 0, 0, 0, 0]),
+            (&SYSCALL_EXIT, 20, &[1, 0]),
+        ]);
+        cut.truncate(cut.len() - 5);
+        assert!(matches!(
+            CpuCapture::decode(0, &cut),
+            Err(CaptureError::Decode {
+                index: 1,
+                source: DecodeError::Truncated { .. },
+                ..
+            })
+        ));
+        let kept = CpuCapture::decode_partial(0, &cut).expect("keeps the whole record");
+        assert_eq!(kept.entries().len(), 1);
+        assert_eq!(kept.entries()[0].timestamp, 10);
+
+        // Through the loaders: strict refuses, partial keeps the first record.
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join(INCOMPLETE), "").expect("write");
+        fs::write(dir.path().join("cpu0"), &cut).expect("write");
+        let input = [dir.path().to_owned()];
+        assert_eq!(
+            Capture::load_partial(&input)
+                .expect("loads")
+                .entries()
+                .len(),
+            1
+        );
+        fs::remove_file(dir.path().join(INCOMPLETE)).expect("remove");
+        assert!(matches!(
+            Capture::load(&input),
+            Err(CaptureError::Decode { .. })
+        ));
+        // A corrupt record is still an error in a partial load.
+        let mut bad = bytes(&[(&SYSCALL_EXIT, 20, &[1, 0])]);
+        bad[4] = 0xff;
+        assert!(CpuCapture::decode_partial(0, &bad).is_err());
     }
 
     #[test]

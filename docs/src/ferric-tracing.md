@@ -176,14 +176,16 @@ it) works as follows:
 A read drains a ring, so each record lands in exactly one file and nothing
 drained is ever deleted:
 
-- `<dir>` is created by the command and must not exist yet, so an earlier
-  capture is never overwritten. It must not overlap the scheme path.
+- `<dir>` is created by the command, with any missing parents, and must not
+  exist yet, so an earlier capture is never overwritten. It must not overlap the scheme path.
 - An `INCOMPLETE` file is written into it first and removed only after
   `stats.end` is saved.
 - If the capture fails or is killed, everything drained so far stays in
   `<dir>` with the marker, and the command says the capture is partial.
   `text` and `perfetto` refuse such a directory unless they are given
-  `--partial`, because CPUs may be missing or cut short.
+  `--partial`, because CPUs may be missing or cut short. With `--partial`, a
+  record cut off at the end of a file is dropped and the whole records before
+  it are kept.
 
 `--scheme <path>` reads another scheme path.
 

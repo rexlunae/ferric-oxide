@@ -115,7 +115,8 @@ pub struct CpuDrained {
 }
 
 /// Drains every CPU of the trace scheme at `scheme` (normally `/scheme/kernel.trace`) into
-/// directory `out`, which this creates and which must not exist yet.
+/// directory `out`, which this creates (with any missing parents) and which must not exist
+/// yet.
 ///
 /// # Errors
 ///
@@ -127,6 +128,10 @@ pub struct CpuDrained {
 /// capture keeps everything drained before the failure and its `INCOMPLETE` marker.
 pub fn drain_scheme(scheme: &Path, out: &Path) -> Result<Vec<CpuDrained>, DrainError> {
     check_overlap(scheme, out)?;
+    // Only `out` itself must be new; its parents may already exist or not.
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(io_error(parent))?;
+    }
     fs::create_dir(out).map_err(|source| {
         if source.kind() == ErrorKind::AlreadyExists {
             DrainError::OutputExists {
@@ -365,6 +370,21 @@ mod tests {
         assert_eq!(capture.entries().len(), 2);
         assert!(saved.join(STATS_START).is_file() && saved.join(STATS_END).is_file());
         assert!(!saved.join(INCOMPLETE).exists());
+    }
+
+    #[test]
+    fn creates_missing_parents() {
+        let scheme = stand_in_scheme();
+        let out = tempfile::tempdir().expect("temp dir");
+        let nested = out.path().join("a/b/capture");
+        drain_scheme(scheme.path(), &nested).expect("drains");
+        assert!(nested.join("cpu0").is_file());
+        assert!(!nested.join(INCOMPLETE).exists());
+        // The parents existing now does not make the output reusable.
+        assert!(matches!(
+            drain_scheme(scheme.path(), &nested),
+            Err(DrainError::OutputExists { .. })
+        ));
     }
 
     #[test]
