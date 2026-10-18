@@ -237,7 +237,10 @@ need "FERRIC_TEST_PASS iommu-grant-dma"
 need "IOMMU: domain [0-9]+: grant mapping at IOVA 0x[0-9a-f]+ unmapped by the driver"
 need "FERRIC_TEST_PASS iommu-grant-unmap"
 need "regbuf: grant [0-9]+ revoked with 1 grant\(s\) under it, unmapping 2 mapping\(s\)"
-taken_down="$(grep -acE "IOMMU: domain [0-9]+: grant mapping at IOVA 0x[0-9a-f]+ taken down with its grant, IOTLB invalidated" <<< "$clean" || true)"
+# Only the edu device's domain counts: ferric-blkgrant-test revokes grants in nvmed's too.
+edu_did="$(grep -aoE "IOMMU: 0000:00:10\.0 attached to domain [0-9]+" <<< "$clean" \
+    | head -n 1 | grep -oE '[0-9]+$')"
+taken_down="$(grep -acE "IOMMU: domain $edu_did: grant mapping at IOVA 0x[0-9a-f]+ taken down with its grant, IOTLB invalidated" <<< "$clean" || true)"
 [ "$taken_down" -eq 2 ] || fail "revoking the grant took down $taken_down IOMMU mapping(s), not 2"
 need "FERRIC_TEST_PASS iommu-grant-revoke"
 need "FERRIC_TEST_PASS iommu-subgrant-revoke"

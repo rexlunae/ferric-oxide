@@ -34,6 +34,10 @@ endif
 # BASE_BINS += drawbench
 
 INITFS_CARGO_ARGS = $(foreach bin,$(INITFS_BINS),-p $(bin))
+# Ferric Oxide: Cargo features of the initfs daemons and drivers from ferric.toml (such as
+# nvmed/grant-dma), passed in the environment. Unset, the build is upstream's.
+FERRIC_INITFS_FEATURES ?=
+FERRIC_INITFS_FEATURE_ARGS = $(if $(strip $(FERRIC_INITFS_FEATURES)),--features "$(strip $(FERRIC_INITFS_FEATURES))")
 INITFS_DRIVERS_CARGO_ARGS = $(foreach bin,$(INITFS_DRIVERS_BINS),-p $(bin))
 BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
@@ -79,7 +83,7 @@ base:
 	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
 		$(CARGO) build $(BUILD_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
-		$(INITFS_CARGO_ARGS) $(INITFS_DRIVERS_CARGO_ARGS)
+		$(INITFS_CARGO_ARGS) $(INITFS_DRIVERS_CARGO_ARGS) $(FERRIC_INITFS_FEATURE_ARGS)
 # Build bootstrap
 	cd "$(SRC_DIR)/bootstrap" && RUSTFLAGS= $(CARGO) rustc $(BUILD_FLAGS) \
 		-- -Ctarget-feature=+crt-static -Clinker="$(LINKER)"

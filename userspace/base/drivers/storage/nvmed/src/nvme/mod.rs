@@ -69,11 +69,21 @@ pub type AtomicSqId = AtomicU16;
 pub type AtomicCmdId = AtomicU16;
 pub type Iv = u16;
 
+/// The bytes one zero-copy command carries without a PRP list (two pages), and the default
+/// before the controller reports its MDTS.
+const ZEROCOPY_CHUNK: u64 = 8192;
+
 struct Caps(u64);
 
 impl Caps {
     fn dstrd(&self) -> u8 {
         ((self.0 >> 32) & 0b1111) as u8
+    }
+
+    /// Ferric Oxide: the minimum memory page size (`CAP.MPSMIN`), in bytes.
+    #[cfg(feature = "grant-dma")]
+    fn min_page_size(&self) -> u64 {
+        1 << (12 + ((self.0 >> 48) & 0b1111))
     }
 }
 
@@ -92,6 +102,14 @@ pub struct Nvme {
     next_cqid: AtomicCqId,
 
     caps: Caps,
+
+    /// Ferric Oxide: spare PRP list pages for zero-copy transfers of more than two pages.
+    #[cfg(feature = "grant-dma")]
+    prp_lists: Mutex<Vec<Dma<[u64; ferric_blkgrant::prp::LIST_ENTRIES]>>>,
+    /// Ferric Oxide: the most bytes one zero-copy command carries (MDTS, capped by one PRP
+    /// list).
+    #[cfg(feature = "grant-dma")]
+    max_transfer: std::sync::atomic::AtomicU64,
 }
 
 pub struct ThreadCtxt {
@@ -186,6 +204,11 @@ impl Nvme {
             next_cqid: AtomicCqId::new(2),
 
             caps,
+
+            #[cfg(feature = "grant-dma")]
+            prp_lists: Mutex::new(Vec::new()),
+            #[cfg(feature = "grant-dma")]
+            max_transfer: std::sync::atomic::AtomicU64::new(ZEROCOPY_CHUNK),
         })
     }
     /// # Locking
@@ -536,6 +559,36 @@ impl Nvme {
         Ok(buf.len())
     }
 
+    /// Ferric Oxide: records the controller's MDTS, which bounds zero-copy transfers.
+    #[cfg(feature = "grant-dma")]
+    fn set_mdts(&self, mdts: u8) {
+        let max = ferric_blkgrant::prp::max_transfer(mdts, self.caps.min_page_size());
+        log::info!(
+            "  - Zero-copy transfers of up to {} KiB (MDTS {mdts})",
+            max / 1024
+        );
+        self.max_transfer
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most bytes one zero-copy command carries.
+    fn max_zerocopy(&self) -> u64 {
+        #[cfg(feature = "grant-dma")]
+        return self.max_transfer.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "grant-dma"))]
+        ZEROCOPY_CHUNK
+    }
+
+    /// Ferric Oxide: a PRP list page, from the spares or newly allocated.
+    #[cfg(feature = "grant-dma")]
+    fn take_prp_list(&self) -> Result<Dma<[u64; ferric_blkgrant::prp::LIST_ENTRIES]>> {
+        if let Some(list) = self.prp_lists.lock().pop() {
+            return Ok(list);
+        }
+        // SAFETY: an all-zero array of integers is initialized.
+        Ok(unsafe { Dma::zeroed()?.assume_init() })
+    }
+
     async fn namespace_rw_zerocopy(
         &self,
         namespace: &NvmeNamespace,
@@ -547,11 +600,25 @@ impl Nvme {
         let block_size = namespace.block_size;
 
         let bytes = ((blocks_1 as u64) + 1) * block_size;
+        #[cfg(feature = "grant-dma")]
+        let mut prp_list = None;
         let (ptr0, ptr1) = if bytes <= 4096 {
             (phys_addr, 0)
         } else if bytes <= 8192 {
             (phys_addr, phys_addr + 4096)
         } else {
+            // Ferric Oxide: longer transfers point PRP2 at a list of the following pages.
+            #[cfg(feature = "grant-dma")]
+            {
+                let mut list = self.take_prp_list()?;
+                let list_addr = list.physical() as u64;
+                let pointers =
+                    ferric_blkgrant::prp::data_pointers(phys_addr, bytes, &mut list[..], list_addr)
+                        .map_err(|_| Error::new(syscall::EINVAL))?;
+                prp_list = Some(list);
+                pointers
+            }
+            #[cfg(not(feature = "grant-dma"))]
             return Err(Error::new(syscall::EINVAL));
         };
 
@@ -566,6 +633,12 @@ impl Nvme {
                 cmd.clone()
             })
             .await;
+
+        // Ferric Oxide: the controller is done with the list once the command completed.
+        #[cfg(feature = "grant-dma")]
+        if let Some(list) = prp_list {
+            self.prp_lists.lock().push(list);
+        }
 
         let status = comp.status >> 1;
         if status == 0 {
@@ -586,7 +659,7 @@ impl Nvme {
         let end_lba = start_lba + num_sectors;
 
         // TODO: PRP
-        let max_blocks = 8192 / namespace.block_size;
+        let max_blocks = self.max_zerocopy() / namespace.block_size;
 
         let mut lba = start_lba;
         while lba < end_lba {
@@ -611,7 +684,7 @@ impl Nvme {
     ) -> Result<()> {
         let end_lba = start_lba + num_sectors;
         // TODO: PRP
-        let max_blocks = 8192 / namespace.block_size;
+        let max_blocks = self.max_zerocopy() / namespace.block_size;
 
         let mut lba = start_lba;
         while lba < end_lba {

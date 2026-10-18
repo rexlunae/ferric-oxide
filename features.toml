@@ -72,6 +72,11 @@ depends = "target.arch == 'x86_64'"
 help = "Kernel tracepoints (Phase T): which are compiled in, and which are on from boot."
 
 [[menu]]
+id = "drivers"
+title = "Drivers"
+help = "Build-time options of the user-space drivers in the base package."
+
+[[menu]]
 id = "image"
 title = "Image contents"
 help = "Which filesystem configuration the image starts from, and changes on top of it."
@@ -408,6 +413,32 @@ closing the region, unmaps it from every process that mapped it, with a TLB
 shootdown, before the call returns. Non-root users may pin 16 MiB each, and
 everyone together a quarter of memory. Off by default; without it the kernel
 has no such scheme, as upstream."""
+
+[[option]]
+id = "drivers.grant_dma"
+menu = "drivers"
+type = "bool"
+title = "Storage DMA into registered buffers (NVMe)"
+default = false
+depends = "kernel.regbuf && kernel.iommu != 'never'"
+rebuild = ["base"]
+help = """
+Let applications attach a registered-buffer grant (Kernel > Registered buffers)
+to a disk or partition descriptor of nvmed's disk scheme, then read and write
+blocks straight between the disk and their own pages: the driver maps the grant
+into its IOMMU DMA domain once (MapGrant) and points the controller at it, with
+no bounce buffer, no copy and no per-request mapping. The device can reach the
+granted pages and nothing else of the application, and revoking the grant
+stops it before Revoke returns. Needs an IOMMU (VT-d or AMD-Vi) with
+kernel.iommu "auto" or "enforce"; without a DMA domain attaching fails with
+ENODEV. Also lets nvmed's zero-copy transfers (RedoxFS's ring included) use
+PRP lists up to the controller's maximum transfer size instead of two pages.
+Builds nvmed with its grant-dma Cargo feature. Off by default; without it the
+disk schemes refuse grants, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/grant-dma" }
 
 [[option]]
 id = "kernel.self_modifying"
