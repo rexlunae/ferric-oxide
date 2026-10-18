@@ -15,7 +15,9 @@
 # 00:05.0) and QEMU's AHCI controller (00:1f.2) must each be attached to a domain that their
 # driver bound. ferric-iommu-test drives QEMU's edu device (00:10.0) and announces the DMA
 # faults it causes; the kernel must log exactly those and no others. boot-smoke.sh places the
-# devices at these addresses.
+# devices at these addresses. It also maps a forked application's registered-buffer grant and
+# sub-grant into its domain (MapGrant), and after the application revokes the grant, the same
+# DMA to their IOVAs must fault: two of the five announced faults.
 #
 # AMD-Vi does not remap interrupts yet, so there pcid hands out compatibility-format MSI
 # messages, and the DMA faults are checked by device and kind only: QEMU's AMD IOMMU leaves the
@@ -66,8 +68,8 @@ check_faults() {
         | sort -u || true)"
     echo "expected faults:"; echo "$expected"
     echo "logged faults:"; echo "$logged"
-    # Ungranted address, write after mprotect, released IOVA.
-    [ "$(wc -l <<< "$expected")" -eq 3 ] || fail "the DMA test did not announce its three faults"
+    # Ungranted address, write after mprotect, revoked grant, revoked sub-grant, released IOVA.
+    [ "$(wc -l <<< "$expected")" -eq 5 ] || fail "the DMA test did not announce its five faults"
     [ "$expected" = "$logged" ] || fail "the kernel's DMA faults differ from the ones the test caused"
 }
 
@@ -81,7 +83,7 @@ check_amd_faults() {
     logged="$(grep -ao 'IOMMU: DMA fault at unit 0x[0-9a-f]*: .*' <<< "$clean" || true)"
     echo "expected faults:"; echo "$expected"
     echo "logged faults:"; echo "$logged"
-    [ "$(wc -l <<< "$expected")" -eq 3 ] || fail "the DMA test did not announce its three faults"
+    [ "$(wc -l <<< "$expected")" -eq 5 ] || fail "the DMA test did not announce its five faults"
     local edu=': 00:10\.0 (read|write) at 0x[0-9a-f]+: I/O page fault'
     grep -qE "$edu" <<< "$logged" || fail "no I/O page fault from the edu device (00:10.0) was logged"
     others="$(grep -vE "$edu" <<< "$logged" || true)"
@@ -109,7 +111,8 @@ case "$mode" in
     none)
         need "IOMMU: no DMAR or IVRS table, IOMMU not enabled"
         # Without an IOMMU pcid has no domain to give the test driver.
-        for t in iommu-unbound iommu-domain iommu-dma iommu-fault iommu-readonly iommu-fork iommu-release; do
+        for t in iommu-unbound iommu-domain iommu-dma iommu-fault iommu-readonly iommu-fork iommu-release \
+            iommu-grant-nodomain iommu-grant-dma iommu-grant-unmap iommu-grant-revoke iommu-subgrant-revoke; do
             need "FERRIC_TEST_SKIP $t"
         done
         if grep -aF "IOMMU: DMA fault" <<< "$clean"; then
@@ -222,6 +225,22 @@ need "FERRIC_TEST_PASS iommu-fork"
 # of the old IOVA faults too.
 need "IOMMU: domain [0-9]+: 1 DMA mapping\(s\) released after an unmap"
 need "FERRIC_TEST_PASS iommu-release"
+
+# Registered-buffer grants in the domain (MapGrant): a forked application's two-page grant and
+# its one-page sub-grant are mapped, the driver's own UnmapGrant works, and revoking the grant
+# takes both IOMMU mappings down (IOTLB invalidated) before Revoke returns, so the device's
+# DMA to their old IOVAs faults (two of the announced faults) and the requests fail with EIO.
+need "FERRIC_TEST_PASS iommu-grant-nodomain"
+need "IOMMU: domain [0-9]+: grant [0-9]+ mapped at IOVA 0x[0-9a-f]+ \(2 page\(s\), read-write\)"
+need "IOMMU: domain [0-9]+: grant [0-9]+ mapped at IOVA 0x[0-9a-f]+ \(1 page\(s\), read-write\)"
+need "FERRIC_TEST_PASS iommu-grant-dma"
+need "IOMMU: domain [0-9]+: grant mapping at IOVA 0x[0-9a-f]+ unmapped by the driver"
+need "FERRIC_TEST_PASS iommu-grant-unmap"
+need "regbuf: grant [0-9]+ revoked with 1 grant\(s\) under it, unmapping 2 mapping\(s\)"
+taken_down="$(grep -acE "IOMMU: domain [0-9]+: grant mapping at IOVA 0x[0-9a-f]+ taken down with its grant, IOTLB invalidated" <<< "$clean" || true)"
+[ "$taken_down" -eq 2 ] || fail "revoking the grant took down $taken_down IOMMU mapping(s), not 2"
+need "FERRIC_TEST_PASS iommu-grant-revoke"
+need "FERRIC_TEST_PASS iommu-subgrant-revoke"
 
 if grep -aE "IOMMU: cannot (attach|create a domain|map|unmap|make)" <<< "$clean"; then
     fail "the iommu scheme refused a domain, an attach or a mapping"

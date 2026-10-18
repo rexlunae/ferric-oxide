@@ -5,5 +5,20 @@ edition = "2024"
 license = "MIT"
 description = "DMA domain test driver for Ferric Oxide"
 
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+# The ABI crates are path dependencies from files/; the cookbook builds a copy of files/ in
+# this recipe's source/, at the same depth, so the relative paths hold there too.
+[dependencies]
+ferric-iommu = { path = "../../../../crates/iommu" }
+ferric-regbuf = { path = "../../../../crates/regbuf" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+libredox = "0.1.25"
+redox-scheme = "0.11.4"
+redox_syscall = "0.9.4"
+
 [profile.release]
 debug = false
