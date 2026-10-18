@@ -152,22 +152,26 @@ are not compiled in gives `EOPNOTSUPP`.
 
 ## Reading a capture on the host
 
-To capture a trace on the target, run as root:
+To capture a trace on the target, run as root in `ion`, the default shell,
+which needs no other tools:
 
-```sh
+```ion
 cat /scheme/kernel.trace/stats > stats.before
 echo "enable syscall scheme" > /scheme/kernel.trace/events
 # ... run the workload ...
 echo "disable syscall scheme" > /scheme/kernel.trace/events
 cat /scheme/kernel.trace/stats > stats.after
-for n in $(awk '{ print $2 }' stats.after); do
-    cat /scheme/kernel.trace/cpu/$n > cpu$n
-done
+let n = 0
+while cat /scheme/kernel.trace/cpu/$n > cpu$n
+    let n += 1
+end
+rm cpu$n
 ```
 
-`stats` has one `cpu <n> ...` line per CPU, and the loop drains each one it
-lists. A read drains a ring, so each record lands in exactly
-one file.
+CPUs are numbered from 0, as `stats` lists them, and opening `cpu/<n>` past
+the last one fails with `ENOENT`. The loop therefore drains every CPU and then
+removes the empty file left by the failed open. A read drains a ring, so each
+record lands in exactly one file.
 
 Each ring holds 64 KiB, and a full ring drops new records. If any CPU's
 `lost` count in `stats.after` is higher than in `stats.before`, the capture is
