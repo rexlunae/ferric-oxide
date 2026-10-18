@@ -4,8 +4,19 @@
 //!
 //! `G` is whatever the driver keeps of the grant (its descriptor, so it can ask whether the
 //! grant was revoked and close it on detach).
+//!
+//! # When a mapping may be released
+//!
+//! A slot holds its grant as a [`Lease`], and every transfer [`resolve`](GrantSlots::resolve)d
+//! from it holds another one until the device has finished with the IOVA. The driver unmaps
+//! the grant in `G`'s `Drop`, which runs only when the last lease goes. That is never earlier
+//! than the slot letting go (detach, re-attach or close) *and* every in-flight transfer
+//! completing. Releasing the IOVA of a revoked grant while a command still targets it would let
+//! a later grant reuse that IOVA and receive the stale DMA; the lease makes that impossible
+//! however detach, close and revocation interleave with transfers.
 
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -24,6 +35,10 @@ pub struct Attached<G> {
     pub writable: bool,
 }
 
+/// A shared hold on an attached grant: one belongs to the slot and one to each transfer in
+/// flight on it. The grant (and so its mapping) is dropped when the last one goes.
+pub type Lease<G> = Rc<Attached<G>>;
+
 /// Which way a transfer moves the bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -34,10 +49,13 @@ pub enum Direction {
 }
 
 /// Where a checked transfer goes.
+///
+/// It holds a [`Lease`] on the slot's grant: keep it until the device has completed the
+/// transfer, so the grant's mapping outlives the command even if the slot is emptied meanwhile.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Resolved<'a, G> {
-    /// The slot's grant.
-    pub grant: &'a G,
+pub struct Resolved<G> {
+    /// The transfer's hold on the slot's grant.
+    pub lease: Lease<G>,
     /// The IOVA of the transfer's first byte, page-aligned.
     pub iova: u64,
     /// The transfer's length in blocks.
@@ -77,7 +95,7 @@ impl core::error::Error for SlotError {}
 /// The grant slots of one disk descriptor.
 #[derive(Debug)]
 pub struct GrantSlots<G> {
-    slots: BTreeMap<Slot, Attached<G>>,
+    slots: BTreeMap<Slot, Lease<G>>,
 }
 
 impl<G> Default for GrantSlots<G> {
@@ -94,19 +112,19 @@ impl<G> GrantSlots<G> {
         Self::default()
     }
 
-    /// Puts `attached` in `slot` and returns the grant it held before, which the caller must
-    /// unmap.
-    pub fn attach(&mut self, slot: Slot, attached: Attached<G>) -> Option<Attached<G>> {
-        self.slots.insert(slot, attached)
+    /// Puts `attached` in `slot` and returns the slot's lease on the grant it held before.
+    /// Dropping that lease releases the old grant once no transfer still holds it.
+    pub fn attach(&mut self, slot: Slot, attached: Attached<G>) -> Option<Lease<G>> {
+        self.slots.insert(slot, Rc::new(attached))
     }
 
-    /// Empties `slot` and returns its grant, which the caller must unmap.
-    pub fn detach(&mut self, slot: Slot) -> Option<Attached<G>> {
+    /// Empties `slot` and returns its lease on the grant (see [`attach`](Self::attach)).
+    pub fn detach(&mut self, slot: Slot) -> Option<Lease<G>> {
         self.slots.remove(&slot)
     }
 
-    /// Empties every slot (the descriptor closed) and returns their grants.
-    pub fn take_all(&mut self) -> Vec<Attached<G>> {
+    /// Empties every slot (the descriptor closed) and returns their leases.
+    pub fn take_all(&mut self) -> Vec<Lease<G>> {
         core::mem::take(&mut self.slots).into_values().collect()
     }
 
@@ -116,7 +134,8 @@ impl<G> GrantSlots<G> {
     }
 
     /// Checks `transfer` against its slot's grant, for a disk with `block_size`-byte blocks,
-    /// and returns where the device must go.
+    /// and returns where the device must go, with a [`Lease`] the transfer must hold until it
+    /// completes.
     ///
     /// # Errors
     ///
@@ -130,7 +149,7 @@ impl<G> GrantSlots<G> {
         transfer: &Transfer,
         direction: Direction,
         block_size: u32,
-    ) -> Result<Resolved<'_, G>, SlotError> {
+    ) -> Result<Resolved<G>, SlotError> {
         let attached = self
             .slots
             .get(&transfer.slot)
@@ -158,7 +177,7 @@ impl<G> GrantSlots<G> {
             .checked_add(transfer.offset)
             .ok_or(SlotError::Range)?;
         Ok(Resolved {
-            grant: &attached.grant,
+            lease: Rc::clone(attached),
             iova,
             blocks,
         })
@@ -167,6 +186,8 @@ impl<G> GrantSlots<G> {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::RefCell;
+
     use super::*;
 
     fn slot(raw: u64) -> Slot {
@@ -197,15 +218,11 @@ mod tests {
     #[test]
     fn a_transfer_inside_the_grant_resolves_to_its_iova() {
         let slots = table(true);
-        let got = slots.resolve(&transfer(0x1000, 0x3000), Direction::ToBuffer, 512);
-        assert_eq!(
-            got,
-            Ok(Resolved {
-                grant: &"g",
-                iova: 0x10_1000,
-                blocks: 24
-            })
-        );
+        let got = slots
+            .resolve(&transfer(0x1000, 0x3000), Direction::ToBuffer, 512)
+            .expect("inside the grant");
+        assert_eq!(got.lease.grant, "g");
+        assert_eq!((got.iova, got.blocks), (0x10_1000, 24));
     }
 
     #[test]
@@ -271,6 +288,81 @@ mod tests {
         assert_eq!(slots.detach(slot(1)).map(|a| a.grant), Some("h"));
         assert!(slots.detach(slot(1)).is_none());
         assert!(slots.is_empty());
+    }
+
+    /// Records when a grant is released, as a driver's unmapping `Drop` would.
+    struct Mapping<'a> {
+        iova: u64,
+        released: &'a RefCell<Vec<u64>>,
+    }
+
+    impl Drop for Mapping<'_> {
+        fn drop(&mut self) {
+            self.released.borrow_mut().push(self.iova);
+        }
+    }
+
+    fn mapped(iova: u64, released: &RefCell<Vec<u64>>) -> Attached<Mapping<'_>> {
+        Attached {
+            grant: Mapping { iova, released },
+            iova,
+            len: 0x4000,
+            writable: true,
+        }
+    }
+
+    #[test]
+    fn a_revoked_grant_stays_mapped_until_its_in_flight_transfer_completes() {
+        let released = RefCell::new(Vec::new());
+        let mut slots = GrantSlots::new();
+        slots.attach(slot(1), mapped(0x10_0000, &released));
+        // A read is submitted to the device and holds its lease while the command runs.
+        let in_flight = slots
+            .resolve(&transfer(0, 0x1000), Direction::ToBuffer, 512)
+            .expect("inside the grant");
+        // Meanwhile the application revokes the grant and detaches it, and attaches a new one
+        // that could otherwise be mapped at the freed IOVA.
+        drop(slots.detach(slot(1)));
+        slots.attach(slot(1), mapped(0x20_0000, &released));
+        assert!(
+            released.borrow().is_empty(),
+            "released under a running command"
+        );
+        assert!(
+            slots
+                .resolve(&transfer(0, 0x1000), Direction::ToBuffer, 512)
+                .is_ok_and(|r| r.iova == 0x20_0000),
+            "new transfers reach the new grant only"
+        );
+        // The command completes: only now may the revoked grant's IOVA be released.
+        assert_eq!(in_flight.iova, 0x10_0000);
+        drop(in_flight);
+        assert_eq!(*released.borrow(), [0x10_0000]);
+    }
+
+    #[test]
+    fn closing_waits_for_every_transfer() {
+        let released = RefCell::new(Vec::new());
+        let mut slots = GrantSlots::new();
+        slots.attach(slot(1), mapped(0x10_0000, &released));
+        slots.attach(slot(2), mapped(0x20_0000, &released));
+        slots.attach(slot(3), mapped(0x30_0000, &released));
+        let on_two = Transfer {
+            slot: slot(2),
+            ..transfer(0, 0x1000)
+        };
+        let first = slots.resolve(&transfer(0, 0x1000), Direction::ToBuffer, 512);
+        let second = slots.resolve(&on_two, Direction::FromBuffer, 512);
+        drop(slots.take_all());
+        assert_eq!(
+            *released.borrow(),
+            [0x30_0000],
+            "an idle grant goes at once"
+        );
+        drop(first);
+        assert_eq!(*released.borrow(), [0x30_0000, 0x10_0000]);
+        drop(second);
+        assert_eq!(*released.borrow(), [0x30_0000, 0x10_0000, 0x20_0000]);
     }
 
     #[test]

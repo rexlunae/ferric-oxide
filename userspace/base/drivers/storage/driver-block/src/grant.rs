@@ -12,12 +12,18 @@
 //! kernel has unmapped. The kernel keeps a revoked grant's IOVA reserved until the driver
 //! unmaps it, so even a transfer that races with the revocation faults at the IOMMU instead of
 //! reaching memory mapped later.
+//!
+//! The driver's unmap is what gives that IOVA back, so it must not happen while a command
+//! still targets it. Each transfer holds a lease on its grant ([`Target`]) until the device
+//! completes it, and the grant is unmapped in [`MappedGrant`]'s `Drop`, which runs only once
+//! the slot has let go (detach, re-attach or close) and every such lease has been dropped
+//! (`ferric_blkgrant::slots`).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use ferric_blkgrant::abi::{Slot, Transfer};
-use ferric_blkgrant::slots::{Attached, Direction, GrantSlots, SlotError};
+use ferric_blkgrant::slots::{Attached, Direction, GrantSlots, Lease, SlotError};
 use ferric_regbuf::abi::{GrantInfo, Request as RegbufRequest};
 use libredox::Fd;
 use syscall::{CallFlags, Error, Result, EACCES, ECANCELED, EINVAL, ENOENT};
@@ -41,18 +47,39 @@ pub trait GrantDma {
     fn unmap_grant(&self, iova: u64) -> Result<()>;
 }
 
+/// A grant mapped into the driver's DMA domain. Dropping it unmaps the grant (giving back
+/// the IOVA of a revoked one) and then closes the driver's descriptor of it.
+pub(crate) struct MappedGrant {
+    fd: Fd,
+    iova: u64,
+    dma: Rc<dyn GrantDma>,
+}
+
+impl Drop for MappedGrant {
+    fn drop(&mut self) {
+        // Runs after the last transfer on the grant completed (see the module docs), so no
+        // command can still reach `iova` when the kernel frees it.
+        if let Err(err) = self.dma.unmap_grant(self.iova) {
+            log::warn!("cannot unmap the grant at IOVA {:#x}: {err}", self.iova);
+        }
+    }
+}
+
 /// The grant slots of every open disk descriptor of a scheme.
 pub(crate) struct GrantState {
     dma: Rc<dyn GrantDma>,
-    handles: BTreeMap<usize, GrantSlots<Fd>>,
+    handles: BTreeMap<usize, GrantSlots<MappedGrant>>,
 }
 
-/// Where the device must go for a checked transfer.
+/// Where the device must go for a checked transfer. Keep it until the device has completed
+/// the transfer: it holds the grant's mapping in place.
 pub(crate) struct Target {
     /// The IOVA of the transfer's first byte.
     pub iova: u64,
     /// The transfer's length in blocks.
     pub blocks: u32,
+    /// The transfer's hold on the grant's mapping.
+    _lease: Lease<MappedGrant>,
 }
 
 impl GrantState {
@@ -65,7 +92,7 @@ impl GrantState {
     }
 
     /// Attaches `grant` to slot `slot` of descriptor `id`, mapping it into the DMA domain.
-    /// A grant the slot held before is unmapped and closed.
+    /// A grant the slot held before is unmapped and closed once no transfer uses it.
     ///
     /// # Errors
     ///
@@ -79,7 +106,11 @@ impl GrantState {
         }
         let iova = self.dma.map_grant(&grant)?;
         let attached = Attached {
-            grant,
+            grant: MappedGrant {
+                fd: grant,
+                iova,
+                dma: Rc::clone(&self.dma),
+            },
             iova,
             len: info.spec.len(),
             writable: info.spec.access().allows_write(),
@@ -90,12 +121,13 @@ impl GrantState {
         );
         let old = self.handles.entry(id).or_default().attach(slot, attached);
         if let Some(old) = old {
-            self.release(old);
+            release(old);
         }
         Ok(())
     }
 
-    /// Detaches the grant in slot `slot` of descriptor `id`.
+    /// Detaches the grant in slot `slot` of descriptor `id`; it is unmapped once no transfer
+    /// uses it.
     ///
     /// # Errors
     ///
@@ -106,7 +138,7 @@ impl GrantState {
             .get_mut(&id)
             .and_then(|slots| slots.detach(slot))
             .ok_or(Error::new(ENOENT))?;
-        self.release(attached);
+        release(attached);
         Ok(())
     }
 
@@ -116,7 +148,7 @@ impl GrantState {
             return;
         };
         for attached in slots.take_all() {
-            self.release(attached);
+            release(attached);
         }
     }
 
@@ -142,20 +174,26 @@ impl GrantState {
         let resolved = slots
             .resolve(transfer, direction, block_size)
             .map_err(slot_errno)?;
-        if grant_info(resolved.grant)?.revoked {
+        if grant_info(&resolved.lease.grant.fd)?.revoked {
             return Err(Error::new(ECANCELED));
         }
         Ok(Target {
             iova: resolved.iova,
             blocks: resolved.blocks,
+            _lease: resolved.lease,
         })
     }
+}
 
-    /// Unmaps a detached grant; dropping it closes the driver's descriptor of it.
-    fn release(&self, attached: Attached<Fd>) {
-        if let Err(err) = self.dma.unmap_grant(attached.iova) {
-            log::warn!("cannot unmap the grant at IOVA {:#x}: {err}", attached.iova);
-        }
+/// Lets go of a slot's lease on a grant. The grant is unmapped now if no transfer holds it,
+/// or when the last one completes.
+fn release(lease: Lease<MappedGrant>) {
+    let in_flight = Rc::strong_count(&lease) - 1;
+    if in_flight > 0 {
+        log::debug!(
+            "grant at IOVA {:#x} unmapped after {in_flight} transfer(s) in flight complete",
+            lease.iova
+        );
     }
 }
 

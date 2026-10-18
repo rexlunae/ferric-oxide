@@ -136,8 +136,10 @@ impl Request {
     ///
     /// # Errors
     ///
-    /// [`EncodeError::Unaligned`] for a transfer offset that is not a multiple of
-    /// [`PAGE_SIZE`], and [`EncodeError::Offset`] for one of 2^48 pages or more.
+    /// [`EncodeError::Empty`] for a transfer of zero bytes (which [`decode`](Self::decode)
+    /// refuses, so every request that encodes also decodes), [`EncodeError::Unaligned`] for a
+    /// transfer offset that is not a multiple of [`PAGE_SIZE`], and [`EncodeError::Offset`]
+    /// for one of 2^48 pages or more.
     pub const fn encode(self) -> Result<([u64; Self::WORDS], usize), EncodeError> {
         match self {
             Self::Read(t) => match Self::transfer(Verb::Read, t) {
@@ -157,6 +159,10 @@ impl Request {
     }
 
     const fn transfer(verb: Verb, t: Transfer) -> Result<[u64; Self::WORDS], EncodeError> {
+        // A zero length would decode as the padding the kernel adds, so it is not a request.
+        if t.len == 0 {
+            return Err(EncodeError::Empty);
+        }
         if !t.offset.is_multiple_of(PAGE_SIZE) {
             return Err(EncodeError::Unaligned);
         }
@@ -214,6 +220,8 @@ impl Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EncodeError {
+    /// The transfer moves zero bytes.
+    Empty,
     /// The transfer's offset in the grant is not a multiple of [`PAGE_SIZE`].
     Unaligned,
     /// The transfer's offset is 2^48 pages or more.
@@ -223,6 +231,7 @@ pub enum EncodeError {
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Empty => "transfer of zero bytes",
             Self::Unaligned => "grant offset is not page-aligned",
             Self::Offset => "grant offset too large to encode",
         })
@@ -289,6 +298,22 @@ mod tests {
             Request::Detach { slot: slot(5) }.encode(),
             Ok(([3 | 5 << 8, 0, 0], 1))
         );
+    }
+
+    #[test]
+    fn zero_length_transfers_do_not_encode() {
+        let empty = Transfer {
+            slot: slot(0),
+            offset: 0,
+            lba: 0,
+            len: 0,
+        };
+        assert_eq!(Request::Read(empty).encode(), Err(EncodeError::Empty));
+        assert_eq!(Request::Write(empty).encode(), Err(EncodeError::Empty));
+        // Every length that does encode reads back, down to one byte.
+        let one = Request::Write(Transfer { len: 1, ..empty });
+        let (words, n) = one.encode().expect("one byte encodes");
+        assert_eq!(Request::decode(&words[..n]), Ok(one));
     }
 
     #[test]

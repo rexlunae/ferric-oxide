@@ -560,6 +560,8 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
                     .await?
             }
         }
+        // The device is done with the IOVA only now; the lease may go.
+        drop(target);
         usize::try_from(transfer.len).map_err(|_| Error::new(EINVAL))
     }
 
