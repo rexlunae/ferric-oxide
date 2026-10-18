@@ -22,6 +22,7 @@ use crate::{
             handle_notify_files, AddrSpace, AddrSpaceWrapper, BorrowedFmapSource, Grant,
             GrantFileRef, MmapMode, PageSpan, UnmapVec, DANGLING,
         },
+        reshare::Bounce,
         unblock_context, wakeup_context, BorrowedHtBuf, ContextLock, PreemptGuardL1, Status,
     },
     event,
@@ -461,6 +462,7 @@ impl UserInner {
                 let (first_page, page_count, _offset) = page_range_containing(base, len);
                 PageSpan::new(first_page, page_count)
             },
+            middle: Bounce::none(),
             addrsp: Some(dst_addr_space),
         })
     }
@@ -501,6 +503,7 @@ impl UserInner {
                     dst: None,
                 },
                 span: PageSpan::empty(),
+                middle: Bounce::none(),
                 addrsp: None,
             });
         }
@@ -535,6 +538,7 @@ impl UserInner {
                     dst: None,
                 },
                 span: PageSpan::empty(),
+                middle: Bounce::none(),
                 addrsp: Some(dst_space_lock),
             });
         }
@@ -549,9 +553,30 @@ impl UserInner {
         let middle_page_count = middle_tail_part_of_buf.len() / PAGE_SIZE;
         let tail_size = middle_tail_part_of_buf.len() % PAGE_SIZE;
 
-        let (_middle_part_of_buf, tail_part_of_buf) = middle_tail_part_of_buf
+        let (middle_part_of_buf, tail_part_of_buf) = middle_tail_part_of_buf
             .split_at(middle_page_count * PAGE_SIZE)
             .expect("split must succeed");
+
+        // Ferric Oxide: a buffer the caller only borrows itself (a scheme passing on the
+        // buffer of a request it serves) is copied, not borrowed again (context/reshare.rs).
+        let middle_bounce = {
+            let src_middle = if head_part_of_buf.is_empty() {
+                src_page
+            } else {
+                src_page.next()
+            };
+            let middle_span = PageSpan::new(src_middle, middle_page_count);
+            let borrowed = middle_page_count != 0 && {
+                let mut lock_token = token.token();
+                let guard = cur_space_lock.acquire_read(lock_token.downgrade());
+                crate::context::reshare::span_has_pinned_borrow(&guard, middle_span)
+            };
+            if borrowed {
+                Bounce::capture(middle_part_of_buf)?
+            } else {
+                Bounce::none()
+            }
+        };
 
         let head_len = core::cmp::min(PAGE_SIZE - offset, user_buf.len());
 
@@ -634,7 +659,25 @@ impl UserInner {
             (free_span.base, src_page)
         };
 
-        if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {
+        if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count)
+            && !middle_bounce.is_empty()
+        {
+            // Ferric Oxide: the copy, pinned like a borrow. Should the page tables run out part
+            // way, the rest of the span stays unmapped: the scheme faults there, and releasing
+            // the capture unmaps the whole span as usual.
+            let frames = middle_bounce.frames();
+            dst_space.mmap(
+                &dst_space_lock,
+                Some(first_middle_dst_page),
+                middle_page_count,
+                map_flags | MAP_FIXED_NOREPLACE,
+                None,
+                |dst_page, page_flags, mapper, flusher| {
+                    let is_pinned = true;
+                    Grant::allocated_shared(&frames, dst_page, page_flags, mapper, flusher, is_pinned)
+                },
+            )?;
+        } else if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {
             dst_space.mmap(
                 &dst_space_lock,
                 Some(first_middle_dst_page),
@@ -716,6 +759,7 @@ impl UserInner {
             len: user_buf.len(),
             head,
             tail,
+            middle: middle_bounce,
             span: {
                 let (first_page, page_count, _offset) = page_range_containing(base, user_buf.len());
                 PageSpan::new(first_page, page_count)
@@ -869,6 +913,16 @@ impl UserInner {
 
                 if page_count != 1 {
                     return Err(Error::new(EINVAL));
+                }
+
+                // Ferric Oxide: a scheme cannot provide a page it only borrows
+                // (context/reshare.rs). Checked before the waiting mmap is taken off.
+                {
+                    let space = AddrSpace::current()?;
+                    let mut lock_token = token.token();
+                    let guard = space.acquire_read(lock_token.downgrade());
+                    let page = PageSpan::new(Page::containing_address(base_addr), 1);
+                    crate::context::reshare::check_span(&guard, page)?;
                 }
 
                 let context = {
@@ -1278,6 +1332,8 @@ pub struct CaptureGuard<const READ: bool, const WRITE: bool> {
 
     head: CopyInfo<READ, WRITE>,
     tail: CopyInfo<READ, WRITE>,
+    /// Ferric Oxide: the copied middle pages of a buffer the caller only borrows.
+    middle: Bounce,
     addrsp: Option<Arc<AddrSpaceWrapper>>,
 }
 impl<const READ: bool, const WRITE: bool> CaptureGuard<READ, WRITE> {
@@ -1317,6 +1373,8 @@ impl<const READ: bool, const WRITE: bool> CaptureGuard<READ, WRITE> {
         if let Some(src) = self.tail.src.take() {
             src.into_drop(token);
         }
+        // Ferric Oxide: unmapped above, so the copy's frames can go (`release` forgets self).
+        drop(mem::take(&mut self.middle));
         res
     }
     fn release_inner(&mut self, token: &mut CleanLockToken) -> Result<()> {
@@ -1344,6 +1402,8 @@ impl<const READ: bool, const WRITE: bool> CaptureGuard<READ, WRITE> {
         {
             dst.copy_from_slice(&src.buf()[..dst.len()])?;
         }
+        // Ferric Oxide: see `capture_inner`.
+        self.middle.write_back()?;
         self.release_inner_drop(token)
     }
     pub fn release(mut self, token: &mut CleanLockToken) -> Result<()> {

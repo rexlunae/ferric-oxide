@@ -527,6 +527,25 @@ impl RaiiFrame {
         core::mem::forget(self);
         f
     }
+
+    /// Ferric Oxide: the frame's bytes, through the kernel's linear map of physical memory.
+    ///
+    /// The frame may also be mapped in user space (a syscall head or tail buffer, a regbuf
+    /// bounce page or registered page), where a process can change it at any time. The kernel
+    /// treats it like any user memory: it copies in and out and never relies on what it read.
+    pub fn bytes(&self) -> &[u8; PAGE_SIZE] {
+        // SAFETY: a `RaiiFrame` holds a reference to an allocated frame for as long as it
+        // lives, so its page of the linear map stays valid for the borrow, and the array has
+        // the alignment and size of a page.
+        unsafe { &*(RmmA::phys_to_virt(self.inner.base()).data() as *const [u8; PAGE_SIZE]) }
+    }
+
+    /// Ferric Oxide: the frame's bytes, writable; see [`RaiiFrame::bytes`].
+    pub fn bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        // SAFETY: as for `bytes`; the exclusive borrow of this reference is the only kernel
+        // access through it while the borrow lasts.
+        unsafe { &mut *(RmmA::phys_to_virt(self.inner.base()).data() as *mut [u8; PAGE_SIZE]) }
+    }
 }
 
 #[cfg(not(test))]
