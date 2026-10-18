@@ -44,8 +44,13 @@ combination in tests, lints and docs. Do not hide a new warning by increasing
 a baseline or disabling a check.
 
 Package coverage is in `crates/fox-core/tests/archive.rs`,
-`crates/fox-store/tests/store.rs` and `tools/fox/tests/cli.rs`. Tests construct
-real signed pkgar fixtures through `fox-core`'s `test-fixtures` feature. The
+`crates/fox-store/tests/store.rs`, `tools/fox/tests/cli.rs`,
+`crates/fox-git/tests/repo.rs`, `crates/fox-build/tests/build.rs` and
+`tools/cargo-fox/tests/cli.rs`. Tests construct real signed pkgar fixtures
+through `fox-core`'s `test-fixtures` feature. The git and build tests create
+repositories with the `git` command and build a small path-only workspace
+with Cargo, so they need `git` and the rustup default toolchain but no
+network; `fox-git` pins a known `fox-tree/1` hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
 

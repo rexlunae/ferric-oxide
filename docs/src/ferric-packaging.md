@@ -2,7 +2,10 @@
 
 `fox` operates on local `.pkgar` archives and an in-place install root. Its
 command and libraries are host-workspace members, and `recipes/core/fox`
-builds the same command for the target. With `ferric.toml`, images ship
+builds the same command for the target. Package authors use `cargo fox` to
+build a git commit hermetically into a signed archive with a build SBOM and a
+signed build attestation (see [Hermetic builds and
+attestations](#hermetic-builds-and-attestations)). With `ferric.toml`, images ship
 `fox` instead of upstream `pkgutils` by default (see
 [Target images](#target-images)). The image build itself still uses the
 cookbook and the installer.
@@ -13,8 +16,11 @@ cookbook and the installer.
 | --- | --- |
 | `crates/fox-core/` | Names, manifests, BLAKE3 digests, trusted Ed25519 keys, signed-head and full archive verification |
 | `crates/fox-store/` | In-place file installation, ownership checks, installed database and re-verification |
-| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information |
+| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, and build SBOMs with the crate graph |
+| `crates/fox-git/` | Local git repositories through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash and tree export |
+| `crates/fox-build/` | The hermetic Cargo build, staging, pkgar packing and attestation writing |
 | `tools/fox/` | CLI and text/JSON reporting |
+| `tools/cargo-fox/` | `cargo fox build`, `package` and `keygen` for package authors |
 
 The archive format is upstream pkgar. A trusted Ed25519 signature covers the
 header and its BLAKE3 entry-table hash; entries carry hashes for file content.
@@ -81,7 +87,10 @@ fox --root ./image-root remove hello
 fox --root ./image-root adopt-pkg
 ```
 
-All commands accept `--root`, `--key` and `--json`. `verify --installed`
+All commands accept `--root`, `--key` and `--json`. `verify` also checks
+the build attestation beside an archive (`<stem>.attest.toml` and its
+`.sig`) whenever one is present, and `verify --require-attestation` fails
+archives without one; see [Attestations](#attestations). `verify --installed`
 accepts optional package names; without them it checks all installed packages.
 `install` and `remove` accept multiple inputs. Verification failures produce
 a failing exit status. `install --force` permits replacement of otherwise
@@ -178,14 +187,128 @@ The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
 requires every package to have been adopted with a signed manifest, then
 runs `fox verify --installed`.
 
+## Hermetic builds and attestations
+
+`cargo fox` (`tools/cargo-fox`, on `crates/fox-build`) builds one commit of
+a Cargo package. Install it with `cargo install --path tools/cargo-fox` or
+run `cargo run -p cargo-fox -- fox ...`.
+
+```sh
+cargo fox keygen ./keys --name ci                 # ./keys/ci.toml, ./keys/ci.pub.toml
+cargo fox build --manifest-path hello/Cargo.toml   # stage only
+cargo fox package --key ./keys/ci.toml --label ferric-ci-1 --rev v1.2.0
+fox --key ./keys/ci.pub.toml verify --require-attestation target/fox/hello-*.pkgar
+```
+
+Build options: `--rev` (default `HEAD`), `-p/--package`, `--target` (default
+the toolchain's host), `--level v3|v4` (x86-64 only, default v3, the image
+baseline), `--features`, `--no-default-features`, `--git-url` (default the
+`origin` remote), `--work-dir`, `--cargo-home`, `--toolchain` and
+`--auditable auto|require|off`. `package` writes into `--out` (default
+`target/fox` in the repository) the files
+`<name>-<version>-<target>[-<level>]-<features>.pkgar`, `.attest.toml`,
+`.attest.toml.sig` and `.cdx.json`, where `<features>` is the first 12 hex
+digits of the feature-set hash.
+
+The pipeline:
+
+1. The commit's tree is exported from git into an empty `src/` in the work
+   directory. Uncommitted and untracked files are never built. Unsafe tree
+   entries (`..`, `.git`, separators in names) are refused, and submodules
+   become empty directories.
+2. The workspace's `Cargo.lock` must be committed; builds fail without it.
+3. Every command runs from an empty environment (only `PATH`, `HOME`,
+   `RUSTUP_HOME` and `TMPDIR`) with a private `CARGO_HOME`. `RUSTFLAGS`,
+   `RUSTC_WRAPPER`, `CARGO_BUILD_*` and `RUSTUP_TOOLCHAIN` do not pass
+   through, so the source's `rust-toolchain.toml` picks the toolchain unless
+   `--toolchain` names one. The build refuses to start if a
+   `.cargo/config.toml` above the work directory, or one in `CARGO_HOME`,
+   could change it; the default work directory is under the system
+   temporary directory for that reason.
+4. `cargo fetch --locked` is the only step given proxy and certificate
+   settings. Metadata and the build run with `--frozen` and
+   `CARGO_NET_OFFLINE`. Path dependencies outside the exported tree are
+   refused.
+5. `cargo build --frozen --release` runs with `SOURCE_DATE_EPOCH` set to the
+   commit time, `--remap-path-prefix` for the source, target and Cargo
+   directories, and `-C target-cpu` for the level. It uses
+   `cargo auditable` when it is installed (`auto`), and the attestation
+   records whether it did.
+6. The stage holds `usr/bin/<binary>` for each binary target (or those in
+   `binaries`), the `[package.metadata.fox.files]` entries (regular files
+   only, mode 0644), the signed manifest and the build SBOM at
+   `usr/share/fox/sbom/<name>.cdx.json`.
+7. `package` packs the stage with `pkgar` (LZMA2), re-opens and verifies
+   the archive, writes the attestation, signs it with the same key, and
+   checks the result as a verifier would.
+
+Two builds of the same commit, options and toolchain produce identical files,
+SBOM and, with the same key, an identical archive; the tests check this
+across different work directories. Isolation is by environment only: the
+network is not blocked by a sandbox, and the build host's toolchain is
+identified by its version output rather than a hash of its files.
+
+`[package.metadata.fox]` is optional; without it a crate is an `app` that
+installs every binary target, built natively. Unknown keys are refused.
+`kind = "recipe"` packages and packages whose `targets` omit `native` are
+refused; wasm targets are not built yet. `runtime-deps` become the
+manifest's `depends`. `capabilities` and the `features` map to `ferric.toml`
+option ids are read but not used yet.
+
+### Build SBOMs
+
+The build SBOM is CycloneDX 1.5 JSON. Besides the package and every staged
+file with its BLAKE3, it lists every crate reached from the package through
+normal and build dependencies for the build's target and features (from
+`cargo metadata` and `Cargo.lock`): registry crates with their `pkg:cargo`
+purl and the SHA-256 checksum `Cargo.lock` pins, git crates with their
+commit, and path crates of the workspace. Crates used only by build scripts
+or procedural macros have scope `excluded`. A `dependencies` section gives
+the graph. Package properties record `fox:tree_blake3`,
+`fox:cargo_lock_blake3`, the target, level, enabled features, feature-set
+hash, toolchain and profile. It has no timestamp, and its serial number is
+derived from the build identity, so it is reproducible. It cannot cite the
+hash of the archive it is packed into; the attestation binds the two.
+
+### Attestations
+
+A `fox-attestation/1` file (`fox_core::attestation`) records:
+
+| Table | Fields |
+| --- | --- |
+| `package` | `name`, `version` |
+| `source` | `git`, `commit`, `tree_blake3`, `cargo_lock_blake3`, and `path` for a package below the repository root |
+| `build` | `target`, `cpu_level`, the resolved `features`, `feature_set_hash`, `toolchain_id`, `profile`, `auditable`, `builder`, `builder_key`, `built_at` |
+| `output` | `pkgar_blake3`, `pkgar_size`, `pkgar_header_signer`, `entries_blake3`, `sbom_blake3` |
+
+`tree_blake3` is the `fox-tree/1` hash (`fox_git`): BLAKE3 over every file,
+symlink and submodule of the commit in byte order of their paths, each with
+a kind byte and length-prefixed path and contents, so git's SHA-1 ids are
+not the only thing naming the source. `feature_set_hash` is BLAKE3 over the
+sorted enabled features and the `Cargo.lock` hash. `entries_blake3` does not
+depend on the signing key, so a rebuilder signing with its own key can still
+show it produced the same files.
+
+The `.sig` file (`fox-signature/1`) holds the Ed25519 key and a signature
+over `fox-attestation-signature/1\0` followed by the attestation's exact
+bytes. Verification looks the key up among the trusted keys first, checks
+the signature, requires `builder_key` to be that key, and then checks that
+the attestation matches the archive: name, version, archive hash and size,
+header signer, entry-table hash, and the BLAKE3 of the SBOM entry inside it.
+Builder keys are the same trusted keys as archive signers
+(`<root>/etc/fox/keys/` and `--key`); one CI key signs both for now.
+
 ## SBOM scope and unfinished packaging work
 
-SBOM output describes the verified package, archive hash, signer, source,
-declared runtime dependencies and individual files/hashes. It is reproducible:
-there is no timestamp, and the serial number derives from the archive hash.
-It does not inventory transitive build dependencies from `Cargo.lock` or
-embedded `cargo auditable` information.
+`fox sbom` output describes the verified package, archive hash, signer,
+source, declared runtime dependencies and individual files/hashes. It is
+reproducible: there is no timestamp, and the serial number derives from the
+archive hash. It is built from the archive's own metadata; the crate graph
+is in the build SBOM that `cargo fox package` packs into archives it builds.
+Reading embedded `cargo auditable` data is not implemented.
 
+`fox install <git-url>` (building from source with trust-on-first-use author
+keys), signed-tag checks and `cargo fox release` are not implemented yet.
 Repository fetching/search, a dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging

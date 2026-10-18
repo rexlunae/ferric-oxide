@@ -21,8 +21,13 @@
 //! - `components`: one `file` component per installed file, named by its
 //!   path, with its BLAKE3.
 //!
-//! Dependency lists from `Cargo.lock` and `cargo auditable` data come with
-//! the hermetic builds of Phase P2.
+//! [`BuildSbom`] is the SBOM a hermetic build (`fox-build`) packs into the
+//! archive it produces, at [`sbom_path`](fox_core::sbom_path). It describes
+//! the same package and files, plus every Rust crate the build resolved from
+//! `Cargo.lock`, the dependency graph between them, and the source tree,
+//! toolchain, target and features. Because it is inside the archive, it
+//! cannot cite the archive's own hash; the build attestation binds the two
+//! instead, by carrying both hashes.
 //!
 //! # Examples
 //!
@@ -48,6 +53,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod build;
+
 use std::io::Write;
 
 use cyclonedx_bom::external_models::uri::Uri;
@@ -62,6 +69,8 @@ use cyclonedx_bom::models::property::{Properties, Property};
 use cyclonedx_bom::models::tool::{Tool, Tools};
 use cyclonedx_bom::prelude::*;
 use fox_core::{Blake3Digest, FileKind, FileRecord, KeyId, Manifest};
+
+pub use build::{BuildInfo, BuildSbom, CrateDependency, CrateSource};
 
 /// Why an SBOM could not be built or written.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +91,12 @@ pub enum SbomError {
     /// The document could not be serialized or written.
     #[error("cannot write the SBOM")]
     Write(#[source] cyclonedx_bom::errors::JsonWriteError),
+    /// A dependency id names no crate in the build's dependency graph.
+    #[error("dependency {id:?} is not in the crate graph")]
+    UnknownCrate {
+        /// The dangling id.
+        id: String,
+    },
 }
 
 /// The inputs for one package's SBOM.
@@ -126,11 +141,7 @@ impl<'a> PackageSbom<'a> {
         Ok(Bom {
             serial_number: Some(serial_number(self.archive_blake3)),
             metadata: Some(Metadata {
-                tools: Some(Tools::List(vec![Tool {
-                    name: Some(NormalizedString::new("fox")),
-                    version: Some(NormalizedString::new(env!("CARGO_PKG_VERSION"))),
-                    ..Tool::default()
-                }])),
+                tools: Some(tool_list()),
                 component: Some(self.package_component()?),
                 ..Metadata::default()
             }),
@@ -152,38 +163,8 @@ impl<'a> PackageSbom<'a> {
     }
 
     fn package_component(&self) -> Result<Component, SbomError> {
-        let manifest = self.manifest;
-        let name = manifest.name.as_str();
-        let mut component = Component::new(
-            Classification::Application,
-            name,
-            &manifest.version,
-            Some(format!("pkg:{name}")),
-        );
-        component.description = manifest.summary.as_deref().map(NormalizedString::new);
-        component.purl =
-            Some(Purl::new("generic", name, &manifest.version).map_err(SbomError::Purl)?);
+        let mut component = package_component(self.manifest)?;
         component.hashes = Some(blake3_hashes(self.archive_blake3));
-        if let Some(license) = &manifest.license {
-            let expression = SpdxExpression::parse_lax(license.clone()).map_err(|source| {
-                SbomError::License {
-                    license: license.clone(),
-                    source,
-                }
-            })?;
-            component.licenses = Some(Licenses(vec![LicenseChoice::Expression(expression)]));
-        }
-        if let Some(source) = &manifest.source {
-            component.external_references = Some(ExternalReferences(vec![ExternalReference {
-                external_reference_type: ExternalReferenceType::Vcs,
-                url: ReferenceUri::Url(Uri::new(&source.git)),
-                comment: source
-                    .commit
-                    .as_ref()
-                    .map(|commit| format!("commit {commit}")),
-                hashes: None,
-            }]));
-        }
         component.properties = Some(Properties(self.properties()));
         Ok(component)
     }
@@ -191,26 +172,78 @@ impl<'a> PackageSbom<'a> {
     fn properties(&self) -> Vec<Property> {
         let manifest = self.manifest;
         let mut properties = Vec::new();
-        let mut add = |name: &str, value: &str| {
-            properties.push(Property {
-                name: name.to_owned(),
-                value: NormalizedString::new(value),
-            });
-        };
         if let Some(target) = &manifest.target {
-            add("fox:target", target);
+            properties.push(property("fox:target", target));
         }
         if let Some(signer) = self.signer {
-            add("fox:signer", &signer.to_string());
+            properties.push(property("fox:signer", &signer.to_string()));
         }
         for dep in &manifest.depends {
-            add("fox:depends", dep.as_str());
+            properties.push(property("fox:depends", dep.as_str()));
         }
         properties
     }
 }
 
-fn file_component(file: &FileRecord) -> Component {
+/// The package itself: name, version, description, purl, licence and VCS
+/// reference, without hashes or properties.
+pub(crate) fn package_component(manifest: &Manifest) -> Result<Component, SbomError> {
+    let name = manifest.name.as_str();
+    let mut component = Component::new(
+        Classification::Application,
+        name,
+        &manifest.version,
+        Some(package_ref(manifest)),
+    );
+    component.description = manifest.summary.as_deref().map(NormalizedString::new);
+    component.purl = Some(Purl::new("generic", name, &manifest.version).map_err(SbomError::Purl)?);
+    if let Some(license) = &manifest.license {
+        let expression =
+            SpdxExpression::parse_lax(license.clone()).map_err(|source| SbomError::License {
+                license: license.clone(),
+                source,
+            })?;
+        component.licenses = Some(Licenses(vec![LicenseChoice::Expression(expression)]));
+    }
+    if let Some(source) = &manifest.source {
+        component.external_references = Some(ExternalReferences(vec![vcs_reference(
+            &source.git,
+            source.commit.as_deref(),
+        )]));
+    }
+    Ok(component)
+}
+
+/// The `bom-ref` of the package component.
+pub(crate) fn package_ref(manifest: &Manifest) -> String {
+    format!("pkg:{}", manifest.name)
+}
+
+pub(crate) fn vcs_reference(url: &str, commit: Option<&str>) -> ExternalReference {
+    ExternalReference {
+        external_reference_type: ExternalReferenceType::Vcs,
+        url: ReferenceUri::Url(Uri::new(url)),
+        comment: commit.map(|commit| format!("commit {commit}")),
+        hashes: None,
+    }
+}
+
+pub(crate) fn property(name: &str, value: &str) -> Property {
+    Property {
+        name: name.to_owned(),
+        value: NormalizedString::new(value),
+    }
+}
+
+pub(crate) fn tool_list() -> Tools {
+    Tools::List(vec![Tool {
+        name: Some(NormalizedString::new("fox")),
+        version: Some(NormalizedString::new(env!("CARGO_PKG_VERSION"))),
+        ..Tool::default()
+    }])
+}
+
+pub(crate) fn file_component(file: &FileRecord) -> Component {
     let mut component = Component::new(
         Classification::File,
         &file.path,
@@ -221,24 +254,22 @@ fn file_component(file: &FileRecord) -> Component {
     component.version = None;
     component.hashes = Some(blake3_hashes(file.blake3));
     if file.kind == FileKind::Symlink {
-        component.properties = Some(Properties(vec![Property {
-            name: "fox:kind".to_owned(),
-            value: NormalizedString::new("symlink"),
-        }]));
+        component.properties = Some(Properties(vec![property("fox:kind", "symlink")]));
     }
     component
 }
 
-fn blake3_hashes(digest: Blake3Digest) -> Hashes {
+pub(crate) fn blake3_hashes(digest: Blake3Digest) -> Hashes {
     Hashes(vec![Hash {
         alg: HashAlgorithm::BLAKE3,
         content: HashValue(digest.to_string()),
     }])
 }
 
-/// A version 8 (custom) UUID URN taken from the first 16 bytes of the
-/// archive hash, so the serial number is stable for a given archive.
-fn serial_number(archive: Blake3Digest) -> UrnUuid {
+/// A version 8 (custom) UUID URN taken from the first 16 bytes of a digest
+/// (the archive hash, or the build identity for build SBOMs), so the serial
+/// number is stable for a given input.
+pub(crate) fn serial_number(archive: Blake3Digest) -> UrnUuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&archive.as_bytes()[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x80;

@@ -5,7 +5,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use fox_core::VerifiedAttestation;
 use fox_core::archive::{Archive, ArchiveError, MetadataSource};
+use fox_core::attested::{attestation_path, verify_archive_attestation};
 use fox_core::keys::{KeyError, load_key_file, trusted_keys_for_root};
 use fox_core::{NameError, PackageName, TrustedKeys};
 use fox_sbom::{PackageSbom, SbomError};
@@ -45,8 +47,14 @@ pub(crate) enum CliError {
 
 pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
     match &cli.command {
-        Command::Verify { installed, targets } if *installed => verify_installed(cli, targets),
-        Command::Verify { targets, .. } => verify_archives(cli, targets),
+        Command::Verify {
+            installed, targets, ..
+        } if *installed => verify_installed(cli, targets),
+        Command::Verify {
+            targets,
+            require_attestation,
+            ..
+        } => verify_archives(cli, targets, *require_attestation),
         Command::Sbom {
             archive,
             format,
@@ -172,48 +180,148 @@ struct VerifyResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     package: Option<ArchiveSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    attestation: Option<AttestationSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
-fn verify_archives(cli: &Cli, targets: &[String]) -> Result<ExitCode, CliError> {
-    let keys = trusted_keys(cli)?;
-    let mut results = Vec::new();
-    for target in targets {
-        let path = PathBuf::from(target);
-        let result = match Archive::open(&path, &keys) {
-            Ok(archive) => {
-                if !cli.json {
-                    sidecar_warning(&archive);
-                    println!(
-                        "ok {} {} {} ({} files, signed by {})",
-                        path.display(),
-                        archive.manifest().name,
-                        archive.manifest().version,
-                        archive.files().len(),
-                        archive.head().signer().label
-                    );
-                }
-                VerifyResult {
-                    path,
-                    ok: true,
-                    package: Some(ArchiveSummary::new(&archive)),
-                    error: None,
-                }
-            }
-            Err(error) => {
-                if !cli.json {
-                    println!("FAILED {}: {}", path.display(), chain(&error));
-                }
-                VerifyResult {
-                    path,
-                    ok: false,
-                    package: None,
-                    error: Some(chain(&error)),
-                }
-            }
-        };
-        results.push(result);
+#[derive(Serialize)]
+struct AttestationSummary {
+    path: PathBuf,
+    builder: String,
+    builder_key: String,
+    git: String,
+    commit: String,
+    tree_blake3: String,
+    target: String,
+    cpu_level: Option<&'static str>,
+    features: Vec<String>,
+    toolchain_id: String,
+    sbom_blake3: String,
+}
+
+impl AttestationSummary {
+    fn new(path: PathBuf, verified: &VerifiedAttestation) -> Self {
+        let a = verified.attestation();
+        Self {
+            path,
+            builder: verified.signer().label.clone(),
+            builder_key: verified.signer().key.to_string(),
+            git: a.source.git.clone(),
+            commit: a.source.commit.clone(),
+            tree_blake3: a.source.tree_blake3.to_string(),
+            target: a.build.target.clone(),
+            cpu_level: a.build.cpu_level.map(fox_core::CpuLevel::as_str),
+            features: a.build.features.clone(),
+            toolchain_id: a.build.toolchain_id.clone(),
+            sbom_blake3: a.output.sbom_blake3.to_string(),
+        }
     }
+}
+
+/// Why an archive's attestation check failed, for output.
+enum AttestationProblem {
+    Missing(PathBuf),
+    Invalid(String),
+}
+
+/// Checks the attestation beside a verified archive, if there is one.
+fn check_attestation(
+    archive: &Archive,
+    keys: &TrustedKeys,
+    required: bool,
+) -> Result<Option<AttestationSummary>, AttestationProblem> {
+    let path = attestation_path(archive.path());
+    if !path.exists() {
+        return if required {
+            Err(AttestationProblem::Missing(path))
+        } else {
+            Ok(None)
+        };
+    }
+    verify_archive_attestation(archive, &path, keys)
+        .map(|verified| Some(AttestationSummary::new(path, &verified)))
+        .map_err(|error| AttestationProblem::Invalid(chain(&error)))
+}
+
+fn verify_one(
+    cli: &Cli,
+    path: PathBuf,
+    keys: &TrustedKeys,
+    require_attestation: bool,
+) -> VerifyResult {
+    let archive = match Archive::open(&path, keys) {
+        Ok(archive) => archive,
+        Err(error) => {
+            if !cli.json {
+                println!("FAILED {}: {}", path.display(), chain(&error));
+            }
+            return VerifyResult {
+                path,
+                ok: false,
+                package: None,
+                attestation: None,
+                error: Some(chain(&error)),
+            };
+        }
+    };
+    let package = Some(ArchiveSummary::new(&archive));
+    match check_attestation(&archive, keys, require_attestation) {
+        Ok(attestation) => {
+            if !cli.json {
+                sidecar_warning(&archive);
+                let attested = attestation
+                    .as_ref()
+                    .map(|a| format!(", built from {} by {}", a.commit, a.builder))
+                    .unwrap_or_default();
+                println!(
+                    "ok {} {} {} ({} files, signed by {}{attested})",
+                    path.display(),
+                    archive.manifest().name,
+                    archive.manifest().version,
+                    archive.files().len(),
+                    archive.head().signer().label
+                );
+            }
+            VerifyResult {
+                path,
+                ok: true,
+                package,
+                attestation,
+                error: None,
+            }
+        }
+        Err(problem) => {
+            let error = match problem {
+                AttestationProblem::Missing(at) => {
+                    format!("no build attestation at {}", at.display())
+                }
+                AttestationProblem::Invalid(error) => error,
+            };
+            if !cli.json {
+                println!("FAILED {}: {error}", path.display());
+            }
+            VerifyResult {
+                path,
+                ok: false,
+                package,
+                attestation: None,
+                error: Some(error),
+            }
+        }
+    }
+}
+
+fn verify_archives(
+    cli: &Cli,
+    targets: &[String],
+    require_attestation: bool,
+) -> Result<ExitCode, CliError> {
+    let keys = trusted_keys(cli)?;
+    let results: Vec<VerifyResult> = targets
+        .iter()
+        .map(|target| verify_one(cli, PathBuf::from(target), &keys, require_attestation))
+        .collect();
     if cli.json {
         print_json(&results)?;
     }

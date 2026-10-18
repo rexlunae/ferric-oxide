@@ -4,13 +4,15 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-core", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cookbook", "tools/ferric-config", "tools/fox"]
+default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/fox"]
 members = [
     "crates/amdvi",
     "crates/blkgrant",
     "crates/cet",
     "crates/elfreloc",
+    "crates/fox-build",
     "crates/fox-core",
+    "crates/fox-git",
     "crates/fox-sbom",
     "crates/fox-store",
     "crates/hwrand",
@@ -20,6 +22,7 @@ members = [
     "crates/ring",
     "crates/trace",
     "crates/vtd",
+    "tools/cargo-fox",
     "tools/cookbook",
     "tools/ferric-config",
     "tools/fox",
@@ -53,6 +56,9 @@ pkgar = "0.2.4"
 pkgar-core = "0.2.4"
 pkgar-keys = "0.2.4"
 thiserror = { version = "2", default-features = false }
+# Git access for fox-git: revision parsing and object reading, without the
+# default network, worktree and diff machinery.
+gix = { version = "0.89", default-features = false, features = ["sha1", "revision"] }
 toml = { version = "1", default-features = false }
 
 [profile.release.package.ferric-config]
