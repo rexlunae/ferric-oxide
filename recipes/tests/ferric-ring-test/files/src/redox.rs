@@ -1014,6 +1014,23 @@ fn async_chains() -> Result<(), Failure> {
 }
 
 fn wait_sync() -> Result<(), Failure> {
+    // The sleeps below only make the overlap likely; `wait_sync_once` checks from timestamps
+    // that it happened, and a run where scheduling broke it is tried again.
+    for _ in 0..WAIT_SYNC_TRIES {
+        if wait_sync_once()? {
+            return Ok(());
+        }
+    }
+    Err(Failure::Mismatch {
+        what: "an overlap of a blocked Enter and a wait-only Enter (scheduling delayed every try)",
+    })
+}
+
+/// How many times `ring-wait-sync` tries to make its two `Enter`s overlap.
+const WAIT_SYNC_TRIES: usize = 3;
+
+/// One try of `ring-wait-sync`: `Ok(false)` when the two `Enter`s did not provably overlap.
+fn wait_sync_once() -> Result<bool, Failure> {
     let mut ring = Ring::new(8, 16)?;
     let [rd, wr] = pipe()?;
     let mut buf = [0u8; 16];
@@ -1021,35 +1038,50 @@ fn wait_sync() -> Result<(), Failure> {
     // A synchronous read of an empty pipe, which blocks the `Enter` that runs it.
     ring.submit(&[Sqe::read(rd as u32, CURRENT_POSITION, addr, 16, 1)])?;
     let fd = &ring.fd;
-    let (submitted, waited, early, wrote) = std::thread::scope(|scope| {
-        let submitter = scope.spawn(|| enter_on(fd, 1, 0));
+    let timed = |n, min_complete| {
+        let start = Instant::now();
+        let result = enter_on(fd, n, min_complete);
+        (start, result, Instant::now())
+    };
+    let (submitted, waited, early, wrote, wrote_at) = std::thread::scope(|scope| {
+        let submitter = scope.spawn(|| timed(1, 0));
         std::thread::sleep(HOLD_DELAY);
         // A wait-only Enter while the read runs in the other thread's Enter must wait for it.
-        let waiter = scope.spawn(|| enter_on(fd, 0, 1));
+        let waiter = scope.spawn(|| timed(0, 1));
         std::thread::sleep(HOLD_DELAY);
         let early = waiter.is_finished();
         let byte = [0x44_u8];
+        let wrote_at = Instant::now();
         // SAFETY: the pipe's write end and a buffer of 1 byte.
         let wrote = unsafe { libc::write(wr, byte.as_ptr().cast(), 1) };
+        let failed = (wrote_at, i64::MIN, wrote_at);
         (
-            submitter.join().unwrap_or(i64::MIN),
-            waiter.join().unwrap_or(i64::MIN),
+            submitter.join().unwrap_or(failed),
+            waiter.join().unwrap_or(failed),
             early,
             wrote,
+            wrote_at,
         )
     });
+    close_fd(rd);
+    close_fd(wr);
     expect("write to the pipe", 1, wrote as i64)?;
-    expect("the submitting Enter", 1, submitted)?;
-    expect("the waiting Enter", 0, waited)?;
+    expect("the submitting Enter", 1, submitted.1)?;
+    expect("the waiting Enter", 0, waited.1)?;
     if early {
         return Err(Failure::Mismatch {
             what: "a wait-only Enter that waited for a chain another Enter runs",
         });
     }
     check_cqes("the synchronous read", &ring.reap()?, &[(1, 1)])?;
-    close_fd(rd);
-    close_fd(wr);
-    Ok(())
+    // Both Enters were called before the write and returned after it, the waiter after the
+    // submitter had started: so the waiter was inside its Enter while the read was blocked, and
+    // returned only once the write let the read finish.
+    let overlapped = submitted.0 < waited.0
+        && waited.0 < wrote_at
+        && submitted.2 > wrote_at
+        && waited.2 > wrote_at;
+    Ok(overlapped)
 }
 
 /// How long `ring-async-close` waits for the closed ring's worker to post its cancellations.
