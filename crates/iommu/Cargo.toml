@@ -8,7 +8,8 @@ description = "The kernel iommu scheme's interface, PCI requester-ID alias rules
 [dependencies]
 
 [dev-dependencies]
-ferric-regbuf = { workspace = true, features = ["alloc"] }
+# Shared crates are also consumed through recipe symlinks outside the host workspace.
+ferric-regbuf = { path = "../regbuf", default-features = false, features = ["alloc"] }
 
 [features]
 default = []
