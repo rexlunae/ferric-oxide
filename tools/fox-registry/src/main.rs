@@ -602,11 +602,16 @@ struct BuildArgs<'a> {
     work_dir: Option<&'a Path>,
 }
 
+/// The target `build` uses without `--target`: the one this binary runs
+/// on, as the build's toolchain defaults to it too.
+const HOST_TARGET: &str = env!("FOX_REGISTRY_HOST_TARGET");
+
 fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
     let registry = Registry::open(dir)?;
     let cache = cache_dir(args.cache)?;
+    let target = args.target.unwrap_or(HOST_TARGET);
     let releases = if args.releases.is_empty() {
-        missing_builds(&registry, args.label, args.target)?
+        missing_builds(&registry, args.label, target)?
     } else {
         args.releases
             .iter()
@@ -626,7 +631,7 @@ fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
             blobs: args.blobs,
             work_dir: &work_dir,
             cache: &cache,
-            target: args.target.map(str::to_owned),
+            target: Some(target.to_owned()),
         };
         let pkgar = ci::build(&registry, &job)?;
         println!("built {name} {version}: {pkgar}");
@@ -645,12 +650,12 @@ fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
     ))
 }
 
-/// Every release, not yanked, that has no artifact attested by `label`
-/// (for `target`, when given).
+/// Every release, not yanked, that has no artifact for `target` attested
+/// by `label`.
 fn missing_builds(
     registry: &Registry,
     label: &str,
-    target: Option<&str>,
+    target: &str,
 ) -> Result<Vec<(PackageName, Version)>, CliError> {
     let mut missing = Vec::new();
     for delegation in &registry.targets().signed.delegations {
@@ -663,7 +668,7 @@ fn missing_builds(
                 .artifacts(&name, &release.version)?
                 .is_some_and(|list| {
                     list.artifacts.iter().any(|artifact| {
-                        target.is_none_or(|target| artifact.target == target)
+                        artifact.target == target
                             && artifact
                                 .attestations
                                 .iter()
@@ -800,8 +805,15 @@ fn print_report(report: &SignReport) {
             "NEEDS SIGNATURES"
         };
         let bumped = if file.bumped { ", new version" } else { "" };
+        let previous = file.previous_root.map_or_else(String::new, |old| {
+            format!(
+                ", {}/{} previous root keys",
+                old.valid.min(old.threshold),
+                old.threshold
+            )
+        });
         println!(
-            "{:<40} v{:<4} {}/{} {state}{bumped}",
+            "{:<40} v{:<4} {}/{} {state}{bumped}{previous}",
             file.file,
             file.version,
             file.valid.min(file.threshold),

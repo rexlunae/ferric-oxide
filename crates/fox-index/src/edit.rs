@@ -20,8 +20,9 @@
 //! instead (edits like [`Registry::admit`] leave such a pending version). A role whose
 //! content did not change keeps its version and gains signatures; it is
 //! also renewed when it has used up half its lifetime and the keyring holds
-//! one of its keys, so a scheduled job only has to run `sign`. A role may be
-//! left short of its threshold (an owner signs a delegation without the
+//! enough of its keys to meet its threshold, so a scheduled job only has to
+//! run `sign` and cannot take a threshold-two role offline on its own. A role
+//! may be left short of its threshold (an owner signs a delegation without the
 //! snapshot key, which CI adds after the merge); [`SignReport`] says which.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,6 +131,11 @@ impl Keyring {
         role.keyids.iter().any(|key| self.secrets.contains_key(key))
     }
 
+    /// Whether the keyring holds `key`.
+    pub fn holds(&self, key: &KeyId) -> bool {
+        self.secrets.contains_key(key)
+    }
+
     fn sign<T: Serialize>(
         &self,
         metadata: &mut Signed<T>,
@@ -168,12 +174,29 @@ pub struct SignedFile {
     pub valid: u32,
     /// The role's threshold.
     pub threshold: u32,
+    /// For a root after the first: its signatures by the previous root's
+    /// root keys, which clients also require. Each key set is checked
+    /// against its own threshold.
+    pub previous_root: Option<PreviousRootSignatures>,
+}
+
+/// A new root's signatures by the root keys of the root before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviousRootSignatures {
+    /// Valid signatures by distinct previous root keys.
+    pub valid: u32,
+    /// The previous root role's threshold.
+    pub threshold: u32,
 }
 
 impl SignedFile {
-    /// Whether the file is signed by enough keys.
+    /// Whether the file is signed by enough keys: for a root, a threshold
+    /// of its own root keys and, separately, of the previous root's.
     pub fn complete(&self) -> bool {
-        self.threshold > 0 && self.valid >= self.threshold
+        let previous = self
+            .previous_root
+            .is_none_or(|old| old.threshold > 0 && old.valid >= old.threshold);
+        self.threshold > 0 && self.valid >= self.threshold && previous
     }
 }
 
@@ -287,6 +310,12 @@ pub enum EditError {
         /// The file.
         file: String,
     },
+    /// The root metadata does not list a top-level role.
+    #[error("root metadata has no {role} role")]
+    MissingRole {
+        /// The missing role.
+        role: &'static str,
+    },
 }
 
 /// A registry working tree opened for editing.
@@ -399,7 +428,17 @@ impl Registry {
         while dir.join(root_file(version + 1)).is_file() {
             version += 1;
         }
-        let root = load(dir, &root_file(version))?;
+        let root: Signed<Root> = load(dir, &root_file(version))?;
+        // `role_keys` trusts that every role is present, so refuse a root
+        // that is not one this crate wrote instead of panicking later.
+        for role in RoleName::ALL {
+            if !root.signed.roles.contains_key(&role) {
+                return Err(EditError::MissingRole {
+                    role: role.as_str(),
+                });
+            }
+            check_role(role.as_str(), root.signed.roles.get(&role))?;
+        }
         let previous_root = if version > 1 {
             Some(load(dir, &root_file(version - 1))?)
         } else {
@@ -673,17 +712,42 @@ impl Registry {
         lifetimes: &Lifetimes,
     ) -> Result<(), EditError> {
         check_role(role.as_str(), Some(&keys))?;
-        if self.root.signatures.is_empty() {
-            // No client can trust an unsigned root yet, so a rotation in
-            // progress is amended rather than chained.
+        if !self.root_published() {
+            // No client can trust a root that is unsigned, or that is only
+            // partly signed for a rotation in progress, so edit it in place
+            // rather than chaining a version nothing can follow.
             self.root.signed.roles.insert(role, keys);
             self.root.signed.expires = Expiry::days_after(now, lifetimes.root);
+            // Changing the roles changes the bytes a signature covers, so
+            // signatures already collected for the pending root no longer
+            // apply to it.
+            self.root.signatures.clear();
         } else {
             let mut next = self.next_root(now, lifetimes)?;
             next.roles.insert(role, keys);
             self.previous_root = Some(std::mem::replace(&mut self.root, Signed::new(next)));
         }
         self.write_root()
+    }
+
+    /// Whether clients would accept the current root: signed by a threshold
+    /// of both its own root keys and the previous root's, as a rotation
+    /// requires.
+    fn root_published(&self) -> bool {
+        let Some(own) = self.root.signed.roles.get(&RoleName::Root) else {
+            return false;
+        };
+        if count_valid(&self.root, own) < own.threshold {
+            return false;
+        }
+        match self
+            .previous_root
+            .as_ref()
+            .and_then(|previous| previous.signed.roles.get(&RoleName::Root))
+        {
+            Some(old) => count_valid(&self.root, old) >= old.threshold,
+            None => true,
+        }
     }
 
     /// Updates and signs every metadata file; see the module docs.
@@ -701,7 +765,7 @@ impl Registry {
     ) -> Result<SignReport, EditError> {
         let mut report = SignReport::default();
         let lifetimes = &options.lifetimes;
-        if options.bump.contains(&RoleName::Root) {
+        if options.bump.contains(&RoleName::Root) && self.root_published() {
             let next = self.next_root(now, lifetimes)?;
             self.previous_root = Some(std::mem::replace(&mut self.root, Signed::new(next)));
         }
@@ -751,7 +815,7 @@ impl Registry {
             now,
             days: lifetimes.targets,
             force: options.bump.contains(&RoleName::Targets),
-            keys: &self.role_keys(RoleName::Targets).clone(),
+            keys: &self.role_keys(RoleName::Targets)?.clone(),
         };
         let (signed, bytes) = step.apply(&mut self.targets, TARGETS_FILE, |targets| {
             targets.targets = wanted;
@@ -768,7 +832,7 @@ impl Registry {
             now,
             days: lifetimes.snapshot,
             force: options.bump.contains(&RoleName::Snapshot),
-            keys: &self.role_keys(RoleName::Snapshot).clone(),
+            keys: &self.role_keys(RoleName::Snapshot)?.clone(),
         };
         let (signed, bytes) = step.apply(&mut self.snapshot, SNAPSHOT_FILE, |snapshot| {
             snapshot.meta = snapshot_meta;
@@ -782,7 +846,7 @@ impl Registry {
             now,
             days: lifetimes.timestamp,
             force: options.bump.contains(&RoleName::Timestamp),
-            keys: &self.role_keys(RoleName::Timestamp).clone(),
+            keys: &self.role_keys(RoleName::Timestamp)?.clone(),
         };
         let (signed, bytes) = step.apply(&mut self.timestamp, TIMESTAMP_FILE, |timestamp| {
             timestamp.snapshot = snapshot_meta;
@@ -797,13 +861,14 @@ impl Registry {
             .ok_or_else(|| EditError::UnknownPackage { name: name.clone() })
     }
 
-    fn role_keys(&self, role: RoleName) -> &RoleKeys {
-        // `init` and `set_role` only write roots with every role.
+    fn role_keys(&self, role: RoleName) -> Result<&RoleKeys, EditError> {
         self.root
             .signed
             .roles
             .get(&role)
-            .expect("every written root has every role")
+            .ok_or(EditError::MissingRole {
+                role: role.as_str(),
+            })
     }
 
     fn next_root(&self, now: OffsetDateTime, lifetimes: &Lifetimes) -> Result<Root, EditError> {
@@ -820,7 +885,7 @@ impl Registry {
 
     fn sign_root(&mut self, keyring: &Keyring) -> Result<SignedFile, EditError> {
         let file = root_file(self.root.signed.version);
-        let mut keys = self.role_keys(RoleName::Root).keyids.clone();
+        let mut keys = self.role_keys(RoleName::Root)?.keyids.clone();
         if let Some(old) = self
             .previous_root
             .as_ref()
@@ -835,13 +900,25 @@ impl Registry {
                 source,
             })?;
         self.write_root()?;
-        let own = self.role_keys(RoleName::Root);
+        // A rotation is only complete when a threshold of the previous root
+        // keys signed too; each key set is reported against its own
+        // threshold, as clients check them.
+        let own = self.role_keys(RoleName::Root)?;
+        let previous_root = self
+            .previous_root
+            .as_ref()
+            .and_then(|previous| previous.signed.roles.get(&RoleName::Root))
+            .map(|old| PreviousRootSignatures {
+                valid: count_valid(&self.root, old),
+                threshold: old.threshold,
+            });
         Ok(SignedFile {
             file,
             version: self.root.signed.version,
             bumped: false,
             valid: count_valid(&self.root, own),
             threshold: own.threshold,
+            previous_root,
         })
     }
 
@@ -906,7 +983,19 @@ impl Step<'_> {
         update(&mut candidate);
         let changed = candidate != metadata.signed;
         let holds_key = self.keyring.holds_any(self.keys);
-        let renew = holds_key && due_for_renewal(&metadata.signed, self.now, self.days);
+        // Renewing writes a new version over the published one, so only do
+        // it when the keyring can sign the replacement to the role's
+        // threshold; a threshold-two role renewed by one key would discard
+        // the still-valid metadata and take the registry offline until the
+        // other keys sign.
+        let held = self
+            .keys
+            .keyids
+            .iter()
+            .filter(|key| self.keyring.holds(key))
+            .count();
+        let can_meet = u32::try_from(held).map_or(true, |held| held >= self.keys.threshold);
+        let renew = holds_key && can_meet && due_for_renewal(&metadata.signed, self.now, self.days);
         let bumped = changed || self.force || renew;
         if bumped {
             // A version nobody has signed yet was never published, so it
@@ -939,6 +1028,7 @@ impl Step<'_> {
                 bumped,
                 valid: count_valid(metadata, self.keys),
                 threshold: self.keys.threshold,
+                previous_root: None,
             },
             bytes,
         ))
