@@ -192,12 +192,15 @@ impl Bounce {
         snapshot
             .try_reserve_exact(src.len())
             .map_err(|_| Error::new(ENOMEM))?;
-        snapshot.extend_from_slice(src);
-        frame
+        snapshot.resize(src.len(), 0);
+        // One read of each region byte fills both, so they agree even while the owner writes
+        // the page; otherwise an untouched bounce page would look changed and its teardown
+        // would copy stale bytes back.
+        let bounce = frame
             .bytes_mut()
             .get_mut(granted)
-            .ok_or(Error::new(EINVAL))?
-            .copy_from_slice(src);
+            .ok_or(Error::new(EINVAL))?;
+        ferric_regbuf::bounce::fill(bounce, &mut snapshot, src.iter().copied());
         Ok(Self {
             frame,
             snapshot,
