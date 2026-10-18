@@ -64,6 +64,13 @@ and policy untouched) and a git package pinned to its commit (a moved tag
 fails until `--update`); unit tests check that changing `rev`, features,
 `default-features`, target, `path` or `package` invalidates a pin and that
 local git sources lock by their canonical `file://` URL.
+The installer's `fox` image step (`tools/installer/src/fox.rs`) is unit
+tested with a stand-in `fox` script: adoption alone without a package set,
+then adoption, a `--locked` sync for the image target and the system SBOM in
+that order, a failing sync that stops before the SBOM, and a missing
+binary. `ferric-config`'s `package_manager_choice` test checks the make
+variables the `packages.*` options generate. Building and booting an image
+through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning and a changed SBOM), and in unit tests
 against a RustSec-layout directory of advisories for crates inside build

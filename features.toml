@@ -923,6 +923,10 @@ The package manager on the target.
             --installed and fox remove cover the whole system.
             fox installs local .pkgar files; it does not fetch from
             package servers.
+            The image build finishes the root with the host fox: it
+            adopts the installed packages at build time, syncs
+            packages.set if one is given, and writes the image SBOM to
+            build/<arch>/<config>/image.cdx.json. Sets FERRIC_FOX_IMAGE=1.
   pkgutils  upstream Redox's pkg, which can fetch from package servers."""
 choices = [
   { value = "fox", title = "fox: verify, install and remove signed local packages" },
@@ -933,6 +937,38 @@ choices = [
 when = "value == 'fox'"
 source_packages = ["fox"]
 ignore_packages = ["pkgutils"]
+make = { FERRIC_FOX_IMAGE = "1" }
+
+[[option]]
+id = "packages.set"
+menu = "packages"
+type = "string"
+title = "Package set synced into the image"
+default = ""
+depends = "packages.manager == 'fox'"
+make_var = "FERRIC_FOX_PACKAGES"
+help = """
+A fox package set (fox-packages/1: registries, packages and policy; see
+the package tooling chapter of the book) that the image build installs
+with `fox sync --target <image target>` after the installer has placed
+the configuration's packages. The lock, fox.lock, is written beside the
+set; commit it to make image builds reproducible. Packages need prebuilt
+artifacts for the image target, or a source build that can cross-compile
+to it. Empty means no set. Sets FERRIC_FOX_PACKAGES."""
+
+[[option]]
+id = "packages.locked"
+menu = "packages"
+type = "bool"
+title = "Require every package to be locked"
+default = false
+depends = "packages.manager == 'fox' && packages.set != ''"
+make_var = "FERRIC_FOX_LOCKED"
+help = """
+Fail the image build unless fox.lock beside packages.set already pins
+every package (fox sync --locked), so a release image is built from
+exactly the archives and commits recorded there. Sets
+FERRIC_FOX_LOCKED."""
 
 [[option]]
 id = "packages.signed_manifests"

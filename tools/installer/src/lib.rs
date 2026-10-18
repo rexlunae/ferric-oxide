@@ -12,6 +12,8 @@ mod image_path;
 pub use image_path::{ImagePathError, image_path, image_relative_path};
 
 mod config;
+mod fox;
+pub use fox::{FoxError, FoxImage, FoxStep};
 #[cfg(feature = "installer")]
 mod disk_wrapper;
 #[cfg(feature = "installer")]

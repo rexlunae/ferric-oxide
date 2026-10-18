@@ -4219,6 +4219,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "uuid",

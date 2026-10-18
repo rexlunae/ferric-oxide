@@ -181,8 +181,10 @@ makes the command exit with a failing status.
 | --- | --- | --- |
 | `packages.manager` | `fox` | `fox`: the image gets the `fox` package, built from source even with `REPO_BINARY`, and no `pkgutils`. `pkgutils`: upstream `pkg` as before |
 | `packages.signed_manifests` | on | Sets `FERRIC_FOX_MANIFEST=1`: the cookbook writes `usr/share/fox/manifest/<name>.toml` into each target package's stage before packing it, so the signature covers the name, version, target, dependencies and git source. Changing it repacks every package |
+| `packages.set` | empty | With `fox`: a package set (see [Package sets and `fox sync`](#package-sets-and-fox-sync)) that the image build syncs into the image. Sets `FERRIC_FOX_PACKAGES` |
+| `packages.locked` | off | With a set: build with `fox sync --locked`, so the image fails to build unless `fox.lock` pins every package. Sets `FERRIC_FOX_LOCKED=1` |
 
-Without `ferric.toml` neither applies, and the build matches upstream.
+Without `ferric.toml` none of these apply, and the build matches upstream.
 
 Remote (`REPO_BINARY`) packages are unpacked and signed again with the
 cookbook's key, so they get manifests too. Packages already packed keep
@@ -191,12 +193,40 @@ what they had until they are repacked.
 When an image includes `fox`, the installer copies the cookbook's public
 key (`build/id_ed25519.pub.toml`) to `/etc/fox/keys/cookbook.toml`, so the
 target trusts the key that signed its packages. The installer still places
-packages with `pkg`'s library. On first boot, `fox`'s
-`/usr/lib/init.d/05_fox-adopt.service` runs
-`fox adopt-pkg --allow-unsigned-metadata`. The unsigned names it accepts are
-the ones the installer took from the image configuration. After that,
+packages with `pkg`'s library.
+
+With `packages.manager = "fox"` (`FERRIC_FOX_IMAGE=1`), the image build then
+finishes the root with the host `fox` (`target/release/fox`, built with the
+other host tools; `fox` itself on a self-hosted Redox build). Once the
+packages, files and accounts are in place, the installer runs, against the
+image root:
+
+1. `fox adopt-pkg --allow-unsigned-metadata`, so the image boots with its
+   packages already in `fox`'s database. The unsigned names it accepts are
+   the ones the installer took from the image configuration.
+2. With `packages.set`, `fox sync --config <set> --target <image target>`
+   (and `--locked` with `packages.locked`). The set's registries, policy and
+   packages are installed into the image, and `fox.lock` is written beside
+   the set. Commit it, and turn on `packages.locked` for release builds, so
+   an image is built from exactly the pinned archives and commits. Changing
+   the set rebuilds the image.
+3. `fox sbom --system --name ferric-oxide-<config>`, writing the image SBOM
+   to `build/<arch>/<config>/image.cdx.json`.
+
+A failing step fails the image build. `fox`'s
+`/usr/lib/init.d/05_fox-adopt.service` still runs
+`fox adopt-pkg --allow-unsigned-metadata` on first boot. On an image built
+this way it finds the packages already adopted, so it only matters for
+images whose root was assembled some other way. After adoption,
 `fox list`, `fox verify --installed`, `fox install` and `fox remove` cover the
 whole system.
+
+The set's packages are installed for the image target, so they need
+prebuilt artifacts for it from enough registry builders, or a git source
+the host can cross-compile. The set's policy (`build = "never"`, say) can
+forbid source builds. Registry checkouts and git source caches stay under
+the image's `var/lib/fox/`, where the target's `fox` can use them. The
+image SBOM is not signed yet.
 
 On the target, `fox` installs local `.pkgar` files only. It does not fetch
 from package servers or resolve dependencies, which `pkg` does. Choose
@@ -756,9 +786,9 @@ Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
 No official registry is published, and `fox` resolves only the requested
-package, not its dependencies. `ferric.toml` does not yet feed a package set
-to the image build, so images are still assembled by the installer and
-adopted on first boot. Downloading artifacts over HTTPS is not
+package, not its dependencies. Images are still assembled by the installer
+with `pkg`'s library and then adopted by `fox`; only `packages.set` is
+installed by `fox` itself, and the image SBOM is unsigned. Downloading artifacts over HTTPS is not
 built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging
