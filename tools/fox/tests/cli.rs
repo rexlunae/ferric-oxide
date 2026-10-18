@@ -285,6 +285,17 @@ fn adopt_pkg_takes_over_a_pkg_root_once() {
         .unwrap()
         .split(heads.join("hello.pkgar_head"), None::<&Path>)
         .unwrap();
+    // pkgar extracts through the umask; set the signed modes so the test
+    // does not depend on the environment's umask.
+    let head_bytes = fs::read(heads.join("hello.pkgar_head")).unwrap();
+    let head = fox_core::verify_head(&head_bytes, &env.key.trusted()).unwrap();
+    for entry in head.entries() {
+        if entry.kind == fox_core::FileKind::File {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::Permissions::from_mode(entry.mode);
+            fs::set_permissions(root.join(entry.path), mode).unwrap();
+        }
+    }
     fs::create_dir_all(root.join("etc/pkg")).unwrap();
     fs::write(
         root.join("etc/pkg/packages.toml"),

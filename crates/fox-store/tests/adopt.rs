@@ -63,6 +63,7 @@ impl Env {
         package
             .split(heads.join(format!("{name}.pkgar_head")), None::<&Path>)
             .unwrap();
+        signed_modes(self.root(), &heads.join(format!("{name}.pkgar_head")), key);
         let deps: Vec<String> = deps.iter().map(|d| format!("{d:?}")).collect();
         self.state.push_str(&format!(
             "[installed.{name:?}]\nremote = \"local\"\nblake3 = \"\"\nmanual = true\ndependencies = [{}]\n",
@@ -79,6 +80,20 @@ impl Env {
             ..AdoptOptions::default()
         };
         self.store.adopt_pkg(keys, options).unwrap()
+    }
+}
+
+/// pkgar extracts through the process umask; give the files their signed
+/// modes, as an extraction without a umask would, so the tests do not
+/// depend on the environment's umask.
+fn signed_modes(root: &Path, head: &Path, key: &FixtureKey) {
+    use std::os::unix::fs::PermissionsExt;
+    let head = fox_core::verify_head(&fs::read(head).unwrap(), &key.trusted()).unwrap();
+    for entry in head.entries() {
+        if entry.kind == fox_core::FileKind::File {
+            let mode = fs::Permissions::from_mode(entry.mode);
+            fs::set_permissions(root.join(entry.path), mode).unwrap();
+        }
     }
 }
 
