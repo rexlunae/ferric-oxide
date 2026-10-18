@@ -952,6 +952,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-amdvi"
+version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
+
+[[package]]
 name = "ferric-cet"
 version = "0.1.0"
 
@@ -986,6 +993,9 @@ version = "0.1.0"
 [[package]]
 name = "ferric-vtd"
 version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
 
 [[package]]
 name = "fiat-crypto"

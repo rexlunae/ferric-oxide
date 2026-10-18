@@ -6,8 +6,9 @@ license = "MIT"
 description = "Intel VT-d: DMAR table parsing, register layouts and translation-table encoding"
 
 [dependencies]
+ferric-iommu = { path = "../iommu" }
 
 [features]
 default = ["alloc"]
 ## The per-domain IOVA and domain-ID allocators (`iova`), which need a heap.
-alloc = []
+alloc = ["ferric-iommu/alloc"]
