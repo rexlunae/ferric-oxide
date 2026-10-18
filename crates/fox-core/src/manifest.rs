@@ -32,6 +32,29 @@ use crate::PackageName;
 /// package manifests.
 pub const MANIFEST_DIR: &str = "usr/share/fox/manifest";
 
+/// Directory inside an archive (relative to the install root) that holds
+/// the CycloneDX SBOMs written by hermetic builds.
+pub const SBOM_DIR: &str = "usr/share/fox/sbom";
+
+/// The archive path of the build SBOM for `name`:
+/// `usr/share/fox/sbom/<name>.cdx.json`.
+///
+/// # Examples
+///
+/// ```
+/// use fox_core::{PackageName, sbom_path};
+///
+/// let name = PackageName::new("hello").unwrap();
+/// assert_eq!(sbom_path(&name), "usr/share/fox/sbom/hello.cdx.json");
+/// ```
+pub fn sbom_path(name: &PackageName) -> String {
+    let mut path = String::from(SBOM_DIR);
+    path.push('/');
+    path.push_str(name.as_str());
+    path.push_str(".cdx.json");
+    path
+}
+
 /// The archive path of the manifest for `name`:
 /// `usr/share/fox/manifest/<name>.toml`.
 ///
