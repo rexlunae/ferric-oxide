@@ -26,7 +26,8 @@
 //! archive installed, plus `request-blake3`: a digest of the build request
 //! (the normalized git source, the revision from `rev` or the URL's `#`
 //! fragment, `path`, `package`, the sorted features, `default-features` and
-//! the effective target, the toolchain's host when none is given). A registry
+//! the target asked for, if any); and the target the archive was built
+//! for, which a later build of the same lock must match. A registry
 //! package is pinned to its version and archive hash; a git package to its
 //! commit (archives built locally are signed with the root's own builder
 //! key, so their hash is recorded but not compared). Sync keeps a locked
@@ -107,6 +108,14 @@ pub(crate) enum SyncError {
         name: PackageName,
         locked: Blake3Digest,
         found: Blake3Digest,
+    },
+    #[error(
+        "{name} was built for {found}, but the lock pins {locked}; name a target or use --update"
+    )]
+    LockedTarget {
+        name: PackageName,
+        locked: String,
+        found: String,
     },
     #[error("{name} was built from commit {found}, but the lock pins {locked}")]
     LockedCommit {
@@ -224,6 +233,9 @@ pub(crate) struct Locked {
     pub(crate) commit: Option<String>,
     /// The digest of the build request it was resolved for.
     pub(crate) request_blake3: Blake3Digest,
+    /// The target the installed archive was built for, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<String>,
     /// The archive installed.
     pub(crate) pkgar_blake3: Blake3Digest,
 }
@@ -235,9 +247,6 @@ struct Request {
     git: Option<GitUrl>,
     /// The git revision asked for, from `rev` or the URL's `#` fragment.
     rev: Option<String>,
-    /// The target built for, resolved before building so the lock records
-    /// what is actually built.
-    target: String,
     /// The digest of everything that changes what is built.
     digest: Blake3Digest,
 }
@@ -262,14 +271,7 @@ impl Want {
     ///
     /// [`SyncError::GitSource`] if the git source is not a git URL or an
     /// existing directory.
-    /// `default_target` is the target used when neither the want nor
-    /// `base` names one: the toolchain's host, from [`default_target`].
-    fn request(
-        &self,
-        name: &PackageName,
-        base: &SourceArgs,
-        default_target: &str,
-    ) -> Result<Request, SyncError> {
+    fn request(&self, name: &PackageName, base: &SourceArgs) -> Result<Request, SyncError> {
         let (git, rev) = match &self.git {
             Some(git) => {
                 let spec = SourceSpec::parse(git).map_err(|source| SyncError::GitSource {
@@ -308,18 +310,14 @@ impl Want {
             hash_field(&mut hasher, Some(feature.as_bytes()));
         }
         hasher.update(&[u8::from(self.default_features)]);
-        // Without a target the build is for the toolchain's host, so two
-        // hosts must not share a pin.
-        let target = self
-            .target
-            .as_deref()
-            .or(base.target.as_deref())
-            .unwrap_or(default_target);
-        hash_field(&mut hasher, Some(target.as_bytes()));
+        // Only the target asked for: which target an implicit build gets
+        // depends on the toolchain the source selects, so it is known only
+        // once built; the lock records it and later builds must match.
+        let target = self.target.as_deref().or(base.target.as_deref());
+        hash_field(&mut hasher, target.map(str::as_bytes));
         Ok(Request {
             git,
             rev,
-            target: target.to_owned(),
             digest: hasher.finalize().into(),
         })
     }
@@ -379,36 +377,16 @@ impl Want {
         }
     }
 
-    /// The `fox install` options for this want: the target is always the
-    /// request's, so the build and the prebuilt choice use the target the
-    /// lock records.
-    fn source_args(&self, base: &SourceArgs, request: &Request) -> SourceArgs {
+    fn source_args(&self, base: &SourceArgs) -> SourceArgs {
         let mut args = base.clone();
         args.features.clone_from(&self.features);
         args.no_default_features = !self.default_features;
-        args.target = Some(request.target.clone());
+        if self.target.is_some() {
+            args.target.clone_from(&self.target);
+        }
         args.path.clone_from(&self.path);
         args.package.clone_from(&self.package);
         args
-    }
-}
-
-/// The target a build defaults to: the host of the toolchain rustup selects
-/// outside any source tree, which may differ from the target `fox` itself
-/// was built for (a musl `fox` with a GNU toolchain, say). Without a
-/// working toolchain nothing can be built from source, so `fox`'s own
-/// target, the default for prebuilt artifacts, is used.
-fn default_target() -> String {
-    match fox_build::toolchain_host(&std::env::temp_dir(), None) {
-        Ok(host) => host,
-        Err(error) => {
-            eprintln!(
-                "fox: warning: cannot ask the toolchain for its host ({}); assuming {}",
-                commands::chain(&error),
-                commands::HOST_TARGET
-            );
-            commands::HOST_TARGET.to_owned()
-        }
     }
 }
 
@@ -462,16 +440,9 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
     } else {
         Lock::default()
     };
-    let needs_default =
-        options.source.target.is_none() && set.packages.values().any(|want| want.target.is_none());
-    let host = if needs_default {
-        default_target()
-    } else {
-        String::new()
-    };
     let mut chosen = BTreeMap::new();
     for (name, want) in &set.packages {
-        let request = want.request(name, options.source, &host)?;
+        let request = want.request(name, options.source)?;
         let locked = previous
             .get(name)
             .filter(|locked| !options.update && want.accepts(locked, &request));
@@ -511,7 +482,7 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
             });
             continue;
         }
-        let args = want.source_args(&base, request);
+        let args = want.source_args(&base);
         let target = want.target(name, request, locked);
         let (pending, registry) = commands::prepare(&root, &target, &args, &policy)?;
         let keys = commands::trusted_keys_for(cli, &root)?;
@@ -630,6 +601,7 @@ fn lock_entry(
             git: Some(git.clone()),
             commit,
             request_blake3: request.digest,
+            target: manifest.target.clone(),
             pkgar_blake3: archive.blake3(),
         },
         None => Locked {
@@ -639,10 +611,24 @@ fn lock_entry(
             git: None,
             commit: None,
             request_blake3: request.digest,
+            target: manifest.target.clone(),
             pkgar_blake3: archive.blake3(),
         },
     };
     if let Some(locked) = locked {
+        // The same request can build for another target on another host
+        // (an implicit target is the toolchain's host), which is not the
+        // package the lock pins.
+        if locked.target != entry.target {
+            return Err(SyncError::LockedTarget {
+                name: name.clone(),
+                locked: locked
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "no target".to_owned()),
+                found: entry.target.unwrap_or_else(|| "no target".to_owned()),
+            });
+        }
         if request.git.is_some() {
             if locked.commit != entry.commit {
                 return Err(SyncError::LockedCommit {
@@ -674,12 +660,10 @@ mod tests {
             git: request.git.clone(),
             commit: request.git.as_ref().map(|_| "c0ffee".to_owned()),
             request_blake3: request.digest,
+            target: None,
             pkgar_blake3: Blake3Digest::of(b"archive"),
         }
     }
-
-    /// The toolchain host the tests resolve to.
-    const HOST: &str = "x86_64-unknown-linux-gnu";
 
     fn base() -> SourceArgs {
         SourceArgs {
@@ -725,7 +709,7 @@ mod tests {
             version: Some("^0.3".parse().unwrap()),
             ..Want::default()
         };
-        let request = want.request(&name, &base(), HOST).unwrap();
+        let request = want.request(&name, &base()).unwrap();
         let pinned = locked("0.3.1", Some("test"), &request);
         assert!(want.accepts(&pinned, &request));
         assert_eq!(
@@ -738,14 +722,14 @@ mod tests {
             registry: Some(PackageName::new("other").unwrap()),
             ..Want::default()
         };
-        let other_request = other_registry.request(&name, &base(), HOST).unwrap();
+        let other_request = other_registry.request(&name, &base()).unwrap();
         assert!(!other_registry.accepts(&pinned, &other_request));
 
         let git = Want {
             git: Some("https://example.com/tiny".into()),
             ..Want::default()
         };
-        let git_request = git.request(&name, &base(), HOST).unwrap();
+        let git_request = git.request(&name, &base()).unwrap();
         let built = locked("0.3.0", None, &git_request);
         assert!(git.accepts(&built, &git_request));
         assert!(!git.accepts(&pinned, &git_request));
@@ -774,7 +758,7 @@ mod tests {
             default_features: true,
             ..Want::default()
         };
-        let request = want.request(&name, &base(), HOST).unwrap();
+        let request = want.request(&name, &base()).unwrap();
         let pinned = locked("1.0.0", None, &request);
         assert!(want.accepts(&pinned, &request));
 
@@ -783,7 +767,7 @@ mod tests {
             features: vec!["a".into(), "b".into(), "a".into()],
             ..want.clone()
         };
-        assert_eq!(reordered.request(&name, &base(), HOST).unwrap(), request);
+        assert_eq!(reordered.request(&name, &base()).unwrap(), request);
 
         let changes = [
             Want {
@@ -812,13 +796,13 @@ mod tests {
             },
         ];
         for changed in changes {
-            let changed_request = changed.request(&name, &base(), HOST).unwrap();
+            let changed_request = changed.request(&name, &base()).unwrap();
             assert!(!changed.accepts(&pinned, &changed_request), "{changed:?}");
         }
         // So does the command line's target, when the set names none.
         let mut cross = base();
         cross.target = Some("x86_64-unknown-redox".into());
-        let cross_request = want.request(&name, &cross, HOST).unwrap();
+        let cross_request = want.request(&name, &cross).unwrap();
         assert!(!want.accepts(&pinned, &cross_request));
     }
 
@@ -830,7 +814,7 @@ mod tests {
             git: Some(dir.path().to_str().unwrap().to_owned()),
             ..Want::default()
         };
-        let request = want.request(&name, &base(), HOST).unwrap();
+        let request = want.request(&name, &base()).unwrap();
         let git = request.git.as_ref().unwrap();
         assert!(git.as_str().starts_with("file://"), "{}", git.as_str());
 
@@ -840,7 +824,7 @@ mod tests {
             git: Some(other.path().to_str().unwrap().to_owned()),
             ..Want::default()
         };
-        let moved_request = moved.request(&name, &base(), HOST).unwrap();
+        let moved_request = moved.request(&name, &base()).unwrap();
         assert!(!moved.accepts(&locked("0.1.0", None, &request), &moved_request));
 
         let missing = Want {
@@ -848,7 +832,7 @@ mod tests {
             ..Want::default()
         };
         assert!(matches!(
-            missing.request(&name, &base(), HOST),
+            missing.request(&name, &base()),
             Err(SyncError::GitSource { .. })
         ));
     }
@@ -861,7 +845,7 @@ mod tests {
             ..Want::default()
         };
         let v1 = at("https://example.com/tiny#v1");
-        let request = v1.request(&name, &base(), HOST).unwrap();
+        let request = v1.request(&name, &base()).unwrap();
         assert_eq!(request.rev.as_deref(), Some("v1"));
         let pinned = locked("1.0.0", None, &request);
         assert!(v1.accepts(&pinned, &request));
@@ -872,7 +856,7 @@ mod tests {
 
         // Moving the fragment to another tag invalidates the pin.
         let v2 = at("https://example.com/tiny#v2");
-        let moved = v2.request(&name, &base(), HOST).unwrap();
+        let moved = v2.request(&name, &base()).unwrap();
         assert_ne!(moved.digest, request.digest);
         assert!(!v2.accepts(&pinned, &moved));
 
@@ -881,49 +865,73 @@ mod tests {
             rev: Some("v1".into()),
             ..v1.clone()
         };
-        assert_eq!(both.request(&name, &base(), HOST).unwrap(), request);
+        assert_eq!(both.request(&name, &base()).unwrap(), request);
         let separate = Want {
             rev: Some("v1".into()),
             ..at("https://example.com/tiny")
         };
-        assert_eq!(separate.request(&name, &base(), HOST).unwrap(), request);
+        assert_eq!(separate.request(&name, &base()).unwrap(), request);
         // ...and an error when they do not.
         let conflict = Want {
             rev: Some("v2".into()),
             ..v1
         };
         assert!(matches!(
-            conflict.request(&name, &base(), HOST),
+            conflict.request(&name, &base()),
             Err(SyncError::ConflictingRev { .. })
         ));
     }
 
     #[test]
-    fn the_implicit_target_is_the_toolchain_s_host() {
+    fn an_implicit_target_is_recorded_and_must_match() {
         let name = PackageName::new("tiny").unwrap();
         let want = Want::default();
-        // fox built for musl, the toolchain for GNU: the toolchain's host
-        // is what gets built, hashed and passed to the build.
-        let musl = "x86_64-unknown-linux-musl";
-        let implicit = want.request(&name, &base(), HOST).unwrap();
-        assert_eq!(implicit.target, HOST);
-        assert_eq!(
-            want.source_args(&base(), &implicit).target.as_deref(),
-            Some(HOST)
-        );
-        let other_host = want.request(&name, &base(), musl).unwrap();
-        assert_ne!(other_host.digest, implicit.digest);
-
-        // Naming the toolchain's host is the same request.
+        let request = want.request(&name, &base()).unwrap();
+        // Naming a target is another request.
         let named = Want {
-            target: Some(HOST.to_owned()),
+            target: Some("x86_64-unknown-linux-gnu".to_owned()),
             ..Want::default()
         };
-        assert_eq!(named.request(&name, &base(), musl).unwrap(), implicit);
-        let cross = Want {
-            target: Some("x86_64-unknown-redox".to_owned()),
-            ..Want::default()
+        assert_ne!(named.request(&name, &base()).unwrap(), request);
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = fox_core::fixtures::FixtureKey::generate(dir.path(), "builder").unwrap();
+        let built_for = |target: &str| {
+            let mut manifest = fox_core::Manifest::new(name.clone(), "1.0.0");
+            manifest.target = Some(target.to_owned());
+            let out = dir.path().join(target);
+            fs::create_dir_all(&out).unwrap();
+            let path = fox_core::fixtures::build_package(
+                &out,
+                &key,
+                Some(&manifest),
+                &[fox_core::fixtures::FixtureEntry::file(
+                    "usr/bin/tiny",
+                    target.as_bytes(),
+                    0o755,
+                )],
+                false,
+            )
+            .unwrap();
+            Archive::open(&path, &key.trusted()).unwrap()
         };
-        assert_ne!(cross.request(&name, &base(), HOST).unwrap(), implicit);
+        // The first build records the target the toolchain chose...
+        let gnu = built_for("x86_64-unknown-linux-gnu");
+        let entry = lock_entry(&name, &request, &gnu, None, None).unwrap();
+        assert_eq!(entry.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert!(want.accepts(
+            &Locked {
+                registry: Some(PackageName::new("test").unwrap()),
+                ..entry.clone()
+            },
+            &request
+        ));
+        // ...and a host whose toolchain builds for another target is refused
+        // rather than pinned to the wrong package.
+        let musl = built_for("x86_64-unknown-linux-musl");
+        assert!(matches!(
+            lock_entry(&name, &request, &musl, None, Some(&entry)),
+            Err(SyncError::LockedTarget { .. })
+        ));
     }
 }

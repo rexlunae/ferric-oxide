@@ -376,6 +376,8 @@ fn sync_installs_locks_and_removes_a_package_set() {
     let text = fs::read_to_string(&lock).unwrap();
     assert!(text.contains("registry = \"test\""), "{text}");
     assert!(text.contains("version = \"0.3.0\""), "{text}");
+    // The target the toolchain built for is recorded, though none was asked.
+    assert!(text.contains("target = "), "{text}");
 
     // The lock is satisfied and the archive is the locked one.
     let again = json(&env.fox(&["--json", "sync", "--locked", "--config", set_arg]));
