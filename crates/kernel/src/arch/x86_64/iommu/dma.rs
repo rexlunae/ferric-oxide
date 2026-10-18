@@ -44,7 +44,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 #[cfg(feature = "regbuf")]
-use ferric_iommu::dma::{complete_unmap, UnmapFailure, UnmapState};
+use ferric_iommu::dma::{
+    complete_unmap,
+    grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
+    UnmapFailure, UnmapState,
+};
 use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Span};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
@@ -99,6 +103,9 @@ pub enum DmaError {
         /// The IOVA whose teardown failed.
         iova: u64,
     },
+    /// Grant installation or rollback could not confirm that DMA is unreachable.
+    #[cfg(feature = "regbuf")]
+    GrantMap(MapRunsError<DomainError>),
 }
 
 impl fmt::Display for DmaError {
@@ -118,6 +125,8 @@ impl fmt::Display for DmaError {
             Self::FailedUnmap { iova } => {
                 write!(f, "unmap of grant IOVA {iova:#x} previously failed")
             }
+            #[cfg(feature = "regbuf")]
+            Self::GrantMap(error) => write!(f, "{error}"),
         }
     }
 }
@@ -517,15 +526,17 @@ impl DmaSpace {
     ///
     /// [`DmaError::GrantSize`] for no frames or too many, [`DmaError::PinOverflow`] and
     /// [`DmaError::FreeFrame`] when a frame cannot be pinned, and [`DmaError::Domain`] when the
-    /// IOVA space is full or the tables cannot be changed. Nothing stays mapped on error;
-    /// frames stay pinned only when an invalidation failed.
+    /// IOVA space is full or the tables cannot be changed. A rejected attempt is fully
+    /// rolled back. An uncertain installation returns a retained attempt: its pins, IOVA
+    /// and failed teardown state stay owned until successful domain blocking. The caller
+    /// must publish that attempt to the grant before returning its error to user space.
     #[cfg(feature = "regbuf")]
     pub fn map_grant(
         &mut self,
         frames: &[Frame],
         writable: bool,
         ticket: u64,
-    ) -> Result<u64, DmaError> {
+    ) -> Result<MapAttempt<u64, DmaError>, DmaError> {
         let len = u64::try_from(frames.len())
             .ok()
             .and_then(|n| n.checked_mul(PAGE))
@@ -539,20 +550,19 @@ impl DmaSpace {
                 return Err(err.into());
             }
         };
-        let mut done = 0_u64;
-        for (phys, run) in runs(frames) {
-            let at = block.start.saturating_add(done);
-            if let Err(err) = self.domain.map(at, phys, run, access(writable)) {
-                // `map` undid its own part; undo the runs before it. If an invalidation
-                // failed anywhere, a unit may still use the entries: keep the frames.
-                let undone = done == 0 || self.domain.unmap(block.start, done).is_ok();
-                if undone && matches!(err, DomainError::Map(_)) {
-                    self.give_back(block, pins);
-                }
-                return Err(err.into());
-            }
-            done = done.saturating_add(run);
-        }
+        let mapped = map_runs(
+            &runs(frames),
+            |step| match step {
+                MapStep::Map { offset, phys, len } => self.domain.map(
+                    block.start.saturating_add(offset),
+                    phys,
+                    len,
+                    access(writable),
+                ),
+                MapStep::Rollback { len } => self.domain.unmap(block.start, len),
+            },
+            |err| matches!(err, DomainError::Map(_)),
+        );
         let held = GrantHeld {
             block,
             len,
@@ -560,8 +570,19 @@ impl DmaSpace {
             ticket,
             unmap: UnmapState::default(),
         };
-        self.grants.insert(block.start, held);
-        Ok(block.start)
+        record_installation(&mut self.grants, block.start, held, mapped, |held| {
+            held.unmap = UnmapState::failed();
+        })
+        .map(|attempt| attempt.map_error(DmaError::GrantMap))
+        .map_err(|(error, held)| {
+            // Only a confirmed rollback returns ownership instead of publishing a record.
+            self.give_back(held.block, held.pins);
+            match error {
+                MapRunsError::Clean(error) => error.into(),
+                MapRunsError::InvalidLength => DmaError::GrantSize,
+                error => DmaError::GrantMap(error),
+            }
+        })
     }
 
     /// Takes the grant mapping at `iova` down strictly (entries cleared, IOTLB invalidated and

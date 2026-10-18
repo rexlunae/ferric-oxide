@@ -170,6 +170,20 @@ its failure marker remains after handle removal: later revocation returns
 close and revocation retire a mapping only once. See `scheme/iommu.rs` and
 `arch/x86_64/iommu/dma.rs` in the kernel.
 
+Failed grant installation is also part of the mapping lifecycle. A confirmed
+rollback releases its IOVA and pins. If installation or rollback cannot
+confirm invalidation, the kernel retains the reservation, frame pins and a
+failed mapping record in both the domain and grant before returning `EIO`.
+Revoking or closing that grant keeps reporting failure and retains its region
+records until the domain's devices are successfully blocked. This applies to
+failures on the first physical run and after earlier runs succeeded; cleared
+page-table entries alone do not prove cached DMA translations are gone.
+
+Host fault-injection tests in `crates/iommu/tests/grant_failures.rs` cover
+those installation and rollback failures, grant and region closure, and IOVA
+retention and release. Hardware boot tests exercise the normal mapping path;
+they do not inject invalidation failures into a real IOMMU.
+
 These are available primitives and tested integration paths. They do not
 automatically make the filesystem, network stack or all drivers use an
 end-to-end registered-buffer protocol. The dedicated image tests exercise CPU

@@ -99,6 +99,8 @@ use crate::{
     sync::{CleanLockToken, WaitCondition, L1},
     syscall::{data::Map, usercopy::UserSliceRw},
 };
+#[cfg(iommu_enabled)]
+use ferric_iommu::dma::grant::MapAttempt;
 
 /// The number of the scheme root.
 const ROOT: usize = 0;
@@ -886,12 +888,21 @@ impl DmaGrant {
     /// device may write them, maps them and returns where; the grant then records the mapping,
     /// so revoking or closing it takes the mapping down. The region stays locked throughout,
     /// so a revocation either comes first (and the grant is refused) or finds the mapping.
+    /// An uncertain installation is recorded too, before returning its error.
     ///
     /// # Errors
     ///
     /// `ECANCELED` once the grant is revoked, `EINVAL` when it is not page-aligned, `ENOENT`
     /// when it is closed, and `map`'s error.
-    pub fn map(&self, map: impl FnOnce(&[Frame], bool) -> Result<DmaRecord>) -> Result<DmaRecord> {
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `map`. The backend must not panic while installing reachable
+    /// DMA mappings, so their outcome can be recorded before returning to the caller.
+    pub fn map(
+        &self,
+        map: impl FnOnce(&[Frame], bool) -> Result<MapAttempt<DmaRecord, Error>>,
+    ) -> Result<DmaRecord> {
         let mut region = self.region.lock();
         let (pages, access) = region
             .grants
@@ -905,19 +916,20 @@ impl DmaGrant {
             .iter()
             .map(RaiiFrame::get)
             .collect::<Vec<_>>();
-        let record = map(&frames, access.allows_write())?;
-        if let Err((err, _)) = region.grants.add_mapping(self.id, Mapping::dma(record)) {
-            // Not reached: the region stayed locked since check_dma.
-            drop(region);
-            if super::iommu::revoke_grant_mapping(record).is_err() {
-                warn!(
-                    "regbuf: {} lost an IOMMU mapping it could not undo",
-                    self.id
-                );
+        map(&frames, access.allows_write())?.publish(|record| {
+            if let Err((err, _)) = region.grants.add_mapping(self.id, Mapping::dma(record)) {
+                // Not reached: the region stayed locked since check_dma.
+                drop(region);
+                if super::iommu::revoke_grant_mapping(record).is_err() {
+                    warn!(
+                        "regbuf: {} lost an IOMMU mapping it could not undo",
+                        self.id
+                    );
+                }
+                return Err(table_errno(&err));
             }
-            return Err(table_errno(&err));
-        }
-        Ok(record)
+            Ok(record)
+        })
     }
 }
 

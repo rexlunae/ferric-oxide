@@ -54,7 +54,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
 #[cfg(feature = "regbuf")]
-use ferric_iommu::dma::links::DomainLinks;
+use ferric_iommu::dma::{grant::MapAttempt, links::DomainLinks};
 use ferric_vtd::{dmar::BusRange, interrupt::SourceValidation, plan::SelectError, Bdf};
 use spin::Mutex;
 use syscall::{
@@ -150,7 +150,7 @@ fn dma_errno(err: &DmaError) -> Error {
         #[cfg(feature = "regbuf")]
         DmaError::GrantSize => Error::new(EINVAL),
         #[cfg(feature = "regbuf")]
-        DmaError::FailedUnmap { .. } => Error::new(EIO),
+        DmaError::FailedUnmap { .. } | DmaError::GrantMap(_) => Error::new(EIO),
     }
 }
 
@@ -726,26 +726,37 @@ fn map_grant(id: usize, grant_fd: u64, token: &mut CleanLockToken) -> Result<usi
         let mut handles = HANDLES.lock();
         let space = bound_domain(&mut handles, id, owner)?;
         let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
-        let iova = space.map_grant(frames, writable, ticket).map_err(|err| {
+        let attempt = space.map_grant(frames, writable, ticket).map_err(|err| {
             warn!(
                 "IOMMU: cannot map {grant_id} in domain {}: {err}",
                 space.id()
             );
             dma_errno(&err)
         })?;
-        info!(
-            "IOMMU: domain {}: {grant_id} mapped at IOVA {iova:#x} ({} page(s), {})",
-            space.id(),
-            frames.len(),
-            if writable { "read-write" } else { "read-only" }
-        );
-        let record = super::regbuf::DmaRecord {
-            domain: id,
-            iova,
-            ticket,
-        };
-        GRANT_LINKS.lock().insert(ticket, id, (link, record));
-        Ok(record)
+        if let MapAttempt::Mapped(iova) = &attempt {
+            info!(
+                "IOMMU: domain {}: {grant_id} mapped at IOVA {iova:#x} ({} page(s), {})",
+                space.id(),
+                frames.len(),
+                if writable { "read-write" } else { "read-only" }
+            );
+        }
+        let attempt = attempt.map_error(|err| {
+            warn!(
+                "IOMMU: retained failed mapping of {grant_id} in domain {}: {err}",
+                space.id()
+            );
+            dma_errno(&err)
+        });
+        Ok(attempt.map_record(|iova| {
+            let record = super::regbuf::DmaRecord {
+                domain: id,
+                iova,
+                ticket,
+            };
+            GRANT_LINKS.lock().insert(ticket, id, (link, record));
+            record
+        }))
     })?;
     usize::try_from(record.iova).map_err(|_| Error::new(EIO))
 }
