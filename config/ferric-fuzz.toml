@@ -17,6 +17,10 @@ echo FERRIC_SMOKE_BEGIN
 uname -a
 cat /scheme/sys/cpu
 ferric-syscall-fuzz --seed random --seconds 1200 --procs 8 --calls 20000 || echo FERRIC_TEST_FAIL fuzz exited with an error
+# The boot job checks fox's adoption on every image (image.yml): re-check the
+# packages against their signed heads after the fuzzer has run.
+fox list
+fox verify --installed && echo FERRIC_TEST_PASS fox-verify || echo FERRIC_TEST_FAIL fox verify --installed failed
 echo FERRIC_SMOKE_OK
 shutdown
 """
