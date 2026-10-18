@@ -238,13 +238,7 @@ impl Ring {
     /// `Enter` for up to `n` SQEs that then waits for `min_complete` completions, as a result
     /// or minus the errno.
     fn enter_wait(&self, n: u32, min_complete: u32) -> i64 {
-        outcome(call(
-            &self.fd,
-            Request::Enter {
-                to_submit: n,
-                min_complete,
-            },
-        ))
+        enter_on(&self.fd, n, min_complete)
     }
 
     /// Takes every completion from the CQ.
@@ -267,6 +261,19 @@ impl Ring {
         expect("Enter", sqes.len() as i64, self.enter(sqes.len() as u32))?;
         self.reap()
     }
+}
+
+/// `Enter` on the ring `fd` for up to `n` SQEs, then waiting for `min_complete` completions, as
+/// a result or minus the errno; unlike [`Ring::enter_wait`] it needs only the descriptor, so
+/// several threads can call it at once.
+fn enter_on(fd: &Fd, n: u32, min_complete: u32) -> i64 {
+    outcome(call(
+        fd,
+        Request::Enter {
+            to_submit: n,
+            min_complete,
+        },
+    ))
 }
 
 /// Checks `cqes` are, in order, the `(user_data, result)` pairs of `expected`.
@@ -1006,6 +1013,45 @@ fn async_chains() -> Result<(), Failure> {
     Ok(())
 }
 
+fn wait_sync() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let [rd, wr] = pipe()?;
+    let mut buf = [0u8; 16];
+    let addr = buf.as_mut_ptr() as u64;
+    // A synchronous read of an empty pipe, which blocks the `Enter` that runs it.
+    ring.submit(&[Sqe::read(rd as u32, CURRENT_POSITION, addr, 16, 1)])?;
+    let fd = &ring.fd;
+    let (submitted, waited, early, wrote) = std::thread::scope(|scope| {
+        let submitter = scope.spawn(|| enter_on(fd, 1, 0));
+        std::thread::sleep(HOLD_DELAY);
+        // A wait-only Enter while the read runs in the other thread's Enter must wait for it.
+        let waiter = scope.spawn(|| enter_on(fd, 0, 1));
+        std::thread::sleep(HOLD_DELAY);
+        let early = waiter.is_finished();
+        let byte = [0x44_u8];
+        // SAFETY: the pipe's write end and a buffer of 1 byte.
+        let wrote = unsafe { libc::write(wr, byte.as_ptr().cast(), 1) };
+        (
+            submitter.join().unwrap_or(i64::MIN),
+            waiter.join().unwrap_or(i64::MIN),
+            early,
+            wrote,
+        )
+    });
+    expect("write to the pipe", 1, wrote as i64)?;
+    expect("the submitting Enter", 1, submitted)?;
+    expect("the waiting Enter", 0, waited)?;
+    if early {
+        return Err(Failure::Mismatch {
+            what: "a wait-only Enter that waited for a chain another Enter runs",
+        });
+    }
+    check_cqes("the synchronous read", &ring.reap()?, &[(1, 1)])?;
+    close_fd(rd);
+    close_fd(wr);
+    Ok(())
+}
+
 /// How long `ring-async-close` waits for the closed ring's worker to post its cancellations.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
@@ -1190,7 +1236,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 18] = [
+    let steps: [(&str, Step); 19] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -1208,6 +1254,7 @@ pub fn main() -> ExitCode {
         ("ring-release", release),
         ("ring-async", async_chains),
         ("ring-async-close", async_close),
+        ("ring-wait-sync", wait_sync),
         ("ring-bench", bench),
     ];
     for (name, step) in steps {

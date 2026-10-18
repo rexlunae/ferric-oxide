@@ -47,6 +47,8 @@
 //! - `ring-async-close`: an asynchronous chain naming its own ring completes with `EINVAL`;
 //!   closing a ring whose worker has a pipe read and a `Nop` queued returns, the worker posts
 //!   `EINTR` for the read and `ECANCELED` for the `Nop`, and rings keep working.
+//! - `ring-wait-sync`: a wait-only `Enter` waits for a synchronous read that another thread's
+//!   `Enter` is blocked in, and returns once the read completes.
 //! - `ring-bench`: times 64-byte writes to the null scheme and 4 KiB reads of a file, as
 //!   system calls and as ring batches of 32, the reads again through a file table slot and
 //!   the writes again on the ring's worker, and prints `FERRIC_BENCH` lines.

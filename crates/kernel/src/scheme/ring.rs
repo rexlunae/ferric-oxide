@@ -364,8 +364,8 @@ fn enter(
 /// take it past), the SQ has no complete chain, or the CQ has no room for the next one. Runs
 /// each chain, or hands it to the worker when it is asynchronous; returns the SQEs consumed.
 ///
-/// Each chain run here counts as in flight while it runs, and its completions are posted and
-/// announced before the next chain runs, so an `Enter` waiting meanwhile neither stops
+/// Each chain counts as in flight from before it is consumed until its completions are posted
+/// (or the worker takes it), and the completions are announced before the next chain runs, so an `Enter` waiting meanwhile neither stops
 /// waiting early nor sleeps past completions already posted.
 ///
 /// # Errors
@@ -396,28 +396,34 @@ fn submit(
             }
             break;
         }
+        // The chain counts as in flight before its consumption is published, and until its
+        // CQEs are posted (or the worker counts it), so a waiting `Enter` that sees it gone
+        // from the SQ also sees it in flight.
+        ring.work.lock().start_sync(chain.len());
         if let Err(err) = sq.consume(mem, &next) {
+            ring.work.lock().end_sync(chain.len());
             ring.unreserve(chain.len());
             return Err(ring_errno(err));
         }
         consumed = consumed.saturating_add(chain.len());
 
         let mut done = Completions::new();
-        let mut ran_here = false;
         if matches!(next, Next::Refused(_)) {
             chain.refuse(errno_result(EINVAL), |cqe| {
                 done.push(cqe);
             });
         } else if chain.is_async() {
             match worker::queue(ring, chain, token) {
-                Ok(()) => continue,
+                Ok(()) => {
+                    // The worker counts the chain now.
+                    ring.work.lock().end_sync(chain.len());
+                    continue;
+                }
                 Err(errno) => chain.refuse(errno_result(errno), |cqe| {
                     done.push(cqe);
                 }),
             }
         } else {
-            ran_here = true;
-            ring.work.lock().start_sync(chain.len());
             let files = resolve_files(ring, &chain, token);
             run_chain(&chain, files, token, |cqe| {
                 done.push(cqe);
@@ -426,9 +432,7 @@ fn submit(
         // The room was set aside, so posting fails only if the application moved its CQ head
         // out of range meanwhile.
         let posted = ring.post(mem, &done);
-        if ran_here {
-            ring.work.lock().end_sync(chain.len());
-        }
+        ring.work.lock().end_sync(chain.len());
         ring.notify_completed(token);
         posted?;
     }

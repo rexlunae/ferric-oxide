@@ -70,8 +70,9 @@ impl Work {
         self.in_flight
     }
 
-    /// Counts `sqes` SQEs that an `Enter` runs itself as in flight, so that a waiting `Enter`
-    /// waits for their completions too.
+    /// Counts `sqes` SQEs that an `Enter` is taking from the SQ as in flight, until it has
+    /// posted their completions or handed them to the worker, so that a waiting `Enter` waits
+    /// for them too.
     pub(super) const fn start_sync(&mut self, sqes: u32) {
         self.in_flight = self.in_flight.saturating_add(sqes);
     }

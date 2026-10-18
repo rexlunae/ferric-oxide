@@ -254,6 +254,9 @@ impl UserInner {
                 // more requests; checked under the lock its cancellation takes.
                 if context.cancelled {
                     drop(context);
+                    // The tag's slot was taken by `next_id` (for `call` and `call_generic`
+                    // alike); give it back, as a response would.
+                    let _ = self.states.lock(token.token()).try_remove(sqe.tag as usize);
                     for description in fds {
                         crate::syscall::fs::release_description(description, token);
                     }
