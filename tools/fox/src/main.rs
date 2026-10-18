@@ -4,7 +4,9 @@
 //! take over a root that upstream `pkg` populated.
 //!
 //! ```text
-//! fox verify <file.pkgar>...            check signature and every hash
+//! fox verify [--require-attestation] <file.pkgar>...
+//!                                       check signature, every hash and the
+//!                                       build attestation beside the archive
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
 //! fox install [--force] [--allow-unsigned-metadata] <file.pkgar>...
@@ -56,6 +58,10 @@ enum Command {
         /// Check installed packages by name (all of them if none are named).
         #[arg(long)]
         installed: bool,
+        /// Fail archives that have no build attestation beside them. An
+        /// attestation that is present is always checked.
+        #[arg(long, conflicts_with = "installed")]
+        require_attestation: bool,
         /// Archives to check, or package names with `--installed`.
         targets: Vec<String>,
     },

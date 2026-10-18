@@ -317,3 +317,102 @@ fn adopt_pkg_takes_over_a_pkg_root_once() {
     assert!(env.fox(&["verify", "--installed"]).status.success());
     assert!(stdout(&env.fox(&["adopt-pkg"])).contains("already adopted"));
 }
+
+/// Writes a signed attestation for `archive` beside it, as a builder would.
+fn attest(env: &Env, archive: &Path) {
+    use fox_core::archive::Archive;
+    use fox_core::attested::{artifact_facts, attestation_path, signature_path};
+    use fox_core::{
+        Attestation, AttestationFormat, AttestationSignature, AttestedPackage, Blake3Digest,
+        BuildRecord, OutputRecord, Profile, SourceRecord, feature_set_hash, sbom_path,
+    };
+
+    let opened = Archive::open(archive, &env.key.trusted()).unwrap();
+    let facts = artifact_facts(&opened);
+    let sbom = facts
+        .files
+        .iter()
+        .find(|f| f.path == sbom_path(facts.name))
+        .unwrap()
+        .blake3;
+    let lock = Blake3Digest::of(b"Cargo.lock");
+    let attestation = Attestation {
+        format: AttestationFormat::V1,
+        package: AttestedPackage {
+            name: facts.name.clone(),
+            version: facts.version.to_owned(),
+        },
+        source: SourceRecord {
+            git: "https://example.com/attested.git".into(),
+            commit: "ab".repeat(20),
+            tree_blake3: Blake3Digest::of(b"tree"),
+            cargo_lock_blake3: lock,
+            path: None,
+        },
+        build: BuildRecord {
+            target: "x86_64-unknown-redox".into(),
+            cpu_level: Some(fox_core::CpuLevel::X86_64V3),
+            features: vec!["default".into()],
+            feature_set_hash: feature_set_hash(&["default"], &lock),
+            toolchain_id: "rust-1.93.0:00".into(),
+            profile: Profile::Release,
+            auditable: false,
+            builder: "ferric-ci-1".into(),
+            builder_key: env.key.key,
+            built_at: "2026-10-17T02:00:00Z".parse().unwrap(),
+        },
+        output: OutputRecord {
+            pkgar_blake3: facts.pkgar_blake3,
+            pkgar_size: facts.pkgar_size,
+            pkgar_header_signer: facts.header_signer,
+            entries_blake3: facts.entries_blake3,
+            sbom_blake3: sbom,
+        },
+    };
+    let text = attestation.to_toml().unwrap();
+    let secret = pkgar_keys::SecretKeyFile::open(&env.key.secret_path)
+        .unwrap()
+        .secret_key()
+        .unwrap();
+    let signature = AttestationSignature::sign(text.as_bytes(), &secret).unwrap();
+    let path = attestation_path(archive);
+    fs::write(&path, text).unwrap();
+    fs::write(signature_path(&path), signature.to_toml().unwrap()).unwrap();
+}
+
+#[test]
+fn verify_checks_build_attestations() {
+    let env = Env::new();
+    env.trust_in_root();
+    let dir = env.work.path().join("attested");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = Manifest::new(PackageName::new("attested").unwrap(), "1.0.0");
+    let entries = [
+        FixtureEntry::file("usr/bin/attested", b"bin", 0o755),
+        FixtureEntry::file("usr/share/fox/sbom/attested.cdx.json", b"{}", 0o644),
+    ];
+    let archive = build_package(&dir, &env.key, Some(&manifest), &entries, false).unwrap();
+    let archive_arg = path_str(&archive);
+
+    // Without an attestation, plain verify passes and the strict one fails.
+    assert!(env.fox(&["verify", archive_arg]).status.success());
+    let strict = env.fox(&["verify", "--require-attestation", archive_arg]);
+    assert!(!strict.status.success());
+    assert!(stdout(&strict).contains("no build attestation"));
+
+    attest(&env, &archive);
+    let ok = env.fox(&["verify", "--require-attestation", archive_arg]);
+    assert!(ok.status.success(), "{}", stdout(&ok));
+    assert!(stdout(&ok).contains("built from abab"));
+    let report = json(&env.fox(&["--json", "verify", archive_arg]));
+    assert_eq!(report[0]["attestation"]["builder"], "ferric-ci-1");
+    assert_eq!(report[0]["attestation"]["cpu_level"], "x86_64-v3");
+
+    // A tampered attestation fails even without --require-attestation.
+    let attestation = archive.with_extension("attest.toml");
+    let text = fs::read_to_string(&attestation).unwrap();
+    fs::write(&attestation, text.replace("1.0.0", "1.0.1")).unwrap();
+    let tampered = env.fox(&["verify", archive_arg]);
+    assert!(!tampered.status.success());
+    assert!(stdout(&tampered).contains("bad attestation signature"));
+}
