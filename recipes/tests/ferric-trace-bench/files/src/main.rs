@@ -1,0 +1,37 @@
+//! Kernel tracing overhead benchmark for Ferric Oxide (roadmap Phase T, overhead budget).
+//!
+//! Two workloads are timed in rounds:
+//!
+//! - `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system, one operation per
+//!   pair. Each call is a request to RedoxFS through its scheme, so this is the storage path the
+//!   budget is about.
+//! - `syscall`: a one-byte `write` to a file descriptor that is not open, the cheapest system
+//!   call that reaches the kernel's dispatch. It shows the per-call cost of a tracepoint and is
+//!   reported, not budgeted.
+//!
+//! On a kernel without `kernel.trace` (no `kernel.trace` scheme) every round runs as state
+//! `out`. With it, the program first turns every event off, then alternates: a round with all
+//! tracepoints off (`off`), `enable all`, the same round with every compiled-in event on (`on`),
+//! `disable all`, and a drain of every CPU's ring so the next `on` round writes to empty rings
+//! instead of counting drops. Alternating keeps slow drift of the machine out of the comparison.
+//!
+//! For each workload and state it prints
+//! `FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>`, the nanoseconds per
+//! operation of the fastest and the median round. `scripts/ferric-ci/check-trace-overhead.sh`
+//! compares these across boots of kernels built with and without tracing. It then prints
+//! `FERRIC_TEST_PASS trace-bench`, or `FERRIC_TEST_FAIL trace-bench: <why>` and exits non-zero.
+
+#[cfg(target_os = "redox")]
+mod redox;
+
+fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "redox")]
+    {
+        redox::main()
+    }
+    #[cfg(not(target_os = "redox"))]
+    {
+        println!("FERRIC_TEST_SKIP trace-bench: only runs on Redox");
+        std::process::ExitCode::SUCCESS
+    }
+}

@@ -176,9 +176,47 @@ are not compiled in gives `EOPNOTSUPP`.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme.
+- **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
+  [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`
   and `trace_boot = "sched"`. It requires all ten step markers and the boot
   log line.
+
+## Overhead budget
+
+Tracing must stay cheap enough to leave compiled in. The roadmap budget, which
+the `trace-overhead` job in `image.yml` enforces on the `io` workload below, is:
+
+| Comparison | Budget |
+| --- | --- |
+| Compiled in, every event off, against compiled out | at most 1% slower |
+| Every compiled-in event on (`enable all`), against all off | at most 5% slower |
+
+`ferric-trace-bench`, in `config/ferric-smoke.toml`, times two workloads in
+rounds:
+
+- `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system. Each
+  call is a request to RedoxFS through its scheme, so a round crosses system
+  call entry and exit, the scheme request path and context switches.
+- `syscall`: a `write` to a descriptor that is not open, the cheapest system
+  call that reaches the kernel's dispatch. Its tracepoints are a large share of
+  its time, so it is reported but not budgeted.
+
+On a kernel without `kernel.trace` every round runs as state `out`. With it,
+rounds alternate between all events off (`off`) and `enable all` (`on`), and
+the rings are drained after each `on` round. The program prints
+`FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` per
+workload and state, and `FERRIC_BENCH lost records=<n>` for records dropped
+during the `on` rounds.
+
+The image workflow builds a second smoke image whose kernel differs only in
+leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
+image twice each, interleaved, and `scripts/ferric-ci/check-trace-overhead.sh`
+compares the fastest round of each workload and state over the boots. Taking
+the fastest round keeps scheduling noise and boot-to-boot variation out of the
+comparison. `OFF_BUDGET_PCT` and `ON_BUDGET_PCT` set the budgets, and the script
+warns when records were dropped, since a dropped record costs less than a
+written one. Every result is printed as a notice on the run.
 
 ## Not implemented yet
 
@@ -187,5 +225,4 @@ are not compiled in gives `EOPNOTSUPP`.
 - Read-only mapping of the rings.
 - An initfs trace configuration.
 - A viewer and Perfetto export.
-- The CI overhead budget.
 - Architectures other than x86_64.

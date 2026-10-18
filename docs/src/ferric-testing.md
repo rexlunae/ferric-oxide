@@ -55,6 +55,7 @@ IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -92,6 +93,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
+| `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
@@ -102,13 +104,17 @@ Tests may skip absent optional features; do not interpret a skip as coverage.
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
 enables IOMMU `auto`, shadow-stack preparation `auto`, registered buffers and
 kernel tracing (with `sched.switch` on from boot),
-and builds a second kernel/image with IOMMU `enforce`. Its five boot variants
+and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
+a third without kernel tracing. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer and tracing result markers, the trace boot log line,
 KASLR/KPTI logs, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode. Read that script for the exact required marker set.
+The `trace-overhead` job boots the images with and without tracing twice
+each, interleaved, and runs `check-trace-overhead.sh` on the four serial logs
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
 
 The workflow exports recipe-facing kernel/relibc/bootloader settings from its
 temporary generated config. It does not install a root `ferric.toml` or
