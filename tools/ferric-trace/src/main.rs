@@ -1,5 +1,5 @@
-//! `ferric-trace`: reads kernel trace captures (the `cpu<n>` files drained from
-//! `/scheme/kernel.trace`) and prints them as text or exports them for Perfetto.
+//! `ferric-trace`: saves kernel trace captures on the target (the `cpu<n>` files drained from
+//! `/scheme/kernel.trace`), and prints them as text or exports them for Perfetto.
 
 use std::error::Error;
 use std::fs;
@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::Capture;
-use ferric_trace_cli::{perfetto, text};
+use ferric_trace_cli::{drain, perfetto, text};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -20,6 +20,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// On the target, as root: drain every CPU's trace ring into a capture directory
+    Capture {
+        /// The directory to write `stats` and the `cpu<n>` files to
+        out: PathBuf,
+        /// The trace scheme
+        #[arg(long, default_value = "/scheme/kernel.trace")]
+        scheme: PathBuf,
+    },
     /// Print every record, one line each, in timestamp order
     Text {
         /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
@@ -46,6 +54,8 @@ enum Cmd {
 enum CliError {
     #[error(transparent)]
     Capture(#[from] ferric_trace_cli::capture::CaptureError),
+    #[error("capture failed")]
+    Drain(#[from] ferric_trace_cli::drain::DrainError),
     #[error("cannot write {}", path.display())]
     Write {
         path: PathBuf,
@@ -56,6 +66,24 @@ enum CliError {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
+        Cmd::Capture { out, scheme } => {
+            let drained = drain::drain_scheme(&scheme, &out)?;
+            let lost: u64 = drained.iter().map(|c| c.lost).sum();
+            for cpu in &drained {
+                println!(
+                    "cpu {}: {} bytes, {} records lost",
+                    cpu.cpu, cpu.bytes, cpu.lost
+                );
+            }
+            println!("saved {} CPUs to {}", drained.len(), out.display());
+            if lost > 0 {
+                // Losses are counted since boot, so they may predate this capture.
+                eprintln!(
+                    "ferric-trace: warning: the rings have dropped {lost} records; compare with an earlier stats read"
+                );
+            }
+            Ok(())
+        }
         Cmd::Text { inputs } => {
             let capture = Capture::load(&inputs)?;
             let stdout = io::stdout();

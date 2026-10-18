@@ -46,7 +46,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
 | `tools/fox/` | Local package verification, installation and SBOM CLI | host |
-| `tools/ferric-trace/` | Kernel trace capture reader: text view and Perfetto/Chrome JSON export | host |
+| `tools/ferric-trace/` | Kernel trace tool: capture on the target (recipe `recipes/tools/ferric-trace`), text view and Perfetto/Chrome JSON export | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |

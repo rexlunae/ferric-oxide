@@ -249,6 +249,8 @@ jobs:
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
           echo "::notice::ferric-trace-test passed all 10 steps"
+          # The ferric-trace tool saved a capture of every CPU and decoded it.
+          grep -aF "FERRIC_TEST_PASS trace-capture" "$LOG"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

@@ -1,0 +1,18 @@
+# Ferric Oxide: the ferric-trace tool (tools/ferric-trace/) for the target, where
+# `ferric-trace capture <dir>` saves a kernel trace capture (kernel.trace). The
+# same tool converts captures on the host.
+[source]
+path = "tools/ferric-trace"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The crate is a member of the repository's host workspace, whose shared
+# dependency versions and lockfile it uses, so it is built in place rather than
+# from the cookbook's copy in source/ (which is outside the workspace). The
+# path source above still makes edits to tools/ferric-trace/ rebuild it.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+COOKBOOK_SOURCE="${COOKBOOK_ROOT}/tools/ferric-trace" cookbook_cargo \
+    --bin ferric-trace --target-dir "${COOKBOOK_BUILD}/target"
+"""

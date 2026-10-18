@@ -2,9 +2,11 @@
 //!
 //! A *capture* is what the kernel's `kernel.trace` scheme hands out: for each CPU, the bytes
 //! read from `/scheme/kernel.trace/cpu/<n>`, a sequence of whole records in the format of
-//! [`ferric_trace::record`]. On the target, `cat /scheme/kernel.trace/cpu/0 > cpu0` (as root)
-//! saves one; this crate reads a directory of such `cpu<n>` files back on the host.
+//! [`ferric_trace::record`]. On the target, `ferric-trace capture <dir>` (as root) saves one
+//! as a directory of `cpu<n>` files, which this crate reads back on the host.
 //!
+//! - [`drain`] saves a capture on the target: it drains every CPU the scheme's `stats` lists
+//!   into a directory (the `ferric-trace capture` command).
 //! - [`capture`] loads and decodes the files against the kernel's event catalog
 //!   ([`ferric_trace::kernel::CATALOG`]) and merges them in timestamp order.
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
@@ -36,5 +38,6 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
+pub mod drain;
 pub mod perfetto;
 pub mod text;

@@ -152,35 +152,33 @@ are not compiled in gives `EOPNOTSUPP`.
 
 ## Reading a capture on the host
 
-To capture a trace on the target, run as root in `ion`, the default shell,
-which needs no other tools:
+To capture a trace on the target, run as root:
 
-```ion
+```sh
 cat /scheme/kernel.trace/stats > stats.before
 echo "enable syscall scheme" > /scheme/kernel.trace/events
 # ... run the workload ...
 echo "disable syscall scheme" > /scheme/kernel.trace/events
-cat /scheme/kernel.trace/stats > stats.after
-let n = 0
-while cat /scheme/kernel.trace/cpu/$n > cpu$n
-    let n += 1
-end
-rm cpu$n
+ferric-trace capture capture/
 ```
 
-CPUs are numbered from 0, as `stats` lists them, and opening `cpu/<n>` past
-the last one fails with `ENOENT`. The loop therefore drains every CPU and then
-removes the empty file left by the failed open. A read drains a ring, so each
-record lands in exactly one file.
+`ferric-trace capture <dir>` (the `ferric-trace` recipe; the smoke image has
+it) reads `stats` for the list of CPUs, saves it as `<dir>/stats`, and drains
+each CPU's ring into `<dir>/cpu<n>` until a read returns 0 bytes. A read that
+fails with `EAGAIN`, because another reader is draining the same CPU, is
+retried after a short wait. Any other error, or a CPU that stays busy, stops
+the capture with a message naming the file. A read drains a ring, so each
+record lands in exactly one file. `--scheme <path>` reads another scheme path.
 
-Each ring holds 64 KiB, and a full ring drops new records. If any CPU's
-`lost` count in `stats.after` is higher than in `stats.before`, the capture is
-missing records, and slices may be cut short or left unmatched. For a long
-or busy workload, drain the `cpu/<n>` files while it runs, for example with a
-loop that appends each read to `cpu<n>`, or capture a shorter window.
+Each ring holds 64 KiB, and a full ring drops new records. The command prints
+each CPU's `lost` count. Those counts run from boot, so compare them with
+`stats.before`. If any is higher, the capture is missing records, and slices
+may be cut short or left unmatched. For a long or busy workload, run
+`ferric-trace capture` more than once while it runs, into separate
+directories, or capture a shorter window.
 
-Copy the `cpu<n>` files to the host and use the `ferric-trace` tool
-(`tools/ferric-trace/`) on them:
+Copy the directory to the host and use the same tool (`tools/ferric-trace/`)
+on it:
 
 ```sh
 cargo run -p ferric-trace-cli -- text capture/
@@ -227,7 +225,9 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   CPU's first switch moved to the outgoing context with its CPU slice, async
   request slices matched by tag through cancels, instants for unmatched
   records, finite timestamps at the frequency limits), refuses bad
-  `--tsc-mhz` values, and runs the binary on a capture directory.
+  `--tsc-mhz` values, runs the binary on a capture directory, and runs
+  `capture` against a stand-in scheme directory (CPU list from `stats`,
+  `EAGAIN` and `EINTR` retries, a CPU that stays busy, other errors).
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
@@ -246,10 +246,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      stream.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
-  `FERRIC_TEST_SKIP trace` without the scheme.
+  `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
+  `ferric-trace capture` and `ferric-trace text` on the result, and prints
+  `FERRIC_TEST_PASS trace-capture` if both succeed.
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`
-  and `trace_boot = "sched"`. It requires all ten step markers and the boot
-  log line.
+  and `trace_boot = "sched"`. It requires all ten step markers, the
+  `trace-capture` marker and the boot log line.
 
 ## Not implemented yet
 
