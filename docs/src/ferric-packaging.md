@@ -623,8 +623,9 @@ refuses one configured with another URL or pin), writes `[policy]` if
 present, installs every package and then writes the lock file, `fox.lock`
 beside the set unless `--lock` names another. The lock (`fox-lock/1`)
 records each package's version, its registry or its git URL and commit, a
-digest of its build request, the target the archive was built for and the
-BLAKE3 of the archive installed:
+digest of its build request, the target the archive was built for
+(`"none"` for an archive that names no target; the field is required) and
+the BLAKE3 of the archive installed:
 
 ```toml
 format = "fox-lock/1"

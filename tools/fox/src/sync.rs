@@ -59,6 +59,18 @@ use crate::commands::{self, CliError, print_json};
 use crate::source::{SourceError, SourceSpec};
 use crate::{Cli, SourceArgs};
 
+/// The lock's `target` for an archive whose manifest names no target.
+const NO_TARGET: &str = "none";
+
+/// The lock's `target` for `archive`.
+fn archive_target(archive: &Archive) -> String {
+    archive
+        .manifest()
+        .target
+        .clone()
+        .unwrap_or_else(|| NO_TARGET.to_owned())
+}
+
 /// Largest package set or lock file read.
 const MAX_FILE: u64 = 1024 * 1024;
 
@@ -233,9 +245,10 @@ pub(crate) struct Locked {
     pub(crate) commit: Option<String>,
     /// The digest of the build request it was resolved for.
     pub(crate) request_blake3: Blake3Digest,
-    /// The target the installed archive was built for, when it names one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) target: Option<String>,
+    /// The target the installed archive was built for, or [`NO_TARGET`]
+    /// for an archive that names none. Required, so a lock without it is a
+    /// parse error rather than an unpinned target.
+    pub(crate) target: String,
     /// The archive installed.
     pub(crate) pkgar_blake3: Blake3Digest,
 }
@@ -601,7 +614,7 @@ fn lock_entry(
             git: Some(git.clone()),
             commit,
             request_blake3: request.digest,
-            target: manifest.target.clone(),
+            target: archive_target(archive),
             pkgar_blake3: archive.blake3(),
         },
         None => Locked {
@@ -611,7 +624,7 @@ fn lock_entry(
             git: None,
             commit: None,
             request_blake3: request.digest,
-            target: manifest.target.clone(),
+            target: archive_target(archive),
             pkgar_blake3: archive.blake3(),
         },
     };
@@ -622,11 +635,8 @@ fn lock_entry(
         if locked.target != entry.target {
             return Err(SyncError::LockedTarget {
                 name: name.clone(),
-                locked: locked
-                    .target
-                    .clone()
-                    .unwrap_or_else(|| "no target".to_owned()),
-                found: entry.target.unwrap_or_else(|| "no target".to_owned()),
+                locked: locked.target.clone(),
+                found: entry.target,
             });
         }
         if request.git.is_some() {
@@ -660,7 +670,7 @@ mod tests {
             git: request.git.clone(),
             commit: request.git.as_ref().map(|_| "c0ffee".to_owned()),
             request_blake3: request.digest,
-            target: None,
+            target: NO_TARGET.to_owned(),
             pkgar_blake3: Blake3Digest::of(b"archive"),
         }
     }
@@ -746,6 +756,13 @@ mod tests {
         assert!(text.contains("format = \"fox-lock/1\""), "{text}");
         assert!(text.contains("request-blake3 = "), "{text}");
         assert_eq!(toml::from_str::<Lock>(&text).unwrap(), lock);
+        // The target is required: a lock without it does not parse.
+        let without_target: String = text
+            .lines()
+            .filter(|line| !line.starts_with("target = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(toml::from_str::<Lock>(&without_target).is_err());
     }
 
     #[test]
@@ -918,7 +935,7 @@ mod tests {
         // The first build records the target the toolchain chose...
         let gnu = built_for("x86_64-unknown-linux-gnu");
         let entry = lock_entry(&name, &request, &gnu, None, None).unwrap();
-        assert_eq!(entry.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(entry.target, "x86_64-unknown-linux-gnu");
         assert!(want.accepts(
             &Locked {
                 registry: Some(PackageName::new("test").unwrap()),
