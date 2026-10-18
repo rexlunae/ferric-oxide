@@ -4,11 +4,14 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/cet", "crates/elfreloc", "crates/iommu", "crates/nospec", "crates/regbuf", "crates/vtd", "tools/cookbook", "tools/ferric-config"]
+default-members = ["crates/amdvi", "crates/cet", "crates/elfreloc", "crates/fox-core", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/nospec", "crates/regbuf", "crates/vtd", "tools/cookbook", "tools/ferric-config", "tools/fox"]
 members = [
     "crates/amdvi",
     "crates/cet",
     "crates/elfreloc",
+    "crates/fox-core",
+    "crates/fox-sbom",
+    "crates/fox-store",
     "crates/hwrand",
     "crates/iommu",
     "crates/nospec",
@@ -16,6 +19,7 @@ members = [
     "crates/vtd",
     "tools/cookbook",
     "tools/ferric-config",
+    "tools/fox",
     "tools/installer",
     "tools/redoxer",
 ]
@@ -39,6 +43,14 @@ serde_json = "1"
 tempfile = "3.20"
 redox_installer = { path = "tools/installer", default-features = false }
 redoxer = { path = "tools/redoxer", default-features = false }
+# The fox crates: the pkgar archive format is reused from upstream Redox, from
+# the crates.io releases (the installer uses the same ones).
+blake3 = { version = "1.8", default-features = false }
+pkgar = "0.2.4"
+pkgar-core = "0.2.4"
+pkgar-keys = "0.2.4"
+thiserror = { version = "2", default-features = false }
+toml = { version = "1", default-features = false }
 
 [profile.release.package.ferric-config]
 opt-level = 2
