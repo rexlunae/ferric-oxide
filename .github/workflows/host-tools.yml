@@ -36,7 +36,7 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-iommu -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -44,7 +44,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-irq -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)

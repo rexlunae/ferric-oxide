@@ -49,6 +49,12 @@
 //!   source-id, and has the device raise an interrupt again: the remapping unit must block it
 //!   and log a source-id fault, and the vector must not fire (`iommu-irq-fault`).
 //!
+//! - with `kernel.irq_percpu` (the root-only `irq:cpus` file exists), it reserves one vector
+//!   number on a CPU other than the BSP and the same number on the BSP, programs the device
+//!   with the message for the other CPU, and has it raise an interrupt: the other CPU's handle
+//!   must count it and the BSP's must not, so the kernel counts interrupts per (CPU, vector)
+//!   and not by vector number alone (`iommu-msi-percpu`).
+//!
 //! For each DMA fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`,
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
 //! checks the kernel logged exactly those faults, from this device. When the program exits the
@@ -208,6 +214,11 @@ enum Failure {
     NoInterrupt(u8),
     /// The forged interrupt arrived.
     ForgedDelivered(u8, usize),
+    /// `irq:cpus` did not parse.
+    Cpus(ferric_irq::ParseError),
+    /// An interrupt for one CPU was counted by the same vector on another: the vector, the
+    /// CPU it was held on, and the count there.
+    CrossCpu(u8, u32, usize),
     /// The test did not run because an earlier step failed.
     NotRun,
 }
@@ -243,6 +254,11 @@ impl fmt::Display for Failure {
             Self::ForgedDelivered(vector, count) => write!(
                 f,
                 "the forged interrupt was delivered: vector {vector:#x} fired {count} time(s)"
+            ),
+            Self::Cpus(err) => write!(f, "irq:cpus does not parse: {err}"),
+            Self::CrossCpu(vector, cpu, count) => write!(
+                f,
+                "vector {vector:#x} held on CPU {cpu} counted {count} interrupt(s) sent to another CPU"
             ),
             Self::NotRun => f.write_str("not run: an earlier step failed"),
         }
@@ -724,6 +740,51 @@ impl Vector {
         Err(Failure::NoVector(cpu))
     }
 
+    /// Reserves one vector number on logical CPU `cpu` and the same number on `other`, for
+    /// checking that an interrupt for one is not counted for the other.
+    fn reserve_pair(cpu: u32, other: u32) -> Result<(Self, Self), Failure> {
+        let dir = format!("/scheme/irq/cpu-{cpu:02x}");
+        for entry in std::fs::read_dir(&dir)? {
+            let Some(irq) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            if irq < 16 {
+                continue;
+            }
+            let open = |cpu: u32| File::create(format!("/scheme/irq/cpu-{cpu:02x}/{irq}"));
+            let first = match open(cpu) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            };
+            match open(other) {
+                Ok(second) => {
+                    let vector = irq + 32;
+                    return Ok((
+                        Self {
+                            file: first,
+                            cpu,
+                            vector,
+                        },
+                        Self {
+                            file: second,
+                            cpu: other,
+                            vector,
+                        },
+                    ));
+                }
+                // Taken on the other CPU: try the next number.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(Failure::NoVector(cpu))
+    }
+
     /// How many interrupts arrived and are not acknowledged yet (0 when none).
     fn pending(&mut self) -> Result<usize, Failure> {
         let mut count = [0_u8; 8];
@@ -826,19 +887,67 @@ fn forged_msi_blocked(setup: &mut Setup, msi: &mut Msi) -> Result<(), Failure> {
     }
 }
 
+/// Runs `iommu-msi-percpu`: the device's interrupt goes to a CPU other than the BSP while the
+/// same vector number is held on the BSP, and only the target's handle may count it. `Ok(None)`
+/// when skipped: the kernel has no `irq:cpus` (built without `kernel.irq_percpu`), or runs one
+/// CPU.
+fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
+    let text = match std::fs::read_to_string("/scheme/irq/cpus") {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let cpus = ferric_irq::parse_cpus(&text)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Failure::Cpus)?;
+    let bsp = bsp()?;
+    let Some(other) = cpus
+        .iter()
+        .map(|entry| entry.cpu.get())
+        .find(|&cpu| cpu != bsp)
+    else {
+        return Ok(None);
+    };
+    let (mut target, mut decoy) = Vector::reserve_pair(other, bsp)?;
+    let message = setup
+        .channel
+        .msi_message(target.cpu, target.vector)?
+        .ok_or(Failure::NoMsiMessage(target.vector))?;
+    setup.channel.set_msi(message)?;
+    setup.edu.raise_interrupt();
+    let count = target.wait(IRQ_WAIT);
+    setup.edu.ack_interrupt();
+    let stray = decoy.wait(IRQ_BLOCKED_WAIT);
+    // Back to the message of the vector `iommu-msi` reserved, for whatever runs next.
+    setup.channel.set_msi(msi.message)?;
+    if count? == 0 {
+        return Err(Failure::NoInterrupt(target.vector));
+    }
+    match stray? {
+        0 => Ok(Some(format!(
+            "vector {:#x} reached CPU {other}, and the same vector held on CPU {bsp} counted nothing",
+            target.vector
+        ))),
+        count => Err(Failure::CrossCpu(decoy.vector, bsp, count)),
+    }
+}
+
 /// The outcome of the interrupt tests.
 struct MsiOutcome {
     msi: Result<String, Failure>,
     /// `Ok(None)` when skipped: the message was in compatibility format.
     forged: Result<Option<()>, Failure>,
+    /// `Ok(None)` when skipped ([`msi_percpu`]).
+    percpu: Result<Option<String>, Failure>,
 }
 
 impl MsiOutcome {
-    /// Neither test ran.
+    /// No test ran.
     fn not_run() -> Self {
         Self {
             msi: Err(Failure::NotRun),
             forged: Err(Failure::NotRun),
+            percpu: Err(Failure::NotRun),
         }
     }
 }
@@ -859,9 +968,11 @@ fn msi_tests(setup: &mut Setup) -> MsiOutcome {
     } else {
         Ok(None)
     };
+    let percpu = msi_percpu(setup, &msi);
     MsiOutcome {
         msi: Ok(msi_detail(&msi)),
         forged,
+        percpu,
     }
 }
 
@@ -1223,7 +1334,17 @@ fn report_msi(msi: MsiOutcome) -> bool {
         ),
         Err(err) => report("iommu-irq-fault", Err(err), ""),
     };
-    delivered && forged
+    let percpu = match msi.percpu {
+        Ok(None) => {
+            println!(
+                "FERRIC_TEST_SKIP iommu-msi-percpu: no irq:cpus (kernel.irq_percpu off) or one CPU"
+            );
+            true
+        }
+        Ok(Some(detail)) => report("iommu-msi-percpu", Ok(()), &detail),
+        Err(err) => report("iommu-msi-percpu", Err(err), ""),
+    };
+    delivered && forged && percpu
 }
 
 fn main() -> ExitCode {

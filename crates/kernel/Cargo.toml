@@ -20,6 +20,7 @@ ferric-amdvi = { path = "../amdvi" }
 ferric-cet = { path = "../cet" }
 ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
+ferric-irq = { path = "../irq", optional = true }
 ferric-nospec = { path = "../nospec" }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
@@ -110,6 +111,9 @@ aslr = ["dep:ferric-hwrand"]
 regbuf = ["dep:ferric-regbuf"]
 # Ferric Oxide: tracepoints, per-CPU trace rings and the kernel.trace scheme (x86_64).
 trace = ["dep:ferric-trace"]
+# Ferric Oxide: count and deliver irq: interrupts per (CPU, vector), and the root-only
+# irq:cpus map of logical CPUs to APIC ids (x86_64).
+irq-percpu = ["dep:ferric-irq"]
 # Ferric Oxide: the subsystems whose tracepoints are compiled in.
 trace_syscall = ["trace"]
 trace_sched = ["trace"]

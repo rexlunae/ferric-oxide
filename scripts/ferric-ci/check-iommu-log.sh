@@ -107,6 +107,11 @@ check_irq_faults() {
         || fail "the kernel's interrupt remapping faults differ from the one the test caused"
 }
 
+# Every CI image has kernel.irq_percpu on: edu's MSI, sent to a CPU other than the BSP while
+# the same vector number is held on the BSP, must be counted on that CPU only, with or without
+# interrupt remapping.
+need "FERRIC_TEST_PASS iommu-msi-percpu: vector 0x[0-9a-f]+ reached CPU [0-9]+, and the same vector held on CPU [0-9]+ counted nothing"
+
 case "$mode" in
     none)
         need "IOMMU: no DMAR or IVRS table, IOMMU not enabled"

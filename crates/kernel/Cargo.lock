@@ -110,6 +110,10 @@ name = "ferric-iommu"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-irq"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
@@ -187,6 +191,7 @@ dependencies = [
  "ferric-cet",
  "ferric-hwrand",
  "ferric-iommu",
+ "ferric-irq",
  "ferric-nospec",
  "ferric-regbuf",
  "ferric-trace",

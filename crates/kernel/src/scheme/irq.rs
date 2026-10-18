@@ -55,16 +55,73 @@ const INO_TOPLEVEL: u64 = 0x8002_0000_0000_0000;
 const INO_AVAIL: u64 = 0x8000_0000_0000_0000;
 const INO_BSP: u64 = 0x8001_0000_0000_0000;
 const INO_PHANDLE: u64 = 0x8003_0000_0000_0000;
+// Ferric Oxide: `irq:cpus`.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+const INO_CPUS: u64 = 0x8004_0000_0000_0000;
+
+/// Ferric Oxide (`irq-percpu`): the interrupt counts per (logical CPU, IRQ), which replace
+/// [`COUNTS`] for counting and delivery, so the same vector number reserved on two CPUs is two
+/// interrupts, and each CPU counts in its own row without a lock.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+static PERCPU_COUNTS: ferric_irq::Counts<{ crate::cpu_set::MAX_CPU_COUNT as usize }> =
+    ferric_irq::Counts::new();
+
+/// Counts an interrupt of `irq` that arrived on this CPU, and returns the CPU whose handles get
+/// it (Ferric Oxide: the BSP, as upstream, without `irq-percpu`).
+fn count_interrupt(irq: u8) -> LogicalCpuId {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        let arrived = ferric_irq::CpuId::new(crate::cpu_id().get());
+        let cpu = number.delivery_cpu(arrived);
+        // Every online CPU has a row: there are `MAX_CPU_COUNT` of them.
+        let _ = PERCPU_COUNTS.trigger(cpu, number);
+        return LogicalCpuId::new(cpu.get());
+    }
+    if let Some(count) = COUNTS.lock().get_mut(usize::from(irq)) {
+        *count = count.wrapping_add(1);
+    }
+    LogicalCpuId::BSP
+}
+
+/// The interrupts of `irq` that handles on `cpu` have had (Ferric Oxide: `cpu` matters only
+/// with `irq-percpu`).
+fn interrupt_count(cpu: LogicalCpuId, irq: u8) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        return PERCPU_COUNTS
+            .get(ferric_irq::CpuId::new(cpu.get()), number)
+            .unwrap_or(0);
+    }
+    let _ = cpu;
+    total_count(irq)
+}
+
+/// The interrupts of `irq` so far on all CPUs, for `sys:irq`.
+pub(super) fn total_count(irq: u8) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        return PERCPU_COUNTS.total(number);
+    }
+    COUNTS.lock().get(usize::from(irq)).copied().unwrap_or(0)
+}
+
+/// Whether a handle for `irq` on `handle_cpu` gets an interrupt of `irq` counted for `cpu`
+/// (Ferric Oxide: every handle for `irq` does without `irq-percpu`, as upstream).
+fn delivers_to(handle_cpu: LogicalCpuId, cpu: LogicalCpuId) -> bool {
+    !cfg!(all(feature = "irq-percpu", target_arch = "x86_64")) || handle_cpu == cpu
+}
 
 /// Add to the input queue
 pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
-    COUNTS.lock()[irq as usize] += 1;
+    let cpu = count_interrupt(irq);
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
             .read(token.token())
             .iter()
             .filter_map(|(fd, handle)| Some((fd, handle.as_irq_handle()?)))
-            .filter(|&(_, (_, handle_irq))| handle_irq == irq)
+            .filter(|&(_, (_, handle_irq, handle_cpu))| {
+                handle_irq == irq && delivers_to(handle_cpu, cpu)
+            })
             .map(|(f, _)| *f)
             .collect()
     };
@@ -80,8 +137,15 @@ enum Handle {
     Irq {
         ack: AtomicUsize,
         irq: u8,
+        // Ferric Oxide: the logical CPU whose interrupts this handle counts (the BSP for the
+        // legacy IRQs and `irq:N`).
+        cpu: LogicalCpuId,
         reservation: Option<IrqReservation>,
     },
+    // Ferric Oxide (`irq-percpu`): the root-only `irq:cpus` map of online logical CPUs to
+    // APIC ids and NUMA nodes, one `ferric_irq::CpuEntry` per line.
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    Cpus(Vec<u8>),
     Avail(LogicalCpuId),
     TopLevel,
     Phandle(u8, Vec<u8>),
@@ -95,9 +159,11 @@ struct IrqReservation {
 }
 
 impl Handle {
-    fn as_irq_handle(&self) -> Option<(&AtomicUsize, u8)> {
+    fn as_irq_handle(&self) -> Option<(&AtomicUsize, u8, LogicalCpuId)> {
         match self {
-            &Self::Irq { ref ack, irq, .. } => Some((ack, irq)),
+            &Self::Irq {
+                ref ack, irq, cpu, ..
+            } => Some((ack, irq, cpu)),
             _ => None,
         }
     }
@@ -151,6 +217,7 @@ impl IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation: None,
                     },
                     InternalFlags::empty(),
@@ -178,6 +245,7 @@ impl IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: irq_number,
+                        cpu: cpu_id,
                         reservation,
                     },
                     InternalFlags::empty(),
@@ -231,6 +299,7 @@ impl IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation,
                     },
                     InternalFlags::empty(),
@@ -238,6 +307,43 @@ impl IrqScheme {
             })
         }
     }
+}
+
+/// The CPUs `irq:` lists as `cpu-XX` (Ferric Oxide: with `irq-percpu`, the running logical
+/// CPUs, which is what `cpu-XX` opens; upstream lists the MADT's ACPI processor UIDs).
+fn listed_cpus() -> Vec<u8> {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    {
+        crate::percpu::all_percpu_blocks()
+            .filter_map(|block| u8::try_from(block.cpu_id.get()).ok())
+            .collect()
+    }
+    #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+    {
+        CPUS.get().expect("IRQ scheme not initialized").clone()
+    }
+}
+
+/// Ferric Oxide (`irq-percpu`): the contents of `irq:cpus`, a [`ferric_irq::CpuEntry`] line for
+/// each running CPU that has an APIC id.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn cpus_file() -> Vec<u8> {
+    use core::fmt::Write;
+
+    let mut text = String::new();
+    for block in crate::percpu::all_percpu_blocks() {
+        let Some(apic) = block.misc_arch_info.apic_id_opt.get() else {
+            continue;
+        };
+        let entry = ferric_irq::CpuEntry {
+            cpu: ferric_irq::CpuId::new(block.cpu_id.get()),
+            apic: ferric_irq::ApicId::new(apic.get()),
+            node: block.numa_node.get().map(|(node, _)| node.get()),
+        };
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(text, "{entry}");
+    }
+    text.into_bytes()
 }
 
 const fn irq_to_vector(irq: u8) -> u8 {
@@ -288,8 +394,10 @@ impl crate::scheme::KernelScheme for IrqScheme {
             use core::fmt::Write;
 
             writeln!(bytes, "bsp").unwrap();
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            let _ = writeln!(bytes, "cpus");
 
-            for cpu_id in CPUS.get().expect("IRQ scheme not initialized") {
+            for cpu_id in listed_cpus() {
                 writeln!(bytes, "cpu-{:02x}", cpu_id).unwrap();
             }
 
@@ -303,9 +411,22 @@ impl crate::scheme::KernelScheme for IrqScheme {
             (Handle::TopLevel, InternalFlags::POSITIONED)
         } else if path_str == "bsp" {
             (Handle::Bsp, InternalFlags::empty())
+        } else if cfg!(all(feature = "irq-percpu", target_arch = "x86_64")) && path_str == "cpus" {
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            {
+                (Handle::Cpus(cpus_file()), InternalFlags::POSITIONED)
+            }
+            #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+            unreachable!()
         } else if let Some(path_str) = path_str.strip_prefix("cpu-") {
-            let cpu_id = u8::from_str_radix(&path_str[..2], 16).or(Err(Error::new(ENOENT)))?;
+            let cpu_id = u8::from_str_radix(path_str.get(..2).ok_or(Error::new(ENOENT))?, 16)
+                .or(Err(Error::new(ENOENT)))?;
             let path_str = path_str[2..].trim_end_matches('/');
+            // Ferric Oxide: a CPU that is not running has no IDT to reserve vectors in (and
+            // looking for one used to panic).
+            if crate::percpu::get_percpu_block(LogicalCpuId::new(cpu_id.into())).is_none() {
+                return Err(Error::new(ENOENT));
+            }
 
             if path_str.is_empty() {
                 (
@@ -346,6 +467,7 @@ impl crate::scheme::KernelScheme for IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: plain_irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation: None,
                     },
                     InternalFlags::empty(),
@@ -378,7 +500,7 @@ impl crate::scheme::KernelScheme for IrqScheme {
 
         match *HANDLES.read(token.token()).get(id)? {
             Handle::TopLevel => {
-                let cpus = CPUS.get().expect("IRQ scheme not initialized");
+                let cpus = listed_cpus();
 
                 if opaque == 0 {
                     buf.entry(DirEntry {
@@ -440,9 +562,10 @@ impl crate::scheme::KernelScheme for IrqScheme {
     ) -> Result<EventFlags> {
         let handles_guard = HANDLES.read(token.token());
         let handle = handles_guard.get(id)?;
-        let (handle_ack, handle_irq) = handle.as_irq_handle().ok_or(Error::new(EBADF))?;
+        let (handle_ack, handle_irq, handle_cpu) =
+            handle.as_irq_handle().ok_or(Error::new(EBADF))?;
 
-        let current = COUNTS.lock()[handle_irq as usize];
+        let current = interrupt_count(handle_cpu, handle_irq);
         if flags.contains(EVENT_READ) && handle_ack.load(Ordering::SeqCst) != current {
             Ok(EventFlags::EVENT_READ)
         } else {
@@ -481,13 +604,14 @@ impl crate::scheme::KernelScheme for IrqScheme {
             &Handle::Irq {
                 irq: handle_irq,
                 ack: ref handle_ack,
+                cpu: handle_cpu,
                 ..
             } => {
                 if buffer.len() < size_of::<usize>() {
                     return Err(Error::new(EINVAL));
                 }
                 let ack = buffer.read_usize()?;
-                let current = COUNTS.lock()[handle_irq as usize];
+                let current = interrupt_count(handle_cpu, handle_irq);
 
                 if ack != current {
                     return Ok(0);
@@ -541,6 +665,14 @@ impl crate::scheme::KernelScheme for IrqScheme {
                 st_nlink: 2,
                 ..Default::default()
             },
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(ref text) => Stat {
+                st_mode: MODE_CHR | 0o400,
+                st_size: text.len() as u64,
+                st_ino: INO_CPUS,
+                st_nlink: 1,
+                ..Default::default()
+            },
             Handle::TopLevel => Stat {
                 st_mode: MODE_DIR | 0o500,
                 st_size: 0,
@@ -563,6 +695,8 @@ impl crate::scheme::KernelScheme for IrqScheme {
             Handle::Avail(cpu_id) => format!("irq:cpu-{:2x}", cpu_id.get()),
             Handle::Phandle(phandle, _) => format!("irq:phandle-{}", phandle),
             Handle::TopLevel => "irq:".to_owned(),
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(_) => "irq:cpus".to_owned(),
             _ => return Err(Error::new(EBADF)),
         }
         .into_bytes();
@@ -586,12 +720,13 @@ impl crate::scheme::KernelScheme for IrqScheme {
             Handle::Irq {
                 irq: handle_irq,
                 ack: ref handle_ack,
+                cpu: handle_cpu,
                 ..
             } => {
                 if buffer.len() < size_of::<usize>() {
                     return Err(Error::new(EINVAL));
                 }
-                let current = COUNTS.lock()[handle_irq as usize];
+                let current = interrupt_count(handle_cpu, handle_irq);
                 if handle_ack.load(Ordering::SeqCst) != current {
                     buffer.write_usize(current)?;
                     Ok(size_of::<usize>())
@@ -605,6 +740,11 @@ impl crate::scheme::KernelScheme for IrqScheme {
                 }
                 buffer.write_u32(LogicalCpuId::BSP.get())?;
                 Ok(size_of::<usize>())
+            }
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(ref text) => {
+                let start = usize::try_from(_offset).map_or(text.len(), |o| o.min(text.len()));
+                buffer.copy_common_bytes_from_slice(text.get(start..).unwrap_or_default())
             }
             Handle::Avail(_) | Handle::TopLevel | Handle::Phandle(_, _) | Handle::SchemeRoot => {
                 Err(Error::new(EISDIR))
