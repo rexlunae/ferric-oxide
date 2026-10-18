@@ -545,7 +545,8 @@ up) to `tree.new/`. Once that verifies, it writes the new state to
 place, and then renames `state.json.new` over `state.json`, the commit
 point. A failure, or an interruption found by the next open, before the
 commit puts the old tree back and drops the new state; after it, only
-`tree.old/` is removed. So the checkout and its state always stay a
+`tree.old/` is removed, and failing to remove it is a warning, not a
+failed update (the next open or update tries again). So the checkout and its state always stay a
 verified pair, and a failed update keeps the last good checkout and the
 rollback protection.
 
