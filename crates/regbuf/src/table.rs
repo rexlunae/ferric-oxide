@@ -552,6 +552,10 @@ impl<M> GrantTable<M> {
     ///
     /// [`TableError::Unknown`] when the grant is not open and [`TableError::NoMapping`] when no
     /// mapping matches.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from the `matches` predicate.
     pub fn take_mapping(
         &mut self,
         id: GrantId,
