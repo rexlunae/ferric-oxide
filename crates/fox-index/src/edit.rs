@@ -10,7 +10,7 @@
 //! 2. **Delegations.** Each package's role lists the hash of its package
 //!    file.
 //! 3. **Targets.** Lists every other signed file (`registry.toml`,
-//!    `artifacts/**`, `advisories/**` and package files no delegation
+//!    `artifacts/**`, `advisories/**`, `vex/**` and package files no delegation
 //!    covers) and the delegations.
 //! 4. **Snapshot**, then **timestamp**, over the files just written.
 //!
@@ -39,7 +39,7 @@ use time::OffsetDateTime;
 use crate::advisory::{Advisory, AdvisoryError, advisory_path};
 use crate::layout::{
     ADVISORIES_DIR, ARTIFACTS_DIR, ArtifactList, LayoutError, PACKAGES_DIR, PackageEntry,
-    REGISTRY_FILE, RegistryConfig, Release, artifacts_path, package_path,
+    REGISTRY_FILE, RegistryConfig, Release, VEX_DIR, artifacts_path, package_path,
 };
 use crate::metadata::{
     Delegation, Expiry, FileMeta, MetadataError, RoleKeys, RoleName, Root, Signed, Snapshot,
@@ -49,6 +49,7 @@ use crate::verify::{
     DELEGATIONS_DIR, METADATA_DIR, ROOT_DIR, SNAPSHOT_FILE, TARGETS_FILE, TIMESTAMP_FILE,
     check_path,
 };
+use crate::vex::{VexFileError, parse_vex, vex_path};
 
 /// How long each kind of metadata stays valid, in days.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +249,9 @@ pub enum EditError {
     /// An advisory is invalid or cannot be written.
     #[error("invalid advisory")]
     Advisory(#[source] Box<AdvisoryError>),
+    /// A VEX document is invalid or its id unusable.
+    #[error("invalid VEX document")]
+    Vex(#[source] Box<VexFileError>),
     /// [`Registry::init`] found an existing registry.
     #[error("{} already holds a registry", path.display())]
     Exists {
@@ -332,7 +336,7 @@ pub struct Registry {
 
 impl Registry {
     /// Creates a registry named `name` in `dir` with the given role keys:
-    /// `registry.toml`, the package, artifact and advisory directories, and
+    /// `registry.toml`, the package, artifact, advisory and VEX directories, and
     /// version 1 of every role, unsigned. Call [`Registry::sign`] next.
     ///
     /// # Errors
@@ -368,6 +372,7 @@ impl Registry {
             PACKAGES_DIR,
             ARTIFACTS_DIR,
             ADVISORIES_DIR,
+            VEX_DIR,
             ROOT_DIR,
             DELEGATIONS_DIR,
         ] {
@@ -734,6 +739,41 @@ impl Registry {
         write_file(&self.dir.join(path), text.as_bytes())
     }
 
+    /// Writes VEX document `id` to `vex/<id>.cdx.json`, replacing one with
+    /// the same id; returns its path. The bytes are stored as given, after
+    /// checking that they are VEX the client can use.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Vex`] if the id is unusable or the document is not
+    /// usable VEX, and [`EditError::Io`] if it cannot be written.
+    pub fn write_vex(&self, id: &str, json: &[u8]) -> Result<String, EditError> {
+        let vex_error = |source| EditError::Vex(Box::new(source));
+        let path = vex_path(id).map_err(vex_error)?;
+        parse_vex(json).map_err(vex_error)?;
+        write_file(&self.dir.join(&path), json)?;
+        Ok(path)
+    }
+
+    /// Removes VEX document `id`, returning its path, or `None` if there
+    /// was none.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Vex`] if the id is unusable, and [`EditError::Io`] if
+    /// the file cannot be removed.
+    pub fn remove_vex(&self, id: &str) -> Result<Option<String>, EditError> {
+        let path = vex_path(id).map_err(|source| EditError::Vex(Box::new(source)))?;
+        match fs::remove_file(self.dir.join(&path)) {
+            Ok(()) => Ok(Some(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(EditError::Io {
+                path: self.dir.join(&path),
+                source,
+            }),
+        }
+    }
+
     /// Starts a new root version that gives `role` these keys, or changes
     /// the newest root in place while clients would not yet accept it.
     /// Either way the root has no signatures until [`Registry::sign`] adds
@@ -982,7 +1022,7 @@ impl Registry {
         let mut files = BTreeMap::new();
         let config = self.dir.join(REGISTRY_FILE);
         files.insert(REGISTRY_FILE.to_owned(), FileMeta::of(&read(&config)?));
-        for sub in [PACKAGES_DIR, ARTIFACTS_DIR, ADVISORIES_DIR] {
+        for sub in [PACKAGES_DIR, ARTIFACTS_DIR, ADVISORIES_DIR, VEX_DIR] {
             let mut found = Vec::new();
             walk(&self.dir, &self.dir.join(sub), &mut found)?;
             for path in found {

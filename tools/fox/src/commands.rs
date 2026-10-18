@@ -141,7 +141,7 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
                 source,
             },
         ),
-        Command::Audit { rustsec } => crate::audit::run(cli, rustsec.as_deref()),
+        Command::Audit { rustsec, no_vex } => crate::audit::run(cli, rustsec.as_deref(), *no_vex),
         Command::Install {
             force,
             allow_unsigned_metadata,

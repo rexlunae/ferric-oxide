@@ -10,10 +10,12 @@
 //!   releases against their repositories (what registry CI runs on a PR);
 //! - `build` is the registry builder: it builds releases from their checked
 //!   tags, signs the archives and attestations, and records them in the
-//!   artifact lists;
+//!   artifact lists, and `rebuild` is the independent rebuilder that adds
+//!   its attestation to archives it reproduces;
 //! - `configure` sets the artifact store and the builders in
 //!   `registry.toml`;
-//! - `advise` publishes or updates a security advisory;
+//! - `advise` publishes or updates a security advisory, and `vex` a
+//!   CycloneDX VEX document;
 //! - `yank` marks a release yanked;
 //! - `set-role` rotates a role's keys through a new root;
 //! - `sign` brings the metadata up to date and signs what the given keys
@@ -187,6 +189,20 @@ enum Command {
         /// The advisory file.
         file: PathBuf,
     },
+    /// Publish, replace or remove a CycloneDX VEX document saying whether
+    /// vulnerabilities affect the registry's packages; it is stored as
+    /// `vex/<id>.cdx.json`.
+    Vex {
+        /// The VEX document (CycloneDX JSON 1.4 or 1.5).
+        #[arg(required_unless_present = "remove", conflicts_with = "remove")]
+        file: Option<PathBuf>,
+        /// Its id (default: the file name without `.cdx.json` or `.json`).
+        #[arg(long, conflicts_with = "remove")]
+        id: Option<String>,
+        /// Remove the document with this id instead.
+        #[arg(long, value_name = "ID")]
+        remove: Option<String>,
+    },
     /// Mark a release yanked, so new installs skip it.
     Yank {
         /// The package.
@@ -321,6 +337,18 @@ enum CliError {
         #[source]
         source: std::io::Error,
     },
+    #[error("cannot read VEX document {}", path.display())]
+    VexFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot name VEX document {} by its file name; pass --id", path.display())]
+    VexId { path: PathBuf },
+    #[error("no VEX document {id}")]
+    NoVex { id: String },
+    #[error("name a VEX document or pass --remove")]
+    NoVexFile,
     #[error("invalid advisory {}", path.display())]
     Advisory {
         path: PathBuf,
@@ -442,6 +470,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             },
         ),
         Command::Advise { file } => advise(dir, file),
+        Command::Vex { file, id, remove } => {
+            vex(dir, file.as_deref(), id.as_deref(), remove.as_deref())
+        }
         Command::ImportRecipes {
             dir: recipes,
             git,
@@ -656,6 +687,45 @@ fn advise(dir: &Path, file: &Path) -> Result<(), CliError> {
     Registry::open(dir)?.write_advisory(&advisory)?;
     println!("wrote {path}; run `fox-registry sign` with the targets key");
     Ok(())
+}
+
+fn vex(
+    dir: &Path,
+    file: Option<&Path>,
+    id: Option<&str>,
+    remove: Option<&str>,
+) -> Result<(), CliError> {
+    let registry = Registry::open(dir)?;
+    let path = if let Some(id) = remove {
+        registry
+            .remove_vex(id)?
+            .ok_or_else(|| CliError::NoVex { id: id.to_owned() })?
+    } else {
+        let file = file.ok_or(CliError::NoVexFile)?;
+        let json = std::fs::read(file).map_err(|source| CliError::VexFile {
+            path: file.to_path_buf(),
+            source,
+        })?;
+        let id = match id {
+            Some(id) => id,
+            None => vex_id(file).ok_or_else(|| CliError::VexId {
+                path: file.to_path_buf(),
+            })?,
+        };
+        registry.write_vex(id, &json)?
+    };
+    println!("updated {path}; run `fox-registry sign` with the targets key");
+    Ok(())
+}
+
+/// A VEX id from a file name: `x.cdx.json` and `x.json` give `x`.
+fn vex_id(file: &Path) -> Option<&str> {
+    let name = file.file_name()?.to_str()?;
+    let id = name
+        .strip_suffix(".cdx.json")
+        .or_else(|| name.strip_suffix(".json"))
+        .unwrap_or(name);
+    Some(id)
 }
 
 struct ConfigureArgs<'a> {

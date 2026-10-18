@@ -1503,6 +1503,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fox-core",
+ "fox-sbom",
  "pkgar-core 0.2.4",
  "semver",
  "serde",

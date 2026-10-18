@@ -470,6 +470,56 @@ fn advisories_are_published_and_signed() {
 }
 
 #[test]
+fn vex_documents_are_published_signed_and_removed() {
+    let env = Env::new();
+    let file = env.keys.path().join("tiny-dos.cdx.json");
+    let vex = r#"{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+        "vulnerabilities": [{"id": "RUSTSEC-2026-0001",
+          "analysis": {"state": "not_affected", "justification": "code_not_present"},
+          "affects": [{"ref": "pkg:generic/tiny@0.1.0"}]}]}"#;
+    fs::write(&file, vex).unwrap();
+    let out = env.ok(&["vex", file.to_str().unwrap()]);
+    assert!(out.contains("vex/tiny-dos.cdx.json"), "{out}");
+    let signing = [
+        env.key("targets"),
+        env.key("snapshot"),
+        env.key("timestamp"),
+    ];
+    let signing: Vec<&str> = signing.iter().map(String::as_str).collect();
+    assert!(env.sign(&signing));
+    env.ok(&["verify"]);
+    let stored = fs::read_to_string(env.registry.path().join("vex/tiny-dos.cdx.json")).unwrap();
+    assert_eq!(stored, vex);
+
+    // A document fox could not use is refused, as is an unusable id.
+    fs::write(&file, vex.replace("pkg:generic/tiny", "pkg:cargo/tiny")).unwrap();
+    let output = env.run(&["vex", file.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not a fox package"),
+        "{}",
+        stderr(&output)
+    );
+    let output = env.run(&["vex", file.to_str().unwrap(), "--id", "../x"]);
+    assert!(
+        stderr(&output).contains("may only hold"),
+        "{}",
+        stderr(&output)
+    );
+
+    let out = env.ok(&["vex", "--remove", "tiny-dos"]);
+    assert!(out.contains("vex/tiny-dos.cdx.json"), "{out}");
+    assert!(env.sign(&signing));
+    env.ok(&["verify"]);
+    let output = env.run(&["vex", "--remove", "tiny-dos"]);
+    assert!(
+        stderr(&output).contains("no VEX document"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn cookbook_recipes_become_recipe_packages() {
     let env = Env::new();
     let repo = tempfile::tempdir().unwrap();

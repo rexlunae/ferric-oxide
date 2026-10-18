@@ -89,9 +89,15 @@ binary. `ferric-config`'s `package_manager_choice` test checks the make
 variables the `packages.*` options and `cpu.x86_64_level` generate. Building and booting an image
 through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
-(including the install warning and a changed SBOM), and in unit tests
+(including the install warning, a registry VEX statement that sets the
+finding aside, `--no-vex` and a changed SBOM), and in unit tests
+for VEX matching by id and alias, other versions, and an `exploitable`
+statement winning over a clearing one; and
 against a RustSec-layout directory of advisories for crates inside build
-SBOMs, with withdrawn, build-only and non-semver cases. Tests construct real signed pkgar fixtures
+SBOMs, with withdrawn, build-only and non-semver cases. `fox-sbom`'s VEX
+reader is unit tested on purl and component references, versions and every
+rejected document, and `fox-registry`'s CLI test publishes, refuses and
+removes VEX documents and signs the result. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no

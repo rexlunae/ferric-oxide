@@ -218,6 +218,9 @@ enum Command {
         /// Also check a checkout of the RustSec advisory database.
         #[arg(long, value_name = "DIR")]
         rustsec: Option<PathBuf>,
+        /// Report every finding, ignoring the registries' VEX statements.
+        #[arg(long)]
+        no_vex: bool,
     },
     /// Search the registries' package names and summaries.
     Search {

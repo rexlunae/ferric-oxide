@@ -447,6 +447,7 @@ registry.toml                     name, artifact URLs, builder keys
 packages/<xx>/<name>.toml         one file per package: git URL, owners, releases
 artifacts/<xx>/<name>/<ver>.toml  prebuilt artifacts of one release
 advisories/                       security advisories
+vex/<id>.cdx.json                 CycloneDX VEX statements about its packages
 metadata/root/<N>.json            every root version, kept for key rotation
 metadata/targets.json             hashes of every file above, and the delegations
 metadata/delegations/<name>.json  each package's file, signed by its owners
@@ -543,6 +544,7 @@ copy only while signing.
 | `check [name...]` | What registry CI runs on a pull request: re-checks every recorded release's tag signature, commit and tree hash, and that the owners match the delegation's keys; a package with no releases yet is only checked against its delegation, without fetching its repository |
 | `import-recipes <dir> --git URL --owner ID=KEY...` | Admits every cookbook recipe under `dir` as a `kind = "recipe"` package whose source is its recipe directory (`path`) in the repository at `URL`, delegated to the owners; the summary is the recipe's `[package] description` or its upstream source. Recipes already in the registry, names that are not package names and recipes that are not valid TOML are skipped and reported. `targets.json` is written once for the whole import, after every package file has been checked, and a failed write removes the files already written, so the import can be retried. Imported recipes are listed and searchable, but `fox` does not build `kind = "recipe"` packages yet (see the `[package.metadata.fox]` notes), so releases recorded for them cannot be installed until recipe builds land |
 | `advise <file>` | Validates a RustSec-format advisory and stores it as `advisories/<id>.toml`, replacing one with that id (to update or withdraw it); signed by the targets key |
+| `vex <file> [--id ID]`, `vex --remove ID` | Validates a CycloneDX VEX document (see [VEX statements](#vex-statements)) and stores its bytes as `vex/<id>.cdx.json` (the id defaults to the file name without `.cdx.json`), replacing one with that id, or removes one; signed by the targets key |
 | `yank <name> <version>` | Marks a release yanked (`--undo` reverses it) |
 | `set-role <role> --key K... [--threshold N]` | Writes a new root that gives the role new keys; clients accept it once the old and the new root keys have signed |
 | `sign [--key F...] [--bump ROLE...] [--complete]` | Updates and signs the metadata |
@@ -812,6 +814,43 @@ findings, the packages whose versions are not semver (`unchecked`) and the
 number of advisories checked. Installing a registry release that an
 advisory affects prints a warning.
 
+#### VEX statements
+
+A registry can say that an advisory does not apply to one of its
+packages, for example a crate advisory for code a package never compiles.
+It publishes a CycloneDX VEX document (JSON, `specVersion` 1.4 or 1.5)
+with `fox-registry vex`:
+
+```json
+{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+ "vulnerabilities": [{
+   "id": "RUSTSEC-2026-0001",
+   "analysis": {"state": "not_affected", "justification": "code_not_present",
+                "detail": "built without the `http` feature"},
+   "affects": [{"ref": "pkg:generic/hello@1.2.0"}]}]}
+```
+
+Each `affects[].ref` names a fox package by the purl its SBOM uses,
+`pkg:generic/<name>` (every version) or `pkg:generic/<name>@<version>`,
+directly or through the `bom-ref` of a component in the document with that
+purl. `versions` entries list more exact versions; entries marked
+`affected` are left out, and `vers:` ranges are refused. A statement
+matches a finding when its `id` or a `references[].id` is the advisory's id
+or one of its aliases, and it covers the installed package and version.
+`fox-registry vex` rejects a document that `fox` could not use, and the
+targets role signs it like every other top-level file.
+
+`fox audit` applies a registry's statements only to packages that registry
+lists, so one registry cannot clear another's packages. A finding covered
+by a `not_affected`, `false_positive`, `resolved` or
+`resolved_with_pedigree` statement moves from `findings` to `suppressed`
+(with the registry, document, state, justification and detail) and no
+longer fails the audit. An `exploitable` or `in_triage` statement keeps the
+finding and is shown with it, and it wins over a clearing statement from any
+registry. `fox audit --no-vex` ignores VEX. The installed-package database
+does not record a package's registry, so a registry's statements apply to
+any installed package with a name it lists.
+
 ### System and image SBOMs
 
 `fox sbom --system [--name N]` writes one CycloneDX 1.5 document for the
@@ -834,7 +873,8 @@ source, declared runtime dependencies and individual files/hashes. It is
 reproducible: there is no timestamp, and the serial number derives from the
 archive hash. It is built from the archive's own metadata; the crate graph
 is in the build SBOM that `cargo fox package` packs into archives it builds.
-Reading embedded `cargo auditable` data, VEX statements, SPDX export, and
+Reading embedded `cargo auditable` data, SPDX export, VEX documents other
+than a registry's (and VEX inside SBOMs), and
 listing the kernel, bootloader and initfs in the system SBOM are not
 implemented. The image build does not yet write `image.cdx.json` itself;
 that comes with images built through fox.
