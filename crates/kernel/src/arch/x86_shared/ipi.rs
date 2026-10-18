@@ -9,9 +9,10 @@ pub enum IpiKind {
     #[cfg(feature = "profiling")]
     Profile = 0x44,
 
-    /// Ferric Oxide: live patching of tracepoint sites (arch/x86_64/static_key.rs).
+    /// Ferric Oxide: live patching of tracepoint sites (arch/x86_64/static_key.rs). 0x45 is
+    /// the VT-d fault event vector (`arch::iommu::FAULT_VECTOR`).
     #[cfg(all(feature = "trace", target_arch = "x86_64"))]
-    TraceSync = 0x45,
+    TraceSync = 0x46,
 }
 
 #[derive(Clone, Copy, Debug)]
