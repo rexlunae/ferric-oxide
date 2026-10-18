@@ -134,8 +134,8 @@ package, adoption:
 - skips packages that are already recorded, would own a reserved path, or
   have files that already belong to another package, and lists why.
 
-Adoption changes no installed file and does not hash them: run
-`fox verify --installed` afterwards. It runs once per root. The database
+Adoption changes no installed file, and the first run does not hash them:
+run `fox verify --installed` afterwards. It runs once per root. The database
 records that it ran, so `pkg`'s stale state cannot bring back a package
 removed with `fox` later; `--again` overrides this. The packages it skipped
 are recorded as pending, and a later `fox adopt-pkg` retries those alone

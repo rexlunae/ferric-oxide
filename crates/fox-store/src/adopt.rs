@@ -17,8 +17,9 @@
 //! [`AdoptOptions::allow_unsigned_metadata`] and recorded as
 //! [`MetadataKind::Legacy`].
 //!
-//! Adoption does not hash the installed files: run [`Store::verify`]
-//! afterwards to compare them with the signed entries. It runs once per
+//! The first adoption does not hash the installed files: run
+//! [`Store::verify`] afterwards to compare them with the signed entries.
+//! It runs once per
 //! root: the database remembers it, so packages removed with `fox` later
 //! are not brought back by `pkg`'s stale state. Packages it skipped are
 //! remembered as pending, and a later adoption retries those alone (once
@@ -180,11 +181,14 @@ impl Store {
     /// [`PKG_STATE`] with a signed head in [`PKG_HEADS_DIR`] that verifies
     /// against `keys`. Each is named by its signed manifest, or with
     /// [`AdoptOptions::allow_unsigned_metadata`] by `pkg`'s state alone.
-    /// No installed file is changed or hashed, and adoption runs once per
-    /// root unless [`AdoptOptions::again`]. Packages that cannot be adopted
-    /// are listed in the report rather than failing the whole adoption, and
+    /// No installed file is changed. Adoption runs once per root unless
+    /// [`AdoptOptions::again`], and that run (or one with `again`) does not
+    /// hash the installed files. Packages that cannot be adopted are listed
+    /// in the report rather than failing the whole adoption, and
     /// remembered: a later adoption retries them, and only them, so
-    /// packages removed with `fox` since are not brought back.
+    /// packages removed with `fox` since are not brought back. A retry
+    /// hashes each signed entry as [`Store::verify`] does and leaves the
+    /// package pending ([`SkipReason::Changed`]) unless all of them match.
     ///
     /// # Errors
     ///

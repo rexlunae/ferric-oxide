@@ -87,7 +87,8 @@ enum Command {
     List,
     /// Record the packages upstream `pkg` installed in the root, from the
     /// signed heads it keeps. Runs once per root, then only retries the
-    /// packages it skipped; files are not changed.
+    /// packages it skipped (hashing their files first); files are not
+    /// changed.
     AdoptPkg {
         /// Adopt packages without a signed manifest under the name `pkg`
         /// gives them.
