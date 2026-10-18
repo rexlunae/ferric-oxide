@@ -1,0 +1,20 @@
+[package]
+name = "fox-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "In-place package store and installed-package database for fox"
+publish = false
+
+[dependencies]
+blake3 = { workspace = true, features = ["std"] }
+fox-core = { path = "../fox-core", features = ["std"] }
+pkgar = { workspace = true }
+pkgar-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+toml = { workspace = true, features = ["parse", "display", "serde", "std"] }
+
+[dev-dependencies]
+fox-core = { path = "../fox-core", features = ["test-fixtures"] }
+tempfile.workspace = true
