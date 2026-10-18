@@ -4,6 +4,9 @@
 //! `pkey` hex field), the same format the cookbook writes to
 //! `build/id_ed25519.pub.toml`. A system trusts every key file in
 //! [`TRUSTED_KEYS_DIR`] under its root; the file stem is the key's label.
+//! It also trusts its own local builder key, [`LOCAL_BUILDER_KEY`], which
+//! `fox install <git-url>` creates to sign the packages it builds from
+//! source.
 
 use std::fs;
 use std::io;
@@ -13,6 +16,16 @@ use crate::{KeyId, TrustedKey, TrustedKeys};
 
 /// Directory, relative to the install root, of trusted signer key files.
 pub const TRUSTED_KEYS_DIR: &str = "etc/fox/keys";
+
+/// The local builder's secret key file, relative to the install root. It
+/// lives in fox's state directory, which no package may write.
+pub const LOCAL_BUILDER_SECRET_KEY: &str = "var/lib/fox/local-builder.toml";
+
+/// The local builder's public key file, relative to the install root.
+pub const LOCAL_BUILDER_KEY: &str = "var/lib/fox/local-builder.pub.toml";
+
+/// The label of the local builder key.
+pub const LOCAL_BUILDER_LABEL: &str = "local-builder";
 
 /// Why trusted keys could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -96,14 +109,20 @@ pub fn load_key_dir(dir: &Path, keys: &mut TrustedKeys) -> Result<usize, KeyErro
 }
 
 /// The keys trusted by the system at `root`: the files in
-/// `<root>/etc/fox/keys`.
+/// `<root>/etc/fox/keys`, and the local builder key if it exists.
 ///
 /// # Errors
 ///
-/// As [`load_key_dir`].
+/// As [`load_key_dir`], and [`KeyError::File`] if the local builder key
+/// exists but cannot be read.
 pub fn trusted_keys_for_root(root: &Path) -> Result<TrustedKeys, KeyError> {
     let mut keys = TrustedKeys::new();
     load_key_dir(&root.join(TRUSTED_KEYS_DIR), &mut keys)?;
+    let local = root.join(LOCAL_BUILDER_KEY);
+    if local.is_file() {
+        let key = load_key_file(&local)?;
+        keys.insert(LOCAL_BUILDER_LABEL, key.key);
+    }
     Ok(keys)
 }
 
@@ -156,5 +175,18 @@ mod tests {
             load_key_dir(dir.path(), &mut TrustedKeys::new()),
             Err(KeyError::File { .. })
         ));
+    }
+
+    #[test]
+    fn root_trusts_its_local_builder() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(trusted_keys_for_root(root.path()).unwrap().is_empty());
+        let (public, _) = pkgar_keys::SecretKeyFile::new();
+        let path = root.path().join(LOCAL_BUILDER_KEY);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        public.save(&path).unwrap();
+        let keys = trusted_keys_for_root(root.path()).unwrap();
+        let key = keys.get(&KeyId::from_bytes(public.pkey)).unwrap();
+        assert_eq!(key.label, LOCAL_BUILDER_LABEL);
     }
 }

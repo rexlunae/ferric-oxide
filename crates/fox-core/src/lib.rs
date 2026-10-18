@@ -15,11 +15,21 @@
 //! - [`TrustedKeys`] and [`verify_head`]: which signers are accepted, and the
 //!   check of a pkgar head (header plus entry table) against them;
 //! - [`FileRecord`]: one verified file, as recorded in the installed-package
-//!   database and in SBOMs.
+//!   database and in SBOMs;
+//! - [`Attestation`], [`AttestationSignature`] and [`verify_attestation`]:
+//!   a builder's signed statement binding a source tree, toolchain, target
+//!   and feature set to an archive and its SBOM, and its verification;
+//! - [`CpuLevel`] and [`feature_set_hash`]: parts of an artifact's
+//!   identity;
+//! - [`GitUrl`]: a repository URL in the normalized form used as a source's
+//!   identity.
 //!
 //! The crate is `no_std` with `alloc`. The `std` feature adds the `archive`
-//! module, which opens `.pkgar` files and hashes every entry's data, and the
-//! `keys` module, which loads trusted keys from disk. The `test-fixtures`
+//! module, which opens `.pkgar` files and hashes every entry's data, the
+//! `attested` module, which reads attestation files and checks them against
+//! an archive, the `keys` module, which loads trusted keys from disk, and the
+//! `trust` module, the store of pinned repository authors and trusted
+//! third-party builders. The `test-fixtures`
 //! feature adds `fixtures`, which builds signed packages for tests.
 //!
 //! # Examples
@@ -42,24 +52,38 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 pub mod archive;
+pub mod attestation;
+#[cfg(feature = "std")]
+pub mod attested;
 mod digest;
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
+mod git_url;
 #[cfg(feature = "std")]
 pub mod keys;
 mod manifest;
 mod name;
 mod record;
+#[cfg(feature = "std")]
+pub mod trust;
 mod verify;
 
+pub use attestation::{
+    ArtifactFacts, Attestation, AttestationError, AttestationFormat, AttestationSignature,
+    AttestedField, AttestedPackage, BuildRecord, CpuLevel, CpuLevelError, Ed25519Signature,
+    OutputRecord, Profile, SIGNING_CONTEXT, SignatureFormat, SignatureParseError, SourceRecord,
+    VerifiedAttestation, feature_set_hash, verify_attestation,
+};
 pub use digest::{Blake3Digest, DigestParseError, KeyId};
+pub use git_url::{GitUrl, GitUrlError};
 pub use manifest::{
-    MANIFEST_DIR, Manifest, ManifestError, ManifestFormat, SourceInfo, manifest_path,
+    MANIFEST_DIR, Manifest, ManifestError, ManifestFormat, SBOM_DIR, SourceInfo, manifest_path,
+    sbom_path,
 };
 pub use name::{NameError, PackageName};
 pub use pkgar_core::{ENTRY_SIZE, HEADER_SIZE};
 pub use record::{FileKind, FileRecord};
 pub use verify::{
-    EntryPathError, TrustedKey, TrustedKeys, VerifiedEntry, VerifiedHead, VerifyError, head_size,
-    verify_head,
+    EntryPathError, TrustedKey, TrustedKeys, VerifiedEntry, VerifiedHead, VerifyError,
+    check_entry_path, head_size, verify_head,
 };

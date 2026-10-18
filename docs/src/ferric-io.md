@@ -294,6 +294,15 @@ completions, so completions are never dropped: `Enter` returns `EBUSY` when
 not even the first chain fits. Chains of more than 32 SQEs, or ones that fill
 the SQ without ending, complete with `EINVAL`.
 
+`Enter` looks up every descriptor a chain names when it takes the chain, before
+any SQE runs, and holds those open file descriptions until the chain is done.
+If another thread closes a descriptor, or replaces it with `dup2`, while the
+chain waits, the chain still acts on the files it named when it was taken, as
+one system call would. Whichever holder lets go of a description last (the
+descriptor table, the ring, or a file system call still running on it, through
+`syscall::fs::release_description`) closes it, so a description closed while a
+ring or a call holds it is still closed exactly once.
+
 The ring memory is shared with the application, which may write any of it at
 any time. The kernel reads it atomically through its own mapping, keeps its
 own indices, copies each SQE once before checking it, and fails `Enter` with
