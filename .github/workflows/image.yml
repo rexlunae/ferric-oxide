@@ -97,7 +97,10 @@ jobs:
       # Several crates (relibc's, redoxfs's) have git dependencies on gitlab.redox-os.org.
       # Cargo only fetches a git dependency when its locked commit is missing from
       # ~/.cargo/git/db, so caching that directory keeps a GitLab outage from failing
-      # builds whose lockfiles have not moved.
+      # builds whose lockfiles have not moved. The key covers this repository's
+      # lockfiles; a dependency the cookbook fetches mid-build has its own lockfile,
+      # so a changed key still falls back to an older cache (restore-keys) and Cargo
+      # retries the fetch.
       - name: Cache Cargo git dependencies
         uses: actions/cache@v4
         with:
