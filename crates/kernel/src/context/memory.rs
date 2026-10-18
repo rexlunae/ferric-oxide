@@ -562,6 +562,51 @@ impl AddrSpaceWrapper {
         page: Page,
         token: &mut CleanLockToken,
     ) -> Result<RaiiFrame> {
+        // Ferric Oxide: the body is `borrow_frame_enforce_rw_with`, shared with
+        // `borrow_frame_enforce_rw_anonymous`.
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| matches!(provider, Provider::Allocated { .. }),
+            token,
+        )
+    }
+    /// Ferric Oxide: borrows a read/write page of private anonymous user memory, as
+    /// `borrow_frame_enforce_rw_allocated` does, but refusing private mappings of a file and
+    /// physically contiguous allocations (regbuf registration, which must pin plain anonymous
+    /// memory only).
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when the page is not mapped, `EPERM` when it is not read/write private
+    /// anonymous memory, `ENOMEM` when memory runs out.
+    #[cfg(feature = "regbuf")]
+    pub fn borrow_frame_enforce_rw_anonymous(
+        self: &Arc<Self>,
+        page: Page,
+        token: &mut CleanLockToken,
+    ) -> Result<RaiiFrame> {
+        self.borrow_frame_enforce_rw_with(
+            page,
+            |provider| {
+                matches!(
+                    provider,
+                    Provider::Allocated {
+                        cow_file_ref: None,
+                        phys_contiguous: false,
+                    }
+                )
+            },
+            token,
+        )
+    }
+    /// Ferric Oxide: borrows a read/write page whose grant provider `accepts`
+    /// (`borrow_frame_enforce_rw_allocated` and `borrow_frame_enforce_rw_anonymous`).
+    fn borrow_frame_enforce_rw_with(
+        self: &Arc<Self>,
+        page: Page,
+        accepts: impl FnOnce(&Provider) -> bool,
+        token: &mut CleanLockToken,
+    ) -> Result<RaiiFrame> {
         let mut lock_token = token.token();
         let guard = self.acquire_write(lock_token.downgrade());
 
@@ -570,7 +615,7 @@ impl AddrSpaceWrapper {
         if !info.can_have_flags(MapFlags::PROT_READ | MapFlags::PROT_WRITE) {
             return Err(Error::new(EPERM));
         }
-        if !matches!(info.provider, Provider::Allocated { .. }) {
+        if !accepts(&info.provider) {
             return Err(Error::new(EPERM));
         }
 
@@ -1360,10 +1405,14 @@ impl Grant {
             .expect("must be possible if previously Zero");
 
         unsafe {
-            mapper
-                .map_phys(page.start_address(), frame.base(), flags, 0)
-                .ok_or(Error::new(ENOMEM))?
-                .ignore();
+            // Ferric Oxide: a failed map gives back the reference just taken, so the frame
+            // does not keep it for good. The caller holds a reference of its own, so this never
+            // frees the frame.
+            let Some(flush) = mapper.map_phys(page.start_address(), frame.base(), flags, 0) else {
+                let _still_referenced = info.remove_ref();
+                return Err(Error::new(ENOMEM));
+            };
+            flush.ignore();
 
             flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
         }
