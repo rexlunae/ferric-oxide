@@ -459,9 +459,7 @@ descriptor claims, and a `registry.toml` whose `name` differs from the
 signed root's. It pins the BLAKE3 of the trusted timestamp's signed payload
 in its saved state (`timestamp_payload`), so a timestamp with the trusted
 version but different content is refused as an equivocation, while
-signatures re-made over the same payload are accepted. States saved before
-this pin hold a whole-file hash under `timestamp_file`; it is ignored, and
-the next successful update replaces it. A package file supplied by its
+signatures re-made over the same payload are accepted. A package file supplied by its
 delegation must list as owners exactly the delegation's keys, so tag
 authority cannot drift from update authority.
 
