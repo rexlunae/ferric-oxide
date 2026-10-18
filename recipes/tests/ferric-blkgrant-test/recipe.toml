@@ -1,0 +1,21 @@
+# Ferric Oxide: the on-target test and benchmark for storage DMA into registered buffers
+# (drivers.grant_dma, with kernel.regbuf and an IOMMU). It registers a buffer, attaches a
+# grant of it to a partition descriptor of nvmed's disk scheme, reads and writes blocks
+# through the grant (the controller DMAs straight into the buffer), checks the refusals,
+# revokes the grant and checks the driver stops, and times reads through the grant against
+# ordinary reads. It prints FERRIC_TEST_SKIP when there is no NVMe disk, no kernel.regbuf
+# scheme, no grant support in nvmed or no DMA domain. Only for test images. Source lives in
+# files/; as a path source (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-blkgrant-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The ABI crates are path dependencies at ../../../../crates/ from files/. The cookbook
+# builds a copy of files/ in this recipe's source/, at the same depth, so the relative
+# paths hold there too.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

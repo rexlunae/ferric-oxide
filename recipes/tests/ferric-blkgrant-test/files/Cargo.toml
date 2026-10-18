@@ -1,0 +1,21 @@
+[package]
+name = "ferric-blkgrant-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Storage DMA into registered buffers: test and benchmark for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-blkgrant = { path = "../../../../crates/blkgrant" }
+ferric-regbuf = { path = "../../../../crates/regbuf" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+libredox = "0.1.25"
+redox_syscall = "0.9.4"
+
+[profile.release]
+debug = false

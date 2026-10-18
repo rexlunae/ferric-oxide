@@ -82,14 +82,15 @@ jobs:
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
           # Registered buffers and kernel tracing are off by default; turn them on so
-          # ferric-regbuf-test and ferric-trace-test run, with sched.switch on from boot.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\ntrace = true\ntrace_boot = "sched"\n' > "$out/ferric.toml"
+          # ferric-regbuf-test and ferric-trace-test run, with sched.switch on from boot, and
+          # nvmed's grant DMA (also off by default) so ferric-blkgrant-test does.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\ntrace = true\ntrace_boot = "sched"\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          # Pass the recipe-facing settings (kernel and relibc features,
+          # Pass the recipe-facing settings (kernel, relibc and initfs features,
           # kernel link arguments, bootloader features, signed fox manifests)
           # on to the build.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_FOX_MANIFEST; do
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_FOX_MANIFEST; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
@@ -264,6 +265,11 @@ jobs:
           done
           echo "::notice::ferric-regbuf-test passed all $(wc -w <<< "$steps") steps"
 
+      # nvmed DMAs into ferric-blkgrant-test's registered buffer through a grant mapped in
+      # its domain (drivers.grant_dma); without an IOMMU the grant steps skip. Both print the
+      # read benchmark, which the step repeats as a notice.
+      - name: Check storage DMA into registered buffers
+        run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
       # The image has kernel.trace on, so ferric-trace-test must run every step, not skip.
       - name: Check kernel tracing
         run: |

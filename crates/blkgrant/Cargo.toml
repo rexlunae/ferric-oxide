@@ -1,0 +1,13 @@
+[package]
+name = "ferric-blkgrant"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Registered-buffer grants on disk schemes: the call ABI, the per-handle slot table and NVMe PRP layout"
+
+[dependencies]
+
+[features]
+default = []
+## The per-handle grant slot table (`slots`), which needs a heap.
+alloc = []

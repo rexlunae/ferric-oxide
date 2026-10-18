@@ -768,7 +768,8 @@ fn map_grant(_id: usize, _grant_fd: u64, _token: &mut CleanLockToken) -> Result<
 }
 
 /// [`Request::UnmapGrant`]: takes the grant mapping at `iova` of domain `id` down strictly, and
-/// drops the grant's record of it.
+/// drops the grant's record of it. When a revocation took the mapping down already, this
+/// frees its retired IOVA block instead, so the IOVA can be reused from now on.
 ///
 /// # Errors
 ///
@@ -781,6 +782,13 @@ fn unmap_grant(id: usize, iova: u64) -> Result<()> {
     let ticket = {
         let mut handles = HANDLES.lock();
         let space = bound_domain(&mut handles, id, alloc::sync::Arc::as_ptr(&addr_space))?;
+        if space.release_retired(iova) {
+            info!(
+                "IOMMU: domain {}: IOVA {iova:#x} of a revoked grant released by the driver",
+                space.id()
+            );
+            return Ok(());
+        }
         let ticket = space
             .unmap_grant(iova, None)
             .map_err(|err| dma_errno(&err))?;

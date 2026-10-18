@@ -70,6 +70,14 @@ jobs:
         run: |
           cargo test --locked -p ferric-trace --all-features
           cargo clippy --locked --all-targets --all-features -p ferric-trace -- -D warnings
+      # ferric-blkgrant's slot table sits behind its `alloc` feature (driver-block turns it on;
+      # clients do not).
+      - name: ferric-blkgrant
+        run: |
+          cargo clippy --locked --all-targets --all-features -p ferric-blkgrant -- -D warnings
+          cargo clippy --locked -p ferric-blkgrant -- -D warnings
+          cargo test --locked -p ferric-blkgrant --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
       # ferric-vtd's allocators sit behind its default `alloc` feature; check the
       # crate builds without them too.
       - name: Clippy (ferric-vtd without alloc)
