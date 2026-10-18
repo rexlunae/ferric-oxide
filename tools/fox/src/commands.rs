@@ -25,7 +25,7 @@ use crate::source::{self, SourceError, SourceSpec};
 use crate::{Cli, Command, SbomFormat, SourceArgs, prebuilt};
 
 /// The target `fox` was built for: the default for prebuilt artifacts.
-const HOST_TARGET: &str = env!("FOX_HOST_TARGET");
+pub(crate) const HOST_TARGET: &str = env!("FOX_HOST_TARGET");
 
 /// Why a command failed.
 #[derive(Debug, thiserror::Error)]

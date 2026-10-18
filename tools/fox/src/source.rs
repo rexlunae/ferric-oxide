@@ -164,6 +164,11 @@ impl SourceSpec {
     pub(crate) fn git(&self) -> &GitUrl {
         &self.git
     }
+
+    /// The tag or revision given after `#`, if any.
+    pub(crate) fn rev(&self) -> Option<&str> {
+        self.rev.as_deref()
+    }
 }
 
 /// A fetched source at the commit chosen for it.
