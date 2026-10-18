@@ -17,13 +17,13 @@
 //!
 //! The shadow stacks are allocated and kept consistent (see below), and CR4.CET with
 //! `IA32_S_CET.SH_STK_EN` is turned on per-CPU once SSP is loaded, at a point with no pending
-//! returns ([`enable_params`]/[`confirm_enabled`], called from the startup path right before the
+//! returns (`enable_params`/`confirm_enabled`, called from the startup path right before the
 //! diverging `kmain`/`kmain_ap` calls). When the decision is on:
 //!
 //! - **Allocation.** Every [`Kstack`](crate::context::context::Kstack) gets a `ShadowStack`:
 //!   each context's kernel stack, the bootstrap processor's kmain stack, each application
 //!   processor's boot stack, the per-CPU backup (IST) stacks and the KPTI entry stacks, which are
-//!   all `Kstack`s. It is freed with the stack.
+//!   all `Kstack`s. Its exclusive pool allocation is returned on drop.
 //! - **Mapping.** Shadow-stack pages need their own page-table entries, present with R/W = 0 and
 //!   Dirty = 1 ([`ferric_cet::shstk::SHADOW_STACK_PTE_FLAGS`]), so they cannot live in the
 //!   writable physical memory map. They are mapped in a window in the upper half of the kernel
@@ -37,13 +37,12 @@
 //!   mappings are visible everywhere at once.
 //! - **Tokens.** The highest entry of each shadow stack holds its supervisor shadow-stack token
 //!   (its own address, not busy), which the CPU checks when it loads `SSP` from `IA32_PL0_SSP`
-//!   or the interrupt SSP table. It is written, like a new context's initial entries, with
-//!   `WRSS` through the shadow-stack mapping once CET is on for the running CPU
-//!   ([`ShadowStack`]'s `write_entry`). Before that (the boot stacks, and boots where CET stays
-//!   off) the kernel writes through the physical memory map instead. The physical memory map's
-//!   alias of every shadow-stack frame stays writable, so a kernel write primitive can still
-//!   forge a shadow stack through it; removing the alias needs the physical map's huge pages
-//!   split around each frame, which is not done yet (see "What this step does not do").
+//!   or the interrupt SSP table. A boot-reserved 32 MiB pool supplies 4096 shadow stacks; its
+//!   frames never enter the writable physical map or ordinary frame allocator. Pool exhaustion
+//!   fails stack allocation without a writable fallback. Before CET is live on a CPU, a bounded
+//!   interrupt-masked initialization block temporarily disables CET and CR0.WP, writes through
+//!   the read-only shadow mapping, then restores CR0, CR4 and RFLAGS. It makes no calls while
+//!   protection is disabled and never publishes a writable PTE. Live CPUs use `WRSS` instead.
 //! - **SSP MSRs.** `init_cpu` points `IA32_INTERRUPT_SSP_TABLE_ADDR` at the CPU's table in its
 //!   processor control region, whose IST 1 entry (`set_ist_ssp`) is the backup stack's token,
 //!   and zeroes `IA32_PL0_SSP` to `IA32_PL2_SSP`. `set_entry_ssp` then points `IA32_PL0_SSP` at
@@ -58,7 +57,7 @@
 //!   address of the incoming context's own `call` into the switch, which `switch_finish_hook`'s
 //!   `ret` pops along with the normal stack's copy. These instructions raise #UD while CET is
 //!   off, so the sequence is an `alternative!` for the `shstk` feature, which
-//!   `alternative::early_init` selects once [`enabled_for_cpu`] is true; otherwise the slot
+//!   `alternative::early_init` selects once `enabled_for_cpu` is true; otherwise the slot
 //!   holds NOPs.
 //! - **New contexts.** `setup_initial_call` builds a new context's kernel stack by hand, with
 //!   `func` and, for user contexts, `enter_usermode` as return addresses no `call` pushed. It
@@ -79,7 +78,7 @@
 //! - **Saved-RIP edits.** A handler that resumes interrupted ring-0 code at a different RIP
 //!   (the `rdmsr_safe`/`wrmsr_safe` #GP recovery, and the breakpoint handler for a ring-0
 //!   `int3`) also moves the return address in the CPU's shadow-stack interrupt frame, with
-//!   [`retarget_kernel_return`], or `IRETQ` would raise #CP. The frame is found by its layout
+//!   `retarget_kernel_return`, or `IRETQ` would raise #CP. The frame is found by its layout
 //!   ([`ferric_cet::shstk::find_supervisor_interrupt_frame`]) between `SSP` and the top of the
 //!   running shadow stack, and rewritten with `WRSS`. Interrupts from ring 3 push no shadow
 //!   frame, so their RIP edits need nothing.
@@ -91,17 +90,12 @@
 //!
 //! - **KPTI.** KPTI's user-mode page tables do not map the kernel shadow stacks, and switching
 //!   SSP alongside RSP on the KPTI entry trampoline is not implemented. Shadow stacks are
-//!   therefore left off whenever KPTI is on ([`enabled_for_cpu`] is `decision() && !kpti`), so on
+//!   therefore left off whenever KPTI is on (`enabled_for_cpu` is `decision() && !kpti`), so on
 //!   a Meltdown-affected Intel CPU with `kpti = "auto"` the stacks are allocated but CET stays
 //!   off. `shstk = "always"` with KPTI not `never` is rejected at config time and panics at boot.
-//! - **Physical-map alias.** Shadow-stack frames are still mapped writable in the physical memory
-//!   map. The kernel itself no longer writes through it once CET is on for a CPU, but an attacker
-//!   with a kernel write primitive could. Removing it means splitting the 1 GiB / 2 MiB pages of
-//!   the physical map around each frame (or carving a frame pool out of it at boot), which `rmm`
-//!   does not support yet.
-//! - **Hardware validation.** None of the CET paths (enable, SYSCALL token handling, the
-//!   single-step IRETQ exit, the saved-RIP shadow sync, `WRSS` writes) has run on CET hardware;
-//!   QEMU does not emulate CET and the CI runners' KVM does not expose it.
+//! - **Hardware validation.** An older CET-enabled image passed its enable self-test on Kleya,
+//!   then raised #CP during syscall fuzzing (#78). The current implementation needs a fresh
+//!   CET-enabled rerun; CI boots without CET do not establish hardware enforcement.
 //!
 //! The `SYSCALL` single-step fallback returns with `IRETQ` and skips the exit `CLRSSBSY`, leaving
 //! `SSP` at the busy supervisor token as after an interrupt from ring 3; `IRETQ` to ring 3 frees
@@ -111,6 +105,11 @@
 
 use ferric_cet::{Feature, Policy};
 use spin::Once;
+
+#[cfg(shstk_compiled)]
+mod private_frames;
+#[cfg(shstk_compiled)]
+pub(crate) use private_frames::{pool_region, recover_pool_probe, reserve_pool};
 
 #[cfg(shstk_compiled)]
 use self::stacks::window_covers_ram;
@@ -142,8 +141,8 @@ fn cpu_has_shstk() -> bool {
 /// Whether this boot uses shadow stacks: the policy applied to the bootstrap processor's CPUID.
 /// Always false when the build has no shadow-stack support.
 ///
-/// "Uses" means they are allocated, mapped and the SSP MSRs kept up to date; CET itself is not
-/// turned on yet (see the module documentation).
+/// "Uses" means stacks are allocated, mapped and their SSP MSRs maintained.
+/// [`enabled_for_cpu`] additionally decides whether the CPU turns CET on.
 pub fn decision() -> bool {
     if POLICY == Policy::Never {
         return false;
@@ -237,8 +236,14 @@ impl core::fmt::Display for FrameError {
 impl core::error::Error for FrameError {}
 
 /// Logs whether the CPU supports shadow stacks and what the policy decided. Called once, on the
-/// BSP, before [`enable_cpu`] turns them on. Does nothing when the policy is `never`.
+/// BSP, before the startup enable sequence turns them on. Does nothing when the policy is `never`.
+///
+/// # Panics
+///
+/// If the compiled shadow-stack pool fails its allocation, mapping or write-protection self-test.
 pub fn report() {
+    #[cfg(shstk_compiled)]
+    stacks::check_pool();
     if POLICY == Policy::Never {
         return;
     }
@@ -274,22 +279,18 @@ mod stacks {
         self, InitialShadowStack, LayoutError, SlotWindow, ENTRY_BYTES, INTERRUPT_SSP_TABLE_ENTRIES,
     };
 
-    use super::FrameError;
+    use super::{private_frames, FrameError};
     use rmm::Arch;
 
     use crate::{
         arch::consts::{shadow_stack_window_offset, SHADOW_STACK_WINDOW_SIZE},
         memory::{
-            allocate_p2frame, deallocate_p2frame, Enomem, Frame, KernelMapper, PageFlags,
-            PhysicalAddress, RmmA, VirtualAddress, PAGE_SIZE,
+            Enomem, KernelMapper, PageFlags, PhysicalAddress, RmmA, VirtualAddress, PAGE_SIZE,
         },
     };
 
-    /// Frame order of a shadow stack: 8 KiB, 1024 return addresses.
-    const ORDER: u32 = 1;
-
     /// Size of a shadow stack in bytes.
-    const SIZE: usize = PAGE_SIZE << ORDER;
+    const SIZE: usize = shstk::pool::STACK_BYTES as usize;
 
     /// Log2 of a kernel stack's size and alignment (64 KiB, see `Kstack`).
     const KSTACK_SHIFT: u32 = 16;
@@ -331,7 +332,7 @@ mod stacks {
     pub enum ShadowStackError {
         /// The kernel stack has no slot in the window, or a layout was invalid.
         Layout(LayoutError),
-        /// No physical memory for the shadow stack.
+        /// The reserved shadow-stack frame pool is exhausted.
         NoFrames,
         /// No physical memory for the page tables mapping the page at `addr`.
         NoPageTables {
@@ -350,7 +351,7 @@ mod stacks {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Layout(_) => f.write_str("invalid shadow-stack layout"),
-                Self::NoFrames => f.write_str("out of memory for a shadow stack"),
+                Self::NoFrames => f.write_str("reserved shadow-stack pool exhausted"),
                 Self::NoPageTables { addr } => {
                     write!(f, "out of memory for page tables mapping {addr:#x}")
                 }
@@ -377,7 +378,7 @@ mod stacks {
     /// A kernel stack's supervisor shadow stack, mapped in the shadow-stack window, with its
     /// supervisor token in the highest entry. Unmapped and freed on drop.
     pub struct ShadowStack {
-        frame: Frame,
+        frame: Option<shstk::pool::StackFrame>,
         /// Lowest mapped address.
         base: usize,
         /// End (exclusive) of the mapping, the top of the slot.
@@ -398,17 +399,31 @@ mod stacks {
             if !super::decision() {
                 return Ok(None);
             }
+            Self::allocate(kstack).map(Some)
+        }
+
+        fn allocate(kstack: PhysicalAddress) -> Result<Self, ShadowStackError> {
             let top = window().slot_top(kstack.data() as u64)? as usize;
             let base = top.checked_sub(SIZE).ok_or(LayoutError::Overflow)?;
-            let frame = allocate_p2frame(ORDER, true).ok_or(ShadowStackError::NoFrames)?;
+            let frame = Some(private_frames::allocate().ok_or(ShadowStackError::NoFrames)?);
             let stack = Self { frame, base, top };
             // Mapped first: once CET is on, `write_entry` writes through this mapping.
             stack.map()?;
+            if current_ssp().is_some() {
+                for addr in (base..top).step_by(ENTRY_BYTES as usize) {
+                    stack.write_entry(addr, 0);
+                }
+            } else {
+                let entries = SIZE
+                    .checked_div(ENTRY_BYTES as usize)
+                    .expect("shadow-stack entries have a nonzero width");
+                private_frames::initialize(&stack, base, 0, entries);
+            }
             stack.write_entry(
                 stack.supervisor_token(),
                 shstk::supervisor_token(stack.supervisor_token() as u64)?,
             );
-            Ok(Some(stack))
+            Ok(stack)
         }
 
         /// Address of the supervisor shadow-stack token, the value for `IA32_PL0_SSP` and the
@@ -453,8 +468,8 @@ mod stacks {
 
         /// Writes one entry. Once CET shadow stacks are on for the running CPU this is a `WRSS`
         /// through the shadow-stack mapping ([`wrss`]); before that (or on boots where CET stays
-        /// off) `WRSS` would raise #UD, so it writes through the physical memory map, whose alias
-        /// of the frame is writable.
+        /// off) initialization uses a bounded pre-enable store with CPU protection state saved
+        /// and restored. The page tables never contain a writable alias.
         ///
         /// # Panics
         ///
@@ -468,12 +483,7 @@ mod stacks {
                 wrss(addr, value);
                 return;
             }
-            // Cannot wrap: `addr` is at or above `base` (asserted).
-            let phys = self.frame.base().add(addr.wrapping_sub(self.base));
-            let ptr = RmmA::phys_to_virt(phys).data() as *mut u64;
-            // SAFETY: the frame belongs to this shadow stack alone and the physical memory map
-            // covers it; the assertion keeps the 8-byte-aligned entry inside the frame.
-            unsafe { ptr.write_volatile(value) };
+            private_frames::initialize(self, addr, value, 1);
         }
 
         /// Maps the frame at `base..top` with the shadow-stack page encoding. On failure the
@@ -486,7 +496,7 @@ mod stacks {
             );
             let mut mapper = KernelMapper::lock_rw();
             for (i, virt) in self.pages().enumerate() {
-                let phys = self.frame.next_by(i).base();
+                let phys = self.physical_page(i);
                 // SAFETY: the slot is this kernel stack's alone and was unmapped (slots are keyed
                 // by the stack's physical address); the frame is ours.
                 let flush = unsafe { mapper.map_phys(virt, phys, page_flags(), 0) }
@@ -501,6 +511,25 @@ mod stacks {
             (self.base..self.top)
                 .step_by(PAGE_SIZE)
                 .map(VirtualAddress::new)
+        }
+
+        /// First physical byte of the allocation retained until mappings are retired on drop.
+        pub(super) fn physical_base(&self) -> usize {
+            self.frame
+                .as_ref()
+                .expect("shadow-stack allocation remains owned until Drop retires its mappings")
+                .physical_address() as usize
+        }
+
+        fn physical_page(&self, index: usize) -> PhysicalAddress {
+            let offset = index
+                .checked_mul(PAGE_SIZE)
+                .expect("shadow-stack page index is bounded by its two mapped pages");
+            PhysicalAddress::new(
+                self.physical_base()
+                    .checked_add(offset)
+                    .expect("reserved shadow-stack pages fit the physical address space"),
+            )
         }
 
         /// Unmaps the pages `map` mapped and flushes them from every CPU's TLB.
@@ -530,8 +559,9 @@ mod stacks {
                 );
             }
             self.unmap();
-            // SAFETY: allocated with this order in `for_kstack`, and unmapped above.
-            unsafe { deallocate_p2frame(self.frame, ORDER) };
+            if let Some(frame) = self.frame.take() {
+                private_frames::release(frame);
+            }
         }
     }
 
@@ -543,6 +573,59 @@ mod stacks {
                 self.base, self.top, self.frame
             )
         }
+    }
+
+    /// Exercises the actual pool, mappings and pre-enable writer even on CI without CET.
+    pub(super) fn check_pool() {
+        // A key within the boot reservation can never belong to a real kernel stack, which is
+        // allocated from the ordinary frame allocator. Its window slot is exclusively ours.
+        let key = private_frames::pool_region()
+            .range()
+            .start
+            .next_multiple_of(1 << KSTACK_SHIFT);
+        for _ in 0..2 {
+            let stack = ShadowStack::allocate(PhysicalAddress::new(key as usize))
+                .unwrap_or_else(|err| panic!("CET: pool isolation self-test allocation: {err}"));
+            {
+                let mapper = KernelMapper::lock_ro();
+                for (i, virt) in stack.pages().enumerate() {
+                    let physical = stack.physical_page(i);
+                    assert!(
+                        mapper.translate(RmmA::phys_to_virt(physical)).is_none(),
+                        "CET: pool frame has a physical-map alias"
+                    );
+                    let (mapped, flags) = mapper
+                        .translate(virt)
+                        .expect("self-test stack is mapped before publication");
+                    assert_eq!(mapped, physical);
+                    assert!(shstk::is_supervisor_shadow_stack_pte(flags.data() as u64));
+                }
+            }
+            let second = stack
+                .base
+                .checked_add(PAGE_SIZE)
+                .expect("mapped two-page shadow stack has an addressable second page");
+            for addr in [stack.base, second] {
+                use private_frames::{check_write_rejected, ProbeAlias};
+                assert_eq!(
+                    check_write_rejected(&stack, addr, ProbeAlias::ShadowStack),
+                    0
+                );
+                stack.write_entry(addr, 0x1234_5678);
+                for alias in [
+                    ProbeAlias::ShadowStack,
+                    ProbeAlias::PhysicalMap,
+                    ProbeAlias::BootPhysicalMap,
+                ] {
+                    assert_eq!(check_write_rejected(&stack, addr, alias), 0x1234_5678);
+                }
+            }
+            stack
+                .install_initial(&[0xAAAA])
+                .expect("one self-test return fits a shadow stack");
+            // Drop tests retirement and pool reuse; the next allocation must be cleared.
+        }
+        info!("CET: shadow-stack pool isolation self-test passed");
     }
 
     /// The SSP MSRs the kernel writes.
@@ -767,7 +850,8 @@ mod stacks {
     ///
     /// # Panics
     ///
-    /// When `SSP` is zero, lies outside `shadow`, or the round trip does not restore it.
+    /// When `SSP` is zero, lies outside `shadow`, the round trip does not restore it, or the
+    /// post-enable pool isolation and WRSS self-test fails.
     pub fn confirm_enabled(shadow: &ShadowStack, bsp: bool) {
         SHSTK_LIVE.store(true, core::sync::atomic::Ordering::Release);
 
@@ -790,6 +874,9 @@ mod stacks {
         );
 
         if bsp {
+            // Exercise the same isolation and reuse checks with real WRSS and CET-safe #PF
+            // recovery now that this CPU's shadow stack is live.
+            check_pool();
             info!("CET: shadow stacks enabled, self-test passed");
         } else {
             debug!("CET: shadow stacks enabled on this CPU, self-test passed");

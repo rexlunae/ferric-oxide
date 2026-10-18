@@ -1,5 +1,5 @@
 //! Intel Control-flow Enforcement Technology (CET) for the Ferric Oxide kernel: indirect branch
-//! tracking (IBT) and, in preparation, supervisor shadow stacks.
+//! tracking (IBT) and supervisor shadow stacks.
 //!
 //! With IBT on, every indirect `call` or `jmp`, and every entry through the IDT or `SYSCALL`,
 //! must land on an `endbr64` instruction, or the CPU raises a control-protection exception
@@ -16,9 +16,10 @@
 //!   supervisor and restore tokens, a new context's initial shadow stack and the slot window the
 //!   kernel maps shadow stacks in.
 //!
-//! The kernel side (`kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4 for IBT. For shadow
-//! stacks, `kernel/src/arch/x86_64/shstk.rs` allocates and maps them and keeps the SSP MSRs and
-//! context switches ready, but nothing turns them on yet. User-mode CET is not covered here.
+//! The kernel side (`crates/kernel/src/arch/x86_64/ibt.rs`) writes the MSR and CR4 for IBT. For shadow
+//! stacks, `crates/kernel/src/arch/x86_64/shstk.rs` allocates private frames and keeps SSP MSRs and
+//! context switches consistent, and enables them where configured and supported. User-mode CET
+//! is not covered here.
 //!
 //! Specification: Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 1,
 //! chapter 17 ("Control-flow Enforcement Technology"); Volume 2, `CPUID` leaf 07H; Volume 3A,

@@ -34,7 +34,7 @@ passed, or that a feature is enabled in every image.
 | Feature configuration | TOML catalog, interactive editor, CLI, validation and generation of Make, image and kernel settings | Catalog defaults apply through `ferric.toml`; no file preserves the upstream-style build path |
 | CPU state | x86-64-v3 baseline for configured user-space builds; optional v4, AVX and AVX-512 state saving, boot checks | Prebuilt packages and toolchain libraries do not acquire local CPU flags |
 | Memory protection | Physical-map and kernel-image KASLR, user ASLR, `PROT_NONE` guards, KPTI and PCID support | Address randomization uses RDRAND with a fixed-layout fallback; fixed user mappings are not relocated |
-| CET | Optional supervisor indirect branch tracking (IBT), plus shadow-stack allocation and bookkeeping | Shadow-stack enforcement and user-mode CET are not enabled |
+| CET | Optional supervisor IBT and shadow-stack enforcement with private frame pools | Shadow stacks require KPTI off; fresh CET hardware validation is pending (#78); user-mode CET remains off |
 | DMA isolation | Intel VT-d and AMD-Vi DMA domains, driver binding, IOVA translation, revocation and an enforce policy | IOMMU defaults to `never`; AMD interrupt remapping is not implemented |
 | Registered buffers | Anonymous-memory registration, byte grants, sub-grants, CPU mappings and page-aligned DMA grants | Off by default; partial pages use bounce buffers; existing production I/O is not automatically converted |
 | `fox` | Local signed archives, installed-file verification, in-place install/remove, CycloneDX SBOMs | No repository downloader, dependency solver or generation/rollback store; not the image build's package installer |

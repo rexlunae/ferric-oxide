@@ -228,6 +228,10 @@ interrupt_error!(protection, |stack, code| {
 
 interrupt_error!(page, |stack, code| {
     let cr2 = VirtualAddress::new(unsafe { x86::controlregs::cr2() });
+    #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+    if crate::arch::shstk::recover_pool_probe(stack, code, cr2.data()) {
+        return;
+    }
     let arch_flags = PageFaultError::from_bits_truncate(code as u32);
     let mut generic_flags = GenericPfFlags::empty();
 

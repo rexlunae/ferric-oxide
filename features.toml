@@ -676,7 +676,10 @@ newer) and logs a boot self-test; "always" additionally panics at boot on CPUs
 without it. On a CPU without CET_SS, or with more than 1 TiB of RAM, "auto"
 stays off and logs that it is skipping. Enabling alongside kernel.cpu.kpti is
 not yet supported: with KPTI on, shadow stacks are allocated but left off
-("always" then panics, so use "auto"). Independent of kernel.cpu.ibt. Like the
+("always" then panics, so use "auto"). Independent of kernel.cpu.ibt. Compiled
+shadow-stack support reserves a private 32 MiB frame pool (4096 stacks), excluded
+from the writable physical map. Pool exhaustion fails allocation without a
+writable fallback. Like the
 other "auto" CPU options it acts as "never" without kernel.self_modifying. Off
 by default because CI cannot test it: KVM on the runners does not expose CET and
 QEMU's emulator does not implement it."""

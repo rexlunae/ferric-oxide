@@ -227,6 +227,7 @@ jobs:
       # detection line and the matching "left off"/"not enabled" line (never the "enabling CET" one).
       - name: Check shadow-stack detection
         run: |
+          grep -aF "CET: shadow-stack pool isolation self-test passed" "$LOG"
           grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off)" "$LOG"
           grep -aE "CET: (shadow stacks not enabled on this boot|supervisor shadow stacks allocated but left off \(KPTI is on)" "$LOG"
           if grep -aF "CET: supervisor shadow stacks allocated for every kernel stack; enabling CET" "$LOG"; then

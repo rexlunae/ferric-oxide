@@ -15,6 +15,7 @@ on:
       - "features.toml"
       - "tools/ferric-config/**"
       - "scripts/ferric-ci/boot-smoke.sh"
+      - "scripts/ferric-ci/boot-cet.sh"
       - ".github/workflows/cet-image.yml"
 
 concurrency:
@@ -85,10 +86,35 @@ jobs:
       - name: Compress image
         run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
 
+      - name: Record the exact CET build
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cp "$FERRIC_KERNEL_CONFIG" kernel-config.toml
+          symbols="$(find recipes/core/kernel/target -type f -name kernel.all -print -quit)"
+          test -n "$symbols"
+          cp "$symbols" kernel.all
+          cp scripts/ferric-ci/boot-cet.sh scripts/ferric-ci/boot-smoke.sh .
+          {
+            printf 'checkout_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'pr_head_commit=%s\n' "$PR_HEAD_SHA"
+            printf 'run_id=%s\nrun_attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'kernel_features=%s\n' "$FERRIC_KERNEL_FEATURES"
+            printf 'kernel_link_args=%s\n' "$FERRIC_KERNEL_LINK_ARGS"
+          } > build-info.txt
+          sha256sum harddrive.img.zst kernel.all kernel-config.toml build-info.txt boot-cet.sh boot-smoke.sh > SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: ferric-cet-image
-          path: harddrive.img.zst
+          path: |
+            harddrive.img.zst
+            kernel.all
+            kernel-config.toml
+            build-info.txt
+            SHA256SUMS
+            boot-cet.sh
+            boot-smoke.sh
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
@@ -134,6 +160,7 @@ jobs:
 
       - name: Check CET reporting
         run: |
+          grep -aF "CET: shadow-stack pool isolation self-test passed" "$LOG"
           grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off)" "$LOG"
           if grep -aF "CET: shadow stacks supported=true" "$LOG"; then
             # A runner with CET passed through: then the self-test must have passed.

@@ -176,6 +176,17 @@ jobs:
         run: make -C "$KERNEL_DIR" BUILD="$RUNNER_TEMP/kernel-shstk" OBJCOPY=objcopy KERNEL_CARGO_FEATURES="$KERNEL_CARGO_FEATURES" all
       - name: Check the shadow-stack sequences
         run: scripts/ferric-ci/check-kernel-shstk.sh "$RUNNER_TEMP/kernel-shstk/kernel.all"
+      - name: Document the enabled shadow-stack APIs
+        if: matrix.ibt == 'never'
+        working-directory: crates/kernel
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps \
+            --features "$KERNEL_CARGO_FEATURES" \
+            --target targets/x86_64-unknown-kernel.json \
+            -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+            -Z json-target-spec
       - name: Check endbr64 at entry points
         if: matrix.ibt != 'never'
         run: scripts/ferric-ci/check-kernel-ibt.sh "$RUNNER_TEMP/kernel-shstk/kernel.all"

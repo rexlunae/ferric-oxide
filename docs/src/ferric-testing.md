@@ -54,6 +54,7 @@ IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -98,7 +99,7 @@ test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
-enables IOMMU `auto`, shadow-stack preparation `auto` and registered buffers,
+enables IOMMU `auto`, shadow-stack policy `auto` and registered buffers,
 and builds a second kernel/image with IOMMU `enforce`. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer result markers, KASLR/KPTI logs, shadow-stack detection and
@@ -152,6 +153,34 @@ output. It uses KVM with `host` when available and otherwise TCG with `max`.
 `BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
 interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
 later; the workflow uses a newer-QEMU container for that variant.
+
+### CET image and Kleya rerun
+
+`cet-image.yml` builds a separate smoke image with `kernel.cpu.shstk=auto`,
+`kernel.cpu.ibt=auto`, and KPTI `auto`. Its `ferric-cet-image` artifact contains
+`harddrive.img.zst`, the unstripped `kernel.all`, `kernel-config.toml`,
+`build-info.txt`, the two boot helper scripts, and `SHA256SUMS`. Build metadata distinguishes the checked-out
+PR merge commit from the PR head and records the run ID and kernel settings.
+Use all files from the same successful run; retain the symbols for #CP traces.
+
+On Kleya, download and extract the fresh artifact, then verify it and use its
+included rerun helper:
+
+```sh
+sha256sum -c SHA256SUMS
+zstd -d harddrive.img.zst -o harddrive.img
+bash boot-cet.sh harddrive.img serial-cet-kleya.log
+```
+
+The helper requires writable KVM and uses `-cpu host,migratable=off`, which
+exposed CET on Kleya where plain `host` hid it. It runs the existing disposable
+image smoke harness and requires CET detection **and enablement**, the pool
+isolation self-test, syscall fuzz success and clean smoke completion. A CET
+skip or KPTI preventing enablement does not count as a successful rerun.
+Preserve `build-info.txt`, `SHA256SUMS`, `kernel.all`, the serial log and QEMU
+version with the result for [#78](https://github.com/rexlunae/ferric-oxide/issues/78).
+The image workflow's ordinary CET-disabled CI boot validates the pool and
+fallback boot, not this hardware result.
 
 The harness rejects crashes and `FERRIC_TEST_FAIL` markers and requires the
 smoke completion marker. A completion marker alone is insufficient because

@@ -52,6 +52,8 @@
 
 use core::fmt;
 
+pub mod pool;
+
 /// `IA32_PL0_SSP`: the shadow-stack pointer the CPU loads on a transition to ring 0 that does not
 /// use an IST stack.
 pub const IA32_PL0_SSP: u32 = 0x6A4;
@@ -375,6 +377,9 @@ impl SlotWindow {
         let Some(end) = end.checked_mul(slot_size) else {
             return None;
         };
+        if end > self.len {
+            return None;
+        }
         let Some(top) = self.base.checked_add(end) else {
             return None;
         };
@@ -643,6 +648,24 @@ mod tests {
             LayoutError::OutsideWindow { key: 1 << 40 }
                 .to_string()
                 .contains("0x10000000000")
+        );
+    }
+
+    #[test]
+    fn partial_final_slot_does_not_extend_past_window() {
+        let window = SlotWindow {
+            base: 0x1000,
+            len: 0x1800,
+            key_shift: 12,
+            slot_shift: 12,
+        };
+        assert!(window.slot_top(0x1000).is_err());
+        for addr in [0x2000, 0x2400, 0x27FF] {
+            assert_eq!(window.stack_containing(addr, 0x1000), None);
+        }
+        assert_eq!(
+            window.stack_containing(0x1FFF, 0x1000),
+            Some((0x1000, 0x2000))
         );
     }
 
