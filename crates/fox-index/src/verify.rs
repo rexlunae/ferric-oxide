@@ -55,7 +55,11 @@ pub const TIMESTAMP_FILE: &str = "metadata/timestamp.json";
 /// Delegated metadata, `metadata/delegations/<name>.json`.
 pub const DELEGATIONS_DIR: &str = "metadata/delegations";
 
-/// Largest metadata file read.
+/// Largest metadata or signed target file read.
+///
+/// The limit covers files whose length comes from signed metadata, so a
+/// signer cannot make a client allocate an arbitrary amount of memory while
+/// verifying a checkout.
 const MAX_METADATA: u64 = 16 * 1024 * 1024;
 
 /// Why a registry checkout did not verify.
@@ -328,6 +332,10 @@ fn verify_targets(
     }
     for delegation in &targets.signed.delegations {
         let name = format!("delegations/{}.json", delegation.name);
+        // The name becomes a filesystem path below; a delegation whose name
+        // contains `..` or an absolute component would otherwise read
+        // metadata outside the checkout.
+        check_path(&name)?;
         let file = format!("{METADATA_DIR}/{name}");
         let delegated: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
         verify_keys(&delegated, &delegation.keys, &file)?;
@@ -413,7 +421,7 @@ fn load<T: for<'de> Deserialize<'de>>(
     dir: &Path,
     file: &str,
 ) -> Result<(Vec<u8>, Signed<T>), VerifyError> {
-    let bytes = read_limited(&dir.join(file), MAX_METADATA)?;
+    let bytes = read_limited(dir, file, MAX_METADATA)?;
     let parsed = Signed::from_json(&bytes).map_err(|source| VerifyError::Metadata {
         file: file.to_owned(),
         source,
@@ -428,7 +436,7 @@ fn load_described<T: for<'de> Deserialize<'de> + Versioned>(
     file: &str,
     described: &VersionMeta,
 ) -> Result<Signed<T>, VerifyError> {
-    let bytes = read_limited(&dir.join(file), described.file.length)?;
+    let bytes = read_limited(dir, file, described.file.length)?;
     if !described.file.matches(&bytes) {
         return Err(VerifyError::HashMismatch {
             file: file.to_owned(),
@@ -448,21 +456,33 @@ fn load_described<T: for<'de> Deserialize<'de> + Versioned>(
     Ok(parsed)
 }
 
-/// Reads at most `limit` bytes, failing if the file is longer.
-fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, VerifyError> {
+/// Reads the file `file` under `base`, at most `limit` bytes, failing if it
+/// is longer.
+///
+/// The resolved path must stay inside `base`, so a symlink in the checkout
+/// cannot make a read follow it outside the registry, and `limit` is capped
+/// at [`MAX_METADATA`] so metadata cannot name an unbounded length.
+fn read_limited(base: &Path, file: &str, limit: u64) -> Result<Vec<u8>, VerifyError> {
+    let path = base.join(file);
     let io_error = |source| VerifyError::Io {
-        path: path.to_path_buf(),
+        path: path.clone(),
         source,
     };
-    let file = fs::File::open(path).map_err(io_error)?;
+    let base = fs::canonicalize(base).map_err(io_error)?;
+    let resolved = fs::canonicalize(&path).map_err(io_error)?;
+    if !resolved.starts_with(&base) {
+        return Err(VerifyError::UnsafePath {
+            path: file.to_owned(),
+        });
+    }
+    let limit = limit.min(MAX_METADATA);
+    let file = fs::File::open(&resolved).map_err(io_error)?;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > limit {
-        return Err(VerifyError::TooLarge {
-            path: path.to_path_buf(),
-        });
+        return Err(VerifyError::TooLarge { path });
     }
     Ok(bytes)
 }
@@ -501,8 +521,10 @@ impl VerifiedRegistry {
     /// # Errors
     ///
     /// [`VerifyError::UnknownTarget`] if no metadata lists it,
-    /// [`VerifyError::Io`] or [`VerifyError::TooLarge`] if it cannot be
-    /// read, and [`VerifyError::HashMismatch`] if it does not match.
+    /// [`VerifyError::UnsafePath`] if `path` or a symlink under it leaves
+    /// the registry, [`VerifyError::Io`] or [`VerifyError::TooLarge`] if it
+    /// cannot be read, and [`VerifyError::HashMismatch`] if it does not
+    /// match.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
         check_path(path)?;
         let meta = self
@@ -511,7 +533,7 @@ impl VerifiedRegistry {
             .ok_or_else(|| VerifyError::UnknownTarget {
                 path: path.to_owned(),
             })?;
-        let bytes = read_limited(&self.dir.join(path), meta.length)?;
+        let bytes = read_limited(&self.dir, path, meta.length)?;
         if !meta.matches(&bytes) {
             return Err(VerifyError::HashMismatch {
                 file: path.to_owned(),
@@ -535,10 +557,20 @@ impl VerifiedRegistry {
     /// invalid.
     pub fn config(&self) -> Result<RegistryConfig, VerifyError> {
         let text = self.read_text(REGISTRY_FILE)?;
-        RegistryConfig::from_toml(&text).map_err(|source| VerifyError::Layout {
+        let config = RegistryConfig::from_toml(&text).map_err(|source| VerifyError::Layout {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
-        })
+        })?;
+        // The signed root fixes the registry's name; a `registry.toml` that
+        // claims a different one must not let a caller qualify packages
+        // under an identity the root does not authorize.
+        if config.name != self.root.registry {
+            return Err(VerifyError::RegistryName {
+                trusted: self.root.registry.clone(),
+                found: config.name,
+            });
+        }
+        Ok(config)
     }
 
     /// The names of every signed package file.
@@ -622,5 +654,21 @@ mod tests {
         for bad in ["", "/etc/passwd", "../x", "a/../b", "./a", "a\\b"] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn described_lengths_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big"),
+            vec![0u8; (MAX_METADATA as usize) + 1],
+        )
+        .unwrap();
+        // A signed length larger than the cap cannot make the reader
+        // allocate an unbounded buffer; the file still trips the limit.
+        assert!(matches!(
+            read_limited(dir.path(), "big", u64::MAX),
+            Err(VerifyError::TooLarge { .. })
+        ));
     }
 }

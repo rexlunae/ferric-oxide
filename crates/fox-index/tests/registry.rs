@@ -6,9 +6,11 @@ use std::path::Path;
 
 use fox_core::trust::AuthorKey;
 use fox_core::{Blake3Digest, KeyId, PackageName};
-use fox_index::edit::{Keyring, Registry, SignOptions, single_key_roles};
+use fox_index::edit::{EditError, Keyring, Registry, SignOptions, single_key_roles};
 use fox_index::layout::{PackageEntry, Release};
-use fox_index::metadata::{RoleKeys, RoleName, Signed, Snapshot, Targets, Timestamp};
+use fox_index::metadata::{
+    FileMeta, RoleKeys, RoleName, Root, Signed, Snapshot, Targets, Timestamp,
+};
 use fox_index::verify::{self, ClientState, VerifyError};
 use pkgar_core::dryoc::classic::crypto_sign::crypto_sign_seed_keypair;
 use semver::Version;
@@ -369,4 +371,208 @@ fn admitting_twice_or_releasing_twice_is_refused() {
     registry.add_release(&ripgrep(), release(1)).unwrap();
     assert!(registry.add_release(&ripgrep(), release(1)).is_err());
     assert!(Registry::init(dir.path(), "again", &single_key_roles(key(1)), now()).is_err());
+}
+
+/// Re-signs the snapshot and timestamp around a hand-edited `targets.json`,
+/// as a maintainer would, keeping their versions.
+fn reseal(dir: &Path, seed: u8) {
+    let targets = fs::read(dir.join("metadata/targets.json")).unwrap();
+    let mut snapshot: Signed<Snapshot> = read(dir, "metadata/snapshot.json");
+    snapshot.signed.meta.get_mut("targets.json").unwrap().file = FileMeta::of(&targets);
+    snapshot.signatures.clear();
+    snapshot.sign(&secret(seed)).unwrap();
+    let snapshot_bytes = snapshot.to_json().unwrap();
+    fs::write(dir.join("metadata/snapshot.json"), &snapshot_bytes).unwrap();
+
+    let mut timestamp: Signed<Timestamp> = read(dir, "metadata/timestamp.json");
+    timestamp.signed.snapshot.file = FileMeta::of(&snapshot_bytes);
+    timestamp.signatures.clear();
+    timestamp.sign(&secret(seed)).unwrap();
+    fs::write(
+        dir.join("metadata/timestamp.json"),
+        timestamp.to_json().unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_delegation_name_cannot_leave_the_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = admitted(dir.path());
+    let mut state = client(&registry);
+
+    let mut targets: Signed<Targets> = read(dir.path(), "metadata/targets.json");
+    targets.signed.delegations.first_mut().unwrap().name = "../escape".to_owned();
+    targets.signatures.clear();
+    targets.sign(&secret(MAINTAINER)).unwrap();
+    fs::write(
+        dir.path().join("metadata/targets.json"),
+        targets.to_json().unwrap(),
+    )
+    .unwrap();
+    reseal(dir.path(), MAINTAINER);
+
+    assert!(matches!(
+        verify::update(dir.path(), &mut state, now()),
+        Err(VerifyError::UnsafePath { .. })
+    ));
+}
+
+#[test]
+fn the_config_name_must_match_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let mut state = client(&registry);
+    let mut config = registry.config().unwrap();
+    config.name = "spoofed".to_owned();
+    registry.set_config(&config).unwrap();
+    registry
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert!(matches!(
+        verified.config(),
+        Err(VerifyError::RegistryName { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_cannot_leave_the_checkout() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = admitted(dir.path());
+    let mut state = client(&registry);
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("secret.toml");
+    fs::write(&target, b"not the package").unwrap();
+    let package = dir.path().join("packages/ri/ripgrep.toml");
+    fs::remove_file(&package).unwrap();
+    symlink(&target, &package).unwrap();
+
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert!(matches!(
+        verified.read("packages/ri/ripgrep.toml"),
+        Err(VerifyError::UnsafePath { .. })
+    ));
+}
+
+#[test]
+fn a_scheduled_run_cannot_renew_a_role_it_cannot_finish() {
+    const T1: u8 = 4;
+    const T2: u8 = 5;
+    let dir = tempfile::tempdir().unwrap();
+    let mut roles = single_key_roles(key(MAINTAINER));
+    roles.insert(RoleName::Timestamp, RoleKeys::new([key(T1), key(T2)], 2));
+    let mut registry = Registry::init(dir.path(), "test", &roles, now()).unwrap();
+    registry.admit(&entry()).unwrap();
+    let report = registry
+        .sign(
+            &keyring(&[MAINTAINER, OWNER, T1, T2]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    let mut state = client(&registry);
+    verify::update(dir.path(), &mut state, now()).unwrap();
+    let version = read::<Timestamp>(dir.path(), "metadata/timestamp.json")
+        .signed
+        .version;
+
+    // Past half of the one-day timestamp lifetime, one of its two keys
+    // must not renew it alone, or clients would reject the one-signature
+    // replacement until the other key signed.
+    let later = now() + Duration::hours(13);
+    let report = registry
+        .sign(&keyring(&[T1]), later, &SignOptions::default())
+        .unwrap();
+    let timestamp = report
+        .files
+        .iter()
+        .find(|file| file.file == "metadata/timestamp.json")
+        .unwrap();
+    assert!(!timestamp.bumped, "{timestamp:?}");
+    assert!(timestamp.complete());
+    assert_eq!(
+        read::<Timestamp>(dir.path(), "metadata/timestamp.json")
+            .signed
+            .version,
+        version
+    );
+    verify::update(dir.path(), &mut state, later).unwrap();
+
+    // Both keys renew it.
+    let report = registry
+        .sign(&keyring(&[T1, T2]), later, &SignOptions::default())
+        .unwrap();
+    let timestamp = report
+        .files
+        .iter()
+        .find(|file| file.file == "metadata/timestamp.json")
+        .unwrap();
+    assert!(timestamp.bumped, "{timestamp:?}");
+    verify::update(dir.path(), &mut state, later).unwrap();
+}
+
+#[test]
+fn an_incomplete_rotation_is_reported_and_amended() {
+    const NEW: u8 = 11;
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let options = SignOptions::default();
+    registry
+        .set_role(
+            RoleName::Root,
+            RoleKeys::new([key(NEW)], 1),
+            now(),
+            &options.lifetimes,
+        )
+        .unwrap();
+    // A first signature from the new key alone cannot complete the rotation.
+    let report = registry.sign(&keyring(&[NEW]), now(), &options).unwrap();
+    let root = report
+        .files
+        .iter()
+        .find(|file| file.file == "metadata/root/2.json")
+        .unwrap();
+    assert!(!root.complete(), "{root:?}");
+
+    // A later edit amends the pending root instead of stranding it.
+    registry
+        .set_role(
+            RoleName::Targets,
+            RoleKeys::new([key(NEW)], 1),
+            now(),
+            &options.lifetimes,
+        )
+        .unwrap();
+    assert!(!dir.path().join("metadata/root/3.json").exists());
+    let report = registry
+        .sign(&keyring(&[MAINTAINER, NEW]), now(), &options)
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(!dir.path().join("metadata/root/3.json").exists());
+}
+
+#[test]
+fn a_root_without_every_role_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    admitted(dir.path());
+    let mut root: Signed<Root> = read(dir.path(), "metadata/root/1.json");
+    root.signed.roles.remove(&RoleName::Targets);
+    fs::write(
+        dir.path().join("metadata/root/1.json"),
+        root.to_json().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        Registry::open(dir.path()),
+        Err(EditError::MissingRole { role: "targets" })
+    ));
 }
