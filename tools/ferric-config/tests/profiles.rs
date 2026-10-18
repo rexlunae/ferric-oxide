@@ -1,4 +1,4 @@
-//! Exercise CI image selection through the public CLI and generated Makefile.
+//! Exercise CI image selection through the CLI, Makefile and installer includes.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -154,15 +154,90 @@ fn assert_profile(profile: &str) {
             .join(include)
             .is_file()
     );
+
+    // Follow the path consumed by Make into the installer's real include loader.
+    let resolved =
+        redox_installer::Config::from_file(&fixture.dir.path().join(&values[2])).unwrap();
+    assert!(resolved.include.is_empty());
+    assert_eq!(resolved.general.filesystem_size, Some(512));
+    assert_profile_packages(profile, &resolved);
+    assert_profile_scripts(profile, &resolved);
+}
+
+fn assert_profile_packages(profile: &str, resolved: &redox_installer::Config) {
+    for package in [
+        "kernel",
+        "relibc",
+        "bootloader",
+        "redoxfs",
+        "base",
+        "ferric-xstate-test",
+        "ferric-aslr-test",
+        "ferric-guard-test",
+        "ferric-tlb-test",
+        "ferric-futex-test",
+        "ferric-syscall-fuzz",
+        "ferric-iommu-test",
+        "ferric-regbuf-test",
+    ] {
+        assert!(
+            matches!(
+                resolved.packages.get(package),
+                Some(redox_installer::PackageConfig::Build(rule)) if rule == "source"
+            ),
+            "{profile}: missing source package {package}"
+        );
+    }
+    // These packages and files come through minimal.toml and base.toml.
+    assert!(resolved.packages.contains_key("ion"));
+    assert!(resolved.packages.contains_key("libgcc"));
+    assert!(
+        resolved
+            .files
+            .iter()
+            .any(|file| file.path == "/etc/hostname")
+    );
+}
+
+fn assert_profile_scripts(profile: &str, resolved: &redox_installer::Config) {
+    let last_file = |path: &str| {
+        let file = resolved
+            .files
+            .iter()
+            .rev()
+            .find(|file| file.path == path)
+            .unwrap();
+        assert!(!file.append && !file.symlink && !file.directory);
+        file.data.as_str()
+    };
+    assert!(last_file("/usr/lib/init.d/30_console").contains("ion /usr/lib/ferric-smoke.ion"));
+    let script = last_file("/usr/lib/ferric-smoke.ion");
+    assert!(script.contains("echo FERRIC_SMOKE_BEGIN"));
+    assert!(script.contains("echo FERRIC_SMOKE_OK"));
+    assert!(script.contains("shutdown"));
+    if profile == "ferric-fuzz" {
+        assert!(
+            script.contains(
+                "ferric-syscall-fuzz --seed random --seconds 1200 --procs 8 --calls 20000"
+            )
+        );
+        assert!(!script.contains("ferric-xstate-test"));
+        assert!(!script.contains("--seed 1 --seconds 15"));
+    } else {
+        assert!(script.contains("ferric-xstate-test ||"));
+        assert!(script.contains("ferric-regbuf-test ||"));
+        assert!(script.contains("ferric-syscall-fuzz --seed 1 --seconds 15"));
+        assert!(!script.contains("--seed random"));
+    }
 }
 
 #[test]
-fn smoke_profile_keeps_saved_features_through_make() {
+fn smoke_profile_keeps_saved_features_through_make_and_installer() {
     assert_profile("ferric-smoke");
 }
 
 #[test]
-fn fuzz_profile_keeps_saved_features_through_make() {
+fn fuzz_profile_keeps_saved_features_through_make_and_installer() {
     assert_profile("ferric-fuzz");
 }
 

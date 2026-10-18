@@ -41,8 +41,10 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
       # warnings are only denied for Ferric Oxide's own tools.
+      # --no-deps keeps imported path dependencies (including the installer
+      # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-nospec -p ferric-vtd -p fox-core -p fox-sbom -p fox-store -p fox -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-nospec -p ferric-vtd -p fox-core -p fox-sbom -p fox-store -p fox -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)

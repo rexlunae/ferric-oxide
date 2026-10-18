@@ -23,9 +23,17 @@ buffer and IOMMU bookkeeping also need their feature-enabled runs. Check
 
 `.github/workflows/host-tools.yml` is the precise CI command list. It denies
 Clippy warnings for the fork's own tools and libraries and builds selected
-Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Imported host tools still have
-upstream lint warnings. It separately runs `cargo test --locked --lib` in
+Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Its selected-package Clippy check uses
+`--no-deps` because imported host tools still have upstream lint warnings,
+including when they are dependencies of a Ferric integration test. It separately
+runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test.
+
+`cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
+in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
+generated Makefile, then load the selected filesystem configuration through the
+installer's include resolver. They check inherited source packages, the effective
+boot script, image overrides and retention of saved CPU/kernel settings.
 
 Use `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps`
 in changed workspaces as required by `AGENTS.md`, accounting for the documented
