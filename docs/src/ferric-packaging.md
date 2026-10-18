@@ -324,7 +324,8 @@ fox --root ./image-root trust list
    `<root>/var/lib/fox/git/<id>`, keyed by the normalized URL (lowercase
    scheme and host, no trailing `/` or `.git`), which is also the source's
    identity in the trust store and in attestations. The cache mirrors the
-   remote's branches and tags. HTTPS uses `gix`'s reqwest transport with
+   remote's branches and tags; a tag deleted upstream is deleted from the
+   cache too, so a withdrawn release is not built. HTTPS uses `gix`'s reqwest transport with
    rustls on ring and is not built for Redox, where `fox` fetches over
    `file://`, `ssh://` (through `ssh`) and `git://` only.
 2. **Choose.** Without `#`, the newest release tag is built: the highest

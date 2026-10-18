@@ -27,7 +27,7 @@ pub(crate) enum ReleaseError {
     Git(#[from] GitError),
     #[error("{} is not inside the work tree of a git repository", path.display())]
     NoWorkTree { path: PathBuf },
-    #[error("the work tree has uncommitted changes; commit or stash them first")]
+    #[error("tracked files have uncommitted changes; commit or stash them first")]
     Dirty,
     #[error("tag {tag} already exists")]
     TagExists { tag: String },
@@ -88,7 +88,13 @@ pub(crate) fn release(
         .ok_or_else(|| ReleaseError::NoWorkTree {
             path: manifest.clone(),
         })?;
-    if !run(&root, "git", &["status", "--porcelain"])?.is_empty() {
+    if !run(
+        &root,
+        "git",
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?
+    .is_empty()
+    {
         return Err(ReleaseError::Dirty);
     }
     let tag = format!("v{version}");

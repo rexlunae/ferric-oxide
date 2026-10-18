@@ -4,7 +4,9 @@
 //! branches and tags (`+refs/heads/*:refs/heads/*` and
 //! `+refs/tags/*:refs/tags/*`), so later builds of the same source only
 //! fetch what changed. A moved tag is fetched like any other change; the
-//! release-tag checks in [`crate::tag`] decide whether it is accepted.
+//! release-tag checks in [`crate::tag`] decide whether it is accepted. Tags
+//! the remote no longer has are deleted from the cache, so a withdrawn
+//! release is not picked as the newest one.
 //!
 //! `file://`, `ssh://` (through the `ssh` program) and `git://` URLs work
 //! everywhere. `https://` and `http://` need the HTTP transport, which is
@@ -15,6 +17,7 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
 use gix::remote::Direction;
 
 use crate::{GitError, Repository};
@@ -45,13 +48,14 @@ pub fn fetch(url: &str, cache: &Path) -> Result<Repository, GitError> {
             .remote_at(url)
             .and_then(|remote| remote.with_refspecs(REFSPECS, Direction::Fetch))
             .map_err(fetch_error)?;
-        remote
+        let outcome = remote
             .connect(Direction::Fetch)
             .and_then(|connection| {
                 connection.prepare_fetch(gix::progress::Discard, Default::default())
             })
             .and_then(|prepare| prepare.receive(gix::progress::Discard, &interrupt))
             .map_err(fetch_error)?;
+        prune_tags(&repo, &outcome.ref_map.remote_refs).map_err(fetch_error)?;
         return Ok(repo);
     }
 
@@ -79,6 +83,29 @@ pub fn fetch(url: &str, cache: &Path) -> Result<Repository, GitError> {
         source,
     })?;
     Repository::open(cache)
+}
+
+/// Deletes the cache's tags that the remote did not advertise.
+fn prune_tags(repo: &Repository, remote_refs: &[gix::protocol::handshake::Ref]) -> gix::Result<()> {
+    let advertised: Vec<&gix::bstr::BStr> = remote_refs.iter().map(|r| r.unpack().0).collect();
+    let mut stale = Vec::new();
+    for reference in repo.inner.references()?.tags()? {
+        let name = reference?.name().to_owned();
+        if !advertised.contains(&name.as_bstr()) {
+            stale.push(name);
+        }
+    }
+    for name in stale {
+        repo.inner.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name,
+            deref: false,
+        })?;
+    }
+    Ok(())
 }
 
 fn remove_partial(partial: &Path) -> Result<(), GitError> {
