@@ -34,6 +34,7 @@ Using redox_installer as an installer:
     --fox-packages        With --fox: fox package set to sync into the image
                           (fox sync --target <image target>, fox.lock beside it)
     --fox-locked          With --fox-packages: fail unless fox.lock pins every package
+    --fox-level           With --fox-packages: x86-64 level (v3 or v4) to install for
     --fox-sbom            With --fox: write the image's CycloneDX SBOM to this path
 
 Using redox_installer as a configuration parser:
@@ -122,6 +123,16 @@ fn sbom_name(config_name: Option<&str>) -> String {
     }
 }
 
+/// `parser` with the `--fox` options added.
+fn with_fox_options(parser: ArgParser) -> ArgParser {
+    parser
+        .add_opt("", "fox")
+        .add_opt("", "fox-packages")
+        .add_opt("", "fox-sbom")
+        .add_opt("", "fox-level")
+        .add_flag(&["fox-locked"])
+}
+
 /// The `--fox` options, or an error message if they are inconsistent.
 fn fox_image(parser: &ArgParser) -> Result<Option<redox_installer::FoxImage>, &'static str> {
     let Some(fox) = parser.get_opt("fox") else {
@@ -134,18 +145,23 @@ fn fox_image(parser: &ArgParser) -> Result<Option<redox_installer::FoxImage>, &'
     if parser.found("fox-locked") && packages.is_none() {
         return Err("--fox-locked needs --fox-packages");
     }
+    let level = parser.get_opt("fox-level");
+    if level.is_some() && packages.is_none() {
+        return Err("--fox-level needs --fox-packages");
+    }
     Ok(Some(redox_installer::FoxImage {
         fox: fox.into(),
         packages: packages.map(Into::into),
         locked: parser.found("fox-locked"),
         target: redox_installer::get_target(),
+        level,
         name: sbom_name(parser.get_opt("config-name").as_deref()),
         sbom: parser.get_opt("fox-sbom").map(Into::into),
     }))
 }
 
 fn main() {
-    let mut parser = ArgParser::new(4)
+    let mut parser = with_fox_options(ArgParser::new(4))
         .add_opt("b", "cookbook")
         .add_opt("", "config-name")
         .add_opt("c", "config")
@@ -155,11 +171,7 @@ fn main() {
         .add_flag(&["filesystem-size"])
         .add_flag(&["l", "list-packages"])
         .add_flag(&["live"])
-        .add_flag(&["no-mount"])
-        .add_opt("", "fox")
-        .add_opt("", "fox-packages")
-        .add_opt("", "fox-sbom")
-        .add_flag(&["fox-locked"]);
+        .add_flag(&["no-mount"]);
     parser.parse(env::args());
 
     let skip_partition = parser.found("skip-partition");
@@ -271,12 +283,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> ArgParser {
-        let mut parser = ArgParser::new(4)
-            .add_opt("", "config-name")
-            .add_opt("", "fox")
-            .add_opt("", "fox-packages")
-            .add_opt("", "fox-sbom")
-            .add_flag(&["fox-locked"]);
+        let mut parser = with_fox_options(ArgParser::new(4).add_opt("", "config-name"));
         parser.parse(
             std::iter::once("redox_installer")
                 .chain(args.iter().copied())
@@ -290,10 +297,12 @@ mod tests {
         assert_eq!(fox_image(&parse(&["image.img"])), Ok(None));
         assert!(fox_image(&parse(&["--fox-packages=set.toml"])).is_err());
         assert!(fox_image(&parse(&["--fox=fox", "--fox-locked"])).is_err());
+        assert!(fox_image(&parse(&["--fox=fox", "--fox-level=v4"])).is_err());
         let fox = fox_image(&parse(&[
             "--fox=target/release/fox",
             "--fox-packages=set.toml",
             "--fox-locked",
+            "--fox-level=v4",
             "--fox-sbom=build/image.cdx.json",
             "--config-name=desktop",
         ]))
@@ -302,6 +311,7 @@ mod tests {
         assert_eq!(fox.fox, Path::new("target/release/fox"));
         assert_eq!(fox.packages.as_deref(), Some(Path::new("set.toml")));
         assert!(fox.locked);
+        assert_eq!(fox.level.as_deref(), Some("v4"));
         assert_eq!(fox.name, "ferric-oxide-desktop");
         assert_eq!(fox.target, redox_installer::get_target());
         assert_eq!(sbom_name(None), "ferric-oxide");

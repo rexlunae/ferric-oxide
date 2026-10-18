@@ -12,7 +12,10 @@
 //!    --config <set> --target <image target>` installs its packages from
 //!    their registries or git sources and writes `fox.lock` beside the set;
 //!    `--locked` makes the build fail unless the lock already pins every
-//!    package, for reproducible images.
+//!    package, for reproducible images. A level (`--level v3` or `v4`)
+//!    picks the x86-64 variants the image's packages are built and
+//!    downloaded for; fox cannot see the image's CPU, so without one it
+//!    uses the set's policy, else the v3 baseline.
 //! 3. With an SBOM path, `fox --root <root> sbom --system --name <name>
 //!    --output <path>` describes every package in the finished root.
 //!
@@ -35,6 +38,9 @@ pub struct FoxImage {
     pub locked: bool,
     /// The target triple packages are installed for.
     pub target: String,
+    /// The x86-64 level (`v3` or `v4`) packages are installed for, passed
+    /// to `fox sync --level`; fox ignores it for other targets.
+    pub level: Option<String>,
     /// The system name recorded in the SBOM.
     pub name: String,
     /// Where to write the image SBOM, if anywhere.
@@ -134,6 +140,10 @@ impl FoxImage {
                 "--target".into(),
                 self.target.clone(),
             ];
+            if let Some(level) = &self.level {
+                args.push("--level".into());
+                args.push(level.clone());
+            }
             if self.locked {
                 args.push("--locked".into());
             }
@@ -203,6 +213,7 @@ mod tests {
             packages: None,
             locked: false,
             target: "x86_64-unknown-redox".into(),
+            level: None,
             name: "ferric-oxide-desktop".into(),
             sbom: None,
         }
@@ -229,6 +240,7 @@ mod tests {
         let fox = FoxImage {
             packages: Some("config/packages.toml".into()),
             locked: true,
+            level: Some("v4".into()),
             sbom: Some("build/image.cdx.json".into()),
             ..image(fake_fox(dir.path(), "none"))
         };
@@ -236,7 +248,7 @@ mod tests {
         assert_eq!(
             log(dir.path()),
             "--root /image adopt-pkg --allow-unsigned-metadata\n\
-             --root /image sync --config config/packages.toml --target x86_64-unknown-redox --locked\n\
+             --root /image sync --config config/packages.toml --target x86_64-unknown-redox --level v4 --locked\n\
              --root /image sbom --system --name ferric-oxide-desktop --output build/image.cdx.json\n"
         );
     }

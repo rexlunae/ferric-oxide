@@ -24,9 +24,10 @@ trust; it pins `metadata/root/1.json`.
    then open a pull request that runs `fox-registry release <name> <tag>`
    and `fox-registry sign --key <owner's SSH key>`.
 3. The `check` workflow re-verifies the tag signature, commit and tree.
-4. After the merge, the `sign` workflow builds missing artifacts, uploads
-   them and signs the targets, snapshot and timestamp roles; the
-   `timestamp` workflow renews the timestamp every six hours.
+4. After the merge, the `sign` workflow builds missing artifacts (one per
+   x86-64 level, v3 and v4), uploads them and signs the targets, snapshot
+   and timestamp roles; the `timestamp` workflow renews the timestamp every
+   six hours.
 
 ## Builders and the artifact store
 

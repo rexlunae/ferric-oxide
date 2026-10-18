@@ -205,7 +205,8 @@ image root:
    packages already in `fox`'s database. The unsigned names it accepts are
    the ones the installer took from the image configuration.
 2. With `packages.set`, `fox sync --config <set> --target <image target>`
-   (and `--locked` with `packages.locked`). The set's registries, policy and
+   (with `--level v3` or `v4` from `cpu.x86_64_level`, and `--locked` with
+   `packages.locked`). The set's registries, policy and
    packages are installed into the image, and `fox.lock` is written beside
    the set. Commit it, and turn on `packages.locked` for release builds, so
    an image is built from exactly the pinned archives and commits. Changing
@@ -545,8 +546,8 @@ copy only while signing.
 | `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
 
 | `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
-| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, also decides which artifacts count as present; `--work-dir` optional) |
-| `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
+| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, and `--level v3\|v4`, default v3 and only for x86-64, also decide which artifacts count as present, each level being its own artifact; `--work-dir` optional) |
+| `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing v3 and v4 artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
 
 `release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
 `$XDG_CACHE_HOME`; `--cache` overrides it). `build` refuses a key that
@@ -592,7 +593,7 @@ requirement (any version if none is given; yanked releases only with
 `allow-yanked`). It then:
 
 1. unless `build = "always"`, looks for an artifact of that release for the
-   target and feature set, downloads its archive, attestation and signature
+   target, [CPU level](#cpu-levels) and feature set, downloads its archive, attestation and signature
    by hash from the registry's `artifact-base-urls`, and installs it when
    enough distinct builders listed in `registry.toml` signed attestations of
    that exact archive, naming the requested package and version and built
@@ -618,11 +619,39 @@ min-builder-signatures = 1    # builders an artifact needs
 allow-unsigned-git = false    # build unsigned tags and commits
 allow-yanked = false          # pick yanked releases when resolving names
 require-fresh-metadata = "24h"
+# max-cpu-level = "v3"        # highest x86-64 level to install (unset: no cap)
 ```
 
 The builder threshold is the larger of the policy's and the registry's
 `min-builder-signatures`, and never less than one. `allow-unsigned-git`
 has the effect of `install --allow-unsigned` for git sources.
+
+#### CPU levels
+
+x86-64 artifacts come in levels: `x86_64-v3`, the baseline every Ferric
+Oxide machine has, and `x86_64-v4`, which adds AVX-512. Other targets,
+`aarch64` among them, have one variant each, chosen by target, and their
+artifacts name no level. `fox install` and `fox sync` pick the level from,
+in order:
+
+1. `--level v3|v4`;
+2. on the running system (`--root /`), the highest level the CPU supports
+   with the state the kernel saves (CPUID and XCR0, so a kernel without
+   AVX-512 state support, `kernel.cpu.avx512`, reads as v3), capped by
+   `max-cpu-level`;
+3. for any other root, such as an image being built, whose CPU `fox` cannot
+   see, `max-cpu-level`, else v3.
+
+From a registry, `fox` tries the artifacts of the highest level not above
+that one first and falls back to lower ones, so a v4 machine installs a v3
+build when no v4 build is attested, and a v3 machine never gets a v4 build.
+An artifact listed without a level counts as v3, and an attestation whose
+level differs from its artifact's listing is not counted. Source builds use
+the level for x86-64 targets and ignore it for others. `fox build` builds
+v3 unless given `--level`. The image build passes `cpu.x86_64_level` (v3
+or v4) through `FERRIC_FOX_LEVEL`; v1 and v2 images have no matching
+packages and get v3 ones. wasm32 and wasm64 variants, and the install-time
+compilation of wasm modules, are not implemented.
 
 ### Package sets and `fox sync`
 
@@ -675,8 +704,10 @@ normalized URL (a local directory becomes the `file://` URL of its
 canonical path, so the same checkout always has the same identity), the
 revision (`rev`, or a `#` fragment of the URL; the two must agree if both
 are given), `path`, `package`, the features (sorted, without repeats),
-`default-features` and the target asked for (the entry's, else
-`--target`'s, else none). Without one, the target an archive gets depends
+`default-features`, the target asked for (the entry's, else
+`--target`'s, else none) and, unless that target is not x86-64, the
+[CPU level](#cpu-levels), so moving a lock to a machine with another level
+resolves its packages again. Without one, the target an archive gets depends
 on the host: the toolchain the source's `rust-toolchain.toml` selects for a
 build, `fox`'s own target for a prebuilt. So it cannot be known before the
 build and is not part of the request. The lock instead records the

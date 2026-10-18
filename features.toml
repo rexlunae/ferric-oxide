@@ -147,7 +147,10 @@ checks at boot and halts with a list of the missing features.
 `make qemu` picks a matching emulated CPU when KVM is off.
 
 v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
-v4 turns on by default."""
+v4 turns on by default.
+
+With packages.manager = "fox", v3 and v4 also pick the level of the
+prebuilt and source-built fox packages synced into the image."""
 choices = [
   { value = "v1", title = "v1 (baseline)" },
   { value = "v2", title = "v2" },
@@ -172,12 +175,12 @@ make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v2", FERRIC_TARG
 
 [[option.effect]]
 when = "value == 'v3'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v3" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v3", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v3" }
 
 [[option.effect]]
 when = "value == 'v4'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v4" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v4", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v4" }
 
 [[option]]

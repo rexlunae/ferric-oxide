@@ -707,6 +707,7 @@ fn trusted_prebuilt(
     let threshold = policy.builder_threshold(config.min_builder_signatures);
     let wanted = prebuilt::Wanted {
         target: args.target.as_deref().unwrap_or(HOST_TARGET),
+        cpu_level: args.cpu_level.unwrap_or(fox_core::CpuLevel::BASELINE),
         default_features: !args.no_default_features,
         features: &args.features,
     };
@@ -829,6 +830,7 @@ fn install(
     let policy = Policy::load(&root)?;
     let mut source_args = source_args.clone();
     source_args.allow_unsigned |= policy.allow_unsigned_git;
+    source_args.cpu_level = Some(crate::cpu::for_root(source_args.cpu_level, &root, &policy));
     let source_args = &source_args;
     let mut specs = Vec::new();
     for target in targets {
@@ -910,6 +912,8 @@ fn build(
     out: &Path,
 ) -> Result<ExitCode, CliError> {
     let spec = SourceSpec::parse(target)?;
+    // `fox build` makes an archive to publish rather than one for the
+    // root, so without `--level` it builds the baseline.
     let resolved = source::resolve(&cli.root, &spec, source_args)?;
     let packaged = source::build(&cli.root, &resolved, source_args, Some(out))?;
     let package = &packaged.contents.package;

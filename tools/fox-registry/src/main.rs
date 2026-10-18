@@ -34,10 +34,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use fox_core::{GitUrl, PackageName};
+use fox_core::{CpuLevel, GitUrl, PackageName};
 use fox_index::advisory::Advisory;
 use fox_index::edit::{EditError, Keyring, Registry, SignOptions, SignReport};
-use fox_index::layout::{Builder, Owner, PackageEntry, PackageKind};
+use fox_index::layout::{Artifact, Builder, Owner, PackageEntry, PackageKind};
 use fox_index::metadata::{RoleKeys, RoleName, Root, Signed};
 use fox_index::verify::{self, ClientState, VerifyError};
 use semver::Version;
@@ -143,6 +143,10 @@ enum Command {
         /// The Rust target (default: this machine's).
         #[arg(long)]
         target: Option<String>,
+        /// The x86-64 level to build for, `v3` or `v4` (default: v3); only
+        /// for x86-64 targets. Each level is its own artifact.
+        #[arg(long = "level", value_name = "LEVEL")]
+        cpu_level: Option<CpuLevel>,
         /// The git cache directory.
         #[arg(long)]
         cache: Option<PathBuf>,
@@ -373,6 +377,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             label,
             blobs,
             target,
+            cpu_level,
             cache,
             work_dir,
         } => build(
@@ -383,6 +388,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 label,
                 blobs,
                 target: target.as_deref(),
+                cpu_level: *cpu_level,
                 cache: cache.as_deref(),
                 work_dir: work_dir.as_deref(),
             },
@@ -692,6 +698,7 @@ struct BuildArgs<'a> {
     label: &'a str,
     blobs: &'a Path,
     target: Option<&'a str>,
+    cpu_level: Option<CpuLevel>,
     cache: Option<&'a Path>,
     work_dir: Option<&'a Path>,
 }
@@ -705,7 +712,7 @@ fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
     let cache = cache_dir(args.cache)?;
     let target = args.target.unwrap_or(HOST_TARGET);
     let releases = if args.releases.is_empty() {
-        missing_builds(&registry, args.label, target)?
+        missing_builds(&registry, args.label, target, args.cpu_level)?
     } else {
         args.releases
             .iter()
@@ -726,6 +733,7 @@ fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
             work_dir: &work_dir,
             cache: &cache,
             target: Some(target.to_owned()),
+            cpu_level: args.cpu_level,
         };
         let pkgar = ci::build(&registry, &job)?;
         println!("built {name} {version}: {pkgar}");
@@ -744,12 +752,14 @@ fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
     ))
 }
 
-/// Every release, not yanked, that has no artifact for `target` attested
-/// by `label`.
+/// Every release, not yanked, that has no artifact for `target` (at
+/// `cpu_level`, default the baseline, for an x86-64 target) attested by
+/// `label`.
 fn missing_builds(
     registry: &Registry,
     label: &str,
     target: &str,
+    cpu_level: Option<CpuLevel>,
 ) -> Result<Vec<(PackageName, Version)>, CliError> {
     let mut missing = Vec::new();
     for delegation in &registry.targets().signed.delegations {
@@ -762,7 +772,7 @@ fn missing_builds(
                 .artifacts(&name, &release.version)?
                 .is_some_and(|list| {
                     list.artifacts.iter().any(|artifact| {
-                        artifact.target == target
+                        is_variant(artifact, target, cpu_level)
                             && artifact
                                 .attestations
                                 .iter()
@@ -775,6 +785,16 @@ fn missing_builds(
         }
     }
     Ok(missing)
+}
+
+/// Whether `artifact` is the build of `target` at `cpu_level` (an x86-64
+/// artifact that names no level is the baseline; levels mean nothing for
+/// other targets).
+fn is_variant(artifact: &Artifact, target: &str, cpu_level: Option<CpuLevel>) -> bool {
+    artifact.target == target
+        && (!CpuLevel::applies_to(target)
+            || artifact.cpu_level.unwrap_or(CpuLevel::BASELINE)
+                == cpu_level.unwrap_or(CpuLevel::BASELINE))
 }
 
 fn parse_owner(value: &str) -> Result<Owner, CliError> {
@@ -952,5 +972,36 @@ mod tests {
     #[test]
     fn cli_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn levels_tell_x86_64_variants_apart_only() {
+        let h = fox_core::Blake3Digest::of(b"x");
+        let artifact = |target: &str, cpu_level| Artifact {
+            target: target.to_owned(),
+            cpu_level,
+            default_features: true,
+            features: Vec::new(),
+            feature_set_hash: h,
+            pkgar_blake3: h,
+            size: 1,
+            sbom_blake3: h,
+            attestations: Vec::new(),
+        };
+        let x86 = "x86_64-unknown-redox";
+        let v3 = Some(CpuLevel::X86_64V3);
+        let v4 = Some(CpuLevel::X86_64V4);
+        assert!(is_variant(&artifact(x86, v3), x86, None));
+        assert!(is_variant(&artifact(x86, None), x86, v3));
+        assert!(is_variant(&artifact(x86, v4), x86, v4));
+        assert!(!is_variant(&artifact(x86, v3), x86, v4));
+        assert!(!is_variant(&artifact(x86, v4), x86, None));
+        assert!(!is_variant(
+            &artifact(x86, None),
+            "aarch64-unknown-redox",
+            None
+        ));
+        let arm = "aarch64-unknown-redox";
+        assert!(is_variant(&artifact(arm, None), arm, None));
     }
 }

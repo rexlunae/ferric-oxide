@@ -332,6 +332,18 @@ fn a_builder_records_attested_artifacts() {
 
     // Nothing is left to build.
     assert!(!env.ok(&build).contains("built"));
+
+    // Each x86-64 level is its own artifact.
+    if cfg!(target_arch = "x86_64") {
+        let v4: Vec<&str> = build.iter().copied().chain(["--level", "v4"]).collect();
+        let out = env.ok(&v4);
+        assert!(out.contains("built tiny 0.1.0"), "{out}");
+        let artifacts =
+            fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+        assert!(artifacts.contains("\"x86_64-v4\""), "{artifacts}");
+        assert!(!env.ok(&v4).contains("built"));
+        assert!(!env.ok(&build).contains("built"));
+    }
 }
 
 #[test]

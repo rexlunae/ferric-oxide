@@ -55,7 +55,8 @@ claiming another path, and a key rotation signed by the new keys only.
 the owner-signed tag, from a prebuilt artifact with too few and then enough
 builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
 and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
-registry builder, unlisted and then listed in `registry.toml`, publishes
+registry builder, unlisted and then listed in `registry.toml`, then again
+with `--level v4` as a second artifact (on x86-64 hosts), publishes
 an advisory, and imports a small recipe tree (a git recipe, a tarball recipe
 with a description, and an invalid name). `fox sync` is tested end to end with a registry package (installed,
 locked, unchanged under `--locked`, removed when the set drops it, kept when
@@ -63,13 +64,21 @@ it was replaced by hand, and a refused `--locked` sync leaving the registries
 and policy untouched) and a git package pinned to its commit (a moved tag
 fails until `--update`); unit tests check that changing `rev`, features,
 `default-features`, target, `path` or `package` invalidates a pin and that
-local git sources lock by their canonical `file://` URL.
+local git sources lock by their canonical `file://` URL, and that the
+x86-64 level is part of the request for x86-64 and implicit targets only.
+CPU-level selection is unit tested in `tools/fox/src/cpu.rs` (an explicit
+`--level`, the running CPU under the policy cap, the policy or baseline for
+another root) and `tools/fox/src/prebuilt.rs` (a v4 machine prefers v4 and
+falls back to v3, a v3 machine never gets v4, other targets take only
+artifacts without a level, and an attestation of another level is refused);
+`fox-registry`'s `is_variant` and `fox-build`'s level choice have unit tests
+too.
 The installer's `fox` image step (`tools/installer/src/fox.rs`) is unit
 tested with a stand-in `fox` script: adoption alone without a package set,
-then adoption, a `--locked` sync for the image target and the system SBOM in
+then adoption, a `--locked` sync for the image target and level and the system SBOM in
 that order, a failing sync that stops before the SBOM, and a missing
 binary. `ferric-config`'s `package_manager_choice` test checks the make
-variables the `packages.*` options generate. Building and booting an image
+variables the `packages.*` options and `cpu.x86_64_level` generate. Building and booting an image
 through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning and a changed SBOM), and in unit tests

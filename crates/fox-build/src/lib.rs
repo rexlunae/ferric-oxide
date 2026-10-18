@@ -367,8 +367,14 @@ pub struct BuildRequest {
     pub package: Option<String>,
     /// The Rust target triple (default: the toolchain's host).
     pub target: Option<String>,
-    /// The CPU level, for x86-64 targets (default: x86-64-v3).
+    /// The CPU level, for x86-64 targets (default: x86-64-v3). Naming one
+    /// for another target is an error.
     pub cpu_level: Option<CpuLevel>,
+    /// The CPU level to use when [`BuildRequest::cpu_level`] is `None` and
+    /// the target turns out to be x86-64, and to ignore otherwise: for a
+    /// caller that picks a level for the machine before it knows the
+    /// target the toolchain defaults to (default: x86-64-v3).
+    pub x86_64_level: Option<CpuLevel>,
     /// The Cargo features.
     pub features: FeatureSelection,
     /// The repository URL to record (default: the `origin` remote, else a
@@ -397,6 +403,7 @@ impl BuildRequest {
             package: None,
             target: None,
             cpu_level: None,
+            x86_64_level: None,
             features: FeatureSelection::default(),
             git_url: None,
             work_dir: work_dir.to_path_buf(),
@@ -614,7 +621,7 @@ pub fn build(request: &BuildRequest) -> Result<Build, BuildError> {
     let mut tools = Tools::new(&pkg_dir, &cargo_home, request.toolchain.as_deref());
     let toolchain = tools.toolchain_info()?;
     let target = request.target.clone().unwrap_or(toolchain.host);
-    let cpu_level = cpu_level(&target, request.cpu_level)?;
+    let cpu_level = cpu_level(&target, request.cpu_level, request.x86_64_level)?;
 
     let workspace = workspace(&tools, &pkg_dir)?;
     let package = select_package(&workspace, request.package.as_deref(), &pkg_dir)?;
@@ -857,15 +864,19 @@ fn check_cargo_configs(work: &Path, cargo_home: &Path) -> Result<(), BuildError>
     Ok(())
 }
 
-fn cpu_level(target: &str, requested: Option<CpuLevel>) -> Result<Option<CpuLevel>, BuildError> {
-    let x86_64 = target.starts_with("x86_64-");
+fn cpu_level(
+    target: &str,
+    requested: Option<CpuLevel>,
+    if_x86_64: Option<CpuLevel>,
+) -> Result<Option<CpuLevel>, BuildError> {
+    let x86_64 = CpuLevel::applies_to(target);
     match requested {
         Some(level) if !x86_64 => Err(BuildError::LevelNeedsX86_64 {
             level,
             target: target.to_owned(),
         }),
         Some(level) => Ok(Some(level)),
-        None => Ok(x86_64.then_some(CpuLevel::X86_64V3)),
+        None => Ok(x86_64.then(|| if_x86_64.unwrap_or(CpuLevel::BASELINE))),
     }
 }
 
@@ -1164,18 +1175,34 @@ mod tests {
     #[test]
     fn cpu_level_defaults_to_v3_on_x86_64_only() {
         assert_eq!(
-            cpu_level("x86_64-unknown-redox", None).unwrap(),
+            cpu_level("x86_64-unknown-redox", None, None).unwrap(),
             Some(CpuLevel::X86_64V3)
         );
         assert_eq!(
-            cpu_level("x86_64-unknown-linux-gnu", Some(CpuLevel::X86_64V4)).unwrap(),
+            cpu_level("x86_64-unknown-linux-gnu", Some(CpuLevel::X86_64V4), None).unwrap(),
             Some(CpuLevel::X86_64V4)
         );
-        assert_eq!(cpu_level("aarch64-unknown-redox", None).unwrap(), None);
+        assert_eq!(
+            cpu_level("aarch64-unknown-redox", None, None).unwrap(),
+            None
+        );
         assert!(matches!(
-            cpu_level("aarch64-unknown-redox", Some(CpuLevel::X86_64V3)),
+            cpu_level("aarch64-unknown-redox", Some(CpuLevel::X86_64V3), None),
             Err(BuildError::LevelNeedsX86_64 { .. })
         ));
+    }
+
+    #[test]
+    fn a_level_for_x86_64_is_used_only_there() {
+        let v4 = Some(CpuLevel::X86_64V4);
+        assert_eq!(cpu_level("x86_64-unknown-redox", None, v4).unwrap(), v4);
+        // An explicit level wins.
+        assert_eq!(
+            cpu_level("x86_64-unknown-redox", Some(CpuLevel::X86_64V3), v4).unwrap(),
+            Some(CpuLevel::X86_64V3)
+        );
+        // Another target ignores it rather than failing.
+        assert_eq!(cpu_level("aarch64-unknown-redox", None, v4).unwrap(), None);
     }
 
     #[test]

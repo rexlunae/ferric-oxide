@@ -64,6 +64,7 @@
 
 mod audit;
 mod commands;
+mod cpu;
 mod inventory;
 mod prebuilt;
 mod registry;
@@ -252,6 +253,13 @@ struct SourceArgs {
     /// Rust target triple (default: the toolchain's host).
     #[arg(long)]
     target: Option<String>,
+    /// x86-64 level to build at and to pick prebuilt variants for: `v3`
+    /// or `v4`. Ignored for other targets. Default for `install` and
+    /// `sync`: this CPU's, capped by the policy's `max-cpu-level`, when the
+    /// root is the running system, else the policy's level or v3; for
+    /// `build`, v3.
+    #[arg(long = "level", value_name = "LEVEL")]
+    cpu_level: Option<fox_core::CpuLevel>,
     /// Package to build, when the manifest holds several.
     #[arg(long, short)]
     package: Option<String>,

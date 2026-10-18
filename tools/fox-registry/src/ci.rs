@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fox_build::{BuildError, BuildRequest, FeatureSelection, Signer};
-use fox_core::{Blake3Digest, KeyId, PackageName};
+use fox_core::{Blake3Digest, CpuLevel, KeyId, PackageName};
 use fox_index::edit::{EditError, Registry};
 use fox_index::layout::{Artifact, ArtifactAttestation, ArtifactList};
 use semver::Version;
@@ -66,6 +66,7 @@ pub(crate) struct BuildJob<'a> {
     pub(crate) work_dir: &'a Path,
     pub(crate) cache: &'a Path,
     pub(crate) target: Option<String>,
+    pub(crate) cpu_level: Option<CpuLevel>,
 }
 
 /// Builds one release and records the artifact; returns its archive hash.
@@ -109,6 +110,7 @@ pub(crate) fn build(registry: &Registry, job: &BuildJob<'_>) -> Result<Blake3Dig
     // The registry names the package; a workspace root may hold another.
     request.package = Some(job.name.to_string());
     request.target = job.target.clone();
+    request.cpu_level = job.cpu_level;
     request.features = FeatureSelection::default();
     let built = fox_build::build(&request)?;
     // Clients check the attestation against the release, so an artifact
