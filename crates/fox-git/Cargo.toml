@@ -3,16 +3,27 @@ name = "fox-git"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Git sources for fox: commits, the fox-tree/1 BLAKE3 tree hash and tree export"
+description = "Git sources for fox: commits, the fox-tree/1 BLAKE3 tree hash, tree export, fetching and SSH-signed release tags"
 publish = false
 
 [dependencies]
 blake3 = { workspace = true, features = ["std"] }
-fox-core = { path = "../fox-core" }
-# Local repository access only: revision parsing and object reading. No
-# network transport is compiled in.
-gix = { workspace = true }
+fox-core = { path = "../fox-core", features = ["std"] }
+# Revision parsing, object reading and writing, and fetching over the
+# file://, ssh:// and git:// transports.
+gix = { workspace = true, features = ["blocking-network-client"] }
+semver.workspace = true
+ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
+
+# HTTPS fetching. reqwest's rustls backend defaults to aws-lc-rs, which does
+# not build for Redox and is not under a license on the project's list, so
+# rustls uses ring and the transport is left out on Redox, where fox fetches
+# over file://, ssh:// and git:// only.
+[target.'cfg(not(target_os = "redox"))'.dependencies]
+gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tempfile.workspace = true

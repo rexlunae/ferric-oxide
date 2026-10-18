@@ -7,15 +7,17 @@ description = "cargo fox: hermetic builds, packages and attestations for fox pac
 publish = false
 
 [dependencies]
-blake3 = { workspace = true, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 fox-build = { path = "../../crates/fox-build" }
 fox-core = { path = "../../crates/fox-core", features = ["std"] }
 fox-git = { path = "../../crates/fox-git" }
-pkgar-keys = { workspace = true }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
+# Edits Cargo.toml versions without losing comments and layout.
+toml_edit = { version = "0.25.4", default-features = false, features = ["parse", "display"] }
 
 [dev-dependencies]
 fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }

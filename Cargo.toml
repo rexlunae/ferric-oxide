@@ -60,6 +60,9 @@ thiserror = { version = "2", default-features = false }
 # default network, worktree and diff machinery.
 gix = { version = "0.89", default-features = false, features = ["sha1", "revision"] }
 toml = { version = "1", default-features = false }
+# Release-tag signatures for fox: OpenSSH Ed25519 keys and SSHSIG.
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
+semver = "1.0.27"
 
 [profile.release.package.ferric-config]
 opt-level = 2

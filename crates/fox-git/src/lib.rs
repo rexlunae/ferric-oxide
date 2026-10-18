@@ -1,5 +1,6 @@
 //! Git sources for `fox`: resolving commits, hashing their trees with
-//! BLAKE3, and exporting them for hermetic builds.
+//! BLAKE3, exporting them for hermetic builds, fetching repositories and
+//! checking SSH-signed release tags.
 //!
 //! A fox package release is a git commit. Git names objects by SHA-1, which
 //! is not trusted on its own, so every source is also identified by a
@@ -9,8 +10,9 @@
 //! `tree_blake3`.
 //!
 //! Repositories are read with [`gix`](https://crates.io/crates/gix), the
-//! pure-Rust git implementation, without its network transports: this crate
-//! works on local repositories only.
+//! pure-Rust git implementation. [`fetch()`] mirrors a remote into a local
+//! bare cache, and the [`tag`] module reads release tags and verifies their
+//! SSH signatures.
 //!
 //! # The `fox-tree/1` hash
 //!
@@ -57,6 +59,12 @@
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+
+mod fetch;
+pub mod tag;
+
+pub use fetch::fetch;
+pub use tag::{SignatureFormat, Tag, TagSigner, tag_version};
 
 use std::fs;
 use std::io;
@@ -123,6 +131,92 @@ pub enum GitError {
     ExportNotEmpty {
         /// The directory.
         path: PathBuf,
+    },
+    /// The tags could not be listed.
+    #[error("cannot list tags")]
+    References {
+        /// The underlying error.
+        #[source]
+        source: Box<gix::Error>,
+    },
+    /// Cloning or fetching a remote failed.
+    #[error("cannot fetch {url}")]
+    Fetch {
+        /// The URL.
+        url: String,
+        /// The underlying error.
+        #[source]
+        source: Box<gix::Error>,
+    },
+    /// A tag object names a different tag than the ref it was found under.
+    #[error("tag {tag} holds a tag object for {object_name:?}")]
+    TagName {
+        /// The ref's tag name.
+        tag: String,
+        /// The name inside the object.
+        object_name: String,
+    },
+    /// A tag object does not point directly at the commit it resolves to.
+    #[error("tag {tag} does not point directly at a commit")]
+    TagTarget {
+        /// The tag.
+        tag: String,
+    },
+    /// A tag has no SSH signature.
+    #[error("tag {tag} has no SSH signature")]
+    TagUnsigned {
+        /// The tag.
+        tag: String,
+    },
+    /// A tag's SSH signature block cannot be decoded.
+    #[error("tag {tag} has a malformed SSH signature")]
+    TagSignatureFormat {
+        /// The tag.
+        tag: String,
+        /// The underlying error.
+        #[source]
+        source: ssh_key::Error,
+    },
+    /// A tag is signed by (or would be signed with) a key that is not
+    /// Ed25519.
+    #[error("tag {tag} is not signed by an Ed25519 key")]
+    TagKey {
+        /// The tag.
+        tag: String,
+        /// The underlying error.
+        #[source]
+        source: fox_core::trust::AuthorKeyError,
+    },
+    /// A tag's SSH signature is not valid for the key.
+    #[error("tag {tag} has no valid signature by the expected key")]
+    TagSignature {
+        /// The tag.
+        tag: String,
+        /// The underlying error.
+        #[source]
+        source: ssh_key::Error,
+    },
+    /// A tag field cannot be written into a tag object.
+    #[error("the tag {field} cannot be written into a tag object")]
+    TagField {
+        /// `tagger` or `message`.
+        field: &'static str,
+    },
+    /// Signing failed.
+    #[error("cannot sign the tag")]
+    Sign {
+        /// The underlying error.
+        #[source]
+        source: ssh_key::Error,
+    },
+    /// An object or ref could not be written.
+    #[error("cannot write {what}")]
+    Write {
+        /// What was being written.
+        what: String,
+        /// The underlying error.
+        #[source]
+        source: Box<gix::Error>,
     },
     /// Writing the exported tree failed.
     #[error("cannot write {}", path.display())]
