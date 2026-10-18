@@ -6,6 +6,8 @@
 #   CPU defaults to "host" with KVM, or "max" under TCG when /dev/kvm is missing.
 #   BOOT_IOMMU=vtd adds an emulated Intel VT-d IOMMU (DMA and interrupt
 #   remapping), for kernels built with kernel.iommu = "auto" or "enforce".
+#   BOOT_IOMMU=amdvi adds an emulated AMD IOMMU (DMA remapping only) instead. Its
+#   DMA translation and I/O page fault events need QEMU 10 or later (dma-remap).
 set -euo pipefail
 
 image="$1"
@@ -44,8 +46,14 @@ case "${BOOT_IOMMU:-none}" in
         # interrupts through the IOMMU.
         iommu=(-device intel-iommu,intremap=on)
         ;;
+    amdvi)
+        # dma-remap=on makes QEMU translate DMA through the device table and page
+        # tables (and log I/O page faults). The kernel does not remap interrupts on
+        # AMD-Vi yet, so interrupt remapping stays off and needs no split irqchip.
+        iommu=(-device amd-iommu,intremap=off,dma-remap=on)
+        ;;
     *)
-        echo "boot-smoke: unknown BOOT_IOMMU=$BOOT_IOMMU (expected none or vtd)" >&2
+        echo "boot-smoke: unknown BOOT_IOMMU=$BOOT_IOMMU (expected none, vtd or amdvi)" >&2
         exit 2
         ;;
 esac

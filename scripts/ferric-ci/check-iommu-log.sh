@@ -3,16 +3,23 @@
 #
 # Usage: check-iommu-log.sh MODE LOG
 #   MODE is how the boot ran:
-#     none     no IOMMU in the machine: VT-d stays off, the test driver skips, no DMA faults;
-#     auto     emulated VT-d, kernel built with kernel.iommu = "auto";
-#     enforce  emulated VT-d, kernel built with kernel.iommu = "enforce".
+#     none           no IOMMU in the machine: it stays off, the test driver skips, no DMA
+#                    faults;
+#     auto           emulated VT-d, kernel built with kernel.iommu = "auto";
+#     enforce        emulated VT-d, kernel built with kernel.iommu = "enforce";
+#     amdvi          emulated AMD-Vi (QEMU 10 or later), kernel.iommu = "auto";
+#     amdvi-enforce  emulated AMD-Vi, kernel.iommu = "enforce".
 #
-# With VT-d, every PCI driver binds a DMA domain of its own when it connects to pcid
+# With either IOMMU, every PCI driver binds a DMA domain of its own when it connects to pcid
 # (pcid_interface::pci_daemon), so the disk (NVMe at 00:04.0), the network card (e1000 at
 # 00:05.0) and QEMU's AHCI controller (00:1f.2) must each be attached to a domain that their
 # driver bound. ferric-iommu-test drives QEMU's edu device (00:10.0) and announces the DMA
 # faults it causes; the kernel must log exactly those and no others. boot-smoke.sh places the
 # devices at these addresses.
+#
+# AMD-Vi does not remap interrupts yet, so there pcid hands out compatibility-format MSI
+# messages, and the DMA faults are checked by device and kind only: QEMU's AMD IOMMU leaves the
+# address out of its I/O page fault events.
 #
 # With VT-d the unit also remaps interrupts: the I/O APIC's timer pin is checked through a
 # remappable entry, the NVMe controller's MSI-X and edu's MSI go through entries pcid had the
@@ -64,6 +71,23 @@ check_faults() {
     [ "$expected" = "$logged" ] || fail "the kernel's DMA faults differ from the ones the test caused"
 }
 
+# AMD-Vi: ferric-iommu-test announced its three faults, the kernel logged at least one I/O
+# page fault from the edu device, and every DMA fault it logged is one. QEMU 10.2 writes its
+# I/O page fault events without the address (and with its own flag bits), so they cannot be
+# matched to the announced addresses the way VT-d's fault records are.
+check_amd_faults() {
+    local expected logged others
+    expected="$(grep -ao 'FERRIC_IOMMU_EXPECT_FAULT [a-z]* 0x[0-9a-f]*' <<< "$clean" | sort -u)"
+    logged="$(grep -ao 'IOMMU: DMA fault at unit 0x[0-9a-f]*: .*' <<< "$clean" || true)"
+    echo "expected faults:"; echo "$expected"
+    echo "logged faults:"; echo "$logged"
+    [ "$(wc -l <<< "$expected")" -eq 3 ] || fail "the DMA test did not announce its three faults"
+    local edu=': 00:10\.0 (read|write) at 0x[0-9a-f]+: I/O page fault'
+    grep -qE "$edu" <<< "$logged" || fail "no I/O page fault from the edu device (00:10.0) was logged"
+    others="$(grep -vE "$edu" <<< "$logged" || true)"
+    [ -z "$others" ] || fail "DMA faults the test did not cause: $others"
+}
+
 # Every interrupt remapping fault the kernel logged must be the one ferric-iommu-test
 # announced: its forged MSI naming the I/O APIC's entry, refused by the source-id check.
 check_irq_faults() {
@@ -83,7 +107,7 @@ check_irq_faults() {
 
 case "$mode" in
     none)
-        need "IOMMU: no DMAR table, VT-d not enabled"
+        need "IOMMU: no DMAR or IVRS table, IOMMU not enabled"
         # Without an IOMMU pcid has no domain to give the test driver.
         for t in iommu-unbound iommu-domain iommu-dma iommu-fault iommu-readonly iommu-fork iommu-release; do
             need "FERRIC_TEST_SKIP $t"
@@ -101,27 +125,56 @@ case "$mode" in
         exit 0
         ;;
     auto)
+        vendor=vtd
         need "IOMMU: VT-d unit at 0xfed90000 enabled \(identity domain\)"
         # Without a domain, translation answers with physical addresses.
         need "FERRIC_TEST_PASS iommu-unbound: translation without a domain gives a physical address"
         need "FERRIC_TEST_PASS iommu-fork: the forked child is unbound: translation gives a physical address"
         ;;
     enforce)
+        vendor=vtd
         need "IOMMU: VT-d unit at 0xfed90000 enabled \(unattached devices blocked\)"
         need "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses"
         need "FERRIC_TEST_PASS iommu-unbound: translation without a domain is refused \(EACCES\)"
         need "FERRIC_TEST_PASS iommu-fork: the forked child is unbound: translation refused \(EACCES\)"
         ;;
+    amdvi)
+        vendor=amdvi
+        need "IOMMU: AMD-Vi unit at 0xfed80000 \(00:01\.0\) enabled \(identity domain\)"
+        need "FERRIC_TEST_PASS iommu-unbound: translation without a domain gives a physical address"
+        need "FERRIC_TEST_PASS iommu-fork: the forked child is unbound: translation gives a physical address"
+        ;;
+    amdvi-enforce)
+        vendor=amdvi
+        need "IOMMU: AMD-Vi unit at 0xfed80000 \(00:01\.0\) enabled \(unattached devices blocked\)"
+        need "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses"
+        need "IOMMU: AMD-Vi interrupt remapping is not implemented yet"
+        need "FERRIC_TEST_PASS iommu-unbound: translation without a domain is refused \(EACCES\)"
+        need "FERRIC_TEST_PASS iommu-fork: the forked child is unbound: translation refused \(EACCES\)"
+        ;;
     *)
-        fail "unknown mode $mode (expected none, auto or enforce)"
+        fail "unknown mode $mode (expected none, auto, enforce, amdvi or amdvi-enforce)"
         ;;
 esac
 
+# The boot self-test of DMA domains attaches an idle device: an empty slot or a host bridge,
+# neither of which initiates DMA.
+need "IOMMU: domain self-test passed \(attach/map/unmap/detach\)"
+
+if [ "$vendor" = amdvi ]; then
+    # QEMU's amd-iommu has IASup and an MSI capability, so the unit invalidates with
+    # INVALIDATE_IOMMU_ALL and its event log raises an interrupt.
+    need "IOMMU: unit 0xfed80000: 8192-entry event log \(MSI\), INVALIDATE_IOMMU_ALL invalidation"
+    # No interrupt remapping: pcid hands out compatibility-format MSI, which the IOMMU passes
+    # through, and the forged-MSI test skips.
+    need "FERRIC_TEST_PASS iommu-msi: .*\(compatibility format, no interrupt remapping\)"
+    need "FERRIC_TEST_SKIP iommu-irq-fault"
+    if grep -aF "IOMMU: interrupt remapping" <<< "$clean"; then
+        fail "interrupt remapping lines on AMD-Vi, which does not remap interrupts yet"
+    fi
+else
 # QEMU's intel-iommu has ECAP.QI, so the unit must use the invalidation queue.
 need "IOMMU: unit 0xfed90000 uses queued invalidation"
-# The boot self-test of DMA domains attaches QEMU's host bridge, which a DRHD scope lists and
-# which never initiates DMA.
-need "IOMMU: domain self-test passed \(attach/map/unmap/detach\)"
 
 # Interrupt remapping: the table is set up and compatibility-format interrupts are blocked
 # (CFI clear) under both auto and enforce.
@@ -141,6 +194,7 @@ if grep -aE "IOMMU: (interrupt remapping not enabled|enforce mode: unit .* canno
 fi
 if grep -aE "pcid: no interrupt remapping entry" <<< "$clean"; then
     fail "pcid could not get an interrupt remapping entry"
+fi
 fi
 
 echo "DMA domains bound:"
@@ -178,14 +232,24 @@ fi
 if grep -aE "IOMMU: .* tried to bind domain" <<< "$clean"; then
     fail "a driver tried to bind an empty domain"
 fi
-check_faults
-check_irq_faults
-if grep -aE "IOMMU: (VT-d unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB)" <<< "$clean"; then
-    fail "the IOMMU lost faults, failed its self-test or skipped a unit"
+if [ "$vendor" = amdvi ]; then
+    check_amd_faults
+else
+    check_faults
+    check_irq_faults
+fi
+if grep -aE "IOMMU: (VT-d unit .* skipped|AMD-Vi unit .* skipped|.*lost faults|domain self-test failed|unit .*: invalid|unit .*: device-TLB|unit .*: illegal|unit .*: hardware error)" <<< "$clean"; then
+    fail "the IOMMU lost faults, failed its self-test, skipped a unit or rejected a command"
 fi
 # A notice annotation, so the result can be read without the job log.
 bound="$(grep -aoE "IOMMU: domain [0-9]+ \([0-9]+ device\(s\)\) bound by [^ ]*" <<< "$clean" \
     | sed -E 's/^IOMMU: //' | paste -sd ';' -)"
+if [ "$vendor" = amdvi ]; then
+    faults="$(grep -acE 'IOMMU: DMA fault at unit 0x[0-9a-f]*: 00:10\.0' <<< "$clean" || true)"
+    echo "::notice title=check-iommu-log ($mode)::OK; $bound; $faults I/O page fault line(s) from 00:10.0; compatibility-format MSI (no interrupt remapping on AMD-Vi yet)"
+    echo "check-iommu-log: $mode OK"
+    exit 0
+fi
 irtes="$(grep -aoE "IOMMU: interrupt remapping entry [0-9]+ for [0-9a-f:.]+: vector 0x[0-9a-f]+" <<< "$clean" \
     | sed -E 's/^IOMMU: interrupt remapping entry ([0-9]+) for 0000:([0-9a-f:.]+): vector (0x[0-9a-f]+)/\2 entry \1 vector \3/' \
     | paste -sd ',' -)"

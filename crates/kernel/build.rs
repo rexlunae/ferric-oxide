@@ -28,8 +28,8 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         println!("cargo:rustc-cfg=x86_64_level=\"{level}\"");
     }
 
-    // Ferric Oxide: VT-d DMA remapping (src/arch/x86_64/iommu.rs) and the iommu scheme
-    // (src/scheme/iommu.rs), both built for "auto" and "enforce".
+    // Ferric Oxide: VT-d and AMD-Vi DMA remapping (src/arch/x86_64/iommu.rs) and the iommu
+    // scheme (src/scheme/iommu.rs), both built for "auto" and "enforce".
     if arch == "x86_64" {
         let iommu = arch_table
             .get("iommu")
