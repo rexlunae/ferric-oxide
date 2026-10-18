@@ -816,6 +816,17 @@ pub fn revoke_grant_mapping(record: super::regbuf::DmaRecord) -> Result<()> {
     Ok(())
 }
 
+/// Whether a grant's domain was removed after confirmed device blocking.
+///
+/// Called with the region locked before restoring a failed teardown. The region-before-
+/// handle order serializes this with closure: either its link finds the restored record,
+/// or this check finishes the still-in-flight record after the domain was blocked.
+#[cfg(feature = "regbuf")]
+pub(crate) fn grant_domain_closed(record: super::regbuf::DmaRecord) -> bool {
+    let handles = HANDLES.lock();
+    !handles.contains_key(&record.domain) && !GRANT_LINKS.lock().closed_failed(record.domain)
+}
+
 /// Performs the hardware teardown without forgetting its link on failure.
 #[cfg(feature = "regbuf")]
 fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
