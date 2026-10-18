@@ -169,18 +169,29 @@ impl Request {
 
     /// The request in call metadata words.
     ///
+    /// The kernel hands a scheme all [`WORDS`](Self::WORDS) metadata words of a call, with
+    /// zeros in place of the ones the caller did not send, so a missing word reads as zero
+    /// and a detach arrives as its head word followed by two zeros.
+    ///
     /// # Errors
     ///
-    /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
-    /// number of words does not match the verb (or a detach carries an offset), and
-    /// [`DecodeError::Slot`] for a slot of [`MAX_SLOTS`] or more.
+    /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] for more
+    /// than [`WORDS`](Self::WORDS) words, a transfer of zero bytes, or a detach with a
+    /// nonzero offset, LBA or length, and [`DecodeError::Slot`] for a slot of [`MAX_SLOTS`]
+    /// or more.
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
         let (&head, args) = words.split_first().ok_or(DecodeError::Verb)?;
         let verb = Verb::from_raw(head & 0xff).ok_or(DecodeError::Verb)?;
         let slot = Slot::new((head >> 8) & 0xff).ok_or(DecodeError::Slot)?;
+        if args.len() >= Self::WORDS {
+            return Err(DecodeError::Length);
+        }
+        let mut padded = [0; Self::WORDS - 1];
+        padded[..args.len()].copy_from_slice(args);
+        let [lba, len] = padded;
         let pages = head >> 16;
-        match (verb, args) {
-            (Verb::Read | Verb::Write, &[lba, len]) => {
+        match verb {
+            Verb::Read | Verb::Write if len != 0 => {
                 let t = Transfer {
                     slot,
                     offset: pages * PAGE_SIZE,
@@ -193,7 +204,7 @@ impl Request {
                     Self::Write(t)
                 })
             }
-            (Verb::Detach, &[]) if pages == 0 => Ok(Self::Detach { slot }),
+            Verb::Detach if pages == 0 && lba == 0 && len == 0 => Ok(Self::Detach { slot }),
             _ => Err(DecodeError::Length),
         }
     }
@@ -226,7 +237,8 @@ impl core::error::Error for EncodeError {}
 pub enum DecodeError {
     /// The verb is missing or unknown.
     Verb,
-    /// The number of words does not match the verb.
+    /// The words do not fit the verb: too many, a transfer of zero bytes, or arguments on a
+    /// detach.
     Length,
     /// The slot is [`MAX_SLOTS`] or more.
     Slot,
@@ -236,7 +248,7 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Verb => "missing or unknown disk grant verb",
-            Self::Length => "wrong number of metadata words for the disk grant verb",
+            Self::Length => "metadata words do not fit the disk grant verb",
             Self::Slot => "grant slot out of range",
         })
     }
@@ -302,13 +314,36 @@ mod tests {
         assert_eq!(Request::decode(&[]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[9, 0]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[1, 0]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[1, 0, 0, 0]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[3, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[1, 0, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[1, 0, 512, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[3, 1]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[3, 0, 512]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[3 | 1 << 16]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[3 | 64 << 8]), Err(DecodeError::Slot));
         assert_eq!(
             Request::decode(&[2 | 64 << 8, 0, 512]),
             Err(DecodeError::Slot)
+        );
+    }
+
+    #[test]
+    fn kernel_padding_is_accepted() {
+        // The kernel always delivers three words, zero-filled past what the caller sent.
+        let slot = Slot::new(5).expect("slot 5 exists");
+        let (words, n) = Request::Detach { slot }.encode().expect("detach encodes");
+        assert_eq!(n, 1);
+        assert_eq!(Request::decode(&words), Ok(Request::Detach { slot }));
+        assert_eq!(Request::decode(&words[..n]), Ok(Request::Detach { slot }));
+        let read = Request::Read(Transfer {
+            slot,
+            offset: 0,
+            lba: 7,
+            len: 512,
+        });
+        assert_eq!(Request::decode(&[1 | 5 << 8, 7, 512]), Ok(read));
+        assert_eq!(
+            Request::decode(&[1 | 5 << 8, 0, 0]),
+            Err(DecodeError::Length)
         );
     }
 
