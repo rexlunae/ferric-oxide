@@ -4,6 +4,9 @@ Feature configuration for the Ferric Oxide build, in the spirit of the Linux
 kernel's `make menuconfig`, but stored as plain TOML so people, scripts and
 agents can all edit it.
 
+For the system-level build flow and component integration, see the book's
+[Build and configuration](../../docs/src/ferric-build.md) chapter.
+
 There are three files:
 
 | File | Tracked | What it is |
@@ -128,9 +131,9 @@ rebuild the kernel. Pass `--no-touch` to `generate` to skip this.
 newer). `make qemu` picks a matching emulated CPU when KVM is off (`max` for
 v3). Notes:
 
-- `v4` (AVX-512) is selectable but not usable yet: the kernel only enables AVX
-  state in XCR0, so AVX-512 instructions fault until it also enables and saves
-  the opmask and ZMM state. `check` warns about this.
+- `v4` (AVX-512) selects `kernel.cpu.avx512 = "always"` by default. The kernel
+  enables opmask and ZMM state in XCR0 and saves/restores it on context switch;
+  the boot CPU must provide the requested level's features.
 - Prebuilt packages (`build.repo_binary`) and the prebuilt toolchain's
   libraries are compiled for baseline x86-64; only what you build locally uses
   the chosen level.

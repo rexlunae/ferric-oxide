@@ -1,0 +1,146 @@
+# Build and configuration
+
+The top-level Make build orchestrates the cross toolchain, host tools,
+cookbook packages and disk image. Running Cargo at the repository root builds
+host tools and shared libraries; it does not produce a bootable OS image.
+
+## Building an image
+
+From the repository root, the usual Podman workflow is:
+
+```sh
+git submodule update --init --recursive
+./podman_bootstrap.sh
+make menuconfig
+make config-check
+make all
+make qemu
+```
+
+`make menuconfig` is the step that opts into the Ferric feature catalog. Save
+the configuration before building. Without a `ferric.toml`, the Make build
+keeps its upstream-style configuration path and does not apply Ferric catalog
+defaults. The local fork sources are still the recipe inputs in either case.
+On hosts without SELinux, use `make all USE_SELINUX=0`.
+
+See the inherited [Podman build](podman-build.md),
+[build-system reference](build-system-reference.md) and
+[troubleshooting](troubleshooting.md) for environment setup and general Make
+targets. Prefer the in-tree component paths in
+[Architecture](ferric-architecture.md) over historical checkout paths there.
+
+## Configuration inputs and precedence
+
+| Input or output | Meaning |
+| --- | --- |
+| `features.toml` | Tracked catalog: menus, typed options, defaults, dependencies, rules, build effects and rebuild scope |
+| `ferric.toml` | Untracked local choices; omitted options take resolved catalog defaults |
+| `.config` | Legacy Make assignments; can shadow generated defaults |
+| `build/ferric/config.mk` | Generated Make values and exported recipe settings |
+| `build/ferric/filesystem.toml` | Generated image configuration including the chosen base config and package/general overrides |
+| `build/ferric/kernel-config.toml` | Generated architecture/CPU policy, copied to the recipe's kernel source as `config.toml` |
+| `build/ferric/state.toml` | Prior per-recipe fingerprints used to mark affected recipes stale |
+
+`tools/ferric-config/src/schema.rs` parses the catalog; `expr.rs` evaluates
+conditions; `model.rs` resolves values and diagnostics; `generate.rs` writes
+the outputs. The editor and `set` preserve comments and layout in the user's
+file. Dependencies control whether options are active, `selects` force boolean
+prerequisites, conditional defaults choose values, and catalog rules report
+invalid combinations or warnings.
+
+`mk/config.mk` reads `.config` before generated settings. Generated Make
+defaults use `?=`, so existing assignments and command-line values win.
+`ferric-config check` reports known `.config` shadowing. The generated Makefile
+guards target-sensitive CPU, kernel and image settings when the actual
+`ARCH`, `BOARD` or `CONFIG_NAME` differs from the generated target.
+
+## CLI for scripts and agents
+
+These commands run from the repository root:
+
+```sh
+cargo run -q -p ferric-config -- list --json
+cargo run -q -p ferric-config -- explain kernel.iommu
+cargo run -q -p ferric-config -- set cpu.x86_64_level=v3 kernel.iommu=auto
+cargo run -q -p ferric-config -- get kernel.iommu
+cargo run -q -p ferric-config -- unset kernel.iommu
+cargo run -q -p ferric-config -- check
+make config-generate
+```
+
+The CLI also accepts `--root`, `--schema`, `--config` and `--out` for explicit
+inputs and destinations. `schema` emits the catalog as JSON; `list --changed`
+shows explicitly chosen values. To preview generated settings, use a fresh
+temporary output directory:
+
+```sh
+preview_dir=$(mktemp -d)
+cargo run -q -p ferric-config -- --out "$preview_dir" generate --no-touch
+```
+
+Inspect the generated files under `$preview_dir`. `--no-touch` suppresses
+recipe timestamp changes, but still writes `state.toml` in the output directory.
+Using the normal `build/ferric/` output for a preview can consume changed
+fingerprints without marking recipes for rebuild, so the temporary output
+directory is required to preserve the real build's state.
+The tool's own usage guide is `tools/ferric-config/README.md`.
+
+A small configuration enabling the implemented buffer and DMA interfaces is:
+
+```toml
+[cpu]
+x86_64_level = "v3"
+
+[kernel]
+iommu = "auto"
+regbuf = true
+```
+
+All other active options resolve from the catalog. In particular, configured
+x86-64 builds default to ASLR, physical-map KASLR, kernel-image KASLR and
+`PROT_NONE` protection; IOMMU and registered buffers are opt-in. Consult
+`explain` or the catalog rather than assuming a menu title means the feature
+is fully enforced.
+
+## How settings reach components
+
+1. `mk/ferric.mk` regenerates configuration when the user file, catalog or
+   configuration tool sources change; Make includes the result and restarts.
+2. `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS` reach target recipe
+   builds through `tools/cookbook/src/cook/script.rs`. `cpu.flags_exclude`
+   excludes the kernel and bootloader by default; their CPU policy is separate.
+3. `recipes/core/kernel/recipe.toml` passes `FERRIC_KERNEL_FEATURES` with
+   `--no-default-features`, copies CPU policy and forwards extra linker
+   arguments. `kernel.kaslr_image` emits `--emit-relocs` and the bootloader's
+   `kaslr` feature. `kernel.aslr` also selects relibc's `aslr` feature.
+4. Local source recipes copy kernel, bootloader, relibc and base trees for
+   building. They create links that preserve relative paths to shared crates.
+   The target installer recipe uses `tools/installer/`; RedoxFS uses
+   `userspace/redoxfs/`.
+5. The installer consumes the filesystem configuration and staged packages to
+   populate the image. `mk/fstools.mk` builds the local host installer and
+   obtains the host RedoxFS tools through its recipe.
+
+The installer GUI recipe still fetches its own complete pinned upstream tree;
+the local host installer import does not include that GUI.
+
+## CPU baseline and rebuilds
+
+Configured x86-64 user-space compilation defaults to x86-64-v3. v4 is optional
+and selects AVX-512 kernel state support by default. The kernel checks the
+requested level at boot and reports missing CPU features. With KVM disabled,
+the generated QEMU model for v3/v4 is `max`. The catalog retains older choices
+from upstream, but new Ferric development targets v3 or v4.
+
+Flags affect locally compiled packages. `build.repo_binary` selects prebuilt
+packages that ignore local compile-time choices, and the prebuilt toolchain's
+libraries retain their original baseline. Selecting v4 is not evidence that
+every object in an image was rebuilt for v4.
+
+Cookbook detects recipe/source timestamps rather than arbitrary environment
+changes. Configuration generation compares fingerprints in `state.toml` and
+touches the `recipe.toml` files named by each changed option's `rebuild` scope.
+`["*"]` marks all recipes; kernel-only options usually mark the kernel. The
+kernel, bootloader and relibc recipes also maintain feature stamps for their
+Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
+stay uncommitted.

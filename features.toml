@@ -300,8 +300,8 @@ help = """
 Place the kernel's map of physical memory at a random 1 GiB-aligned address at
 each boot (about 17 bits of randomness, from RDRAND), so a physical address no
 longer gives away its kernel virtual address. Without RDRAND the map stays at
-its usual place and the boot log says so. Randomizing the kernel image itself
-comes later."""
+its usual place and the boot log says so. The separate kernel.kaslr_image
+option randomizes the kernel image itself."""
 
 [[option]]
 id = "kernel.kaslr_image"
