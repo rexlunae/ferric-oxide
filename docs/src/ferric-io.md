@@ -128,10 +128,23 @@ on both handles. With `kernel.irq_percpu` (off by default, x86_64 only):
   logical id, as upstream did.
 
 In every build, opening `cpu-XX` for a CPU that does not exist returns
-`ENOENT` instead of panicking the kernel. MSI-X allocation still puts every
-vector on the BSP; per-CPU allocation, steering and per-core NVMe queues are
-later steps of roadmap Phase 2.4. `ferric-iommu-test` checks
+`ENOENT` instead of panicking the kernel. `ferric-iommu-test` checks
 delivery with `iommu-msi-percpu`.
+
+Drivers give MSI-X table entries to CPUs through `pcid_interface`:
+
+- `Msix::alloc_on(cpu)` programs the next entry with a vector on that logical
+  CPU.
+- `Msix::alloc_spread(count, node)` programs up to `count` entries, one per CPU
+  before any CPU gets a second, with CPUs on the device's NUMA node first
+  (`ferric_irq::spread`).
+- `InterruptVector::cpu` says where each vector went.
+
+Without `irq:cpus` these calls put every vector on the BSP, like upstream's
+`Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
+`percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
+logical id. No driver uses these calls yet; IRQ steering and per-core NVMe
+queues are later steps of roadmap Phase 2.4.
 
 ## From PCI discovery to a driver's DMA address
 

@@ -14,6 +14,9 @@
 //! - [`CpuEntry`], one line of the root-only `irq:cpus` file, which maps each online logical
 //!   CPU to its APIC id and NUMA node: written by the kernel ([`core::fmt::Display`]), read by
 //!   pcid and drivers ([`core::str::FromStr`], [`parse_cpus`]).
+//! - [`apic_of`] and [`ApicId::compatibility_destination`], with which pcid builds
+//!   compatibility-format MSI messages for a logical CPU, and [`spread`], the order in which a
+//!   driver gives its MSI-X vectors to CPUs.
 //!
 //! The crate is `no_std`, has no unsafe code and no dependencies, and is tested on the host.
 //!
@@ -330,6 +333,34 @@ pub fn apic_of(text: &str, cpu: CpuId) -> Result<Option<ApicId>, ParseError> {
     Ok(None)
 }
 
+/// The CPUs to give a device's interrupt vectors to, in order: one vector per CPU before any
+/// CPU gets a second.
+///
+/// The CPUs on `node` (the device's NUMA node, when known) come first, in the order `cpus` lists
+/// them, then the others. After the last CPU the order starts again, so `spread(..).take(n)`
+/// spreads `n` vectors over all CPUs round-robin, the device's node first. The iterator is empty
+/// when `cpus` is.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_irq::{spread, ApicId, CpuEntry, CpuId};
+///
+/// let cpu = |cpu, node| CpuEntry { cpu: CpuId::new(cpu), apic: ApicId::new(cpu), node };
+/// let cpus = [cpu(0, Some(0)), cpu(1, Some(1)), cpu(2, Some(0))];
+/// let order: Vec<u32> = spread(&cpus, Some(1)).take(4).map(CpuId::get).collect();
+/// assert_eq!(order, [1, 0, 2, 1]);
+/// ```
+pub fn spread(cpus: &[CpuEntry], node: Option<u32>) -> impl Iterator<Item = CpuId> + Clone + '_ {
+    let near = move |entry: &&CpuEntry| node.is_some() && entry.node == node;
+    let far = move |entry: &&CpuEntry| !near(entry);
+    cpus.iter()
+        .filter(near)
+        .chain(cpus.iter().filter(far))
+        .map(|entry| entry.cpu)
+        .cycle()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +368,44 @@ mod tests {
 
     fn irq(n: u8) -> Irq {
         Irq::new(n).expect("a valid IRQ")
+    }
+
+    fn entry(cpu: u32, node: Option<u32>) -> CpuEntry {
+        CpuEntry {
+            cpu: CpuId::new(cpu),
+            apic: ApicId::new(cpu),
+            node,
+        }
+    }
+
+    fn order(cpus: &[CpuEntry], node: Option<u32>, n: usize) -> Vec<u32> {
+        spread(cpus, node).take(n).map(CpuId::get).collect()
+    }
+
+    #[test]
+    fn spread_gives_each_cpu_one_before_any_gets_two() {
+        let cpus = [entry(0, None), entry(1, None), entry(2, None)];
+        assert_eq!(order(&cpus, None, 2), [0, 1]);
+        assert_eq!(order(&cpus, None, 7), [0, 1, 2, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn spread_prefers_the_device_node() {
+        let cpus = [
+            entry(0, Some(0)),
+            entry(1, Some(1)),
+            entry(2, Some(0)),
+            entry(3, Some(1)),
+        ];
+        assert_eq!(order(&cpus, Some(1), 5), [1, 3, 0, 2, 1]);
+        // An unknown node, or none, keeps the listed order.
+        assert_eq!(order(&cpus, Some(7), 4), [0, 1, 2, 3]);
+        assert_eq!(order(&cpus, None, 4), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn spread_over_no_cpus_is_empty() {
+        assert_eq!(spread(&[], Some(0)).next(), None);
     }
 
     #[test]
