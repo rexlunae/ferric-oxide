@@ -245,10 +245,10 @@ jobs:
       - name: Check kernel tracing
         run: |
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
-          for step in boot enable decode order write read yield sched disable; do
+          for step in boot enable decode order write read yield sched scheme disable; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
-          echo "::notice::ferric-trace-test passed all 9 steps"
+          echo "::notice::ferric-trace-test passed all 10 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

@@ -5,7 +5,7 @@
 //! tracepoints exist, turns them on and off, and writes their records:
 //!
 //! - **Build time.** Without the `trace` feature the macro expands to nothing. With it, an event
-//!   is compiled in when its subsystem's feature (`trace_syscall`, `trace_sched`) is on and its
+//!   is compiled in when its subsystem's feature (`trace_syscall`, `trace_sched`, `trace_scheme`) is on and its
 //!   level is within the `trace_level_*` maximum; other events also expand to nothing, and their
 //!   arguments are never evaluated.
 //! - **Static keys.** A compiled-in tracepoint is a 5-byte NOP until its event is enabled, when it

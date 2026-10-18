@@ -113,6 +113,7 @@ trace = ["dep:ferric-trace"]
 # Ferric Oxide: the subsystems whose tracepoints are compiled in.
 trace_syscall = ["trace"]
 trace_sched = ["trace"]
+trace_scheme = ["trace"]
 # Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
 trace_level_warn = ["trace"]
 trace_level_info = ["trace_level_warn"]

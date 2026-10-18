@@ -22,17 +22,20 @@ pub enum Subsystem {
     Syscall = 0,
     /// The scheduler: context switches.
     Sched = 1,
+    /// User-space scheme requests and responses, tagged with their ring SQE/CQE tags.
+    Scheme = 2,
 }
 
 impl Subsystem {
     /// Every subsystem.
-    pub const ALL: [Subsystem; 2] = [Subsystem::Syscall, Subsystem::Sched];
+    pub const ALL: [Subsystem; 3] = [Subsystem::Syscall, Subsystem::Sched, Subsystem::Scheme];
 
     /// The subsystem's name: the first part of its events' names, and its Cargo feature's suffix.
     pub const fn name(self) -> &'static str {
         match self {
             Subsystem::Syscall => "syscall",
             Subsystem::Sched => "sched",
+            Subsystem::Scheme => "scheme",
         }
     }
 

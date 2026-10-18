@@ -249,6 +249,16 @@ impl UserInner {
                     callee_responsible: PageSpan::empty(),
                 };
             }
+            // Ferric Oxide: the scheme.request tracepoint (`kernel.trace`).
+            trace_event!(
+                ferric_trace::kernel::SCHEME_REQUEST,
+                self.scheme_id.get(),
+                sqe.tag,
+                sqe.opcode,
+                sqe.caller,
+                sqe.args[0],
+                sqe.args[2],
+            );
             self.todo.send(sqe, token);
 
             event::trigger(self.root_id, self.scheme_id.get(), EVENT_READ, token);
@@ -345,6 +355,12 @@ impl UserInner {
                             let mut preempt = PreemptGuardL1::new(&current_context, &mut token);
                             let token = preempt.token();
 
+                            // Ferric Oxide: the scheme.cancel tracepoint (`kernel.trace`).
+                            trace_event!(
+                                ferric_trace::kernel::SCHEME_CANCEL,
+                                self.scheme_id.get(),
+                                sqe.tag,
+                            );
                             self.todo.send_locked(
                                 Sqe {
                                     opcode: Opcode::Cancel as u8,
@@ -998,6 +1014,18 @@ impl UserInner {
     }
     fn respond(&self, tag: u32, mut response: Response, token: &mut CleanLockToken) -> Result<()> {
         let to_close: Vec<FileDescription>;
+
+        // Ferric Oxide: the scheme.response tracepoint (`kernel.trace`).
+        trace_event!(
+            ferric_trace::kernel::SCHEME_RESPONSE,
+            self.scheme_id.get(),
+            tag,
+            match &response {
+                Response::Regular(res, _, _) => Error::mux(*res),
+                Response::Fd(_) | Response::MultipleFds(_) => 0,
+            },
+            context::current().read(token.token()).pid,
+        );
 
         {
             let mut states_lock = self.states.lock(token.token());
