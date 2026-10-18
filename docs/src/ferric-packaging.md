@@ -672,9 +672,13 @@ installed by hand, or replaced by hand since the last sync, are left alone
 (reported as `kept`). `--locked` fails on any package the lock does not pin
 (for reproducible image builds), and checks every package before it adds a
 registry or writes the policy, so a refused sync changes nothing;
-`--update` resolves every package again, and replaces a lock that cannot be
-read or parsed (with a warning naming why) instead of failing on it; without
-`--update` such a lock is an error.
+`--update` resolves every package again, and replaces a lock file whose
+contents do not parse instead of failing on it. The warning says why, and
+that the packages the old lock installed are no longer known to sync, so
+they are not removed automatically and need checking with `fox list`.
+Without `--update` such a lock is an error, and a lock that cannot be read,
+or a lock path that is not a regular file, is always an error before
+anything in the root changes.
 
 ### Advisories and `fox audit`
 

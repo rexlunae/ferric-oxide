@@ -83,6 +83,8 @@ pub(crate) enum SyncError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{} is not a regular file", path.display())]
+    NotAFile { path: PathBuf },
     #[error("{} is larger than 1 MiB", path.display())]
     TooLarge { path: PathBuf },
     #[error("invalid {}", path.display())]
@@ -554,24 +556,43 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
 }
 
 /// The lock a sync starts from. `--update` re-resolves every package and
-/// rewrites the lock anyway, so there a lock that cannot be read or parsed
-/// is reported and replaced instead of blocking the update; otherwise it is
-/// an error, since keeping its pins is the point of the lock.
+/// rewrites the lock anyway, so there a lock file whose contents do not
+/// parse is reported and replaced instead of blocking the update. Anything
+/// else (a lock that cannot be read, or a path that is not a regular file)
+/// is an error before the root is touched, as is an invalid lock without
+/// `--update`, since keeping its pins is the point of the lock.
 fn previous_lock(path: &Path, update: bool) -> Result<Lock, SyncError> {
-    if !path.exists() {
-        return Ok(Lock::default());
+    match fs::metadata(path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Lock::default());
+        }
+        Err(source) => {
+            return Err(SyncError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(SyncError::NotAFile {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(_) => {}
     }
     match read_toml(path) {
-        Ok(lock) => Ok(lock),
-        Err(error) if update => {
+        Err(error @ SyncError::Parse { .. }) if update => {
+            // The old pins are lost with the file, and so is the record of
+            // which packages sync installed, so removal cannot cover them.
             eprintln!(
-                "fox: warning: replacing {}: {}",
+                "fox: warning: replacing {}: {}; packages it locked are no longer \
+                 known to sync and will not be removed automatically, so check \
+                 `fox list` for any the package set no longer wants",
                 path.display(),
                 commands::chain(&error)
             );
             Ok(Lock::default())
         }
-        Err(error) => Err(error),
+        result => result,
     }
 }
 
@@ -985,5 +1006,23 @@ mod tests {
             Err(SyncError::Parse { .. })
         ));
         assert_eq!(previous_lock(&path, true).unwrap(), Lock::default());
+
+        // Only unparseable contents are recovered: a lock path that is not a
+        // regular file is an error even with --update.
+        let dir_lock = dir.path().join("dir.lock");
+        fs::create_dir(&dir_lock).unwrap();
+        for update in [false, true] {
+            assert!(matches!(
+                previous_lock(&dir_lock, update),
+                Err(SyncError::NotAFile { .. })
+            ));
+        }
+        // So is one that cannot be read.
+        let binary = dir.path().join("binary.lock");
+        fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(matches!(
+            previous_lock(&binary, true),
+            Err(SyncError::Io { .. })
+        ));
     }
 }
