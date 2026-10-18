@@ -158,6 +158,12 @@ impl SourceSpec {
             rev,
         })
     }
+
+    /// The source's identity: its normalized URL, with a local directory
+    /// turned into a `file://` URL of its canonical path.
+    pub(crate) fn git(&self) -> &GitUrl {
+        &self.git
+    }
 }
 
 /// A fetched source at the commit chosen for it.

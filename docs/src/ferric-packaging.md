@@ -619,8 +619,8 @@ A package entry takes `version` and `registry`, or `git` with an optional
 refuses one configured with another URL or pin), writes `[policy]` if
 present, installs every package and then writes the lock file, `fox.lock`
 beside the set unless `--lock` names another. The lock (`fox-lock/1`)
-records each package's version, its registry or its git URL and commit, and
-the BLAKE3 of the archive installed:
+records each package's version, its registry or its git URL and commit, a
+digest of its build request and the BLAKE3 of the archive installed:
 
 ```toml
 format = "fox-lock/1"
@@ -629,18 +629,32 @@ format = "fox-lock/1"
 name = "nginx"
 version = "1.27.3"
 registry = "ferric"
+request-blake3 = "<BLAKE3 of the build request>"
 pkgar-blake3 = "<BLAKE3 of the archive>"
 ```
 
+The build request is what changes the archive built: the git source's
+normalized URL (a local directory becomes the `file://` URL of its
+canonical path, so the same checkout always has the same identity), `rev`,
+`path`, `package`, the features (sorted, without repeats),
+`default-features` and the target (the entry's, else `--target`'s). A git
+source that is neither a git URL nor an existing directory is an error,
+not an unpinned entry.
+
 On the next sync a locked package is kept while the lock still satisfies
-the set (same source, version still matching): it is skipped if the
+the set (same source and build request, version still matching), so
+changing a package's `rev`, features, target, `path` or `package` resolves
+it again; a kept package is skipped if the
 installed archive is the locked one, and otherwise installed again at the
 locked version, which for a registry package must be the locked archive.
 Git packages are pinned to their commit instead, since an archive built
 locally is signed with that root's own builder key and so differs between
 roots. Packages that the previous lock listed and the set no longer does
-are removed; packages installed by hand are left alone. `--locked` fails
-on any package the lock does not pin (for reproducible image builds), and
+are removed if the installed archive is still the locked one; packages
+installed by hand, or replaced by hand since the last sync, are left alone
+(reported as `kept`). `--locked` fails on any package the lock does not pin
+(for reproducible image builds), and checks every package before it adds a
+registry or writes the policy, so a refused sync changes nothing;
 `--update` resolves every package again.
 
 ### Advisories and `fox audit`
