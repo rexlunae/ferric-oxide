@@ -64,6 +64,15 @@ pub enum VectorError {
         /// The CPU asked for.
         cpu: CpuId,
     },
+    /// Duplicating the vector's `irq` handle failed (out of file descriptors, for example).
+    #[error("cannot duplicate the interrupt handle on CPU {}", cpu.get())]
+    Clone {
+        /// The CPU of the vector.
+        cpu: CpuId,
+        /// Why `dup` failed.
+        #[source]
+        source: io::Error,
+    },
     /// Every entry of the MSI-X table already has a vector.
     #[error("all {size} MSI-X table entries are in use")]
     TableFull {

@@ -404,6 +404,20 @@ mod tests {
     }
 
     #[test]
+    fn spread_continues_across_batches() {
+        // `Msix::alloc_spread` skips the entries already programmed, so two batches of one
+        // land on two CPUs, as one batch of two would.
+        let cpus = [entry(0, None), entry(1, None)];
+        let first: Vec<u32> = spread(&cpus, None).take(1).map(CpuId::get).collect();
+        let second: Vec<u32> = spread(&cpus, None)
+            .skip(1)
+            .take(1)
+            .map(CpuId::get)
+            .collect();
+        assert_eq!([first, second].concat(), order(&cpus, None, 2));
+    }
+
+    #[test]
     fn spread_over_no_cpus_is_empty() {
         assert_eq!(spread(&[], Some(0)).next(), None);
     }

@@ -354,43 +354,73 @@ impl Msix {
     /// free), one per CPU before any CPU gets a second, CPUs on NUMA node `node` first
     /// ([`ferric_irq::spread`]). Without per-CPU delivery every vector is on the BSP.
     ///
+    /// Entry `i` of the table goes to the `i`-th CPU of that order, so separate calls carry on
+    /// the rotation where the entries programmed so far (by any call) left it.
+    ///
     /// # Errors
     ///
-    /// The first error of [`Self::alloc_on`]; the entries programmed before it keep their
-    /// vectors until the `Msix` is dropped.
+    /// The first error of [`Self::alloc_on`]. The entries this call programmed before it are
+    /// masked and given back (their vectors are released and the next call reuses them), so a
+    /// failed call changes nothing.
     pub fn alloc_spread(
         &mut self,
         count: u16,
         node: Option<u32>,
     ) -> Result<Vec<InterruptVector>, VectorError> {
-        let free = self.table_size().saturating_sub(self.next);
+        let first = self.next;
+        let free = self.table_size().saturating_sub(first);
         let count = usize::from(count.min(free));
         let targets: Vec<CpuId> = match &self.cpus {
-            Some(cpus) => ferric_irq::spread(cpus, node).take(count).collect(),
+            Some(cpus) => ferric_irq::spread(cpus, node)
+                .skip(usize::from(first))
+                .take(count)
+                .collect(),
             None => Vec::new(),
         };
-        if targets.len() < count {
-            // No per-CPU delivery (or an empty map): `alloc_on` falls back to the BSP.
-            return (0..count).map(|_| self.alloc_on(CpuId::BSP)).collect();
+        // No per-CPU delivery (or an empty map): `alloc_on` falls back to the BSP.
+        let targets = if targets.len() < count {
+            vec![CpuId::BSP; count]
+        } else {
+            targets
+        };
+        let mut vectors = Vec::with_capacity(count);
+        for cpu in targets {
+            match self.alloc_on(cpu) {
+                Ok(vector) => vectors.push(vector),
+                Err(err) => {
+                    drop(vectors);
+                    self.release_from(first);
+                    return Err(err);
+                }
+            }
         }
-        targets.into_iter().map(|cpu| self.alloc_on(cpu)).collect()
+        Ok(vectors)
+    }
+
+    /// Ferric Oxide: masks the table entries from `first` on and gives them back, closing the
+    /// handles this `Msix` keeps for them, so the next allocation programs `first` again.
+    fn release_from(&mut self, first: u16) {
+        for index in first..self.next {
+            self.mapped.table_entry_pointer(usize::from(index)).mask();
+        }
+        self.handles.truncate(usize::from(first));
+        self.next = first;
     }
 
     /// Ferric Oxide: programs the next table entry with a vector on `cpu`.
     fn program_next(&mut self, cpu: CpuId) -> Result<InterruptVector, VectorError> {
         let index = self.next;
         let (msg_addr_and_data, irq_handle) = percpu::allocate_msi(&self.channel, cpu)?;
+        // Before the entry is touched, so a failure leaves nothing to undo.
+        let kept = irq_handle
+            .try_clone()
+            .map_err(|source| VectorError::Clone { cpu, source })?;
         self.next += 1;
         let entry = self.mapped.table_entry_pointer(index as usize);
         entry.write_addr_and_data(msg_addr_and_data);
         entry.unmask();
 
-        self.handles.push((
-            irq_handle
-                .try_clone()
-                .expect("failed to clone MSI-X IRQ handle"),
-            cpu,
-        ));
+        self.handles.push((kept, cpu));
 
         Ok(InterruptVector {
             irq_handle,
