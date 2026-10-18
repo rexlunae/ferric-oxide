@@ -1274,6 +1274,14 @@ name = "ferric-cet"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-codecache"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-config"
 version = "0.1.0"
 dependencies = [
@@ -1321,6 +1329,10 @@ version = "0.1.0"
 dependencies = [
  "ferric-iommu",
 ]
+
+[[package]]
+name = "ferric-wasm-abi"
+version = "0.1.0"
 
 [[package]]
 name = "ff"

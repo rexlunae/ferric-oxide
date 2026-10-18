@@ -1,0 +1,11 @@
+[package]
+name = "ferric-codecache"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The Ferric Oxide wasm code cache: cache keys, the sealed entry format, its MAC and relocations"
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+

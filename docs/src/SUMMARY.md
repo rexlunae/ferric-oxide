@@ -11,6 +11,7 @@
   - [Registered Buffers and IOMMUs](./ferric-io.md)
   - [Kernel Tracing](./ferric-tracing.md)
   - [Package Tooling: fox](./ferric-packaging.md)
+  - [WebAssembly Interfaces](./ferric-wasm.md)
   - [Validation and Debugging](./ferric-testing.md)
 
 # Introduction
