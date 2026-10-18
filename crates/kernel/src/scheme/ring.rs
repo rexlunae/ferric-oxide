@@ -253,12 +253,6 @@ fn register_files(
     descriptions: Vec<Description>,
     token: &mut CleanLockToken,
 ) -> core::result::Result<usize, (Error, Vec<Description>)> {
-    let is_ring = |description: &Description, token: &mut CleanLockToken| {
-        matches!(
-            description.read(token.token()).scheme_ref,
-            KernelSchemeRef::Global(GlobalSchemes::Ring)
-        )
-    };
     let mut any_ring = false;
     for description in &descriptions {
         any_ring |= is_ring(description, token);
@@ -352,14 +346,11 @@ fn enter(
     if min_complete > shared.layout.cq_entries() {
         return Err(Error::new(EINVAL));
     }
-    let (consumed, posted) = if to_submit == 0 {
-        (0, false)
+    let consumed = if to_submit == 0 {
+        0
     } else {
         submit(ring, shared, to_submit, token)?
     };
-    if posted {
-        ring.notify_completed(token);
-    }
     if min_complete > 0
         && let Err(err) = wait_for(ring, shared, min_complete, token)
         && consumed == 0
@@ -371,8 +362,11 @@ fn enter(
 
 /// Takes complete chains from the SQ until `to_submit` SQEs are consumed (the last chain may
 /// take it past), the SQ has no complete chain, or the CQ has no room for the next one. Runs
-/// each chain, or hands it to the worker when it is asynchronous; returns the SQEs consumed
-/// and whether completions were posted.
+/// each chain, or hands it to the worker when it is asynchronous; returns the SQEs consumed.
+///
+/// Each chain run here counts as in flight while it runs, and its completions are posted and
+/// announced before the next chain runs, so an `Enter` waiting meanwhile neither stops
+/// waiting early nor sleeps past completions already posted.
 ///
 /// # Errors
 ///
@@ -383,7 +377,7 @@ fn submit(
     shared: &Shared,
     to_submit: u32,
     token: &mut CleanLockToken,
-) -> Result<(usize, bool)> {
+) -> Result<usize> {
     let mut entered = Entered {
         ring,
         sq: ring.sq.lock().take(),
@@ -391,7 +385,6 @@ fn submit(
     let sq = entered.sq.as_mut().ok_or(Error::new(EBUSY))?;
     let mem = &shared.frames;
     let mut consumed: u32 = 0;
-    let mut posted = false;
     while consumed < to_submit {
         let next = sq.peek(mem).map_err(ring_errno)?;
         let (Next::Chain(chain) | Next::Refused(chain)) = next else {
@@ -410,6 +403,7 @@ fn submit(
         consumed = consumed.saturating_add(chain.len());
 
         let mut done = Completions::new();
+        let mut ran_here = false;
         if matches!(next, Next::Refused(_)) {
             chain.refuse(errno_result(EINVAL), |cqe| {
                 done.push(cqe);
@@ -422,6 +416,8 @@ fn submit(
                 }),
             }
         } else {
+            ran_here = true;
+            ring.work.lock().start_sync(chain.len());
             let files = resolve_files(ring, &chain, token);
             run_chain(&chain, files, token, |cqe| {
                 done.push(cqe);
@@ -429,10 +425,14 @@ fn submit(
         }
         // The room was set aside, so posting fails only if the application moved its CQ head
         // out of range meanwhile.
-        ring.post(mem, &done)?;
-        posted = true;
+        let posted = ring.post(mem, &done);
+        if ran_here {
+            ring.work.lock().end_sync(chain.len());
+        }
+        ring.notify_completed(token);
+        posted?;
     }
-    Ok((consumed as usize, posted))
+    Ok(consumed as usize)
 }
 
 /// The completions in the CQ that the application has not taken.
@@ -492,6 +492,31 @@ fn resolve_files(ring: &Ring, chain: &Chain, token: &mut CleanLockToken) -> Chai
         .map(|sqe| {
             let file = sqe.op().ok().and_then(|op| op.file());
             file.map(|file| resolve(ring, file, token))
+        })
+        .collect()
+}
+
+/// Whether `description` is a ring's.
+fn is_ring(description: &Description, token: &mut CleanLockToken) -> bool {
+    matches!(
+        description.read(token.token()).scheme_ref,
+        KernelSchemeRef::Global(GlobalSchemes::Ring)
+    )
+}
+
+/// Refuses, with `EINVAL`, every ring among the files of an asynchronous chain, and lets go
+/// of it. A job holds its files until it is done, and a ring closes only when the last
+/// reference to its description goes, so a job holding its own ring while an earlier SQE
+/// blocks would keep the ring from ever closing, and its worker from ever being cancelled.
+fn refuse_rings(files: ChainFiles, token: &mut CleanLockToken) -> ChainFiles {
+    files
+        .into_iter()
+        .map(|file| match file {
+            Some(Ok(description)) if is_ring(&description, token) => {
+                release_description(description, token);
+                Some(Err(Error::new(EINVAL)))
+            }
+            other => other,
         })
         .collect()
 }

@@ -248,9 +248,19 @@ impl UserInner {
     ) -> Result<Response> {
         {
             let current_context = context::current();
-            current_context
-                .write(token.token())
-                .block("UserInner::call");
+            {
+                let mut context = current_context.write(token.token());
+                // Ferric Oxide: a cancelled context (a ring worker whose ring closed) sends no
+                // more requests; checked under the lock its cancellation takes.
+                if context.cancelled {
+                    drop(context);
+                    for description in fds {
+                        crate::syscall::fs::release_description(description, token);
+                    }
+                    return Err(Error::new(EINTR));
+                }
+                context.block("UserInner::call");
+            }
             {
                 let mut states = self.states.lock(token.token());
                 states[sqe.tag as usize] = State::Waiting {

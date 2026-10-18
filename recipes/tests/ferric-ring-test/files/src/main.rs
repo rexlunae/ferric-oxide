@@ -44,8 +44,9 @@
 //!   asynchronous chain across write, fsync and read, and one broken by a closed descriptor,
 //!   complete by the chain rules; `min_complete` above the CQ is refused, and with nothing
 //!   running does not wait.
-//! - `ring-async-close`: closing a ring whose worker is blocked in a pipe read returns, and
-//!   rings keep working.
+//! - `ring-async-close`: an asynchronous chain naming its own ring completes with `EINVAL`;
+//!   closing a ring whose worker has a pipe read and a `Nop` queued returns, the worker posts
+//!   `EINTR` for the read and `ECANCELED` for the `Nop`, and rings keep working.
 //! - `ring-bench`: times 64-byte writes to the null scheme and 4 KiB reads of a file, as
 //!   system calls and as ring batches of 32, the reads again through a file table slot and
 //!   the writes again on the ring's worker, and prints `FERRIC_BENCH` lines.

@@ -17,7 +17,7 @@ use ferric_ring::{Consumer, Cqe, Layout, NotifyMode, Producer, Sqe, abi::Request
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_NONBLOCK, O_RDWR};
 use syscall::error::{
-    EAGAIN, EBADF, EBUSY, ECANCELED, EEXIST, EFAULT, EINVAL, ENODEV, ENOENT, EOPNOTSUPP,
+    EAGAIN, EBADF, EBUSY, ECANCELED, EEXIST, EFAULT, EINTR, EINVAL, ENODEV, ENOENT, EOPNOTSUPP,
 };
 use syscall::{CallFlags, EVENT_READ};
 
@@ -1006,20 +1006,54 @@ fn async_chains() -> Result<(), Failure> {
     Ok(())
 }
 
+/// How long `ring-async-close` waits for the closed ring's worker to post its cancellations.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 fn async_close() -> Result<(), Failure> {
     let mut ring = Ring::new(8, 16)?;
+    // A job holds its files until it is done, so one holding its own ring would keep the ring
+    // from closing: rings are refused in asynchronous chains.
+    ring.submit(&[Sqe::fsize(ring.fd.raw() as u32, 1).run_async()])?;
+    expect("Enter of a chain naming its ring", 1, ring.enter_wait(1, 1))?;
+    let cqes = ring.reap()?;
+    check_cqes(
+        "an asynchronous chain naming its own ring",
+        &cqes,
+        &[(1, neg(EINVAL))],
+    )?;
+
     let [rd, wr] = pipe()?;
     let mut buf = [0u8; 16];
     ring.submit(&[
-        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 1).run_async(),
-        Sqe::nop(2).run_async(),
+        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 2).run_async(),
+        Sqe::nop(3).run_async(),
     ])?;
     expect("Enter of a blocked read and a Nop", 2, ring.enter(2))?;
-    // Closing the ring interrupts the read and cancels the Nop; it must not wait for the pipe.
-    drop(ring);
+    // Closing the ring's descriptor (the mapping stays) interrupts the read and cancels the
+    // Nop; it must not wait for the pipe. The worker posts both, so it saw the close whether
+    // it was already blocked in the read or not yet.
+    let Ring {
+        fd, map, mut cq, ..
+    } = ring;
+    drop(fd);
+    let start = Instant::now();
+    let mut cqes = Vec::new();
+    while cqes.len() < 2 && start.elapsed() < CLOSE_WAIT {
+        match cq.pop(map.words()) {
+            Ok(Some(cqe)) => cqes.push(cqe),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return Err(Failure::Mismatch { what: "a valid CQ" }),
+        }
+    }
+    check_cqes(
+        "the closed ring's cancelled jobs",
+        &cqes,
+        &[(2, neg(EINTR)), (3, neg(ECANCELED))],
+    )?;
+    drop(map);
     let mut other = Ring::new(8, 16)?;
-    let cqes = other.run(&[Sqe::nop(3)])?;
-    check_cqes("a new ring after the close", &cqes, &[(3, 0)])?;
+    let cqes = other.run(&[Sqe::nop(4)])?;
+    check_cqes("a new ring after the close", &cqes, &[(4, 0)])?;
     close_fd(rd);
     close_fd(wr);
     Ok(())

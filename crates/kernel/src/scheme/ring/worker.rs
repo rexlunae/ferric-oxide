@@ -10,15 +10,17 @@
 //!   user schemes are the submitter's, runs the chain by the usual break rules with the files
 //!   `queue` found, removes the address space again, and posts the chain's CQEs. It holds no
 //!   descriptor table: a job reaches only the files `queue` resolved, so the worker never keeps
-//!   another process's descriptors, or the ring itself, open.
-//! - [`close`] (the ring's close) marks the work closing and interrupts the job running, as a
-//!   signal would; the worker completes the jobs still queued with `ECANCELED` without
+//!   another process's descriptors open. `queue` refuses rings among them (`EINVAL`), so a job
+//!   never keeps its own ring, or another, from closing.
+//! - [`close`] (the ring's close) marks the work closing and cancels the worker's context
+//!   ([`context::cancel_context`]): the wait the running job is in ends as for a signal, and so
+//!   does any it starts later; the worker completes the jobs still queued with `ECANCELED` without
 //!   running them, and ends. A job whose submitter's address space is gone completes with
 //!   `ECANCELED` too.
 //!
 //! The worker holds the ring, so the ring's memory stays until the worker has posted its last
-//! completion. `in_flight` counts the SQEs queued or running; `Enter`'s `min_complete` waits
-//! only while it is not zero.
+//! completion. `in_flight` counts the SQEs queued or running, on the worker or in a
+//! submitting `Enter`; `Enter`'s `min_complete` waits only while it is not zero.
 
 use alloc::{
     collections::VecDeque,
@@ -30,10 +32,12 @@ use ferric_ring::chain::{Chain, Completions};
 use spin::Mutex;
 use syscall::error::{Result, EBADF, ECANCELED, ENOMEM};
 
-use super::{errno_result, release_files, resolve_files, run_chain, ChainFiles, Ring};
+use super::{
+    errno_result, refuse_rings, release_files, resolve_files, run_chain, ChainFiles, Ring,
+};
 use crate::{
     context::{
-        self, memory::AddrSpaceWrapper, unblock_context, wakeup_context, ContextLock, Status,
+        self, cancel_context, memory::AddrSpaceWrapper, wakeup_context, ContextLock, Status,
     },
     scheme::CallerCtx,
     sync::{CleanLockToken, L1},
@@ -64,6 +68,17 @@ impl Work {
     /// The SQEs queued or running.
     pub(super) const fn in_flight(&self) -> u32 {
         self.in_flight
+    }
+
+    /// Counts `sqes` SQEs that an `Enter` runs itself as in flight, so that a waiting `Enter`
+    /// waits for their completions too.
+    pub(super) const fn start_sync(&mut self, sqes: u32) {
+        self.in_flight = self.in_flight.saturating_add(sqes);
+    }
+
+    /// Counts the `sqes` SQEs of [`Self::start_sync`] done.
+    pub(super) const fn end_sync(&mut self, sqes: u32) {
+        self.in_flight = self.in_flight.saturating_sub(sqes);
     }
 }
 
@@ -112,6 +127,7 @@ pub(super) fn queue(
     token: &mut CleanLockToken,
 ) -> core::result::Result<(), i32> {
     let files = resolve_files(ring, &chain, token);
+    let files = refuse_rings(files, token);
     let (space, caller) = {
         let current = Arc::clone(&*context::current());
         let context = current.read(token.token());
@@ -217,8 +233,10 @@ pub(super) fn close(ring: &Ring, token: &mut CleanLockToken) {
     };
     ring.jobs_ready.notify(token);
     if let Some(context) = running {
-        // A job blocked in a scheme request sees this as a signal: the request is cancelled.
-        unblock_context(&context, &mut token.downgrade());
+        // A job blocked in a wait sees this as a signal: a pipe read returns, a request to a
+        // user scheme is cancelled. The cancellation stays, so a job that is still runnable
+        // now and only blocks later is interrupted too.
+        cancel_context(&context, &mut token.downgrade());
     }
 }
 
