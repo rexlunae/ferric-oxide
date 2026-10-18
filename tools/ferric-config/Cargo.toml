@@ -16,4 +16,5 @@ toml = "1"
 toml_edit = "0.25"
 
 [dev-dependencies]
+redox_installer.workspace = true
 tempfile.workspace = true

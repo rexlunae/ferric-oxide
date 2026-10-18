@@ -102,6 +102,14 @@ $T check                       # exit status 1 on errors
 
 ## How options reach the build
 
+On x86-64, select `image.config=ferric-smoke` for the smoke-test image or
+`image.config=ferric-fuzz` for the extended syscall fuzzer, through the CLI or
+menuconfig. Both profiles preserve saved CPU/kernel settings and generated
+image overrides. They do not force CI's optional kernel test features. Other
+architectures are rejected because the included tests use x86-64 instructions.
+Use these catalog choices instead of a mismatching command-line `CONFIG_NAME`;
+see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reproducing-a-boot).
+
 | Option kind | Mechanism |
 | --- | --- |
 | Make variables (`ARCH`, `CONFIG_NAME`, `PODMAN_BUILD`, `REPO_*`, `QEMU_*`, ...) | `build/ferric/config.mk`, included near the top of `mk/config.mk`. Values use `?=`, so `.config` and the command line still win; `check` warns when `.config` shadows one. |
