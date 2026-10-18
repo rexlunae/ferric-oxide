@@ -58,7 +58,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_level_info \
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
             --target targets/x86_64-unknown-kernel.json \
             -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
             -Z json-target-spec

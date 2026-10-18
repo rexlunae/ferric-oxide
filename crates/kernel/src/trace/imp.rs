@@ -40,6 +40,7 @@ pub const MAX_LEVEL: Level = if cfg!(feature = "trace_level_trace") {
 const fn subsystem_compiled(subsystem: Subsystem) -> bool {
     (matches!(subsystem, Subsystem::Syscall) && cfg!(feature = "trace_syscall"))
         || (matches!(subsystem, Subsystem::Sched) && cfg!(feature = "trace_sched"))
+        || (matches!(subsystem, Subsystem::Scheme) && cfg!(feature = "trace_scheme"))
 }
 
 /// Whether `event`'s tracepoints are compiled in: its subsystem is, and its level is within

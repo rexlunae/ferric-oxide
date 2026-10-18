@@ -7,9 +7,13 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 use ferric_trace::abi::{self, EventLine, StatsLine};
-use ferric_trace::kernel::{CATALOG, SCHED_SWITCH, SYSCALL_ENTER, SYSCALL_EXIT};
+use ferric_trace::kernel::{
+    CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
+    SYSCALL_EXIT,
+};
 use ferric_trace::record::Records;
 use ferric_trace::{Event, EventId};
+use syscall::schemev2::Opcode;
 use syscall::{EBADF, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
@@ -17,6 +21,18 @@ const BAD_FD: usize = 0x7e57;
 
 /// The length of the marker system calls' buffers, which their records carry.
 const MARK_LEN: usize = 3217;
+
+/// The length of the marker write to the null scheme, which `zerod` serves in user space.
+const SCHEME_MARK_LEN: usize = 2749;
+
+/// The traced events this test turns on and off.
+const TESTED: [&Event; 5] = [
+    &SYSCALL_ENTER,
+    &SYSCALL_EXIT,
+    &SCHEME_REQUEST,
+    &SCHEME_RESPONSE,
+    &SCHEME_CANCEL,
+];
 
 /// How much one read of a CPU's ring asks for (the scheme's maximum).
 const READ_LEN: usize = 64 * 1024;
@@ -204,8 +220,10 @@ struct Marks {
     read_fd: u64,
     /// The `read`'s byte count.
     read_len: u64,
-    /// The `write` buffer's address.
+    /// The `write` buffer's address, which the write to the null scheme uses too.
     write_buf: u64,
+    /// The null scheme descriptor.
+    null_fd: u64,
 }
 
 /// Makes the marker system calls.
@@ -235,6 +253,22 @@ fn mark(step: &'static str) -> Result<Marks, Failure> {
             },
         });
     };
+    let null_path = "/scheme/null";
+    let null = OpenOptions::new()
+        .write(true)
+        .open(null_path)
+        .map_err(io_failure(step, null_path))?;
+    let null_fd = usize::try_from(null.as_raw_fd()).map_err(|_| check(step, "negative fd"))?;
+    let result = syscall::write(null_fd, &buf[..SCHEME_MARK_LEN]);
+    if result != Ok(SCHEME_MARK_LEN) {
+        return Err(Failure {
+            step,
+            why: Why::Call {
+                call: "write to the null scheme",
+                result,
+            },
+        });
+    }
     let result = syscall::sched_yield();
     if result != Ok(0) {
         return Err(Failure {
@@ -250,6 +284,7 @@ fn mark(step: &'static str) -> Result<Marks, Failure> {
         read_fd: fd as u64,
         read_len: read_len as u64,
         write_buf: buf.as_ptr() as u64,
+        null_fd: null_fd as u64,
     })
 }
 
@@ -277,13 +312,65 @@ fn find_pair(cpus: &[Vec<Entry>], enter: &[u64], result: u64) -> Option<()> {
     })
 }
 
+/// `trace-scheme`: the write to the null scheme has a `scheme.request` (a write of
+/// [`SCHEME_MARK_LEN`] bytes) and, later and on any CPU, a `scheme.response` with the same scheme
+/// and tag, the byte count as its result, and another process as the responder.
+///
+/// The request is found through this program's own `syscall.enter` for the write (its null
+/// scheme descriptor, buffer address and length): the kernel queues the request on the same CPU
+/// before the caller blocks, so it is the first `scheme.request` after that enter and before the
+/// CPU switches away. Another process's write of the same length cannot match.
+fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
+    let step = "trace-scheme";
+    let enter = [
+        SYS_WRITE as u64,
+        marks.null_fd,
+        marks.write_buf,
+        SCHEME_MARK_LEN as u64,
+    ];
+    let request = trace
+        .iter()
+        .find_map(|entries| {
+            let start = entries.iter().position(|e| {
+                e.is(&SYSCALL_ENTER) && enter.iter().enumerate().all(|(i, &v)| e.arg(i) == Some(v))
+            })?;
+            entries[start + 1..]
+                .iter()
+                .take_while(|e| !e.is(&SCHED_SWITCH) && !e.is(&SYSCALL_EXIT))
+                .find(|e| e.is(&SCHEME_REQUEST))
+        })
+        .ok_or_else(|| check(step, "no scheme.request for the write to the null scheme"))?;
+    if request.arg(2) != Some(Opcode::Write as u64)
+        || request.arg(5) != Some(SCHEME_MARK_LEN as u64)
+    {
+        return Err(check(step, format!("the write's request is {request:?}")));
+    }
+    let (scheme, tag, caller) = (request.arg(0), request.arg(1), request.arg(3));
+    let all = || trace.iter().flatten();
+    let response = all()
+        .filter(|e| e.is(&SCHEME_RESPONSE) && e.arg(0) == scheme && e.arg(1) == tag)
+        .filter(|e| e.timestamp >= request.timestamp)
+        .min_by_key(|e| e.timestamp)
+        .ok_or_else(|| check(step, format!("no scheme.response for {request:?}")))?;
+    if response.arg(2) != Some(SCHEME_MARK_LEN as u64) {
+        return Err(check(step, format!("response {response:?} to {request:?}")));
+    }
+    if response.arg(3) == caller {
+        return Err(check(
+            step,
+            format!("the caller answered its own request: {response:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     let list = listing("trace-boot")?;
     if !is_on("trace-boot", &list, &SCHED_SWITCH)? {
         return Err(check("trace-boot", "sched.switch is not on from boot"));
     }
-    for event in [&SYSCALL_ENTER, &SYSCALL_EXIT] {
+    for event in TESTED {
         if is_on("trace-boot", &list, event)? {
             return Err(check(
                 "trace-boot",
@@ -297,9 +384,9 @@ fn run() -> Result<(), Failure> {
     // Empty the rings first: sched.switch has been filling them since boot, and a full ring
     // drops new records.
     drain("trace-enable", &cpus)?;
-    command("trace-enable", "enable syscall")?;
+    command("trace-enable", "enable syscall scheme")?;
     let list = listing("trace-enable")?;
-    for event in [&SYSCALL_ENTER, &SYSCALL_EXIT] {
+    for event in TESTED {
         if !is_on("trace-enable", &list, event)? {
             return Err(check(
                 "trace-enable",
@@ -310,7 +397,7 @@ fn run() -> Result<(), Failure> {
     println!("FERRIC_TEST_PASS trace-enable");
 
     let marks = mark("trace-enable")?;
-    command("trace-disable", "disable syscall")?;
+    command("trace-disable", "disable syscall scheme")?;
     let trace = drain("trace-decode", &cpus)?;
     let total: usize = trace.iter().map(Vec::len).sum();
     println!(
@@ -377,6 +464,9 @@ fn run() -> Result<(), Failure> {
     }
     println!("FERRIC_TEST_PASS trace-sched ({switches} switches)");
 
+    check_scheme(&trace, &marks)?;
+    println!("FERRIC_TEST_PASS trace-scheme");
+
     // Records written before the disable finished may still be in the rings: drop them, then
     // repeat the calls, which must leave nothing.
     drain("trace-disable", &cpus)?;
@@ -385,12 +475,12 @@ fn run() -> Result<(), Failure> {
     let stray = after
         .iter()
         .flatten()
-        .filter(|e| e.is(&SYSCALL_ENTER) || e.is(&SYSCALL_EXIT))
+        .filter(|e| TESTED.iter().any(|event| e.is(event)))
         .count();
     if stray != 0 {
         return Err(check(
             "trace-disable",
-            format!("{stray} syscall records after disable"),
+            format!("{stray} syscall or scheme records after disable"),
         ));
     }
     println!("FERRIC_TEST_PASS trace-disable");
