@@ -414,7 +414,7 @@ fn a_delegation_name_cannot_leave_the_checkout() {
 
     assert!(matches!(
         verify::update(dir.path(), &mut state, now()),
-        Err(VerifyError::UnsafePath { .. })
+        Err(VerifyError::DelegationName { .. })
     ));
 }
 
@@ -882,4 +882,51 @@ fn a_failed_batch_leaves_nothing_behind() {
     fs::remove_file(dir.path().join("packages/ba")).unwrap();
     registry.admit_all(&[other("fd"), other("bat")]).unwrap();
     assert!(fd.exists());
+}
+
+#[test]
+fn a_delegation_name_is_one_path_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = admitted(dir.path());
+    let mut state = client(&registry);
+
+    // A nested name, with its metadata moved to match and described by a
+    // re-signed snapshot, is still refused.
+    let mut targets: Signed<Targets> = read(dir.path(), "metadata/targets.json");
+    targets.signed.delegations.first_mut().unwrap().name = "ri/ripgrep".to_owned();
+    targets.signatures.clear();
+    targets.sign(&secret(MAINTAINER)).unwrap();
+    fs::write(
+        dir.path().join("metadata/targets.json"),
+        targets.to_json().unwrap(),
+    )
+    .unwrap();
+    let delegations = dir.path().join("metadata/delegations");
+    fs::create_dir_all(delegations.join("ri")).unwrap();
+    fs::rename(
+        delegations.join("ripgrep.json"),
+        delegations.join("ri/ripgrep.json"),
+    )
+    .unwrap();
+    let mut snapshot: Signed<Snapshot> = read(dir.path(), "metadata/snapshot.json");
+    let meta = snapshot
+        .signed
+        .meta
+        .remove("delegations/ripgrep.json")
+        .unwrap();
+    snapshot
+        .signed
+        .meta
+        .insert("delegations/ri/ripgrep.json".to_owned(), meta);
+    fs::write(
+        dir.path().join("metadata/snapshot.json"),
+        snapshot.to_json().unwrap(),
+    )
+    .unwrap();
+    reseal(dir.path(), MAINTAINER);
+
+    assert!(matches!(
+        verify::update(dir.path(), &mut state, now()),
+        Err(VerifyError::DelegationName { name }) if name == "ri/ripgrep"
+    ));
 }

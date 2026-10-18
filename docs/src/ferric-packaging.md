@@ -643,7 +643,8 @@ canonical path, so the same checkout always has the same identity), `rev`,
 `path`, `package`, the features (sorted, without repeats),
 `default-features` and the target (the entry's, else `--target`'s). A git
 source that is neither a git URL nor an existing directory is an error,
-not an unpinned entry.
+not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
+on any incompatible change to its fields.
 
 On the next sync a locked package is kept while the lock still satisfies
 the set (same source and build request, version still matching), so

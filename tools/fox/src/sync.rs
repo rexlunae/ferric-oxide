@@ -181,7 +181,8 @@ fn hash_field(hasher: &mut blake3::Hasher, field: Option<&[u8]>) {
     }
 }
 
-/// The lock file format version.
+/// The lock file format version, bumped on any incompatible change to
+/// [`Lock`] or [`Locked`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) enum LockFormat {
     #[default]
