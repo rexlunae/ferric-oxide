@@ -507,7 +507,7 @@ copy only while signing.
 | `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
 
 | `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
-| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline, signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, `--work-dir` optional) |
+| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, also decides which artifacts count as present; `--work-dir` optional) |
 | `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
 
 `release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
@@ -535,9 +535,13 @@ repository, refuses it unless `metadata/root/1.json` has the pinned hash,
 and verifies it. Each registry keeps `var/lib/fox/registries/<name>/`: a
 bare mirror in `git/`, the verified checkout in `tree/`, and `state.json`
 with the trusted root, the metadata versions seen and the time of the last
-update. An update exports the new head to `tree.new/` and replaces `tree/`
-and the state only once it verifies, so a failed update keeps the last good
-checkout and the rollback protection.
+update. An update exports the head of the registry's default branch (the
+mirror's `HEAD` follows the remote's, so a renamed default branch is picked
+up) to `tree.new/`. Once that verifies, it moves `tree/` aside to
+`tree.old/`, moves the new tree into place, and saves the state. If either
+step fails the old tree is put back, and the next open finishes an
+interrupted swap, so a failed update keeps the last good checkout and the
+rollback protection.
 
 Installing by name looks the package up in every configured registry (or
 the named one), updating any whose checkout is older than
@@ -549,11 +553,14 @@ requirement (any version if none is given; yanked releases only with
    target and feature set, downloads its archive, attestation and signature
    by hash from the registry's `artifact-base-urls`, and installs it when
    enough distinct builders listed in `registry.toml` signed attestations of
-   that exact archive, built from the release's commit and tree;
+   that exact archive, naming the requested package and version and built
+   from the release's commit and tree;
 2. otherwise, unless `build = "never"`, fetches the package's repository,
    checks that the release tag is SSH-signed by one of the owners the
    registry lists and still names the recorded commit and tree, and builds
-   it as a [git source](#git-sources). The owners come from the signed
+   it as a [git source](#git-sources). The Cargo package built is the one
+   the registry names (so a workspace root can hold others), and the build
+   fails if its manifest names another package. The owners come from the signed
    registry, so there is no trust-on-first-use prompt.
 
 `fox verify --installed` accepts the registries' builder keys (labelled

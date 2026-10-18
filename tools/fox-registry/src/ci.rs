@@ -35,6 +35,13 @@ pub(crate) enum CiError {
     NoRelease { name: PackageName, version: Version },
     #[error("builder {label} with key {key} is not listed in registry.toml")]
     NotABuilder { label: String, key: KeyId },
+    #[error("release {version} of {name} built package {found} {found_version}")]
+    Mismatch {
+        name: PackageName,
+        version: Version,
+        found: PackageName,
+        found_version: String,
+    },
     #[error("cannot store blob {}", path.display())]
     Blob {
         path: PathBuf,
@@ -99,9 +106,21 @@ pub(crate) fn build(registry: &Registry, job: &BuildJob<'_>) -> Result<Blake3Dig
     request.rev = release.commit.clone();
     request.git_url = Some(entry.git.to_string());
     request.package_dir = entry.path.as_ref().map(PathBuf::from).unwrap_or_default();
+    // The registry names the package; a workspace root may hold another.
+    request.package = Some(job.name.to_string());
     request.target = job.target.clone();
     request.features = FeatureSelection::default();
     let built = fox_build::build(&request)?;
+    // Clients check the attestation against the release, so an artifact
+    // of another package or version would never be used.
+    if &built.manifest.name != job.name || built.manifest.version != job.version.to_string() {
+        return Err(CiError::Mismatch {
+            name: job.name.clone(),
+            version: job.version.clone(),
+            found: built.manifest.name.clone(),
+            found_version: built.manifest.version.clone(),
+        });
+    }
     let packaged = fox_build::package(&built, &signer, &job.work_dir.join("out"))?;
 
     store_blob(job.blobs, &packaged.archive)?;

@@ -34,6 +34,8 @@ use crate::{Cli, RegistryCommand};
 const GIT_DIR: &str = "git";
 const TREE_DIR: &str = "tree";
 const NEW_TREE_DIR: &str = "tree.new";
+/// The previous checkout while a new one is swapped in.
+const OLD_TREE_DIR: &str = "tree.old";
 const STATE_FILE: &str = "state.json";
 const FIRST_ROOT: &str = "metadata/root/1.json";
 
@@ -228,6 +230,7 @@ pub(crate) fn update(
     now: OffsetDateTime,
 ) -> Result<VerifiedRegistry, RegistryError> {
     let dir = entry.state_dir(root);
+    recover_tree(&dir)?;
     let tree = fetch_tree(entry, &dir)?;
     let mut client = match load_state(&dir)? {
         Some(saved) => saved.client,
@@ -236,18 +239,60 @@ pub(crate) fn update(
     };
     verify::update(&tree, &mut client, now).map_err(verify_error(&entry.name))?;
     let current = dir.join(TREE_DIR);
-    if current.exists() {
-        fs::remove_dir_all(&current).map_err(io_error(&current))?;
-    }
-    fs::rename(&tree, &current).map_err(io_error(&current))?;
     let saved = SavedState {
         updated: now.unix_timestamp(),
         client,
     };
-    save_state(&dir, &saved)?;
+    swap_tree(&dir, &tree, &saved)?;
     // Re-verify at its final path; the versions just saved are accepted.
     let mut client = saved.client;
     verify::update(&current, &mut client, now).map_err(verify_error(&entry.name))
+}
+
+/// Replaces `tree/` with the verified `new` tree and then saves `state`.
+/// The old checkout is kept as `tree.old/` until both steps succeed, and
+/// put back if either fails, so a failed update leaves the last verified
+/// checkout and its state in place. An interrupted swap is finished by
+/// [`recover_tree`].
+fn swap_tree(dir: &Path, new: &Path, state: &SavedState) -> Result<(), RegistryError> {
+    let current = dir.join(TREE_DIR);
+    let old = dir.join(OLD_TREE_DIR);
+    if old.exists() {
+        fs::remove_dir_all(&old).map_err(io_error(&old))?;
+    }
+    let had_tree = current.exists();
+    if had_tree {
+        fs::rename(&current, &old).map_err(io_error(&current))?;
+    }
+    let swapped = fs::rename(new, &current)
+        .map_err(io_error(&current))
+        .and_then(|()| save_state(dir, state));
+    if let Err(error) = swapped {
+        if had_tree {
+            // Best effort: the error being reported is the swap's.
+            if current.exists() {
+                let _ = fs::remove_dir_all(&current);
+            }
+            let _ = fs::rename(&old, &current);
+        }
+        return Err(error);
+    }
+    if had_tree {
+        fs::remove_dir_all(&old).map_err(io_error(&old))?;
+    }
+    Ok(())
+}
+
+/// Puts back the checkout an interrupted [`swap_tree`] moved aside: if
+/// `tree/` is missing but `tree.old/` exists, the state still describes
+/// the old tree.
+fn recover_tree(dir: &Path) -> Result<(), RegistryError> {
+    let current = dir.join(TREE_DIR);
+    let old = dir.join(OLD_TREE_DIR);
+    if !current.exists() && old.exists() {
+        fs::rename(&old, &current).map_err(io_error(&current))?;
+    }
+    Ok(())
 }
 
 /// The verified checkout of `entry`, updated first if it is missing or
@@ -259,6 +304,7 @@ pub(crate) fn open(
     now: OffsetDateTime,
 ) -> Result<VerifiedRegistry, RegistryError> {
     let dir = entry.state_dir(root);
+    recover_tree(&dir)?;
     let Some(saved) = load_state(&dir)? else {
         return update(root, entry, now);
     };
@@ -637,6 +683,78 @@ pub(crate) fn info(cli: &Cli, spec: &str) -> Result<ExitCode, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_state(dir: &Path) -> SavedState {
+        let secret = pkgar_core::dryoc::classic::crypto_sign::crypto_sign_seed_keypair(&[1; 32]).1;
+        let mut keys = fox_index::edit::Keyring::new();
+        let key = keys.add(secret);
+        let now = OffsetDateTime::now_utc();
+        let mut registry = fox_index::edit::Registry::init(
+            dir,
+            "test",
+            &fox_index::edit::single_key_roles(key),
+            now,
+        )
+        .unwrap();
+        registry
+            .sign(&keys, now, &fox_index::edit::SignOptions::default())
+            .unwrap();
+        SavedState {
+            updated: 1,
+            client: ClientState::trust_root(registry.root().clone()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_failed_swap_keeps_the_verified_checkout() {
+        let reg = tempfile::tempdir().unwrap();
+        let state = saved_state(reg.path());
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        fs::create_dir_all(dir.join(TREE_DIR)).unwrap();
+        fs::write(dir.join(TREE_DIR).join("marker"), "old").unwrap();
+
+        // The new tree cannot be moved into place.
+        let missing = dir.join("missing");
+        assert!(swap_tree(dir, &missing, &state).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join(TREE_DIR).join("marker")).unwrap(),
+            "old"
+        );
+
+        // The state cannot be saved: the new tree is taken out again.
+        let new = dir.join(NEW_TREE_DIR);
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("marker"), "new").unwrap();
+        fs::create_dir_all(dir.join(STATE_FILE)).unwrap();
+        assert!(swap_tree(dir, &new, &state).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join(TREE_DIR).join("marker")).unwrap(),
+            "old"
+        );
+        assert!(!dir.join(OLD_TREE_DIR).exists());
+
+        fs::remove_dir(dir.join(STATE_FILE)).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("marker"), "new").unwrap();
+        swap_tree(dir, &new, &state).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(TREE_DIR).join("marker")).unwrap(),
+            "new"
+        );
+        assert!(load_state(dir).unwrap().is_some());
+        assert!(!dir.join(OLD_TREE_DIR).exists());
+    }
+
+    #[test]
+    fn an_interrupted_swap_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        fs::create_dir_all(dir.join(OLD_TREE_DIR)).unwrap();
+        recover_tree(dir).unwrap();
+        assert!(dir.join(TREE_DIR).is_dir());
+        assert!(!dir.join(OLD_TREE_DIR).exists());
+    }
 
     #[test]
     fn package_specs() {
