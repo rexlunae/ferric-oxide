@@ -340,7 +340,7 @@ impl<L: Level, T: Default> Default for RwLock<L, T> {
 /// The RAII guards returned from the locking methods implement Deref (and DerefMut for the write methods)
 /// to allow access to the container of the lock.
 impl<L: Level, T> RwLock<L, T> {
-    /// Creates a new instance of an RwLock<T> which is unlocked.
+    /// Creates a new instance of an `RwLock<T>` which is unlocked.
     pub const fn new(val: T) -> Self {
         Self {
             inner: spin::RwLock::new(val),

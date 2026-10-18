@@ -2,6 +2,7 @@ name: kernel-lints
 
 # Holds kernel Clippy warnings and `unsafe` uses at or below the baseline in
 # ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh), and
+# builds kernel Rustdoc with warnings denied, and
 # checks that the bootloader can relocate the kernel (kernel image KASLR; see
 # scripts/ferric-ci/check-kernel-relocs.sh) and that a kernel built with
 # indirect branch tracking (kernel.cpu.ibt) has
@@ -22,6 +23,46 @@ on:
       - ".github/workflows/kernel-lints.yml"
 
 jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        iommu: [never, auto]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nasm
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
+      - name: Install the kernel toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            crates/kernel/target
+          key: kernel-docs-${{ matrix.iommu }}-${{ hashFiles('crates/kernel/Cargo.lock', 'crates/kernel/rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: kernel-docs-${{ matrix.iommu }}-
+      - name: Configure the documented kernel
+        run: |
+          out="$RUNNER_TEMP/ferric-docs"
+          mkdir -p "$out"
+          printf '[kernel]\niommu = "%s"\n' '${{ matrix.iommu }}' > "$out/ferric.toml"
+          cargo run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          cp "$out/kernel-config.toml" crates/kernel/config.toml
+      - name: Kernel docs with warnings denied
+        working-directory: crates/kernel
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features regbuf \
+            --target targets/x86_64-unknown-kernel.json \
+            -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+            -Z json-target-spec
+
   ratchet:
     runs-on: ubuntu-24.04
     steps:

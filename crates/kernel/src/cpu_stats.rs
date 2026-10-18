@@ -86,7 +86,7 @@ impl CpuStats {
 
     /// Increments time statistics of a CPU, return the state is was accounting to.
     ///
-    /// Which statistic is incremented depends on the [`State`] of the CPU.
+    /// Which statistic is incremented depends on the [`CpuState`] of the CPU.
     #[inline]
     pub fn add_time(&self, nanos: u64) -> u8 {
         let state = self.state.load(Ordering::Relaxed);
@@ -110,7 +110,7 @@ impl CpuStats {
 
     /// Add an IRQ event to both the global count and the CPU that handled it.
     ///
-    /// This should be called in all [`crate::arch::interrupt:irq::eoi`],
+    /// This should be called in all [`crate::arch::interrupt::irq::eoi`],
     /// for all architectures.
     #[inline]
     pub fn add_irq(&self, irq: u8) {

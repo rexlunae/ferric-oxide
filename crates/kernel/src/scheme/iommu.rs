@@ -3,37 +3,37 @@
 //!
 //! - Opening the scheme root (`/scheme/kernel.iommu`) as root gives the *attach capability*.
 //!   pcid opens it at boot. A later capability system replaces the root check.
-//! - Opening [`DOMAIN_PATH`] from the attach capability creates a domain with empty tables, so
+//! - Opening [`DOMAIN_PATH`](ferric_iommu::abi::DOMAIN_PATH) from the attach capability creates a domain with empty tables, so
 //!   DMA from its devices faults until something is mapped.
-//! - [`Request::Attach`] and [`Request::Detach`], called on the attach capability and a domain,
+//! - [`Request::Attach`](ferric_iommu::abi::Request::Attach) and [`Request::Detach`](ferric_iommu::abi::Request::Detach), called on the attach capability and a domain,
 //!   move a device into the domain (mapping its RMRRs one-to-one first) or block it.
-//!   [`Request::Bridge`] on the attach capability reports a bridge's bus range, which resolves
+//!   [`Request::Bridge`](ferric_iommu::abi::Request::Bridge) on the attach capability reports a bridge's bus range, which resolves
 //!   device scopes that name bridges.
-//! - [`Request::Bind`] on a domain makes it the calling process's own: a process (an address
+//! - [`Request::Bind`](ferric_iommu::abi::Request::Bind) on a domain makes it the calling process's own: a process (an address
 //!   space) binds at most one domain, and a domain is bound by at most one process. Under
 //!   `kernel.iommu = "enforce"` only a domain with a device attached can be bound.
-//! - [`Request::Join`] on a domain moves its devices into the domain the calling process has
+//! - [`Request::Join`](ferric_iommu::abi::Request::Join) on a domain moves its devices into the domain the calling process has
 //!   bound, so a driver of several functions keeps one domain: pcid gives it a domain for each
 //!   function, it binds the first and joins the others into it. A forked child has an address
 //!   space of its own, so it starts with no bound domain (`EACCES` from translation under
 //!   `enforce`), and it cannot bind its parent's domain while the parent has it bound.
-//! - Once a process has bound a domain, `memory:translation` ([`translate`]) answers with IOVAs
+//! - Once a process has bound a domain, `memory:translation` ([`translate`](crate::scheme::iommu::translate)) answers with IOVAs
 //!   in it: the frames are pinned and mapped with the page's protection, and repeat
 //!   translations return the same IOVA (`arch/x86_64/iommu/dma.rs`). When the process unmaps
-//!   that memory, the address-space code calls [`release`], which takes the mappings down
+//!   that memory, the address-space code calls [`release`](crate::scheme::iommu::release), which takes the mappings down
 //!   strictly. When it takes write access away (`mprotect`), the address-space code calls
-//!   [`narrow`], which makes the mappings that memory reaches read-only for the device. A
+//!   [`narrow`](crate::scheme::iommu::narrow), which makes the mappings that memory reaches read-only for the device. A
 //!   process without a bound domain gets physical addresses, or `EACCES` under `enforce`.
-//! - [`Request::AllocIrte`] on the attach capability makes an interrupt remapping entry that
+//! - [`Request::AllocIrte`](ferric_iommu::abi::Request::AllocIrte) on the attach capability makes an interrupt remapping entry that
 //!   delivers a vector to a CPU for one function's MSI or MSI-X requests, and writes the
-//!   remappable-format message that names it into the payload; [`Request::FreeIrte`] frees it
+//!   remappable-format message that names it into the payload; [`Request::FreeIrte`](ferric_iommu::abi::Request::FreeIrte) frees it
 //!   (`arch/x86_64/iommu/interrupt.rs`). pcid makes these calls when a driver asks it for an MSI
 //!   message, and frees the entries when the driver's channel closes. `ENODEV` means the unit
 //!   does not remap interrupts, so compatibility-format messages still work.
-//! - With the `regbuf` feature, [`Request::MapGrant`] on a domain the caller has bound maps a
+//! - With the `regbuf` feature, [`Request::MapGrant`](ferric_iommu::abi::Request::MapGrant) on a domain the caller has bound maps a
 //!   page-aligned `kernel.regbuf` grant (named by the caller's descriptor number) at a fresh
 //!   contiguous IOVA range, with the grant's access, and returns the IOVA; the grant records
-//!   the mapping (`scheme/regbuf.rs`). [`Request::UnmapGrant`], or revoking or closing the
+//!   the mapping (`scheme/regbuf.rs`). [`Request::UnmapGrant`](ferric_iommu::abi::Request::UnmapGrant), or revoking or closing the
 //!   grant (or one it was derived from, or its region), takes it down strictly: the entries are
 //!   cleared and the IOTLB invalidated and waited on before the call returns, so the device's
 //!   DMA to the old IOVA faults. Without a bound domain `MapGrant` fails with `ENODEV`: the

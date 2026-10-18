@@ -126,7 +126,7 @@ pub struct Context {
     pub active_cpu_time: u128,
     /// Amount of CPU time while being the sched context (see `currently_scheduled`)
     pub sched_cpu_time: u128,
-    /// Scheduler CPU affinity. If set, [`cpu_id`] can except [`None`] never be anything outside
+    /// Scheduler CPU affinity. If set, [`cpu_id`](Self::cpu_id) can except [`None`] never be anything outside
     /// this set, and hence, this context can never run on CPUs outside it.
     pub sched_affinity: LogicalCpuSet,
     /// Keeps track of whether this context is currently handling a syscall. Only up-to-date when

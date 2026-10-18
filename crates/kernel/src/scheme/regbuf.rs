@@ -1,14 +1,14 @@
 //! Ferric Oxide: the `kernel.regbuf` scheme, registered buffers and revocable zero-copy grants
 //! (io/registered-buffers-design.md in the project files; built with the `regbuf` feature).
 //!
-//! - Opening [`REGION_PATH`] from the scheme root gives an empty *region*.
-//!   [`Request::Register`] on it pins a page-aligned range of the caller's anonymous read-write
+//! - Opening [`REGION_PATH`](ferric_regbuf::abi::REGION_PATH) from the scheme root gives an empty *region*.
+//!   [`Request::Register`](ferric_regbuf::abi::Request::Register) on it pins a page-aligned range of the caller's anonymous read-write
 //!   memory, private or `MAP_SHARED` (file-backed private mappings and pages the caller only
 //!   borrows, see `context/reshare.rs`, are refused): each frame gets a shared reference, the
 //!   one user/kernel shared pages take (`AddrSpaceWrapper::borrow_frame_enforce_rw_anonymous`).
 //!   If the owner forks, its child gets copies of private frames, so the region keeps pointing
 //!   at the owner's memory; `MAP_SHARED` frames stay shared with the child, as such memory
-//!   always is. The pages are charged to the region opener's user ID ([`Budget`], `EDQUOT`
+//!   always is. The pages are charged to the region opener's user ID ([`Budget`](ferric_regbuf::budget::Budget), `EDQUOT`
 //!   over the limit) until the region closes.
 //! - Opening a grant path (`GrantSpec::encode_path`) from a region gives a *grant* descriptor:
 //!   read-only or read-write access to a byte range of the region. Its holder, typically a
@@ -18,39 +18,39 @@
 //!   `munmap`, `mprotect` or `mremap` it (`EBUSY`), cannot share it onward (`EPERM`, see
 //!   `context/reshare.rs`), a fork of the holder does not inherit it, and the grant records
 //!   every mapping. A window page the grant covers only in part is a bounce page holding just
-//!   the granted bytes ([`Bounce`]). When a writable mapping is taken down, the bytes its holder
+//!   the granted bytes (`Bounce`). When a writable mapping is taken down, the bytes its holder
 //!   changed are copied back into the region, and only those (`ferric_regbuf::bounce`), so
 //!   newer writes of the owner or of other grants to the other bytes survive. The holder drops
-//!   a mapping with [`Request::Unmap`]; closing the grant drops all of them.
+//!   a mapping with [`Request::Unmap`](ferric_regbuf::abi::Request::Unmap); closing the grant drops all of them.
 //! - Opening a sub-grant path (`GrantSpec::encode_sub_path`) from a grant gives a *sub-grant*:
 //!   a grant of part of the parent's range, with the parent's access or less, that the holder
 //!   can pass on (a file system to its disk driver). It is a grant like any other, and revoking
 //!   its parent, or any grant above it, revokes it as well (`ferric_regbuf::table`).
 //! - With an IOMMU, a driver maps a page-aligned grant into the DMA domain it has bound with
-//!   `MapGrant` on the domain's descriptor (`scheme/iommu.rs`, [`DmaGrant`]): the region's
+//!   `MapGrant` on the domain's descriptor (`scheme/iommu.rs`, `DmaGrant`): the region's
 //!   frames at consecutive IOVAs. The grant records that mapping like a CPU mapping (a
-//!   [`Mapping`] with a [`DmaRecord`]), and taking it down unmaps it from the domain with the
+//!   `Mapping` with a `DmaRecord`), and taking it down unmaps it from the domain with the
 //!   IOTLB invalidated and waited on, so the device's DMA to the old IOVA faults.
-//! - [`Request::Revoke`] on the region, or closing the region, marks grants revoked (mapping
+//! - [`Request::Revoke`](ferric_regbuf::abi::Request::Revoke) on the region, or closing the region, marks grants revoked (mapping
 //!   them again fails with `ECANCELED`) and unmaps every recorded mapping, with a TLB shootdown,
 //!   before it returns. Closing the region also unpins its frames and refunds the charge.
 //!
 //! Locks: a region's lock is taken before an address space's lock (mapping) and before the
 //! `iommu` scheme's handle table (`MapGrant`), never after.
-//! Every teardown (revocation, closing a grant or the region, [`Request::Unmap`]) takes the
-//! mappings out of the region under its lock ([`Taken`], counted in flight by the table),
+//! Every teardown (revocation, closing a grant or the region, [`Request::Unmap`](ferric_regbuf::abi::Request::Unmap)) takes the
+//! mappings out of the region under its lock ([`Taken`](ferric_regbuf::table::Taken), counted in flight by the table),
 //! unmaps them after releasing it, and takes it again to report each outcome
-//! ([`take_down`], which also copies bounce pages back). So:
+//! (`take_down`, which also copies bounce pages back). So:
 //!
 //! - `Revoke` returns only once nothing of the grant (or of the grants derived from it) is
 //!   mapped, in an address space or an IOMMU domain, even when another thread (the
-//!   grant's close, an `Unmap`) is unmapping some of it: it waits on [`TEARDOWN`] until the
+//!   grant's close, an `Unmap`) is unmapping some of it: it waits on `TEARDOWN` until the
 //!   table says the grant is settled.
 //! - An unmap that fails leaves the mapping recorded on its revoked or closed grant, so it stays
 //!   blocked from new mappings and the next `Revoke` retries it; the call reports `EIO`.
 //! - A closed region keeps its frames, and their charge, until nothing maps them: its last
 //!   teardown has finished and no failed one left a mapping recorded. A closed region with such
-//!   a mapping goes on [`STUCK`] and is retried on the scheme's next close or `Revoke`. A
+//!   a mapping goes on `STUCK` and is retried on the scheme's next close or `Revoke`. A
 //!   registration that loses the race with the close fails and refunds its own charge.
 //!
 //! The grant table and budget logic is the host-tested `ferric-regbuf` crate (`crates/regbuf`),

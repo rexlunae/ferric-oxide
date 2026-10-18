@@ -414,7 +414,7 @@ pub struct Frame {
     physaddr: NonZeroUsize,
 }
 
-/// Option<Frame> combined with power-of-two size.
+/// `Option<Frame>` combined with power-of-two size.
 #[derive(Clone, Copy)]
 struct P2Frame(usize);
 impl P2Frame {
