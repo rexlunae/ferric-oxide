@@ -16,7 +16,7 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Build an image, change feature options or add a recipe | [Build and configuration](docs/src/ferric-build.md), [ferric-config usage](tools/ferric-config/README.md), [feature catalog](features.toml), [build-system reference](docs/src/build-system-reference.md) and [application porting](docs/src/porting-applications.md) |
 | Change address spaces, CPU state or kernel hardening | [Memory and CPU protection](docs/src/ferric-memory.md), relevant Rustdoc in `crates/kernel/` and the shared crates under `crates/` |
 | Work on PCI drivers, DMA, IOMMU domains or registered buffers | [Registered buffers and IOMMUs](docs/src/ferric-io.md), ABI/module docs in `crates/{regbuf,iommu,vtd,amdvi}/src/`, and `userspace/base/drivers/pcid/` |
-| Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, and `crates/kernel/src/trace/` |
+| Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, `crates/kernel/src/trace/` and `tools/ferric-trace/` |
 | Change package verification, installation, manifests or SBOMs | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom}/` and `tools/fox/` |
 | Select checks, debug a failure, reproduce a boot or run fuzzing | [Validation and debugging](docs/src/ferric-testing.md), [CI workflows](.github/workflows/), [CI scripts](scripts/ferric-ci/) and [kernel lint baseline](ci/kernel-lints.json) |
 | Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
@@ -46,6 +46,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
 | `tools/fox/` | Local package verification, installation and SBOM CLI | host |
+| `tools/ferric-trace/` | Kernel trace capture reader: text view and Perfetto/Chrome JSON export | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |

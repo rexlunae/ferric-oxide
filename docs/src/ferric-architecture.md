@@ -16,6 +16,7 @@ developed through libraries and ports; it does not make this a Linux kernel.
 | `tools/installer/` | Image configuration parsing and installation; shared by host tooling and the target installer recipe |
 | `tools/redoxer/` | Component execution/build support in a Redox environment; its example is standalone |
 | `tools/fox/` | Local package verification, installation and SBOM command |
+| `tools/ferric-trace/` | Kernel trace captures on the host: text view and Perfetto/Chrome trace JSON export |
 | `crates/kernel/` | Independent `no_std` kernel workspace, custom target specifications, linker scripts and its own lockfile |
 | `crates/bootloader/` | Standalone bootloader, including the UEFI target and optional kernel relocation |
 | `crates/relibc/` | C/POSIX library and `redox-rt` process/thread runtime, with its own workspace |

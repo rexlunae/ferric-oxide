@@ -150,6 +150,47 @@ open. A `cpu/<n>` read follows these rules:
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
 
+## Reading a capture on the host
+
+To capture a trace on the target, run as root:
+
+```sh
+echo "enable syscall scheme" > /scheme/kernel.trace/events
+# ... run the workload ...
+echo "disable syscall scheme" > /scheme/kernel.trace/events
+for n in 0 1 2 3; do cat /scheme/kernel.trace/cpu/$n > cpu$n; done
+```
+
+`stats` lists the CPUs. A read drains a ring, so each record lands in exactly
+one file. Copy the `cpu<n>` files to the host and use the `ferric-trace` tool
+(`tools/ferric-trace/`) on them:
+
+```sh
+cargo run -p ferric-trace-cli -- text capture/
+cargo run -p ferric-trace-cli -- perfetto --tsc-mhz 3000 -o trace.json capture/
+```
+
+`text` prints one line per record in timestamp order: the CPU, the cycles
+since the first record, the event and its named arguments.
+
+`perfetto` writes Chrome trace event JSON. Open it at <https://ui.perfetto.dev>
+or in `chrome://tracing`.
+
+- **CPU tracks.** With `sched.switch` captured, each CPU track shows which
+  context ran when.
+- **Context tracks.** Each context has a track (a process per kernel pid, a
+  thread per context). It shows that context's system calls as slices, even
+  when the context moved to another CPU while it was blocked.
+- **Scheme requests.** Each request is an async slice on the caller's track,
+  from `scheme.request` to the `scheme.response` with the same scheme and tag.
+  The slice is named with the scheme id and opcode, and the end carries the
+  responder's pid.
+- **Unmatched records.** A record whose start was not captured is an instant.
+
+`--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
+frequency; the default, 1000, shows one cycle as one nanosecond. The format and
+the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
@@ -157,6 +198,11 @@ are not compiled in gives `EOPNOTSUPP`.
   - record encoding and decoding, including truncated and corrupt input;
   - ring wrap-around, loss counting, too-small buffers and uncommitted reads;
   - a two-thread test with a million records.
+- **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
+  (including bad and unknown records and duplicate CPUs), checks the text
+  lines, checks the JSON mapping (slices on the right context across CPUs,
+  async request slices matched by tag, instants for unmatched records), and
+  runs the binary on a capture directory.
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
@@ -186,6 +232,6 @@ are not compiled in gives `EOPNOTSUPP`.
   process lifecycle).
 - Read-only mapping of the rings.
 - An initfs trace configuration.
-- A viewer and Perfetto export.
+- Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
 - The CI overhead budget.
 - Architectures other than x86_64.
