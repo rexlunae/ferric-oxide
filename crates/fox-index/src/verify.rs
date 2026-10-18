@@ -157,6 +157,13 @@ pub enum VerifyError {
         /// The path.
         path: String,
     },
+    /// A delegation's name is not a single normal path component, so its
+    /// metadata file would not be `delegations/<name>.json`.
+    #[error("{name:?} is not a valid delegation name")]
+    DelegationName {
+        /// The name.
+        name: String,
+    },
     /// A verified registry file is invalid.
     #[error("invalid {path}")]
     Layout {
@@ -384,10 +391,11 @@ fn verify_targets(
     }
     let mut delegated = BTreeMap::new();
     for delegation in &targets.signed.delegations {
+        // The name becomes a filesystem path below: it must name one file
+        // directly under delegations/, and the whole path is checked again
+        // so that nothing can read metadata outside the checkout.
+        check_delegation_name(&delegation.name)?;
         let name = format!("delegations/{}.json", delegation.name);
-        // The name becomes a filesystem path below; a delegation whose name
-        // contains `..` or an absolute component would otherwise read
-        // metadata outside the checkout.
         check_path(&name)?;
         let file = format!("{METADATA_DIR}/{name}");
         let signed: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
@@ -556,6 +564,20 @@ fn read_limited(base: &Path, file: &str, limit: u64) -> Result<Vec<u8>, VerifyEr
 }
 
 /// Accepts relative paths of normal components only.
+/// Checks that a delegation name is exactly one normal path component.
+fn check_delegation_name(name: &str) -> Result<(), VerifyError> {
+    let mut components = Path::new(name).components();
+    let single = matches!(components.next(), Some(Component::Normal(part)) if part == name)
+        && components.next().is_none();
+    if single && !name.contains(['/', '\\']) {
+        Ok(())
+    } else {
+        Err(VerifyError::DelegationName {
+            name: name.to_owned(),
+        })
+    }
+}
+
 pub(crate) fn check_path(path: &str) -> Result<(), VerifyError> {
     let unsafe_path = || VerifyError::UnsafePath {
         path: path.to_owned(),
