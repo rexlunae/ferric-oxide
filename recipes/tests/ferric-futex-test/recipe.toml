@@ -1,0 +1,12 @@
+# Exercises the compare-and-queue race in futex waits through standard-library
+# condition variables, with bounded waits so a lost wake fails the test.
+[source]
+path = "recipes/tests/ferric-futex-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""
