@@ -644,6 +644,110 @@ fn hold() -> Result<(), Failure> {
     expect("bytes in the pipe moved onto its number", 0, other)
 }
 
+/// Sets or clears `O_NONBLOCK` on a descriptor's description.
+fn set_nonblocking(fd: c_int, on: bool) -> Result<(), Failure> {
+    // SAFETY: fcntl on a descriptor this test opened, with no pointer arguments.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let flags = if on {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return io("fcntl", Err(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Writes pages to `fd`, a pipe's write end, until the pipe is full; returns the bytes it
+/// holds.
+fn fill(fd: c_int) -> Result<usize, Failure> {
+    set_nonblocking(fd, true)?;
+    let page = [0x11_u8; PAGE];
+    let mut held = 0;
+    loop {
+        // SAFETY: the write end from pipe(), and a buffer of `PAGE` bytes.
+        let n = unsafe { libc::write(fd, page.as_ptr().cast(), PAGE) };
+        if n <= 0 {
+            break;
+        }
+        held += n as usize;
+    }
+    set_nonblocking(fd, false)?;
+    Ok(held)
+}
+
+fn release() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let [wake_rd, wake_wr] = pipe()?;
+    let [rd, wr] = pipe()?;
+    let held = fill(wr)?;
+    let mut buf = [0u8; 16];
+    let addr = buf.as_mut_ptr() as u64;
+    // The chain holds `wr` from when it is taken; its second SQE fails (a read of a write
+    // end), which does not matter: only the hold does.
+    ring.submit(&[
+        Sqe::read(wake_rd as u32, CURRENT_POSITION, addr, 1, 1).linked(),
+        Sqe::read(wr as u32, CURRENT_POSITION, addr, 1, 2),
+    ])?;
+    // An ordinary write that blocks on the full pipe, so it holds `wr` too.
+    let writer = std::thread::spawn(move || {
+        let byte = [0x22_u8];
+        // SAFETY: the write end from pipe(), and a buffer of 1 byte.
+        unsafe { libc::write(wr, byte.as_ptr().cast(), 1) }
+    });
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(HOLD_DELAY);
+        // The descriptor goes while the ring and the write both hold its description.
+        close_fd(wr);
+        let byte = [0x33_u8];
+        // SAFETY: the write end from pipe(), and a buffer of 1 byte.
+        unsafe { libc::write(wake_wr, byte.as_ptr().cast(), 1) }
+    });
+    // The ring lets go first: Enter returns before the blocked write can finish.
+    let entered = ring.enter(2);
+    let woke = closer.join().map_err(|_| Failure::Mismatch {
+        what: "the closing thread",
+    })?;
+    expect("waking the chain", 1, woke as i64)?;
+    expect("Enter", 2, entered)?;
+    check_cqes(
+        "a chain holding a descriptor closed meanwhile",
+        &ring.reap()?,
+        &[(1, 1), (2, neg(EBADF))],
+    )?;
+    // Room in the pipe lets the write finish; it holds the last reference.
+    let mut page = vec![0u8; PAGE];
+    // SAFETY: the read end from pipe(), and a buffer of `PAGE` bytes.
+    let first = unsafe { libc::read(rd, page.as_mut_ptr().cast(), PAGE) };
+    let wrote = writer.join().map_err(|_| Failure::Mismatch {
+        what: "the writing thread",
+    })?;
+    expect("the blocked write", 1, wrote as i64)?;
+    // With the last reference gone the pipe has no writer: after its bytes, a read sees the
+    // end of the file, not `EAGAIN` as it would if the description had never been closed.
+    set_nonblocking(rd, true)?;
+    let mut left = held.saturating_sub(first.max(0) as usize).saturating_add(1);
+    let end = loop {
+        // SAFETY: as above.
+        let n = unsafe { libc::read(rd, page.as_mut_ptr().cast(), PAGE) };
+        if n <= 0 {
+            break if n == 0 {
+                0
+            } else {
+                neg(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            };
+        }
+        left = left.saturating_sub(n as usize);
+    };
+    for fd in [rd, wake_rd, wake_wr] {
+        close_fd(fd);
+    }
+    expect("bytes left in the pipe", 0, left as i64)?;
+    expect("a read once the last holder let go", 0, end)
+}
+
 /// Operations per benchmark.
 const BENCH_OPS: usize = 20_000;
 /// SQEs per `Enter` in the ring benchmarks.
@@ -733,7 +837,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 13] = [
+    let steps: [(&str, Step); 14] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -746,6 +850,7 @@ pub fn main() -> ExitCode {
         ("ring-corrupt", corrupt),
         ("ring-event", event),
         ("ring-hold", hold),
+        ("ring-release", release),
         ("ring-bench", bench),
     ];
     for (name, step) in steps {

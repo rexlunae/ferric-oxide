@@ -66,7 +66,10 @@ use crate::{
     sync::CleanLockToken,
     syscall::{
         data::{GlobalSchemes, Map},
-        fs::{description_op, file_description, read_description, write_description},
+        fs::{
+            description_op, file_description, read_description, release_description,
+            write_description,
+        },
         usercopy::{UserSlice, UserSliceRw},
     },
 };
@@ -267,21 +270,10 @@ fn resolve_files(chain: &Chain, token: &mut CleanLockToken) -> ChainFiles {
         .collect()
 }
 
-/// Lets go of a description, closing it when this was the last reference, as closing a
-/// descriptor does.
-fn release(description: Description, token: &mut CleanLockToken) {
-    // `Arc::into_inner` hands the description to exactly one of the last holders, even when
-    // they let go at the same time.
-    if let Some(description) = Arc::into_inner(description) {
-        // Like a descriptor closed on exit, the ring has no one to report a failed close to.
-        let _ = description.into_inner().try_close(token);
-    }
-}
-
-/// [`release`] for every file of a chain that is still held.
+/// [`release_description`] for every file of a chain that is still held.
 fn release_files(files: ChainFiles, token: &mut CleanLockToken) {
     for description in files.into_iter().flatten().flatten() {
-        release(description, token);
+        release_description(description, token);
     }
 }
 
@@ -314,7 +306,7 @@ fn run(sqe: &Sqe, file: Option<Result<Description>>, token: &mut CleanLockToken)
         .map_err(sqe_errno)
         .and_then(|op| run_op(op, &mut file, token));
     if let Some(Ok(description)) = file {
-        release(description, token);
+        release_description(description, token);
     }
     match result {
         Ok(value) => Cqe::encode_result(Ok(value as u64)),
@@ -334,16 +326,14 @@ fn resolve(file: FileRef, token: &mut CleanLockToken) -> Result<Description> {
     }
 }
 
-/// Runs `op` on the SQE's file, taken from `file`.
+/// Runs `op` on the SQE's file, taken from `file`; `op` lets go of it.
 fn with_file<T>(
     file: &mut Option<Result<Description>>,
     token: &mut CleanLockToken,
     op: impl FnOnce(Description, &mut CleanLockToken) -> Result<T>,
 ) -> Result<T> {
-    let description = file.take().unwrap_or(Err(Error::new(EBADF)))?;
-    let result = op(Arc::clone(&description), token);
-    release(description, token);
-    result
+    // The op hands the reference on to `description_op`, which lets go of it afterwards.
+    op(file.take().unwrap_or(Err(Error::new(EBADF)))?, token)
 }
 
 /// The address and length of a buffer in the caller's address space.

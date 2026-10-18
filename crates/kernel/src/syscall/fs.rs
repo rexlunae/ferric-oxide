@@ -50,8 +50,25 @@ pub fn file_description(
     let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
     Ok(file.description)
 }
+/// Lets go of a reference to an open file description, and closes the description when that
+/// was the last reference, as closing its last descriptor does (Ferric Oxide).
+///
+/// An operation or a ring that holds a description while another thread closes the
+/// descriptor must let go through this, or the description, the last reference gone, would
+/// be dropped without its scheme ever seeing the close. A failed close has no one to report
+/// to, as for a descriptor closed on exit.
+pub fn release_description(description: Arc<LockedFileDescription>, token: &mut CleanLockToken) {
+    // `Arc::into_inner` hands the description to exactly one of the last holders, even when
+    // they let go at the same time.
+    if let Some(description) = Arc::into_inner(description) {
+        let _ = description.into_inner().try_close(token);
+    }
+}
 /// [`file_op_generic_ext`] on a description already looked up (Ferric Oxide: the ring file
-/// table holds descriptions, not descriptors).
+/// table holds descriptions, not descriptors). The op must not keep the description it is
+/// given past its return: this lets go of the operation's reference afterwards with
+/// [`release_description`], so the description is closed if its descriptor was closed
+/// meanwhile.
 pub fn description_op<T>(
     description: Arc<LockedFileDescription>,
     token: &mut CleanLockToken,
@@ -65,9 +82,18 @@ pub fn description_op<T>(
     // TODO: potential unnecessary clone
     let desc = description.read(token.token()).clone();
 
-    let scheme = desc.scheme_ref.upgrade()?;
+    let scheme = match desc.scheme_ref.upgrade() {
+        Ok(scheme) => scheme,
+        Err(err) => {
+            release_description(description, token);
+            return Err(err);
+        }
+    };
 
-    op(&*scheme, description, desc, token)
+    let held = Arc::clone(&description);
+    let result = op(&*scheme, description, desc, token);
+    release_description(held, token);
+    result
 }
 pub fn copy_path_to_buf(raw_path: UserSliceRo, max_len: usize) -> Result<String> {
     let mut path_buf = vec![0_u8; max_len];
@@ -747,15 +773,27 @@ pub fn mremap(
 }
 
 pub fn lseek(fd: FileHandle, pos: i64, whence: usize, token: &mut CleanLockToken) -> Result<usize> {
-    let (fsize, desc) = file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+    let description = file_description(fd, token)?;
+    let result = lseek_description(&description, pos, whence, token);
+    release_description(description, token);
+    result
+}
+/// [`lseek`] on a description.
+fn lseek_description(
+    description: &Arc<LockedFileDescription>,
+    pos: i64,
+    whence: usize,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let fsize = description_op(Arc::clone(description), token, |scheme, _, desc, token| {
         Ok(if whence == SEEK_END {
-            (Some(scheme.fsize(desc.number, token)?), desc_arc)
+            Some(scheme.fsize(desc.number, token)?)
         } else {
-            (None, desc_arc)
+            None
         })
     })?;
 
-    let mut guard = desc.write(token.token());
+    let mut guard = description.write(token.token());
 
     let new_pos = match whence {
         SEEK_SET => pos,
@@ -780,24 +818,25 @@ pub fn read_description(
     buf: UserSliceWo,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
-    let (bytes_read, desc_arc, desc) =
-        description_op(description, token, |scheme, desc_arc, desc, token| {
-            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-                desc.offset
-            } else {
-                u64::MAX
-            };
-            Ok((
-                scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
-                desc_arc,
-                desc,
-            ))
-        })?;
-    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-        let offset = &mut desc_arc.write(token.token()).offset;
-        *offset = offset.saturating_add(bytes_read as u64)
+    let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
+        let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+            desc.offset
+        } else {
+            u64::MAX
+        };
+        Ok((
+            scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+            desc,
+        ))
+    });
+    if let Ok((bytes_read, desc)) = &result
+        && desc.internal_flags.contains(InternalFlags::POSITIONED)
+    {
+        let offset = &mut description.write(token.token()).offset;
+        *offset = offset.saturating_add(*bytes_read as u64)
     }
-    Ok(bytes_read)
+    release_description(description, token);
+    result.map(|(bytes_read, _)| bytes_read)
 }
 pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -> Result<usize> {
     write_description(file_description(fd, token)?, buf, token)
@@ -808,22 +847,23 @@ pub fn write_description(
     buf: UserSliceRo,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
-    let (bytes_written, desc_arc, desc) =
-        description_op(description, token, |scheme, desc_arc, desc, token| {
-            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-                desc.offset
-            } else {
-                u64::MAX
-            };
-            Ok((
-                scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
-                desc_arc,
-                desc,
-            ))
-        })?;
-    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-        let offset = &mut desc_arc.write(token.token()).offset;
-        *offset = offset.saturating_add(bytes_written as u64)
+    let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
+        let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+            desc.offset
+        } else {
+            u64::MAX
+        };
+        Ok((
+            scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+            desc,
+        ))
+    });
+    if let Ok((bytes_written, desc)) = &result
+        && desc.internal_flags.contains(InternalFlags::POSITIONED)
+    {
+        let offset = &mut description.write(token.token()).offset;
+        *offset = offset.saturating_add(*bytes_written as u64)
     }
-    Ok(bytes_written)
+    release_description(description, token);
+    result.map(|(bytes_written, _)| bytes_written)
 }
