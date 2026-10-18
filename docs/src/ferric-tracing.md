@@ -225,7 +225,9 @@ three times the budget.
 
 Each boot reports every result line and any failure as a workflow annotation,
 so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
-`ON_BUDGET_PCT` set the budgets. The script warns when records were dropped,
+`ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
+medians. The script fails, naming the logs, when a boot lacks a result or a
+traced boot lacks its `lost records` line. It warns when records were dropped,
 since a dropped record costs less than a written one, and prints every result
 as a notice on the run.
 

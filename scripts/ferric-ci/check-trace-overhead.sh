@@ -117,9 +117,23 @@ for workload in io syscall; do
 done
 # A full ring drops records, which is cheaper than writing them, so losses make "on" look
 # better than it is.
-lost="$(cat "${in_logs[@]}" | tr -d '\r' | { grep -ao 'FERRIC_BENCH lost records=[0-9]*' || true; } \
-    | sed 's/.*=//' | awk '{ s += $1 } END { print s + 0 }')"
-if [ "$lost" -gt 0 ]; then
+# Every traced boot prints its count, so a log without one is incomplete, not
+# a boot that lost nothing.
+lost=0
+no_count=()
+for log in "${in_logs[@]}"; do
+    count="$(tr -d '\r' < "$log" | { grep -ao 'FERRIC_BENCH lost records=[0-9]*' || true; } \
+        | sed 's/.*=//' | head -n 1)"
+    if [ -n "$count" ]; then
+        lost=$((lost + count))
+    else
+        no_count+=("$log")
+    fi
+done
+if [ "${#no_count[@]}" -gt 0 ]; then
+    echo "::error title=trace overhead::no FERRIC_BENCH lost records= line in ${no_count[*]}"
+    status=1
+elif [ "$lost" -gt 0 ]; then
     echo "::warning title=trace overhead::$lost records were dropped during the on rounds; the on figure is low"
 fi
 exit "$status"
