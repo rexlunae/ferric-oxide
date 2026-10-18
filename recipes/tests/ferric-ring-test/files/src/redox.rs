@@ -791,7 +791,26 @@ fn fill(fd: c_int) -> Result<usize, Failure> {
     Ok(held)
 }
 
+/// The waits `ring-release` tries in turn before the closing thread closes the descriptor.
+const RELEASE_DELAYS_MS: [u64; 5] = [500, 1000, 2000, 4000, 8000];
+
 fn release() -> Result<(), Failure> {
+    // Nothing tells the closing thread that the writer is blocked in `write` yet; if the
+    // writer had not started when the descriptor went, its `write` fails with `EBADF` and
+    // nothing was tested, so the step runs again with a longer wait.
+    for delay in RELEASE_DELAYS_MS {
+        if release_attempt(Duration::from_millis(delay))? {
+            return Ok(());
+        }
+    }
+    Err(Failure::Mismatch {
+        what: "a writer blocked in write before the close, after every wait",
+    })
+}
+
+/// One try of `ring-release`, whose closing thread waits `delay`; `false` when the writer
+/// had not yet started its `write` when the descriptor was closed.
+fn release_attempt(delay: Duration) -> Result<bool, Failure> {
     let mut ring = Ring::new(8, 16)?;
     let [wake_rd, wake_wr] = pipe()?;
     let [rd, wr] = pipe()?;
@@ -808,10 +827,13 @@ fn release() -> Result<(), Failure> {
     let writer = std::thread::spawn(move || {
         let byte = [0x22_u8];
         // SAFETY: the write end from pipe(), and a buffer of 1 byte.
-        unsafe { libc::write(wr, byte.as_ptr().cast(), 1) }
+        let n = unsafe { libc::write(wr, byte.as_ptr().cast(), 1) };
+        // errno is per thread, so it is taken here.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        (n, errno)
     });
     let closer = std::thread::spawn(move || {
-        std::thread::sleep(HOLD_DELAY);
+        std::thread::sleep(delay);
         // The descriptor goes while the ring and the write both hold its description.
         close_fd(wr);
         let byte = [0x33_u8];
@@ -834,9 +856,21 @@ fn release() -> Result<(), Failure> {
     let mut page = vec![0u8; PAGE];
     // SAFETY: the read end from pipe(), and a buffer of `PAGE` bytes.
     let first = unsafe { libc::read(rd, page.as_mut_ptr().cast(), PAGE) };
-    let wrote = writer.join().map_err(|_| Failure::Mismatch {
+    let (wrote, errno) = writer.join().map_err(|_| Failure::Mismatch {
         what: "the writing thread",
     })?;
+    if wrote < 0 {
+        for fd in [rd, wake_rd, wake_wr] {
+            close_fd(fd);
+        }
+        if errno == EBADF {
+            return Ok(false);
+        }
+        return Err(Failure::Errno {
+            what: "the blocked write",
+            errno,
+        });
+    }
     expect("the blocked write", 1, wrote as i64)?;
     // With the last reference gone the pipe has no writer: after its bytes, a read sees the
     // end of the file, not `EAGAIN` as it would if the description had never been closed.
@@ -858,7 +892,8 @@ fn release() -> Result<(), Failure> {
         close_fd(fd);
     }
     expect("bytes left in the pipe", 0, left as i64)?;
-    expect("a read once the last holder let go", 0, end)
+    expect("a read once the last holder let go", 0, end)?;
+    Ok(true)
 }
 
 /// Operations per benchmark.
