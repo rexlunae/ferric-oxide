@@ -33,7 +33,7 @@ If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot
 
 `make menuconfig` opens a menu, much like the Linux kernel's, for choosing the target, the processor baseline (x86-64-v3 by default), kernel features, image contents and build settings. Your choices are saved in `ferric.toml`, a short TOML file that you or an agent can also edit directly or change with `ferric-config set`; every option is described in [`features.toml`](features.toml). Without a `ferric.toml` the build behaves exactly like upstream. See [tools/ferric-config](tools/ferric-config/README.md).
 
-Until Ferric Oxide has its own book, the upstream Redox documentation is the reference for building and running the system:
+The in-tree [system documentation](docs/src/ferric-oxide.md) describes the implemented architecture, configuration, memory and CPU protection, registered buffers and DMA isolation, package tooling, and validation. See [docs/README.md](docs/README.md) to build or serve the book. The inherited Redox chapters remain useful background, alongside the upstream build guides:
 
 - [Building with Podman](https://doc.redox-os.org/book/podman-build.html)
 - [Build System Reference](https://doc.redox-os.org/book/build-system-reference.html)
@@ -44,7 +44,7 @@ Internal names such as the `x86_64-unknown-redox` target, `relibc`, `RedoxFS` an
 
 ## Contributing
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [AI Contribution Policy](AI_POLICY.md). Hardware test reports go in [HARDWARE.md](HARDWARE.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [AI Contribution Policy](AI_POLICY.md). Update the relevant system documentation alongside implementation changes; [AGENTS.md](AGENTS.md) maps tasks to the useful documents. Hardware test reports go in [HARDWARE.md](HARDWARE.md).
 
 ## Components
 
@@ -66,7 +66,8 @@ The kernel, bootloader, relibc, base, RedoxFS and book are imported upstream tre
 
 ### Host workspace imports
 
-The root workspace contains cookbook, ferric-config, installer and Redoxer.
+The root workspace contains cookbook, ferric-config, installer, Redoxer, fox
+and the host-testable shared crates listed in the [architecture guide](docs/src/ferric-architecture.md).
 Cookbook uses the local installer and Redoxer libraries; `make fstools` installs
 from `tools/installer`, and the installer recipe copies that same source for
 Redox target builds. RedoxFS stays under `userspace/redoxfs` and builds separately

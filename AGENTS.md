@@ -6,26 +6,55 @@ Guidance for AI coding agents (and humans) working in the Ferric Oxide repositor
 
 Ferric Oxide is a fork of [Redox OS](https://www.redox-os.org/): a microkernel operating system written in Rust, aimed at high performance on modern hardware. This repository started as the Redox build system and is becoming a monorepo that holds the kernel, bootloader, relibc, user space and build tools together.
 
+## Documentation: where to look
+
+Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the current architecture, integration status and known limitations. The Ferric chapters live in `docs/src/` and are part of the book's [table of contents](docs/src/SUMMARY.md). The inherited Redox chapters provide background, but can contain historical paths and outdated implementation descriptions; verify them against this checkout before relying on them.
+
+| Task | Documents and implementation references |
+| --- | --- |
+| Understand the system, boot sequence, services or workspace boundaries | [Architecture](docs/src/ferric-architecture.md), then [schemes](docs/src/schemes-resources.md) and [scheme operation](docs/src/scheme-operation.md) |
+| Build an image, change feature options or add a recipe | [Build and configuration](docs/src/ferric-build.md), [ferric-config usage](tools/ferric-config/README.md), [feature catalog](features.toml), [build-system reference](docs/src/build-system-reference.md) and [application porting](docs/src/porting-applications.md) |
+| Change address spaces, CPU state or kernel hardening | [Memory and CPU protection](docs/src/ferric-memory.md), relevant Rustdoc in `crates/kernel/` and the shared crates under `crates/` |
+| Work on PCI drivers, DMA, IOMMU domains or registered buffers | [Registered buffers and IOMMUs](docs/src/ferric-io.md), ABI/module docs in `crates/{regbuf,iommu,vtd,amdvi}/src/`, and `userspace/base/drivers/pcid/` |
+| Change package verification, installation, manifests or SBOMs | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom}/` and `tools/fox/` |
+| Select checks, debug a failure, reproduce a boot or run fuzzing | [Validation and debugging](docs/src/ferric-testing.md), [CI workflows](.github/workflows/), [CI scripts](scripts/ferric-ci/) and [kernel lint baseline](ci/kernel-lints.json) |
+| Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
+| Report hardware results | [HARDWARE.md](HARDWARE.md); inherited reports are not proof of current Ferric support |
+| Contribute, review or handle upstream imports | [CONTRIBUTING.md](CONTRIBUTING.md), [AI_POLICY.md](AI_POLICY.md), [PR template](.github/pull_request_template.md), [subtree-sync workflow](.github/workflows/subtree-sync.yml) |
+| Check licensing or user-facing names | [LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md) |
+| Add or render book pages | [Book README](docs/README.md), [writing docs](docs/src/writing-docs-correctly.md) and [documentation checks](docs/src/ferric-testing.md#documentation-checks) |
+
+Source and tests establish what is implemented; `features.toml` establishes configuration choices and defaults; workflows establish required CI commands. Some source comments refer to design files such as `io/iommu-design.md`, `io/registered-buffers-design.md` and `packaging/packaging-design.md` that are not tracked here. Do not assume those files are available or treat their phase labels as completed behavior. Use the local system chapters and code, and request the design only if the task needs information they do not contain.
+
+### Keep system documentation current
+
+- **Update documentation in the same change as the implementation.** Changes to behavior, architecture, public interfaces, feature defaults, build/configuration commands, package formats or validation requirements must update the relevant system chapter in `docs/src/` and any affected component README or Rustdoc. Documentation updates are part of completing the task.
+- Document the implemented behavior, enabling configuration, constraints and relevant checks. Distinguish prepared interfaces or planned work from active enforcement; do not claim a successful test, boot, benchmark or hardware result without evidence.
+- Keep the [system status table](docs/src/ferric-oxide.md#implementation-status) and this document map accurate when adding components or completing previously unfinished work. Prefer links to authoritative catalog/API/workflow details over copying lists that will diverge.
+- Put system documentation in `docs/`. Add Ferric-specific pages locally and list them in `docs/src/SUMMARY.md`; preserve inherited upstream content and avoid unrelated reorganization of the book subtree.
+- Run the book checks described in [Validation and debugging](docs/src/ferric-testing.md#documentation-checks) when changing its pages. Report unavailable tooling and validation limits. Never commit generated `docs/book/` output.
+
 ## Repository layout
 
-The repository is moving to the layout below. Parts of it do not exist yet; put new code where it will live in this layout, not where the old one would have put it.
+The implemented layout is below. Put new code in the appropriate component directory, not at the repository root; planned components must be labelled as such until they exist.
 
 | Path | What it is | Cargo workspace |
 | --- | --- | --- |
 | `Cargo.toml` (root) | Host workspace: build tools that run on the developer machine | host |
 | `tools/cookbook/` | The recipe engine and `repo` binary | host |
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
-| `tools/installer/`, `tools/redoxfs-host/` | Image installer and host-side RedoxFS tools | host |
+| `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
+| `tools/fox/` | Local package verification, installation and SBOM CLI | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |
-| `crates/` (others) | Shared libraries used by several workspaces (`ferric-nospec`, `ferric-hwrand`, later `ferric-abi`, …), `no_std` where possible | pulled in by path |
-| `userspace/` | Daemons, drivers, file system, new Ferric Oxide services. `base/` and `redoxfs/` are upstream subtrees | userspace |
+| `crates/` (others) | Shared protection, relocation, registered-buffer, IOMMU and fox libraries, `no_std` where possible | host-tested members, consumed by path across targets |
+| `userspace/` | Daemons, drivers and file system. `base/` and `redoxfs/` are upstream subtrees; RedoxFS also supplies host tools | separate base workspace and standalone RedoxFS/bootstrap builds |
 | `recipes/`, `config/`, `mk/` | Package recipes, image configs, Makefile fragments | — |
 | `features.toml` | Catalog of build-time feature options | — |
-| `docs/` | The book. Upstream subtree | — |
+| `docs/` | The book: implemented Ferric system chapters and inherited Redox background. Upstream subtree with local additions | — |
 
-Each target (host, kernel, UEFI, `x86_64-unknown-redox`) has its own workspace because a Cargo workspace has one target, one lockfile and one set of profiles. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
+Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` and a general `ferric-abi` crate do not exist yet. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
 
 ## Non-negotiable project rules
 
@@ -114,11 +143,12 @@ cargo test
 cargo doc --no-deps   # must build without warnings
 ```
 
-For the host workspace, CI (`.github/workflows/host-tools.yml`) runs `cargo fmt --all --check`, `cargo test --locked --workspace` and `cargo clippy --locked --all-targets -p ferric-config -- -D warnings` from the repository root. The cookbook is upstream code with many existing lint warnings, so clippy is not yet denied for it. If gitlab.redox-os.org is unreachable (as in cloud sessions), `git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/` plus `CARGO_NET_GIT_FETCH_WITH_CLI=true` lets Cargo fetch the cookbook's git dependencies from the GitHub mirrors. For the kernel, CI (`.github/workflows/kernel-lints.yml`) runs `scripts/ferric-ci/kernel-lint-ratchet.sh`, which fails if any Clippy warning count or the number of `unsafe` uses goes above the baseline in `ci/kernel-lints.json`. Fix new warnings instead of raising the baseline, and when you remove some, run the script with `--update` and commit the lower baseline. Changes that affect the image (kernel, drivers, recipes, config) also need `make all` and a boot with `make qemu` where your environment allows it; say in the PR if you could not.
+For the host workspace, CI ([host-tools.yml](.github/workflows/host-tools.yml)) runs `cargo fmt --all --check`, `cargo test --locked --workspace`, feature-enabled shared-crate checks, strict Rustdoc and Clippy for Ferric tools/libraries, and separate host RedoxFS tests. Imported host tools have existing upstream lint warnings, so Clippy is not yet denied for all of them. Use the workflow for the exact package/feature combinations and [Validation and debugging](docs/src/ferric-testing.md) for how the checks fit together. If gitlab.redox-os.org is unreachable (as in cloud sessions), `git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/` plus `CARGO_NET_GIT_FETCH_WITH_CLI=true` lets Cargo fetch the cookbook's git dependencies from the GitHub mirrors. For the kernel, CI ([kernel-lints.yml](.github/workflows/kernel-lints.yml)) runs `scripts/ferric-ci/kernel-lint-ratchet.sh`, which fails if any Clippy warning count or the number of `unsafe` uses goes above the baseline in `ci/kernel-lints.json`, and checks kernel relocations and IBT entry points. Fix new warnings instead of raising the baseline, and when you remove some, run the script with `--update` and commit the lower baseline. Changes that affect the image (kernel, drivers, recipes, config) also need `make all` and a boot with `make qemu` where your environment allows it; say in the PR if you could not.
 
 Then:
 
 - Keep each PR focused on one change, and fill in the [pull request template](.github/pull_request_template.md), including the AI assistance section.
+- Include the documentation updates required above and check that new book pages appear in `docs/src/SUMMARY.md`.
 - Sign off each commit (`git commit -s`).
 - Do not commit `ferric.toml`, `build/` or other generated output.
 - Do not mix formatting-only changes in upstream subtrees with real changes; they make upstream merges conflict.
