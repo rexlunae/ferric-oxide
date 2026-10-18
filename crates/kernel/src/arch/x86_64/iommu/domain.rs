@@ -19,7 +19,7 @@
 //! (page-selective where possible) and waited on, and only then are emptied table pages
 //! freed.
 //!
-//! AMD-Vi device table entries change in the same order (`amdvi::set_device`).
+//! AMD-Vi device table entries change in the same order (`amdvi::attach`, `amdvi::detach`).
 //!
 //! A device that an RMRR (VT-d) or a unity or exclusion IVMD (AMD-Vi) names gets that
 //! reserved memory mapped one-to-one in the domain before it is attached, so the firmware's
@@ -440,13 +440,7 @@ impl Domain {
                 })
                 .map(drop)
             }
-            Vendor::AmdVi(_) => {
-                let target = amdvi::Target::Translated {
-                    root: self.root,
-                    domain: self.did,
-                };
-                amdvi::set_device(index, device, target, amdvi::refuse_busy)
-            }
+            Vendor::AmdVi(_) => amdvi::attach(index, device, self.root, self.did),
         };
         if let Err(err) = result {
             self.unmap_reserved(mapped);
@@ -599,11 +593,12 @@ fn release_did(did: u16) {
     }
 }
 
-/// Blocks `device` on unit `index` of `vendor`.
+/// Blocks `device` on unit `index` of `vendor` (on AMD-Vi, an alias entry another attached
+/// function still uses stays in its domain).
 fn block(vendor: Vendor, index: usize, device: Device) -> Result<(), DomainError> {
     match vendor {
         Vendor::Vtd(_) => set_context(index, device.bdf, Target::Blocked, |_| Ok(())).map(drop),
-        Vendor::AmdVi(_) => amdvi::set_device(index, device, amdvi::Target::Blocked, |_| Ok(())),
+        Vendor::AmdVi(_) => amdvi::detach(index, device),
     }
 }
 
@@ -791,7 +786,7 @@ fn context_entry(index: usize, bdf: Bdf) -> Result<ContextEntry, DomainError> {
 pub(super) fn restore_identity(device: Device) -> Result<(), DomainError> {
     let index = unit_for(device)?;
     if let Some(Vendor::AmdVi(_)) = Vendor::current() {
-        return amdvi::set_device(index, device, amdvi::Target::Identity, amdvi::refuse_busy);
+        return amdvi::restore_identity(index, device);
     }
     set_context(index, device.bdf, Target::Identity, |old| {
         if old.is_present() && old.domain_id() != IDENTITY_DOMAIN {

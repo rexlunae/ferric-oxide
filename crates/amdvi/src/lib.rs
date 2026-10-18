@@ -23,6 +23,10 @@
 //!   command buffer's head and tail.
 //! - [`event`] decodes event log entries and models the event log's head and tail.
 //! - [`plan`] decides, from an IOMMU's registers, whether and how the kernel can enable it.
+//! - [`claims`] tracks which DMA domain holds each device table entry and which functions use
+//!   it, so a shared alias is neither taken over by another domain nor blocked while in use.
+//!
+//! The crate is `no_std` and uses `alloc` (for [`claims`] only).
 //!
 //! The kernel side (`crates/kernel/src/arch/x86_64/iommu/amdvi.rs`) maps the registers,
 //! allocates the tables and rings and runs the enable sequence. See `io/iommu-design.md` in the
@@ -49,6 +53,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod claims;
 pub mod command;
 pub mod dte;
 pub mod event;

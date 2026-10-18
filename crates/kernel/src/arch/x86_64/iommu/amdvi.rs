@@ -9,7 +9,11 @@
 //!   translated), or, under `kernel.iommu = "enforce"`, blocked (translated through an empty
 //!   table with reads and writes refused). Each entry takes the DTE setting of the IVHD device
 //!   entry that names its device, and requests a device makes under an alias ID (IVHD alias
-//!   entries) are handled by programming the alias's entry too;
+//!   entries) are handled by programming the alias's entry too. Several functions can share
+//!   an alias, so `ferric_amdvi::claims` records which domain holds each entry and which
+//!   attached functions use it: another domain cannot take a held entry, attaching to an
+//!   entry the same domain holds changes nothing, and detaching blocks only the entries no
+//!   other function uses;
 //! - a one-page command buffer (section 3.3.1). Every batch of commands ends with a
 //!   COMPLETION_WAIT that stores a sequence number, which the kernel polls for;
 //! - an event log of [`EVENT_LOG_ENTRIES`] entries (section 3.3.2), drained after every command
@@ -40,6 +44,7 @@ use core::{
 };
 
 use ferric_amdvi::{
+    claims::{Claims, Holder},
     command::{Command, CommandBuffer, PageRange},
     dte::DeviceTableEntry,
     event::{Coalescer, Event, EventLog, Run},
@@ -175,6 +180,8 @@ struct UnitState {
     sequence: u64,
     /// Set after the command buffer stopped; no more commands are sent.
     stopped: bool,
+    /// Which DMA domain holds each entry, and which attached functions use it.
+    claims: Claims,
 }
 
 /// A unit's event log.
@@ -185,7 +192,7 @@ struct Events {
 
 /// What a device's entry becomes.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Target {
+enum Target {
     /// Translated through the host page tables at `root`, in domain `domain`.
     Translated {
         /// The root table.
@@ -470,56 +477,131 @@ pub(super) fn unit_for(device: Device) -> Result<usize, DomainError> {
     }
 }
 
-/// The check [`set_device`] takes for attaching: refuses a device in a DMA domain.
-pub(super) fn refuse_busy(old: DeviceTableEntry) -> Result<(), DomainError> {
-    match old.domain_id() {
-        did if old.is_valid() && did >= FIRST_DMA_DOMAIN => Err(DomainError::Busy { did }),
-        _ => Ok(()),
+impl Unit {
+    /// The DTE setting of `device` and the entries its DMA can use: its IVHD alias, if it
+    /// has one, then its own.
+    fn entries_for(&self, device: DeviceId) -> (DteSetting, Vec<DeviceId>) {
+        let (setting, requester) = self.device_setting(device);
+        let ids = if requester == device {
+            Vec::from([device])
+        } else {
+            Vec::from([requester, device])
+        };
+        (setting, ids)
+    }
+
+    /// Changes the entries `ids` to `target`, with the invalidations the change needs: each
+    /// gets a blocked word 0 first, then the entries and their old domains' pages are
+    /// invalidated, then the new entries are written and invalidated again.
+    fn replace(
+        &self,
+        state: &mut UnitState,
+        ids: &[DeviceId],
+        setting: DteSetting,
+        target: Target,
+    ) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let blocked = blocked_entry(setting).0[0];
+        let mut commands = Vec::with_capacity(ids.len().saturating_mul(2).saturating_add(1));
+        let mut old_domains: Vec<u16> = Vec::new();
+        for &each in ids {
+            let old = state.dte(each).domain_id();
+            if !old_domains.contains(&old) {
+                old_domains.push(old);
+            }
+            state.write_word0(each, blocked);
+            commands.push(Command::invalidate_devtab_entry(each));
+        }
+        commands.extend(
+            old_domains
+                .iter()
+                .map(|&did| Command::invalidate_iommu_pages(did, PageRange::All)),
+        );
+        self.submit(state, &commands)?;
+        let new = target.entry(setting);
+        commands.clear();
+        for &each in ids {
+            state.write_dte(each, new);
+            commands.push(Command::invalidate_devtab_entry(each));
+        }
+        commands.push(Command::invalidate_iommu_pages(
+            new.domain_id(),
+            PageRange::All,
+        ));
+        self.submit(state, &commands)
     }
 }
 
-/// Changes `device`'s entry (and its alias's) on unit `index` to `target`, after `check`
-/// accepts the current one, with the invalidations the change needs.
-pub(super) fn set_device(
+/// Attaches `device` on unit `index` to the domain with ID `domain` and root table `root`:
+/// its own entry and its IVHD alias's. An entry that domain already holds (an alias pcid
+/// attaches after the function, or one another function in the domain shares) is left as it
+/// is.
+///
+/// # Errors
+///
+/// [`DomainError::Busy`] when another domain holds one of the entries, since taking it would
+/// move the DMA of the functions using it into this domain; [`DomainError::Hardware`] when an
+/// invalidation fails.
+pub(super) fn attach(
     index: usize,
     device: Device,
-    target: Target,
-    check: impl FnOnce(DeviceTableEntry) -> Result<(), DomainError>,
+    root: u64,
+    domain: u16,
 ) -> Result<(), DomainError> {
     let unit = units().get(index).ok_or(DomainError::NotEnabled)?;
     let id = DeviceId(device.bdf.source_id());
-    let (setting, requester) = unit.device_setting(id);
-    let ids: &[DeviceId] = if requester == id {
-        &[id]
-    } else {
-        &[requester, id]
-    };
+    let (setting, ids) = unit.entries_for(id);
+    let holder = Holder { domain, root };
     let mut state = unit.state.lock();
-    let old = state.dte(requester);
-    check(old)?;
-    // Block first, then drop what the IOMMU cached for the old entry and domain.
-    let blocked = blocked_entry(setting).0[0];
-    let mut commands = Vec::with_capacity(4);
-    for &each in ids {
-        state.write_word0(each, blocked);
-        commands.push(Command::invalidate_devtab_entry(each));
+    let writes = state
+        .claims
+        .check_attach(&ids, holder)
+        .map_err(|conflict| DomainError::Busy {
+            did: conflict.holder.domain,
+        })?;
+    unit.replace(
+        &mut state,
+        &writes,
+        setting,
+        Target::Translated { root, domain },
+    )?;
+    state.claims.record_attach(id, &ids, holder);
+    Ok(())
+}
+
+/// Takes `device` out of its domain on unit `index`. Entries no other attached function
+/// uses are blocked; a shared alias stays in the domain until its last user leaves.
+///
+/// # Errors
+///
+/// [`DomainError::Hardware`] when an invalidation fails; the device then stays attached.
+pub(super) fn detach(index: usize, device: Device) -> Result<(), DomainError> {
+    let unit = units().get(index).ok_or(DomainError::NotEnabled)?;
+    let id = DeviceId(device.bdf.source_id());
+    let (setting, ids) = unit.entries_for(id);
+    let mut state = unit.state.lock();
+    let last = state.claims.check_release(id, &ids);
+    unit.replace(&mut state, &last, setting, Target::Blocked)?;
+    state.claims.record_release(id, &ids);
+    Ok(())
+}
+
+/// Puts `device`, attached to no domain, back to its boot entry (and its alias's).
+///
+/// # Errors
+///
+/// [`DomainError::Busy`] when a domain holds one of the entries, and
+/// [`DomainError::Hardware`] when an invalidation fails.
+pub(super) fn restore_identity(index: usize, device: Device) -> Result<(), DomainError> {
+    let unit = units().get(index).ok_or(DomainError::NotEnabled)?;
+    let (setting, ids) = unit.entries_for(DeviceId(device.bdf.source_id()));
+    let mut state = unit.state.lock();
+    if let Some(holder) = ids.iter().find_map(|&each| state.claims.holder(each)) {
+        return Err(DomainError::Busy { did: holder.domain });
     }
-    commands.push(Command::invalidate_iommu_pages(
-        old.domain_id(),
-        PageRange::All,
-    ));
-    unit.submit(&mut state, &commands)?;
-    let new = target.entry(setting);
-    commands.clear();
-    for &each in ids {
-        state.write_dte(each, new);
-        commands.push(Command::invalidate_devtab_entry(each));
-    }
-    commands.push(Command::invalidate_iommu_pages(
-        new.domain_id(),
-        PageRange::All,
-    ));
-    unit.submit(&mut state, &commands)?;
+    unit.replace(&mut state, &ids, setting, Target::Identity)?;
     Ok(())
 }
 
@@ -668,6 +750,7 @@ fn init_unit(ivhd: Ivhd<'static>) -> Result<Unit, Error> {
         completion: Block::alloc(0)?,
         sequence: 0,
         stopped: false,
+        claims: Claims::new(),
     };
     let events = Events {
         log: EventLog::new(event_size),
