@@ -12,14 +12,20 @@ use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_RDWR};
 use syscall::CallFlags;
 
-use super::{Op, SCHEME, errno, server};
+use super::{FILL_BYTE, Op, PEER, SCHEME, errno, path, server};
 
 /// Pages in the test buffer.
 const PAGES: usize = 4;
 const LEN: usize = PAGES * PAGE_SIZE as usize;
+/// A page, as a buffer length.
+const PAGE: usize = PAGE_SIZE as usize;
 /// Slots the application names its grants by.
 const SLOT_RW: u64 = 1;
 const SLOT_RO: u64 = 2;
+const SLOT_RESHARE: u64 = 3;
+const SLOT_SHARED: u64 = 4;
+const SLOT_BYTES_RW: u64 = 5;
+const SLOT_BYTES_RO: u64 = 6;
 
 /// Why a step failed.
 #[derive(Debug)]
@@ -42,6 +48,8 @@ enum Failure {
     },
     /// The kernel answered with a payload the ABI crate rejects.
     Payload(ferric_regbuf::abi::BytesError),
+    /// Pages the scheme only borrows reached this process through it: the re-share gap.
+    Reshared { what: &'static str },
 }
 
 impl fmt::Display for Failure {
@@ -60,6 +68,7 @@ impl fmt::Display for Failure {
                 got,
             } => write!(f, "{what}: {got} pages pinned, expected {expected}"),
             Self::Payload(err) => write!(f, "bad payload from the kernel: {err}"),
+            Self::Reshared { what } => write!(f, "{what}: borrowed pages were shared onward"),
         }
     }
 }
@@ -129,8 +138,9 @@ struct Scheme {
 }
 
 impl Scheme {
-    /// Forks the server and opens its scheme once it is registered.
-    fn start() -> Result<Self, Failure> {
+    /// Forks a server registered as `name`, forwarding to `peer`, and opens its scheme once it
+    /// is registered.
+    fn start(name: &'static str, peer: Option<&'static str>) -> Result<Self, Failure> {
         let mut ready: [c_int; 2] = [0; 2];
         // SAFETY: `ready` has room for the two descriptors.
         if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 {
@@ -149,7 +159,7 @@ impl Scheme {
             });
         }
         if child == 0 {
-            let code = server::serve(ready[1]);
+            let code = server::serve(ready[1], name, peer);
             // SAFETY: ends the child at once, as `fork` requires.
             unsafe { libc::_exit(code) }
         }
@@ -161,7 +171,7 @@ impl Scheme {
                 errno: errno::EIO,
             });
         }
-        let path = format!("/scheme/{SCHEME}");
+        let path = format!("/scheme/{name}");
         let fd = ctx(
             "open the test scheme",
             Fd::open(&path, O_RDWR | O_CLOEXEC, 0),
@@ -198,20 +208,29 @@ impl Scheme {
     }
 }
 
-/// The application's buffer: private anonymous memory.
+/// The application's buffer: anonymous memory, private unless made with [`Buffer::shared`].
 struct Buffer {
     ptr: *mut u8,
 }
 
 impl Buffer {
     fn new() -> Result<Self, Failure> {
-        // SAFETY: a fresh private mapping at an address the kernel chooses.
+        Self::map(libc::MAP_PRIVATE)
+    }
+
+    /// A `MAP_SHARED` anonymous buffer.
+    fn shared() -> Result<Self, Failure> {
+        Self::map(libc::MAP_SHARED)
+    }
+
+    fn map(kind: c_int) -> Result<Self, Failure> {
+        // SAFETY: a fresh anonymous mapping at an address the kernel chooses.
         let ptr = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
                 LEN,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                kind | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
@@ -266,6 +285,8 @@ fn grant(region: &Fd, access: Access, offset: u64, len: u64) -> Result<(Fd, Gran
 struct Test {
     root: Fd,
     scheme: Scheme,
+    /// A second instance the first forwards reads to.
+    peer: Scheme,
     buffer: Buffer,
     region: Option<Fd>,
     rw: GrantId,
@@ -304,17 +325,24 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 7] = [
+    let steps: [(&str, Step); 13] = [
         ("regbuf-register", register),
         ("regbuf-grant-rw", grant_rw),
         ("regbuf-grant-ro", grant_ro),
         ("regbuf-pinned", pinned_mapping),
+        ("regbuf-reshare-mmap", reshare_mmap),
+        ("regbuf-reshare-register", reshare_register),
+        ("regbuf-reshare-borrow", reshare_borrow),
+        ("regbuf-forward-borrow", forward_borrow),
         ("regbuf-revoke", revoke),
         ("regbuf-unmap", unmap),
         ("regbuf-close", close),
+        ("regbuf-shared", shared),
+        ("regbuf-bytes", bytes),
     ];
     let ok = steps.iter().all(|(name, f)| step(name, f(&mut test)));
     test.scheme.stop();
+    test.peer.stop();
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -324,12 +352,14 @@ pub fn run() -> ExitCode {
 
 fn setup(root: Fd) -> Result<Test, Failure> {
     let pinned_before = pinned(&root)?;
-    let scheme = Scheme::start()?;
+    let scheme = Scheme::start(SCHEME, Some(PEER))?;
+    let peer = Scheme::start(PEER, None)?;
     let mut buffer = Buffer::new()?;
     buffer.bytes().fill(0x5a);
     Ok(Test {
         root,
         scheme,
+        peer,
         buffer,
         region: None,
         rw: GrantId::new(0),
@@ -490,4 +520,277 @@ fn close(t: &mut Test) -> Result<(), Failure> {
         });
     }
     Ok(())
+}
+
+/// Maps `len` bytes of the test scheme with `flags` at offset `offset`: the scheme answers with
+/// one of its grant mappings ([`server`]'s `mmap_prep`).
+fn map_scheme(t: &Test, offset: u64, flags: c_int) -> Result<*mut u8, Failure> {
+    let fd = c_int::try_from(t.scheme.fd.raw()).map_err(|_| Failure::Errno {
+        what: "the scheme's descriptor",
+        errno: errno::EINVAL,
+    })?;
+    let offset = libc::off_t::try_from(offset).map_err(|_| Failure::Errno {
+        what: "the mmap offset",
+        errno: errno::EINVAL,
+    })?;
+    // SAFETY: a new mapping at an address the kernel chooses; the scheme provides its pages.
+    let ptr = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ,
+            flags,
+            fd,
+            offset,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(Failure::Errno {
+            what: "mmap of the scheme",
+            errno: super::last_errno(),
+        });
+    }
+    Ok(ptr.cast())
+}
+
+/// Whether this process can still read `ptr`: the kernel copies a byte from it into a pipe
+/// and fails with `EFAULT` once it is not mapped.
+fn readable(ptr: *const u8) -> Result<bool, Failure> {
+    let mut pipe: [c_int; 2] = [0; 2];
+    // SAFETY: `pipe` has room for the two descriptors.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(Failure::Errno {
+            what: "pipe",
+            errno: super::last_errno(),
+        });
+    }
+    // SAFETY: the kernel reads from the pointer itself and fails with EFAULT when it is not
+    // mapped; this process never dereferences it.
+    let written = unsafe { libc::write(pipe[1], ptr.cast(), 1) };
+    let errno = super::last_errno();
+    // SAFETY: closes the two descriptors just made.
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+    match written {
+        1 => Ok(true),
+        _ if errno == errno::EFAULT => Ok(false),
+        _ => Err(Failure::Errno {
+            what: "probe a mapping",
+            errno,
+        }),
+    }
+}
+
+/// The scheme answers `mmap` with the address of its grant mapping, trying to share pages it
+/// only borrows; the kernel must refuse (`EPERM`) both shared and private maps. If it did not,
+/// the pages would outlive revocation: the step checks that too, and fails either way.
+fn reshare_mmap(t: &mut Test) -> Result<(), Failure> {
+    let (fd, id) = grant(region(t)?, Access::ReadWrite, 0, PAGE_SIZE)?;
+    t.scheme.send(fd, SLOT_RESHARE)?;
+    t.scheme.op("map the grant", Op::Map, SLOT_RESHARE, 1)?;
+    let offset = SLOT_RESHARE * PAGE_SIZE;
+    for (what, flags) in [
+        ("MAP_SHARED re-share", libc::MAP_SHARED),
+        ("MAP_PRIVATE re-share", libc::MAP_PRIVATE),
+    ] {
+        match map_scheme(t, offset, flags) {
+            Err(Failure::Errno { errno, .. }) if errno == errno::EPERM => {}
+            Err(other) => return Err(other),
+            Ok(ptr) => {
+                call(region(t)?, "Revoke", Request::Revoke(id))?;
+                return Err(Failure::Reshared {
+                    what: if readable(ptr)? {
+                        "the re-shared mapping survived revocation"
+                    } else {
+                        what
+                    },
+                });
+            }
+        }
+    }
+    // Revoking still takes the scheme's own mapping away.
+    call(region(t)?, "Revoke", Request::Revoke(id))?;
+    expect_errno(
+        "a system call on the revoked mapping",
+        errno::EFAULT,
+        t.scheme.op("probe", Op::Probe, SLOT_RESHARE, 0),
+    )
+}
+
+/// The scheme cannot register its grant mapping in a region of its own and grant it on.
+fn reshare_register(t: &mut Test) -> Result<(), Failure> {
+    let got = t
+        .scheme
+        .op("Register a grant mapping", Op::Register, SLOT_RW, 0)?;
+    match got {
+        0 => Err(Failure::Reshared {
+            what: "Register of a grant mapping",
+        }),
+        errno::EPERM => Ok(()),
+        got => Err(Failure::Expected {
+            what: "Register of a grant mapping",
+            expected: errno::EPERM,
+            got,
+        }),
+    }
+}
+
+/// Nor its per-request borrow of the buffer of a `read` this process makes.
+fn reshare_borrow(_t: &mut Test) -> Result<(), Failure> {
+    let fd = ctx(
+        "open the register-borrow handle",
+        Fd::open(
+            &format!("/scheme/{SCHEME}/{}", path::REGISTER_BORROW),
+            O_RDWR | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    let mut buffer = Buffer::new()?;
+    expect_errno(
+        "Register of a request buffer",
+        errno::EPERM,
+        ctx("read", fd.read(&mut buffer.bytes()[..2 * PAGE])),
+    )
+}
+
+/// A scheme can still pass a buffer it borrows on in a request of its own (the kernel copies
+/// it instead of borrowing it again): the peer's data reaches this process's buffer.
+fn forward_borrow(_t: &mut Test) -> Result<(), Failure> {
+    let fd = ctx(
+        "open the forward handle",
+        Fd::open(
+            &format!("/scheme/{SCHEME}/{}", path::FORWARD),
+            O_RDWR | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    let mut buffer = Buffer::new()?;
+    // Whole pages and a partial one, so the forwarded buffer has borrowed middle pages.
+    let len = 2 * PAGE + 100;
+    let got = ctx("forwarded read", fd.read(&mut buffer.bytes()[..len]))?;
+    if got != len || buffer.bytes()[..len].iter().any(|&b| b != FILL_BYTE) {
+        return Err(Failure::Data {
+            what: "a read forwarded through a borrowed buffer",
+        });
+    }
+    Ok(())
+}
+
+/// Opens a region of `buffer`, all of it registered.
+fn register_region(buffer: &Buffer) -> Result<Fd, Failure> {
+    let region = ctx(
+        "open a region",
+        Fd::open(&region_path(), O_RDWR | O_CLOEXEC, 0),
+    )?;
+    call(
+        &region,
+        "Register",
+        Request::Register {
+            addr: buffer.addr(),
+            len: LEN as u64,
+        },
+    )?;
+    Ok(region)
+}
+
+/// Fails unless the pinned count is back where it started.
+fn unpinned(t: &Test, what: &'static str) -> Result<(), Failure> {
+    let got = pinned(&t.root)?;
+    if got != t.pinned_before {
+        return Err(Failure::Pinned {
+            what,
+            expected: t.pinned_before,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// `MAP_SHARED` anonymous memory registers too, and grants of it are the same pages.
+fn shared(t: &mut Test) -> Result<(), Failure> {
+    let mut buffer = Buffer::shared()?;
+    buffer.bytes().fill(0x21);
+    let region = register_region(&buffer)?;
+    let (fd, id) = grant(&region, Access::ReadWrite, 0, LEN as u64)?;
+    t.scheme.send(fd, SLOT_SHARED)?;
+    t.scheme
+        .op("map the shared grant", Op::Map, SLOT_SHARED, 1)?;
+    t.scheme
+        .op("scheme reads shared memory", Op::Check, SLOT_SHARED, 0x21)?;
+    t.scheme.op("scheme writes", Op::Fill, SLOT_SHARED, 0x34)?;
+    if buffer.bytes().iter().any(|&b| b != 0x34) {
+        return Err(Failure::Data {
+            what: "the scheme's write in the shared buffer",
+        });
+    }
+    buffer.bytes().fill(0x35);
+    t.scheme
+        .op("scheme sees the app's write", Op::Check, SLOT_SHARED, 0x35)?;
+    call(&region, "Revoke", Request::Revoke(id))?;
+    expect_errno(
+        "a system call on the revoked shared mapping",
+        errno::EFAULT,
+        t.scheme.op("probe", Op::Probe, SLOT_SHARED, 0),
+    )?;
+    drop(region);
+    unpinned(t, "after closing the shared region")
+}
+
+/// Byte-granular grants: a read-write grant from 0x100 into the first page to 0x100 into the
+/// third maps three pages, the middle one the application's own; the scheme sees only the
+/// granted bytes, and its writes reach only those, the partial pages once the grant is
+/// revoked. A read-only grant of 0x20 bytes inside the last page shows just those.
+fn bytes(t: &mut Test) -> Result<(), Failure> {
+    let mut buffer = Buffer::new()?;
+    buffer.bytes().fill(0x77);
+    let region = register_region(&buffer)?;
+    let granted = 0x100..2 * PAGE + 0x100;
+    let (fd, id) = grant(&region, Access::ReadWrite, 0x100, 2 * PAGE_SIZE)?;
+    t.scheme.send(fd, SLOT_BYTES_RW)?;
+    t.scheme.op("map the window", Op::Map, SLOT_BYTES_RW, 1)?;
+    t.scheme.op(
+        "scheme sees only the granted bytes",
+        Op::CheckGranted,
+        SLOT_BYTES_RW,
+        0x77,
+    )?;
+    t.scheme.op(
+        "scheme writes the whole window",
+        Op::Fill,
+        SLOT_BYTES_RW,
+        0x99,
+    )?;
+    if buffer.bytes()[PAGE..2 * PAGE].iter().any(|&b| b != 0x99) {
+        return Err(Failure::Data {
+            what: "the scheme's write in the wholly granted page",
+        });
+    }
+    call(&region, "Revoke", Request::Revoke(id))?;
+    let wrong = buffer.bytes().iter().enumerate().any(|(i, &b)| {
+        let want = if granted.contains(&i) { 0x99 } else { 0x77 };
+        b != want
+    });
+    if wrong {
+        return Err(Failure::Data {
+            what: "the app's buffer after a byte-granular grant is revoked",
+        });
+    }
+    let (fd, _) = grant(&region, Access::Read, 3 * PAGE_SIZE + 0x10, 0x20)?;
+    t.scheme.send(fd, SLOT_BYTES_RO)?;
+    t.scheme.op("map the r window", Op::Map, SLOT_BYTES_RO, 0)?;
+    t.scheme.op(
+        "scheme sees only the 0x20 granted bytes",
+        Op::CheckGranted,
+        SLOT_BYTES_RO,
+        0x77,
+    )?;
+    drop(region);
+    expect_errno(
+        "a system call on a mapping of a closed region",
+        errno::EFAULT,
+        t.scheme.op("probe", Op::Probe, SLOT_BYTES_RO, 0),
+    )?;
+    unpinned(t, "after closing the byte-granular region")
 }

@@ -9,8 +9,27 @@ use std::process::ExitCode;
 /// The test scheme's name.
 const SCHEME: &str = "regbuf-test";
 
+/// The name of a second instance of the test scheme, which the first forwards reads to.
+const PEER: &str = "regbuf-test-peer";
+
+/// Paths of the test scheme's handles besides the root's (the empty path, for [`Op`] calls).
+mod path {
+    /// `read` on it registers the request's buffer, borrowed from the reader, in a regbuf
+    /// region of the scheme's own; the read fails with that `Register`'s errno.
+    pub const REGISTER_BORROW: &str = "register-borrow";
+    /// `read` on it reads the peer scheme's [`FILL`] handle into the request's buffer: the
+    /// scheme passes on a buffer it only borrows.
+    pub const FORWARD: &str = "forward";
+    /// `read` on it fills the buffer with [`super::FILL_BYTE`].
+    pub const FILL: &str = "fill";
+}
+
+/// What a `read` of the [`path::FILL`] handle writes.
+const FILL_BYTE: u8 = 0x42;
+
 /// The errno values the test expects, as relibc numbers them.
 mod errno {
+    pub const EPERM: usize = 1;
     pub const EIO: usize = 5;
     pub const EFAULT: usize = 14;
     pub const EBUSY: usize = 16;
@@ -42,6 +61,12 @@ enum Op {
     Remap = 7,
     /// Leave the request loop and exit.
     Exit = 8,
+    /// Check the granted bytes of the kept mapping are `arg` and the rest of its pages are
+    /// zero: a byte-granular grant shows nothing of the region outside it.
+    CheckGranted = 9,
+    /// Try to register the kept mapping in a regbuf region of the scheme's own: 0 if that
+    /// worked, else its errno (`EPERM`, borrowed pages cannot be registered).
+    Register = 10,
 }
 
 impl Op {
@@ -55,6 +80,8 @@ impl Op {
             6 => Self::Unmap,
             7 => Self::Remap,
             8 => Self::Exit,
+            9 => Self::CheckGranted,
+            10 => Self::Register,
             _ => return None,
         })
     }
