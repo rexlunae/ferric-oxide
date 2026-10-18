@@ -529,6 +529,23 @@ mod tests {
     }
 
     #[test]
+    fn ops_name_their_file() {
+        assert_eq!(Op::Nop.file(), None);
+        assert_eq!(
+            Sqe::write(4, 0, 0x1000, 8, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(4)))
+        );
+        assert_eq!(
+            Sqe::fsync(3, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(3)))
+        );
+        assert_eq!(
+            Sqe::fsize(3, 1).fixed().op().map(|op| op.file()),
+            Ok(Some(FileRef::Fixed(3)))
+        );
+    }
+
+    #[test]
     fn cqes_round_trip() {
         for cqe in [
             Cqe::new(1, 0),

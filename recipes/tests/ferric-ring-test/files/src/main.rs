@@ -32,6 +32,12 @@
 //!   with `EBADF`.
 //! - `ring-fstat`: `Fstat` gives the same `Stat` as `fstat`, `st_dev` included, and `Fsize`
 //!   the file's length.
+//! - `ring-hold`: a chain blocked in its first SQE still writes, in its second, to the pipe
+//!   its submitter named after another thread moves a different pipe onto that descriptor
+//!   number with `dup2`: `Enter` holds a chain's files from when it takes the chain.
+//! - `ring-release`: a pipe's write end, closed while a ring chain and a blocked `write` both
+//!   hold it, is closed for good by whichever lets go last (here the `write`), so the reader
+//!   sees the end of the file.
 //! - `ring-async`: an `ASYNC` read of an empty pipe leaves `Enter` without a completion and
 //!   without an event, keeps working after its descriptor is closed, and completes once the
 //!   pipe has data, which `Enter` with `min_complete` waits for and an event queue sees; an

@@ -26,15 +26,11 @@ use alloc::{
     vec::Vec,
 };
 
-use ferric_ring::{
-    abi::MAX_CHAIN,
-    chain::{Chain, Completions},
-    entry::FileRef,
-};
+use ferric_ring::chain::{Chain, Completions};
 use spin::Mutex;
-use syscall::error::{Error, Result, EBADF, ECANCELED, ENOMEM};
+use syscall::error::{Result, EBADF, ECANCELED, ENOMEM};
 
-use super::{errno_result, release, resolve, run_with, Description, Ring};
+use super::{errno_result, release_files, resolve_files, run_chain, ChainFiles, Ring};
 use crate::{
     context::{
         self, memory::AddrSpaceWrapper, unblock_context, wakeup_context, ContextLock, Status,
@@ -86,8 +82,8 @@ enum Worker {
 /// An asynchronous chain, as `Enter` took it.
 struct Job {
     chain: Chain,
-    /// Each entry's file, looked up by `Enter`: `None` for an entry that names none.
-    files: Vec<Option<Result<Description>>>,
+    /// Each entry's file, looked up by `Enter` ([`resolve_files`]).
+    files: ChainFiles,
     /// The submitter's address space, which holds the buffers.
     space: Weak<AddrSpaceWrapper>,
     /// The submitter's credentials, which requests to user schemes carry.
@@ -101,27 +97,6 @@ static STARTING: Mutex<alloc::collections::BTreeMap<usize, Arc<Ring>>> =
 /// A context's key in [`STARTING`].
 fn key(context: &Arc<ContextLock>) -> usize {
     Arc::as_ptr(context) as usize
-}
-
-/// Looks up the files of `chain` in the caller's context, as `Enter` would to run it.
-fn resolve_files(
-    ring: &Ring,
-    chain: &Chain,
-    token: &mut CleanLockToken,
-) -> Vec<Option<Result<Description>>> {
-    let mut files = Vec::with_capacity(MAX_CHAIN);
-    for sqe in chain.entries() {
-        let file = sqe.op().ok().and_then(|op| op.file());
-        files.push(file.map(|file| resolve(ring, file, token)));
-    }
-    files
-}
-
-/// Gives back the files a job did not use.
-fn release_files(files: Vec<Option<Result<Description>>>, token: &mut CleanLockToken) {
-    for description in files.into_iter().flatten().flatten() {
-        release(description, token);
-    }
 }
 
 /// Queues `chain` for the ring's worker, starting the worker for the first one. Room for its
@@ -325,7 +300,7 @@ fn run_job(job: Job, token: &mut CleanLockToken) -> Completions {
     };
     let Job {
         chain,
-        mut files,
+        files,
         caller,
         ..
     } = job;
@@ -333,24 +308,9 @@ fn run_job(job: Job, token: &mut CleanLockToken) -> Completions {
     drop_space(install(Some(space), token), token);
 
     let mut done = Completions::new();
-    let mut slots = files.iter_mut();
-    chain.run(
-        |sqe| {
-            let mut file = slots.next().and_then(Option::take);
-            run_with(
-                sqe,
-                &mut |_: FileRef, _: &mut CleanLockToken| {
-                    file.take().unwrap_or(Err(Error::new(EBADF)))
-                },
-                token,
-            )
-        },
-        errno_result(ECANCELED),
-        |cqe| {
-            done.push(cqe);
-        },
-    );
-    release_files(files, token);
+    run_chain(&chain, files, token, |cqe| {
+        done.push(cqe);
+    });
 
     let space = install(None, token);
     drop_space(space, token);

@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ferric_ring::abi::{MAX_FIXED_FILES, RING_PATH, SCHEME_NAME, header};
 use ferric_ring::entry::{CURRENT_POSITION, SqeFlags};
@@ -705,6 +705,208 @@ fn close_fd(fd: c_int) {
     unsafe { libc::close(fd) };
 }
 
+/// Reads what is left in a pipe whose write ends are all closed.
+fn drain(fd: c_int) -> i64 {
+    let mut buf = [0u8; 64];
+    // SAFETY: a read end from pipe(), and a buffer of 64 bytes.
+    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+/// How long the other thread waits before swapping the descriptor, so that the chain has
+/// been taken and is blocked by then.
+const HOLD_DELAY: Duration = Duration::from_millis(500);
+
+fn hold() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    // The chain blocks reading `wake` until the other thread writes it.
+    let [wake_rd, wake_wr] = pipe()?;
+    // The chain's second SQE writes to `named`'s write end.
+    let [named_rd, named_wr] = pipe()?;
+    // Moved onto `named_wr`'s number while the chain is blocked.
+    let [other_rd, other_wr] = pipe()?;
+    let mut buf = [0u8; 16];
+    let addr = buf.as_mut_ptr() as u64;
+    ring.submit(&[
+        Sqe::read(wake_rd as u32, CURRENT_POSITION, addr, 16, 1).linked(),
+        Sqe::write(named_wr as u32, CURRENT_POSITION, addr, 16, 2),
+    ])?;
+    let swap = std::thread::spawn(move || {
+        std::thread::sleep(HOLD_DELAY);
+        // SAFETY: both descriptors are open; dup2 closes `named_wr`'s description in this
+        // table and puts `other_wr`'s at its number.
+        let moved = unsafe { libc::dup2(other_wr, named_wr) };
+        let bytes = [0x5a_u8; 16];
+        // SAFETY: the write end from pipe(), and a buffer of 16 bytes.
+        let woke = unsafe { libc::write(wake_wr, bytes.as_ptr().cast(), bytes.len()) };
+        (moved, woke)
+    });
+    let entered = ring.enter(2);
+    let (moved, woke) = swap.join().map_err(|_| Failure::Mismatch {
+        what: "the swapping thread",
+    })?;
+    expect(
+        "dup2 onto the chain's descriptor",
+        named_wr as i64,
+        moved as i64,
+    )?;
+    expect("waking the chain", 16, woke as i64)?;
+    expect("Enter", 2, entered)?;
+    check_cqes(
+        "a chain whose descriptor was replaced while it waited",
+        &ring.reap()?,
+        &[(1, 16), (2, 16)],
+    )?;
+    // `named_wr`'s number now holds `other`'s write end; closing it and `other_wr` leaves
+    // both pipes without writers, so the reads below return what each pipe holds.
+    for fd in [named_wr, other_wr, wake_wr, wake_rd] {
+        close_fd(fd);
+    }
+    let (named, other) = (drain(named_rd), drain(other_rd));
+    close_fd(named_rd);
+    close_fd(other_rd);
+    expect("bytes in the pipe the chain named", 16, named)?;
+    expect("bytes in the pipe moved onto its number", 0, other)
+}
+
+/// Sets or clears `O_NONBLOCK` on a descriptor's description.
+fn set_nonblocking(fd: c_int, on: bool) -> Result<(), Failure> {
+    // SAFETY: fcntl on a descriptor this test opened, with no pointer arguments.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let flags = if on {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return io("fcntl", Err(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Writes pages to `fd`, a pipe's write end, until the pipe is full; returns the bytes it
+/// holds.
+fn fill(fd: c_int) -> Result<usize, Failure> {
+    set_nonblocking(fd, true)?;
+    let page = [0x11_u8; PAGE];
+    let mut held = 0;
+    loop {
+        // SAFETY: the write end from pipe(), and a buffer of `PAGE` bytes.
+        let n = unsafe { libc::write(fd, page.as_ptr().cast(), PAGE) };
+        if n <= 0 {
+            break;
+        }
+        held += n as usize;
+    }
+    set_nonblocking(fd, false)?;
+    Ok(held)
+}
+
+/// The waits `ring-release` tries in turn before the closing thread closes the descriptor.
+const RELEASE_DELAYS_MS: [u64; 5] = [500, 1000, 2000, 4000, 8000];
+
+fn release() -> Result<(), Failure> {
+    // Nothing tells the closing thread that the writer is blocked in `write` yet; if the
+    // writer had not started when the descriptor went, its `write` fails with `EBADF` and
+    // nothing was tested, so the step runs again with a longer wait.
+    for delay in RELEASE_DELAYS_MS {
+        if release_attempt(Duration::from_millis(delay))? {
+            return Ok(());
+        }
+    }
+    Err(Failure::Mismatch {
+        what: "a writer blocked in write before the close, after every wait",
+    })
+}
+
+/// One try of `ring-release`, whose closing thread waits `delay`; `false` when the writer
+/// had not yet started its `write` when the descriptor was closed.
+fn release_attempt(delay: Duration) -> Result<bool, Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let [wake_rd, wake_wr] = pipe()?;
+    let [rd, wr] = pipe()?;
+    let held = fill(wr)?;
+    let mut buf = [0u8; 16];
+    let addr = buf.as_mut_ptr() as u64;
+    // The chain holds `wr` from when it is taken; its second SQE fails (a read of a write
+    // end), which does not matter: only the hold does.
+    ring.submit(&[
+        Sqe::read(wake_rd as u32, CURRENT_POSITION, addr, 1, 1).linked(),
+        Sqe::read(wr as u32, CURRENT_POSITION, addr, 1, 2),
+    ])?;
+    // An ordinary write that blocks on the full pipe, so it holds `wr` too.
+    let writer = std::thread::spawn(move || {
+        let byte = [0x22_u8];
+        // SAFETY: the write end from pipe(), and a buffer of 1 byte.
+        let n = unsafe { libc::write(wr, byte.as_ptr().cast(), 1) };
+        // errno is per thread, so it is taken here.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        (n, errno)
+    });
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        // The descriptor goes while the ring and the write both hold its description.
+        close_fd(wr);
+        let byte = [0x33_u8];
+        // SAFETY: the write end from pipe(), and a buffer of 1 byte.
+        unsafe { libc::write(wake_wr, byte.as_ptr().cast(), 1) }
+    });
+    // The ring lets go first: Enter returns before the blocked write can finish.
+    let entered = ring.enter(2);
+    let woke = closer.join().map_err(|_| Failure::Mismatch {
+        what: "the closing thread",
+    })?;
+    expect("waking the chain", 1, woke as i64)?;
+    expect("Enter", 2, entered)?;
+    check_cqes(
+        "a chain holding a descriptor closed meanwhile",
+        &ring.reap()?,
+        &[(1, 1), (2, neg(EBADF))],
+    )?;
+    // Room in the pipe lets the write finish; it holds the last reference.
+    let mut page = vec![0u8; PAGE];
+    // SAFETY: the read end from pipe(), and a buffer of `PAGE` bytes.
+    let first = unsafe { libc::read(rd, page.as_mut_ptr().cast(), PAGE) };
+    let (wrote, errno) = writer.join().map_err(|_| Failure::Mismatch {
+        what: "the writing thread",
+    })?;
+    if wrote < 0 {
+        for fd in [rd, wake_rd, wake_wr] {
+            close_fd(fd);
+        }
+        if errno == EBADF {
+            return Ok(false);
+        }
+        return Err(Failure::Errno {
+            what: "the blocked write",
+            errno,
+        });
+    }
+    expect("the blocked write", 1, wrote as i64)?;
+    // With the last reference gone the pipe has no writer: after its bytes, a read sees the
+    // end of the file, not `EAGAIN` as it would if the description had never been closed.
+    set_nonblocking(rd, true)?;
+    let mut left = held.saturating_sub(first.max(0) as usize).saturating_add(1);
+    let end = loop {
+        // SAFETY: as above.
+        let n = unsafe { libc::read(rd, page.as_mut_ptr().cast(), PAGE) };
+        if n <= 0 {
+            break if n == 0 {
+                0
+            } else {
+                neg(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            };
+        }
+        left = left.saturating_sub(n as usize);
+    };
+    for fd in [rd, wake_rd, wake_wr] {
+        close_fd(fd);
+    }
+    expect("bytes left in the pipe", 0, left as i64)?;
+    expect("a read once the last holder let go", 0, end)?;
+    Ok(true)
+}
+
 fn async_chains() -> Result<(), Failure> {
     let mut ring = Ring::new(8, 16)?;
     let queue = ctx(
@@ -954,7 +1156,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 16] = [
+    let steps: [(&str, Step); 18] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -968,6 +1170,8 @@ pub fn main() -> ExitCode {
         ("ring-event", event),
         ("ring-fixed", fixed),
         ("ring-fstat", fstat),
+        ("ring-hold", hold),
+        ("ring-release", release),
         ("ring-async", async_chains),
         ("ring-async-close", async_close),
         ("ring-bench", bench),
