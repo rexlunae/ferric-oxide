@@ -1220,6 +1220,15 @@ unsafe fn switch_to(
     let prev_context = &mut *prev_context_guard;
     let next_context = &mut *next_context_guard;
 
+    // Ferric Oxide: the sched.switch tracepoint (`kernel.trace`).
+    trace_event!(
+        ferric_trace::kernel::SCHED_SWITCH,
+        prev_context.pid,
+        next_context.pid,
+        prev_context.debug_id,
+        next_context.debug_id,
+    );
+
     // Set the previous context as "not running"
     prev_context.running = false;
 

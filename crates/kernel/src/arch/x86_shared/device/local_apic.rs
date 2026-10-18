@@ -33,6 +33,20 @@ pub unsafe fn the_local_apic() -> &'static mut LocalApic {
     unsafe { &mut *LOCAL_APIC.get() }
 }
 
+/// Ferric Oxide: signals end of interrupt to this CPU's local APIC, as every handler of an
+/// interrupt the local APIC delivered must. Does nothing before the local APIC is set up.
+pub fn eoi() {
+    // SAFETY: `init` sets the register access (MMIO address or x2APIC) up once, before any
+    // interrupt can come through the local APIC, and does not change it later; writing the EOI
+    // register only retires the highest-priority interrupt in service on this CPU.
+    unsafe {
+        let apic = the_local_apic();
+        if apic.x2 || apic.address != 0 {
+            apic.eoi();
+        }
+    }
+}
+
 pub unsafe fn init(active_table: &mut KernelMapper<true>) {
     unsafe {
         the_local_apic().init(active_table);

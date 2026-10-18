@@ -667,8 +667,7 @@ interrupt!(fault_interrupt, || {
     }
     amdvi::on_fault_vector();
     interrupt::on_fault_vector();
-    // SAFETY: this runs in an interrupt delivered through the local APIC.
-    unsafe { local_apic::the_local_apic().eoi() };
+    local_apic::eoi();
 });
 
 /// The RMRRs in the DMAR table, logged once at boot.

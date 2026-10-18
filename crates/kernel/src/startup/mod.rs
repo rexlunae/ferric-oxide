@@ -172,6 +172,10 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     scheme::init_globals();
 
     debug!("BSP: {} CPUs", crate::cpu_count());
+
+    // Ferric Oxide: a trace ring for each CPU, now that they are counted.
+    #[cfg(feature = "trace")]
+    crate::trace::init_rings();
     debug!("Env: {:?}", ::core::str::from_utf8(bootstrap.env));
 
     BOOTSTRAP.call_once(|| bootstrap);

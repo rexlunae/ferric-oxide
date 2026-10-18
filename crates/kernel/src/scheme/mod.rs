@@ -88,6 +88,10 @@ pub mod sys;
 /// `time:` - allows reading time, setting timeouts and getting events when they are met
 pub mod time;
 
+/// Ferric Oxide: `kernel.trace` - turns tracepoints on and off and reads the trace rings (`trace`)
+#[cfg(feature = "trace")]
+pub mod trace;
+
 /// A wrapper around userspace schemes, tightly dependent on `root`
 pub mod user;
 
@@ -214,6 +218,10 @@ fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
         // Ferric Oxide: the regbuf scheme exists only with the `regbuf` feature.
         if cfg!(feature = "regbuf") {
             insert_globals(&[RegBuf]);
+        }
+        // Ferric Oxide: the trace scheme exists only with the `trace` feature.
+        if cfg!(feature = "trace") {
+            insert_globals(&[Trace]);
         }
     }
     let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -550,6 +558,9 @@ pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
     // Ferric Oxide: see `regbuf`.
     #[cfg(feature = "regbuf")]
     GlobalSchemes::RegBuf,
+    // Ferric Oxide: see `trace`.
+    #[cfg(feature = "trace")]
+    GlobalSchemes::Trace,
 ];
 
 pub const MAX_GLOBAL_SCHEMES: usize = 16;
@@ -589,6 +600,11 @@ impl SchemeExt for GlobalSchemes {
             Self::RegBuf => &regbuf::RegBufScheme,
             #[cfg(not(feature = "regbuf"))]
             Self::RegBuf => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
+            // Ferric Oxide: the trace scheme.
+            #[cfg(feature = "trace")]
+            Self::Trace => &trace::TraceScheme,
+            #[cfg(not(feature = "trace"))]
+            Self::Trace => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
         }
     }
     fn scheme_id(self) -> SchemeId {

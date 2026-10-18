@@ -26,6 +26,10 @@ mod common;
 #[macro_use]
 mod macros;
 
+/// Ferric Oxide: tracepoints (`trace_event!`) and their per-CPU rings (`kernel.trace`)
+#[macro_use]
+mod trace;
+
 /// Architecture-dependent stuff
 #[macro_use]
 #[allow(dead_code)] // TODO
@@ -167,6 +171,10 @@ mod kernel_executable_offsets {
 
     #[cfg(target_arch = "x86_64")]
     linker_offsets!(__altrelocs_start, __altrelocs_end, KERNEL_LINK_BASE);
+
+    // Ferric Oxide: the tracepoint sites (arch/x86_64/static_key.rs).
+    #[cfg(all(target_arch = "x86_64", feature = "trace"))]
+    linker_offsets!(__ferric_trace_keys_start, __ferric_trace_keys_end);
 }
 
 /// Ferric Oxide: how far above its link address the bootloader loaded the kernel (kernel image
