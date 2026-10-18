@@ -1663,6 +1663,15 @@ impl Grant {
                         flush.flush();
                         guard = new_guard;
                     }
+                    let (phys, _) = guard
+                        .table
+                        .utable
+                        .translate(page.start_address())
+                        .ok_or(Error::new(EFAULT))?;
+                    // Device memory cannot acquire the allocator's COW references.
+                    if get_page_info(Frame::containing(phys)).is_none() {
+                        return Err(Error::new(EOPNOTSUPP));
+                    }
                 }
                 let mut src_flusher = Flusher::with_cpu_set(
                     &src.addr_space_lock.used_by,
