@@ -5,6 +5,7 @@
 //! | open [`REGION_PATH`] | the scheme root | `open("/scheme/kernel.regbuf/region")` |
 //! | [`Request::Register`] | a region | `SYS_CALL`, metadata `[verb, addr, len]` |
 //! | open a grant | a region | `openat(region, GrantSpec::encode_path(..))` |
+//! | open a sub-grant | a grant | `openat(grant, GrantSpec::encode_sub_path(..))` |
 //! | [`Request::Revoke`] | a region | metadata `[verb, grant ID]` |
 //! | [`Request::Info`] | a grant | metadata `[verb]`, payload [`GrantInfo::BYTES`] |
 //! | [`Request::Unmap`] | a grant | metadata `[verb, addr]` |
@@ -22,6 +23,19 @@
 //! application sees the scheme's writes to those bytes once it has revoked the grant. Bytes of
 //! the region outside the range never reach the holder.
 //!
+//! A *sub-grant* is a grant derived from another one ([`GrantSpec::encode_sub_path`]): its
+//! range counts from the parent grant's first byte and must lie inside the parent, and its
+//! access must be the parent's or narrower (`r` from `rw`). It is a grant like any other (it
+//! can be mapped, passed on, and have sub-grants of its own), but revoking its parent, or any
+//! grant above it, revokes it too. Closing the parent's descriptor does not: the sub-grant
+//! stays valid until its own descriptor closes or something above it is revoked. A scheme
+//! derives one per extent it forwards (RedoxFS to a disk driver), so the application's one
+//! `Revoke` reaches everything.
+//!
+//! A device driver maps a page-aligned grant into its IOMMU domain with `MapGrant` on its
+//! domain descriptor (encoded in `ferric-iommu`'s `abi`, not here); revocation takes those
+//! mappings down too, with the IOTLB invalidated before `Revoke` returns.
+//!
 //! [`Request::encode`] and [`Request::decode`] are the one place the metadata layout is written
 //! down. The kernel reads at most three metadata words.
 //!
@@ -29,7 +43,8 @@
 //! already registered, `EPERM` for memory that is not anonymous read-write memory (private or
 //! `MAP_SHARED`) or that the caller only borrows from another process (a grant mapping or a
 //! scheme request's buffer),
-//! `EACCES` for a write mapping of a read-only grant, `ECANCELED` once a grant is revoked,
+//! `EACCES` for a write mapping of a read-only grant or a writable sub-grant of a read-only
+//! grant, `ECANCELED` once a grant is revoked (mapping it or deriving a sub-grant),
 //! `ENOENT` for an unknown grant ID or mapping, and `EDQUOT` when pinning would exceed the
 //! caller's limit.
 
@@ -45,6 +60,13 @@ pub const SCHEME_NAME: &str = "kernel.regbuf";
 
 /// The path that, opened from the scheme root, creates an empty region.
 pub const REGION_PATH: &str = "region";
+
+/// The first component of a grant path, opened from a region ([`GrantSpec::encode_path`]).
+pub const GRANT_PREFIX: &str = "grant";
+
+/// The first component of a sub-grant path, opened from a grant
+/// ([`GrantSpec::encode_sub_path`]).
+pub const SUB_PREFIX: &str = "sub";
 
 /// The granularity of regions and mappings, in bytes. Grants are byte-granular.
 pub const PAGE_SIZE: u64 = 4096;
@@ -140,7 +162,8 @@ impl core::error::Error for SpecError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PathError {
-    /// The path does not have the form `grant/<access>/<offset>/<len>`.
+    /// The path does not have the form `grant/<access>/<offset>/<len>` (or, for a sub-grant,
+    /// `sub/<access>/<offset>/<len>`).
     Form,
     /// The access is neither `r` nor `rw`.
     Access,
@@ -153,7 +176,7 @@ pub enum PathError {
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Form => f.write_str("not a grant path (grant/<r|rw>/<offset>/<len>)"),
+            Self::Form => f.write_str("not a grant path (grant|sub/<r|rw>/<offset>/<len>)"),
             Self::Access => f.write_str("grant access is neither r nor rw"),
             Self::Number => f.write_str("grant offset or length is not a 64-bit hex number"),
             Self::Spec(_) => f.write_str("grant path names an invalid range"),
@@ -271,12 +294,23 @@ impl GrantSpec {
     /// Writes the path that opens this grant from a region into `buf` and returns it:
     /// `grant/<r|rw>/<offset>/<len>`, numbers in lowercase hexadecimal.
     pub fn encode_path<'a>(&self, buf: &'a mut [u8; Self::PATH_MAX]) -> &'a str {
+        self.encode_with(GRANT_PREFIX, buf)
+    }
+
+    /// Writes the path that opens a sub-grant from a grant into `buf` and returns it:
+    /// `sub/<r|rw>/<offset>/<len>`, numbers in lowercase hexadecimal. Here the range counts
+    /// from the parent grant's first byte (not the region's), and must lie inside the parent.
+    pub fn encode_sub_path<'a>(&self, buf: &'a mut [u8; Self::PATH_MAX]) -> &'a str {
+        self.encode_with(SUB_PREFIX, buf)
+    }
+
+    fn encode_with<'a>(&self, prefix: &str, buf: &'a mut [u8; Self::PATH_MAX]) -> &'a str {
         let mut out = Cursor { buf, len: 0 };
         // The longest path is 9 + 16 + 1 + 16 bytes, well inside PATH_MAX, so no write is cut.
         let _ = fmt::write(
             &mut out,
             format_args!(
-                "grant/{}/{:x}/{:x}",
+                "{prefix}/{}/{:x}/{:x}",
                 self.access.as_str(),
                 self.offset,
                 self.len
@@ -296,8 +330,26 @@ impl GrantSpec {
     /// offset or length that is not hexadecimal or does not fit in 64 bits, and
     /// [`PathError::Spec`] when they do not make a valid range.
     pub fn parse_path(path: &[u8]) -> Result<Self, PathError> {
+        Self::parse_with(GRANT_PREFIX, path)
+    }
+
+    /// Parses a path written by [`GrantSpec::encode_sub_path`]: the range is relative to the
+    /// parent grant. A leading `/` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// As [`GrantSpec::parse_path`], with [`PathError::Form`] when the path is not
+    /// `sub/<access>/<offset>/<len>`.
+    pub fn parse_sub_path(path: &[u8]) -> Result<Self, PathError> {
+        Self::parse_with(SUB_PREFIX, path)
+    }
+
+    fn parse_with(prefix: &str, path: &[u8]) -> Result<Self, PathError> {
         let path = path.strip_prefix(b"/").unwrap_or(path);
-        let rest = path.strip_prefix(b"grant/").ok_or(PathError::Form)?;
+        let rest = path
+            .strip_prefix(prefix.as_bytes())
+            .and_then(|rest| rest.strip_prefix(b"/"))
+            .ok_or(PathError::Form)?;
         let mut parts = rest.split(|&b| b == b'/');
         let (Some(access), Some(offset), Some(len), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -702,6 +754,37 @@ mod tests {
         ] {
             assert_eq!(GrantSpec::parse_path(path), Err(err), "{path:?}");
         }
+    }
+
+    #[test]
+    fn sub_path_round_trip() {
+        let mut buf = [0; GrantSpec::PATH_MAX];
+        let s = spec(Access::Read, 0x200, 0x1e00);
+        let path = s.encode_sub_path(&mut buf);
+        assert_eq!(path, "sub/r/200/1e00");
+        assert_eq!(GrantSpec::parse_sub_path(path.as_bytes()), Ok(s));
+        assert_eq!(
+            GrantSpec::parse_sub_path(b"/sub/rw/0/1000"),
+            Ok(spec(Access::ReadWrite, 0, 0x1000))
+        );
+        // Each parser takes only its own prefix.
+        assert_eq!(GrantSpec::parse_path(path.as_bytes()), Err(PathError::Form));
+        assert_eq!(
+            GrantSpec::parse_sub_path(b"grant/r/0/1000"),
+            Err(PathError::Form)
+        );
+        assert_eq!(
+            GrantSpec::parse_sub_path(b"subr/0/1000"),
+            Err(PathError::Form)
+        );
+        assert_eq!(
+            GrantSpec::parse_path(b"grantr/0/1000"),
+            Err(PathError::Form)
+        );
+        assert_eq!(
+            GrantSpec::parse_sub_path(b"sub/r/0/0"),
+            Err(PathError::Spec(SpecError::Empty))
+        );
     }
 
     #[test]

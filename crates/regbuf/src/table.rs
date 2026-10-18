@@ -11,11 +11,19 @@
 //! Grants are byte-granular. [`GrantTable::check_map`] plans a mapping of a grant's window
 //! ([`MapPlan`]): which region pages it maps, and which of them the grant covers only in part
 //! ([`PartialPage`]), which the kernel maps as bounce pages instead of the region's own.
+//! [`GrantTable::check_dma`] checks a grant can be mapped into an IOMMU domain, which needs
+//! whole pages: a device cannot be given a bounce page's partial view.
+//!
+//! Sub-grants ([`GrantTable::create_sub`]) sit in the same table and remember every grant above
+//! them, up to [`MAX_DEPTH`] levels. Revoking a grant revokes everything derived from it, even
+//! when a grant in between has been closed; closing a grant's descriptor
+//! ([`GrantTable::remove`]) leaves the grants derived from it alone. The mappings the table
+//! records are CPU and IOMMU mappings alike: the table only hands them back.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::fmt;
 
-use crate::abi::{GrantId, GrantInfo, GrantSpec, PAGE_SIZE};
+use crate::abi::{Access, GrantId, GrantInfo, GrantSpec, PAGE_SIZE};
 
 /// Why a table operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +48,12 @@ pub enum TableError {
     NoMapping(GrantId),
     /// Every grant ID has been used.
     IdsExhausted,
+    /// A sub-grant would be more than [`MAX_DEPTH`] levels below a grant of the region.
+    TooDeep(GrantId),
 }
+
+/// How many levels of sub-grants a grant opened from a region can have below it.
+pub const MAX_DEPTH: usize = 8;
 
 impl fmt::Display for TableError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,6 +67,7 @@ impl fmt::Display for TableError {
             Self::Access(id) => write!(f, "{id} is read-only"),
             Self::NoMapping(id) => write!(f, "{id} has no such mapping"),
             Self::IdsExhausted => f.write_str("grant IDs exhausted"),
+            Self::TooDeep(id) => write!(f, "{id} is too deep to derive sub-grants from"),
         }
     }
 }
@@ -128,6 +142,16 @@ struct Entry<M> {
     spec: GrantSpec,
     revoked: bool,
     mappings: Vec<M>,
+    /// The grants it was derived from: its parent first, up to the grant opened from the
+    /// region. Empty for a grant opened from the region.
+    ancestors: Vec<GrantId>,
+}
+
+impl<M> Entry<M> {
+    /// Whether revoking `id` revokes this grant: it is `id` or derived from it.
+    fn under(&self, own: GrantId, id: GrantId) -> bool {
+        own == id || self.ancestors.contains(&id)
+    }
 }
 
 /// The grants of one region, with the mappings each has made.
@@ -200,6 +224,47 @@ impl<M> GrantTable<M> {
         if !spec.fits(self.region_len) {
             return Err(TableError::OutOfRange);
         }
+        self.insert(spec, Vec::new())
+    }
+
+    /// Makes a sub-grant of grant `parent` and returns its ID. `spec`'s range counts from the
+    /// parent's first byte.
+    ///
+    /// # Errors
+    ///
+    /// [`TableError::Unknown`] when the parent is not open, [`TableError::Revoked`] once it is
+    /// revoked, [`TableError::Access`] when `spec` asks for write access to a read-only parent,
+    /// [`TableError::OutOfRange`] when the range leaves the parent, [`TableError::TooDeep`]
+    /// when the parent is [`MAX_DEPTH`] levels deep already, and [`TableError::IdsExhausted`]
+    /// after `u64::MAX` grants.
+    pub fn create_sub(&mut self, parent: GrantId, spec: GrantSpec) -> Result<GrantId, TableError> {
+        let entry = self.entry(parent)?;
+        if entry.revoked {
+            return Err(TableError::Revoked(parent));
+        }
+        let outer = entry.spec;
+        if !outer.access().covers(spec.access()) {
+            return Err(TableError::Access(parent));
+        }
+        if !spec.fits(outer.len()) {
+            return Err(TableError::OutOfRange);
+        }
+        if entry.ancestors.len() >= MAX_DEPTH {
+            return Err(TableError::TooDeep(parent));
+        }
+        let offset = outer
+            .offset()
+            .checked_add(spec.offset())
+            .ok_or(TableError::OutOfRange)?;
+        let absolute = GrantSpec::new(spec.access(), offset, spec.len())
+            .map_err(|_| TableError::OutOfRange)?;
+        let mut ancestors = Vec::with_capacity(entry.ancestors.len() + 1);
+        ancestors.push(parent);
+        ancestors.extend_from_slice(&entry.ancestors);
+        self.insert(absolute, ancestors)
+    }
+
+    fn insert(&mut self, spec: GrantSpec, ancestors: Vec<GrantId>) -> Result<GrantId, TableError> {
         let id = GrantId::new(self.next_id);
         self.next_id = self
             .next_id
@@ -211,9 +276,19 @@ impl<M> GrantTable<M> {
                 spec,
                 revoked: false,
                 mappings: Vec::new(),
+                ancestors,
             },
         );
         Ok(id)
+    }
+
+    /// The grant `id` was derived from, or `None` for a grant opened from the region.
+    ///
+    /// # Errors
+    ///
+    /// [`TableError::Unknown`] when the grant is not open.
+    pub fn parent(&self, id: GrantId) -> Result<Option<GrantId>, TableError> {
+        Ok(self.entry(id)?.ancestors.first().copied())
     }
 
     /// Whether `id` was ever made from this region.
@@ -306,6 +381,31 @@ impl<M> GrantTable<M> {
         Ok(MapPlan { pages, partial })
     }
 
+    /// Checks that grant `id` may be mapped into an IOMMU domain and returns the region pages
+    /// it covers and its access. The device gets the region's own pages, so the grant must
+    /// start and end on page boundaries.
+    ///
+    /// # Errors
+    ///
+    /// [`TableError::Unknown`] when the grant is not open, [`TableError::Revoked`] once it is
+    /// revoked, and [`TableError::Unaligned`] for a grant that is not page-aligned.
+    pub fn check_dma(&self, id: GrantId) -> Result<(PageRange, Access), TableError> {
+        let entry = self.entry(id)?;
+        if entry.revoked {
+            return Err(TableError::Revoked(id));
+        }
+        let spec = entry.spec;
+        if !spec.is_page_aligned() {
+            return Err(TableError::Unaligned);
+        }
+        let index = |bytes: u64| usize::try_from(bytes).map_err(|_| TableError::OutOfRange);
+        let pages = PageRange {
+            first: index(spec.offset() / PAGE_SIZE)?,
+            count: index(spec.len() / PAGE_SIZE)?,
+        };
+        Ok((pages, spec.access()))
+    }
+
     /// Records a mapping grant `id` has made.
     ///
     /// # Errors
@@ -344,23 +444,35 @@ impl<M> GrantTable<M> {
         Ok(entry.mappings.swap_remove(index))
     }
 
-    /// Revokes grant `id` and returns its mappings, which the caller must take down. A grant
-    /// whose descriptor has closed is gone already, so revoking it returns nothing; so does
-    /// revoking a revoked grant.
+    /// Revokes grant `id` and every grant derived from it, and returns their mappings, which
+    /// the caller must take down. A grant whose descriptor has closed is gone already, but the
+    /// sub-grants derived from it are revoked all the same. Revoking a revoked grant returns
+    /// nothing.
     ///
     /// # Errors
     ///
     /// [`TableError::Unknown`] when no grant with this ID was ever made from the region.
     pub fn revoke(&mut self, id: GrantId) -> Result<Vec<M>, TableError> {
-        let issued = self.issued(id);
-        match self.grants.get_mut(&id) {
-            Some(entry) => {
-                entry.revoked = true;
-                Ok(core::mem::take(&mut entry.mappings))
-            }
-            None if issued => Ok(Vec::new()),
-            None => Err(TableError::Unknown(id)),
+        if !self.issued(id) {
+            return Err(TableError::Unknown(id));
         }
+        let mut gone = Vec::new();
+        for (&own, entry) in &mut self.grants {
+            if entry.under(own, id) {
+                entry.revoked = true;
+                gone.append(&mut entry.mappings);
+            }
+        }
+        Ok(gone)
+    }
+
+    /// How many open grants revoking `id` reaches: `id` itself, if open, and every open grant
+    /// derived from it.
+    pub fn subtree_len(&self, id: GrantId) -> usize {
+        self.grants
+            .iter()
+            .filter(|&(&own, entry)| entry.under(own, id))
+            .count()
     }
 
     /// Forgets grant `id`, whose descriptor has closed, and returns its mappings, which the
@@ -388,7 +500,6 @@ impl<M> GrantTable<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Access;
 
     const P: u64 = PAGE_SIZE;
 
@@ -587,6 +698,139 @@ mod tests {
             Err(TableError::NoMapping(g))
         );
         assert_eq!(t.mapping_count(g), 1);
+    }
+
+    #[test]
+    fn sub_grants_narrow_their_parent() {
+        let mut t = table(8);
+        let ro = t.create(spec(Access::Read, 2 * P, 4 * P)).expect("fits");
+        let rw = t
+            .create(spec(Access::ReadWrite, 0x100, 4 * P))
+            .expect("fits");
+        // Relative to the parent: page 1 of the read-only grant is region page 3.
+        let sub = t
+            .create_sub(ro, spec(Access::Read, P, P))
+            .expect("inside the parent");
+        assert_eq!(
+            t.info(sub).map(|i| i.spec),
+            Ok(spec(Access::Read, 3 * P, P))
+        );
+        assert_eq!(t.parent(sub), Ok(Some(ro)));
+        assert_eq!(t.parent(ro), Ok(None));
+        // Equal range and access are allowed; wider access or range are not.
+        assert!(t.create_sub(ro, spec(Access::Read, 0, 4 * P)).is_ok());
+        assert_eq!(
+            t.create_sub(ro, spec(Access::ReadWrite, 0, P)),
+            Err(TableError::Access(ro))
+        );
+        assert_eq!(
+            t.create_sub(ro, spec(Access::Read, 3 * P, 2 * P)),
+            Err(TableError::OutOfRange)
+        );
+        // Byte-granular parents give byte-granular sub-grants, offsets from the parent.
+        let bytes = t
+            .create_sub(rw, spec(Access::Read, 0x10, 0x20))
+            .expect("inside");
+        assert_eq!(
+            t.info(bytes).map(|i| i.spec),
+            Ok(spec(Access::Read, 0x110, 0x20))
+        );
+        let missing = GrantId::new(99);
+        assert_eq!(
+            t.create_sub(missing, spec(Access::Read, 0, P)),
+            Err(TableError::Unknown(missing))
+        );
+    }
+
+    #[test]
+    fn revoking_a_parent_revokes_its_subtree() {
+        let mut t = table(8);
+        let root = t.create(spec(Access::ReadWrite, 0, 8 * P)).expect("fits");
+        let other = t.create(spec(Access::ReadWrite, 0, 8 * P)).expect("fits");
+        let child = t
+            .create_sub(root, spec(Access::ReadWrite, 0, 4 * P))
+            .expect("fits");
+        let grandchild = t.create_sub(child, spec(Access::Read, P, P)).expect("fits");
+        let sibling = t
+            .create_sub(root, spec(Access::Read, 4 * P, P))
+            .expect("fits");
+        for (id, m) in [
+            (root, 1),
+            (child, 2),
+            (grandchild, 3),
+            (sibling, 4),
+            (other, 5),
+        ] {
+            t.add_mapping(id, m).expect("live");
+        }
+        assert_eq!(t.subtree_len(root), 4);
+        // Revoking the child takes it and the grandchild only.
+        let mut gone = t.revoke(child).expect("issued");
+        gone.sort_unstable();
+        assert_eq!(gone, [2, 3]);
+        assert!(!t.info(root).expect("open").revoked);
+        assert!(t.info(grandchild).expect("open").revoked);
+        assert_eq!(
+            t.create_sub(child, spec(Access::Read, 0, P)),
+            Err(TableError::Revoked(child))
+        );
+        // Revoking the root takes the rest of its subtree, but not the other grant.
+        let mut gone = t.revoke(root).expect("issued");
+        gone.sort_unstable();
+        assert_eq!(gone, [1, 4]);
+        assert!(t.info(sibling).expect("open").revoked);
+        assert_eq!(t.check_dma(sibling), Err(TableError::Revoked(sibling)));
+        assert!(!t.info(other).expect("open").revoked);
+        assert_eq!(t.mapping_count(other), 1);
+    }
+
+    #[test]
+    fn closing_a_parent_keeps_the_subtree_revocable() {
+        let mut t = table(4);
+        let root = t.create(spec(Access::ReadWrite, 0, 4 * P)).expect("fits");
+        let mid = t
+            .create_sub(root, spec(Access::ReadWrite, 0, 2 * P))
+            .expect("fits");
+        let leaf = t
+            .create_sub(mid, spec(Access::ReadWrite, 0, P))
+            .expect("fits");
+        t.add_mapping(leaf, 7).expect("live");
+        // Closing the parent and the grant in between leaves the leaf usable...
+        assert!(t.remove(root).is_empty());
+        assert!(t.remove(mid).is_empty());
+        assert!(t.check_dma(leaf).is_ok());
+        // ...until the application revokes the root's ID.
+        assert_eq!(t.revoke(root), Ok(alloc::vec![7]));
+        assert!(t.info(leaf).expect("open").revoked);
+    }
+
+    #[test]
+    fn sub_grant_depth_is_limited() {
+        let mut t = table(1);
+        let mut id = t.create(spec(Access::Read, 0, P)).expect("fits");
+        for _ in 0..MAX_DEPTH {
+            id = t
+                .create_sub(id, spec(Access::Read, 0, P))
+                .expect("within depth");
+        }
+        assert_eq!(
+            t.create_sub(id, spec(Access::Read, 0, P)),
+            Err(TableError::TooDeep(id))
+        );
+    }
+
+    #[test]
+    fn dma_needs_whole_pages() {
+        let mut t = table(4);
+        let whole = t.create(spec(Access::ReadWrite, P, 2 * P)).expect("fits");
+        let bytes = t.create(spec(Access::Read, 0x10, P)).expect("fits");
+        assert_eq!(
+            t.check_dma(whole),
+            Ok((PageRange { first: 1, count: 2 }, Access::ReadWrite))
+        );
+        assert_eq!(t.check_dma(bytes), Err(TableError::Unaligned));
+        let missing = GrantId::new(42);
+        assert_eq!(t.check_dma(missing), Err(TableError::Unknown(missing)));
     }
 
     #[test]
