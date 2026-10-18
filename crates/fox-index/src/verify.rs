@@ -8,7 +8,10 @@
 //!    by a threshold of both the trusted root's and its own root keys, and
 //!    carry version `N`. The newest root must not have expired.
 //! 2. **Timestamp.** Signed by the root's timestamp role, not older than the
-//!    trusted version, not expired.
+//!    trusted version, not expired, and carrying the same signed content as
+//!    the trusted one at a version the client already trusts, so re-made
+//!    signatures (for example after a timestamp-key rotation) do not read as
+//!    an equivocation.
 //! 3. **Snapshot.** Its length and BLAKE3 match the timestamp; signed by the
 //!    snapshot role; version as the timestamp says, not older than trusted;
 //!    no file it lists is older than in the trusted snapshot; not expired.
@@ -22,14 +25,17 @@
 //! checking their length and BLAKE3 against the targets metadata (top-level
 //! first, then the delegation that covers the path). Files that no metadata
 //! lists cannot be read. A package may disappear from a newer snapshot; its
-//! file then simply stops being readable.
+//! file then simply stops being readable. A package whose signed bytes came
+//! from a delegation must also list exactly the keys that delegation grants
+//! as its owners, so tag authority cannot diverge from update authority;
+//! bytes the top-level targets role signed are authorized directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use fox_core::PackageName;
+use fox_core::{KeyId, PackageName};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -55,7 +61,11 @@ pub const TIMESTAMP_FILE: &str = "metadata/timestamp.json";
 /// Delegated metadata, `metadata/delegations/<name>.json`.
 pub const DELEGATIONS_DIR: &str = "metadata/delegations";
 
-/// Largest metadata file read.
+/// Largest metadata or signed target file read.
+///
+/// The limit covers files whose length comes from signed metadata, so a
+/// signer cannot make a client allocate an arbitrary amount of memory while
+/// verifying a checkout.
 const MAX_METADATA: u64 = 16 * 1024 * 1024;
 
 /// Why a registry checkout did not verify.
@@ -167,6 +177,18 @@ pub enum VerifyError {
     /// The client state file is invalid.
     #[error("invalid client state")]
     State(#[source] serde_json::Error),
+    /// Signed metadata changed without a version bump.
+    #[error("{file} changed at the same version; refusing an equivocation")]
+    Equivocation {
+        /// The file.
+        file: String,
+    },
+    /// A package's owners do not match the keys of its delegation.
+    #[error("package {package} has owners that do not match its delegation keys")]
+    OwnerMismatch {
+        /// The package.
+        package: String,
+    },
 }
 
 /// What a client remembers about a registry between updates.
@@ -181,6 +203,20 @@ pub struct ClientState {
     pub snapshot: u64,
     /// Versions of the files the trusted snapshot listed.
     pub meta: BTreeMap<String, u64>,
+    /// The length and BLAKE3 of the trusted timestamp's signed payload —
+    /// the bytes its signatures cover — so a same-version replacement with
+    /// different content is refused instead of accepted as fresh. Re-made
+    /// signatures over unchanged payload bytes are not an equivocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_payload: Option<FileMeta>,
+    /// What states saved before the payload pin kept under
+    /// `timestamp_file`: the hash of the whole timestamp file, signatures
+    /// included. It is a different byte sequence from the payload, so it
+    /// is read (to accept those states) but never compared, and the
+    /// timestamp counts as unpinned until the next successful update
+    /// replaces it with `timestamp_payload`. Rollback checks still apply.
+    #[serde(default, rename = "timestamp_file", skip_serializing)]
+    legacy_timestamp_file: Option<FileMeta>,
 }
 
 impl ClientState {
@@ -198,6 +234,8 @@ impl ClientState {
             timestamp: 0,
             snapshot: 0,
             meta: BTreeMap::new(),
+            timestamp_payload: None,
+            legacy_timestamp_file: None,
         })
     }
 
@@ -226,6 +264,9 @@ pub struct VerifiedRegistry {
     dir: PathBuf,
     root: Root,
     files: BTreeMap<String, FileMeta>,
+    /// The keys of the delegation that supplied each path a delegation
+    /// covers; a path absent here was signed by the top-level targets role.
+    delegated: BTreeMap<String, RoleKeys>,
 }
 
 /// Verifies the checkout at `dir` against `state` at time `now`, and
@@ -244,9 +285,23 @@ pub fn update(
     check_expiry(&root.signed, "root", now)?;
     let roles = &root.signed;
 
-    let timestamp: Signed<Timestamp> = load(dir, TIMESTAMP_FILE)?.1;
+    let (_, timestamp): (Vec<u8>, Signed<Timestamp>) = load(dir, TIMESTAMP_FILE)?;
     verify_role(&timestamp, roles, RoleName::Timestamp, TIMESTAMP_FILE)?;
     not_older(TIMESTAMP_FILE, state.timestamp, timestamp.signed.version)?;
+    // The timestamp pins the whole chain below it by hash, so accepting a
+    // same-version timestamp with different content would let a signer feed a
+    // client a different snapshot, targets and packages without a bump. Only
+    // the signed payload is pinned: signatures may be re-made at an unchanged
+    // version, for example when the timestamp key rotates.
+    let timestamp_payload = signed_meta(&timestamp, TIMESTAMP_FILE)?;
+    if timestamp.signed.version == state.timestamp
+        && let Some(trusted) = state.timestamp_payload
+        && trusted != timestamp_payload
+    {
+        return Err(VerifyError::Equivocation {
+            file: TIMESTAMP_FILE.to_owned(),
+        });
+    }
     check_expiry(&timestamp.signed, TIMESTAMP_FILE, now)?;
 
     let snapshot: Signed<Snapshot> =
@@ -260,11 +315,12 @@ pub fn update(
     }
     check_expiry(&snapshot.signed, SNAPSHOT_FILE, now)?;
 
-    let files = verify_targets(dir, roles, &snapshot.signed, now)?;
+    let VerifiedTargets { files, delegated } = verify_targets(dir, roles, &snapshot.signed, now)?;
     let registry = VerifiedRegistry {
         dir: dir.to_path_buf(),
         root: root.signed.clone(),
         files,
+        delegated,
     };
     *state = ClientState {
         root,
@@ -276,6 +332,8 @@ pub fn update(
             .iter()
             .map(|(file, meta)| (file.clone(), meta.version))
             .collect(),
+        timestamp_payload: Some(timestamp_payload),
+        legacy_timestamp_file: None,
     };
     Ok(registry)
 }
@@ -309,13 +367,21 @@ fn update_root(dir: &Path, trusted: &Signed<Root>) -> Result<Signed<Root>, Verif
     }
 }
 
+/// The signed files and supplied delegations of a verified targets tree.
+struct VerifiedTargets {
+    /// Every signed path, with the length and hash its bytes must match.
+    files: BTreeMap<String, FileMeta>,
+    /// The keys of the delegation that supplied each delegated path.
+    delegated: BTreeMap<String, RoleKeys>,
+}
+
 /// Verifies targets and delegations, and returns every signed file.
 fn verify_targets(
     dir: &Path,
     roles: &Root,
     snapshot: &Snapshot,
     now: OffsetDateTime,
-) -> Result<BTreeMap<String, FileMeta>, VerifyError> {
+) -> Result<VerifiedTargets, VerifyError> {
     let targets_file = format!("{METADATA_DIR}/{TARGETS_FILE}");
     let targets: Signed<Targets> =
         load_described(dir, &targets_file, meta(snapshot, TARGETS_FILE)?)?;
@@ -326,13 +392,18 @@ fn verify_targets(
         check_path(path)?;
         files.insert(path.clone(), *file);
     }
+    let mut delegated = BTreeMap::new();
     for delegation in &targets.signed.delegations {
         let name = format!("delegations/{}.json", delegation.name);
+        // The name becomes a filesystem path below; a delegation whose name
+        // contains `..` or an absolute component would otherwise read
+        // metadata outside the checkout.
+        check_path(&name)?;
         let file = format!("{METADATA_DIR}/{name}");
-        let delegated: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
-        verify_keys(&delegated, &delegation.keys, &file)?;
-        check_expiry(&delegated.signed, &file, now)?;
-        for (path, meta) in &delegated.signed.targets {
+        let signed: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
+        verify_keys(&signed, &delegation.keys, &file)?;
+        check_expiry(&signed.signed, &file, now)?;
+        for (path, meta) in &signed.signed.targets {
             if !delegation.paths.contains(path) {
                 return Err(VerifyError::DelegationPath {
                     role: delegation.name.clone(),
@@ -340,11 +411,15 @@ fn verify_targets(
                 });
             }
             check_path(path)?;
-            // Top-level targets take precedence, as in TUF's search order.
-            files.entry(path.clone()).or_insert(*meta);
+            // Top-level targets take precedence, as in TUF's search order;
+            // only a path they do not list is supplied by the delegation.
+            if !files.contains_key(path) {
+                files.insert(path.clone(), *meta);
+                delegated.insert(path.clone(), delegation.keys.clone());
+            }
         }
     }
-    Ok(files)
+    Ok(VerifiedTargets { files, delegated })
 }
 
 fn meta<'a>(snapshot: &'a Snapshot, name: &str) -> Result<&'a VersionMeta, VerifyError> {
@@ -354,6 +429,17 @@ fn meta<'a>(snapshot: &'a Snapshot, name: &str) -> Result<&'a VersionMeta, Verif
         .ok_or_else(|| VerifyError::MissingMeta {
             file: format!("{METADATA_DIR}/{name}"),
         })
+}
+
+/// The length and BLAKE3 of the bytes `metadata`'s signatures cover.
+fn signed_meta<T: Serialize>(metadata: &Signed<T>, file: &str) -> Result<FileMeta, VerifyError> {
+    let bytes = metadata
+        .signed_bytes()
+        .map_err(|source| VerifyError::Metadata {
+            file: file.to_owned(),
+            source,
+        })?;
+    Ok(FileMeta::of(&bytes))
 }
 
 fn verify_role<T: Serialize>(
@@ -413,7 +499,7 @@ fn load<T: for<'de> Deserialize<'de>>(
     dir: &Path,
     file: &str,
 ) -> Result<(Vec<u8>, Signed<T>), VerifyError> {
-    let bytes = read_limited(&dir.join(file), MAX_METADATA)?;
+    let bytes = read_limited(dir, file, MAX_METADATA)?;
     let parsed = Signed::from_json(&bytes).map_err(|source| VerifyError::Metadata {
         file: file.to_owned(),
         source,
@@ -428,7 +514,7 @@ fn load_described<T: for<'de> Deserialize<'de> + Versioned>(
     file: &str,
     described: &VersionMeta,
 ) -> Result<Signed<T>, VerifyError> {
-    let bytes = read_limited(&dir.join(file), described.file.length)?;
+    let bytes = read_limited(dir, file, described.file.length)?;
     if !described.file.matches(&bytes) {
         return Err(VerifyError::HashMismatch {
             file: file.to_owned(),
@@ -448,21 +534,33 @@ fn load_described<T: for<'de> Deserialize<'de> + Versioned>(
     Ok(parsed)
 }
 
-/// Reads at most `limit` bytes, failing if the file is longer.
-fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, VerifyError> {
+/// Reads the file `file` under `base`, at most `limit` bytes, failing if it
+/// is longer.
+///
+/// The resolved path must stay inside `base`, so a symlink in the checkout
+/// cannot make a read follow it outside the registry, and `limit` is capped
+/// at [`MAX_METADATA`] so metadata cannot name an unbounded length.
+fn read_limited(base: &Path, file: &str, limit: u64) -> Result<Vec<u8>, VerifyError> {
+    let path = base.join(file);
     let io_error = |source| VerifyError::Io {
-        path: path.to_path_buf(),
+        path: path.clone(),
         source,
     };
-    let file = fs::File::open(path).map_err(io_error)?;
+    let base = fs::canonicalize(base).map_err(io_error)?;
+    let resolved = fs::canonicalize(&path).map_err(io_error)?;
+    if !resolved.starts_with(&base) {
+        return Err(VerifyError::UnsafePath {
+            path: file.to_owned(),
+        });
+    }
+    let limit = limit.min(MAX_METADATA);
+    let file = fs::File::open(&resolved).map_err(io_error)?;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > limit {
-        return Err(VerifyError::TooLarge {
-            path: path.to_path_buf(),
-        });
+        return Err(VerifyError::TooLarge { path });
     }
     Ok(bytes)
 }
@@ -501,8 +599,10 @@ impl VerifiedRegistry {
     /// # Errors
     ///
     /// [`VerifyError::UnknownTarget`] if no metadata lists it,
-    /// [`VerifyError::Io`] or [`VerifyError::TooLarge`] if it cannot be
-    /// read, and [`VerifyError::HashMismatch`] if it does not match.
+    /// [`VerifyError::UnsafePath`] if `path` or a symlink under it leaves
+    /// the registry, [`VerifyError::Io`] or [`VerifyError::TooLarge`] if it
+    /// cannot be read, and [`VerifyError::HashMismatch`] if it does not
+    /// match.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
         check_path(path)?;
         let meta = self
@@ -511,7 +611,7 @@ impl VerifiedRegistry {
             .ok_or_else(|| VerifyError::UnknownTarget {
                 path: path.to_owned(),
             })?;
-        let bytes = read_limited(&self.dir.join(path), meta.length)?;
+        let bytes = read_limited(&self.dir, path, meta.length)?;
         if !meta.matches(&bytes) {
             return Err(VerifyError::HashMismatch {
                 file: path.to_owned(),
@@ -535,10 +635,20 @@ impl VerifiedRegistry {
     /// invalid.
     pub fn config(&self) -> Result<RegistryConfig, VerifyError> {
         let text = self.read_text(REGISTRY_FILE)?;
-        RegistryConfig::from_toml(&text).map_err(|source| VerifyError::Layout {
+        let config = RegistryConfig::from_toml(&text).map_err(|source| VerifyError::Layout {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
-        })
+        })?;
+        // The signed root fixes the registry's name; a `registry.toml` that
+        // claims a different one must not let a caller qualify packages
+        // under an identity the root does not authorize.
+        if config.name != self.root.registry {
+            return Err(VerifyError::RegistryName {
+                trusted: self.root.registry.clone(),
+                found: config.name,
+            });
+        }
+        Ok(config)
     }
 
     /// The names of every signed package file.
@@ -558,20 +668,39 @@ impl VerifiedRegistry {
     ///
     /// # Errors
     ///
-    /// As [`VerifiedRegistry::read`], and [`VerifyError::Layout`] if it is
-    /// invalid.
+    /// As [`VerifiedRegistry::read`], [`VerifyError::Layout`] if it is
+    /// invalid, and [`VerifyError::OwnerMismatch`] if its owners disagree
+    /// with the keys of the delegation that supplied its bytes.
     pub fn package(&self, name: &PackageName) -> Result<Option<PackageEntry>, VerifyError> {
         let path = package_path(name);
+        let keys = self.delegated.get(&path);
         if !self.files.contains_key(&path) {
             return Ok(None);
         }
         let text = self.read_text(&path)?;
-        PackageEntry::from_toml(&text, &path)
-            .map(Some)
-            .map_err(|source| VerifyError::Layout {
+        let entry =
+            PackageEntry::from_toml(&text, &path).map_err(|source| VerifyError::Layout {
                 path,
                 source: Box::new(source),
-            })
+            })?;
+        // The owners an installer checks release tags against must be the
+        // same keys the delegation that supplied the package's signed bytes
+        // grants, or a package edit could claim owners whose tags the
+        // delegation would never authorize. Bytes the top-level targets role
+        // signed need no such agreement; that role authorized them directly.
+        if let Some(keys) = keys {
+            let owners: BTreeSet<KeyId> = entry
+                .owners
+                .iter()
+                .map(|owner| owner.delegation_key())
+                .collect();
+            if owners != keys.keyids {
+                return Err(VerifyError::OwnerMismatch {
+                    package: name.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(Some(entry))
     }
 
     /// The artifact list of `name` `version`, if there is one.
@@ -622,5 +751,21 @@ mod tests {
         for bad in ["", "/etc/passwd", "../x", "a/../b", "./a", "a\\b"] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn described_lengths_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big"),
+            vec![0u8; (MAX_METADATA as usize) + 1],
+        )
+        .unwrap();
+        // A signed length larger than the cap cannot make the reader
+        // allocate an unbounded buffer; the file still trips the limit.
+        assert!(matches!(
+            read_limited(dir.path(), "big", u64::MAX),
+            Err(VerifyError::TooLarge { .. })
+        ));
     }
 }
