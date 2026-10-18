@@ -642,8 +642,11 @@ canonical path, so the same checkout always has the same identity), the
 revision (`rev`, or a `#` fragment of the URL; the two must agree if both
 are given), `path`, `package`, the features (sorted, without repeats),
 `default-features` and the target (the entry's, else `--target`'s, else the
-host target `fox` was built for, so locks from different hosts do not
-share pins). A git
+host of the toolchain rustup selects, from `rustc -vV`, which can differ
+from the target `fox` itself was built for; `fox`'s own target only if no
+toolchain runs). Sync passes that target to the build and the prebuilt
+choice explicitly, so the lock records what was built, and locks from
+different hosts do not share pins. A git
 source that is neither a git URL nor an existing directory is an error,
 not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
 on any incompatible change to its fields.

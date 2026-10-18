@@ -574,6 +574,25 @@ pub fn default_work_dir(key: &[u8]) -> PathBuf {
     std::env::temp_dir().join(format!("fox-build-{}", &digest[..16]))
 }
 
+/// The host triple of the toolchain a build in `dir` would use with
+/// `toolchain` (or, without one, the toolchain rustup selects there): the
+/// target [`build`] builds for when [`BuildRequest::target`] is `None`.
+/// Callers that record the target before building (a lock file, say)
+/// resolve it with this and pass it explicitly.
+///
+/// # Errors
+///
+/// [`BuildError::Spawn`] or [`BuildError::Command`] if `rustc -vV` or
+/// `cargo -vV` cannot run, and [`BuildError::ToolchainVersion`] if rustc's
+/// output lacks a host.
+pub fn toolchain_host(dir: &Path, toolchain: Option<&str>) -> Result<String, BuildError> {
+    // -vV reads no Cargo configuration, so a throwaway CARGO_HOME will do.
+    let cargo_home = dir.join(".fox-cargo-home");
+    Tools::new(dir, &cargo_home, toolchain)
+        .toolchain_info()
+        .map(|info| info.host)
+}
+
 /// Runs the hermetic build described by `request`.
 ///
 /// # Errors
