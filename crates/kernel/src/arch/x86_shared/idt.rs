@@ -124,9 +124,10 @@ fn set_exceptions(idt: &mut [IdtEntry]) {
     idt[18].set_func(exception::machine_check);
     idt[19].set_func(exception::simd);
     idt[20].set_func(exception::virtualization);
-    // Ferric Oxide (IBT): control protection exception, only possible with IBT built in.
+    // Ferric Oxide (CET): control protection exception, raised by IBT and by shadow stacks, so
+    // installed when either is built in. Without it a #CP would escalate to a double fault.
     #[cfg(target_arch = "x86_64")]
-    if crate::arch::ibt::COMPILED
+    if (crate::arch::ibt::COMPILED || crate::arch::shstk::COMPILED)
         && let Some(entry) = idt.get_mut(21)
     {
         entry.set_func(exception::control_protection);

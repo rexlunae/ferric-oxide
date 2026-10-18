@@ -79,11 +79,20 @@ interrupt_stack!(breakpoint, |stack| {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Ferric Oxide (shadow stacks): this rewrites the saved RIP but is only reached from a
-        // ring-3 int3, whose return goes through IRETQ with an SSP the CPU reloaded from
-        // IA32_PL0_SSP, so the shadow-stack copy is not involved and needs no sync. A future
-        // in-kernel breakpoint would need the shadow frame updated too (see arch/x86_64/shstk.rs).
+        let after_int3 = stack.iret.rip;
         stack.iret.rip -= 1;
+        // Ferric Oxide (shadow stacks): a ring-3 int3 pushes no shadow-stack frame, so only a
+        // ring-0 int3 (which IDT entry 3 also accepts) needs the frame's return address moved
+        // with the saved RIP, or IRETQ raises #CP. No-op while CET shadow stacks are off.
+        if stack.iret.cs & 3 == 0
+            && let Err(err) = crate::arch::shstk::retarget_kernel_return(
+                stack.iret.cs,
+                after_int3,
+                stack.iret.rip,
+            )
+        {
+            panic!("CET: cannot rewind a kernel int3: {err}");
+        }
     }
 
     let mut token = unsafe { CleanLockToken::new() };
@@ -187,15 +196,16 @@ interrupt_error!(protection, |stack, code| {
 
         if was_failing_msr {
             // 0F 30 (WRMSR) or 0F 32 (RDMSR)
-            // Ferric Oxide (shadow stacks): this advances the saved RIP past the faulting MSR
-            // instruction inside the ring-0 rdmsr_safe/wrmsr_safe wrappers, then returns via
-            // IRETQ. With CET shadow stacks on, the ring-0 #GP pushed a shadow frame whose LIP
-            // still points at the faulting instruction, so this IRETQ would raise #CP unless the
-            // shadow copy is advanced too (which is left for a later step; the frame layout is not
-            // verified here). This path is only reached from the privileged ACPI/MSR scheme
-            // (rdmsr_safe/wrmsr_safe have no in-kernel callers), so boot and the shadow-stack
-            // self-test never hit it; see arch/x86_64/shstk.rs.
-            stack.iret.rip += 2;
+            let resume = stack.iret.rip + 2;
+            // Ferric Oxide (shadow stacks): the ring-0 #GP pushed a shadow-stack frame whose
+            // return address is the faulting instruction; IRETQ raises #CP unless it is moved
+            // past it along with the saved RIP. No-op while CET shadow stacks are off.
+            if let Err(err) =
+                crate::arch::shstk::retarget_kernel_return(stack.iret.cs, stack.iret.rip, resume)
+            {
+                panic!("CET: cannot resume after a failed MSR access: {err}");
+            }
+            stack.iret.rip = resume;
             stack.scratch.rsi = usize::MAX;
         }
     };

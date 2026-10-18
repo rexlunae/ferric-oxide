@@ -37,10 +37,13 @@
 //!   mappings are visible everywhere at once.
 //! - **Tokens.** The highest entry of each shadow stack holds its supervisor shadow-stack token
 //!   (its own address, not busy), which the CPU checks when it loads `SSP` from `IA32_PL0_SSP`
-//!   or the interrupt SSP table. It is written, like a new context's initial entries, through the
-//!   physical memory map, whose alias of the frame stays writable. That is how the kernel sets up
-//!   shadow stacks without `WRSS`; it also means a kernel write primitive can still forge a
-//!   shadow stack through the alias, a limit worth removing later by unmapping the frames there.
+//!   or the interrupt SSP table. It is written, like a new context's initial entries, with
+//!   `WRSS` through the shadow-stack mapping once CET is on for the running CPU
+//!   ([`ShadowStack`]'s `write_entry`). Before that (the boot stacks, and boots where CET stays
+//!   off) the kernel writes through the physical memory map instead. The physical memory map's
+//!   alias of every shadow-stack frame stays writable, so a kernel write primitive can still
+//!   forge a shadow stack through it; removing the alias needs the physical map's huge pages
+//!   split around each frame, which is not done yet (see "What this step does not do").
 //! - **SSP MSRs.** [`init_cpu`] points `IA32_INTERRUPT_SSP_TABLE_ADDR` at the CPU's table in its
 //!   processor control region, whose IST 1 entry ([`set_ist_ssp`]) is the backup stack's token,
 //!   and zeroes `IA32_PL0_SSP` to `IA32_PL2_SSP`. [`set_entry_ssp`] then points `IA32_PL0_SSP` at
@@ -72,8 +75,14 @@
 //!   `alternative!`s for the `shstk` feature.
 //! - **Non-local returns.** `recover_and_efault` restarts the faulting `rep movsb` as a no-op
 //!   (`rcx = 0`) and returns normally, keeping both stacks consistent instead of editing a saved
-//!   RIP, so the usercopy fault path works with CET on. (The `rdmsr_safe`/`wrmsr_safe` #GP
-//!   recovery, which advances a saved ring-0 RIP, is a deferred limitation; see below.)
+//!   RIP, so the usercopy fault path works with CET on.
+//! - **Saved-RIP edits.** A handler that resumes interrupted ring-0 code at a different RIP
+//!   (the `rdmsr_safe`/`wrmsr_safe` #GP recovery, and the breakpoint handler for a ring-0
+//!   `int3`) also moves the return address in the CPU's shadow-stack interrupt frame, with
+//!   [`retarget_kernel_return`], or `IRETQ` would raise #CP. The frame is found by its layout
+//!   ([`ferric_cet::shstk::find_supervisor_interrupt_frame`]) between `SSP` and the top of the
+//!   running shadow stack, and rewritten with `WRSS`. Interrupts from ring 3 push no shadow
+//!   frame, so their RIP edits need nothing.
 //! - **Separate IST stacks.** The NMI, double-fault and machine-check handlers run on their own
 //!   IST stacks, each with its own shadow stack and SSP-table entry, so a fault while the normal
 //!   shadow stack is inconsistent still has a valid shadow stack to switch to.
@@ -85,17 +94,18 @@
 //!   therefore left off whenever KPTI is on ([`enabled_for_cpu`] is `decision() && !kpti`), so on
 //!   a Meltdown-affected Intel CPU with `kpti = "auto"` the stacks are allocated but CET stays
 //!   off. `shstk = "always"` with KPTI not `never` is rejected at config time and panics at boot.
-//! - **`SYSCALL` single-step IRETQ fallback.** The rare single-step-over-`SYSRET` path returns
-//!   with `IRETQ` without building a shadow frame; it predates shadow stacks and is left as-is.
-//! - **Saved-RIP edits.** Handlers that rewrite a saved RIP do not yet sync the shadow-stack
-//!   copy, because the interrupt shadow-frame layout is not verified here:
-//!   - The breakpoint/ptrace path (`exception.rs`) is only reached from a ring-3 `int3`, whose
-//!     return goes through `IRETQ` with a hardware-reloaded SSP, so it does not fault today; a
-//!     future in-kernel breakpoint would need the sync.
-//!   - The `#GP` rdmsr/wrmsr recovery advances a *ring-0* RIP and returns by `IRETQ` into that
-//!     frame, so with CET on it would raise #CP. It is only reachable from the privileged
-//!     ACPI/MSR scheme (`rdmsr_safe`/`wrmsr_safe` have no in-kernel callers), so boot and the
-//!     self-test never hit it; syncing its shadow frame (via `WRSS`) is left for a later step.
+//! - **Physical-map alias.** Shadow-stack frames are still mapped writable in the physical memory
+//!   map. The kernel itself no longer writes through it once CET is on for a CPU, but an attacker
+//!   with a kernel write primitive could. Removing it means splitting the 1 GiB / 2 MiB pages of
+//!   the physical map around each frame (or carving a frame pool out of it at boot), which `rmm`
+//!   does not support yet.
+//! - **Hardware validation.** None of the CET paths (enable, SYSCALL token handling, the
+//!   single-step IRETQ exit, the saved-RIP shadow sync, `WRSS` writes) has run on CET hardware;
+//!   QEMU does not emulate CET and the CI runners' KVM does not expose it.
+//!
+//! The `SYSCALL` single-step fallback returns with `IRETQ` and skips the exit `CLRSSBSY`, leaving
+//! `SSP` at the busy supervisor token as after an interrupt from ring 3; `IRETQ` to ring 3 frees
+//! that token and checks no shadow frame.
 //!
 //! The CPUID, policy, page-encoding and token logic lives in the host-tested `ferric-cet` crate.
 
@@ -106,6 +116,10 @@ use spin::Once;
 use self::stacks::window_covers_ram;
 #[cfg(shstk_compiled)]
 pub use self::stacks::*;
+
+/// Whether the kernel is built with shadow-stack support (`kernel.cpu.shstk` is `auto` or
+/// `always`). Like `ibt::COMPILED`, it decides whether the #CP handler is installed.
+pub const COMPILED: bool = cfg!(shstk_compiled);
 
 /// The configured policy.
 const POLICY: Policy = if cfg!(cpu_feature_always = "shstk") {
@@ -180,6 +194,48 @@ fn window_covers_ram() -> bool {
     false
 }
 
+/// Without shadow-stack support there is no shadow frame to move.
+#[cfg(not(shstk_compiled))]
+pub fn retarget_kernel_return(_cs: usize, _from: usize, _to: usize) -> Result<(), FrameError> {
+    Ok(())
+}
+
+/// Why [`retarget_kernel_return`] could not move an interrupt's shadow-stack return address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FrameError {
+    /// `SSP` is not inside a shadow stack in the shadow-stack window.
+    SspOutsideWindow {
+        /// The running CPU's `SSP`.
+        ssp: usize,
+    },
+    /// No interrupt frame returning to `cs:rip` lies between `SSP` and the top of its stack.
+    NotFound {
+        /// The code segment of the interrupted code.
+        cs: usize,
+        /// The return address looked for.
+        rip: usize,
+    },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SspOutsideWindow { ssp } => {
+                write!(f, "SSP {ssp:#x} is not in a kernel shadow stack")
+            }
+            Self::NotFound { cs, rip } => {
+                write!(
+                    f,
+                    "no shadow-stack interrupt frame returns to {cs:#x}:{rip:#x}"
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for FrameError {}
+
 /// Logs whether the CPU supports shadow stacks and what the policy decided. Called once, on the
 /// BSP, before [`enable_cpu`] turns them on. Does nothing when the policy is `never`.
 pub fn report() {
@@ -217,6 +273,8 @@ mod stacks {
     use ferric_cet::shstk::{
         self, InitialShadowStack, LayoutError, SlotWindow, ENTRY_BYTES, INTERRUPT_SSP_TABLE_ENTRIES,
     };
+
+    use super::FrameError;
     use rmm::Arch;
 
     use crate::{
@@ -344,11 +402,12 @@ mod stacks {
             let base = top.checked_sub(SIZE).ok_or(LayoutError::Overflow)?;
             let frame = allocate_p2frame(ORDER, true).ok_or(ShadowStackError::NoFrames)?;
             let stack = Self { frame, base, top };
+            // Mapped first: once CET is on, `write_entry` writes through this mapping.
+            stack.map()?;
             stack.write_entry(
                 stack.supervisor_token(),
                 shstk::supervisor_token(stack.supervisor_token() as u64)?,
             );
-            stack.map()?;
             Ok(Some(stack))
         }
 
@@ -392,8 +451,10 @@ mod stacks {
             self.base..self.top
         }
 
-        /// Writes one entry through the physical memory map, whose alias of the frame is
-        /// writable.
+        /// Writes one entry. Once CET shadow stacks are on for the running CPU this is a `WRSS`
+        /// through the shadow-stack mapping ([`wrss`]); before that (or on boots where CET stays
+        /// off) `WRSS` would raise #UD, so it writes through the physical memory map, whose alias
+        /// of the frame is writable.
         ///
         /// # Panics
         ///
@@ -403,6 +464,10 @@ mod stacks {
                 (self.base..self.top).contains(&addr) && addr.is_multiple_of(8),
                 "shadow-stack entry {addr:#x} outside its stack"
             );
+            if current_ssp().is_some() {
+                wrss(addr, value);
+                return;
+            }
             // Cannot wrap: `addr` is at or above `base` (asserted).
             let phys = self.frame.base().add(addr.wrapping_sub(self.base));
             let ptr = RmmA::phys_to_virt(phys).data() as *mut u64;
@@ -556,10 +621,9 @@ mod stacks {
         write_ssp_msr(SspMsr::Pl2, 0);
     }
 
-    /// Set once a CPU has turned CET shadow stacks on, so [`current_ssp`] only runs `RDSSPQ`
-    /// (which raises #UD while CET is off) after that point. It stays set for the rest of the
-    /// boot; a CPU never drops a `Kstack` between the bootstrap processor enabling CET and that
-    /// CPU reaching its own [enable][crate::arch::shstk] point.
+    /// Set once a CPU has turned CET shadow stacks on, so [`current_ssp`] skips `RDSSPQ`
+    /// entirely on boots where no CPU ever does. It stays set for the rest of the boot; whether
+    /// a given CPU has them on is what [`current_ssp`] reads.
     static SHSTK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     /// Whether CET shadow stacks are turned on and in use on this boot, set once the first CPU
@@ -569,19 +633,103 @@ mod stacks {
         SHSTK_LIVE.load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Reads the current shadow-stack pointer, or `None` while CET is off (so `RDSSPQ` would
-    /// #UD). Used by the self-test and the drop assertion.
+    /// Reads the running CPU's shadow-stack pointer, or `None` while CET shadow stacks are off on
+    /// it. Used by the self-test, the drop assertion and [`ShadowStack`]'s writes, which pick
+    /// `WRSS` exactly when this is `Some`.
     pub fn current_ssp() -> Option<usize> {
         if !SHSTK_LIVE.load(core::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        let ssp: usize;
-        // SAFETY: `SHSTK_LIVE` is only set after CET shadow stacks are on, so `RDSSPQ` is legal.
-        // It reads `SSP` into a register and has no other effect.
+        // `RDSSPQ` sits in the hint-NOP encoding space: it leaves its register unchanged while
+        // shadow stacks are off at CPL 0, as on an application processor that has not reached
+        // its enable point after the bootstrap processor set `SHSTK_LIVE`. Starting from 0 makes
+        // that case read as "off" rather than as garbage. SSP is never 0 while they are on.
+        let mut ssp: usize = 0;
+        // SAFETY: `RDSSPQ` only copies SSP into the register, or does nothing when shadow stacks
+        // are off; it touches no memory or flags.
         unsafe {
-            core::arch::asm!("rdsspq {}", out(reg) ssp, options(nomem, nostack, preserves_flags))
+            core::arch::asm!("rdsspq {}", inout(reg) ssp, options(nomem, nostack, preserves_flags))
         };
-        Some(ssp)
+        (ssp != 0).then_some(ssp)
+    }
+
+    /// Writes `value` to the shadow-stack entry at `addr` with `WRSSQ`, the store that may target
+    /// a shadow-stack page, through the shadow-stack window.
+    ///
+    /// `WRSS` faults (#PF) on any page that is not a shadow-stack page, so it cannot change
+    /// ordinary memory; the assertions keep it to window slots' shadow-stack halves.
+    ///
+    /// # Panics
+    ///
+    /// When CET shadow stacks are off on this CPU (`WRSS` would raise #UD), or `addr` is not an
+    /// 8-byte-aligned address in the shadow-stack part of a window slot.
+    fn wrss(addr: usize, value: u64) {
+        assert!(
+            current_ssp().is_some(),
+            "CET: WRSS to {addr:#x} while shadow stacks are off on this CPU"
+        );
+        assert!(
+            addr.is_multiple_of(ENTRY_BYTES as usize)
+                && window()
+                    .stack_containing(addr as u64, SIZE as u64)
+                    .is_some(),
+            "CET: WRSS target {addr:#x} is not a shadow-stack entry in the window"
+        );
+        // SAFETY: shadow stacks are on for this CPU, and `enable_params` set
+        // IA32_S_CET.WR_SHSTK_EN with them (`ferric_cet::s_cet_value`), so WRSSQ is legal at
+        // CPL 0. It stores 8 bytes at `addr`, an aligned entry of a window slot's shadow-stack
+        // half; the CPU refuses (#PF) the store unless that page is mapped as a supervisor shadow
+        // stack, so no ordinary memory can change. It changes no register or flag.
+        unsafe {
+            core::arch::asm!(
+                "wrssq [{addr}], {value}",
+                addr = in(reg) addr,
+                value = in(reg) value,
+                options(nostack, preserves_flags),
+            )
+        };
+    }
+
+    /// Moves the return address of the innermost shadow-stack interrupt frame for interrupted
+    /// ring-0 code at `cs:from` to `to`, for a handler that resumes that code at `to` instead
+    /// (by editing the saved RIP its `IRETQ` uses). `IRETQ` back to ring 0 pops the frame and
+    /// raises #CP unless its return address matches the saved RIP. Does nothing while CET shadow
+    /// stacks are off on this CPU. Only for exceptions that do not switch to an IST stack.
+    ///
+    /// The frame is located from its layout (see
+    /// [`ferric_cet::shstk::find_supervisor_interrupt_frame`]) in the entries between `SSP` and
+    /// the top of the running shadow stack, so it does not depend on how deep the handler's own
+    /// calls are, and is rewritten with `WRSS`.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::SspOutsideWindow`] when `SSP` is not in a kernel shadow stack, and
+    /// [`FrameError::NotFound`] when no frame for `cs:from` lies above it.
+    pub fn retarget_kernel_return(cs: usize, from: usize, to: usize) -> Result<(), FrameError> {
+        let Some(ssp) = current_ssp() else {
+            return Ok(());
+        };
+        let (_, top) = window()
+            .stack_containing(ssp as u64, SIZE as u64)
+            .ok_or(FrameError::SspOutsideWindow { ssp })?;
+        let not_found = FrameError::NotFound { cs, rip: from };
+        // Cannot wrap: `ssp` is inside the stack, below `top`.
+        let count = (top as usize).wrapping_sub(ssp) / ENTRY_BYTES as usize;
+        // SAFETY: `ssp..top` is the running CPU's live shadow stack (SSP is inside it, and the
+        // whole stack is mapped while it is in use), readable with ordinary loads, 8-byte aligned.
+        // Only this CPU's calls change it, and only below SSP, so the entries are stable while
+        // the slice is alive; it is dropped before the `WRSS` below.
+        let entries = unsafe { core::slice::from_raw_parts(ssp as *const u64, count) };
+        // The frame holds the 16-bit selector zero-extended; the saved CS slot's upper bits are
+        // not architecturally defined.
+        let cs_selector = (cs & 0xFFFF) as u16;
+        let lip_index =
+            shstk::find_supervisor_interrupt_frame(ssp as u64, entries, cs_selector, from as u64)
+                .ok_or(not_found)?;
+        // Cannot wrap: the entry lies inside `ssp..top`.
+        let lip_addr = ssp.wrapping_add(lip_index.wrapping_mul(ENTRY_BYTES as usize));
+        wrss(lip_addr, to as u64);
+        Ok(())
     }
 
     /// Whether indirect branch tracking is on for the current CPU, so the combined `IA32_S_CET`
