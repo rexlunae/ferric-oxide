@@ -18,17 +18,19 @@ what is on at run time.
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch` |
+| `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
 
 The last four options take effect only with `kernel.trace`. They map to the
-kernel Cargo features `trace_syscall`, `trace_sched` and `trace_level_*`.
+kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme` and
+`trace_level_*`.
 `ferric-config` rejects `kernel.trace` together with `kernel.profiling`, because
 the profiler takes a CPU out of the system and that CPU would never answer the
 interrupt that live patching waits for.
 
 A selection is a comma- or space-separated list. Each item is `all`, a
-subsystem (`syscall`, `sched`) or an event name (`sched.switch`). Besides
+subsystem (`syscall`, `sched`, `scheme`) or an event name (`sched.switch`). Besides
 `trace.boot`, the boot environment can set `FERRIC_TRACE=<selection>`, which
 the bootloader's environment editor can change. Both are applied on the
 bootstrap processor before the other CPUs start, and the kernel logs
@@ -58,8 +60,8 @@ rewrites the NOP as a jump to the code that writes the record.
 The kernel writes the bytes with the same text-patching routine the CPU
 feature alternatives use.
 
-Tracepoints sit only where interrupts are off: in system call handling and
-the context switch. Each CPU's ring therefore has a single producer.
+Tracepoints sit only where interrupts are off: in system call handling,
+including the kernel's side of scheme requests, and in the context switch. Each CPU's ring therefore has a single producer.
 
 The first events are:
 
@@ -68,6 +70,43 @@ The first events are:
 | `syscall.enter` | `nr`, `a`, `b`, `c`, `d` (the system call number and first four arguments) |
 | `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`) |
 | `sched.switch` | `prev_pid`, `next_pid`, `prev_id`, `next_id` |
+| `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
+| `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
+| `scheme.cancel` | `scheme`, `tag` |
+
+The scheme events cover requests to user-space schemes
+(`crates/kernel/src/scheme/user.rs`).
+
+- `scheme.request` is recorded when the kernel queues a request.
+  - `tag` is the request's SQE tag.
+  - `opcode` is a `schemev2::Opcode`.
+  - `caller` is the caller's pid.
+  - `arg0` and `arg2` are the request's first and third arguments. For reads
+    and writes they are the scheme's file number and the byte count.
+- `scheme.response` is recorded when the kernel accepts the scheme's CQE for
+  a request that is still waiting. A CQE the kernel rejects, for an unknown or
+  already answered tag, is not recorded.
+  - `ret` is the result the caller's system call gets: `-errno` on failure,
+    and 0 for a response that carries file descriptors. It is the scheme's
+    value after the kernel's normalization: `ECANCELED` becomes `EINTR` for a
+    request being cancelled, and an `EINTR` the kernel did not ask for becomes
+    `EIO`.
+  - `responder` is the answering process's pid.
+- `scheme.cancel` is recorded when the kernel asks the scheme to cancel an
+  interrupted caller's request. It does not end the request: the scheme still
+  answers it, usually with `EINTR`, and that answer is a `scheme.response`.
+
+A tag is unique among one scheme's requests in flight and is then reused. A
+request is therefore matched with the next response that has the same scheme
+id and tag. A cancel in between is a mark on the request, not its end.
+
+The pids let you follow one I/O through several schemes. For example, an
+application's read reaches RedoxFS as a request with the application as
+`caller`. While serving it, RedoxFS makes its own requests to the disk driver,
+with RedoxFS as `caller`, before it answers as `responder`.
+
+These events do not cover one-way messages (`close`, `detach`) or the kernel's
+own mmap requests.
 
 ## Records and rings
 
@@ -123,22 +162,28 @@ are not compiled in gives `EOPNOTSUPP`.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
   following:
   1. checks that `sched.switch` is on from boot;
-  2. enables `syscall`;
-  3. makes a `write` to a closed descriptor, a `read` of `stats` and a `yield`;
-  4. disables `syscall`;
+  2. enables `syscall` and `scheme`;
+  3. makes a `write` to a closed descriptor, a `read` of `stats`, a `write` to
+     the null scheme and a `yield`;
+  4. disables them;
   5. drains and decodes every CPU's ring;
   6. checks the enter/exit pairs, the results, the timestamp order, that
-     `sched.switch` records are present, and that `disable` stops the stream.
+     `sched.switch` records are present, that the null-scheme write has a
+     request (the first one on its CPU after the program's own
+     `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
+     result, another process as responder), and that `disable` stops the
+     stream.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme.
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`
-  and `trace_boot = "sched"`. It requires all nine step markers and the boot
+  and `trace_boot = "sched"`. It requires all ten step markers and the boot
   log line.
 
 ## Not implemented yet
 
-- Tracepoints for scheme requests and other subsystems.
+- Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
+  process lifecycle).
 - Read-only mapping of the rings.
 - An initfs trace configuration.
 - A viewer and Perfetto export.

@@ -249,6 +249,16 @@ impl UserInner {
                     callee_responsible: PageSpan::empty(),
                 };
             }
+            // Ferric Oxide: the scheme.request tracepoint (`kernel.trace`).
+            trace_event!(
+                ferric_trace::kernel::SCHEME_REQUEST,
+                self.scheme_id.get(),
+                sqe.tag,
+                sqe.opcode,
+                sqe.caller,
+                sqe.args[0],
+                sqe.args[2],
+            );
             self.todo.send(sqe, token);
 
             event::trigger(self.root_id, self.scheme_id.get(), EVENT_READ, token);
@@ -345,6 +355,12 @@ impl UserInner {
                             let mut preempt = PreemptGuardL1::new(&current_context, &mut token);
                             let token = preempt.token();
 
+                            // Ferric Oxide: the scheme.cancel tracepoint (`kernel.trace`).
+                            trace_event!(
+                                ferric_trace::kernel::SCHEME_CANCEL,
+                                self.scheme_id.get(),
+                                sqe.tag,
+                            );
                             self.todo.send_locked(
                                 Sqe {
                                     opcode: Opcode::Cancel as u8,
@@ -1037,6 +1053,20 @@ impl UserInner {
                             // syscall returns EINTR.
                             *res = Err(Error::new(EIO));
                         }
+
+                        // Ferric Oxide: the scheme.response tracepoint (`kernel.trace`), only
+                        // for a CQE answering a waiting request, with the result as normalized
+                        // above.
+                        trace_event!(
+                            ferric_trace::kernel::SCHEME_RESPONSE,
+                            self.scheme_id.get(),
+                            tag,
+                            match &response {
+                                Response::Regular(res, _, _) => Error::mux(*res),
+                                Response::Fd(_) | Response::MultipleFds(_) => 0,
+                            },
+                            crate::context::current().read(lock_token.token()).pid,
+                        );
 
                         if let Response::MultipleFds(ref mut response_fds) = response {
                             *response_fds = Some(fds);

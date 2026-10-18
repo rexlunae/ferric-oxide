@@ -70,7 +70,7 @@ copying the desired kernel configuration, reproduce the check from
 
 ```sh
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
-  cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_level_info \
+  cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -91,7 +91,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, timestamp order and disable |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
