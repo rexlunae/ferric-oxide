@@ -415,6 +415,9 @@ impl<T> DmaMappings<T> {
     }
 }
 
+/// Lifecycle of links between DMA domains and registered-buffer grants.
+pub mod links;
+
 #[cfg(test)]
 mod tests {
     extern crate std;
