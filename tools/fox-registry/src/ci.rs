@@ -14,10 +14,11 @@
 //! Uploading the blobs to the registry's artifact store and running `sign`
 //! are left to the CI job.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fox_build::{Build, BuildError, BuildRequest, FeatureSelection, Signer};
+use fox_build::{Build, BuildError, BuildRequest, Difference, FeatureSelection, Signer};
 use fox_core::archive::{Archive, ArchiveError};
 use fox_core::{Blake3Digest, CpuLevel, KeyId, PackageName};
 use fox_git::{DownloadError, download_blob};
@@ -25,6 +26,7 @@ use fox_index::edit::{EditError, Registry};
 use fox_index::layout::{Artifact, ArtifactAttestation, ArtifactList, RegistryConfig};
 use semver::Version;
 
+use crate::attested::Attester;
 use crate::source::{self, SourceError};
 
 /// Why a build could not be recorded.
@@ -52,6 +54,17 @@ pub(crate) enum CiError {
         found: PackageName,
         found_version: String,
     },
+    #[error(
+        "the rebuild of {name} {version} does not reproduce {}",
+        diverged.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    )]
+    NotReproduced {
+        name: PackageName,
+        version: Version,
+        /// The archives it did reproduce, whose attestations are recorded.
+        reproduced: Vec<Blake3Digest>,
+        diverged: Vec<Diverged>,
+    },
     #[error("no artifact of {name} {version} for this target and level to rebuild")]
     NothingToRebuild { name: PackageName, version: Version },
     #[error("cannot download the published archive {pkgar}")]
@@ -72,6 +85,19 @@ pub(crate) enum CiError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// A published archive a rebuild did not reproduce.
+#[derive(Debug)]
+pub(crate) struct Diverged {
+    pub(crate) pkgar: Blake3Digest,
+    pub(crate) difference: Difference,
+}
+
+impl fmt::Display for Diverged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.pkgar, self.difference)
+    }
 }
 
 impl From<BuildError> for CiError {
@@ -103,31 +129,27 @@ pub(crate) fn build(registry: &Registry, job: &BuildJob<'_>) -> Result<Blake3Dig
 }
 
 /// Rebuilds one release and attests to every published archive of this
-/// target and level, not yet attested by `job.label`, that the rebuild
-/// reproduces; returns their hashes.
+/// target and level, without a current attestation by `job.label`, that
+/// the rebuild reproduces; returns their hashes.
 ///
 /// # Errors
 ///
 /// [`CiError::NothingToRebuild`] if no such archive is listed, and
-/// [`CiError::Build`] with [`BuildError::NotReproduced`] if the rebuild
-/// matches none of them.
+/// [`CiError::NotReproduced`] if the rebuild does not reproduce one or more
+/// of them; the attestations of those it does reproduce are recorded
+/// either way.
 pub(crate) fn rebuild(
     registry: &Registry,
     job: &BuildJob<'_>,
+    attester: &Attester<'_>,
 ) -> Result<Vec<Blake3Digest>, CiError> {
+    let target = job.target.as_deref().unwrap_or_default();
     let pending: Vec<Artifact> = registry
         .artifacts(job.name, job.version)?
         .map(|list| {
             list.artifacts
                 .into_iter()
-                .filter(|artifact| {
-                    crate::unattested(
-                        artifact,
-                        job.label,
-                        job.target.as_deref().unwrap_or_default(),
-                        job.cpu_level,
-                    )
-                })
+                .filter(|artifact| crate::unattested(artifact, attester, target, job.cpu_level))
                 .collect()
         })
         .unwrap_or_default();
@@ -140,20 +162,38 @@ pub(crate) fn rebuild(
     let (built, signer) = build_release(registry, job)?;
     let config = registry.config()?;
     let mut reproduced = Vec::new();
-    let mut last = None;
+    let mut diverged = Vec::new();
     for artifact in pending {
         let (archive, path) = published(job, &config, &artifact)?;
         match fox_build::reattest(&built, &signer, &archive, &path, &job.work_dir.join("out")) {
             Ok(packaged) => {
                 reproduced.push(record(registry, job, artifact, &packaged)?);
             }
-            Err(error @ BuildError::NotReproduced { .. }) => last = Some(error),
+            Err(BuildError::NotReproduced { difference }) => diverged.push(Diverged {
+                pkgar: artifact.pkgar_blake3,
+                difference,
+            }),
             Err(error) => return Err(error.into()),
         }
     }
-    match last {
-        Some(error) if reproduced.is_empty() => Err(error.into()),
-        _ => Ok(reproduced),
+    outcome(job, reproduced, diverged)
+}
+
+/// Success only if every pending archive was reproduced.
+fn outcome(
+    job: &BuildJob<'_>,
+    reproduced: Vec<Blake3Digest>,
+    diverged: Vec<Diverged>,
+) -> Result<Vec<Blake3Digest>, CiError> {
+    if diverged.is_empty() {
+        Ok(reproduced)
+    } else {
+        Err(CiError::NotReproduced {
+            name: job.name.clone(),
+            version: job.version.clone(),
+            reproduced,
+            diverged,
+        })
     }
 }
 
@@ -284,4 +324,43 @@ fn store_blob(blobs: &Path, path: &Path) -> Result<Blake3Digest, CiError> {
     fs::create_dir_all(&dir).map_err(error)?;
     fs::write(dir.join(hash.to_string()), bytes).map_err(error)?;
     Ok(hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rebuild_fails_when_any_archive_diverges() {
+        let name = PackageName::new("tiny").unwrap();
+        let version = Version::new(0, 1, 0);
+        let dir = Path::new("unused");
+        let job = BuildJob {
+            name: &name,
+            version: &version,
+            key: dir,
+            label: "rebuilder",
+            blobs: dir,
+            work_dir: dir,
+            cache: dir,
+            target: None,
+            cpu_level: None,
+        };
+        let (a, b) = (Blake3Digest::of(b"a"), Blake3Digest::of(b"b"));
+        assert_eq!(outcome(&job, vec![a], Vec::new()).unwrap(), vec![a]);
+        let diverged = Diverged {
+            pkgar: b,
+            difference: Difference::Changed {
+                path: "usr/bin/tiny".into(),
+            },
+        };
+        let error = outcome(&job, vec![a], vec![diverged]).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(&b.to_string()), "{text}");
+        assert!(text.contains("usr/bin/tiny"), "{text}");
+        assert!(matches!(
+            error,
+            CiError::NotReproduced { reproduced, .. } if reproduced == vec![a]
+        ));
+    }
 }

@@ -59,7 +59,8 @@ registry builder, unlisted and then listed in `registry.toml`, then again
 with `--level v4` as a second artifact (on x86-64 hosts), runs `rebuild`
 as an independent rebuilder in another work directory (refused until it is
 listed, then reproducing the archive and adding its attestation to the same
-artifact, after which nothing is left to rebuild), publishes
+artifact, after which nothing is left to rebuild, and attesting again once
+its key is replaced), publishes
 an advisory, and imports a small recipe tree (a git recipe, a tarball recipe
 with a description, and an invalid name). `fox sync` is tested end to end with a registry package (installed,
 locked, unchanged under `--locked`, removed when the set drops it, kept when
@@ -76,7 +77,10 @@ falls back to v3, a v3 machine never gets v4, other targets take only
 artifacts without a level, and an attestation of another level is refused);
 `fox-registry`'s `is_variant` and `fox-build`'s level choice have unit tests
 too, and `fox-build`'s rebuild comparison is unit tested for a changed,
-missing or extra file, a changed mode and another version.
+missing or extra file, a changed mode and another version. `fox-registry`
+unit tests check that a rebuild with any divergent archive fails while
+keeping the ones it reproduced, and that an unlisted builder or unreadable
+attestation counts as not attested.
 The installer's `fox` image step (`tools/installer/src/fox.rs`) is unit
 tested with a stand-in `fox` script: adoption alone without a package set,
 then adoption, a `--locked` sync for the image target and level and the system SBOM in

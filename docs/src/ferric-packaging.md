@@ -550,15 +550,32 @@ copy only while signing.
 
 | `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
 | `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, and `--level v3\|v4`, default v3 and only for x86-64, also decide which artifacts count as present, each level being its own artifact; `--work-dir` optional) |
-| `rebuild [name@version...] --key F --label L --blobs DIR` | The independent rebuilder: builds each release the same way (by default every release with a default-feature artifact for `--target` and `--level` that `L` has not attested), downloads the published archive from the artifact store, and only if the rebuild staged exactly the archive's files (paths, kinds, modes, sizes and BLAKE3 hashes, the SBOM and manifest included) signs its own attestation of that archive and adds it to the same artifact. The archive is not repacked, so its header stays signed by the original builder. A rebuild that differs fails and names the first differing file; `L` must be listed in `registry.toml` |
+| `rebuild [name@version...] --key F --label L --blobs DIR` | The independent rebuilder: builds each release the same way (by default every release with a default-feature artifact for `--target` and `--level` that `L` has not attested), downloads the published archive from the artifact store, and only if the rebuild staged exactly the archive's files (paths, kinds, modes, sizes and BLAKE3 hashes, the SBOM and manifest included) signs its own attestation of that archive and adds it to the same artifact. The archive is not repacked, so its header stays signed by the original builder. If the rebuild does not reproduce one or more of a release's archives, it names each one with its first difference, keeps the attestations it did record, moves on to the next release and exits unsuccessfully at the end. `L` must be listed in `registry.toml` |
 | `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing v3 and v4 artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
 
 `release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
 `$XDG_CACHE_HOME`; `--cache` overrides it). `build` refuses a key that
 `registry.toml` does not list under that label, and artifact lists merge:
 a second builder attesting to the same archive hash adds its attestation
-to the same artifact. No `rexlunae/ferric-registry` repository is published
-yet; `init --github` is the template for one.
+to the same artifact.
+
+When `build` and `rebuild` pick releases themselves, an attestation by `L`
+counts only if its signature verifies with `L`'s current key in
+`registry.toml`, as clients check it. After `configure --builder` replaces
+a builder's key, its old attestations are stale, and the next run attests
+again and replaces them. Attestation blobs are read from `DIR` when they are
+there with the right hash, and otherwise downloaded from the artifact store;
+a blob that cannot be read counts as missing, with a warning. Without
+`--work-dir`, each builder label, mode, target, level and package gets its
+own work directory under the system temporary directory, so builders that
+share a machine do not overwrite each other's source and stage.
+
+The `init --github` template runs only the registry's own builder. An
+independent rebuilder runs `rebuild` on its own infrastructure, publishes its
+blobs at its own URL (added with `--artifact-url`; clients try each URL in
+turn) and proposes the `artifacts/` change as a pull request. The template
+README describes this. No `rexlunae/ferric-registry` repository is
+published yet; `init --github` is the template for one.
 
 ### Using registries
 

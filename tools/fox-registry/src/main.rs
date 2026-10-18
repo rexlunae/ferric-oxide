@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+mod attested;
 mod ci;
 mod keys;
 mod recipes;
@@ -43,6 +44,7 @@ use fox_index::verify::{self, ClientState, VerifyError};
 use semver::Version;
 use time::OffsetDateTime;
 
+use crate::attested::Attester;
 use crate::keys::KeyError;
 use crate::source::SourceError;
 
@@ -273,6 +275,8 @@ impl From<Role> for RoleName {
 enum CliError {
     #[error(transparent)]
     Edit(#[from] EditError),
+    #[error("the rebuild did not reproduce every published archive of {}", releases.join(", "))]
+    NotReproduced { releases: Vec<String> },
     #[error("the registry does not verify")]
     Verify(#[from] VerifyError),
     #[error(transparent)]
@@ -352,15 +356,32 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("fox-registry: {error}");
-            let mut source = std::error::Error::source(&error);
-            while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
-                source = cause.source();
-            }
+            report(&error);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints an error and its sources, one per line.
+fn report(error: &dyn std::error::Error) {
+    eprintln!("fox-registry: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
+}
+
+/// Formats an error and its sources on one line, for a warning.
+pub(crate) fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn run(cli: &Cli) -> Result<(), CliError> {
@@ -695,10 +716,12 @@ fn build(dir: &Path, args: &BuilderArgs, mode: Mode) -> Result<(), CliError> {
     let registry = Registry::open(dir)?;
     let cache = cache_dir(args.cache.as_deref())?;
     let target = args.target.as_deref().unwrap_or(HOST_TARGET);
+    let config = registry.config()?;
+    let attester = Attester::new(&config, &args.label, &args.blobs);
     let releases = if args.releases.is_empty() {
         match mode {
-            Mode::Build => missing_builds(&registry, &args.label, target, args.cpu_level)?,
-            Mode::Rebuild => missing_rebuilds(&registry, &args.label, target, args.cpu_level)?,
+            Mode::Build => missing_builds(&registry, &attester, target, args.cpu_level)?,
+            Mode::Rebuild => missing_rebuilds(&registry, &attester, target, args.cpu_level)?,
         }
     } else {
         args.releases
@@ -706,10 +729,12 @@ fn build(dir: &Path, args: &BuilderArgs, mode: Mode) -> Result<(), CliError> {
             .map(|value| parse_release(value))
             .collect::<Result<_, _>>()?
     };
+    let mut diverged = Vec::new();
     for (name, version) in releases {
-        let work_dir = args.work_dir.clone().unwrap_or_else(|| {
-            fox_build::default_work_dir(format!("fox-registry/{name}").as_bytes())
-        });
+        let work_dir = args
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| default_work_dir(mode, &args.label, target, args.cpu_level, &name));
         let job = ci::BuildJob {
             name: &name,
             version: &version,
@@ -726,14 +751,48 @@ fn build(dir: &Path, args: &BuilderArgs, mode: Mode) -> Result<(), CliError> {
                 let pkgar = ci::build(&registry, &job)?;
                 println!("built {name} {version}: {pkgar}");
             }
-            Mode::Rebuild => {
-                for pkgar in ci::rebuild(&registry, &job)? {
-                    println!("reproduced {name} {version}: {pkgar}");
+            Mode::Rebuild => match ci::rebuild(&registry, &job, &attester) {
+                Ok(reproduced) => print_reproduced(&name, &version, &reproduced),
+                // A release whose archives disagree with the rebuild must
+                // not stop the others from being rebuilt; it fails the run
+                // at the end.
+                Err(error @ ci::CiError::NotReproduced { .. }) => {
+                    if let ci::CiError::NotReproduced { reproduced, .. } = &error {
+                        print_reproduced(&name, &version, reproduced);
+                    }
+                    report(&error);
+                    diverged.push(format!("{name}@{version}"));
                 }
-            }
+                Err(error) => return Err(error.into()),
+            },
         }
     }
-    Ok(())
+    if diverged.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::NotReproduced { releases: diverged })
+    }
+}
+
+fn print_reproduced(name: &PackageName, version: &Version, reproduced: &[fox_core::Blake3Digest]) {
+    for pkgar in reproduced {
+        println!("reproduced {name} {version}: {pkgar}");
+    }
+}
+
+/// The work directory without `--work-dir`: one per builder, mode, target,
+/// level and package, so builders running at once on one machine do not
+/// replace each other's source and stage.
+fn default_work_dir(
+    mode: Mode,
+    label: &str,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+    name: &PackageName,
+) -> PathBuf {
+    let level = cpu_level.map(|level| level.to_string()).unwrap_or_default();
+    let key = format!("fox-registry/{mode:?}/{label}/{target}/{level}/{name}");
+    fox_build::default_work_dir(key.as_bytes())
 }
 
 fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
@@ -752,7 +811,7 @@ fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
 /// `label`.
 fn missing_builds(
     registry: &Registry,
-    label: &str,
+    attester: &Attester<'_>,
     target: &str,
     cpu_level: Option<CpuLevel>,
 ) -> Result<Vec<(PackageName, Version)>, CliError> {
@@ -767,11 +826,7 @@ fn missing_builds(
                 .artifacts(&name, &release.version)?
                 .is_some_and(|list| {
                     list.artifacts.iter().any(|artifact| {
-                        is_variant(artifact, target, cpu_level)
-                            && artifact
-                                .attestations
-                                .iter()
-                                .any(|attestation| attestation.builder == label)
+                        is_variant(artifact, target, cpu_level) && attester.has_attested(artifact)
                     })
                 });
             if !built {
@@ -786,7 +841,7 @@ fn missing_builds(
 /// `target` at `cpu_level` that `label` has not attested.
 fn missing_rebuilds(
     registry: &Registry,
-    label: &str,
+    attester: &Attester<'_>,
     target: &str,
     cpu_level: Option<CpuLevel>,
 ) -> Result<Vec<(PackageName, Version)>, CliError> {
@@ -802,7 +857,7 @@ fn missing_rebuilds(
                 .is_some_and(|list| {
                     list.artifacts
                         .iter()
-                        .any(|artifact| unattested(artifact, label, target, cpu_level))
+                        .any(|artifact| unattested(artifact, attester, target, cpu_level))
                 });
             if pending {
                 missing.push((name.clone(), release.version.clone()));
@@ -813,20 +868,18 @@ fn missing_rebuilds(
 }
 
 /// Whether `artifact` is a default-feature build of `target` at
-/// `cpu_level` that `label` has not attested: what `rebuild` reproduces.
+/// `cpu_level` without a current attestation by the attester's builder:
+/// what `rebuild` reproduces.
 pub(crate) fn unattested(
     artifact: &Artifact,
-    label: &str,
+    attester: &Attester<'_>,
     target: &str,
     cpu_level: Option<CpuLevel>,
 ) -> bool {
     artifact.default_features
         && artifact.features.is_empty()
         && is_variant(artifact, target, cpu_level)
-        && !artifact
-            .attestations
-            .iter()
-            .any(|attestation| attestation.builder == label)
+        && !attester.has_attested(artifact)
 }
 
 /// Whether `artifact` is the build of `target` at `cpu_level` (an x86-64

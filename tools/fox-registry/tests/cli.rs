@@ -387,6 +387,38 @@ fn a_builder_records_attested_artifacts() {
         stderr(&output)
     );
 
+    // Replacing the rebuilder's key makes its attestation stale: clients
+    // would no longer count it, so the rebuilder attests again.
+    let rotated = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(tempfile::tempdir().unwrap().path())
+        .args(["init", "--name", "r2", "--single-key", "--keys"])
+        .arg(rotated.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rotated_key = rotated.path().join("registry.key").display().to_string();
+    let rotated_arg = format!(
+        "rebuilder={}",
+        rotated.path().join("registry.pub").display()
+    );
+    env.ok(&["configure", "--builder", &rotated_arg]);
+    let mut rotated_rebuild: Vec<&str> = rebuild.to_vec();
+    rotated_rebuild[2] = &rotated_key;
+    let out = env.ok(&rotated_rebuild);
+    assert!(out.contains("reproduced tiny 0.1.0"), "{out}");
+    let artifacts =
+        fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+    assert_eq!(
+        artifacts.matches("builder = \"rebuilder\"").count(),
+        1,
+        "{artifacts}"
+    );
+    assert!(env.sign(&[&targets, &snapshot, &timestamp]));
+    env.ok(&["verify"]);
+    assert!(!env.ok(&rotated_rebuild).contains("reproduced"));
+
     // Each x86-64 level is its own artifact.
     if cfg!(target_arch = "x86_64") {
         let v4: Vec<&str> = build.iter().copied().chain(["--level", "v4"]).collect();
