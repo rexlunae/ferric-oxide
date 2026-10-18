@@ -370,3 +370,67 @@ fn advisories_are_published_and_signed() {
         stderr(&output)
     );
 }
+
+#[test]
+fn cookbook_recipes_become_recipe_packages() {
+    let env = Env::new();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    for (dir, text) in [
+        (
+            "recipes/core/hello",
+            "[source]\ngit = \"https://example.com/hello.git\"\n\n[build]\ntemplate = \"cargo\"\n",
+        ),
+        (
+            "recipes/libs/zlib",
+            "[source]\ntar = \"https://example.com/zlib.tar.gz\"\n\n[package]\ndescription = \"Compression library\"\n",
+        ),
+        ("recipes/libs/bad@name", "[build]\ntemplate = \"custom\"\n"),
+    ] {
+        fs::create_dir_all(repo.path().join(dir)).unwrap();
+        fs::write(repo.path().join(dir).join("recipe.toml"), text).unwrap();
+    }
+    let owner = owner_key(5);
+    let owner_path = env.keys.path().join("owner_ed25519");
+    fs::write(
+        &owner_path,
+        owner.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+    )
+    .unwrap();
+    let owner_arg = format!("me={}", owner.public_key().to_openssh().unwrap());
+    let recipes = repo.path().join("recipes");
+    let import = [
+        "import-recipes",
+        recipes.to_str().unwrap(),
+        "--git",
+        "https://example.com/ferric-oxide.git",
+        "--owner",
+        &owner_arg,
+    ];
+    let output = env.run(&import);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("admitted 2 recipes (0 already"), "{out}");
+    assert!(stderr(&output).contains("bad@name"), "{}", stderr(&output));
+
+    let hello = fs::read_to_string(env.registry.path().join("packages/he/hello.toml")).unwrap();
+    assert!(hello.contains("kind = \"recipe\""), "{hello}");
+    assert!(hello.contains("path = \"recipes/core/hello\""), "{hello}");
+    assert!(
+        hello.contains("Cookbook recipe for https://example.com/hello.git"),
+        "{hello}"
+    );
+    let zlib = fs::read_to_string(env.registry.path().join("packages/zl/zlib.toml")).unwrap();
+    assert!(zlib.contains("Compression library"), "{zlib}");
+
+    let owner_path = owner_path.display().to_string();
+    assert!(env.sign(&[
+        &owner_path,
+        &env.key("targets"),
+        &env.key("snapshot"),
+        &env.key("timestamp")
+    ]));
+    env.ok(&["verify"]);
+    // Importing again admits nothing new.
+    assert!(env.ok(&import).contains("admitted 0 recipes (2 already"));
+}

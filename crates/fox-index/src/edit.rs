@@ -515,28 +515,51 @@ impl Registry {
     /// [`EditError::AlreadyAdmitted`] if the package file or delegation
     /// exists, and as [`Registry::write_package`].
     pub fn admit(&mut self, entry: &PackageEntry) -> Result<(), EditError> {
-        let path = package_path(&entry.name);
-        let name = entry.name.as_str().to_owned();
-        if self.dir.join(&path).exists() || self.delegations.contains_key(&name) {
-            return Err(EditError::AlreadyAdmitted {
-                name: entry.name.clone(),
-            });
+        self.admit_all(core::slice::from_ref(entry))
+    }
+
+    /// Admits several packages, as [`Registry::admit`] does for each, but
+    /// writes `targets.json` once. Nothing is written unless every package
+    /// is new.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::AlreadyAdmitted`] if any package file or delegation
+    /// exists or a name repeats, and as [`Registry::write_package`].
+    pub fn admit_all(&mut self, entries: &[PackageEntry]) -> Result<(), EditError> {
+        let mut names = BTreeSet::new();
+        for entry in entries {
+            let path = package_path(&entry.name);
+            if self.dir.join(&path).exists()
+                || self.delegations.contains_key(entry.name.as_str())
+                || !names.insert(entry.name.as_str())
+            {
+                return Err(EditError::AlreadyAdmitted {
+                    name: entry.name.clone(),
+                });
+            }
         }
-        self.write_package(entry)?;
-        self.targets.signed.delegations.push(Delegation {
-            name: name.clone(),
-            keys: RoleKeys::new(entry.owners.iter().map(|owner| owner.delegation_key()), 1),
-            paths: BTreeSet::from([path]),
-        });
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in entries {
+            let name = entry.name.as_str().to_owned();
+            self.write_package(entry)?;
+            self.targets.signed.delegations.push(Delegation {
+                name: name.clone(),
+                keys: RoleKeys::new(entry.owners.iter().map(|owner| owner.delegation_key()), 1),
+                paths: BTreeSet::from([package_path(&entry.name)]),
+            });
+            self.delegations.insert(
+                name,
+                Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
+            );
+        }
         self.targets
             .signed
             .delegations
             .sort_by(|a, b| a.name.cmp(&b.name));
-        self.delegations.insert(
-            name,
-            Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
-        );
-        // The delegation must survive until the next `sign`, which may run
+        // The delegations must survive until the next `sign`, which may run
         // in another process.
         if !self.targets.signatures.is_empty() {
             self.targets.signed.version =

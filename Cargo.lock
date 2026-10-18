@@ -1526,10 +1526,12 @@ dependencies = [
  "fox-index",
  "pkgar-keys 0.2.4",
  "semver",
+ "serde",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
  "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]

@@ -488,6 +488,7 @@ copy only while signing.
 | `admit <git-url> --name N --owner ID=KEY` | Writes the package file and a delegation to the owners (`--kind`, `--summary`, `--path` optional) |
 | `release <name> <tag>` | Fetches the repository, checks the tag is SSH-signed by an owner and names a version, and records its commit and tree hash |
 | `check [name...]` | What registry CI runs on a pull request: re-checks every recorded release's tag signature, commit and tree hash, and that the owners match the delegation's keys |
+| `import-recipes <dir> --git URL --owner ID=KEY...` | Admits every cookbook recipe under `dir` as a `kind = "recipe"` package whose source is its recipe directory (`path`) in the repository at `URL`, delegated to the owners; the summary is the recipe's `[package] description` or its upstream source. Recipes already in the registry, names that are not package names and recipes that are not valid TOML are skipped and reported. `targets.json` is written once for the whole import |
 | `advise <file>` | Validates a RustSec-format advisory and stores it as `advisories/<id>.toml`, replacing one with that id (to update or withdraw it); signed by the targets key |
 | `yank <name> <version>` | Marks a release yanked (`--undo` reverses it) |
 | `set-role <role> --key K... [--threshold N]` | Writes a new root that gives the role new keys; clients accept it once the old and the new root keys have signed |

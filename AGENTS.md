@@ -47,7 +47,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
 | `tools/fox/` | Package verification, installation (from archives, signed git sources or registries), trust store, adoption, audit, SBOM and sync CLI; also built for the target by `recipes/core/fox` | host, and `x86_64-unknown-redox` through the recipe |
 | `tools/cargo-fox/` | `cargo fox`: hermetic builds, signed archives, build attestations and signed release tags for package authors | host |
-| `tools/fox-registry/` | `fox-registry`: package registry creation, admission, release checks, registry CI builds, advisories and metadata signing | host |
+| `tools/fox-registry/` | `fox-registry`: package registry creation, admission, release checks, registry CI builds, advisories, recipe import and metadata signing | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |

@@ -5,6 +5,7 @@
 //!
 //! - `init` creates a registry with fresh role keys;
 //! - `admit` adds a package and delegates its file to its owners;
+//! - `import-recipes` admits cookbook recipes as `recipe` packages;
 //! - `release` records a signed release tag, and `check` re-checks recorded
 //!   releases against their repositories (what registry CI runs on a PR);
 //! - `build` is the registry builder: it builds releases from their checked
@@ -25,6 +26,7 @@
 
 mod ci;
 mod keys;
+mod recipes;
 mod source;
 
 use std::collections::BTreeSet;
@@ -91,6 +93,18 @@ enum Command {
         path: Option<String>,
         /// An owner, as `ID=KEY`: KEY is an `ssh-ed25519` line or a file
         /// holding one.
+        #[arg(long = "owner", required = true, value_name = "ID=KEY")]
+        owners: Vec<String>,
+    },
+    /// Admit every cookbook recipe under a directory as a `recipe` package
+    /// whose source is its recipe directory in this repository.
+    ImportRecipes {
+        /// The recipes directory (or one category of it).
+        dir: PathBuf,
+        /// The URL of the repository holding the recipes.
+        #[arg(long)]
+        git: String,
+        /// An owner of every imported package, as `ID=KEY`.
         #[arg(long = "owner", required = true, value_name = "ID=KEY")]
         owners: Vec<String>,
     },
@@ -297,6 +311,16 @@ enum CliError {
         #[source]
         source: fox_index::advisory::AdvisoryError,
     },
+    #[error(transparent)]
+    Recipe(#[from] recipes::RecipeError),
+    #[error("cannot find the git repository holding {}", path.display())]
+    RecipeRepo {
+        path: PathBuf,
+        #[source]
+        source: Box<fox_git::GitError>,
+    },
+    #[error("the repository holding {} has no work tree", path.display())]
+    BareRecipeRepo { path: PathBuf },
     #[error("--builder {value:?} is not LABEL=KEY")]
     BuilderSyntax { value: String },
     #[error("no builder {label} to remove")]
@@ -403,6 +427,11 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             },
         ),
         Command::Advise { file } => advise(dir, file),
+        Command::ImportRecipes {
+            dir: recipes,
+            git,
+            owners,
+        } => import_recipes(dir, recipes, git, owners),
         Command::Release { name, tag, cache } => release(dir, name, tag, cache.as_deref()),
         Command::Check { names, cache } => check(dir, names, cache.as_deref()),
         Command::Yank {
@@ -530,6 +559,71 @@ fn write_templates(dir: &Path) -> Result<(), CliError> {
         std::fs::write(&path, text).map_err(error)?;
     }
     println!("wrote README.md and .github/workflows; add the key secrets the README lists");
+    Ok(())
+}
+
+fn import_recipes(
+    dir: &Path,
+    recipes_dir: &Path,
+    git: &str,
+    owners: &[String],
+) -> Result<(), CliError> {
+    let git = GitUrl::new(git)?;
+    let owners = owners
+        .iter()
+        .map(|owner| parse_owner(owner))
+        .collect::<Result<Vec<_>, _>>()?;
+    let repo_error = |source| CliError::RecipeRepo {
+        path: recipes_dir.to_path_buf(),
+        source: Box::new(source),
+    };
+    let repo = fox_git::Repository::discover(recipes_dir).map_err(repo_error)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| CliError::BareRecipeRepo {
+            path: recipes_dir.to_path_buf(),
+        })?
+        .canonicalize()
+        .map_err(|source| CliError::RootFile {
+            path: recipes_dir.to_path_buf(),
+            source,
+        })?;
+    let scan_dir = recipes_dir
+        .canonicalize()
+        .map_err(|source| CliError::RootFile {
+            path: recipes_dir.to_path_buf(),
+            source,
+        })?;
+    let scan = recipes::scan(&workdir, &scan_dir)?;
+    for error in &scan.invalid {
+        report_failure("fox-registry: skipped", error);
+    }
+    let mut registry = Registry::open(dir)?;
+    let mut entries = Vec::new();
+    let (mut existing, mut invalid) = (0, Vec::new());
+    for recipe in &scan.found {
+        let Some(entry) = recipe.entry(&git, &owners) else {
+            invalid.push(recipe.name.as_str());
+            continue;
+        };
+        if registry.package(&entry.name)?.is_some() {
+            existing += 1;
+            continue;
+        }
+        entries.push(entry);
+    }
+    registry.admit_all(&entries)?;
+    println!(
+        "admitted {} recipes ({existing} already in the registry); run `fox-registry sign` with the targets key",
+        entries.len()
+    );
+    if !invalid.is_empty() {
+        eprintln!(
+            "fox-registry: skipped {} recipes whose names are not package names: {}",
+            invalid.len(),
+            invalid.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -783,9 +877,9 @@ fn owners_match_delegation(registry: &Registry, entry: &PackageEntry) -> bool {
         .is_some_and(|delegation| delegation.keys.keyids == owners)
 }
 
-fn report_failure(what: &str, error: &SourceError) {
+fn report_failure(what: &str, error: &dyn std::error::Error) {
     eprintln!("{what}: {error}");
-    let mut source = std::error::Error::source(error);
+    let mut source = error.source();
     while let Some(cause) = source {
         eprintln!("  caused by: {cause}");
         source = cause.source();

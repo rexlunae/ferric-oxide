@@ -6,7 +6,7 @@ use std::path::Path;
 
 use fox_core::trust::AuthorKey;
 use fox_core::{Blake3Digest, KeyId, PackageName};
-use fox_index::edit::{Keyring, Registry, SignOptions, single_key_roles};
+use fox_index::edit::{EditError, Keyring, Registry, SignOptions, single_key_roles};
 use fox_index::layout::{PackageEntry, Release};
 use fox_index::metadata::{RoleKeys, RoleName, Signed, Snapshot, Targets, Timestamp};
 use fox_index::verify::{self, ClientState, VerifyError};
@@ -369,4 +369,40 @@ fn admitting_twice_or_releasing_twice_is_refused() {
     registry.add_release(&ripgrep(), release(1)).unwrap();
     assert!(registry.add_release(&ripgrep(), release(1)).is_err());
     assert!(Registry::init(dir.path(), "again", &single_key_roles(key(1)), now()).is_err());
+}
+
+#[test]
+fn packages_are_admitted_together_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let other = |name: &str| {
+        let mut entry = entry();
+        entry.name = PackageName::new(name).unwrap();
+        entry
+    };
+    // One package already admitted refuses the whole batch.
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), entry()]),
+        Err(EditError::AlreadyAdmitted { .. })
+    ));
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("fd")]),
+        Err(EditError::AlreadyAdmitted { .. })
+    ));
+    assert!(!dir.path().join("packages/fd/fd.toml").exists());
+
+    registry.admit_all(&[other("fd"), other("bat")]).unwrap();
+    // The delegations persist for another process to sign.
+    let mut reopened = Registry::open(dir.path()).unwrap();
+    let report = reopened
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    let mut state = client(&reopened);
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert_eq!(verified.package_names().len(), 3);
 }
