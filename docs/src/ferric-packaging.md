@@ -671,7 +671,9 @@ installed by hand, or replaced by hand since the last sync, are left alone
 (reported as `kept`). `--locked` fails on any package the lock does not pin
 (for reproducible image builds), and checks every package before it adds a
 registry or writes the policy, so a refused sync changes nothing;
-`--update` resolves every package again.
+`--update` resolves every package again, and replaces a lock that cannot be
+read or parsed (with a warning naming why) instead of failing on it; without
+`--update` such a lock is an error.
 
 ### Advisories and `fox audit`
 

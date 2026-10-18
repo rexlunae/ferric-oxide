@@ -448,11 +448,7 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         || options.config.with_file_name("fox.lock"),
         Path::to_path_buf,
     );
-    let previous: Lock = if lock_path.exists() {
-        read_toml(&lock_path)?
-    } else {
-        Lock::default()
-    };
+    let previous = previous_lock(&lock_path, options.update)?;
     let mut chosen = BTreeMap::new();
     for (name, want) in &set.packages {
         let request = want.request(name, options.source)?;
@@ -555,6 +551,28 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The lock a sync starts from. `--update` re-resolves every package and
+/// rewrites the lock anyway, so there a lock that cannot be read or parsed
+/// is reported and replaced instead of blocking the update; otherwise it is
+/// an error, since keeping its pins is the point of the lock.
+fn previous_lock(path: &Path, update: bool) -> Result<Lock, SyncError> {
+    if !path.exists() {
+        return Ok(Lock::default());
+    }
+    match read_toml(path) {
+        Ok(lock) => Ok(lock),
+        Err(error) if update => {
+            eprintln!(
+                "fox: warning: replacing {}: {}",
+                path.display(),
+                commands::chain(&error)
+            );
+            Ok(Lock::default())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Adds the set's registries that are not configured yet, and refuses one
@@ -950,5 +968,22 @@ mod tests {
             lock_entry(&name, &request, &musl, None, Some(&entry)),
             Err(SyncError::LockedTarget { .. })
         ));
+    }
+
+    #[test]
+    fn update_replaces_a_lock_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fox.lock");
+        assert_eq!(previous_lock(&path, false).unwrap(), Lock::default());
+        fs::write(
+            &path,
+            "format = \"fox-lock/1\"\n[[package]]\nname = \"tiny\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            previous_lock(&path, false),
+            Err(SyncError::Parse { .. })
+        ));
+        assert_eq!(previous_lock(&path, true).unwrap(), Lock::default());
     }
 }
