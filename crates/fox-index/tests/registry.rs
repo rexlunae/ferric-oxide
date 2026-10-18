@@ -630,3 +630,91 @@ fn a_same_version_timestamp_cannot_change() {
         Err(VerifyError::Equivocation { .. })
     ));
 }
+
+#[test]
+fn a_timestamp_key_rotation_keeps_clients_updating() {
+    const NEW: u8 = 12;
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let mut state = client(&registry);
+    verify::update(dir.path(), &mut state, now()).unwrap();
+    let trusted = fs::read(dir.path().join("metadata/timestamp.json")).unwrap();
+
+    // Rotating the timestamp role re-signs the same payload at the same
+    // version with the new key; a client must follow the rotation instead
+    // of reading the re-signed bytes as an equivocation.
+    let options = SignOptions::default();
+    registry
+        .set_role(
+            RoleName::Timestamp,
+            RoleKeys::new([key(NEW)], 1),
+            now(),
+            &options.lifetimes,
+        )
+        .unwrap();
+    let report = registry
+        .sign(&keyring(&[MAINTAINER, NEW]), now(), &options)
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    let row = report
+        .files
+        .iter()
+        .find(|file| file.file == "metadata/timestamp.json")
+        .unwrap();
+    assert!(!row.bumped, "{row:?}");
+    let timestamp: Signed<Timestamp> = read(dir.path(), "metadata/timestamp.json");
+    assert_eq!(timestamp.signed.version, state.timestamp);
+    assert_eq!(
+        timestamp
+            .signatures
+            .iter()
+            .map(|signature| signature.keyid)
+            .collect::<Vec<_>>(),
+        [key(NEW)]
+    );
+    assert_ne!(
+        fs::read(dir.path().join("metadata/timestamp.json")).unwrap(),
+        trusted
+    );
+
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert!(verified.package(&ripgrep()).unwrap().is_some());
+}
+
+#[test]
+fn a_top_level_package_ignores_an_overlapping_delegation() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = admitted(dir.path());
+    let mut state = client(&registry);
+
+    // The package file gains an owner its delegation does not grant...
+    let mut entry = registry.package(&ripgrep()).unwrap().unwrap();
+    entry.owners.push(Owner {
+        id: "other".to_owned(),
+        key: owner_key(8),
+    });
+    registry.write_package(&entry).unwrap();
+
+    // ...but the maintainer signs those exact bytes into the top-level
+    // targets, which take precedence over the delegation for that path.
+    let mut targets: Signed<Targets> = read(dir.path(), "metadata/targets.json");
+    let bytes = fs::read(dir.path().join("packages/ri/ripgrep.toml")).unwrap();
+    targets
+        .signed
+        .targets
+        .insert("packages/ri/ripgrep.toml".to_owned(), FileMeta::of(&bytes));
+    targets.signatures.clear();
+    targets.sign(&secret(MAINTAINER)).unwrap();
+    fs::write(
+        dir.path().join("metadata/targets.json"),
+        targets.to_json().unwrap(),
+    )
+    .unwrap();
+    reseal(dir.path(), MAINTAINER);
+
+    // The package's bytes are the top-level-signed ones, so the delegation
+    // does not constrain its owners.
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    let found = verified.package(&ripgrep()).unwrap().unwrap();
+    assert_eq!(found.owners, entry.owners);
+}

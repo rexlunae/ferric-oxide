@@ -8,8 +8,10 @@
 //!    by a threshold of both the trusted root's and its own root keys, and
 //!    carry version `N`. The newest root must not have expired.
 //! 2. **Timestamp.** Signed by the root's timestamp role, not older than the
-//!    trusted version, not expired, and byte-for-byte identical when it is
-//!    the version the client already trusts.
+//!    trusted version, not expired, and carrying the same signed content as
+//!    the trusted one at a version the client already trusts, so re-made
+//!    signatures (for example after a timestamp-key rotation) do not read as
+//!    an equivocation.
 //! 3. **Snapshot.** Its length and BLAKE3 match the timestamp; signed by the
 //!    snapshot role; version as the timestamp says, not older than trusted;
 //!    no file it lists is older than in the trusted snapshot; not expired.
@@ -23,9 +25,10 @@
 //! checking their length and BLAKE3 against the targets metadata (top-level
 //! first, then the delegation that covers the path). Files that no metadata
 //! lists cannot be read. A package may disappear from a newer snapshot; its
-//! file then simply stops being readable. A package's owners must also be
-//! the keys its delegation grants, so tag authority cannot diverge from
-//! update authority.
+//! file then simply stops being readable. A package whose signed bytes came
+//! from a delegation must also list exactly the keys that delegation grants
+//! as its owners, so tag authority cannot diverge from update authority;
+//! bytes the top-level targets role signed are authorized directly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -200,8 +203,10 @@ pub struct ClientState {
     pub snapshot: u64,
     /// Versions of the files the trusted snapshot listed.
     pub meta: BTreeMap<String, u64>,
-    /// The length and BLAKE3 of the trusted timestamp, so a same-version
-    /// replacement is refused instead of accepted as fresh.
+    /// The length and BLAKE3 of the trusted timestamp's signed payload —
+    /// the bytes its signatures cover — so a same-version replacement with
+    /// different content is refused instead of accepted as fresh. Re-made
+    /// signatures over unchanged payload bytes are not an equivocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_file: Option<FileMeta>,
 }
@@ -250,7 +255,9 @@ pub struct VerifiedRegistry {
     dir: PathBuf,
     root: Root,
     files: BTreeMap<String, FileMeta>,
-    delegations: BTreeMap<String, RoleKeys>,
+    /// The keys of the delegation that supplied each path a delegation
+    /// covers; a path absent here was signed by the top-level targets role.
+    delegated: BTreeMap<String, RoleKeys>,
 }
 
 /// Verifies the checkout at `dir` against `state` at time `now`, and
@@ -269,15 +276,18 @@ pub fn update(
     check_expiry(&root.signed, "root", now)?;
     let roles = &root.signed;
 
-    let (timestamp_bytes, timestamp): (Vec<u8>, Signed<Timestamp>) = load(dir, TIMESTAMP_FILE)?;
+    let (_, timestamp): (Vec<u8>, Signed<Timestamp>) = load(dir, TIMESTAMP_FILE)?;
     verify_role(&timestamp, roles, RoleName::Timestamp, TIMESTAMP_FILE)?;
     not_older(TIMESTAMP_FILE, state.timestamp, timestamp.signed.version)?;
     // The timestamp pins the whole chain below it by hash, so accepting a
-    // same-version timestamp with different bytes would let a signer feed a
-    // client a different snapshot, targets and packages without a bump.
+    // same-version timestamp with different content would let a signer feed a
+    // client a different snapshot, targets and packages without a bump. Only
+    // the signed payload is pinned: signatures may be re-made at an unchanged
+    // version, for example when the timestamp key rotates.
+    let timestamp_payload = signed_meta(&timestamp, TIMESTAMP_FILE)?;
     if timestamp.signed.version == state.timestamp
         && let Some(trusted) = state.timestamp_file
-        && !trusted.matches(&timestamp_bytes)
+        && trusted != timestamp_payload
     {
         return Err(VerifyError::Equivocation {
             file: TIMESTAMP_FILE.to_owned(),
@@ -296,12 +306,12 @@ pub fn update(
     }
     check_expiry(&snapshot.signed, SNAPSHOT_FILE, now)?;
 
-    let (files, delegations) = verify_targets(dir, roles, &snapshot.signed, now)?;
+    let VerifiedTargets { files, delegated } = verify_targets(dir, roles, &snapshot.signed, now)?;
     let registry = VerifiedRegistry {
         dir: dir.to_path_buf(),
         root: root.signed.clone(),
         files,
-        delegations,
+        delegated,
     };
     *state = ClientState {
         root,
@@ -313,7 +323,7 @@ pub fn update(
             .iter()
             .map(|(file, meta)| (file.clone(), meta.version))
             .collect(),
-        timestamp_file: Some(FileMeta::of(&timestamp_bytes)),
+        timestamp_file: Some(timestamp_payload),
     };
     Ok(registry)
 }
@@ -347,8 +357,13 @@ fn update_root(dir: &Path, trusted: &Signed<Root>) -> Result<Signed<Root>, Verif
     }
 }
 
-/// The signed files and the delegation keys of a verified targets tree.
-type VerifiedTargets = (BTreeMap<String, FileMeta>, BTreeMap<String, RoleKeys>);
+/// The signed files and supplied delegations of a verified targets tree.
+struct VerifiedTargets {
+    /// Every signed path, with the length and hash its bytes must match.
+    files: BTreeMap<String, FileMeta>,
+    /// The keys of the delegation that supplied each delegated path.
+    delegated: BTreeMap<String, RoleKeys>,
+}
 
 /// Verifies targets and delegations, and returns every signed file.
 fn verify_targets(
@@ -367,7 +382,7 @@ fn verify_targets(
         check_path(path)?;
         files.insert(path.clone(), *file);
     }
-    let mut delegations = BTreeMap::new();
+    let mut delegated = BTreeMap::new();
     for delegation in &targets.signed.delegations {
         let name = format!("delegations/{}.json", delegation.name);
         // The name becomes a filesystem path below; a delegation whose name
@@ -375,10 +390,10 @@ fn verify_targets(
         // metadata outside the checkout.
         check_path(&name)?;
         let file = format!("{METADATA_DIR}/{name}");
-        let delegated: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
-        verify_keys(&delegated, &delegation.keys, &file)?;
-        check_expiry(&delegated.signed, &file, now)?;
-        for (path, meta) in &delegated.signed.targets {
+        let signed: Signed<Targets> = load_described(dir, &file, meta(snapshot, &name)?)?;
+        verify_keys(&signed, &delegation.keys, &file)?;
+        check_expiry(&signed.signed, &file, now)?;
+        for (path, meta) in &signed.signed.targets {
             if !delegation.paths.contains(path) {
                 return Err(VerifyError::DelegationPath {
                     role: delegation.name.clone(),
@@ -386,12 +401,15 @@ fn verify_targets(
                 });
             }
             check_path(path)?;
-            // Top-level targets take precedence, as in TUF's search order.
-            files.entry(path.clone()).or_insert(*meta);
+            // Top-level targets take precedence, as in TUF's search order;
+            // only a path they do not list is supplied by the delegation.
+            if !files.contains_key(path) {
+                files.insert(path.clone(), *meta);
+                delegated.insert(path.clone(), delegation.keys.clone());
+            }
         }
-        delegations.insert(delegation.name.clone(), delegation.keys.clone());
     }
-    Ok((files, delegations))
+    Ok(VerifiedTargets { files, delegated })
 }
 
 fn meta<'a>(snapshot: &'a Snapshot, name: &str) -> Result<&'a VersionMeta, VerifyError> {
@@ -401,6 +419,17 @@ fn meta<'a>(snapshot: &'a Snapshot, name: &str) -> Result<&'a VersionMeta, Verif
         .ok_or_else(|| VerifyError::MissingMeta {
             file: format!("{METADATA_DIR}/{name}"),
         })
+}
+
+/// The length and BLAKE3 of the bytes `metadata`'s signatures cover.
+fn signed_meta<T: Serialize>(metadata: &Signed<T>, file: &str) -> Result<FileMeta, VerifyError> {
+    let bytes = metadata
+        .signed_bytes()
+        .map_err(|source| VerifyError::Metadata {
+            file: file.to_owned(),
+            source,
+        })?;
+    Ok(FileMeta::of(&bytes))
 }
 
 fn verify_role<T: Serialize>(
@@ -631,9 +660,10 @@ impl VerifiedRegistry {
     ///
     /// As [`VerifiedRegistry::read`], [`VerifyError::Layout`] if it is
     /// invalid, and [`VerifyError::OwnerMismatch`] if its owners disagree
-    /// with the keys its delegation grants.
+    /// with the keys of the delegation that supplied its bytes.
     pub fn package(&self, name: &PackageName) -> Result<Option<PackageEntry>, VerifyError> {
         let path = package_path(name);
+        let keys = self.delegated.get(&path);
         if !self.files.contains_key(&path) {
             return Ok(None);
         }
@@ -644,10 +674,11 @@ impl VerifiedRegistry {
                 source: Box::new(source),
             })?;
         // The owners an installer checks release tags against must be the
-        // same keys the targets metadata delegates update authority to, or a
-        // package edit could claim owners whose tags the delegation would
-        // never authorize.
-        if let Some(keys) = self.delegations.get(name.as_str()) {
+        // same keys the delegation that supplied the package's signed bytes
+        // grants, or a package edit could claim owners whose tags the
+        // delegation would never authorize. Bytes the top-level targets role
+        // signed need no such agreement; that role authorized them directly.
+        if let Some(keys) = keys {
             let owners: BTreeSet<KeyId> = entry
                 .owners
                 .iter()
