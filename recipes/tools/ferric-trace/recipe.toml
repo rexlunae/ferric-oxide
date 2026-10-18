@@ -1,6 +1,11 @@
 # Ferric Oxide: the ferric-trace tool (tools/ferric-trace/) for the target, where
 # `ferric-trace capture <dir>` saves a kernel trace capture (kernel.trace). The
 # same tool converts captures on the host.
+#
+# The cookbook decides whether to rebuild from this one path source, so an edit
+# to crates/trace alone (the event catalog and ABI the tool links) does not
+# rebuild it. After one, run `make cr.ferric-trace`. CI images always build it
+# fresh. The test recipes that use crates/trace have the same limit.
 [source]
 path = "tools/ferric-trace"
 

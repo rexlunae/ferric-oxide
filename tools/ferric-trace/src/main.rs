@@ -22,7 +22,7 @@ struct Cli {
 enum Cmd {
     /// On the target, as root: drain every CPU's trace ring into a capture directory
     Capture {
-        /// The directory to write `stats` and the `cpu<n>` files to
+        /// The directory to save the capture in: new, or empty
         out: PathBuf,
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
@@ -68,18 +68,17 @@ fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Cmd::Capture { out, scheme } => {
             let drained = drain::drain_scheme(&scheme, &out)?;
-            let lost: u64 = drained.iter().map(|c| c.lost).sum();
             for cpu in &drained {
                 println!(
-                    "cpu {}: {} bytes, {} records lost",
-                    cpu.cpu, cpu.bytes, cpu.lost
+                    "cpu {}: {} bytes, {} records lost before the capture, {} during it",
+                    cpu.cpu, cpu.bytes, cpu.lost_before, cpu.lost_during
                 );
             }
             println!("saved {} CPUs to {}", drained.len(), out.display());
-            if lost > 0 {
-                // Losses are counted since boot, so they may predate this capture.
+            let during: u64 = drained.iter().map(|c| c.lost_during).sum();
+            if during > 0 {
                 eprintln!(
-                    "ferric-trace: warning: the rings have dropped {lost} records; compare with an earlier stats read"
+                    "ferric-trace: warning: {during} records were dropped while the capture ran"
                 );
             }
             Ok(())

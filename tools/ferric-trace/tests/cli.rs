@@ -137,7 +137,8 @@ fn captures_a_scheme_directory() {
         bytes(&[(&SYSCALL_EXIT, 5, &[1, 2])]),
     )
     .expect("write");
-    let out = scheme.path().join("saved");
+    let saved = tempfile::tempdir().expect("temp dir");
+    let out = saved.path().join("capture");
     let output = ferric_trace()
         .args(["capture", "--scheme"])
         .arg(scheme.path())
@@ -147,17 +148,28 @@ fn captures_a_scheme_directory() {
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(
-        text.starts_with("cpu 0: 32 bytes, 0 records lost\n"),
+        text.starts_with("cpu 0: 32 bytes, 0 records lost before the capture, 0 during it\n"),
         "{text}"
     );
     let printed = ferric_trace().arg("text").arg(&out).output().expect("runs");
     assert!(printed.status.success());
     assert_eq!(String::from_utf8_lossy(&printed.stdout).lines().count(), 1);
 
+    // The capture just saved is not overwritten.
+    let again = ferric_trace()
+        .args(["capture", "--scheme"])
+        .arg(scheme.path())
+        .arg(&out)
+        .output()
+        .expect("runs");
+    assert!(!again.status.success());
+    let err = String::from_utf8(again.stderr).expect("utf-8");
+    assert!(err.contains("already exists and is not empty"), "{err}");
+
     let missing = ferric_trace()
         .args(["capture", "--scheme"])
         .arg(scheme.path().join("nothing"))
-        .arg(&out)
+        .arg(saved.path().join("other"))
         .output()
         .expect("runs");
     assert!(!missing.status.success());
