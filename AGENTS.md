@@ -17,7 +17,7 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Change address spaces, CPU state or kernel hardening | [Memory and CPU protection](docs/src/ferric-memory.md), relevant Rustdoc in `crates/kernel/` and the shared crates under `crates/` |
 | Work on PCI drivers, DMA, IOMMU domains or registered buffers | [Registered buffers and IOMMUs](docs/src/ferric-io.md), ABI/module docs in `crates/{regbuf,iommu,vtd,amdvi}/src/`, and `userspace/base/drivers/pcid/` |
 | Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, and `crates/kernel/src/trace/` |
-| Change package verification, installation, manifests, SBOMs, attestations, hermetic builds, git sources or the trust store | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom,git,build}/`, `tools/fox/` and `tools/cargo-fox/`; manifest packing in `tools/cookbook/src/cook/fox_manifest.rs`; the boot check in `config/ferric-smoke.toml` |
+| Change package verification, installation, manifests, SBOMs, attestations, hermetic builds, git sources, the trust store or package registries | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom,git,build,index}/`, `tools/fox/`, `tools/cargo-fox/` and `tools/fox-registry/`; manifest packing in `tools/cookbook/src/cook/fox_manifest.rs`; the boot check in `config/ferric-smoke.toml` |
 | Select checks, debug a failure, reproduce a boot or run fuzzing | [Validation and debugging](docs/src/ferric-testing.md), [CI workflows](.github/workflows/), [CI scripts](scripts/ferric-ci/) and [kernel lint baseline](ci/kernel-lints.json) |
 | Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
 | Report hardware results | [HARDWARE.md](HARDWARE.md); inherited reports are not proof of current Ferric support |
@@ -47,6 +47,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
 | `tools/fox/` | Package verification, installation (from archives or signed git sources), trust store, adoption and SBOM CLI; also built for the target by `recipes/core/fox` | host, and `x86_64-unknown-redox` through the recipe |
 | `tools/cargo-fox/` | `cargo fox`: hermetic builds, signed archives, build attestations and signed release tags for package authors | host |
+| `tools/fox-registry/` | `fox-registry`: package registry creation, admission, release checks and metadata signing | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |

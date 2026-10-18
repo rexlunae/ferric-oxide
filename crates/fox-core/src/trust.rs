@@ -156,6 +156,12 @@ impl AuthorKey {
         &self.0
     }
 
+    /// The raw 32-byte Ed25519 public key.
+    pub fn ed25519_bytes(&self) -> [u8; 32] {
+        // `new` admits only Ed25519 keys.
+        self.0.key_data().ed25519().map_or([0; 32], |key| key.0)
+    }
+
     /// The `SHA256:…` fingerprint `ssh-keygen -l` shows.
     pub fn fingerprint(&self) -> String {
         self.0.fingerprint(HashAlg::Sha256).to_string()

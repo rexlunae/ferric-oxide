@@ -64,6 +64,7 @@ pub mod keys;
 mod manifest;
 mod name;
 mod record;
+pub mod signing;
 #[cfg(feature = "std")]
 pub mod trust;
 mod verify;

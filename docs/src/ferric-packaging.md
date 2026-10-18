@@ -7,7 +7,9 @@ build a git commit hermetically into a signed archive with a build SBOM and a
 signed build attestation (see [Hermetic builds and
 attestations](#hermetic-builds-and-attestations)), and `cargo fox release` to
 make the SSH-signed release tag that `fox install <git-url>` checks before it
-builds a source itself (see [Git sources](#git-sources)). With `ferric.toml`, images ship
+builds a source itself (see [Git sources](#git-sources)). Registry
+maintainers use `fox-registry` to keep a signed package registry (see
+[Registries](#registries)). With `ferric.toml`, images ship
 `fox` instead of upstream `pkgutils` by default (see
 [Target images](#target-images)). The image build itself still uses the
 cookbook and the installer.
@@ -21,8 +23,10 @@ cookbook and the installer.
 | `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, and build SBOMs with the crate graph |
 | `crates/fox-git/` | Git through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash, tree export, fetching into a bare cache, and SSH-signed release tags |
 | `crates/fox-build/` | The hermetic Cargo build, staging, pkgar packing and attestation writing |
+| `crates/fox-index/` | The registry layout, `fox-tuf/1` signed metadata, client verification and the maintainer-side editing |
 | `tools/fox/` | CLI and text/JSON reporting |
 | `tools/cargo-fox/` | `cargo fox build`, `package`, `keygen` and `release` for package authors |
+| `tools/fox-registry/` | `fox-registry` for registry maintainers, package owners and registry CI |
 
 The archive format is upstream pkgar. A trusted Ed25519 signature covers the
 header and its BLAKE3 entry-table hash; entries carry hashes for file content.
@@ -390,6 +394,101 @@ back, verifies its signature and prints the key's fingerprint, which users
 see when they first install the source. It refuses a dirty work tree or an
 existing tag, and pushes nothing.
 
+## Registries
+
+A registry is a git repository of TOML files whose integrity comes from
+signed metadata, not from the git host. `crates/fox-index` implements both
+sides and `fox-registry` is the maintainer tool. Clients (`fox registry`,
+`fox search`, installing by name) are not wired up yet.
+
+```text
+registry.toml                     name, artifact URLs, builder keys
+packages/<xx>/<name>.toml         one file per package: git URL, owners, releases
+artifacts/<xx>/<name>/<ver>.toml  prebuilt artifacts of one release
+advisories/                       security advisories
+metadata/root/<N>.json            every root version, kept for key rotation
+metadata/targets.json             hashes of every file above, and the delegations
+metadata/delegations/<name>.json  each package's file, signed by its owners
+metadata/snapshot.json            versions and hashes of targets and delegations
+metadata/timestamp.json           hash of the snapshot; expires after a day
+```
+
+`<xx>` is the name's first two characters (`_` pads one-character names).
+Package files keep `[[owners]]` (an id and an OpenSSH Ed25519 key) and
+`[[release]]` (version, tag, commit, `fox-tree/1` `tree_blake3`, `yanked`).
+Artifact lists live apart from package files so CI can add them under the
+targets key without the owners' signatures.
+
+### Signed metadata: `fox-tuf/1`
+
+The metadata follows the role model of The Update Framework (TUF
+specification 1.0): root, targets, snapshot and timestamp roles, delegations
+by exact path, version numbers and expiry dates. `fox-index` implements this
+subset itself rather than using the `tough` crate, whose async runtime and
+dependency set do not suit the target. Each file is
+`{"signed": ..., "signatures": [{"keyid", "sig"}]}`; a signature is Ed25519
+over `fox-tuf-metadata/1\0` followed by the OLPC canonical JSON of `signed`,
+key ids are the raw public keys in hex, and file hashes are BLAKE3.
+
+| Role | Signs | Default expiry |
+| --- | --- | --- |
+| root | the keys and thresholds of every role | 365 days |
+| targets | `registry.toml`, `artifacts/`, `advisories/`, undelegated package files, and the delegations | 90 days |
+| package delegation | that package's file only; keys are its owners' SSH keys, threshold 1 | 365 days |
+| snapshot | the version, length and hash of `targets.json` and every delegation | 7 days |
+| timestamp | the version, length and hash of `snapshot.json` | 1 day |
+
+A client starts from a root it trusts (shipped with the image or pinned by
+its BLAKE3) and keeps the versions it has seen. `fox_index::verify::update`
+then checks, in order: each newer root against the old and its own root keys;
+the timestamp; the snapshot against the timestamp's hash; that no version
+went backwards (rollback); that nothing has expired (freeze); targets and
+every delegation against the snapshot; and that a delegation lists only the
+paths it was given. Files are read only through the verified registry, which
+checks each against its signed length and hash; a file no metadata lists
+cannot be read. Top-level targets win over a delegation for the same path.
+
+### Running a registry
+
+```sh
+fox-registry -C reg init --name ferric --keys ./keys
+fox-registry -C reg admit https://example.com/hello.git --name hello \
+    --owner alice="ssh-ed25519 AAAA... alice@example.com"
+fox-registry -C reg sign --key keys/targets.key --key keys/snapshot.key \
+    --key keys/timestamp.key
+```
+
+`init` generates a `pkgar-keys` pair per role (`--single-key` uses one key
+for all four, for a personal registry) and prints the BLAKE3 of
+`metadata/root/1.json` for clients to pin. Edits (`admit`, `release`,
+`yank`, `set-role`) only change files; `sign` then recomputes every role in
+order (root, delegations, targets, snapshot, timestamp), gives a role whose
+content changed a new version and expiry, and signs with whichever `--key`
+files the role lists. A version nobody has signed yet is updated in place.
+A role that has used up half its lifetime is renewed when its key is given,
+so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
+fresh. `sign --complete` fails if any file is short of its threshold, which
+is a normal intermediate state: an owner signs a delegation without the
+snapshot key, and CI adds snapshot and timestamp after the merge.
+
+`--key` takes a `pkgar-keys` secret key file or an OpenSSH Ed25519 private
+key (owners sign with the key their tags are signed with). Both must be
+unencrypted; keep them on offline or encrypted storage and use a decrypted
+copy only while signing.
+
+| Command | What it does |
+| --- | --- |
+| `admit <git-url> --name N --owner ID=KEY` | Writes the package file and a delegation to the owners (`--kind`, `--summary`, `--path` optional) |
+| `release <name> <tag>` | Fetches the repository, checks the tag is SSH-signed by an owner and names a version, and records its commit and tree hash |
+| `check [name...]` | What registry CI runs on a pull request: re-checks every recorded release's tag signature, commit and tree hash, and that the owners match the delegation's keys |
+| `yank <name> <version>` | Marks a release yanked (`--undo` reverses it) |
+| `set-role <role> --key K... [--threshold N]` | Writes a new root that gives the role new keys; clients accept it once the old and the new root keys have signed |
+| `sign [--key F...] [--bump ROLE...] [--complete]` | Updates and signs the metadata |
+| `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
+
+`release` and `check` fetch into `~/.cache/fox-registry/git` (or
+`$XDG_CACHE_HOME`; `--cache` overrides it).
+
 ## SBOM scope and unfinished packaging work
 
 `fox sbom` output describes the verified package, archive hash, signer,
@@ -402,7 +501,9 @@ Reading embedded `cargo auditable` data is not implemented.
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
-Package repositories and search, a dependency solver, hermetic recipe builds,
+The registry format and maintainer tool exist, but `fox` does not yet read
+registries, so there is no search or install by name, and no official
+registry is published. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging
 design phases and `packaging/packaging-design.md`; that design file is not
