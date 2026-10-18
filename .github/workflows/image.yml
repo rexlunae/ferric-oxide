@@ -47,17 +47,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The submodules come from gitlab.redox-os.org, which sometimes answers HTTP 500 for a
-      # few minutes, so their clone is retried instead of failing the whole build.
+      # The submodules come from gitlab.redox-os.org, which sometimes fails for minutes or
+      # hours at a time, so their clone is retried and then falls back to the redox-os
+      # mirrors on GitHub instead of failing the whole build.
       - name: Fetch submodules
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          for attempt in 1 2 3 4 5; do
+          for attempt in 1 2 3; do
             git submodule update --init --recursive && exit 0
-            echo "::warning title=Submodule fetch failed::attempt $attempt of 5, retrying in 60s"
+            echo "::warning title=Submodule fetch failed::GitLab attempt $attempt of 3"
             sleep 60
           done
-          exit 1
+          echo "::warning title=Submodule fetch failed::using the GitHub mirrors"
+          git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/
+          git submodule sync --recursive
+          git submodule update --init --recursive
 
       - name: Install Rust
         run: |
