@@ -57,6 +57,37 @@ struct Cli {
     command: Command,
 }
 
+/// The options of `build` and `rebuild`.
+#[derive(Debug, clap::Args)]
+struct BuilderArgs {
+    /// `name@version` releases to build; without any, every release that
+    /// this builder has not built (or, for `rebuild`, attested) yet.
+    releases: Vec<String>,
+    /// The builder's `pkgar-keys` secret key.
+    #[arg(long)]
+    key: PathBuf,
+    /// The builder's label in `registry.toml`.
+    #[arg(long)]
+    label: String,
+    /// Where to store the blobs, as `<dir>/blake3/<hash>`.
+    #[arg(long)]
+    blobs: PathBuf,
+    /// The Rust target (default: this machine's).
+    #[arg(long)]
+    target: Option<String>,
+    /// The x86-64 level to build for, `v3` or `v4` (default: v3); only
+    /// for x86-64 targets. Each level is its own artifact.
+    #[arg(long = "level", value_name = "LEVEL")]
+    cpu_level: Option<CpuLevel>,
+    /// The git cache directory.
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// The build work directory (default: one per package under the
+    /// system temporary directory).
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create a registry with fresh role keys, and sign it.
@@ -127,34 +158,11 @@ enum Command {
         cache: Option<PathBuf>,
     },
     /// Build releases and record them as artifacts (registry builders).
-    Build {
-        /// `name@version` releases to build; without any, every release
-        /// that has no artifact from this builder yet.
-        releases: Vec<String>,
-        /// The builder's `pkgar-keys` secret key.
-        #[arg(long)]
-        key: PathBuf,
-        /// The builder's label in `registry.toml`.
-        #[arg(long)]
-        label: String,
-        /// Where to store the blobs, as `<dir>/blake3/<hash>`.
-        #[arg(long)]
-        blobs: PathBuf,
-        /// The Rust target (default: this machine's).
-        #[arg(long)]
-        target: Option<String>,
-        /// The x86-64 level to build for, `v3` or `v4` (default: v3); only
-        /// for x86-64 targets. Each level is its own artifact.
-        #[arg(long = "level", value_name = "LEVEL")]
-        cpu_level: Option<CpuLevel>,
-        /// The git cache directory.
-        #[arg(long)]
-        cache: Option<PathBuf>,
-        /// The build work directory (default: one per package under the
-        /// system temporary directory).
-        #[arg(long)]
-        work_dir: Option<PathBuf>,
-    },
+    Build(BuilderArgs),
+    /// Reproduce artifacts another builder published and add this
+    /// builder's attestation to each one it reproduces (independent
+    /// rebuilders).
+    Rebuild(BuilderArgs),
     /// Change `registry.toml`: the artifact store and the builders.
     Configure {
         /// Replace the artifact store base URLs with these.
@@ -371,28 +379,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Build {
-            releases,
-            key,
-            label,
-            blobs,
-            target,
-            cpu_level,
-            cache,
-            work_dir,
-        } => build(
-            dir,
-            &BuildArgs {
-                releases,
-                key,
-                label,
-                blobs,
-                target: target.as_deref(),
-                cpu_level: *cpu_level,
-                cache: cache.as_deref(),
-                work_dir: work_dir.as_deref(),
-            },
-        ),
+        Command::Build(args) => build(dir, args, Mode::Build),
+        Command::Rebuild(args) => build(dir, args, Mode::Rebuild),
         Command::Admit {
             git,
             name,
@@ -692,27 +680,26 @@ fn configure(dir: &Path, args: &ConfigureArgs<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
-struct BuildArgs<'a> {
-    releases: &'a [String],
-    key: &'a Path,
-    label: &'a str,
-    blobs: &'a Path,
-    target: Option<&'a str>,
-    cpu_level: Option<CpuLevel>,
-    cache: Option<&'a Path>,
-    work_dir: Option<&'a Path>,
+/// Whether `build` builds new artifacts or reproduces published ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Build,
+    Rebuild,
 }
 
 /// The target `build` uses without `--target`: the one this binary runs
 /// on, as the build's toolchain defaults to it too.
 const HOST_TARGET: &str = env!("FOX_REGISTRY_HOST_TARGET");
 
-fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
+fn build(dir: &Path, args: &BuilderArgs, mode: Mode) -> Result<(), CliError> {
     let registry = Registry::open(dir)?;
-    let cache = cache_dir(args.cache)?;
-    let target = args.target.unwrap_or(HOST_TARGET);
+    let cache = cache_dir(args.cache.as_deref())?;
+    let target = args.target.as_deref().unwrap_or(HOST_TARGET);
     let releases = if args.releases.is_empty() {
-        missing_builds(&registry, args.label, target, args.cpu_level)?
+        match mode {
+            Mode::Build => missing_builds(&registry, &args.label, target, args.cpu_level)?,
+            Mode::Rebuild => missing_rebuilds(&registry, &args.label, target, args.cpu_level)?,
+        }
     } else {
         args.releases
             .iter()
@@ -720,23 +707,31 @@ fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
             .collect::<Result<_, _>>()?
     };
     for (name, version) in releases {
-        let work_dir = args.work_dir.map_or_else(
-            || fox_build::default_work_dir(format!("fox-registry/{name}").as_bytes()),
-            Path::to_path_buf,
-        );
+        let work_dir = args.work_dir.clone().unwrap_or_else(|| {
+            fox_build::default_work_dir(format!("fox-registry/{name}").as_bytes())
+        });
         let job = ci::BuildJob {
             name: &name,
             version: &version,
-            key: args.key,
-            label: args.label,
-            blobs: args.blobs,
+            key: &args.key,
+            label: &args.label,
+            blobs: &args.blobs,
             work_dir: &work_dir,
             cache: &cache,
             target: Some(target.to_owned()),
             cpu_level: args.cpu_level,
         };
-        let pkgar = ci::build(&registry, &job)?;
-        println!("built {name} {version}: {pkgar}");
+        match mode {
+            Mode::Build => {
+                let pkgar = ci::build(&registry, &job)?;
+                println!("built {name} {version}: {pkgar}");
+            }
+            Mode::Rebuild => {
+                for pkgar in ci::rebuild(&registry, &job)? {
+                    println!("reproduced {name} {version}: {pkgar}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -785,6 +780,53 @@ fn missing_builds(
         }
     }
     Ok(missing)
+}
+
+/// Every release, not yanked, with a default-feature artifact for
+/// `target` at `cpu_level` that `label` has not attested.
+fn missing_rebuilds(
+    registry: &Registry,
+    label: &str,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+) -> Result<Vec<(PackageName, Version)>, CliError> {
+    let mut missing = Vec::new();
+    for delegation in &registry.targets().signed.delegations {
+        let name = PackageName::new(delegation.name.as_str())?;
+        let Some(entry) = registry.package(&name)? else {
+            continue;
+        };
+        for release in entry.releases.iter().filter(|release| !release.yanked) {
+            let pending = registry
+                .artifacts(&name, &release.version)?
+                .is_some_and(|list| {
+                    list.artifacts
+                        .iter()
+                        .any(|artifact| unattested(artifact, label, target, cpu_level))
+                });
+            if pending {
+                missing.push((name.clone(), release.version.clone()));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// Whether `artifact` is a default-feature build of `target` at
+/// `cpu_level` that `label` has not attested: what `rebuild` reproduces.
+pub(crate) fn unattested(
+    artifact: &Artifact,
+    label: &str,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+) -> bool {
+    artifact.default_features
+        && artifact.features.is_empty()
+        && is_variant(artifact, target, cpu_level)
+        && !artifact
+            .attestations
+            .iter()
+            .any(|attestation| attestation.builder == label)
 }
 
 /// Whether `artifact` is the build of `target` at `cpu_level` (an x86-64

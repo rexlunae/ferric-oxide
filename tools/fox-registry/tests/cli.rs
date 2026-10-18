@@ -333,6 +333,60 @@ fn a_builder_records_attested_artifacts() {
     // Nothing is left to build.
     assert!(!env.ok(&build).contains("built"));
 
+    // An independent rebuilder, in another work directory, reproduces the
+    // archive and adds its own attestation to the same artifact.
+    let rebuilder = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(tempfile::tempdir().unwrap().path())
+        .args(["init", "--name", "r", "--single-key", "--keys"])
+        .arg(rebuilder.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rebuilder_key = rebuilder.path().join("registry.key").display().to_string();
+    let rebuilder_pub = rebuilder.path().join("registry.pub").display().to_string();
+    let rework = tempfile::tempdir().unwrap();
+    let rebuild = [
+        "rebuild",
+        "--key",
+        &rebuilder_key,
+        "--label",
+        "rebuilder",
+        "--blobs",
+        blobs_arg,
+        "--work-dir",
+        rework.path().to_str().unwrap(),
+    ];
+    let output = env.run(&rebuild);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not listed"),
+        "{}",
+        stderr(&output)
+    );
+    let rebuilder_arg = format!("rebuilder={rebuilder_pub}");
+    env.ok(&["configure", "--builder", &rebuilder_arg]);
+    let out = env.ok(&rebuild);
+    assert!(out.contains("reproduced tiny 0.1.0"), "{out}");
+    let artifacts =
+        fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+    assert_eq!(artifacts.matches("[[artifact]]").count(), 1, "{artifacts}");
+    assert!(artifacts.contains("builder = \"rebuilder\""), "{artifacts}");
+    assert!(env.sign(&[&targets, &snapshot, &timestamp]));
+    env.ok(&["verify"]);
+    // Nothing is left to rebuild, and naming the release again fails.
+    assert!(!env.ok(&rebuild).contains("reproduced"));
+    let mut again: Vec<&str> = rebuild.to_vec();
+    again.push("tiny@0.1.0");
+    let output = env.run(&again);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no artifact of tiny 0.1.0"),
+        "{}",
+        stderr(&output)
+    );
+
     // Each x86-64 level is its own artifact.
     if cfg!(target_arch = "x86_64") {
         let v4: Vec<&str> = build.iter().copied().chain(["--level", "v4"]).collect();

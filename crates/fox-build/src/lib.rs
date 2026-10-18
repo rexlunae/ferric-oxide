@@ -29,6 +29,10 @@
 //!    the archive is re-opened and verified, and an attestation binding the
 //!    source, lockfile, toolchain, target, CPU level, features and SBOM to
 //!    the archive is written and signed with the same key.
+//! 8. **Or re-attest** ([`reattest`]). An independent rebuilder compares
+//!    its staging tree with an archive another builder published and, if
+//!    every file matches, signs its own attestation of that archive, so
+//!    clients can require more than one builder.
 //!
 //! Commands run from an empty environment with a private `CARGO_HOME`, and
 //! [`build`] refuses to run when a `.cargo/config.toml` above the work
@@ -58,7 +62,9 @@ mod deps;
 pub mod metadata;
 mod stage;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -318,6 +324,53 @@ pub enum BuildError {
     /// The build timestamp could not be formatted.
     #[error("cannot format the build time")]
     Time(#[source] time::error::Format),
+    /// A rebuild did not reproduce the published archive's files.
+    #[error("the rebuild does not reproduce the archive: {difference}")]
+    NotReproduced {
+        /// The first difference found.
+        difference: Difference,
+    },
+}
+
+/// How a rebuild differs from the archive it was meant to reproduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Difference {
+    /// The package name or version differs.
+    Package {
+        /// The archive's `name version`.
+        published: String,
+        /// The rebuild's `name version`.
+        rebuilt: String,
+    },
+    /// A file is only in the archive.
+    Missing {
+        /// Its path.
+        path: String,
+    },
+    /// A file is only in the rebuild.
+    Extra {
+        /// Its path.
+        path: String,
+    },
+    /// A file's kind, mode, size or contents differ.
+    Changed {
+        /// Its path.
+        path: String,
+    },
+}
+
+impl fmt::Display for Difference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package { published, rebuilt } => {
+                write!(f, "built {rebuilt}, the archive holds {published}")
+            }
+            Self::Missing { path } => write!(f, "{path} is not built"),
+            Self::Extra { path } => write!(f, "{path} is built but not in the archive"),
+            Self::Changed { path } => write!(f, "{path} differs"),
+        }
+    }
 }
 
 /// Whether binaries embed their dependency list with `cargo auditable`.
@@ -765,6 +818,109 @@ pub fn package(build: &Build, signer: &Signer, out_dir: &Path) -> Result<Package
     })
 }
 
+/// Attests that `build` reproduces `archive`, an archive another builder
+/// published: the rebuild staged exactly the archive's files (paths,
+/// kinds, modes, sizes and BLAKE3 hashes, the SBOM and manifest included),
+/// so `signer` can vouch for the published archive without repacking it.
+/// The attestation and its signature are written into `out_dir` as
+/// `<stem>.attest.toml` and `.sig`, and the returned
+/// [`Packaged::archive`] is the published archive's path.
+///
+/// # Errors
+///
+/// [`BuildError::NotReproduced`] if the files differ,
+/// [`BuildError::Attestation`] or [`BuildError::SelfCheck`] if the
+/// attestation cannot be written or does not verify against the archive
+/// with `signer` trusted, [`BuildError::Time`] if the build time cannot be
+/// formatted, and [`BuildError::Io`] for file errors.
+pub fn reattest(
+    build: &Build,
+    signer: &Signer,
+    archive: &Archive,
+    archive_path: &Path,
+    out_dir: &Path,
+) -> Result<Packaged, BuildError> {
+    if let Some(difference) = difference(build, archive) {
+        return Err(BuildError::NotReproduced { difference });
+    }
+    fs::create_dir_all(out_dir).map_err(io_error(out_dir))?;
+    let stem = artifact_stem(build);
+    let contents = attestation(build, signer, archive)?;
+    let text = contents.to_toml().map_err(BuildError::Attestation)?;
+    let signature = AttestationSignature::sign(text.as_bytes(), &signer.secret)
+        .map_err(BuildError::Attestation)?;
+    let attestation = out_dir.join(format!("{stem}.attest.toml"));
+    let sig_path = signature_path(&attestation);
+    fs::write(&attestation, &text).map_err(io_error(&attestation))?;
+    let sig_text = signature.to_toml().map_err(BuildError::Attestation)?;
+    fs::write(&sig_path, sig_text).map_err(io_error(&sig_path))?;
+    let sbom = out_dir.join(format!("{stem}.cdx.json"));
+    fs::write(&sbom, &build.sbom).map_err(io_error(&sbom))?;
+    verify_archive_attestation(archive, &attestation, &signer.trusted())
+        .map_err(|source| BuildError::SelfCheck(Box::new(source)))?;
+    Ok(Packaged {
+        archive: archive_path.to_path_buf(),
+        attestation,
+        signature: sig_path,
+        sbom,
+        contents,
+    })
+}
+
+/// The first way the files `build` staged differ from `archive`'s.
+fn difference(build: &Build, archive: &Archive) -> Option<Difference> {
+    let manifest = archive.manifest();
+    compare(
+        Side {
+            name: &manifest.name,
+            version: &manifest.version,
+            files: archive.files(),
+        },
+        Side {
+            name: &build.manifest.name,
+            version: &build.manifest.version,
+            files: &build.files,
+        },
+    )
+}
+
+/// One side of a [`compare`].
+struct Side<'a> {
+    name: &'a PackageName,
+    version: &'a str,
+    files: &'a [FileRecord],
+}
+
+/// The first difference between a published package and a rebuild.
+fn compare(published: Side<'_>, rebuilt: Side<'_>) -> Option<Difference> {
+    if published.name != rebuilt.name || published.version != rebuilt.version {
+        return Some(Difference::Package {
+            published: format!("{} {}", published.name, published.version),
+            rebuilt: format!("{} {}", rebuilt.name, rebuilt.version),
+        });
+    }
+    let by_path = |files: &'_ [FileRecord]| -> BTreeMap<String, FileRecord> {
+        files
+            .iter()
+            .map(|file| (file.path.clone(), file.clone()))
+            .collect()
+    };
+    let (published, rebuilt) = (by_path(published.files), by_path(rebuilt.files));
+    for (path, file) in &published {
+        match rebuilt.get(path) {
+            None => return Some(Difference::Missing { path: path.clone() }),
+            Some(built) if built != file => {
+                return Some(Difference::Changed { path: path.clone() });
+            }
+            Some(_) => {}
+        }
+    }
+    rebuilt
+        .keys()
+        .find(|path| !published.contains_key(*path))
+        .map(|path| Difference::Extra { path: path.clone() })
+}
+
 fn attestation(
     build: &Build,
     signer: &Signer,
@@ -1190,6 +1346,60 @@ mod tests {
             cpu_level("aarch64-unknown-redox", Some(CpuLevel::X86_64V3), None),
             Err(BuildError::LevelNeedsX86_64 { .. })
         ));
+    }
+
+    #[test]
+    fn a_rebuild_must_stage_exactly_the_published_files() {
+        let name = PackageName::new("tiny").unwrap();
+        let file = |path: &str, contents: &[u8]| FileRecord {
+            path: path.into(),
+            kind: fox_core::FileKind::File,
+            mode: 0o755,
+            size: contents.len() as u64,
+            blake3: Blake3Digest::of(contents),
+        };
+        let files = [file("usr/bin/tiny", b"elf"), file("usr/share/doc", b"doc")];
+        let side = |version, files| Side {
+            name: &name,
+            version,
+            files,
+        };
+        assert_eq!(compare(side("1.0.0", &files), side("1.0.0", &files)), None);
+        // Order does not matter.
+        let reversed = [files[1].clone(), files[0].clone()];
+        assert_eq!(
+            compare(side("1.0.0", &files), side("1.0.0", &reversed)),
+            None
+        );
+        assert!(matches!(
+            compare(side("1.0.0", &files), side("1.0.1", &files)),
+            Some(Difference::Package { .. })
+        ));
+        let changed = [file("usr/bin/tiny", b"elf2"), files[1].clone()];
+        assert_eq!(
+            compare(side("1.0.0", &files), side("1.0.0", &changed)),
+            Some(Difference::Changed {
+                path: "usr/bin/tiny".into()
+            })
+        );
+        let mut mode = files.clone();
+        mode[0].mode = 0o644;
+        assert!(matches!(
+            compare(side("1.0.0", &files), side("1.0.0", &mode)),
+            Some(Difference::Changed { .. })
+        ));
+        assert_eq!(
+            compare(side("1.0.0", &files), side("1.0.0", &files[..1])),
+            Some(Difference::Missing {
+                path: "usr/share/doc".into()
+            })
+        );
+        assert_eq!(
+            compare(side("1.0.0", &files[..1]), side("1.0.0", &files)),
+            Some(Difference::Extra {
+                path: "usr/share/doc".into()
+            })
+        );
     }
 
     #[test]

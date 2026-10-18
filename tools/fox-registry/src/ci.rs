@@ -1,18 +1,28 @@
-//! `fox-registry build`: what a registry builder runs for a new release.
-//! It checks the release against its owner-signed tag, builds it with the
-//! hermetic `fox-build` pipeline, signs the archive and attestation with the
-//! builder's key, stores the three blobs as `<blobs>/blake3/<hash>`, and
-//! records the attestation in the release's artifact list. Uploading the
-//! blobs to the registry's artifact store and running `sign` are left to
-//! the CI job.
+//! `fox-registry build` and `rebuild`: what registry builders run.
+//!
+//! `build` checks a release against its owner-signed tag, builds it with
+//! the hermetic `fox-build` pipeline, signs the archive and attestation with
+//! the builder's key, stores the three blobs as `<blobs>/blake3/<hash>`, and
+//! records the attestation in the release's artifact list.
+//!
+//! `rebuild` is the independent rebuilder: it builds the release the same
+//! way, downloads the archive another builder published, and, only if the
+//! rebuild staged exactly the archive's files, signs its own attestation of
+//! that archive and adds it to the same artifact. Clients can then require
+//! several builders (`min-builder-signatures`).
+//!
+//! Uploading the blobs to the registry's artifact store and running `sign`
+//! are left to the CI job.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fox_build::{BuildError, BuildRequest, FeatureSelection, Signer};
+use fox_build::{Build, BuildError, BuildRequest, FeatureSelection, Signer};
+use fox_core::archive::{Archive, ArchiveError};
 use fox_core::{Blake3Digest, CpuLevel, KeyId, PackageName};
+use fox_git::{DownloadError, download_blob};
 use fox_index::edit::{EditError, Registry};
-use fox_index::layout::{Artifact, ArtifactAttestation, ArtifactList};
+use fox_index::layout::{Artifact, ArtifactAttestation, ArtifactList, RegistryConfig};
 use semver::Version;
 
 use crate::source::{self, SourceError};
@@ -41,6 +51,20 @@ pub(crate) enum CiError {
         version: Version,
         found: PackageName,
         found_version: String,
+    },
+    #[error("no artifact of {name} {version} for this target and level to rebuild")]
+    NothingToRebuild { name: PackageName, version: Version },
+    #[error("cannot download the published archive {pkgar}")]
+    Download {
+        pkgar: Blake3Digest,
+        #[source]
+        source: Box<DownloadError>,
+    },
+    #[error("the published archive {pkgar} does not verify against the registry's builders")]
+    Published {
+        pkgar: Blake3Digest,
+        #[source]
+        source: Box<ArchiveError>,
     },
     #[error("cannot store blob {}", path.display())]
     Blob {
@@ -71,6 +95,102 @@ pub(crate) struct BuildJob<'a> {
 
 /// Builds one release and records the artifact; returns its archive hash.
 pub(crate) fn build(registry: &Registry, job: &BuildJob<'_>) -> Result<Blake3Digest, CiError> {
+    let (built, signer) = build_release(registry, job)?;
+    let packaged = fox_build::package(&built, &signer, &job.work_dir.join("out"))?;
+    store_blob(job.blobs, &packaged.archive)?;
+    let artifact = Artifact::from_attestation(&packaged.contents, true, Vec::new());
+    record(registry, job, artifact, &packaged)
+}
+
+/// Rebuilds one release and attests to every published archive of this
+/// target and level, not yet attested by `job.label`, that the rebuild
+/// reproduces; returns their hashes.
+///
+/// # Errors
+///
+/// [`CiError::NothingToRebuild`] if no such archive is listed, and
+/// [`CiError::Build`] with [`BuildError::NotReproduced`] if the rebuild
+/// matches none of them.
+pub(crate) fn rebuild(
+    registry: &Registry,
+    job: &BuildJob<'_>,
+) -> Result<Vec<Blake3Digest>, CiError> {
+    let pending: Vec<Artifact> = registry
+        .artifacts(job.name, job.version)?
+        .map(|list| {
+            list.artifacts
+                .into_iter()
+                .filter(|artifact| {
+                    crate::unattested(
+                        artifact,
+                        job.label,
+                        job.target.as_deref().unwrap_or_default(),
+                        job.cpu_level,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return Err(CiError::NothingToRebuild {
+            name: job.name.clone(),
+            version: job.version.clone(),
+        });
+    }
+    let (built, signer) = build_release(registry, job)?;
+    let config = registry.config()?;
+    let mut reproduced = Vec::new();
+    let mut last = None;
+    for artifact in pending {
+        let (archive, path) = published(job, &config, &artifact)?;
+        match fox_build::reattest(&built, &signer, &archive, &path, &job.work_dir.join("out")) {
+            Ok(packaged) => {
+                reproduced.push(record(registry, job, artifact, &packaged)?);
+            }
+            Err(error @ BuildError::NotReproduced { .. }) => last = Some(error),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match last {
+        Some(error) if reproduced.is_empty() => Err(error.into()),
+        _ => Ok(reproduced),
+    }
+}
+
+/// Downloads a published archive into the work directory and opens it
+/// against the registry's builders.
+fn published(
+    job: &BuildJob<'_>,
+    config: &RegistryConfig,
+    artifact: &Artifact,
+) -> Result<(Archive, PathBuf), CiError> {
+    let pkgar = artifact.pkgar_blake3;
+    let bytes =
+        download_blob(&config.artifact_base_urls, &pkgar, artifact.size).map_err(|source| {
+            CiError::Download {
+                pkgar,
+                source: Box::new(source),
+            }
+        })?;
+    let dir = job.work_dir.join("published");
+    let path = dir.join(format!("{pkgar}.pkgar"));
+    let error = |source| CiError::Blob {
+        path: path.clone(),
+        source,
+    };
+    fs::create_dir_all(&dir).map_err(error)?;
+    fs::write(&path, bytes).map_err(error)?;
+    let archive =
+        Archive::open(&path, &config.builder_keys()).map_err(|source| CiError::Published {
+            pkgar,
+            source: Box::new(source),
+        })?;
+    Ok((archive, path))
+}
+
+/// Checks the release against its tag and the builder against
+/// `registry.toml`, and builds it.
+fn build_release(registry: &Registry, job: &BuildJob<'_>) -> Result<(Build, Signer), CiError> {
     let entry = registry
         .package(job.name)?
         .ok_or_else(|| EditError::UnknownPackage {
@@ -123,15 +243,22 @@ pub(crate) fn build(registry: &Registry, job: &BuildJob<'_>) -> Result<Blake3Dig
             found_version: built.manifest.version.clone(),
         });
     }
-    let packaged = fox_build::package(&built, &signer, &job.work_dir.join("out"))?;
+    Ok((built, signer))
+}
 
-    store_blob(job.blobs, &packaged.archive)?;
+/// Stores the attestation blobs and records them on `artifact` in the
+/// release's artifact list; returns the archive hash.
+fn record(
+    registry: &Registry,
+    job: &BuildJob<'_>,
+    artifact: Artifact,
+    packaged: &fox_build::Packaged,
+) -> Result<Blake3Digest, CiError> {
     let attestation = ArtifactAttestation {
         builder: job.label.to_owned(),
         attestation_blake3: store_blob(job.blobs, &packaged.attestation)?,
         signature_blake3: store_blob(job.blobs, &packaged.signature)?,
     };
-    let artifact = Artifact::from_attestation(&packaged.contents, true, Vec::new());
     let pkgar = artifact.pkgar_blake3;
     let mut list = registry
         .artifacts(job.name, job.version)?

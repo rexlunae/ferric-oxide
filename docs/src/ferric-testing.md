@@ -56,7 +56,10 @@ the owner-signed tag, from a prebuilt artifact with too few and then enough
 builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
 and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
 registry builder, unlisted and then listed in `registry.toml`, then again
-with `--level v4` as a second artifact (on x86-64 hosts), publishes
+with `--level v4` as a second artifact (on x86-64 hosts), runs `rebuild`
+as an independent rebuilder in another work directory (refused until it is
+listed, then reproducing the archive and adding its attestation to the same
+artifact, after which nothing is left to rebuild), publishes
 an advisory, and imports a small recipe tree (a git recipe, a tarball recipe
 with a description, and an invalid name). `fox sync` is tested end to end with a registry package (installed,
 locked, unchanged under `--locked`, removed when the set drops it, kept when
@@ -72,7 +75,8 @@ another root) and `tools/fox/src/prebuilt.rs` (a v4 machine prefers v4 and
 falls back to v3, a v3 machine never gets v4, other targets take only
 artifacts without a level, and an attestation of another level is refused);
 `fox-registry`'s `is_variant` and `fox-build`'s level choice have unit tests
-too.
+too, and `fox-build`'s rebuild comparison is unit tested for a changed,
+missing or extra file, a changed mode and another version.
 The installer's `fox` image step (`tools/installer/src/fox.rs`) is unit
 tested with a stand-in `fox` script: adoption alone without a package set,
 then adoption, a `--locked` sync for the image target and level and the system SBOM in

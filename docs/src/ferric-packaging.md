@@ -338,7 +338,10 @@ a kind byte and length-prefixed path and contents, so git's SHA-1 ids are
 not the only thing naming the source. `feature_set_hash` is BLAKE3 over the
 sorted enabled features and the `Cargo.lock` hash. `entries_blake3` does not
 depend on the signing key, so a rebuilder signing with its own key can still
-show it produced the same files.
+show it produced the same files. `fox_build::reattest` does that: it
+compares a rebuild's staged files with a published archive and, when they
+match, writes the rebuilder's attestation of the published archive, whose
+`output` names the original header signer.
 
 The `.sig` file (`fox-signature/1`) holds the Ed25519 key and a signature
 over `fox-attestation-signature/1\0` followed by the attestation's exact
@@ -547,6 +550,7 @@ copy only while signing.
 
 | `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
 | `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, and `--level v3\|v4`, default v3 and only for x86-64, also decide which artifacts count as present, each level being its own artifact; `--work-dir` optional) |
+| `rebuild [name@version...] --key F --label L --blobs DIR` | The independent rebuilder: builds each release the same way (by default every release with a default-feature artifact for `--target` and `--level` that `L` has not attested), downloads the published archive from the artifact store, and only if the rebuild staged exactly the archive's files (paths, kinds, modes, sizes and BLAKE3 hashes, the SBOM and manifest included) signs its own attestation of that archive and adds it to the same artifact. The archive is not repacked, so its header stays signed by the original builder. A rebuild that differs fails and names the first differing file; `L` must be listed in `registry.toml` |
 | `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing v3 and v4 artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
 
 `release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
@@ -623,7 +627,12 @@ require-fresh-metadata = "24h"
 ```
 
 The builder threshold is the larger of the policy's and the registry's
-`min-builder-signatures`, and never less than one. `allow-unsigned-git`
+`min-builder-signatures`, and never less than one. Builders count by
+distinct key, so one builder listed under two labels counts once. Once
+independent rebuilders run `fox-registry rebuild`, a registry (`configure
+--min-builders 2`) or a client (`min-builder-signatures = 2`) can require
+two builders to have produced the same archive from the release's source;
+`fox info` lists who attested each artifact. `allow-unsigned-git`
 has the effect of `install --allow-unsigned` for git sources.
 
 #### CPU levels
