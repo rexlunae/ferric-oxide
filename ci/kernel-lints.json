@@ -8,6 +8,6 @@
   "dead_code": 17,
   "unsafe keyword": 1156,
   "unused_imports": 5,
-  "unused_mut": 4,
-  "unused_variables": 2
+  "unused_mut": 3,
+  "unused_variables": 1
 }

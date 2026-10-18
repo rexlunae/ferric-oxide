@@ -332,6 +332,15 @@ fn schedule(
             }
         });
 
+        // A context can be locked by another CPU when its timer expires. Retry those
+        // timers next time instead of discarding them with the temporary buffer.
+        percpu
+            .switch_internals
+            .run_queue
+            .lock()
+            .timers
+            .extend(timers.drain(..));
+
         // Drain from percpu
         {
             let mut local_wake = percpu.switch_internals.local_wakeup_list.borrow_mut();

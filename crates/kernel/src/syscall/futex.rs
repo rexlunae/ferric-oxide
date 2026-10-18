@@ -110,6 +110,8 @@ pub fn futex(
     match op {
         // TODO: FUTEX_WAIT_MULTIPLE?
         FUTEX_WAIT | FUTEX_WAIT64 => {
+            // Reading the timeout can fault; no address-space lock may be held then.
+            drop(addr_space_guard);
             let timeout_opt = UserSlice::ro(val2, size_of::<TimeSpec>())?
                 .none_if_null()
                 .map(|buf| unsafe { buf.read_exact::<TimeSpec>() })
@@ -120,8 +122,17 @@ pub fn futex(
                 crate::time::check_timespec(timeout)?;
             }
 
-            {
+            let target_physaddr = {
+                // FUTEX_WAKE holds this same lock. The comparison and waiter insertion
+                // must be one critical section, or a wake between them is lost.
+                let mut futexes_lock = FUTEXES.lock(token.token());
+                let (futexes, mut token) = futexes_lock.token_split();
                 let context_lock = context::current();
+                let mut lock_token = token.token();
+                let addr_space_guard = current_addrsp.acquire_read(lock_token.downgrade());
+                let target_physaddr =
+                    validate_and_translate_virt(&addr_space_guard, target_virtaddr)
+                        .ok_or(Error::new(EFAULT))?;
 
                 let (fetched, expected) = if op == FUTEX_WAIT {
                     // Must be aligned, otherwise it could cross a page boundary and mess up the
@@ -173,21 +184,14 @@ pub fn futex(
 
                 drop(addr_space_guard);
 
+                let mut context = context_lock.write(token.token());
+                if let Some((tctl, pctl, _)) = context.sigcontrol()
+                    && tctl.currently_pending_unblocked(pctl) != 0
                 {
-                    let mut context = context_lock.write(token.token());
-
-                    context.wake = timeout_opt.map(|time| time.to_nanos());
-                    if let Some((tctl, pctl, _)) = context.sigcontrol()
-                        && tctl.currently_pending_unblocked(pctl) != 0
-                    {
-                        return Err(Error::new(EINTR));
-                    }
-
-                    context.block("futex");
+                    return Err(Error::new(EINTR));
                 }
-
-                let mut futexes = FUTEXES.lock(token.token());
-                let (futexes, mut token) = futexes.token_split();
+                context.wake = timeout_opt.map(|time| time.to_nanos());
+                context.block("futex");
 
                 futexes
                     .entry(target_physaddr)
@@ -195,15 +199,19 @@ pub fn futex(
                     .push(FutexEntry {
                         context_lock: Arc::downgrade(&context_lock),
                     });
-            }
+                target_physaddr
+            };
 
             context::switch(token);
 
             // The scheduler clears `wake` on timeout. Hence if a timeout was
             // set and `wake` is now `None`, we timed out.
-            if timeout_opt.is_some() && context::current().read(token.token()).wake.is_none() {
-                return Err(Error::new(ETIMEDOUT));
-            }
+            let wake = context::current().write(token.token()).wake.take();
+            let resume_result = if timeout_opt.is_some() && wake.is_none() {
+                Err(Error::new(ETIMEDOUT))
+            } else {
+                Ok(0)
+            };
 
             // TODO: this doing a second search is not efficient. It probably best to have another
             // hashtable mapping context and whether it was woken up AND where to remove index from FUTEXES
@@ -211,7 +219,7 @@ pub fn futex(
             let (futexes_map, _) = futexes_map.token_split();
 
             let Some(futexes) = futexes_map.get_mut(&target_physaddr) else {
-                return Ok(0);
+                return resume_result;
             };
             let current_lock = context::current();
             let mut found = false;
@@ -231,12 +239,14 @@ pub fn futex(
                 }
             }
 
-            if !found {
-                return Ok(0);
-            }
-
             if futexes.is_empty() {
                 futexes_map.remove(&target_physaddr);
+            }
+
+            // Timeouts must remove their waiter too, otherwise a later wake can be
+            // consumed by a context that is no longer waiting on this word.
+            if !found || resume_result.is_err() {
+                return resume_result;
             }
 
             // Not woken up by FUTEX_WAKE, likely by signal
@@ -258,9 +268,9 @@ pub fn futex(
                         let futex = unsafe { futexes.get_unchecked_mut(i) };
                         if let Some(ctx) = futex.context_lock.upgrade() {
                             unblock_context(&ctx, &mut token.token().downgrade());
+                            woken += 1;
                         }
                         futexes.swap_remove(i);
-                        woken += 1;
                     }
 
                     futexes.is_empty()
