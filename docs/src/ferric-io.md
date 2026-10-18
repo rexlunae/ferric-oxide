@@ -137,6 +137,20 @@ registered frames at consecutive IOVAs with the grant's access and returns
 the starting IOVA. DMA requires a whole-page-aligned grant; byte grants using
 partial-page bounce views cannot expose those pages directly to a device.
 
+Failed grant installation is also part of the mapping lifecycle. A confirmed
+rollback releases its IOVA and pins. If installation or rollback cannot
+confirm invalidation, the kernel retains the reservation, frame pins and a
+failed mapping record in both the domain and grant before returning `EIO`.
+Revoking or closing that grant keeps reporting failure and retains its region
+records until the domain's devices are successfully blocked. This applies to
+failures on the first physical run and after earlier runs succeeded; cleared
+page-table entries alone do not prove cached DMA translations are gone.
+
+Host fault-injection tests in `crates/iommu/tests/grant_failures.rs` cover
+those installation and rollback failures, grant and region closure, and IOVA
+retention and release. Hardware boot tests exercise the normal mapping path;
+they do not inject invalidation failures into a real IOMMU.
+
 `MapGrant` checks that the caller has bound the domain. `UnmapGrant` currently
 operates on the supplied domain descriptor without repeating that binding
 check, so a domain descriptor must not be treated as a mapping-only delegated

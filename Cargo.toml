@@ -38,6 +38,7 @@ exclude = [
 
 # Versions shared by more than one host tool.
 [workspace.dependencies]
+ferric-regbuf = { path = "crates/regbuf", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.20"

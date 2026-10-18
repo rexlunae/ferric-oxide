@@ -7,6 +7,9 @@ description = "The kernel iommu scheme's interface, PCI requester-ID alias rules
 
 [dependencies]
 
+[dev-dependencies]
+ferric-regbuf = { workspace = true, features = ["alloc"] }
+
 [features]
 default = []
 ## Requester-ID alias computation (`alias`), the DMA mapping bookkeeping (`dma`) and the

@@ -277,6 +277,9 @@ impl Domain {
     ///
     /// [`DomainError::Map`] when an address is misaligned, out of range or already mapped, or
     /// a table cannot be allocated; whatever was mapped is unmapped again.
+    /// [`DomainError::Hardware`] or [`DomainError::Unmap`] when invalidation or rollback
+    /// fails: entries or cached translations may remain reachable. The caller must keep
+    /// the frames, IOVA reservation and teardown record until confirmed domain blocking.
     pub fn map(
         &mut self,
         iova: u64,

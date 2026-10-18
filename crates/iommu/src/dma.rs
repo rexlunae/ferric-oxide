@@ -92,6 +92,16 @@ impl<E: core::error::Error + 'static> core::error::Error for UnmapFailure<E> {
 }
 
 impl UnmapState {
+    /// A mapping whose installation or rollback already failed to confirm invalidation.
+    ///
+    /// Retain its resources and grant record until successful domain blocking. Clearing
+    /// entries again cannot establish that translations cached before the failure are gone.
+    pub const fn failed() -> Self {
+        Self {
+            status: UnmapStatus::Failed,
+        }
+    }
+
     /// Runs `unmap` once, recording whether its strict invalidation completed.
     ///
     /// Keep the mapping's IOVA and frame pins owned until this returns `Ok`, or until
@@ -417,6 +427,9 @@ impl<T> DmaMappings<T> {
 
 /// Lifecycle of links between DMA domains and registered-buffer grants.
 pub mod links;
+
+/// Grant installation, rollback and publication of possibly reachable mappings.
+pub mod grant;
 
 #[cfg(test)]
 mod tests {
