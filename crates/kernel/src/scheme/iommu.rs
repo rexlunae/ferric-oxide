@@ -733,11 +733,15 @@ fn map_grant(_id: usize, _grant_fd: u64, _token: &mut CleanLockToken) -> Result<
 ///
 /// # Errors
 ///
-/// `ENOENT` when no grant is mapped at `iova`, `EBADF` or `EINVAL` when `id` is not a domain,
+/// `ENODEV` when the caller has not bound the domain, `ENOENT` when no grant is mapped at
+/// `iova`, `EBADF` or `EINVAL` when `id` is not a domain,
 /// and `EIO` when the unmap or its invalidation failed (the frames then stay pinned).
 #[cfg(feature = "regbuf")]
 fn unmap_grant(id: usize, iova: u64) -> Result<()> {
-    let ticket = with_domain(&mut HANDLES.lock(), id, |space, _| {
+    let addr_space = AddrSpace::current()?;
+    let ticket = {
+        let mut handles = HANDLES.lock();
+        let space = bound_domain(&mut handles, id, alloc::sync::Arc::as_ptr(&addr_space))?;
         let ticket = space
             .unmap_grant(iova, None)
             .map_err(|err| dma_errno(&err))?;
@@ -745,8 +749,8 @@ fn unmap_grant(id: usize, iova: u64) -> Result<()> {
             "IOMMU: domain {}: grant mapping at IOVA {iova:#x} unmapped by the driver",
             space.id()
         );
-        Ok(ticket)
-    })?;
+        ticket
+    };
     // The region's lock comes before the table's, so take the link out and drop the guard
     // before forgetting the record.
     let link = GRANT_LINKS.lock().remove(&ticket);

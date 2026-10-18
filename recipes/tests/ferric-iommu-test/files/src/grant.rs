@@ -15,7 +15,8 @@
 //! - `iommu-grant-nodomain`: `MapGrant` on the domain descriptor it inherited, which it has
 //!   not bound (a forked child has no bound domain), fails with `ENODEV`;
 //! - `iommu-grant-dma`: the device's DMA through the mapped grant, and through the mapped
-//!   sub-grant, lands in the application's own buffer, page by page as asked;
+//!   sub-grant, lands in the application's own buffer, page by page as asked, after refusing
+//!   the unbound child's attempt to unmap the driver's mapping using its inherited descriptor;
 //! - `iommu-grant-unmap`: the driver's own `UnmapGrant` works, and a second one of the same IOVA
 //!   fails with `ENOENT`;
 //! - `iommu-grant-revoke`: after `Revoke`, the same DMA to the grant's old IOVA faults at the
@@ -226,7 +227,7 @@ impl Driver<'_> {
             Op::Map => {
                 let iova = map_grant(self.domain, self.grant(slot)?).map_err(sys)?;
                 self.iovas.insert(slot, iova);
-                Ok(0)
+                Ok(iova)
             }
             Op::Load => {
                 let byte = u8::try_from(arg).map_err(|_| Error::new(EINVAL))?;
@@ -586,7 +587,13 @@ impl App {
 
     /// The device DMAs through the grant into page 0, and through the sub-grant into page 1.
     fn dma(&mut self) -> Result<(), AppFailure> {
-        self.op("MapGrant of the grant", Op::Map, SLOT_GRANT, 0)?;
+        let iova = self.op("MapGrant of the grant", Op::Map, SLOT_GRANT, 0)?;
+        let got = errno_of(ctx(
+            "UnmapGrant from the unbound child",
+            unmap_grant(self.domain, iova),
+        ))?;
+        expect("UnmapGrant without a bound domain", ENODEV, got)?;
+        // The parent's DMA below must still reach the mapping the child could not remove.
         self.op("loading the device", Op::Load, 0, u64::from(FIRST))?;
         self.op("DMA through the grant", Op::Dma, SLOT_GRANT, 0)?;
         self.buffer.check("page 0 after the DMA", 0, FIRST)?;
