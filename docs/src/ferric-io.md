@@ -154,14 +154,14 @@ per-domain link-retirement registry in this revision. Closing a domain does
 not proactively reconcile all of its grant records or release a closed region
 that was waiting on those records.
 
-Failed DMA-grant unmapping keeps frame references pinned, but removes the
-mapping from the DMA-space bookkeeping. A later retry can therefore find it
-missing and treat it as complete without retrying the hardware invalidation.
-Likewise, revocation treats an absent domain handle as already closed, without
-retaining the hardware-close result there. These paths need lifecycle
-hardening before successful retries can be taken as proof of completed DMA
-revocation after an earlier failure. See `scheme/iommu.rs` and
-`arch/x86_64/iommu/dma.rs` in the kernel.
+Failed DMA-grant unmapping retains its mapping record, grant link, frame
+references and allocated IOVA. Once hardware unmapping fails, later attempts
+return `EIO` rather than treating cleared page-table entries as proof of
+completed invalidation. Resources are retired only after confirmed unmapping
+or a safely blocked domain. An absent domain handle is still treated as
+already closed without preserving the hardware-close result; that
+domain-close limitation is separate from failed-unmap bookkeeping. See
+`scheme/iommu.rs` and `arch/x86_64/iommu/dma.rs` in the kernel.
 
 These are available primitives and tested integration paths. They do not
 automatically make the filesystem, network stack or all drivers use an
