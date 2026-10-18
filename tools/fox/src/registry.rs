@@ -262,6 +262,16 @@ pub(crate) fn update(
 /// A failure before the commit point puts the old tree back and drops the
 /// new state, so the last verified checkout and its state stay together.
 fn swap_tree(dir: &Path, new: &Path, state: &SavedState) -> Result<(), RegistryError> {
+    swap_tree_with(dir, new, state, |old| fs::remove_dir_all(old))
+}
+
+/// [`swap_tree`], removing the replaced tree with `remove_old`.
+fn swap_tree_with(
+    dir: &Path,
+    new: &Path,
+    state: &SavedState,
+    remove_old: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), RegistryError> {
     let current = dir.join(TREE_DIR);
     let old = dir.join(OLD_TREE_DIR);
     let pending = dir.join(PENDING_STATE_FILE);
@@ -284,10 +294,22 @@ fn swap_tree(dir: &Path, new: &Path, state: &SavedState) -> Result<(), RegistryE
         let _ = roll_back(dir);
         return Err(error);
     }
-    if old.exists() {
-        fs::remove_dir_all(&old).map_err(io_error(&old))?;
+    // The swap is committed, so failing to tidy up must not report the
+    // update as failed: tree.old/ stays for recover_tree to remove.
+    if old.exists()
+        && let Err(error) = remove_old(&old)
+    {
+        warn_old_tree(&old, &error);
     }
     Ok(())
+}
+
+fn warn_old_tree(old: &Path, error: &std::io::Error) {
+    eprintln!(
+        "fox: warning: cannot remove {}: {}",
+        old.display(),
+        crate::commands::chain(error)
+    );
 }
 
 /// Finishes an interrupted [`swap_tree`]. While `state.json.new` exists the
@@ -301,7 +323,11 @@ fn recover_tree(dir: &Path) -> Result<(), RegistryError> {
     let old = dir.join(OLD_TREE_DIR);
     if old.exists() {
         if dir.join(TREE_DIR).exists() {
-            fs::remove_dir_all(&old).map_err(io_error(&old))?;
+            // Committed: tree/ is current, and a leftover tree.old/ only
+            // costs space, so it must not stop the registry being used.
+            if let Err(error) = fs::remove_dir_all(&old) {
+                warn_old_tree(&old, &error);
+            }
         } else {
             // Only reachable if tree/ was removed by hand.
             fs::rename(&old, dir.join(TREE_DIR)).map_err(io_error(&old))?;
@@ -820,6 +846,29 @@ mod tests {
         fs::write(dir.join(PENDING_STATE_FILE), "new state").unwrap();
         recover_tree(dir).unwrap();
         assert_eq!(tree_marker(dir), "old");
+    }
+
+    #[test]
+    fn a_committed_swap_survives_a_failed_cleanup() {
+        let reg = tempfile::tempdir().unwrap();
+        let state = saved_state(reg.path());
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        marker(dir, TREE_DIR, "old");
+        marker(dir, NEW_TREE_DIR, "new");
+        let new = dir.join(NEW_TREE_DIR);
+        swap_tree_with(dir, &new, &state, |_| {
+            Err(std::io::Error::other("cannot remove"))
+        })
+        .unwrap();
+        assert_eq!(tree_marker(dir), "new");
+        assert!(dir.join(STATE_FILE).exists());
+        assert!(!dir.join(PENDING_STATE_FILE).exists());
+        // The leftover is removed on the next open or update.
+        assert!(dir.join(OLD_TREE_DIR).exists());
+        recover_tree(dir).unwrap();
+        assert!(!dir.join(OLD_TREE_DIR).exists());
+        assert_eq!(tree_marker(dir), "new");
     }
 
     #[test]
