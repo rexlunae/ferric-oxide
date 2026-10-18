@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use ferric_ring::abi::{RING_PATH, SCHEME_NAME, header};
+use ferric_ring::abi::{MAX_FIXED_FILES, RING_PATH, SCHEME_NAME, header};
 use ferric_ring::entry::{CURRENT_POSITION, SqeFlags};
 use ferric_ring::queue::HeaderInfo;
 use ferric_ring::{Consumer, Cqe, Layout, NotifyMode, Producer, Sqe, abi::Request};
@@ -108,6 +108,20 @@ fn open_ring() -> libredox::error::Result<Fd> {
 fn call(fd: &Fd, request: Request) -> libredox::error::Result<usize> {
     let (words, len) = request.encode();
     fd.call_wo(&[], CallFlags::empty(), &words[..len])
+}
+
+/// Sends `fds` to the ring's file table from slot `first`, keeping them open here
+/// (`FD_CLONE`), as a result or minus the errno.
+fn register(ring: &Fd, first: u32, fds: &[usize]) -> i64 {
+    let (words, len) = Request::RegisterFiles { first }.encode();
+    let payload: Vec<u8> = fds.iter().flat_map(|fd| fd.to_ne_bytes()).collect();
+    outcome(ring.call_wo(&payload, CallFlags::FD | CallFlags::FD_CLONE, &words[..len]))
+}
+
+/// Empties `count` slots of the ring's file table from `first` on, as a result or minus the
+/// errno.
+fn unregister(ring: &Fd, first: u32, count: u32) -> i64 {
+    outcome(call(ring, Request::UnregisterFiles { first, count }))
 }
 
 /// Maps `len` bytes of `fd` shared and read-write, or returns the errno.
@@ -471,7 +485,7 @@ fn refuse_sqe() -> Result<(), Failure> {
         &[
             (1, neg(EINVAL)),
             (2, neg(EOPNOTSUPP)),
-            (3, neg(EOPNOTSUPP)),
+            (3, neg(EBADF)),
             (4, neg(EFAULT)),
         ],
     )?;
@@ -565,6 +579,105 @@ fn event() -> Result<(), Failure> {
     Ok(())
 }
 
+fn fixed() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let (file, data) = scratch_file("fixed", PAGE)?;
+    let null = io(
+        "open the null scheme",
+        OpenOptions::new().write(true).open("/scheme/null"),
+    )?;
+    let null_fd = null.as_raw_fd() as usize;
+    expect(
+        "register a file and the null scheme",
+        2,
+        register(&ring.fd, 0, &[file.as_raw_fd() as usize, null_fd]),
+    )?;
+    // The slot holds the file open after the descriptor is closed.
+    drop(file);
+    let mut buf = vec![0u8; PAGE];
+    let addr = buf.as_mut_ptr() as u64;
+    let cqes = ring.run(&[
+        Sqe::read(0, 0, addr, PAGE as u32, 1).fixed().linked(),
+        Sqe::write(1, CURRENT_POSITION, addr, PAGE as u32, 2).fixed(),
+        Sqe::fsize(0, 3).fixed(),
+        Sqe::fsize(5, 4).fixed(),
+    ])?;
+    check_cqes(
+        "fixed-file read, write and size",
+        &cqes,
+        &[
+            (1, PAGE as i64),
+            (2, PAGE as i64),
+            (3, PAGE as i64),
+            (4, neg(EBADF)),
+        ],
+    )?;
+    if buf != data {
+        return Err(Failure::Mismatch {
+            what: "the page read through a slot",
+        });
+    }
+
+    let other = ctx("open a second ring", open_ring())?;
+    let refused = [
+        ("register into a full slot", neg(EBUSY), 1, null_fd),
+        (
+            "register past the table",
+            neg(EINVAL),
+            MAX_FIXED_FILES,
+            null_fd,
+        ),
+        ("register the ring itself", neg(EINVAL), 4, ring.fd.raw()),
+        ("register another ring", neg(EINVAL), 4, other.raw()),
+    ];
+    for (what, errno, first, fd) in refused {
+        expect(what, errno, register(&ring.fd, first, &[fd]))?;
+    }
+    expect(
+        "RegisterFiles without descriptors",
+        neg(EINVAL),
+        outcome(call(&ring.fd, Request::RegisterFiles { first: 4 })),
+    )?;
+    let cqes = ring.run(&[Sqe::fsize(4, 5).fixed()])?;
+    check_cqes("a slot a refused call named", &cqes, &[(5, neg(EBADF))])?;
+
+    expect("unregister", 2, unregister(&ring.fd, 0, 8))?;
+    expect("unregister again", 0, unregister(&ring.fd, 0, 8))?;
+    expect(
+        "unregister past the table",
+        neg(EINVAL),
+        unregister(&ring.fd, MAX_FIXED_FILES, 1),
+    )?;
+    let cqes = ring.run(&[Sqe::fsize(0, 6).fixed()])?;
+    check_cqes("an emptied slot", &cqes, &[(6, neg(EBADF))])?;
+    // An emptied slot takes a file again.
+    expect("register again", 1, register(&ring.fd, 0, &[null_fd]))?;
+    Ok(())
+}
+
+fn fstat() -> Result<(), Failure> {
+    let mut ring = Ring::new(8, 16)?;
+    let len = 3 * PAGE + 5;
+    let (file, _) = scratch_file("fstat", len)?;
+    let fd = file.as_raw_fd() as u32;
+    let mut direct = syscall::data::Stat::default();
+    syscall::fstat(fd as usize, &mut direct).map_err(|err| Failure::Errno {
+        what: "fstat",
+        errno: err.errno,
+    })?;
+    let mut via_ring = syscall::data::Stat::default();
+    let size = size_of::<syscall::data::Stat>() as u32;
+    let cqes = ring.run(&[
+        Sqe::fstat(fd, &raw mut via_ring as u64, size, 1),
+        Sqe::fsize(fd, 2),
+    ])?;
+    check_cqes("Fstat and Fsize", &cqes, &[(1, 0), (2, len as i64)])?;
+    expect("st_size", len as i64, via_ring.st_size as i64)?;
+    expect("st_ino", direct.st_ino as i64, via_ring.st_ino as i64)?;
+    // The kernel fills in the scheme, as fstat does.
+    expect("st_dev", direct.st_dev as i64, via_ring.st_dev as i64)
+}
+
 /// Operations per benchmark.
 const BENCH_OPS: usize = 20_000;
 /// SQEs per `Enter` in the ring benchmarks.
@@ -632,6 +745,18 @@ fn bench() -> Result<(), Failure> {
         "FERRIC_BENCH ring file-read-4k: lseek+read {syscall_ns:.0} ns/op, ring pread (batch {BENCH_BATCH}) {ring_ns:.0} ns/op, {:.2}x",
         syscall_ns / ring_ns
     );
+
+    // The same reads through a slot of the file table: no descriptor lookup per SQE.
+    expect(
+        "register the benchmark file",
+        1,
+        register(&ring.fd, 0, &[file.as_raw_fd() as usize]),
+    )?;
+    let fixed_ns = bench_ring(&mut ring, Sqe { fd: 0, ..sqe }.fixed(), PAGE as i64)?;
+    println!(
+        "FERRIC_BENCH ring file-read-4k-fixed: ring pread by descriptor {ring_ns:.0} ns/op, by slot {fixed_ns:.0} ns/op, {:.2}x",
+        ring_ns / fixed_ns
+    );
     Ok(())
 }
 
@@ -654,7 +779,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let steps: [(&str, Step); 12] = [
+    let steps: [(&str, Step); 14] = [
         ("ring-setup", setup),
         ("ring-refuse-setup", refuse_setup),
         ("ring-nop", nop),
@@ -666,6 +791,8 @@ pub fn main() -> ExitCode {
         ("ring-backpressure", backpressure),
         ("ring-corrupt", corrupt),
         ("ring-event", event),
+        ("ring-fixed", fixed),
+        ("ring-fstat", fstat),
         ("ring-bench", bench),
     ];
     for (name, step) in steps {

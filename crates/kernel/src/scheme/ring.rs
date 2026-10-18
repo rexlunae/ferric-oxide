@@ -10,13 +10,22 @@
 //! - [`Request::Enter`] is a *brokered* submission: in the caller's own context, the kernel
 //!   takes complete chains from the SQ (`ferric_ring::chain`) and runs each SQE as the system
 //!   call it stands for on the caller's descriptor: `Read` and `Write` as `read`/`write`
-//!   (offset [`CURRENT_POSITION`]) or `SYS_READ2`/`SYS_WRITE2`, `Fsync` as `fsync`. A user
+//!   (offset [`CURRENT_POSITION`]) or `SYS_READ2`/`SYS_WRITE2`, `Fsize`, `Fstat` and `Fsync`
+//!   as the system calls of those names (`syscall/fs.rs`'s description helpers). A user
 //!   scheme sees an ordinary scheme request (`scheme/user.rs`), so every scheme works
 //!   unchanged, and the buffer is checked like any system call's. Each SQE gets one CQE; a
 //!   chain is taken only when the CQ has room for all of its CQEs, so none is ever dropped.
 //!   After posting completions, `Enter` triggers `EVENT_READ` on the ring.
 //! - `fevent` reports `EVENT_READ` while the CQ holds completions the application has not
 //!   taken.
+//! - The file table ([`FileTable`]) holds file descriptions sent with
+//!   [`Request::RegisterFiles`] (an `FD` call, `kfdwrite`). A fixed-file SQE runs on the
+//!   description in its slot, so the file stays open for the ring after the application closes
+//!   its descriptor. Descriptions of rings are refused, so no ring holds a ring open and closing
+//!   the last descriptor of a ring always frees it. A description leaves the table through
+//!   [`Request::UnregisterFiles`] or when the ring is closed, and every reference the scheme
+//!   takes is given back through [`release`], which closes the description when it was the
+//!   last one.
 //!
 //! The ring memory is shared with the application, which may write any of it at any time.
 //! The kernel reads it only through its own mapping of the frames, with atomic accesses
@@ -26,9 +35,9 @@
 //! private indices out of their lock for the duration (`Entered`), and a second one gets
 //! `EBUSY`. No lock is held while an SQE runs, since that may block in another scheme.
 //!
-//! Not yet (later PRs of the design): fixed files and grant buffers (`EOPNOTSUPP`), waiting in
-//! `Enter` for completions, the `SqPoll` and `Umwait` notify modes (`EOPNOTSUPP`), and rings
-//! served natively by user schemes.
+//! Not yet (later PRs of the design): grant buffers (`EOPNOTSUPP`), waiting in `Enter` for
+//! completions, the `SqPoll` and `Umwait` notify modes (`EOPNOTSUPP`), and rings served
+//! natively by user schemes.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
@@ -40,6 +49,7 @@ use ferric_ring::{
     abi::{header, Layout, NotifyMode, Request, PAGE_SIZE as RING_PAGE_SIZE, RING_PATH},
     chain::{Next, SqReader},
     entry::{Buffer, FileRef, Op, SqeError, CURRENT_POSITION},
+    files::{FileTable, Refused, TableError},
     queue::{HeaderInfo, Memory, RingError},
     Consumer, Cqe, Producer, Sqe,
 };
@@ -47,6 +57,7 @@ use spin::{Mutex, Once};
 use syscall::{
     error::{
         Error, Result, EBADF, EBUSY, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, EOPNOTSUPP,
+        EOVERFLOW,
     },
     flag::{CallFlags, EventFlags, MapFlags, EVENT_READ},
 };
@@ -54,7 +65,7 @@ use syscall::{
 use super::{CallerCtx, FileHandle, KernelScheme, OpenResult, SchemeExt, StrOrBytes};
 use crate::{
     context::{
-        file::InternalFlags,
+        file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
         memory::{handle_notify_files, AddrSpaceWrapper, Grant, PageSpan},
     },
     event,
@@ -62,7 +73,10 @@ use crate::{
     sync::CleanLockToken,
     syscall::{
         data::{GlobalSchemes, Map},
-        fs::{file_op_generic, file_op_generic_ext, sys_read, sys_write},
+        fs::{
+            description_op, file_description, fstat_description, read_description,
+            write_description,
+        },
         usercopy::{UserSlice, UserSliceRw},
     },
 };
@@ -106,11 +120,16 @@ struct Indices {
     cq: Producer<Cqe>,
 }
 
+/// A file description the ring holds a reference to.
+type Description = Arc<LockedFileDescription>;
+
 /// A ring.
 struct Ring {
     shared: Once<Shared>,
     /// `None` before `Setup`, and while an `Enter` holds the indices.
     indices: Mutex<Option<Indices>>,
+    /// `None` once the ring is closed, so nothing is registered after the table was emptied.
+    files: Mutex<Option<FileTable<Description>>>,
 }
 
 /// The indices of a ring, taken by the running `Enter` and put back when it ends.
@@ -147,6 +166,86 @@ fn sqe_errno(err: SqeError) -> Error {
         SqeError::Opcode(_) => EOPNOTSUPP,
         _ => EINVAL,
     })
+}
+
+/// The errno for a file table call the table refused.
+fn table_errno(err: TableError) -> Error {
+    Error::new(match err {
+        TableError::Occupied { .. } => EBUSY,
+        TableError::NoMemory => ENOMEM,
+        _ => EINVAL,
+    })
+}
+
+/// Gives back a reference to a file description, closing the description when it was the last
+/// one, as closing a descriptor does.
+fn release(description: Description, token: &mut CleanLockToken) {
+    // `Arc::into_inner` hands the description to exactly one of the last holders, even when
+    // they let go at the same time.
+    if let Some(description) = Arc::into_inner(description) {
+        // Like a descriptor closed on exit, the ring has no one to report a failed close to.
+        let _ = description.into_inner().try_close(token);
+    }
+}
+
+/// [`release`] for each of `descriptions`.
+fn release_all(descriptions: Vec<Description>, token: &mut CleanLockToken) {
+    for description in descriptions {
+        release(description, token);
+    }
+}
+
+/// [`Request::RegisterFiles`]: puts `descriptions` into the ring's file table from slot
+/// `first` on, or hands them all back with the errno.
+fn register_files(
+    ring: &Ring,
+    first: u32,
+    descriptions: Vec<Description>,
+    token: &mut CleanLockToken,
+) -> core::result::Result<usize, (Error, Vec<Description>)> {
+    let is_ring = |description: &Description, token: &mut CleanLockToken| {
+        matches!(
+            description.read(token.token()).scheme_ref,
+            KernelSchemeRef::Global(GlobalSchemes::Ring)
+        )
+    };
+    let mut any_ring = false;
+    for description in &descriptions {
+        any_ring |= is_ring(description, token);
+    }
+    if any_ring {
+        return Err((Error::new(EINVAL), descriptions));
+    }
+    let count = descriptions.len();
+    let mut files = ring.files.lock();
+    let Some(table) = files.as_mut() else {
+        return Err((Error::new(EBADF), descriptions));
+    };
+    table
+        .register(first, descriptions)
+        .map(|()| count)
+        .map_err(|Refused { error, files }| (table_errno(error), files))
+}
+
+/// [`Request::UnregisterFiles`]: empties `count` slots from `first` on and returns how many
+/// held a file.
+fn unregister_files(
+    ring: &Ring,
+    first: u32,
+    count: u32,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let removed = ring
+        .files
+        .lock()
+        .as_mut()
+        .ok_or(Error::new(EBADF))?
+        .unregister(first, count)
+        .map_err(table_errno)?;
+    let removed_count = removed.len();
+    // Closing may call into another scheme, so it happens with the table unlocked.
+    release_all(removed, token);
+    Ok(removed_count)
 }
 
 /// [`Request::Setup`]: allocates the ring's memory and writes its header.
@@ -227,7 +326,11 @@ fn enter(ring: &Ring, to_submit: u32, token: &mut CleanLockToken) -> Result<usiz
         if matches!(next, Next::Refused(_)) {
             chain.refuse(errno_result(EINVAL), post);
         } else {
-            chain.run(|sqe| run(sqe, token), errno_result(ECANCELED), &mut post);
+            chain.run(
+                |sqe| run(ring, sqe, token),
+                errno_result(ECANCELED),
+                &mut post,
+            );
         }
         // The room was checked, so staging fails only if the application moved its CQ head
         // out of range meanwhile.
@@ -243,20 +346,47 @@ fn errno_result(errno: i32) -> i64 {
 }
 
 /// Runs `sqe` and returns its CQE result.
-fn run(sqe: &Sqe, token: &mut CleanLockToken) -> i64 {
-    let result = sqe.op().map_err(sqe_errno).and_then(|op| run_op(op, token));
+fn run(ring: &Ring, sqe: &Sqe, token: &mut CleanLockToken) -> i64 {
+    let result = sqe
+        .op()
+        .map_err(sqe_errno)
+        .and_then(|op| run_op(ring, op, token));
     match result {
         Ok(value) => Cqe::encode_result(Ok(value as u64)),
         Err(err) => errno_result(err.errno),
     }
 }
 
-/// The caller's descriptor `file` names.
-fn descriptor(file: FileRef) -> Result<FileHandle> {
+/// The description `file` names: the caller's descriptor's, or the one in a slot of the
+/// ring's file table.
+///
+/// # Errors
+///
+/// `EBADF` when the descriptor is not open or the slot is empty.
+fn resolve(ring: &Ring, file: FileRef, token: &mut CleanLockToken) -> Result<Description> {
     match file {
-        FileRef::Fd(fd) => Ok(FileHandle::from(fd as usize)),
-        FileRef::Fixed(_) => Err(Error::new(EOPNOTSUPP)),
+        FileRef::Fd(fd) => file_description(FileHandle::from(fd as usize), token),
+        FileRef::Fixed(slot) => ring
+            .files
+            .lock()
+            .as_ref()
+            .and_then(|table| table.get(slot))
+            .cloned()
+            .ok_or(Error::new(EBADF)),
     }
+}
+
+/// Runs `op` on the description `file` names, and gives the reference back afterwards.
+fn with_file<T>(
+    ring: &Ring,
+    file: FileRef,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(Description, &mut CleanLockToken) -> Result<T>,
+) -> Result<T> {
+    let description = resolve(ring, file, token)?;
+    let result = op(Arc::clone(&description), token);
+    release(description, token);
+    result
 }
 
 /// The address and length of a buffer in the caller's address space.
@@ -270,34 +400,52 @@ fn user_buffer(buf: Buffer) -> Result<(usize, usize)> {
     }
 }
 
-/// Runs `op` as the system call it stands for, on the caller's descriptors and memory.
-fn run_op(op: Op, token: &mut CleanLockToken) -> Result<usize> {
+/// Runs `op` as the system call it stands for, on the caller's memory and the caller's
+/// descriptors or the ring's file table.
+fn run_op(ring: &Ring, op: Op, token: &mut CleanLockToken) -> Result<usize> {
     match op {
         Op::Nop => Ok(0),
         Op::Read { file, offset, buf } => {
-            let fd = descriptor(file)?;
             let (addr, len) = user_buffer(buf)?;
             let buf = UserSlice::wo(addr, len)?;
-            if offset == CURRENT_POSITION {
-                return sys_read(fd, buf, token);
-            }
-            file_op_generic_ext(fd, token, |scheme, _, desc, token| {
-                scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+            with_file(ring, file, token, |description, token| {
+                if offset == CURRENT_POSITION {
+                    return read_description(description, buf, token);
+                }
+                description_op(description, token, |scheme, _, desc, token| {
+                    scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+                })
             })
         }
         Op::Write { file, offset, buf } => {
-            let fd = descriptor(file)?;
             let (addr, len) = user_buffer(buf)?;
             let buf = UserSlice::ro(addr, len)?;
-            if offset == CURRENT_POSITION {
-                return sys_write(fd, buf, token);
-            }
-            file_op_generic_ext(fd, token, |scheme, _, desc, token| {
-                scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+            with_file(ring, file, token, |description, token| {
+                if offset == CURRENT_POSITION {
+                    return write_description(description, buf, token);
+                }
+                description_op(description, token, |scheme, _, desc, token| {
+                    scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)
+                })
             })
         }
-        Op::Fsync { file } => file_op_generic(descriptor(file)?, token, |scheme, number, token| {
-            scheme.fsync(number, token).map(|()| 0)
+        Op::Fsize { file } => with_file(ring, file, token, |description, token| {
+            description_op(description, token, |scheme, _, desc, token| {
+                usize::try_from(scheme.fsize(desc.number, token)?)
+                    .map_err(|_| Error::new(EOVERFLOW))
+            })
+        }),
+        Op::Fstat { file, buf } => {
+            let (addr, len) = user_buffer(buf)?;
+            let buf = UserSlice::wo(addr, len)?;
+            with_file(ring, file, token, |description, token| {
+                fstat_description(description, buf, token).map(|()| 0)
+            })
+        }
+        Op::Fsync { file } => with_file(ring, file, token, |description, token| {
+            description_op(description, token, |scheme, _, desc, token| {
+                scheme.fsync(desc.number, token).map(|()| 0)
+            })
         }),
         _ => Err(Error::new(EOPNOTSUPP)),
     }
@@ -367,16 +515,22 @@ impl KernelScheme for RingScheme {
         let ring = Arc::new(Ring {
             shared: Once::new(),
             indices: Mutex::new(None),
+            files: Mutex::new(Some(FileTable::new())),
         });
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         HANDLES.lock().insert(id, ring);
         Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()))
     }
 
-    fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
         // A running Enter keeps its own reference; the frames go with the last one, or with
-        // the last mapping.
-        HANDLES.lock().remove(&id);
+        // the last mapping. The files go now: an Enter still running holds its own reference
+        // to the one it is using.
+        let ring = HANDLES.lock().remove(&id).ok_or(Error::new(EBADF))?;
+        let files = ring.files.lock().take();
+        if let Some(mut table) = files {
+            release_all(table.take_all(), token);
+        }
         Ok(())
     }
 
@@ -405,8 +559,35 @@ impl KernelScheme for RingScheme {
                 }
                 Ok(consumed)
             }
+            Request::UnregisterFiles { first, count } => {
+                unregister_files(&ring, first, count, token)
+            }
+            // RegisterFiles needs descriptors: it comes as an FD call, to `kfdwrite`.
             _ => Err(Error::new(EINVAL)),
         }
+    }
+
+    fn kfdwrite(
+        &self,
+        id: usize,
+        descs: Vec<Arc<LockedFileDescription>>,
+        _flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let registered = match (ring(id), Request::decode(metadata)) {
+            (Ok(ring), Ok(Request::RegisterFiles { first })) => {
+                register_files(&ring, first, descs, token)
+            }
+            (Err(err), _) => Err((err, descs)),
+            (Ok(_), _) => Err((Error::new(EINVAL), descs)),
+        };
+        // The descriptors were sent to the ring; any it does not keep are closed, as a
+        // scheme closes the descriptors of a call it refuses.
+        registered.map_err(|(err, descs)| {
+            release_all(descs, token);
+            err
+        })
     }
 
     fn fevent(

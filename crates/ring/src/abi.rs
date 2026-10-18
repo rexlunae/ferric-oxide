@@ -11,6 +11,8 @@
 //! | --- | --- |
 //! | [`Request::Setup`] | `SYS_CALL` on the ring, metadata `[1 \| notify << 8, sq_entries, cq_entries]` |
 //! | [`Request::Enter`] | `SYS_CALL` on the ring, metadata `[2, to_submit]`; returns the SQEs consumed |
+//! | [`Request::RegisterFiles`] | `SYS_CALL` on the ring with `CallFlags::FD` (and `FD_CLONE` to keep them), the descriptors as `usize`s in the payload, metadata `[3, first]`; returns how many were registered |
+//! | [`Request::UnregisterFiles`] | `SYS_CALL` on the ring, metadata `[4, first, count]`; returns how many slots held a file |
 //! | `mmap` | `MAP_SHARED`, offset 0, length [`Layout::map_len`] |
 //! | `fevent` | `EVENT_READ` while the CQ holds completions |
 //!
@@ -21,6 +23,15 @@
 //! after the SQ ([`Layout`]). Both sides compute the layout from the entry counts, so neither
 //! reads it back from memory the other side can write.
 //!
+//! # File table
+//!
+//! A ring has a table of [`MAX_FIXED_FILES`] slots. [`Request::RegisterFiles`] puts the
+//! descriptors it is sent into consecutive slots from `first`; an SQE with
+//! [`SqeFlags::FIXED_FILE`](crate::SqeFlags::FIXED_FILE) then names a slot instead of a
+//! descriptor, so the kernel skips the descriptor lookup and the file stays open for the ring
+//! even if the application closes its descriptor. A slot keeps its file until
+//! [`Request::UnregisterFiles`] or until the ring is closed.
+//!
 //! # Errors
 //!
 //! `Setup`: `EINVAL` for entry counts that [`Layout::new`] refuses or an unknown notify mode,
@@ -29,7 +40,11 @@
 //! `Setup`, for an offset other than 0, a length other than [`Layout::map_len`], or a mapping
 //! that is not `MAP_SHARED`. `Enter`: `EINVAL` before `Setup` or when the ring's indices are
 //! corrupt, `EBUSY` when another `Enter` on the ring is running or when the CQ has no room for
-//! the next chain's completions and nothing was consumed.
+//! the next chain's completions and nothing was consumed. `RegisterFiles`: `EINVAL` for slots
+//! past [`MAX_FIXED_FILES`] or a ring descriptor (a ring may not hold itself or another ring
+//! open), `EBUSY` when a slot already holds a file; nothing is registered then, and the
+//! descriptors sent are closed. `UnregisterFiles`: `EINVAL` for slots past
+//! [`MAX_FIXED_FILES`].
 
 use core::fmt;
 
@@ -56,6 +71,9 @@ pub const MAX_SQ_ENTRIES: u32 = 4096;
 
 /// The most CQ entries a ring may have.
 pub const MAX_CQ_ENTRIES: u32 = 8192;
+
+/// The slots of a ring's file table ([`Request::RegisterFiles`]).
+pub const MAX_FIXED_FILES: u32 = 1024;
 
 /// The most SQEs one chain may link together ([`chain`](crate::chain)).
 pub const MAX_CHAIN: usize = 32;
@@ -153,6 +171,21 @@ pub enum Request {
         /// The most SQEs to consume.
         to_submit: u32,
     },
+    /// Put the descriptors sent with the call into the file table, from slot `first` on.
+    ///
+    /// Only the metadata is encoded here: the descriptors go in the payload of a
+    /// `CallFlags::FD` call.
+    RegisterFiles {
+        /// The first slot.
+        first: u32,
+    },
+    /// Empty `count` slots of the file table from `first` on, closing their files.
+    UnregisterFiles {
+        /// The first slot.
+        first: u32,
+        /// How many slots.
+        count: u32,
+    },
 }
 
 /// Why metadata words are not a [`Request`].
@@ -163,7 +196,7 @@ pub enum DecodeError {
     Verb(u64),
     /// `Setup` names no [`NotifyMode`].
     Notify(u64),
-    /// An entry count does not fit in 32 bits.
+    /// An entry count, a slot or a slot count does not fit in 32 bits.
     Entries(u64),
 }
 
@@ -172,7 +205,7 @@ impl fmt::Display for DecodeError {
         match self {
             Self::Verb(raw) => write!(f, "no ring call has verb {raw}"),
             Self::Notify(raw) => write!(f, "no notify mode is numbered {raw}"),
-            Self::Entries(raw) => write!(f, "{raw} entries do not fit in 32 bits"),
+            Self::Entries(raw) => write!(f, "{raw} does not fit in 32 bits"),
         }
     }
 }
@@ -183,6 +216,10 @@ impl core::error::Error for DecodeError {}
 const VERB_SETUP: u64 = 1;
 /// The verb of [`Request::Enter`].
 const VERB_ENTER: u64 = 2;
+/// The verb of [`Request::RegisterFiles`].
+const VERB_REGISTER_FILES: u64 = 3;
+/// The verb of [`Request::UnregisterFiles`].
+const VERB_UNREGISTER_FILES: u64 = 4;
 
 impl Request {
     /// The metadata words of the call and how many of them to send.
@@ -201,6 +238,11 @@ impl Request {
                 3,
             ),
             Self::Enter { to_submit } => ([VERB_ENTER, u64::from(to_submit), 0], 2),
+            Self::RegisterFiles { first } => ([VERB_REGISTER_FILES, u64::from(first), 0], 2),
+            Self::UnregisterFiles { first, count } => (
+                [VERB_UNREGISTER_FILES, u64::from(first), u64::from(count)],
+                3,
+            ),
         }
     }
 
@@ -223,6 +265,11 @@ impl Request {
             }
             VERB_ENTER => Ok(Self::Enter {
                 to_submit: entries(1)?,
+            }),
+            VERB_REGISTER_FILES => Ok(Self::RegisterFiles { first: entries(1)? }),
+            VERB_UNREGISTER_FILES => Ok(Self::UnregisterFiles {
+                first: entries(1)?,
+                count: entries(2)?,
             }),
             _ => Err(DecodeError::Verb(word(0))),
         }
@@ -427,6 +474,11 @@ mod tests {
                 notify: NotifyMode::Umwait,
             },
             Request::Enter { to_submit: 7 },
+            Request::RegisterFiles { first: 5 },
+            Request::UnregisterFiles {
+                first: 1,
+                count: u32::MAX,
+            },
             Request::Enter {
                 to_submit: u32::MAX,
             },
