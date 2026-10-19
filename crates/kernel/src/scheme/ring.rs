@@ -10,13 +10,22 @@
 //! - [`Request::Enter`] is a *brokered* submission: in the caller's own context, the kernel
 //!   takes complete chains from the SQ (`ferric_ring::chain`) and runs each SQE as the system
 //!   call it stands for on the caller's descriptor: `Read` and `Write` as `read`/`write`
-//!   (offset [`CURRENT_POSITION`]) or `SYS_READ2`/`SYS_WRITE2`, `Fsync` as `fsync`. A user
+//!   (offset [`CURRENT_POSITION`]) or `SYS_READ2`/`SYS_WRITE2`, `Fsize`, `Fstat` and `Fsync`
+//!   as the system calls of those names (`syscall/fs.rs`'s description helpers). A user
 //!   scheme sees an ordinary scheme request (`scheme/user.rs`), so every scheme works
 //!   unchanged, and the buffer is checked like any system call's. Each SQE gets one CQE; a
 //!   chain is taken only when the CQ has room for all of its CQEs, so none is ever dropped.
 //!   After posting completions, `Enter` triggers `EVENT_READ` on the ring.
 //! - `fevent` reports `EVENT_READ` while the CQ holds completions the application has not
 //!   taken.
+//! - The file table ([`FileTable`]) holds file descriptions sent with
+//!   [`Request::RegisterFiles`] (an `FD` call, `kfdwrite`). A fixed-file SQE runs on the
+//!   description in its slot, so the file stays open for the ring after the application closes
+//!   its descriptor. Descriptions of rings are refused, so no ring holds a ring open and closing
+//!   the last descriptor of a ring always frees it. A description leaves the table through
+//!   [`Request::UnregisterFiles`] or when the ring is closed, and every reference the scheme
+//!   takes is given back through [`release`], which closes the description when it was the
+//!   last one.
 //!
 //! The ring memory is shared with the application, which may write any of it at any time.
 //! The kernel reads it only through its own mapping of the frames, with atomic accesses
@@ -30,9 +39,9 @@
 //! on the files its submitter named even if another thread closes or reuses one of the
 //! descriptors meanwhile, as a single system call would.
 //!
-//! Not yet (later PRs of the design): fixed files and grant buffers (`EOPNOTSUPP`), waiting in
-//! `Enter` for completions, the `SqPoll` and `Umwait` notify modes (`EOPNOTSUPP`), and rings
-//! served natively by user schemes.
+//! Not yet (later PRs of the design): grant buffers (`EOPNOTSUPP`), waiting in `Enter` for
+//! completions, the `SqPoll` and `Umwait` notify modes (`EOPNOTSUPP`), and rings served
+//! natively by user schemes.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
@@ -44,6 +53,7 @@ use ferric_ring::{
     abi::{header, Layout, NotifyMode, Request, PAGE_SIZE as RING_PAGE_SIZE, RING_PATH},
     chain::{Chain, Next, SqReader},
     entry::{Buffer, FileRef, Op, SqeError, CURRENT_POSITION},
+    files::{FileTable, Refused, TableError},
     queue::{HeaderInfo, Memory, RingError},
     Consumer, Cqe, Producer, Sqe,
 };
@@ -51,6 +61,7 @@ use spin::{Mutex, Once};
 use syscall::{
     error::{
         Error, Result, EBADF, EBUSY, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, EOPNOTSUPP,
+        EOVERFLOW,
     },
     flag::{CallFlags, EventFlags, MapFlags, EVENT_READ},
 };
@@ -58,7 +69,7 @@ use syscall::{
 use super::{CallerCtx, FileHandle, KernelScheme, OpenResult, SchemeExt, StrOrBytes};
 use crate::{
     context::{
-        file::{InternalFlags, LockedFileDescription},
+        file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
         memory::{handle_notify_files, AddrSpaceWrapper, Grant, PageSpan},
     },
     event,
@@ -67,8 +78,8 @@ use crate::{
     syscall::{
         data::{GlobalSchemes, Map},
         fs::{
-            description_op, file_description, read_description, release_description,
-            write_description,
+            description_op, file_description, fstat_description, read_description,
+            release_description, write_description,
         },
         usercopy::{UserSlice, UserSliceRw},
     },
@@ -113,7 +124,7 @@ struct Indices {
     cq: Producer<Cqe>,
 }
 
-/// A file an SQE runs on: a reference to its open file description.
+/// A file description the ring holds a reference to.
 type Description = Arc<LockedFileDescription>;
 
 /// A ring.
@@ -121,6 +132,8 @@ struct Ring {
     shared: Once<Shared>,
     /// `None` before `Setup`, and while an `Enter` holds the indices.
     indices: Mutex<Option<Indices>>,
+    /// `None` once the ring is closed, so nothing is registered after the table was emptied.
+    files: Mutex<Option<FileTable<Description>>>,
 }
 
 /// The indices of a ring, taken by the running `Enter` and put back when it ends.
@@ -157,6 +170,75 @@ fn sqe_errno(err: SqeError) -> Error {
         SqeError::Opcode(_) => EOPNOTSUPP,
         _ => EINVAL,
     })
+}
+
+/// The errno for a file table call the table refused.
+fn table_errno(err: TableError) -> Error {
+    Error::new(match err {
+        TableError::Occupied { .. } => EBUSY,
+        TableError::NoMemory => ENOMEM,
+        _ => EINVAL,
+    })
+}
+
+/// [`release_description`] for each of `descriptions`.
+fn release_all(descriptions: Vec<Description>, token: &mut CleanLockToken) {
+    for description in descriptions {
+        release_description(description, token);
+    }
+}
+
+/// [`Request::RegisterFiles`]: puts `descriptions` into the ring's file table from slot
+/// `first` on, or hands them all back with the errno.
+fn register_files(
+    ring: &Ring,
+    first: u32,
+    descriptions: Vec<Description>,
+    token: &mut CleanLockToken,
+) -> core::result::Result<usize, (Error, Vec<Description>)> {
+    let is_ring = |description: &Description, token: &mut CleanLockToken| {
+        matches!(
+            description.read(token.token()).scheme_ref,
+            KernelSchemeRef::Global(GlobalSchemes::Ring)
+        )
+    };
+    let mut any_ring = false;
+    for description in &descriptions {
+        any_ring |= is_ring(description, token);
+    }
+    if any_ring {
+        return Err((Error::new(EINVAL), descriptions));
+    }
+    let count = descriptions.len();
+    let mut files = ring.files.lock();
+    let Some(table) = files.as_mut() else {
+        return Err((Error::new(EBADF), descriptions));
+    };
+    table
+        .register(first, descriptions)
+        .map(|()| count)
+        .map_err(|Refused { error, files }| (table_errno(error), files))
+}
+
+/// [`Request::UnregisterFiles`]: empties `count` slots from `first` on and returns how many
+/// held a file.
+fn unregister_files(
+    ring: &Ring,
+    first: u32,
+    count: u32,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let removed = ring
+        .files
+        .lock()
+        .as_mut()
+        .ok_or(Error::new(EBADF))?
+        .unregister(first, count)
+        .map_err(table_errno)?;
+    let removed_count = removed.len();
+    // Closing may call into another scheme, so it happens with the table unlocked.
+    release_all(removed, token);
+    Ok(removed_count)
 }
 
 /// [`Request::Setup`]: allocates the ring's memory and writes its header.
@@ -237,7 +319,7 @@ fn enter(ring: &Ring, to_submit: u32, token: &mut CleanLockToken) -> Result<usiz
         if matches!(next, Next::Refused(_)) {
             chain.refuse(errno_result(EINVAL), post);
         } else {
-            let files = resolve_files(&chain, token);
+            let files = resolve_files(ring, &chain, token);
             run_chain(&chain, files, token, &mut post);
         }
         // The room was checked, so staging fails only if the application moved its CQ head
@@ -259,13 +341,13 @@ type ChainFiles = Vec<Option<Result<Description>>>;
 
 /// Looks up every file `chain` names and holds its description, before any of the chain
 /// runs.
-fn resolve_files(chain: &Chain, token: &mut CleanLockToken) -> ChainFiles {
+fn resolve_files(ring: &Ring, chain: &Chain, token: &mut CleanLockToken) -> ChainFiles {
     chain
         .entries()
         .iter()
         .map(|sqe| {
             let file = sqe.op().ok().and_then(|op| op.file());
-            file.map(|file| resolve(file, token))
+            file.map(|file| resolve(ring, file, token))
         })
         .collect()
 }
@@ -314,15 +396,22 @@ fn run(sqe: &Sqe, file: Option<Result<Description>>, token: &mut CleanLockToken)
     }
 }
 
-/// The description `file` names: the caller's descriptor's.
+/// The description `file` names: the caller's descriptor's, or the one in a slot of the
+/// ring's file table.
 ///
 /// # Errors
 ///
-/// `EBADF` when the descriptor is not open, `EOPNOTSUPP` for a fixed file.
-fn resolve(file: FileRef, token: &mut CleanLockToken) -> Result<Description> {
+/// `EBADF` when the descriptor is not open or the slot is empty.
+fn resolve(ring: &Ring, file: FileRef, token: &mut CleanLockToken) -> Result<Description> {
     match file {
         FileRef::Fd(fd) => file_description(FileHandle::from(fd as usize), token),
-        FileRef::Fixed(_) => Err(Error::new(EOPNOTSUPP)),
+        FileRef::Fixed(slot) => ring
+            .files
+            .lock()
+            .as_ref()
+            .and_then(|table| table.get(slot))
+            .cloned()
+            .ok_or(Error::new(EBADF)),
     }
 }
 
@@ -378,6 +467,19 @@ fn run_op(
                 description_op(description, token, |scheme, _, desc, token| {
                     scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)
                 })
+            })
+        }
+        Op::Fsize { .. } => with_file(file, token, |description, token| {
+            description_op(description, token, |scheme, _, desc, token| {
+                usize::try_from(scheme.fsize(desc.number, token)?)
+                    .map_err(|_| Error::new(EOVERFLOW))
+            })
+        }),
+        Op::Fstat { buf, .. } => {
+            let (addr, len) = user_buffer(buf)?;
+            let buf = UserSlice::wo(addr, len)?;
+            with_file(file, token, |description, token| {
+                fstat_description(description, buf, token).map(|()| 0)
             })
         }
         Op::Fsync { .. } => with_file(file, token, |description, token| {
@@ -453,16 +555,22 @@ impl KernelScheme for RingScheme {
         let ring = Arc::new(Ring {
             shared: Once::new(),
             indices: Mutex::new(None),
+            files: Mutex::new(Some(FileTable::new())),
         });
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         HANDLES.lock().insert(id, ring);
         Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()))
     }
 
-    fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
         // A running Enter keeps its own reference; the frames go with the last one, or with
-        // the last mapping.
-        HANDLES.lock().remove(&id);
+        // the last mapping. The files go now: an Enter still running holds its own reference
+        // to the one it is using.
+        let ring = HANDLES.lock().remove(&id).ok_or(Error::new(EBADF))?;
+        let files = ring.files.lock().take();
+        if let Some(mut table) = files {
+            release_all(table.take_all(), token);
+        }
         Ok(())
     }
 
@@ -491,8 +599,35 @@ impl KernelScheme for RingScheme {
                 }
                 Ok(consumed)
             }
+            Request::UnregisterFiles { first, count } => {
+                unregister_files(&ring, first, count, token)
+            }
+            // RegisterFiles needs descriptors: it comes as an FD call, to `kfdwrite`.
             _ => Err(Error::new(EINVAL)),
         }
+    }
+
+    fn kfdwrite(
+        &self,
+        id: usize,
+        descs: Vec<Arc<LockedFileDescription>>,
+        _flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let registered = match (ring(id), Request::decode(metadata)) {
+            (Ok(ring), Ok(Request::RegisterFiles { first })) => {
+                register_files(&ring, first, descs, token)
+            }
+            (Err(err), _) => Err((err, descs)),
+            (Ok(_), _) => Err((Error::new(EINVAL), descs)),
+        };
+        // The descriptors were sent to the ring; any it does not keep are closed, as a
+        // scheme closes the descriptors of a call it refuses.
+        registered.map_err(|(err, descs)| {
+            release_all(descs, token);
+            err
+        })
     }
 
     fn fevent(
