@@ -46,8 +46,11 @@ a baseline or disabling a check.
 Package coverage is in `crates/fox-core/tests/archive.rs`,
 `crates/fox-store/tests/store.rs`, `tools/fox/tests/cli.rs`,
 `tools/fox/tests/git_sources.rs`, `crates/fox-git/tests/repo.rs`,
-`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs` and
-`tools/cargo-fox/tests/cli.rs`. Tests construct real signed pkgar fixtures
+`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs`,
+`tools/cargo-fox/tests/cli.rs`, `crates/fox-index/tests/registry.rs` and
+`tools/fox-registry/tests/cli.rs`. The registry tests sign metadata with
+fixed-seed keys and attack it: rollback, expiry, a changed file, a delegation
+claiming another path, and a key rotation signed by the new keys only. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no
@@ -104,7 +107,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
-| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsync` through a ring, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
