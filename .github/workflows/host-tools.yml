@@ -1,7 +1,7 @@
 name: host-tools
 
 # Tests and lints the host workspace: tools/* and the shared crates in crates/.
-# Also runs RedoxFS's own unit tests, which build on the host.
+# Also runs RedoxFS's own unit tests and driver-block's, which build on the host.
 
 on:
   push:
@@ -16,6 +16,7 @@ on:
       - "features.toml"
       - "config/**"
       - "userspace/redoxfs/**"
+      - "userspace/base/drivers/storage/driver-block/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
@@ -143,3 +144,23 @@ jobs:
           restore-keys: redoxfs-
       - name: Test
         run: cargo test --locked --lib
+
+  # driver-block's concurrent-request and close-ordering tests run on the host.
+  driver-block:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: userspace/base
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/base/target
+          key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
+          restore-keys: userspace-base-
+      - name: Test
+        run: cargo test --locked -p driver-block

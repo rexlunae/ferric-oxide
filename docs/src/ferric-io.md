@@ -253,15 +253,19 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   requests skip dead workers, and run on the main queue once none is left.
   The pipe's reader keeps the part of an id that a read splits for the next
   read (`ferric_blkqueue::ids::IdStream`).
-- driver-block serves a disk's plain reads and writes as concurrent tasks when
-  the disk says its clones may run at once (`Disk::concurrent`). nvmed says so
+- driver-block (roadmap Phase 2.4, #133) serves a disk's plain reads and
+  writes as concurrent tasks when the disk says its clones may run at once
+  (`Disk::concurrent`). nvmed says so
   only with per-CPU workers under the `Workers` policy
   (`QueuePolicy::serves_concurrently`). Each request is checked and located at once, and then
   runs on a clone of the disk, which writes the response itself. Every other
   call, and every call on other disks, is still served one at a time, as
   upstream. A descriptor closed while its requests run stays open until the
-  last one ends (`ferric_blkqueue::order::CloseGate`), and the close then runs
-  before the next request is served. So a later exclusive open cannot see
+  last one ends (`driver_block::SharedGate`, over
+  `ferric_blkqueue::order::CloseGate`). The close then runs before the next
+  request is served, and the request that makes it ready wakes the scheme's
+  loop (`SharedGate::ready`, which nvmed waits on beside the scheme's events),
+  so it runs on an idle disk too. So a later exclusive open cannot see
   the lock released before the writes land. On nvmed's side, the main
   thread's queue pair still serves one request at a time (its thread context
   and bounce buffer are shared): `MainQueue` requests queue for it on an

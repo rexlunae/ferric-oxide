@@ -354,13 +354,17 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     log::debug!("Starting to listen for scheme events");
 
+    // Ferric Oxide: a close held back for concurrent requests becomes ready when the last of
+    // them ends, which is no scheme event, so the loop also wakes for that.
+    let closes = scheme.borrow().close_gate();
     executor.block_on(async {
         loop {
             log::trace!("new event iteration");
             if let Err(err) = scheme.borrow_mut().tick().await {
                 log::error!("scheme error: {err}");
             }
-            let _ = scheme_events.as_mut().next().await;
+            let event = std::pin::pin!(scheme_events.as_mut().next());
+            futures::future::select(event, closes.ready()).await;
         }
     });
 

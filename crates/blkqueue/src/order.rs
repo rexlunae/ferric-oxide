@@ -72,6 +72,12 @@ impl CloseGate {
         self.in_flight.get(&id).copied().unwrap_or(0)
     }
 
+    /// Whether a waiting close may now run (what [`take_ready`](Self::take_ready) would hand
+    /// out), without taking it.
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
     /// Takes the descriptors whose waiting close may now run, in the order they became ready.
     pub fn take_ready(&mut self) -> Vec<usize> {
         core::mem::take(&mut self.ready)
@@ -98,8 +104,11 @@ mod tests {
         gate.end(3);
         assert!(gate.take_ready().is_empty(), "one request still runs");
         assert_eq!(gate.in_flight(3), 1);
+        assert!(!gate.has_ready());
         gate.end(3);
+        assert!(gate.has_ready());
         assert_eq!(gate.take_ready(), [3]);
+        assert!(!gate.has_ready());
         assert!(gate.take_ready().is_empty(), "a close is handed out once");
         assert_eq!(gate.in_flight(3), 0);
     }

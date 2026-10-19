@@ -36,6 +36,8 @@ use super::Disk;
 
 // Ferric Oxide: reads and writes served as concurrent tasks.
 mod concurrent;
+pub use concurrent::{CloseReady, SharedGate};
+
 use crate::{EventSource, PhysAddr};
 
 struct RingEventSource<'a, Ev: EventSource>(Mutex<Pin<&'a mut Ev>>);
@@ -310,9 +312,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         let mut inner = RingDiskSchemeInner {
             scheme_name,
             socket,
-            gate: Rc::new(std::cell::RefCell::new(
-                ferric_blkqueue::order::CloseGate::new(),
-            )),
+            gate: concurrent::SharedGate::default(),
             disks: BTreeMap::from_iter(
                 disks
                     .into_iter()
@@ -347,6 +347,14 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         self.inner.socket.inner()
     }
 
+    /// Ferric Oxide: the gate that holds closes back while their descriptors' concurrent
+    /// requests run. A driver whose disks serve requests concurrently ([`Disk::concurrent`])
+    /// waits on [`SharedGate::ready`] beside the scheme's events, and calls [`Self::tick`]
+    /// when either fires, so that a close becoming ready on an idle disk still runs.
+    pub fn close_gate(&self) -> SharedGate {
+        self.inner.gate.clone()
+    }
+
     /// Ferric Oxide: lets applications attach registered-buffer grants to their disk
     /// descriptors (`ferric_blkgrant::abi`), mapped into the driver's DMA domain with `dma`.
     #[cfg(feature = "grant-dma")]
@@ -361,7 +369,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         // Handle new scheme requests
         loop {
             // Ferric Oxide: closes that waited for their descriptors' concurrent requests.
-            let ready = self.inner.gate.borrow_mut().take_ready();
+            let ready = self.inner.gate.take_ready();
             for id in ready {
                 self.inner.on_close(id);
             }
@@ -413,7 +421,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
                 }
                 RequestKind::OnClose { id } => {
                     // Ferric Oxide: not while the descriptor's requests still run.
-                    if self.inner.gate.borrow_mut().close(id) {
+                    if self.inner.gate.close(id) {
                         self.inner.on_close(id);
                     }
                     continue;
@@ -433,7 +441,7 @@ struct RingDiskSchemeInner<T: Disk, Hw: Hardware> {
     scheme_name: String,
     socket: Rc<Socket>,
     /// Ferric Oxide: in-flight concurrent requests per descriptor, and the closes they hold.
-    gate: Rc<std::cell::RefCell<ferric_blkqueue::order::CloseGate>>,
+    gate: concurrent::SharedGate,
     disks: BTreeMap<u32, RingDiskWrapper<T>>,
     handles: HandleMap<Handle<Hw, T>>,
     /// Ferric Oxide: the process that opened each disk descriptor, the only one that may set
