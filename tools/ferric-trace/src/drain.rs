@@ -7,13 +7,20 @@
 //! the scheme's `clock` file, which says what the timestamps count, when the kernel has one
 //! (kernels before T3d do not).
 //!
+//! Each CPU is read in one of two ways ([`Via`]). Through the mapping (`Via::Map`), the ring
+//! is mapped read-only (`ferric_trace_map::Mapping`, Redox only), records are copied out of
+//! it with [`View`], and each copy is consumed with `commit <end>` only after it was written
+//! to the output, so a capture that dies keeps every record it took from the ring. Without it
+//! (`Via::Read`), `cpu/<n>` is read, which consumes as it copies. `Via::Auto`, the default,
+//! maps where it can and reads otherwise (a kernel before T3a, or a host stand-in).
+//!
 //! The capture is a snapshot: a CPU is drained until it has given the bytes `stats.start`
 //! listed as pending for it, or until a read returns 0 bytes (the ring is empty), whichever
 //! comes first. Draining until empty alone never ends while tracing is on, because saving a
 //! capture makes events of its own (every write to the output is a scheme request), so the
-//! ring refills as fast as it is read and the output grows until the disk is full. A read fails with `EAGAIN` while another reader is
-//! draining the same CPU; that read is retried after a short wait, up to [`AGAIN_RETRIES`]
-//! times in a row. Any other error stops the capture, naming the file.
+//! ring refills as fast as it is read and the output grows until the disk is full. A read or a
+//! commit fails with `EAGAIN` while another reader is draining the same CPU; it is retried
+//! after a short wait, up to [`AGAIN_RETRIES`] times in a row. Any other error stops the capture, naming the file.
 //!
 //! Ring reads are destructive, so nothing drained is ever deleted. The output directory is
 //! created with exclusive creation (it must not exist), an `INCOMPLETE` marker
@@ -25,14 +32,17 @@
 //!
 //! The scheme's interface is [`ferric_trace::abi`].
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use ferric_trace::abi::{self, LineError, StatsLine};
+use ferric_trace::abi::{self, CpuCommand, LineError, StatsLine};
 use ferric_trace::record::WORD_BYTES;
+use ferric_trace::ring::{ReadError, View, ViewError, Words};
 
 use crate::capture::INCOMPLETE;
 
@@ -52,6 +62,56 @@ const AGAIN_WAIT: Duration = Duration::from_millis(5);
 const READ_BYTES: usize = 64 * 1024;
 
 const _: () = assert!(READ_BYTES >= abi::READ_MIN);
+
+/// How [`drain_scheme`] takes records out of the rings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Via {
+    /// Through the mapping where the ring can be mapped, by reading otherwise.
+    #[default]
+    Auto,
+    /// Through the mapping only: a ring that cannot be mapped fails the capture.
+    Map,
+    /// By reading `cpu/<n>` only.
+    Read,
+}
+
+/// A [`Via`] name that is not `auto`, `map` or `read`.
+#[derive(Debug, thiserror::Error)]
+#[error("not a way to read the rings (auto, map or read)")]
+pub struct ViaError;
+
+impl FromStr for Via {
+    type Err = ViaError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "auto" => Ok(Self::Auto),
+            "map" => Ok(Self::Map),
+            "read" => Ok(Self::Read),
+            _ => Err(ViaError),
+        }
+    }
+}
+
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Map => "map",
+            Self::Read => "read",
+        })
+    }
+}
+
+/// A mapped ring that stopped at a record that does not decode, which only a kernel bug
+/// leaves.
+#[derive(Debug, thiserror::Error)]
+#[error("a record at position {position} does not decode")]
+pub struct CorruptRecord {
+    /// The ring position of the record.
+    pub position: u64,
+}
 
 /// Why a capture could not be saved.
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +159,24 @@ pub enum DrainError {
         #[source]
         source: Box<DrainError>,
     },
+    /// A CPU's ring could not be mapped, with [`Via::Map`].
+    #[error("{}: cannot map the ring", path.display())]
+    Map {
+        /// The CPU file.
+        path: PathBuf,
+        /// The kernel's error, or [`ErrorKind::Unsupported`] off Redox.
+        #[source]
+        source: io::Error,
+    },
+    /// A mapped ring's header is not one this reader understands.
+    #[error("{}: not a ring this reader can map", path.display())]
+    View {
+        /// The CPU file.
+        path: PathBuf,
+        /// What is wrong with the header.
+        #[source]
+        source: ViewError,
+    },
     /// The output directory is inside the scheme path, or holds it.
     #[error("{} overlaps the scheme path {}", out.display(), scheme.display())]
     Overlap {
@@ -120,11 +198,13 @@ pub struct CpuDrained {
     pub lost_before: u64,
     /// Records the CPU dropped while the capture ran.
     pub lost_during: u64,
+    /// Whether the ring was read through its mapping.
+    pub mapped: bool,
 }
 
 /// Drains every CPU of the trace scheme at `scheme` (normally `/scheme/kernel.trace`) into
 /// directory `out`, which this creates (with any missing parents) and which must not exist
-/// yet.
+/// yet, taking the records out `via` the mapping or reads.
 ///
 /// # Errors
 ///
@@ -132,9 +212,11 @@ pub struct CpuDrained {
 /// [`DrainError::Io`] if it cannot be created; nothing has been read then. Any later failure is
 /// [`DrainError::Partial`], whose source is a [`DrainError::Io`] for a file that cannot be read
 /// or written, a [`DrainError::Stats`] for a `stats` line that does not parse, or a
-/// [`DrainError::Busy`] for a CPU file that another reader holds for too long. A partial
+/// [`DrainError::Busy`] for a CPU file that another reader holds for too long. With
+/// [`Via::Map`], it can also be a [`DrainError::Map`] or [`DrainError::View`] for a ring that
+/// cannot be mapped or read in place, whichever [`Via`] is asked for. A partial
 /// capture keeps everything drained before the failure and its `INCOMPLETE` marker.
-pub fn drain_scheme(scheme: &Path, out: &Path) -> Result<Vec<CpuDrained>, DrainError> {
+pub fn drain_scheme(scheme: &Path, out: &Path, via: Via) -> Result<Vec<CpuDrained>, DrainError> {
     check_overlap(scheme, out)?;
     // Only `out` itself must be new; its parents may already exist or not.
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -149,7 +231,7 @@ pub fn drain_scheme(scheme: &Path, out: &Path) -> Result<Vec<CpuDrained>, DrainE
             io_error(out)(source)
         }
     })?;
-    drain_into(scheme, out).map_err(|source| DrainError::Partial {
+    drain_into(scheme, out, via).map_err(|source| DrainError::Partial {
         out: out.to_owned(),
         source: Box::new(source),
     })
@@ -181,7 +263,7 @@ fn absolute(path: &Path) -> PathBuf {
 
 /// Marks `dir` incomplete, saves the start snapshot, every CPU and the end snapshot into it,
 /// and removes the mark.
-fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> {
+fn drain_into(scheme: &Path, dir: &Path, via: Via) -> Result<Vec<CpuDrained>, DrainError> {
     let marker = dir.join(INCOMPLETE);
     fs::write(&marker, "ferric-trace capture did not finish\n").map_err(io_error(&marker))?;
     copy_clock(scheme, &dir.join(crate::capture::CLOCK))?;
@@ -190,21 +272,195 @@ fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> 
     for line in &start {
         let from = scheme.join(abi::CPU_DIR).join(line.cpu.to_string());
         let to = dir.join(format!("cpu{}", line.cpu));
-        let mut source = File::open(&from).map_err(io_error(&from))?;
-        let mut sink = File::create(&to).map_err(io_error(&to))?;
         let budget = line.pending.saturating_mul(WORD_BYTES as u64);
-        let bytes = drain(&mut source, &from, &mut sink, &to, budget, AGAIN_WAIT)?;
+        let (bytes, mapped) = drain_cpu(&from, &to, budget, via)?;
         drained.push(CpuDrained {
             cpu: line.cpu,
             bytes,
             lost_before: line.lost,
             lost_during: 0,
+            mapped,
         });
     }
     let end = snapshot(scheme, &dir.join(STATS_END))?;
     count_losses(&mut drained, &end);
     fs::remove_file(&marker).map_err(io_error(&marker))?;
     Ok(drained)
+}
+
+/// Drains CPU file `from` into a new file `to` until `budget` bytes, through the mapping or
+/// by reading as `via` says, and returns the bytes saved and whether the mapping was used.
+fn drain_cpu(from: &Path, to: &Path, budget: u64, via: Via) -> Result<(u64, bool), DrainError> {
+    if via != Via::Read {
+        match map::open(from) {
+            Ok(cpu) => return map::drain(&cpu, from, to, budget).map(|bytes| (bytes, true)),
+            Err(err) if via == Via::Map => return Err(err),
+            // A ring that cannot be mapped is read instead.
+            Err(_) => {}
+        }
+    }
+    let mut source = Reading(File::open(from).map_err(io_error(from))?);
+    let mut sink = File::create(to).map_err(io_error(to))?;
+    let bytes = drain(&mut source, from, &mut sink, to, budget, AGAIN_WAIT)?;
+    Ok((bytes, false))
+}
+
+/// Mapping a CPU's ring, on Redox.
+#[cfg(target_os = "redox")]
+mod map {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    use ferric_trace::ring::View;
+    use ferric_trace_map::Mapping;
+
+    use super::{AGAIN_WAIT, DrainError, Mapped, io_error};
+
+    /// A CPU file, open for reading and for `commit`, and its ring mapped.
+    pub(super) struct Cpu {
+        file: File,
+        map: Mapping,
+    }
+
+    /// Opens CPU file `path` for reading and `commit`, and maps its ring.
+    pub(super) fn open(path: &Path) -> Result<Cpu, DrainError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(io_error(path))?;
+        let map_error = |source| DrainError::Map {
+            path: path.to_owned(),
+            source,
+        };
+        let fd = usize::try_from(file.as_raw_fd())
+            .map_err(|_| map_error(io::Error::from(ErrorKind::InvalidInput)))?;
+        let map =
+            Mapping::ring(fd).map_err(|err| map_error(io::Error::from_raw_os_error(err.errno)))?;
+        Ok(Cpu { file, map })
+    }
+
+    /// Drains `cpu`'s ring in place into a new file `to`.
+    pub(super) fn drain(cpu: &Cpu, from: &Path, to: &Path, budget: u64) -> Result<u64, DrainError> {
+        let view = View::new(cpu.map.words()).map_err(|source| DrainError::View {
+            path: from.to_owned(),
+            source,
+        })?;
+        let mut source = Mapped::new(view, &cpu.file);
+        let mut sink = File::create(to).map_err(io_error(to))?;
+        super::drain(&mut source, from, &mut sink, to, budget, AGAIN_WAIT)
+    }
+}
+
+/// Off Redox no ring maps: the host's stand-in files are read.
+#[cfg(not(target_os = "redox"))]
+mod map {
+    use std::io::{self, ErrorKind};
+    use std::path::Path;
+
+    use super::DrainError;
+
+    /// A mapped CPU, which cannot exist here.
+    pub(super) enum Cpu {}
+
+    /// Fails: nothing maps off Redox.
+    pub(super) fn open(path: &Path) -> Result<Cpu, DrainError> {
+        Err(DrainError::Map {
+            path: path.to_owned(),
+            source: io::Error::from(ErrorKind::Unsupported),
+        })
+    }
+
+    pub(super) fn drain(cpu: &Cpu, _: &Path, _: &Path, _: u64) -> Result<u64, DrainError> {
+        match *cpu {}
+    }
+}
+
+/// Where [`drain`] takes one CPU's records from.
+trait Source {
+    /// Copies whole records into `buf` and returns the bytes copied, 0 when there are none.
+    fn copy(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Consumes what the last [`Source::copy`] gave, now that it is saved.
+    fn consume(&mut self) -> io::Result<()>;
+}
+
+/// A CPU file read with `read`, which consumes as it copies.
+struct Reading<R>(R);
+
+impl<R: Read> Source for Reading<R> {
+    fn copy(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+
+    fn consume(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hands a position back to the ring's owner: `commit <end>` on the CPU file.
+#[cfg_attr(not(target_os = "redox"), allow(dead_code))]
+trait Commit {
+    /// Lets the owner reuse the ring up to `end`.
+    fn commit(&mut self, end: u64) -> io::Result<()>;
+}
+
+impl Commit for &File {
+    fn commit(&mut self, end: u64) -> io::Result<()> {
+        // One write is one command.
+        self.write(CpuCommand::Commit(end).to_string().as_bytes())
+            .map(drop)
+    }
+}
+
+/// A mapped ring read in place through a [`View`], each copy committed once saved.
+// Off Redox only the tests make one.
+#[cfg_attr(not(target_os = "redox"), allow(dead_code))]
+struct Mapped<W, C> {
+    view: View<W>,
+    /// Where the next copy starts: the end of the last one.
+    pos: u64,
+    commit: C,
+}
+
+impl<W: Words, C: Commit> Mapped<W, C> {
+    #[cfg_attr(not(target_os = "redox"), allow(dead_code))]
+    fn new(view: View<W>, commit: C) -> Self {
+        let pos = view.tail();
+        Self { view, pos, commit }
+    }
+}
+
+impl<W: Words, C: Commit> Source for Mapped<W, C> {
+    fn copy(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // `drain` never asks for less than READ_MIN, which holds the largest record.
+        let peek = self
+            .view
+            .peek(self.pos, buf)
+            .map_err(|err: ReadError| io::Error::new(ErrorKind::InvalidInput, err))?;
+        if peek.is_corrupt() && peek.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                CorruptRecord {
+                    position: self.pos.max(self.view.tail()),
+                },
+            ));
+        }
+        self.pos = peek.end();
+        Ok(peek.len())
+    }
+
+    fn consume(&mut self) -> io::Result<()> {
+        match self.commit.commit(self.pos) {
+            // Another reader consumed past this copy already: nothing is left to hand back.
+            Err(err) if err.kind() == ErrorKind::InvalidInput && self.view.tail() >= self.pos => {
+                Ok(())
+            }
+            other => other,
+        }
+    }
 }
 
 /// Sets each CPU's `lost_during` from the `stats` snapshot taken after draining.
@@ -245,13 +501,14 @@ fn snapshot(scheme: &Path, to: &Path) -> Result<Vec<StatsLine>, DrainError> {
 }
 
 /// Copies `source` (at `from`) to `sink` (at `to`) until `budget` bytes have been copied or a
-/// read returns 0 bytes, retrying `EAGAIN` and `EINTR` reads, and returns the bytes copied.
+/// copy returns 0 bytes, consuming each copy once it is written, retrying `EAGAIN` and `EINTR`
+/// copies and commits, and returns the bytes copied.
 ///
 /// Reads ask for no more than the bytes left in the budget, but never for less than
 /// [`abi::READ_MIN`] (a ring read returns whole records and refuses a buffer too small for
 /// the largest one), so the copy can end up to one record past the budget.
 fn drain(
-    source: &mut impl Read,
+    source: &mut impl Source,
     from: &Path,
     sink: &mut impl Write,
     to: &Path,
@@ -264,28 +521,53 @@ fn drain(
     while total < budget {
         let left = usize::try_from(budget - total).unwrap_or(usize::MAX);
         let want = left.clamp(abi::READ_MIN, READ_BYTES);
-        match source.read(&mut buf[..want]) {
-            Ok(0) => break,
-            Ok(n) => {
-                busy = 0;
-                sink.write_all(&buf[..n]).map_err(io_error(to))?;
-                total += n as u64;
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                busy += 1;
-                if busy >= AGAIN_RETRIES {
-                    return Err(DrainError::Busy {
-                        path: from.to_owned(),
-                    });
-                }
-                thread::sleep(wait);
-            }
-            Err(err) => return Err(io_error(from)(err)),
+        let Some(n) = retry(|| source.copy(&mut buf[..want]), &mut busy, from, wait)? else {
+            continue;
+        };
+        if n == 0 {
+            break;
         }
+        sink.write_all(&buf[..n]).map_err(io_error(to))?;
+        total += n as u64;
+        // Saved before it is consumed: a commit that never comes loses nothing.
+        sink.flush().map_err(io_error(to))?;
+        while retry(|| source.consume(), &mut busy, from, wait)?.is_none() {}
     }
     sink.flush().map_err(io_error(to))?;
     Ok(total)
+}
+
+/// Runs `op` once: `Some` with its result, `None` after an `EINTR` or an `EAGAIN` (waiting
+/// `wait` after the latter), counting `EAGAIN`s in a row in `busy`.
+///
+/// # Errors
+///
+/// [`DrainError::Busy`] at the [`AGAIN_RETRIES`]th `EAGAIN` in a row, and
+/// [`DrainError::Io`] for `from` on any other error.
+fn retry<T>(
+    op: impl FnOnce() -> io::Result<T>,
+    busy: &mut u32,
+    from: &Path,
+    wait: Duration,
+) -> Result<Option<T>, DrainError> {
+    match op() {
+        Ok(value) => {
+            *busy = 0;
+            Ok(Some(value))
+        }
+        Err(err) if err.kind() == ErrorKind::Interrupted => Ok(None),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            *busy += 1;
+            if *busy >= AGAIN_RETRIES {
+                return Err(DrainError::Busy {
+                    path: from.to_owned(),
+                });
+            }
+            thread::sleep(wait);
+            Ok(None)
+        }
+        Err(err) => Err(io_error(from)(err)),
+    }
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DrainError + '_ {
@@ -300,7 +582,10 @@ mod tests {
     use super::*;
     use crate::capture::Capture;
     use crate::capture::tests::bytes;
+    use ferric_trace::Event;
     use ferric_trace::kernel::{SYSCALL_ENTER, SYSCALL_EXIT};
+    use ferric_trace::ring::{Ring, SHARED_HEADER_WORDS, Shared};
+    use std::sync::atomic::AtomicU64;
 
     /// A reader that gives `results` in turn, then 0 bytes.
     struct Script(Vec<io::Result<Vec<u8>>>);
@@ -321,10 +606,10 @@ mod tests {
     }
 
     fn run(script: Vec<io::Result<Vec<u8>>>) -> Result<(u64, Vec<u8>), DrainError> {
-        run_with(&mut Script(script), u64::MAX)
+        run_with(&mut Reading(Script(script)), u64::MAX)
     }
 
-    fn run_with(source: &mut impl Read, budget: u64) -> Result<(u64, Vec<u8>), DrainError> {
+    fn run_with(source: &mut impl Source, budget: u64) -> Result<(u64, Vec<u8>), DrainError> {
         let mut sink = Vec::new();
         let n = drain(
             source,
@@ -362,7 +647,7 @@ mod tests {
             largest: 0,
             smallest: usize::MAX,
         };
-        let (n, sink) = run_with(&mut ring, 10 * WORD_BYTES as u64).expect("drains");
+        let (n, sink) = run_with(&mut Reading(&mut ring), 10 * WORD_BYTES as u64).expect("drains");
         assert_eq!(n, 80);
         assert_eq!(sink.len(), 80);
         assert_eq!(ring.reads, 10);
@@ -378,7 +663,10 @@ mod tests {
             largest: 0,
             smallest: usize::MAX,
         };
-        assert_eq!(run_with(&mut ring, 0).expect("drains"), (0, Vec::new()));
+        assert_eq!(
+            run_with(&mut Reading(&mut ring), 0).expect("drains"),
+            (0, Vec::new())
+        );
         assert_eq!(ring.reads, 0);
     }
 
@@ -389,7 +677,7 @@ mod tests {
             largest: 0,
             smallest: usize::MAX,
         };
-        run_with(&mut ring, 1 << 20).expect("drains");
+        run_with(&mut Reading(&mut ring), 1 << 20).expect("drains");
         assert_eq!(ring.largest, READ_BYTES);
     }
 
@@ -430,12 +718,160 @@ mod tests {
         );
     }
 
+    /// A shared ring in memory, and the commits made to it.
+    struct InMemory {
+        ring: Ring<Shared<Vec<AtomicU64>>>,
+    }
+
+    impl InMemory {
+        fn new(records: &[(&Event, u64, &[u64])]) -> Self {
+            let words = (0..SHARED_HEADER_WORDS + 64)
+                .map(|_| AtomicU64::new(0))
+                .collect();
+            let ring = Ring::shared(words).expect("a ring");
+            for (event, ts, args) in records {
+                ring.push(event.id(), *ts, args).expect("fits");
+            }
+            Self { ring }
+        }
+
+        fn view(&self) -> View<&[AtomicU64]> {
+            View::new(&self.ring.words()[..]).expect("a valid header")
+        }
+
+        fn tail(&self) -> u64 {
+            self.view().tail()
+        }
+    }
+
+    /// Commits to an in-memory ring, as the kernel does for `commit <end>`; `busy` commits fail
+    /// with `EAGAIN` first.
+    struct Committer<'a> {
+        ring: &'a InMemory,
+        busy: u32,
+        commits: Vec<u64>,
+    }
+
+    impl Commit for Committer<'_> {
+        fn commit(&mut self, end: u64) -> io::Result<()> {
+            if self.busy > 0 {
+                self.busy -= 1;
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            self.commits.push(end);
+            self.ring
+                .ring
+                .commit_to(end)
+                .map_err(|_| io::Error::from(ErrorKind::InvalidInput))
+        }
+    }
+
+    const TWO_CALLS: &[(&Event, u64, &[u64])] = &[
+        (&SYSCALL_ENTER, 10, &[1, 0, 0, 0, 0]),
+        (&SYSCALL_EXIT, 20, &[1, 0]),
+    ];
+
+    #[test]
+    fn a_mapped_ring_is_committed_after_each_saved_copy() {
+        let ring = InMemory::new(TWO_CALLS);
+        let committer = Committer {
+            ring: &ring,
+            busy: 2,
+            commits: Vec::new(),
+        };
+        let mut source = Mapped::new(ring.view(), committer);
+        let (n, sink) = run_with(&mut source, u64::MAX).expect("drains");
+        // A 7-word and a 4-word record, consumed with one commit after two busy tries.
+        assert_eq!(n, 88);
+        assert_eq!(sink, bytes(TWO_CALLS));
+        assert_eq!(source.commit.commits, [11]);
+        assert_eq!(ring.tail(), 11);
+    }
+
+    #[test]
+    fn a_mapped_ring_stops_at_the_budget() {
+        let ring = InMemory::new(TWO_CALLS);
+        let committer = Committer {
+            ring: &ring,
+            busy: 0,
+            commits: Vec::new(),
+        };
+        let mut source = Mapped::new(ring.view(), committer);
+        // A copy holds whole records, as many as fit in READ_MIN bytes: the first one here,
+        // which uses up the budget, and only it is consumed.
+        let (n, _) = run_with(&mut source, 8).expect("drains");
+        assert_eq!(n, 56);
+        assert_eq!(source.commit.commits, [7]);
+        assert_eq!(ring.tail(), 7);
+        let ring = InMemory::new(&[(&SYSCALL_ENTER, 10, &[1, 0, 0, 0, 0])]);
+        let mut source = Mapped::new(
+            ring.view(),
+            Committer {
+                ring: &ring,
+                busy: 0,
+                commits: Vec::new(),
+            },
+        );
+        assert_eq!(run_with(&mut source, 0).expect("drains").0, 0);
+        assert!(
+            source.commit.commits.is_empty(),
+            "nothing copied, nothing committed"
+        );
+        assert_eq!(ring.tail(), 0);
+    }
+
+    #[test]
+    fn a_mapped_ring_read_by_another_reader_meanwhile_is_not_an_error() {
+        let ring = InMemory::new(TWO_CALLS);
+        let mut source = Mapped::new(ring.view(), Overtaken(&ring));
+        let (n, _) = run_with(&mut source, u64::MAX).expect("drains");
+        assert_eq!(n, 88);
+    }
+
+    /// A commit refused because another reader consumed further first.
+    struct Overtaken<'a>(&'a InMemory);
+
+    impl Commit for Overtaken<'_> {
+        fn commit(&mut self, _: u64) -> io::Result<()> {
+            let head = self.0.view().head();
+            self.0
+                .ring
+                .commit_to(head)
+                .expect("the other reader's commit");
+            Err(io::Error::from(ErrorKind::InvalidInput))
+        }
+    }
+
+    #[test]
+    fn a_refused_commit_stops_the_capture() {
+        let ring = InMemory::new(TWO_CALLS);
+        struct Refused;
+        impl Commit for Refused {
+            fn commit(&mut self, _: u64) -> io::Result<()> {
+                Err(io::Error::from(ErrorKind::InvalidInput))
+            }
+        }
+        let mut source = Mapped::new(ring.view(), Refused);
+        assert!(matches!(
+            run_with(&mut source, u64::MAX),
+            Err(DrainError::Io { source, .. }) if source.kind() == ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn via_names_round_trip() {
+        for via in [Via::Auto, Via::Map, Via::Read] {
+            assert_eq!(via.to_string().parse::<Via>().ok(), Some(via));
+        }
+        assert!("mmap".parse::<Via>().is_err());
+    }
+
     #[test]
     fn drains_every_cpu_stats_lists() {
         let scheme = stand_in_scheme();
         let out = tempfile::tempdir().expect("temp dir");
         let saved = out.path().join("capture");
-        let drained = drain_scheme(scheme.path(), &saved).expect("drains");
+        let drained = drain_scheme(scheme.path(), &saved, Via::Auto).expect("drains");
         assert_eq!(
             drained,
             [
@@ -443,13 +879,15 @@ mod tests {
                     cpu: 0,
                     bytes: 56,
                     lost_before: 0,
-                    lost_during: 0
+                    lost_during: 0,
+                    mapped: false,
                 },
                 CpuDrained {
                     cpu: 2,
                     bytes: 32,
                     lost_before: 5,
-                    lost_during: 0
+                    lost_during: 0,
+                    mapped: false,
                 }
             ]
         );
@@ -473,7 +911,7 @@ mod tests {
         fs::write(scheme.path().join("clock"), line.to_string()).expect("write");
         let out = tempfile::tempdir().expect("temp dir");
         let saved = out.path().join("capture");
-        drain_scheme(scheme.path(), &saved).expect("drains");
+        drain_scheme(scheme.path(), &saved, Via::Auto).expect("drains");
         let capture = Capture::load(std::slice::from_ref(&saved)).expect("loads back");
         assert_eq!(capture.clock(), Some(line));
     }
@@ -483,12 +921,12 @@ mod tests {
         let scheme = stand_in_scheme();
         let out = tempfile::tempdir().expect("temp dir");
         let nested = out.path().join("a/b/capture");
-        drain_scheme(scheme.path(), &nested).expect("drains");
+        drain_scheme(scheme.path(), &nested, Via::Auto).expect("drains");
         assert!(nested.join("cpu0").is_file());
         assert!(!nested.join(INCOMPLETE).exists());
         // The parents existing now does not make the output reusable.
         assert!(matches!(
-            drain_scheme(scheme.path(), &nested),
+            drain_scheme(scheme.path(), &nested, Via::Auto),
             Err(DrainError::OutputExists { .. })
         ));
     }
@@ -505,7 +943,7 @@ mod tests {
         fs::create_dir(&empty).expect("mkdir");
         for dir in [&earlier, &empty] {
             assert!(matches!(
-                drain_scheme(scheme.path(), dir),
+                drain_scheme(scheme.path(), dir, Via::Auto),
                 Err(DrainError::OutputExists { .. })
             ));
         }
@@ -521,7 +959,7 @@ mod tests {
         let out = tempfile::tempdir().expect("temp dir");
         let saved = out.path().join("capture");
         fs::remove_file(scheme.path().join("cpu/2")).expect("remove");
-        let err = drain_scheme(scheme.path(), &saved).expect_err("CPU 2 is missing");
+        let err = drain_scheme(scheme.path(), &saved, Via::Auto).expect_err("CPU 2 is missing");
         let DrainError::Partial { out: at, source } = &err else {
             panic!("{err:?}");
         };
@@ -542,7 +980,7 @@ mod tests {
         let bad = out.path().join("bad-stats");
         fs::write(scheme.path().join("stats"), "cpu zero\n").expect("write");
         assert!(matches!(
-            drain_scheme(scheme.path(), &bad),
+            drain_scheme(scheme.path(), &bad, Via::Auto),
             Err(DrainError::Partial { source, .. }) if matches!(*source, DrainError::Stats { .. })
         ));
         assert!(bad.join(INCOMPLETE).is_file());
@@ -560,7 +998,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    drain_scheme(scheme.path(), &out),
+                    drain_scheme(scheme.path(), &out, Via::Auto),
                     Err(DrainError::Overlap { .. })
                 ),
                 "{}",
@@ -579,6 +1017,7 @@ mod tests {
             bytes: 8,
             lost_before,
             lost_during: 0,
+            mapped: false,
         };
         let mut drained = [cpu(0, 0), cpu(1, 4), cpu(2, 9)];
         let end = ["cpu 0 pending 0 lost 3", "cpu 1 pending 9 lost 4"]

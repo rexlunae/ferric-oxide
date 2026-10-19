@@ -326,15 +326,23 @@ it) works as follows:
   started. Draining until the ring is empty would never end while tracing is
   on, because the capture's own writes are traced and refill the ring as fast
   as it is read.
-  A read that fails with `EAGAIN`, because another reader is draining the same
-  CPU, is retried after a short wait.
+  A read or commit that fails with `EAGAIN`, because another reader is
+  draining the same CPU, is retried after a short wait.
+- It takes the records out of each ring through its read-only mapping
+  ([Mapping a ring](#mapping-a-ring), the `ferric-trace-map` crate): it copies
+  whole records out with `View`, writes them to `<dir>/cpu<n>`, and only then
+  writes `commit <end>`, so the kernel reuses no word before it is saved. A
+  ring that cannot be mapped (a kernel before the mapping existed) is read
+  instead. `--via map` insists on the mapping, `--via read` always reads, and
+  the default, `--via auto`, maps where it can. The command prints `(mapped)`
+  or `(read)` after each CPU's counts.
 - It reads `stats` again into `<dir>/stats.end`.
 - It copies the `clock` file into `<dir>/clock`, when the kernel has one.
 - Any other error, or a CPU that stays busy, stops the capture with a message
   naming the file.
 
-A read drains a ring, so each record lands in exactly one file and nothing
-drained is ever deleted:
+Either way each record taken from a ring lands in exactly one file, and
+nothing drained is ever deleted:
 
 - `<dir>` is created by the command, with any missing parents, and must not
   exist yet, so an earlier capture is never overwritten. It must not overlap the scheme path.
@@ -460,7 +468,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
-  `ferric-trace capture` and `ferric-trace text` on the result, and prints
+  `ferric-trace capture --via map` (through the mapping, which fails if a
+  ring does not map) and `ferric-trace text` on the result, and prints
   `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
   `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
   `trace-overhead` job's baseline image, which requires that skip.
@@ -557,7 +566,6 @@ as a notice on the run.
 
 - Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
   process lifecycle).
-- A reader that maps the rings in the `ferric-trace` tool (it still reads them).
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
 - A flight-recorder ring mode, so a crash dump keeps the last records even
   when nobody reads the rings.

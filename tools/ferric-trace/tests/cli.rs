@@ -148,7 +148,9 @@ fn captures_a_scheme_directory() {
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(
-        text.starts_with("cpu 0: 32 bytes, 0 records lost before the capture, 0 during it\n"),
+        text.starts_with(
+            "cpu 0: 32 bytes, 0 records lost before the capture, 0 during it (read)\n"
+        ),
         "{text}"
     );
     let printed = ferric_trace().arg("text").arg(&out).output().expect("runs");
@@ -204,4 +206,28 @@ fn captures_a_scheme_directory() {
         .output()
         .expect("runs");
     assert!(json.status.success(), "{json:?}");
+}
+
+#[test]
+fn capture_via_the_mapping_needs_a_ring_that_maps() {
+    let scheme = tempfile::tempdir().expect("temp dir");
+    fs::write(scheme.path().join("stats"), "cpu 0 pending 0 lost 0\n").expect("write");
+    fs::create_dir(scheme.path().join("cpu")).expect("mkdir");
+    fs::write(scheme.path().join("cpu/0"), b"").expect("write");
+    let saved = tempfile::tempdir().expect("temp dir");
+    let output = ferric_trace()
+        .args(["capture", "--via", "map", "--scheme"])
+        .arg(scheme.path())
+        .arg(saved.path().join("capture"))
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    // A stand-in file is not a ring: the mapping is refused, and the error says so.
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("cannot map the ring"), "{err}");
+    let refused = ferric_trace()
+        .args(["capture", "--via", "mmap", "x"])
+        .output()
+        .expect("runs");
+    assert!(!refused.status.success());
 }
