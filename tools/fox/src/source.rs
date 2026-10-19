@@ -158,6 +158,17 @@ impl SourceSpec {
             rev,
         })
     }
+
+    /// The source's identity: its normalized URL, with a local directory
+    /// turned into a `file://` URL of its canonical path.
+    pub(crate) fn git(&self) -> &GitUrl {
+        &self.git
+    }
+
+    /// The tag or revision given after `#`, if any.
+    pub(crate) fn rev(&self) -> Option<&str> {
+        self.rev.as_deref()
+    }
 }
 
 /// A fetched source at the commit chosen for it.
