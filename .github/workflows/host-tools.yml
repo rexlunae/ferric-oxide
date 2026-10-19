@@ -82,6 +82,15 @@ jobs:
       # crate builds without them too.
       - name: Clippy (ferric-vtd without alloc)
         run: cargo clippy --locked -p ferric-vtd --no-default-features -- -D warnings
+      # ferric-lvm: read-only LVM2 labels, metadata and LV mapping; no_std, so check it
+      # builds for a bare-metal target as the kernel and the bootloader would use it.
+      - name: ferric-lvm
+        run: |
+          cargo clippy --locked --all-targets -p ferric-lvm -- -D warnings
+          cargo test --locked -p ferric-lvm
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-lvm
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-lvm --target x86_64-unknown-none
 
   redoxfs:
     runs-on: ubuntu-24.04

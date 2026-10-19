@@ -1304,6 +1304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-lvm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
