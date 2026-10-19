@@ -1357,12 +1357,13 @@ fn clear_staging(dir: &Path) -> Result<(), EditError> {
     for entry in entries {
         let entry = entry.map_err(io_error(&staging))?;
         let path = entry.path();
-        let age = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .map_err(io_error(&path))?
-            .elapsed()
-            .unwrap_or_default();
+        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
+            Ok(modified) => modified,
+            // Its write finished (renamed it) or another open removed it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path)(source)),
+        };
+        let age = modified.elapsed().unwrap_or_default();
         if age < STALE_STAGING {
             continue;
         }
