@@ -171,6 +171,11 @@ pub fn drain_ipi_context_wakeups(token: &mut CleanLockToken) {
 pub enum SwitchResult {
     Switched,
     AllContextsIdle,
+    /// Ferric Oxide: nothing was switched to, but a runnable context was passed over because a
+    /// lock it needs (its own, or its address space's) was held elsewhere for a moment. The
+    /// caller should try again soon rather than halt: halting waits for the next timer
+    /// interrupt, as the wake-up that made the context runnable has already been spent.
+    Contended,
 }
 
 /// This function performs the context switch, using select_next_context to
@@ -183,6 +188,8 @@ pub enum SwitchResult {
 /// - `SwitchResult::Switched`: Indicates a successful switch to a new context.
 /// - `SwitchResult::AllContextsIdle`: Indicates all contexts are idle, and the CPU will switch
 ///   to an idle context.
+/// - `SwitchResult::Contended`: As `AllContextsIdle`, but a runnable context was passed over
+///   for a lock held elsewhere, so the idle loop should retry instead of halting.
 pub fn switch(token: &mut CleanLockToken) -> SwitchResult {
     let percpu = PercpuBlock::current();
     let schedule_time = crate::time::monotonic(token);
@@ -215,6 +222,9 @@ fn switch_inner(
             ScheduleResult::AllContextsIdle => {
                 percpu.stats.set_state(cpu_stats::CpuState::Idle);
 
+                if percpu.switch_internals.passed_over.get() {
+                    return SwitchResult::Contended;
+                }
                 return SwitchResult::AllContextsIdle;
             }
         };
@@ -290,6 +300,7 @@ fn schedule(
 
     //set PIT Interrupt counter to 0, giving each process same amount of PIT ticks
     percpu.switch_internals.pit_ticks.set(0);
+    percpu.switch_internals.passed_over.set(false);
 
     // Lock the previous (sched) context.
     let mut prev_context_guard = {
@@ -369,6 +380,7 @@ fn schedule(
 
                 let Some(mut guard) = (unsafe { context_lock.try_write_arc() }) else {
                     crate::context::wakelat::skip(1);
+                    percpu.switch_internals.passed_over.set(true);
                     if let Some(wake) = wake_opt {
                         run_queue.timers.insert((wake, context_ref));
                     } else {
@@ -699,6 +711,7 @@ fn select_next_context(
 
         let Some(mut guard) = (unsafe { context_lock.try_write_arc() }) else {
             crate::context::wakelat::skip(16);
+            percpu.switch_internals.passed_over.set(true);
             continue;
         };
 
@@ -768,6 +781,9 @@ fn select_next_context(
                 best_addr_space = Some(unsafe { AddrSpaceSwitchReadGuard::new(addr) });
             } else {
                 crate::context::wakelat::skip(256);
+                // Ferric Oxide: another thread of the process is mapping or unmapping (a scheme
+                // daemon does for each request it serves).
+                percpu.switch_internals.passed_over.set(true);
                 continue;
             }
         }
@@ -1461,6 +1477,9 @@ pub struct ContextSwitchPercpu {
     pub(crate) queue_len: AtomicUsize,
     pub(crate) total_weight: AtomicU64,
     pub(crate) steal_counter: AtomicUsize,
+    /// Ferric Oxide: the current `schedule` call passed a runnable context over because a lock
+    /// it needs was held elsewhere (see [`SwitchResult::Contended`]).
+    passed_over: Cell<bool>,
 }
 
 impl ContextSwitchPercpu {
@@ -1483,6 +1502,7 @@ impl ContextSwitchPercpu {
             queue_len: AtomicUsize::new(0),
             total_weight: AtomicU64::new(0),
             steal_counter: AtomicUsize::new(0),
+            passed_over: Cell::new(false),
 
             #[cfg(feature = "profiling")]
             current_dbg_id: core::sync::atomic::AtomicU32::new(!0),
