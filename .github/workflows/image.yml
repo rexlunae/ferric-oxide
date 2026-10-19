@@ -143,12 +143,20 @@ jobs:
           fi
 
       - name: Compress image
-        run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+        run: |
+          zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+          # The image's kernel with its symbol table, so a boot that times out can name the
+          # functions its CPUs are stuck in (boot-smoke.sh, KERNEL_ELF).
+          kernel="$(ls recipes/core/kernel/target/*/stage/usr/lib/boot/kernel 2>/dev/null | head -n 1)"
+          if [ -n "$kernel" ]; then zstd -q -T0 "$kernel" -o kernel.elf.zst; fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ferric-smoke-image
-          path: harddrive.img.zst
+          path: |
+            harddrive.img.zst
+            kernel.elf.zst
+          if-no-files-found: warn
           retention-days: 7
 
       # The same image with a kernel built with kernel.iommu = "enforce": only the kernel is
@@ -299,6 +307,10 @@ jobs:
           BOOT_IOMMU: ${{ matrix.iommu == 'enforce' && 'vtd' || startsWith(matrix.iommu, 'amdvi') && 'amdvi' || matrix.iommu }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
+          if [ -f kernel.elf.zst ]; then
+            zstd -q -d kernel.elf.zst -o kernel.elf
+            export KERNEL_ELF="$PWD/kernel.elf"
+          fi
           if [ "$BOOT_IOMMU" = amdvi ]; then
             # Ubuntu 24.04's QEMU 8.2 does not translate DMA through amd-iommu (dma-remap
             # came in QEMU 10), so the AMD-Vi boots run Ubuntu 26.04's QEMU in a container,

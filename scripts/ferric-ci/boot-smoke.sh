@@ -128,9 +128,10 @@ import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.settimeout(2)
-for cmd in (b"info cpus\n", b"info registers -a\n"):
+# An NMI first: the kernel prints where each CPU was and its frames on the serial log.
+for cmd, wait in ((b"nmi\n", 3), (b"info cpus\n", 1), (b"info registers -a\n", 1)):
     s.sendall(cmd)
-    time.sleep(1)
+    time.sleep(wait)
 out = b""
 try:
     while True:
@@ -147,6 +148,26 @@ PY
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
     status=124
+    # KERNEL_ELF (the image's kernel, with its symbol table) names the functions the NMI
+    # found the CPUs in.
+    if [ -n "${KERNEL_ELF:-}" ] && [ -f "$KERNEL_ELF" ]; then
+        grep -aoE 'NMI: interrupted at 0x[0-9a-f]+' "$log" | awk '{ print $4 }' \
+            | python3 -c '
+import bisect, subprocess, sys
+syms = []
+for line in subprocess.run(["nm", "-n", "-C", "--defined-only", sys.argv[1]],
+                           capture_output=True, text=True).stdout.splitlines():
+    parts = line.split(" ", 2)
+    if len(parts) == 3 and parts[1] in "tTwW":
+        syms.append((int(parts[0], 16), parts[2]))
+keys = [a for a, _ in syms]
+for addr in sys.stdin:
+    a = int(addr, 16)
+    i = bisect.bisect_right(keys, a) - 1
+    name = f"{syms[i][1]}+{a - syms[i][0]:#x}" if i >= 0 else "?"
+    print(f"boot-smoke-cpu: NMI at {a:#x} is in {name}")
+' "$KERNEL_ELF" >&2 || true
+    fi
 fi
 kill "$tail_pid" 2>/dev/null || true
 
