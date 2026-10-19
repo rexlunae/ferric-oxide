@@ -81,7 +81,9 @@ use fox_core::{Blake3Digest, FileKind, FileRecord, KeyId, Manifest};
 pub use build::{BuildInfo, BuildSbom, CrateDependency, CrateSource};
 /// The CycloneDX document type, as [`read_build_sbom`] returns it.
 pub use cyclonedx_bom::models::bom::Bom;
-pub use system::{CargoCrate, SystemPackage, SystemSbom, cargo_crates, read_build_sbom};
+pub use system::{
+    CargoCrate, SystemPackage, SystemSbom, cargo_crates, read_build_sbom, source_tree,
+};
 
 /// Why an SBOM could not be built or written.
 #[derive(Debug, thiserror::Error)]

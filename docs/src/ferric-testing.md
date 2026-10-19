@@ -90,12 +90,14 @@ variables the `packages.*` options and `cpu.x86_64_level` generate. Building and
 through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning, a registry VEX statement that sets the
-finding aside, `--no-vex` and a changed SBOM), and in unit tests
-for VEX matching by id and alias, other versions, and an `exploitable`
-statement winning over a clearing one; and
+finding aside, `--no-vex` skipping a broken VEX document, and a changed
+SBOM), and in unit tests for VEX matching by id and alias, other versions,
+an `exploitable` statement winning over a clearing one, and VEX applying
+only to packages whose archive or source tree the registry published; and
 against a RustSec-layout directory of advisories for crates inside build
 SBOMs, with withdrawn, build-only and non-semver cases. `fox-sbom`'s VEX
-reader is unit tested on purl and component references, versions and every
+reader is unit tested on purl and component references, versions (including
+an `affected` version the purl also names) and every
 rejected document, and `fox-registry`'s CLI test publishes, refuses and
 removes VEX documents and signs the result. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create

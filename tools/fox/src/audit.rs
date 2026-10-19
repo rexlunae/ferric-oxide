@@ -15,24 +15,32 @@
 //! Each registry's signed VEX documents (`vex/*.cdx.json`, see
 //! [`fox_index::vex`]) can set findings aside. A statement applies to a
 //! finding when it names the advisory's id or one of its aliases and
-//! covers the installed package and version, and only when the registry
-//! that published it lists that package, so one registry cannot vouch for
-//! another's packages. A `not_affected`, `false_positive` or `resolved`
-//! statement moves the finding to `suppressed`; an `exploitable` or
-//! `in_triage` one keeps it a finding and wins over a clearing statement
-//! from any registry. `--no-vex` ignores VEX.
+//! covers the installed package and version, and only when that registry
+//! published what is installed: the installed archive's BLAKE3 is among
+//! the registry's artifacts for that package and version, or the build
+//! SBOM's source tree (`fox:tree_blake3`) is the tree the registry records
+//! for that release. A registry can therefore vouch only for its own
+//! archives and its own source, not for a same-named package from another
+//! registry, a package adopted from `pkg` or a build of other source
+//! (whose findings stay findings). A `not_affected`,
+//! `false_positive` or `resolved` statement moves the finding to
+//! `suppressed`; an `exploitable` or `in_triage` one keeps it a finding
+//! and wins over a clearing statement from any registry. `--no-vex`
+//! ignores VEX without reading it, so a broken VEX document cannot stop
+//! an audit that does not use it.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use fox_core::PackageName;
 use fox_core::policy::Policy;
 use fox_core::registries::Registries;
+use fox_core::{Blake3Digest, PackageName};
 use fox_index::advisory::{Advisory, AdvisoryError, Ecosystem};
-use fox_index::verify::VerifiedRegistry;
-use fox_sbom::cargo_crates;
+use fox_index::verify::{VerifiedRegistry, VerifyError};
 use fox_sbom::vex::VexStatement;
+use fox_sbom::{cargo_crates, source_tree};
 use fox_store::Store;
 use semver::Version;
 use serde::Serialize;
@@ -130,12 +138,10 @@ struct AuditJson {
 
 /// `fox audit [--rustsec <dir>] [--no-vex]`.
 pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>, no_vex: bool) -> Result<ExitCode, CliError> {
-    let mut sources = load(&cli.root, rustsec)?;
-    if no_vex {
-        sources.vex.clear();
-    }
     let store = Store::open(&cli.root)?;
     let inventory = inventory::take(&store)?;
+    let vex_for = (!no_vex).then_some(inventory.as_slice());
+    let sources = load(&cli.root, rustsec, vex_for)?;
     let report = check(&inventory, &sources.advisories, &sources.vex);
     if cli.json {
         print_json(&report)?;
@@ -149,7 +155,13 @@ pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>, no_vex: bool) -> Result<Exi
     })
 }
 
-fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
+/// Loads every source's advisories and, when `vex_for` is given, the VEX
+/// statements that apply to those installed packages.
+fn load(
+    root: &Path,
+    rustsec: Option<&Path>,
+    vex_for: Option<&[Inventoried]>,
+) -> Result<Sources, CliError> {
     let registries = Registries::load(root)?;
     if registries.entries().is_empty() && rustsec.is_none() {
         return Err(AuditError::NoSources.into());
@@ -160,7 +172,9 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
     let mut vex = Vec::new();
     for entry in registries.entries() {
         let verified = registry::open(root, entry, &policy, now)?;
-        vex.extend(registry_vex(&verified, entry.name.as_ref())?);
+        if let Some(inventory) = vex_for {
+            vex.extend(registry_vex(&verified, entry.name.as_ref(), inventory)?);
+        }
         let advisories = verified
             .advisories()
             .map_err(|source| RegistryError::Verify {
@@ -189,19 +203,25 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
     })
 }
 
-/// The registry's VEX statements about packages it lists.
-fn registry_vex(verified: &VerifiedRegistry, source: &str) -> Result<Vec<SourcedVex>, CliError> {
+/// The registry's VEX statements about installed packages it published
+/// (see the module docs).
+fn registry_vex(
+    verified: &VerifiedRegistry,
+    source: &str,
+    inventory: &[Inventoried],
+) -> Result<Vec<SourcedVex>, CliError> {
     let verify_error = |error| RegistryError::Verify {
         name: source.to_owned(),
         source: Box::new(error),
     };
+    let published = published_by(inventory, |name, version| {
+        release_of(verified, name, version)
+    })
+    .map_err(verify_error)?;
     let mut statements = Vec::new();
     for document in verified.vex_documents().map_err(verify_error)? {
         for statement in document.statements {
-            let Ok(name) = PackageName::new(statement.package.as_str()) else {
-                continue;
-            };
-            if verified.package(&name).map_err(verify_error)?.is_some() {
+            if published.contains(statement.package.as_str()) {
                 statements.push(SourcedVex {
                     source: source.to_owned(),
                     path: document.path.clone(),
@@ -211,6 +231,67 @@ fn registry_vex(verified: &VerifiedRegistry, source: &str) -> Result<Vec<Sourced
         }
     }
     Ok(statements)
+}
+
+/// What a registry published for one release of a package.
+#[derive(Debug, Default)]
+struct Published {
+    /// The `fox-tree/1` hash of the release's source, if it lists the
+    /// release.
+    tree: Option<Blake3Digest>,
+    /// The BLAKE3 of each prebuilt archive it lists for the release.
+    archives: Vec<Blake3Digest>,
+}
+
+/// The release `name` `version` as `verified` records it.
+fn release_of(
+    verified: &VerifiedRegistry,
+    name: &PackageName,
+    version: &Version,
+) -> Result<Published, VerifyError> {
+    let tree = verified.package(name)?.and_then(|entry| {
+        entry
+            .releases
+            .into_iter()
+            .find(|release| release.version == *version)
+            .map(|release| release.tree_blake3)
+    });
+    let archives = verified
+        .artifacts(name, version)?
+        .map(|list| list.artifacts.into_iter().map(|a| a.pkgar_blake3).collect())
+        .unwrap_or_default();
+    Ok(Published { tree, archives })
+}
+
+/// The names of the installed packages a registry published, as `lookup`
+/// describes its releases: those installed from one of the release's
+/// archives, or built from the release's source tree as their build SBOM
+/// records it. A package with neither (adopted from `pkg`, or built from
+/// other source) or with a non-semver version is never included.
+fn published_by<E>(
+    inventory: &[Inventoried],
+    mut lookup: impl FnMut(&PackageName, &Version) -> Result<Published, E>,
+) -> Result<BTreeSet<String>, E> {
+    let mut published = BTreeSet::new();
+    for item in inventory {
+        let package = &item.package;
+        let Ok(version) = package.version.parse::<Version>() else {
+            continue;
+        };
+        let tree = item.build_sbom.as_ref().and_then(source_tree);
+        if package.archive_blake3.is_none() && tree.is_none() {
+            continue;
+        }
+        let release = lookup(&package.name, &version)?;
+        let from_archive = package
+            .archive_blake3
+            .is_some_and(|archive| release.archives.contains(&archive));
+        let from_source = tree.is_some() && tree == release.tree;
+        if from_archive || from_source {
+            published.insert(package.name.to_string());
+        }
+    }
+    Ok(published)
 }
 
 /// Every `crates/<crate>/*.md` advisory in a RustSec database checkout.
@@ -506,7 +587,7 @@ mod tests {
         }
         fs::write(db.path().join("crates/smallcrate/README.txt"), "skipped").unwrap();
         let root = tempfile::tempdir().unwrap();
-        let sources = load(root.path(), Some(db.path())).unwrap();
+        let sources = load(root.path(), Some(db.path()), Some(&[])).unwrap();
         let advisories = sources.advisories;
         // The withdrawn advisory is dropped.
         assert_eq!(advisories.len(), 2);
@@ -626,5 +707,52 @@ mod tests {
         assert_eq!(report.unchecked, ["app 2024.1"]);
         let report = check(&[inventoried("app", "1.0.0", &[])], &advisories, &[]);
         assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn vex_applies_only_to_packages_the_registry_published() {
+        // Every inventoried package below was built from tree b"tree";
+        // `without_sbom` drops that record.
+        let package = |name: &str, archive: Option<&[u8]>, with_sbom: bool| {
+            let mut item = inventoried(name, "1.0.0", &[]);
+            item.package.archive_blake3 = archive.map(Blake3Digest::of);
+            if !with_sbom {
+                item.build_sbom = None;
+            }
+            item
+        };
+        let inventory = [
+            package("archive", Some(b"ours.pkgar"), false),
+            package("source", None, true),
+            package("other-source", None, true),
+            package("other-archive", Some(b"theirs.pkgar"), false),
+            package("adopted", None, false),
+        ];
+        let mut asked = Vec::new();
+        let published = published_by(&inventory, |name, _version| {
+            asked.push(name.to_string());
+            let ours = Published {
+                tree: Some(Blake3Digest::of(b"tree")),
+                archives: vec![Blake3Digest::of(b"ours.pkgar")],
+            };
+            Ok::<_, std::convert::Infallible>(match name.as_str() {
+                "other-source" => Published {
+                    tree: Some(Blake3Digest::of(b"another tree")),
+                    ..ours
+                },
+                _ => ours,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            published.into_iter().collect::<Vec<_>>(),
+            ["archive", "source"]
+        );
+        // A package with neither an archive nor a source tree cannot be
+        // matched, so the registry is not asked about it.
+        assert_eq!(
+            asked,
+            ["archive", "source", "other-source", "other-archive"]
+        );
     }
 }

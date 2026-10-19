@@ -110,13 +110,32 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io_error)?;
     }
+    replace_file(path, bytes).map_err(io_error)
+}
+
+/// Replaces `path` with `bytes` atomically: writes and syncs `<path>.new`
+/// in the same directory, then renames it over `path`. A failure at any
+/// step leaves the old file whole and removes the temporary file. The
+/// directory must exist.
+///
+/// # Errors
+///
+/// The I/O error of the step that failed.
+pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
     temp.push(".new");
     let temp = PathBuf::from(temp);
-    let mut file = fs::File::create(&temp).map_err(io_error)?;
-    file.write_all(bytes).map_err(io_error)?;
-    file.sync_all().map_err(io_error)?;
-    fs::rename(&temp, path).map_err(io_error)
+    let result = fs::File::create(&temp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        // Best effort: the error that matters is the one returned.
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]

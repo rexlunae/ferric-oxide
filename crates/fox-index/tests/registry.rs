@@ -878,10 +878,26 @@ fn a_failed_batch_leaves_nothing_behind() {
         targets
     );
 
-    // So the same batch can be retried.
+    // A failed write of the targets metadata itself (here its temporary
+    // file cannot be created) leaves the old targets whole, not truncated.
     fs::remove_file(dir.path().join("packages/ba")).unwrap();
+    let blocker = dir.path().join("metadata/targets.json.new");
+    fs::create_dir(&blocker).unwrap();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("bat")]),
+        Err(EditError::Io { .. })
+    ));
+    assert!(!fd.exists());
+    assert_eq!(
+        fs::read(dir.path().join("metadata/targets.json")).unwrap(),
+        targets
+    );
+
+    // So the same batch can be retried.
+    fs::remove_dir(&blocker).unwrap();
     registry.admit_all(&[other("fd"), other("bat")]).unwrap();
     assert!(fd.exists());
+    assert!(!blocker.exists());
 }
 
 #[test]

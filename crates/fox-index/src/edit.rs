@@ -1285,11 +1285,14 @@ fn remove_new_file(path: &Path) {
     }
 }
 
+/// Writes `bytes` to `path` through a temporary file and a rename, so a
+/// failed write (a full disk, say) leaves the old file whole instead of
+/// truncated, and a batch that fails part-way can be retried.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
-    fs::write(path, bytes).map_err(|source| EditError::Io {
+    fox_core::config::replace_file(path, bytes).map_err(|source| EditError::Io {
         path: path.to_path_buf(),
         source,
     })

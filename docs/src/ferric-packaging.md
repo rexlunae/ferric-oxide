@@ -833,23 +833,27 @@ with `fox-registry vex`:
 Each `affects[].ref` names a fox package by the purl its SBOM uses,
 `pkg:generic/<name>` (every version) or `pkg:generic/<name>@<version>`,
 directly or through the `bom-ref` of a component in the document with that
-purl. `versions` entries list more exact versions; entries marked
-`affected` are left out, and `vers:` ranges are refused. A statement
+purl. `versions` entries list more exact versions; a version an entry marks
+`affected` is never covered, even when the purl names it, and `vers:`
+ranges are refused. A statement
 matches a finding when its `id` or a `references[].id` is the advisory's id
 or one of its aliases, and it covers the installed package and version.
 `fox-registry vex` rejects a document that `fox` could not use, and the
 targets role signs it like every other top-level file.
 
-`fox audit` applies a registry's statements only to packages that registry
-lists, so one registry cannot clear another's packages. A finding covered
+`fox audit` applies a registry's statements only to installed packages
+that registry published: the installed archive is one of the artifacts it
+lists for that release, or the build SBOM's source tree is the tree it
+records for that release. One registry therefore cannot clear a same-named
+package from another registry, and packages adopted from `pkg` (which keep
+no archive hash or build SBOM) get no VEX. A finding covered
 by a `not_affected`, `false_positive`, `resolved` or
 `resolved_with_pedigree` statement moves from `findings` to `suppressed`
 (with the registry, document, state, justification and detail) and no
 longer fails the audit. An `exploitable` or `in_triage` statement keeps the
 finding and is shown with it, and it wins over a clearing statement from any
-registry. `fox audit --no-vex` ignores VEX. The installed-package database
-does not record a package's registry, so a registry's statements apply to
-any installed package with a name it lists.
+registry. `fox audit --no-vex` ignores VEX without reading it, so a
+broken VEX document does not stop that audit.
 
 ### System and image SBOMs
 

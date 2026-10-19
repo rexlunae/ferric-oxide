@@ -83,6 +83,24 @@ pub fn cargo_crates(bom: &Bom) -> Vec<CargoCrate> {
         .collect()
 }
 
+/// The `fox-tree/1` hash of the source a build SBOM's package was built
+/// from: its `fox:tree_blake3` property. `None` when the SBOM does not
+/// record one or the value is not a digest.
+pub fn source_tree(bom: &Bom) -> Option<Blake3Digest> {
+    let properties = bom
+        .metadata
+        .as_ref()?
+        .component
+        .as_ref()?
+        .properties
+        .as_ref()?;
+    properties
+        .0
+        .iter()
+        .find(|property| property.name == "fox:tree_blake3")
+        .and_then(|property| property.value.to_string().parse().ok())
+}
+
 /// The index URLs Cargo records for crates.io (git and sparse).
 const CRATES_IO_INDEXES: [&str; 2] = [
     "https://github.com/rust-lang/crates.io-index",
@@ -513,6 +531,14 @@ mod tests {
             .write_cyclonedx_json(&mut again)
             .unwrap();
         assert_eq!(out, again);
+    }
+
+    #[test]
+    fn source_tree_reads_the_build_sbom_tree_hash() {
+        let manifest = Manifest::new(PackageName::new("hello").unwrap(), "1.0.0");
+        let bom = build_sbom(&manifest, &[]);
+        assert_eq!(source_tree(&bom), Some(Blake3Digest::of(b"tree")));
+        assert_eq!(source_tree(&Bom::default()), None);
     }
 
     #[test]
