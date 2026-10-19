@@ -3,7 +3,7 @@ name = "ferric-trace-cli"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Reads Ferric Oxide kernel trace captures: a text view and Perfetto/Chrome trace JSON export"
+description = "Reads Ferric Oxide kernel trace captures: a text view, Perfetto/Chrome trace JSON and OpenTelemetry (OTLP/JSON) export"
 publish = false
 
 [[bin]]

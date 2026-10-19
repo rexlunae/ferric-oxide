@@ -16,6 +16,8 @@
 //!   UI (<https://ui.perfetto.dev>) and `chrome://tracing` open. The format is described in
 //!   Google's "Trace Event Format" document; Perfetto's JSON importer accepts the subset used
 //!   here.
+//! - [`spans`] pairs a capture's records into system call and scheme request spans on the
+//!   contexts that made them, and [`otlp`] exports those as OpenTelemetry (OTLP/JSON) traces.
 //!
 //! # Examples
 //!
@@ -42,5 +44,7 @@
 pub mod capture;
 pub mod crash;
 pub mod drain;
+pub mod otlp;
 pub mod perfetto;
+pub mod spans;
 pub mod text;

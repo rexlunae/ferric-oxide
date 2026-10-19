@@ -379,11 +379,7 @@ impl Converter {
     fn request(&mut self, entry: &Entry) {
         let track = self.track(entry);
         let (scheme, tag) = (entry.arg(0), entry.arg(1));
-        let opcode = u8::try_from(entry.arg(2))
-            .ok()
-            .and_then(Opcode::try_from_raw)
-            .map_or_else(|| format!("op {}", entry.arg(2)), |op| format!("{op:?}"));
-        let name = format!("scheme {scheme} {opcode}");
+        let name = format!("scheme {scheme} {}", opcode_name(entry.arg(2)));
         let id = self.next_request;
         self.next_request += 1;
         let i = self.push(entry, "b", name.clone(), track);
@@ -469,6 +465,14 @@ impl Converter {
         names.extend(self.events);
         names
     }
+}
+
+/// A scheme opcode's name (`Write`), or `op <n>` for a number `schemev2::Opcode` does not know.
+pub(crate) fn opcode_name(raw: u64) -> String {
+    u8::try_from(raw)
+        .ok()
+        .and_then(Opcode::try_from_raw)
+        .map_or_else(|| format!("op {raw}"), |op| format!("{op:?}"))
 }
 
 /// An event without arguments at `ts`.

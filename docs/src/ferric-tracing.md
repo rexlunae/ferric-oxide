@@ -396,6 +396,42 @@ the TSC. For TSC timestamps, and for captures without a `clock` file,
 more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
+### OpenTelemetry
+
+`otlp` writes the capture as OpenTelemetry traces, in the OTLP/JSON encoding
+of an `ExportTraceServiceRequest` (OTLP 1.x, "JSON Protobuf Encoding"):
+
+```sh
+cargo run -p ferric-trace-cli -- otlp --start-unix-ns 1760000000000000000 -o otlp.json capture/
+curl -H 'Content-Type: application/json' --data-binary @otlp.json http://collector:4318/v1/traces
+```
+
+An OTLP/HTTP collector, or a backend such as Jaeger that takes OTLP, accepts
+the file on `/v1/traces`; the OpenTelemetry Collector's `otlpjsonfile`
+receiver also reads it from disk.
+
+- **Spans.** Each system call is a span, and each scheme request a client span.
+  Records are paired and given to contexts by the same rules as `perfetto`.
+  A request made during a system call is the system call's child and shares
+  its trace; every span without a parent starts a trace of its own.
+- **Resources.** The spans of each process are under a resource whose
+  `service.name` is `pid <n>` (with `process.pid` and `service.namespace`
+  `ferric-oxide`). `thread.id` is the context and `cpu.logical_number` the CPU.
+- **Arguments** of the opening and closing records are attributes named
+  `<event>.<argument>`, as hexadecimal strings. A cancel, and any other record
+  made while a span was open on its context, is a span event; a record outside
+  every span is a span of zero length.
+- **Status.** A system call or request whose result is an error number has
+  status `ERROR` with the error's text. A span still open at the end of the
+  capture ends at its last record and has `ferric.unfinished` set.
+
+A capture does not record the wall time, so `--start-unix-ns` gives the Unix
+time of its first record in nanoseconds; the default, 0, makes every time the
+time since the first record. Later times use the capture's clock and
+`--tsc-mhz` as `perfetto` does. Trace ids start with a hash of the capture and
+the start time, so two captures sent to one backend keep separate traces. The
+mapping is described in `tools/ferric-trace/src/otlp.rs`.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
@@ -558,7 +594,7 @@ as a notice on the run.
 - Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
   process lifecycle).
 - A reader that maps the rings in the `ferric-trace` tool (it still reads them).
-- Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
+- Live viewing on the target and Perfetto's protobuf format.
 - A flight-recorder ring mode, so a crash dump keeps the last records even
   when nobody reads the rings.
 - Architectures other than x86_64.
