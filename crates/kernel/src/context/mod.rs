@@ -166,6 +166,16 @@ pub fn unblock_context(context_lock: &Arc<ContextLock>, token: &mut LockToken<'_
     true
 }
 
+/// Ferric Oxide: cancels `context_lock` for good. Marks it [`Context::cancelled`] and wakes it
+/// from the wait it is in, as a signal would; any interruptible wait it starts afterwards
+/// ends at once. Marking and waking under the context's lock, as the waits check the mark
+/// and block under it, means no wait can miss it.
+#[cfg(feature = "rings")]
+pub fn cancel_context(context_lock: &Arc<ContextLock>, token: &mut LockToken<'_, L3>) {
+    context_lock.write(token.token()).cancelled = true;
+    unblock_context(context_lock, token);
+}
+
 pub fn wakeup_context(
     context_lock: &Arc<ContextLock>,
     cpu_id: Option<LogicalCpuId>,
