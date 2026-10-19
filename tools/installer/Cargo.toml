@@ -76,3 +76,6 @@ fuse = ["redoxfs/fuse"]
 [patch.crates-io]
 # https://github.com/briansmith/ring/issues/1999
 ring = { git = "https://github.com/rexlunae/ring.git", branch = "redox-0.17.8" } # Ferric mirror of redox-os/ring
+
+[dev-dependencies]
+tempfile.workspace = true

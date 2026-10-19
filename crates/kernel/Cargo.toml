@@ -23,7 +23,7 @@ ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
 ferric-nospec = { path = "../nospec" }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
-ferric-ring = { path = "../ring", optional = true }
+ferric-ring = { path = "../ring", optional = true, features = ["alloc"] }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }

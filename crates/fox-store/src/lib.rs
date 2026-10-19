@@ -84,6 +84,8 @@ use std::path::{Path, PathBuf};
 
 use fox_core::archive::{Archive, ArchiveError, MetadataSource};
 use fox_core::keys::TRUSTED_KEYS_DIR;
+use fox_core::policy::POLICY_FILE;
+use fox_core::registries::REGISTRIES_FILE;
 use fox_core::trust::TRUST_FILE;
 use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
@@ -99,9 +101,16 @@ use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
 pub const STATE_DIR: &str = "var/lib/fox";
 
 /// Paths no package may write into, replace or redirect: the store's own
-/// state (which also holds the local builder key), the trusted signer keys
-/// and the trust store file.
-pub const RESERVED_DIRS: [&str; 3] = [STATE_DIR, TRUSTED_KEYS_DIR, TRUST_FILE];
+/// state (which also holds the local builder key and the registry
+/// checkouts), the trusted signer keys, the trust store, the install policy
+/// and the registry list.
+pub const RESERVED_DIRS: [&str; 5] = [
+    STATE_DIR,
+    TRUSTED_KEYS_DIR,
+    TRUST_FILE,
+    POLICY_FILE,
+    REGISTRIES_FILE,
+];
 
 /// Mode bits the store sets and checks on installed files (permissions,
 /// setuid, setgid and sticky), the bits pkgar signs.
@@ -854,6 +863,9 @@ mod tests {
             "var/lib/fox/heads/x.pkgar_head",
             "etc/fox/keys/attacker.toml",
             "etc/fox/trust.toml",
+            "etc/fox/policy.toml",
+            "etc/fox/registries.toml",
+            "var/lib/fox/registries/ferric/state.json",
             "var/lib/fox/local-builder.pub.toml",
             "var",
             "var/lib",
