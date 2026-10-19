@@ -23,6 +23,7 @@ ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
 ferric-nospec = { path = "../nospec" }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
+ferric-ring = { path = "../ring", optional = true }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
@@ -109,6 +110,8 @@ prot_none = []
 aslr = ["dep:ferric-hwrand"]
 # Ferric Oxide: the kernel.regbuf scheme, registered buffers and zero-copy grants.
 regbuf = ["dep:ferric-regbuf"]
+# Ferric Oxide: the kernel.ring scheme, submission/completion rings brokered to any scheme.
+rings = ["dep:ferric-ring"]
 # Ferric Oxide: tracepoints, per-CPU trace rings and the kernel.trace scheme (x86_64).
 trace = ["dep:ferric-trace"]
 # Ferric Oxide: count and deliver irq: interrupts per (CPU, vector), and the root-only

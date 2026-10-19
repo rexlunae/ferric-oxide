@@ -1,4 +1,4 @@
-# Registered buffers and IOMMUs
+# Registered buffers, IOMMUs and rings
 
 The implemented I/O extensions expose registered memory and DMA domains
 through kernel schemes. Their ABI definitions live in shared crates so the
@@ -288,3 +288,61 @@ These are available primitives and tested integration paths. Apart from the
 drivers use an end-to-end registered-buffer protocol. The dedicated image tests exercise CPU
 grants, forwarding, sub-grants, device DMA and revocation; see
 [Validation and debugging](ferric-testing.md).
+
+## Submission/completion rings
+
+`kernel.rings = true` (Kernel menu, default `false`) enables `/scheme/kernel.ring`.
+`crates/ring` (ferric-ring) is the one definition of the ring format: the
+memory layout, the 64-byte SQE and 32-byte CQE, opcodes (the kernel's scheme
+request numbers, so `Read` is 5 in both), flags, notify modes, chain rules and
+the scheme's calls. It is `no_std` with no `unsafe` code, and the kernel,
+bootstrap and clients all use it. The kernel side is
+`crates/kernel/src/scheme/ring.rs`.
+
+1. Open `ring` beneath the scheme root. `Request::Setup` allocates the ring:
+   one header page, then the SQ and CQ slots, each on pages of its own. Entry
+   counts are powers of two, at most 4096 SQ and 8192 CQ entries, with a CQ at
+   least as large as the SQ (twice the SQ by default). Map the whole
+   `Layout::map_len()` with `MAP_SHARED`.
+2. Write SQEs with a `Producer<Sqe>` and publish them, then call
+   `Request::Enter`. The kernel takes complete chains from the SQ and runs
+   each SQE in the caller's context as the system call it stands for, on the
+   caller's descriptor and buffer: `Read`/`Write` at an offset as
+   `SYS_READ2`/`SYS_WRITE2`, at `CURRENT_POSITION` as `read`/`write`, and
+   `Fsync` as `fsync`. A user scheme receives an ordinary scheme request, so
+   every scheme works with rings unchanged.
+3. Read one CQE per SQE with a `Consumer<Cqe>`: the SQE's `user_data` and the
+   result, or minus the errno. `fevent` on the ring descriptor reports
+   `EVENT_READ` while completions are waiting, and `Enter` triggers it.
+
+Linked SQEs (`SqeFlags::LINK`) form a chain that runs in order, possibly
+across schemes. A failure, or a `Read`/`Write` that moves fewer bytes than
+asked, cancels the rest of the chain with `ECANCELED`. A chain is taken only
+once its last SQE is published and only when the CQ has room for all of its
+completions, so completions are never dropped: `Enter` returns `EBUSY` when
+not even the first chain fits. Chains of more than 32 SQEs, or ones that fill
+the SQ without ending, complete with `EINVAL`.
+
+`Enter` looks up every descriptor a chain names when it takes the chain, before
+any SQE runs, and holds those open file descriptions until the chain is done.
+If another thread closes a descriptor, or replaces it with `dup2`, while the
+chain waits, the chain still acts on the files it named when it was taken, as
+one system call would. Whichever holder lets go of a description last (the
+descriptor table, the ring, or a file system call still running on it, through
+`syscall::fs::release_description`) closes it, so a description closed while a
+ring or a call holds it is still closed exactly once.
+
+The ring memory is shared with the application, which may write any of it at
+any time. The kernel reads it atomically through its own mapping, keeps its
+own indices, copies each SQE once before checking it, and fails `Enter` with
+`EINVAL` when the application's SQ tail is out of range. One `Enter` runs on
+a ring at a time; a concurrent one gets `EBUSY`.
+
+Fixed files, registered-buffer grants as SQE buffers, waiting for
+completions in `Enter`, polled (`SqPoll`) and `UMWAIT` notification, and
+rings served natively by user schemes come later (see the design in
+`io/rings-design.md` in the project files). Their flags and modes already
+have encodings and return `EOPNOTSUPP` today. `ferric-ring-test` covers the
+calls, chains across RedoxFS, the pipe scheme and the null scheme, the
+refusals, back-pressure and a corrupt tail, and prints ring versus system
+call timings.
