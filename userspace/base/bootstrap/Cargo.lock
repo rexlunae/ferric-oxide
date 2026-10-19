@@ -21,6 +21,7 @@ dependencies = [
  "arrayvec",
  "ferric-iommu",
  "ferric-regbuf",
+ "ferric-ring",
  "ferric-trace",
  "hashbrown",
  "libredox",
@@ -44,6 +45,13 @@ name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-ring"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "ferric-trace"
 version = "0.1.0"
 
@@ -56,7 +64,6 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "generic-rt"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#9f5a66f0874a48b37609bcf6371214e2fbcf0f15"
 
 [[package]]
 name = "goblin"
@@ -166,7 +173,6 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 [[package]]
 name = "redox-rt"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#9f5a66f0874a48b37609bcf6371214e2fbcf0f15"
 dependencies = [
  "bitflags",
  "generic-rt",
@@ -191,7 +197,6 @@ dependencies = [
 [[package]]
 name = "redox_syscall"
 version = "0.9.4"
-source = "git+https://gitlab.redox-os.org/redox-os/kernel/#7a7353f22bdfbc0156b1b63102244b776d05c511"
 dependencies = [
  "bitflags",
 ]

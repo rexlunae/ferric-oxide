@@ -136,7 +136,10 @@ impl FileDescriptor {
             }
         }
 
-        if let Ok(file) = Arc::try_unwrap(self.description).map(RwLock::into_inner) {
+        // Ferric Oxide: `Arc::into_inner`, not `try_unwrap`, so that when another holder
+        // (an operation still running, or a ring) lets go at the same time, exactly one of the
+        // two closes the description (`syscall::fs::release_description`).
+        if let Some(file) = Arc::into_inner(self.description).map(RwLock::into_inner) {
             file.try_close(token)?;
         }
 
