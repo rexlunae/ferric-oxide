@@ -629,8 +629,10 @@ image 0x0 path /usr/bin/ferric-proc-test
 - `context`: the context's debug id (the id `sched.switch` records carry, so
   a trace and this file name the same context), process id, effective user
   and group, state (`runnable`, `sleeping`, `blocked`, `dead`), the CPU it is
-  on and whether it is running there, and its CPU time in nanoseconds. The
-  name comes last and runs to the end of the line; control characters in it
+  on and whether it is running there, and its CPU time in nanoseconds
+  (`active_ns` running, `sched_ns` scheduled). A running context's times
+  include its current timeslice, so two reads in a row show them growing.
+  Each CPU's idle context (`[kmain]`) is never charged. The name comes last and runs to the end of the line; control characters in it
   are printed as `?`, so a name cannot forge a line.
 - `memory`: bytes of grants the address space owns (`private`) and shares
   with other address spaces or schemes (`shared`), and the kernel memory the
@@ -639,11 +641,13 @@ image 0x0 path /usr/bin/ferric-proc-test
 - `fd`: each open descriptor with the scheme it is open on and the scheme's
   handle number. Kernel schemes are named. A user-space scheme has no name in
   the kernel, so it shows as `user:<scheme id>`; descriptors open on the same
-  user scheme share the id.
+  user scheme share the id. The scheme manager's descriptors show as `mgr`,
+  except the scheme creation capability, which is `cap`.
 - `grant`: each mapping of the address space, with its base address, size in
   pages, where the memory comes from (`allocated`, `allocated_shared`,
-  `phys`, `external`, `fmap`) and its protection. Threads of one process
-  share an address space and list the same grants.
+  `phys`, `external`, `fmap`) and its protection, as user space may use it:
+  a `PROT_NONE` guard page (`kernel.prot_none`) is `---`, not readable.
+  Threads of one process share an address space and list the same grants.
 - `image`: each ELF image its loaders recorded (see "Sampling profiles"): the
   load bias (0 for an executable that is not position-independent) and the
   path, which runs to the end of the line.
@@ -656,8 +660,10 @@ shown partly before and partly after the change.
 
 `ferric_procinfo::processes` groups the file into one record per context.
 `ferric-proc-test` (in the smoke image, with `sys_proc` on in CI) checks its
-own block (name, CPU time, a file it holds open, an 8 MiB allocation) and
-that user 1000 is refused the file.
+own block (name, CPU time, a file it holds open, an 8 MiB allocation), that
+its CPU time grows between two reads, that a thread stack's guard page shows
+as `---`, that no `mgr` descriptor names the capability, and that user 1000
+is refused the file.
 
 ## Not implemented yet
 
