@@ -1,0 +1,474 @@
+//! A benchmark job, described with fio's command-line options.
+//!
+//! The options, their names and their value syntax are fio's (fio's HOWTO, "Job file
+//! parameters"), so a job reads the same here and on Linux:
+//!
+//! | Option | Values | Default |
+//! | --- | --- | --- |
+//! | `--rw` (`--readwrite`) | `read` (sequential), `randread` | `read` |
+//! | `--bs` (`--blocksize`) | a size, a multiple of 512 | `4k` |
+//! | `--iodepth` | 1 to [`MAX_SUBMITTERS`] | 1 |
+//! | `--numjobs` | 1 to [`MAX_SUBMITTERS`] | 1 |
+//! | `--io_size` (`--size`) | a size, a whole number of blocks | `4m` |
+//! | `--randseed` | a number | [`DEFAULT_SEED`] |
+//! | `--ioengine` | `psync`, `sync` or `pvsync` | `psync` |
+//! | `--direct` | `0` or `1` | `1` |
+//! | `--name` | anything (ignored; the runner names jobs itself) | |
+//!
+//! Sizes take fio's suffixes with its default `kb_base=1024`: `4k` is 4096 bytes, `1m` is
+//! 1 MiB, and `k`, `m`, `g`, `t` may be followed by `b` or `ib`.
+//!
+//! There is no asynchronous engine: the runner keeps `iodepth × numjobs` reads in flight by
+//! running that many threads, each with one synchronous positioned read at a time
+//! ([`Job::submitters`]). On Linux that is `--ioengine=psync --numjobs=N`; the queue depth
+//! the disk sees is the same as `--ioengine=io_uring --iodepth=N` ([`FioEngine`]). Writes are
+//! refused: the runner reads the disk the system runs from.
+
+use core::fmt;
+
+/// The most reads a job keeps in flight, and the largest `--iodepth` or `--numjobs`.
+pub const MAX_SUBMITTERS: u32 = 256;
+/// The seed of the random block order when `--randseed` is not given.
+pub const DEFAULT_SEED: u64 = 0x8000_0000_f10e_5eed;
+/// The sector size every block size and offset is a multiple of.
+pub const SECTOR: u32 = 512;
+
+const DEFAULT_IO_SIZE: u64 = 4 << 20;
+
+/// The access pattern (`--rw`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Rw {
+    /// Sequential reads (`read`).
+    Read,
+    /// Random reads, every block once (`randread`).
+    RandRead,
+}
+
+impl Rw {
+    /// fio's name for it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::RandRead => "randread",
+        }
+    }
+}
+
+/// A job: what to read, in which order, and how many reads to keep in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Job {
+    /// The access pattern.
+    pub rw: Rw,
+    /// Bytes per read, a multiple of [`SECTOR`].
+    pub bs: u32,
+    /// Reads in flight per job.
+    pub iodepth: u32,
+    /// Jobs running side by side.
+    pub numjobs: u32,
+    /// Bytes read in all, a whole number of blocks.
+    pub io_size: u64,
+    /// The seed of the random block order.
+    pub seed: u64,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            rw: Rw::Read,
+            bs: 4096,
+            iodepth: 1,
+            numjobs: 1,
+            io_size: DEFAULT_IO_SIZE,
+            seed: DEFAULT_SEED,
+        }
+    }
+}
+
+/// Why a job's options were refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JobError<'a> {
+    /// An option fio does not have, or this runner does not take.
+    Unknown(&'a str),
+    /// An option without `=value`.
+    NoValue(&'a str),
+    /// A value the option does not take.
+    Value {
+        /// The option.
+        option: &'a str,
+        /// The value given.
+        value: &'a str,
+    },
+    /// A value fio takes but this runner does not run (a write, an asynchronous engine).
+    Unsupported {
+        /// The option.
+        option: &'a str,
+        /// The value given.
+        value: &'a str,
+    },
+    /// The options do not fit together: `io_size` is not a whole number of blocks, or more
+    /// than [`MAX_SUBMITTERS`] reads would be in flight.
+    Shape,
+}
+
+impl fmt::Display for JobError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(option) => write!(f, "unknown option {option}"),
+            Self::NoValue(option) => write!(f, "option {option} needs a value"),
+            Self::Value { option, value } => write!(f, "{option}: invalid value {value:?}"),
+            Self::Unsupported { option, value } => write!(f, "{option}={value} is not supported"),
+            Self::Shape => f.write_str(
+                "io_size must be a whole number of blocks, with at most 256 reads in flight",
+            ),
+        }
+    }
+}
+
+impl core::error::Error for JobError<'_> {}
+
+impl Job {
+    /// Parses a job from fio-style options, `--option=value` (the leading dashes may be left
+    /// out). Options not given keep their defaults (the table in the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Unknown`], [`JobError::NoValue`], [`JobError::Value`] and
+    /// [`JobError::Unsupported`] name the option at fault; [`JobError::Shape`] is for
+    /// options that do not fit together.
+    pub fn parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Self, JobError<'a>> {
+        let mut job = Self::default();
+        for arg in args {
+            let arg = arg.trim_start_matches('-');
+            let (option, value) = arg.split_once('=').ok_or(JobError::NoValue(arg))?;
+            job.set(option, value)?;
+        }
+        job.check()?;
+        Ok(job)
+    }
+
+    fn set<'a>(&mut self, option: &'a str, value: &'a str) -> Result<(), JobError<'a>> {
+        let bad = JobError::Value { option, value };
+        match option {
+            "rw" | "readwrite" => self.rw = parse_rw(option, value)?,
+            "bs" | "blocksize" => self.bs = block_size(value).ok_or(bad)?,
+            "iodepth" => self.iodepth = count(value).ok_or(bad)?,
+            "numjobs" => self.numjobs = count(value).ok_or(bad)?,
+            "io_size" | "size" => self.io_size = parse_size(value).filter(|&n| n > 0).ok_or(bad)?,
+            "randseed" => self.seed = value.parse().map_err(|_| bad)?,
+            "ioengine" => check_engine(option, value)?,
+            "direct" if matches!(value, "0" | "1") => {}
+            "direct" => return Err(bad),
+            "name" => {}
+            _ => return Err(JobError::Unknown(option)),
+        }
+        Ok(())
+    }
+
+    fn check<'a>(&self) -> Result<(), JobError<'a>> {
+        let whole = self.io_size.is_multiple_of(u64::from(self.bs));
+        if whole && self.submitters() <= MAX_SUBMITTERS {
+            Ok(())
+        } else {
+            Err(JobError::Shape)
+        }
+    }
+
+    /// Reads in flight: `iodepth × numjobs`, each a thread with one synchronous read at a
+    /// time.
+    pub const fn submitters(&self) -> u32 {
+        self.iodepth.saturating_mul(self.numjobs)
+    }
+
+    /// Reads in the job: `io_size / bs`.
+    pub const fn ios(&self) -> u64 {
+        self.io_size / self.bs as u64
+    }
+
+    /// A short name for the job, as in `randread-4k-qd32`: the pattern, the block size and
+    /// the reads in flight.
+    pub const fn label(&self) -> Label {
+        Label(*self)
+    }
+
+    /// The fio command line that runs this job on Linux against `filename` with `engine`:
+    /// the same blocks (the first `io_size` bytes, each read once), block size and reads in
+    /// flight, with `--direct=1` so Linux's page cache is bypassed as the disk scheme has none.
+    pub const fn fio_command<'a>(&'a self, filename: &'a str, engine: FioEngine) -> FioCommand<'a> {
+        FioCommand {
+            job: self,
+            filename,
+            engine,
+        }
+    }
+}
+
+fn parse_rw<'a>(option: &'a str, value: &'a str) -> Result<Rw, JobError<'a>> {
+    match value {
+        "read" => Ok(Rw::Read),
+        "randread" => Ok(Rw::RandRead),
+        "write" | "randwrite" | "rw" | "readwrite" | "randrw" | "trim" | "randtrim"
+        | "trimwrite" => Err(JobError::Unsupported { option, value }),
+        _ => Err(JobError::Value { option, value }),
+    }
+}
+
+fn check_engine<'a>(option: &'a str, value: &'a str) -> Result<(), JobError<'a>> {
+    match value {
+        "psync" | "sync" | "pvsync" => Ok(()),
+        _ => Err(JobError::Unsupported { option, value }),
+    }
+}
+
+fn block_size(value: &str) -> Option<u32> {
+    let bytes = u32::try_from(parse_size(value)?).ok()?;
+    (bytes > 0 && bytes.is_multiple_of(SECTOR)).then_some(bytes)
+}
+
+fn count(value: &str) -> Option<u32> {
+    value
+        .parse()
+        .ok()
+        .filter(|n| (1..=MAX_SUBMITTERS).contains(n))
+}
+
+/// Parses a size with fio's suffixes and its default `kb_base=1024`: `512`, `4k`, `1M`,
+/// `2gib`. `None` for anything else, or a size past `u64::MAX`.
+pub fn parse_size(value: &str) -> Option<u64> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, suffix) = value.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let Some((&unit, rest)) = suffix.as_bytes().split_first() else {
+        return Some(number);
+    };
+    let shift = match unit.to_ascii_lowercase() {
+        b'k' => 10,
+        b'm' => 20,
+        b'g' => 30,
+        b't' => 40,
+        _ => return None,
+    };
+    let tail_ok =
+        rest.is_empty() || rest.eq_ignore_ascii_case(b"b") || rest.eq_ignore_ascii_case(b"ib");
+    if tail_ok {
+        number.checked_mul(1 << shift)
+    } else {
+        None
+    }
+}
+
+/// [`Job::label`]: `randread-4k-qd32`.
+#[derive(Clone, Copy, Debug)]
+pub struct Label(Job);
+
+impl fmt::Display for Label {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let job = &self.0;
+        write!(
+            f,
+            "{}-{}-qd{}",
+            job.rw.as_str(),
+            Size(u64::from(job.bs)),
+            job.submitters()
+        )
+    }
+}
+
+/// A size in fio's shortest exact form: `4k`, `128k`, `1m`, or bytes.
+struct Size(u64);
+
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.0;
+        for (shift, unit) in [(30, "g"), (20, "m"), (10, "k")] {
+            if n >= 1 << shift && n.is_multiple_of(1 << shift) {
+                return write!(f, "{}{unit}", n >> shift);
+            }
+        }
+        write!(f, "{n}")
+    }
+}
+
+/// How the Linux fio run of a job keeps its reads in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FioEngine {
+    /// `--ioengine=psync --numjobs=N`: N threads with one synchronous read each, as the
+    /// runner does. The like-for-like comparison.
+    Psync,
+    /// `--ioengine=io_uring --iodepth=N`: one thread with N reads in flight, Linux's fastest
+    /// path and the roadmap's exit baseline.
+    IoUring,
+}
+
+/// [`Job::fio_command`]: the fio command line for a job.
+#[derive(Clone, Copy, Debug)]
+pub struct FioCommand<'a> {
+    job: &'a Job,
+    filename: &'a str,
+    engine: FioEngine,
+}
+
+impl fmt::Display for FioCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let job = self.job;
+        let n = job.submitters();
+        write!(
+            f,
+            "fio --name={} --filename={} --rw={} --bs={} --direct=1 --randseed={} ",
+            job.label(),
+            self.filename,
+            job.rw.as_str(),
+            job.bs,
+            job.seed,
+        )?;
+        match self.engine {
+            // Each fio job has its own region and random map, so the region is cut into one
+            // slice per job: together they read every block once, as the runner's shared
+            // order does. fio rounds a slice that is not whole blocks down.
+            FioEngine::Psync => {
+                let slice = job.io_size / u64::from(n);
+                write!(
+                    f,
+                    "--ioengine=psync --numjobs={n} --size={slice} --offset_increment={slice} \
+                     --group_reporting"
+                )
+            }
+            FioEngine::IoUring => write!(
+                f,
+                "--ioengine=io_uring --iodepth={n} --numjobs=1 --size={}",
+                job.io_size
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use std::string::ToString;
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_a_sequential_4k_read_at_depth_one() {
+        let job = Job::parse([]).unwrap();
+        assert_eq!(job, Job::default());
+        assert_eq!(job.label().to_string(), "read-4k-qd1");
+        assert_eq!(job.ios(), 1024);
+    }
+
+    #[test]
+    fn fio_options_parse_with_or_without_dashes() {
+        let job = Job::parse([
+            "--rw=randread",
+            "bs=128k",
+            "--iodepth=8",
+            "--numjobs=4",
+            "--io_size=16m",
+            "--randseed=7",
+            "--ioengine=psync",
+            "--direct=1",
+            "--name=whatever",
+        ])
+        .unwrap();
+        assert_eq!(job.rw, Rw::RandRead);
+        assert_eq!(job.bs, 128 << 10);
+        assert_eq!(job.submitters(), 32);
+        assert_eq!(job.io_size, 16 << 20);
+        assert_eq!(job.seed, 7);
+        assert_eq!(job.label().to_string(), "randread-128k-qd32");
+    }
+
+    #[test]
+    fn sizes_take_fio_suffixes() {
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("4k"), Some(4096));
+        assert_eq!(parse_size("4K"), Some(4096));
+        assert_eq!(parse_size("4kb"), Some(4096));
+        assert_eq!(parse_size("1MiB"), Some(1 << 20));
+        assert_eq!(parse_size("2g"), Some(2 << 30));
+        assert_eq!(parse_size("1t"), Some(1 << 40));
+        assert_eq!(parse_size("4x"), None);
+        assert_eq!(parse_size("k"), None);
+        assert_eq!(parse_size("4kibb"), None);
+        assert_eq!(parse_size("99999999999t"), None);
+    }
+
+    #[test]
+    fn writes_and_async_engines_are_refused() {
+        assert_eq!(
+            Job::parse(["--rw=randwrite"]),
+            Err(JobError::Unsupported {
+                option: "rw",
+                value: "randwrite"
+            })
+        );
+        assert_eq!(
+            Job::parse(["--ioengine=io_uring"]),
+            Err(JobError::Unsupported {
+                option: "ioengine",
+                value: "io_uring"
+            })
+        );
+    }
+
+    #[test]
+    fn bad_options_name_themselves() {
+        assert_eq!(Job::parse(["--bogus=1"]), Err(JobError::Unknown("bogus")));
+        assert_eq!(Job::parse(["--bs"]), Err(JobError::NoValue("bs")));
+        assert_eq!(
+            Job::parse(["--bs=100"]),
+            Err(JobError::Value {
+                option: "bs",
+                value: "100"
+            })
+        );
+        assert_eq!(
+            Job::parse(["--iodepth=0"]),
+            Err(JobError::Value {
+                option: "iodepth",
+                value: "0"
+            })
+        );
+        assert_eq!(
+            Job::parse(["--direct=2"]),
+            Err(JobError::Value {
+                option: "direct",
+                value: "2"
+            })
+        );
+    }
+
+    #[test]
+    fn shapes_that_do_not_fit_are_refused() {
+        assert_eq!(
+            Job::parse(["--bs=4k", "--io_size=6k"]),
+            Err(JobError::Shape)
+        );
+        assert_eq!(
+            Job::parse(["--iodepth=32", "--numjobs=16"]),
+            Err(JobError::Shape)
+        );
+    }
+
+    #[test]
+    fn the_fio_command_runs_the_same_job_on_linux() {
+        let job = Job::parse(["--rw=randread", "--bs=4k", "--iodepth=32", "--io_size=8m"]).unwrap();
+        assert_eq!(
+            job.fio_command("/dev/nvme0n1", FioEngine::Psync)
+                .to_string(),
+            "fio --name=randread-4k-qd32 --filename=/dev/nvme0n1 --rw=randread --bs=4096 \
+             --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=32 \
+             --size=262144 --offset_increment=262144 --group_reporting"
+        );
+        assert_eq!(
+            job.fio_command("/dev/nvme0n1", FioEngine::IoUring)
+                .to_string(),
+            "fio --name=randread-4k-qd32 --filename=/dev/nvme0n1 --rw=randread --bs=4096 \
+             --direct=1 --randseed=9223372040899026669 --ioengine=io_uring --iodepth=32 \
+             --numjobs=1 --size=8388608"
+        );
+    }
+}

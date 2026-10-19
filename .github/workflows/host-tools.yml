@@ -88,6 +88,13 @@ jobs:
           cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
           cargo test --locked -p ferric-blkqueue --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
+      # ferric-iobench: the disk benchmark's fio-style jobs, block order, latency histogram and
+      # report (recipes/tests/ferric-iobench runs them on the target).
+      - name: ferric-iobench
+        run: |
+          cargo clippy --locked --all-targets -p ferric-iobench -- -D warnings
+          cargo test --locked -p ferric-iobench
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-iobench
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
       # kernel turns it on; file systems do not).
       - name: ferric-pcache

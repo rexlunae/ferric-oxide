@@ -311,6 +311,98 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+## Disk benchmark (ferric-iobench)
+
+Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
+fio itself is GPL-2.0, so the project does not ship or port it
+(`recipes/wip/bench/io/fio` is an upstream recipe and stays unused). The
+benchmark is its own MIT code, in two parts:
+
+- `crates/iobench` (`ferric-iobench`, `no_std`, host-tested) holds the logic.
+  It parses fio's options (`--rw`, `--bs`, `--iodepth`, `--numjobs`,
+  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct`) and
+  refuses writes and asynchronous engines by name. It has the block order, a
+  latency histogram with fio's bucket layout, the IOPS, bandwidth and
+  percentile report, and the fio command line for running the same job on
+  Linux.
+- `recipes/tests/ferric-iobench` is the on-target runner. It reads the
+  largest partition of the NVMe disk scheme. Without arguments it runs three
+  jobs: `randread-4k-qd1` (latency), `randread-4k-qd32` (IOPS) and
+  `read-128k-qd1` (bandwidth). With arguments it runs the one job they
+  describe, for example `ferric-iobench --rw=randread --bs=4k --iodepth=8`.
+
+When nvmed has per-CPU queue pairs, every round runs the job once with each
+queue policy: `MainQueue` (the one-queue path), `Adaptive` (the default) and
+`Workers`. Odd rounds run the policies in reverse order.
+`ferric_blkqueue::ab` compares `Adaptive` against `MainQueue` round by round,
+with the same paired rule and confirmation rounds as `nvme-read-4k-t<N>`
+above. The runner prints one line per policy and one for the comparison:
+
+```text
+FERRIC_BENCH iobench-randread-4k-qd32 policy=main rounds=3 ios=6144 iops=… mib_s=… lat_min_ns=… lat_mean_ns=… lat_p50_ns=… lat_p99_ns=… lat_p999_ns=… lat_max_ns=…
+FERRIC_BENCH iobench-randread-4k-qd32 ab_baseline_iops=… ab_candidate_iops=… ab_ratio=… ab_tolerance=… ab_rounds=3 ab=pass
+```
+
+A policy's line covers all of its rounds: total reads over total time, and
+every read in the histogram. The A/B line gives the per-round medians. Without
+per-CPU queues there is one path, `policy=single`, and `ab=none`.
+`scripts/ferric-ci/check-iobench-log.sh` requires every line on each of the
+five CI boots, fails on `ab=fail`, and puts the numbers in a notice and in a
+table in the job summary. CI runs on emulated NVMe under KVM on shared
+runners, so its numbers are only good for the same-boot comparison, not as
+absolute figures.
+
+### Comparing with fio on Linux
+
+`Job::fio_command` prints the fio command line that runs the same job on
+Linux. Run it in a guest with the same shape (the same QEMU `-cpu`, CPU count,
+memory and `-device nvme` options as `boot-smoke.sh`, or the same reference
+machine), against the partition block device that matches the one the runner
+read. There are two engines, and they answer different questions:
+
+- `FioEngine::Psync` is the like-for-like run. It uses
+  `--ioengine=psync --numjobs=N`, so there are N threads each doing one
+  synchronous `pread`, which is exactly what the runner does. The runner
+  shares a single block order between its threads. fio gives each job its own
+  region, so the command cuts the region into one slice per job
+  (`--size=S --offset_increment=S`) and `--group_reporting` adds the jobs
+  together. In both, every block is read once. The difference between the two
+  numbers is the system's per-read cost: Ferric Oxide's system call, scheme
+  IPC and nvmed against Linux's block layer and NVMe driver.
+- `FioEngine::IoUring` is the exit baseline. It uses
+  `--ioengine=io_uring --iodepth=N`: one thread with N reads in flight, which
+  is Linux's fastest path. The disk sees the same queue depth. Ferric Oxide
+  has no asynchronous disk path in the runner yet (kernel rings can carry disk
+  reads later), so this gap includes the cost of using threads instead of a
+  ring.
+
+For the default jobs, with `DEV` as the partition device:
+
+```sh
+fio --name=randread-4k-qd1 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=1 --size=4194304 --offset_increment=4194304 --group_reporting
+fio --name=randread-4k-qd32 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=32 --size=262144 --offset_increment=262144 --group_reporting
+fio --name=randread-4k-qd32 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=io_uring --iodepth=32 --numjobs=1 --size=8388608
+fio --name=read-128k-qd1 --filename=DEV --rw=read --bs=131072 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=1 --size=33554432 --offset_increment=33554432 --group_reporting
+```
+
+The figures map onto fio's output like this:
+
+| `ferric-iobench` | fio | Notes |
+| --- | --- | --- |
+| `iops` | `read: IOPS=` | Reads over the wall-clock time from the first submission to the last completion. The runner's time includes starting its threads (well under a millisecond against a round of thousands of reads); fio starts its jobs before its clock. |
+| `mib_s` | `BW=… MiB/s` | Both use `kb_base=1024`. |
+| `lat_*_ns` | `clat` (and `lat`) | Measured per read, from just before the `pread` to just after it returns. With a synchronous engine, fio's `slat` is close to zero, so `lat` and `clat` agree. fio prints microseconds by default. |
+| `lat_p50_ns`, `lat_p99_ns`, `lat_p999_ns` | `clat percentiles` 50.00th, 99.00th, 99.90th | The bucket layout is the same: exact below 128 ns, then 64 linear buckets per power of two, so each bucket is within 1/64 (1.6%). Like fio, the value reported is the middle of the bucket that holds the read of that rank, with the rank rounded up. |
+| `lat_min_ns`, `lat_max_ns`, `lat_mean_ns` | `clat min`, `max`, `avg` | Exact, not from the buckets. |
+
+The random order is a seeded permutation (a bijective mix over the next power
+of two, with cycle-walking), not fio's LFSR. The same `--randseed` therefore
+gives a different sequence on each system. Both read every block exactly once,
+with no locality. A flash drive's random-read figure does not depend on the
+exact sequence, so the numbers compare. The disk scheme has no page cache, so
+every read reaches the device, as `--direct=1` does on Linux. Neither side has
+a ramp-up period (`ramp_time` is 0 by default).
+
 ## From PCI discovery to a driver's DMA address
 
 1. Bootstrap exposes `/scheme/kernel.iommu`. `pcid` opens its root as root
