@@ -444,15 +444,16 @@ impl<W: Words, C: Commit> Source for Mapped<W, C> {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 CorruptRecord {
-                    position: self.pos.max(self.view.tail()),
+                    position: peek.verified_end(),
                 },
             ));
         }
         // A corrupt peek ends at `head`: the words after a record that does not decode cannot
         // be split into records. Keep and commit only the verified prefix; the next copy starts
-        // at the corruption and fails with `CorruptRecord`, leaving the capture incomplete.
+        // at the corruption and fails with `CorruptRecord`, leaving the capture incomplete. The
+        // prefix end comes from the peek itself: `tail` read again now may have moved.
         self.pos = if peek.is_corrupt() {
-            self.pos.max(self.view.tail()) + (peek.len() / WORD_BYTES) as u64
+            peek.verified_end()
         } else {
             peek.end()
         };
@@ -591,7 +592,8 @@ mod tests {
     use crate::capture::tests::bytes;
     use ferric_trace::Event;
     use ferric_trace::kernel::{SYSCALL_ENTER, SYSCALL_EXIT};
-    use ferric_trace::ring::{Ring, SHARED_HEADER_WORDS, Shared};
+    use ferric_trace::ring::{Ring, SHARED_HEADER_WORDS, Shared, TAIL_WORD};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A reader that gives `results` in turn, then 0 bytes.
@@ -870,6 +872,62 @@ mod tests {
         // Only the record before the corruption was consumed, not the rest of the ring.
         assert_eq!(source.commit.commits, [7]);
         assert_eq!(ring.tail(), 7);
+    }
+
+    /// A view's words that let another reader move `tail` (and the producer push a record)
+    /// just before the `race_at`-th load of `tail`, as a concurrent reader could.
+    struct RacingTail<'a> {
+        ring: &'a InMemory,
+        tail_loads: Cell<u32>,
+        race_at: u32,
+    }
+
+    impl Words for RacingTail<'_> {
+        fn len(&self) -> usize {
+            self.ring.ring.words().len()
+        }
+
+        fn word(&self, index: usize) -> &AtomicU64 {
+            if index == TAIL_WORD {
+                let loads = self.tail_loads.get() + 1;
+                self.tail_loads.set(loads);
+                if loads == self.race_at {
+                    let head = self.ring.view().head();
+                    self.ring.ring.words()[TAIL_WORD].store(head, Ordering::Release);
+                    self.ring
+                        .ring
+                        .push(SYSCALL_ENTER.id(), 30, &[2, 0, 0, 0, 0])
+                        .expect("fits");
+                }
+            }
+            &self.ring.ring.words()[index]
+        }
+    }
+
+    #[test]
+    fn a_reader_moving_tail_after_a_corrupt_peek_loses_nothing() {
+        let ring = InMemory::new(TWO_CALLS);
+        // Words 0..7 hold a record, 7..11 one that no longer decodes.
+        ring.ring.words()[SHARED_HEADER_WORDS + 7].store(u64::MAX, Ordering::Relaxed);
+        // `Mapped::new` loads `tail` once and the first copy's peek twice; another reader then
+        // consumes everything (to 11) and the producer writes a record at 11..18.
+        let words = RacingTail {
+            ring: &ring,
+            tail_loads: Cell::new(0),
+            race_at: 4,
+        };
+        let mut source = Mapped::new(
+            View::new(words).expect("a valid header"),
+            Committer {
+                ring: &ring,
+                busy: 0,
+                commits: Vec::new(),
+            },
+        );
+        let (bytes, _) = run_with(&mut source, u64::MAX).expect("drains");
+        // Both whole records were saved; none was committed without being copied.
+        assert_eq!(bytes, 2 * 7 * WORD_BYTES as u64);
+        assert_eq!(ring.tail(), 18);
     }
 
     #[test]

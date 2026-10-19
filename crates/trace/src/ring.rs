@@ -490,6 +490,7 @@ impl<S: Storage> Ring<S> {
                 return Ok(Peek {
                     len: written,
                     end: head,
+                    verified_end: pos,
                     corrupt: true,
                 });
             };
@@ -509,6 +510,7 @@ impl<S: Storage> Ring<S> {
         Ok(Peek {
             len: written,
             end: pos,
+            verified_end: pos,
             corrupt: false,
         })
     }
@@ -719,6 +721,7 @@ impl<W: Words> View<W> {
 pub struct Peek {
     len: usize,
     end: u64,
+    verified_end: u64,
     corrupt: bool,
 }
 
@@ -738,6 +741,15 @@ impl Peek {
     /// starts.
     pub fn end(&self) -> u64 {
         self.end
+    }
+
+    /// The position after the last whole record copied, counted from the start this peek
+    /// actually used. It equals [`Peek::end`] unless the copy is corrupt, when it is where
+    /// the record that does not decode starts. A reader that keeps a corrupt copy's records
+    /// but not the corruption commits to this position, not to one worked out from a later
+    /// load of `tail`, which another reader may have moved since.
+    pub fn verified_end(&self) -> u64 {
+        self.verified_end
     }
 
     /// Whether the copy stopped at a record that does not decode.
@@ -1078,6 +1090,31 @@ mod tests {
         assert_eq!((peek.len(), peek.end()), (0, 4));
         ring.commit_to(peek.end()).expect("dropped");
         assert_eq!((ring.pending(), ring.lost()), (0, 1));
+    }
+
+    #[test]
+    fn a_corrupt_peek_reports_where_its_verified_records_end() {
+        let mem = words(SHARED_HEADER_WORDS + 64);
+        let ring = Ring::shared(&mem[..]).expect("valid");
+        for ts in 1..=3 {
+            ring.push(EventId::new(1), ts, &[]).expect("room");
+        }
+        // The second two-word record no longer decodes.
+        mem[SHARED_HEADER_WORDS + 2].store(u64::MAX, Ordering::Relaxed);
+        let view = View::new(&mem[..]).expect("valid header");
+        let mut buf = [0u8; 64];
+        let peek = view.peek(0, &mut buf).expect("stops");
+        assert!(peek.is_corrupt());
+        assert_eq!((peek.len(), peek.end(), peek.verified_end()), (16, 6, 2));
+        // A whole copy's verified end is its end.
+        let mem = words(SHARED_HEADER_WORDS + 64);
+        let ring = Ring::shared(&mem[..]).expect("valid");
+        ring.push(EventId::new(1), 1, &[]).expect("room");
+        let peek = View::new(&mem[..])
+            .expect("valid")
+            .peek(0, &mut buf)
+            .expect("copies");
+        assert_eq!((peek.end(), peek.verified_end()), (2, 2));
     }
 
     #[test]
