@@ -77,7 +77,7 @@ exclude = ["bootstrap"]
 # Low-level Redox OS crates should be kept in sync using workspace dependencies
 # Remember to also update bootstrap dependencies, those are not in the workspace
 [workspace.dependencies]
-acpi =  { git = "https://gitlab.redox-os.org/redox-os/acpi.git", branch = "redox-6.x" }
+acpi =  { git = "https://github.com/rexlunae/acpi.git", branch = "redox-6.x" } # Ferric mirror of redox-os/acpi
 anyhow = "1"
 bitflags = "2"
 clap = "4"
@@ -96,14 +96,16 @@ parking_lot = "0.12"
 pico-args = "0.5"
 plain = "0.2.3"
 redox_event = "0.4.8"
-redox-ioctl = { git = "https://gitlab.redox-os.org/redox-os/relibc.git" }
-redox-log = { git = "https://gitlab.redox-os.org/redox-os/redox-log.git" }
+# Ferric Oxide: the in-tree relibc subtree supplies redox-ioctl; nothing
+# in this workspace fetches from upstream Redox infrastructure.
+redox-ioctl = { path = "../../crates/relibc/redox-ioctl" }
+redox-log = { git = "https://github.com/rexlunae/redox-log.git" } # Ferric mirror of redox-os/redox-log
 redox-scheme = { version = "0.11.2", default-features = false }
 redox_syscall = { version = "0.9.4",  features = ["std"] }
 # Ferric Oxide: shared crates of the repository (../../crates; the base recipe links them
 # next to its copy of this tree).
 ferric-iommu = { path = "../../crates/iommu" }
-redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", features = ["userspace", "sync"] }
+redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
 redox_termios = "0.1.4"
 ron = "0.8.1"
 serde = { version = "1", features = ["derive"] }
@@ -123,6 +125,3 @@ missing_safety_doc = "warn" #TODO: set to deny when all safety documentation is 
 precedence = "deny"
 unused_io_amount = "warn" #TODO: have an abstraction to irq file read/write, then set to deny
 perf = { level = "deny", priority = -1 }
-
-[patch."https://gitlab.redox-os.org/redox-os/relibc.git"]
-#redox-ioctl = { path = "../../relibc/source/redox-ioctl" }
