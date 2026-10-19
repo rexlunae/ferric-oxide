@@ -19,9 +19,11 @@
 //! - [`filter`]: steering filters, their validation, their fixed-size encoding and the software
 //!   match copy mode uses.
 //! - [`call`]: the queue socket's path and `SYS_CALL` requests, and the statistics record.
+//! - [`ring`]: the four rings' layout in their shared region, and each side's handles, on
+//!   `ferric-ring`'s index protocol, hostile-peer checks and need-wakeup.
 //!
-//! The ring index protocol itself is `ferric-ring`'s, generalized to these slot widths in a
-//! later change. Everything here is plain data: nothing touches memory or hardware.
+//! Nothing here touches hardware, and the only memory it touches is ring memory, through
+//! `ferric-ring`'s atomic accesses.
 //!
 //! All multi-byte integers in shared memory and call payloads are little-endian; addresses and
 //! MAC addresses are octets in network order. Frame formats follow IEEE 802.3 (Ethernet II),
@@ -79,4 +81,5 @@ pub mod call;
 pub mod desc;
 pub mod filter;
 pub mod frame;
+pub mod ring;
 pub mod umem;
