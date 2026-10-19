@@ -303,6 +303,9 @@ fn schedule(
     }
     */
 
+    // Ferric Oxide: contexts woken here whose affinity excludes this CPU, with the CPU to hand
+    // each to (see below).
+    let mut forward: SmallVec<[(LogicalCpuId, WeakContextRef); 4]> = SmallVec::new();
     {
         // Alarm (previously in update_runnable)
         let mut wakeups = percpu.switch_internals.tmp_wakeups.borrow_mut();
@@ -400,6 +403,25 @@ fn schedule(
                     continue;
                 }
 
+                // Ferric Oxide: a wake-up lands on the CPU the context last ran on (or the
+                // waker's), which its affinity may no longer include, for example a thread that
+                // pinned itself elsewhere. This CPU never runs it, and work stealing takes it
+                // only from a much longer queue, so it could wait forever: hand it to a CPU it
+                // may run on instead.
+                let target = if guard.sched_affinity.contains(percpu.cpu_id) {
+                    None
+                } else {
+                    guard
+                        .sched_affinity
+                        .iter()
+                        .find(|&cpu| get_percpu_block(cpu).is_some())
+                };
+                if let Some(target) = target {
+                    drop(guard);
+                    forward.push((target, context_ref));
+                    continue;
+                }
+
                 let new_vtime = guard.vtime.max(run_queue.v);
                 guard.vtime = new_vtime;
 
@@ -447,6 +469,21 @@ fn schedule(
                     .store(run_queue.queue.len(), Ordering::Relaxed);
             }
         }
+    }
+
+    // Ferric Oxide: the run queue lock is released; queue the forwarded contexts on their CPUs,
+    // as a wake-up from another CPU does (`context::wakeup_context`).
+    if !forward.is_empty() {
+        for (target, context_ref) in forward.drain(..) {
+            if let Some(target) = get_percpu_block(target) {
+                target
+                    .switch_internals
+                    .ipi_context_wakeup_list
+                    .lock(token.token())
+                    .push(context_ref);
+            }
+        }
+        crate::ipi::ipi(crate::ipi::IpiKind::Wakeup, crate::ipi::IpiTarget::Other);
     }
 
     /* // uncomment to debug contexts count

@@ -163,7 +163,11 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
 - Each pair's completion queue interrupts through its own entry, and a worker
   thread pinned to that CPU (`pcid_interface::percpu::pin_current_thread`,
   which writes the thread's `sched-affinity` mask from `ferric_irq::affinity`)
-  serves it with its own executor, `irq:` handle and bounce buffer.
+  serves it with its own executor, `irq:` handle and bounce buffer. The
+  scheduler queues a woken context on the CPU it last ran on, which a thread
+  that just pinned itself elsewhere may no longer be allowed to use. The
+  kernel then hands such a context to a CPU in its affinity
+  (`context::switch`), instead of leaving it in a queue that never runs it.
 - The disk scheme stays on the main thread and hands each read and write to
   the workers in turn, then waits for the worker to report it done on a pipe.
   It cannot see the caller's CPU yet, so requests are spread round-robin, and
