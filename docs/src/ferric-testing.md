@@ -31,6 +31,14 @@ including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test.
 
+Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
+running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
+rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining
+the lockfiles' exact commit IDs. Other mirrors can lack current commits, so their
+upstream URLs remain in use with increased retries. This also covers Cargo
+dependency resolution during feature generation; successful submodule checkout
+alone does not establish that Cargo can reach GitLab.
+
 `cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
@@ -115,6 +123,7 @@ IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
@@ -185,7 +194,7 @@ test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
-enables IOMMU `auto`, shadow-stack preparation `auto`, registered buffers,
+enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
 `nvmed` grant DMA (`drivers.grant_dma`) and kernel tracing (with
 `sched.switch` on from boot),
 and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
@@ -256,6 +265,34 @@ output. It uses KVM with `host` when available and otherwise TCG with `max`.
 `BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
 interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
 later; the workflow uses a newer-QEMU container for that variant.
+
+### CET image and Kleya rerun
+
+`cet-image.yml` builds a separate smoke image with `kernel.cpu.shstk=auto`,
+`kernel.cpu.ibt=auto`, and KPTI `auto`. Its `ferric-cet-image` artifact contains
+`harddrive.img.zst`, the unstripped `kernel.all`, `kernel-config.toml`,
+`build-info.txt`, the two boot helper scripts, and `SHA256SUMS`. Build metadata distinguishes the checked-out
+PR merge commit from the PR head and records the run ID and kernel settings.
+Use all files from the same successful run; retain the symbols for #CP traces.
+
+On Kleya, download and extract the fresh artifact, then verify it and use its
+included rerun helper:
+
+```sh
+sha256sum -c SHA256SUMS
+zstd -d harddrive.img.zst -o harddrive.img
+bash boot-cet.sh harddrive.img serial-cet-kleya.log
+```
+
+The helper requires writable KVM and uses `-cpu host,migratable=off`, which
+exposed CET on Kleya where plain `host` hid it. It runs the existing disposable
+image smoke harness and requires CET detection **and enablement**, the pool
+isolation self-test, syscall fuzz success and clean smoke completion. A CET
+skip or KPTI preventing enablement does not count as a successful rerun.
+Preserve `build-info.txt`, `SHA256SUMS`, `kernel.all`, the serial log and QEMU
+version with the result for [#78](https://github.com/rexlunae/ferric-oxide/issues/78).
+The image workflow's ordinary CET-disabled CI boot validates the pool and
+fallback boot, not this hardware result.
 
 The harness rejects crashes and `FERRIC_TEST_FAIL` markers and requires the
 smoke completion marker. A completion marker alone is insufficient because

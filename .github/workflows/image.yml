@@ -49,40 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The submodules come from gitlab.redox-os.org, which sometimes fails for minutes or
-      # hours at a time. Their git data is cached by commit, so a build only needs GitLab
-      # when a submodule moves; a fetch is retried and then tries the redox-os mirrors on
-      # GitHub (openlibm is mirrored there, dlmalloc-rs is not).
-      - name: Submodule cache key
-        id: submodules
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          echo "key=submodules-$(git ls-files -s | awk '$1 == 160000 { print $2 }' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore submodules
-        id: submodule-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .git/modules
-          key: ${{ steps.submodules.outputs.key }}
-
-      - name: Fetch submodules
-        run: |
-          for attempt in 1 2 3; do
-            git submodule update --init --recursive && exit 0
-            echo "::warning title=Submodule fetch failed::GitLab attempt $attempt of 3"
-            sleep 60
-          done
-          echo "::warning title=Submodule fetch failed::trying the GitHub mirrors"
-          git config --global url.https://github.com/redox-os/.insteadOf https://gitlab.redox-os.org/redox-os/
-          git submodule update --init --recursive
-
-      - name: Save submodules
-        if: steps.submodule-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .git/modules
-          key: ${{ steps.submodules.outputs.key }}
+      - uses: ./.github/actions/prepare-submodules
 
       - name: Install Rust
         run: |
@@ -319,11 +286,19 @@ jobs:
             if grep -aF "KPTI: PCID enabled" "$LOG"; then exit 1; fi
           fi
 
-      # kernel.cpu.shstk = "auto" does not enable shadow stacks yet. Whether KVM passes CET_SS
-      # through depends on the runner, so accept either answer but require the line.
+      # This image forces kpti = "always", and shadow stacks are left off whenever KPTI is on, so
+      # CET is never enabled on this boot regardless of what the runner's CPU reports. Whether KVM
+      # passes CET_SS through depends on the runner, so accept either decision but require the
+      # detection line and the matching "left off"/"not enabled" line (never the "enabling CET" one).
       - name: Check shadow-stack detection
         run: |
-          grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off) \(not yet enabled\)" "$LOG"
+          grep -aF "CET: shadow-stack pool isolation self-test passed" "$LOG"
+          grep -aE "CET: shadow stacks supported=(true|false) policy=auto decision=(on|off)" "$LOG"
+          grep -aE "CET: (shadow stacks not enabled on this boot|supervisor shadow stacks allocated but left off \(KPTI is on)" "$LOG"
+          if grep -aF "CET: supervisor shadow stacks allocated for every kernel stack; enabling CET" "$LOG"; then
+            echo "::error::shadow stacks were enabled despite KPTI being forced on"
+            exit 1
+          fi
 
       # fox replaced pkg (config/ferric-smoke.toml): on first boot it adopted every
       # package the installer put in the image, each with a signed manifest the
