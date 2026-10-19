@@ -399,6 +399,24 @@ rebuild = ["kernel"]
 help = "Parse SRAT and keep per-node memory information. Experimental upstream."
 
 [[option]]
+id = "kernel.irq_percpu"
+menu = "kernel"
+type = "bool"
+title = "Per-CPU interrupt delivery"
+default = false
+depends = "target.arch == 'x86_64' && kernel.multi_core"
+kernel_feature = "irq-percpu"
+rebuild = ["kernel"]
+help = """
+Count and deliver interrupts per (CPU, vector) in the irq: scheme (Phase 2.4),
+so a vector reserved on one CPU (irq:cpu-XX/N) is a different interrupt from
+the same vector number on another, and each CPU counts its interrupts without
+a shared lock. Adds the root-only irq:cpus file, which maps each running
+logical CPU to its APIC id and NUMA node, and lists CPUs under irq: by logical
+id. The groundwork for per-core NVMe and NIC queues. Off by default; without
+it, irq: counts interrupts by vector number alone, as upstream."""
+
+[[option]]
 id = "kernel.regbuf"
 menu = "kernel"
 type = "bool"
