@@ -28,7 +28,10 @@ use alloc::{
     vec::Vec,
 };
 
-use ferric_ring::chain::{Chain, Completions};
+use ferric_ring::{
+    chain::{Chain, Completions},
+    notify::{Drained, InFlight},
+};
 use spin::Mutex;
 use syscall::error::{Result, EBADF, ECANCELED, ENOMEM};
 
@@ -48,7 +51,7 @@ use crate::{
 pub(super) struct Work {
     jobs: VecDeque<Job>,
     /// SQEs queued or running.
-    in_flight: u32,
+    in_flight: InFlight,
     worker: Worker,
     /// The ring is closed: queued jobs are cancelled and the worker ends.
     closing: bool,
@@ -59,7 +62,7 @@ impl Work {
     pub(super) const fn new() -> Self {
         Self {
             jobs: VecDeque::new(),
-            in_flight: 0,
+            in_flight: InFlight::new(),
             worker: Worker::None,
             closing: false,
         }
@@ -67,19 +70,22 @@ impl Work {
 
     /// The SQEs queued or running.
     pub(super) const fn in_flight(&self) -> u32 {
-        self.in_flight
+        self.in_flight.get()
     }
 
     /// Counts `sqes` SQEs that an `Enter` is taking from the SQ as in flight, until it has
     /// posted their completions or handed them to the worker, so that a waiting `Enter` waits
     /// for them too.
     pub(super) const fn start_sync(&mut self, sqes: u32) {
-        self.in_flight = self.in_flight.saturating_add(sqes);
+        self.in_flight.start(sqes);
     }
 
-    /// Counts the `sqes` SQEs of [`Self::start_sync`] done.
-    pub(super) const fn end_sync(&mut self, sqes: u32) {
-        self.in_flight = self.in_flight.saturating_sub(sqes);
+    /// Counts the `sqes` SQEs of [`Self::start_sync`] done. [`Drained`] when none is left in
+    /// flight: a caller that posts no completions must then wake the waiters
+    /// ([`Ring::wake_waiters`]).
+    #[must_use]
+    pub(super) const fn end_sync(&mut self, sqes: u32) -> Option<Drained> {
+        self.in_flight.end(sqes)
     }
 }
 
@@ -154,7 +160,7 @@ pub(super) fn queue(
             return Err(EBADF);
         }
         work.jobs.push_back(job);
-        work.in_flight = work.in_flight.saturating_add(chain.len());
+        work.in_flight.start(chain.len());
         let start = matches!(work.worker, Worker::None);
         if start {
             work.worker = Worker::Starting;
@@ -201,7 +207,8 @@ fn fail_start(ring: &Ring, token: &mut CleanLockToken) {
             .iter()
             .map(|job| job.chain.len())
             .fold(0, u32::saturating_add);
-        work.in_flight = work.in_flight.saturating_sub(sqes);
+        // `notify_completed` below, or the caller's own completions, wake the waiters.
+        let _ = work.in_flight.end(sqes);
         jobs
     };
     // The caller's own chain was queued last.
@@ -301,8 +308,8 @@ fn finish(ring: &Ring, sqes: u32, done: &Completions, token: &mut CleanLockToken
         let _ = ring.post(&shared.frames, done);
     }
     {
-        let mut work = ring.work.lock();
-        work.in_flight = work.in_flight.saturating_sub(sqes);
+        // `notify_completed` below wakes the waiters.
+        let _ = ring.work.lock().in_flight.end(sqes);
     }
     ring.notify_completed(token);
 }
