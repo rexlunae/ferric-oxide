@@ -4,7 +4,7 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/irq", "crates/luks", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/fox", "tools/fox-registry"]
+default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/irq", "crates/luks", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/ferric-trace", "tools/fox", "tools/fox-registry"]
 members = [
     "crates/amdvi",
     "crates/blkgrant",
@@ -28,6 +28,7 @@ members = [
     "tools/cargo-fox",
     "tools/cookbook",
     "tools/ferric-config",
+    "tools/ferric-trace",
     "tools/fox",
     "tools/fox-registry",
     "tools/installer",
