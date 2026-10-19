@@ -164,7 +164,8 @@ pub struct Context {
     /// interrupts or syscalls occur. This flag is set for all contexts but kmain.
     pub userspace: bool,
     pub being_sigkilled: bool,
-    /// Ferric Oxide: the context was cancelled for good ([`super::cancel_context`]): every
+    /// Ferric Oxide: the context was cancelled for good (`cancel_context`, built with the
+    /// `rings` feature): every
     /// interruptible wait it starts from now on ends at once, as if a signal were pending. A
     /// ring worker is cancelled when its ring closes; such a context has no signal state, so
     /// this is how an interruption that comes before the wait is not lost.

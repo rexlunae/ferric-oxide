@@ -30,7 +30,7 @@
 //!   its descriptor. Descriptions of rings are refused, so no ring holds a ring open and closing
 //!   the last descriptor of a ring always frees it. A description leaves the table through
 //!   [`Request::UnregisterFiles`] or when the ring is closed, and every reference the scheme
-//!   takes is given back through [`release`], which closes the description when it was the
+//!   takes is given back through [`release_description`], which closes the description when it was the
 //!   last one.
 //!
 //! The ring memory is shared with the application, which may write any of it at any time.

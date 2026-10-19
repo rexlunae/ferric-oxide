@@ -70,7 +70,9 @@ pub mod irq;
 #[cfg(feature = "regbuf")]
 pub mod regbuf;
 
-/// Ferric Oxide: `kernel.ring` - submission/completion rings brokered to any scheme (`rings`)
+// Ferric Oxide: `kernel.ring` - submission/completion rings brokered to any scheme (`rings`).
+// Its docs are all inner (`//!`): with an outer doc as well, rustdoc resolves the inner docs'
+// links here, where the module's imports are not in scope.
 #[cfg(feature = "rings")]
 pub mod ring;
 
