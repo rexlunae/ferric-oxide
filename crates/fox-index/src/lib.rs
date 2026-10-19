@@ -10,6 +10,8 @@
 //!   [`Signed`](metadata::Signed) envelopes that sign and verify them;
 //! - [`layout`]: `registry.toml`, package files, artifact lists and the
 //!   paths they live at;
+//! - [`advisory`]: security advisories, in the RustSec format, from the
+//!   registry or the RustSec database;
 //! - [`verify`]: the client workflow that checks a checkout and reads only
 //!   files the metadata signs;
 //! - [`edit`]: the maintainer side, which creates a registry, admits
@@ -48,6 +50,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod advisory;
 pub mod canonical;
 pub mod edit;
 pub mod layout;

@@ -119,6 +119,32 @@ impl Tag {
                 source,
             })
     }
+
+    /// Checks that the tag's SSH signature is valid and made by one of
+    /// `allowed`, and returns that key.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError::TagUnsigned`] if the tag has no SSH signature,
+    /// [`GitError::TagSignerNotAllowed`] if its key is not in `allowed`, and
+    /// [`GitError::TagSignature`] if the signature is not valid.
+    pub fn verify_signed_by<'a>(
+        &self,
+        allowed: impl IntoIterator<Item = &'a AuthorKey>,
+    ) -> Result<&'a AuthorKey, GitError> {
+        let signed = self.signed.as_ref().ok_or_else(|| GitError::TagUnsigned {
+            tag: self.name.clone(),
+        })?;
+        let key = allowed
+            .into_iter()
+            .find(|key| **key == signed.key)
+            .ok_or_else(|| GitError::TagSignerNotAllowed {
+                tag: self.name.clone(),
+                fingerprint: signed.key.fingerprint(),
+            })?;
+        self.verify(key)?;
+        Ok(key)
+    }
 }
 
 /// The version a tag name gives: `1.2.3` or `v1.2.3`, in semver syntax.

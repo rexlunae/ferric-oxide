@@ -29,6 +29,9 @@
 //! cannot cite the archive's own hash; the build attestation binds the two
 //! instead, by carrying both hashes.
 //!
+//! [`SystemSbom`] merges the installed packages of a root into one
+//! document, with each package's files and the crates from its build SBOM.
+//!
 //! # Examples
 //!
 //! ```
@@ -54,6 +57,7 @@
 #![forbid(unsafe_code)]
 
 mod build;
+mod system;
 
 use std::io::Write;
 
@@ -71,6 +75,9 @@ use cyclonedx_bom::prelude::*;
 use fox_core::{Blake3Digest, FileKind, FileRecord, KeyId, Manifest};
 
 pub use build::{BuildInfo, BuildSbom, CrateDependency, CrateSource};
+/// The CycloneDX document type, as [`read_build_sbom`] returns it.
+pub use cyclonedx_bom::models::bom::Bom;
+pub use system::{CargoCrate, SystemPackage, SystemSbom, cargo_crates, read_build_sbom};
 
 /// Why an SBOM could not be built or written.
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +98,9 @@ pub enum SbomError {
     /// The document could not be serialized or written.
     #[error("cannot write the SBOM")]
     Write(#[source] cyclonedx_bom::errors::JsonWriteError),
+    /// A build SBOM is not CycloneDX JSON.
+    #[error("cannot read the SBOM")]
+    Read(#[source] Box<cyclonedx_bom::errors::JsonReadError>),
     /// A dependency id names no crate in the build's dependency graph.
     #[error("dependency {id:?} is not in the crate graph")]
     UnknownCrate {
