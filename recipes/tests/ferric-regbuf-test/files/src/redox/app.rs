@@ -997,15 +997,14 @@ fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
     // The probe goes on (or ends) whatever happened, so it is always reaped.
     write_byte(to_child[1], 0);
     let ran = read_byte(to_parent[0]);
-    let mut status = 0;
-    // SAFETY: `status` is a live integer for the call to fill in.
-    unsafe { libc::waitpid(child, &mut status, 0) };
+    let status = wait_child(child, "wait for the protection probe");
     // SAFETY: closes the parent's own pipe ends, which nothing uses any more.
     unsafe {
         libc::close(to_parent[0]);
         libc::close(to_child[1]);
     }
     revoked?;
+    let status = status?;
     if mapped != Some(PROBE_MAPPED) {
         return Err(Failure::Probe { status });
     }
@@ -1146,14 +1145,32 @@ fn prot_none_enforced() -> Result<bool, Failure> {
         // SAFETY: ends the child at once, as `fork` requires.
         unsafe { libc::_exit(0) }
     }
-    let mut status = 0;
-    // SAFETY: `status` is a live integer for the call to fill in.
-    unsafe { libc::waitpid(child, &mut status, 0) };
+    let status = wait_child(child, "wait for the PROT_NONE check")?;
     if killed_by_sigsegv(status) {
         Ok(true)
     } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         Ok(false)
     } else {
         Err(Failure::Probe { status })
+    }
+}
+
+/// Waits for `child` to end and returns its wait status, waiting again when a signal
+/// interrupts the wait.
+///
+/// # Errors
+///
+/// [`Failure::Errno`] with `what` when `waitpid` fails other than with `EINTR`.
+fn wait_child(child: libc::pid_t, what: &'static str) -> Result<c_int, Failure> {
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is a live integer for the call to fill in.
+        if unsafe { libc::waitpid(child, &mut status, 0) } == child {
+            return Ok(status);
+        }
+        let errno = super::last_errno();
+        if errno != errno::EINTR {
+            return Err(Failure::Errno { what, errno });
+        }
     }
 }
