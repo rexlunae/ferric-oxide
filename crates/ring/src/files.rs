@@ -32,6 +32,8 @@ pub enum TableError {
     },
     /// The table could not grow (`ENOMEM`).
     NoMemory,
+    /// A registration with no files (`EINVAL`), which would report success for nothing.
+    Empty,
 }
 
 impl fmt::Display for TableError {
@@ -43,6 +45,7 @@ impl fmt::Display for TableError {
             ),
             Self::Occupied { slot } => write!(f, "slot {slot} already holds a file"),
             Self::NoMemory => f.write_str("the file table could not grow"),
+            Self::Empty => f.write_str("a registration needs at least one file"),
         }
     }
 }
@@ -107,8 +110,9 @@ impl<T> FileTable<T> {
     /// # Errors
     ///
     /// A [`Refused`] holding every one of `files`: [`TableError::Range`] when the slots run past
-    /// [`MAX_FIXED_FILES`], [`TableError::Occupied`] when one of them holds a file, and
-    /// [`TableError::NoMemory`] when the table cannot grow.
+    /// [`MAX_FIXED_FILES`], [`TableError::Occupied`] when one of them holds a file,
+    /// [`TableError::NoMemory`] when the table cannot grow, and [`TableError::Empty`] when
+    /// `files` is empty.
     pub fn register(&mut self, first: u32, files: Vec<T>) -> Result<(), Refused<T>> {
         if let Err(error) = self.check_register(first, files.len()) {
             return Err(Refused { error, files });
@@ -125,6 +129,9 @@ impl<T> FileTable<T> {
 
     /// Checks that `count` slots from `first` are free, and grows the table to hold them.
     fn check_register(&mut self, first: u32, count: usize) -> Result<(), TableError> {
+        if count == 0 {
+            return Err(TableError::Empty);
+        }
         let slots = range(first, count)?;
         if let Some(i) = slots.clone().find(|&i| self.get(i as u32).is_some()) {
             return Err(TableError::Occupied { slot: i as u32 });
@@ -209,6 +216,13 @@ mod tests {
                     count: 2
                 },
                 files: vec![8, 9],
+            })
+        );
+        assert_eq!(
+            table.register(0, Vec::new()),
+            Err(Refused {
+                error: TableError::Empty,
+                files: Vec::new(),
             })
         );
         assert_eq!(

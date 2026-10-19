@@ -58,8 +58,9 @@
 //! something was, `Enter` returns the count; the SQEs consumed run and complete either way),
 //! `ENOMEM` as the result of an `ASYNC` chain's SQEs when the ring's worker
 //! cannot be started. `RegisterFiles`: `EINVAL` for slots
-//! past [`MAX_FIXED_FILES`] or a ring descriptor (a ring may not hold itself or another ring
-//! open), `EBUSY` when a slot already holds a file; nothing is registered then, and the
+//! past [`MAX_FIXED_FILES`], for no descriptors, or for a ring descriptor (a ring may not hold
+//! itself or another ring open), `EBUSY` when a slot already holds a file; nothing is
+//! registered then, and the
 //! descriptors sent are closed. `UnregisterFiles`: `EINVAL` for slots past
 //! [`MAX_FIXED_FILES`].
 
