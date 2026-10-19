@@ -585,7 +585,7 @@ needs `kernel.regbuf`) builds `driver-network` with its `bypass` feature
 (through `e1000d/bypass`), which adds the `queue` path in copy mode. Without
 the option the network schemes have no `queue` path, as upstream.
 Zero-copy mode, `igbd`, port ownership for unprivileged sockets, TX
-validation and an on-target test come in later changes.
+validation and a benchmark come in later changes.
 
 An application opens `queue` beneath a network scheme
 (`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
@@ -625,7 +625,8 @@ netstack.
   only when it has room, so no frame is lost. Frames that cannot be delivered
   are dropped and counted in `Stats`. UMEM and ring memory are seen as atomic
   words, so the application writing them at any time cannot cause undefined
-  behaviour.
+  behaviour. `write_frame` and `read_frame` are those copies; applications
+  use them for their side too.
 
 In `driver-network` (`src/bypass.rs`), `Attach` maps both grants read-write
 and shared; each must be a read-write grant of whole pages. `Bind` starts the
@@ -637,6 +638,18 @@ that). `Kick` sends up to 256 TX packets through the adapter. A socket whose
 rings turn out corrupt is stopped, and its calls fail with `EIO`. Closing a
 socket unmaps its grants. Every queue socket is root's, since the scheme
 root is root-only, and root may send raw frames.
+
+`ferric-netq-test` (`recipes/tests/ferric-netq-test`, in the CI smoke image)
+is the on-target test. It checks netstack answers an ICMP echo to the
+gateway, attaches a UMEM and a ring region to a queue socket on e1000d, and
+checks the refusals (calls before `Bind`, a zero-copy `Bind`, a second
+`Bind`, an unknown filter, a short `Stats` payload) and that `Mode::Auto`
+runs in copy mode. With an ARP filter it sends an ARP request for the
+gateway through its TX ring and receives the reply on RX, while netstack's
+echo still works beside it; with an ICMP filter it sends its own echo
+request and receives the reply. It then checks the counters, closes the
+socket with requests in flight, and checks netstack answers again. It skips
+when the driver has no queue sockets or there is no `kernel.regbuf` scheme.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.

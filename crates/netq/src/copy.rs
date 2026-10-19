@@ -301,9 +301,29 @@ impl CopyQueue {
     }
 }
 
-/// Copies `bytes` into `frame` of the UMEM `words`. The tail of the last word is zeroed; it
-/// lies inside the frame, since frames are whole words.
-fn write_frame(words: &[AtomicU64], frame: Frame, bytes: &[u8]) {
+/// Copies `bytes` into `frame` of the UMEM `words`, with atomic word stores. The tail of the
+/// last word is zeroed; it lies inside the frame, since frames are whole words. Both sides use
+/// it: the driver for received frames, the application for frames it sends.
+///
+/// Words past the end of `words` are skipped, so a short slice cannot make it panic; callers
+/// check `bytes.len()` against the frame size first.
+///
+/// # Examples
+///
+/// ```
+/// use core::sync::atomic::AtomicU64;
+/// use ferric_netq::copy::{read_frame, write_frame};
+/// use ferric_netq::umem::{FrameSize, Umem};
+///
+/// let umem = Umem::new(4 * 2048, FrameSize::Bytes2048).expect("a valid UMEM");
+/// let words: Vec<AtomicU64> = (0..umem.bytes() / 8).map(|_| AtomicU64::new(0)).collect();
+/// let frame = umem.frame(2).expect("frame 2");
+/// write_frame(&words, frame, b"hello, queue");
+/// let mut back = [0; 12];
+/// read_frame(&words, frame, &mut back);
+/// assert_eq!(&back, b"hello, queue");
+/// ```
+pub fn write_frame(words: &[AtomicU64], frame: Frame, bytes: &[u8]) {
     let first = word_index(frame);
     for (i, chunk) in bytes.chunks(8).enumerate() {
         let mut le = [0u8; 8];
@@ -314,8 +334,9 @@ fn write_frame(words: &[AtomicU64], frame: Frame, bytes: &[u8]) {
     }
 }
 
-/// Copies the first `bytes.len()` bytes of `frame` of the UMEM `words` into `bytes`.
-fn read_frame(words: &[AtomicU64], frame: Frame, bytes: &mut [u8]) {
+/// Copies the first `bytes.len()` bytes of `frame` of the UMEM `words` into `bytes`, with
+/// atomic word loads; words past the end of `words` read as zero. See [`write_frame`].
+pub fn read_frame(words: &[AtomicU64], frame: Frame, bytes: &mut [u8]) {
     let first = word_index(frame);
     for (i, chunk) in bytes.chunks_mut(8).enumerate() {
         let word = words
