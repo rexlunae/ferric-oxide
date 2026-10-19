@@ -29,8 +29,7 @@ ferric-regbuf = { path = "../../../crates/regbuf" }
 ferric-trace = { path = "../../../crates/trace" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
-redox-rt = { git = "https://gitlab.redox-os.org/redox-os/relibc.git", default-features = false }
-#redox-rt = { path = "../../../relibc/source/redox-rt", default-features = false }
+redox-rt = { path = "../../../crates/relibc/redox-rt", default-features = false } # Ferric Oxide: in-tree relibc subtree
 
 [lints.clippy]
 perf = { level = "deny", priority = -1 }
@@ -45,5 +44,5 @@ panic = "abort"
 opt-level = "s"
 
 [patch.crates-io]
-redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/kernel/" }
-#redox_syscall = { path = "../../../kernel/source/syscall" }
+# Ferric Oxide: the in-tree kernel subtree supplies redox_syscall.
+redox_syscall = { path = "../../../crates/kernel/syscall" }
