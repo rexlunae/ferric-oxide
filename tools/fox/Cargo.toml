@@ -12,15 +12,19 @@ clap = { version = "4", features = ["derive"] }
 fox-build = { path = "../../crates/fox-build" }
 fox-core = { path = "../../crates/fox-core", features = ["std"] }
 fox-git = { path = "../../crates/fox-git" }
+fox-index = { path = "../../crates/fox-index" }
 fox-sbom = { path = "../../crates/fox-sbom" }
 fox-store = { path = "../../crates/fox-store" }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = { workspace = true, features = ["std"] }
+time = { workspace = true, features = ["formatting"] }
 
 [dev-dependencies]
 fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
 pkgar = { workspace = true }
 pkgar-keys = { workspace = true }
+pkgar-core.workspace = true
 ssh-key.workspace = true
 tempfile.workspace = true

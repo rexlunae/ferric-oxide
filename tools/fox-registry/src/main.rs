@@ -7,6 +7,12 @@
 //! - `admit` adds a package and delegates its file to its owners;
 //! - `release` records a signed release tag, and `check` re-checks recorded
 //!   releases against their repositories (what registry CI runs on a PR);
+//! - `build` is the registry builder: it builds releases from their checked
+//!   tags, signs the archives and attestations, and records them in the
+//!   artifact lists;
+//! - `configure` sets the artifact store and the builders in
+//!   `registry.toml`;
+//! - `advise` publishes or updates a security advisory;
 //! - `yank` marks a release yanked;
 //! - `set-role` rotates a role's keys through a new root;
 //! - `sign` brings the metadata up to date and signs what the given keys
@@ -17,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+mod ci;
 mod keys;
 mod source;
 
@@ -26,8 +33,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fox_core::{GitUrl, PackageName};
+use fox_index::advisory::Advisory;
 use fox_index::edit::{EditError, Keyring, Registry, SignOptions, SignReport};
-use fox_index::layout::{Owner, PackageEntry, PackageKind};
+use fox_index::layout::{Builder, Owner, PackageEntry, PackageKind};
 use fox_index::metadata::{RoleKeys, RoleName, Root, Signed};
 use fox_index::verify::{self, ClientState, VerifyError};
 use semver::Version;
@@ -60,6 +68,10 @@ enum Command {
         /// Use one key for every role, for a personal or test registry.
         #[arg(long)]
         single_key: bool,
+        /// Also write a README and GitHub Actions workflows that check pull
+        /// requests, build and sign after merges, and renew the timestamp.
+        #[arg(long)]
+        github: bool,
     },
     /// Add a package and delegate its file to its owners.
     Admit {
@@ -99,6 +111,53 @@ enum Command {
         /// The git cache directory.
         #[arg(long)]
         cache: Option<PathBuf>,
+    },
+    /// Build releases and record them as artifacts (registry builders).
+    Build {
+        /// `name@version` releases to build; without any, every release
+        /// that has no artifact from this builder yet.
+        releases: Vec<String>,
+        /// The builder's `pkgar-keys` secret key.
+        #[arg(long)]
+        key: PathBuf,
+        /// The builder's label in `registry.toml`.
+        #[arg(long)]
+        label: String,
+        /// Where to store the blobs, as `<dir>/blake3/<hash>`.
+        #[arg(long)]
+        blobs: PathBuf,
+        /// The Rust target (default: this machine's).
+        #[arg(long)]
+        target: Option<String>,
+        /// The git cache directory.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// The build work directory (default: one per package under the
+        /// system temporary directory).
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
+    /// Change `registry.toml`: the artifact store and the builders.
+    Configure {
+        /// Replace the artifact store base URLs with these.
+        #[arg(long = "artifact-url")]
+        artifact_urls: Vec<String>,
+        /// Add or replace a builder, as `LABEL=KEY` (KEY as for
+        /// `set-role`).
+        #[arg(long = "builder", value_name = "LABEL=KEY")]
+        builders: Vec<String>,
+        /// Remove a builder.
+        #[arg(long = "remove-builder", value_name = "LABEL")]
+        remove_builders: Vec<String>,
+        /// How many builders must attest to an artifact.
+        #[arg(long)]
+        min_builders: Option<u32>,
+    },
+    /// Publish or update a security advisory from a RustSec-style TOML
+    /// file; it is stored as `advisories/<id>.toml`.
+    Advise {
+        /// The advisory file.
+        file: PathBuf,
     },
     /// Mark a release yanked, so new installs skip it.
     Yank {
@@ -224,6 +283,32 @@ enum CliError {
     ChecksFailed { failed: usize },
     #[error("no cache directory: set --cache or HOME")]
     NoCache,
+    #[error(transparent)]
+    Ci(Box<ci::CiError>),
+    #[error("cannot read {}", path.display())]
+    AdvisoryFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid advisory {}", path.display())]
+    Advisory {
+        path: PathBuf,
+        #[source]
+        source: fox_index::advisory::AdvisoryError,
+    },
+    #[error("--builder {value:?} is not LABEL=KEY")]
+    BuilderSyntax { value: String },
+    #[error("no builder {label} to remove")]
+    NoBuilder { label: String },
+    #[error("{value:?} is not name@version")]
+    ReleaseSyntax { value: String },
+    #[error("cannot write {}", path.display())]
+    Template {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 fn main() -> ExitCode {
@@ -250,7 +335,34 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             name,
             keys,
             single_key,
-        } => init(dir, name, keys, *single_key, now),
+            github,
+        } => {
+            init(dir, name, keys, *single_key, now)?;
+            if *github {
+                write_templates(dir)?;
+            }
+            Ok(())
+        }
+        Command::Build {
+            releases,
+            key,
+            label,
+            blobs,
+            target,
+            cache,
+            work_dir,
+        } => build(
+            dir,
+            &BuildArgs {
+                releases,
+                key,
+                label,
+                blobs,
+                target: target.as_deref(),
+                cache: cache.as_deref(),
+                work_dir: work_dir.as_deref(),
+            },
+        ),
         Command::Admit {
             git,
             name,
@@ -276,6 +388,21 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             println!("admitted {name}; run `fox-registry sign` with the targets key");
             Ok(())
         }
+        Command::Configure {
+            artifact_urls,
+            builders,
+            remove_builders,
+            min_builders,
+        } => configure(
+            dir,
+            &ConfigureArgs {
+                artifact_urls,
+                builders,
+                remove_builders,
+                min_builders: *min_builders,
+            },
+        ),
+        Command::Advise { file } => advise(dir, file),
         Command::Release { name, tag, cache } => release(dir, name, tag, cache.as_deref()),
         Command::Check { names, cache } => check(dir, names, cache.as_deref()),
         Command::Yank {
@@ -365,6 +492,195 @@ fn init(
         keys_dir.display()
     );
     Ok(())
+}
+
+impl From<ci::CiError> for CliError {
+    fn from(error: ci::CiError) -> Self {
+        Self::Ci(Box::new(error))
+    }
+}
+
+/// The repository template `init --github` writes.
+const TEMPLATES: [(&str, &str); 4] = [
+    ("README.md", include_str!("../template/README.md")),
+    (
+        ".github/workflows/check.yml",
+        include_str!("../template/check.yml"),
+    ),
+    (
+        ".github/workflows/sign.yml",
+        include_str!("../template/sign.yml"),
+    ),
+    (
+        ".github/workflows/timestamp.yml",
+        include_str!("../template/timestamp.yml"),
+    ),
+];
+
+fn write_templates(dir: &Path) -> Result<(), CliError> {
+    for (path, text) in TEMPLATES {
+        let path = dir.join(path);
+        let error = |source| CliError::Template {
+            path: path.clone(),
+            source,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(error)?;
+        }
+        std::fs::write(&path, text).map_err(error)?;
+    }
+    println!("wrote README.md and .github/workflows; add the key secrets the README lists");
+    Ok(())
+}
+
+fn advise(dir: &Path, file: &Path) -> Result<(), CliError> {
+    let text = std::fs::read_to_string(file).map_err(|source| CliError::AdvisoryFile {
+        path: file.to_path_buf(),
+        source,
+    })?;
+    let invalid = |source| CliError::Advisory {
+        path: file.to_path_buf(),
+        source,
+    };
+    let advisory = Advisory::parse(&text).map_err(invalid)?;
+    let path = fox_index::advisory::advisory_path(&advisory.advisory.id).map_err(invalid)?;
+    Registry::open(dir)?.write_advisory(&advisory)?;
+    println!("wrote {path}; run `fox-registry sign` with the targets key");
+    Ok(())
+}
+
+struct ConfigureArgs<'a> {
+    artifact_urls: &'a [String],
+    builders: &'a [String],
+    remove_builders: &'a [String],
+    min_builders: Option<u32>,
+}
+
+fn configure(dir: &Path, args: &ConfigureArgs<'_>) -> Result<(), CliError> {
+    let registry = Registry::open(dir)?;
+    let mut config = registry.config()?;
+    if !args.artifact_urls.is_empty() {
+        config.artifact_base_urls = args.artifact_urls.to_vec();
+    }
+    for label in args.remove_builders {
+        let before = config.builders.len();
+        config.builders.retain(|builder| &builder.label != label);
+        if config.builders.len() == before {
+            return Err(CliError::NoBuilder {
+                label: label.clone(),
+            });
+        }
+    }
+    for value in args.builders {
+        let (label, key) = value
+            .split_once('=')
+            .ok_or_else(|| CliError::BuilderSyntax {
+                value: value.clone(),
+            })?;
+        let key = keys::parse_public(key)?;
+        config.builders.retain(|builder| builder.label != label);
+        config.builders.push(Builder {
+            label: label.to_owned(),
+            key,
+        });
+    }
+    if let Some(min) = args.min_builders {
+        config.min_builder_signatures = min;
+    }
+    registry.set_config(&config)?;
+    println!("registry.toml updated; run `fox-registry sign` with the targets key");
+    Ok(())
+}
+
+struct BuildArgs<'a> {
+    releases: &'a [String],
+    key: &'a Path,
+    label: &'a str,
+    blobs: &'a Path,
+    target: Option<&'a str>,
+    cache: Option<&'a Path>,
+    work_dir: Option<&'a Path>,
+}
+
+/// The target `build` uses without `--target`: the one this binary runs
+/// on, as the build's toolchain defaults to it too.
+const HOST_TARGET: &str = env!("FOX_REGISTRY_HOST_TARGET");
+
+fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
+    let registry = Registry::open(dir)?;
+    let cache = cache_dir(args.cache)?;
+    let target = args.target.unwrap_or(HOST_TARGET);
+    let releases = if args.releases.is_empty() {
+        missing_builds(&registry, args.label, target)?
+    } else {
+        args.releases
+            .iter()
+            .map(|value| parse_release(value))
+            .collect::<Result<_, _>>()?
+    };
+    for (name, version) in releases {
+        let work_dir = args.work_dir.map_or_else(
+            || fox_build::default_work_dir(format!("fox-registry/{name}").as_bytes()),
+            Path::to_path_buf,
+        );
+        let job = ci::BuildJob {
+            name: &name,
+            version: &version,
+            key: args.key,
+            label: args.label,
+            blobs: args.blobs,
+            work_dir: &work_dir,
+            cache: &cache,
+            target: Some(target.to_owned()),
+        };
+        let pkgar = ci::build(&registry, &job)?;
+        println!("built {name} {version}: {pkgar}");
+    }
+    Ok(())
+}
+
+fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
+    let syntax = || CliError::ReleaseSyntax {
+        value: value.to_owned(),
+    };
+    let (name, version) = value.split_once('@').ok_or_else(syntax)?;
+    Ok((
+        PackageName::new(name)?,
+        version.parse().map_err(|_| syntax())?,
+    ))
+}
+
+/// Every release, not yanked, that has no artifact for `target` attested
+/// by `label`.
+fn missing_builds(
+    registry: &Registry,
+    label: &str,
+    target: &str,
+) -> Result<Vec<(PackageName, Version)>, CliError> {
+    let mut missing = Vec::new();
+    for delegation in &registry.targets().signed.delegations {
+        let name = PackageName::new(delegation.name.as_str())?;
+        let Some(entry) = registry.package(&name)? else {
+            continue;
+        };
+        for release in entry.releases.iter().filter(|release| !release.yanked) {
+            let built = registry
+                .artifacts(&name, &release.version)?
+                .is_some_and(|list| {
+                    list.artifacts.iter().any(|artifact| {
+                        artifact.target == target
+                            && artifact
+                                .attestations
+                                .iter()
+                                .any(|attestation| attestation.builder == label)
+                    })
+                });
+            if !built {
+                missing.push((name.clone(), release.version.clone()));
+            }
+        }
+    }
+    Ok(missing)
 }
 
 fn parse_owner(value: &str) -> Result<Owner, CliError> {

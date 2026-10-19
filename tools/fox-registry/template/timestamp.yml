@@ -1,0 +1,33 @@
+# Renews the one-day timestamp (and the snapshot when it is half expired),
+# so clients never see stale metadata while the registry is quiet.
+name: timestamp
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sign
+jobs:
+  timestamp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fox-registry
+        run: cargo install --locked --git https://github.com/rexlunae/ferric-oxide fox-registry
+      - name: Sign
+        env:
+          SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+          TIMESTAMP_KEY: ${{ secrets.TIMESTAMP_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$SNAPSHOT_KEY" > "$RUNNER_TEMP/snapshot.key"
+          printf '%s' "$TIMESTAMP_KEY" > "$RUNNER_TEMP/timestamp.key"
+          fox-registry sign --complete --key "$RUNNER_TEMP/snapshot.key" --key "$RUNNER_TEMP/timestamp.key"
+      - name: Push
+        run: |
+          git config user.name "registry CI"
+          git config user.email "registry-ci@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "Renew timestamp"; git push; }

@@ -60,9 +60,11 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod download;
 mod fetch;
 pub mod tag;
 
+pub use download::{DownloadError, download_blob};
 pub use fetch::fetch;
 pub use tag::{SignatureFormat, Tag, TagSigner, tag_version};
 
@@ -186,6 +188,14 @@ pub enum GitError {
         /// The underlying error.
         #[source]
         source: fox_core::trust::AuthorKeyError,
+    },
+    /// A tag is SSH-signed, but by none of the keys allowed to sign it.
+    #[error("tag {tag} is signed by {fingerprint}, which may not sign it")]
+    TagSignerNotAllowed {
+        /// The tag.
+        tag: String,
+        /// The `SHA256:` fingerprint of the signing key.
+        fingerprint: String,
     },
     /// A tag's SSH signature is not valid for the key.
     #[error("tag {tag} has no valid signature by the expected key")]

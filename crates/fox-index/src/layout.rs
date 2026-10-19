@@ -157,6 +157,47 @@ pub struct Release {
     pub yanked: bool,
 }
 
+impl Release {
+    /// Checks that a repository's tag gave this release's commit and tree.
+    ///
+    /// # Errors
+    ///
+    /// [`ReleaseMismatch`] naming the first field that differs.
+    pub fn check_source(
+        &self,
+        commit: &str,
+        tree_blake3: &Blake3Digest,
+    ) -> Result<(), ReleaseMismatch> {
+        if commit != self.commit {
+            return Err(ReleaseMismatch {
+                field: "commit",
+                recorded: self.commit.clone(),
+                actual: commit.to_owned(),
+            });
+        }
+        if *tree_blake3 != self.tree_blake3 {
+            return Err(ReleaseMismatch {
+                field: "tree_blake3",
+                recorded: self.tree_blake3.to_string(),
+                actual: tree_blake3.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A repository disagrees with a recorded release.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the registry records {field} {recorded}, the repository has {actual}")]
+pub struct ReleaseMismatch {
+    /// `commit` or `tree_blake3`.
+    pub field: &'static str,
+    /// The registry's value.
+    pub recorded: String,
+    /// The repository's value.
+    pub actual: String,
+}
+
 /// The prebuilt artifacts of one release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,7 +251,51 @@ pub struct ArtifactAttestation {
     pub signature_blake3: Blake3Digest,
 }
 
+impl Artifact {
+    /// The artifact a builder's attestation describes, with no attestations
+    /// listed yet. `default_features` and `features` are the feature
+    /// selection the build was asked for.
+    pub fn from_attestation(
+        attestation: &fox_core::Attestation,
+        default_features: bool,
+        features: Vec<String>,
+    ) -> Self {
+        Self {
+            target: attestation.build.target.clone(),
+            cpu_level: attestation.build.cpu_level,
+            default_features,
+            features,
+            feature_set_hash: attestation.build.feature_set_hash,
+            pkgar_blake3: attestation.output.pkgar_blake3,
+            size: attestation.output.pkgar_size,
+            sbom_blake3: attestation.output.sbom_blake3,
+            attestations: Vec::new(),
+        }
+    }
+}
+
 impl ArtifactList {
+    /// Records `attestation` of `artifact`: added to the listed artifact
+    /// with the same archive hash (replacing that builder's earlier
+    /// attestation), or as a new artifact.
+    pub fn add_attestation(&mut self, artifact: Artifact, attestation: ArtifactAttestation) {
+        let index = match self
+            .artifacts
+            .iter()
+            .position(|known| known.pkgar_blake3 == artifact.pkgar_blake3)
+        {
+            Some(index) => index,
+            None => {
+                self.artifacts.push(artifact);
+                self.artifacts.len() - 1
+            }
+        };
+        let attestations = &mut self.artifacts[index].attestations;
+        attestations.retain(|known| known.builder != attestation.builder);
+        attestations.push(attestation);
+        attestations.sort_by(|a, b| a.builder.cmp(&b.builder));
+    }
+
     /// The artifact with this archive hash, if the list has it.
     pub fn artifact(&self, pkgar_blake3: &Blake3Digest) -> Option<&Artifact> {
         self.artifacts
@@ -439,6 +524,16 @@ impl PackageEntry {
             .max_by(|a, b| a.version.cmp(&b.version))
     }
 
+    /// The newest release matching `req`. Pre-releases match only a
+    /// requirement that names one (semver's rule), and yanked releases are
+    /// skipped unless `allow_yanked`.
+    pub fn select_release(&self, req: &semver::VersionReq, allow_yanked: bool) -> Option<&Release> {
+        self.releases
+            .iter()
+            .filter(|release| (allow_yanked || !release.yanked) && req.matches(&release.version))
+            .max_by(|a, b| a.version.cmp(&b.version))
+    }
+
     /// The owner whose key is `key`, ignoring comments.
     pub fn owner_with_key(&self, key: &AuthorKey) -> Option<&Owner> {
         self.owners.iter().find(|owner| &owner.key == key)
@@ -531,6 +626,45 @@ tree_blake3 = "{h}"
     }
 
     #[test]
+    fn releases_are_selected_by_requirement() {
+        let mut entry = PackageEntry::from_toml(&entry_text(), "packages/ri/ripgrep.toml").unwrap();
+        let any = semver::VersionReq::STAR;
+        assert_eq!(
+            entry.select_release(&any, false).unwrap().version,
+            Version::new(14, 2, 0)
+        );
+        let pre: semver::VersionReq = ">=15.0.0-rc.1".parse().unwrap();
+        assert_eq!(
+            entry
+                .select_release(&pre, false)
+                .unwrap()
+                .version
+                .to_string(),
+            "15.0.0-rc.1"
+        );
+        entry.releases[0].yanked = true;
+        assert!(entry.select_release(&any, false).is_none());
+        assert!(entry.select_release(&any, true).is_some());
+    }
+
+    #[test]
+    fn releases_check_their_source() {
+        let entry = PackageEntry::from_toml(&entry_text(), "packages/ri/ripgrep.toml").unwrap();
+        let release = &entry.releases[0];
+        let tree = Blake3Digest::of(b"tree");
+        assert!(release.check_source(&release.commit, &tree).is_ok());
+        let moved = release
+            .check_source("0".repeat(40).as_str(), &tree)
+            .unwrap_err();
+        assert_eq!(moved.field, "commit");
+        let changed = release
+            .check_source(&release.commit, &Blake3Digest::of(b"other"))
+            .unwrap_err();
+        assert_eq!(changed.field, "tree_blake3");
+        assert_eq!(changed.recorded, tree.to_string());
+    }
+
+    #[test]
     fn fanout_paths() {
         let name = |text| PackageName::new(text).unwrap();
         assert_eq!(package_path(&name("x")), "packages/x_/x.toml");
@@ -566,6 +700,16 @@ tree_blake3 = "{h}"
         let path = "artifacts/ri/ripgrep/14.2.0.toml";
         let list = ArtifactList::from_toml(&text, path).unwrap();
         assert_eq!(list.artifact(&h).unwrap().attestations[0].builder, "ci");
+        let mut more = list.clone();
+        let again = more.artifacts[0].clone();
+        let other = ArtifactAttestation {
+            builder: "rebuilder".to_owned(),
+            ..again.attestations[0].clone()
+        };
+        more.add_attestation(again.clone(), other);
+        more.add_attestation(again, list.artifacts[0].attestations[0].clone());
+        assert_eq!(more.artifacts.len(), 1);
+        assert_eq!(more.artifacts[0].attestations.len(), 2);
         assert_eq!(
             ArtifactList::from_toml(&list.to_toml().unwrap(), path).unwrap(),
             list
