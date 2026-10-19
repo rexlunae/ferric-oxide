@@ -404,19 +404,9 @@ fn schedule(
                 }
 
                 // Ferric Oxide: a wake-up lands on the CPU the context last ran on (or the
-                // waker's), which its affinity may no longer include, for example a thread that
-                // pinned itself elsewhere. This CPU never runs it, and work stealing takes it
-                // only from a much longer queue, so it could wait forever: hand it to a CPU it
-                // may run on instead.
-                let target = if guard.sched_affinity.contains(percpu.cpu_id) {
-                    None
-                } else {
-                    guard
-                        .sched_affinity
-                        .iter()
-                        .find(|&cpu| get_percpu_block(cpu).is_some())
-                };
-                if let Some(target) = target {
+                // waker's), which its affinity may no longer include (see
+                // `affinity_elsewhere`).
+                if let Some(target) = affinity_elsewhere(&guard, percpu.cpu_id) {
                     drop(guard);
                     forward.push((target, context_ref));
                     continue;
@@ -471,20 +461,8 @@ fn schedule(
         }
     }
 
-    // Ferric Oxide: the run queue lock is released; queue the forwarded contexts on their CPUs,
-    // as a wake-up from another CPU does (`context::wakeup_context`).
-    if !forward.is_empty() {
-        for (target, context_ref) in forward.drain(..) {
-            if let Some(target) = get_percpu_block(target) {
-                target
-                    .switch_internals
-                    .ipi_context_wakeup_list
-                    .lock(token.token())
-                    .push(context_ref);
-            }
-        }
-        crate::ipi::ipi(crate::ipi::IpiKind::Wakeup, crate::ipi::IpiTarget::Other);
-    }
+    // Ferric Oxide: the run queue lock is released.
+    forward_contexts(&mut forward, token);
 
     /* // uncomment to debug contexts count
     let cpu_count = crate::cpu_count() as usize;
@@ -509,14 +487,17 @@ fn schedule(
     let was_idle = percpu.stats.add_time(percpu_ms) == CpuState::Idle as u8;
     percpu.switch_internals.schedule_time.set(schedule_time);
 
-    let Some((mut next_sched_context, next_address_space)) = select_next_context(
+    let next = select_next_context(
         percpu,
         percpu.cpu_id,
         schedule_time,
         percpu_nanos,
         was_idle,
         &mut prev_context_guard,
-    ) else {
+        &mut forward,
+    );
+    forward_contexts(&mut forward, token);
+    let Some((mut next_sched_context, next_address_space)) = next else {
         return ScheduleResult::AllContextsIdle;
     };
 
@@ -542,6 +523,42 @@ fn schedule(
 }
 
 /// This is the scheduler function which currently utilises EEVDF Scheduler
+/// Ferric Oxide: the first online CPU `context` may run on, when its affinity excludes
+/// `cpu_id`: a context queued or woken on a CPU it may not use (a thread that pinned itself
+/// while running elsewhere) is never run there, and work stealing takes it only from a much
+/// longer queue, so it is handed to such a CPU instead.
+fn affinity_elsewhere(context: &Context, cpu_id: LogicalCpuId) -> Option<LogicalCpuId> {
+    if context.sched_affinity.contains(cpu_id) {
+        return None;
+    }
+    context
+        .sched_affinity
+        .iter()
+        .find(|&cpu| get_percpu_block(cpu).is_some())
+}
+
+/// Ferric Oxide: queues each of `forward` on its CPU's cross-CPU wake-up list and sends the
+/// wake-up IPI, as a wake-up from another CPU does (`context::wakeup_context`). The caller holds
+/// no run queue lock.
+fn forward_contexts(
+    forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
+    token: &mut CleanLockToken,
+) {
+    if forward.is_empty() {
+        return;
+    }
+    for (target, context_ref) in forward.drain(..) {
+        if let Some(target) = get_percpu_block(target) {
+            target
+                .switch_internals
+                .ipi_context_wakeup_list
+                .lock(token.token())
+                .push(context_ref);
+        }
+    }
+    crate::ipi::ipi(crate::ipi::IpiKind::Wakeup, crate::ipi::IpiTarget::Other);
+}
+
 fn select_next_context(
     percpu: &PercpuBlock,
     cpu_id: LogicalCpuId,
@@ -549,6 +566,7 @@ fn select_next_context(
     elapsed_time: u64,
     was_idle: bool,
     prev_context_guard: &mut ArcRwLockWriteGuard<L4, Context>,
+    forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
 ) -> Option<(ArcContextLockWriteGuard, Option<AddrSpaceSwitchReadGuard>)> {
     let mut contexts_data = percpu.switch_internals.run_queue.lock();
     let idle_context = percpu.switch_internals.idle_context();
@@ -659,6 +677,27 @@ fn select_next_context(
         let Some(mut guard) = (unsafe { context_lock.try_write_arc() }) else {
             continue;
         };
+
+        // Ferric Oxide: a context this CPU may not run leaves its queue for one it may.
+        if guard.status.is_runnable()
+            && !guard.running
+            && !guard.currently_scheduled
+            && let Some(target) = affinity_elsewhere(&guard, cpu_id)
+        {
+            if guard.is_active {
+                guard.is_active = false;
+                weight_change = weight_change.saturating_add(*context_weight);
+            }
+            guard.queue_key = None;
+            contexts_to_remove.push(ContextQueueKey {
+                vd: *vd,
+                rem_slice: *rem_slice,
+                ctxt_id: *ctxt_id,
+            });
+            drop(guard);
+            forward.push((target, context_ref.clone()));
+            continue;
+        }
 
         // next_is_current_sched is false by the above check
         let sw = update_runnable(
@@ -1585,7 +1624,15 @@ mod tests {
             cpu1.switch_internals.queue_len.store(1, Ordering::Relaxed);
         }
 
-        let chosen = select_next_context(cpu0, cpu0.cpu_id, 1000, 100, false, &mut prev_guard_0);
+        let chosen = select_next_context(
+            cpu0,
+            cpu0.cpu_id,
+            1000,
+            100,
+            false,
+            &mut prev_guard_0,
+            &mut SmallVec::new(),
+        );
 
         // CPU 0 should be idling and NOT steal from CPU 1
         assert_eq!(cpu0.switch_internals.run_queue.lock().queue.len(), 0);
@@ -1608,7 +1655,15 @@ mod tests {
             cpu1.switch_internals.queue_len.store(4, Ordering::Relaxed);
         }
 
-        let chosen = select_next_context(cpu0, cpu0.cpu_id, 2000, 100, false, &mut prev_guard_0);
+        let chosen = select_next_context(
+            cpu0,
+            cpu0.cpu_id,
+            2000,
+            100,
+            false,
+            &mut prev_guard_0,
+            &mut SmallVec::new(),
+        );
 
         // CPU 0 should steal 2 tasks, 1 is pushed to its own queue
         assert_eq!(cpu0.switch_internals.run_queue.lock().queue.len(), 1);
@@ -1621,7 +1676,15 @@ mod tests {
 
         // third test ---
 
-        let chosen = select_next_context(cpu1, cpu1.cpu_id, 2000, 100, false, &mut prev_guard_0);
+        let chosen = select_next_context(
+            cpu1,
+            cpu1.cpu_id,
+            2000,
+            100,
+            false,
+            &mut prev_guard_0,
+            &mut SmallVec::new(),
+        );
 
         // CPU 1 should not steal task yet, but it has something to do
         assert_eq!(cpu0.switch_internals.run_queue.lock().queue.len(), 1);
@@ -1651,7 +1714,15 @@ mod tests {
             guard.status = Status::Blocked;
         }
 
-        let chosen = select_next_context(cpu1, cpu1.cpu_id, 2000, 100, false, &mut prev_guard_0);
+        let chosen = select_next_context(
+            cpu1,
+            cpu1.cpu_id,
+            2000,
+            100,
+            false,
+            &mut prev_guard_0,
+            &mut SmallVec::new(),
+        );
 
         // CPU 1 should steal 1 task from CPU 0 used as the chosen one
         assert_eq!(cpu0.switch_internals.run_queue.lock().queue.len(), 1);
