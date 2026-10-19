@@ -24,11 +24,12 @@
 //!   span events named after their event, with their arguments.
 //! - **Status.** A system call or request whose result is an error number has status `ERROR`
 //!   with the error's text; others leave it unset. A span still open when the capture ends
-//!   ends at its last record, with `ferric.unfinished` set.
+//!   ends at its context's last record ([`Spans::last_seen`]), with `ferric.unfinished` set.
 //!
 //! Times are Unix nanoseconds: the first record is at [`Options::start_unix_ns`], and later
 //! ones are converted with the capture's [`TickRate`]. Trace ids begin with a hash of the
-//! capture and the start time, so two captures sent to one backend do not share ids.
+//! start time and every record, so two captures sent to one backend do not share ids unless
+//! they are the same capture sent twice with the same start.
 
 use std::collections::BTreeMap;
 
@@ -160,7 +161,7 @@ fn int(key: &str, value: u64) -> KeyValue {
 /// The conversion state.
 struct Exporter<'a> {
     entries: &'a [Entry],
-    spans: &'a [Span],
+    spans: &'a Spans,
     options: Options,
     base: u64,
     /// The trace ids' first half, from the capture.
@@ -189,12 +190,17 @@ impl Exporter<'_> {
     }
 
     fn span(&mut self, index: usize) -> OtlpSpan {
-        let span = &self.spans[index];
+        let span = &self.spans.spans[index];
         let trace = self.trace_of(span);
         self.traces.push(trace);
         let start = &self.entries[span.start];
-        let last = self.entries.len() - 1;
-        let end = span.end.unwrap_or(last);
+        // An unfinished span ends where its context was last seen, not at whatever another
+        // CPU recorded last.
+        let end = span
+            .end
+            .or_else(|| self.spans.last_seen(span.context))
+            .unwrap_or(span.start)
+            .max(span.start);
         let (name, kind) = match span.kind {
             SpanKind::Syscall { nr } => (format!("syscall {nr:#x}"), KIND_INTERNAL),
             SpanKind::Request { scheme, opcode, .. } => (
@@ -303,6 +309,21 @@ fn resource(pid: Option<u64>) -> Resource {
     Resource { attributes }
 }
 
+/// The trace ids' seed: a hash of the start time and every record (CPU, event, timestamp and
+/// arguments), so captures that differ in any record get different ids.
+fn seed(entries: &[Entry], start_unix_ns: u64) -> u64 {
+    let mut words = vec![start_unix_ns, entries.len() as u64];
+    for entry in entries {
+        words.extend([
+            u64::from(entry.cpu),
+            u64::from(entry.event.id().get()),
+            entry.timestamp,
+        ]);
+        words.extend(&entry.args);
+    }
+    fnv1a(&words)
+}
+
 /// FNV-1a over `words`: a stable hash that needs no dependency.
 fn fnv1a(words: &[u64]) -> u64 {
     words
@@ -337,16 +358,13 @@ fn fnv1a(words: &[u64]) -> u64 {
 pub fn to_json(capture: &Capture, options: Options) -> String {
     let entries = capture.entries();
     let spans = Spans::build(capture);
-    let (first, last) = match (entries.first(), entries.last()) {
-        (Some(first), Some(last)) => (first.timestamp, last.timestamp),
-        _ => (0, 0),
-    };
+    let first = entries.first().map_or(0, |entry| entry.timestamp);
     let mut exporter = Exporter {
         entries,
-        spans: &spans.spans,
+        spans: &spans,
         options,
         base: first,
-        seed: fnv1a(&[options.start_unix_ns, first, last, entries.len() as u64]),
+        seed: seed(entries, options.start_unix_ns),
         traces: Vec::with_capacity(spans.spans.len()),
         next_trace: 0,
     };
@@ -384,9 +402,21 @@ mod tests {
     use super::*;
     use crate::capture::{CpuCapture, tests::bytes};
 
-    fn export(records: &[(&ferric_trace::Event, u64, &[u64])], start_unix_ns: u64) -> Value {
-        let capture =
-            Capture::from_cpus(vec![CpuCapture::decode(0, &bytes(records)).expect("valid")]);
+    type Records<'a> = &'a [(&'a ferric_trace::Event, u64, &'a [u64])];
+
+    fn export(records: Records<'_>, start_unix_ns: u64) -> Value {
+        export_cpus(&[records], start_unix_ns)
+    }
+
+    fn export_cpus(cpus: &[Records<'_>], start_unix_ns: u64) -> Value {
+        let capture = Capture::from_cpus(
+            cpus.iter()
+                .enumerate()
+                .map(|(cpu, records)| {
+                    CpuCapture::decode(cpu as u32, &bytes(records)).expect("valid")
+                })
+                .collect(),
+        );
         let rate = TickRate::new(1000.0).expect("a valid rate");
         let json = to_json(
             &capture,
@@ -420,12 +450,13 @@ mod tests {
     #[test]
     fn a_request_is_a_child_span_of_its_syscall() {
         let doc = export(CALL, 1_700_000_000_000_000_000);
-        let [resource] = doc["resourceSpans"]
+        // The first switch puts out context 1 of pid 0: an instant of that resource.
+        let [_, resource] = doc["resourceSpans"]
             .as_array()
             .expect("an array")
             .as_slice()
         else {
-            panic!("one resource: {doc}");
+            panic!("two resources: {doc}");
         };
         let res = &resource["resource"]["attributes"];
         assert_eq!(
@@ -527,6 +558,78 @@ mod tests {
             |doc: &Value| doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"].clone();
         assert_ne!(id(&a), id(&b));
         assert_eq!(id(&a), id(&export(CALL, 0)), "the export is deterministic");
+    }
+
+    #[test]
+    fn records_decide_the_trace_ids() {
+        let id =
+            |doc: &Value| doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"].clone();
+        let a = export(
+            &[
+                (&SYSCALL_ENTER, 100, &[4, 0, 0, 0, 0]),
+                (&SYSCALL_EXIT, 200, &[4, 0]),
+            ],
+            0,
+        );
+        let b = export(
+            &[
+                (&SYSCALL_ENTER, 100, &[5, 0, 0, 0, 0]),
+                (&SYSCALL_EXIT, 200, &[5, 0]),
+            ],
+            0,
+        );
+        assert_ne!(id(&a), id(&b));
+    }
+
+    #[test]
+    fn an_unfinished_span_ends_where_its_context_was_last_seen() {
+        let doc = export_cpus(
+            &[
+                &[
+                    (&SCHED_SWITCH, 0, &[0, 3, 1, 7]),
+                    (&SYSCALL_ENTER, 10, &[4, 0, 0, 0, 0]),
+                    (&SCHED_SWITCH, 20, &[3, 0, 7, 1]),
+                ],
+                // Another context keeps CPU 1 busy long after.
+                &[
+                    (&SCHED_SWITCH, 5, &[0, 4, 2, 8]),
+                    (&SYSCALL_ENTER, 1_000_000, &[1, 0, 0, 0, 0]),
+                ],
+            ],
+            0,
+        );
+        let call = doc["resourceSpans"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .flat_map(|r| r["scopeSpans"][0]["spans"].as_array().expect("an array"))
+            .find(|s| s["name"] == "syscall 0x4")
+            .expect("the call");
+        // 1000 ticks per microsecond: tick 20, the switch that put context 7 out.
+        assert_eq!(call["endTimeUnixNano"], "20");
+        assert_eq!(
+            attribute(&call["attributes"], "ferric.unfinished"),
+            Some(&serde_json::json!({ "boolValue": true }))
+        );
+    }
+
+    #[test]
+    fn a_switch_only_capture_is_not_empty() {
+        let doc = export(
+            &[
+                (&SCHED_SWITCH, 0, &[0, 3, 1, 7]),
+                (&SCHED_SWITCH, 10, &[3, 0, 7, 1]),
+            ],
+            0,
+        );
+        let names: Vec<_> = doc["resourceSpans"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .flat_map(|r| r["scopeSpans"][0]["spans"].as_array().expect("an array"))
+            .map(|s| s["name"].clone())
+            .collect();
+        assert_eq!(names, ["sched.switch", "sched.switch"]);
     }
 
     #[test]

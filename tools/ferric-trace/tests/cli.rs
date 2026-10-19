@@ -53,7 +53,9 @@ fn exports_otlp_json() {
         .expect("runs");
     assert!(output.status.success(), "{output:?}");
     let doc: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    let spans = doc["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    // The first resource is pid 0, whose context the first switch put out (an instant); the
+    // second is pid 3's.
+    let spans = doc["resourceSpans"][1]["scopeSpans"][0]["spans"]
         .as_array()
         .expect("spans");
     // The system call, and the scheme request it made as its child.
