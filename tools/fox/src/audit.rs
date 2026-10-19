@@ -11,15 +11,28 @@
 //! crate is found in every package that links it. Withdrawn and
 //! informational advisories are skipped. A package whose version is not
 //! semver cannot be compared and is reported as unchecked.
+//!
+//! Each registry's signed VEX documents (`vex/*.cdx.json`, see
+//! [`fox_index::vex`]) can set findings aside. A statement applies to a
+//! finding when it names the advisory's id or one of its aliases and
+//! covers the installed package and version, and only when the registry
+//! that published it lists that package, so one registry cannot vouch for
+//! another's packages. A `not_affected`, `false_positive` or `resolved`
+//! statement moves the finding to `suppressed`; an `exploitable` or
+//! `in_triage` one keeps it a finding and wins over a clearing statement
+//! from any registry. `--no-vex` ignores VEX.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use fox_core::PackageName;
 use fox_core::policy::Policy;
 use fox_core::registries::Registries;
 use fox_index::advisory::{Advisory, AdvisoryError, Ecosystem};
+use fox_index::verify::VerifiedRegistry;
 use fox_sbom::cargo_crates;
+use fox_sbom::vex::VexStatement;
 use fox_store::Store;
 use semver::Version;
 use serde::Serialize;
@@ -55,6 +68,31 @@ struct Sourced {
     advisory: Advisory,
 }
 
+/// A VEX statement, the registry that signed it and its file there.
+struct SourcedVex {
+    source: String,
+    path: String,
+    statement: VexStatement,
+}
+
+/// What the advisories are checked against and with.
+struct Sources {
+    advisories: Vec<Sourced>,
+    vex: Vec<SourcedVex>,
+}
+
+/// The VEX statement applied to a finding.
+#[derive(Debug, Serialize)]
+struct VexJson {
+    source: String,
+    document: String,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    justification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct CrateJson {
     name: String,
@@ -74,23 +112,31 @@ struct FindingJson {
     title: String,
     aliases: Vec<String>,
     patched: Vec<String>,
+    /// The VEX statement about it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vex: Option<VexJson>,
 }
 
 #[derive(Debug, Serialize)]
 struct AuditJson {
     findings: Vec<FindingJson>,
+    /// Findings a registry's VEX says do not apply.
+    suppressed: Vec<FindingJson>,
     /// Packages whose version is not semver, so advisories naming them
     /// could not be compared.
     unchecked: Vec<String>,
     advisories: usize,
 }
 
-/// `fox audit [--rustsec <dir>]`.
-pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>) -> Result<ExitCode, CliError> {
-    let advisories = load(&cli.root, rustsec)?;
+/// `fox audit [--rustsec <dir>] [--no-vex]`.
+pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>, no_vex: bool) -> Result<ExitCode, CliError> {
+    let mut sources = load(&cli.root, rustsec)?;
+    if no_vex {
+        sources.vex.clear();
+    }
     let store = Store::open(&cli.root)?;
     let inventory = inventory::take(&store)?;
-    let report = check(&inventory, &advisories);
+    let report = check(&inventory, &sources.advisories, &sources.vex);
     if cli.json {
         print_json(&report)?;
     } else {
@@ -103,7 +149,7 @@ pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>) -> Result<ExitCode, CliErro
     })
 }
 
-fn load(root: &Path, rustsec: Option<&Path>) -> Result<Vec<Sourced>, CliError> {
+fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
     let registries = Registries::load(root)?;
     if registries.entries().is_empty() && rustsec.is_none() {
         return Err(AuditError::NoSources.into());
@@ -111,8 +157,10 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Vec<Sourced>, CliError> {
     let policy = Policy::load(root)?;
     let now = OffsetDateTime::now_utc();
     let mut all = Vec::new();
+    let mut vex = Vec::new();
     for entry in registries.entries() {
         let verified = registry::open(root, entry, &policy, now)?;
+        vex.extend(registry_vex(&verified, entry.name.as_ref())?);
         let advisories = verified
             .advisories()
             .map_err(|source| RegistryError::Verify {
@@ -135,7 +183,34 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Vec<Sourced>, CliError> {
         );
     }
     all.retain(|sourced| sourced.advisory.is_active());
-    Ok(all)
+    Ok(Sources {
+        advisories: all,
+        vex,
+    })
+}
+
+/// The registry's VEX statements about packages it lists.
+fn registry_vex(verified: &VerifiedRegistry, source: &str) -> Result<Vec<SourcedVex>, CliError> {
+    let verify_error = |error| RegistryError::Verify {
+        name: source.to_owned(),
+        source: Box::new(error),
+    };
+    let mut statements = Vec::new();
+    for document in verified.vex_documents().map_err(verify_error)? {
+        for statement in document.statements {
+            let Ok(name) = PackageName::new(statement.package.as_str()) else {
+                continue;
+            };
+            if verified.package(&name).map_err(verify_error)?.is_some() {
+                statements.push(SourcedVex {
+                    source: source.to_owned(),
+                    path: document.path.clone(),
+                    statement,
+                });
+            }
+        }
+    }
+    Ok(statements)
 }
 
 /// Every `crates/<crate>/*.md` advisory in a RustSec database checkout.
@@ -176,7 +251,7 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, AuditError> {
     Ok(paths)
 }
 
-fn check(inventory: &[Inventoried], advisories: &[Sourced]) -> AuditJson {
+fn check(inventory: &[Inventoried], advisories: &[Sourced], vex: &[SourcedVex]) -> AuditJson {
     let mut findings = Vec::new();
     let mut unchecked = Vec::new();
     for item in inventory {
@@ -220,11 +295,42 @@ fn check(inventory: &[Inventoried], advisories: &[Sourced]) -> AuditJson {
             }
         }
     }
+    let (suppressed, findings) = findings
+        .into_iter()
+        .map(|finding| apply_vex(finding, vex))
+        .partition::<Vec<_>, _>(|(cleared, _)| *cleared);
     AuditJson {
-        findings,
+        findings: findings.into_iter().map(|(_, finding)| finding).collect(),
+        suppressed: suppressed.into_iter().map(|(_, finding)| finding).collect(),
         unchecked,
         advisories: advisories.len(),
     }
+}
+
+/// Attaches the VEX statement that decides `finding`, and whether it
+/// clears it. A statement that does not clear it wins, so a registry
+/// cannot hide a vulnerability another one reports as exploitable.
+fn apply_vex(mut finding: FindingJson, vex: &[SourcedVex]) -> (bool, FindingJson) {
+    let mut matching = vex.iter().filter(|sourced| {
+        sourced.statement.names(&finding.advisory, &finding.aliases)
+            && sourced.statement.covers(&finding.package, &finding.version)
+    });
+    let deciding = matching
+        .clone()
+        .find(|sourced| !sourced.statement.state.clears())
+        .or_else(|| matching.next());
+    let Some(sourced) = deciding else {
+        return (false, finding);
+    };
+    let statement = &sourced.statement;
+    finding.vex = Some(VexJson {
+        source: sourced.source.clone(),
+        document: sourced.path.clone(),
+        state: statement.state.as_str(),
+        justification: statement.justification.clone(),
+        detail: statement.detail.clone(),
+    });
+    (statement.state.clears(), finding)
 }
 
 fn advisories_for<'a>(
@@ -255,32 +361,53 @@ fn finding(item: &Inventoried, via: Option<CrateJson>, sourced: &Sourced) -> Fin
             .iter()
             .map(ToString::to_string)
             .collect(),
+        vex: None,
     }
 }
 
 fn print_report(report: &AuditJson) {
     for finding in &report.findings {
-        let via = finding.via.as_ref().map_or_else(String::new, |krate| {
-            let build = if krate.build_only { ", build only" } else { "" };
-            format!(" (crate {} {}{build})", krate.name, krate.version)
-        });
-        let patched = if finding.patched.is_empty() {
-            "no patched version".to_owned()
-        } else {
-            format!("patched: {}", finding.patched.join(", "))
-        };
-        println!(
-            "{} {}{via}: {} [{}] {}; {patched}",
-            finding.package, finding.version, finding.advisory, finding.source, finding.title
-        );
+        print_finding(finding);
+    }
+    for finding in &report.suppressed {
+        if let Some(vex) = &finding.vex {
+            let why = vex
+                .justification
+                .as_ref()
+                .map_or_else(String::new, |why| format!(", {why}"));
+            println!(
+                "{} {}: {} set aside by {} VEX ({}{why})",
+                finding.package, finding.version, finding.advisory, vex.source, vex.state
+            );
+        }
     }
     for package in &report.unchecked {
         eprintln!("fox: cannot compare {package} with its advisories: not a semver version");
     }
     println!(
-        "{} finding(s) against {} advisories",
+        "{} finding(s) against {} advisories; {} set aside by VEX",
         report.findings.len(),
-        report.advisories
+        report.advisories,
+        report.suppressed.len()
+    );
+}
+
+fn print_finding(finding: &FindingJson) {
+    let via = finding.via.as_ref().map_or_else(String::new, |krate| {
+        let build = if krate.build_only { ", build only" } else { "" };
+        format!(" (crate {} {}{build})", krate.name, krate.version)
+    });
+    let patched = if finding.patched.is_empty() {
+        "no patched version".to_owned()
+    } else {
+        format!("patched: {}", finding.patched.join(", "))
+    };
+    let vex = finding.vex.as_ref().map_or_else(String::new, |vex| {
+        format!("; {} VEX: {}", vex.source, vex.state)
+    });
+    println!(
+        "{} {}{via}: {} [{}] {}; {patched}{vex}",
+        finding.package, finding.version, finding.advisory, finding.source, finding.title
     );
 }
 
@@ -379,7 +506,8 @@ mod tests {
         }
         fs::write(db.path().join("crates/smallcrate/README.txt"), "skipped").unwrap();
         let root = tempfile::tempdir().unwrap();
-        let advisories = load(root.path(), Some(db.path())).unwrap();
+        let sources = load(root.path(), Some(db.path())).unwrap();
+        let advisories = sources.advisories;
         // The withdrawn advisory is dropped.
         assert_eq!(advisories.len(), 2);
 
@@ -395,7 +523,7 @@ mod tests {
             ),
             inventoried("fixed", "2.0.0", &[("smallcrate", "0.3.2", false)]),
         ];
-        let report = check(&inventory, &advisories);
+        let report = check(&inventory, &advisories, &[]);
         let found: Vec<(&str, &str, bool)> = report
             .findings
             .iter()
@@ -421,6 +549,68 @@ mod tests {
         ));
     }
 
+    fn vex(source: &str, id: &str, package: &str, state: &str) -> SourcedVex {
+        let json = format!(
+            r#"{{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+                "vulnerabilities": [{{"id": "{id}", "analysis": {{"state": "{state}",
+                  "justification": "code_not_present"}},
+                  "affects": [{{"ref": "pkg:generic/{package}@1.0.0"}}]}}]}}"#
+        );
+        let statement = fox_sbom::vex::read_vex(json.as_bytes()).unwrap().remove(0);
+        SourcedVex {
+            source: source.to_owned(),
+            path: format!("vex/{id}.cdx.json"),
+            statement,
+        }
+    }
+
+    #[test]
+    fn vex_sets_findings_aside_unless_another_statement_disagrees() {
+        let advisory = |id: &str, aliases: &str| Sourced {
+            source: "test".to_owned(),
+            advisory: Advisory::parse(&format!(
+                "[advisory]\nid = \"{id}\"\npackage = \"app\"\ndate = \"2026-01-01\"\n\
+                 aliases = [{aliases}]\n"
+            ))
+            .unwrap(),
+        };
+        let advisories = [advisory("FOX-1", ""), advisory("FOX-2", "\"CVE-2026-2\"")];
+        let inventory = [
+            inventoried("app", "1.0.0", &[]),
+            inventoried("app2", "1.0.0", &[]),
+        ];
+
+        // By id, and by alias; other packages and versions are untouched.
+        let statements = [
+            vex("test", "FOX-1", "app", "not_affected"),
+            vex("test", "CVE-2026-2", "app", "false_positive"),
+        ];
+        let report = check(&inventory, &advisories, &statements);
+        assert!(report.findings.is_empty());
+        assert_eq!(report.suppressed.len(), 2);
+        let vex_json = report.suppressed[0].vex.as_ref().unwrap();
+        assert_eq!(vex_json.state, "not_affected");
+        assert_eq!(vex_json.justification.as_deref(), Some("code_not_present"));
+        assert_eq!(vex_json.document, "vex/FOX-1.cdx.json");
+        let report = check(
+            &[inventoried("app", "1.0.1", &[])],
+            &advisories,
+            &statements,
+        );
+        assert_eq!(report.findings.len(), 2);
+
+        // An exploitable statement from another registry wins, and stays
+        // attached to the finding.
+        let disagreeing = [
+            vex("test", "FOX-1", "app", "not_affected"),
+            vex("other", "FOX-1", "app", "exploitable"),
+        ];
+        let report = check(&inventory, &advisories[..1], &disagreeing);
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.suppressed.is_empty());
+        assert_eq!(report.findings[0].vex.as_ref().unwrap().source, "other");
+    }
+
     #[test]
     fn non_semver_versions_are_unchecked() {
         let advisory = Advisory::parse(
@@ -431,10 +621,10 @@ mod tests {
             source: "test".to_owned(),
             advisory,
         }];
-        let report = check(&[inventoried("app", "2024.1", &[])], &advisories);
+        let report = check(&[inventoried("app", "2024.1", &[])], &advisories, &[]);
         assert!(report.findings.is_empty());
         assert_eq!(report.unchecked, ["app 2024.1"]);
-        let report = check(&[inventoried("app", "1.0.0", &[])], &advisories);
+        let report = check(&[inventoried("app", "1.0.0", &[])], &advisories, &[]);
         assert_eq!(report.findings.len(), 1);
     }
 }

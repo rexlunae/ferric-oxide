@@ -15,9 +15,11 @@ fox-git = { path = "../../crates/fox-git" }
 fox-index = { path = "../../crates/fox-index" }
 pkgar-keys.workspace = true
 semver.workspace = true
+serde.workspace = true
 ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 time = { workspace = true, features = ["formatting", "parsing"] }
+toml = { workspace = true, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]
 fox-git = { path = "../../crates/fox-git" }

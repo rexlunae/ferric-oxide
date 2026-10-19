@@ -5,14 +5,17 @@
 //!
 //! - `init` creates a registry with fresh role keys;
 //! - `admit` adds a package and delegates its file to its owners;
+//! - `import-recipes` admits cookbook recipes as `recipe` packages;
 //! - `release` records a signed release tag, and `check` re-checks recorded
 //!   releases against their repositories (what registry CI runs on a PR);
 //! - `build` is the registry builder: it builds releases from their checked
 //!   tags, signs the archives and attestations, and records them in the
-//!   artifact lists;
+//!   artifact lists, and `rebuild` is the independent rebuilder that adds
+//!   its attestation to archives it reproduces;
 //! - `configure` sets the artifact store and the builders in
 //!   `registry.toml`;
-//! - `advise` publishes or updates a security advisory;
+//! - `advise` publishes or updates a security advisory, and `vex` a
+//!   CycloneDX VEX document;
 //! - `yank` marks a release yanked;
 //! - `set-role` rotates a role's keys through a new root;
 //! - `sign` brings the metadata up to date and signs what the given keys
@@ -23,8 +26,10 @@
 
 #![forbid(unsafe_code)]
 
+mod attested;
 mod ci;
 mod keys;
+mod recipes;
 mod source;
 
 use std::collections::BTreeSet;
@@ -32,15 +37,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use fox_core::{GitUrl, PackageName};
+use fox_core::{CpuLevel, GitUrl, PackageName};
 use fox_index::advisory::Advisory;
 use fox_index::edit::{EditError, Keyring, Registry, SignOptions, SignReport};
-use fox_index::layout::{Builder, Owner, PackageEntry, PackageKind};
+use fox_index::layout::{Artifact, Builder, Owner, PackageEntry, PackageKind};
 use fox_index::metadata::{RoleKeys, RoleName, Root, Signed};
 use fox_index::verify::{self, ClientState, VerifyError};
 use semver::Version;
 use time::OffsetDateTime;
 
+use crate::attested::Attester;
 use crate::keys::KeyError;
 use crate::source::SourceError;
 
@@ -53,6 +59,37 @@ struct Cli {
     registry: PathBuf,
     #[command(subcommand)]
     command: Command,
+}
+
+/// The options of `build` and `rebuild`.
+#[derive(Debug, clap::Args)]
+struct BuilderArgs {
+    /// `name@version` releases to build; without any, every release that
+    /// this builder has not built (or, for `rebuild`, attested) yet.
+    releases: Vec<String>,
+    /// The builder's `pkgar-keys` secret key.
+    #[arg(long)]
+    key: PathBuf,
+    /// The builder's label in `registry.toml`.
+    #[arg(long)]
+    label: String,
+    /// Where to store the blobs, as `<dir>/blake3/<hash>`.
+    #[arg(long)]
+    blobs: PathBuf,
+    /// The Rust target (default: this machine's).
+    #[arg(long)]
+    target: Option<String>,
+    /// The x86-64 level to build for, `v3` or `v4` (default: v3); only
+    /// for x86-64 targets. Each level is its own artifact.
+    #[arg(long = "level", value_name = "LEVEL")]
+    cpu_level: Option<CpuLevel>,
+    /// The git cache directory.
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// The build work directory (default: one per package under the
+    /// system temporary directory).
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +131,18 @@ enum Command {
         #[arg(long = "owner", required = true, value_name = "ID=KEY")]
         owners: Vec<String>,
     },
+    /// Admit every cookbook recipe under a directory as a `recipe` package
+    /// whose source is its recipe directory in this repository.
+    ImportRecipes {
+        /// The recipes directory (or one category of it).
+        dir: PathBuf,
+        /// The URL of the repository holding the recipes.
+        #[arg(long)]
+        git: String,
+        /// An owner of every imported package, as `ID=KEY`.
+        #[arg(long = "owner", required = true, value_name = "ID=KEY")]
+        owners: Vec<String>,
+    },
     /// Record a release from a signed tag of the package's repository.
     Release {
         /// The package.
@@ -113,30 +162,11 @@ enum Command {
         cache: Option<PathBuf>,
     },
     /// Build releases and record them as artifacts (registry builders).
-    Build {
-        /// `name@version` releases to build; without any, every release
-        /// that has no artifact from this builder yet.
-        releases: Vec<String>,
-        /// The builder's `pkgar-keys` secret key.
-        #[arg(long)]
-        key: PathBuf,
-        /// The builder's label in `registry.toml`.
-        #[arg(long)]
-        label: String,
-        /// Where to store the blobs, as `<dir>/blake3/<hash>`.
-        #[arg(long)]
-        blobs: PathBuf,
-        /// The Rust target (default: this machine's).
-        #[arg(long)]
-        target: Option<String>,
-        /// The git cache directory.
-        #[arg(long)]
-        cache: Option<PathBuf>,
-        /// The build work directory (default: one per package under the
-        /// system temporary directory).
-        #[arg(long)]
-        work_dir: Option<PathBuf>,
-    },
+    Build(BuilderArgs),
+    /// Reproduce artifacts another builder published and add this
+    /// builder's attestation to each one it reproduces (independent
+    /// rebuilders).
+    Rebuild(BuilderArgs),
     /// Change `registry.toml`: the artifact store and the builders.
     Configure {
         /// Replace the artifact store base URLs with these.
@@ -158,6 +188,20 @@ enum Command {
     Advise {
         /// The advisory file.
         file: PathBuf,
+    },
+    /// Publish, replace or remove a CycloneDX VEX document saying whether
+    /// vulnerabilities affect the registry's packages; it is stored as
+    /// `vex/<id>.cdx.json`.
+    Vex {
+        /// The VEX document (CycloneDX JSON 1.4 or 1.5).
+        #[arg(required_unless_present = "remove", conflicts_with = "remove")]
+        file: Option<PathBuf>,
+        /// Its id (default: the file name without `.cdx.json` or `.json`).
+        #[arg(long, conflicts_with = "remove")]
+        id: Option<String>,
+        /// Remove the document with this id instead.
+        #[arg(long, value_name = "ID")]
+        remove: Option<String>,
     },
     /// Mark a release yanked, so new installs skip it.
     Yank {
@@ -247,6 +291,8 @@ impl From<Role> for RoleName {
 enum CliError {
     #[error(transparent)]
     Edit(#[from] EditError),
+    #[error("the rebuild did not reproduce every published archive of {}", releases.join(", "))]
+    NotReproduced { releases: Vec<String> },
     #[error("the registry does not verify")]
     Verify(#[from] VerifyError),
     #[error(transparent)]
@@ -291,12 +337,34 @@ enum CliError {
         #[source]
         source: std::io::Error,
     },
+    #[error("cannot read VEX document {}", path.display())]
+    VexFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot name VEX document {} by its file name; pass --id", path.display())]
+    VexId { path: PathBuf },
+    #[error("no VEX document {id}")]
+    NoVex { id: String },
+    #[error("name a VEX document or pass --remove")]
+    NoVexFile,
     #[error("invalid advisory {}", path.display())]
     Advisory {
         path: PathBuf,
         #[source]
         source: fox_index::advisory::AdvisoryError,
     },
+    #[error(transparent)]
+    Recipe(#[from] recipes::RecipeError),
+    #[error("cannot find the git repository holding {}", path.display())]
+    RecipeRepo {
+        path: PathBuf,
+        #[source]
+        source: Box<fox_git::GitError>,
+    },
+    #[error("the repository holding {} has no work tree", path.display())]
+    BareRecipeRepo { path: PathBuf },
     #[error("--builder {value:?} is not LABEL=KEY")]
     BuilderSyntax { value: String },
     #[error("no builder {label} to remove")]
@@ -316,15 +384,32 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("fox-registry: {error}");
-            let mut source = std::error::Error::source(&error);
-            while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
-                source = cause.source();
-            }
+            report(&error);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints an error and its sources, one per line.
+fn report(error: &dyn std::error::Error) {
+    eprintln!("fox-registry: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
+}
+
+/// Formats an error and its sources on one line, for a warning.
+pub(crate) fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn run(cli: &Cli) -> Result<(), CliError> {
@@ -343,26 +428,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Build {
-            releases,
-            key,
-            label,
-            blobs,
-            target,
-            cache,
-            work_dir,
-        } => build(
-            dir,
-            &BuildArgs {
-                releases,
-                key,
-                label,
-                blobs,
-                target: target.as_deref(),
-                cache: cache.as_deref(),
-                work_dir: work_dir.as_deref(),
-            },
-        ),
+        Command::Build(args) => build(dir, args, Mode::Build),
+        Command::Rebuild(args) => build(dir, args, Mode::Rebuild),
         Command::Admit {
             git,
             name,
@@ -403,6 +470,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             },
         ),
         Command::Advise { file } => advise(dir, file),
+        Command::Vex { file, id, remove } => {
+            vex(dir, file.as_deref(), id.as_deref(), remove.as_deref())
+        }
+        Command::ImportRecipes {
+            dir: recipes,
+            git,
+            owners,
+        } => import_recipes(dir, recipes, git, owners),
         Command::Release { name, tag, cache } => release(dir, name, tag, cache.as_deref()),
         Command::Check { names, cache } => check(dir, names, cache.as_deref()),
         Command::Yank {
@@ -533,6 +608,71 @@ fn write_templates(dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+fn import_recipes(
+    dir: &Path,
+    recipes_dir: &Path,
+    git: &str,
+    owners: &[String],
+) -> Result<(), CliError> {
+    let git = GitUrl::new(git)?;
+    let owners = owners
+        .iter()
+        .map(|owner| parse_owner(owner))
+        .collect::<Result<Vec<_>, _>>()?;
+    let repo_error = |source| CliError::RecipeRepo {
+        path: recipes_dir.to_path_buf(),
+        source: Box::new(source),
+    };
+    let repo = fox_git::Repository::discover(recipes_dir).map_err(repo_error)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| CliError::BareRecipeRepo {
+            path: recipes_dir.to_path_buf(),
+        })?
+        .canonicalize()
+        .map_err(|source| CliError::RootFile {
+            path: recipes_dir.to_path_buf(),
+            source,
+        })?;
+    let scan_dir = recipes_dir
+        .canonicalize()
+        .map_err(|source| CliError::RootFile {
+            path: recipes_dir.to_path_buf(),
+            source,
+        })?;
+    let scan = recipes::scan(&workdir, &scan_dir)?;
+    for error in &scan.invalid {
+        report_failure("fox-registry: skipped", error);
+    }
+    let mut registry = Registry::open(dir)?;
+    let mut entries = Vec::new();
+    let (mut existing, mut invalid) = (0, Vec::new());
+    for recipe in &scan.found {
+        let Some(entry) = recipe.entry(&git, &owners) else {
+            invalid.push(recipe.name.as_str());
+            continue;
+        };
+        if registry.package(&entry.name)?.is_some() {
+            existing += 1;
+            continue;
+        }
+        entries.push(entry);
+    }
+    registry.admit_all(&entries)?;
+    println!(
+        "admitted {} recipes ({existing} already in the registry); run `fox-registry sign` with the targets key",
+        entries.len()
+    );
+    if !invalid.is_empty() {
+        eprintln!(
+            "fox-registry: skipped {} recipes whose names are not package names: {}",
+            invalid.len(),
+            invalid.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn advise(dir: &Path, file: &Path) -> Result<(), CliError> {
     let text = std::fs::read_to_string(file).map_err(|source| CliError::AdvisoryFile {
         path: file.to_path_buf(),
@@ -547,6 +687,45 @@ fn advise(dir: &Path, file: &Path) -> Result<(), CliError> {
     Registry::open(dir)?.write_advisory(&advisory)?;
     println!("wrote {path}; run `fox-registry sign` with the targets key");
     Ok(())
+}
+
+fn vex(
+    dir: &Path,
+    file: Option<&Path>,
+    id: Option<&str>,
+    remove: Option<&str>,
+) -> Result<(), CliError> {
+    let registry = Registry::open(dir)?;
+    let path = if let Some(id) = remove {
+        registry
+            .remove_vex(id)?
+            .ok_or_else(|| CliError::NoVex { id: id.to_owned() })?
+    } else {
+        let file = file.ok_or(CliError::NoVexFile)?;
+        let json = std::fs::read(file).map_err(|source| CliError::VexFile {
+            path: file.to_path_buf(),
+            source,
+        })?;
+        let id = match id {
+            Some(id) => id,
+            None => vex_id(file).ok_or_else(|| CliError::VexId {
+                path: file.to_path_buf(),
+            })?,
+        };
+        registry.write_vex(id, &json)?
+    };
+    println!("updated {path}; run `fox-registry sign` with the targets key");
+    Ok(())
+}
+
+/// A VEX id from a file name: `x.cdx.json` and `x.json` give `x`.
+fn vex_id(file: &Path) -> Option<&str> {
+    let name = file.file_name()?.to_str()?;
+    let id = name
+        .strip_suffix(".cdx.json")
+        .or_else(|| name.strip_suffix(".json"))
+        .unwrap_or(name);
+    Some(id)
 }
 
 struct ConfigureArgs<'a> {
@@ -592,51 +771,98 @@ fn configure(dir: &Path, args: &ConfigureArgs<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
-struct BuildArgs<'a> {
-    releases: &'a [String],
-    key: &'a Path,
-    label: &'a str,
-    blobs: &'a Path,
-    target: Option<&'a str>,
-    cache: Option<&'a Path>,
-    work_dir: Option<&'a Path>,
+/// Whether `build` builds new artifacts or reproduces published ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Build,
+    Rebuild,
 }
 
 /// The target `build` uses without `--target`: the one this binary runs
 /// on, as the build's toolchain defaults to it too.
 const HOST_TARGET: &str = env!("FOX_REGISTRY_HOST_TARGET");
 
-fn build(dir: &Path, args: &BuildArgs<'_>) -> Result<(), CliError> {
+fn build(dir: &Path, args: &BuilderArgs, mode: Mode) -> Result<(), CliError> {
     let registry = Registry::open(dir)?;
-    let cache = cache_dir(args.cache)?;
-    let target = args.target.unwrap_or(HOST_TARGET);
+    let cache = cache_dir(args.cache.as_deref())?;
+    let target = args.target.as_deref().unwrap_or(HOST_TARGET);
+    let config = registry.config()?;
+    let attester = Attester::new(&config, &args.label, &args.blobs);
     let releases = if args.releases.is_empty() {
-        missing_builds(&registry, args.label, target)?
+        match mode {
+            Mode::Build => missing_builds(&registry, &attester, target, args.cpu_level)?,
+            Mode::Rebuild => missing_rebuilds(&registry, &attester, target, args.cpu_level)?,
+        }
     } else {
         args.releases
             .iter()
             .map(|value| parse_release(value))
             .collect::<Result<_, _>>()?
     };
+    let mut diverged = Vec::new();
     for (name, version) in releases {
-        let work_dir = args.work_dir.map_or_else(
-            || fox_build::default_work_dir(format!("fox-registry/{name}").as_bytes()),
-            Path::to_path_buf,
-        );
+        let work_dir = args
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| default_work_dir(mode, &args.label, target, args.cpu_level, &name));
         let job = ci::BuildJob {
             name: &name,
             version: &version,
-            key: args.key,
-            label: args.label,
-            blobs: args.blobs,
+            key: &args.key,
+            label: &args.label,
+            blobs: &args.blobs,
             work_dir: &work_dir,
             cache: &cache,
             target: Some(target.to_owned()),
+            cpu_level: args.cpu_level,
         };
-        let pkgar = ci::build(&registry, &job)?;
-        println!("built {name} {version}: {pkgar}");
+        match mode {
+            Mode::Build => {
+                let pkgar = ci::build(&registry, &job)?;
+                println!("built {name} {version}: {pkgar}");
+            }
+            Mode::Rebuild => match ci::rebuild(&registry, &job, &attester) {
+                Ok(reproduced) => print_reproduced(&name, &version, &reproduced),
+                // A release whose archives disagree with the rebuild must
+                // not stop the others from being rebuilt; it fails the run
+                // at the end.
+                Err(error @ ci::CiError::NotReproduced { .. }) => {
+                    if let ci::CiError::NotReproduced { reproduced, .. } = &error {
+                        print_reproduced(&name, &version, reproduced);
+                    }
+                    report(&error);
+                    diverged.push(format!("{name}@{version}"));
+                }
+                Err(error) => return Err(error.into()),
+            },
+        }
     }
-    Ok(())
+    if diverged.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::NotReproduced { releases: diverged })
+    }
+}
+
+fn print_reproduced(name: &PackageName, version: &Version, reproduced: &[fox_core::Blake3Digest]) {
+    for pkgar in reproduced {
+        println!("reproduced {name} {version}: {pkgar}");
+    }
+}
+
+/// The work directory without `--work-dir`: one per builder, mode, target,
+/// level and package, so builders running at once on one machine do not
+/// replace each other's source and stage.
+fn default_work_dir(
+    mode: Mode,
+    label: &str,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+    name: &PackageName,
+) -> PathBuf {
+    let level = cpu_level.map(|level| level.to_string()).unwrap_or_default();
+    let key = format!("fox-registry/{mode:?}/{label}/{target}/{level}/{name}");
+    fox_build::default_work_dir(key.as_bytes())
 }
 
 fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
@@ -650,12 +876,14 @@ fn parse_release(value: &str) -> Result<(PackageName, Version), CliError> {
     ))
 }
 
-/// Every release, not yanked, that has no artifact for `target` attested
-/// by `label`.
+/// Every release, not yanked, that has no artifact for `target` (at
+/// `cpu_level`, default the baseline, for an x86-64 target) attested by
+/// `label`.
 fn missing_builds(
     registry: &Registry,
-    label: &str,
+    attester: &Attester<'_>,
     target: &str,
+    cpu_level: Option<CpuLevel>,
 ) -> Result<Vec<(PackageName, Version)>, CliError> {
     let mut missing = Vec::new();
     for delegation in &registry.targets().signed.delegations {
@@ -668,11 +896,7 @@ fn missing_builds(
                 .artifacts(&name, &release.version)?
                 .is_some_and(|list| {
                     list.artifacts.iter().any(|artifact| {
-                        artifact.target == target
-                            && artifact
-                                .attestations
-                                .iter()
-                                .any(|attestation| attestation.builder == label)
+                        is_variant(artifact, target, cpu_level) && attester.has_attested(artifact)
                     })
                 });
             if !built {
@@ -681,6 +905,61 @@ fn missing_builds(
         }
     }
     Ok(missing)
+}
+
+/// Every release, not yanked, with a default-feature artifact for
+/// `target` at `cpu_level` that `label` has not attested.
+fn missing_rebuilds(
+    registry: &Registry,
+    attester: &Attester<'_>,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+) -> Result<Vec<(PackageName, Version)>, CliError> {
+    let mut missing = Vec::new();
+    for delegation in &registry.targets().signed.delegations {
+        let name = PackageName::new(delegation.name.as_str())?;
+        let Some(entry) = registry.package(&name)? else {
+            continue;
+        };
+        for release in entry.releases.iter().filter(|release| !release.yanked) {
+            let pending = registry
+                .artifacts(&name, &release.version)?
+                .is_some_and(|list| {
+                    list.artifacts
+                        .iter()
+                        .any(|artifact| unattested(artifact, attester, target, cpu_level))
+                });
+            if pending {
+                missing.push((name.clone(), release.version.clone()));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// Whether `artifact` is a default-feature build of `target` at
+/// `cpu_level` without a current attestation by the attester's builder:
+/// what `rebuild` reproduces.
+pub(crate) fn unattested(
+    artifact: &Artifact,
+    attester: &Attester<'_>,
+    target: &str,
+    cpu_level: Option<CpuLevel>,
+) -> bool {
+    artifact.default_features
+        && artifact.features.is_empty()
+        && is_variant(artifact, target, cpu_level)
+        && !attester.has_attested(artifact)
+}
+
+/// Whether `artifact` is the build of `target` at `cpu_level` (an x86-64
+/// artifact that names no level is the baseline; levels mean nothing for
+/// other targets).
+fn is_variant(artifact: &Artifact, target: &str, cpu_level: Option<CpuLevel>) -> bool {
+    artifact.target == target
+        && (!CpuLevel::applies_to(target)
+            || artifact.cpu_level.unwrap_or(CpuLevel::BASELINE)
+                == cpu_level.unwrap_or(CpuLevel::BASELINE))
 }
 
 fn parse_owner(value: &str) -> Result<Owner, CliError> {
@@ -753,6 +1032,13 @@ fn check(dir: &Path, names: &[String], cache: Option<&Path>) -> Result<(), CliEr
             eprintln!("{name}: owners differ from the delegation's keys");
             failed += 1;
         }
+        // Nothing to compare against the repository yet (an imported recipe
+        // has no releases until its first tag is recorded), so don't make
+        // the check depend on reaching it.
+        if entry.releases.is_empty() {
+            println!("{name}: no releases");
+            continue;
+        }
         let repo = match source::fetch(&entry, &cache) {
             Ok(repo) => repo,
             Err(error) => {
@@ -788,9 +1074,9 @@ fn owners_match_delegation(registry: &Registry, entry: &PackageEntry) -> bool {
         .is_some_and(|delegation| delegation.keys.keyids == owners)
 }
 
-fn report_failure(what: &str, error: &SourceError) {
+fn report_failure(what: &str, error: &dyn std::error::Error) {
     eprintln!("{what}: {error}");
-    let mut source = std::error::Error::source(error);
+    let mut source = error.source();
     while let Some(cause) = source {
         eprintln!("  caused by: {cause}");
         source = cause.source();
@@ -851,5 +1137,36 @@ mod tests {
     #[test]
     fn cli_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn levels_tell_x86_64_variants_apart_only() {
+        let h = fox_core::Blake3Digest::of(b"x");
+        let artifact = |target: &str, cpu_level| Artifact {
+            target: target.to_owned(),
+            cpu_level,
+            default_features: true,
+            features: Vec::new(),
+            feature_set_hash: h,
+            pkgar_blake3: h,
+            size: 1,
+            sbom_blake3: h,
+            attestations: Vec::new(),
+        };
+        let x86 = "x86_64-unknown-redox";
+        let v3 = Some(CpuLevel::X86_64V3);
+        let v4 = Some(CpuLevel::X86_64V4);
+        assert!(is_variant(&artifact(x86, v3), x86, None));
+        assert!(is_variant(&artifact(x86, None), x86, v3));
+        assert!(is_variant(&artifact(x86, v4), x86, v4));
+        assert!(!is_variant(&artifact(x86, v3), x86, v4));
+        assert!(!is_variant(&artifact(x86, v4), x86, None));
+        assert!(!is_variant(
+            &artifact(x86, None),
+            "aarch64-unknown-redox",
+            None
+        ));
+        let arm = "aarch64-unknown-redox";
+        assert!(is_variant(&artifact(arm, None), arm, None));
     }
 }

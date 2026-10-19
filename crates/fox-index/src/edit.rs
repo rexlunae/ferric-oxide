@@ -10,7 +10,7 @@
 //! 2. **Delegations.** Each package's role lists the hash of its package
 //!    file.
 //! 3. **Targets.** Lists every other signed file (`registry.toml`,
-//!    `artifacts/**`, `advisories/**` and package files no delegation
+//!    `artifacts/**`, `advisories/**`, `vex/**` and package files no delegation
 //!    covers) and the delegations.
 //! 4. **Snapshot**, then **timestamp**, over the files just written.
 //!
@@ -39,7 +39,7 @@ use time::OffsetDateTime;
 use crate::advisory::{Advisory, AdvisoryError, advisory_path};
 use crate::layout::{
     ADVISORIES_DIR, ARTIFACTS_DIR, ArtifactList, LayoutError, PACKAGES_DIR, PackageEntry,
-    REGISTRY_FILE, RegistryConfig, Release, artifacts_path, package_path,
+    REGISTRY_FILE, RegistryConfig, Release, VEX_DIR, artifacts_path, package_path,
 };
 use crate::metadata::{
     Delegation, Expiry, FileMeta, MetadataError, RoleKeys, RoleName, Root, Signed, Snapshot,
@@ -49,6 +49,7 @@ use crate::verify::{
     DELEGATIONS_DIR, METADATA_DIR, ROOT_DIR, SNAPSHOT_FILE, TARGETS_FILE, TIMESTAMP_FILE,
     check_path,
 };
+use crate::vex::{VexFileError, parse_vex, vex_path};
 
 /// How long each kind of metadata stays valid, in days.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +249,9 @@ pub enum EditError {
     /// An advisory is invalid or cannot be written.
     #[error("invalid advisory")]
     Advisory(#[source] Box<AdvisoryError>),
+    /// A VEX document is invalid or its id unusable.
+    #[error("invalid VEX document")]
+    Vex(#[source] Box<VexFileError>),
     /// [`Registry::init`] found an existing registry.
     #[error("{} already holds a registry", path.display())]
     Exists {
@@ -332,7 +336,7 @@ pub struct Registry {
 
 impl Registry {
     /// Creates a registry named `name` in `dir` with the given role keys:
-    /// `registry.toml`, the package, artifact and advisory directories, and
+    /// `registry.toml`, the package, artifact, advisory and VEX directories, and
     /// version 1 of every role, unsigned. Call [`Registry::sign`] next.
     ///
     /// # Errors
@@ -368,6 +372,7 @@ impl Registry {
             PACKAGES_DIR,
             ARTIFACTS_DIR,
             ADVISORIES_DIR,
+            VEX_DIR,
             ROOT_DIR,
             DELEGATIONS_DIR,
         ] {
@@ -534,15 +539,8 @@ impl Registry {
     /// [`EditError::Layout`] if the entry is invalid, and [`EditError::Io`]
     /// if it cannot be written.
     pub fn write_package(&self, entry: &PackageEntry) -> Result<(), EditError> {
-        let path = package_path(&entry.name);
-        let layout = |source| EditError::Layout {
-            path: path.clone(),
-            source: Box::new(source),
-        };
-        let text = entry.to_toml().map_err(layout)?;
-        // Write only what a client would accept.
-        PackageEntry::from_toml(&text, &path).map_err(layout)?;
-        write_file(&self.dir.join(&path), text.as_bytes())
+        let (path, text) = package_text(entry)?;
+        write_file(&self.dir.join(path), text.as_bytes())
     }
 
     /// Adds a package: writes its file and delegates that file to its
@@ -554,47 +552,95 @@ impl Registry {
     /// [`EditError::AlreadyAdmitted`] if the package file or delegation
     /// exists, and as [`Registry::write_package`].
     pub fn admit(&mut self, entry: &PackageEntry) -> Result<(), EditError> {
-        let path = package_path(&entry.name);
-        let name = entry.name.as_str().to_owned();
-        if self.dir.join(&path).exists() || self.delegations.contains_key(&name) {
-            return Err(EditError::AlreadyAdmitted {
-                name: entry.name.clone(),
+        self.admit_all(core::slice::from_ref(entry))
+    }
+
+    /// Admits several packages, as [`Registry::admit`] does for each, but
+    /// writes `targets.json` once. Nothing is written unless every package
+    /// is new and valid, and if a write fails the package files already
+    /// written are removed again, so a failed batch can be retried as is.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::AlreadyAdmitted`] if any package file or delegation
+    /// exists or a name repeats, and as [`Registry::write_package`].
+    pub fn admit_all(&mut self, entries: &[PackageEntry]) -> Result<(), EditError> {
+        let mut names = BTreeSet::new();
+        for entry in entries {
+            let path = package_path(&entry.name);
+            if self.dir.join(&path).exists()
+                || self.delegations.contains_key(entry.name.as_str())
+                || !names.insert(entry.name.as_str())
+            {
+                return Err(EditError::AlreadyAdmitted {
+                    name: entry.name.clone(),
+                });
+            }
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Everything that can fail without touching the disk is done
+        // first: each package file is serialized and checked, and the new
+        // targets metadata is built and serialized aside.
+        let files = entries
+            .iter()
+            .map(package_text)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut targets = self.targets.clone();
+        for entry in entries {
+            targets.signed.delegations.push(Delegation {
+                name: entry.name.as_str().to_owned(),
+                keys: RoleKeys::new(entry.owners.iter().map(|owner| owner.delegation_key()), 1),
+                paths: BTreeSet::from([package_path(&entry.name)]),
             });
         }
-        self.write_package(entry)?;
-        self.targets.signed.delegations.push(Delegation {
-            name: name.clone(),
-            keys: RoleKeys::new(entry.owners.iter().map(|owner| owner.delegation_key()), 1),
-            paths: BTreeSet::from([path]),
-        });
-        self.targets
+        targets
             .signed
             .delegations
             .sort_by(|a, b| a.name.cmp(&b.name));
-        self.delegations.insert(
-            name,
-            Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
-        );
-        // The delegation must survive until the next `sign`, which may run
+        // The delegations must survive until the next `sign`, which may run
         // in another process.
-        if !self.targets.signatures.is_empty() {
-            self.targets.signed.version =
-                self.targets.signed.version.checked_add(1).ok_or_else(|| {
-                    EditError::VersionOverflow {
-                        file: metadata_file(TARGETS_FILE),
-                    }
-                })?;
-            self.targets.signatures.clear();
+        if !targets.signatures.is_empty() {
+            targets.signed.version = targets.signed.version.checked_add(1).ok_or_else(|| {
+                EditError::VersionOverflow {
+                    file: metadata_file(TARGETS_FILE),
+                }
+            })?;
+            targets.signatures.clear();
         }
         let file = metadata_file(TARGETS_FILE);
-        let bytes = self
-            .targets
-            .to_json()
-            .map_err(|source| EditError::Metadata {
-                file: file.clone(),
-                source,
-            })?;
-        write_file(&self.dir.join(file), &bytes)
+        let bytes = targets.to_json().map_err(|source| EditError::Metadata {
+            file: file.clone(),
+            source,
+        })?;
+
+        // Then the writes, undone if one fails, so that a failed batch can
+        // simply be retried.
+        let mut written = Vec::new();
+        let result = files
+            .iter()
+            .try_for_each(|(path, text)| {
+                let full = self.dir.join(path);
+                write_file(&full, text.as_bytes())?;
+                written.push(full);
+                Ok(())
+            })
+            .and_then(|()| write_file(&self.dir.join(&file), &bytes));
+        if let Err(error) = result {
+            for path in &written {
+                remove_new_file(path);
+            }
+            return Err(error);
+        }
+        self.targets = targets;
+        for entry in entries {
+            self.delegations.insert(
+                entry.name.as_str().to_owned(),
+                Signed::new(empty_targets(OffsetDateTime::UNIX_EPOCH, 0)),
+            );
+        }
+        Ok(())
     }
 
     /// Records a release in a package file.
@@ -691,6 +737,41 @@ impl Registry {
         let path = advisory_path(&advisory.advisory.id).map_err(advisory_error)?;
         let text = advisory.to_toml().map_err(advisory_error)?;
         write_file(&self.dir.join(path), text.as_bytes())
+    }
+
+    /// Writes VEX document `id` to `vex/<id>.cdx.json`, replacing one with
+    /// the same id; returns its path. The bytes are stored as given, after
+    /// checking that they are VEX the client can use.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Vex`] if the id is unusable or the document is not
+    /// usable VEX, and [`EditError::Io`] if it cannot be written.
+    pub fn write_vex(&self, id: &str, json: &[u8]) -> Result<String, EditError> {
+        let vex_error = |source| EditError::Vex(Box::new(source));
+        let path = vex_path(id).map_err(vex_error)?;
+        parse_vex(json).map_err(vex_error)?;
+        write_file(&self.dir.join(&path), json)?;
+        Ok(path)
+    }
+
+    /// Removes VEX document `id`, returning its path, or `None` if there
+    /// was none.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Vex`] if the id is unusable, and [`EditError::Io`] if
+    /// the file cannot be removed.
+    pub fn remove_vex(&self, id: &str) -> Result<Option<String>, EditError> {
+        let path = vex_path(id).map_err(|source| EditError::Vex(Box::new(source)))?;
+        match fs::remove_file(self.dir.join(&path)) {
+            Ok(()) => Ok(Some(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(EditError::Io {
+                path: self.dir.join(&path),
+                source,
+            }),
+        }
     }
 
     /// Starts a new root version that gives `role` these keys, or changes
@@ -941,7 +1022,7 @@ impl Registry {
         let mut files = BTreeMap::new();
         let config = self.dir.join(REGISTRY_FILE);
         files.insert(REGISTRY_FILE.to_owned(), FileMeta::of(&read(&config)?));
-        for sub in [PACKAGES_DIR, ARTIFACTS_DIR, ADVISORIES_DIR] {
+        for sub in [PACKAGES_DIR, ARTIFACTS_DIR, ADVISORIES_DIR, VEX_DIR] {
             let mut found = Vec::new();
             walk(&self.dir, &self.dir.join(sub), &mut found)?;
             for path in found {
@@ -1178,6 +1259,30 @@ fn create_dir(path: &Path) -> Result<(), EditError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// A package file's path and text, checked to be what a client accepts.
+fn package_text(entry: &PackageEntry) -> Result<(String, String), EditError> {
+    let path = package_path(&entry.name);
+    let layout = |source| EditError::Layout {
+        path: path.clone(),
+        source: Box::new(source),
+    };
+    let text = entry.to_toml().map_err(layout)?;
+    // Write only what a client would accept.
+    PackageEntry::from_toml(&text, &path).map_err(layout)?;
+    Ok((path, text))
+}
+
+/// Best-effort removal of a file written by a batch that failed, and of
+/// its directory if that is now empty. A file that cannot be removed is
+/// reported by the batch's retry as already admitted.
+fn remove_new_file(path: &Path) {
+    if fs::remove_file(path).is_ok()
+        && let Some(parent) = path.parent()
+    {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
