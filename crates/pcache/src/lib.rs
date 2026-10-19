@@ -16,6 +16,8 @@
 //! - [`page`]: the state of one cached page and the transitions fills, writes, writeback and
 //!   truncation make.
 //! - [`readahead`]: how far ahead of a reader the kernel fills, per open file description.
+//! - `object` (with the `alloc` feature): one object's page index, which says what a read
+//!   needs (fills to queue, fills to wait for) and applies the file system's answers.
 //! - `clock` (with the `alloc` feature): the two-list CLOCK replacement that picks pages to
 //!   evict under memory pressure.
 //! - `rmap` (with the `alloc` feature): an object's reverse map, from a file page to the
@@ -62,6 +64,8 @@ extern crate alloc;
 pub mod abi;
 #[cfg(feature = "alloc")]
 pub mod clock;
+#[cfg(feature = "alloc")]
+pub mod object;
 pub mod page;
 pub mod readahead;
 #[cfg(feature = "alloc")]

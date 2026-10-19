@@ -457,6 +457,25 @@ unchanged. Off by default; without it the kernel has no such scheme, as
 upstream."""
 
 [[option]]
+id = "kernel.page_cache"
+menu = "kernel"
+type = "bool"
+title = "Shared page cache (read path)"
+default = false
+kernel_feature = "page_cache"
+rebuild = ["kernel"]
+help = """
+Provide the kernel.pcache scheme (Phase 2.6). A file system keeps the contents
+of the files it chooses to cache in kernel objects, and the kernel serves read
+and pread of those files from them, copying from memory with no round trip to
+the file system once the pages are there. A miss becomes a fill request on the
+file system's queue, with readahead past it; a failed fill fails its readers
+with EIO and the next read tries again. This first step caches reads only:
+mappings, writes and reclaim come later, so an object keeps every page read
+until the file system closes it. Off by default; without it the kernel has no
+such scheme and every read goes to the file system, as upstream."""
+
+[[option]]
 id = "drivers.grant_dma"
 menu = "drivers"
 type = "bool"

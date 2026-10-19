@@ -552,28 +552,65 @@ table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
 blocked, the refusals, back-pressure and a corrupt tail, and prints ring
 versus system call timings, by descriptor, by slot and on the worker.
 
-## Page cache (prepared)
+## Page cache (read path)
 
-`ferric-pcache` holds the interface and the policies of a planned kernel page
-cache, kept in a host-tested crate before any kernel code uses them. Nothing in
-the kernel or the image uses it yet: there is no `kernel.pcache` scheme, and
-file systems still serve every read through their own scheme.
+With `kernel.page_cache = true` in `ferric.toml` (Kernel menu, off by
+default), the kernel has a `kernel.pcache` scheme that caches file contents in
+kernel memory and serves `read` and `pread` from it, without a round trip to
+the file system once the pages are there (roadmap Phase 2.6, design in
+`io/pagecache-design.md` in the project files). This first step is the read
+path only: no file system in the image uses it yet (RedoxFS comes next), and
+mappings, writes, writeback and reclaim are later steps, so an object keeps
+every page it was given until it closes. Without the option the kernel has no
+such scheme and every read goes to the file system, as upstream.
+
+How a file system uses it:
+
+1. It opens `/scheme/kernel.pcache/queue` (root only) and binds the queue to
+   its own scheme with `Bind`, passing its scheme socket as a `CallFlags::FD`
+   descriptor. The queue then serves only that scheme's descriptions.
+2. It opens `object/<hex id>` from the queue for each file it caches (an empty
+   object, `EEXIST` if the ID is in use), sets its size with `SetSize`, and
+   attaches each client description it opens with `Attach`, naming the handle
+   number its scheme gave the description.
+3. A positioned `read` or `pread` of an attached description is served from
+   the object. Pages that are there are copied to the reader. Absent ones
+   become 32-byte `Fill` records on the queue, with readahead past them (a
+   window that starts at 4 pages and doubles on sequential reads, up to the
+   queue's `SetReadaheadMax`, 32 pages by default); the reader waits.
+4. The file system reads records from the queue (`fevent` reports
+   `EVENT_READ` while there are some) and answers each with `Filled` on the
+   object: the pages' bytes as the payload, zero past the end of the file,
+   which the kernel copies into new frames. A failed answer carries a non-zero
+   errno and an empty payload; the readers waiting for those pages get `EIO`,
+   and the next read fills them again.
+5. Closing a description detaches it. Closing an object or its queue ends the
+   cache of it: outstanding fills fail with `EIO`, and later reads of its
+   descriptions go to the file system's scheme as before.
+
+Every call fits the three metadata words the kernel passes a kernel scheme.
+`ferric-pcache` (`crates/pcache`) is the one definition of the interface and
+holds the policies, host-tested:
 
 - `abi`: the scheme's paths, the `SYS_CALL` requests on queues and objects,
-  and the 32-byte records the kernel would put on a file system's fill queue.
-  A fill or writeback record names 1 to `MAX_RECORD_PAGES` (1024) pages, which
-  `RecordPages` enforces; longer runs are split into several records. A failed
-  answer carries a non-zero errno, since errno 0 means done.
+  and the fill-queue records. A record names 1 to `MAX_RECORD_PAGES` (1024)
+  pages, which `RecordPages` enforces; longer runs are split. An answer is
+  `[verb, first page, count | errno << 32]` on the object the record named.
 - `page`: the state of one cached page and the transitions fills, writes,
   writeback and truncation make.
-- `readahead`: a per-description window that starts small and doubles on
-  sequential reads, up to a maximum that fits one record.
+- `object` (with the `alloc` feature): one object's page index, which turns a
+  read into fills to queue or wait for and applies the file system's answers.
+- `readahead`: the per-description window.
 - `clock` and `rmap` (with the `alloc` feature): two-list CLOCK replacement
   for reclaim, and the reverse map from a file page to the mappings that show
-  it.
+  it, for the later steps.
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
-`alloc`.
+`alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
+the option on: it serves a small file system scheme of its own and checks a
+miss, a hit with no scheme read, readahead, a failed fill and a closed queue,
+and prints the time of a cached 4 KiB `pread` next to the same read through
+the scheme.
 
 ## Kernel-bypass network queues (ABI only)
 

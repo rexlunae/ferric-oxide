@@ -1810,6 +1810,9 @@ impl KernelScheme for UserScheme {
     }
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        // Ferric Oxide: the handle number may be reused, so it is no longer attached.
+        #[cfg(feature = "page_cache")]
+        super::pcache::closed(&self.inner, id);
         self.inner.todo.send(
             Sqe {
                 opcode: Opcode::CloseMsg as u8,
@@ -1915,6 +1918,12 @@ impl KernelScheme for UserScheme {
         _stored_flags: u32,
         token: &mut CleanLockToken,
     ) -> Result<usize> {
+        // Ferric Oxide: a description the file system attached to a page cache object is read
+        // from the cache (`kernel.pcache`).
+        #[cfg(feature = "page_cache")]
+        if let Some(result) = super::pcache::read_attached(&self.inner, file, buf, offset, token) {
+            return result;
+        }
         let ctx = { context::current().read(token.token()).caller_ctx() };
 
         let mut address = self.inner.capture_user(buf, token)?;

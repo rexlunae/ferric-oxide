@@ -3,32 +3,44 @@
 //! | Operation | On | Encoding |
 //! | --- | --- | --- |
 //! | open [`QUEUE_PATH`] | the scheme root (root only) | `open("/scheme/kernel.pcache/queue")` |
+//! | [`Request::Bind`] | a queue | `SYS_CALL` with `FD \| WRITE`, the scheme socket, metadata `[verb]` |
 //! | open an object path | a queue | `openat(queue, ObjectId::encode_path(..))`: a new, empty object |
 //! | [`Request::SetSize`] | an object | `SYS_CALL`, metadata `[verb, size]` |
 //! | [`Request::Attach`] | an object | metadata `[verb, handle]` |
 //! | [`Request::Detach`] | an object | metadata `[verb, handle]` |
-//! | [`Request::Filled`] | a queue | metadata `[verb, object, first page, count, errno]` |
-//! | [`Request::WrittenBack`] | a queue | metadata `[verb, object, first page, count, errno]` |
+//! | [`Request::Filled`] | an object | metadata `[verb, first page, count \| errno << 32]`, payload the pages |
+//! | [`Request::WrittenBack`] | an object | metadata `[verb, first page, count \| errno << 32]` |
 //! | [`Request::SetReadaheadMax`] | a queue | metadata `[verb, pages]` |
 //! | read records | a queue | `read(queue, buf)`: whole [`Record::BYTES`]-byte records |
 //! | map an object | the file system | `mmap(object, ..., MAP_SHARED)`: only pages being filled or written back are writable |
 //!
-//! A file system opens one queue. Each object it creates belongs to that queue: the kernel puts
-//! the object's [`Record`]s there, and only that queue's [`Request::Filled`] and
-//! [`Request::WrittenBack`] answers are accepted for it. The file system picks each object's
-//! ID ([`ObjectId`], unique on its queue, for example the file's node number) when it creates
-//! the object, so records name objects in its own terms and need no lookup. Opening an ID the
-//! queue already has fails with `EEXIST`.
+//! Every call fits the three metadata words the kernel passes a kernel scheme
+//! ([`Request::MAX_WORDS`]).
+//!
+//! A file system opens one queue and binds it to its own scheme with [`Request::Bind`],
+//! passing its scheme socket, so the queue can only ever serve that scheme's descriptions.
+//! Each object it creates belongs to that queue: the kernel puts the object's [`Record`]s
+//! there, and the file system answers each record with [`Request::Filled`] or
+//! [`Request::WrittenBack`] on the object's descriptor, which only it holds. The file system
+//! picks each object's ID ([`ObjectId`], unique on its queue, for example the file's node
+//! number) when it creates the object, so records name objects in its own terms and need no
+//! lookup. Opening an ID the queue already has fails with `EEXIST`.
 //!
 //! [`Request::Attach`] ties a client's open file description to the object: `handle` is the
 //! number the file system's scheme gave the client's description. The kernel then serves that
-//! description's `read`, `pread` and shared `mmap` from the object.
+//! description's `read`, `pread` and shared `mmap` from the object, until the file system
+//! detaches it, the client closes it, or the object or its queue closes.
 //!
 //! [`Request::encode`] and [`Request::decode`] are the one place the metadata layout is written
 //! down; [`Record::to_bytes`] and [`Record::from_bytes`] the one place the record layout is.
 
 use core::fmt;
 use core::num::NonZeroU16;
+
+/// The scheme's number among the kernel's global schemes (`GlobalSchemes` in the kernel's
+/// `redox_syscall`), which bootstrap uses to find it among the kernel scheme capabilities it is
+/// started with.
+pub const SCHEME_ID: u8 = 16;
 
 /// The scheme's name in the namespace: file systems open `/scheme/kernel.pcache`.
 pub const SCHEME_NAME: &str = "kernel.pcache";
@@ -276,8 +288,16 @@ impl Outcome {
 }
 
 /// A call on a queue or an object, as `SYS_CALL` metadata words.
+///
+/// Every request fits the three metadata words the kernel passes a kernel scheme. An answer
+/// to a record is a call on the object the record named, so it need not repeat the object,
+/// and its page count and outcome share a word ([`Self::encode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
+    /// On a queue, as a descriptor-passing call (`CallFlags::FD | CallFlags::WRITE`) carrying
+    /// the file system's scheme socket: the queue serves that scheme's descriptions. Only once
+    /// per queue, and before any [`Self::Attach`].
+    Bind,
     /// On an object: the file's size is now `size` bytes. Pages past it are dropped and
     /// unmapped; a mapping that touches them afterwards gets `SIGBUS`.
     SetSize {
@@ -294,19 +314,18 @@ pub enum Request {
         /// The handle number given to [`Self::Attach`].
         handle: u64,
     },
-    /// On a queue: the answer to a [`Record::Fill`].
+    /// On the object a [`Record::Fill`] named: the answer to it. When the fill is
+    /// [`Outcome::Done`], the call's payload is the pages' bytes, whole pages (`count` times
+    /// [`PAGE_SIZE`], zero past the end of the file), which the kernel copies into the
+    /// object's frames; a failed fill has an empty payload.
     Filled {
-        /// The object.
-        object: ObjectId,
         /// The pages the record named.
         pages: RecordPages,
         /// How the fill ended.
         outcome: Outcome,
     },
-    /// On a queue: the answer to a [`Record::Writeback`].
+    /// On the object a [`Record::Writeback`] named: the answer to it.
     WrittenBack {
-        /// The object.
-        object: ObjectId,
         /// The pages the record named.
         pages: RecordPages,
         /// How the writeback ended.
@@ -328,6 +347,7 @@ enum Verb {
     Filled = 4,
     WrittenBack = 5,
     SetReadaheadMax = 6,
+    Bind = 7,
 }
 
 impl Verb {
@@ -339,51 +359,45 @@ impl Verb {
             4 => Self::Filled,
             5 => Self::WrittenBack,
             6 => Self::SetReadaheadMax,
+            7 => Self::Bind,
             _ => return None,
         })
     }
 }
 
 impl Request {
-    /// The most metadata words a request takes.
-    pub const MAX_WORDS: usize = 5;
+    /// The most metadata words a request takes: what the kernel passes a kernel scheme.
+    pub const MAX_WORDS: usize = 3;
 
     /// The metadata words, and how many of them are used.
+    ///
+    /// [`Self::Filled`] and [`Self::WrittenBack`] are `[verb, first page, count | errno << 32]`:
+    /// the page count in the low 32 bits of the last word and the outcome's errno (0 for
+    /// [`Outcome::Done`]) in the 16 bits above it.
     pub const fn encode(self) -> ([u64; Self::MAX_WORDS], usize) {
         match self {
-            Self::SetSize { size } => ([Verb::SetSize as u64, size, 0, 0, 0], 2),
-            Self::Attach { handle } => ([Verb::Attach as u64, handle, 0, 0, 0], 2),
-            Self::Detach { handle } => ([Verb::Detach as u64, handle, 0, 0, 0], 2),
-            Self::Filled {
-                object,
-                pages,
-                outcome,
-            } => (
+            Self::Bind => ([Verb::Bind as u64, 0, 0], 1),
+            Self::SetSize { size } => ([Verb::SetSize as u64, size, 0], 2),
+            Self::Attach { handle } => ([Verb::Attach as u64, handle, 0], 2),
+            Self::Detach { handle } => ([Verb::Detach as u64, handle, 0], 2),
+            Self::Filled { pages, outcome } => (
                 [
                     Verb::Filled as u64,
-                    object.0,
                     pages.0.first,
-                    pages.0.count as u64,
-                    outcome.to_word(),
+                    answer_word(pages, outcome),
                 ],
-                5,
+                3,
             ),
-            Self::WrittenBack {
-                object,
-                pages,
-                outcome,
-            } => (
+            Self::WrittenBack { pages, outcome } => (
                 [
                     Verb::WrittenBack as u64,
-                    object.0,
                     pages.0.first,
-                    pages.0.count as u64,
-                    outcome.to_word(),
+                    answer_word(pages, outcome),
                 ],
-                5,
+                3,
             ),
             Self::SetReadaheadMax { pages } => {
-                ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0, 0, 0], 2)
+                ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0], 2)
             }
         }
     }
@@ -394,29 +408,22 @@ impl Request {
     ///
     /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
     /// number of words does not match it, and [`DecodeError::Value`] for a page range that is
-    /// empty, overflows or is longer than [`MAX_RECORD_PAGES`], an errno above 16 bits, or a
-    /// readahead maximum of 0 or above [`MAX_RECORD_PAGES`].
+    /// empty, overflows or is longer than [`MAX_RECORD_PAGES`], an answer word with bits set
+    /// above the errno, or a readahead maximum of 0 or above [`MAX_RECORD_PAGES`].
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
         let (&verb, args) = words.split_first().ok_or(DecodeError::Verb)?;
         match (Verb::from_raw(verb).ok_or(DecodeError::Verb)?, args) {
+            (Verb::Bind, &[]) => Ok(Self::Bind),
             (Verb::SetSize, &[size]) => Ok(Self::SetSize { size }),
             (Verb::Attach, &[handle]) => Ok(Self::Attach { handle }),
             (Verb::Detach, &[handle]) => Ok(Self::Detach { handle }),
-            (Verb::Filled, &[object, first, count, outcome]) => {
-                let (pages, outcome) = answer(first, count, outcome)?;
-                Ok(Self::Filled {
-                    object: ObjectId(object),
-                    pages,
-                    outcome,
-                })
+            (Verb::Filled, &[first, word]) => {
+                let (pages, outcome) = answer(first, word)?;
+                Ok(Self::Filled { pages, outcome })
             }
-            (Verb::WrittenBack, &[object, first, count, outcome]) => {
-                let (pages, outcome) = answer(first, count, outcome)?;
-                Ok(Self::WrittenBack {
-                    object: ObjectId(object),
-                    pages,
-                    outcome,
-                })
+            (Verb::WrittenBack, &[first, word]) => {
+                let (pages, outcome) = answer(first, word)?;
+                Ok(Self::WrittenBack { pages, outcome })
             }
             (Verb::SetReadaheadMax, &[pages]) => u32::try_from(pages)
                 .ok()
@@ -428,10 +435,16 @@ impl Request {
     }
 }
 
+/// The last word of a [`Request::Filled`] or [`Request::WrittenBack`]: the count, and the
+/// errno above it.
+const fn answer_word(pages: RecordPages, outcome: Outcome) -> u64 {
+    pages.0.count as u64 | (outcome.to_word() << 32)
+}
+
 /// The page range and outcome of a [`Request::Filled`] or [`Request::WrittenBack`].
-fn answer(first: u64, count: u64, outcome: u64) -> Result<(RecordPages, Outcome), DecodeError> {
-    let pages = record_range(first, count).ok_or(DecodeError::Value)?;
-    let outcome = Outcome::from_word(outcome).ok_or(DecodeError::Value)?;
+fn answer(first: u64, word: u64) -> Result<(RecordPages, Outcome), DecodeError> {
+    let pages = record_range(first, word & u64::from(u32::MAX)).ok_or(DecodeError::Value)?;
+    let outcome = Outcome::from_word(word >> 32).ok_or(DecodeError::Value)?;
     Ok((pages, outcome))
 }
 
@@ -653,31 +666,42 @@ mod tests {
 
     #[test]
     fn an_errno_is_never_done() {
-        // Errno 0 on the wire is Done; a failure always encodes as a non-zero word.
+        // Errno 0 on the wire is Done; a failure always encodes as a non-zero errno field.
         let failed = Request::Filled {
-            object: ObjectId::new(1),
             pages: record(0, 1),
             outcome: Outcome::Failed(errno(1)),
         };
         let (words, len) = failed.encode();
-        assert_eq!(words[4], 1);
+        assert_eq!(len, 3);
+        assert_eq!(words[2], 1 | 1 << 32);
         assert_eq!(Request::decode(&words[..len]), Ok(failed));
         assert_eq!(
-            Request::decode(&[4, 1, 0, 1, 0]),
+            Request::decode(&[4, 0, 1]),
             Ok(Request::Filled {
-                object: ObjectId::new(1),
                 pages: record(0, 1),
                 outcome: Outcome::Done,
             })
         );
         assert_eq!(
-            Request::decode(&[4, 1, 0, 1, 0xffff]),
+            Request::decode(&[4, 7, 3 | 0xffff << 32]),
             Ok(Request::Filled {
-                object: ObjectId::new(1),
-                pages: record(0, 1),
+                pages: record(7, 3),
                 outcome: Outcome::Failed(errno(0xffff)),
             })
         );
+    }
+
+    #[test]
+    fn every_request_fits_a_kernel_call() {
+        // The kernel hands a kernel scheme at most three metadata words.
+        assert_eq!(Request::MAX_WORDS, 3);
+        let widest = Request::WrittenBack {
+            pages: record(u64::MAX - MAX_RECORD_PAGES as u64, MAX_RECORD_PAGES),
+            outcome: Outcome::Failed(errno(u16::MAX)),
+        };
+        let (words, len) = widest.encode();
+        assert_eq!(Request::decode(&words[..len]), Ok(widest));
+        assert_eq!(Request::Bind.encode(), ([7, 0, 0], 1));
     }
 
     #[test]
@@ -727,16 +751,15 @@ mod tests {
     #[test]
     fn requests_round_trip() {
         let all = [
+            Request::Bind,
             Request::SetSize { size: 12_345 },
             Request::Attach { handle: 9 },
             Request::Detach { handle: 9 },
             Request::Filled {
-                object: ObjectId::new(3),
                 pages: record(8, 4),
                 outcome: Outcome::Done,
             },
             Request::WrittenBack {
-                object: ObjectId::new(3),
                 pages: record(0, MAX_RECORD_PAGES),
                 outcome: Outcome::Failed(errno(5)),
             },
@@ -759,15 +782,14 @@ mod tests {
         assert_eq!(Request::decode(&[99]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[1]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[1, 2, 3]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[7, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[4, 1, 0, 1]), Err(DecodeError::Length));
         // An empty range, a too long one, an errno above 16 bits, a zero readahead maximum.
-        assert_eq!(Request::decode(&[4, 1, 0, 0, 0]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[4, 0, 0]), Err(DecodeError::Value));
         let long = u64::from(MAX_RECORD_PAGES) + 1;
+        assert_eq!(Request::decode(&[4, 0, long]), Err(DecodeError::Value));
         assert_eq!(
-            Request::decode(&[4, 1, 0, long, 0]),
-            Err(DecodeError::Value)
-        );
-        assert_eq!(
-            Request::decode(&[5, 1, 0, 1, 0x1_0000]),
+            Request::decode(&[5, 0, 1 | 0x1_0000 << 32]),
             Err(DecodeError::Value)
         );
         assert_eq!(Request::decode(&[6, 0]), Err(DecodeError::Value));

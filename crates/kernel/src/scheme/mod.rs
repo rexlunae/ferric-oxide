@@ -79,6 +79,10 @@ pub mod ring;
 /// `memory:` - a scheme for accessing physical memory
 pub mod memory;
 
+/// Ferric Oxide: `kernel.pcache` - the shared page cache (`page_cache`)
+#[cfg(feature = "page_cache")]
+pub mod pcache;
+
 /// `pipe:` - used internally by the kernel to implement `pipe`
 pub mod pipe;
 
@@ -242,6 +246,10 @@ fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
         // Ferric Oxide: the ring scheme exists only with the `rings` feature.
         if cfg!(feature = "rings") {
             insert_globals(&[Ring]);
+        }
+        // Ferric Oxide: the page cache scheme exists only with the `page_cache` feature.
+        if cfg!(feature = "page_cache") {
+            insert_globals(&[Pcache]);
         }
     }
     let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -584,9 +592,14 @@ pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
     // Ferric Oxide: see `ring`.
     #[cfg(feature = "rings")]
     GlobalSchemes::Ring,
+    // Ferric Oxide: see `pcache`.
+    #[cfg(feature = "page_cache")]
+    GlobalSchemes::Pcache,
 ];
 
-pub const MAX_GLOBAL_SCHEMES: usize = 16;
+// Ferric Oxide: 32 rather than 16, room for the fork's kernel schemes (`kernel.pcache` is
+// number 16). User schemes are numbered from here up.
+pub const MAX_GLOBAL_SCHEMES: usize = 32;
 pub const KERNEL_SCHEMES_COUNT: usize = ALL_KERNEL_SCHEMES.len();
 const _: () = {
     assert!(1 + KERNEL_SCHEMES_COUNT < MAX_GLOBAL_SCHEMES);
@@ -633,6 +646,11 @@ impl SchemeExt for GlobalSchemes {
             Self::Ring => &ring::RingScheme,
             #[cfg(not(feature = "rings"))]
             Self::Ring => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
+            // Ferric Oxide: the page cache scheme.
+            #[cfg(feature = "page_cache")]
+            Self::Pcache => &pcache::PcacheScheme,
+            #[cfg(not(feature = "page_cache"))]
+            Self::Pcache => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
         }
     }
     fn scheme_id(self) -> SchemeId {

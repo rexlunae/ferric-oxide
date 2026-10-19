@@ -470,6 +470,8 @@ pub enum GlobalSchemes {
     Trace = 14,
     /// Ferric Oxide: `kernel.ring`, submission/completion rings (ferric-ring's `abi::SCHEME_ID`).
     Ring = 15,
+    /// Ferric Oxide: `kernel.pcache`, the shared page cache (ferric-pcache's `abi::SCHEME_ID`).
+    Pcache = 16,
 }
 impl GlobalSchemes {
     pub fn try_from_raw(raw: u8) -> Option<Self> {
@@ -489,6 +491,7 @@ impl GlobalSchemes {
             13 => Some(Self::RegBuf),
             14 => Some(Self::Trace),
             15 => Some(Self::Ring),
+            16 => Some(Self::Pcache),
             _ => None,
         }
     }
@@ -509,6 +512,7 @@ impl GlobalSchemes {
             Self::RegBuf => "kernel.regbuf",
             Self::Trace => "kernel.trace",
             Self::Ring => "kernel.ring",
+            Self::Pcache => "kernel.pcache",
         }
     }
 }
