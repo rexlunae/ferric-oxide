@@ -157,6 +157,13 @@ fetches from upstream Redox at build time.
   requests and never writes there. Recipes that fetch their own component
   trees from upstream Redox are outside this list and remain to be migrated.
 
+The prebuilt toolchain, the package key and the Rust nightly components in
+`mk/prefix.mk` are downloaded with `wget` through its `WGET` variable. It
+prefers IPv4, because hosts without IPv6, such as GitHub's runners, cannot reach
+an IPv6-only answer. It looks the host up again on each try. It tries up to 20
+times (wget's default), waiting up to 5 seconds between tries, and also retries
+refused connections and failed lookups.
+
 ## CPU baseline and rebuilds
 
 Configured x86-64 user-space compilation defaults to x86-64-v3. v4 is optional

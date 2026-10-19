@@ -5,7 +5,7 @@ PREFIX=prefix/$(TARGET)
 # Ferric Oxide: downloads retry. static.redox-os.org has sometimes resolved to
 # IPv6 addresses only, which hosts without IPv6 (GitHub's runners) cannot
 # reach, so prefer IPv4 and resolve again on each try.
-WGET=wget --prefer-family=IPv4 --no-dns-cache --tries=5 --retry-connrefused --retry-on-host-error --waitretry=5
+WGET=wget --prefer-family=IPv4 --no-dns-cache --tries=20 --retry-connrefused --retry-on-host-error --waitretry=5
 
 PREFIX_INSTALL=$(PREFIX)/sysroot/
 PREFIX_PATH=$(ROOT)/$(PREFIX_INSTALL)/bin
