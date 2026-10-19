@@ -20,8 +20,15 @@
 //! benchmark uses to compare them. A worker runs its jobs one at a time,
 //! through its own bounce buffer and queue pair, and reports each finished job on a pipe that
 //! the main thread's executor waits on; the job's future then completes. A job's buffer
-//! belongs to the scheme's future until the job is done, so a future dropped early waits for
-//! the worker first.
+//! belongs to the scheme's future until the job is settled, so a future dropped early waits
+//! for the worker first.
+//!
+//! A worker holds each job through a [`Claim`], which settles the job's [`JobSlot`] once:
+//! done, or abandoned if the worker drops the job unfinished. When a worker thread ends
+//! (returns or unwinds), its [`WorkerEnd`] marks it dead, drops the jobs still queued for it
+//! (abandoning them), and reports [`WORKER_GONE`] on the pipe, which wakes every waiting
+//! future; an abandoned job's future returns `EIO`. Later requests skip dead workers, and run
+//! on the main thread's pair once none is left.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -32,10 +39,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use ferric_blkqueue::ids::{self, IdStream, WORKER_GONE};
+use ferric_blkqueue::slot::{Claim, JobSlot, Outcome};
 use ferric_blkqueue::{QueuePolicy, Route};
 use ferric_irq::{CpuEntry, CpuId};
 use pcid_interface::irq_helpers::{InterruptVector, Msix};
@@ -62,11 +71,8 @@ pub enum Op {
     WriteDma { addr: u64, sectors: u64 },
 }
 
-/// A finished job's result, written by the worker.
-struct Slot {
-    result: Mutex<Option<syscall::Result<usize>>>,
-    done: AtomicBool,
-}
+/// A job's result slot.
+type Slot = JobSlot<syscall::Result<usize>>;
 
 /// One read or write for a worker.
 struct Job {
@@ -74,12 +80,13 @@ struct Job {
     namespace: NvmeNamespace,
     lba: u64,
     op: Op,
-    slot: Arc<Slot>,
+    claim: Claim<syscall::Result<usize>>,
 }
 
-// SAFETY: the pointers in `op` stay valid until the job is done: the scheme future that made
-// the job does not return or drop before `slot.done` is set (see `JobFuture`'s `Drop`), and
-// the worker is the only one touching the buffer meanwhile.
+// SAFETY: the pointers in `op` stay valid until the job is settled: the scheme future that
+// made the job does not return or drop before its slot is settled, done or abandoned (see
+// `JobFuture`'s `Drop`), the claim settles it only once the worker is done with the buffer,
+// and the worker is the only one touching the buffer meanwhile.
 unsafe impl Send for Job {}
 
 /// The main thread's handle on one worker.
@@ -91,6 +98,15 @@ struct Worker {
     /// How many times the worker's watchdog has ticked: still 0, or not rising, while a job
     /// waits means the worker thread is not running at all.
     ticks: Arc<AtomicU64>,
+    /// Cleared by the worker's [`WorkerEnd`] as its thread ends, or here when a job cannot be
+    /// sent to it.
+    alive: Arc<AtomicBool>,
+}
+
+impl Worker {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
 }
 
 /// When a job was handed out, the index of its worker, and its result slot.
@@ -103,6 +119,8 @@ pub struct Dispatcher {
     next_id: Cell<u64>,
     /// The read end of the pipe the workers report finished jobs on (non-blocking).
     done: File,
+    /// The ids read from `done` so far, with any part of one that a read split.
+    reports: RefCell<IdStream>,
     waiting: RefCell<HashMap<u64, Waker>>,
     /// When each unfinished job was handed out, to which worker, and its result slot, for the
     /// watchdog.
@@ -140,10 +158,25 @@ impl Dispatcher {
     /// the caller runs it inline while holding the guard. `None` means it goes to a worker
     /// through [`run`](Self::run).
     pub fn claim_inline(&self) -> Option<InFlightGuard> {
-        match self.policy.get().route(self.in_flight.get()) {
+        let route = match self.policy.get().route(self.in_flight.get()) {
+            Route::Worker if !self.workers.iter().any(Worker::is_alive) => Route::Main,
+            route => route,
+        };
+        match route {
             Route::Main => Some(InFlightGuard::new(&self.in_flight)),
             Route::Worker => None,
         }
+    }
+
+    /// The index of the next live worker in turn, or `None` when every worker has ended.
+    fn next_live_worker(&self) -> Option<usize> {
+        let count = self.workers.len();
+        let start = self.next_worker.get();
+        let index = (0..count)
+            .map(|step| (start + step) % count)
+            .find(|&index| self.workers[index].is_alive())?;
+        self.next_worker.set((index + 1) % count);
+        Some(index)
     }
 
     /// Runs `op` on the next worker and returns its result.
@@ -160,23 +193,23 @@ impl Dispatcher {
     ) -> syscall::Result<usize> {
         let _counted = InFlightGuard::new(&self.in_flight);
         let id = self.next_id.get();
-        self.next_id.set(id.wrapping_add(1));
-        let slot = Arc::new(Slot {
-            result: Mutex::new(None),
-            done: AtomicBool::new(false),
-        });
-        let index = self.next_worker.get();
-        self.next_worker.set((index + 1) % self.workers.len());
+        self.next_id.set(ids::next_id(id));
+        let Some(index) = self.next_live_worker() else {
+            log::error!("nvmed: every worker has ended");
+            return Err(syscall::Error::new(syscall::EIO));
+        };
         let worker = &self.workers[index];
+        let (slot, claim) = JobSlot::new();
         let job = Job {
             id,
             namespace,
             lba,
             op,
-            slot: Arc::clone(&slot),
+            claim,
         };
         if worker.jobs.send(job).is_err() {
             log::error!("nvmed: the worker on CPU {} is gone", worker.cpu.get());
+            worker.alive.store(false, Ordering::Release);
             // The job came back undelivered and is dropped: nothing touches the buffer.
             return Err(syscall::Error::new(syscall::EIO));
         }
@@ -201,22 +234,17 @@ impl Dispatcher {
         result
     }
 
-    /// Wakes the futures of the jobs the workers finished, and returns how many it woke.
+    /// Wakes the futures of the jobs the workers settled, and returns how many it woke.
     fn drain(&self) -> usize {
-        let mut ids = [0_u8; 8 * 32];
+        let mut bytes = [0_u8; 8 * 32];
         let mut woken = 0;
         loop {
-            match (&self.done).read(&mut ids) {
+            match (&self.done).read(&mut bytes) {
                 Ok(0) => return woken,
-                Ok(len) => {
-                    for id in ids[..len - len % 8].chunks_exact(8) {
-                        let id = u64::from_ne_bytes(id.try_into().expect("8-byte chunk"));
-                        if let Some(waker) = self.waiting.borrow_mut().remove(&id) {
-                            waker.wake();
-                            woken += 1;
-                        }
-                    }
-                }
+                Ok(len) => self
+                    .reports
+                    .borrow_mut()
+                    .feed(&bytes[..len], |id| woken += self.report(id)),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return woken,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => {
@@ -224,6 +252,27 @@ impl Dispatcher {
                     return woken;
                 }
             }
+        }
+    }
+
+    /// Wakes the future waiting for job `id`, or every waiting future when a worker reports
+    /// that it ended (its unfinished jobs are abandoned); returns how many it woke.
+    fn report(&self, id: u64) -> usize {
+        let mut waiting = self.waiting.borrow_mut();
+        if id == WORKER_GONE {
+            let all: Vec<Waker> = waiting.drain().map(|(_, waker)| waker).collect();
+            drop(waiting);
+            let woken = all.len();
+            all.into_iter().for_each(Waker::wake);
+            return woken;
+        }
+        match waiting.remove(&id) {
+            Some(waker) => {
+                drop(waiting);
+                waker.wake();
+                1
+            }
+            None => 0,
         }
     }
 
@@ -245,7 +294,7 @@ impl Dispatcher {
                 .started
                 .borrow()
                 .iter()
-                .filter(|(_, (_, _, slot))| slot.done.load(Ordering::Acquire))
+                .filter(|(_, (_, _, slot))| slot.is_done())
                 .map(|(&id, _)| id)
                 .collect();
             let unreported = finished.intersection(&finished_before).count();
@@ -267,7 +316,7 @@ impl Dispatcher {
                 .started
                 .borrow()
                 .iter()
-                .filter(|(_, (_, _, slot))| !slot.done.load(Ordering::Acquire))
+                .filter(|(_, (_, _, slot))| !slot.is_settled())
                 .map(|(&id, (since, index, _))| (id, since.elapsed(), *index))
                 .find(|&(_, waited, _)| waited >= Duration::from_secs(1));
             if let Some((id, waited, index)) = stalled {
@@ -308,26 +357,23 @@ impl Future for JobFuture {
     type Output = syscall::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.slot.done.load(Ordering::Acquire) || self.worker_gone() {
-            let result = self.slot.result.lock().map(|mut r| r.take());
-            return Poll::Ready(match result {
-                Ok(Some(result)) => result,
-                _ => Err(syscall::Error::new(syscall::EIO)),
-            });
+        match self.slot.take() {
+            Outcome::Done(Some(result)) => Poll::Ready(result),
+            // Polled again after its result was taken, or the worker ended without running it.
+            Outcome::Done(None) | Outcome::Abandoned => {
+                Poll::Ready(Err(syscall::Error::new(syscall::EIO)))
+            }
+            Outcome::Pending => {
+                // The worker settles the slot before it reports the job (or its own end) on
+                // the pipe, and the pipe is read on this thread, so the waker is in place
+                // before that report is handled.
+                self.dispatcher
+                    .waiting
+                    .borrow_mut()
+                    .insert(self.id, cx.waker().clone());
+                Poll::Pending
+            }
         }
-        self.dispatcher
-            .waiting
-            .borrow_mut()
-            .insert(self.id, cx.waker().clone());
-        Poll::Pending
-    }
-}
-
-impl JobFuture {
-    /// Whether the worker dropped the job without finishing it (its thread panicked): it no
-    /// longer touches the buffer, and no result is coming.
-    fn worker_gone(&self) -> bool {
-        Arc::strong_count(&self.slot) == 1
     }
 }
 
@@ -335,8 +381,8 @@ impl Drop for JobFuture {
     fn drop(&mut self) {
         self.dispatcher.waiting.borrow_mut().remove(&self.id);
         // The worker may still be using the buffer: it is the caller's again only once the job
-        // is done.
-        while !self.slot.done.load(Ordering::Acquire) && !self.worker_gone() {
+        // is settled, which a worker that ends does for every job it holds.
+        while !self.slot.is_settled() {
             std::thread::yield_now();
         }
     }
@@ -526,7 +572,8 @@ pub fn start(
     }
     let on: Vec<u32> = workers.iter().map(|w| w.cpu.get()).collect();
     log::info!(
-        "nvmed: {} per-CPU I/O queue pairs (controller grants {granted} pairs), workers on CPUs {on:?}",
+        "nvmed: {} I/O queue pairs (controller grants {granted}): pair 1 on the main thread, {} per-CPU, workers on CPUs {on:?}",
+        workers.len() + 1,
         workers.len()
     );
     Some(Rc::new(Dispatcher {
@@ -536,6 +583,7 @@ pub fn start(
         in_flight: Rc::new(Cell::new(0)),
         next_id: Cell::new(0),
         done,
+        reports: RefCell::new(IdStream::new()),
         waiting: RefCell::new(HashMap::new()),
         started: RefCell::new(HashMap::new()),
     }))
@@ -611,19 +659,83 @@ fn spawn_worker(
         .map_err(|err| io::Error::from_raw_os_error(err.errno))?;
     let (jobs, rx) = mpsc::channel();
     let ticks = Arc::new(AtomicU64::new(0));
+    let alive = Arc::new(AtomicBool::new(true));
     let nvme = Arc::clone(nvme);
+    let end = WorkerEnd {
+        qid,
+        jobs: Some(rx),
+        done_tx,
+        alive: Arc::clone(&alive),
+    };
     std::thread::Builder::new()
         .name(format!("nvmed-q{qid}"))
         .spawn({
             let ticks = Arc::clone(&ticks);
-            move || serve(nvme, qid, iv, cpu, irq, rx, wake_rx, done_tx, ticks)
+            move || serve(nvme, qid, iv, cpu, irq, end, wake_rx, ticks)
         })?;
     Ok(Worker {
         jobs,
         wake,
         cpu,
         ticks,
+        alive,
     })
+}
+
+/// What a worker finds in its queue.
+enum Next {
+    /// A job to run.
+    Job(Job),
+    /// Nothing queued: wait for a wake-up.
+    Idle,
+    /// The dispatcher is gone: end the thread.
+    Closed,
+}
+
+/// A worker thread's job queue and report pipe, which say the worker has ended when they drop
+/// (as the thread returns or unwinds): the worker is marked dead, the jobs still queued are
+/// dropped, which abandons them, and [`WORKER_GONE`] wakes every waiting future to see how its
+/// job settled.
+struct WorkerEnd {
+    qid: u16,
+    /// `Some` until the drop.
+    jobs: Option<mpsc::Receiver<Job>>,
+    done_tx: File,
+    alive: Arc<AtomicBool>,
+}
+
+impl WorkerEnd {
+    /// The next queued job, if any, or whether the dispatcher is gone.
+    fn next_job(&self) -> Next {
+        match self.jobs.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(job)) => Next::Job(job),
+            Some(Err(mpsc::TryRecvError::Empty)) => Next::Idle,
+            Some(Err(mpsc::TryRecvError::Disconnected)) | None => Next::Closed,
+        }
+    }
+
+    /// Reports job `id` as settled.
+    fn report(&mut self, id: u64) {
+        if self.done_tx.write_all(&id.to_ne_bytes()).is_err() {
+            log::error!(
+                "nvmed: queue pair {} worker cannot report job {id}",
+                self.qid
+            );
+        }
+    }
+}
+
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        // Dropping the receiver drops the queued jobs, and with them their claims, so every
+        // job this worker held is settled before the report below.
+        self.jobs = None;
+        if std::thread::panicking() {
+            log::error!("nvmed: queue pair {} worker panicked", self.qid);
+        }
+        self.report(WORKER_GONE);
+    }
 }
 
 /// A worker thread: pins itself to `cpu`, then runs the jobs it is sent on queue pair `qid`.
@@ -634,9 +746,8 @@ fn serve(
     iv: u16,
     cpu: CpuId,
     irq: File,
-    jobs: mpsc::Receiver<Job>,
+    mut end: WorkerEnd,
     wake_rx: File,
-    mut done_tx: File,
     ticks: Arc<AtomicU64>,
 ) {
     if let Err(err) = percpu::pin_current_thread(cpu) {
@@ -666,18 +777,16 @@ fn serve(
             let mut bytes = [0_u8; 64];
             while matches!((&wake_rx).read(&mut bytes), Ok(n) if n > 0) {}
             loop {
-                match jobs.try_recv() {
-                    Ok(job) => {
+                match end.next_job() {
+                    Next::Job(job) => {
                         let id = job.id;
                         in_flight.set(Some((id, Instant::now())));
                         run(&nvme, job).await;
                         in_flight.set(None);
-                        if done_tx.write_all(&id.to_ne_bytes()).is_err() {
-                            log::error!("nvmed: queue pair {qid} worker cannot report job {id}");
-                        }
+                        end.report(id);
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => return,
+                    Next::Idle => break,
+                    Next::Closed => return,
                 }
             }
             let _ = wake.as_mut().next().await;
@@ -691,12 +800,12 @@ async fn run(nvme: &Nvme, job: Job) {
         namespace,
         lba,
         op,
-        slot,
+        claim,
         ..
     } = job;
     let result = match op {
         Op::Read { buf, len } => {
-            // SAFETY: see `Job`'s `Send`: the buffer is this job's until `done` is set.
+            // SAFETY: see `Job`'s `Send`: the buffer is this job's until the claim settles.
             let buf = unsafe { std::slice::from_raw_parts_mut(buf, len) };
             nvme.namespace_read(&namespace, lba, buf).await
         }
@@ -714,8 +823,5 @@ async fn run(nvme: &Nvme, job: Job) {
             .await
             .map(|()| 0),
     };
-    if let Ok(mut stored) = slot.result.lock() {
-        *stored = Some(result);
-    }
-    slot.done.store(true, Ordering::Release);
+    claim.complete(result);
 }

@@ -586,7 +586,14 @@ fn select_next_context(
     // Lock the previous context.
     let prev_context_lock = Arc::clone(ArcRwLockWriteGuard::rwlock(prev_context_guard));
     let is_idle = Arc::ptr_eq(&prev_context_lock, &idle_context);
-    let prev_runnable = !is_idle && prev_context_guard.status.is_runnable();
+    // Ferric Oxide: a running context whose affinity no longer includes this CPU (it pinned
+    // itself elsewhere while running) does not keep running here: it leaves the queue like a
+    // blocked one, and goes on this CPU's local wake-up list, whose next drain (once it is no
+    // longer running) forwards it to a CPU it may use.
+    let prev_elsewhere = !is_idle
+        && prev_context_guard.status.is_runnable()
+        && affinity_elsewhere(prev_context_guard, cpu_id).is_some();
+    let prev_runnable = !is_idle && prev_context_guard.status.is_runnable() && !prev_elsewhere;
 
     let elapsed_ticks = elapsed_time as u128 * SCALE / NANOS_PER_TICK;
 
@@ -624,7 +631,20 @@ fn select_next_context(
         }
         prev_context_guard.rem_slice = 0;
 
-        if let Some(wake) = prev_context_guard.wake {
+        if prev_elsewhere {
+            if let Some(old_key) = prev_context_guard.queue_key.take() {
+                contexts_data.queue.remove(&old_key);
+                percpu
+                    .switch_internals
+                    .queue_len
+                    .store(contexts_data.queue.len(), Ordering::Relaxed);
+            }
+            percpu
+                .switch_internals
+                .local_wakeup_list
+                .borrow_mut()
+                .push(WeakContextRef(Arc::downgrade(&prev_context_lock)));
+        } else if let Some(wake) = prev_context_guard.wake {
             contexts_data
                 .timers
                 .insert((wake, WeakContextRef(Arc::downgrade(&prev_context_lock))));
@@ -1091,7 +1111,8 @@ fn select_next_context(
             None
         }
     } else {
-        let prev_is_dead = !is_idle && !prev_context_guard.status.is_runnable();
+        // Ferric Oxide: a context leaving for another CPU gives way to the idle context too.
+        let prev_is_dead = !is_idle && (!prev_context_guard.status.is_runnable() || prev_elsewhere);
 
         percpu
             .switch_internals

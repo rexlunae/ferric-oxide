@@ -7,6 +7,12 @@
 //! queue, MSI-X entry and thread context (bounce buffer included). The thread that serves it
 //! then calls [`Nvme::enter_queue_pair`], after which its reads and writes go to that pair and
 //! its executor polls only that pair's completion queue.
+//!
+//! A pair is published (its context and vectors recorded) only once the controller has
+//! accepted both Create I/O Completion Queue (05h) and Create I/O Submission Queue (01h); if
+//! the submission queue fails, the completion queue is deleted again with Delete I/O
+//! Completion Queue (04h), as the NVMe Base Specification 2.0, section 5.6, describes, and
+//! the caller carries on with the pairs it has.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -57,13 +63,26 @@ impl Nvme {
     ///
     /// # Errors
     ///
-    /// `ENOMEM` when the context's buffers cannot be allocated.
+    /// - `EIO` when the controller fails either Create command; nothing is published, and a
+    ///   completion queue it had created is deleted again.
+    /// - `ENOMEM` when the context's buffers cannot be allocated.
     pub async fn add_queue_pair(&self, qid: u16, vector: InterruptVector) -> Result<()> {
         let iv: Iv = vector.vector();
-        let cq = self.create_io_completion_queue(qid as CqId, Some(iv)).await;
-        let sq = self
-            .create_io_submission_queue(qid as SqId, qid as CqId)
+        let (cq, status) = self
+            .create_io_completion_queue_status(qid as CqId, Some(iv))
             .await;
+        if status != 0 {
+            log::error!("nvmed: Create I/O Completion Queue {qid} failed with status {status:#x}");
+            return Err(Error::new(EIO));
+        }
+        let (sq, status) = self
+            .create_io_submission_queue_status(qid as SqId, qid as CqId)
+            .await;
+        if status != 0 {
+            log::error!("nvmed: Create I/O Submission Queue {qid} failed with status {status:#x}");
+            self.delete_completion_queue(qid, cq).await;
+            return Err(Error::new(EIO));
+        }
         let ctxt = ThreadCtxt {
             // SAFETY: all-zero bytes and integers are initialized.
             buffer: RefCell::new(unsafe { Dma::zeroed()?.assume_init() }),
@@ -83,6 +102,23 @@ impl Nvme {
         Ok(())
     }
 
+    /// Deletes I/O completion queue `qid`, which has no submission queue, and frees its memory
+    /// once the controller has let go of it.
+    async fn delete_completion_queue(&self, qid: u16, cq: super::NvmeCompQueue) {
+        let comp = self
+            .submit_and_complete_admin_command(|cid| NvmeCmd::delete_io_completion_queue(cid, qid))
+            .await;
+        let status = comp.status >> 1;
+        if status != 0 {
+            log::error!(
+                "nvmed: Delete I/O Completion Queue {qid} failed with status {status:#x}; its memory stays allocated"
+            );
+            // The controller may still write completions there, so the memory must not be
+            // reused.
+            std::mem::forget(cq);
+        }
+    }
+
     /// Whether queue pair `qid`'s completion queue, in the calling thread's context, has an
     /// entry waiting that nothing has taken yet.
     pub fn completion_waiting(&self, qid: u16) -> bool {
@@ -100,5 +136,27 @@ impl Nvme {
     /// [`Self::add_queue_pair`] created.
     pub fn enter_queue_pair(&self, vector: Iv) {
         THREAD_CTXT.with(|key| key.set(vector));
+    }
+}
+
+impl NvmeCmd {
+    /// Delete I/O Completion Queue (admin opcode 04h, NVMe Base Specification 2.0, section
+    /// 5.6): command dword 10 bits 15:0 hold the queue id.
+    fn delete_io_completion_queue(cid: u16, qid: u16) -> Self {
+        Self {
+            opcode: 0x04,
+            flags: 0,
+            cid,
+            nsid: 0,
+            _rsvd: 0,
+            mptr: 0,
+            dptr: [0, 0],
+            cdw10: u32::from(qid),
+            cdw11: 0,
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        }
     }
 }

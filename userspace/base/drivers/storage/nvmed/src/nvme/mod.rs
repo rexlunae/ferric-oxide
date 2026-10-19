@@ -393,6 +393,18 @@ impl Nvme {
         io_cq_id: CqId,
         vector: Option<Iv>,
     ) -> NvmeCompQueue {
+        self.create_io_completion_queue_status(io_cq_id, vector)
+            .await
+            .0
+    }
+
+    /// Ferric Oxide: [`Self::create_io_completion_queue`], with the command's status field
+    /// (0 on success).
+    pub async fn create_io_completion_queue_status(
+        &self,
+        io_cq_id: CqId,
+        vector: Option<Iv>,
+    ) -> (NvmeCompQueue, u16) {
         let doorbell = unsafe { self.get_doorbell(2 * (io_cq_id as usize) + 1) };
         let queue =
             NvmeCompQueue::new(doorbell).expect("nvmed: failed to allocate I/O completion queue");
@@ -422,9 +434,21 @@ impl Nvme {
             _ => (),
         }*/
 
-        queue
+        (queue, comp.status >> 1)
     }
     pub async fn create_io_submission_queue(&self, io_sq_id: SqId, io_cq_id: CqId) -> NvmeCmdQueue {
+        self.create_io_submission_queue_status(io_sq_id, io_cq_id)
+            .await
+            .0
+    }
+
+    /// Ferric Oxide: [`Self::create_io_submission_queue`], with the command's status field
+    /// (0 on success).
+    pub async fn create_io_submission_queue_status(
+        &self,
+        io_sq_id: SqId,
+        io_cq_id: CqId,
+    ) -> (NvmeCmdQueue, u16) {
         let doorbell = unsafe { self.get_doorbell(2 * (io_sq_id as usize)) };
         let q = NvmeCmdQueue::new(doorbell).expect("failed to create submission queue");
 
@@ -452,7 +476,7 @@ impl Nvme {
             _ => (),
         }*/
 
-        q
+        (q, comp.status >> 1)
     }
 
     pub async fn init_with_queues(&self) -> BTreeMap<u32, NvmeNamespace> {

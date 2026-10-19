@@ -83,8 +83,9 @@ jobs:
       - name: ferric-blkqueue
         run: |
           cargo clippy --locked --all-targets -p ferric-blkqueue -- -D warnings
-          cargo test --locked -p ferric-blkqueue
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue
+          cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
+          cargo test --locked -p ferric-blkqueue --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
       # kernel turns it on; file systems do not).
       - name: ferric-pcache

@@ -12,6 +12,12 @@
 //! - [`abi`] is the one definition of the call that sets a disk's policy, shared by
 //!   driver-block and its clients (the same-boot benchmark compares the policies with it).
 //! - [`ab`] summarises that benchmark's rounds and holds its pass rule.
+//! - [`ids`] reads the finished jobs' ids back from the workers' pipe, keeping a part of an
+//!   id that one read splits for the next, and reserves the id a worker reports as it exits.
+//! - `openers` (with the `alloc` feature) records which process opened each disk
+//!   descriptor, so only that process may set the policy through it.
+//! - `slot` (with the `std` feature) is a job's result slot between the thread that waits
+//!   and the worker that runs it, which settles once, done or abandoned.
 //!
 //! # Examples
 //!
@@ -23,12 +29,20 @@
 //! assert_eq!(QueuePolicy::MainQueue.route(3), Route::Main);
 //! ```
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub mod ab;
 pub mod abi;
+pub mod ids;
+#[cfg(feature = "alloc")]
+pub mod openers;
+#[cfg(feature = "std")]
+pub mod slot;
 
 /// How a disk driver with per-CPU queue pairs places requests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

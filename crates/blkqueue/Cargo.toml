@@ -6,3 +6,10 @@ license = "MIT"
 description = "Per-CPU disk queue routing: which queue pair a disk request runs on, and the call that chooses the policy"
 
 [dependencies]
+
+[features]
+default = []
+## The table of descriptor openers (`openers`).
+alloc = []
+## The job result slot (`slot`), which needs threads and locks.
+std = ["alloc"]

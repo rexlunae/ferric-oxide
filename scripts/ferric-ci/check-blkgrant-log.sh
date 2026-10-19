@@ -43,10 +43,10 @@ fi
 # entries over the CPUs in two batches, checks them against irq:cpus, and serves each pair from
 # a worker thread on its CPU.
 need "nvmed: MSI-X entries 1\.\.=[0-9]+ spread over CPUs \[[0-9, ]+\] in batches of [0-9]+ and [0-9]+, as irq:cpus and ferric_irq::spread give"
-need "nvmed: [2-9][0-9]* per-CPU I/O queue pairs \(controller grants [0-9]+ pairs\), workers on CPUs \[[0-9, ]+\]"
+need "nvmed: ([3-9]|[1-9][0-9]+) I/O queue pairs \(controller grants [0-9]+\): pair 1 on the main thread, ([2-9]|[1-9][0-9]+) per-CPU, workers on CPUs \[[0-9, ]+\]"
 # A watchdog line means a job's completion or report was not delivered by its event, and was
 # only picked up by the once-a-second tick.
-if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker not pinned|no worker for I/O queue pair|watchdog)" <<< "$clean"; then
+if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker (not pinned|panicked)|no worker for I/O queue pair|every worker has ended|Create I/O (Completion|Submission) Queue [0-9]+ failed|watchdog)" <<< "$clean"; then
     fail "nvmed's per-CPU queue pairs were not set up as expected"
 fi
 
