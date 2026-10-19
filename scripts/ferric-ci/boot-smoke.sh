@@ -83,7 +83,9 @@ fi
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
-trap 'rm -f "$disk"' EXIT
+# A QEMU monitor of its own, so a run that times out can dump where each CPU is.
+monitor="$(mktemp -u --suffix=.mon)"
+trap 'rm -f "$disk" "$monitor"' EXIT
 
 # Run QEMU in the background and watch the log, so a crash or the shutdown
 # ends the run at once instead of waiting for the timeout.
@@ -96,7 +98,8 @@ qemu-system-x86_64 \
     -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
     -nographic -vga none "${reboot[@]}" \
-    -serial mon:stdio < /dev/null > "$log" 2>&1 &
+    -monitor unix:"$monitor",server,nowait \
+    -serial stdio < /dev/null > "$log" 2>&1 &
 qemu_pid=$!
 tail -n +1 -f "$log" --pid="$qemu_pid" &
 tail_pid=$!
@@ -117,6 +120,30 @@ for ((i = 0; i < timeout_secs; i++)); do
     sleep 1
 done
 if [ -z "$status" ]; then
+    # Where every CPU is when the run times out: a guest stuck in the kernel shows kernel
+    # addresses (and IF clear when it spins with interrupts off).
+    echo "boot-smoke: CPU state at the timeout" >&2
+    python3 - "$monitor" <<'PY' >&2 || true
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.settimeout(2)
+for cmd in (b"info cpus\n", b"info registers -a\n"):
+    s.sendall(cmd)
+    time.sleep(1)
+out = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        out += chunk
+except OSError:
+    pass
+for line in out.decode(errors="replace").splitlines():
+    if line.startswith(("*", " ", "CPU", "RIP", "RSP", "RFL", "CS", "CR3")) or "thread_id" in line:
+        print("boot-smoke-cpu: " + line.strip())
+PY
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
     status=124

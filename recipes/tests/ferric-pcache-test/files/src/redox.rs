@@ -113,6 +113,7 @@ impl SchemeSync for FileScheme {
         if fd != ROOT || path.trim_matches('/') != FILE_PATH {
             return Err(Error::new(ENOENT));
         }
+        progress("scheme: openat");
         self.next += 1;
         let number = self.next;
         let (words, n) = Request::Attach {
@@ -121,6 +122,7 @@ impl SchemeSync for FileScheme {
         .encode();
         libredox::call::call_wo(self.object, &[], CallFlags::empty(), &words[..n])
             .map_err(|err| Error::new(err.errno()))?;
+        progress("scheme: Attach answered");
         // Positioned, so the kernel passes every read's offset.
         Ok(OpenResult::ThisScheme {
             number,
@@ -562,7 +564,12 @@ fn progress(what: &str) {
 /// not stall the rest of the smoke script.
 fn start_watchdog() {
     thread::spawn(|| {
-        thread::sleep(WATCHDOG);
+        // A line every few seconds shows whether user space still runs while a call is stuck.
+        let start = Instant::now();
+        while start.elapsed() < WATCHDOG {
+            thread::sleep(Duration::from_secs(10));
+            progress(&format!("alive after {:?}", start.elapsed()));
+        }
         println!("FERRIC_TEST_FAIL pcache-watchdog: still running after {WATCHDOG:?}");
         std::process::exit(1);
     });
@@ -619,6 +626,7 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         hit_ns: 0,
     };
     let file = open_file().map_err(|f| ("pcache-setup", f))?;
+    progress("opened the file");
     let steps: [(&'static str, &dyn Fn(&mut Cache) -> Result<(), Failure>); 5] = [
         ("pcache-miss", &|cache| miss(cache, &file)),
         ("pcache-hit", &|cache| hit(cache, &file)),
