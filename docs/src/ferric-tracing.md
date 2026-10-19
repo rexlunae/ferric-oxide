@@ -502,7 +502,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   it checks that every announced fault has a record: on VT-d each DMA fault by
   page and access and the forged interrupt by its remapping entry, decoded with
   `ferric-vtd`; on AMD-Vi an I/O page fault event, decoded with
-  `ferric-amdvi`, since QEMU leaves the address out of those. It prints
+  `ferric-amdvi`, since QEMU leaves the address out of those. Each announced
+  fault needs a record of its own. AMD-Vi events of two faults are identical,
+  and the kernel merges identical events drained in one pass, so the test
+  waits for the previous fault's record to come back from the rings before it
+  causes the next fault; the kernel drains the event log on every event
+  interrupt, so that record comes promptly. It prints
   `FERRIC_TEST_PASS iommu-trace`, which `check-iommu-log.sh` requires with
   either IOMMU, and a skip without one. It also turns the `irq` events on
   around the interrupt of `iommu-msi`, which it acknowledges itself as a driver

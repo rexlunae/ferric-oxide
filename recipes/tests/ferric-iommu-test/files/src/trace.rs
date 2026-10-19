@@ -18,9 +18,12 @@
 //!
 //! Each announced fault takes a record of its own: one record never stands for two
 //! announcements. On AMD-Vi the events of two faults look the same, and the kernel merges
-//! identical events in a row into one record, so before announcing the next fault [`expect`]
-//! waits until the faults announced so far have their records. That ends the kernel's run of
-//! identical events, and the next fault's events start a new record.
+//! identical events it drains in one pass into one record, so before announcing the next
+//! fault [`expect`] waits until the faults announced so far have their records, read back from
+//! the rings. The kernel drains the event log on every event interrupt (and a call that finds
+//! it busy makes the drainer go round again), so a fault's events are drained, and their
+//! record written, before the test moves on; the next fault's events then start a new
+//! record. A fault's events can still be split over several records, which only adds records.
 //!
 //! The `irq` events are on only around `iommu-msi`'s interrupt ([`watch_interrupt`],
 //! [`interrupt_handled`]): the test reserves a vector, has the device raise its MSI, and
@@ -48,8 +51,10 @@ use ferric_vtd::fault::{FaultRecord, RequestKind};
 /// How long [`finish`] waits for the records of announced faults.
 const WAIT: Duration = Duration::from_secs(3);
 
-/// How long [`expect`] waits for the records of the faults announced before.
-const PREVIOUS_WAIT: Duration = Duration::from_secs(1);
+/// How long [`expect`] waits for the records of the faults announced before. They normally
+/// come within milliseconds; the bound only keeps a missing record from hanging the test,
+/// which [`finish`] then reports.
+const PREVIOUS_WAIT: Duration = Duration::from_secs(5);
 
 /// How much one read of a CPU's ring asks for (the scheme's maximum).
 const READ_LEN: usize = 64 * 1024;
