@@ -322,8 +322,9 @@ bootstrap and clients all use it. The kernel side is
    each SQE in the caller's context as the system call it stands for, on the
    caller's descriptor and buffer: `Read`/`Write` at an offset as
    `SYS_READ2`/`SYS_WRITE2`, at `CURRENT_POSITION` as `read`/`write`, and
-   `Fsync` as `fsync`. A user scheme receives an ordinary scheme request, so
-   every scheme works with rings unchanged.
+   `Fsize`, `Fstat` and `Fsync` as the system calls of those names. A user
+   scheme receives an ordinary scheme request, so every scheme works with
+   rings unchanged.
 3. Read one CQE per SQE with a `Consumer<Cqe>`: the SQE's `user_data` and the
    result, or minus the errno. `fevent` on the ring descriptor reports
    `EVENT_READ` while completions are waiting, and `Enter` triggers it.
@@ -351,11 +352,37 @@ own indices, copies each SQE once before checking it, and fails `Enter` with
 `EINVAL` when the application's SQ tail is out of range. One `Enter` runs on
 a ring at a time; a concurrent one gets `EBUSY`.
 
-Fixed files, registered-buffer grants as SQE buffers, waiting for
-completions in `Enter`, polled (`SqPoll`) and `UMWAIT` notification, and
-rings served natively by user schemes come later (see the design in
+Each ring has a file table of 1024 slots. `Request::RegisterFiles { first }`
+is a `SYS_CALL` with `CallFlags::FD` whose payload holds descriptors (add
+`FD_CLONE` to keep them open in the caller); they go into consecutive slots
+from `first`, all or none. An SQE with `SqeFlags::FIXED_FILE` names a slot
+instead of a descriptor, which skips the descriptor lookup and keeps working
+after the application closes its descriptor. A slot keeps its file until
+`Request::UnregisterFiles { first, count }` or until the ring is closed. A
+full slot is refused with `EBUSY`; slots past the table and ring descriptors
+(a ring may not hold a ring open) with `EINVAL`; the descriptors of a
+refused call are closed. An empty slot completes with `EBADF`.
+
+A chain whose first SQE has `SqeFlags::ASYNC` runs on the ring's worker, a
+kernel context the ring starts on first use. `Enter` takes the chain, sets
+aside room in the CQ for its completions, looks up the files it names
+(refusing rings with `EINVAL`, since a chain holding its ring would keep the
+ring from closing), and returns without waiting; the worker runs asynchronous chains in order, with
+the submitter's address space and credentials, and posts each chain's CQEs
+together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+min_complete }` waits after submitting until the CQ holds `min_complete`
+completions or nothing submitted is still running, on the worker or in
+another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
+`Enter` announces each chain it runs itself as soon as its CQEs are posted.
+Closing the ring cancels the worker for good, as a signal that never clears:
+the wait the running chain is in ends, as does any it starts later, and the
+queued chains complete with `ECANCELED`.
+
+Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
+notification, and rings served natively by user schemes come later (see the design in
 `io/rings-design.md` in the project files). Their flags and modes already
 have encodings and return `EOPNOTSUPP` today. `ferric-ring-test` covers the
-calls, chains across RedoxFS, the pipe scheme and the null scheme, the
-refusals, back-pressure and a corrupt tail, and prints ring versus system
-call timings.
+calls, chains across RedoxFS, the pipe scheme and the null scheme, the file
+table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
+blocked, the refusals, back-pressure and a corrupt tail, and prints ring
+versus system call timings, by descriptor, by slot and on the worker.
