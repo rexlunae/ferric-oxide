@@ -1,4 +1,6 @@
 [package]
+# Ferric Oxide: explicit workspace root for cross-workspace path dependencies.
+workspace = ".."
 name = "redox-ioctl"
 authors = ["bjorn3 <bjorn3_gh@protonmail.com>"]
 version = "0.1.0"
