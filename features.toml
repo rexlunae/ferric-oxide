@@ -238,6 +238,25 @@ when = "value != ''"
 make_append = { FERRIC_TARGET_CPPFLAGS = "{value}" }
 
 [[option]]
+id = "cpu.frame_pointers"
+menu = "cpu"
+type = "bool"
+title = "Keep frame pointers in user space"
+default = false
+rebuild = ["*"]
+help = """
+Build every userspace package with frame pointers (-C force-frame-pointers=yes
+for Rust, -fno-omit-frame-pointer for C and C++), so the kernel profiler
+(kernel.profiling) can walk user stacks and `ferric-trace flamegraph` can show
+whole call chains. Costs a register and a few instructions per call. The Rust
+standard library comes prebuilt with the toolchain and is not rebuilt, so a
+chain may stop inside it."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_TARGET_RUSTFLAGS = "-C force-frame-pointers=yes", FERRIC_TARGET_CPPFLAGS = "-fno-omit-frame-pointer" }
+
+[[option]]
 id = "cpu.flags_exclude"
 menu = "cpu"
 type = "list"
