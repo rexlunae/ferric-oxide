@@ -21,6 +21,8 @@ ferric-aslr-test = "source"
 ferric-guard-test = "source"
 ferric-tlb-test = "source"
 ferric-futex-test = "source"
+# Reads /scheme/sys/proc (kernel.sys_proc, which CI turns on); skips otherwise.
+ferric-proc-test = "source"
 ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
 # DMA domain from pcid and has the device DMA through it.
@@ -71,6 +73,7 @@ ferric-tlb-test || echo FERRIC_TEST_FAIL tlb exited with an error
 ferric-regbuf-test || echo FERRIC_TEST_FAIL regbuf exited with an error
 ferric-blkgrant-test || echo FERRIC_TEST_FAIL nvme-grant exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
+ferric-proc-test || echo FERRIC_TEST_FAIL proc exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
 # Saves a capture and reads it back, on a kernel with kernel.trace. The /scheme listing says
 # whether it has one, as in ferric-trace-test; the trace-overhead baseline image has none.
