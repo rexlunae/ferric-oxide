@@ -13,7 +13,7 @@
 
 use core::fmt;
 
-use crate::abi::PageRange;
+use crate::abi::{MAX_RECORD_PAGES, PageRange};
 
 /// The readahead window bounds, in pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,10 +28,14 @@ impl ReadaheadConfig {
     /// # Errors
     ///
     /// [`ConfigError::Zero`] when `initial` is 0, [`ConfigError::Order`] when it is above
-    /// `max`.
+    /// `max`, and [`ConfigError::TooLarge`] when `max` is above [`MAX_RECORD_PAGES`], so that
+    /// every window [`Readahead::on_read`] returns fits in one fill record.
     pub const fn new(initial: u32, max: u32) -> Result<Self, ConfigError> {
         if initial == 0 {
             return Err(ConfigError::Zero);
+        }
+        if max > MAX_RECORD_PAGES {
+            return Err(ConfigError::TooLarge);
         }
         if initial > max {
             return Err(ConfigError::Order);
@@ -70,6 +74,8 @@ pub enum ConfigError {
     Zero,
     /// The initial window is larger than the maximum.
     Order,
+    /// The maximum is above [`MAX_RECORD_PAGES`], more than one record can carry.
+    TooLarge,
 }
 
 impl fmt::Display for ConfigError {
@@ -77,6 +83,7 @@ impl fmt::Display for ConfigError {
         f.write_str(match self {
             Self::Zero => "the initial readahead window is 0 pages",
             Self::Order => "the initial readahead window is larger than the maximum",
+            Self::TooLarge => "the readahead maximum is larger than one fill record",
         })
     }
 }
@@ -104,7 +111,7 @@ impl Readahead {
     }
 
     /// Records a read of `pages` in a file of `file_pages` pages, and returns the pages to fill
-    /// past it, if any.
+    /// past it, if any: at most [`MAX_RECORD_PAGES`], as the config allows no more.
     pub fn on_read(&mut self, pages: PageRange, file_pages: u64) -> Option<PageRange> {
         let sequential = pages.first() == self.next || pages.first() == 0;
         self.next = pages.end();
@@ -202,9 +209,27 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_window_fits_one_record() {
+        let config = ReadaheadConfig::new(MAX_RECORD_PAGES, MAX_RECORD_PAGES).expect("valid");
+        let mut ahead = Readahead::new(config);
+        for page in 0..4 {
+            let extra = ahead.on_read(range(page, 1), u64::MAX).expect("readahead");
+            assert!(crate::abi::RecordPages::new(extra).is_some());
+        }
+    }
+
+    #[test]
     fn configs_are_checked_and_can_shrink() {
         assert_eq!(ReadaheadConfig::new(0, 4), Err(ConfigError::Zero));
         assert_eq!(ReadaheadConfig::new(8, 4), Err(ConfigError::Order));
+        assert_eq!(
+            ReadaheadConfig::new(4, MAX_RECORD_PAGES + 1),
+            Err(ConfigError::TooLarge)
+        );
+        assert_ne!(
+            ConfigError::TooLarge.to_string(),
+            ConfigError::Order.to_string()
+        );
         assert_eq!(ReadaheadConfig::default(), ReadaheadConfig::DEFAULT);
         assert!(!ConfigError::Order.to_string().is_empty());
         let mut ahead = reader();

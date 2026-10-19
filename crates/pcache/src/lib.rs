@@ -32,7 +32,7 @@
 //! # Examples
 //!
 //! ```
-//! use ferric_pcache::abi::{ObjectId, PageRange, Record};
+//! use ferric_pcache::abi::{ObjectId, PageRange, Record, RecordPages};
 //! use ferric_pcache::page::{Event, PageState};
 //! use ferric_pcache::readahead::{Readahead, ReadaheadConfig};
 //!
@@ -42,8 +42,9 @@
 //! let extra = ahead.on_read(wanted, 100);
 //! assert_eq!(extra, PageRange::new(4, 4));
 //!
-//! // The fill goes on the file system's queue as a record.
-//! let fill = Record::Fill { object: ObjectId::new(7), pages: wanted };
+//! // The fill goes on the file system's queue as a record (at most 1024 pages each).
+//! let pages = RecordPages::new(wanted).expect("4 pages fit one record");
+//! let fill = Record::Fill { object: ObjectId::new(7), pages };
 //! assert_eq!(Record::from_bytes(&fill.to_bytes()), Ok(fill));
 //!
 //! // Each page moves from absent to filling to up to date.

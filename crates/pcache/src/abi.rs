@@ -28,6 +28,7 @@
 //! down; [`Record::to_bytes`] and [`Record::from_bytes`] the one place the record layout is.
 
 use core::fmt;
+use core::num::NonZeroU16;
 
 /// The scheme's name in the namespace: file systems open `/scheme/kernel.pcache`.
 pub const SCHEME_NAME: &str = "kernel.pcache";
@@ -174,28 +175,82 @@ impl PageRange {
     }
 }
 
+/// A run of pages one fill or writeback record may name: 1 to [`MAX_RECORD_PAGES`] pages.
+///
+/// [`Record::Fill`], [`Record::Writeback`] and their answers carry this type rather than a
+/// [`PageRange`], so a range the wire format would refuse cannot be built. Longer ranges go in
+/// several records, [`RecordPages::split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecordPages(PageRange);
+
+impl RecordPages {
+    /// `pages`, or `None` when it is longer than [`MAX_RECORD_PAGES`].
+    pub const fn new(pages: PageRange) -> Option<Self> {
+        if pages.count > MAX_RECORD_PAGES {
+            return None;
+        }
+        Some(Self(pages))
+    }
+
+    /// `count` pages from `first`, or `None` when that is empty, overflows or is longer than
+    /// [`MAX_RECORD_PAGES`].
+    pub const fn from_parts(first: u64, count: u32) -> Option<Self> {
+        match PageRange::new(first, count) {
+            Some(pages) => Self::new(pages),
+            None => None,
+        }
+    }
+
+    /// The pages.
+    pub const fn pages(self) -> PageRange {
+        self.0
+    }
+
+    /// `pages` in order, cut into runs of at most [`MAX_RECORD_PAGES`] pages.
+    pub fn split(pages: PageRange) -> impl Iterator<Item = Self> {
+        let max = u64::from(MAX_RECORD_PAGES);
+        let mut first = pages.first;
+        let end = pages.end();
+        core::iter::from_fn(move || {
+            let next = end.min(first.saturating_add(max));
+            let run = PageRange::from_bounds(first, next).and_then(Self::new)?;
+            first = next;
+            Some(run)
+        })
+    }
+}
+
+impl From<RecordPages> for PageRange {
+    fn from(pages: RecordPages) -> Self {
+        pages.0
+    }
+}
+
 /// How a file system finished a fill or a writeback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
     /// The pages are filled, or written back.
     Done,
     /// It failed with this errno; the kernel fails waiting readers with `EIO`, whatever it is.
-    Failed(u16),
+    /// Non-zero, since errno 0 on the wire means [`Self::Done`].
+    Failed(NonZeroU16),
 }
 
 impl Outcome {
     const fn to_word(self) -> u64 {
         match self {
             Self::Done => 0,
-            Self::Failed(errno) => errno as u64,
+            Self::Failed(errno) => errno.get() as u64,
         }
     }
 
     const fn from_word(word: u64) -> Option<Self> {
-        match word {
-            0 => Some(Self::Done),
-            1..=0xffff => Some(Self::Failed(word as u16)),
-            _ => None,
+        if word > u16::MAX as u64 {
+            return None;
+        }
+        match NonZeroU16::new(word as u16) {
+            None => Some(Self::Done),
+            Some(errno) => Some(Self::Failed(errno)),
         }
     }
 }
@@ -224,7 +279,7 @@ pub enum Request {
         /// The object.
         object: ObjectId,
         /// The pages the record named.
-        pages: PageRange,
+        pages: RecordPages,
         /// How the fill ended.
         outcome: Outcome,
     },
@@ -233,13 +288,14 @@ pub enum Request {
         /// The object.
         object: ObjectId,
         /// The pages the record named.
-        pages: PageRange,
+        pages: RecordPages,
         /// How the writeback ended.
         outcome: Outcome,
     },
     /// On a queue: read ahead at most `pages` pages for this file system's objects.
     SetReadaheadMax {
-        /// The largest readahead window, in pages.
+        /// The largest readahead window, in pages: 1 to [`MAX_RECORD_PAGES`], so a window
+        /// fits in one record ([`crate::readahead::ReadaheadConfig::new`] has the same bound).
         pages: u32,
     },
 }
@@ -287,8 +343,8 @@ impl Request {
                 [
                     Verb::Filled as u64,
                     object.0,
-                    pages.first,
-                    pages.count as u64,
+                    pages.0.first,
+                    pages.0.count as u64,
                     outcome.to_word(),
                 ],
                 5,
@@ -301,8 +357,8 @@ impl Request {
                 [
                     Verb::WrittenBack as u64,
                     object.0,
-                    pages.first,
-                    pages.count as u64,
+                    pages.0.first,
+                    pages.0.count as u64,
                     outcome.to_word(),
                 ],
                 5,
@@ -320,7 +376,7 @@ impl Request {
     /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
     /// number of words does not match it, and [`DecodeError::Value`] for a page range that is
     /// empty, overflows or is longer than [`MAX_RECORD_PAGES`], an errno above 16 bits, or a
-    /// readahead maximum of 0.
+    /// readahead maximum of 0 or above [`MAX_RECORD_PAGES`].
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
         let (&verb, args) = words.split_first().ok_or(DecodeError::Verb)?;
         match (Verb::from_raw(verb).ok_or(DecodeError::Verb)?, args) {
@@ -344,7 +400,9 @@ impl Request {
                 })
             }
             (Verb::SetReadaheadMax, &[pages]) => match u32::try_from(pages) {
-                Ok(pages) if pages > 0 => Ok(Self::SetReadaheadMax { pages }),
+                Ok(pages) if pages > 0 && pages <= MAX_RECORD_PAGES => {
+                    Ok(Self::SetReadaheadMax { pages })
+                }
                 _ => Err(DecodeError::Value),
             },
             _ => Err(DecodeError::Length),
@@ -353,19 +411,15 @@ impl Request {
 }
 
 /// The page range and outcome of a [`Request::Filled`] or [`Request::WrittenBack`].
-fn answer(first: u64, count: u64, outcome: u64) -> Result<(PageRange, Outcome), DecodeError> {
+fn answer(first: u64, count: u64, outcome: u64) -> Result<(RecordPages, Outcome), DecodeError> {
     let pages = record_range(first, count).ok_or(DecodeError::Value)?;
     let outcome = Outcome::from_word(outcome).ok_or(DecodeError::Value)?;
     Ok((pages, outcome))
 }
 
 /// A page range a record or an answer may carry.
-fn record_range(first: u64, count: u64) -> Option<PageRange> {
-    let count = u32::try_from(count).ok()?;
-    if count > MAX_RECORD_PAGES {
-        return None;
-    }
-    PageRange::new(first, count)
+fn record_range(first: u64, count: u64) -> Option<RecordPages> {
+    RecordPages::from_parts(first, u32::try_from(count).ok()?)
 }
 
 /// Why metadata words are not a valid [`Request`].
@@ -400,7 +454,7 @@ pub enum Record {
         /// The object.
         object: ObjectId,
         /// The pages to fill.
-        pages: PageRange,
+        pages: RecordPages,
     },
     /// Write these dirty pages of the object to the file, then answer
     /// [`Request::WrittenBack`].
@@ -408,7 +462,7 @@ pub enum Record {
         /// The object.
         object: ObjectId,
         /// The pages to write.
-        pages: PageRange,
+        pages: RecordPages,
     },
     /// The kernel needs memory: close the object if it is only retained (no client has the
     /// file open).
@@ -442,7 +496,7 @@ impl Record {
             Self::Release { object } => (Self::KIND_RELEASE, object, None),
             Self::Accessed { object } => (Self::KIND_ACCESSED, object, None),
         };
-        let (first, count) = pages.map_or((0, 0), |p| (p.first, p.count));
+        let (first, count) = pages.map_or((0, 0), |p| (p.0.first, p.0.count));
         let mut bytes = [0; Self::BYTES];
         bytes[0..4].copy_from_slice(&kind.to_le_bytes());
         bytes[8..16].copy_from_slice(&object.0.to_le_bytes());
@@ -548,6 +602,66 @@ mod tests {
         PageRange::new(first, count).expect("a valid range")
     }
 
+    fn record(first: u64, count: u32) -> RecordPages {
+        RecordPages::from_parts(first, count).expect("a valid record range")
+    }
+
+    fn errno(n: u16) -> NonZeroU16 {
+        NonZeroU16::new(n).expect("non-zero")
+    }
+
+    #[test]
+    fn record_pages_are_bounded_and_split() {
+        assert_eq!(
+            RecordPages::from_parts(0, MAX_RECORD_PAGES).map(RecordPages::pages),
+            Some(range(0, MAX_RECORD_PAGES))
+        );
+        assert_eq!(RecordPages::from_parts(0, MAX_RECORD_PAGES + 1), None);
+        assert_eq!(RecordPages::new(range(0, 1025)), None);
+        assert_eq!(RecordPages::from_parts(0, 0), None);
+        let runs: std::vec::Vec<_> = RecordPages::split(range(10, 2 * MAX_RECORD_PAGES + 1))
+            .map(PageRange::from)
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                range(10, MAX_RECORD_PAGES),
+                range(10 + 1024, MAX_RECORD_PAGES),
+                range(10 + 2048, 1)
+            ]
+        );
+        assert_eq!(RecordPages::split(range(u64::MAX - 3, 3)).count(), 1);
+    }
+
+    #[test]
+    fn an_errno_is_never_done() {
+        // Errno 0 on the wire is Done; a failure always encodes as a non-zero word.
+        let failed = Request::Filled {
+            object: ObjectId::new(1),
+            pages: record(0, 1),
+            outcome: Outcome::Failed(errno(1)),
+        };
+        let (words, len) = failed.encode();
+        assert_eq!(words[4], 1);
+        assert_eq!(Request::decode(&words[..len]), Ok(failed));
+        assert_eq!(
+            Request::decode(&[4, 1, 0, 1, 0]),
+            Ok(Request::Filled {
+                object: ObjectId::new(1),
+                pages: record(0, 1),
+                outcome: Outcome::Done,
+            })
+        );
+        assert_eq!(
+            Request::decode(&[4, 1, 0, 1, 0xffff]),
+            Ok(Request::Filled {
+                object: ObjectId::new(1),
+                pages: record(0, 1),
+                outcome: Outcome::Failed(errno(0xffff)),
+            })
+        );
+    }
+
     #[test]
     fn page_ranges_refuse_empty_and_overflowing_runs() {
         assert_eq!(PageRange::new(5, 0), None);
@@ -600,15 +714,18 @@ mod tests {
             Request::Detach { handle: 9 },
             Request::Filled {
                 object: ObjectId::new(3),
-                pages: range(8, 4),
+                pages: record(8, 4),
                 outcome: Outcome::Done,
             },
             Request::WrittenBack {
                 object: ObjectId::new(3),
-                pages: range(0, MAX_RECORD_PAGES),
-                outcome: Outcome::Failed(5),
+                pages: record(0, MAX_RECORD_PAGES),
+                outcome: Outcome::Failed(errno(5)),
             },
             Request::SetReadaheadMax { pages: 64 },
+            Request::SetReadaheadMax {
+                pages: MAX_RECORD_PAGES,
+            },
         ];
         for request in all {
             let (words, len) = request.encode();
@@ -635,6 +752,7 @@ mod tests {
         );
         assert_eq!(Request::decode(&[6, 0]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[6, 1 << 32]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[6, long]), Err(DecodeError::Value));
     }
 
     #[test]
@@ -643,11 +761,11 @@ mod tests {
         for record in [
             Record::Fill {
                 object,
-                pages: range(1, 2),
+                pages: record(1, 2),
             },
             Record::Writeback {
                 object,
-                pages: range(u64::MAX - 8, 8),
+                pages: record(u64::MAX - 8, 8),
             },
             Record::Release { object },
             Record::Accessed { object },
@@ -661,7 +779,7 @@ mod tests {
     fn bad_records_are_refused() {
         let fill = Record::Fill {
             object: ObjectId::new(1),
-            pages: range(4, 1),
+            pages: record(4, 1),
         }
         .to_bytes();
         assert_eq!(Record::from_bytes(&fill[..31]), Err(RecordError::Length));
@@ -673,6 +791,9 @@ mod tests {
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Reserved));
         let mut bad = fill;
         bad[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
+        let mut bad = fill;
+        bad[24..28].copy_from_slice(&(MAX_RECORD_PAGES + 1).to_le_bytes());
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
         let mut release = Record::Release {
             object: ObjectId::new(1),

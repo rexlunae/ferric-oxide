@@ -19,8 +19,11 @@
 //! CLOCK-Pro (Jiang, Chen and Zhang, USENIX ATC 2005); this is the simpler two-list form of
 //! both, without their history of evicted pages.
 //!
-//! Every operation is O(log n) amortized: the lists hold `(key, generation)` and a removed or
-//! moved page leaves a stale entry that the hand skips.
+//! Every operation is O(log n) amortized: the lists hold `(key, generation)`, and a page
+//! removed while it is not at the hand leaves a stale entry that the hand skips. So that pages
+//! inserted and discarded without eviction do not grow the lists without bound, [`Clock::remove`]
+//! drops the stale entries once they outnumber the pages (plus a small slack), which keeps the
+//! lists below twice the page count and costs O(1) amortized per removal.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use core::fmt;
@@ -132,10 +135,30 @@ impl<K: Ord + Copy> Clock<K> {
                 if entry.list == List::Inactive {
                     self.inactive_len -= 1;
                 }
+                self.compact_if_stale();
                 true
             }
             None => false,
         }
+    }
+
+    /// The list entries kept beyond the pages before [`Self::remove`] compacts.
+    const STALE_SLACK: usize = 16;
+
+    /// Drops the stale list entries once there are more of them than pages (plus
+    /// [`Self::STALE_SLACK`]). Each compaction is O(n) and follows at least n removals since the
+    /// last one, so it is O(1) amortized.
+    fn compact_if_stale(&mut self) {
+        let entries = self.inactive.len() + self.active.len();
+        if entries <= 2 * self.pages.len() + Self::STALE_SLACK {
+            return;
+        }
+        let pages = &self.pages;
+        let current = |&(key, generation): &(K, u64)| {
+            pages.get(&key).is_some_and(|e| e.generation == generation)
+        };
+        self.inactive.retain(current);
+        self.active.retain(current);
     }
 
     /// Moves the hand until it finds a page to evict, removes it from the lists and returns
@@ -275,6 +298,37 @@ mod tests {
             clock.insert(page).expect("a new page");
         }
         clock
+    }
+
+    #[test]
+    fn discarded_pages_do_not_grow_the_lists() {
+        // Pages come in and are discarded with no eviction, on both lists.
+        let mut lists = clock(0..8);
+        for page in 0..4 {
+            lists.touch(page);
+        }
+        // The hand promotes 0..4 on its way to 4, which goes.
+        assert_eq!(lists.evict(|_| true), Some(4));
+        assert_eq!(lists.active_len(), 4);
+        for round in 0..10_000u32 {
+            let page = 100 + round;
+            lists.insert(page).expect("a new page");
+            assert!(lists.remove(page));
+            let active = round % 4;
+            assert!(lists.remove(active));
+            lists.insert(active).expect("back again");
+            lists.touch(active);
+            let entries = lists.inactive.len() + lists.active.len();
+            assert!(
+                entries <= 2 * lists.len() + Clock::<u32>::STALE_SLACK,
+                "{entries} entries for {} pages",
+                lists.len()
+            );
+        }
+        // The generation check still holds after compactions: every page comes out once.
+        let mut out: Vec<u32> = core::iter::from_fn(|| lists.evict(|_| true)).collect();
+        out.sort_unstable();
+        assert_eq!(out, [0, 1, 2, 3, 5, 6, 7]);
     }
 
     #[test]
