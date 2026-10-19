@@ -19,7 +19,7 @@
 //! the worker first.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read, Write};
@@ -87,6 +87,9 @@ struct Worker {
     ticks: Arc<AtomicU64>,
 }
 
+/// When a job was handed out, the index of its worker, and its result slot.
+type Started = (Instant, usize, Arc<Slot>);
+
 /// Hands jobs to the workers and completes their futures; lives on the main thread.
 pub struct Dispatcher {
     workers: Vec<Worker>,
@@ -95,8 +98,9 @@ pub struct Dispatcher {
     /// The read end of the pipe the workers report finished jobs on (non-blocking).
     done: File,
     waiting: RefCell<HashMap<u64, Waker>>,
-    /// When each unfinished job was handed out, and to which worker, for the watchdog.
-    started: RefCell<HashMap<u64, (Instant, usize)>>,
+    /// When each unfinished job was handed out, to which worker, and its result slot, for the
+    /// watchdog.
+    started: RefCell<HashMap<u64, Started>>,
 }
 
 impl Dispatcher {
@@ -143,7 +147,7 @@ impl Dispatcher {
         }
         self.started
             .borrow_mut()
-            .insert(id, (Instant::now(), index));
+            .insert(id, (Instant::now(), index, Arc::clone(&slot)));
         let result = JobFuture {
             dispatcher: Rc::clone(self),
             id,
@@ -188,23 +192,40 @@ impl Dispatcher {
             return;
         };
         let mut told = 0;
+        // Jobs the workers had finished at the previous tick that the pump had not completed:
+        // the pipe's event may simply not have been handled yet when a tick comes, so a job
+        // counts as unreported only once it is still waiting a whole tick later.
+        let mut finished_before: HashSet<u64> = HashSet::new();
         loop {
             ticks.next().await;
-            let woken = self.drain();
+            let finished: HashSet<u64> = self
+                .started
+                .borrow()
+                .iter()
+                .filter(|(_, (_, _, slot))| slot.done.load(Ordering::Acquire))
+                .map(|(&id, _)| id)
+                .collect();
+            let unreported = finished.intersection(&finished_before).count();
+            finished_before = finished;
+            if unreported != 0 {
+                self.drain();
+                finished_before.clear();
+                if told < STALL_REPORTS {
+                    told += 1;
+                    log::warn!(
+                        "nvmed: watchdog: {unreported} job(s) finished a second ago, but the completion pipe's event did not wake the main thread"
+                    );
+                }
+            }
             if told >= STALL_REPORTS {
                 continue;
-            }
-            if woken != 0 {
-                told += 1;
-                log::warn!(
-                    "nvmed: watchdog found {woken} finished job(s) the completion pipe's event did not report"
-                );
             }
             let stalled = self
                 .started
                 .borrow()
                 .iter()
-                .map(|(&id, &(since, index))| (id, since.elapsed(), index))
+                .filter(|(_, (_, _, slot))| !slot.done.load(Ordering::Acquire))
+                .map(|(&id, (since, index, _))| (id, since.elapsed(), *index))
                 .find(|&(_, waited, _)| waited >= Duration::from_secs(1));
             if let Some((id, waited, index)) = stalled {
                 told += 1;
