@@ -80,6 +80,7 @@ jobs:
           cargo clippy --locked -p ferric-blkgrant -- -D warnings
           cargo test --locked -p ferric-blkgrant --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
+      # ferric-blkqueue's close gate sits behind its `alloc` feature (driver-block turns it on).
       - name: ferric-blkqueue
         run: |
           cargo clippy --locked --all-targets -p ferric-blkqueue -- -D warnings

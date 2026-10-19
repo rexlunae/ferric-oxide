@@ -16,6 +16,8 @@
 //!   id that one read splits for the next, and reserves the id a worker reports as it exits.
 //! - `openers` (with the `alloc` feature) records which process opened each disk
 //!   descriptor, so only that process may set the policy through it.
+//! - `order` (with the `alloc` feature) holds a descriptor's close back until its in-flight
+//!   requests are done, for a scheme that serves requests concurrently.
 //! - `slot` (with the `std` feature) is a job's result slot between the thread that waits
 //!   and the worker that runs it, which settles once, done or abandoned.
 //!
@@ -41,6 +43,8 @@ pub mod abi;
 pub mod ids;
 #[cfg(feature = "alloc")]
 pub mod openers;
+#[cfg(feature = "alloc")]
+pub mod order;
 #[cfg(feature = "std")]
 pub mod slot;
 
