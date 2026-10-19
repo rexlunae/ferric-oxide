@@ -1,0 +1,24 @@
+[package]
+name = "ferric-trace-cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Reads Ferric Oxide kernel trace captures: a text view and Perfetto/Chrome trace JSON export"
+publish = false
+
+[[bin]]
+name = "ferric-trace"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ferric-trace = { path = "../../crates/trace" }
+serde.workspace = true
+# For the scheme opcode names (`schemev2::Opcode`); no system calls are made.
+redox_syscall = { version = "0.9.4", default-features = false }
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
