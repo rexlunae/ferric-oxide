@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -323,6 +323,12 @@ fn attach(fd: &Fd, region: &Fd, buffer: &Buffer, layout: &RingLayout) -> Result<
         "Register",
         region.call_wo(&[], CallFlags::empty(), &words[..n]),
     )?;
+    attach_grants(fd, region, layout)
+}
+
+/// `Attach` on `fd` with fresh grants of the UMEM and the rings in `region`, which already
+/// holds the buffer.
+fn attach_grants(fd: &Fd, region: &Fd, layout: &RingLayout) -> Result<(), Failure> {
     let umem = grant(region, 0, UMEM_BYTES as u64)?;
     let rings = grant(region, UMEM_BYTES as u64, layout.map_len() as u64)?;
     // The descriptors move to the driver, so they must not be closed here.
@@ -385,6 +391,36 @@ fn config_addr(path: &'static str) -> Result<Ipv4Addr, Failure> {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .ok_or(Failure::Config { path })
+}
+
+/// netcfg's live address of `eth0`: `ifaces/eth0/addr/list` holds it as `a.b.c.d/len`.
+const NETCFG_ADDR: &str = "/scheme/netcfg/ifaces/eth0/addr/list";
+/// netcfg's live route table, one rule a line; the default route reads `default via a.b.c.d …`.
+const NETCFG_ROUTES: &str = "/scheme/netcfg/route/list";
+
+/// The address netstack uses now. DHCP can change it after boot, so `/etc/net/ip` (the static
+/// configuration) can be stale; it is only the fallback when netcfg has none.
+fn live_ip() -> Result<Ipv4Addr, Failure> {
+    std::fs::read_to_string(NETCFG_ADDR)
+        .ok()
+        .and_then(|text| text.trim().split('/').next()?.parse().ok())
+        .map_or_else(|| config_addr("/etc/net/ip"), Ok)
+}
+
+/// The gateway of netstack's default route now, with `/etc/net/ip_router` as the fallback.
+fn live_gateway() -> Result<Ipv4Addr, Failure> {
+    std::fs::read_to_string(NETCFG_ROUTES)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .filter(|line| line.starts_with("default"))
+                .find_map(|line| {
+                    let mut words = line.split_whitespace();
+                    words.find(|&word| word == "via")?;
+                    words.next()?.parse().ok()
+                })
+        })
+        .map_or_else(|| config_addr("/etc/net/ip_router"), Ok)
 }
 
 /// Has netstack send an ICMP echo request to `to` and waits up to `wait` for the reply.
@@ -826,15 +862,19 @@ fn ping_step(t: &mut Test) -> Result<(), Failure> {
         QueueRequest::RemoveFilter(arp),
         &[],
     )?;
-    let icmp = MatchSpec {
-        ip_protocol: Some(IP_PROTOCOL_ICMP),
-        src_addr: Some(IpAddr::V4(gateway)),
-        ..MatchSpec::default()
-    };
-    add_filter(&socket.fd, icmp)?;
+    add_filter(&socket.fd, icmp_from(gateway))?;
     socket.exchange(buffer, "echo reply through the socket", &request, |f| {
         is_echo_reply(f, 1).then_some(())
     })
+}
+
+/// A filter for ICMP from `gateway`.
+fn icmp_from(gateway: Ipv4Addr) -> MatchSpec {
+    MatchSpec {
+        ip_protocol: Some(IP_PROTOCOL_ICMP),
+        src_addr: Some(IpAddr::V4(gateway)),
+        ..MatchSpec::default()
+    }
 }
 
 fn stats_step(t: &mut Test) -> Result<(), Failure> {
@@ -865,7 +905,9 @@ fn stats_step(t: &mut Test) -> Result<(), Failure> {
         && stats.tx_packets == socket.sent
         && socket.sent >= 2
         && stats.invalid_descriptors == 0
-        && stats.tx_rejected == 0;
+        && stats.tx_rejected == 0
+        && stats.fill_empty_drops == 0
+        && stats.overflow_drops == 0;
     if ok {
         Ok(())
     } else {
@@ -1076,13 +1118,35 @@ fn close_step(t: &mut Test) -> Result<(), Failure> {
     drop(socket);
     drop(t.owned.take());
     netstack_echo(t.gateway, 3, WAIT)?;
-    // The driver serves new sockets after the close: open, attach nothing, close.
+    // The driver serves a new socket after the close: on fresh grants of the same memory
+    // (the rings zeroed, as for a new socket), it binds, takes ICMP from the gateway again,
+    // and answers an echo the test sends through it.
     let path = format!("/scheme/{}/{QUEUE_PATH}", t.scheme);
-    ctx(
+    let fd = ctx(
         "open a queue socket again",
         Fd::open(&path, O_RDWR | O_CLOEXEC, 0),
     )?;
-    Ok(())
+    for word in t.buffer.rings() {
+        word.store(0, Ordering::SeqCst);
+    }
+    attach_grants(&fd, &t.region, &t.layout)?;
+    queue_call(
+        &fd,
+        "Bind the second socket",
+        QueueRequest::Bind,
+        &bind_record(Mode::Copy, BindFlags::RAW_TX).to_bytes(),
+    )?;
+    let mut again = Socket::new(fd, &t.layout, &t.buffer)?;
+    add_filter(&again.fd, icmp_from(t.gateway))?;
+    let request = t.echo_request(200)?;
+    again.exchange(
+        &t.buffer,
+        "echo reply through the second socket",
+        &request,
+        |f| is_echo_reply(f, 200).then_some(()),
+    )?;
+    drop(again);
+    netstack_echo(t.gateway, 4, WAIT)
 }
 
 /// One step of the test.
@@ -1127,8 +1191,8 @@ fn setup() -> Result<Setup, Failure> {
             what: "the MAC address",
         });
     }
-    let ip = config_addr("/etc/net/ip")?;
-    let gateway = config_addr("/etc/net/ip_router")?;
+    let ip = live_ip()?;
+    let gateway = live_gateway()?;
     let dns = config_addr("/etc/net/dns")?;
     let size = RingSize::new(ENTRIES).expect("64 entries is a valid ring size");
     let layout = RingLayout::new(size, size, size, size);
@@ -1151,6 +1215,7 @@ fn setup() -> Result<Setup, Failure> {
     })))
 }
 
+/// Runs the test: sets up, runs each step in order, and stops at the first failure.
 pub fn main() -> ExitCode {
     let mut t = match setup() {
         Ok(Setup::Ready(t)) => t,

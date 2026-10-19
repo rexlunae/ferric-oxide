@@ -17,8 +17,11 @@
 //!   socket may filter on that destination port and send from it. A filter on a port the
 //!   socket does not own fails with `EACCES`.
 //!
-//! A socket whose rings turn out corrupt is stopped: its calls fail with `EIO` and it takes no
-//! more frames. Closing it unmaps both grants and closes the driver's descriptors of them.
+//! A socket whose rings turn out corrupt, or whose grant its owner revokes (checked on every
+//! tick and call), is stopped: its calls fail with `EIO` and it takes no more frames. A revoke
+//! is only safe once the kernel replaces a revoked grant's CPU mappings with zeroed pages
+//! instead of unmapping them; until then a revoke between the check and an access faults the
+//! driver. Closing it unmaps both grants and closes the driver's descriptors of them.
 //!
 //! Not here yet: zero-copy mode (`Bind` with `Mode::ZeroCopy` fails with `ENOSPC`),
 //! unprivileged sockets (every queue socket is root's, as the scheme root is root-only, so any
@@ -32,7 +35,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
 use ferric_netq::call::{Bind, Mode, Request, Stats};
-use ferric_netq::copy::{CopyQueue, FilterTableError, Shared};
+use ferric_netq::copy::{offer, CopyQueue, FilterTableError, Offered, Received, Receiver, Shared};
 use ferric_netq::filter::Filter;
 use ferric_netq::frame::{Headers, MacAddr};
 use ferric_netq::own::{OwnError, OwnedPort};
@@ -110,13 +113,14 @@ pub(crate) fn steer<'a, T: NetworkAdapter + 'a>(
     handles: impl Iterator<Item = (&'a usize, &'a mut NetworkResource<T>)>,
     data: &mut NetworkSchemeData<T>,
 ) -> Vec<usize> {
-    let mut queues: Vec<(usize, &mut Bound)> = handles
+    let mut queues: Vec<Steered<'_>> = handles
         .filter_map(|(&id, handle)| match handle {
             NetworkResource::Queue(Queue {
                 bound: Some(bound), ..
-            }) if !bound.stopped => Some((id, bound)),
+            }) => Some(Steered { id, bound }),
             _ => None,
         })
+        .filter_map(|steered| steered.bound.check_grants().then_some(steered))
         .collect();
     let mut woken = Vec::new();
     let state = &mut data.bypass;
@@ -134,27 +138,52 @@ pub(crate) fn steer<'a, T: NetworkAdapter + 'a>(
             }
         };
         let frame = &state.buf[..len];
-        let target = Headers::parse(frame).ok().and_then(|headers| {
-            queues
-                .iter_mut()
-                .find(|(_, bound)| bound.queue.wants(&headers))
-        });
-        match target {
-            Some((id, bound)) => {
-                bound.receive(frame);
-                if !woken.contains(id) {
-                    woken.push(*id);
-                }
-            }
-            None => {
+        // A socket a frame stops is skipped for the rest of the pass, and only a frame that
+        // reached a socket's RX ring wakes it.
+        match offer(&mut queues, frame) {
+            Offered::Unclaimed => {
                 if state.pending.len() == PENDING_MAX {
                     state.pending.pop_front();
                 }
                 state.pending.push_back(frame.to_vec());
             }
+            offered => {
+                if let Some(id) = offered.woken().and_then(|i| queues.get(i)).map(|q| q.id) {
+                    if !woken.contains(&id) {
+                        woken.push(id);
+                    }
+                }
+            }
         }
     }
     woken
+}
+
+/// A bound socket in one steering pass.
+struct Steered<'a> {
+    id: usize,
+    bound: &'a mut Bound,
+}
+
+impl Receiver for Steered<'_> {
+    fn active(&self) -> bool {
+        !self.bound.stopped
+    }
+
+    fn wants(&self, headers: &Headers) -> bool {
+        self.bound.queue.wants(headers)
+    }
+
+    fn deliver(&mut self, frame: &[u8]) -> Option<Received> {
+        match self.bound.queue.receive(self.bound.grants.shared(), frame) {
+            Ok(received) => Some(received),
+            Err(err) => {
+                log::warn!("driver-network: queue socket stopped: {err}");
+                self.bound.stopped = true;
+                None
+            }
+        }
+    }
 }
 
 /// A queue socket.
@@ -195,11 +224,18 @@ struct Bound {
 }
 
 impl Bound {
-    fn receive(&mut self, frame: &[u8]) {
-        if let Err(err) = self.queue.receive(self.grants.shared(), frame) {
-            log::warn!("driver-network: queue socket stopped: {err}");
+    /// Whether the socket can be served this tick: not stopped, and neither grant revoked.
+    /// A revoked grant stops the socket for good.
+    ///
+    /// This check alone cannot make a revoke safe, since one can land between it and an
+    /// access; it relies on the kernel replacing a revoked grant's CPU mappings with zeroed
+    /// pages rather than unmapping them, so the driver's accesses never fault.
+    fn check_grants(&mut self) -> bool {
+        if !self.stopped && (self.grants.umem.revoked() || self.grants.rings.revoked()) {
+            log::warn!("driver-network: queue socket stopped: its grant was revoked");
             self.stopped = true;
         }
+        !self.stopped
     }
 }
 
@@ -266,6 +302,12 @@ impl Mapping {
             base,
             len,
         })
+    }
+
+    /// Whether the grant's owner has revoked it. A grant whose state cannot be read counts as
+    /// revoked.
+    fn revoked(&self) -> bool {
+        grant_info(&self._fd).map_or(true, |info| info.revoked)
     }
 
     /// The mapping as words.
@@ -335,7 +377,7 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
             return self.bind(payload, MacAddr(data.adapter.mac_address()));
         }
         let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
-        if bound.stopped {
+        if !bound.check_grants() {
             return Err(Error::new(EIO));
         }
         match request {

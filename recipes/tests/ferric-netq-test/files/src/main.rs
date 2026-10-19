@@ -17,10 +17,11 @@
 //!   ICMP echo still works.
 //! - `netq-ping`: with the ARP filter removed and an ICMP filter for the gateway added, an echo
 //!   request the test builds and sends itself is answered on its RX ring.
-//! - `netq-stats`: the driver's counters agree with what the test sent and received, and no
-//!   descriptor was invalid.
+//! - `netq-stats`: the driver's counters agree with what the test sent and received, no
+//!   descriptor was invalid, and no frame was dropped (Fill empty or RX overflow).
 //! - `netq-close`: closing the socket with requests still in flight leaves the driver serving
-//!   netstack, which answers an echo again.
+//!   netstack, which answers an echo again; a second socket then opened on fresh grants of the
+//!   same memory binds, and an echo the test sends through it is answered on its RX ring.
 //!
 //! The application's side of the rings is `ferric_netq::ring::AppRings`, and the frames go in
 //! and out of the UMEM with `ferric_netq::copy`'s atomic copies, as the driver's do. Frames are
@@ -30,6 +31,9 @@
 //! stops at the first failure and exits non-zero. Without a network driver, a `kernel.regbuf`
 //! scheme or queue sockets in the driver (`drivers.net_bypass`), it prints
 //! `FERRIC_TEST_SKIP netq: <why>` and exits zero.
+
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "redox")]
 mod redox;
