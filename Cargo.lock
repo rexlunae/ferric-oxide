@@ -1327,6 +1327,19 @@ name = "ferric-trace"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-trace-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ferric-trace",
+ "redox_syscall 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-vtd"
 version = "0.1.0"
 dependencies = [
