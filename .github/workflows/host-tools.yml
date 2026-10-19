@@ -17,12 +17,14 @@ on:
       - "config/**"
       - "userspace/redoxfs/**"
       - ".github/workflows/host-tools.yml"
+      - ".github/actions/prepare-cargo-git/**"
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |
@@ -78,6 +80,14 @@ jobs:
           cargo clippy --locked -p ferric-blkgrant -- -D warnings
           cargo test --locked -p ferric-blkgrant --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
+      # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
+      # kernel turns it on; file systems do not).
+      - name: ferric-pcache
+        run: |
+          cargo clippy --locked --all-targets --all-features -p ferric-pcache -- -D warnings
+          cargo clippy --locked -p ferric-pcache -- -D warnings
+          cargo test --locked -p ferric-pcache --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-pcache
       # ferric-ring: the shared ring format, its queues and chain rules, and the
       # kernel.ring scheme's calls (kernel, bootstrap and ferric-ring-test use it).
       - name: ferric-ring
@@ -107,6 +117,7 @@ jobs:
         working-directory: userspace/redoxfs
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |

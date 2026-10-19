@@ -716,6 +716,25 @@ impl ArchIntCtx for InterruptStack {
         self.iret.rip
     }
     fn recover_and_efault(&mut self) {
+        // We were inside a usercopy function (a `rep movsb`, see `arch_copy_to_user`) that
+        // faulted. The caller expects a non-zero return (EFAULT).
+        //
+        // Ferric Oxide (shadow stacks): when CET shadow stacks are on, do NOT rewrite the saved
+        // RIP to emulate the usercopy function's `ret`. Doing so would leave the RIP on the
+        // kernel stack disagreeing with the copy on the shadow stack that the CPU pushed when it
+        // delivered the page fault, so IRETQ would raise #CP. Instead, make the faulting
+        // instruction a no-op on restart: `rep movsb` with RCX = 0 copies nothing, so IRETQ
+        // returns to it, it falls through to the usercopy function's own `clac`/`ret`, and that
+        // `ret` pops the normal and shadow stacks together, keeping them consistent. RAX = 1 is
+        // the EFAULT indicator the function would otherwise have left zero. This works with CET
+        // off too, but the default build must match upstream exactly, so the original
+        // ret-emulation stays on that path.
+        #[cfg(shstk_compiled)]
+        if crate::arch::shstk::live() {
+            self.scratch.rax = 1;
+            self.scratch.rcx = 0;
+            return;
+        }
         // We were inside a usercopy function that failed. This is handled by setting rax to a
         // nonzero value, and emulating the ret instruction.
         self.scratch.rax = 1;

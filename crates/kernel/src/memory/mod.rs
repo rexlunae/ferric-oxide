@@ -548,9 +548,10 @@ impl RaiiFrame {
     }
 
     /// Ferric Oxide: the frame as 64-bit atomic words, for memory the kernel shares with user
-    /// space as a protocol (`kernel.ring` rings): each access is one atomic load or store, so
-    /// whatever another CPU or process writes, the kernel only ever reads some value.
-    #[cfg(feature = "rings")]
+    /// space as a protocol (`kernel.ring` rings, `kernel.trace` trace rings): each access is
+    /// one atomic load or store, so whatever another CPU or process writes, the kernel only
+    /// ever reads some value.
+    #[cfg(any(feature = "rings", feature = "trace"))]
     pub fn words(&self) -> &[core::sync::atomic::AtomicU64; PAGE_SIZE / 8] {
         const _: () = assert!(
             core::mem::size_of::<[core::sync::atomic::AtomicU64; PAGE_SIZE / 8]>() == PAGE_SIZE

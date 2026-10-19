@@ -30,7 +30,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use ferric_iommu::abi::{
-    Bridge, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH, SCHEME_NAME,
+    Bridge, IrteTarget, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH,
+    SCHEME_NAME,
 };
 use ferric_iommu::alias::{requester_ids, BridgeKind, UpstreamBridge};
 use ferric_iommu::irte::{IrteBook, Route};
@@ -438,6 +439,19 @@ impl Iommu {
         Ok((id, message))
     }
 
+    /// Asks the kernel where remapping entry `id` delivers now. Root may have steered it to
+    /// another CPU and vector since pcid made it.
+    fn irte_target(&self, id: u32) -> libredox::error::Result<Route> {
+        let cap = self
+            .cap
+            .as_ref()
+            .ok_or(libredox::error::Error::new(libredox::errno::ENODEV))?;
+        let word = call(&[cap.raw()], Request::IrteTarget(id))?;
+        let IrteTarget { cpu, vector } = IrteTarget::from_word(word as u64)
+            .ok_or(libredox::error::Error::new(libredox::errno::EIO))?;
+        Ok(Route { cpu, vector })
+    }
+
     /// Answers `MsiMessage` on channel `id` for function `addr`: a remappable-format message
     /// when the kernel remaps the function's interrupts, otherwise the compatibility-format one.
     pub fn msi_message(
@@ -452,10 +466,16 @@ impl Iommu {
             return no_message;
         };
         // A route the channel already has keeps its entry, so a driver that gave a vector back
-        // and reserved it again does not use up another one.
+        // and reserved it again does not use up another one. The entry is reused only if it
+        // was not steered elsewhere since.
         let route = Route { cpu, vector };
         let mut irtes = core::mem::take(&mut self.irtes);
-        let made = irtes.get_or_alloc(id, route, || self.alloc_irte(function, cpu, vector));
+        let made = irtes.get_or_alloc(
+            id,
+            route,
+            |entry| self.irte_target(entry),
+            || self.alloc_irte(function, cpu, vector),
+        );
         self.irtes = irtes;
         match made {
             Ok((entry, message)) => {

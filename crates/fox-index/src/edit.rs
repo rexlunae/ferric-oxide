@@ -51,6 +51,18 @@ use crate::verify::{
 };
 use crate::vex::{VexFileError, parse_vex, vex_path};
 
+/// Where [`write_file`] stages its temporary files, at the top of the
+/// registry and outside every signed directory. Git does not track the
+/// directory itself, and it holds files only while writes are in progress
+/// or after one was interrupted; [`Registry::open`] removes those older
+/// than [`STALE_STAGING`].
+const STAGING_DIR: &str = ".fox-staging";
+
+/// How old a staging file must be before [`Registry::open`] takes it for
+/// the leftover of a killed write rather than one still in progress in
+/// another process.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// How long each kind of metadata stays valid, in days.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lifetimes {
@@ -367,7 +379,7 @@ impl Registry {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
         })?;
-        write_file(&dir.join(REGISTRY_FILE), text.as_bytes())?;
+        write_file(dir, REGISTRY_FILE, text.as_bytes())?;
         for sub in [
             PACKAGES_DIR,
             ARTIFACTS_DIR,
@@ -416,7 +428,8 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Opens the registry in `dir`.
+    /// Opens the registry in `dir`, removing the temporary files of any
+    /// write that was interrupted.
     ///
     /// # Errors
     ///
@@ -430,6 +443,7 @@ impl Registry {
                 path: dir.to_path_buf(),
             });
         }
+        clear_staging(dir)?;
         while dir.join(root_file(version + 1)).is_file() {
             version += 1;
         }
@@ -509,7 +523,7 @@ impl Registry {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
         })?;
-        write_file(&self.dir.join(REGISTRY_FILE), text.as_bytes())
+        write_file(&self.dir, REGISTRY_FILE, text.as_bytes())
     }
 
     /// The package file of `name`, if there is one.
@@ -540,7 +554,7 @@ impl Registry {
     /// if it cannot be written.
     pub fn write_package(&self, entry: &PackageEntry) -> Result<(), EditError> {
         let (path, text) = package_text(entry)?;
-        write_file(&self.dir.join(path), text.as_bytes())
+        write_file(&self.dir, path, text.as_bytes())
     }
 
     /// Adds a package: writes its file and delegates that file to its
@@ -622,11 +636,11 @@ impl Registry {
             .iter()
             .try_for_each(|(path, text)| {
                 let full = self.dir.join(path);
-                write_file(&full, text.as_bytes())?;
+                write_file(&self.dir, path, text.as_bytes())?;
                 written.push(full);
                 Ok(())
             })
-            .and_then(|()| write_file(&self.dir.join(&file), &bytes));
+            .and_then(|()| write_file(&self.dir, &file, &bytes));
         if let Err(error) = result {
             for path in &written {
                 remove_new_file(path);
@@ -722,7 +736,7 @@ impl Registry {
             path: path.clone(),
             source: Box::new(source),
         })?;
-        write_file(&self.dir.join(&path), text.as_bytes())
+        write_file(&self.dir, &path, text.as_bytes())
     }
 
     /// Writes an advisory to `advisories/<id>.toml`, replacing one with
@@ -736,7 +750,7 @@ impl Registry {
         let advisory_error = |source| EditError::Advisory(Box::new(source));
         let path = advisory_path(&advisory.advisory.id).map_err(advisory_error)?;
         let text = advisory.to_toml().map_err(advisory_error)?;
-        write_file(&self.dir.join(path), text.as_bytes())
+        write_file(&self.dir, path, text.as_bytes())
     }
 
     /// Writes VEX document `id` to `vex/<id>.cdx.json`, replacing one with
@@ -751,7 +765,7 @@ impl Registry {
         let vex_error = |source| EditError::Vex(Box::new(source));
         let path = vex_path(id).map_err(vex_error)?;
         parse_vex(json).map_err(vex_error)?;
-        write_file(&self.dir.join(&path), json)?;
+        write_file(&self.dir, &path, json)?;
         Ok(path)
     }
 
@@ -887,7 +901,7 @@ impl Registry {
                 targets.targets = wanted;
                 targets.delegations.clear();
             })?;
-            write_file(&self.dir.join(metadata_file(&name)), &bytes)?;
+            write_file(&self.dir, metadata_file(&name), &bytes)?;
             snapshot_meta.insert(name, version_meta(metadata.signed.version, &bytes));
             report.files.push(signed);
         }
@@ -903,7 +917,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.targets, TARGETS_FILE, |targets| {
             targets.targets = wanted;
         })?;
-        write_file(&self.dir.join(metadata_file(TARGETS_FILE)), &bytes)?;
+        write_file(&self.dir, metadata_file(TARGETS_FILE), &bytes)?;
         snapshot_meta.insert(
             TARGETS_FILE.to_owned(),
             version_meta(self.targets.signed.version, &bytes),
@@ -920,7 +934,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.snapshot, SNAPSHOT_FILE, |snapshot| {
             snapshot.meta = snapshot_meta;
         })?;
-        write_file(&self.dir.join(SNAPSHOT_FILE), &bytes)?;
+        write_file(&self.dir, SNAPSHOT_FILE, &bytes)?;
         let snapshot_meta = version_meta(self.snapshot.signed.version, &bytes);
         report.files.push(signed);
 
@@ -934,7 +948,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.timestamp, TIMESTAMP_FILE, |timestamp| {
             timestamp.snapshot = snapshot_meta;
         })?;
-        write_file(&self.dir.join(TIMESTAMP_FILE), &bytes)?;
+        write_file(&self.dir, TIMESTAMP_FILE, &bytes)?;
         report.files.push(signed);
         Ok(report)
     }
@@ -1011,7 +1025,7 @@ impl Registry {
             file: file.clone(),
             source,
         })?;
-        write_file(&self.dir.join(file), &bytes)
+        write_file(&self.dir, file, &bytes)
     }
 
     /// Every file under the signed directories that no delegation covers.
@@ -1285,12 +1299,137 @@ fn remove_new_file(path: &Path) {
     }
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
+/// Writes `bytes` to `relative` under the registry `dir` through a
+/// temporary file and a rename, so a failed write (a full disk, say)
+/// leaves the old file whole instead of truncated, and a batch that fails
+/// part-way can be retried.
+///
+/// The temporary file is in [`STAGING_DIR`], never beside the file: every
+/// file in the signed directories is a target, so a write interrupted
+/// there would leave a stray file that the next signing signs.
+fn write_file(dir: &Path, relative: impl AsRef<Path>, bytes: &[u8]) -> Result<(), EditError> {
+    let relative = relative.as_ref();
+    let path = dir.join(relative);
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
-    fs::write(path, bytes).map_err(|source| EditError::Io {
-        path: path.to_path_buf(),
+    let staging = dir.join(STAGING_DIR);
+    create_dir(&staging)?;
+    let temp = staging.join(staging_name(relative));
+    fox_core::config::replace_file_via(&path, bytes, &temp).map_err(|source| EditError::Io {
+        path: path.clone(),
         source,
     })
+}
+
+/// A staging file name for `relative` that no other write, in this
+/// process or another, uses: the path flattened reversibly (`%` and `/`
+/// escaped, so two paths never share a name), then the process id and a
+/// per-call random value.
+fn staging_name(relative: &Path) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
+    let flat = relative
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+    format!("{flat}.{}.{:016x}", std::process::id(), hasher.finish())
+}
+
+/// Removes what killed writes left in [`STAGING_DIR`]: files older than
+/// [`STALE_STAGING`]. Only [`write_file`] writes there, and each write
+/// renames or removes its own file within moments, so a younger file may
+/// belong to a write still running in another process and is kept.
+fn clear_staging(dir: &Path) -> Result<(), EditError> {
+    let staging = dir.join(STAGING_DIR);
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| EditError::Io { path, source }
+    };
+    let entries = match fs::read_dir(&staging) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(&staging)(source)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error(&staging))?;
+        let path = entry.path();
+        let modified = entry.metadata().and_then(|meta| meta.modified());
+        if !is_stale(&path, modified, std::time::SystemTime::now())? {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            // Another process cleared it first.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path)(source)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the staging file at `path`, last modified at `modified` as its
+/// metadata lookup returned it, is old enough at `now` to be a killed
+/// write's leftover. A file that is gone (`NotFound`: its write renamed it
+/// into place, or another open removed it) is not.
+///
+/// # Errors
+///
+/// [`EditError::Io`] for any other failure to read its modification time.
+fn is_stale(
+    path: &Path,
+    modified: io::Result<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Result<bool, EditError> {
+    match modified {
+        Ok(modified) => Ok(now.duration_since(modified).unwrap_or_default() >= STALE_STAGING),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(EditError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_staging_file_is_stale_only_when_old_and_still_there() {
+        let path = Path::new(".fox-staging/x");
+        let now = SystemTime::now();
+        let ago = |secs| Ok(now - Duration::from_secs(secs));
+        assert!(is_stale(path, ago(2 * 60 * 60), now).unwrap());
+        assert!(!is_stale(path, ago(60), now).unwrap());
+        // A clock that puts the file in the future keeps it.
+        assert!(!is_stale(path, Ok(now + Duration::from_secs(60)), now).unwrap());
+        // Renamed by its finished write, or removed by another open.
+        let gone = io::Error::from(io::ErrorKind::NotFound);
+        assert!(!is_stale(path, Err(gone), now).unwrap());
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            is_stale(path, Err(denied), now),
+            Err(EditError::Io { path: p, .. }) if p == path
+        ));
+    }
+
+    #[test]
+    fn staging_names_are_unique_and_keep_paths_apart() {
+        let flat = |name: &str| name.rsplitn(3, '.').nth(2).unwrap().to_owned();
+        let a = staging_name(Path::new("packages/fd/fd.toml"));
+        let b = staging_name(Path::new("packages/fd/fd.toml"));
+        assert_ne!(a, b);
+        assert_eq!(flat(&a), "packages%2Ffd%2Ffd.toml");
+        // A `%` in a path cannot make it look like another path's `/`.
+        assert_ne!(
+            flat(&staging_name(Path::new("a%2Fb"))),
+            flat(&staging_name(Path::new("a/b")))
+        );
+        assert!(!a.contains('/'));
+    }
 }
