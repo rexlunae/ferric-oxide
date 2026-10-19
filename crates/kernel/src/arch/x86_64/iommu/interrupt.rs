@@ -475,7 +475,10 @@ pub fn move_vector(
     // Every unit's lock is held from the check to the last write, in `units()` order (nothing
     // else holds two at once), so no entry can be allocated or freed in between: a move either
     // changes nothing or rewrites every matching entry.
-    let mut states: Vec<_> = units().iter().map(|unit| (unit, unit.state.lock())).collect();
+    let mut states: Vec<_> = units()
+        .iter()
+        .map(|unit| (unit, unit.state.lock()))
+        .collect();
     // Every unit with an entry to move must be able to name the new destination before any
     // entry changes; a unit without one (in xAPIC format, say) does not matter.
     for (_, state) in &mut states {
