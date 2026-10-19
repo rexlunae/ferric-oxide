@@ -691,6 +691,15 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
         metadata: &[u64],
         _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
+        // Ferric Oxide: the per-CPU queue policy call, on any disk or partition descriptor.
+        if let Handle::Disk { num, .. } = *self.handles.get(id)? {
+            if let Some(policy) =
+                ferric_blkqueue::abi::decode(metadata).map_err(|_| Error::new(EINVAL))?
+            {
+                let disk = self.disks.get_mut(&num).ok_or(Error::new(EBADF))?;
+                return disk.disk_mut().set_queue_policy(policy).map(|()| 0);
+            }
+        }
         #[cfg(feature = "grant-dma")]
         if let Handle::Disk { num, pt } = *self.handles.get(id)? {
             return self.grant_call(id, num, pt, metadata).await;

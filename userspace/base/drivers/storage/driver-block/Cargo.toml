@@ -26,6 +26,8 @@ zerocopy = "0.8.55"
 # ../../crates from userspace/base/).
 ferric-blkgrant = { path = "../../../../../crates/blkgrant", features = ["alloc"], optional = true }
 ferric-regbuf = { path = "../../../../../crates/regbuf", optional = true }
+# Ferric Oxide: the per-CPU queue policy call on disk descriptors.
+ferric-blkqueue = { path = "../../../../../crates/blkqueue" }
 
 [features]
 default = []

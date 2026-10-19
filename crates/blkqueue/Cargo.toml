@@ -1,0 +1,8 @@
+[package]
+name = "ferric-blkqueue"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Per-CPU disk queue routing: which queue pair a disk request runs on, and the call that chooses the policy"
+
+[dependencies]

@@ -50,10 +50,17 @@ if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker not pinn
     fail "nvmed's per-CPU queue pairs were not set up as expected"
 fi
 
-# 4 KiB preads from 1, 2 and 4 threads at once, in every mode (per-core NVMe queues).
+# 4 KiB preads from 1, 2 and 4 threads at once, in every mode (per-core NVMe queues), as a
+# same-boot A/B of nvmed's queue policies. The default policy must reach the single queue's
+# IOPS within the rounds' noise (ferric_blkqueue::ab); the numbers go out as a notice first.
 for threads in 1 2 4; do
-    need "FERRIC_BENCH nvme-read-4k-t$threads .*copy_iops="
+    need "FERRIC_BENCH nvme-read-4k-t$threads .*copy_iops=.* ab=(pass|fail)"
 done
+if grep -aE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .* ab=fail" <<< "$clean"; then
+    ab="$(grep -aoE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
+    echo "::notice title=queue policy A/B ($mode)::$ab"
+    fail "nvmed's default queue policy is slower than its single queue in the same boot"
+fi
 
 case "$mode" in
     none)

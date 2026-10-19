@@ -10,9 +10,14 @@
 //! 3. starts one worker thread per pair, pinned to its vector's CPU, with its own executor
 //!    waiting on its own `irq:` handle.
 //!
-//! The disk scheme stays on the main thread. Its reads and writes become [`Job`]s, which a
-//! [`Dispatcher`] hands to the workers in turn (the scheme cannot see the caller's CPU, so in
-//! this brokered mode requests are spread round-robin). A worker runs its jobs one at a time,
+//! The disk scheme stays on the main thread. Under the default
+//! [`QueuePolicy::Adaptive`](ferric_blkqueue::QueuePolicy), a read or write that arrives while
+//! no other is in flight runs on the main thread's own queue pair, as with one I/O queue: a
+//! hand-off costs two cross-CPU wake-ups and gains nothing without overlap. The others become
+//! [`Job`]s, which a [`Dispatcher`] hands to the workers in turn (the scheme cannot see the
+//! caller's CPU, so in this brokered mode requests are spread round-robin). The disk scheme's
+//! set-policy call (`ferric-blkqueue`'s `abi`) can pin either path, which the same-boot
+//! benchmark uses to compare them. A worker runs its jobs one at a time,
 //! through its own bounce buffer and queue pair, and reports each finished job on a pipe that
 //! the main thread's executor waits on; the job's future then completes. A job's buffer
 //! belongs to the scheme's future until the job is done, so a future dropped early waits for
@@ -31,6 +36,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use ferric_blkqueue::{QueuePolicy, Route};
 use ferric_irq::{CpuEntry, CpuId};
 use pcid_interface::irq_helpers::{InterruptVector, Msix};
 use pcid_interface::percpu;
@@ -101,9 +107,45 @@ pub struct Dispatcher {
     /// When each unfinished job was handed out, to which worker, and its result slot, for the
     /// watchdog.
     started: RefCell<HashMap<u64, Started>>,
+    /// How requests are placed.
+    policy: Cell<QueuePolicy>,
+    /// Requests in flight on any queue pair, the main thread's included.
+    in_flight: Rc<Cell<usize>>,
+}
+
+/// One request counted in [`Dispatcher`]'s in-flight total until it is dropped.
+pub struct InFlightGuard(Rc<Cell<usize>>);
+
+impl InFlightGuard {
+    fn new(count: &Rc<Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(Rc::clone(count))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 impl Dispatcher {
+    /// Sets how requests are placed from now on.
+    pub fn set_policy(&self, policy: QueuePolicy) {
+        log::info!("nvmed: queue policy {policy:?}");
+        self.policy.set(policy);
+    }
+
+    /// Claims a new request for the main thread's queue pair when the policy routes it there:
+    /// the caller runs it inline while holding the guard. `None` means it goes to a worker
+    /// through [`run`](Self::run).
+    pub fn claim_inline(&self) -> Option<InFlightGuard> {
+        match self.policy.get().route(self.in_flight.get()) {
+            Route::Main => Some(InFlightGuard::new(&self.in_flight)),
+            Route::Worker => None,
+        }
+    }
+
     /// Runs `op` on the next worker and returns its result.
     ///
     /// # Safety
@@ -116,6 +158,7 @@ impl Dispatcher {
         lba: u64,
         op: Op,
     ) -> syscall::Result<usize> {
+        let _counted = InFlightGuard::new(&self.in_flight);
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
         let slot = Arc::new(Slot {
@@ -489,6 +532,8 @@ pub fn start(
     Some(Rc::new(Dispatcher {
         workers,
         next_worker: Cell::new(0),
+        policy: Cell::new(QueuePolicy::default()),
+        in_flight: Rc::new(Cell::new(0)),
         next_id: Cell::new(0),
         done,
         waiting: RefCell::new(HashMap::new()),

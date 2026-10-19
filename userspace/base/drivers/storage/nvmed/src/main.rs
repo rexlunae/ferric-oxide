@@ -26,7 +26,41 @@ struct NvmeDisk {
     workers: Option<Rc<percore::Dispatcher>>,
 }
 
+/// Ferric Oxide: where one request runs (see [`NvmeDisk::claim`]).
+#[cfg(feature = "percore")]
+enum Claim {
+    /// On the main thread's queue pair, counted in flight until the guard (if any) drops.
+    Inline(Option<percore::InFlightGuard>),
+    /// On a worker, through the dispatcher.
+    Worker(Rc<percore::Dispatcher>),
+}
+
+#[cfg(feature = "percore")]
+impl NvmeDisk {
+    /// Where the next request runs: inline without per-CPU workers or when the queue policy
+    /// keeps it on the main thread's queue pair, on a worker otherwise.
+    fn claim(&self) -> Claim {
+        match &self.workers {
+            None => Claim::Inline(None),
+            Some(workers) => match workers.claim_inline() {
+                Some(guard) => Claim::Inline(Some(guard)),
+                None => Claim::Worker(Rc::clone(workers)),
+            },
+        }
+    }
+}
+
 impl Disk for NvmeDisk {
+    #[cfg(feature = "percore")]
+    fn set_queue_policy(&mut self, policy: ferric_blkqueue::QueuePolicy) -> syscall::Result<()> {
+        let workers = self
+            .workers
+            .as_ref()
+            .ok_or(syscall::Error::new(syscall::EOPNOTSUPP))?;
+        workers.set_policy(policy);
+        Ok(())
+    }
+
     fn block_size(&self) -> u32 {
         self.ns.block_size.try_into().unwrap()
     }
@@ -37,27 +71,33 @@ impl Disk for NvmeDisk {
 
     async fn read(&mut self, block: u64, buffer: &mut [u8]) -> syscall::Result<usize> {
         #[cfg(feature = "percore")]
-        if let Some(workers) = &self.workers {
-            let op = percore::Op::Read {
-                buf: buffer.as_mut_ptr(),
-                len: buffer.len(),
-            };
-            // SAFETY: `buffer` is borrowed for as long as this future lives.
-            return unsafe { workers.run(self.ns, block, op) }.await;
-        }
+        let _inline = match self.claim() {
+            Claim::Inline(guard) => guard,
+            Claim::Worker(workers) => {
+                let op = percore::Op::Read {
+                    buf: buffer.as_mut_ptr(),
+                    len: buffer.len(),
+                };
+                // SAFETY: `buffer` is borrowed for as long as this future lives.
+                return unsafe { workers.run(self.ns, block, op) }.await;
+            }
+        };
         self.nvme.namespace_read(&self.ns, block, buffer).await
     }
 
     async fn write(&mut self, block: u64, buffer: &[u8]) -> syscall::Result<usize> {
         #[cfg(feature = "percore")]
-        if let Some(workers) = &self.workers {
-            let op = percore::Op::Write {
-                buf: buffer.as_ptr(),
-                len: buffer.len(),
-            };
-            // SAFETY: as in `read`.
-            return unsafe { workers.run(self.ns, block, op) }.await;
-        }
+        let _inline = match self.claim() {
+            Claim::Inline(guard) => guard,
+            Claim::Worker(workers) => {
+                let op = percore::Op::Write {
+                    buf: buffer.as_ptr(),
+                    len: buffer.len(),
+                };
+                // SAFETY: as in `read`.
+                return unsafe { workers.run(self.ns, block, op) }.await;
+            }
+        };
         self.nvme.namespace_write(&self.ns, block, buffer).await
     }
 
@@ -68,16 +108,19 @@ impl Disk for NvmeDisk {
         num_sectors: u32,
     ) -> syscall::Result<()> {
         #[cfg(feature = "percore")]
-        if let Some(workers) = &self.workers {
-            let op = percore::Op::WriteDma {
-                addr: addr.as_usize() as u64,
-                sectors: num_sectors as u64,
-            };
-            // SAFETY: a DMA job borrows no memory of this process.
-            return unsafe { workers.run(self.ns, start_lba, op) }
-                .await
-                .map(drop);
-        }
+        let _inline = match self.claim() {
+            Claim::Inline(guard) => guard,
+            Claim::Worker(workers) => {
+                let op = percore::Op::WriteDma {
+                    addr: addr.as_usize() as u64,
+                    sectors: num_sectors as u64,
+                };
+                // SAFETY: a DMA job borrows no memory of this process.
+                return unsafe { workers.run(self.ns, start_lba, op) }
+                    .await
+                    .map(drop);
+            }
+        };
         self.nvme
             .namespace_write_zerocopy(
                 &self.ns,
@@ -95,16 +138,19 @@ impl Disk for NvmeDisk {
         num_sectors: u32,
     ) -> syscall::Result<()> {
         #[cfg(feature = "percore")]
-        if let Some(workers) = &self.workers {
-            let op = percore::Op::ReadDma {
-                addr: addr.as_usize() as u64,
-                sectors: num_sectors as u64,
-            };
-            // SAFETY: as in `write_dma`.
-            return unsafe { workers.run(self.ns, start_lba, op) }
-                .await
-                .map(drop);
-        }
+        let _inline = match self.claim() {
+            Claim::Inline(guard) => guard,
+            Claim::Worker(workers) => {
+                let op = percore::Op::ReadDma {
+                    addr: addr.as_usize() as u64,
+                    sectors: num_sectors as u64,
+                };
+                // SAFETY: as in `write_dma`.
+                return unsafe { workers.run(self.ns, start_lba, op) }
+                    .await
+                    .map(drop);
+            }
+        };
         self.nvme
             .namespace_read_zerocopy(
                 &self.ns,

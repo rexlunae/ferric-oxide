@@ -640,6 +640,7 @@ dependencies = [
  "daemon",
  "executor",
  "ferric-blkgrant",
+ "ferric-blkqueue",
  "ferric-regbuf",
  "futures",
  "libredox",
@@ -880,6 +881,10 @@ source = "git+https://github.com/repnop/fdt.git?rev=059bb23#059bb2383873f8001959
 
 [[package]]
 name = "ferric-blkgrant"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-blkqueue"
 version = "0.1.0"
 
 [[package]]
@@ -1599,6 +1604,7 @@ dependencies = [
  "driver-block",
  "executor",
  "ferric-blkgrant",
+ "ferric-blkqueue",
  "ferric-irq",
  "futures",
  "libc",

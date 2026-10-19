@@ -1282,6 +1282,10 @@ name = "ferric-blkgrant"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-blkqueue"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-cet"
 version = "0.1.0"
 

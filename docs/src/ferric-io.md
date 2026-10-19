@@ -221,12 +221,20 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   that just pinned itself elsewhere may no longer be allowed to use. The
   kernel then hands such a context to a CPU in its affinity
   (`context::switch`), instead of leaving it in a queue that never runs it.
-- The disk scheme stays on the main thread and hands each read and write to
-  the workers in turn, then waits for the worker to report it done on a pipe.
-  It cannot see the caller's CPU yet, so requests are spread round-robin, and
-  it still serves one scheme call at a time. Native rings with a home CPU
-  (later steps of the plan) are what route a request to the queue of the core
-  it came from.
+- The disk scheme stays on the main thread. A read or write that arrives while
+  no other is in flight runs there, on the first I/O queue pair, exactly as
+  with one queue: a hand-off costs two cross-CPU wake-ups (about 40 us a
+  request on CI runners) and gains nothing without overlap. Requests that
+  overlap go to the workers in turn, and the main thread waits for each
+  worker to report its job done on a pipe. This rule is
+  `ferric_blkqueue::QueuePolicy::Adaptive`. The disk scheme's set-policy call
+  (`ferric_blkqueue::abi`, on any disk descriptor) can instead keep every
+  request on the main queue (`MainQueue`) or send every request to a worker
+  (`Workers`). The scheme cannot see the caller's CPU yet, so worker requests
+  are spread round-robin. driver-block still serves one scheme call at a time,
+  so until it serves calls concurrently, requests never overlap. Native rings
+  with a home CPU (later steps of the plan) are what route a request to the
+  queue of the core it came from.
 - A watchdog ticks once a second on each worker and on the main thread. It
   logs `nvmed: watchdog ...` when a job has waited a second or more, saying
   whether its completion queue holds an entry nobody was woken for, or when
@@ -235,7 +243,23 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   on any watchdog line.
 
 `ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
-throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once.
+throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once. It is a
+same-boot A/B: three rounds of each queue policy, in alternating order. It
+reports the medians (`copy_iops` for the default policy, `single_iops` for
+`MainQueue`, `workers_iops` for `Workers`) and the verdict of
+`ferric_blkqueue::ab`: the default must reach the single queue's median,
+less the rounds' spread (between 5% and 15%). Runner hardware varies about
+2x between CI jobs, so numbers from different runs make a poor gate. CI fails
+a boot whose line says `ab=fail`.
+
+The kernel fix this work turned up is not specific to NVMe. When `schedule`
+passes a runnable context over because its lock or its address space's lock
+is held elsewhere for a moment, `switch` now returns
+`SwitchResult::Contended` and the idle loop tries again instead of halting.
+Before, the context waited for the CPU's next timer interrupt (up to about
+4 ms). With two threads reading at once, nvmed's main thread mapping the next
+client's buffer kept tripping this on the CPU of the worker it had just
+woken, which held two-thread reads to about 400 IOPS.
 
 ## From PCI discovery to a driver's DMA address
 
