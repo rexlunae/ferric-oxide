@@ -26,7 +26,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -82,6 +82,9 @@ struct Worker {
     /// The write end of the pipe the worker's executor waits on.
     wake: File,
     cpu: CpuId,
+    /// How many times the worker's watchdog has ticked: still 0, or not rising, while a job
+    /// waits means the worker thread is not running at all.
+    ticks: Arc<AtomicU64>,
 }
 
 /// Hands jobs to the workers and completes their futures; lives on the main thread.
@@ -92,6 +95,8 @@ pub struct Dispatcher {
     /// The read end of the pipe the workers report finished jobs on (non-blocking).
     done: File,
     waiting: RefCell<HashMap<u64, Waker>>,
+    /// When each unfinished job was handed out, and to which worker, for the watchdog.
+    started: RefCell<HashMap<u64, (Instant, usize)>>,
 }
 
 impl Dispatcher {
@@ -136,12 +141,17 @@ impl Dispatcher {
                 worker.cpu.get()
             );
         }
-        JobFuture {
+        self.started
+            .borrow_mut()
+            .insert(id, (Instant::now(), index));
+        let result = JobFuture {
             dispatcher: Rc::clone(self),
             id,
             slot,
         }
-        .await
+        .await;
+        self.started.borrow_mut().remove(&id);
+        result
     }
 
     /// Wakes the futures of the jobs the workers finished, and returns how many it woke.
@@ -181,10 +191,29 @@ impl Dispatcher {
         loop {
             ticks.next().await;
             let woken = self.drain();
-            if woken != 0 && told < STALL_REPORTS {
+            if told >= STALL_REPORTS {
+                continue;
+            }
+            if woken != 0 {
                 told += 1;
                 log::warn!(
                     "nvmed: watchdog found {woken} finished job(s) the completion pipe's event did not report"
+                );
+            }
+            let stalled = self
+                .started
+                .borrow()
+                .iter()
+                .map(|(&id, &(since, index))| (id, since.elapsed(), index))
+                .find(|&(_, waited, _)| waited >= Duration::from_secs(1));
+            if let Some((id, waited, index)) = stalled {
+                told += 1;
+                let worker = &self.workers[index];
+                log::warn!(
+                    "nvmed: watchdog: job {id} has waited {} ms for the worker on CPU {}, whose watchdog has ticked {} time(s)",
+                    waited.as_millis(),
+                    worker.cpu.get(),
+                    worker.ticks.load(Ordering::Relaxed)
                 );
             }
         }
@@ -298,13 +327,20 @@ type InFlight = Rc<Cell<Option<(u64, Instant)>>>;
 /// waited a second or more, and whether its completion queue holds an entry nothing took
 /// (a completion interrupt that did not wake the worker) or not (the controller has not
 /// answered). The tick also wakes the executor, which then polls the queue.
-async fn watch_worker(nvme: Arc<Nvme>, qid: u16, in_flight: InFlight, executor: Rc<NvmeExecutor>) {
+async fn watch_worker(
+    nvme: Arc<Nvme>,
+    qid: u16,
+    in_flight: InFlight,
+    alive: Arc<AtomicU64>,
+    executor: Rc<NvmeExecutor>,
+) {
     let Some(mut ticks) = Ticks::new(&executor) else {
         return;
     };
     let mut told = 0;
     loop {
         ticks.next().await;
+        alive.fetch_add(1, Ordering::Relaxed);
         let Some((id, since)) = in_flight.get() else {
             continue;
         };
@@ -435,6 +471,7 @@ pub fn start(
         next_id: Cell::new(0),
         done,
         waiting: RefCell::new(HashMap::new()),
+        started: RefCell::new(HashMap::new()),
     }))
 }
 
@@ -507,11 +544,20 @@ fn spawn_worker(
         .block_on(nvme.add_queue_pair(qid, vector))
         .map_err(|err| io::Error::from_raw_os_error(err.errno))?;
     let (jobs, rx) = mpsc::channel();
+    let ticks = Arc::new(AtomicU64::new(0));
     let nvme = Arc::clone(nvme);
     std::thread::Builder::new()
         .name(format!("nvmed-q{qid}"))
-        .spawn(move || serve(nvme, qid, iv, cpu, irq, rx, wake_rx, done_tx))?;
-    Ok(Worker { jobs, wake, cpu })
+        .spawn({
+            let ticks = Arc::clone(&ticks);
+            move || serve(nvme, qid, iv, cpu, irq, rx, wake_rx, done_tx, ticks)
+        })?;
+    Ok(Worker {
+        jobs,
+        wake,
+        cpu,
+        ticks,
+    })
 }
 
 /// A worker thread: pins itself to `cpu`, then runs the jobs it is sent on queue pair `qid`.
@@ -525,6 +571,7 @@ fn serve(
     jobs: mpsc::Receiver<Job>,
     wake_rx: File,
     mut done_tx: File,
+    ticks: Arc<AtomicU64>,
 ) {
     if let Err(err) = percpu::pin_current_thread(cpu) {
         log::warn!(
@@ -543,6 +590,7 @@ fn serve(
         Arc::clone(&nvme),
         qid,
         Rc::clone(&in_flight),
+        ticks,
         Rc::clone(&executor),
     ));
     executor.block_on(async {
