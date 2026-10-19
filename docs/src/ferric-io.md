@@ -618,6 +618,10 @@ netstack.
   hands each side its producers and consumers. A peer's out-of-range index is
   `ferric-ring`'s `RingError::Corrupt`, and the driver sets `NEED_WAKEUP` before it sleeps on
   an empty Fill or TX ring, so the application only `Kick`s when asked.
+  `CopyQueue::transmit` also leaves `NEED_WAKEUP` set on TX when it stops with
+  entries still there, because its budget ran out or Completion was full: the
+  driver sends only when kicked, so the application must kick again (after
+  reaping Completion) for the rest. Each `transmit` clears the flag first.
 
 - `copy`: one socket in copy mode (`CopyQueue`): up to 16 filters, the copy
   of a matched received frame into the next Fill frame and onto RX, and the
@@ -631,10 +635,13 @@ In `driver-network` (`src/bypass.rs`), `Attach` maps both grants read-write
 and shared; each must be a read-write grant of whole pages. `Bind` starts the
 socket in copy mode (`Mode::ZeroCopy` fails with `ENOSPC`). While any socket
 is bound, every tick drains the adapter, gives each frame to the first socket
-with a matching filter (and posts `EVENT_READ` on it), and keeps the rest, in
+with a matching filter (`ferric_netq::copy::offer`; `EVENT_READ` is posted
+only when a frame reached the socket's RX ring), and keeps the rest, in
 order, for netstack's reads (up to 256 frames; the oldest is dropped beyond
 that). `Kick` sends up to 256 TX packets through the adapter. A socket whose
-rings turn out corrupt is stopped, and its calls fail with `EIO`. Closing a
+rings turn out corrupt, or whose grant its owner revokes (checked on every
+tick and call), is stopped, and its calls fail with `EIO`; a socket stopped
+during a pass gets none of that pass's later frames. Closing a
 socket unmaps its grants. Every queue socket is root's, since the scheme
 root is root-only, and root may send raw frames.
 
