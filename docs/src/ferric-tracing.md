@@ -183,9 +183,12 @@ The codes in the last four events have one definition, next to the events in
   the IRQ, the handle's CPU and the count. An `irq.ack` with the IRQ, CPU and
   count of an `irq.deliver` ends that interrupt's handling. An acknowledgement
   of a stale count changes nothing and is not recorded.
-- `iommu.fault` is recorded for each report an IOMMU makes, along with the
-  kernel's log line: a blocked DMA or interrupt request, or an error of the
-  unit itself.
+- `iommu.fault` is recorded, along with the kernel's log line, for each report
+  an IOMMU writes: a VT-d fault recording register (a blocked DMA or interrupt
+  request) or an AMD-Vi event log entry (any event, including the unit's own
+  command and table errors). Conditions without a report of their own are only
+  logged: VT-d invalidation queue errors and fault overflow, and a full AMD-Vi
+  event log.
   - `unit` is the unit's register base.
   - `format` is an `IommuFormat`: 1 for a VT-d fault record, 2 for an AMD-Vi
     event log entry.

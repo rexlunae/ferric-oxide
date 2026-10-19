@@ -116,10 +116,15 @@ crate::events! {
         args: ["irq", "cpu", "count"],
     }
 
-    /// An IOMMU reported a fault, a blocked DMA or interrupt request or an error of its own:
-    /// the unit's register base, the format of the report (an [`IommuFormat`]), the report's
-    /// two 64-bit words as the hardware wrote them, and how many identical reports in a row
-    /// this record stands for.
+    /// An IOMMU wrote a report: a VT-d fault recording register (a blocked DMA or interrupt
+    /// request; always one report per record) or an AMD-Vi event log entry (any event,
+    /// including the unit's own command and table errors). The record holds the unit's
+    /// register base, the format of the report (an [`IommuFormat`]), the report's two 64-bit
+    /// words as the hardware wrote them, and how many identical reports in a row it stands for.
+    ///
+    /// Conditions that have no report of their own are only logged, not recorded: VT-d's
+    /// invalidation queue errors and primary fault overflow (fault status bits), and a full
+    /// AMD-Vi event log.
     ///
     /// The words are kept raw so that nothing is lost; decoders read them with the format's
     /// own decoder (`ferric-vtd`'s `FaultRecord::decode`, `ferric-amdvi`'s `Event`).

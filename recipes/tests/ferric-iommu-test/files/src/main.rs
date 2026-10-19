@@ -879,7 +879,8 @@ fn msi_delivered(setup: &mut Setup) -> Result<Msi, Failure> {
         .ok_or(Failure::NoMsiMessage(vector.vector))?;
     setup.channel.set_msi(message)?;
     setup.channel.enable_msi()?;
-    trace::watch_interrupt();
+    // The IRQ number of the vector: `irq:cpu-XX/N` names vector N + 32.
+    trace::watch_interrupt(vector.cpu, vector.vector - 32);
     setup.edu.raise_interrupt();
     let count = vector.wait(IRQ_WAIT);
     setup.edu.ack_interrupt();

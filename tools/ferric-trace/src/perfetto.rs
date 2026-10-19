@@ -380,7 +380,9 @@ impl Converter {
             let event = self.with_args(i, entry);
             event.cat = Some("irq");
             event.s = Some("t");
-            event.args.insert("source".to_owned(), Value::from(source));
+            event
+                .args
+                .insert("source_name".to_owned(), Value::from(source));
             return;
         }
         let id = self.next_request;
@@ -389,7 +391,9 @@ impl Converter {
         let event = self.with_args(i, entry);
         event.cat = Some("irq");
         event.id = Some(format!("{id:#x}"));
-        event.args.insert("source".to_owned(), Value::from(source));
+        event
+            .args
+            .insert("source_name".to_owned(), Value::from(source));
         // A later delivery of the same count can only follow an acknowledgement, which
         // removes this one, so the key is free.
         let key = (entry.arg(0), entry.arg(1), entry.arg(3));
@@ -849,7 +853,12 @@ mod tests {
             .collect();
         assert_eq!((begins.len(), ends.len()), (2, 1));
         assert_eq!(begins[0]["name"], "irq 11");
-        assert_eq!(begins[0]["args"]["source"], "vector");
+        assert_eq!(begins[0]["args"]["source_name"], "vector");
+        // The recorded code stays as it is beside its name.
+        assert_eq!(
+            begins[0]["args"]["source"],
+            ferric_trace::kernel::IrqSource::Vector.raw()
+        );
         assert_eq!(
             (begins[0]["pid"].clone(), begins[0]["tid"].clone()),
             (CPU_PID.into(), 1.into())

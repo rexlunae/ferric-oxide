@@ -12,9 +12,15 @@
 //! - VT-d: each announced DMA fault has a fault record, decoded with `ferric-vtd`, for that page
 //!   and access, and the forged interrupt a record of an interrupt remapping fault for its
 //!   index;
-//! - AMD-Vi: there is an I/O page fault event, decoded with `ferric-amdvi`. QEMU's AMD IOMMU
-//!   leaves the address out of its events, so they cannot be matched to the announced
-//!   addresses (the boot log check has the same limit).
+//! - AMD-Vi: an I/O page fault event, decoded with `ferric-amdvi`. QEMU's AMD IOMMU leaves the
+//!   address out of its events, so they cannot be matched to the announced addresses (the
+//!   boot log check has the same limit).
+//!
+//! Each announced fault takes a record of its own: one record never stands for two
+//! announcements. On AMD-Vi the events of two faults look the same, and the kernel merges
+//! identical events in a row into one record, so before announcing the next fault [`expect`]
+//! waits until the faults announced so far have their records. That ends the kernel's run of
+//! identical events, and the next fault's events start a new record.
 //!
 //! The `irq` events are on only around `iommu-msi`'s interrupt ([`watch_interrupt`],
 //! [`interrupt_handled`]): the test reserves a vector, has the device raise its MSI, and
@@ -41,6 +47,9 @@ use ferric_vtd::fault::{FaultRecord, RequestKind};
 
 /// How long [`finish`] waits for the records of announced faults.
 const WAIT: Duration = Duration::from_secs(3);
+
+/// How long [`expect`] waits for the records of the faults announced before.
+const PREVIOUS_WAIT: Duration = Duration::from_secs(1);
 
 /// How much one read of a CPU's ring asks for (the scheme's maximum).
 const READ_LEN: usize = 64 * 1024;
@@ -139,17 +148,21 @@ struct Interrupts {
     enabled_here: Vec<&'static str>,
     /// Whether an interrupt was raised and acknowledged while the events were on.
     expected: bool,
+    /// The CPU and IRQ number of the vector `iommu-msi` reserved: only its delivery and
+    /// acknowledgement count, not another driver's.
+    target: Option<(u64, u64)>,
     deliveries: Vec<Delivery>,
     acks: Vec<Ack>,
 }
 
 impl Interrupts {
-    /// The first delivery that woke a handle and has the acknowledgement of the same IRQ, CPU
-    /// and count.
+    /// The first delivery of the reserved vector that woke a handle and has the
+    /// acknowledgement of the same IRQ, CPU and count.
     fn handled(&self) -> Option<(Delivery, Ack)> {
+        let (cpu, irq) = self.target?;
         self.deliveries
             .iter()
-            .filter(|d| d.handles > 0)
+            .filter(|d| d.cpu == cpu && d.irq == irq && d.handles > 0)
             .find_map(|d| {
                 self.acks
                     .iter()
@@ -168,7 +181,7 @@ pub enum Error {
     Parse { path: String, what: String },
     /// An announced fault has no record.
     Missing { expected: String, records: usize },
-    /// The acknowledged interrupt has no matching `irq.deliver` and `irq.ack`.
+    /// The reserved vector's interrupt has no matching `irq.deliver` and `irq.ack`.
     Unacknowledged { deliveries: usize, acks: usize },
 }
 
@@ -183,7 +196,7 @@ impl fmt::Display for Error {
             ),
             Self::Unacknowledged { deliveries, acks } => write!(
                 f,
-                "no irq.deliver that woke a handle has an irq.ack of the same IRQ, CPU and count ({deliveries} irq.deliver, {acks} irq.ack records)"
+                "no irq.deliver of the reserved vector that woke a handle has an irq.ack of the same IRQ, CPU and count ({deliveries} irq.deliver, {acks} irq.ack records)"
             ),
         }
     }
@@ -397,20 +410,37 @@ impl Tracer {
                 .is_some_and(|i| i.expected && i.handled().is_none())
     }
 
-    /// The first announced fault without a record.
+    /// The first announced fault without a record of its own: each announcement, in order,
+    /// takes the first record that matches it and no earlier announcement took.
     fn missing(&self) -> Option<Expected> {
-        self.expected
-            .iter()
-            .copied()
-            .find(|&expected| !self.faults.iter().any(|fault| fault.records(expected)))
+        let mut taken = vec![false; self.faults.len()];
+        self.expected.iter().copied().find(|&expected| {
+            let free = self
+                .faults
+                .iter()
+                .zip(taken.iter_mut())
+                .find(|(fault, taken)| !**taken && fault.records(expected));
+            match free {
+                Some((_, taken)) => {
+                    *taken = true;
+                    false
+                }
+                None => true,
+            }
+        })
     }
 }
 
-/// Notes a fault about to happen and makes room for its record. Draining errors are left
-/// for [`finish`], which drains again.
+/// Notes a fault about to happen and makes room for its record. It first waits (up to
+/// [`PREVIOUS_WAIT`]) until the faults announced before have their records, so that this one
+/// does not share a record with them. Draining errors are left for [`finish`], which drains
+/// again, as is a fault whose record does not come.
 fn expect(expected: Expected) {
     if let Some(tracer) = lock().as_mut() {
-        let _ = tracer.drain();
+        let deadline = Instant::now() + PREVIOUS_WAIT;
+        while tracer.drain().is_ok() && tracer.missing().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         tracer.expected.push(expected);
     }
 }
@@ -429,9 +459,10 @@ pub fn expect_irq_fault(index: u16) {
     expect(Expected::Interrupt { index });
 }
 
-/// Turns the `irq` events on for the interrupt `iommu-msi` is about to raise, after making room
-/// in the rings. Errors are left for [`finish`], which drains again.
-pub fn watch_interrupt() {
+/// Turns the `irq` events on for the interrupt `iommu-msi` is about to raise on IRQ `irq` of
+/// logical CPU `cpu` (the `irq:cpu-XX/N` numbering), after making room in the rings. Errors are
+/// left for [`finish`], which drains again.
+pub fn watch_interrupt(cpu: u32, irq: u8) {
     let mut guard = lock();
     let Some(tracer) = guard.as_mut() else {
         return;
@@ -440,6 +471,7 @@ pub fn watch_interrupt() {
     let Some(interrupts) = tracer.interrupts.as_mut() else {
         return;
     };
+    interrupts.target = Some((u64::from(cpu), u64::from(irq)));
     let on = read_text(abi::EVENTS_PATH).unwrap_or_default();
     for name in [IRQ_DELIVER.name(), IRQ_ACK.name()] {
         let enabled = on
