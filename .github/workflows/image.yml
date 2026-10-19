@@ -477,6 +477,10 @@ jobs:
                 failed=1
                 echo "::error title=$image boot $run::ferric-trace-test did not skip on the kernel without kernel.trace"
               fi
+              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace-capture: no" "$log.clean"; then
+                failed=1
+                echo "::error title=$image boot $run::the trace capture check did not skip on the kernel without kernel.trace"
+              fi
             done
           done
           for image in notrace trace; do

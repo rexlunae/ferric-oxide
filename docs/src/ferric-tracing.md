@@ -277,7 +277,9 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
   `ferric-trace capture` and `ferric-trace text` on the result, and prints
-  `FERRIC_TEST_PASS trace-capture` if both succeed.
+  `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
+  `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
+  `trace-overhead` job's baseline image, which requires that skip.
 - **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`
