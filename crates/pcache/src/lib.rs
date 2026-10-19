@@ -22,6 +22,8 @@
 //!   evict under memory pressure.
 //! - `rmap` (with the `alloc` feature): an object's reverse map, from a file page to the
 //!   mappings that show it, for unmapping on truncation and eviction.
+//! - `client` (with the `client` feature, on Redox): the file system's side, its queue,
+//!   objects and the thread that takes fill records off the queue.
 //!
 //! Nothing here touches memory or hardware: the kernel feeds these types the facts and acts on
 //! their answers.
@@ -62,6 +64,8 @@
 extern crate alloc;
 
 pub mod abi;
+#[cfg(all(feature = "client", target_os = "redox"))]
+pub mod client;
 #[cfg(feature = "alloc")]
 pub mod clock;
 #[cfg(feature = "alloc")]

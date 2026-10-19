@@ -20,6 +20,9 @@ else
 	$(MAKE) fstools_fetch PODMAN_BUILD=$(GOING_TO_PODMAN_AGAIN)
 
 	# Compile installer and redoxfs for host (may be outside of podman container)
+	# Ferric Oxide: redoxfs's copy in recipes/core/redoxfs/source reaches the
+	# shared crates at ../../crates, as in the redoxfs and base recipes.
+	ln -sfn $(ROOT)/crates $(ROOT)/recipes/core/crates
 	cd $@.partial && \
 		export CARGO_TARGET_DIR=../$@-target && \
 		$(HOST_CARGO) install --root . --path $(ROOT)/tools/installer --locked $(INSTALLER_FEATURES) && \

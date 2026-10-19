@@ -558,11 +558,12 @@ With `kernel.page_cache = true` in `ferric.toml` (Kernel menu, off by
 default), the kernel has a `kernel.pcache` scheme that caches file contents in
 kernel memory and serves `read` and `pread` from it, without a round trip to
 the file system once the pages are there (roadmap Phase 2.6, design in
-`io/pagecache-design.md` in the project files). This first step is the read
-path only: no file system in the image uses it yet (RedoxFS comes next), and
-mappings, writes, writeback and reclaim are later steps, so an object keeps
-every page it was given until it closes. Without the option the kernel has no
-such scheme and every read goes to the file system, as upstream.
+`io/pagecache-design.md` in the project files). This step is the read path:
+RedoxFS serves the files its clients open read-only from it, and writes stay
+with RedoxFS, which drops the pages they change. Mappings, cached writes,
+writeback and reclaim are later steps, so an object keeps every page it was
+given until it closes. Without the option the kernel has no such scheme and
+every read goes to the file system, as upstream.
 
 How a file system uses it:
 
@@ -584,7 +585,12 @@ How a file system uses it:
    which the kernel copies into new frames. A failed answer carries a non-zero
    errno and an empty payload; the readers waiting for those pages get `EIO`,
    and the next read fills them again.
-5. Closing a description detaches it. Closing an object or its queue ends the
+5. When the file system changes a file's bytes itself (it served a write or a
+   truncation), it calls `Invalidate` on the object with the pages that
+   changed, then `SetSize`, before it replies. The cached copies are dropped;
+   a fill in flight over them is stale, so its answer is not taken and its
+   readers fill again. A read after a write therefore sees the new bytes.
+6. Closing a description detaches it. Closing an object or its queue ends the
    cache of it: outstanding fills fail with `EIO`, and later reads of its
    descriptions go to the file system's scheme as before.
 
@@ -604,13 +610,34 @@ holds the policies, host-tested:
 - `clock` and `rmap` (with the `alloc` feature): two-list CLOCK replacement
   for reclaim, and the reverse map from a file page to the mappings that show
   it, for the later steps.
+- `client` (with the `client` feature, on Redox): the file system's side, the
+  queue and object calls with typed errors, and `spawn_pump`, a thread that
+  waits on the queue and hands each batch of records to the file system.
+
+RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
+mounts and the kernel has the scheme. Each regular file with a description
+opened `O_RDONLY` gets an object (the node ID is the object ID), and those
+descriptions are attached; writers, directories, `mmap` and `fstat` stay with
+RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme as a
+call, so the main loop answers them in order with the writes it serves,
+reading the pages the way a `read` does (after decompression and decryption,
+and from a mapped buffer when there is one). Writes, appends, `ftruncate` and
+`O_TRUNC` invalidate the pages they change. A file mapped shared and writable
+is not cached until it is closed and unmapped everywhere, because stores
+through the mapping change its bytes without a write call.
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
-miss, a hit with no scheme read, readahead, a failed fill and a closed queue,
-and prints the time of a cached 4 KiB `pread` next to the same read through
-the scheme.
+miss, a hit with no scheme read, readahead, a failed fill, invalidation (with a
+stale fill answered with the wrong bytes) and a closed queue, and prints the
+time of a cached 4 KiB `pread` next to the same read through the scheme. Then,
+on RedoxFS, it checks that a read-only description sees writes, a write past
+the end and truncations made through another one, and benchmarks warm 4 KiB
+`pread`s and 1 MiB sequential reads of one file through a read-only
+description (cached) against a read-write one (served by RedoxFS, as with the
+option off) in the same boot, with the paired A/B rule of
+`ferric_blkqueue::ab`; it fails if the cache is slower.
 
 The kernel fix this test turned up is not specific to the page cache. When a
 request is sent to a user scheme, the caller switches straight to the context

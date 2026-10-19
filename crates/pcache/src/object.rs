@@ -18,6 +18,12 @@
 //! [`PageIndex::fail_all`] fails every outstanding fill when the file system goes away. A
 //! failed page goes back to [`PageState::Absent`] marked failed: a reader that waited for it
 //! gets [`Read::Failed`] (the kernel's `EIO`), and the next new read fills it again.
+//!
+//! [`PageIndex::invalidate`] drops pages whose bytes changed outside the cache (the file
+//! system served a write itself). A page being filled then is marked stale: the answer to that
+//! fill may hold the old bytes, so it is not taken. The page goes back to
+//! [`PageState::Absent`] without being marked failed, and the readers that waited for it fill
+//! it again on their retry.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -58,6 +64,8 @@ struct Entry<F> {
     frame: Option<F>,
     /// The last fill failed (the page is `Absent`).
     failed: bool,
+    /// The page was invalidated while being filled: the fill's answer is not taken.
+    stale: bool,
 }
 
 impl<F> Entry<F> {
@@ -66,6 +74,7 @@ impl<F> Entry<F> {
             state: PageState::Absent,
             frame: None,
             failed: false,
+            stale: false,
         }
     }
 }
@@ -255,6 +264,9 @@ impl<F> PageIndex<F> {
                     });
                 }
                 for (page, frame) in (range.first()..range.end()).zip(frames) {
+                    if self.take_stale(page)? {
+                        continue;
+                    }
                     self.transition(page, Event::FillDone)?;
                     if let Some(entry) = self.pages.get_mut(&page) {
                         entry.frame = Some(frame);
@@ -263,11 +275,55 @@ impl<F> PageIndex<F> {
             }
             Outcome::Failed(_) => {
                 for page in range.first()..range.end() {
-                    self.fail(page)?;
+                    if !self.take_stale(page)? {
+                        self.fail(page)?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Drops the cached copies of `pages`, whose bytes changed outside the cache, and marks
+    /// those being filled stale (see the module docs). Pages under writeback are left as they
+    /// are: they hold data newer than the file system's, which only the write path (PR 5)
+    /// creates.
+    pub fn invalidate(&mut self, pages: PageRange) -> Invalidated {
+        let mut done = Invalidated::default();
+        let touched: Vec<u64> = self
+            .pages
+            .range(pages.first()..pages.end())
+            .map(|(&page, _)| page)
+            .collect();
+        for page in touched {
+            let Some(entry) = self.pages.get_mut(&page) else {
+                continue;
+            };
+            match entry.state {
+                PageState::Filling => {
+                    entry.stale = true;
+                    done.stale += 1;
+                }
+                PageState::Writeback { .. } => {}
+                _ => {
+                    if self.pages.remove(&page).is_some_and(|e| e.frame.is_some()) {
+                        done.dropped += 1;
+                    }
+                }
+            }
+        }
+        done
+    }
+
+    /// If `page` is stale, ends its fill without taking the answer: the page is absent again,
+    /// not marked failed. Returns whether it was stale.
+    fn take_stale(&mut self, page: u64) -> Result<bool, FillError> {
+        if !self.pages.get(&page).is_some_and(|entry| entry.stale) {
+            return Ok(false);
+        }
+        self.transition(page, Event::FillFailed)?;
+        self.pages.remove(&page);
+        Ok(true)
     }
 
     /// Fails every outstanding fill (the file system's queue closed), and returns how many
@@ -309,6 +365,15 @@ fn push_run(fills: &mut Vec<RecordPages>, run: Option<(u64, u64)>) {
     if let Some(pages) = run.and_then(|(first, end)| PageRange::from_bounds(first, end)) {
         fills.extend(RecordPages::split(pages));
     }
+}
+
+/// What [`PageIndex::invalidate`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Invalidated {
+    /// Cached pages dropped (their frames released).
+    pub dropped: usize,
+    /// Pages being filled, whose fills are now stale.
+    pub stale: usize,
 }
 
 /// Why a fill answer was not applied.
@@ -551,6 +616,82 @@ mod tests {
             Ok(())
         );
         assert_eq!(index.pages_for_read(4 * PAGE_SIZE, 10), None);
+    }
+
+    #[test]
+    fn invalidating_drops_cached_pages() {
+        let mut index = index();
+        let _ = index.start_read(range(0, 4), Attempt::First);
+        index
+            .complete_fill(record(0, 4), Outcome::Done, frames(0, 4))
+            .expect("pages 0..4 are filling");
+        assert_eq!(
+            index.invalidate(range(1, 2)),
+            Invalidated {
+                dropped: 2,
+                stale: 0
+            }
+        );
+        assert_eq!(index.resident(), 2);
+        assert_eq!(index.state(1), PageState::Absent);
+        // The next read of them fills them again; the pages left alone still hit.
+        assert_eq!(index.start_read(range(0, 1), Attempt::First), Read::Ready);
+        assert_eq!(
+            index.start_read(range(1, 2), Attempt::First),
+            Read::Wait {
+                fills: vec![record(1, 2)]
+            }
+        );
+        // Absent pages and pages past the range are not counted.
+        assert_eq!(index.invalidate(range(5, 5)), Invalidated::default());
+    }
+
+    #[test]
+    fn a_fill_in_flight_over_invalidated_pages_is_not_taken() {
+        let mut index = index();
+        let _ = index.start_read(range(0, 3), Attempt::First);
+        assert_eq!(
+            index.invalidate(range(1, 1)),
+            Invalidated {
+                dropped: 0,
+                stale: 1
+            }
+        );
+        // The answer may hold the old bytes of page 1: pages 0 and 2 are taken, page 1 is
+        // absent again, not failed, and the waiting reader's retry fills it anew.
+        index
+            .complete_fill(record(0, 3), Outcome::Done, frames(0, 3))
+            .expect("pages 0..3 are filling");
+        assert_eq!(index.state(0), PageState::Uptodate);
+        assert_eq!(index.state(1), PageState::Absent);
+        assert_eq!(index.state(2), PageState::Uptodate);
+        assert_eq!(
+            index.start_read(range(0, 3), Attempt::Retry),
+            Read::Wait {
+                fills: vec![record(1, 1)]
+            }
+        );
+        index
+            .complete_fill(record(1, 1), Outcome::Done, vec![100])
+            .expect("page 1 is filling again");
+        assert_eq!(index.frames(range(0, 3)), Some(vec![0, 100, 2]));
+    }
+
+    #[test]
+    fn a_stale_fill_that_fails_does_not_fail_its_readers() {
+        let mut index = index();
+        let _ = index.start_read(range(4, 1), Attempt::First);
+        let _ = index.invalidate(range(4, 1));
+        index
+            .complete_fill(record(4, 1), EIO, Vec::new())
+            .expect("page 4 is filling");
+        assert_eq!(index.state(4), PageState::Absent);
+        assert_eq!(
+            index.start_read(range(4, 1), Attempt::Retry),
+            Read::Wait {
+                fills: vec![record(4, 1)]
+            }
+        );
     }
 
     #[test]

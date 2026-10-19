@@ -89,7 +89,8 @@ jobs:
           cargo test --locked -p ferric-blkqueue --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
-      # kernel turns it on; file systems do not).
+      # kernel turns it on). Its `client` feature (RedoxFS's side) only builds on Redox, so
+      # the image build checks it.
       - name: ferric-pcache
         run: |
           cargo clippy --locked --all-targets --all-features -p ferric-pcache -- -D warnings

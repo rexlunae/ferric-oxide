@@ -9,6 +9,7 @@ description = "Shared page cache read path: on-target test for Ferric Oxide"
 [workspace]
 
 [dependencies]
+ferric-blkqueue = { path = "../../../../crates/blkqueue" }
 ferric-pcache = { path = "../../../../crates/pcache" }
 
 [target.'cfg(target_os = "redox")'.dependencies]

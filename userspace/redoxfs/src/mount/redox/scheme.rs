@@ -98,6 +98,9 @@ pub struct FileScheme<'sock, D: Disk> {
     other_scheme_fd_map: BTreeMap<u32, Fd>,
 
     proc_creds_capability: Fd,
+
+    // Ferric Oxide: the kernel's page cache, when it has one (see `pcache`).
+    pcache: Option<super::pcache::PageCache>,
 }
 
 impl<'sock, D: Disk> FileScheme<'sock, D> {
@@ -107,6 +110,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
         fs: FileSystem<D>,
         socket: &'sock Socket,
     ) -> Result<FileScheme<'sock, D>> {
+        let pcache = super::pcache::PageCache::start(socket, &mounted_path);
         Ok(FileScheme {
             scheme_name: RedoxScheme::new(scheme_name)
                 .expect("scheme name for FileScheme is not valid"),
@@ -124,6 +128,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                     0,
                 )?
             },
+            pcache,
         })
     }
 
@@ -354,6 +359,9 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                         self.fs.tx(|tx| {
                             tx.truncate_node(node_ptr, 0, mtime.as_secs(), mtime.subsec_nanos())
                         })?;
+                        if let Some(pcache) = &mut self.pcache {
+                            pcache.changed(&mut self.fs, node_ptr, node.data().size(), 0, 0);
+                        }
                     }
 
                     Handle::ResourceFile((
@@ -439,6 +447,13 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.handles.insert(id, handle);
+
+        // Ferric Oxide: the kernel serves reads of files opened read-only from its page cache.
+        if let Some(pcache) = &mut self.pcache {
+            if flags & O_ACCMODE == O_RDONLY && flags & (O_STAT | O_SYMLINK) == 0 {
+                pcache.attach(&mut self.fs, id, node_ptr);
+            }
+        }
 
         Ok(OpenResult::ThisScheme {
             number: id,
@@ -772,7 +787,20 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     ) -> Result<usize> {
         // println!("Write {}, {:X} {}", id, buf.as_ptr() as usize, buf.len());
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
-        self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx))
+        // Ferric Oxide: drop the pages the write changes from the page cache before replying.
+        let node_ptr = file.node_ptr();
+        let pcache = self.pcache.as_mut();
+        let before = pcache
+            .as_ref()
+            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let written = self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx));
+        if let (Some(pcache), Some(before)) = (pcache, before) {
+            // A failed write may still have changed some of the bytes.
+            let len = written.as_ref().map_or(buf.len(), |&n| n);
+            let end = offset.saturating_add(len as u64);
+            pcache.changed(&mut self.fs, node_ptr, before, offset, end);
+        }
+        written
     }
 
     fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> Result<u64> {
@@ -915,7 +943,17 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     fn ftruncate(&mut self, id: usize, len: u64, _ctx: &CallerCtx) -> Result<()> {
         // println!("Ftruncate {}, {}", id, len);
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
-        self.fs.tx(|tx| file.truncate(len, tx))
+        let node_ptr = file.node_ptr();
+        let pcache = self.pcache.as_mut();
+        let before = pcache
+            .as_ref()
+            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let truncated = self.fs.tx(|tx| file.truncate(len, tx));
+        // Ferric Oxide: drop the pages between the old and the new end from the page cache.
+        if let (Some(pcache), Some(before)) = (pcache, before) {
+            pcache.changed(&mut self.fs, node_ptr, before, len, len);
+        }
+        truncated
     }
 
     fn futimens(&mut self, id: usize, times: &[TimeSpec], _ctx: &CallerCtx) -> Result<()> {
@@ -945,6 +983,10 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
+        // Ferric Oxide: a shared writable mapping ends the file's page caching.
+        if let Some(pcache) = &mut self.pcache {
+            pcache.mapped(file.node_ptr(), flags);
+        }
         self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx))
     }
     fn munmap(
@@ -966,6 +1008,9 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let Some(file) = self.handles.remove(&id) else {
             return;
         };
+        if let Some(pcache) = &mut self.pcache {
+            pcache.closed(id);
+        }
         let Ok(resource) = file.resource() else {
             return;
         };
@@ -984,6 +1029,9 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             // Notify filesystem of close
             if let Err(err) = self.fs.tx(|tx| tx.on_close_node(node_ptr)) {
                 log::error!("failed to close node {}: {}", node_ptr.id(), err);
+            }
+            if let Some(pcache) = &mut self.pcache {
+                pcache.node_closed(node_ptr);
             }
 
             /*TODO: leaks memory, but why?
@@ -1095,8 +1143,21 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         id: usize,
         payload: &mut [u8],
         metadata: &[u64],
-        _ctx: &CallerCtx,
+        ctx: &CallerCtx,
     ) -> Result<usize> {
+        // Ferric Oxide: fill records the page cache's pump thread forwards from the kernel.
+        // Only root (RedoxFS itself) may send them; even then they cannot put bytes in the
+        // cache that are not the file's, since RedoxFS reads the pages itself and the kernel
+        // takes an answer only for pages it is filling.
+        if metadata.first() == Some(&ferric_pcache::client::FORWARDED_RECORDS) {
+            if ctx.uid != 0 {
+                return Err(Error::new(EPERM));
+            }
+            if let Some(pcache) = &mut self.pcache {
+                pcache.fill(&mut self.fs, &mut self.fmap, payload);
+            }
+            return Ok(0);
+        }
         let Some(verb) = FsCall::try_from_raw(metadata[0] as usize) else {
             return Err(Error::new(EINVAL));
         };

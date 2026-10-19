@@ -21,12 +21,16 @@
 //!   [`Request::Filled`](ferric_pcache::abi::Request::Filled) on the object, whose payload the
 //!   kernel copies into new frames. A failed fill fails the readers waiting for it with
 //!   `EIO`; the next read fills again.
+//! - When a file's bytes change outside the cache (a write or truncation through the file
+//!   system's scheme), the file system drops the cached copies with
+//!   [`Request::Invalidate`](ferric_pcache::abi::Request::Invalidate); a fill already
+//!   outstanding for those pages is answered but its data discarded.
 //! - Closing a description detaches it (`UserScheme::close` calls
 //!   [`closed`](crate::scheme::pcache::closed)). Closing an object, or its queue, ends the
 //!   cache of it: outstanding fills fail, their readers get `EIO`, and later reads of its
 //!   descriptions go to the file system's scheme as before.
 //!
-//! Only reads are served here. Mappings, writes, writeback and reclaim are later steps of the
+//! Only reads are served here. Mappings, cached writes, writeback and reclaim are later steps of the
 //! design, so an object holds every page read until it closes. The page index, fill planning
 //! and readahead are the host-tested `ferric-pcache` crate (`crates/pcache`), which also has
 //! the call encoding file systems use.
@@ -723,6 +727,12 @@ impl KernelScheme for PcacheScheme {
             }
             (Request::Attach { handle }, Handle::Object(object)) => attach(&object, handle),
             (Request::Detach { handle }, Handle::Object(object)) => detach(&object, handle),
+            (Request::Invalidate { pages }, Handle::Object(object)) => {
+                // Readers of pages being filled keep waiting; the stale fill's answer wakes
+                // them and they fill again (`PageIndex::invalidate`).
+                object.state.lock().index.invalidate(pages);
+                Ok(0)
+            }
             (Request::Filled { pages, outcome }, Handle::Object(object)) => {
                 filled(&object, pages, outcome, payload, token)
             }
