@@ -83,6 +83,19 @@ impl Nvme {
         Ok(())
     }
 
+    /// Whether queue pair `qid`'s completion queue, in the calling thread's context, has an
+    /// entry waiting that nothing has taken yet.
+    pub fn completion_waiting(&self, qid: u16) -> bool {
+        let ctxt = self.cur_thread_ctxt();
+        let guard = ctxt.lock();
+        let waiting = guard
+            .queues
+            .borrow()
+            .get(&qid)
+            .is_some_and(|(_, cq)| cq.has_entry());
+        waiting
+    }
+
     /// Makes the calling thread serve the queue pair on MSI-X entry `vector`, which
     /// [`Self::add_queue_pair`] created.
     pub fn enter_queue_pair(&self, vector: Iv) {

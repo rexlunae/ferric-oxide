@@ -260,6 +260,7 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     #[cfg(feature = "percore")]
     if let Some(workers) = &workers {
         executor.spawn(Rc::clone(workers).pump(Rc::clone(&executor)));
+        executor.spawn(Rc::clone(workers).watch(Rc::clone(&executor)));
     }
 
     let scheme = Rc::new(RefCell::new(RingDiskScheme::new(

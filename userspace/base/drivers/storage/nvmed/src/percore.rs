@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use ferric_irq::{CpuEntry, CpuId};
 use pcid_interface::irq_helpers::{InterruptVector, Msix};
@@ -143,26 +144,48 @@ impl Dispatcher {
         .await
     }
 
-    /// Wakes the futures of the jobs the workers finished.
-    fn drain(&self) {
+    /// Wakes the futures of the jobs the workers finished, and returns how many it woke.
+    fn drain(&self) -> usize {
         let mut ids = [0_u8; 8 * 32];
+        let mut woken = 0;
         loop {
             match (&self.done).read(&mut ids) {
-                Ok(0) => return,
+                Ok(0) => return woken,
                 Ok(len) => {
                     for id in ids[..len - len % 8].chunks_exact(8) {
                         let id = u64::from_ne_bytes(id.try_into().expect("8-byte chunk"));
                         if let Some(waker) = self.waiting.borrow_mut().remove(&id) {
                             waker.wake();
+                            woken += 1;
                         }
                     }
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return woken,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => {
                     log::error!("nvmed: cannot read finished jobs: {err}");
-                    return;
+                    return woken;
                 }
+            }
+        }
+    }
+
+    /// Ferric Oxide watchdog: once a second, completes the jobs whose report the pipe's event
+    /// did not deliver, and says so (a few times), so a lost wake-up shows in the log as a
+    /// stall instead of a hang.
+    pub async fn watch(self: Rc<Self>, executor: Rc<NvmeExecutor>) {
+        let Some(mut ticks) = Ticks::new(&executor) else {
+            return;
+        };
+        let mut told = 0;
+        loop {
+            ticks.next().await;
+            let woken = self.drain();
+            if woken != 0 && told < STALL_REPORTS {
+                told += 1;
+                log::warn!(
+                    "nvmed: watchdog found {woken} finished job(s) the completion pipe's event did not report"
+                );
             }
         }
     }
@@ -222,6 +245,81 @@ impl Drop for JobFuture {
         // is done.
         while !self.slot.done.load(Ordering::Acquire) && !self.worker_gone() {
             std::thread::yield_now();
+        }
+    }
+}
+
+/// How many times each watchdog reports a stall.
+const STALL_REPORTS: u32 = 5;
+
+/// A once-a-second tick from `/scheme/time`, as an event on an executor.
+struct Ticks {
+    time: File,
+    events: Pin<Box<executor::ExternalEventHandle<crate::nvme::executor::NvmeHw>>>,
+}
+
+impl Ticks {
+    /// A tick source on `executor`, or `None` (logged) when the clock cannot be opened.
+    fn new(executor: &NvmeExecutor) -> Option<Self> {
+        let path = format!("/scheme/time/{}", libredox::flag::CLOCK_MONOTONIC);
+        let time = match File::open(&path) {
+            Ok(time) => time,
+            Err(err) => {
+                log::warn!("nvmed: no watchdog: cannot open {path}: {err}");
+                return None;
+            }
+        };
+        let events = Box::pin(
+            executor.register_external_event(time.as_raw_fd() as usize, event::EventFlags::READ),
+        );
+        Some(Self { time, events })
+    }
+
+    /// Waits for the next tick, a second from now.
+    async fn next(&mut self) {
+        let mut now = syscall::TimeSpec::default();
+        let armed = (&self.time).read(&mut now).is_ok() && {
+            now.tv_sec += 1;
+            (&self.time).write(&now).is_ok()
+        };
+        if armed {
+            let _ = self.events.as_mut().next().await;
+        } else {
+            log::warn!("nvmed: watchdog clock cannot be armed");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// The job a worker is running and when it started, for its watchdog.
+type InFlight = Rc<Cell<Option<(u64, Instant)>>>;
+
+/// Ferric Oxide watchdog for a worker: once a second, reports (a few times) a job that has
+/// waited a second or more, and whether its completion queue holds an entry nothing took
+/// (a completion interrupt that did not wake the worker) or not (the controller has not
+/// answered). The tick also wakes the executor, which then polls the queue.
+async fn watch_worker(nvme: Arc<Nvme>, qid: u16, in_flight: InFlight, executor: Rc<NvmeExecutor>) {
+    let Some(mut ticks) = Ticks::new(&executor) else {
+        return;
+    };
+    let mut told = 0;
+    loop {
+        ticks.next().await;
+        let Some((id, since)) = in_flight.get() else {
+            continue;
+        };
+        let waited = since.elapsed();
+        if waited >= Duration::from_secs(1) && told < STALL_REPORTS {
+            told += 1;
+            let entry = if nvme.completion_waiting(qid) {
+                "holds an entry the worker was not woken for"
+            } else {
+                "is empty"
+            };
+            log::warn!(
+                "nvmed: watchdog: queue pair {qid} job {id} has waited {} ms; its completion queue {entry}",
+                waited.as_millis()
+            );
         }
     }
 }
@@ -440,6 +538,13 @@ fn serve(
     let mut wake = Box::pin(
         executor.register_external_event(wake_rx.as_raw_fd() as usize, event::EventFlags::READ),
     );
+    let in_flight: InFlight = Rc::new(Cell::new(None));
+    executor.spawn(watch_worker(
+        Arc::clone(&nvme),
+        qid,
+        Rc::clone(&in_flight),
+        Rc::clone(&executor),
+    ));
     executor.block_on(async {
         loop {
             // Drain the wake-ups before looking for jobs, so one sent after the look still
@@ -450,7 +555,9 @@ fn serve(
                 match jobs.try_recv() {
                     Ok(job) => {
                         let id = job.id;
+                        in_flight.set(Some((id, Instant::now())));
                         run(&nvme, job).await;
+                        in_flight.set(None);
                         if done_tx.write_all(&id.to_ne_bytes()).is_err() {
                             log::error!("nvmed: queue pair {qid} worker cannot report job {id}");
                         }

@@ -170,6 +170,12 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   it still serves one scheme call at a time. Native rings with a home CPU
   (later steps of the plan) are what route a request to the queue of the core
   it came from.
+- A watchdog ticks once a second on each worker and on the main thread. It
+  logs `nvmed: watchdog ...` when a job has waited a second or more, saying
+  whether its completion queue holds an entry nobody was woken for, or when
+  it finds finished jobs whose report never arrived. The tick also wakes the
+  executor, so a lost wake-up shows up as a stall rather than a hang. CI fails
+  on any watchdog line.
 
 `ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
 throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once.

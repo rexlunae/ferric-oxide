@@ -44,7 +44,9 @@ fi
 # a worker thread on its CPU.
 need "nvmed: MSI-X entries 1\.\.=[0-9]+ spread over CPUs \[[0-9, ]+\] in batches of [0-9]+ and [0-9]+, as irq:cpus and ferric_irq::spread give"
 need "nvmed: [2-9][0-9]* per-CPU I/O queue pairs \(controller grants [0-9]+ pairs\), workers on CPUs \[[0-9, ]+\]"
-if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker not pinned|no worker for I/O queue pair)" <<< "$clean"; then
+# A watchdog line means a job's completion or report was not delivered by its event, and was
+# only picked up by the once-a-second tick.
+if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker not pinned|no worker for I/O queue pair|watchdog)" <<< "$clean"; then
     fail "nvmed's per-CPU queue pairs were not set up as expected"
 fi
 
