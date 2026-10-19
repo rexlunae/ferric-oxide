@@ -358,6 +358,11 @@ jobs:
       - name: Check futex wakeups
         run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
 
+      # A process opens a scheme it created on the same thread and serves from another: the
+      # kernel must block the caller rather than direct-switch it to itself.
+      - name: Check a scheme opened by its creating thread
+        run: grep -aF "FERRIC_TEST_PASS scheme-self-open" "$LOG"
+
       # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
       - name: Check registered buffers
         run: |
