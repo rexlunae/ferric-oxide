@@ -135,7 +135,7 @@ impl CrashReport {
 
     /// Writes the records as a capture directory `out` of `cpu<n>` files, which must not
     /// exist yet. As `ferric-trace capture` does, it marks the directory
-    /// [`INCOMPLETE`](crate::capture::INCOMPLETE) until every file is written, so a save cut
+    /// [`INCOMPLETE`] until every file is written, so a save cut
     /// short is not loaded as a whole capture.
     ///
     /// # Errors
