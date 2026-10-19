@@ -37,19 +37,63 @@ pub fn file_op_generic_ext<T>(
         &mut CleanLockToken,
     ) -> Result<T>,
 ) -> Result<T> {
-    let (file, desc) = {
-        let current_lock = context::current();
-        let mut current = current_lock.read(token.token());
-        let (context, mut token) = current.token_split();
-        let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
-        // TODO: potential unnecessary clone
-        let desc = file.description.read(token.token()).clone();
-        (file, desc)
+    description_op(file_description(fd, token)?, token, op)
+}
+/// The description behind the current context's descriptor `fd`.
+pub fn file_description(
+    fd: FileHandle,
+    token: &mut CleanLockToken,
+) -> Result<Arc<LockedFileDescription>> {
+    let current_lock = context::current();
+    let mut current = current_lock.read(token.token());
+    let (context, mut token) = current.token_split();
+    let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
+    Ok(file.description)
+}
+/// Lets go of a reference to an open file description, and closes the description when that
+/// was the last reference, as closing its last descriptor does (Ferric Oxide).
+///
+/// An operation or a ring that holds a description while another thread closes the
+/// descriptor must let go through this, or the description, the last reference gone, would
+/// be dropped without its scheme ever seeing the close. A failed close has no one to report
+/// to, as for a descriptor closed on exit.
+pub fn release_description(description: Arc<LockedFileDescription>, token: &mut CleanLockToken) {
+    // `Arc::into_inner` hands the description to exactly one of the last holders, even when
+    // they let go at the same time.
+    if let Some(description) = Arc::into_inner(description) {
+        let _ = description.into_inner().try_close(token);
+    }
+}
+/// [`file_op_generic_ext`] on a description already looked up (Ferric Oxide: the ring file
+/// table holds descriptions, not descriptors). The op must not keep the description it is
+/// given past its return: this lets go of the operation's reference afterwards with
+/// [`release_description`], so the description is closed if its descriptor was closed
+/// meanwhile.
+pub fn description_op<T>(
+    description: Arc<LockedFileDescription>,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(
+        &dyn KernelScheme,
+        Arc<LockedFileDescription>,
+        FileDescription,
+        &mut CleanLockToken,
+    ) -> Result<T>,
+) -> Result<T> {
+    // TODO: potential unnecessary clone
+    let desc = description.read(token.token()).clone();
+
+    let scheme = match desc.scheme_ref.upgrade() {
+        Ok(scheme) => scheme,
+        Err(err) => {
+            release_description(description, token);
+            return Err(err);
+        }
     };
 
-    let scheme = desc.scheme_ref.upgrade()?;
-
-    op(&*scheme, file.description, desc, token)
+    let held = Arc::clone(&description);
+    let result = op(&*scheme, description, desc, token);
+    release_description(held, token);
+    result
 }
 pub fn copy_path_to_buf(raw_path: UserSliceRo, max_len: usize) -> Result<String> {
     let mut path_buf = vec![0_u8; max_len];
@@ -574,7 +618,15 @@ pub fn frename(fd: FileHandle, raw_path: UserSliceRo, token: &mut CleanLockToken
 
 /// File status
 pub fn fstat(fd: FileHandle, user_buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
-    file_op_generic_ext(fd, token, |scheme, _, desc, token| {
+    fstat_description(file_description(fd, token)?, user_buf, token)
+}
+/// [`fstat`] on a description.
+pub fn fstat_description(
+    description: Arc<LockedFileDescription>,
+    user_buf: UserSliceWo,
+    token: &mut CleanLockToken,
+) -> Result<()> {
+    description_op(description, token, |scheme, _, desc, token| {
         scheme.kfstat(desc.number, user_buf, token)?;
 
         // TODO: Ensure only the kernel can access the stat when st_dev is set, or use another API
@@ -721,15 +773,27 @@ pub fn mremap(
 }
 
 pub fn lseek(fd: FileHandle, pos: i64, whence: usize, token: &mut CleanLockToken) -> Result<usize> {
-    let (fsize, desc) = file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+    let description = file_description(fd, token)?;
+    let result = lseek_description(&description, pos, whence, token);
+    release_description(description, token);
+    result
+}
+/// [`lseek`] on a description.
+fn lseek_description(
+    description: &Arc<LockedFileDescription>,
+    pos: i64,
+    whence: usize,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let fsize = description_op(Arc::clone(description), token, |scheme, _, desc, token| {
         Ok(if whence == SEEK_END {
-            (Some(scheme.fsize(desc.number, token)?), desc_arc)
+            Some(scheme.fsize(desc.number, token)?)
         } else {
-            (None, desc_arc)
+            None
         })
     })?;
 
-    let mut guard = desc.write(token.token());
+    let mut guard = description.write(token.token());
 
     let new_pos = match whence {
         SEEK_SET => pos,
@@ -746,42 +810,60 @@ pub fn lseek(fd: FileHandle, pos: i64, whence: usize, token: &mut CleanLockToken
     Ok(guard.offset as usize)
 }
 pub fn sys_read(fd: FileHandle, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
-    let (bytes_read, desc_arc, desc) =
-        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
-            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-                desc.offset
-            } else {
-                u64::MAX
-            };
-            Ok((
-                scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
-                desc_arc,
-                desc,
-            ))
-        })?;
-    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-        let offset = &mut desc_arc.write(token.token()).offset;
-        *offset = offset.saturating_add(bytes_read as u64)
+    read_description(file_description(fd, token)?, buf, token)
+}
+/// [`sys_read`] on a description.
+pub fn read_description(
+    description: Arc<LockedFileDescription>,
+    buf: UserSliceWo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
+        let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+            desc.offset
+        } else {
+            u64::MAX
+        };
+        Ok((
+            scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+            desc,
+        ))
+    });
+    if let Ok((bytes_read, desc)) = &result
+        && desc.internal_flags.contains(InternalFlags::POSITIONED)
+    {
+        let offset = &mut description.write(token.token()).offset;
+        *offset = offset.saturating_add(*bytes_read as u64)
     }
-    Ok(bytes_read)
+    release_description(description, token);
+    result.map(|(bytes_read, _)| bytes_read)
 }
 pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -> Result<usize> {
-    let (bytes_written, desc_arc, desc) =
-        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
-            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-                desc.offset
-            } else {
-                u64::MAX
-            };
-            Ok((
-                scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
-                desc_arc,
-                desc,
-            ))
-        })?;
-    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-        let offset = &mut desc_arc.write(token.token()).offset;
-        *offset = offset.saturating_add(bytes_written as u64)
+    write_description(file_description(fd, token)?, buf, token)
+}
+/// [`sys_write`] on a description.
+pub fn write_description(
+    description: Arc<LockedFileDescription>,
+    buf: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
+        let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+            desc.offset
+        } else {
+            u64::MAX
+        };
+        Ok((
+            scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+            desc,
+        ))
+    });
+    if let Ok((bytes_written, desc)) = &result
+        && desc.internal_flags.contains(InternalFlags::POSITIONED)
+    {
+        let offset = &mut description.write(token.token()).offset;
+        *offset = offset.saturating_add(*bytes_written as u64)
     }
-    Ok(bytes_written)
+    release_description(description, token);
+    result.map(|(bytes_written, _)| bytes_written)
 }
