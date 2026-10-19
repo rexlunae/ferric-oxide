@@ -1222,6 +1222,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1345,6 +1354,14 @@ dependencies = [
 name = "ferric-lvm"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ferric-netq"
+version = "0.1.0"
+dependencies = [
+ "etherparse",
  "thiserror 2.0.17",
 ]
 

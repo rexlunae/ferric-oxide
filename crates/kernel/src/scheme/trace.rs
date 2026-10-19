@@ -8,6 +8,8 @@
 //!   Writing `filter <event> <filter>` to `events` sets that event's argument filter
 //!   (`ferric_trace::filter`), and `filter <event> none` removes it.
 //! - `filters`: one line per filtered event, written as the command that sets its filter.
+//! - `clock`: the clock record timestamps come from and its tick length
+//!   (`ferric_trace::clock::ClockLine`), chosen once at boot (`trace::clock`).
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
@@ -31,7 +33,7 @@
 //! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
 //! The mapping needs `PROT_READ`: a mapping without it would still be readable.
 //!
-//! `events`, `stats` and `filters` are read from a snapshot taken at the first read of each open, as in
+//! `events`, `stats`, `clock` and `filters` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
 //! addresses, and a Phase 4 capability will replace the uid check.
 
@@ -83,13 +85,14 @@ enum Text {
     Events,
     Stats,
     Filters,
+    Clock,
     Crash,
 }
 
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events`, `stats` or `filters`, with the snapshot its reads come from once taken.
+    /// `events`, `stats`, `clock` or `filters`, with the snapshot its reads come from once taken.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
@@ -142,6 +145,9 @@ fn render(text: Text) -> Arc<[u8]> {
                     Loaded::Empty => Ok(()),
                 };
             }
+        }
+        Text::Clock => {
+            let _ = write!(out, "{}", trace::clock::choice().line());
         }
     }
     Arc::from(out.into_bytes())
@@ -285,6 +291,7 @@ impl KernelScheme for TraceScheme {
             Path::Events => (Text::Events, InternalFlags::POSITIONED),
             Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
             Path::Filters => (Text::Filters, InternalFlags::POSITIONED),
+            Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
             Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
             Path::Crash => return Err(Error::new(ENOENT)),
             Path::Cpu(cpu) if cpu < crate::cpu_count() => {
@@ -375,7 +382,7 @@ impl KernelScheme for TraceScheme {
                 text: Text::Crash, ..
             } => crash_command(buf),
             Handle::Text {
-                text: Text::Stats | Text::Filters,
+                text: Text::Stats | Text::Clock | Text::Filters,
                 ..
             } => Err(Error::new(EBADF)),
         }
@@ -449,6 +456,9 @@ impl KernelScheme for TraceScheme {
                 text: Text::Filters,
                 ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::FILTERS_PATH),
+            Handle::Text {
+                text: Text::Clock, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CLOCK_PATH),
             Handle::Text {
                 text: Text::Crash, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CRASH_PATH),

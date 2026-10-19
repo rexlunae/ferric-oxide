@@ -8,6 +8,7 @@
 //! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>`, `disable <selection>`, or `filter <event> <filter\|none>` |
 //! | [`STATS_PATH`] | one [`StatsLine`] per CPU | — |
 //! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it (a [`FilterBusyLine`] for one that could not be read) | — |
+//! | [`CLOCK_PATH`] | one [`ClockLine`](crate::clock::ClockLine): the clock behind the timestamps | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
@@ -56,6 +57,9 @@ pub const STATS_PATH: &str = "stats";
 /// The file listing the argument filters that are set ([`crate::filter`]).
 pub const FILTERS_PATH: &str = "filters";
 
+/// The file naming the clock record timestamps come from ([`crate::clock`]).
+pub const CLOCK_PATH: &str = "clock";
+
 /// The crash dump the previous boot's panic left ([`crate::crash`]), with `kernel.trace_crash`.
 ///
 /// It exists only when there is a dump: opening it otherwise fails with `ENOENT`. Reads give
@@ -102,6 +106,8 @@ pub enum Path {
     Stats,
     /// [`FILTERS_PATH`].
     Filters,
+    /// [`CLOCK_PATH`].
+    Clock,
     /// `cpu/<n>`: the records of CPU `n`.
     Cpu(u32),
     /// [`CRASH_PATH`].
@@ -116,6 +122,7 @@ impl Path {
             EVENTS_PATH => Some(Path::Events),
             STATS_PATH => Some(Path::Stats),
             FILTERS_PATH => Some(Path::Filters),
+            CLOCK_PATH => Some(Path::Clock),
             CRASH_PATH => Some(Path::Crash),
             other => {
                 let n = other.strip_prefix(CPU_DIR)?.strip_prefix('/')?;
@@ -270,6 +277,8 @@ pub enum LineError {
     Level,
     /// The state field is neither `on` nor `off`.
     State,
+    /// The clock field is not a clock name ([`crate::clock::Clock`]).
+    Clock,
 }
 
 impl fmt::Display for LineError {
@@ -279,6 +288,7 @@ impl fmt::Display for LineError {
             LineError::Number => "a field is not a number",
             LineError::Level => "unknown level",
             LineError::State => "state is not on or off",
+            LineError::Clock => "unknown clock",
         })
     }
 }
@@ -286,7 +296,7 @@ impl fmt::Display for LineError {
 impl core::error::Error for LineError {}
 
 /// The fields of `line` split at spaces, which must be exactly `N` of them.
-fn fields<const N: usize>(line: &str) -> Result<[&str; N], LineError> {
+pub(crate) fn fields<const N: usize>(line: &str) -> Result<[&str; N], LineError> {
     let mut out = [""; N];
     let mut parts = line.trim_end_matches('\n').split(' ');
     for slot in &mut out {
@@ -299,7 +309,7 @@ fn fields<const N: usize>(line: &str) -> Result<[&str; N], LineError> {
 }
 
 /// A number field.
-fn number<T: FromStr>(field: &str) -> Result<T, LineError> {
+pub(crate) fn number<T: FromStr>(field: &str) -> Result<T, LineError> {
     field.parse().map_err(|_| LineError::Number)
 }
 
@@ -460,6 +470,7 @@ mod tests {
         assert_eq!(Path::parse("events"), Some(Path::Events));
         assert_eq!(Path::parse("/stats/"), Some(Path::Stats));
         assert_eq!(Path::parse("filters"), Some(Path::Filters));
+        assert_eq!(Path::parse("clock"), Some(Path::Clock));
         assert_eq!(Path::parse("crash"), Some(Path::Crash));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));
         assert_eq!(Path::parse("cpu/17"), Some(Path::Cpu(17)));

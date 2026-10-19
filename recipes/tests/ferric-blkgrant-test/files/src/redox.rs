@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ferric_blkgrant::abi::{EncodeError, Request as DiskRequest, Slot, Transfer};
 use ferric_blkqueue::QueuePolicy;
-use ferric_blkqueue::ab::{self, Comparison};
+use ferric_blkqueue::ab::{self, Comparison, Verdict};
 use ferric_regbuf::abi::{
     Access, BytesError, GrantId, GrantInfo, GrantSpec, REGION_PATH, Request, SCHEME_NAME,
 };
@@ -33,8 +33,6 @@ const BENCH: [(usize, usize); 2] = [(128 << 10, 32 << 20), (4 << 10, 8 << 20)];
 const BENCH_THREADS: [usize; 3] = [1, 2, 4];
 /// The bytes one round of the threaded benchmark reads, between its threads.
 const BENCH_ROUND_BYTES: usize = 4 << 20;
-/// Rounds of each queue policy in the threaded benchmark's same-boot A/B.
-const BENCH_ROUNDS: usize = 3;
 /// The slot of the read-write grant over the whole buffer.
 const SLOT_RW: u64 = 0;
 /// The slot of a read-only grant of the first page.
@@ -492,11 +490,13 @@ fn bench_round(read: &Disk, threads: usize) -> Result<u32, Failure> {
 /// Prints one `FERRIC_BENCH nvme-read-4k-t<N>` line for each of [`BENCH_THREADS`]: `N`
 /// threads `pread` 4 KiB blocks at once.
 ///
-/// With per-CPU queue pairs, it is a same-boot A/B: [`BENCH_ROUNDS`] rounds of each queue
-/// policy, in alternating order, then the medians (`copy_iops` is the default policy's,
-/// `single_iops` the main queue alone, `workers_iops` every request on a worker) and the
-/// verdict of `ferric_blkqueue::ab` for the default against the single queue (`ab=pass` or
-/// `ab=fail`). Without them, `ab=none` and every round is the one path there is.
+/// With per-CPU queue pairs, it is a same-boot A/B: [`ab::ROUNDS`] rounds of each queue
+/// policy, in alternating order, and [`ab::CONFIRM_ROUNDS`] more when `ferric_blkqueue::ab`
+/// asks for them. The line gives the medians (`copy_iops` is the default policy's,
+/// `single_iops` the main queue alone, `workers_iops` every request on a worker), the median
+/// of the default's per-round ratio to the single queue, the tolerance, the rounds run, and
+/// the verdict (`ab=pass` or `ab=fail`). Without per-CPU queue pairs, `ab=none` and every
+/// round is the one path there is.
 fn bench_threads(read: &Disk) -> Result<(), Failure> {
     const POLICIES: [QueuePolicy; 3] = [
         QueuePolicy::MainQueue,
@@ -505,44 +505,66 @@ fn bench_threads(read: &Disk) -> Result<(), Failure> {
     ];
     let percore = set_policy(read, QueuePolicy::Adaptive)?;
     for threads in BENCH_THREADS {
-        // Per round, per policy in POLICIES order.
-        let mut rounds = [[0_u32; POLICIES.len()]; BENCH_ROUNDS];
-        for (round, samples) in rounds.iter_mut().enumerate() {
-            for step in 0..POLICIES.len() {
-                // Alternate the order, so drift during the run does not favour one policy.
-                let k = if round % 2 == 0 {
-                    step
-                } else {
-                    POLICIES.len() - 1 - step
-                };
-                if percore {
-                    set_policy(read, POLICIES[k])?;
-                }
-                samples[k] = bench_round(read, threads)?;
+        // Per policy in POLICIES order, per round.
+        let mut samples = [[0_u32; ab::MAX_ROUNDS]; POLICIES.len()];
+        let mut rounds = 0;
+        let mut batch = ab::ROUNDS;
+        let cmp = loop {
+            for round in rounds..rounds + batch {
+                bench_round_policies(read, threads, percore, round, &POLICIES, &mut samples)?;
             }
-        }
+            rounds += batch;
+            let cmp = Comparison::new(&samples[0][..rounds], &samples[1][..rounds]);
+            if !percore || cmp.verdict() != Verdict::Confirm {
+                break cmp;
+            }
+            batch = ab::CONFIRM_ROUNDS;
+        };
         if percore {
             set_policy(read, QueuePolicy::Adaptive)?;
         }
-        let column = |k: usize| rounds.map(|samples| samples[k]);
-        let (mut single, mut adaptive, mut workers) = (column(0), column(1), column(2));
-        let cmp = Comparison::new(&mut single, &mut adaptive);
-        let verdict = match (percore, cmp.passes()) {
+        let verdict = match (percore, cmp.verdict()) {
             (false, _) => "none",
-            (true, true) => "pass",
-            (true, false) => "fail",
+            (true, Verdict::Pass) => "pass",
+            (true, _) => "fail",
         };
         println!(
             "FERRIC_BENCH nvme-read-4k-t{threads} bytes={} copy_mib_s={:.1} copy_iops={} \
-             single_iops={} workers_iops={} ab_ratio={} ab_tolerance={} ab={verdict}",
-            BENCH_ROUND_BYTES * BENCH_ROUNDS,
+             single_iops={} workers_iops={} ab_ratio={} ab_tolerance={} ab_rounds={rounds} \
+             ab={verdict}",
+            BENCH_ROUND_BYTES * rounds,
             f64::from(cmp.candidate) * 4096.0 / f64::from(1 << 20),
             cmp.candidate,
             cmp.baseline,
-            ab::median(&mut workers),
-            cmp.ratio(),
+            ab::median(&mut samples[2][..rounds]),
+            cmp.ratio,
             cmp.tolerance,
         );
+    }
+    Ok(())
+}
+
+/// Runs round `round` of every policy in `policies`, recording each one's IOPS in
+/// `samples[policy][round]`. Odd rounds run the policies in reverse order, so drift during
+/// the run does not favour one policy.
+fn bench_round_policies(
+    read: &Disk,
+    threads: usize,
+    percore: bool,
+    round: usize,
+    policies: &[QueuePolicy],
+    samples: &mut [[u32; ab::MAX_ROUNDS]],
+) -> Result<(), Failure> {
+    for step in 0..policies.len() {
+        let k = if round.is_multiple_of(2) {
+            step
+        } else {
+            policies.len() - 1 - step
+        };
+        if percore {
+            set_policy(read, policies[k])?;
+        }
+        samples[k][round] = bench_round(read, threads)?;
     }
     Ok(())
 }
