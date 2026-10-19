@@ -62,7 +62,8 @@ enum Cmd {
         #[arg(long, short)]
         output: Option<PathBuf>,
         /// The TSC frequency of the traced machine in MHz, to turn cycles into time (at least
-        /// 1 MHz)
+        /// 1 MHz). Used when the capture's timestamps are TSC cycles; a capture whose clock is
+        /// the KVM clock or the HPET carries its own rate
         #[arg(long, default_value = "1000")]
         tsc_mhz: perfetto::TscMhz,
     },
@@ -123,7 +124,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             tsc_mhz,
         } => {
             let capture = loader(partial)(&inputs)?;
-            let json = perfetto::to_json(&capture, tsc_mhz);
+            let rate = perfetto::TickRate::for_clock(capture.clock(), tsc_mhz);
+            let json = perfetto::to_json(&capture, rate);
             match output {
                 Some(path) => {
                     fs::write(&path, json).map_err(|source| CliError::Write { path, source })
@@ -154,6 +156,11 @@ fn crash(dump: &std::path::Path, out: Option<&std::path::Path>) -> Result<(), Cl
     match &report.message {
         Some((cpu, message)) => writeln!(w, "panic on CPU {cpu}: {message}"),
         None => writeln!(w, "no panic message"),
+    }
+    .map_err(write_error)?;
+    match report.clock {
+        Some(clock) => write!(w, "{clock}"),
+        None => writeln!(w, "clock not recorded (TSC cycles)"),
     }
     .map_err(write_error)?;
     for cpu in &report.cpus {

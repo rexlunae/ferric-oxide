@@ -3,7 +3,9 @@
 //!
 //! [`drain_scheme`] reads the scheme's `stats` file for the list of CPUs and saves it as
 //! `stats.start`, drains each `cpu/<n>` file into `cpu<n>`, then reads `stats` again and saves
-//! it as `stats.end`, so records dropped while the capture ran are counted too.
+//! it as `stats.end`, so records dropped while the capture ran are counted too. It also copies
+//! the scheme's `clock` file, which says what the timestamps count, when the kernel has one
+//! (kernels before T3d do not).
 //!
 //! The capture is a snapshot: a CPU is drained until it has given the bytes `stats.start`
 //! listed as pending for it, or until a read returns 0 bytes (the ring is empty), whichever
@@ -182,6 +184,7 @@ fn absolute(path: &Path) -> PathBuf {
 fn drain_into(scheme: &Path, dir: &Path) -> Result<Vec<CpuDrained>, DrainError> {
     let marker = dir.join(INCOMPLETE);
     fs::write(&marker, "ferric-trace capture did not finish\n").map_err(io_error(&marker))?;
+    copy_clock(scheme, &dir.join(crate::capture::CLOCK))?;
     let start = snapshot(scheme, &dir.join(STATS_START))?;
     let mut drained = Vec::with_capacity(start.len());
     for line in &start {
@@ -210,6 +213,16 @@ fn count_losses(drained: &mut [CpuDrained], end: &[StatsLine]) {
         if let Some(line) = end.iter().find(|l| l.cpu == cpu.cpu) {
             cpu.lost_during = line.lost.saturating_sub(cpu.lost_before);
         }
+    }
+}
+
+/// Copies the scheme's `clock` file to `to`, if the kernel has one.
+fn copy_clock(scheme: &Path, to: &Path) -> Result<(), DrainError> {
+    let path = scheme.join(abi::CLOCK_PATH);
+    match fs::read(&path) {
+        Ok(bytes) => fs::write(to, bytes).map_err(io_error(to)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DrainError::Io { path, source }),
     }
 }
 
@@ -443,8 +456,26 @@ mod tests {
         let capture = Capture::load(std::slice::from_ref(&saved)).expect("loads back");
         assert_eq!(capture.cpus(), [0, 2]);
         assert_eq!(capture.entries().len(), 2);
+        // The stand-in has no clock file, as a kernel before T3d.
+        assert_eq!(capture.clock(), None);
         assert!(saved.join(STATS_START).is_file() && saved.join(STATS_END).is_file());
         assert!(!saved.join(INCOMPLETE).exists());
+    }
+
+    #[test]
+    fn copies_the_clock() {
+        use ferric_trace::clock::{Clock, ClockLine};
+        let scheme = stand_in_scheme();
+        let line = ClockLine {
+            clock: Clock::KvmClock,
+            period_fs: Some(1_000_000),
+        };
+        fs::write(scheme.path().join("clock"), line.to_string()).expect("write");
+        let out = tempfile::tempdir().expect("temp dir");
+        let saved = out.path().join("capture");
+        drain_scheme(scheme.path(), &saved).expect("drains");
+        let capture = Capture::load(std::slice::from_ref(&saved)).expect("loads back");
+        assert_eq!(capture.clock(), Some(line));
     }
 
     #[test]

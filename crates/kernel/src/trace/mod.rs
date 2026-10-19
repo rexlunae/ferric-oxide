@@ -19,12 +19,15 @@
 //!   memory that survives a warm reboot, for the next boot to hand out (`crash`).
 //!
 //! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
-//! records after a header page). Tracepoints may only sit
+//! records after a header page), stamped by the clock the `clock` module picks at boot: an invariant
+//! TSC, else the KVM clock, else the HPET. Tracepoints may only sit
 //! where interrupts are off, as in the system call path and the scheduler: then nothing else
 //! runs on the CPU while a record is written, and the CPU's ring has a single producer.
 
 #[cfg(feature = "trace_crash")]
 pub mod crash;
+#[cfg(feature = "trace")]
+pub mod clock;
 #[cfg(feature = "trace")]
 mod imp;
 

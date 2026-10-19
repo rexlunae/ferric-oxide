@@ -9,9 +9,9 @@
 //!   areas.
 //! - [`init`], in `kmain`, copies a complete dump the previous boot left there to the heap (the
 //!   scheme's `crash` file serves it), logs its panic message, and arms the region again.
-//! - [`dump`], from the panic handler, writes the panic message and the newest records of every
-//!   CPU's ring there. Other CPUs keep running meanwhile; their records are copied with atomic
-//!   loads, and a torn one is rejected by the reader.
+//! - [`dump`], from the panic handler, writes the panic message, the timestamp clock and the
+//!   newest records of every CPU's ring there. Other CPUs keep running meanwhile; their records
+//!   are copied with atomic loads, and a torn one is rejected by the reader.
 //!
 //! With `kernel.trace_crash_test`, writing `panic` to the scheme's `crash` file calls
 //! [`test_panic`], after which the panic handler resets the machine instead of halting, so CI
@@ -147,6 +147,7 @@ pub fn dump(info: &PanicInfo) {
         return;
     };
     writer.message(crate::cpu_id().get(), message.as_bytes());
+    writer.clock(super::clock::current());
     let count = crate::cpu_count();
     for cpu in 0..count {
         let Some(ring) = super::ring(LogicalCpuId::new(cpu)) else {
