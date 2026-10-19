@@ -15,7 +15,7 @@ log.workspace = true
 orbclient.workspace = true
 plain.workspace = true
 redox_syscall.workspace = true
-rehid = { git = "https://gitlab.redox-os.org/redox-os/rehid.git" }
+rehid = { git = "https://github.com/rexlunae/rehid.git" } # Ferric mirror of redox-os/rehid
 smallvec.workspace = true
 xhcid = { path = "../../usb/xhcid" }
 

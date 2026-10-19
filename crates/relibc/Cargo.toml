@@ -107,8 +107,8 @@ libm = "0.2"
 log = "0.4"
 spin = "0.9.8"
 argon2 = "0.5.3"
-redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", default-features = false, features = ["sync"] }
-redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]}
+redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", default-features = false, features = ["sync"] } # Ferric mirror of redox-os/redox-rings
+redox-buffer-pool = { git = "https://github.com/rexlunae/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]} # Ferric mirror of redox-os/redox-buffer-pool
 
 zerocopy = { version = "0.8.55", features = ["derive"] }
 
@@ -119,7 +119,7 @@ features = ["c_api"]
 
 [dependencies.object]
 version = "0.36.7"
-git = "https://gitlab.redox-os.org/andypython/object"
+git = "https://github.com/rexlunae/object"
 branch = "new"
 default-features = false
 features = ["elf", "read_core"]
@@ -154,4 +154,5 @@ panic = "abort"
 panic = "abort"
 
 [patch.crates-io]
-redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/kernel.git" }
+# Ferric Oxide: the in-tree kernel subtree supplies redox_syscall.
+redox_syscall = { path = "../kernel/syscall" }
