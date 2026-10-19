@@ -198,6 +198,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-hwrand"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,7 +342,7 @@ dependencies = [
 [[package]]
 name = "object"
 version = "0.36.7"
-source = "git+https://gitlab.redox-os.org/andypython/object?branch=new#da781336d847df0deb897ed1162785f6c2057c56"
+source = "git+https://github.com/rexlunae/object?branch=new#da781336d847df0deb897ed1162785f6c2057c56"
 dependencies = [
  "memchr",
 ]
@@ -457,7 +461,7 @@ dependencies = [
 [[package]]
 name = "redox-buffer-pool"
 version = "0.6.0"
-source = "git+https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git#259719734304f6d2138b8b910fbdac663ebe6ff0"
+source = "git+https://github.com/rexlunae/redox-buffer-pool.git#259719734304f6d2138b8b910fbdac663ebe6ff0"
 dependencies = [
  "guard-trait",
  "log",
@@ -482,7 +486,7 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 [[package]]
 name = "redox-rings"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
+source = "git+https://github.com/rexlunae/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
 dependencies = [
  "bitflags",
  "redox_syscall",
@@ -494,6 +498,7 @@ name = "redox-rt"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "ferric-hwrand",
  "generic-rt",
  "goblin",
  "ioslice",
@@ -517,7 +522,6 @@ dependencies = [
 [[package]]
 name = "redox_syscall"
 version = "0.9.4"
-source = "git+https://gitlab.redox-os.org/redox-os/kernel.git#7a7353f22bdfbc0156b1b63102244b776d05c511"
 dependencies = [
  "bitflags",
 ]
