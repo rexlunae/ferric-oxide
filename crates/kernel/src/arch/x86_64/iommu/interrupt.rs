@@ -472,10 +472,14 @@ pub fn move_vector(
     }
     let from = (apic_id(from_cpu)?, from_vector);
     let to_apic = apic_id(to_cpu)?;
+    // Every unit's lock is held from the check to the last write, in `units()` order (nothing
+    // else holds two at once), so no entry can be allocated or freed in between: a move either
+    // changes nothing or rewrites every matching entry.
+    let mut states: Vec<_> = units().iter().map(|unit| (unit, unit.state.lock())).collect();
     // Every unit with an entry to move must be able to name the new destination before any
     // entry changes; a unit without one (in xAPIC format, say) does not matter.
-    for unit in units() {
-        if let Some(table) = unit.state.lock().interrupts.as_mut()
+    for (_, state) in &mut states {
+        if let Some(table) = state.interrupts.as_mut()
             && Destination::for_apic(to_apic, table.extended).is_none()
             && holds(table, from)
         {
@@ -484,16 +488,12 @@ pub fn move_vector(
     }
     let mut moved: u32 = 0;
     let mut result: Result<(), IrqError> = Ok(());
-    for unit in units() {
-        let mut state = unit.state.lock();
+    for (unit, state) in &mut states {
         let Some(table) = state.interrupts.as_mut() else {
             continue;
         };
         let Some(destination) = Destination::for_apic(to_apic, table.extended) else {
-            // The preflight found nothing to move here; an entry allocated since cannot move.
-            if holds(table, from) {
-                result = Err(IrqError::Destination { apic_id: to_apic });
-            }
+            // The check above found nothing to move here, and the lock keeps it so.
             continue;
         };
         let used: Vec<u16> = table.entries.used().collect();
@@ -518,10 +518,11 @@ pub fn move_vector(
             requests = alloc::vec![Request::IecGlobal];
         }
         // Keep going on a failure, so every unit's entries agree on where the vector is.
-        if let Err(err) = unit.invalidate(&mut state, &requests) {
+        if let Err(err) = unit.invalidate(state, &requests) {
             result = Err(IrqError::Hardware(err));
         }
     }
+    drop(states);
     result?;
     if moved != 0 {
         info!(
