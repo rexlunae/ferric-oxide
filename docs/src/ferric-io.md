@@ -63,6 +63,22 @@ descendants are gone, including work started by another thread. CPU teardown
 includes TLB shootdowns; DMA teardown includes completed IOTLB invalidation.
 New mappings of revoked grants fail with `ECANCELED`.
 
+A revoke, or the region's close, takes the registered frames away from a
+holder at a moment the holder did not choose. So a holder's CPU mapping is
+not unmapped but replaced in place, under one hold of the holder's address
+space lock, with zeroed private anonymous memory of the same protection. The
+frames are unpinned and the TLBs shot down as before, so the holder can no
+longer see or change the owner's memory. But the range stays mapped: the
+holder reads zeros there, its writes go to its own private pages, and it never
+faults on memory it was granted. A driver that keeps a grant mapped (such as
+a kernel-bypass queue socket's UMEM in `driver-network`) can therefore check
+`GrantInfo::revoked` once per tick and stop serving the grant, without a
+revoke between the check and an access crashing it. The replacement memory
+is the holder's to `munmap` like any other. When the holder itself lets go,
+with `Request::Unmap` or by closing its grant, the mapping is unmapped as
+before. `crates/regbuf/src/table.rs` records why each mapping is taken down
+(`Teardown`), and its host tests cover which operations keep the range.
+
 If teardown fails, the request reports an error such as `EIO`; it does not
 promise revocation completed. The mapping stays recorded for retry, and its
 frames remain pinned. Closed regions with outstanding mappings are retained

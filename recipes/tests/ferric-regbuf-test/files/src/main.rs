@@ -20,7 +20,8 @@
 //! - `regbuf-reshare-mmap`: the scheme answers the application's `mmap` of it, shared and
 //!   private, with its grant mapping's address; the kernel refuses (`EPERM`), so the pages
 //!   cannot escape revocation. Had it not, the step checks whether the re-shared mapping
-//!   survives a revoke; it fails either way. The revoke still takes the scheme's mapping.
+//!   survives a revoke; it fails either way. The revoke still takes the region's pages from
+//!   the scheme's mapping.
 //! - `regbuf-reshare-register`: the scheme cannot register its grant mapping in a region of
 //!   its own (`EPERM`).
 //! - `regbuf-reshare-borrow`: nor the buffer of a `read` it serves, borrowed from the
@@ -28,13 +29,16 @@
 //! - `regbuf-forward-borrow`: a scheme can still pass such a buffer on in a request of its own
 //!   (to a second instance of the test scheme), and the data arrives.
 //! - `regbuf-revoke`: after the application revokes the read-write grant, the scheme's mapping
-//!   is gone (a system call given its address gets `EFAULT`), mapping the grant again fails
-//!   with `ECANCELED`, and the read-only grant still reaches the application's pages.
+//!   stays mapped but holds zeros (a system call given its address works, so the holder never
+//!   faults), what the scheme writes there no longer reaches the application, mapping the
+//!   grant again fails with `ECANCELED`, and the read-only grant still reaches the
+//!   application's pages.
 //! - `regbuf-unmap`: the scheme drops its read-only mapping with the `Unmap` call.
-//! - `regbuf-close`: closing the region revokes the remaining grant (its fresh mapping is gone,
-//!   new ones fail) and unpins the pages (the pinned count returns to where it was).
+//! - `regbuf-close`: closing the region revokes the remaining grant (its fresh mapping holds
+//!   zeros, new ones fail) and unpins the pages (the pinned count returns to where it was).
 //! - `regbuf-shared`: a `MAP_SHARED` anonymous buffer registers too; the scheme and the
-//!   application see each other's writes, and revoke takes the scheme's mapping away.
+//!   application see each other's writes, and revoke takes the shared pages from the scheme's
+//!   mapping (it holds zeros, and its writes stay its own).
 //! - `regbuf-bytes`: a byte-granular read-write grant maps its window; the scheme sees only the
 //!   granted bytes (zeros elsewhere), writes the wholly granted page in place, and after the
 //!   revoke exactly the granted bytes hold its writes. A read-only grant of 0x20 bytes inside

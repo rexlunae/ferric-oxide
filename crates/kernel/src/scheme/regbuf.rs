@@ -32,8 +32,12 @@
 //!   `Mapping` with a `DmaRecord`), and taking it down unmaps it from the domain with the
 //!   IOTLB invalidated and waited on, so the device's DMA to the old IOVA faults.
 //! - [`Request::Revoke`](ferric_regbuf::abi::Request::Revoke) on the region, or closing the region, marks grants revoked (mapping
-//!   them again fails with `ECANCELED`) and unmaps every recorded mapping, with a TLB shootdown,
-//!   before it returns. Closing the region also unpins its frames and refunds the charge.
+//!   them again fails with `ECANCELED`) and takes every recorded mapping down, with a TLB
+//!   shootdown, before it returns. A holder's CPU mapping is not unmapped but replaced in place
+//!   with zeroed private memory (`AddrSpaceWrapper::replace_with_zeroed`,
+//!   [`Teardown::Revoked`]): the holder did not choose the moment and may still be using it, so
+//!   it reads zeros there instead of faulting. The holder's own `Unmap` or close of its grant
+//!   unmaps. Closing the region also unpins its frames and refunds the charge.
 //!
 //! Locks: a region's lock is taken before an address space's lock (mapping) and before the
 //! `iommu` scheme's handle table (`MapGrant`), never after.
@@ -69,7 +73,7 @@ use core::{
 use ferric_regbuf::{
     abi::{GrantId, GrantInfo, GrantSpec, PathError, Request, Usage, REGION_PATH},
     budget::{Budget, Limits},
-    table::{GrantTable, MapPlan, PartialPage, TableError, Taken},
+    table::{GrantTable, MapPlan, PartialPage, TableError, Taken, Teardown},
 };
 use spin::Mutex;
 use syscall::{
@@ -336,14 +340,16 @@ fn path_errno(err: &PathError) -> Error {
     })
 }
 
-/// Unmaps `mapping`. A mapping whose address space has gone needs nothing. An IOMMU mapping
-/// is unmapped with the IOTLB invalidated and waited on before this returns.
+/// Takes `mapping` down. A mapping whose address space has gone needs nothing. An IOMMU mapping
+/// is unmapped with the IOTLB invalidated and waited on before this returns. A CPU mapping is
+/// unmapped when its holder let go of it, and replaced in place with zeroed memory when the
+/// owner revoked it ([`Teardown::keeps_range`]), so a holder still using it never faults.
 ///
 /// # Errors
 ///
 /// What `munmap` returns, or `EIO` when the IOMMU unmap or its invalidation failed; the
 /// mapping is then still there.
-fn unmap_one(mapping: &Mapping, token: &mut CleanLockToken) -> Result<()> {
+fn unmap_one(mapping: &Mapping, teardown: Teardown, token: &mut CleanLockToken) -> Result<()> {
     #[cfg(iommu_enabled)]
     if let Some(record) = mapping.dma {
         return super::iommu::revoke_grant_mapping(record);
@@ -353,7 +359,17 @@ fn unmap_one(mapping: &Mapping, token: &mut CleanLockToken) -> Result<()> {
     };
     // Unpinning is what lets the pinned borrows go; the holder could not have removed or
     // replaced them, so the span still holds exactly this mapping.
-    let notify = space.munmap(mapping.span, true, token).inspect_err(|err| {
+    let notify = if teardown.keeps_range() {
+        let flags = if mapping.writable {
+            MapFlags::PROT_READ | MapFlags::PROT_WRITE
+        } else {
+            MapFlags::PROT_READ
+        };
+        space.replace_with_zeroed(mapping.span, flags, token)
+    } else {
+        space.munmap(mapping.span, true, token)
+    }
+    .inspect_err(|err| {
         warn!(
             "regbuf: cannot unmap {:#x} ({} pages): {err:?}",
             mapping.span.base.start_address().data(),
@@ -380,7 +396,7 @@ fn take_down(
     let outcomes: Vec<_> = taken
         .into_iter()
         .map(|taken| {
-            let outcome = unmap_one(&taken.mapping, token);
+            let outcome = unmap_one(&taken.mapping, taken.teardown, token);
             (taken, outcome)
         })
         .collect();
@@ -574,7 +590,7 @@ impl KernelScheme for RegBufScheme {
         if let Err((err, mapping)) = region.grants.add_mapping(id, mapping) {
             // Not reached: the region stayed locked since check_map.
             drop(region);
-            unmap_one(&mapping, token)?;
+            unmap_one(&mapping, Teardown::Holder, token)?;
             return Err(table_errno(&err));
         }
         Ok(span.base.start_address().data())
@@ -810,7 +826,7 @@ fn map_frames(
         return (span, Ok(()));
     }
     // The page tables ran out part way.
-    match unmap_one(&Mapping::plain(space, span), token) {
+    match unmap_one(&Mapping::plain(space, span), Teardown::Holder, token) {
         Ok(()) => (PageSpan::empty(), Err(Error::new(ENOMEM))),
         Err(_) => (span, Err(Error::new(ENOMEM))),
     }

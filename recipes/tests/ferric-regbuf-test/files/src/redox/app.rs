@@ -544,14 +544,30 @@ fn pinned_mapping(t: &mut Test) -> Result<(), Failure> {
     )
 }
 
+/// Checks the scheme's kept mapping in `slot`, whose grant was revoked or whose region closed:
+/// it is still mapped (the holder never faults on memory it was granted) but holds zeros, none
+/// of the region's bytes.
+fn expect_zeroed(t: &Test, slot: u64) -> Result<(), Failure> {
+    t.scheme
+        .op("a system call on the revoked mapping", Op::Probe, slot, 0)?;
+    t.scheme
+        .op("the revoked mapping reads zeros", Op::Check, slot, 0)?;
+    Ok(())
+}
+
 fn revoke(t: &mut Test) -> Result<(), Failure> {
     t.scheme.op("probe before revoke", Op::Probe, SLOT_RW, 0)?;
     call(region(t)?, "Revoke", Request::Revoke(t.rw))?;
-    expect_errno(
-        "a system call on the revoked mapping",
-        errno::EFAULT,
-        t.scheme.op("probe", Op::Probe, SLOT_RW, 0),
-    )?;
+    expect_zeroed(t, SLOT_RW)?;
+    // What the scheme writes there now is its own: none of it reaches the application.
+    let before = t.buffer.bytes().to_vec();
+    t.scheme
+        .op("write the revoked mapping", Op::Fill, SLOT_RW, 0x5a)?;
+    if t.buffer.bytes() != before.as_slice() {
+        return Err(Failure::Data {
+            what: "the app's buffer after the scheme wrote its revoked mapping",
+        });
+    }
     expect_errno(
         "mapping a revoked grant",
         errno::ECANCELED,
@@ -580,11 +596,7 @@ fn unmap(t: &mut Test) -> Result<(), Failure> {
 
 fn close(t: &mut Test) -> Result<(), Failure> {
     drop(t.region.take());
-    expect_errno(
-        "a system call on a mapping of a closed region",
-        errno::EFAULT,
-        t.scheme.op("probe", Op::Probe, SLOT_RO, 0),
-    )?;
+    expect_zeroed(t, SLOT_RO)?;
     expect_errno(
         "mapping a grant of a closed region",
         errno::ECANCELED,
@@ -695,13 +707,9 @@ fn reshare_mmap(t: &mut Test) -> Result<(), Failure> {
             }
         }
     }
-    // Revoking still takes the scheme's own mapping away.
+    // Revoking still takes the region's pages from the scheme's own mapping.
     call(region(t)?, "Revoke", Request::Revoke(id))?;
-    expect_errno(
-        "a system call on the revoked mapping",
-        errno::EFAULT,
-        t.scheme.op("probe", Op::Probe, SLOT_RESHARE, 0),
-    )
+    expect_zeroed(t, SLOT_RESHARE)
 }
 
 /// The scheme cannot register its grant mapping in a region of its own and grant it on.
@@ -814,11 +822,18 @@ fn shared(t: &mut Test) -> Result<(), Failure> {
     t.scheme
         .op("scheme sees the app's write", Op::Check, SLOT_SHARED, 0x35)?;
     call(&region, "Revoke", Request::Revoke(id))?;
-    expect_errno(
-        "a system call on the revoked shared mapping",
-        errno::EFAULT,
-        t.scheme.op("probe", Op::Probe, SLOT_SHARED, 0),
+    expect_zeroed(t, SLOT_SHARED)?;
+    t.scheme.op(
+        "write the revoked shared mapping",
+        Op::Fill,
+        SLOT_SHARED,
+        0x36,
     )?;
+    if buffer.bytes().iter().any(|&b| b != 0x35) {
+        return Err(Failure::Data {
+            what: "the shared buffer after the scheme wrote its revoked mapping",
+        });
+    }
     drop(region);
     unpinned(t, "after closing the shared region")
 }
@@ -872,11 +887,7 @@ fn bytes(t: &mut Test) -> Result<(), Failure> {
         0x77,
     )?;
     drop(region);
-    expect_errno(
-        "a system call on a mapping of a closed region",
-        errno::EFAULT,
-        t.scheme.op("probe", Op::Probe, SLOT_BYTES_RO, 0),
-    )?;
+    expect_zeroed(t, SLOT_BYTES_RO)?;
     unpinned(t, "after closing the byte-granular region")
 }
 
