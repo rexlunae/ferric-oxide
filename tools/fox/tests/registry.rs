@@ -313,6 +313,32 @@ fn audit_reports_advised_packages_and_system_sboms_list_them() {
     assert_eq!(report["findings"][0]["patched"][0], ">=0.3.1");
     assert_eq!(report["advisories"], 1);
 
+    // The registry says tiny 0.3.0 is not affected: the finding is set
+    // aside, and comes back with --no-vex.
+    Registry::open(reg.dir.path())
+        .unwrap()
+        .write_vex(
+            "tiny-0001",
+            br#"{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+                "vulnerabilities": [{"id": "FOX-2026-0001",
+                  "analysis": {"state": "not_affected", "justification": "code_not_reachable"},
+                  "affects": [{"ref": "pkg:generic/tiny@0.3.0"}]}]}"#,
+        )
+        .unwrap();
+    reg.sign_and_commit();
+    assert!(env.fox(&["registry", "update"]).status.success());
+    let audit = env.fox(&["--json", "audit"]);
+    assert!(audit.status.success(), "{}", stderr(&audit));
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(report["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(report["suppressed"][0]["advisory"], "FOX-2026-0001");
+    assert_eq!(report["suppressed"][0]["vex"]["state"], "not_affected");
+    assert_eq!(
+        report["suppressed"][0]["vex"]["document"],
+        "vex/tiny-0001.cdx.json"
+    );
+    assert!(!env.fox(&["audit", "--no-vex"]).status.success());
+
     let sbom = json(&env.fox(&["sbom", "--system", "--name", "test-image"]));
     assert_eq!(sbom["metadata"]["component"]["name"], "test-image");
     let tiny = &sbom["components"][0];

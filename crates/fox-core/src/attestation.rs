@@ -128,10 +128,10 @@ pub enum SignatureFormat {
 #[non_exhaustive]
 pub enum CpuLevel {
     /// x86-64-v3 (AVX2, BMI2, FMA): the baseline.
-    #[serde(rename = "x86_64-v3")]
+    #[serde(rename = "x86_64-v3", alias = "v3", alias = "x86-64-v3")]
     X86_64V3,
     /// x86-64-v4 (AVX-512).
-    #[serde(rename = "x86_64-v4")]
+    #[serde(rename = "x86_64-v4", alias = "v4", alias = "x86-64-v4")]
     X86_64V4,
 }
 
@@ -141,6 +141,24 @@ pub enum CpuLevel {
 pub struct CpuLevelError(String);
 
 impl CpuLevel {
+    /// The level every x86-64 build defaults to and every x86-64 machine
+    /// Ferric Oxide runs on has.
+    pub const BASELINE: Self = Self::X86_64V3;
+
+    /// Whether CPU levels apply to `target`: true for x86-64 triples.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fox_core::CpuLevel;
+    ///
+    /// assert!(CpuLevel::applies_to("x86_64-unknown-redox"));
+    /// assert!(!CpuLevel::applies_to("aarch64-unknown-redox"));
+    /// ```
+    pub fn applies_to(target: &str) -> bool {
+        target.starts_with("x86_64-")
+    }
+
     /// The name used in attestations and file names, such as `x86_64-v3`.
     pub const fn as_str(self) -> &'static str {
         match self {

@@ -1510,6 +1510,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fox-core",
+ "fox-sbom",
  "pkgar-core 0.2.4",
  "semver",
  "serde",
@@ -1533,10 +1534,12 @@ dependencies = [
  "fox-index",
  "pkgar-keys 0.2.4",
  "semver",
+ "serde",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
  "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -4224,6 +4227,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "uuid",

@@ -377,6 +377,8 @@ pub(crate) fn build(
         .map(ToString::to_string)
         .or_else(|| args.package.clone());
     request.target = args.target.clone();
+    // A level for the machine, which applies only if the target is x86-64.
+    request.x86_64_level = args.cpu_level;
     request.features = FeatureSelection {
         default_features: !args.no_default_features,
         features: args.features.clone(),

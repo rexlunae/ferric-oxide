@@ -17,7 +17,7 @@ developed through libraries and ports; it does not make this a Linux kernel.
 | `tools/redoxer/` | Component execution/build support in a Redox environment; its example is standalone |
 | `tools/fox/` | Package verification (including build attestations), installation from archives, signed git sources or registries, trust store, install policy, `fox audit`, package and system SBOMs, and `fox sync` with `fox.lock` |
 | `tools/cargo-fox/` | `cargo fox`: hermetic package builds, signed archives, attestations and signed release tags for package authors |
-| `tools/fox-registry/` | `fox-registry`: creating a package registry, admitting packages, recording releases, checking them, building and recording prebuilt artifacts as a registry builder, publishing advisories, and signing the registry metadata; `init --github` writes the CI template |
+| `tools/fox-registry/` | `fox-registry`: creating a package registry, admitting packages, recording releases, checking them, building and recording prebuilt artifacts as a registry builder, publishing advisories, importing cookbook recipes, and signing the registry metadata; `init --github` writes the CI template |
 | `crates/kernel/` | Independent `no_std` kernel workspace, custom target specifications, linker scripts and its own lockfile |
 | `crates/bootloader/` | Standalone bootloader, including the UEFI target and optional kernel relocation |
 | `crates/relibc/` | C/POSIX library and `redox-rt` process/thread runtime, with its own workspace |

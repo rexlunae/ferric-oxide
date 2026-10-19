@@ -24,9 +24,10 @@ trust; it pins `metadata/root/1.json`.
    then open a pull request that runs `fox-registry release <name> <tag>`
    and `fox-registry sign --key <owner's SSH key>`.
 3. The `check` workflow re-verifies the tag signature, commit and tree.
-4. After the merge, the `sign` workflow builds missing artifacts, uploads
-   them and signs the targets, snapshot and timestamp roles; the
-   `timestamp` workflow renews the timestamp every six hours.
+4. After the merge, the `sign` workflow builds missing artifacts (one per
+   x86-64 level, v3 and v4), uploads them and signs the targets, snapshot
+   and timestamp roles; the `timestamp` workflow renews the timestamp every
+   six hours.
 
 ## Builders and the artifact store
 
@@ -40,6 +41,24 @@ fox-registry sign --key targets.key --key snapshot.key --key timestamp.key
 
 Clients use a prebuilt artifact only when `min-builder-signatures`
 builders listed here attest to it; otherwise they build from the tag.
+
+### Independent rebuilders
+
+The `sign` workflow runs only this registry's own builder. A second
+builder is worth counting only if it runs somewhere else, under someone
+else's control, so it has no workflow here. A rebuilder clones this
+repository and, on its own machine, runs
+
+```sh
+fox-registry rebuild --key rebuilder.key --label <label> --blobs blobs
+```
+
+It publishes `blobs/blake3/*` at a URL of its own and opens a pull request
+with the changed `artifacts/` files. A maintainer lists it with
+`fox-registry configure --builder <label>=<its public key>` and adds its
+URL with `--artifact-url` (clients try each URL in turn). After the merge,
+the `sign` workflow signs the change. Then raise the threshold with
+`configure --min-builders 2`.
 
 ## Keys
 

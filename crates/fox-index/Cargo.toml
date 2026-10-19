@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 blake3 = { workspace = true, features = ["std"] }
 fox-core = { path = "../fox-core", features = ["std"] }
+fox-sbom = { path = "../fox-sbom" }
 pkgar-core.workspace = true
 semver = { workspace = true, features = ["serde"] }
 serde.workspace = true

@@ -32,6 +32,9 @@
 //! [`SystemSbom`] merges the installed packages of a root into one
 //! document, with each package's files and the crates from its build SBOM.
 //!
+//! [`vex`] reads CycloneDX VEX documents: statements that a vulnerability
+//! does or does not affect a fox package.
+//!
 //! # Examples
 //!
 //! ```
@@ -58,6 +61,7 @@
 
 mod build;
 mod system;
+pub mod vex;
 
 use std::io::Write;
 

@@ -5,6 +5,7 @@
 //! packages/<xx>/<name>.toml              one package; <xx> is the name's first two characters
 //! artifacts/<xx>/<name>/<version>.toml   prebuilt artifacts of one release
 //! advisories/<id>.toml                   security advisories
+//! vex/<id>.cdx.json                      CycloneDX VEX statements (crate::vex)
 //! metadata/                              signed trust metadata (crate::metadata)
 //! ```
 //!
@@ -32,6 +33,9 @@ pub const ARTIFACTS_DIR: &str = "artifacts";
 
 /// The directory of advisories.
 pub const ADVISORIES_DIR: &str = "advisories";
+
+/// The directory of VEX documents.
+pub const VEX_DIR: &str = "vex";
 
 /// The registry format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
