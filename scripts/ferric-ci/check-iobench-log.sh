@@ -14,7 +14,7 @@ set -euo pipefail
 
 mode="$1"
 log="$2"
-clean="$(tr -d '\r' < "$log")"
+clean="$(tr -d '\r\000' < "$log")"
 jobs="randread-4k-qd1 randread-4k-qd32 read-128k-qd1"
 
 fail() {
