@@ -91,15 +91,22 @@ ordinary host `cargo test` is not a kernel boot test. When removing warnings,
 run the ratchet with `--update` and commit the lower baseline. The workflow
 contains the exact preparation for an IBT-configured binary.
 
-The workflow also builds kernel Rustdoc with warnings denied and `regbuf`
-and the tracing features enabled, for both `kernel.iommu = "never"` and `"auto"`. This covers common
-kernel documentation and the optional DMA-grant APIs. After generating and
-copying the desired kernel configuration, reproduce the check from
-`crates/kernel/`:
+The workflow also builds kernel Rustdoc with warnings denied, `regbuf` and the
+tracing features enabled, in two configurations: `kernel.iommu = "never"`
+without `rings`, and `"auto"` with `rings`. Between them they cover the common
+kernel documentation, the optional DMA-grant APIs and the ring scheme, and
+catch links to items that a feature compiles out. After generating and copying
+the desired kernel configuration, reproduce the check from `crates/kernel/`,
+with `FEATURES` set to the matching list:
 
 ```sh
+# iommu = "never":
+FEATURES=regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info
+# iommu = "auto":
+FEATURES=regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info
+
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
-  cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  cargo doc --locked --no-deps --features "$FEATURES" \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
