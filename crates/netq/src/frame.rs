@@ -72,7 +72,9 @@ pub struct Ip {
 pub struct Headers {
     /// The destination MAC address.
     pub dst_mac: MacAddr,
-    /// The VLAN ID of the outermost VLAN tag, if the frame has one.
+    /// The VLAN ID of the outermost VLAN tag that has one. Priority tags (VLAN ID 0, IEEE
+    /// 802.1Q-2018 section 9.6) carry no VLAN ID and are skipped, so a frame with only
+    /// priority tags has none, like an untagged frame.
     pub vlan: Option<u16>,
     /// The EtherType of the payload: after the VLAN tags, if any.
     pub ether_type: u16,
@@ -98,7 +100,10 @@ impl Headers {
         let mut ether_type = ethernet.ether_type().0;
         for ext in &packet.link_exts {
             if let LinkExtSlice::Vlan(tag) = ext {
-                vlan = vlan.or(Some(tag.vlan_identifier().value()));
+                let id = tag.vlan_identifier().value();
+                if id != 0 {
+                    vlan = vlan.or(Some(id));
+                }
                 ether_type = tag.ether_type().0;
             }
         }

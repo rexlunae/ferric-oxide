@@ -3,18 +3,28 @@
 //! `open("/scheme/network.<nic>/queue")` ([`QUEUE_PATH`]) gives an unbound queue socket. The
 //! application sets it up with `SYS_CALL` on it:
 //!
-//! | Request | Metadata words | Payload |
-//! | --- | --- | --- |
-//! | [`Request::Bind`] | `[verb, frame size, fill, rx, tx, completion, mode, cpu]` | the UMEM grant and the ring grant, as `CallFlags::FD` descriptors in that order |
-//! | [`Request::AddFilter`] | `[verb]` | a [`Filter`](crate::filter::Filter), [`Filter::BYTES`](crate::filter::Filter::BYTES) bytes; the reply is the [`FilterId`] |
-//! | [`Request::RemoveFilter`] | `[verb, filter ID]` | none |
-//! | [`Request::Kick`] | `[verb]` | none |
-//! | [`Request::Stats`] | `[verb]` | the reply is a [`Stats`] record, [`Stats::BYTES`] bytes |
+//! | Request | Call | Metadata words | Payload |
+//! | --- | --- | --- | --- |
+//! | [`Request::Attach`] | `CallFlags::WRITE \| CallFlags::FD` | `[verb]` | the descriptor numbers of the UMEM grant and the ring grant, in that order (they move to the driver) |
+//! | [`Request::Bind`] | plain | `[verb]` | a [`Bind`] record, [`Bind::BYTES`] bytes |
+//! | [`Request::AddFilter`] | plain | `[verb]` | a [`Filter`](crate::filter::Filter), [`Filter::BYTES`](crate::filter::Filter::BYTES) bytes; the reply is the [`FilterId`] |
+//! | [`Request::RemoveFilter`] | plain | `[verb, filter ID]` | none |
+//! | [`Request::Kick`] | plain | `[verb]` | none |
+//! | [`Request::Stats`] | plain | `[verb]` | the reply is a [`Stats`] record, [`Stats::BYTES`] bytes |
+//!
+//! `Attach` comes before `Bind`, which starts the queue on the attached grants; attaching
+//! again before `Bind` replaces them.
+//!
+//! The kernel gives a scheme at most [`Request::CALL_WORDS`] metadata words of a plain call,
+//! padded with zeros to that many (the caller's word count does not reach the scheme), and only
+//! the first word of a descriptor-passing call. So every request fits in three words, the
+//! `Attach` verb in one, and [`Request::decode`] reads a request from the words exactly as the
+//! scheme receives them: words a request does not use must be zero.
 //!
 //! [`Request::encode`] and [`Request::decode`] are the one place the metadata layout is
-//! written down, and [`Stats::to_bytes`] and [`Stats::from_bytes`] the one place the
-//! statistics layout is. Closing the socket stops its queue, removes its filters and unmaps
-//! its grants.
+//! written down, [`Bind::to_bytes`] and [`Bind::from_bytes`] the one place the bind record's
+//! is, and [`Stats::to_bytes`] and [`Stats::from_bytes`] the one place the statistics
+//! layout is. Closing the socket stops its queue, removes its filters and unmaps its grants.
 
 use thiserror::Error;
 
@@ -28,6 +38,7 @@ const VERB_ADD_FILTER: u64 = 2;
 const VERB_REMOVE_FILTER: u64 = 3;
 const VERB_KICK: u64 = 4;
 const VERB_STATS: u64 = 5;
+const VERB_ATTACH: u64 = 6;
 
 /// The number of entries of a ring: a power of two from [`RingSize::MIN`] to
 /// [`RingSize::MAX`], so free-running indices wrap onto slots with a mask.
@@ -87,7 +98,7 @@ impl Mode {
     }
 }
 
-/// The parameters of [`Request::Bind`].
+/// The parameters of [`Request::Bind`], its payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Bind {
     /// The UMEM's frame size.
@@ -104,6 +115,65 @@ pub struct Bind {
     pub mode: Mode,
     /// The logical CPU whose queue interrupt and driver worker serve the socket.
     pub cpu: u32,
+}
+
+impl Bind {
+    /// The size of the record: eight little-endian `u32`s, the frame size in bytes, the Fill,
+    /// RX, TX and Completion ring sizes in entries, the mode (1 auto, 2 copy, 3 zero-copy),
+    /// the CPU, and a reserved zero.
+    pub const BYTES: usize = 32;
+
+    /// The record.
+    pub fn to_bytes(&self) -> [u8; Self::BYTES] {
+        let words = [
+            self.frame_size.bytes(),
+            self.fill.get(),
+            self.rx.get(),
+            self.tx.get(),
+            self.completion.get(),
+            self.mode.to_word() as u32,
+            self.cpu,
+            0,
+        ];
+        let mut out = [0; Self::BYTES];
+        for (chunk, word) in out.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    /// The parameters `bytes` hold.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Length`] when `bytes` is not [`Bind::BYTES`] long, and
+    /// [`DecodeError::Value`] for a frame size, ring size or mode out of range, or a reserved
+    /// word that is not zero.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::BYTES {
+            return Err(DecodeError::Length);
+        }
+        let mut words = [0u32; 8];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            let mut le = [0; 4];
+            le.copy_from_slice(chunk);
+            *word = u32::from_le_bytes(le);
+        }
+        let [frame_size, fill, rx, tx, completion, mode, cpu, reserved] = words;
+        if reserved != 0 {
+            return Err(DecodeError::Value);
+        }
+        let ring = |entries| RingSize::new(entries).ok_or(DecodeError::Value);
+        Ok(Self {
+            frame_size: FrameSize::from_bytes(u64::from(frame_size)).ok_or(DecodeError::Value)?,
+            fill: ring(fill)?,
+            rx: ring(rx)?,
+            tx: ring(tx)?,
+            completion: ring(completion)?,
+            mode: Mode::from_word(u64::from(mode)).ok_or(DecodeError::Value)?,
+            cpu,
+        })
+    }
 }
 
 /// A filter's ID on its socket, from [`Request::AddFilter`].
@@ -126,8 +196,10 @@ impl FilterId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Request {
-    /// Attach the UMEM and the rings and start the queue.
-    Bind(Bind),
+    /// Hand the driver the UMEM grant and the ring grant (a descriptor-passing call).
+    Attach,
+    /// Start the queue on the attached grants, with the [`Bind`] parameters in the payload.
+    Bind,
     /// Steer the frames a filter matches to the socket.
     AddFilter,
     /// Remove a filter.
@@ -139,25 +211,31 @@ pub enum Request {
 }
 
 impl Request {
-    /// The most metadata words a request takes.
-    pub const MAX_WORDS: usize = 8;
+    /// The most metadata words the kernel hands a scheme for a plain call
+    /// (`crates/kernel/src/syscall/fs.rs`, `call`).
+    pub const CALL_WORDS: usize = 3;
+
+    /// The metadata words the kernel hands a scheme for a descriptor-passing call (the
+    /// `Sendfd` request carries only the first).
+    pub const FD_CALL_WORDS: usize = 1;
+
+    /// Whether the request is a descriptor-passing call (`CallFlags::FD`) rather than a plain
+    /// one. A driver refuses a request that arrives on the other kind of call.
+    pub const fn passes_descriptors(self) -> bool {
+        matches!(self, Self::Attach)
+    }
 
     /// The metadata words, and how many of them are used.
-    pub const fn encode(self) -> ([u64; Self::MAX_WORDS], usize) {
-        let mut words = [0; Self::MAX_WORDS];
+    pub const fn encode(self) -> ([u64; Self::CALL_WORDS], usize) {
+        let mut words = [0; Self::CALL_WORDS];
         let len = match self {
-            Self::Bind(bind) => {
-                words = [
-                    VERB_BIND,
-                    bind.frame_size.bytes() as u64,
-                    bind.fill.get() as u64,
-                    bind.rx.get() as u64,
-                    bind.tx.get() as u64,
-                    bind.completion.get() as u64,
-                    bind.mode.to_word(),
-                    bind.cpu as u64,
-                ];
-                8
+            Self::Attach => {
+                words[0] = VERB_ATTACH;
+                1
+            }
+            Self::Bind => {
+                words[0] = VERB_BIND;
+                1
             }
             Self::AddFilter => {
                 words[0] = VERB_ADD_FILTER;
@@ -180,26 +258,29 @@ impl Request {
         (words, len)
     }
 
-    /// The request `words` encode.
+    /// The request `words` encode, as the scheme receives them: up to
+    /// [`CALL_WORDS`](Self::CALL_WORDS) words, where those the request does not use are zero.
     ///
     /// # Errors
     ///
-    /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
-    /// number of words does not match it, and [`DecodeError::Value`] for a frame size, ring
-    /// size, mode or CPU number out of range.
+    /// [`DecodeError::Verb`] for a missing or unknown verb, and [`DecodeError::Length`] when
+    /// a word the request needs is missing, or a word it does not use is not zero.
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
         let (&verb, args) = words.split_first().ok_or(DecodeError::Verb)?;
-        let expected = match verb {
-            VERB_BIND => 7,
+        let used = match verb {
             VERB_REMOVE_FILTER => 1,
-            VERB_ADD_FILTER | VERB_KICK | VERB_STATS => 0,
+            VERB_ATTACH | VERB_BIND | VERB_ADD_FILTER | VERB_KICK | VERB_STATS => 0,
             _ => return Err(DecodeError::Verb),
         };
-        if args.len() != expected {
+        if args.len() < used
+            || args.len() >= Self::CALL_WORDS
+            || args[used..].iter().any(|&w| w != 0)
+        {
             return Err(DecodeError::Length);
         }
         Ok(match verb {
-            VERB_BIND => Self::Bind(decode_bind(args)?),
+            VERB_ATTACH => Self::Attach,
+            VERB_BIND => Self::Bind,
             VERB_ADD_FILTER => Self::AddFilter,
             VERB_REMOVE_FILTER => Self::RemoveFilter(FilterId(args[0])),
             VERB_KICK => Self::Kick,
@@ -208,39 +289,19 @@ impl Request {
     }
 }
 
-fn decode_bind(args: &[u64]) -> Result<Bind, DecodeError> {
-    let &[frame_size, fill, rx, tx, completion, mode, cpu] = args else {
-        return Err(DecodeError::Length);
-    };
-    let ring = |word: u64| {
-        u32::try_from(word)
-            .ok()
-            .and_then(RingSize::new)
-            .ok_or(DecodeError::Value)
-    };
-    Ok(Bind {
-        frame_size: FrameSize::from_bytes(frame_size).ok_or(DecodeError::Value)?,
-        fill: ring(fill)?,
-        rx: ring(rx)?,
-        tx: ring(tx)?,
-        completion: ring(completion)?,
-        mode: Mode::from_word(mode).ok_or(DecodeError::Value)?,
-        cpu: u32::try_from(cpu).map_err(|_| DecodeError::Value)?,
-    })
-}
-
-/// Why metadata words are not a valid [`Request`].
+/// Why metadata words are not a valid [`Request`], or bytes not a valid [`Bind`] record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DecodeError {
     /// The verb is missing or unknown.
     #[error("missing or unknown queue socket verb")]
     Verb,
-    /// The number of words does not match the verb.
-    #[error("wrong number of metadata words for the queue socket verb")]
+    /// A word the verb needs is missing, a word it does not use is not zero, or a payload
+    /// record has the wrong length.
+    #[error("queue socket call words or payload do not fit the verb")]
     Length,
-    /// A word has a value the call does not allow.
-    #[error("a queue socket call word is out of range")]
+    /// A payload field has a value the call does not allow.
+    #[error("a queue socket call field is out of range")]
     Value,
 }
 
@@ -372,27 +433,71 @@ mod tests {
         }
     }
 
+    /// The metadata a user-space scheme receives for a plain `SYS_CALL` with `words`, as the
+    /// kernel builds it: `call` (`crates/kernel/src/syscall/fs.rs`) copies at most
+    /// [`Request::CALL_WORDS`] words in as bytes, and `call_generic`
+    /// (`crates/kernel/src/scheme/user.rs`) puts them in the request zero-padded to that many.
+    fn through_plain_call(words: &[u64]) -> [u64; Request::CALL_WORDS] {
+        let mut bytes = [0u8; Request::CALL_WORDS * 8];
+        let sent: std::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        let copied = sent.len().min(bytes.len());
+        bytes[..copied].copy_from_slice(&sent[..copied]);
+        let mut meta = [0u64; Request::CALL_WORDS];
+        for (word, chunk) in meta.iter_mut().zip(bytes.chunks_exact(8)).take(copied / 8) {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(chunk);
+            *word = u64::from_ne_bytes(raw);
+        }
+        meta
+    }
+
+    /// The metadata a user-space scheme receives for a descriptor-passing `SYS_CALL`: the
+    /// `Sendfd` request carries only the first word (`kfdwrite` in
+    /// `crates/kernel/src/scheme/user.rs`).
+    fn through_fd_call(words: &[u64]) -> [u64; Request::FD_CALL_WORDS] {
+        [words.first().copied().unwrap_or(0)]
+    }
+
     #[test]
-    fn requests_round_trip() {
+    fn requests_round_trip_through_the_kernel() {
         for request in [
-            Request::Bind(bind()),
-            Request::Bind(Bind {
-                frame_size: FrameSize::Bytes4096,
-                mode: Mode::ZeroCopy,
-                cpu: u32::MAX,
-                ..bind()
-            }),
-            Request::Bind(Bind {
-                mode: Mode::Copy,
-                ..bind()
-            }),
+            Request::Attach,
+            Request::Bind,
             Request::AddFilter,
             Request::RemoveFilter(FilterId::new(u64::MAX)),
             Request::Kick,
             Request::Stats,
         ] {
             let (words, len) = request.encode();
-            assert_eq!(Request::decode(&words[..len]), Ok(request));
+            let sent = &words[..len];
+            assert_eq!(Request::decode(sent), Ok(request), "{request:?}");
+            if request.passes_descriptors() {
+                assert!(len <= Request::FD_CALL_WORDS);
+                assert_eq!(Request::decode(&through_fd_call(sent)), Ok(request));
+            } else {
+                assert_eq!(Request::decode(&through_plain_call(sent)), Ok(request));
+            }
+        }
+    }
+
+    #[test]
+    fn bind_records_round_trip() {
+        for bind in [
+            bind(),
+            Bind {
+                frame_size: FrameSize::Bytes4096,
+                mode: Mode::ZeroCopy,
+                cpu: u32::MAX,
+                ..bind()
+            },
+            Bind {
+                mode: Mode::Copy,
+                fill: ring(RingSize::MIN),
+                completion: ring(RingSize::MAX),
+                ..bind()
+            },
+        ] {
+            assert_eq!(Bind::from_bytes(&bind.to_bytes()), Ok(bind));
         }
     }
 
@@ -400,29 +505,46 @@ mod tests {
     fn bad_requests_are_refused() {
         assert_eq!(Request::decode(&[]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[0]), Err(DecodeError::Verb));
-        assert_eq!(Request::decode(&[99]), Err(DecodeError::Verb));
-        assert_eq!(Request::decode(&[VERB_KICK, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[99, 0, 0]), Err(DecodeError::Verb));
+        assert_eq!(
+            Request::decode(&[VERB_KICK, 1, 0]),
+            Err(DecodeError::Length)
+        );
+        assert_eq!(
+            Request::decode(&[VERB_KICK, 0, 7]),
+            Err(DecodeError::Length)
+        );
+        assert_eq!(
+            Request::decode(&[VERB_KICK, 0, 0, 0]),
+            Err(DecodeError::Length)
+        );
         assert_eq!(
             Request::decode(&[VERB_REMOVE_FILTER]),
             Err(DecodeError::Length)
         );
-        let (good, len) = Request::Bind(bind()).encode();
-        assert_eq!(Request::decode(&good[..len - 1]), Err(DecodeError::Length));
-        for (at, value) in [
-            (1, 1024),
-            (2, 4),
-            (3, 3000),
-            (4, 1 << 17),
-            (5, u64::MAX),
-            (6, 0),
-            (7, 1 << 32),
+        assert_eq!(
+            Request::decode(&[VERB_REMOVE_FILTER, 5, 1]),
+            Err(DecodeError::Length)
+        );
+
+        let good = bind().to_bytes();
+        assert_eq!(Bind::from_bytes(&good[..31]), Err(DecodeError::Length));
+        for (word, value) in [
+            (0, 1024),
+            (1, 4),
+            (2, 3000),
+            (3, 1 << 17),
+            (4, u32::MAX),
+            (5, 0),
+            (5, 4),
+            (7, 1),
         ] {
             let mut bad = good;
-            bad[at] = value;
+            bad[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
             assert_eq!(
-                Request::decode(&bad[..len]),
+                Bind::from_bytes(&bad),
                 Err(DecodeError::Value),
-                "word {at}"
+                "word {word}"
             );
         }
         assert!(!DecodeError::Value.to_string().is_empty());

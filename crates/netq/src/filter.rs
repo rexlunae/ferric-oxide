@@ -2,8 +2,9 @@
 //!
 //! A [`FilterSpec`] is one of:
 //!
-//! - an exact match ([`MatchSpec`]) on any of EtherType, VLAN ID, IP protocol, destination and
-//!   source IP address, and (for TCP and UDP) destination and source port;
+//! - an exact match ([`MatchSpec`]) on any of EtherType, VLAN ([`VlanMatch`]: one VLAN ID, or
+//!   no VLAN ID at all), IP protocol, destination and source IP address, and (for TCP and UDP)
+//!   destination and source port;
 //! - all frames of the port, which takes the NIC away from netstack;
 //! - all frames sent to a dedicated secondary unicast MAC address.
 //!
@@ -20,9 +21,9 @@
 //! | --- | --- |
 //! | 0 | kind: 1 match, 2 all frames, 3 secondary MAC |
 //! | 1 | reserved, 0 |
-//! | 2..4 | the fields a match uses, a bit each (`u16`): EtherType, VLAN, protocol, destination address, destination port, source address, source port |
+//! | 2..4 | the fields a match uses, a bit each (`u16`): EtherType, VLAN ID, protocol, destination address, destination port, source address, source port, untagged (at most one of VLAN ID and untagged) |
 //! | 4..6 | EtherType (`u16`) |
-//! | 6..8 | VLAN ID (`u16`) |
+//! | 6..8 | VLAN ID (`u16`), for the VLAN ID bit |
 //! | 8 | IP protocol |
 //! | 9 | destination address family: 0 none, 4 IPv4, 6 IPv6 |
 //! | 10 | source address family |
@@ -65,13 +66,37 @@ impl VlanId {
     }
 }
 
+/// Which VLAN a [`MatchSpec`] selects.
+///
+/// IEEE 802.1Q-2018 (section 9.6) gives VLAN ID 0 to *priority-tagged* frames: they carry a
+/// priority but no VLAN ID, and belong to the port's untagged traffic. So a priority tag never
+/// names a VLAN, and frames that only have priority tags go with untagged frames
+/// ([`Headers::vlan`] skips them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VlanMatch {
+    /// Frames with no VLAN ID: untagged, or carrying only priority tags.
+    Untagged,
+    /// Frames whose outermost VLAN ID is this one.
+    Id(VlanId),
+}
+
+impl VlanMatch {
+    fn matches(self, vlan: Option<u16>) -> bool {
+        match self {
+            Self::Untagged => vlan.is_none(),
+            Self::Id(id) => vlan == Some(id.get()),
+        }
+    }
+}
+
 /// An exact match: every field that is set must equal the frame's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MatchSpec {
     /// The payload EtherType, after any VLAN tags.
     pub ether_type: Option<u16>,
-    /// The outermost VLAN ID.
-    pub vlan: Option<VlanId>,
+    /// The VLAN: the outermost VLAN ID, or none.
+    pub vlan: Option<VlanMatch>,
     /// The IP protocol (after IPv6 extension headers).
     pub ip_protocol: Option<u8>,
     /// The destination IP address.
@@ -111,6 +136,7 @@ const HAS_DST_ADDR: u16 = 1 << 3;
 const HAS_DST_PORT: u16 = 1 << 4;
 const HAS_SRC_ADDR: u16 = 1 << 5;
 const HAS_SRC_PORT: u16 = 1 << 6;
+const HAS_UNTAGGED: u16 = 1 << 7;
 
 impl Filter {
     /// The size of an encoded filter.
@@ -239,7 +265,7 @@ fn match_fields(fields: &MatchSpec, headers: &Headers) -> bool {
     let ip = headers.ip.as_ref();
     let ports = ip.and_then(|ip| ip.ports);
     eq(fields.ether_type, Some(headers.ether_type))
-        && eq(fields.vlan.map(VlanId::get), headers.vlan)
+        && fields.vlan.is_none_or(|vlan| vlan.matches(headers.vlan))
         && eq(fields.ip_protocol, ip.map(|ip| ip.protocol))
         && eq(fields.dst_addr, ip.map(|ip| ip.dst))
         && eq(fields.src_addr, ip.map(|ip| ip.src))
@@ -254,9 +280,13 @@ fn encode_match(fields: &MatchSpec, out: &mut [u8; Filter::BYTES]) {
         mask |= HAS_ETHER_TYPE;
         out[4..6].copy_from_slice(&ether_type.to_le_bytes());
     }
-    if let Some(vlan) = fields.vlan {
-        mask |= HAS_VLAN;
-        out[6..8].copy_from_slice(&vlan.get().to_le_bytes());
+    match fields.vlan {
+        Some(VlanMatch::Id(id)) => {
+            mask |= HAS_VLAN;
+            out[6..8].copy_from_slice(&id.get().to_le_bytes());
+        }
+        Some(VlanMatch::Untagged) => mask |= HAS_UNTAGGED,
+        None => {}
     }
     if let Some(protocol) = fields.ip_protocol {
         mask |= HAS_PROTOCOL;
@@ -312,8 +342,13 @@ fn decode_match(bytes: &[u8; Filter::BYTES]) -> Result<MatchSpec, DecodeError> {
     };
     Ok(MatchSpec {
         ether_type: has(HAS_ETHER_TYPE).then(|| word(4)),
+        // Both VLAN bits at once re-encode with only the ID bit, so `from_bytes` refuses them.
         vlan: if has(HAS_VLAN) {
-            Some(VlanId::new(word(6)).ok_or(DecodeError::Field)?)
+            Some(VlanMatch::Id(
+                VlanId::new(word(6)).ok_or(DecodeError::Field)?,
+            ))
+        } else if has(HAS_UNTAGGED) {
+            Some(VlanMatch::Untagged)
         } else {
             None
         },
@@ -422,11 +457,26 @@ mod tests {
         let ip = ipv6(IP_PROTOCOL_UDP, v6, v6, &udp(1, 2));
         let tagged = Headers::parse(&ethernet(&[100], ETHERTYPE_IPV6, &ip)).expect("well-formed");
         let vlan = filter(MatchSpec {
-            vlan: VlanId::new(100),
+            vlan: VlanId::new(100).map(VlanMatch::Id),
             ..MatchSpec::default()
         });
         assert!(vlan.matches(&tagged));
         assert!(!vlan.matches(&udp4(1)));
+        let untagged = filter(MatchSpec {
+            vlan: Some(VlanMatch::Untagged),
+            ..MatchSpec::default()
+        });
+        assert!(untagged.matches(&udp4(1)));
+        assert!(!untagged.matches(&tagged));
+
+        // A priority tag (VLAN ID 0) names no VLAN: the frame is untagged traffic, and the
+        // VLAN ID of a tag inside it is the frame's VLAN.
+        let priority = Headers::parse(&ethernet(&[0], ETHERTYPE_IPV6, &ip)).expect("well-formed");
+        assert!(untagged.matches(&priority));
+        assert!(!vlan.matches(&priority));
+        let inner = Headers::parse(&ethernet(&[0, 100], ETHERTYPE_IPV6, &ip)).expect("well-formed");
+        assert!(vlan.matches(&inner));
+        assert!(!untagged.matches(&inner));
         let ptp = filter(MatchSpec {
             ether_type: Some(0x88f7),
             ..MatchSpec::default()
@@ -519,7 +569,7 @@ mod tests {
             FilterSpec::SecondaryMac(MacAddr([2, 1, 2, 3, 4, 5])),
             FilterSpec::Match(MatchSpec {
                 ether_type: Some(ETHERTYPE_IPV6),
-                vlan: VlanId::new(4094),
+                vlan: VlanId::new(4094).map(VlanMatch::Id),
                 ip_protocol: Some(IP_PROTOCOL_TCP),
                 dst_addr: Some(v6),
                 dst_port: Some(443),
@@ -528,6 +578,12 @@ mod tests {
             }),
             FilterSpec::Match(MatchSpec {
                 dst_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                ..MatchSpec::default()
+            }),
+            FilterSpec::Match(MatchSpec {
+                vlan: Some(VlanMatch::Untagged),
+                ip_protocol: Some(IP_PROTOCOL_UDP),
+                dst_port: Some(319),
                 ..MatchSpec::default()
             }),
         ] {
@@ -559,6 +615,15 @@ mod tests {
         // An unknown mask bit.
         let mut bad = good;
         bad[3] = 0x80;
+        assert_eq!(Filter::from_bytes(&bad), Err(DecodeError::Field));
+        // A VLAN ID of 0 (a priority tag names no VLAN; untagged has its own bit), and a VLAN
+        // ID together with untagged.
+        let mut bad = good;
+        bad[2] |= HAS_VLAN as u8;
+        assert_eq!(Filter::from_bytes(&bad), Err(DecodeError::Field));
+        bad[6] = 5;
+        assert!(Filter::from_bytes(&bad).is_ok());
+        bad[2] |= HAS_UNTAGGED as u8;
         assert_eq!(Filter::from_bytes(&bad), Err(DecodeError::Field));
         // A destination address with an unknown family.
         let mut bad = good;

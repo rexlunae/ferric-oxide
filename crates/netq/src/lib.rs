@@ -18,7 +18,8 @@
 //! - [`frame`]: the header fields of a received Ethernet frame that filters match on.
 //! - [`filter`]: steering filters, their validation, their fixed-size encoding and the software
 //!   match copy mode uses.
-//! - [`call`]: the queue socket's path and `SYS_CALL` requests, and the statistics record.
+//! - [`call`]: the queue socket's path, its `SYS_CALL` requests (within the three metadata
+//!   words the kernel passes a scheme) and the bind and statistics records.
 //! - [`ring`]: the four rings' layout in their shared region, and each side's handles, on
 //!   `ferric-ring`'s index protocol, hostile-peer checks and need-wakeup.
 //!
