@@ -42,6 +42,10 @@
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without
 //! the `trace` feature) it prints `FERRIC_TEST_SKIP trace` and exits zero.
+//!
+//! `ferric-trace-test crash` runs the crash-dump test instead (`kernel.trace_crash`): on a
+//! crash-test kernel's first boot it panics the kernel on purpose (`trace-crash-armed`), and on
+//! the boot after it checks the dump that panic left (`trace-crash-read`); see `redox::crash`.
 
 #[cfg(target_os = "redox")]
 mod redox;

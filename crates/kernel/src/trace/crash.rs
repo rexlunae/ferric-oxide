@@ -1,0 +1,177 @@
+//! Ferric Oxide: the crash dump (`kernel.trace_crash`; layout in `ferric_trace::crash`).
+//!
+//! The kernel keeps `REGION_BYTES` of RAM at a fixed physical address (`trace.crash_base` in its
+//! `config.toml`, 64 MiB by default) out of the frame allocator, so the same memory is found
+//! again after a warm reboot, where firmware leaves RAM as it was:
+//!
+//! - [`reserve`], during memory setup, takes the region out of the free memory, provided it is
+//!   wholly free RAM in the boot memory map, and has it mapped like the boot-time identity-mapped
+//!   areas.
+//! - [`init`], in `kmain`, copies a complete dump the previous boot left there to the heap (the
+//!   scheme's `crash` file serves it), logs its panic message, and arms the region again.
+//! - [`dump`], from the panic handler, writes the panic message and the newest records of every
+//!   CPU's ring there. Other CPUs keep running meanwhile; their records are copied with atomic
+//!   loads, and a torn one is rejected by the reader.
+//!
+//! With `kernel.trace_crash_test`, writing `panic` to the scheme's `crash` file calls
+//! [`test_panic`], after which the panic handler resets the machine instead of halting, so CI
+//! can read the dump back on the next boot.
+
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    fmt::Write,
+    panic::PanicInfo,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+use ferric_trace::crash::{Dump, MessageBuf, Writer, REGION_BYTES, REGION_WORDS};
+use rmm::{Arch, PhysicalAddress};
+use spin::Once;
+
+use crate::{
+    cpu_set::LogicalCpuId,
+    memory::{RmmA, PAGE_SIZE},
+    startup::memory::{register_memory_region, BootloaderMemoryKind},
+};
+
+/// The region's physical address without `trace.crash_base`.
+const DEFAULT_BASE: usize = 64 << 20;
+
+/// Whether [`reserve`] took the region out of the free memory.
+static RESERVED: AtomicBool = AtomicBool::new(false);
+
+/// The region's words, once [`init`] armed it.
+static REGION: Once<&'static [AtomicU64]> = Once::new();
+
+/// The dump the previous boot left, if any.
+static SAVED: Once<Arc<[u8]>> = Once::new();
+
+/// Set by the first panic to dump, so a panic during the dump does not start another.
+static DUMPING: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`test_panic`]: reset the machine once the dump is written.
+static RESET: AtomicBool = AtomicBool::new(false);
+
+/// The region's physical address: `trace.crash_base` (the build script checked it is a
+/// page-aligned number), or [`DEFAULT_BASE`].
+fn base() -> usize {
+    option_env!("FERRIC_TRACE_CRASH_BASE")
+        .and_then(|base| base.parse().ok())
+        .unwrap_or(DEFAULT_BASE)
+}
+
+/// Takes the region out of the free memory, if all of it is free RAM in the boot memory map, as
+/// `is_free(start, end)` says. Called during memory setup, after the bootloader's areas are
+/// registered and before the free areas are built from them.
+pub fn reserve(is_free: impl Fn(usize, usize) -> bool) {
+    let base = base();
+    let end = base.saturating_add(REGION_BYTES);
+    if !base.is_multiple_of(PAGE_SIZE) || !is_free(base, end) {
+        warn!("trace: crash region {base:#x}..{end:#x} is not free RAM; no crash dumps");
+        return;
+    }
+    // Identity-mapped areas are kept out of the frame allocator and mapped in the physical map.
+    register_memory_region(base, REGION_BYTES, BootloaderMemoryKind::IdentityMap);
+    RESERVED.store(true, Ordering::Release);
+}
+
+/// Saves the dump the previous boot left, if there is one, and arms the region for this boot.
+/// Called from `kmain` once the heap exists.
+pub fn init() {
+    if !RESERVED.load(Ordering::Acquire) {
+        return;
+    }
+    let virt = RmmA::phys_to_virt(PhysicalAddress::new(base())).data();
+    // SAFETY: `reserve` took the REGION_BYTES at `base` out of the free memory and had them
+    // mapped in the physical map, where they stay for the kernel's life, and nothing else uses
+    // them. They are page aligned, so aligned for `AtomicU64`, and any bits are a valid
+    // `AtomicU64`. Every access through the slice is atomic, so the panic handler writing on one
+    // CPU while another reads is no data race.
+    let words: &'static [AtomicU64] =
+        unsafe { core::slice::from_raw_parts(virt as *const AtomicU64, REGION_WORDS) };
+    match Dump::len_in(words) {
+        Ok(len) => save(words, len),
+        Err(err) => debug!("trace: no crash dump from the previous boot: {err}"),
+    }
+    if let Err(err) = Writer::arm(words) {
+        warn!("trace: crash region not armed: {err}");
+        return;
+    }
+    REGION.call_once(|| words);
+    info!(
+        "trace: crash region at {:#x} ({} KiB)",
+        base(),
+        REGION_BYTES / 1024
+    );
+}
+
+/// Copies the `len` bytes of the dump in `words` to the heap and logs its message.
+fn save(words: &[AtomicU64], len: usize) {
+    let bytes: Vec<u8> = words
+        .iter()
+        .flat_map(|word| word.load(Ordering::Relaxed).to_le_bytes())
+        .take(len)
+        .collect();
+    let Ok(dump) = Dump::parse(&bytes) else {
+        // The region changed under the copy, which nothing at this point of boot does.
+        warn!("trace: the crash dump from the previous boot changed while it was read");
+        return;
+    };
+    if let Some((cpu, message)) = dump.message() {
+        let message = core::str::from_utf8(message).unwrap_or("(not UTF-8)");
+        warn!("trace: the previous boot panicked on CPU {cpu}: {message}");
+    }
+    info!("trace: its crash dump ({len} bytes) is in /scheme/kernel.trace/crash");
+    SAVED.call_once(|| Arc::from(bytes));
+}
+
+/// The dump the previous boot left, if any.
+pub fn saved() -> Option<Arc<[u8]>> {
+    SAVED.get().cloned()
+}
+
+/// Writes the panic message `info` and the newest records of every CPU's ring to the region.
+/// Called first thing by the panic handler; does nothing before [`init`] or in a panic during
+/// the dump.
+pub fn dump(info: &PanicInfo) {
+    let Some(words) = REGION.get() else {
+        return;
+    };
+    if DUMPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut message = MessageBuf::new();
+    let _ = write!(message, "{info}");
+    let Ok(mut writer) = Writer::begin(words) else {
+        return;
+    };
+    writer.message(crate::cpu_id().get(), message.as_bytes());
+    let count = crate::cpu_count();
+    for cpu in 0..count {
+        let Some(ring) = super::ring(LogicalCpuId::new(cpu)) else {
+            continue;
+        };
+        // An equal share of what is left for each CPU still to go.
+        let share = writer
+            .remaining()
+            .checked_div(count.saturating_sub(cpu) as usize)
+            .unwrap_or(0);
+        writer.cpu(cpu, ring, share);
+    }
+    writer.finish();
+    println!("trace: crash dump written");
+}
+
+/// Whether the panic handler should reset the machine after the dump, as it does after
+/// [`test_panic`].
+pub fn reset_after_panic() -> bool {
+    RESET.load(Ordering::Acquire)
+}
+
+/// Panics on purpose, for testing the dump across a reboot (`kernel.trace_crash_test`): the
+/// panic handler writes the dump and resets the machine.
+#[cfg(feature = "trace_crash_test")]
+pub fn test_panic() -> ! {
+    RESET.store(true, Ordering::Release);
+    panic!("ferric-trace crash test (kernel.trace_crash_test)");
+}

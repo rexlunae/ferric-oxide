@@ -660,6 +660,15 @@ pub unsafe fn init(
     register_memory_from_kernel_args(args);
 
     unsafe {
+        // Ferric Oxide: keep the trace crash region out of the free memory, if it lies inside
+        // one free area of the boot memory map (which only this CPU writes, now).
+        #[cfg(feature = "trace_crash")]
+        crate::trace::crash::reserve(|start, end| {
+            (*MEMORY_MAP.get())
+                .free()
+                .any(|entry| entry.start <= start && end <= entry.end)
+        });
+
         let physmem_limit = MemoryEntry {
             start: align_up(low_limit.unwrap_or(0)),
             end: align_down(high_limit.unwrap_or(usize::MAX)),
