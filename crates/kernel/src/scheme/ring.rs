@@ -403,6 +403,9 @@ fn submit(
         if let Err(err) = sq.consume(mem, &next) {
             ring.work.lock().end_sync(chain.len());
             ring.unreserve(chain.len());
+            // A waiting `Enter` may have seen the chain in flight; with it gone, wake it to
+            // check again, or it could sleep until some later completion.
+            ring.notify_completed(token);
             return Err(ring_errno(err));
         }
         consumed = consumed.saturating_add(chain.len());
