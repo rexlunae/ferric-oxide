@@ -1,0 +1,12 @@
+[package]
+name = "ferric-ring"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The shared submission/completion ring format of Ferric Oxide's schemes and the kernel.ring scheme's interface"
+
+[dependencies]
+bitflags = { version = "2", default-features = false }
+
+[features]
+default = []
