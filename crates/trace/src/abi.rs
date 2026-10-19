@@ -5,8 +5,9 @@
 //!
 //! | Path | Read | Write |
 //! | --- | --- | --- |
-//! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>` or `disable <selection>` |
+//! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>`, `disable <selection>`, or `filter <event> <filter\|none>` |
 //! | [`STATS_PATH`] | one [`StatsLine`] per CPU | — |
+//! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
@@ -52,6 +53,9 @@ pub const EVENTS_PATH: &str = "events";
 /// The per-CPU statistics file.
 pub const STATS_PATH: &str = "stats";
 
+/// The file listing the argument filters that are set ([`crate::filter`]).
+pub const FILTERS_PATH: &str = "filters";
+
 /// The longest command, in bytes, one write to [`EVENTS_PATH`] may carry; the kernel refuses
 /// longer writes.
 pub const MAX_COMMAND_BYTES: usize = 4096;
@@ -84,6 +88,8 @@ pub enum Path {
     Events,
     /// [`STATS_PATH`].
     Stats,
+    /// [`FILTERS_PATH`].
+    Filters,
     /// `cpu/<n>`: the records of CPU `n`.
     Cpu(u32),
 }
@@ -95,6 +101,7 @@ impl Path {
             "" => Some(Path::Root),
             EVENTS_PATH => Some(Path::Events),
             STATS_PATH => Some(Path::Stats),
+            FILTERS_PATH => Some(Path::Filters),
             other => {
                 let n = other.strip_prefix(CPU_DIR)?.strip_prefix('/')?;
                 // `u32::from_str` takes a leading `+`; a path does not.
@@ -114,6 +121,15 @@ pub enum Command<'a> {
     Enable(&'a str),
     /// Turn off the events of a selection.
     Disable(&'a str),
+    /// Set the argument filter of one event, or remove it with
+    /// [`filter::NONE`](crate::filter::NONE): `filter <event> <filter>`. The filter text is
+    /// parsed against the event's arguments with [`Filter::parse`](crate::filter::Filter::parse).
+    Filter {
+        /// The event's name.
+        event: &'a str,
+        /// The filter text.
+        filter: &'a str,
+    },
 }
 
 /// A write to [`EVENTS_PATH`] that is not a command.
@@ -126,6 +142,8 @@ pub enum CommandError {
     UnknownVerb,
     /// The position of a `commit` is missing or not a decimal number.
     Position,
+    /// A `filter` without both an event name and a filter.
+    FilterEvent,
 }
 
 impl fmt::Display for CommandError {
@@ -133,8 +151,9 @@ impl fmt::Display for CommandError {
         f.write_str(match self {
             CommandError::NotUtf8 => "trace command is not UTF-8",
             CommandError::UnknownVerb => {
-                "trace command must start with enable or disable (events) or commit (cpu/<n>)"
+                "trace command must start with enable, disable or filter (events) or commit (cpu/<n>)"
             }
+            CommandError::FilterEvent => "trace filter needs an event name and a filter",
             CommandError::Position => "trace commit needs a decimal position",
         })
     }
@@ -157,12 +176,22 @@ impl<'a> Command<'a> {
     ///
     /// # Errors
     ///
-    /// [`CommandError::NotUtf8`] or [`CommandError::UnknownVerb`].
+    /// [`CommandError::NotUtf8`], [`CommandError::UnknownVerb`], or
+    /// [`CommandError::FilterEvent`] for a `filter` without an event and a filter.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, CommandError> {
         let (verb, rest) = verb(bytes)?;
         match verb {
             "enable" => Ok(Command::Enable(rest)),
             "disable" => Ok(Command::Disable(rest)),
+            "filter" => {
+                let (event, filter) = rest
+                    .split_once(|c: char| c.is_ascii_whitespace())
+                    .ok_or(CommandError::FilterEvent)?;
+                Ok(Command::Filter {
+                    event,
+                    filter: filter.trim(),
+                })
+            }
             _ => Err(CommandError::UnknownVerb),
         }
     }
@@ -209,6 +238,7 @@ impl fmt::Display for Command<'_> {
         match self {
             Command::Enable(spec) => write!(f, "enable {spec}"),
             Command::Disable(spec) => write!(f, "disable {spec}"),
+            Command::Filter { event, filter } => write!(f, "filter {event} {filter}"),
         }
     }
 }
@@ -321,6 +351,28 @@ impl fmt::Display for EventLine<'_> {
     }
 }
 
+/// One line of the [`FILTERS_PATH`] file: the command that sets the filter,
+/// `filter <event> <filter>`, which [`Command::parse`] reads back.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterLine<'a> {
+    /// The filtered event.
+    pub event: &'a Event,
+    /// Its filter.
+    pub filter: &'a crate::filter::Filter,
+}
+
+impl fmt::Display for FilterLine<'_> {
+    /// The line, with its `\n`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "filter {} {}",
+            self.event.name(),
+            self.filter.display(self.event)
+        )
+    }
+}
+
 /// One line of the [`STATS_PATH`] file: `cpu <n> pending <words> lost <records>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatsLine {
@@ -374,6 +426,7 @@ mod tests {
         assert_eq!(Path::parse("/"), Some(Path::Root));
         assert_eq!(Path::parse("events"), Some(Path::Events));
         assert_eq!(Path::parse("/stats/"), Some(Path::Stats));
+        assert_eq!(Path::parse("filters"), Some(Path::Filters));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));
         assert_eq!(Path::parse("cpu/17"), Some(Path::Cpu(17)));
         assert_eq!(Path::parse("cpu"), None);
@@ -382,6 +435,29 @@ mod tests {
         assert_eq!(Path::parse("cpu/x"), None);
         assert_eq!(Path::parse("cpus/1"), None);
         assert_eq!(Path::parse("other"), None);
+    }
+
+    #[test]
+    fn filter_lines_read_back_as_commands() {
+        use crate::filter::Filter;
+        let filter = Filter::parse(&SCHED_SWITCH, "next_pid == 7")
+            .expect("parses")
+            .expect("set");
+        let line = FilterLine {
+            event: &SCHED_SWITCH,
+            filter: &filter,
+        }
+        .to_string();
+        assert_eq!(line, "filter sched.switch next_pid == 0x7\n");
+        let Ok(Command::Filter {
+            event,
+            filter: text,
+        }) = Command::parse(line.as_bytes())
+        else {
+            panic!("{line:?} is not a filter command");
+        };
+        assert_eq!(event, "sched.switch");
+        assert_eq!(Filter::parse(&SCHED_SWITCH, text), Ok(Some(filter)));
     }
 
     #[test]
@@ -400,6 +476,22 @@ mod tests {
             Err(CommandError::UnknownVerb)
         );
         assert_eq!(Command::parse(b"\xff"), Err(CommandError::NotUtf8));
+        assert_eq!(
+            Command::parse(b"filter syscall.enter  nr == 3 && a < 4\n"),
+            Ok(Command::Filter {
+                event: "syscall.enter",
+                filter: "nr == 3 && a < 4"
+            })
+        );
+        assert_eq!(
+            Command::parse(b"filter syscall.enter"),
+            Err(CommandError::FilterEvent)
+        );
+        let line = Command::Filter {
+            event: "sched.switch",
+            filter: "none",
+        };
+        assert_eq!(Command::parse(line.to_string().as_bytes()), Ok(line));
         assert_eq!(Command::Enable("all").to_string(), "enable all");
     }
 

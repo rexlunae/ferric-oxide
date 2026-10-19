@@ -19,6 +19,8 @@
 //!   `unsafe` code.
 //! - [`select()`] parses event selections (`all`, a subsystem name, an event name) into an
 //!   [`EventSet`], for the boot environment and the trace scheme.
+//! - [`filter`] holds per-event argument filters (`nr == 3 && a < 0x1000`) and the lock-free
+//!   slot the kernel checks them in.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
 //! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
@@ -58,6 +60,7 @@ pub mod abi;
 #[cfg(feature = "config")]
 pub mod config;
 mod event;
+pub mod filter;
 pub mod kernel;
 mod level;
 pub mod record;

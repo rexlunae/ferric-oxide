@@ -18,7 +18,7 @@ use ferric_trace::record::{Records, WORD_BYTES};
 use ferric_trace::ring::View;
 use ferric_trace::{Event, EventId};
 use syscall::schemev2::Opcode;
-use syscall::{EACCES, EBADF, EINVAL, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
+use syscall::{EACCES, EBADF, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -796,6 +796,92 @@ fn run() -> Result<(), Failure> {
 
     check_mmap(&cpus)?;
     println!("FERRIC_TEST_PASS trace-mmap");
+    check_filter(&cpus)?;
+    Ok(())
+}
+
+/// Writes `text` to the event listing, which must fail with `errno`.
+fn command_fails(step: &'static str, text: &str, errno: i32) -> Result<(), Failure> {
+    let path = path(abi::EVENTS_PATH);
+    let result = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    match result {
+        Err(err) if err.raw_os_error() == Some(errno) => Ok(()),
+        other => Err(check(
+            step,
+            format!("{text:?} gave {other:?}, not errno {errno}"),
+        )),
+    }
+}
+
+/// `trace-filter`: with `filter syscall.enter nr == <write> && a == <closed fd>` set, the
+/// `filters` file lists it, and a write to the closed descriptor, a read of `stats` and a
+/// `yield` leave `syscall.enter` records only for the write, while `syscall.exit`, which has
+/// no filter, still records all three. `filter syscall.enter none` removes it, and the
+/// kernel refuses a filter on an unknown event (`ENOENT`) or that does not parse (`EINVAL`).
+fn check_filter(cpus: &[u32]) -> Result<(), Failure> {
+    let step = "trace-filter";
+    command_fails(step, "filter no.such.event nr == 1", ENOENT)?;
+    command_fails(step, "filter syscall.enter pid == 1", EINVAL)?;
+    let set = format!(
+        "filter syscall.enter nr == {} && a == {:#x}",
+        SYS_WRITE, BAD_FD
+    );
+    command(step, &set)?;
+    let listed = read_text(step, abi::FILTERS_PATH)?;
+    let expected = format!(
+        "filter syscall.enter nr == {:#x} && a == {:#x}\n",
+        SYS_WRITE, BAD_FD
+    );
+    if listed != expected {
+        return Err(check(
+            step,
+            format!("filters lists {listed:?}, not {expected:?}"),
+        ));
+    }
+    drain(step, cpus)?;
+    command(step, "enable syscall")?;
+    let marks = mark(step)?;
+    command(step, "disable syscall")?;
+    command(step, "filter syscall.enter none")?;
+    let trace = drain(step, cpus)?;
+    let all = || trace.iter().flatten();
+    let enters: Vec<&Entry> = all().filter(|e| e.is(&SYSCALL_ENTER)).collect();
+    if let Some(other) = enters
+        .iter()
+        .find(|e| e.arg(0) != Some(SYS_WRITE as u64) || e.arg(1) != Some(BAD_FD as u64))
+    {
+        return Err(check(
+            step,
+            format!(
+                "a syscall.enter the filter should have dropped: {:?}",
+                other.args
+            ),
+        ));
+    }
+    if !enters.iter().any(|e| e.arg(2) == Some(marks.write_buf)) {
+        return Err(check(step, "no syscall.enter for the write to a closed fd"));
+    }
+    let exit_of = |nr: usize| all().any(|e| e.is(&SYSCALL_EXIT) && e.arg(0) == Some(nr as u64));
+    if !(exit_of(SYS_WRITE) && exit_of(SYS_READ) && exit_of(SYS_YIELD)) {
+        return Err(check(
+            step,
+            "syscall.exit, which has no filter, lost records",
+        ));
+    }
+    let listed = read_text(step, abi::FILTERS_PATH)?;
+    if !listed.is_empty() {
+        return Err(check(
+            step,
+            format!("filters still lists {listed:?} after none"),
+        ));
+    }
+    println!(
+        "FERRIC_TEST_PASS trace-filter ({} syscall.enter records kept)",
+        enters.len()
+    );
     Ok(())
 }
 

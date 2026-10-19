@@ -38,6 +38,10 @@
 //!   `ferric_trace::ring::View`; `commit <end>` past `head` or inside a record is refused
 //!   and leaves `tail` alone, and `commit` of the end read moves `tail` there, after which a
 //!   read of the ring no longer gives the call.
+//! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
+//!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
+//!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
+//!   unknown events or arguments are refused.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without

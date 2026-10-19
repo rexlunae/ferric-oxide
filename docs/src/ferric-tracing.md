@@ -174,11 +174,12 @@ The paths are defined in `ferric_trace::abi`.
 
 | Path | Read | Write |
 | --- | --- | --- |
-| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
+| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live; `filter <event> <filter\|none>` sets or removes an argument filter ([Argument filters](#argument-filters)) |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
+| `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 
-`events` and `stats` are read from a snapshot taken at the first read of each
+`events`, `stats` and `filters` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
 
 - It consumes records only after they have been copied to the caller, so a
@@ -190,6 +191,38 @@ open. A `cpu/<n>` read follows these rules:
 
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
+
+### Argument filters
+
+`filter <event> <filter>` keeps only the records of `<event>` whose arguments
+pass `<filter>`; other records are not written and not counted as lost. A
+filter is up to four conditions joined by `&&`, each `<arg> <op> <value>`:
+
+```sh
+echo "filter syscall.enter nr == 3 && a < 0x1000" > /scheme/kernel.trace/events
+echo "filter sched.switch next_pid == 42" > /scheme/kernel.trace/events
+echo "filter syscall.enter none" > /scheme/kernel.trace/events
+```
+
+- `<arg>` is one of the event's argument names, as the event table above
+  lists them.
+- `<op>` is `==`, `!=`, `<`, `<=`, `>`, `>=`, or `&` (any of the value's bits
+  set).
+- `<value>` is a decimal or `0x` hexadecimal 64-bit number.
+
+A filter is independent of whether the event is on: it is kept while the event
+is off and applies when it is turned on. Setting a filter replaces the event's
+previous one. A filter on an unknown event gives `ENOENT`, on an event that is
+not compiled in `EOPNOTSUPP`, and one that does not parse (an unknown argument
+or operator, a bad number, more than four conditions) `EINVAL`. The kernel logs
+each filter it sets, and `filters` lists them in the same syntax, with values
+in hexadecimal.
+
+Each event's filter sits in a sequence-locked slot of atomics
+(`ferric_trace::filter::Slot`). A tracepoint checks it without a lock: an event
+without a filter costs one relaxed load more, and a record that races with a
+filter being replaced is kept rather than dropped, so a filter only ever
+removes records.
 
 ### Mapping a ring
 
@@ -362,7 +395,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      private mappings and an `mprotect` to writable are refused, finds the
      `write` to a closed descriptor by reading the mappings, and checks that
      `commit` refuses a position past `head` or inside a record and accepts
-     the end of what was read.
+     the end of what was read;
+  8. sets `filter syscall.enter nr == <write> && a == <closed fd>`, checks the
+     `filters` listing, and repeats the marker calls with `syscall` on: only
+     the write keeps its `syscall.enter`, while `syscall.exit` (no filter)
+     records every call; then removes the filter and checks that unknown events
+     and arguments are refused (`trace-filter`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
@@ -374,7 +412,7 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
-  requires all twelve step markers, the `trace-capture` marker, the boot log
+  requires all thirteen step markers, the kernel's log of the filter, the `trace-capture` marker, the boot log
   line and the kernel's log of bootstrap's `enable scheme.cancel`.
 
 ## Overhead budget

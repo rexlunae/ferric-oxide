@@ -5,6 +5,9 @@
 //!   `enable <selection>` or `disable <selection>` turns events on or off, patching their
 //!   tracepoints live (`arch::static_key`).
 //! - `stats`: one line per CPU with the words waiting in its ring and the records it lost.
+//!   Writing `filter <event> <filter>` to `events` sets that event's argument filter
+//!   (`ferric_trace::filter`), and `filter <event> none` removes it.
+//! - `filters`: one line per filtered event, written as the command that sets its filter.
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
@@ -23,7 +26,7 @@
 //! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
 //! The mapping needs `PROT_READ`: a mapping without it would still be readable.
 //!
-//! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
+//! `events`, `stats` and `filters` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
 //! addresses, and a Phase 4 capability will replace the uid check.
 
@@ -33,7 +36,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ferric_trace::abi::{Command, CpuCommand, EventLine, Path, StatsLine, CPU_MAP_BYTES};
+use ferric_trace::abi::{
+    Command, CpuCommand, EventLine, FilterLine, Path, StatsLine, CPU_MAP_BYTES,
+};
 use spin::{Mutex, MutexGuard};
 use syscall::{
     error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP},
@@ -49,7 +54,7 @@ use crate::{
         data::Map,
         usercopy::{UserSliceRo, UserSliceWo},
     },
-    trace::{self, ControlError, Mode},
+    trace::{self, ControlError, FilterControlError, Mode},
 };
 
 /// The number of the scheme root.
@@ -69,12 +74,13 @@ pub struct TraceScheme;
 enum Text {
     Events,
     Stats,
+    Filters,
 }
 
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events` or `stats`, with the snapshot its reads come from once taken.
+    /// `events`, `stats` or `filters`, with the snapshot its reads come from once taken.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
@@ -111,6 +117,18 @@ fn render(text: Text) -> Arc<[u8]> {
                 let _ = write!(out, "{}", StatsLine { cpu, pending, lost });
             }
         }
+        Text::Filters => {
+            for (event, filter) in trace::filters() {
+                let _ = write!(
+                    out,
+                    "{}",
+                    FilterLine {
+                        event,
+                        filter: &filter
+                    }
+                );
+            }
+        }
     }
     Arc::from(out.into_bytes())
 }
@@ -143,6 +161,7 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
     let (spec, on) = match command {
         Command::Enable(spec) => (spec, true),
         Command::Disable(spec) => (spec, false),
+        Command::Filter { event, filter } => return filter_command(event, filter, len),
     };
     match trace::control(spec, on, Mode::Live) {
         Ok(changed) => {
@@ -152,6 +171,28 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
         Err(err) => {
             warn!("trace: {command}: {err}");
             Err(control_errno(&err))
+        }
+    }
+}
+
+/// Runs `filter <event> <filter>`: sets or removes the event's argument filter.
+fn filter_command(event: &str, filter: &str, len: usize) -> Result<usize> {
+    match trace::set_filter(event, filter) {
+        Ok((event, Some(set))) => {
+            info!("trace: filter {} {}", event.name(), set.display(event));
+            Ok(len)
+        }
+        Ok((event, None)) => {
+            info!("trace: filter {} none", event.name());
+            Ok(len)
+        }
+        Err(err) => {
+            warn!("trace: filter {event} {filter}: {err}");
+            Err(Error::new(match err {
+                FilterControlError::UnknownEvent(_) => ENOENT,
+                FilterControlError::NotCompiled(_) => EOPNOTSUPP,
+                FilterControlError::Filter(_) => EINVAL,
+            }))
         }
     }
 }
@@ -203,6 +244,7 @@ impl KernelScheme for TraceScheme {
             Path::Root => return Err(Error::new(ENOENT)),
             Path::Events => (Text::Events, InternalFlags::POSITIONED),
             Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
+            Path::Filters => (Text::Filters, InternalFlags::POSITIONED),
             Path::Cpu(cpu) if cpu < crate::cpu_count() => {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 HANDLES
@@ -288,7 +330,8 @@ impl KernelScheme for TraceScheme {
             } => events_command(buf),
             Handle::Cpu(cpu) => cpu_command(cpu, buf),
             Handle::Text {
-                text: Text::Stats, ..
+                text: Text::Stats | Text::Filters,
+                ..
             } => Err(Error::new(EBADF)),
         }
     }
@@ -357,6 +400,10 @@ impl KernelScheme for TraceScheme {
             Handle::Text {
                 text: Text::Stats, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::STATS_PATH),
+            Handle::Text {
+                text: Text::Filters,
+                ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::FILTERS_PATH),
             Handle::Cpu(cpu) => alloc::format!(
                 "/scheme/kernel.trace/{}/{}",
                 ferric_trace::abi::CPU_DIR,
