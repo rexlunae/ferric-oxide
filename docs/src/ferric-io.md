@@ -66,8 +66,9 @@ New mappings of revoked grants fail with `ECANCELED`.
 A revoke, or the region's close, takes the registered frames away from a
 holder at a moment the holder did not choose. So a holder's CPU mapping is
 not unmapped but replaced in place, under one hold of the holder's address
-space lock, with zeroed private anonymous memory of the same protection. The
-frames are unpinned and the TLBs shot down as before, so the holder can no
+space lock, with zeroed private anonymous memory of the same protection (the
+`PROT_READ`, `PROT_WRITE` and `PROT_EXEC` bits the holder mapped it with, so a
+`PROT_NONE` mapping stays inaccessible). The frames are unpinned and the TLBs shot down as before, so the holder can no
 longer see or change the owner's memory. But the range stays mapped: the
 holder reads zeros there, its writes go to its own private pages, and it never
 faults on memory it was granted. A driver that keeps a grant mapped (such as

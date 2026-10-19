@@ -47,6 +47,10 @@
 //!   the scheme fills; the application then writes the page. After revoking both, the page
 //!   holds the application's writes except where the scheme wrote: a bounce page copies back
 //!   only the bytes its holder changed.
+//! - `regbuf-revoke-prot`: a revoke keeps each mapping's protection. A forked probe maps one
+//!   grant readable, writable and executable and another `PROT_NONE`; after the revoke, a
+//!   `ret` it writes in the first still runs, and reading the second still kills it with
+//!   `SIGSEGV`.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.regbuf` scheme (a kernel built

@@ -52,6 +52,9 @@ enum Failure {
     Payload(ferric_regbuf::abi::BytesError),
     /// Pages the scheme only borrows reached this process through it: the re-share gap.
     Reshared { what: &'static str },
+    /// The probe child of `regbuf-revoke-prot` ended other than by `SIGSEGV` on the
+    /// `PROT_NONE` page (`status` as `waitpid` gave it).
+    Probe { status: c_int },
 }
 
 impl fmt::Display for Failure {
@@ -71,6 +74,11 @@ impl fmt::Display for Failure {
             } => write!(f, "{what}: {got} pages pinned, expected {expected}"),
             Self::Payload(err) => write!(f, "bad payload from the kernel: {err}"),
             Self::Reshared { what } => write!(f, "{what}: borrowed pages were shared onward"),
+            Self::Probe { status } => write!(
+                f,
+                "the protection probe ended with wait status {status:#x}, not SIGSEGV on its \
+                 PROT_NONE page"
+            ),
         }
     }
 }
@@ -327,7 +335,7 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 15] = [
+    let steps: [(&str, Step); 16] = [
         ("regbuf-register", register),
         ("regbuf-file-backed", file_backed),
         ("regbuf-grant-rw", grant_rw),
@@ -343,6 +351,7 @@ pub fn run() -> ExitCode {
         ("regbuf-shared", shared),
         ("regbuf-bytes", bytes),
         ("regbuf-bounce-newer", bounce_newer),
+        ("regbuf-revoke-prot", revoke_prot),
     ];
     let ok = steps.iter().all(|(name, f)| step(name, f(&mut test)));
     test.scheme.stop();
@@ -925,4 +934,154 @@ fn bounce_newer(t: &mut Test) -> Result<(), Failure> {
     }
     drop(region);
     unpinned(t, "after closing the bounce region")
+}
+
+/// How the probe child of [`revoke_prot`] tells the parent where it is.
+const PROBE_MAPPED: u8 = 1;
+const PROBE_RAN: u8 = 2;
+
+/// A revoke keeps each holder mapping's protection: the zeroed replacement of an executable
+/// mapping still runs code written there, and that of a `PROT_NONE` mapping still faults
+/// (rather than turning into readable zeros). A forked probe holds both mappings, so the fault
+/// ends only the probe.
+fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
+    // Shared, so the fork below leaves the registered pages shared rather than copy-on-write,
+    // which a grant mapping cannot take.
+    let buffer = Buffer::shared()?;
+    let region = register_region(&buffer)?;
+    let (exec_fd, exec_id) = grant(&region, Access::ReadWrite, 0, PAGE_SIZE)?;
+    let (none_fd, none_id) = grant(&region, Access::Read, PAGE_SIZE, PAGE_SIZE)?;
+    let to_parent = pipe()?;
+    let to_child = pipe()?;
+    // SAFETY: the program is single-threaded here, so the child is a consistent copy; it only
+    // maps, touches memory and uses the pipes, and leaves with `_exit`.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(Failure::Errno {
+            what: "fork the probe",
+            errno: super::last_errno(),
+        });
+    }
+    if child == 0 {
+        let code = prot_probe(
+            exec_fd.raw() as c_int,
+            none_fd.raw() as c_int,
+            to_parent[1],
+            to_child[0],
+        );
+        // SAFETY: ends the child at once, as `fork` requires.
+        unsafe { libc::_exit(code) }
+    }
+    // SAFETY: closes the child's ends in the parent, so a probe that dies reads as the end of
+    // its pipe here.
+    unsafe {
+        libc::close(to_parent[1]);
+        libc::close(to_child[0]);
+    }
+    let mapped = read_byte(to_parent[0]);
+    let revoked = if mapped == Some(PROBE_MAPPED) {
+        call(&region, "Revoke", Request::Revoke(exec_id))
+            .and_then(|_| call(&region, "Revoke", Request::Revoke(none_id)))
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    // The probe goes on (or ends) whatever happened, so it is always reaped.
+    write_byte(to_child[1], 0);
+    let ran = read_byte(to_parent[0]);
+    let mut status = 0;
+    // SAFETY: `status` is a live integer for the call to fill in.
+    unsafe { libc::waitpid(child, &mut status, 0) };
+    // SAFETY: closes the parent's own pipe ends, which nothing uses any more.
+    unsafe {
+        libc::close(to_parent[0]);
+        libc::close(to_child[1]);
+    }
+    revoked?;
+    if mapped != Some(PROBE_MAPPED) {
+        return Err(Failure::Probe { status });
+    }
+    if ran != Some(PROBE_RAN) {
+        return Err(Failure::Data {
+            what: "code in the zeroed replacement of an executable mapping",
+        });
+    }
+    if !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV) {
+        return Err(Failure::Probe { status });
+    }
+    drop((exec_fd, none_fd));
+    drop(region);
+    unpinned(t, "after closing the protection region")
+}
+
+/// The probe child of [`revoke_prot`]: maps the `exec` grant readable, writable and
+/// executable and the `none` grant `PROT_NONE`, reports, waits for the revoke, then runs a
+/// `ret` written in the first and reads the second, which must kill it with `SIGSEGV`. The
+/// exit code says where it stopped otherwise.
+fn prot_probe(exec: c_int, none: c_int, report: c_int, wait: c_int) -> c_int {
+    // SAFETY: fresh shared mappings of the grants at addresses the kernel chooses.
+    let (code, guard) = unsafe {
+        (
+            libc::mmap(
+                core::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_SHARED,
+                exec,
+                0,
+            ),
+            libc::mmap(
+                core::ptr::null_mut(),
+                PAGE,
+                libc::PROT_NONE,
+                libc::MAP_SHARED,
+                none,
+                0,
+            ),
+        )
+    };
+    if code == libc::MAP_FAILED || guard == libc::MAP_FAILED {
+        return 2;
+    }
+    write_byte(report, PROBE_MAPPED);
+    if read_byte(wait).is_none() {
+        return 3;
+    }
+    let code = code.cast::<u8>();
+    // SAFETY: `code` is this process's page, mapped writable: x86-64 `ret`.
+    unsafe { code.write_volatile(0xc3) };
+    // SAFETY: the page holds a lone `ret`, mapped executable, which returns at once.
+    let ret: extern "C" fn() = unsafe { core::mem::transmute(code) };
+    ret();
+    write_byte(report, PROBE_RAN);
+    // SAFETY: deliberately touches the PROT_NONE page; the fault ends this child, which is
+    // what the parent checks.
+    unsafe { core::ptr::read_volatile(guard.cast::<u8>()) };
+    4
+}
+
+/// A new pipe: read end, write end.
+fn pipe() -> Result<[c_int; 2], Failure> {
+    let mut fds: [c_int; 2] = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(Failure::Errno {
+            what: "pipe",
+            errno: super::last_errno(),
+        });
+    }
+    Ok(fds)
+}
+
+/// One byte from `fd`, or `None` at its end or on an error.
+fn read_byte(fd: c_int) -> Option<u8> {
+    let mut byte = 0_u8;
+    // SAFETY: reads one byte into a local.
+    (unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } == 1).then_some(byte)
+}
+
+/// Writes `byte` to `fd`; a failure shows up as the reader's end of input.
+fn write_byte(fd: c_int, byte: u8) {
+    // SAFETY: writes one byte from a local.
+    unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
 }

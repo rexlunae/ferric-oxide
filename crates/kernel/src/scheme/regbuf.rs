@@ -34,7 +34,8 @@
 //! - [`Request::Revoke`](ferric_regbuf::abi::Request::Revoke) on the region, or closing the region, marks grants revoked (mapping
 //!   them again fails with `ECANCELED`) and takes every recorded mapping down, with a TLB
 //!   shootdown, before it returns. A holder's CPU mapping is not unmapped but replaced in place
-//!   with zeroed private memory (`AddrSpaceWrapper::replace_with_zeroed`,
+//!   with zeroed private memory of the protection it was mapped with
+//!   (`AddrSpaceWrapper::replace_with_zeroed`,
 //!   [`Teardown::Revoked`](ferric_regbuf::table::Teardown::Revoked)): the holder did not
 //!   choose the moment and may still be using it, so it reads zeros there instead of
 //!   faulting. The holder's own `Unmap` or close of its grant unmaps. Closing the region also unpins its frames and refunds the charge.
@@ -119,8 +120,10 @@ struct Mapping {
     span: PageSpan,
     /// The bounce pages among them.
     bounces: Vec<Bounce>,
-    /// Whether the holder could write them, so bounce pages are copied back.
-    writable: bool,
+    /// The protection the holder mapped them with (`PROT_READ`, `PROT_WRITE`, `PROT_EXEC`;
+    /// none of them for `PROT_NONE`). A revoke maps the zeroed replacement with the same, and
+    /// bounce pages are copied back only when it includes `PROT_WRITE`.
+    prot: MapFlags,
     /// Where the grant is mapped in an IOMMU domain (`MapGrant`).
     #[cfg(iommu_enabled)]
     dma: Option<DmaRecord>,
@@ -147,18 +150,19 @@ impl Mapping {
             space: Weak::new(),
             span: PageSpan::empty(),
             bounces: Vec::new(),
-            writable: false,
+            prot: MapFlags::empty(),
             dma: Some(record),
         }
     }
 
-    /// A mapping of `span` in `space` without bounce pages.
+    /// A mapping of `span` in `space` without bounce pages, for undoing it at once (its
+    /// protection is not recorded).
     fn plain(space: &Arc<AddrSpaceWrapper>, span: PageSpan) -> Self {
         Self {
             space: Arc::downgrade(space),
             span,
             bounces: Vec::new(),
-            writable: false,
+            prot: MapFlags::empty(),
             #[cfg(iommu_enabled)]
             dma: None,
         }
@@ -167,7 +171,7 @@ impl Mapping {
     /// Copies a writable mapping's bounce pages back into the region's `frames`, once the
     /// mapping is gone.
     fn write_back(&self, frames: &mut [RaiiFrame]) {
-        if self.writable {
+        if self.prot.contains(MapFlags::PROT_WRITE) {
             for bounce in &self.bounces {
                 bounce.write_back(frames);
             }
@@ -340,6 +344,13 @@ fn path_errno(err: &PathError) -> Error {
     })
 }
 
+/// The protection bits of a holder's `mmap` flags, as its grant mapping is made with them and
+/// as a revoke maps the zeroed replacement: `PROT_READ`, `PROT_WRITE` and `PROT_EXEC`, and none
+/// of them for `PROT_NONE`.
+fn holder_prot(flags: MapFlags) -> MapFlags {
+    flags & (MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::PROT_EXEC)
+}
+
 /// Takes `mapping` down. A mapping whose address space has gone needs nothing. An IOMMU mapping
 /// is unmapped with the IOTLB invalidated and waited on before this returns. A CPU mapping is
 /// unmapped when its holder let go of it, and replaced in place with zeroed memory when the
@@ -360,12 +371,9 @@ fn unmap_one(mapping: &Mapping, teardown: Teardown, token: &mut CleanLockToken) 
     // Unpinning is what lets the pinned borrows go; the holder could not have removed or
     // replaced them, so the span still holds exactly this mapping.
     let notify = if teardown.keeps_range() {
-        let flags = if mapping.writable {
-            MapFlags::PROT_READ | MapFlags::PROT_WRITE
-        } else {
-            MapFlags::PROT_READ
-        };
-        space.replace_with_zeroed(mapping.span, flags, token)
+        // The holder's own protection: executable stays executable, and PROT_NONE stays
+        // inaccessible rather than becoming readable zeros.
+        space.replace_with_zeroed(mapping.span, mapping.prot, token)
     } else {
         space.munmap(mapping.span, true, token)
     }
@@ -569,13 +577,13 @@ impl KernelScheme for RegBufScheme {
             .check_map(id, map.offset as u64, map.size as u64, write)
             .map_err(|err| table_errno(&err))?;
         let (frames, bounces) = plan_frames(&region.frames, &plan)?;
-        let prot = map.flags & (MapFlags::PROT_READ | MapFlags::PROT_WRITE);
+        let prot = holder_prot(map.flags);
         let (span, result) = map_frames(addr_space, &frames, prot, token);
         let mapping = Mapping {
             space: Arc::downgrade(addr_space),
             span,
             bounces,
-            writable: write,
+            prot,
             #[cfg(iommu_enabled)]
             dma: None,
         };
