@@ -584,8 +584,7 @@ is host-tested. `drivers.net_bypass = true` (Drivers menu, default `false`,
 needs `kernel.regbuf`) builds `driver-network` with its `bypass` feature
 (through `e1000d/bypass`), which adds the `queue` path in copy mode. Without
 the option the network schemes have no `queue` path, as upstream.
-Zero-copy mode, `igbd`, port ownership for unprivileged sockets, TX
-validation and a benchmark come in later changes.
+Zero-copy mode, `igbd` and unprivileged sockets come in later changes.
 
 An application opens `queue` beneath a network scheme
 (`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
@@ -609,9 +608,21 @@ netstack.
   `Attach` passes the UMEM grant and the ring grant as `CallFlags::FD`
   descriptors (the kernel gives a scheme only the first metadata word of such
   a call), then `Bind` starts the queue with its parameters (frame size, ring
-  sizes, mode, CPU) in a 32-byte payload. `AddFilter`, `RemoveFilter`, `Kick`
-  and `Stats` follow. Every request fits the three metadata words the kernel
-  passes on a plain call.
+  sizes, mode, CPU, and `BindFlags`) in a 32-byte payload. `Own`,
+  `AddFilter`, `RemoveFilter`, `Kick` and `Stats` follow. Every request fits
+  the three metadata words the kernel passes on a plain call.
+- `own`: port ownership and TX validation. `Own` passes a netstack `udp` or
+  `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
+  reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
+  keeps the socket open, so netstack keeps the port reserved. A filter on a
+  TCP or UDP destination port needs that port owned (on the filter's address,
+  when the netstack socket is bound to one). TX validation drops a frame
+  unless it has the NIC's source MAC, no VLAN tag, and is TCP or UDP from an
+  owned port (and address); `BindFlags::RAW_TX` skips it. Dropped frames still
+  come back on Completion and are counted in `Stats::tx_rejected`. The path
+  check guards against mistakes, not a hostile root, since queue sockets are
+  root's and root can serve any scheme. Unprivileged sockets will need the
+  kernel to vouch for the scheme that answered.
 - `ring`: the four rings on `ferric-ring`'s index protocol. `RingLayout`
   places them in the ring grant (one header page of indices and flags, then
   each ring's slots on pages of their own, Fill, RX, TX, Completion), and
@@ -634,10 +645,14 @@ socket in copy mode (`Mode::ZeroCopy` fails with `ENOSPC`). While any socket
 is bound, every tick drains the adapter, gives each frame to the first socket
 with a matching filter (and posts `EVENT_READ` on it), and keeps the rest, in
 order, for netstack's reads (up to 256 frames; the oldest is dropped beyond
-that). `Kick` sends up to 256 TX packets through the adapter. A socket whose
-rings turn out corrupt is stopped, and its calls fail with `EIO`. Closing a
-socket unmaps its grants. Every queue socket is root's, since the scheme
-root is root-only, and root may send raw frames.
+that). `Kick` sends up to 256 TX packets through the adapter, after TX
+validation unless the socket was bound with `RAW_TX`. A filter on a port the
+socket does not own fails with `EACCES`, and an `Own` with anything but a
+bound netstack TCP or UDP socket with `EINVAL`. A socket whose rings turn
+out corrupt is stopped, and its calls fail with `EIO`. Closing a socket
+unmaps its grants and closes its netstack sockets. Every queue socket is
+root's, since the scheme root is root-only, so any socket may ask for raw
+TX.
 
 `ferric-netq-test` (`recipes/tests/ferric-netq-test`, in the CI smoke image)
 is the on-target test. It checks netstack answers an ICMP echo to the
@@ -647,9 +662,17 @@ checks the refusals (calls before `Bind`, a zero-copy `Bind`, a second
 runs in copy mode. With an ARP filter it sends an ARP request for the
 gateway through its TX ring and receives the reply on RX, while netstack's
 echo still works beside it; with an ICMP filter it sends its own echo
-request and receives the reply. It then checks the counters, closes the
-socket with requests in flight, and checks netstack answers again. It skips
-when the driver has no queue sockets or there is no `kernel.regbuf` scheme.
+request and receives the reply; this socket is bound with `RAW_TX`. A second
+socket, bound without it, owns a UDP port through a netstack socket. Filters
+on unowned ports and an `Own` with a file are refused. It exchanges a DNS
+query with the configured server from that port, and has three spoofed
+frames dropped and counted: a foreign source MAC, an unowned source port,
+and ICMP. A TX benchmark then sends 20,000 60-byte UDP frames through the
+socket and the same number through netstack's UDP socket, and prints both
+rates (`FERRIC_BENCH netq-tx-udp60`; QEMU numbers, for trend only). Last, it
+checks the counters, closes both sockets with requests in flight, and checks
+netstack answers again. It skips when the driver has no queue sockets or
+there is no `kernel.regbuf` scheme.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.

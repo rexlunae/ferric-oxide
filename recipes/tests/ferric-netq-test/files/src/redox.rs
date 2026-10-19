@@ -1,7 +1,8 @@
 //! The test proper; see the crate documentation for the steps.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64;
@@ -14,8 +15,8 @@ use etherparse::{
     SlicedPacket, TransportSlice,
 };
 use ferric_netq::call::{
-    ActiveMode, Bind, FilterId, Mode, QUEUE_PATH, Request as QueueRequest, RingSize, Stats,
-    StatsError,
+    ActiveMode, Bind, BindFlags, FilterId, Mode, QUEUE_PATH, Request as QueueRequest, RingSize,
+    Stats, StatsError,
 };
 use ferric_netq::copy::{read_frame, write_frame};
 use ferric_netq::desc::{DescError, Packet};
@@ -29,7 +30,7 @@ use ferric_ring::queue::{PushError, RingError};
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR};
 use syscall::CallFlags;
-use syscall::error::{EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOSPC, ENOTCONN};
+use syscall::error::{EACCES, EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOSPC, ENOTCONN};
 
 /// The UMEM's frame size.
 const FRAME_SIZE: FrameSize = FrameSize::Bytes2048;
@@ -59,6 +60,23 @@ const RESEND: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(2);
 /// Echo requests left in flight when the socket is closed.
 const IN_FLIGHT: u16 = 8;
+/// The UDP port the second socket owns, through a netstack socket bound on it.
+const OWNED_PORT: u16 = 47353;
+/// The UDP protocol number (RFC 768).
+const IP_PROTOCOL_UDP: u8 = 17;
+/// How long the DNS round trip may take: the configured server is past QEMU's gateway.
+const DNS_WAIT: Duration = Duration::from_secs(10);
+/// The DNS query's ID.
+const DNS_ID: u16 = 0x4e71;
+/// Frames each side sends in the TX benchmark.
+const BENCH_FRAMES: u64 = 20_000;
+/// The UDP payload of a benchmark frame: 18 bytes make a 60-byte frame, the Ethernet minimum
+/// without the frame check sequence.
+const BENCH_PAYLOAD: [u8; 18] = *b"ferric-netq bench!";
+/// How long either side of the benchmark may take before the step fails.
+const BENCH_LIMIT: Duration = Duration::from_secs(60);
+/// The discard port (RFC 863), where the benchmark sends.
+const DISCARD_PORT: u16 = 9;
 
 /// Why a step failed.
 #[derive(Debug)]
@@ -142,6 +160,14 @@ fn ctx<T>(what: &'static str, r: libredox::error::Result<T>) -> Result<T, Failur
     r.map_err(|e| Failure::Errno {
         what,
         errno: e.errno(),
+    })
+}
+
+/// Wraps a `std::io` result with what it was doing.
+fn io<T>(what: &'static str, r: std::io::Result<T>) -> Result<T, Failure> {
+    r.map_err(|e| Failure::Errno {
+        what,
+        errno: e.raw_os_error().unwrap_or(EIO),
     })
 }
 
@@ -270,8 +296,8 @@ fn stats_call(fd: &Fd, len: usize) -> Result<Stats, Failure> {
     Stats::from_bytes(&bytes).map_err(Failure::Stats)
 }
 
-/// The `Bind` record the test binds with, in `mode`.
-fn bind_record(mode: Mode) -> Bind {
+/// The `Bind` record the test binds with, in `mode` with `flags`.
+fn bind_record(mode: Mode, flags: BindFlags) -> Bind {
     let size = RingSize::new(ENTRIES).expect("64 entries is a valid ring size");
     Bind {
         frame_size: FRAME_SIZE,
@@ -281,6 +307,56 @@ fn bind_record(mode: Mode) -> Bind {
         completion: size,
         mode,
         cpu: 0,
+        flags,
+    }
+}
+
+/// Registers `buffer` in `region` and attaches grants of its UMEM and its rings to the queue
+/// socket `fd`.
+fn attach(fd: &Fd, region: &Fd, buffer: &Buffer, layout: &RingLayout) -> Result<(), Failure> {
+    let (words, n) = RegbufRequest::Register {
+        addr: buffer.addr(),
+        len: buffer.len as u64,
+    }
+    .encode();
+    ctx(
+        "Register",
+        region.call_wo(&[], CallFlags::empty(), &words[..n]),
+    )?;
+    let umem = grant(region, 0, UMEM_BYTES as u64)?;
+    let rings = grant(region, UMEM_BYTES as u64, layout.map_len() as u64)?;
+    // The descriptors move to the driver, so they must not be closed here.
+    let mut payload = umem.into_raw().to_ne_bytes().to_vec();
+    payload.extend_from_slice(&rings.into_raw().to_ne_bytes());
+    let (words, n) = QueueRequest::Attach.encode();
+    ctx(
+        "Attach",
+        libredox::call::call_wo(fd.raw(), &payload, CallFlags::FD, &words[..n]),
+    )?;
+    Ok(())
+}
+
+/// `Own` with descriptor `raw`, which stays open here too (`FD_CLONE`).
+fn own(fd: &Fd, raw: usize) -> Result<(), Failure> {
+    let (words, n) = QueueRequest::Own.encode();
+    ctx(
+        "Own",
+        libredox::call::call_wo(
+            fd.raw(),
+            &raw.to_ne_bytes(),
+            CallFlags::FD | CallFlags::FD_CLONE,
+            &words[..n],
+        ),
+    )?;
+    Ok(())
+}
+
+/// A filter for UDP to `port`.
+fn udp_port(port: u16) -> MatchSpec {
+    MatchSpec {
+        ip_protocol: Some(IP_PROTOCOL_UDP),
+        dst_port: Some(port),
+        ..MatchSpec::default()
     }
 }
 
@@ -364,6 +440,53 @@ struct Socket {
 }
 
 impl Socket {
+    /// The application's side of the bound socket `fd`, with every receive frame on Fill.
+    fn new(fd: Fd, layout: &RingLayout, buffer: &Buffer) -> Result<Self, Failure> {
+        let umem = Umem::new(UMEM_BYTES as u64, FRAME_SIZE).expect("UMEM_BYTES is whole frames");
+        let free_tx = (RX_FRAMES..FRAMES)
+            .map(|index| umem.frame(index).expect("TX frames lie inside the UMEM"))
+            .collect();
+        let mut socket = Self {
+            fd,
+            rings: layout.app(),
+            umem,
+            free_tx,
+            received: 0,
+            sent: 0,
+        };
+        socket.fill(buffer)?;
+        Ok(socket)
+    }
+
+    /// Puts up to `count` copies of `bytes` on TX, as many as there are free frames, and
+    /// kicks once. Returns how many the driver sent.
+    fn send_batch(&mut self, buffer: &Buffer, bytes: &[u8], count: usize) -> Result<u64, Failure> {
+        self.reclaim(buffer)?;
+        let len =
+            u32::try_from(bytes.len()).map_err(|_| Failure::FrameTooLong { len: bytes.len() })?;
+        for _ in 0..count {
+            let Some(frame) = self.free_tx.pop() else {
+                break;
+            };
+            let packet = Packet::new(&self.umem, frame, len)
+                .map_err(|_| Failure::FrameTooLong { len: bytes.len() })?;
+            write_frame(buffer.umem(), frame, bytes);
+            self.rings
+                .tx
+                .push(buffer.rings(), &PacketSlot::new(&packet))
+                .map_err(|source| Failure::Push { ring: "TX", source })?;
+        }
+        let sent = queue_call(&self.fd, "Kick", QueueRequest::Kick, &[])? as u64;
+        self.sent += sent;
+        Ok(sent)
+    }
+
+    /// TX frames not on TX, once Completion is drained.
+    fn free_tx(&mut self, buffer: &Buffer) -> Result<usize, Failure> {
+        self.reclaim(buffer)?;
+        Ok(self.free_tx.len())
+    }
+
     /// Hands the driver every receive frame.
     fn fill(&mut self, buffer: &Buffer) -> Result<(), Failure> {
         for index in 0..RX_FRAMES {
@@ -440,6 +563,18 @@ impl Socket {
         buffer: &Buffer,
         what: &'static str,
         request: &[u8],
+        answer: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Result<T, Failure> {
+        self.exchange_within(buffer, what, request, WAIT, answer)
+    }
+
+    /// [`exchange`](Self::exchange), waiting up to `wait`.
+    fn exchange_within<T>(
+        &mut self,
+        buffer: &Buffer,
+        what: &'static str,
+        request: &[u8],
+        wait: Duration,
         mut answer: impl FnMut(&[u8]) -> Option<T>,
     ) -> Result<T, Failure> {
         let start = Instant::now();
@@ -454,12 +589,21 @@ impl Socket {
                     return Ok(found);
                 }
             }
-            if start.elapsed() > WAIT {
-                return Err(Failure::Timeout { what, wait: WAIT });
+            if start.elapsed() > wait {
+                return Err(Failure::Timeout { what, wait });
             }
             thread::sleep(POLL);
         }
     }
+}
+
+/// The second socket: bound without raw TX, owning [`OWNED_PORT`].
+struct Owned {
+    socket: Socket,
+    buffer: Buffer,
+    _region: Fd,
+    /// The netstack socket that proves the port; the benchmark also sends through it.
+    netstack: UdpSocket,
 }
 
 /// Everything the steps share.
@@ -479,12 +623,43 @@ struct Test {
     gateway_mac: [u8; 6],
     /// The ARP filter's ID, once added.
     arp_filter: Option<FilterId>,
+    /// The DNS server netstack is configured with.
+    dns: Ipv4Addr,
+    /// The second socket, from the own step.
+    owned: Option<Owned>,
 }
 
 impl Test {
     fn unbound(&self) -> Result<&Fd, Failure> {
         self.unbound.as_ref().ok_or(Failure::Errno {
             what: "the unbound socket",
+            errno: ENOTCONN,
+        })
+    }
+
+    /// A UDP frame from `src_mac` and port `src_port` to `to` port `dst_port`, through the
+    /// gateway.
+    fn udp_frame(
+        &self,
+        src_mac: [u8; 6],
+        src_port: u16,
+        to: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Failure> {
+        let builder = PacketBuilder::ethernet2(src_mac, self.gateway_mac)
+            .ipv4(self.ip.octets(), to.octets(), 64)
+            .udp(src_port, dst_port);
+        let mut out = Vec::with_capacity(builder.size(payload.len()));
+        builder
+            .write_to_vec(&mut out, payload)
+            .map_err(Failure::Build)?;
+        Ok(out)
+    }
+
+    fn owned(&mut self) -> Result<&mut Owned, Failure> {
+        self.owned.as_mut().ok_or(Failure::Errno {
+            what: "the owning socket",
             errno: ENOTCONN,
         })
     }
@@ -516,29 +691,10 @@ fn attach_step(t: &mut Test) -> Result<(), Failure> {
             fd,
             "Bind",
             QueueRequest::Bind,
-            &bind_record(Mode::Copy).to_bytes(),
+            &bind_record(Mode::Copy, BindFlags::empty()).to_bytes(),
         ),
     )?;
-    let (words, n) = RegbufRequest::Register {
-        addr: t.buffer.addr(),
-        len: t.buffer.len as u64,
-    }
-    .encode();
-    ctx(
-        "Register",
-        t.region.call_wo(&[], CallFlags::empty(), &words[..n]),
-    )?;
-    let umem = grant(&t.region, 0, UMEM_BYTES as u64)?;
-    let rings = grant(&t.region, UMEM_BYTES as u64, t.layout.map_len() as u64)?;
-    // The descriptors move to the driver, so they must not be closed here.
-    let mut payload = umem.into_raw().to_ne_bytes().to_vec();
-    payload.extend_from_slice(&rings.into_raw().to_ne_bytes());
-    let (words, n) = QueueRequest::Attach.encode();
-    ctx(
-        "Attach",
-        libredox::call::call_wo(fd.raw(), &payload, CallFlags::FD, &words[..n]),
-    )?;
-    Ok(())
+    attach(fd, &t.region, &t.buffer, &t.layout)
 }
 
 fn checks_step(t: &mut Test) -> Result<(), Failure> {
@@ -556,10 +712,11 @@ fn checks_step(t: &mut Test) -> Result<(), Failure> {
             fd,
             "Bind",
             QueueRequest::Bind,
-            &bind_record(Mode::ZeroCopy).to_bytes(),
+            &bind_record(Mode::ZeroCopy, BindFlags::empty()).to_bytes(),
         ),
     )?;
-    let auto = bind_record(Mode::Auto).to_bytes();
+    // This socket sends ARP and ICMP, which only raw TX allows.
+    let auto = bind_record(Mode::Auto, BindFlags::RAW_TX).to_bytes();
     queue_call(fd, "Bind", QueueRequest::Bind, &auto)?;
     expect_errno(
         "a second Bind",
@@ -587,20 +744,7 @@ fn checks_step(t: &mut Test) -> Result<(), Failure> {
         what: "the unbound socket",
         errno: ENOTCONN,
     })?;
-    let umem = Umem::new(UMEM_BYTES as u64, FRAME_SIZE).expect("UMEM_BYTES is whole frames");
-    let free_tx = (RX_FRAMES..FRAMES)
-        .map(|index| umem.frame(index).expect("TX frames lie inside the UMEM"))
-        .collect();
-    let mut socket = Socket {
-        fd,
-        rings: t.layout.app(),
-        umem,
-        free_tx,
-        received: 0,
-        sent: 0,
-    };
-    socket.fill(&t.buffer)?;
-    t.socket = Some(socket);
+    t.socket = Some(Socket::new(fd, &t.layout, &t.buffer)?);
     Ok(())
 }
 
@@ -703,12 +847,13 @@ fn stats_step(t: &mut Test) -> Result<(), Failure> {
     let stats = stats_call(&socket.fd, Stats::BYTES)?;
     println!(
         "netq: rx_packets={} tx_packets={} fill_empty_drops={} overflow_drops={} \
-         invalid_descriptors={} (test received {}, sent {})",
+         invalid_descriptors={} tx_rejected={} (test received {}, sent {})",
         stats.rx_packets,
         stats.tx_packets,
         stats.fill_empty_drops,
         stats.overflow_drops,
         stats.invalid_descriptors,
+        stats.tx_rejected,
         socket.received,
         socket.sent
     );
@@ -719,7 +864,8 @@ fn stats_step(t: &mut Test) -> Result<(), Failure> {
         && socket.received >= 2
         && stats.tx_packets == socket.sent
         && socket.sent >= 2
-        && stats.invalid_descriptors == 0;
+        && stats.invalid_descriptors == 0
+        && stats.tx_rejected == 0;
     if ok {
         Ok(())
     } else {
@@ -727,6 +873,189 @@ fn stats_step(t: &mut Test) -> Result<(), Failure> {
             what: "the socket's counters",
         })
     }
+}
+
+fn own_step(t: &mut Test) -> Result<(), Failure> {
+    let fd = ctx(
+        "open a second queue socket",
+        Fd::open(
+            &format!("/scheme/{}/{QUEUE_PATH}", t.scheme),
+            O_RDWR | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    // A region holds one registration, so the second socket's memory has its own.
+    let region = ctx(
+        "open a second region",
+        Fd::open(
+            &format!("/scheme/{SCHEME_NAME}/{REGION_PATH}"),
+            O_RDWR | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    let buffer = Buffer::new(UMEM_BYTES + t.layout.map_len())?;
+    attach(&fd, &region, &buffer, &t.layout)?;
+    let netstack = io(
+        "bind a netstack UDP socket",
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, OWNED_PORT)),
+    )?;
+    let raw = netstack.as_raw_fd() as usize;
+    expect_errno("Own before Bind", ENOTCONN, own(&fd, raw))?;
+    let bind = bind_record(Mode::Copy, BindFlags::empty()).to_bytes();
+    queue_call(&fd, "Bind", QueueRequest::Bind, &bind)?;
+    expect_errno(
+        "AddFilter on a port the socket does not own",
+        EACCES,
+        add_filter(&fd, udp_port(OWNED_PORT)),
+    )?;
+    let file = ctx(
+        "open a file",
+        Fd::open("/etc/net/ip", O_RDONLY | O_CLOEXEC, 0),
+    )?;
+    expect_errno("Own with a file", EINVAL, own(&fd, file.raw()))?;
+    own(&fd, raw)?;
+    add_filter(&fd, udp_port(OWNED_PORT))?;
+    expect_errno(
+        "AddFilter on another port",
+        EACCES,
+        add_filter(&fd, udp_port(OWNED_PORT + 1)),
+    )?;
+    let socket = Socket::new(fd, &t.layout, &buffer)?;
+    t.owned = Some(Owned {
+        socket,
+        buffer,
+        _region: region,
+        netstack,
+    });
+    Ok(())
+}
+
+/// A DNS query (RFC 1035) for the root's name servers, which any recursive server answers.
+fn dns_query() -> Vec<u8> {
+    let mut query = Vec::with_capacity(17);
+    query.extend_from_slice(&DNS_ID.to_be_bytes());
+    // Recursion desired; one question.
+    query.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    // The root name, type NS (2), class IN (1).
+    query.extend_from_slice(&[0, 0, 2, 0, 1]);
+    query
+}
+
+/// Whether `frame` is the DNS server's answer to [`dns_query`], to [`OWNED_PORT`].
+fn is_dns_answer(frame: &[u8], dns: Ipv4Addr) -> bool {
+    let Ok(packet) = SlicedPacket::from_ethernet(frame) else {
+        return false;
+    };
+    let from_dns =
+        matches!(&packet.net, Some(NetSlice::Ipv4(ip)) if ip.header().source() == dns.octets());
+    let Some(TransportSlice::Udp(udp)) = packet.transport else {
+        return false;
+    };
+    let payload = udp.payload();
+    from_dns
+        && udp.source_port() == 53
+        && udp.destination_port() == OWNED_PORT
+        && payload.len() >= 3
+        && payload[..2] == DNS_ID.to_be_bytes()
+        && payload[2] & 0x80 != 0
+}
+
+fn udp_step(t: &mut Test) -> Result<(), Failure> {
+    let dns = t.dns;
+    let query = t.udp_frame(t.mac, OWNED_PORT, dns, 53, &dns_query())?;
+    let owned = t.owned()?;
+    owned.socket.exchange_within(
+        &owned.buffer,
+        "DNS answer through the socket",
+        &query,
+        DNS_WAIT,
+        |f| is_dns_answer(f, dns).then_some(()),
+    )
+}
+
+fn spoof_step(t: &mut Test) -> Result<(), Failure> {
+    let gateway = t.gateway;
+    let spoofs = [
+        t.udp_frame(
+            [2, 0, 0, 0, 0, 0x66],
+            OWNED_PORT,
+            gateway,
+            DISCARD_PORT,
+            b"spoof",
+        )?,
+        t.udp_frame(t.mac, OWNED_PORT + 1, gateway, DISCARD_PORT, b"spoof")?,
+        t.echo_request(200)?,
+    ];
+    let owned = t.owned()?;
+    let before = stats_call(&owned.socket.fd, Stats::BYTES)?;
+    for frame in &spoofs {
+        owned.socket.send(&owned.buffer, frame)?;
+    }
+    let after = stats_call(&owned.socket.fd, Stats::BYTES)?;
+    let free = owned.socket.free_tx(&owned.buffer)?;
+    println!(
+        "netq: tx_rejected {} -> {}, tx_packets {} -> {}, {free} TX frames free",
+        before.tx_rejected, after.tx_rejected, before.tx_packets, after.tx_packets
+    );
+    let ok = after.tx_rejected == before.tx_rejected + spoofs.len() as u64
+        && after.tx_packets == before.tx_packets
+        && free == (FRAMES - RX_FRAMES) as usize;
+    if ok {
+        Ok(())
+    } else {
+        Err(Failure::Data {
+            what: "TX validation of spoofed frames",
+        })
+    }
+}
+
+/// Frames per second for `frames` frames in `elapsed`.
+fn per_second(frames: u64, elapsed: Duration) -> u64 {
+    (frames as f64 / elapsed.as_secs_f64().max(1e-9)) as u64
+}
+
+fn bench_step(t: &mut Test) -> Result<(), Failure> {
+    let gateway = t.gateway;
+    let frame = t.udp_frame(t.mac, OWNED_PORT, gateway, DISCARD_PORT, &BENCH_PAYLOAD)?;
+    let owned = t.owned()?;
+    let batch = (FRAMES - RX_FRAMES) as usize;
+    let start = Instant::now();
+    let mut sent = 0;
+    while sent < BENCH_FRAMES {
+        let want = batch.min((BENCH_FRAMES - sent) as usize);
+        sent += owned.socket.send_batch(&owned.buffer, &frame, want)?;
+        if start.elapsed() > BENCH_LIMIT {
+            return Err(Failure::Timeout {
+                what: "end of the bypass TX benchmark",
+                wait: BENCH_LIMIT,
+            });
+        }
+    }
+    let bypass = start.elapsed();
+    let start = Instant::now();
+    for _ in 0..BENCH_FRAMES {
+        io(
+            "send through netstack",
+            owned
+                .netstack
+                .send_to(&BENCH_PAYLOAD, (gateway, DISCARD_PORT)),
+        )?;
+        if start.elapsed() > BENCH_LIMIT {
+            return Err(Failure::Timeout {
+                what: "end of the netstack TX benchmark",
+                wait: BENCH_LIMIT,
+            });
+        }
+    }
+    let netstack = start.elapsed();
+    let bypass_fps = per_second(BENCH_FRAMES, bypass);
+    let netstack_fps = per_second(BENCH_FRAMES, netstack);
+    println!(
+        "FERRIC_BENCH netq-tx-udp60 frames={BENCH_FRAMES} bypass_fps={bypass_fps} \
+         netstack_fps={netstack_fps} bypass_vs_netstack={:.2}",
+        bypass_fps as f64 / netstack_fps.max(1) as f64
+    );
+    Ok(())
 }
 
 fn close_step(t: &mut Test) -> Result<(), Failure> {
@@ -742,8 +1071,10 @@ fn close_step(t: &mut Test) -> Result<(), Failure> {
     for request in &requests {
         socket.send(buffer, request)?;
     }
-    // Closing unmaps the grants in the driver while the replies are on their way.
+    // Closing unmaps the grants in the driver while the replies are on their way, and closes
+    // the driver's copy of the owning netstack socket.
     drop(socket);
+    drop(t.owned.take());
     netstack_echo(t.gateway, 3, WAIT)?;
     // The driver serves new sockets after the close: open, attach nothing, close.
     let path = format!("/scheme/{}/{QUEUE_PATH}", t.scheme);
@@ -798,6 +1129,7 @@ fn setup() -> Result<Setup, Failure> {
     }
     let ip = config_addr("/etc/net/ip")?;
     let gateway = config_addr("/etc/net/ip_router")?;
+    let dns = config_addr("/etc/net/dns")?;
     let size = RingSize::new(ENTRIES).expect("64 entries is a valid ring size");
     let layout = RingLayout::new(size, size, size, size);
     let buffer = Buffer::new(UMEM_BYTES + layout.map_len())?;
@@ -814,6 +1146,8 @@ fn setup() -> Result<Setup, Failure> {
         gateway,
         gateway_mac: [0; 6],
         arp_filter: None,
+        dns,
+        owned: None,
     })))
 }
 
@@ -829,7 +1163,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 8] = [
+    let steps: [(&str, Step); 12] = [
         ("netq-netstack", netstack_step),
         ("netq-attach", attach_step),
         ("netq-checks", checks_step),
@@ -837,6 +1171,10 @@ pub fn main() -> ExitCode {
         ("netq-steer", steer_step),
         ("netq-ping", ping_step),
         ("netq-stats", stats_step),
+        ("netq-own", own_step),
+        ("netq-udp", udp_step),
+        ("netq-spoof", spoof_step),
+        ("netq-bench", bench_step),
         ("netq-close", close_step),
     ];
     for (name, f) in steps {

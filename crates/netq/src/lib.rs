@@ -22,6 +22,8 @@
 //!   words the kernel passes a scheme) and the bind and statistics records.
 //! - [`ring`]: the four rings' layout in their shared region, and each side's handles, on
 //!   `ferric-ring`'s index protocol, hostile-peer checks and need-wakeup.
+//! - [`own`]: port ownership (a netstack socket proves a port is the application's) and TX
+//!   validation of the frames a socket sends.
 //! - [`copy`]: the driver's side of a socket in copy mode: software filters, and copies
 //!   between received or sent frames and the UMEM, with the socket's counters.
 //!
@@ -85,5 +87,6 @@ pub mod copy;
 pub mod desc;
 pub mod filter;
 pub mod frame;
+pub mod own;
 pub mod ring;
 pub mod umem;

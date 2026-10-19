@@ -1361,6 +1361,7 @@ dependencies = [
 name = "ferric-netq"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.2",
  "etherparse",
  "ferric-ring",
  "thiserror 2.0.17",

@@ -72,6 +72,8 @@ pub struct Ip {
 pub struct Headers {
     /// The destination MAC address.
     pub dst_mac: MacAddr,
+    /// The source MAC address, which TX validation checks.
+    pub src_mac: MacAddr,
     /// The VLAN ID of the outermost VLAN tag that has one. Priority tags (VLAN ID 0, IEEE
     /// 802.1Q-2018 section 9.6) carry no VLAN ID and are skipped, so a frame with only
     /// priority tags has none, like an untagged frame.
@@ -109,6 +111,7 @@ impl Headers {
         }
         Ok(Self {
             dst_mac: MacAddr(ethernet.destination()),
+            src_mac: MacAddr(ethernet.source()),
             vlan,
             ether_type,
             ip: ip_fields(&packet),
@@ -178,12 +181,14 @@ pub(crate) mod tests {
     use std::vec::Vec;
 
     pub(crate) const HOST: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    /// The source MAC of the frames `ethernet` builds.
+    pub(crate) const PEER: [u8; 6] = [2, 0, 0, 0, 0, 9];
 
     /// An Ethernet frame with optional VLAN tags around `payload` of `ether_type`.
     pub(crate) fn ethernet(vlans: &[u16], ether_type: u16, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
         frame.extend_from_slice(&HOST);
-        frame.extend_from_slice(&[2, 0, 0, 0, 0, 9]);
+        frame.extend_from_slice(&PEER);
         for &vid in vlans {
             frame.extend_from_slice(&0x8100u16.to_be_bytes());
             frame.extend_from_slice(&vid.to_be_bytes());
@@ -247,6 +252,7 @@ pub(crate) mod tests {
         );
         let headers = Headers::parse(&ethernet(&[], ETHERTYPE_IPV4, &ip)).expect("well-formed");
         assert_eq!(headers.dst_mac, MacAddr(HOST));
+        assert_eq!(headers.src_mac, MacAddr(PEER));
         assert_eq!(headers.vlan, None);
         assert_eq!(headers.ether_type, ETHERTYPE_IPV4);
         assert_eq!(
