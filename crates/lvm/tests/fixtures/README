@@ -1,0 +1,20 @@
+LVM2 physical volumes made with lvm2 2.03.16 (Debian package) on 64 MiB loop devices,
+then cut after the metadata area: the tests zero-extend them, since only the label and the
+metadata are read. Device-mapper was not available, so every logical volume was created
+with `--driverloaded n -an -Zn` (metadata only, no activation, no zeroing), and the striped
+data layout is checked against lvcreate(8) and lvmraid(7), not against dm-stripe I/O. The
+commands each file went through are recorded in the `description` lines of the old metadata
+copies still in its circular buffer (`strings FILE | grep ^description`).
+
+two-lvs.img         vgcreate -q testvg (4 MiB extents)
+                    lvcreate -L 8M -n lv1; lvcreate -L 12M -n lv2; lvextend -L +4M testvg/lv1
+                    lv1 = PE 0-1 then PE 5; lv2 = PE 2-4.
+stripevg-pv0.img    vgcreate -q -s 1m stripevg on two PVs; these are the two PVs.
+stripevg-pv1.img    lvcreate -l 70 -n spans (59 extents on pv0 from PE 4, then 11 on pv1)
+                    lvcreate -l 3 -n tail on pv1 (PE 15-17)
+                    lvcreate -i2 -I64k -l 8 -n striped (PE 0-3 of each PV, 64 KiB chunks;
+                    created first, so it starts both PVs)
+wrapped-mda.img     a PV with a 60 KiB metadata area at 4 KiB and data from 64 KiB, in
+                    wrapvg (1 MiB extents); twelve one-extent LVs and two renames bring the
+                    metadata to seqno 19, whose 4399-byte text starts 512 bytes before the
+                    end of the area and wraps round to just after the area header.
