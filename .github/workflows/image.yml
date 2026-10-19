@@ -362,7 +362,7 @@ jobs:
       # The image has kernel.sys_proc on, so ferric-proc-test must run every step, not skip.
       - name: Check per-process introspection
         run: |
-          for step in parse self root-only; do
+          for step in parse self slice guard cap root-only; do
             grep -aF "FERRIC_TEST_PASS proc-$step" "$LOG"
           done
           grep -aF "FERRIC_TEST_PASS proc-self" "$LOG" | tr -d '\r' | sed 's/^.*FERRIC_TEST_PASS //' | while read -r line; do

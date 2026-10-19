@@ -11,8 +11,11 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 
 use ferric_procinfo::{
-    ContextLine, FdLine, GrantLine, MemoryLine, Name, Prot, Provider, SchemeRef, Status,
+    cpu_time_ns, ContextLine, FdLine, GrantLine, MemoryLine, Name, Prot, Provider, SchemeRef,
+    Status,
 };
+use hashbrown::HashMap;
+use syscall::flag::MapFlags;
 
 use crate::{
     context::{self, contexts, memory::AddrSpaceWrapper},
@@ -20,6 +23,10 @@ use crate::{
     sync::CleanLockToken,
     syscall::error::Result,
 };
+
+/// The name `context::init` gives each CPU's idle context. The scheduler never charges an
+/// idle context's time, so its current period is not counted either.
+const IDLE_NAME: &str = "[kmain]";
 
 /// One context, copied out under its lock.
 struct Snapshot {
@@ -61,6 +68,7 @@ fn provider(provider: &context::memory::Provider) -> Provider {
 
 /// Copies every context out, with its descriptors' scheme ids.
 fn snapshots(token: &mut CleanLockToken) -> Vec<Snapshot> {
+    let now = crate::time::monotonic(token);
     let mut out = Vec::new();
     let mut contexts = contexts(token.downgrade());
     let (contexts, mut token) = contexts.token_split();
@@ -77,6 +85,10 @@ fn snapshots(token: &mut CleanLockToken) -> Vec<Snapshot> {
                 fds.push((fd, scheme, description.number));
             }
         }
+        // The scheduler adds a period to these counters only when it ends.
+        let charged = !(context.name.as_str() == IDLE_NAME && !context.userspace);
+        let switched_in = (charged && context.running).then_some(context.switch_time);
+        let scheduled = (charged && context.currently_scheduled).then_some(context.schedule_time);
         out.push(Snapshot {
             id: context.debug_id,
             pid: context.pid as u64,
@@ -85,9 +97,8 @@ fn snapshots(token: &mut CleanLockToken) -> Vec<Snapshot> {
             status: status(&context.status, context.wake.is_some()),
             cpu: context.cpu_id.map(|cpu| cpu.get()),
             running: context.running,
-            // A u64 of nanoseconds lasts 584 years.
-            active_ns: u64::try_from(context.active_cpu_time).unwrap_or(u64::MAX),
-            sched_ns: u64::try_from(context.sched_cpu_time).unwrap_or(u64::MAX),
+            active_ns: cpu_time_ns(context.active_cpu_time, switched_in, now),
+            sched_ns: cpu_time_ns(context.sched_cpu_time, scheduled, now),
             name: String::from(context.name.as_str()),
             kernel_bytes: context.kfx.len().saturating_add(context.kstack.len()) as u64,
             addr_space: context.addr_space().ok().cloned(),
@@ -114,15 +125,17 @@ fn memory(
             context::memory::Provider::PhysBorrowed { .. } => {}
             _ => shared = shared.saturating_add(bytes),
         }
-        let flags = info.flags();
+        // What user space may do, as mmap reports it: a guard page mapped without the user
+        // bit (`prot_none`) is present but `---`.
+        let flags = context::memory::map_flags(info.flags());
         grants.push(GrantLine {
             base: base.start_address().data() as u64,
             pages: info.page_count() as u64,
             provider: provider(&info.provider),
             prot: Prot {
-                read: flags.has_present(),
-                write: flags.has_write(),
-                execute: flags.has_execute(),
+                read: flags.contains(MapFlags::PROT_READ),
+                write: flags.contains(MapFlags::PROT_WRITE),
+                execute: flags.contains(MapFlags::PROT_EXEC),
             },
         });
     }
@@ -134,9 +147,23 @@ fn memory(
     (line, grants)
 }
 
-/// The name of scheme `id` as the scheme table gives it.
-fn scheme_ref<'a>(handle: Option<&'a scheme::Handle>, id: SchemeId) -> SchemeRef<'a> {
-    match handle {
+/// The name of the scheme a descriptor with handle `number` on scheme `id` is open on, as
+/// the scheme table gives it. A descriptor on the scheme manager names a scheme table entry
+/// by its number; the one naming the scheme creation capability is that capability.
+fn scheme_ref<'a>(
+    schemes: &'a HashMap<SchemeId, scheme::Handle>,
+    id: SchemeId,
+    number: usize,
+) -> SchemeRef<'a> {
+    match schemes.get(&id) {
+        Some(scheme::Handle::Scheme(KernelSchemes::SchemeMgr))
+            if matches!(
+                schemes.get(&SchemeId::from(number)),
+                Some(scheme::Handle::SchemeCreationCapability)
+            ) =>
+        {
+            SchemeRef::Capability
+        }
         Some(scheme::Handle::Scheme(KernelSchemes::Global(global))) => {
             SchemeRef::Kernel(global.as_str())
         }
@@ -183,7 +210,7 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         let schemes = handles().read(token.token());
         for &(fd, id, number) in &snapshot.fds {
             let scheme = match id {
-                Some(id) => scheme_ref(schemes.get(&id), id),
+                Some(id) => scheme_ref(&schemes, id, number),
                 None => SchemeRef::Gone,
             };
             let _ = write!(

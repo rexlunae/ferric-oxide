@@ -7,6 +7,12 @@
 //! - `proc-self`: this process's own block: its name, `runnable` and running, some CPU time,
 //!   the `sys` file it holds open, and a grant of at least the [`ALLOC_BYTES`] it allocated,
 //!   counted in its private memory.
+//! - `proc-slice`: two reads in a row show this running context's CPU time growing, so the
+//!   current timeslice is counted and not only the ones that ended.
+//! - `proc-guard`: with a thread parked, the guard page below its stack (`PROT_NONE`) is a
+//!   grant with no permissions (`---`), as `kernel.prot_none` (on by default) maps it.
+//! - `proc-cap`: no descriptor on the scheme manager is shown naming the scheme creation
+//!   capability's entry (number 0) as `mgr`; it is `cap`.
 //! - `proc-root-only`: the same program run as user 1000 cannot open the file (`EPERM`).
 //!
 //! Without the file (a kernel built without `sys_proc`) it prints
@@ -123,6 +129,80 @@ fn check_self(text: &str, held: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// This process's running context in `all`.
+fn running<'a, 'b>(all: &'b [Process<'a>]) -> Result<&'b Process<'a>, Failure> {
+    let pid = u64::from(std::process::id());
+    all.iter()
+        .find(|p| p.context.pid == pid && p.context.running)
+        .ok_or_else(|| check(format!("no running context of pid {pid}")))
+}
+
+fn read() -> Result<String, Failure> {
+    fs::read_to_string(PATH).map_err(|source| Failure::Io { what: PATH, source })
+}
+
+/// `proc-slice`: two reads in a row, with no switch likely between them.
+fn check_slice() -> Result<(), Failure> {
+    let (first, second) = (read()?, read()?);
+    let first = ferric_procinfo::processes(&first).map_err(Failure::Parse)?;
+    let second = ferric_procinfo::processes(&second).map_err(Failure::Parse)?;
+    let (a, b) = (
+        running(&first)?.context.active_ns,
+        running(&second)?.context.active_ns,
+    );
+    if b <= a {
+        return Err(check(format!(
+            "running context's CPU time went from {a} to {b} ns"
+        )));
+    }
+    println!("FERRIC_TEST_PASS proc-slice ({a} then {b} ns)");
+    Ok(())
+}
+
+/// `proc-guard` and `proc-cap`.
+fn check_guard_and_cap() -> Result<(), Failure> {
+    let (parked, done) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _ = done.recv();
+    });
+    let text = read();
+    drop(parked);
+    let _ = thread.join();
+    let text = text?;
+    let all = ferric_procinfo::processes(&text).map_err(Failure::Parse)?;
+    let me = running(&all)?;
+    let Some(guard) = me
+        .grants
+        .iter()
+        .find(|g| !g.prot.read && !g.prot.write && !g.prot.execute)
+    else {
+        return Err(check(
+            "no grant without permissions (a thread stack's guard)",
+        ));
+    };
+    println!(
+        "FERRIC_TEST_PASS proc-guard ({} pages at {:#x})",
+        guard.pages, guard.base
+    );
+    let wrong = all
+        .iter()
+        .flat_map(|p| p.fds.iter().map(move |fd| (p.context.pid, fd)))
+        .find(|(_, fd)| fd.scheme == SchemeRef::Manager && fd.number == 0);
+    if let Some((pid, fd)) = wrong {
+        return Err(check(format!(
+            "pid {pid} fd {} names the scheme creation capability as mgr",
+            fd.fd
+        )));
+    }
+    let caps = all
+        .iter()
+        .flat_map(|p| p.fds.iter())
+        .filter(|fd| fd.scheme == SchemeRef::Capability)
+        .count();
+    println!("FERRIC_TEST_PASS proc-cap ({caps} cap descriptors)");
+    Ok(())
+}
+
 /// `proc-root-only`: runs this program as [`USER`], which must be refused the file.
 fn check_root_only() -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|source| Failure::Io {
@@ -169,8 +249,10 @@ fn run() -> Result<(), Failure> {
         source,
     })?;
     let held = vec![0x5au8; ALLOC_BYTES];
-    let text = fs::read_to_string(PATH).map_err(|source| Failure::Io { what: PATH, source })?;
+    let text = read()?;
     check_self(&text, &held)?;
+    check_slice()?;
+    check_guard_and_cap()?;
     check_root_only()
 }
 

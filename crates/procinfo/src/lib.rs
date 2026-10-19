@@ -153,12 +153,32 @@ pub struct ContextLine<'a> {
     pub cpu: Option<u32>,
     /// Whether it is running on that CPU now.
     pub running: bool,
-    /// Nanoseconds it has run.
+    /// Nanoseconds it has run, including the current timeslice of a running context.
     pub active_ns: u64,
-    /// Nanoseconds the scheduler has spent on it.
+    /// Nanoseconds the scheduler has spent on it, including the current scheduling period.
     pub sched_ns: u64,
     /// Its name.
     pub name: Name<'a>,
+}
+
+/// Nanoseconds of CPU time to show for a context: the `accumulated` time of the periods
+/// that have ended, plus the one in progress if there is one (`current_since`, when it
+/// began), up to `now`. The kernel adds a period to its counter only when the period ends,
+/// so without this a running context would show none of its current timeslice. All three
+/// are on the same clock. A period that seems to begin after `now` (another CPU's clock
+/// read a little later) counts as empty, and a total past `u64::MAX` (584 years) saturates.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_procinfo::cpu_time_ns;
+///
+/// assert_eq!(cpu_time_ns(500, None, 2_000), 500);
+/// assert_eq!(cpu_time_ns(500, Some(1_500), 2_000), 1_000);
+/// ```
+pub fn cpu_time_ns(accumulated: u128, current_since: Option<u128>, now: u128) -> u64 {
+    let current = current_since.map_or(0, |since| now.saturating_sub(since));
+    u64::try_from(accumulated.saturating_add(current)).unwrap_or(u64::MAX)
 }
 
 /// The memory of a context.
@@ -181,7 +201,8 @@ pub enum SchemeRef<'a> {
     Kernel(&'a str),
     /// A user-space scheme, by scheme id: `user:<id>`.
     User(u64),
-    /// The capability to create schemes: `cap`.
+    /// The capability to create schemes: `cap`. It is a descriptor on the scheme manager,
+    /// told apart from the manager's other descriptors by the handle it names.
     Capability,
     /// The scheme manager: `mgr`.
     Manager,
@@ -658,6 +679,16 @@ mod tests {
         sched_ns: 61_000,
         name: Name("/usr/bin/a b"),
     };
+
+    #[test]
+    fn cpu_time_counts_the_current_period() {
+        assert_eq!(cpu_time_ns(7, None, 100), 7);
+        assert_eq!(cpu_time_ns(7, Some(60), 100), 47);
+        // A period stamped on another CPU just after `now` adds nothing.
+        assert_eq!(cpu_time_ns(7, Some(101), 100), 7);
+        assert_eq!(cpu_time_ns(u128::MAX, Some(0), u128::MAX), u64::MAX);
+        assert_eq!(cpu_time_ns(u128::from(u64::MAX) + 1, None, 0), u64::MAX);
+    }
 
     #[test]
     fn every_line_round_trips() {
