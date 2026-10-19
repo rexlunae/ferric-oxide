@@ -1872,14 +1872,6 @@ impl Grant {
             if !src_grant.can_have_flags(map_flags) {
                 return Err(Error::new(EPERM));
             }
-
-            if let Provider::FmapBorrowed {
-                ref mut pin_refcount,
-                ..
-            } = src_grant.provider
-            {
-                *pin_refcount += 1;
-            }
         }
 
         let Some(last_span) = prev_span else {
@@ -1933,6 +1925,19 @@ impl Grant {
                         TlbShootdownActions::NEW_MAPPING,
                     );
                 }
+            }
+        }
+
+        // Ferric Oxide: pin the source's fmap-borrowed grants only once nothing above can fail.
+        // `unmap` of the returned grant drops these pins again; a pin taken before an error
+        // return above was never dropped, and the source's exit then panicked unmapping it.
+        for (_, src_grant) in src_address_space.grants.conflicts_mut(src_span) {
+            if let Provider::FmapBorrowed {
+                ref mut pin_refcount,
+                ..
+            } = src_grant.provider
+            {
+                *pin_refcount += 1;
             }
         }
 
