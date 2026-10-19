@@ -55,6 +55,8 @@ pub mod archive;
 pub mod attestation;
 #[cfg(feature = "std")]
 pub mod attested;
+#[cfg(feature = "std")]
+pub mod config;
 mod digest;
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
@@ -63,7 +65,12 @@ mod git_url;
 pub mod keys;
 mod manifest;
 mod name;
+#[cfg(feature = "std")]
+pub mod policy;
 mod record;
+#[cfg(feature = "std")]
+pub mod registries;
+pub mod signing;
 #[cfg(feature = "std")]
 pub mod trust;
 mod verify;

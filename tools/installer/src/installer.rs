@@ -320,6 +320,12 @@ pub fn install_dir(
         FileConfig::new_file("/etc/group".to_string(), groups_data).create(&output_dir)?;
     }
 
+    // Ferric Oxide: fox adopts, syncs and describes the finished root, so
+    // its database and SBOM cover everything the image holds.
+    if let Some(fox) = &config.fox {
+        fox.run(&output_dir)?;
+    }
+
     Ok(())
 }
 

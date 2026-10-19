@@ -1442,15 +1442,20 @@ dependencies = [
  "fox-build",
  "fox-core",
  "fox-git",
+ "fox-index",
  "fox-sbom",
  "fox-store",
  "pkgar 0.2.4",
+ "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
+ "semver",
  "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -1504,6 +1509,44 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "fox-index"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fox-core",
+ "fox-sbom",
+ "pkgar-core 0.2.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "fox-registry"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "fox-build",
+ "fox-core",
+ "fox-git",
+ "fox-index",
+ "pkgar-keys 0.2.4",
+ "semver",
+ "serde",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -4191,6 +4234,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "uuid",

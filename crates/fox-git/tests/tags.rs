@@ -34,6 +34,13 @@ fn signed_tags_verify_against_their_key_only() {
         Err(GitError::TagSignature { .. })
     ));
 
+    let owners = [author(2), author(1)];
+    assert_eq!(tag.verify_signed_by(&owners).unwrap(), &author(1));
+    assert!(matches!(
+        tag.verify_signed_by(&owners[..1]),
+        Err(GitError::TagSignerNotAllowed { .. })
+    ));
+
     // git accepts the object and sees the signature where it puts its own.
     let object = git(dir.path(), &["cat-file", "tag", "v1.0.0"]);
     assert!(object.starts_with(&format!("object {}\ntype commit\ntag v1.0.0\n", head.id())));
@@ -153,6 +160,19 @@ fn fetches_into_a_bare_cache_and_updates_it() {
         cached.tree_blake3(&second).unwrap(),
         origin.tree_blake3(&second).unwrap()
     );
+
+    // The remote switches its default branch; the cache's HEAD follows.
+    git(upstream.path(), &["checkout", "-q", "-b", "trunk"]);
+    git(
+        upstream.path(),
+        &["commit", "-q", "--allow-empty", "-m", "three"],
+    );
+    let third = Repository::open(upstream.path())
+        .unwrap()
+        .resolve("HEAD")
+        .unwrap();
+    let cached = fetch(&url, &cache).unwrap();
+    assert_eq!(cached.resolve("HEAD").unwrap(), third);
 
     assert!(matches!(
         fetch(

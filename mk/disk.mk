@@ -1,6 +1,6 @@
 # Configuration file with the commands configuration of the Redox image
 
-$(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG)
+$(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -17,7 +17,7 @@ else
 	mv $@.partial $@
 endif
 
-$(BUILD)/redox-live.iso: $(FSTOOLS) $(REPO_TAG) redox.ipxe
+$(BUILD)/redox-live.iso: $(FSTOOLS) $(REPO_TAG) redox.ipxe $(FERRIC_FOX_PACKAGES)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -34,7 +34,7 @@ else
 	cp redox.ipxe $(BUILD)/redox.ipxe
 endif
 
-$(BUILD)/filesystem.img: $(FSTOOLS) $(REPO_TAG)
+$(BUILD)/filesystem.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
