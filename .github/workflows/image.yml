@@ -469,13 +469,9 @@ jobs:
               # is printed above its register dump, out of reach of a short tail.
               tail="$({ grep -aE 'FERRIC_TEST_|EXCEPTION|panic|PANIC' "$log.clean" | grep -av 'funmap passed' | tail -n 40
                 grep -av 'funmap passed' "$log.clean" | tail -n 30; } | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
-              if ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
+              if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
                 failed=1
-                echo "::error title=$image boot $run::boot exit $status, no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
-              elif [ "$status" -ne 0 ]; then
-                # The bench finished and its results count. Something else in the smoke run
-                # failed; the boot matrix judges that, on fewer boots.
-                echo "::warning title=$image boot $run::boot exit $status after FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
+                echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
               fi
               # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
               if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then
