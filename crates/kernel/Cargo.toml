@@ -147,3 +147,7 @@ panic = "abort"
 panic = "abort"
 #lto = true
 debug = "full"
+# Ferric Oxide: one codegen unit. With several, which functions are inlined into the system call
+# path depends on how rustc happens to split the crate, so any change elsewhere in the kernel (an
+# optional feature such as kernel.trace, say) can move hot-path inlining and cost a few percent.
+codegen-units = 1

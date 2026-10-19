@@ -68,7 +68,7 @@ The first events are:
 | Event | Arguments |
 | --- | --- |
 | `syscall.enter` | `nr`, `a`, `b`, `c`, `d` (the system call number and first four arguments) |
-| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`) |
+| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`). A call that ends its context (`exit`, or a pending `SIGKILL`) has none |
 | `sched.switch` | `prev_pid`, `next_pid`, `prev_id`, `next_id` |
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |

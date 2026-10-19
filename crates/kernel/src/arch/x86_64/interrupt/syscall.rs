@@ -71,6 +71,20 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
         if allowed.unwrap_or(true) {
             let scratch = &(*stack).scratch;
 
+            // Ferric Oxide: the syscall tracepoints (`kernel.trace`). They sit here, not in
+            // `syscall::syscall`, so that function compiles as it does without tracing: there,
+            // the exit event kept the system call number in a register across the whole call.
+            // Here the arguments are read from the saved registers, and only while the event is
+            // on.
+            trace_event!(
+                ferric_trace::kernel::SYSCALL_ENTER,
+                scratch.rax,
+                scratch.rdi,
+                scratch.rsi,
+                scratch.rdx,
+                scratch.r10,
+            );
+
             let ret = syscall::syscall(
                 scratch.rax,
                 scratch.rdi,
@@ -80,6 +94,11 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
                 scratch.r8,
                 scratch.r9,
                 &mut token,
+            );
+            trace_event!(
+                ferric_trace::kernel::SYSCALL_EXIT,
+                (*stack).scratch.rax,
+                ret
             );
             (*stack).scratch.rax = ret;
         }
