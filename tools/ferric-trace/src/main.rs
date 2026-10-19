@@ -159,8 +159,9 @@ fn crash(dump: &std::path::Path, out: Option<&std::path::Path>) -> Result<(), Cl
     for cpu in &report.cpus {
         writeln!(
             w,
-            "cpu {}: {} bytes of records, {} lost before the panic, {} bytes torn",
+            "cpu {}: {} records ({} bytes), {} lost before the panic, {} bytes torn",
             cpu.cpu,
+            cpu.record_count(),
             cpu.records.len(),
             cpu.lost,
             cpu.dropped

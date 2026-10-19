@@ -60,8 +60,9 @@ fn base() -> usize {
         .unwrap_or(DEFAULT_BASE)
 }
 
-/// Takes the region out of the free memory, if all of it is free RAM in the boot memory map, as
-/// `is_free(start, end)` says. Called during memory setup, after the bootloader's areas are
+/// Takes the region out of the free memory, if all of it is free RAM in the boot memory map that
+/// no other area overlaps, as `is_free(start, end)` says
+/// ([`ferric_trace::crash::region_is_free`]). Called during memory setup, after the bootloader's areas are
 /// registered and before the free areas are built from them.
 pub fn reserve(is_free: impl Fn(usize, usize) -> bool) {
     let base = base();

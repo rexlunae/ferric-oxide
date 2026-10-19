@@ -25,6 +25,12 @@
 //!
 //! A region is complete only when its state says so and the checksum matches, so a cold
 //! boot's random RAM, or a panic cut short by a second one, never reads as a dump.
+//!
+//! # Placement
+//!
+//! The kernel writes the region in its panic handler, so it must be plain RAM that nothing
+//! else owns: [`region_is_free`] checks the region against the boot memory map before the
+//! kernel reserves it.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -173,6 +179,44 @@ fn check(len: usize, word: impl Fn(usize) -> u64) -> Result<usize, CrashError> {
         at += words;
     }
     Ok(total)
+}
+
+/// An area of the boot memory map, as [`region_is_free`] needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapArea {
+    /// The first byte's physical address.
+    pub start: usize,
+    /// The physical address after the last byte.
+    pub end: usize,
+    /// Whether the area is free RAM; every other kind (reserved, ACPI, device memory, the
+    /// kernel, the boot loader's data) is not.
+    pub free: bool,
+}
+
+/// Whether the region `start..end` can hold a crash dump: it is not empty, lies wholly inside
+/// one free area of `map`, and overlaps no area that is not free. A memory map can list a
+/// reserved or device area inside a free one, and the dump must not write over it.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_trace::crash::{MapArea, region_is_free};
+///
+/// let ram = MapArea { start: 0, end: 0x1000_0000, free: true };
+/// let acpi = MapArea { start: 0x400_8000, end: 0x400_9000, free: false };
+/// assert!(region_is_free(0x400_0000, 0x401_0000, [ram]));
+/// assert!(!region_is_free(0x400_0000, 0x401_0000, [ram, acpi]));
+/// ```
+pub fn region_is_free(start: usize, end: usize, map: impl IntoIterator<Item = MapArea>) -> bool {
+    let mut covered = false;
+    for area in map {
+        if area.free {
+            covered |= area.start <= start && end <= area.end;
+        } else if area.start < end && start < area.end {
+            return false;
+        }
+    }
+    start < end && covered
 }
 
 /// Writes a dump into a region. The kernel makes one in its panic handler.
@@ -436,6 +480,57 @@ mod tests {
     use crate::record::Records;
     use core::fmt::Write as _;
     use std::vec::Vec;
+
+    #[test]
+    fn a_region_must_be_free_ram_that_nothing_else_overlaps() {
+        let free = |start, end| MapArea {
+            start,
+            end,
+            free: true,
+        };
+        let taken = |start, end| MapArea {
+            start,
+            end,
+            free: false,
+        };
+        let (start, end) = (0x4000, 0x8000);
+        assert!(region_is_free(start, end, [free(0, 0x10000)]));
+        assert!(region_is_free(start, end, [free(start, end)]));
+        // Not covered: no map, outside, partly outside, or split over two free areas.
+        assert!(!region_is_free(start, end, []));
+        assert!(!region_is_free(start, end, [free(0x10000, 0x20000)]));
+        assert!(!region_is_free(start, end, [free(0, 0x6000)]));
+        assert!(!region_is_free(
+            start,
+            end,
+            [free(0, 0x6000), free(0x6000, 0x10000)]
+        ));
+        // A non-free area inside, across either end, or around it, before or after the free
+        // one in the map.
+        for area in [
+            taken(0x5000, 0x6000),
+            taken(0x3000, 0x4001),
+            taken(0x7fff, 0x9000),
+            taken(0, 0x10000),
+        ] {
+            assert!(
+                !region_is_free(start, end, [free(0, 0x10000), area]),
+                "{area:?}"
+            );
+            assert!(
+                !region_is_free(start, end, [area, free(0, 0x10000)]),
+                "{area:?}"
+            );
+        }
+        // Touching is not overlapping.
+        assert!(region_is_free(
+            start,
+            end,
+            [taken(0, start), free(0, 0x10000), taken(end, 0x9000)]
+        ));
+        // An empty region is never free.
+        assert!(!region_is_free(start, start, [free(0, 0x10000)]));
+    }
 
     fn region(words: usize) -> Vec<AtomicU64> {
         (0..words).map(|_| AtomicU64::new(0)).collect()

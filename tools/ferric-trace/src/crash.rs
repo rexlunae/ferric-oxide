@@ -16,7 +16,7 @@ use ferric_trace::crash::{CrashError, Dump};
 use ferric_trace::kernel::CATALOG;
 use ferric_trace::record::{Records, WORD_BYTES};
 
-use crate::capture::{Capture, CaptureError, CpuCapture};
+use crate::capture::{Capture, CaptureError, CpuCapture, INCOMPLETE};
 
 /// Why a crash dump could not be read or saved.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,13 @@ pub struct CpuCrash {
     pub records: Vec<u8>,
     /// The bytes after them that do not decode (a torn record and what followed it).
     pub dropped: usize,
+}
+
+impl CpuCrash {
+    /// The number of records in [`CpuCrash::records`].
+    pub fn record_count(&self) -> usize {
+        Records::new(&self.records).count()
+    }
 }
 
 /// A crash dump, read.
@@ -127,22 +134,37 @@ impl CrashReport {
     }
 
     /// Writes the records as a capture directory `out` of `cpu<n>` files, which must not
-    /// exist yet.
+    /// exist yet. As `ferric-trace capture` does, it marks the directory
+    /// [`INCOMPLETE`](crate::capture::INCOMPLETE) until every file is written, so a save cut
+    /// short is not loaded as a whole capture.
     ///
     /// # Errors
     ///
-    /// [`CrashDumpError::Io`] when the directory or a file cannot be created.
+    /// [`CrashDumpError::Io`] when the directory, the marker or a file cannot be written, or the
+    /// marker cannot be removed. The directory is left behind, marked, unless the error is
+    /// creating it.
     pub fn save(&self, out: &Path) -> Result<(), CrashDumpError> {
+        self.save_with(out, |path, bytes| fs::write(path, bytes))
+    }
+
+    /// [`CrashReport::save`], writing each `cpu<n>` file with `write`.
+    fn save_with(
+        &self,
+        out: &Path,
+        mut write: impl FnMut(&Path, &[u8]) -> io::Result<()>,
+    ) -> Result<(), CrashDumpError> {
         let io = |path: &Path| {
             let path = path.to_owned();
             move |source| CrashDumpError::Io { path, source }
         };
         fs::create_dir(out).map_err(io(out))?;
+        let marker = out.join(INCOMPLETE);
+        fs::write(&marker, "ferric-trace crash did not finish\n").map_err(io(&marker))?;
         for cpu in &self.cpus {
             let path = out.join(format!("cpu{}", cpu.cpu));
-            fs::write(&path, &cpu.records).map_err(io(&path))?;
+            write(&path, &cpu.records).map_err(io(&path))?;
         }
-        Ok(())
+        fs::remove_file(&marker).map_err(io(&marker))
     }
 }
 
@@ -213,6 +235,8 @@ mod tests {
         assert_eq!(report.cpus.len(), 2);
         assert_eq!(report.cpus[0].dropped, 0);
         assert_eq!(report.cpus[1].dropped, 24);
+        assert_eq!(report.cpus[0].record_count(), 2);
+        assert_eq!(report.cpus[1].record_count(), 1);
         let capture = report.capture().expect("decodes");
         assert_eq!(capture.cpus(), [0, 1]);
         let stamps: Vec<_> = capture.entries().iter().map(|e| e.timestamp).collect();
@@ -225,9 +249,30 @@ mod tests {
         let report = CrashReport::parse(&dump_bytes(b"x")).expect("a dump");
         let out = dir.path().join("crash");
         report.save(&out).expect("saved");
+        assert!(!out.join(INCOMPLETE).exists());
         let capture = Capture::load(std::slice::from_ref(&out)).expect("a capture");
         assert_eq!(capture.entries().len(), 3);
         assert!(matches!(report.save(&out), Err(CrashDumpError::Io { .. })));
+    }
+
+    /// A save that fails after the first CPU leaves a capture that does not load.
+    #[test]
+    fn a_failed_save_stays_marked_incomplete() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = CrashReport::parse(&dump_bytes(b"x")).expect("a dump");
+        let out = dir.path().join("crash");
+        let mut files = 0;
+        let result = report.save_with(&out, |path, bytes| {
+            files += 1;
+            if files == 2 {
+                return Err(io::Error::other("disk full"));
+            }
+            fs::write(path, bytes)
+        });
+        assert!(matches!(result, Err(CrashDumpError::Io { path, .. }) if path == out.join("cpu1")));
+        assert!(out.join("cpu0").is_file());
+        assert!(out.join(INCOMPLETE).is_file());
+        assert!(Capture::load(std::slice::from_ref(&out)).is_err());
     }
 
     #[test]

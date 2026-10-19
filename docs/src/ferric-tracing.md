@@ -270,8 +270,10 @@ ferric-trace crash dump.bin --out crash/   # also saves the records as a capture
 ferric-trace perfetto crash/ -o crash.json
 ```
 
-`ferric-trace crash` prints the message, each CPU's record count, `lost` count
-and torn bytes, and the records as text.
+`ferric-trace crash` prints the message, each CPU's record count and bytes,
+`lost` count and torn bytes, and the records as text. `--out` saves the
+capture the way `ferric-trace capture` does, marked `INCOMPLETE` until every
+file is written.
 
 ## Reading a capture on the host
 

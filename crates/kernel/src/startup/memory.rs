@@ -661,12 +661,18 @@ pub unsafe fn init(
 
     unsafe {
         // Ferric Oxide: keep the trace crash region out of the free memory, if it lies inside
-        // one free area of the boot memory map (which only this CPU writes, now).
+        // one free area of the boot memory map (which only this CPU writes, now) and overlaps
+        // no other area.
         #[cfg(feature = "trace_crash")]
         crate::trace::crash::reserve(|start, end| {
-            (*MEMORY_MAP.get())
-                .free()
-                .any(|entry| entry.start <= start && end <= entry.end)
+            let map = (*MEMORY_MAP.get())
+                .iter()
+                .map(|entry| ferric_trace::crash::MapArea {
+                    start: entry.start,
+                    end: entry.end,
+                    free: entry.kind == BootloaderMemoryKind::Free,
+                });
+            ferric_trace::crash::region_is_free(start, end, map)
         });
 
         let physmem_limit = MemoryEntry {
