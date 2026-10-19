@@ -9,6 +9,8 @@ use std::io::prelude::*;
 use std::io::{self};
 use std::num::NonZeroU8;
 
+use ferric_vtd::interrupt::MsiFormat;
+
 use crate::msi::{MsiAddrAndData, MsixTableEntry};
 // Ferric Oxide: vectors on a chosen CPU.
 use crate::percpu::{self, CpuEntry, CpuId, VectorError};
@@ -394,17 +396,23 @@ impl Msix {
     /// Ferric Oxide: steers MSI-X table entry `index` to logical CPU `cpu` (root only), keeping
     /// its `irq:` handles: the kernel moves the vector and re-keys every handle for it.
     ///
-    /// When the kernel does not remap the device's interrupts, the entry is masked, given pcid's
-    /// message for the new vector and unmasked again. The [`InterruptVector::cpu`] that
-    /// [`Self::alloc_on`] returned for the entry is not updated; this call returns the new CPU's
-    /// result instead.
+    /// The entry's own message decides who moves it. A remappable-format message names an
+    /// interrupt remapping entry, which the kernel rewrites. A compatibility-format message
+    /// names the CPU and vector itself, so the entry is masked before the kernel moves the
+    /// vector (and gives the old one back), given pcid's message for the new vector, and then
+    /// left masked or unmasked as it was; an interrupt raised while it is masked stays pending
+    /// in the device and is sent the new way. The [`InterruptVector::cpu`] that
+    /// [`Self::alloc_on`] returned for the entry is not updated; this call returns the new
+    /// CPU's result instead.
     ///
     /// # Errors
     ///
     /// [`VectorError::NoEntry`] when `index` has no vector, [`VectorError::UnknownCpu`] when
     /// `cpu` is not online or the kernel has no per-CPU delivery, [`VectorError::Move`] when
-    /// the kernel refuses, and [`VectorError::NoMessage`] when pcid has no message for the new
-    /// vector (the entry then stays masked).
+    /// the kernel refuses (the entry is as it was), [`VectorError::NoMessage`] when pcid has no
+    /// message for the new vector (the entry then stays masked), and
+    /// [`VectorError::NotRemapped`] when the entry is remapped but the kernel found no
+    /// remapping entry to move.
     pub fn retarget(
         &mut self,
         index: u16,
@@ -416,24 +424,43 @@ impl Msix {
         {
             return Err(VectorError::UnknownCpu { cpu });
         }
-        let (handle, held) = self
-            .handles
-            .get_mut(usize::from(index))
-            .ok_or(VectorError::NoEntry { index })?;
-        let moved = percpu::move_vector(handle, cpu)?;
-        *held = cpu;
-        if moved.remapped == 0 {
-            // The message names the CPU and vector itself, so it is the driver's to rewrite.
-            let vector = moved.irq.get() + 32;
-            let entry = self.mapped.table_entry_pointer(usize::from(index));
-            entry.mask();
-            let message = self
-                .channel
-                .msi_message(cpu.get() as usize, vector)
-                .ok_or(VectorError::NoMessage { cpu, vector })?;
-            entry.write_addr_and_data(message);
-            entry.unmask();
+        if usize::from(index) >= self.handles.len() {
+            return Err(VectorError::NoEntry { index });
         }
+        let entry = self.mapped.table_entry_pointer(usize::from(index));
+        let remapped = matches!(MsiFormat::of(entry.addr()), MsiFormat::Remappable { .. });
+        let was_masked = entry.vec_ctl() & MsixTableEntry::VEC_CTL_MASK_BIT != 0;
+        if !remapped {
+            // Masked before the kernel gives the old vector back, so nothing reaches it after.
+            entry.mask();
+        }
+        let (handle, held) = &mut self.handles[usize::from(index)];
+        let moved = match percpu::move_vector(handle, cpu) {
+            Ok(moved) => moved,
+            Err(err) => {
+                // Nothing moved, so the old message is still right.
+                self.mapped
+                    .table_entry_pointer(usize::from(index))
+                    .set_masked(was_masked);
+                return Err(err);
+            }
+        };
+        *held = cpu;
+        if remapped {
+            return if moved.remapped == 0 {
+                Err(VectorError::NotRemapped { index })
+            } else {
+                Ok(moved)
+            };
+        }
+        let vector = moved.irq.get() + 32;
+        let message = self
+            .channel
+            .msi_message(cpu.get() as usize, vector)
+            .ok_or(VectorError::NoMessage { cpu, vector })?;
+        let entry = self.mapped.table_entry_pointer(usize::from(index));
+        entry.write_addr_and_data(message);
+        entry.set_masked(was_masked);
         Ok(moved)
     }
 

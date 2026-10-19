@@ -143,8 +143,8 @@ Drivers give MSI-X table entries to CPUs through `pcid_interface`:
 Without `irq:cpus` these calls put every vector on the BSP, like upstream's
 `Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
 `percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
-logical id. No driver uses these calls yet; per-core NVMe queues are a later
-step of roadmap Phase 2.4.
+logical id. No driver uses these calls yet; per-core NVMe queues are the next
+step of roadmap Phase 2.4, whose progress is in the status table in `ROADMAP.md`.
 
 ### Steering a vector to another CPU
 
@@ -164,15 +164,26 @@ kernel:
    wakeup).
 
 A vector given back this way (or by closing its handle) can be reserved again.
-The new reservation starts with its count already acknowledged, so it does not
-report the interrupts the previous owner received.
+The new reservation starts with the count read just before it was made
+acknowledged, so it does not report the interrupts the previous owner
+received but does report one that arrives right after. Reserving, moving and
+giving back vectors take one lock, so two moves of the same vector run one
+after the other (the second from where the first left it), and the owner's
+close waits for a move in progress. A remapping unit has to be able to name
+the target CPU's APIC only if it holds an entry to move; that is checked for
+every unit before any entry changes.
 
 The call returns `ferric_irq::call::Moved`: the new IRQ number and how many
 remapping entries moved. When none moved, the device's interrupts are not
 remapped and its MSI or MSI-X message names the CPU and vector itself, so
 the driver must program the message for the new vector.
 `pcid_interface::irq_helpers::Msix::retarget(index, cpu)` does all of this for
-one MSI-X table entry (`percpu::move_vector` is the bare call). A handle
+one MSI-X table entry (`percpu::move_vector` is the bare call). It goes by the
+entry's own message rather than by the count, which can include other
+devices' entries for the same vector: a remappable-format message is left to
+the kernel, and a compatibility-format one is masked before the move (so the
+device holds an interrupt pending instead of sending it to the vector given
+back), reprogrammed, and restored to its earlier mask state. A handle
 opened with `O_STAT`, which reserves nothing, can move a vector only when
 remapping entries carry it. Errors: `EINVAL` (a legacy IRQ, an unreserved
 vector, or the same CPU), `ENOENT` (no such CPU), `EEXIST` (no free vector on

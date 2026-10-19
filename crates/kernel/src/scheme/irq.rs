@@ -39,6 +39,13 @@ use crate::{
 ///
 /// IRQ queues
 pub(super) static COUNTS: Mutex<[usize; 224]> = Mutex::new([0; 224]);
+
+/// Ferric Oxide: serializes reserving, steering and giving back `irq:` vectors, so a move
+/// works from the route its handle has when it starts and keeps it until the handles are
+/// re-keyed: a second move of the same vector waits and then starts from where the first left
+/// it, and a close cannot give back the old vector while its remapping entries are being
+/// rewritten. Taken before [`HANDLES`], never while holding it, and never in interrupt context.
+static VECTORS: Mutex<()> = Mutex::new(());
 static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
 
 /// These are IRQs 0..=15 (corresponding to interrupt vectors 32..=47). They are opened without the
@@ -261,13 +268,18 @@ impl IrqScheme {
                 if flags & O_CREAT == 0 && flags & O_STAT == 0 {
                     return Err(Error::new(EINVAL));
                 }
+                let mut ack = 0;
                 let reservation = if flags & O_STAT == 0 {
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     {
                         let index = irq_to_vector(irq_number);
+                        let _vectors = VECTORS.lock();
                         if is_reserved(cpu_id, index) {
                             return Err(Error::new(EEXIST));
                         }
+                        // Taken before the vector is published as reserved, so an interrupt
+                        // that arrives for the new owner right after is reported to it.
+                        ack = fresh_ack(cpu_id, irq_number);
                         set_reserved(cpu_id, index, true);
                         Some(IrqReservation { cpu_id, index })
                     }
@@ -278,7 +290,7 @@ impl IrqScheme {
                 };
                 (
                     Handle::Irq {
-                        ack: AtomicUsize::new(fresh_ack(cpu_id, irq_number, reservation.is_some())),
+                        ack: AtomicUsize::new(ack),
                         irq: irq_number,
                         cpu: cpu_id,
                         reservation,
@@ -404,6 +416,7 @@ fn steer(
     to: LogicalCpuId,
     token: &mut CleanLockToken,
 ) -> Result<ferric_irq::call::Moved> {
+    let vectors = VECTORS.lock();
     let (from, irq, owns) = {
         let handles = HANDLES.read(token.token());
         let Handle::Irq {
@@ -484,9 +497,11 @@ fn steer(
     if moved_reservation {
         set_reserved(from, from_vector, false);
     } else {
-        // The owner closed its handle meanwhile, which gave the old vector back already.
+        // Not reached: the owner was there when the move started, under `VECTORS`, and its
+        // close waits for the lock. Kept so the new vector is never left reserved by nobody.
         set_reserved(to, to_vector, false);
     }
+    drop(vectors);
     for fd in fds {
         event::trigger(GlobalSchemes::Irq.scheme_id(), fd, EVENT_READ, token);
     }
@@ -526,18 +541,19 @@ fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -
     }
 }
 
-/// Ferric Oxide: the acknowledged count a new handle starts with. With `kernel.irq_percpu` a
-/// vector can be reserved again after its owner gave it back (or after it was steered
-/// elsewhere), and its row still holds the old owner's interrupts; a new reservation starts
-/// acknowledged at that count, so it reports only interrupts that arrive for it. Everything
-/// else starts at 0, as upstream.
-fn fresh_ack(cpu: LogicalCpuId, irq: u8, reserves: bool) -> usize {
+/// Ferric Oxide: the acknowledged count a new reservation of `irq` on `cpu` starts with. With
+/// `kernel.irq_percpu` a vector can be reserved again after its owner gave it back (or after it
+/// was steered elsewhere), and its row still holds the old owner's interrupts; the new handle
+/// starts acknowledged at that count, so it reports only interrupts that arrive for it. The
+/// caller reads it before marking the vector reserved. Without `irq_percpu`, 0, as upstream.
+fn fresh_ack(cpu: LogicalCpuId, irq: u8) -> usize {
     #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
-    if reserves {
-        return interrupt_count(cpu, irq);
+    return interrupt_count(cpu, irq);
+    #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+    {
+        let _ = (cpu, irq);
+        0
     }
-    let _ = (cpu, irq, reserves);
-    0
 }
 
 const fn irq_to_vector(irq: u8) -> u8 {
@@ -812,6 +828,8 @@ impl crate::scheme::KernelScheme for IrqScheme {
     }
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        // Ferric Oxide: a move of this handle's vector finishes before it is given back.
+        let _vectors = VECTORS.lock();
         let handle = HANDLES.write(token.token()).remove(id)?;
 
         if let Handle::Irq {

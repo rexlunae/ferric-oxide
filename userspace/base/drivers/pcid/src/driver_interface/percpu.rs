@@ -100,6 +100,15 @@ pub enum VectorError {
         /// The entry asked for.
         index: u16,
     },
+    /// The entry sends a remappable-format message, but the kernel moved no interrupt
+    /// remapping entry for its vector, so its interrupts still go the old way.
+    #[error(
+        "MSI-X table entry {index} is remapped, but the kernel moved no remapping entry for it"
+    )]
+    NotRemapped {
+        /// The entry asked for.
+        index: u16,
+    },
 }
 
 /// The logical id of the bootstrap processor, which `irq:bsp` holds.

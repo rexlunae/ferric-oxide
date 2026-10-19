@@ -472,11 +472,14 @@ pub fn move_vector(
     }
     let from = (apic_id(from_cpu)?, from_vector);
     let to_apic = apic_id(to_cpu)?;
-    // Every unit must be able to name the new destination before any entry changes.
+    // Every unit with an entry to move must be able to name the new destination before any
+    // entry changes; a unit without one (in xAPIC format, say) does not matter.
     for unit in units() {
-        if let Some(table) = unit.state.lock().interrupts.as_ref() {
-            Destination::for_apic(to_apic, table.extended)
-                .ok_or(IrqError::Destination { apic_id: to_apic })?;
+        if let Some(table) = unit.state.lock().interrupts.as_mut()
+            && Destination::for_apic(to_apic, table.extended).is_none()
+            && holds(table, from)
+        {
+            return Err(IrqError::Destination { apic_id: to_apic });
         }
     }
     let mut moved: u32 = 0;
@@ -487,6 +490,10 @@ pub fn move_vector(
             continue;
         };
         let Some(destination) = Destination::for_apic(to_apic, table.extended) else {
+            // The preflight found nothing to move here; an entry allocated since cannot move.
+            if holds(table, from) {
+                result = Err(IrqError::Destination { apic_id: to_apic });
+            }
             continue;
         };
         let used: Vec<u16> = table.entries.used().collect();
@@ -523,6 +530,13 @@ pub fn move_vector(
         );
     }
     Ok(moved)
+}
+
+/// Whether any entry in use in `table` delivers `from.1` to physical APIC `from.0`.
+fn holds(table: &mut RemapTable, from: (u32, u8)) -> bool {
+    let used: Vec<u16> = table.entries.used().collect();
+    used.into_iter()
+        .any(|index| Irte::delivers(table.read(index), table.extended, from))
 }
 
 /// Ferric Oxide: the logical CPU and vector the entry [`alloc_msi`] returned as `id` delivers to

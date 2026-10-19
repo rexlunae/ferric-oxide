@@ -364,6 +364,33 @@ impl Irte {
         }))
     }
 
+    /// Ferric Oxide: whether entry `words` (of a table whose destinations are `extended` or
+    /// not) is present and delivers vector `from.1` to physical APIC `from.0`: the entries
+    /// [`Self::retarget_low`] moves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_vtd::interrupt::{Destination, Irte, SourceValidation};
+    ///
+    /// let source = SourceValidation::RequesterId { source_id: 0x0020, ignore_function_bits: 0 };
+    /// let words = Irte::fixed(0x30, Destination::XApic(1), source).encode();
+    /// assert!(Irte::delivers(words, false, (1, 0x30)));
+    /// assert!(!Irte::delivers(words, false, (1, 0x31)));
+    /// assert!(!Irte::delivers(Irte::NOT_PRESENT, false, (0, 0)));
+    /// ```
+    pub fn delivers(words: [u64; 2], extended: bool, from: (u32, u8)) -> bool {
+        Self::delivering(words, extended, from).is_some()
+    }
+
+    /// The decoded entry `words` when it delivers `from.1` to physical APIC `from.0`.
+    fn delivering(words: [u64; 2], extended: bool, from: (u32, u8)) -> Option<Self> {
+        let entry = Self::decode(words, extended).ok().flatten()?;
+        let (apic, vector) = from;
+        (!entry.logical && entry.vector == vector && entry.destination.apic_id() == apic)
+            .then_some(entry)
+    }
+
     /// Ferric Oxide: the new low word that moves entry `words` (of a table whose destinations
     /// are `extended` or not) from delivering `from.1` to physical APIC `from.0` to delivering
     /// `vector` to `destination`, or `None` when the entry is not present, cannot be decoded,
@@ -392,11 +419,7 @@ impl Irte {
         vector: u8,
         destination: Destination,
     ) -> Option<u64> {
-        let entry = Self::decode(words, extended).ok().flatten()?;
-        let (apic, from_vector) = from;
-        if entry.logical || entry.vector != from_vector || entry.destination.apic_id() != apic {
-            return None;
-        }
+        let entry = Self::delivering(words, extended, from)?;
         let moved = Self {
             vector,
             destination,
@@ -799,6 +822,30 @@ mod tests {
         // AVAIL (bits 11:8) belongs to software.
         let avail = Irte::decode([1 | (0xf << 8), 0], true);
         assert!(matches!(avail, Ok(Some(_))));
+    }
+
+    #[test]
+    fn delivers_matches_what_retargeting_moves() {
+        let from = Irte::fixed(0x45, Destination::X2Apic(0x1_0000), EXACT);
+        let words = from.encode();
+        assert!(Irte::delivers(words, true, (0x1_0000, 0x45)));
+        assert!(!Irte::delivers(words, true, (0x1_0000, 0x46)));
+        assert!(!Irte::delivers(words, true, (0, 0x45)));
+        let logical = Irte {
+            logical: true,
+            ..from
+        };
+        assert!(!Irte::delivers(logical.encode(), true, (0x1_0000, 0x45)));
+        for (words, from) in [
+            (words, (0x1_0000, 0x45)),
+            (logical.encode(), (0x1_0000, 0x45)),
+        ] {
+            let to = Destination::X2Apic(2);
+            assert_eq!(
+                Irte::delivers(words, true, from),
+                Irte::retarget_low(words, true, from, 0x60, to).is_some()
+            );
+        }
     }
 
     #[test]
