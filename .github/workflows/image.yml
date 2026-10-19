@@ -379,10 +379,10 @@ jobs:
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
           # Bootstrap applied the initfs trace.toml; the kernel logs the command.
           grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
-          for step in initfs boot enable decode order write read yield sched scheme disable mmap clock; do
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap clock cap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
-          echo "::notice::ferric-trace-test passed all 13 steps"
+          echo "::notice::ferric-trace-test passed all 14 steps"
           # The kernel logged the timestamp clock it picked (T3d); trace-clock checked its
           # rate against the wall clock. Both go up as notices.
           grep -qaE "trace: clock (tsc|kvmclock|hpet) \(" "$LOG"

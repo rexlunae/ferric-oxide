@@ -13,6 +13,8 @@ ferric-trace = { path = "../../../../crates/trace", features = ["config"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 redox_syscall = "0.9.5"
+# `dup` with a path, through relibc so its descriptor table stays right (trace-cap).
+libredox = { version = "0.1.25", default-features = false, features = ["call", "std"] }
 
 [profile.release]
 debug = false

@@ -43,6 +43,9 @@
 //!   with the wall time between them, within a factor of two, when the clock's tick length is
 //!   known (the KVM clock, the HPET); for the TSC only their order is checked, and the
 //!   frequency they imply is printed.
+//! - `trace-cap`: a process that is not root cannot open the scheme by path, but can through
+//!   a capability (`cap/read`, `cap/control`) root handed it, with that capability's access
+//!   and no more; see `redox::cap`.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without
