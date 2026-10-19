@@ -368,6 +368,7 @@ fn schedule(
                 };
 
                 let Some(mut guard) = (unsafe { context_lock.try_write_arc() }) else {
+                    crate::context::wakelat::skip(1);
                     if let Some(wake) = wake_opt {
                         run_queue.timers.insert((wake, context_ref));
                     } else {
@@ -396,6 +397,12 @@ fn schedule(
                 //
                 // The idle context is runnable, but also should not be pushed.
                 if !guard.status.is_runnable() || guard.currently_scheduled || !guard.userspace {
+                    if !guard.status.is_runnable() {
+                        crate::context::wakelat::skip(2);
+                    }
+                    if guard.currently_scheduled {
+                        crate::context::wakelat::skip(4);
+                    }
                     continue;
                 }
 
@@ -404,6 +411,7 @@ fn schedule(
                 if guard.running
                     && !(context_ptr == cur_context_ptr && context_ptr != prev_context_ptr)
                 {
+                    crate::context::wakelat::skip(8);
                     continue;
                 }
 
@@ -411,6 +419,7 @@ fn schedule(
                 // waker's), which its affinity may no longer include (see
                 // `affinity_elsewhere`).
                 if let Some(target) = affinity_elsewhere(&guard, percpu.cpu_id) {
+                    crate::context::wakelat::skip(64);
                     drop(guard);
                     forward.push((target, context_ref));
                     continue;
@@ -689,6 +698,7 @@ fn select_next_context(
         }
 
         let Some(mut guard) = (unsafe { context_lock.try_write_arc() }) else {
+            crate::context::wakelat::skip(16);
             continue;
         };
 
@@ -723,6 +733,7 @@ fn select_next_context(
         );
 
         if matches!(sw, UpdateResult::Blocked) {
+            crate::context::wakelat::skip(128);
             if guard.is_active {
                 guard.is_active = false;
                 weight_change += context_weight;
@@ -746,6 +757,7 @@ fn select_next_context(
         }
 
         if !matches!(sw, UpdateResult::CanSwitch) {
+            crate::context::wakelat::skip(32);
             continue;
         }
 
@@ -755,6 +767,7 @@ fn select_next_context(
             if let Some(addr) = addr_space.inner.try_read(t.token()) {
                 best_addr_space = Some(unsafe { AddrSpaceSwitchReadGuard::new(addr) });
             } else {
+                crate::context::wakelat::skip(256);
                 continue;
             }
         }

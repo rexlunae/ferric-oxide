@@ -32,7 +32,17 @@ pub fn ipi_drain(nonempty: bool) {
     }
 }
 
+static MASK: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+static PREV_MASK: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+
+/// Records why the scheduler passed a context over in this schedule call.
+pub fn skip(bit: u64) {
+    MASK[cpu()].fetch_or(bit, Relaxed);
+}
+
 pub fn schedule_entry() {
+    let mask = MASK[cpu()].swap(0, Relaxed);
+    PREV_MASK[cpu()].store(mask, Relaxed);
     let now = tsc();
     let last = LAST_SCHED[cpu()].swap(now, Relaxed);
     PREV_SCHED[cpu()].store(last, Relaxed);
@@ -81,12 +91,13 @@ pub fn picked(next: &mut Context, prev: &Context, prev_is_idle: bool, now_ns: u1
     {
         let per_us = TSC_PER_US.load(Relaxed);
         println!(
-            "WL slow cpu{} {}us ipi{} ipine{} psched{} {} r{} prev={}/{} next={}/{}",
+            "WL slow cpu{} {}us ipi{} ipine{} psched{} m{:x} {} r{} prev={}/{} next={}/{}",
             crate::cpu_id().get(),
             lat / per_us,
             now.saturating_sub(LAST_IPI[cpu()].load(Relaxed)) / per_us,
             now.saturating_sub(LAST_IPI_NONEMPTY[cpu()].load(Relaxed)) / per_us,
             now.saturating_sub(PREV_SCHED[cpu()].load(Relaxed)) / per_us,
+            PREV_MASK[cpu()].load(Relaxed),
             NAMES[bin],
             u8::from(next.wake_remote),
             prev.name,
