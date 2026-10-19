@@ -12,7 +12,9 @@
 //! - A dump: the second boot. `trace-crash-read` checks that it parses, that its message is the
 //!   crash test's panic, that it records the clock this boot's `clock` file names (the same
 //!   machine picks the same clock), and that its records hold the marker `write` and the
-//!   `write` of `panic` that ended the first boot.
+//!   `write` of `panic` that ended the first boot. With `kernel.log_persist`, `log-previous`
+//!   then checks that the previous boot's kernel log ([`PREVIOUS_PATH`]) ends with that
+//!   panic.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -21,6 +23,7 @@ use ferric_trace::abi::{CLOCK_PATH, CRASH_PATH, CRASH_TEST_COMMAND};
 use ferric_trace::clock::ClockLine;
 use ferric_trace::crash::Dump;
 use ferric_trace::kernel::{CATALOG, SYSCALL_ENTER};
+use ferric_trace::klog::PREVIOUS_PATH;
 use ferric_trace::record::Records;
 use syscall::{EBADF, SYS_WRITE};
 
@@ -144,6 +147,44 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
         entries.len(),
         clock.clock,
         message.lines().last().unwrap_or_default()
+    );
+    previous_log()
+}
+
+/// `log-previous`: the previous boot's kernel log holds the panic the dump recorded. Skipped
+/// without the file (no `kernel.log_persist`).
+fn previous_log() -> Result<(), Failure> {
+    let step = "log-previous";
+    let log = match std::fs::read(PREVIOUS_PATH) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("FERRIC_TEST_SKIP log-previous: no {PREVIOUS_PATH} (no kernel.log_persist)");
+            return Ok(());
+        }
+        Err(source) => return Err(io_failure(step, PREVIOUS_PATH)(source)),
+        Ok(log) => log,
+    };
+    let log = String::from_utf8_lossy(&log);
+    let Some(panic) = log.rfind("KERNEL PANIC: ") else {
+        return Err(check(
+            step,
+            format!(
+                "no KERNEL PANIC line in the previous boot's {} bytes of log",
+                log.len()
+            ),
+        ));
+    };
+    // A panic prints `panicked at <file>:<line>:<column>:` and the message on the next line.
+    let lines: Vec<&str> = log[panic..].lines().take(2).collect();
+    let Some(message) = lines.iter().find(|line| line.contains(TEST_PANIC)) else {
+        return Err(check(
+            step,
+            format!("the logged panic is not the test's: {lines:?}"),
+        ));
+    };
+    println!(
+        "FERRIC_TEST_PASS log-previous ({} bytes, {})",
+        log.len(),
+        message.trim()
     );
     Ok(())
 }

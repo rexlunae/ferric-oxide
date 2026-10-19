@@ -127,6 +127,9 @@ trace_crash = ["trace"]
 # Ferric Oxide: writing `panic` to kernel.trace/crash panics the kernel and resets the machine
 # after the dump, for testing it in CI.
 trace_crash_test = ["trace_crash"]
+# Ferric Oxide: everything the kernel logs is also kept in reserved memory that survives a warm
+# reboot, served by sys:log_previous on the next boot.
+log_persist = ["dep:ferric-trace"]
 # Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
 trace_level_warn = ["trace"]
 trace_level_info = ["trace_level_warn"]

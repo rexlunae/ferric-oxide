@@ -28,6 +28,9 @@ impl Log {
     }
 
     pub fn write(&mut self, buf: &[u8]) {
+        // Ferric Oxide: also into reserved memory that the next boot can read.
+        #[cfg(feature = "log_persist")]
+        crate::log_persist::append(buf);
         for &b in buf {
             while self.data.len() + 1 >= self.size {
                 self.data.pop_front();

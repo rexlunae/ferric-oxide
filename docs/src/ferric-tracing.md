@@ -26,6 +26,8 @@ what is on at run time.
 | `kernel.trace_crash` | `false` | Reserves the crash region: a panic leaves its message and the newest records for the next boot ([Crash dump](#crash-dump)) |
 | `kernel.trace_crash_base` | `"0x4000000"` | The crash region's physical address, written to the kernel `config.toml` as `trace.crash_base` |
 | `kernel.trace_crash_test` | `false` | Testing only: writing `panic` to `kernel.trace/crash` panics the kernel and resets the machine after the dump |
+| `kernel.log_persist` | `false` | Keeps the kernel log in reserved RAM too, so the next boot serves its end as `/scheme/sys/log_previous` ([Persistent kernel log](#persistent-kernel-log)); needs no `kernel.trace` |
+| `kernel.log_persist_base` | `"0x4010000"` | The persistent log region's physical address, written to the kernel `config.toml` as `log.persist_base` |
 
 The options below `kernel.trace` take effect only with it. The next four map
 to the kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme`
@@ -488,6 +490,42 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   records the clock this boot's `clock` file names, and that its records hold the marker `write` and the `write` of `panic`
   (`FERRIC_TEST_PASS trace-crash-read`). The job also requires the kernel's
   lines for the dump, the reset and the dump found, and exactly two boots.
+- **Persistent log.** `cargo test -p ferric-trace` appends to a region and
+  reads it back: order, wrap-around, a write longer than the region, re-arming,
+  short copies and headers that do not fit. Every image in `image.yml` has
+  `log_persist = true`. The boot job requires the region's `boot 0` line and no
+  previous log. In the `crash` job, the second boot must log `boot 1` and the
+  previous boot's log, and `ferric-trace-test crash` checks that
+  `/scheme/sys/log_previous` holds the test panic's `KERNEL PANIC` lines
+  (`FERRIC_TEST_PASS log-previous`).
+
+## Persistent kernel log
+
+With `kernel.log_persist`, everything the kernel logs (its own messages, the
+panic handler's, and what user space writes through the `debug` scheme) also
+goes to a second reserved region, so after a panic, a watchdog reset or a
+plain reboot the next boot can show how the previous one ended. It does not
+need tracing.
+
+- **The region.** 64 KiB at `kernel.log_persist_base` (`0x4010000` by
+  default, right after the crash region's default), reserved the same way as
+  the crash region (the kernel's `reserved` module) and refused the same way:
+  a region that is not wholly free RAM, or that overlaps the crash region,
+  turns the feature off with a warning.
+- **The format** (`ferric_trace::klog`): a header of eight words (magic
+  `FOKLOG01`, version 1, the data length, the bytes written this boot and the
+  boot's sequence number), then a byte ring. The written count is stored after
+  the bytes, so a reset in the middle of a write loses only that write. Once
+  the ring is full the newest bytes replace the oldest, so the kept text can
+  start in the middle of a line.
+- **This boot.** `Log::write`, under the in-memory log's lock, appends every
+  byte to the region. `kmain` arms the region early, copying the in-memory log
+  so far, so the region holds the whole boot until it wraps.
+- **The next boot.** Before arming, `kmain` copies what the previous boot left
+  to the heap and logs `log: the previous boot's log (<n> bytes) is in
+  /scheme/sys/log_previous`. That file serves the copy until the next reboot
+  (empty after a cold boot). The boot number counts warm reboots since the last
+  cold one: `log: persistent log at <base> (64 KiB), boot <n>`.
 
 ## Overhead budget
 

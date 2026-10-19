@@ -76,6 +76,13 @@ const FILES: &[(&str, Kind)] = &[
     ("iostat", Rd(iostat::resource)),
     ("irq", Rd(irq::resource)),
     ("log", Rd(log::resource)),
+    // Ferric Oxide: the end of the previous boot's log (`kernel.log_persist`), empty after a
+    // cold boot.
+    #[cfg(feature = "log_persist")]
+    (
+        "log_previous",
+        Rd(|_| Ok(crate::log_persist::previous().map_or_else(Vec::new, |log| log.to_vec()))),
+    ),
     ("syscall", Rd(syscall::resource)),
     ("uname", Rd(uname::resource)),
     ("env", Rd(|_| Ok(Vec::from(crate::startup::init_env())))),

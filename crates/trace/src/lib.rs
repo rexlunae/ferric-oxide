@@ -65,6 +65,7 @@ pub mod config;
 pub mod crash;
 mod event;
 pub mod kernel;
+pub mod klog;
 mod level;
 pub mod record;
 pub mod ring;
