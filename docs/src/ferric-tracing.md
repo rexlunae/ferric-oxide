@@ -277,7 +277,10 @@ manner of Linux's pstore/ramoops:
   `ferric-trace capture` does. A flight-recorder mode that overwrites the
   oldest records instead is not implemented yet.
 - **The format** (`ferric_trace::crash`): a header of eight words (magic
-  `FOCRASH1`, version 1, state, payload length, checksum), then sections, each
+  `FOCRASH1`, version 1, state, payload length, checksum, and the timestamp
+  clock as `1 +` its kind and its tick length in femtoseconds, both `0` in
+  dumps from kernels that did not record it, whose timestamps are TSC cycles),
+  then sections, each
   a word `kind | cpu << 8 | bytes << 32` and its data: the message, or a CPU's
   `lost` count and records. The state is set to complete last, and the checksum
   (64-bit FNV-1a over every other word) is checked before anything is read, so
@@ -295,9 +298,10 @@ ferric-trace crash dump.bin --out crash/   # also saves the records as a capture
 ferric-trace perfetto crash/ -o crash.json
 ```
 
-`ferric-trace crash` prints the message, each CPU's record count and bytes,
-`lost` count and torn bytes, and the records as text. `--out` saves the
-capture the way `ferric-trace capture` does, marked `INCOMPLETE` until every
+`ferric-trace crash` prints the message, the clock line, each CPU's record
+count and bytes, `lost` count and torn bytes, and the records as text. `--out`
+saves the capture, with a `clock` file when the dump records its clock, the way
+`ferric-trace capture` does, marked `INCOMPLETE` until every
 file is written.
 
 ## Reading a capture on the host
@@ -382,8 +386,11 @@ or in `chrome://tracing`.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
 A capture whose `clock` names the KVM clock or the HPET carries its own tick
-length, and `perfetto` converts with that. Two inputs with different clocks are
-refused. For TSC timestamps, and for captures without a `clock` file,
+length, and `perfetto` converts with that, however slow the clock (an HPET tick
+can be longer than a microsecond). Two inputs with different clocks are
+refused, and so is an input without a `clock` file (from a kernel that does not
+say, so its timestamps are TSC cycles) together with one whose clock is not
+the TSC. For TSC timestamps, and for captures without a `clock` file,
 `--tsc-mhz` converts cycles to time. Pass the traced machine's TSC frequency; the default, 1000, shows one cycle as one nanosecond. A value below
 1 MHz, or not a finite number, is refused: real TSCs run at hundreds of MHz or
 more, and a tinier divisor would overflow timestamps to infinity. The format and
@@ -477,8 +484,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   `ferric-trace-test crash` turns on the `syscall` events, makes a marker
   `write`, prints `FERRIC_TEST_PASS trace-crash-armed` and writes `panic` to
   `kernel.trace/crash`; the kernel dumps and resets. On the second boot it
-  checks that the dump parses, that its message is the test's panic and that
-  its records hold the marker `write` and the `write` of `panic`
+  checks that the dump parses, that its message is the test's panic, that it
+  records the clock this boot's `clock` file names, and that its records hold the marker `write` and the `write` of `panic`
   (`FERRIC_TEST_PASS trace-crash-read`). The job also requires the kernel's
   lines for the dump, the reset and the dump found, and exactly two boots.
 

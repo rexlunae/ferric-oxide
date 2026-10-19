@@ -34,6 +34,19 @@ pub fn choice() -> Choice {
     *CHOICE.call_once(select)
 }
 
+/// The clock timestamps come from now, without picking one: [`choice`]'s line once it has
+/// run, and the TSC with an unknown period before, which is what [`now`] reads until then.
+/// The panic handler uses it for the crash dump, where picking and logging is not wanted.
+pub fn current() -> clock::ClockLine {
+    CHOICE.get().map_or(
+        clock::ClockLine {
+            clock: Clock::Tsc,
+            period_fs: None,
+        },
+        |choice| choice.line(),
+    )
+}
+
 /// Picks the clock from what this machine offers and logs why.
 fn select() -> Choice {
     let max_extended = core::arch::x86_64::__cpuid(0x8000_0000).eax;

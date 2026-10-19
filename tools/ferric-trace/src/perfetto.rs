@@ -22,9 +22,9 @@
 //! - A record that has no matching start (its start was not captured) is an instant (`i`).
 //!
 //! Timestamps are microseconds since the first record. The rate ticks are divided by is a
-//! [`TscMhz`]: for TSC cycles the TSC frequency the caller gives, and for a capture whose
-//! `clock` names a clock with a known tick length (the KVM clock, the HPET) that clock's own
-//! rate ([`TscMhz::for_clock`]).
+//! [`TickRate`]: for TSC cycles the TSC frequency the caller gives (a [`TscMhz`]), and for a
+//! capture whose `clock` names a clock with a known tick length (the KVM clock, the HPET) that
+//! clock's own rate, however slow ([`TickRate::for_clock`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -92,16 +92,6 @@ impl TscMhz {
     pub fn get(self) -> f64 {
         self.0
     }
-
-    /// The rate to turn timestamps of `clock` into time: the clock's ticks per microsecond
-    /// when its tick length is known, otherwise `tsc` (TSC cycles, or a capture from a kernel
-    /// that does not say).
-    pub fn for_clock(clock: Option<ClockLine>, tsc: Self) -> Self {
-        clock
-            .and_then(|line| line.ticks_per_us())
-            .and_then(|rate| Self::new(rate).ok())
-            .unwrap_or(tsc)
-    }
 }
 
 impl FromStr for TscMhz {
@@ -113,6 +103,81 @@ impl FromStr for TscMhz {
 }
 
 impl fmt::Display for TscMhz {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The rate timestamps are divided by to get microseconds: ticks per microsecond, positive,
+/// finite and at least [`TickRate::MIN`].
+///
+/// Unlike [`TscMhz`], which checks a frequency a person typed, it takes the slow clocks a
+/// [`ClockLine`] can name, such as an HPET whose tick is longer than a microsecond.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct TickRate(f64);
+
+/// Why a tick rate was refused.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TickRateError {
+    /// The value is below [`TickRate::MIN`], infinite or not a number.
+    #[error(
+        "tick rate {value} per microsecond is not a finite number of at least {}",
+        TickRate::MIN.0
+    )]
+    OutOfRange {
+        /// The value given.
+        value: f64,
+    },
+}
+
+impl TickRate {
+    /// The lowest rate accepted, 10^-11 ticks per microsecond. It is below the slowest clock a
+    /// [`ClockLine`] can describe (a period of `u64::MAX` femtoseconds is about 5.4 × 10^-11
+    /// ticks per microsecond), and dividing any `u64` tick count by it still gives a finite
+    /// time, which JSON needs.
+    pub const MIN: Self = Self(1e-11);
+
+    /// `ticks_per_us` as a tick rate.
+    ///
+    /// # Errors
+    ///
+    /// [`TickRateError::OutOfRange`] unless `ticks_per_us` is finite and at least
+    /// [`TickRate::MIN`].
+    pub fn new(ticks_per_us: f64) -> Result<Self, TickRateError> {
+        if ticks_per_us.is_finite() && ticks_per_us >= Self::MIN.0 {
+            Ok(Self(ticks_per_us))
+        } else {
+            Err(TickRateError::OutOfRange {
+                value: ticks_per_us,
+            })
+        }
+    }
+
+    /// Ticks per microsecond.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+
+    /// The rate to turn timestamps of `clock` into time: the clock's ticks per microsecond
+    /// when its tick length is known, otherwise `tsc` (TSC cycles, or a capture from a kernel
+    /// that does not say).
+    pub fn for_clock(clock: Option<ClockLine>, tsc: TscMhz) -> Self {
+        clock
+            .and_then(|line| line.ticks_per_us())
+            .and_then(|rate| Self::new(rate).ok())
+            .unwrap_or(tsc.into())
+    }
+}
+
+impl From<TscMhz> for TickRate {
+    /// A TSC frequency in MHz is the TSC's ticks per microsecond.
+    fn from(tsc: TscMhz) -> Self {
+        Self(tsc.0)
+    }
+}
+
+impl fmt::Display for TickRate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -149,7 +214,7 @@ struct OpenRequest {
 /// The conversion state.
 struct Converter {
     base: u64,
-    tsc_mhz: TscMhz,
+    rate: TickRate,
     events: Vec<TraceEvent>,
     /// The context `sched.switch` last put on each CPU.
     running: HashMap<u32, Track>,
@@ -168,7 +233,7 @@ struct Converter {
 
 impl Converter {
     fn ts(&self, timestamp: u64) -> f64 {
-        timestamp.saturating_sub(self.base) as f64 / self.tsc_mhz.get()
+        timestamp.saturating_sub(self.base) as f64 / self.rate.get()
     }
 
     fn push(&mut self, entry: &Entry, ph: &'static str, name: String, track: Track) -> usize {
@@ -428,11 +493,12 @@ fn name_event(kind: &str, name: &str, track: Track) -> TraceEvent {
     event
 }
 
-/// The JSON document for `capture`, with the TSC running at `tsc_mhz`.
-pub fn to_json(capture: &Capture, tsc_mhz: TscMhz) -> String {
+/// The JSON document for `capture`, with its timestamps ticking at `rate` (a [`TscMhz`] for
+/// TSC cycles, or [`TickRate::for_clock`] for the capture's own clock).
+pub fn to_json(capture: &Capture, rate: impl Into<TickRate>) -> String {
     let mut converter = Converter {
         base: capture.entries().first().map_or(0, |e| e.timestamp),
-        tsc_mhz,
+        rate: rate.into(),
         events: Vec::new(),
         running: HashMap::new(),
         cpu_open: HashMap::new(),
@@ -458,26 +524,48 @@ mod tests {
         TscMhz::new(value).expect("a valid frequency")
     }
 
+    fn rate(value: f64) -> TickRate {
+        TickRate::new(value).expect("a valid rate")
+    }
+
     #[test]
     fn rate_follows_the_clock() {
         use ferric_trace::clock::Clock;
         let tsc = mhz(2400.0);
-        assert_eq!(TscMhz::for_clock(None, tsc), tsc);
+        assert_eq!(TickRate::for_clock(None, tsc), rate(2400.0));
         let line = |clock, period_fs| ClockLine { clock, period_fs };
-        assert_eq!(TscMhz::for_clock(Some(line(Clock::Tsc, None)), tsc), tsc);
         assert_eq!(
-            TscMhz::for_clock(Some(line(Clock::KvmClock, Some(1_000_000))), tsc),
-            mhz(1000.0)
+            TickRate::for_clock(Some(line(Clock::Tsc, None)), tsc),
+            rate(2400.0)
         );
         assert_eq!(
-            TscMhz::for_clock(Some(line(Clock::Hpet, Some(10_000_000))), tsc),
-            mhz(100.0)
+            TickRate::for_clock(Some(line(Clock::KvmClock, Some(1_000_000))), tsc),
+            rate(1000.0)
         );
-        // A tick longer than a microsecond is below the lowest rate: the given one is used.
         assert_eq!(
-            TscMhz::for_clock(Some(line(Clock::Hpet, Some(2_000_000_000))), tsc),
-            tsc
+            TickRate::for_clock(Some(line(Clock::Hpet, Some(10_000_000))), tsc),
+            rate(100.0)
         );
+        // A tick longer than a microsecond is below TscMhz's minimum but still the clock's rate.
+        assert_eq!(
+            TickRate::for_clock(Some(line(Clock::Hpet, Some(2_000_000_000))), tsc),
+            rate(0.5)
+        );
+        // The slowest clock a line can describe still has a rate.
+        let slowest = TickRate::for_clock(Some(line(Clock::Hpet, Some(u64::MAX))), tsc);
+        assert_eq!(slowest, rate(1e9 / u64::MAX as f64));
+    }
+
+    #[test]
+    fn tick_rate_refuses_what_is_not_a_rate() {
+        for bad in [0.0, -1.0, f64::INFINITY, f64::NAN, 5e-324, 1e-12] {
+            assert!(
+                matches!(TickRate::new(bad), Err(TickRateError::OutOfRange { .. })),
+                "{bad}"
+            );
+        }
+        assert_eq!(TickRate::new(1e-11).ok(), Some(TickRate::MIN));
+        assert_eq!(TickRate::from(mhz(2400.0)), rate(2400.0));
     }
 
     fn events(json: &str) -> Vec<Value> {
@@ -639,7 +727,7 @@ mod tests {
             (&SYSCALL_EXIT, u64::MAX, &[1, 0]),
         ]);
         let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &cpu0).expect("valid")]);
-        for tsc in [TscMhz::MIN, mhz(f64::MAX)] {
+        for tsc in [TickRate::MIN, TscMhz::MIN.into(), mhz(f64::MAX).into()] {
             let all = events(&to_json(&capture, tsc));
             let stamps: Vec<_> = phases(&all, "i").iter().map(|e| e["ts"].as_f64()).collect();
             assert_eq!(stamps.len(), 2);

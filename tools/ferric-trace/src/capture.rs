@@ -1,13 +1,13 @@
 //! Loading and decoding a capture: one file of drained records per CPU, and the `clock` file
 //! that says what their timestamps count ([`ferric_trace::clock::ClockLine`]; captures from
-//! kernels before T3d have none).
+//! kernels before T3d have none, and count TSC cycles).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use ferric_trace::abi::LineError;
-use ferric_trace::clock::ClockLine;
+use ferric_trace::clock::{Clock, ClockLine};
 use ferric_trace::kernel::CATALOG;
 use ferric_trace::record::{DecodeError, Records};
 use ferric_trace::{Event, EventId};
@@ -94,6 +94,13 @@ pub enum CaptureError {
         first: String,
         /// The other.
         second: String,
+    },
+    /// One input has no clock file, so its timestamps are TSC cycles (it comes from a kernel
+    /// that does not say), and another's come from a different clock.
+    #[error("an input has no clock file (TSC cycles) and another's clock is {}", clock.clock)]
+    LegacyClockMismatch {
+        /// The other input's clock.
+        clock: ClockLine,
     },
     /// A capture directory holds the [`INCOMPLETE`] marker: the capture failed or was killed,
     /// so CPUs may be missing or cut short.
@@ -257,7 +264,9 @@ impl Capture {
     /// named after its CPU, [`CaptureError::DuplicateCpu`], [`CaptureError::Empty`] when no
     /// files were found, [`CaptureError::Incomplete`] for a directory (or a file in one) that a
     /// failed capture left, [`CaptureError::Clock`] for a `clock` file that does not parse,
-    /// [`CaptureError::ClockMismatch`] for inputs with different clocks, and the errors of
+    /// [`CaptureError::ClockMismatch`] for inputs with different clocks,
+    /// [`CaptureError::LegacyClockMismatch`] for an input without a clock file (TSC cycles)
+    /// together with one whose clock is not the TSC, and the errors of
     /// [`CpuCapture::decode`].
     pub fn load(inputs: &[PathBuf]) -> Result<Self, CaptureError> {
         Self::load_inner(inputs, DecodeMode::Strict)
@@ -277,7 +286,7 @@ impl Capture {
 
     fn load_inner(inputs: &[PathBuf], mode: DecodeMode) -> Result<Self, CaptureError> {
         let mut files = Vec::new();
-        let mut clock = None;
+        let mut clock = ClockMerge::default();
         for input in inputs {
             let meta = fs::metadata(input).map_err(|source| CaptureError::Io {
                 path: input.clone(),
@@ -296,7 +305,7 @@ impl Capture {
                 });
             }
             if let Some(dir) = dir {
-                merge_clock(&mut clock, read_clock(dir)?)?;
+                clock.add(read_clock(dir)?)?;
             }
             if meta.is_dir() {
                 files.extend(dir_files(input)?);
@@ -321,7 +330,7 @@ impl Capture {
                 CpuCapture::decode_inner(cpu, &bytes, mode)
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self::from_cpus(cpus).with_clock(clock))
+        Ok(Self::from_cpus(cpus).with_clock(clock.clock))
     }
 
     /// The CPUs captured, in order.
@@ -357,21 +366,35 @@ fn read_clock(dir: &Path) -> Result<Option<ClockLine>, CaptureError> {
         })
 }
 
-/// Adds `found` to the clock of the inputs read so far, which must agree.
-fn merge_clock(
-    clock: &mut Option<ClockLine>,
-    found: Option<ClockLine>,
-) -> Result<(), CaptureError> {
-    match (*clock, found) {
-        (Some(first), Some(second)) if first != second => Err(CaptureError::ClockMismatch {
-            first: first.to_string().trim_end().to_owned(),
-            second: second.to_string().trim_end().to_owned(),
-        }),
-        (None, Some(found)) => {
-            *clock = Some(found);
-            Ok(())
+/// The clock of the inputs read so far, which must agree.
+#[derive(Debug, Default)]
+struct ClockMerge {
+    /// The clock the inputs with a clock file name.
+    clock: Option<ClockLine>,
+    /// Whether an input had no clock file: its timestamps are TSC cycles.
+    legacy: bool,
+}
+
+impl ClockMerge {
+    /// Adds the clock of one more input, `None` for one without a clock file.
+    fn add(&mut self, found: Option<ClockLine>) -> Result<(), CaptureError> {
+        match (self.clock, found) {
+            (Some(first), Some(second)) if first != second => {
+                return Err(CaptureError::ClockMismatch {
+                    first: first.to_string().trim_end().to_owned(),
+                    second: second.to_string().trim_end().to_owned(),
+                });
+            }
+            (_, Some(found)) => self.clock = Some(found),
+            (_, None) => self.legacy = true,
         }
-        _ => Ok(()),
+        // An input without a clock counts TSC cycles, which only a TSC clock agrees with.
+        match self.clock {
+            Some(clock) if self.legacy && clock.clock != Clock::Tsc => {
+                Err(CaptureError::LegacyClockMismatch { clock })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -613,6 +636,45 @@ pub(crate) mod tests {
         assert!(matches!(
             Capture::load(&both),
             Err(CaptureError::ClockMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_clock_is_the_tsc() {
+        use ferric_trace::clock::Clock;
+        let line = |clock, period_fs| Some(ClockLine { clock, period_fs });
+        let kvm = line(Clock::KvmClock, Some(1_000_000));
+        let tsc = line(Clock::Tsc, None);
+        for inputs in [[None, kvm], [kvm, None]] {
+            let mut merge = ClockMerge::default();
+            let result = inputs.into_iter().try_for_each(|clock| merge.add(clock));
+            assert!(
+                matches!(result, Err(CaptureError::LegacyClockMismatch { clock }) if Some(clock) == kvm),
+                "{inputs:?}"
+            );
+        }
+        for inputs in [[None, tsc], [tsc, None], [None, None]] {
+            let mut merge = ClockMerge::default();
+            for clock in inputs {
+                merge.add(clock).expect("TSC cycles agree");
+            }
+            assert_eq!(merge.clock, inputs.into_iter().flatten().next());
+        }
+        // A directory without a clock file merged with one that has a KVM clock.
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (name, cpu) in [("old", "cpu0"), ("new", "cpu1")] {
+            let sub = dir.path().join(name);
+            fs::create_dir(&sub).expect("mkdir");
+            fs::write(sub.join(cpu), bytes(&[(&SYSCALL_EXIT, 5, &[1, 2])])).expect("write");
+        }
+        fs::write(
+            dir.path().join("new").join(CLOCK),
+            "clock kvmclock period_fs 1000000\n",
+        )
+        .expect("write");
+        assert!(matches!(
+            Capture::load(&[dir.path().join("old/cpu0"), dir.path().join("new")]),
+            Err(CaptureError::LegacyClockMismatch { .. })
         ));
     }
 

@@ -124,7 +124,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             tsc_mhz,
         } => {
             let capture = loader(partial)(&inputs)?;
-            let rate = perfetto::TscMhz::for_clock(capture.clock(), tsc_mhz);
+            let rate = perfetto::TickRate::for_clock(capture.clock(), tsc_mhz);
             let json = perfetto::to_json(&capture, rate);
             match output {
                 Some(path) => {
@@ -156,6 +156,11 @@ fn crash(dump: &std::path::Path, out: Option<&std::path::Path>) -> Result<(), Cl
     match &report.message {
         Some((cpu, message)) => writeln!(w, "panic on CPU {cpu}: {message}"),
         None => writeln!(w, "no panic message"),
+    }
+    .map_err(write_error)?;
+    match report.clock {
+        Some(clock) => write!(w, "{clock}"),
+        None => writeln!(w, "clock not recorded (TSC cycles)"),
     }
     .map_err(write_error)?;
     for cpu in &report.cpus {

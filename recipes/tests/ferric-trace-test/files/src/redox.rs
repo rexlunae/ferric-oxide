@@ -803,7 +803,8 @@ fn run() -> Result<(), Failure> {
     Ok(())
 }
 
-/// The length of `trace-clock`'s marker writes to a closed descriptor.
+/// The length of `trace-clock`'s first marker write to a closed descriptor; the second is one
+/// byte longer, so the two are told apart and their order checked.
 const CLOCK_MARK_LEN: usize = 1931;
 
 /// How long `trace-clock` sleeps between its two marker writes.
@@ -811,8 +812,9 @@ const CLOCK_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// `trace-clock`: the `clock` file names the clock timestamps come from, and two marker
 /// writes [`CLOCK_SLEEP`] apart have `syscall.enter` timestamps that agree with the wall
-/// time between them: within a factor of two when the clock's tick length is known (the KVM
-/// clock, the HPET), and only in order for the TSC, whose frequency the kernel does not know.
+/// time between them: the second later than the first, and within a factor of two of the
+/// wall time when the clock's tick length is known (the KVM clock, the HPET); for the TSC,
+/// whose frequency the kernel does not know, only the order is checked.
 /// The two writes may run on different CPUs, so this also compares clocks across CPUs.
 fn check_clock(cpus: &[u32]) -> Result<(), Failure> {
     let step = "trace-clock";
@@ -821,8 +823,8 @@ fn check_clock(cpus: &[u32]) -> Result<(), Failure> {
         .map_err(|err| check(step, format!("clock line {text:?}: {err}")))?;
     drain(step, cpus)?;
     command(step, "enable syscall")?;
-    let marker = vec![0x5au8; CLOCK_MARK_LEN];
-    let first = syscall::write(BAD_FD, &marker);
+    let marker = vec![0x5au8; CLOCK_MARK_LEN + 1];
+    let first = syscall::write(BAD_FD, &marker[..CLOCK_MARK_LEN]);
     let start = std::time::Instant::now();
     std::thread::sleep(CLOCK_SLEEP);
     let wall = start.elapsed();
@@ -840,28 +842,39 @@ fn check_clock(cpus: &[u32]) -> Result<(), Failure> {
         }
     }
     let trace = drain(step, cpus)?;
-    let mut stamps: Vec<u64> = trace
-        .iter()
-        .flatten()
-        .filter(|e| {
-            e.is(&SYSCALL_ENTER)
-                && e.arg(0) == Some(SYS_WRITE as u64)
-                && e.arg(1) == Some(BAD_FD as u64)
-                && e.arg(3) == Some(CLOCK_MARK_LEN as u64)
-        })
-        .map(|e| e.timestamp)
-        .collect();
-    stamps.sort_unstable();
-    let [before, after] = stamps[..] else {
+    // The timestamps of the writes of `len` bytes.
+    let marks = |len: usize| -> Vec<u64> {
+        trace
+            .iter()
+            .flatten()
+            .filter(|e| {
+                e.is(&SYSCALL_ENTER)
+                    && e.arg(0) == Some(SYS_WRITE as u64)
+                    && e.arg(1) == Some(BAD_FD as u64)
+                    && e.arg(3) == Some(len as u64)
+            })
+            .map(|e| e.timestamp)
+            .collect()
+    };
+    let (firsts, seconds) = (marks(CLOCK_MARK_LEN), marks(CLOCK_MARK_LEN + 1));
+    let ([before], [after]) = (&firsts[..], &seconds[..]) else {
         return Err(check(
             step,
-            format!("{} marker writes recorded, not 2", stamps.len()),
+            format!(
+                "{} first and {} second marker writes recorded, not 1 of each",
+                firsts.len(),
+                seconds.len()
+            ),
         ));
     };
-    let ticks = after - before;
-    if ticks == 0 {
-        return Err(check(step, "the marker writes have the same timestamp"));
-    }
+    // The second write came 200 ms after the first, so a timestamp that is not later ran
+    // backward (or stood still) between the CPUs or reads.
+    let Some(ticks) = after.checked_sub(*before).filter(|&ticks| ticks > 0) else {
+        return Err(check(
+            step,
+            format!("the second marker's timestamp {after} is not after the first's {before}"),
+        ));
+    };
     let wall_us = wall.as_secs_f64() * 1e6;
     let detail = match line.ticks_per_us() {
         Some(rate) => {
