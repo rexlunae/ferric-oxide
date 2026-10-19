@@ -61,6 +61,9 @@ uname -a
 cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
+# The crash dump (kernel.trace_crash): skips unless there is one, or, on the crash image's
+# first boot, panics the kernel on purpose; the next boot checks the dump it left.
+ferric-trace-test crash || echo FERRIC_TEST_FAIL trace-crash exited with an error
 ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
 ferric-aslr-test || echo FERRIC_TEST_FAIL aslr exited with an error
 ferric-guard-test || echo FERRIC_TEST_FAIL guard exited with an error

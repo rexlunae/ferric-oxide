@@ -1029,6 +1029,23 @@ mod tests {
     }
 
     #[test]
+    fn trace_crash_options() {
+        let s = real_schema();
+        let mut user = trace_user(&[], &[], true);
+        user.insert("kernel.trace_crash".into(), Value::Bool(true));
+        user.insert("kernel.trace_crash_test".into(), Value::Bool(true));
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert!(out.kernel_features.contains("trace_crash"));
+        assert!(out.kernel_features.contains("trace_crash_test"));
+        assert_eq!(out.kernel_config["trace.crash_base"], "0x4000000");
+        // Both need kernel.trace.
+        let mut user = trace_user(&[], &[], false);
+        user.insert("kernel.trace_crash".into(), Value::Bool(true));
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert!(!out.kernel_features.iter().any(|f| f.starts_with("trace")));
+    }
+
+    #[test]
     fn absolute_output_finds_the_base_config() {
         let s = real_schema();
         let r = resolve(&s, &BTreeMap::new());

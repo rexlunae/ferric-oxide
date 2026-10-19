@@ -8,6 +8,9 @@
 #   remapping), for kernels built with kernel.iommu = "auto" or "enforce".
 #   BOOT_IOMMU=amdvi adds an emulated AMD IOMMU (DMA remapping only) instead. Its
 #   DMA translation and I/O page fault events need QEMU 10 or later (dma-remap).
+#   BOOT_REBOOT=1 lets the guest reset and boot again (no -no-reboot), and does not
+#   treat a kernel panic as a failure: for the crash-dump image, whose first boot
+#   panics on purpose and resets (see image.yml's crash job, which checks the log).
 set -euo pipefail
 
 image="$1"
@@ -69,6 +72,14 @@ edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
 disk_dev=(-device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0)
 net_dev=(-device e1000,netdev=net0,addr=5.0)
 
+reboot=(-no-reboot)
+crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
+if [ "${BOOT_REBOOT:-0}" = 1 ]; then
+    reboot=()
+    # The intended panic is checked by the caller; only an exception still ends the run.
+    crash_pattern='UNHANDLED EXCEPTION'
+fi
+
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
@@ -84,13 +95,12 @@ qemu-system-x86_64 \
     -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
     -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
-    -nographic -vga none -no-reboot \
+    -nographic -vga none "${reboot[@]}" \
     -serial mon:stdio < /dev/null > "$log" 2>&1 &
 qemu_pid=$!
 tail -n +1 -f "$log" --pid="$qemu_pid" &
 tail_pid=$!
 
-crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
 status=""
 crash=""
 for ((i = 0; i < timeout_secs; i++)); do
