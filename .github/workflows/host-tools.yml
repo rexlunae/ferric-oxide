@@ -80,6 +80,12 @@ jobs:
           cargo clippy --locked -p ferric-blkgrant -- -D warnings
           cargo test --locked -p ferric-blkgrant --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
+      - name: ferric-blkqueue
+        run: |
+          cargo clippy --locked --all-targets -p ferric-blkqueue -- -D warnings
+          cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
+          cargo test --locked -p ferric-blkqueue --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
       # kernel turns it on; file systems do not).
       - name: ferric-pcache
@@ -109,6 +115,14 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-lvm
           rustup target add x86_64-unknown-none
           cargo build --locked -p ferric-lvm --target x86_64-unknown-none
+      # ferric-luks runs in the bootloader (soft-float UEFI, with `force-soft`) as well as
+      # in user space; check both builds, and its docs and lints.
+      - name: ferric-luks
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-luks -- -D warnings
+          cargo clippy --locked --no-deps --all-targets --all-features -p ferric-luks -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-luks
+          RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-luks --features force-soft -Zbuild-std=core,alloc --target x86_64-unknown-uefi
 
   redoxfs:
     runs-on: ubuntu-24.04

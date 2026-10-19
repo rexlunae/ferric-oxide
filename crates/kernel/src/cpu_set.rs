@@ -49,6 +49,10 @@ pub const MAX_CPU_COUNT: u32 = 32;
 
 const SET_WORDS: usize = (MAX_CPU_COUNT / usize::BITS) as usize;
 
+// Ferric Oxide: drivers build the mask `sched-affinity` takes with `ferric_irq::affinity`.
+#[cfg(all(feature = "irq-percpu", target_pointer_width = "64"))]
+const _: () = assert!(core::mem::size_of::<RawMask>() == ferric_irq::affinity::MASK_BYTES);
+
 // TODO: Support more than 128 CPUs.
 // The maximum number of CPUs on Linux is configurable, and the type for LogicalCpuSet and
 // LogicalCpuId may be optimized accordingly. In that case, box the mask if it's larger than some

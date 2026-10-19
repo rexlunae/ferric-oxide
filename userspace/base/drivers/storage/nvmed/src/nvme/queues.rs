@@ -85,6 +85,14 @@ impl NvmeCompQueue {
         }
     }
 
+    /// Ferric Oxide: whether an entry is waiting at the head, without taking it (for
+    /// `percore`'s stall watchdog).
+    #[cfg(feature = "percore")]
+    pub(crate) fn has_entry(&self) -> bool {
+        let entry = unsafe { ptr::read_volatile(self.data[usize::from(self.head)].get()) };
+        ((entry.status & 1) == 1) == self.phase
+    }
+
     /// Get a new CQ entry, busy waiting until an entry appears.
     pub fn complete_spin(&mut self) -> NvmeComp {
         log::debug!("Waiting for new CQ entry");
