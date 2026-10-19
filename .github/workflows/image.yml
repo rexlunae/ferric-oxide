@@ -105,8 +105,10 @@ jobs:
           # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
           # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
           # ferric-iommu-test's iommu-msi-percpu runs, and nvmed's per-CPU queue pairs
-          # (also off by default) are on so the boot disk runs through them.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\n' > "$out/ferric.toml"
+          # (also off by default) are on so the boot disk runs through them. The crash dump
+          # region (off by default) is on, so every boot reserves and arms it; the crash image
+          # below also tests a dump.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -184,7 +186,7 @@ jobs:
           # The catalog-defaults config above, without the tracing lines. Only the kernel
           # changes, and make cr.kernel rebuilds it, so no other recipe is marked stale.
           # The initfs keeps its trace.toml; bootstrap logs that there is no kernel.trace.
-          grep -v -e '^trace = ' -e '^trace_boot = ' -e '^trace_initfs_' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
+          grep -v -e '^trace = ' -e '^trace_boot = ' -e '^trace_initfs_' -e '^trace_crash' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
           cat "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate --no-touch
@@ -206,6 +208,38 @@ jobs:
         with:
           name: ferric-smoke-image-notrace
           path: notrace/harddrive.img.zst
+          retention-days: 7
+
+      # The same image with a crash-test kernel (kernel.trace_crash_test): writing `panic` to
+      # /scheme/kernel.trace/crash panics it and resets the machine after the dump, which the
+      # crash job reads back on the next boot. Only the kernel differs.
+      - name: Build the crash image
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          out="$RUNNER_TEMP/ferric-crash"
+          mkdir -p "$out"
+          sed 's/^trace_crash = true$/trace_crash = true\ntrace_crash_test = true/' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
+          cat "$out/ferric.toml"
+          "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate --no-touch
+          FERRIC_KERNEL_FEATURES="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
+          echo "FERRIC_KERNEL_FEATURES=$FERRIC_KERNEL_FEATURES"
+          case "$FERRIC_KERNEL_FEATURES" in
+            *trace_crash_test*) ;;
+            *) echo "::error::the crash kernel has no trace_crash_test feature"; exit 1 ;;
+          esac
+          export FERRIC_KERNEL_FEATURES FERRIC_KERNEL_CONFIG="$out/kernel-config.toml"
+          make cr.kernel CONFIG_NAME="$CONFIG_NAME"
+          rm -f "build/x86_64/$CONFIG_NAME/harddrive.img"
+          make all CONFIG_NAME="$CONFIG_NAME"
+          mkdir -p crash
+          zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o crash/harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        with:
+          name: ferric-smoke-image-crash
+          path: crash/harddrive.img.zst
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -353,7 +387,10 @@ jobs:
           grep -aF "FERRIC_TEST_PASS trace-capture" "$LOG"
           if [ "$CONFIG_NAME" = ferric-smoke ]; then
             grep -aF "FERRIC_TEST_PASS trace-bench" "$LOG"
+            # kernel.trace_crash reserved and armed its region; a clean boot has no dump.
+            grep -aF "FERRIC_TEST_SKIP trace-crash" "$LOG"
           fi
+          grep -aF "trace: crash region at 0x4000000 (64 KiB)" "$LOG"
 
       # The image has kernel.rings on, so ferric-ring-test must run every step, not skip.
       - name: Check rings
@@ -399,6 +436,88 @@ jobs:
   # off and then alternating off and on, on the image with it. Ten boots of each, interleaved, and
   # the median of each boot's fastest round of each kind keep boot-to-boot noise out
   # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
+  # The crash dump across a warm reboot (kernel.trace_crash). The crash image's kernel has the
+  # test hook: on the first boot ferric-trace-test panics it, the panic handler writes the dump
+  # and resets the machine, and QEMU (without -no-reboot) boots again with RAM as it was. The
+  # second boot finds the dump, and ferric-trace-test checks its message and records.
+  crash:
+    needs: build
+    if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      LOG: serial-crash.log
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf zstd
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-smoke-image-crash
+
+      - name: Boot, panic, reboot and read the dump
+        env:
+          BOOT_REBOOT: "1"
+          BOOT_TIMEOUT: "600"
+        run: |
+          set -o pipefail
+          zstd -d harddrive.img.zst -o harddrive.img
+          # boot-smoke.sh's verdict goes to the failure annotations too.
+          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" host 2>&1 | tee boot-smoke.out
+
+      - name: Check the crash dump
+        run: |
+          # First boot: the test panicked the kernel, which wrote the dump and reset.
+          grep -aF "FERRIC_TEST_PASS trace-crash-armed" "$LOG"
+          grep -aF "ferric-trace crash test (kernel.trace_crash_test)" "$LOG"
+          grep -aF "trace: crash dump written" "$LOG"
+          grep -aF "RESET" "$LOG"
+          # Second boot: the kernel found the dump, and the test read it back.
+          grep -aF "trace: the previous boot panicked on CPU" "$LOG"
+          grep -aF "trace: its crash dump (" "$LOG"
+          grep -aF "FERRIC_TEST_PASS trace-crash-read" "$LOG" | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+          grep -aF "FERRIC_TEST_PASS trace-crash-read" "$LOG"
+          # Exactly two boots.
+          test "$(grep -acF "FERRIC_SMOKE_BEGIN" "$LOG")" = 2
+
+      - name: Annotate the serial log on failure
+        if: failure()
+        run: |
+          [ -f "$LOG" ] || exit 0
+          # An annotation keeps only its first few KiB, so each one is short: the test results,
+          # the kernel's crash-dump and reset lines, then the end of the log.
+          annotate() {
+            tr -d '\r' | tail -c 3500 | sed -e 's/%/%25/g' \
+              | awk -v title="$1" 'BEGIN { printf "::error title=%s::", title } { printf "%s%%0A", $0 } END { print "" }'
+          }
+          # boot-smoke.sh prints the markers from the log with the console's CRs removed.
+          [ -f boot-smoke.out ] && grep -a '^FERRIC_\(TEST_FAIL\|TEST_PASS trace-crash\|SMOKE_\)' boot-smoke.out \
+            | annotate "crash boot results" || true
+          tr -d '\r' < "$LOG" | grep -aE 'trace: |KERNEL PANIC|panicked at|RESET|HALT|kreset|Reset with|UNHANDLED' \
+            | grep -avE 'trace: (enable|disable) ' | annotate "crash boot kernel lines" || true
+          tail -n 30 "$LOG" | annotate "crash boot serial log (tail)"
+          [ -f boot-smoke.out ] && grep -a '^boot-smoke:' boot-smoke.out | annotate "boot-smoke verdict" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-log-crash
+          path: ${{ env.LOG }}
+          retention-days: 7
+
   trace-overhead:
     needs: build
     if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
