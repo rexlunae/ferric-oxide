@@ -85,6 +85,13 @@ fn count_interrupt(irq: u8, owner: LogicalCpuId) -> LogicalCpuId {
     LogicalCpuId::BSP
 }
 
+/// Ferric Oxide: whether a handle for `irq` on `cpu` is a vector below 16 reserved on an AP
+/// (`irq:cpu-XX/N`), which no PIC or I/O APIC line backs: the legacy IRQs 0-15 exist only
+/// on the BSP.
+const fn ap_low_vector(cpu: LogicalCpuId, irq: u8) -> bool {
+    irq < BASE_IRQ_COUNT && cpu.get() != LogicalCpuId::BSP.get()
+}
+
 /// The interrupts of `irq` that handles on `cpu` have had (Ferric Oxide: `cpu` matters only
 /// with `irq-percpu`).
 fn interrupt_count(cpu: LogicalCpuId, irq: u8) -> usize {
@@ -649,8 +656,13 @@ impl crate::scheme::KernelScheme for IrqScheme {
                     return Ok(0);
                 }
                 handle_ack.store(ack, Ordering::SeqCst);
-                unsafe {
-                    acknowledge(handle_irq as usize);
+                // Ferric Oxide: only a legacy line has a PIC or I/O APIC pin to unmask. A number
+                // below 16 reserved on an AP is an ordinary vector there, and acknowledging it
+                // must not unmask the BSP's line of the same number.
+                if !ap_low_vector(handle_cpu, handle_irq) {
+                    unsafe {
+                        acknowledge(handle_irq as usize);
+                    }
                 }
                 Ok(size_of::<usize>())
             }
