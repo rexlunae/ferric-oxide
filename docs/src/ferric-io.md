@@ -286,13 +286,21 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
 
 `ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
 throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once. It is a
-same-boot A/B: three rounds of each queue policy, in alternating order. It
-reports the medians (`copy_iops` for the default policy, `single_iops` for
+same-boot A/B: three rounds of each queue policy in alternating order, or
+nine when the first three fail (see below). It reports the medians (`copy_iops` for the default policy, `single_iops` for
 `MainQueue`, `workers_iops` for `Workers`) and the verdict of
-`ferric_blkqueue::ab`: the default must reach the single queue's median,
-less the rounds' spread (between 5% and 15%). Runner hardware varies about
-2x between CI jobs, so numbers from different runs make a poor gate. CI fails
-a boot whose line says `ab=fail`.
+`ferric_blkqueue::ab`. Rounds are paired: the median of the default's
+per-round ratio to the single queue (`ab_ratio`, which cancels drift during
+the boot) must reach 1 less the rounds' spread (`ab_tolerance`, between 5%
+and 15%). When the first three rounds fail, the benchmark runs six more
+rounds of each policy and decides on all nine (`ab_rounds` says how many ran).
+A round whose single queue measured nothing counts as a tie if the default
+measured nothing too, and as a win for the default otherwise. While the scheme serves one call at a
+time, `Adaptive` runs exactly the `MainQueue` path, and one unlucky round
+used to fail the boot. With the extra rounds, identical code passes, while a
+default that is slower in every round still fails. Runner hardware varies
+about 2x between CI jobs, so numbers from different runs make a poor gate.
+CI fails a boot whose line says `ab=fail`.
 
 The kernel fix this work turned up is not specific to NVMe. When `schedule`
 passes a runnable context over because its lock or its address space's lock
@@ -566,3 +574,42 @@ file systems still serve every read through their own scheme.
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`.
+
+## Kernel-bypass network queues (ABI only)
+
+`ferric-netq` (`crates/netq`) is the ABI of the planned kernel-bypass network
+queues (roadmap Phase 2.5, design in `io/netbypass-design.md` in the project
+files). It is `no_std` with no `unsafe` code and is host-tested. **No driver
+uses it yet:** there is no `queue` path on any network scheme and no
+`drivers.net_bypass` option, so nothing in the image changes. Copy mode in
+`driver-network` (with an e1000 test), then `igbd` and zero-copy come in later
+changes.
+
+An application opens `queue` beneath a network scheme
+(`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
+2 or 4 KiB frames) and exchanges frames with the driver through four rings in
+shared memory: Fill and TX from the application, RX and Completion from the
+driver. Filters say which received frames go to the socket instead of
+netstack.
+
+- `umem`: frame geometry, and the check that an offset names one of its
+  frames.
+- `desc`: the ring entries (8-byte frame entries for Fill and Completion,
+  16-byte packet descriptors for RX and TX), checked against the UMEM on
+  decode, since neither side trusts the other.
+- `frame`: the Ethernet, VLAN, IP and TCP/UDP header fields filters match on.
+  Priority tags (VLAN ID 0) name no VLAN, as in IEEE 802.1Q.
+- `filter`: steering filters (an exact match, every frame of the port, or a
+  secondary MAC address), their validation, a canonical 64-byte encoding and
+  the software match copy mode will use. A match can select one VLAN ID or
+  untagged traffic.
+- `call`: the queue socket's `SYS_CALL` requests and the statistics record.
+  `Attach` passes the UMEM grant and the ring grant as `CallFlags::FD`
+  descriptors (the kernel gives a scheme only the first metadata word of such
+  a call), then `Bind` starts the queue with its parameters (frame size, ring
+  sizes, mode, CPU) in a 32-byte payload. `AddFilter`, `RemoveFilter`, `Kick`
+  and `Stats` follow. Every request fits the three metadata words the kernel
+  passes on a plain call.
+
+Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
+RFC 9293, parsed with the `etherparse` crate.

@@ -43,6 +43,11 @@
 //!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
 //!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
 //!   failed`.
+//! - `trace-clock`: the `clock` file names the clock timestamps come from
+//!   (`ferric_trace::clock`), and two marker writes 200 ms apart have timestamps that agree
+//!   with the wall time between them, within a factor of two, when the clock's tick length is
+//!   known (the KVM clock, the HPET); for the TSC only their order is checked, and the
+//!   frequency they imply is printed.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. `trace-fault` prints `FERRIC_TEST_SKIP trace-fault` on a

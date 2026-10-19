@@ -52,7 +52,8 @@ fi
 
 # 4 KiB preads from 1, 2 and 4 threads at once, in every mode (per-core NVMe queues), as a
 # same-boot A/B of nvmed's queue policies. The default policy must reach the single queue's
-# IOPS within the rounds' noise (ferric_blkqueue::ab); the numbers go out as a notice first.
+# IOPS within the rounds' noise, paired round by round, with confirmation rounds before a
+# failure (ferric_blkqueue::ab); the numbers go out as a notice first.
 for threads in 1 2 4; do
     need "FERRIC_BENCH nvme-read-4k-t$threads .*copy_iops=.* ab=(pass|fail)"
 done
