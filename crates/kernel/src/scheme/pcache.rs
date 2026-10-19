@@ -14,16 +14,17 @@
 //!   ([`Request::Attach`](ferric_pcache::abi::Request::Attach), by the handle number its scheme
 //!   gave them).
 //! - A positioned `read` or `pread` of an attached description (`UserScheme::kreadoff`) comes
-//!   here first ([`read_attached`]). Pages that hold the file's data are copied to the reader
-//!   from the object's frames. Absent ones are marked filling and become `Fill` records on the
+//!   here first ([`read_attached`](crate::scheme::pcache::read_attached)). Pages that hold
+//!   the file's data are copied to the reader from the object's frames. Absent ones are marked filling and become `Fill` records on the
 //!   queue, with readahead past them (`ferric_pcache::readahead`); the reader waits for them.
 //!   The file system reads records from the queue, and answers each with
 //!   [`Request::Filled`](ferric_pcache::abi::Request::Filled) on the object, whose payload the
 //!   kernel copies into new frames. A failed fill fails the readers waiting for it with
 //!   `EIO`; the next read fills again.
-//! - Closing a description detaches it (`UserScheme::close` calls [`closed`]). Closing an
-//!   object, or its queue, ends the cache of it: outstanding fills fail, their readers get
-//!   `EIO`, and later reads of its descriptions go to the file system's scheme as before.
+//! - Closing a description detaches it (`UserScheme::close` calls
+//!   [`closed`](crate::scheme::pcache::closed)). Closing an object, or its queue, ends the
+//!   cache of it: outstanding fills fail, their readers get `EIO`, and later reads of its
+//!   descriptions go to the file system's scheme as before.
 //!
 //! Only reads are served here. Mappings, writes, writeback and reclaim are later steps of the
 //! design, so an object holds every page read until it closes. The page index, fill planning
