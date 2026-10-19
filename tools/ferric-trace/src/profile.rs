@@ -14,22 +14,24 @@
 //!   `/scheme/sys/proc` (`kernel.sys_proc`, in the `ferric-procinfo` format): where each ELF
 //!   image was loaded, which symbolizes user addresses under ASLR. Missing without `sys_proc`.
 //!
-//! [`record`] first drains whatever earlier runs left in the buffers and throws it away, then
-//! turns sampling on, runs a command or waits, and drains every buffer every
-//! [`DRAIN_INTERVAL`] until sampling is off again, so the buffers never fill. It reads
-//! `/scheme/sys/proc` at the same times and keeps the last images it saw for each context, so
-//! programs that exit before the end are still covered unless they lived less than one
-//! interval. As with trace
-//! captures, the directory is created exclusively and holds an `INCOMPLETE` marker
-//! ([`crate::capture::INCOMPLETE`]) until everything is saved. Sampling is turned off on every
-//! path out of [`record`], including errors.
+//! [`record`] first takes the profiler for itself by writing `x` to `ctl-profiling`, which
+//! stops sampling and makes any other recorder's writes fail (`EBUSY`, reported as
+//! [`ProfileError::Busy`]) until this one closes its control file. It then drains whatever
+//! earlier runs left in the buffers and throws it away, turns sampling on, runs a command or
+//! waits, and drains every buffer every [`DRAIN_INTERVAL`] until sampling is off again, so the
+//! buffers never fill. It reads `/scheme/sys/proc` at the same times and keeps the last images
+//! it saw for each context, so programs that exit before the end are still covered unless they
+//! lived less than one interval. As with trace captures, the directory is created exclusively
+//! (its parents as needed) and holds an `INCOMPLETE` marker ([`crate::capture::INCOMPLETE`])
+//! until everything is saved. Sampling is turned off on every path out of [`record`], including
+//! errors, and a command it started is killed and waited for if recording fails.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -126,6 +128,26 @@ pub enum ProfileError {
         /// The debug scheme path.
         path: PathBuf,
     },
+    /// Another recorder owns the profiler (its write of `x` to `ctl-profiling` came first).
+    #[error("{}: the profiler is in use by another recorder", path.display())]
+    Busy {
+        /// The control file.
+        path: PathBuf,
+    },
+    /// [`Run::For`] a length no clock deadline can represent.
+    #[error("cannot sample for {length:?}")]
+    TooLong {
+        /// The length asked for.
+        length: Duration,
+    },
+    /// A CPU's sample file is missing while a higher CPU's is there.
+    #[error("{}: no samples for CPU {cpu}, but samples for a later CPU", path.display())]
+    MissingSamples {
+        /// The profile directory.
+        path: PathBuf,
+        /// The CPU without a file.
+        cpu: usize,
+    },
     /// The profile is marked `INCOMPLETE` and was not loaded as partial.
     #[error("{} is incomplete (the recording failed or was killed)", path.display())]
     Incomplete {
@@ -174,16 +196,24 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ProfileError + '_ {
 /// # Errors
 ///
 /// [`ProfileError::NoBuffers`] without the profiler, [`ProfileError::Control`] if
-/// `ctl-profiling` gives no control line (a kernel without the read), [`ProfileError::Command`]
-/// if the command does not start, and [`ProfileError::Io`] naming the file for any other
-/// failure, or [`ProfileError::Proc`] if `proc` does not parse. Whatever was saved stays in
-/// `out` with its `INCOMPLETE` marker.
+/// `ctl-profiling` gives no control line (a kernel without the read), [`ProfileError::TooLong`]
+/// for a length past what the clock can count to, [`ProfileError::Busy`] while another
+/// recorder runs, [`ProfileError::Command`] if the command does not start or cannot be waited
+/// for, [`ProfileError::Proc`] if `proc` does not parse, and [`ProfileError::Io`] naming the
+/// file for any other failure. Whatever was saved stays in `out` with its `INCOMPLETE` marker.
 pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Recorded, ProfileError> {
     let ctl_path = debug.join(CTL_FILE);
     let text = fs::read_to_string(&ctl_path).map_err(io_error(&ctl_path))?;
     let control = parse_control(&ctl_path, &text)?;
     let mut cpus = open_buffers(debug)?;
+    if let Run::For(length) = run {
+        deadline(*length)?;
+    }
+    let mut sampling = Sampling::claim(&ctl_path)?;
 
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(io_error(parent))?;
+    }
     fs::create_dir(out).map_err(io_error(out))?;
     let marker = out.join(INCOMPLETE);
     fs::write(&marker, b"").map_err(io_error(&marker))?;
@@ -199,13 +229,14 @@ pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Record
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Samples from an earlier run would be attributed to this one.
+    // Samples from an earlier run would be attributed to this one. Sampling is off since the
+    // claim, so the buffers stay empty once drained.
     for buffer in &mut cpus {
         drain(buffer, &mut io::sink())?;
     }
     let mut images = ImageTracker::new(proc);
     images.snapshot()?;
-    let sampling = Sampling::start(&ctl_path)?;
+    sampling.start()?;
     let status = sample(run, &mut || {
         drain_all(&mut cpus, &mut files)?;
         images.snapshot()
@@ -304,24 +335,42 @@ fn drain_all(cpus: &mut [Buffer], files: &mut [(PathBuf, File)]) -> Result<(), P
     Ok(())
 }
 
-/// Profiling switched on, until [`Sampling::stop`]; dropping it unstopped (on an error path)
-/// switches it off too.
+/// The profiler, owned through its control file from [`Sampling::claim`] until dropped;
+/// sampling is on from [`Sampling::start`] until [`Sampling::stop`]. Dropping it unstopped (on
+/// an error path) switches sampling off too, as does the kernel when the file closes.
 struct Sampling {
     path: PathBuf,
     ctl: Option<File>,
 }
 
 impl Sampling {
-    fn start(path: &Path) -> Result<Self, ProfileError> {
+    /// Opens the control file and takes the profiler (`x`), which also stops sampling.
+    fn claim(path: &Path) -> Result<Self, ProfileError> {
         let mut ctl = OpenOptions::new()
             .write(true)
             .open(path)
             .map_err(io_error(path))?;
-        ctl.write_all(b"1").map_err(io_error(path))?;
+        ctl.write_all(b"x").map_err(|source| {
+            if source.kind() == ErrorKind::ResourceBusy {
+                ProfileError::Busy {
+                    path: path.to_owned(),
+                }
+            } else {
+                io_error(path)(source)
+            }
+        })?;
         Ok(Self {
             path: path.to_owned(),
             ctl: Some(ctl),
         })
+    }
+
+    /// Switches sampling on.
+    fn start(&mut self) -> Result<(), ProfileError> {
+        match &mut self.ctl {
+            Some(ctl) => ctl.write_all(b"1").map_err(io_error(&self.path)),
+            None => Ok(()),
+        }
     }
 
     fn stop(mut self) -> Result<(), ProfileError> {
@@ -396,32 +445,58 @@ fn sample(
 ) -> Result<Option<ExitStatus>, ProfileError> {
     match run {
         Run::For(length) => {
-            let end = Instant::now() + *length;
+            let end = deadline(*length)?;
             while let Some(left) = end.checked_duration_since(Instant::now()) {
                 thread::sleep(left.min(DRAIN_INTERVAL));
                 tick()?;
             }
             Ok(None)
         }
-        Run::Command(argv) => {
-            let (program, args) = argv.split_first().ok_or(ProfileError::NoCommand)?;
-            let command_error = |source| ProfileError::Command {
-                program: program.clone(),
-                source,
-            };
-            let mut child = Command::new(program)
-                .args(args)
-                .spawn()
-                .map_err(command_error)?;
-            loop {
-                if let Some(status) = child.try_wait().map_err(command_error)? {
-                    return Ok(Some(status));
-                }
-                thread::sleep(DRAIN_INTERVAL);
-                tick()?;
-            }
+        Run::Command(argv) => run_command(argv, tick).map(Some),
+    }
+}
+
+/// When sampling for `length` from now ends.
+fn deadline(length: Duration) -> Result<Instant, ProfileError> {
+    Instant::now()
+        .checked_add(length)
+        .ok_or(ProfileError::TooLong { length })
+}
+
+/// Runs `argv` and calls `tick` every [`DRAIN_INTERVAL`] until it exits. If `tick` or waiting
+/// fails, the command is killed and waited for, and that first error is returned.
+fn run_command(
+    argv: &[OsString],
+    mut tick: impl FnMut() -> Result<(), ProfileError>,
+) -> Result<ExitStatus, ProfileError> {
+    let (program, args) = argv.split_first().ok_or(ProfileError::NoCommand)?;
+    let command_error = |source| ProfileError::Command {
+        program: program.clone(),
+        source,
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .spawn()
+        .map_err(command_error)?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(source) => return Err(stop_child(&mut child, command_error(source))),
+        }
+        thread::sleep(DRAIN_INTERVAL);
+        if let Err(err) = tick() {
+            return Err(stop_child(&mut child, err));
         }
     }
+}
+
+/// Kills and reaps `child` after `err`, which stays the error reported: a failure to kill
+/// (it may have exited already) or to wait would only hide it.
+fn stop_child(child: &mut Child, err: ProfileError) -> ProfileError {
+    let _ = child.kill();
+    let _ = child.wait();
+    err
 }
 
 /// Names every context the saved samples mention.
@@ -434,7 +509,7 @@ fn name_contexts(
         let words = load_words(path)?;
         ids.extend(
             Samples::new(&words)
-                .map_while(Result::ok)
+                .filter_map(Result::ok)
                 .map(|s| s.context),
         );
     }
@@ -507,6 +582,22 @@ fn parse_names(path: &Path, text: &str) -> Result<BTreeMap<u32, String>, Profile
         .collect()
 }
 
+/// The CPU numbers of the `samples<n>` files in `dir`, in order.
+fn sample_cpus(dir: &Path) -> Result<Vec<usize>, ProfileError> {
+    let mut cpus = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io_error(dir))? {
+        let entry = entry.map_err(io_error(dir))?;
+        let name = entry.file_name();
+        let cpu = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(SAMPLES_PREFIX))
+            .and_then(|n| n.parse::<usize>().ok());
+        cpus.extend(cpu);
+    }
+    cpus.sort_unstable();
+    Ok(cpus)
+}
+
 fn load_words(path: &Path) -> Result<Vec<u64>, ProfileError> {
     let bytes = fs::read(path).map_err(io_error(path))?;
     if bytes.len() % WORD_BYTES != 0 {
@@ -571,7 +662,8 @@ impl Profile {
     /// # Errors
     ///
     /// [`ProfileError::Incomplete`], [`ProfileError::Control`], [`ProfileError::TornWord`],
-    /// [`ProfileError::Names`], [`ProfileError::Proc`] for a bad images file, or
+    /// [`ProfileError::MissingSamples`] when the CPUs' files are not numbered from 0 without
+    /// gaps, [`ProfileError::Names`], [`ProfileError::Proc`] for a bad images file, or
     /// [`ProfileError::Io`] naming the file. A missing images file (a kernel without
     /// `sys_proc`) is no error.
     pub fn load(dir: &Path, partial: bool) -> Result<Self, ProfileError> {
@@ -585,12 +677,14 @@ impl Profile {
         let text = fs::read_to_string(&text_path).map_err(io_error(&text_path))?;
         let kernel_text = parse_control(&text_path, &text)?;
         let mut cpus = Vec::new();
-        loop {
-            let path = dir.join(format!("{SAMPLES_PREFIX}{}", cpus.len()));
-            if !path.exists() {
-                break;
+        for (index, cpu) in sample_cpus(dir)?.into_iter().enumerate() {
+            if cpu != index {
+                return Err(ProfileError::MissingSamples {
+                    path: dir.to_owned(),
+                    cpu: index,
+                });
             }
-            cpus.push(load_words(&path)?);
+            cpus.push(load_words(&dir.join(format!("{SAMPLES_PREFIX}{cpu}")))?);
         }
         let names_path = dir.join(NAMES);
         let names = match fs::read_to_string(&names_path) {
@@ -622,8 +716,8 @@ impl Profile {
         })
     }
 
-    /// Every sample with its CPU, CPU by CPU. A CPU's samples stop at its first bad one, which
-    /// is given as the error.
+    /// Every sample with its CPU, CPU by CPU. Words that are not a whole sample come as one
+    /// error each run of them, and the samples after them follow ([`Samples`]).
     pub fn samples(&self) -> impl Iterator<Item = (usize, Result<Sample<'_>, SampleError>)> {
         self.cpus
             .iter()
@@ -746,9 +840,73 @@ mod tests {
                 path: "/usr/bin/a b".to_owned()
             }]
         );
-        // Sampling was switched on, then off (each write lands after the last in a plain file).
+        // The profiler was claimed, then sampling switched on and off (each write lands after
+        // the last in a plain file).
         let ctl = fs::read_to_string(scheme.path().join(CTL_FILE)).unwrap();
-        assert!(ctl.starts_with("10"), "{ctl:?}");
+        assert!(ctl.starts_with("x10"), "{ctl:?}");
+    }
+
+    /// A stand-in debug scheme with one empty CPU buffer.
+    fn stand_in_scheme() -> tempfile::TempDir {
+        let scheme = tempfile::tempdir().unwrap();
+        fs::write(scheme.path().join(CTL_FILE), "kernel_text 0x1000\n").unwrap();
+        fs::write(scheme.path().join(format!("{CPU_FILE_PREFIX}0")), b"").unwrap();
+        scheme
+    }
+
+    #[test]
+    fn record_makes_the_parents() {
+        let scheme = stand_in_scheme();
+        let out = scheme.path().join("a/b/profile");
+        let no_proc = scheme.path().join("no-proc");
+        record(scheme.path(), &no_proc, &out, &Run::For(Duration::ZERO)).unwrap();
+        assert!(Profile::load(&out, false).is_ok());
+    }
+
+    #[test]
+    fn record_refuses_an_endless_length() {
+        let scheme = stand_in_scheme();
+        let out = scheme.path().join("profile");
+        assert!(matches!(
+            record(
+                scheme.path(),
+                &scheme.path().join("no-proc"),
+                &out,
+                &Run::For(Duration::MAX)
+            ),
+            Err(ProfileError::TooLong { .. })
+        ));
+        assert!(!out.exists());
+    }
+
+    /// A failed drain kills and reaps the command, and is the error returned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_drain_stops_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let argv = ["sh".into(), "-c".into(), script.into()];
+        let started = Instant::now();
+        let result = run_command(&argv, || match fs::read_to_string(&pid_file) {
+            Ok(pid) if pid.ends_with('\n') => Err(ProfileError::NoCommand),
+            _ => Ok(()),
+        });
+        assert!(matches!(result, Err(ProfileError::NoCommand)));
+        assert!(started.elapsed() < Duration::from_secs(20));
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+    }
+
+    #[test]
+    fn load_refuses_a_gap_in_the_cpus() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &[&[], &[], &[]], "");
+        fs::remove_file(dir.path().join(format!("{SAMPLES_PREFIX}1"))).unwrap();
+        assert!(matches!(
+            Profile::load(dir.path(), false),
+            Err(ProfileError::MissingSamples { cpu: 1, .. })
+        ));
     }
 
     #[test]
