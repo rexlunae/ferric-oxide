@@ -421,6 +421,32 @@ sampled context. Like a capture, the directory is marked `INCOMPLETE` until it
 is complete, and sampling is switched off on every way out, errors included.
 User stacks are only walked through frame pointers, so build the image with
 `cpu.frame_pointers` ([#149](https://github.com/rexlunae/ferric-oxide/pull/149)) for useful user frames.
+With `kernel.sys_proc` it also reads `/scheme/sys/proc` at each drain and saves
+an `images` file: the `image` lines of every sampled context.
+
+Those lines come from the loaders. Exec (`redox-rt`) records the program and
+its interpreter, and `ld.so` each library it maps: the load bias and path
+(`ferric_procinfo::ImageRecord`, written to the address space's `images`
+handle in the proc scheme). The kernel keeps up to 64 per address space,
+copies them on fork and starts empty on exec, so user addresses can be
+symbolized with ASLR on. A program that lives less than one drain interval may
+be missed, and its frames then show as `[unknown]`.
+
+```sh
+ferric-trace flamegraph prof/ --kernel kernel.all --root build/x86_64/ferric-smoke/sysroot \
+    --folded prof.folded -o prof.svg
+```
+
+`ferric-trace flamegraph` (on the host or the target) symbolizes each stack
+from ELF symbol tables. Kernel addresses use the kernel ELF, with the KASLR
+slide taken from `kernel_text`. User addresses use the image that holds them,
+read from `--root` (unstripped binaries, such as the cookbook's build trees,
+give names; stripped ones show `[<file>]`). It writes the folded stacks
+(`root;frame;frame count`, the format other flame graph tools read) and its own
+self-contained SVG (`tools/ferric-trace/src/svg.rs`): root at the bottom,
+frames sorted by name, the name, count and share in each frame's tooltip.
+`profile-image.yml` builds an image with `kernel.profiling`, `kernel.sys_proc`
+and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
 
 ## Validation
 
@@ -597,6 +623,7 @@ fd 0 scheme pipe number 3
 fd 3 scheme sys number 7
 fd 4 scheme user:7 number 1
 grant 0x400000 pages 12 provider allocated prot r-x
+image 0x0 path /usr/bin/ferric-proc-test
 ```
 
 - `context`: the context's debug id (the id `sched.switch` records carry, so
@@ -617,6 +644,9 @@ grant 0x400000 pages 12 provider allocated prot r-x
   pages, where the memory comes from (`allocated`, `allocated_shared`,
   `phys`, `external`, `fmap`) and its protection. Threads of one process
   share an address space and list the same grants.
+- `image`: each ELF image its loaders recorded (see "Sampling profiles"): the
+  load bias (0 for an executable that is not position-independent) and the
+  path, which runs to the end of the line.
 
 The kernel builds the file in two passes, so it takes no lock out of order.
 First it copies each context, and its descriptors' scheme ids, under that

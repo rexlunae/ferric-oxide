@@ -9,11 +9,17 @@
 //! - `samples<n>` ([`SAMPLES_PREFIX`]): the words drained from `profiling-<n>`, the samples of
 //!   ordinary CPU `n`, as native-endian (little-endian on x86_64) `u64`s;
 //! - [`NAMES`]: one `<debug id> <name>` line for each context the samples name, as the kernel
-//!   names it (the `debug` scheme's `call` on a CPU file).
+//!   names it (the `debug` scheme's `call` on a CPU file);
+//! - [`IMAGES`]: for each context that had any, its `context` line and `image` lines from
+//!   `/scheme/sys/proc` (`kernel.sys_proc`, in the `ferric-procinfo` format): where each ELF
+//!   image was loaded, which symbolizes user addresses under ASLR. Missing without `sys_proc`.
 //!
 //! [`record`] first drains whatever earlier runs left in the buffers and throws it away, then
 //! turns sampling on, runs a command or waits, and drains every buffer every
-//! [`DRAIN_INTERVAL`] until sampling is off again, so the buffers never fill. As with trace
+//! [`DRAIN_INTERVAL`] until sampling is off again, so the buffers never fill. It reads
+//! `/scheme/sys/proc` at the same times and keeps the last images it saw for each context, so
+//! programs that exit before the end are still covered unless they lived less than one
+//! interval. As with trace
 //! captures, the directory is created exclusively and holds an `INCOMPLETE` marker
 //! ([`crate::capture::INCOMPLETE`]) until everything is saved. Sampling is turned off on every
 //! path out of [`record`], including errors.
@@ -42,6 +48,9 @@ pub const SAMPLES_PREFIX: &str = "samples";
 /// The file naming the sampled contexts.
 pub const NAMES: &str = "names";
 
+/// The file listing each context's loaded images.
+pub const IMAGES: &str = "images";
+
 /// How often [`record`] drains the buffers while sampling.
 pub const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -69,6 +78,8 @@ pub struct Recorded {
     pub cpu_bytes: Vec<u64>,
     /// How many contexts were named.
     pub names: usize,
+    /// How many contexts' images were saved (none without `/scheme/sys/proc`).
+    pub images: usize,
     /// The command's exit status, for [`Run::Command`].
     pub status: Option<ExitStatus>,
 }
@@ -129,6 +140,15 @@ pub enum ProfileError {
         /// Its length.
         len: usize,
     },
+    /// The per-process file (or a profile's images file) does not parse.
+    #[error("{}", path.display())]
+    Proc {
+        /// The file.
+        path: PathBuf,
+        /// Why it does not parse.
+        #[source]
+        source: ferric_procinfo::FileError,
+    },
     /// A line of the names file is not `<id> <name>`.
     #[error("{}: bad line {line:?}", path.display())]
     Names {
@@ -147,15 +167,18 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ProfileError + '_ {
 }
 
 /// Records a profile into `out`, which must not exist, from the debug scheme at `debug`
-/// (`/scheme/debug`). Needs root, and a kernel with `kernel.profiling`.
+/// (`/scheme/debug`), with the images listed by the per-process file `proc`
+/// (`/scheme/sys/proc`; skipped if it does not exist). Needs root, and a kernel with
+/// `kernel.profiling`.
 ///
 /// # Errors
 ///
 /// [`ProfileError::NoBuffers`] without the profiler, [`ProfileError::Control`] if
 /// `ctl-profiling` gives no control line (a kernel without the read), [`ProfileError::Command`]
 /// if the command does not start, and [`ProfileError::Io`] naming the file for any other
-/// failure. Whatever was saved stays in `out` with its `INCOMPLETE` marker.
-pub fn record(debug: &Path, out: &Path, run: &Run) -> Result<Recorded, ProfileError> {
+/// failure, or [`ProfileError::Proc`] if `proc` does not parse. Whatever was saved stays in
+/// `out` with its `INCOMPLETE` marker.
+pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Recorded, ProfileError> {
     let ctl_path = debug.join(CTL_FILE);
     let text = fs::read_to_string(&ctl_path).map_err(io_error(&ctl_path))?;
     let control = parse_control(&ctl_path, &text)?;
@@ -180,10 +203,17 @@ pub fn record(debug: &Path, out: &Path, run: &Run) -> Result<Recorded, ProfileEr
     for buffer in &mut cpus {
         drain(buffer, &mut io::sink())?;
     }
+    let mut images = ImageTracker::new(proc);
+    images.snapshot()?;
     let sampling = Sampling::start(&ctl_path)?;
-    let status = sample(run, &mut cpus, &mut files)?;
+    let status = sample(run, &mut || {
+        drain_all(&mut cpus, &mut files)?;
+        images.snapshot()
+    })?;
     sampling.stop()?;
     drain_all(&mut cpus, &mut files)?;
+    images.snapshot()?;
+    write_file(&out.join(IMAGES), images.text().as_bytes())?;
     let cpu_bytes = files
         .iter()
         .map(|(path, file)| file.metadata().map(|m| m.len()).map_err(io_error(path)))
@@ -199,6 +229,7 @@ pub fn record(debug: &Path, out: &Path, run: &Run) -> Result<Recorded, ProfileEr
     Ok(Recorded {
         cpu_bytes,
         names: names.len(),
+        images: images.blocks.len(),
         status,
     })
 }
@@ -310,18 +341,65 @@ impl Drop for Sampling {
     }
 }
 
-/// Samples for the run, draining as it goes.
+/// The image blocks of the per-process file, the last seen for each context.
+struct ImageTracker {
+    path: PathBuf,
+    /// Off once the file turned out not to exist (a kernel without `sys_proc`).
+    on: bool,
+    blocks: BTreeMap<u32, String>,
+}
+
+impl ImageTracker {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            on: true,
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    fn snapshot(&mut self) -> Result<(), ProfileError> {
+        if !self.on {
+            return Ok(());
+        }
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                self.on = false;
+                return Ok(());
+            }
+            Err(source) => return Err(io_error(&self.path)(source)),
+        };
+        let processes = ferric_procinfo::processes(&text).map_err(|source| ProfileError::Proc {
+            path: self.path.clone(),
+            source,
+        })?;
+        for process in processes.iter().filter(|p| !p.images.is_empty()) {
+            let mut block = process.context.to_string();
+            for image in &process.images {
+                block.push_str(&image.to_string());
+            }
+            self.blocks.insert(process.context.id, block);
+        }
+        Ok(())
+    }
+
+    fn text(&self) -> String {
+        self.blocks.values().map(String::as_str).collect()
+    }
+}
+
+/// Samples for the run, calling `tick` (which drains) every [`DRAIN_INTERVAL`].
 fn sample(
     run: &Run,
-    cpus: &mut [Buffer],
-    files: &mut [(PathBuf, File)],
+    tick: &mut dyn FnMut() -> Result<(), ProfileError>,
 ) -> Result<Option<ExitStatus>, ProfileError> {
     match run {
         Run::For(length) => {
             let end = Instant::now() + *length;
             while let Some(left) = end.checked_duration_since(Instant::now()) {
                 thread::sleep(left.min(DRAIN_INTERVAL));
-                drain_all(cpus, files)?;
+                tick()?;
             }
             Ok(None)
         }
@@ -340,7 +418,7 @@ fn sample(
                     return Ok(Some(status));
                 }
                 thread::sleep(DRAIN_INTERVAL);
-                drain_all(cpus, files)?;
+                tick()?;
             }
         }
     }
@@ -452,6 +530,38 @@ pub struct Profile {
     pub cpus: Vec<Vec<u64>>,
     /// The contexts' names, by debug id.
     pub names: BTreeMap<u32, String>,
+    /// The images loaded into each context's address space, by debug id.
+    pub images: BTreeMap<u32, Vec<LoadedImage>>,
+}
+
+/// An ELF image in a profiled context's address space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedImage {
+    /// The load bias: run-time address minus ELF virtual address.
+    pub base: u64,
+    /// The path it was loaded from, on the target.
+    pub path: String,
+}
+
+fn parse_images(path: &Path, text: &str) -> Result<BTreeMap<u32, Vec<LoadedImage>>, ProfileError> {
+    let processes = ferric_procinfo::processes(text).map_err(|source| ProfileError::Proc {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(processes
+        .into_iter()
+        .map(|process| {
+            let images = process
+                .images
+                .iter()
+                .map(|image| LoadedImage {
+                    base: image.base,
+                    path: image.path.0.to_owned(),
+                })
+                .collect();
+            (process.context.id, images)
+        })
+        .collect())
 }
 
 impl Profile {
@@ -461,7 +571,9 @@ impl Profile {
     /// # Errors
     ///
     /// [`ProfileError::Incomplete`], [`ProfileError::Control`], [`ProfileError::TornWord`],
-    /// [`ProfileError::Names`], or [`ProfileError::Io`] naming the file.
+    /// [`ProfileError::Names`], [`ProfileError::Proc`] for a bad images file, or
+    /// [`ProfileError::Io`] naming the file. A missing images file (a kernel without
+    /// `sys_proc`) is no error.
     pub fn load(dir: &Path, partial: bool) -> Result<Self, ProfileError> {
         let incomplete = dir.join(INCOMPLETE).exists();
         if incomplete && !partial {
@@ -491,10 +603,22 @@ impl Profile {
                 });
             }
         };
+        let images_path = dir.join(IMAGES);
+        let images = match fs::read_to_string(&images_path) {
+            Ok(text) => parse_images(&images_path, &text)?,
+            Err(err) if err.kind() == ErrorKind::NotFound => BTreeMap::new(),
+            Err(source) => {
+                return Err(ProfileError::Io {
+                    path: images_path,
+                    source,
+                });
+            }
+        };
         Ok(Self {
             kernel_text,
             cpus,
             names,
+            images,
         })
     }
 
@@ -597,7 +721,17 @@ mod tests {
         let dir = out.path().join("profile");
         let append = format!("cat {} >> {}", fresh.display(), cpu0.display());
         let run = Run::Command(vec!["sh".into(), "-c".into(), append.into()]);
-        let recorded = record(scheme.path(), &dir, &run).unwrap();
+        let proc = scheme.path().join("proc");
+        fs::write(
+            &proc,
+            "context 9 pid 4 euid 0 egid 0 status runnable cpu 0 running yes active_ns 1 sched_ns 1 name sh\n\
+             memory private 0 shared 0 kernel 0\n\
+             image 0x7000 path /usr/bin/a b\n\
+             context 10 pid 5 euid 0 egid 0 status runnable cpu 0 running no active_ns 1 sched_ns 1 name kmain\n",
+        )
+        .unwrap();
+        let recorded = record(scheme.path(), &proc, &dir, &run).unwrap();
+        assert_eq!(recorded.images, 1);
         assert!(recorded.status.unwrap().success());
         assert_eq!(recorded.cpu_bytes, [32]);
 
@@ -605,6 +739,13 @@ mod tests {
         assert_eq!(profile.kernel_text.text_start, 0x1000);
         let only = profile.samples().next().unwrap().1.unwrap();
         assert_eq!((only.ip, only.context), (2, 9));
+        assert_eq!(
+            profile.images[&9],
+            [LoadedImage {
+                base: 0x7000,
+                path: "/usr/bin/a b".to_owned()
+            }]
+        );
         // Sampling was switched on, then off (each write lands after the last in a plain file).
         let ctl = fs::read_to_string(scheme.path().join(CTL_FILE)).unwrap();
         assert!(ctl.starts_with("10"), "{ctl:?}");
@@ -616,7 +757,12 @@ mod tests {
         fs::write(scheme.path().join(CTL_FILE), "kernel_text 0x1000\n").unwrap();
         let out = scheme.path().join("profile");
         assert!(matches!(
-            record(scheme.path(), &out, &Run::For(Duration::ZERO)),
+            record(
+                scheme.path(),
+                &scheme.path().join("no-proc"),
+                &out,
+                &Run::For(Duration::ZERO)
+            ),
             Err(ProfileError::NoBuffers { .. })
         ));
         assert!(!out.exists());

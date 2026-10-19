@@ -460,6 +460,16 @@ impl DSO {
         } else {
             elf.entry() as usize
         };
+        // Ferric Oxide: tell the kernel where this library went (sys_proc), for profilers.
+        #[cfg(target_os = "redox")]
+        if base_addr.is_none() {
+            let bias = if is_pie_enabled(&elf) {
+                mmap.as_ptr() as usize
+            } else {
+                0
+            };
+            redox_rt::proc::record_own_image(bias, path.as_bytes());
+        }
 
         let dso = DSO {
             name,

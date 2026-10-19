@@ -13,6 +13,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ferric-trace = { path = "../../crates/trace" }
+ferric-procinfo = { path = "../../crates/procinfo", features = ["alloc"] }
+# ELF symbol tables for `flamegraph`.
+object = { version = "0.38", default-features = false, features = ["read_core", "elf", "std"] }
+rustc-demangle = "0.1.28"
 serde.workspace = true
 # For the scheme opcode names (`schemev2::Opcode`); no system calls are made.
 redox_syscall = { version = "0.9.4", default-features = false }

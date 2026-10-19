@@ -171,6 +171,9 @@ pub fn fexec_impl(
         0
     };
 
+    // Ferric Oxide: the program, or on the second pass its interpreter.
+    record_image(&grants_fd, base_addr, path);
+
     let mut phdrs_vaddr = 0;
     let mut interpreter = None;
 
@@ -692,6 +695,43 @@ pub fn munmap_transfer(
     )?;
     Ok(())
 }
+/// Ferric Oxide: tells the kernel that the ELF image at `path` was loaded with load bias `base`
+/// into the address space `addrspace_fd` names, for `/scheme/sys/proc` (`kernel.sys_proc`), so
+/// profilers can symbolize user addresses under ASLR. Best effort: a kernel without
+/// `sys_proc` refuses the handle, and a path that is not UTF-8 or too long is not recorded.
+pub fn record_image(addrspace_fd: &FdGuardUpper, base: usize, path: &[u8]) {
+    let Ok(path) = core::str::from_utf8(path) else {
+        return;
+    };
+    let mut record = [0; ferric_procinfo::MAX_IMAGE_RECORD];
+    let Ok(len) = (ferric_procinfo::ImageRecord {
+        base: base as u64,
+        path,
+    })
+    .encode(&mut record) else {
+        return;
+    };
+    if let Ok(images) = addrspace_fd.dup(ferric_procinfo::IMAGES_HANDLE.as_bytes()) {
+        let _ = images.write(&record[..len]);
+    }
+}
+
+/// Ferric Oxide: [`record_image`] for the calling thread's own address space (`ld.so`'s
+/// libraries).
+pub fn record_own_image(base: usize, path: &[u8]) {
+    // SAFETY: the TCB pointer is checked by `current`; the thread fd is only replaced while
+    // ld.so sets up the final TCB, after every startup library is mapped, and a dlopen runs
+    // on a thread whose TCB is complete.
+    let Some(thread_fd) =
+        (unsafe { crate::Tcb::current().and_then(|tcb| (*tcb.os_specific.thr_fd.get()).as_ref()) })
+    else {
+        return;
+    };
+    if let Ok(addrspace) = thread_fd.dup_into_upper(b"addrspace") {
+        record_image(&addrspace, base, path);
+    }
+}
+
 fn pread_all(fd: &FdGuardUpper, offset: u64, buf: &mut [u8]) -> Result<()> {
     fd.lseek(offset as isize, SEEK_SET)?;
 

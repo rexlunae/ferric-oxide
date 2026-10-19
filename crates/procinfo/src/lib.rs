@@ -11,6 +11,7 @@
 //! fd 0 scheme pipe number 3
 //! fd 4 scheme user:7 number 1
 //! grant 0x400000 pages 12 provider allocated prot r-x
+//! image 0x400000 path /usr/bin/ion
 //! ```
 //!
 //! - A [`ContextLine`] starts each context's block: its debug id (the id `sched.switch`
@@ -22,12 +23,23 @@
 //!   kernel knows, so it is given by its scheme id.
 //! - A [`GrantLine`] for each grant (mapping) of the address space: base address, size in
 //!   pages, where the memory comes from and its protection.
+//! - An [`ImageLine`] for each ELF image the address space's loaders recorded: the load bias
+//!   and the path. Profiling tools use it to symbolize user addresses under ASLR.
 //!
 //! Each line is space-separated `key value` pairs in a fixed order after the first keyword,
 //! ending in `\n`. The context's name comes last and runs to the end of the line; the kernel
 //! replaces control characters in it with `?` ([`Name`]), so a name cannot start a line of
 //! its own. Contexts whose address space is shared (threads of one process) each list the
-//! same grants.
+//! same grants and images.
+//!
+//! # Image records
+//!
+//! The kernel learns about images from their loaders: `redox-rt`'s exec records the program
+//! and its interpreter, and `ld.so` each library it maps. A loader dups [`IMAGES_HANDLE`]
+//! from the proc scheme handle of the address space and writes one [`ImageRecord`] to it:
+//! the load bias as a little-endian `u64`, then the path as UTF-8. The kernel keeps up to
+//! [`MAX_IMAGES`] per address space, copies them when the address space is cloned (fork),
+//! and starts a new one empty (exec).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -340,6 +352,135 @@ pub enum Line<'a> {
     Fd(FdLine<'a>),
     /// One of its grants.
     Grant(GrantLine),
+    /// One of the images loaded into its address space.
+    Image(ImageLine<'a>),
+}
+
+/// An ELF image in a context's address space: `image 0x<base> path <path>`, the path running
+/// to the end of the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageLine<'a> {
+    /// The load bias: what was added to the image's ELF virtual addresses (0 for an
+    /// executable that is not position-independent).
+    pub base: u64,
+    /// The path its loader opened it by, as the kernel prints it.
+    pub path: Name<'a>,
+}
+
+impl fmt::Display for ImageLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "image {:#x} path {}", self.base, self.path)
+    }
+}
+
+/// The proc scheme handle a loader dups from an address-space handle to record an image.
+pub const IMAGES_HANDLE: &str = "images";
+
+/// The most images the kernel keeps for one address space; later records are dropped.
+pub const MAX_IMAGES: usize = 64;
+
+/// The longest path an [`ImageRecord`] holds, in bytes.
+pub const MAX_IMAGE_PATH: usize = 255;
+
+/// The size of the bias in an [`ImageRecord`].
+const BIAS_BYTES: usize = size_of::<u64>();
+
+/// The longest [`ImageRecord`] in bytes.
+pub const MAX_IMAGE_RECORD: usize = BIAS_BYTES + MAX_IMAGE_PATH;
+
+/// What a loader writes to the [`IMAGES_HANDLE`] to record one image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRecord<'a> {
+    /// The load bias.
+    pub base: u64,
+    /// The path the image was opened by: 1 to [`MAX_IMAGE_PATH`] bytes.
+    pub path: &'a str,
+}
+
+/// Why an [`ImageRecord`] cannot be encoded or decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordError {
+    /// The record is shorter than its bias.
+    Short,
+    /// The path is empty, longer than [`MAX_IMAGE_PATH`] or not UTF-8.
+    Path,
+}
+
+impl fmt::Display for RecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RecordError::Short => "the image record is too short",
+            RecordError::Path => "the image path is empty, too long or not UTF-8",
+        })
+    }
+}
+
+impl core::error::Error for RecordError {}
+
+impl<'a> ImageRecord<'a> {
+    /// Writes the record into `out`, returning its length.
+    ///
+    /// # Errors
+    ///
+    /// [`RecordError::Path`] for an empty or too long path.
+    pub fn encode(&self, out: &mut [u8; MAX_IMAGE_RECORD]) -> Result<usize, RecordError> {
+        let path = self.path.as_bytes();
+        if path.is_empty() || path.len() > MAX_IMAGE_PATH {
+            return Err(RecordError::Path);
+        }
+        let (bias, rest) = out.split_at_mut(BIAS_BYTES);
+        bias.copy_from_slice(&self.base.to_le_bytes());
+        rest[..path.len()].copy_from_slice(path);
+        Ok(BIAS_BYTES + path.len())
+    }
+
+    /// Reads a record a loader wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`RecordError::Short`] without a whole bias, [`RecordError::Path`] for a bad path.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, RecordError> {
+        let (bias, path) = bytes
+            .split_first_chunk::<BIAS_BYTES>()
+            .ok_or(RecordError::Short)?;
+        if path.is_empty() || path.len() > MAX_IMAGE_PATH {
+            return Err(RecordError::Path);
+        }
+        Ok(Self {
+            base: u64::from_le_bytes(*bias),
+            path: core::str::from_utf8(path).map_err(|_| RecordError::Path)?,
+        })
+    }
+}
+
+/// An image the kernel keeps for an address space, owned.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// The load bias.
+    pub base: u64,
+    /// The path.
+    pub path: alloc::boxed::Box<str>,
+}
+
+#[cfg(feature = "alloc")]
+impl Image {
+    /// The owned copy of `record`.
+    pub fn from_record(record: &ImageRecord<'_>) -> Self {
+        Self {
+            base: record.base,
+            path: record.path.into(),
+        }
+    }
+
+    /// The image's line.
+    pub fn line(&self) -> ImageLine<'_> {
+        ImageLine {
+            base: self.base,
+            path: Name(&self.path),
+        }
+    }
 }
 
 impl fmt::Display for ContextLine<'_> {
@@ -413,6 +554,7 @@ impl fmt::Display for Line<'_> {
             Line::Memory(line) => line.fmt(f),
             Line::Fd(line) => line.fmt(f),
             Line::Grant(line) => line.fmt(f),
+            Line::Image(line) => line.fmt(f),
         }
     }
 }
@@ -493,6 +635,13 @@ impl<'a> Line<'a> {
                     prot: f.last("prot")?.parse()?,
                 }))
             }
+            "image" => {
+                let (base, rest) = rest.split_once(' ').ok_or(LineError::Fields)?;
+                Ok(Line::Image(ImageLine {
+                    base: hex(base)?,
+                    path: Name(fields(rest, 1).last("path")?),
+                }))
+            }
             _ => Err(LineError::Kind),
         }
     }
@@ -551,6 +700,8 @@ pub struct Process<'a> {
     pub fds: alloc::vec::Vec<FdLine<'a>>,
     /// Its grants.
     pub grants: alloc::vec::Vec<GrantLine>,
+    /// The images loaded into its address space.
+    pub images: alloc::vec::Vec<ImageLine<'a>>,
 }
 
 /// Why a whole file does not parse.
@@ -570,7 +721,7 @@ pub struct FileError {
 pub enum FileErrorKind {
     /// The line does not parse.
     Line(LineError),
-    /// A memory, fd or grant line comes before the first context line.
+    /// A memory, fd, grant or image line comes before the first context line.
     Orphan,
 }
 
@@ -625,6 +776,7 @@ pub fn processes(text: &str) -> Result<alloc::vec::Vec<Process<'_>>, FileError> 
                 memory: None,
                 fds: alloc::vec::Vec::new(),
                 grants: alloc::vec::Vec::new(),
+                images: alloc::vec::Vec::new(),
             });
             continue;
         }
@@ -633,6 +785,7 @@ pub fn processes(text: &str) -> Result<alloc::vec::Vec<Process<'_>>, FileError> 
             Line::Memory(memory) => process.memory = Some(memory),
             Line::Fd(fd) => process.fds.push(fd),
             Line::Grant(grant) => process.grants.push(grant),
+            Line::Image(image) => process.images.push(image),
             Line::Context(_) => {}
         }
     }
@@ -698,6 +851,10 @@ mod tests {
                     write: false,
                     execute: true,
                 },
+            }),
+            Line::Image(ImageLine {
+                base: 0x7f00_0000,
+                path: Name("/usr/lib/a b.so"),
             }),
         ];
         for line in lines {
@@ -789,11 +946,13 @@ mod tests {
         text.push_str(&CONTEXT.to_string());
         text.push_str("memory private 1 shared 2 kernel 3\nfd 0 scheme pipe number 1\n");
         text.push_str("grant 0x1000 pages 1 provider fmap prot rw-\n");
+        text.push_str("image 0x0 path /usr/bin/ion\n");
         text.push_str(&ContextLine { id: 13, ..CONTEXT }.to_string());
         let all = processes(&text).expect("valid");
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].fds.len(), 1);
         assert_eq!(all[0].grants[0].provider, Provider::FmapBorrowed);
+        assert_eq!(all[0].images[0].path.0, "/usr/bin/ion");
         assert_eq!(all[1].context.id, 13);
         assert!(all[1].memory.is_none());
         assert_eq!(
@@ -806,9 +965,49 @@ mod tests {
         assert_eq!(
             processes(&std::format!("{text}bogus line\n")).map(|_| ()),
             Err(FileError {
-                line: 6,
+                line: 7,
                 kind: FileErrorKind::Line(LineError::Kind)
             })
+        );
+    }
+
+    #[test]
+    fn image_records_round_trip() {
+        let mut buf = [0; MAX_IMAGE_RECORD];
+        let record = ImageRecord {
+            base: 0x7f12_3000,
+            path: "/usr/lib/libc.so",
+        };
+        let len = record.encode(&mut buf).expect("fits");
+        assert_eq!(len, 8 + record.path.len());
+        assert_eq!(buf[..8], 0x7f12_3000u64.to_le_bytes());
+        assert_eq!(ImageRecord::decode(&buf[..len]), Ok(record));
+
+        let long = "x".repeat(MAX_IMAGE_PATH + 1);
+        for path in ["", long.as_str()] {
+            assert_eq!(
+                ImageRecord { base: 0, path }.encode(&mut buf),
+                Err(RecordError::Path)
+            );
+        }
+        assert_eq!(ImageRecord::decode(&[1, 2, 3]), Err(RecordError::Short));
+        assert_eq!(ImageRecord::decode(&[0; 8]), Err(RecordError::Path));
+        assert_eq!(
+            ImageRecord::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 0xff]),
+            Err(RecordError::Path)
+        );
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn an_owned_image_prints_its_line() {
+        let image = Image::from_record(&ImageRecord {
+            base: 0x1000,
+            path: "/bin/evil\nfd 0",
+        });
+        assert_eq!(
+            image.line().to_string(),
+            "image 0x1000 path /bin/evil?fd 0\n"
         );
     }
 }

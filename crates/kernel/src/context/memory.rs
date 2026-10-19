@@ -160,6 +160,9 @@ pub struct AddrSpace {
     /// the exception that we have a memory safe kernel which doesn't have to protect itself
     /// against null pointers, so fixed mmaps to address zero are still allowed.
     pub mmap_min: usize,
+    /// Ferric Oxide: the ELF images its loaders recorded, for `/scheme/sys/proc`.
+    #[cfg(feature = "sys_proc")]
+    pub images: Vec<ferric_procinfo::Image>,
 }
 impl AddrSpaceWrapper {
     /// Attempt to clone an existing address space so that all mappings are copied (CoW).
@@ -253,6 +256,8 @@ impl AddrSpaceWrapper {
 
             new.inner.get_mut().grants.insert(new_grant);
         }
+        #[cfg(feature = "sys_proc")]
+        new.inner.get_mut().images.clone_from(&guard.images);
         Ok(new_arc)
     }
     pub fn mprotect(
@@ -686,6 +691,8 @@ impl AddrSpace {
             grants: UserGrants::new(),
             table: Table { utable, kpti },
             mmap_min: MMAP_MIN_DEFAULT,
+            #[cfg(feature = "sys_proc")]
+            images: Vec::new(),
         })
     }
     fn munmap_inner(

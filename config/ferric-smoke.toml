@@ -83,6 +83,15 @@ else
     echo FERRIC_TEST_SKIP trace-capture: no kernel.trace scheme
 end
 ferric-trace-bench || echo FERRIC_TEST_FAIL trace-bench exited with an error
+# A sampling profile of a short fuzz run and its flame graph, on a kernel with
+# kernel.profiling (profile-image.yml); ctl-profiling can be read only there.
+if cat /scheme/debug/ctl-profiling
+    ferric-trace profile /tmp/ferric-profile -- ferric-syscall-fuzz --seed 2 --seconds 3 && ferric-trace flamegraph /tmp/ferric-profile --folded /tmp/ferric-profile.folded -o /tmp/ferric-profile.svg && test -s /tmp/ferric-profile.folded && echo FERRIC_TEST_PASS profile || echo FERRIC_TEST_FAIL profile
+    cat /tmp/ferric-profile/images
+    head -n 20 /tmp/ferric-profile.folded
+else
+    echo FERRIC_TEST_SKIP profile: no kernel.profiling
+end
 ferric-ring-test || echo FERRIC_TEST_FAIL ring exited with an error
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error

@@ -13,8 +13,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::crash::CrashReport;
+use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
 use ferric_trace_cli::profile::{self, Run};
-use ferric_trace_cli::{drain, perfetto, text};
+use ferric_trace_cli::{drain, perfetto, svg, text};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -44,9 +45,36 @@ enum Cmd {
         /// The debug scheme
         #[arg(long, default_value = "/scheme/debug")]
         scheme: PathBuf,
+        /// The per-process file listing loaded images (skipped if missing)
+        #[arg(long, default_value = "/scheme/sys/proc")]
+        proc: PathBuf,
         /// The command to profile, after `--`
         #[arg(last = true)]
         command: Vec<OsString>,
+    },
+    /// Draw a profile as a flame graph SVG, and optionally save its folded stacks
+    Flamegraph {
+        /// The profile directory `ferric-trace profile` saved
+        profile: PathBuf,
+        /// The kernel ELF the profile ran (to symbolize kernel frames)
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        /// The target's root directory on this machine, such as the cookbook sysroot or a
+        /// mounted image (to symbolize user frames)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Where to write the SVG (default: standard output)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// Also write the folded stacks here
+        #[arg(long)]
+        folded: Option<PathBuf>,
+        /// The graph's heading
+        #[arg(long, default_value = "Ferric Oxide profile")]
+        title: String,
+        /// Read a profile marked INCOMPLETE anyway
+        #[arg(long)]
+        partial: bool,
     },
     /// Print every record, one line each, in timestamp order
     Text {
@@ -96,6 +124,8 @@ enum CliError {
     Drain(#[from] ferric_trace_cli::drain::DrainError),
     #[error("profile failed")]
     Profile(#[from] ferric_trace_cli::profile::ProfileError),
+    #[error("cannot symbolize")]
+    Flamegraph(#[from] ferric_trace_cli::flamegraph::FlamegraphError),
     #[error("--seconds must be a non-negative number, not {0}")]
     Seconds(f64),
     #[error(transparent)]
@@ -131,8 +161,44 @@ fn run(cli: Cli) -> Result<(), CliError> {
             out,
             seconds,
             scheme,
+            proc,
             command,
-        } => record_profile(&scheme, &out, seconds, command),
+        } => record_profile(&scheme, &proc, &out, seconds, command),
+        Cmd::Flamegraph {
+            profile,
+            kernel,
+            root,
+            output,
+            folded,
+            title,
+            partial,
+        } => {
+            let profile = profile::Profile::load(&profile, partial)?;
+            let mut symbolizer = Symbolizer::new(&profile, kernel.as_deref(), root.as_deref())?;
+            let stacks = Folded::new(&profile, &mut symbolizer);
+            if let Some(path) = folded {
+                fs::write(&path, stacks.text())
+                    .map_err(|source| CliError::Write { path, source })?;
+            }
+            eprintln!(
+                "ferric-trace: {} samples, {} distinct stacks, {} unreadable",
+                stacks.total(),
+                stacks.stacks.len(),
+                stacks.bad
+            );
+            let svg = svg::render(&stacks.stacks, &title);
+            match output {
+                Some(path) => {
+                    fs::write(&path, svg).map_err(|source| CliError::Write { path, source })
+                }
+                None => io::stdout()
+                    .write_all(svg.as_bytes())
+                    .map_err(|source| CliError::Write {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    }),
+            }
+        }
         Cmd::Crash { dump, out } => crash(&dump, out.as_deref()),
         Cmd::Text { inputs, partial } => {
             let capture = loader(partial)(&inputs)?;
@@ -172,6 +238,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
 /// `ferric-trace profile`.
 fn record_profile(
     scheme: &std::path::Path,
+    proc: &std::path::Path,
     out: &std::path::Path,
     seconds: Option<f64>,
     command: Vec<OsString>,
@@ -182,15 +249,23 @@ fn record_profile(
         }
         None => Run::Command(command),
     };
-    let recorded = profile::record(scheme, out, &run)?;
+    let recorded = profile::record(scheme, proc, out, &run)?;
     for (cpu, bytes) in recorded.cpu_bytes.iter().enumerate() {
         println!("cpu {cpu}: {bytes} bytes of samples");
     }
     println!(
-        "named {} contexts; saved to {}",
+        "named {} contexts, images of {}; saved to {}",
         recorded.names,
+        recorded.images,
         out.display()
     );
+    if recorded.images == 0 {
+        eprintln!(
+            "ferric-trace: warning: no images recorded ({} missing or empty); user frames will \
+             not be symbolized",
+            proc.display()
+        );
+    }
     if let Some(status) = recorded.status
         && !status.success()
     {
