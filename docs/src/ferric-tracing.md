@@ -155,7 +155,7 @@ A record is a sequence of little-endian 64-bit words:
 | Word | Contents |
 | --- | --- |
 | 0 | Length in words (bits 7:0), argument count (15:8), event id (31:16), reserved zero (63:32) |
-| 1 | Timestamp: the TSC |
+| 1 | Timestamp, from the clock the kernel picked at boot (see [Timestamps](#timestamps)) |
 | 2.. | One word per argument |
 
 Event ids and names come from `ferric_trace::kernel::CATALOG`. Decoders use
@@ -167,7 +167,31 @@ The ring sits in kernel-allocated pages in the shared layout of
 `ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
 data length, and `head`, `tail` and `lost` on cache lines of their own), then
 the data pages.
-Timestamps assume an invariant TSC that is synchronized across CPUs.
+
+### Timestamps
+
+Records on different CPUs are merged by timestamp, so the clock must agree
+across CPUs. The kernel picks one clock for the whole boot, before the first
+ring exists (`crates/kernel/src/trace/clock.rs`, with the rule in
+`ferric_trace::clock::choose`):
+
+1. **`tsc`**, when CPUID leaf `0x8000_0007` reports an invariant TSC (EDX bit
+   8; Intel SDM Vol. 3B, 18.17.1, and AMD APM Vol. 3, `Fn8000_0007_EDX`
+   `TscInvariant`). One `RDTSC` per record.
+2. **`kvmclock`**, when the TSC is not invariant but KVM offers a stable
+   paravirtual clock, in nanoseconds. Hosts usually hide the invariant TSC bit
+   from guests because it does not survive migration, so this is the common
+   clock in a VM.
+3. **`hpet`**, when neither is there but the HPET's main counter is 64 bits
+   wide and running. It is one counter for all CPUs, read through MMIO, so it
+   is the slowest.
+4. Otherwise **`tsc`** anyway, with a warning in the log that timestamps of
+   different CPUs may disagree.
+
+The kernel logs its choice (`trace: clock kvmclock (the TSC is not invariant;
+the KVM clock is stable)`), and the scheme's `clock` file says it as `clock
+<name> period_fs <femtoseconds|unknown>`. The tick length is unknown for the
+TSC, because the kernel does not calibrate it.
 
 ## The `kernel.trace` scheme
 
@@ -179,10 +203,11 @@ The paths are defined in `ferric_trace::abi`.
 | --- | --- | --- |
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
+| `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 
-`events` and `stats` are read from a snapshot taken at the first read of each
+`events`, `stats` and `clock` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
 
 - It consumes records only after they have been copied to the caller, so a
@@ -252,7 +277,10 @@ manner of Linux's pstore/ramoops:
   `ferric-trace capture` does. A flight-recorder mode that overwrites the
   oldest records instead is not implemented yet.
 - **The format** (`ferric_trace::crash`): a header of eight words (magic
-  `FOCRASH1`, version 1, state, payload length, checksum), then sections, each
+  `FOCRASH1`, version 1, state, payload length, checksum, and the timestamp
+  clock as `1 +` its kind and its tick length in femtoseconds, both `0` in
+  dumps from kernels that did not record it, whose timestamps are TSC cycles),
+  then sections, each
   a word `kind | cpu << 8 | bytes << 32` and its data: the message, or a CPU's
   `lost` count and records. The state is set to complete last, and the checksum
   (64-bit FNV-1a over every other word) is checked before anything is read, so
@@ -270,9 +298,10 @@ ferric-trace crash dump.bin --out crash/   # also saves the records as a capture
 ferric-trace perfetto crash/ -o crash.json
 ```
 
-`ferric-trace crash` prints the message, each CPU's record count and bytes,
-`lost` count and torn bytes, and the records as text. `--out` saves the
-capture the way `ferric-trace capture` does, marked `INCOMPLETE` until every
+`ferric-trace crash` prints the message, the clock line, each CPU's record
+count and bytes, `lost` count and torn bytes, and the records as text. `--out`
+saves the capture, with a `clock` file when the dump records its clock, the way
+`ferric-trace capture` does, marked `INCOMPLETE` until every
 file is written.
 
 ## Reading a capture on the host
@@ -300,6 +329,7 @@ it) works as follows:
   A read that fails with `EAGAIN`, because another reader is draining the same
   CPU, is retried after a short wait.
 - It reads `stats` again into `<dir>/stats.end`.
+- It copies the `clock` file into `<dir>/clock`, when the kernel has one.
 - Any other error, or a CPU that stays busy, stops the capture with a message
   naming the file.
 
@@ -355,8 +385,13 @@ or in `chrome://tracing`.
   responder's pid. A `scheme.cancel` is an instant on the slice, not its end.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
-`--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
-frequency; the default, 1000, shows one cycle as one nanosecond. A value below
+A capture whose `clock` names the KVM clock or the HPET carries its own tick
+length, and `perfetto` converts with that, however slow the clock (an HPET tick
+can be longer than a microsecond). Two inputs with different clocks are
+refused, and so is an input without a `clock` file (from a kernel that does not
+say, so its timestamps are TSC cycles) together with one whose clock is not
+the TSC. For TSC timestamps, and for captures without a `clock` file,
+`--tsc-mhz` converts cycles to time. Pass the traced machine's TSC frequency; the default, 1000, shows one cycle as one nanosecond. A value below
 1 MHz, or not a finite number, is refused: real TSCs run at hundreds of MHz or
 more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
@@ -416,7 +451,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      private mappings and an `mprotect` to writable are refused, finds the
      `write` to a closed descriptor by reading the mappings, and checks that
      `commit` refuses a position past `head` or inside a record and accepts
-     the end of what was read.
+     the end of what was read;
+  8. reads the `clock` file and, with `syscall` on, makes two marker writes
+     200 ms apart: when the clock's tick length is known (the KVM clock, the
+     HPET), the time between their timestamps must be within a factor of two
+     of the wall time; for the TSC it prints the frequency they imply
+     (`trace-clock`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
@@ -428,8 +468,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"`, `trace_initfs_enable = ["scheme.cancel"]` and
-  `trace_crash = true`. It requires all twelve step markers, the
-  `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
+  `trace_crash = true`. It requires all thirteen step markers, the kernel's
+  `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
   `enable scheme.cancel`, the crash region's log line, and
   `FERRIC_TEST_SKIP trace-crash` (a clean boot has no dump).
 - **Crash dump.** `cargo test -p ferric-trace` writes dumps into a region and
@@ -444,8 +484,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   `ferric-trace-test crash` turns on the `syscall` events, makes a marker
   `write`, prints `FERRIC_TEST_PASS trace-crash-armed` and writes `panic` to
   `kernel.trace/crash`; the kernel dumps and resets. On the second boot it
-  checks that the dump parses, that its message is the test's panic and that
-  its records hold the marker `write` and the `write` of `panic`
+  checks that the dump parses, that its message is the test's panic, that it
+  records the clock this boot's `clock` file names, and that its records hold the marker `write` and the `write` of `panic`
   (`FERRIC_TEST_PASS trace-crash-read`). The job also requires the kernel's
   lines for the dump, the reset and the dump found, and exactly two boots.
 
