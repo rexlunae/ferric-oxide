@@ -3,8 +3,9 @@
 The full plan, with the design and exit criteria for every phase, is the
 [Roadmap chapter](docs/src/ferric-roadmap.md) of the book. This file tracks
 progress against it. For what the system does today, read
-[Implemented System](docs/src/ferric-oxide.md); a phase marked done here means
-its pull requests merged, not that every exit criterion has been measured.
+[Implemented System](docs/src/ferric-oxide.md). "Merged" lists pull requests
+that landed; it does not mean the phase is done. A phase is done only when its
+exit criteria are met.
 
 Phases run in dependency order, several in parallel. The two release milestones
 are **M1 "Server/VM usable"** (Phases 0–4, P through P5, T, V and guest
