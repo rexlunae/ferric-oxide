@@ -281,9 +281,8 @@ mod tests {
         Umem::new(64 * 2048, FrameSize::Bytes2048).expect("a valid UMEM")
     }
 
-    #[test]
-    fn rings_do_not_overlap_and_fit_the_region() {
-        let layout = layout();
+    /// Checks that `layout`'s rings sit apart, after the header page, inside the region.
+    fn check_layout(layout: &RingLayout) {
         let queues = [
             (layout.fill(), 1),
             (layout.rx(), 2),
@@ -318,6 +317,69 @@ mod tests {
         for (queue, _) in queues {
             assert_ne!(queue.tail / LINE_WORDS, queue.head / LINE_WORDS);
         }
+    }
+
+    #[test]
+    fn rings_do_not_overlap_and_fit_the_region() {
+        check_layout(&layout());
+    }
+
+    #[test]
+    fn the_largest_rings_lay_out_as_specified() {
+        let max = size(RingSize::MAX);
+        let layout = RingLayout::new(max, max, max, max);
+        check_layout(&layout);
+        // 65,536 slots: 512 KiB of 8-byte frame entries, 1 MiB of 16-byte packet descriptors.
+        let frame_ring = (RingSize::MAX as usize) * 8;
+        let packet_ring = (RingSize::MAX as usize) * 16;
+        let bases = [
+            (layout.fill(), PAGE_SIZE),
+            (layout.rx(), PAGE_SIZE + frame_ring),
+            (layout.tx(), PAGE_SIZE + frame_ring + packet_ring),
+            (
+                layout.completion(),
+                PAGE_SIZE + frame_ring + 2 * packet_ring,
+            ),
+        ];
+        for (queue, base) in bases {
+            assert_eq!(queue.base * 8, base);
+            assert_eq!(queue.entries, RingSize::MAX);
+        }
+        let len = PAGE_SIZE + 2 * frame_ring + 2 * packet_ring;
+        assert_eq!(layout.map_len(), len);
+        assert_eq!(layout.map_len(), 4096 + (3 << 20));
+        assert_eq!(layout.words(), len / 8);
+        // Filling each ring to the last slot stays inside a region of exactly that size (the
+        // slice would refuse a word past it).
+        let memory = memory(&layout);
+        let mut app = layout.app();
+        let mut driver = layout.driver();
+        let umem = Umem::new(4 * 2048, FrameSize::Bytes2048).expect("a valid UMEM");
+        let frame = umem.frame(3).expect("frame 3");
+        for _ in 0..RingSize::MAX {
+            app.fill
+                .push(&memory[..], &FrameSlot::new(frame))
+                .expect("room");
+        }
+        assert_eq!(app.fill.free(&memory[..]), Ok(0));
+        let mut taken = 0;
+        while let Some(slot) = driver.fill.pop(&memory[..]).expect("valid") {
+            assert_eq!(slot.frame(&umem), Ok(frame));
+            taken += 1;
+        }
+        assert_eq!(taken, RingSize::MAX);
+        let packet = Packet::new(&umem, frame, 60).expect("fits");
+        for _ in 0..RingSize::MAX {
+            driver
+                .completion
+                .push(&memory[..], &FrameSlot::new(frame))
+                .expect("room");
+            app.tx
+                .push(&memory[..], &PacketSlot::new(&packet))
+                .expect("room");
+        }
+        assert_eq!(app.tx.free(&memory[..]), Ok(0));
+        assert_eq!(driver.completion.free(&memory[..]), Ok(0));
     }
 
     #[test]
