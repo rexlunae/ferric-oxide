@@ -681,7 +681,7 @@ impl<D: Disk> Resource<D> for FileResource {
                 //FIXME: Use result?
                 let _ = fmap_info.ranges.insert(range.start, range_size, fmap);
             } else {
-                let map = unsafe {
+                let mut map = unsafe {
                     Fmap::new(
                         self.node_ptr,
                         flags,
@@ -691,6 +691,10 @@ impl<D: Disk> Resource<D> for FileResource {
                         tx,
                     )?
                 };
+                // Ferric Oxide: just read, so current. Reads of the file come from the mapped
+                // buffer only while its ranges are current, and must, or a store through a
+                // shared mapping would not be seen by read() until the funmap writes it back.
+                map.version = fmap_info.version;
                 //FIXME: Use result?
                 //TODO: Save aligned size for unmap
                 let _ = fmap_info.ranges.insert(range.start, range_size, map);
