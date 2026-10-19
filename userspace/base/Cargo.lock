@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "acpi"
 version = "6.1.1"
-source = "git+https://gitlab.redox-os.org/redox-os/acpi.git?branch=redox-6.x#90cbe88e13468c7cc80a68c801a3dd2ea8f51d02"
+source = "git+https://github.com/rexlunae/acpi.git?branch=redox-6.x#90cbe88e13468c7cc80a68c801a3dd2ea8f51d02"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
@@ -2055,7 +2055,6 @@ dependencies = [
 [[package]]
 name = "redox-ioctl"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#c0e250aaf7be53a4aa649c4db858b24fda6b703d"
 dependencies = [
  "drm-sys",
  "redox_syscall 0.9.4",
@@ -2064,7 +2063,7 @@ dependencies = [
 [[package]]
 name = "redox-log"
 version = "0.1.5"
-source = "git+https://gitlab.redox-os.org/redox-os/redox-log.git#ac8cbc40a281879f1fee77483342edcc4de89983"
+source = "git+https://github.com/rexlunae/redox-log.git#ac8cbc40a281879f1fee77483342edcc4de89983"
 dependencies = [
  "chrono",
  "log",
@@ -2081,7 +2080,7 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 [[package]]
 name = "redox-rings"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
+source = "git+https://github.com/rexlunae/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
 dependencies = [
  "bitflags 2.13.1",
  "libredox",
@@ -2180,7 +2179,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rehid"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/rehid.git#da987bc6d0f043bb025ece0d35804da2b250fab3"
+source = "git+https://github.com/rexlunae/rehid.git#da987bc6d0f043bb025ece0d35804da2b250fab3"
 dependencies = [
  "hidreport",
  "log",
