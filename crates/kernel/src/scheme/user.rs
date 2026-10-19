@@ -248,9 +248,22 @@ impl UserInner {
     ) -> Result<Response> {
         {
             let current_context = context::current();
-            current_context
-                .write(token.token())
-                .block("UserInner::call");
+            {
+                let mut context = current_context.write(token.token());
+                // Ferric Oxide: a cancelled context (a ring worker whose ring closed) sends no
+                // more requests; checked under the lock its cancellation takes.
+                if context.cancelled {
+                    drop(context);
+                    // The tag's slot was taken by `next_id` (for `call` and `call_generic`
+                    // alike); give it back, as a response would.
+                    let _ = self.states.lock(token.token()).try_remove(sqe.tag as usize);
+                    for description in fds {
+                        crate::syscall::fs::release_description(description, token);
+                    }
+                    return Err(Error::new(EINTR));
+                }
+                context.block("UserInner::call");
+            }
             {
                 let mut states = self.states.lock(token.token());
                 states[sqe.tag as usize] = State::Waiting {

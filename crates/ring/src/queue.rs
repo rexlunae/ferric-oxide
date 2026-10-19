@@ -244,6 +244,78 @@ impl<E: Entry> Producer<E> {
     }
 }
 
+/// A [`Producer`] whose free slots can be set aside before the entries exist, so that work
+/// accepted now is sure of room for its completions later, whatever is posted meanwhile.
+///
+/// The kernel side of a ring takes a chain only once [`Reserving::try_reserve`] has set aside
+/// a CQ slot for each of its SQEs, and posts the chain's CQEs with [`Reserving::post`] when it
+/// has run, synchronously or on the ring's worker.
+#[derive(Debug)]
+pub struct Reserving<E> {
+    producer: Producer<E>,
+    /// Slots set aside and not posted yet.
+    reserved: u32,
+}
+
+impl<E: Entry> Reserving<E> {
+    /// An empty `queue` with nothing set aside.
+    pub const fn new(queue: QueueLayout) -> Self {
+        Self {
+            producer: Producer::new(queue),
+            reserved: 0,
+        }
+    }
+
+    /// The slots set aside and not posted yet.
+    pub const fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
+    /// Sets aside `count` slots if that many are free and not set aside already; returns
+    /// whether it did.
+    ///
+    /// # Errors
+    ///
+    /// [`RingError`] when the consumer's head is corrupt or the memory too small.
+    pub fn try_reserve<M: Memory + ?Sized>(
+        &mut self,
+        mem: &M,
+        count: u32,
+    ) -> Result<bool, RingError> {
+        let free = self.producer.free(mem)?.saturating_sub(self.reserved);
+        if free < count {
+            return Ok(false);
+        }
+        self.reserved = self.reserved.saturating_add(count);
+        Ok(true)
+    }
+
+    /// Gives back `count` slots set aside for work that will not post after all.
+    pub fn unreserve(&mut self, count: u32) {
+        self.reserved = self.reserved.saturating_sub(count);
+    }
+
+    /// Writes `entries` into slots set aside before and publishes them together. The slots are
+    /// no longer set aside afterwards, even when this fails.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::Full`] when fewer slots are set aside than `entries` (nothing is written),
+    /// [`PushError::Ring`] when the queue cannot be used.
+    pub fn post<M: Memory + ?Sized>(&mut self, mem: &M, entries: &[E]) -> Result<(), PushError> {
+        let count = u32::try_from(entries.len()).map_err(|_| PushError::Full)?;
+        if count > self.reserved {
+            return Err(PushError::Full);
+        }
+        self.reserved -= count;
+        for entry in entries {
+            self.producer.stage(mem, entry)?;
+        }
+        self.producer.publish(mem)?;
+        Ok(())
+    }
+}
+
 /// The consuming side of a queue.
 #[derive(Debug)]
 pub struct Consumer<E> {
@@ -410,6 +482,49 @@ mod tests {
 
     fn memory(layout: &Layout) -> Vec<AtomicU64> {
         (0..layout.words()).map(|_| AtomicU64::new(0)).collect()
+    }
+
+    #[test]
+    fn reserved_slots_stay_free_for_later_posts() {
+        let layout = Layout::new(4, 4).expect("valid");
+        let mem = memory(&layout);
+        let mem = &mem[..];
+        let mut cq = Reserving::<Cqe>::new(layout.cq());
+        let mut rx = Consumer::<Cqe>::new(layout.cq());
+        // Work taken first, to be posted last.
+        assert_eq!(cq.try_reserve(mem, 3), Ok(true));
+        assert_eq!(cq.try_reserve(mem, 2), Ok(false));
+        assert_eq!(cq.try_reserve(mem, 1), Ok(true));
+        assert_eq!(cq.reserved(), 4);
+        assert_eq!(cq.try_reserve(mem, 0), Ok(true));
+        assert_eq!(cq.try_reserve(mem, 1), Ok(false));
+        cq.post(mem, &[Cqe::new(9, 0)]).expect("reserved");
+        cq.post(mem, &[Cqe::new(1, 0), Cqe::new(2, 0), Cqe::new(3, 0)])
+            .expect("reserved");
+        assert_eq!(cq.reserved(), 0);
+        let tags: Vec<u64> = (0..4)
+            .map(|_| rx.pop(mem).expect("valid").expect("posted").user_data)
+            .collect();
+        assert_eq!(tags, [9, 1, 2, 3]);
+        assert_eq!(cq.try_reserve(mem, 4), Ok(true));
+    }
+
+    #[test]
+    fn posting_more_than_was_reserved_writes_nothing() {
+        let layout = Layout::new(4, 4).expect("valid");
+        let mem = memory(&layout);
+        let mem = &mem[..];
+        let mut cq = Reserving::<Cqe>::new(layout.cq());
+        assert_eq!(cq.try_reserve(mem, 1), Ok(true));
+        assert_eq!(
+            cq.post(mem, &[Cqe::new(1, 0), Cqe::new(2, 0)]),
+            Err(PushError::Full)
+        );
+        assert_eq!(cq.reserved(), 1);
+        assert_eq!(Consumer::<Cqe>::new(layout.cq()).pending(mem), Ok(0));
+        cq.unreserve(1);
+        assert_eq!(cq.reserved(), 0);
+        assert_eq!(cq.try_reserve(mem, 4), Ok(true));
     }
 
     #[test]

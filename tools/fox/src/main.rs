@@ -29,6 +29,8 @@
 //!                                       configured package registries
 //! fox search <query>                    packages in the registries
 //! fox info [registry/]name              owners, releases and artifacts
+//! fox sync --config <set.toml> [--lock <fox.lock>] [--locked | --update]
+//!                                       make the root match a package set
 //! fox list                              installed packages
 //! fox remove [--force] <name>...        remove installed packages
 //! fox adopt-pkg [--allow-unsigned-metadata] [--again]
@@ -66,6 +68,7 @@ mod inventory;
 mod prebuilt;
 mod registry;
 mod source;
+mod sync;
 mod trust;
 
 use std::path::PathBuf;
@@ -149,6 +152,25 @@ enum Command {
         /// names, `[registry/]name[@version requirement]`.
         #[arg(required = true)]
         targets: Vec<String>,
+    },
+    /// Make the root match a package set (`fox-packages/1`): add its
+    /// registries, write its policy, install its packages and remove those
+    /// the previous lock had that it no longer lists; then write the lock.
+    Sync {
+        /// The package set.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        /// The lock file (default: `fox.lock` beside the package set).
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+        /// Install only what the lock pins; fail on anything else.
+        #[arg(long, conflicts_with = "update")]
+        locked: bool,
+        /// Resolve every package again, ignoring the lock.
+        #[arg(long)]
+        update: bool,
+        #[command(flatten)]
+        source: SourceArgs,
     },
     /// Build a git source into a signed archive, attestation and SBOM,
     /// without installing it.
