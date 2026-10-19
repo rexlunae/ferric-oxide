@@ -154,6 +154,21 @@ impl ParsedCqe {
     }
 }
 
+/// Ferric Oxide: reads a `Cqe` from the scheme's buffer by its bytes, in `Cqe`'s `repr(C)` field
+/// order (flags, extra, tag, result), so no raw copy into the struct is needed.
+fn read_cqe(chunk: UserSliceRo) -> Result<Cqe> {
+    const _: () = assert!(size_of::<Cqe>() == 16);
+    let mut bytes = [0_u8; 16];
+    chunk.copy_to_slice(&mut bytes)?;
+    let [flags, e0, e1, e2, t0, t1, t2, t3, r0, r1, r2, r3, r4, r5, r6, r7] = bytes;
+    Ok(Cqe {
+        flags,
+        extra_raw: [e0, e1, e2],
+        tag: u32::from_ne_bytes([t0, t1, t2, t3]),
+        result: u64::from_ne_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
+    })
+}
+
 // Controls whether `UserScheme` calls should by default direct-switch to the scheme's context.
 // Userspace has been tested to work quite well with this, and it does improve performance in
 // macro-benchmarks (often ~5%), likely related to the avoidance of BTreeMap in the scheduler and
@@ -820,7 +835,8 @@ impl UserInner {
     pub fn write(&self, buf: UserSliceRo, token: &mut CleanLockToken) -> Result<usize> {
         let mut bytes_read = 0;
         for chunk in buf.in_exact_chunks(size_of::<Cqe>()) {
-            match ParsedCqe::parse_cqe(&unsafe { chunk.read_exact::<Cqe>()? })
+            match read_cqe(chunk)
+                .and_then(|cqe| ParsedCqe::parse_cqe(&cqe))
                 .and_then(|p| self.handle_parsed(&p, token))
             {
                 Ok(()) => bytes_read += size_of::<Cqe>(),

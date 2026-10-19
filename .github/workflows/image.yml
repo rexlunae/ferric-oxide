@@ -132,10 +132,11 @@ jobs:
           # and logs that there is no DMAR table on the other.
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
-          # Registered buffers and kernel tracing are off by default; turn them on so
-          # ferric-regbuf-test and ferric-trace-test run, with sched.switch on from boot, and
-          # nvmed's grant DMA (also off by default) so ferric-blkgrant-test does.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\ntrace = true\ntrace_boot = "sched"\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
+          # Registered buffers, kernel tracing and rings are off by default; turn them on so
+          # ferric-regbuf-test, ferric-trace-test (with sched.switch on from boot) and
+          # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
+          # ferric-blkgrant-test does.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -329,6 +330,17 @@ jobs:
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
           echo "::notice::ferric-trace-test passed all 10 steps"
+
+      # The image has kernel.rings on, so ferric-ring-test must run every step, not skip.
+      - name: Check rings
+        run: |
+          for step in setup refuse-setup nop file chain cancel refuse-sqe incomplete backpressure corrupt event hold release bench; do
+            grep -aF "FERRIC_TEST_PASS ring-$step" "$LOG"
+          done
+          grep -aF "FERRIC_BENCH ring" "$LOG" | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+          echo "::notice::ferric-ring-test passed all 14 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and
