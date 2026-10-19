@@ -367,6 +367,7 @@ impl AddrSpaceWrapper {
     /// # Errors
     ///
     /// What unmapping the span returns; the span is then left as it was.
+    #[cfg(feature = "regbuf")]
     pub fn replace_with_zeroed(
         &self,
         span: PageSpan,

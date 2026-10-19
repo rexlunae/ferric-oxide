@@ -35,9 +35,9 @@
 //!   them again fails with `ECANCELED`) and takes every recorded mapping down, with a TLB
 //!   shootdown, before it returns. A holder's CPU mapping is not unmapped but replaced in place
 //!   with zeroed private memory (`AddrSpaceWrapper::replace_with_zeroed`,
-//!   [`Teardown::Revoked`]): the holder did not choose the moment and may still be using it, so
-//!   it reads zeros there instead of faulting. The holder's own `Unmap` or close of its grant
-//!   unmaps. Closing the region also unpins its frames and refunds the charge.
+//!   [`Teardown::Revoked`](ferric_regbuf::table::Teardown::Revoked)): the holder did not
+//!   choose the moment and may still be using it, so it reads zeros there instead of
+//!   faulting. The holder's own `Unmap` or close of its grant unmaps. Closing the region also unpins its frames and refunds the charge.
 //!
 //! Locks: a region's lock is taken before an address space's lock (mapping) and before the
 //! `iommu` scheme's handle table (`MapGrant`), never after.
