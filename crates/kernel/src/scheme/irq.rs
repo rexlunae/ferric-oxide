@@ -85,11 +85,17 @@ fn count_interrupt(irq: u8, owner: LogicalCpuId) -> LogicalCpuId {
     LogicalCpuId::BSP
 }
 
-/// Ferric Oxide: whether a handle for `irq` on `cpu` is a vector below 16 reserved on an AP
-/// (`irq:cpu-XX/N`), which no PIC or I/O APIC line backs: the legacy IRQs 0-15 exist only
-/// on the BSP.
+/// Ferric Oxide: whether a handle for `irq` on `cpu` gets only the interrupts of a vector below
+/// 16 reserved on an AP (`irq:cpu-XX/N`), which no PIC or I/O APIC line backs: the legacy IRQs
+/// 0-15 exist only on the BSP.
+///
+/// Only with `irq-percpu`, where such a handle counts only its own CPU's interrupts. Without
+/// it, counts are per number as upstream, so the handle also sees the BSP's legacy IRQ of the
+/// same number and must unmask its line when acknowledging, or the line stays masked.
 const fn ap_low_vector(cpu: LogicalCpuId, irq: u8) -> bool {
-    irq < BASE_IRQ_COUNT && cpu.get() != LogicalCpuId::BSP.get()
+    cfg!(all(feature = "irq-percpu", target_arch = "x86_64"))
+        && irq < BASE_IRQ_COUNT
+        && cpu.get() != LogicalCpuId::BSP.get()
 }
 
 /// The interrupts of `irq` that handles on `cpu` have had (Ferric Oxide: `cpu` matters only
