@@ -339,10 +339,13 @@ boots handles the variation between boots: kernel image KASLR moves the code
 and runner load changes, and the first runs showed a spread of about 3%,
 three times the budget.
 
-Every boot's result lines go into one workflow annotation per image (GitHub
-keeps only ten notices per step), and a failed boot gets its own, with its test
-results and crash lines ahead of the serial tail, so a failing run can be read
-without its logs. `OFF_BUDGET_PCT` and
+Every boot's bench and trace result lines go into a few workflow annotations
+per image (GitHub keeps ten notices per step and 4 KiB of each). A boot without
+`FERRIC_TEST_PASS trace-bench` fails the job. A boot that finished the bench
+and failed something else afterwards only gets a warning, because its results
+still count and the boot matrix judges the rest of the smoke run. Both
+annotations put the boot's test results and crash lines ahead of the serial
+tail, so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
 `ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
 medians. The script fails, naming the logs, when a boot lacks a result or a
 traced boot lacks its `lost records` line. It warns when records were dropped,
