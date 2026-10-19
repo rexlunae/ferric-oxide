@@ -1357,14 +1357,8 @@ fn clear_staging(dir: &Path) -> Result<(), EditError> {
     for entry in entries {
         let entry = entry.map_err(io_error(&staging))?;
         let path = entry.path();
-        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
-            Ok(modified) => modified,
-            // Its write finished (renamed it) or another open removed it.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_error(&path)(source)),
-        };
-        let age = modified.elapsed().unwrap_or_default();
-        if age < STALE_STAGING {
+        let modified = entry.metadata().and_then(|meta| meta.modified());
+        if !is_stale(&path, modified, std::time::SystemTime::now())? {
             continue;
         }
         match fs::remove_file(&path) {
@@ -1377,9 +1371,52 @@ fn clear_staging(dir: &Path) -> Result<(), EditError> {
     Ok(())
 }
 
+/// Whether the staging file at `path`, last modified at `modified` as its
+/// metadata lookup returned it, is old enough at `now` to be a killed
+/// write's leftover. A file that is gone (`NotFound`: its write renamed it
+/// into place, or another open removed it) is not.
+///
+/// # Errors
+///
+/// [`EditError::Io`] for any other failure to read its modification time.
+fn is_stale(
+    path: &Path,
+    modified: io::Result<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Result<bool, EditError> {
+    match modified {
+        Ok(modified) => Ok(now.duration_since(modified).unwrap_or_default() >= STALE_STAGING),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(EditError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_staging_file_is_stale_only_when_old_and_still_there() {
+        let path = Path::new(".fox-staging/x");
+        let now = SystemTime::now();
+        let ago = |secs| Ok(now - Duration::from_secs(secs));
+        assert!(is_stale(path, ago(2 * 60 * 60), now).unwrap());
+        assert!(!is_stale(path, ago(60), now).unwrap());
+        // A clock that puts the file in the future keeps it.
+        assert!(!is_stale(path, Ok(now + Duration::from_secs(60)), now).unwrap());
+        // Renamed by its finished write, or removed by another open.
+        let gone = io::Error::from(io::ErrorKind::NotFound);
+        assert!(!is_stale(path, Err(gone), now).unwrap());
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            is_stale(path, Err(denied), now),
+            Err(EditError::Io { path: p, .. }) if p == path
+        ));
+    }
 
     #[test]
     fn staging_names_are_unique_and_keep_paths_apart() {
