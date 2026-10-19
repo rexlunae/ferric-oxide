@@ -647,6 +647,12 @@ netstack.
   sizes, mode, CPU) in a 32-byte payload. `AddFilter`, `RemoveFilter`, `Kick`
   and `Stats` follow. Every request fits the three metadata words the kernel
   passes on a plain call.
+- `ring`: the four rings on `ferric-ring`'s index protocol. `RingLayout`
+  places them in the ring grant (one header page of indices and flags, then
+  each ring's slots on pages of their own, Fill, RX, TX, Completion), and
+  hands each side its producers and consumers. A peer's out-of-range index is
+  `ferric-ring`'s `RingError::Corrupt`, and the driver sets `NEED_WAKEUP` before it sleeps on
+  an empty Fill or TX ring, so the application only `Kick`s when asked.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.
