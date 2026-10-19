@@ -448,7 +448,14 @@ impl<W: Words, C: Commit> Source for Mapped<W, C> {
                 },
             ));
         }
-        self.pos = peek.end();
+        // A corrupt peek ends at `head`: the words after a record that does not decode cannot
+        // be split into records. Keep and commit only the verified prefix; the next copy starts
+        // at the corruption and fails with `CorruptRecord`, leaving the capture incomplete.
+        self.pos = if peek.is_corrupt() {
+            self.pos.max(self.view.tail()) + (peek.len() / WORD_BYTES) as u64
+        } else {
+            peek.end()
+        };
         Ok(peek.len())
     }
 
@@ -585,7 +592,7 @@ mod tests {
     use ferric_trace::Event;
     use ferric_trace::kernel::{SYSCALL_ENTER, SYSCALL_EXIT};
     use ferric_trace::ring::{Ring, SHARED_HEADER_WORDS, Shared};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A reader that gives `results` in turn, then 0 bytes.
     struct Script(Vec<io::Result<Vec<u8>>>);
@@ -840,6 +847,29 @@ mod tests {
                 .expect("the other reader's commit");
             Err(io::Error::from(ErrorKind::InvalidInput))
         }
+    }
+
+    #[test]
+    fn a_corrupt_record_after_valid_ones_stops_the_capture_there() {
+        let ring = InMemory::new(TWO_CALLS);
+        // The second record's header no longer decodes.
+        ring.ring.words()[SHARED_HEADER_WORDS + 7].store(u64::MAX, Ordering::Relaxed);
+        let mut source = Mapped::new(
+            ring.view(),
+            Committer {
+                ring: &ring,
+                busy: 0,
+                commits: Vec::new(),
+            },
+        );
+        let result = run_with(&mut source, u64::MAX);
+        assert!(
+            matches!(&result, Err(DrainError::Io { source, .. }) if source.kind() == ErrorKind::InvalidData),
+            "{result:?}"
+        );
+        // Only the record before the corruption was consumed, not the rest of the ring.
+        assert_eq!(source.commit.commits, [7]);
+        assert_eq!(ring.tail(), 7);
     }
 
     #[test]
