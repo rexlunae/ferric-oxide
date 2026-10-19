@@ -20,6 +20,7 @@ ferric-xstate-test = "source"
 ferric-aslr-test = "source"
 ferric-guard-test = "source"
 ferric-tlb-test = "source"
+ferric-borrow-test = "source"
 ferric-futex-test = "source"
 ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
@@ -68,6 +69,7 @@ ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
 ferric-aslr-test || echo FERRIC_TEST_FAIL aslr exited with an error
 ferric-guard-test || echo FERRIC_TEST_FAIL guard exited with an error
 ferric-tlb-test || echo FERRIC_TEST_FAIL tlb exited with an error
+ferric-borrow-test || echo FERRIC_TEST_FAIL borrow exited with an error
 ferric-regbuf-test || echo FERRIC_TEST_FAIL regbuf exited with an error
 ferric-blkgrant-test || echo FERRIC_TEST_FAIL nvme-grant exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
