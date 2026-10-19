@@ -30,6 +30,7 @@ common = { path = "../common" }
 ferric-iommu = { workspace = true, features = ["alloc"] }
 # Ferric Oxide: the irq:cpus format, for the APIC id of a logical CPU.
 ferric-irq.workspace = true
+thiserror.workspace = true
 daemon = { path = "../../daemon" }
 libredox.workspace = true
 

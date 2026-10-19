@@ -33,6 +33,7 @@ use ferric_iommu::abi::{
     Bridge, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH, SCHEME_NAME,
 };
 use ferric_iommu::alias::{requester_ids, BridgeKind, UpstreamBridge};
+use ferric_iommu::irte::{IrteBook, Route};
 use log::{debug, info, warn};
 use pci_types::{ConfigRegionAccess, PciAddress, PciPciBridgeHeader};
 use pcid_interface::msi::MsiAddrAndData;
@@ -58,7 +59,7 @@ pub struct Iommu {
     /// Channels that already got a domain.
     given: BTreeSet<usize>,
     /// The interrupt remapping entries made for each channel, by channel handle.
-    irtes: BTreeMap<usize, Vec<u32>>,
+    irtes: IrteBook<MsiMessage>,
     /// The scheme socket, which moves descriptors to a client.
     pub socket: Option<Rc<Socket>>,
     /// The kernel's logical CPU to APIC id map, for compatibility-format messages.
@@ -450,9 +451,14 @@ impl Iommu {
         let Some(function) = device(addr) else {
             return no_message;
         };
-        match self.alloc_irte(function, cpu, vector) {
+        // A route the channel already has keeps its entry, so a driver that gave a vector back
+        // and reserved it again does not use up another one.
+        let route = Route { cpu, vector };
+        let mut irtes = core::mem::take(&mut self.irtes);
+        let made = irtes.get_or_alloc(id, route, || self.alloc_irte(function, cpu, vector));
+        self.irtes = irtes;
+        match made {
             Ok((entry, message)) => {
-                self.irtes.entry(id).or_default().push(entry);
                 debug!("pcid: {function} vector {vector} on CPU {cpu} through interrupt remapping entry {entry:#x}");
                 PcidClientResponse::MsiMessage(MsiAddrAndData {
                     addr: message.address,
@@ -486,9 +492,7 @@ impl Iommu {
     pub fn on_close(&mut self, id: usize) {
         self.pending.remove(&id);
         self.given.remove(&id);
-        let Some(entries) = self.irtes.remove(&id) else {
-            return;
-        };
+        let entries = self.irtes.close(id);
         let Some(cap) = &self.cap else {
             return;
         };
