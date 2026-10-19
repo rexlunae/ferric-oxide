@@ -12,6 +12,12 @@ use crate::{
 
 use crate::{arch::cpuid::cpuid, memory::KernelMapper};
 
+/// Read-only identification registers available through either APIC transport.
+enum IdentificationRegister {
+    Id,
+    Version,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ApicId(u32);
 
@@ -131,20 +137,29 @@ impl LocalApic {
         }
     }
 
+    fn identification(&self, register: IdentificationRegister) -> u32 {
+        let (mmio, msr) = match register {
+            IdentificationRegister::Id => (0x20, IA32_X2APIC_APICID),
+            IdentificationRegister::Version => (0x30, IA32_X2APIC_VERSION),
+        };
+        // SAFETY: initialization selects the supported APIC transport and maps its registers
+        // before these getters run. The closed register set contains only read-only ID/version
+        // registers, available in both transports; these reads do not alter interrupt state.
+        unsafe {
+            if self.x2 {
+                rdmsr(msr) as u32
+            } else {
+                self.read(mmio)
+            }
+        }
+    }
+
     pub fn id(&self) -> ApicId {
-        ApicId::new(if self.x2 {
-            unsafe { rdmsr(IA32_X2APIC_APICID) as u32 }
-        } else {
-            unsafe { self.read(0x20) }
-        })
+        ApicId::new(self.identification(IdentificationRegister::Id))
     }
 
     pub fn version(&self) -> u32 {
-        if self.x2 {
-            unsafe { rdmsr(IA32_X2APIC_VERSION) as u32 }
-        } else {
-            unsafe { self.read(0x30) }
-        }
+        self.identification(IdentificationRegister::Version)
     }
 
     pub fn icr(&self) -> u64 {

@@ -14,6 +14,7 @@
 //! | [`Request::Join`] | domain | verb |
 //! | [`Request::AllocIrte`] | attach capability | verb, [`PciDevice::encode`] with [`SourceCheck::encode`] in bits 32 to 55, CPU and vector |
 //! | [`Request::FreeIrte`] | attach capability | verb, entry ID |
+//! | [`Request::IrteTarget`] | attach capability | verb, entry ID |
 //! | [`Request::MapGrant`] | domain | verb, the caller's descriptor number of a `kernel.regbuf` grant |
 //! | [`Request::UnmapGrant`] | domain | verb, IOVA |
 //!
@@ -227,6 +228,36 @@ pub struct MsiRoute {
     pub vector: u8,
 }
 
+/// Where an interrupt remapping entry delivers now, as [`Request::IrteTarget`] returns it.
+///
+/// An entry can move after [`Request::AllocIrte`] made it: steering a vector to another CPU
+/// (`ferric_irq::call::Call::Move` on the `irq:` handle) rewrites every entry that delivered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IrteTarget {
+    /// The logical CPU.
+    pub cpu: u32,
+    /// The vector on that CPU.
+    pub vector: u8,
+}
+
+impl IrteTarget {
+    /// The call's return value: the CPU in bits 31:0, the vector in bits 39:32.
+    pub const fn to_word(self) -> u64 {
+        self.cpu as u64 | ((self.vector as u64) << 32)
+    }
+
+    /// The target in return value `word`, or `None` when bits above 39 are set.
+    pub const fn from_word(word: u64) -> Option<Self> {
+        if word >> 40 != 0 {
+            return None;
+        }
+        Some(Self {
+            cpu: word as u32,
+            vector: (word >> 32) as u8,
+        })
+    }
+}
+
 /// An MSI address and data pair, as [`Request::AllocIrte`] returns it in its payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsiMessage {
@@ -283,6 +314,8 @@ pub enum Verb {
     MapGrant = 8,
     /// Take a grant mapping down.
     UnmapGrant = 9,
+    /// Ask where an interrupt remapping entry delivers now.
+    IrteTarget = 10,
 }
 
 impl Verb {
@@ -298,6 +331,7 @@ impl Verb {
             7 => Self::FreeIrte,
             8 => Self::MapGrant,
             9 => Self::UnmapGrant,
+            10 => Self::IrteTarget,
             _ => return None,
         })
     }
@@ -333,6 +367,10 @@ pub enum Request {
     AllocIrte(MsiRoute),
     /// Free the interrupt remapping entry with this ID: requests that name it fault.
     FreeIrte(u32),
+    /// Where the interrupt remapping entry with this ID delivers now, as
+    /// [`IrteTarget::to_word`]. pcid asks before it gives a driver an entry it made earlier for
+    /// the same route, since the entry may have been steered elsewhere since.
+    IrteTarget(u32),
     /// Map the `kernel.regbuf` grant behind the caller's descriptor `grant_fd` into the domain,
     /// which the caller must have bound, at a fresh contiguous IOVA range, and return the IOVA
     /// of its first byte (see the module documentation).
@@ -376,6 +414,7 @@ impl Request {
                 3,
             ),
             Self::FreeIrte(index) => ([Verb::FreeIrte as u64, index as u64, 0], 2),
+            Self::IrteTarget(index) => ([Verb::IrteTarget as u64, index as u64, 0], 2),
             Self::MapGrant { grant_fd } => ([Verb::MapGrant as u64, grant_fd, 0], 2),
             Self::UnmapGrant { iova } => ([Verb::UnmapGrant as u64, iova, 0], 2),
         }
@@ -423,6 +462,9 @@ impl Request {
             }
             (Verb::FreeIrte, &[index]) => u32::try_from(index)
                 .map(Self::FreeIrte)
+                .map_err(|_| DecodeError::Reserved),
+            (Verb::IrteTarget, &[index]) => u32::try_from(index)
+                .map(Self::IrteTarget)
                 .map_err(|_| DecodeError::Reserved),
             (Verb::MapGrant, &[grant_fd]) => Ok(Self::MapGrant { grant_fd }),
             (Verb::UnmapGrant, &[iova]) => Ok(Self::UnmapGrant { iova }),
@@ -516,6 +558,7 @@ mod tests {
                 vector: 0xfe,
             }),
             Request::FreeIrte(0x0001_0fff),
+            Request::IrteTarget(0x0001_0fff),
             Request::MapGrant { grant_fd: 7 },
             Request::UnmapGrant {
                 iova: 0x7fff_f000_0000,
@@ -524,6 +567,22 @@ mod tests {
             let (words, len) = request.encode();
             assert_eq!(Request::decode(&words[..len]), Ok(request));
         }
+    }
+
+    #[test]
+    fn irte_targets_round_trip() {
+        for target in [
+            IrteTarget { cpu: 0, vector: 0 },
+            IrteTarget {
+                cpu: u32::MAX,
+                vector: 0xfe,
+            },
+        ] {
+            assert_eq!(IrteTarget::from_word(target.to_word()), Some(target));
+        }
+        assert_eq!(IrteTarget::from_word(1 << 40), None);
+        assert_eq!(Request::decode(&[10, 1 << 32]), Err(DecodeError::Reserved));
+        assert_eq!(Request::decode(&[10]), Err(DecodeError::Length));
     }
 
     #[test]
@@ -560,7 +619,7 @@ mod tests {
         assert_eq!(Request::decode(&[7, 1 << 32]), Err(DecodeError::Reserved));
         assert_eq!(Request::decode(&[8]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[9, 0, 0]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[10, 0]), Err(DecodeError::Verb));
+        assert_eq!(Request::decode(&[11, 0]), Err(DecodeError::Verb));
     }
 
     #[test]

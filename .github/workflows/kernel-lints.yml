@@ -4,9 +4,11 @@ name: kernel-lints
 # ci/kernel-lints.json (see scripts/ferric-ci/kernel-lint-ratchet.sh), and
 # builds kernel Rustdoc with warnings denied, and
 # checks that the bootloader can relocate the kernel (kernel image KASLR; see
-# scripts/ferric-ci/check-kernel-relocs.sh) and that a kernel built with
-# indirect branch tracking (kernel.cpu.ibt) has
-# endbr64 at its entry points (scripts/ferric-ci/check-kernel-ibt.sh).
+# scripts/ferric-ci/check-kernel-relocs.sh), that a kernel built with indirect
+# branch tracking (kernel.cpu.ibt) has endbr64 at its entry points
+# (scripts/ferric-ci/check-kernel-ibt.sh), and that one built with shadow
+# stacks (kernel.cpu.shstk) carries the alternative and CR4.CET enable
+# sequences (scripts/ferric-ci/check-kernel-shstk.sh).
 
 on:
   push:
@@ -18,18 +20,27 @@ on:
       - "scripts/ferric-ci/kernel-lint-ratchet.sh"
       - "scripts/ferric-ci/check-kernel-relocs.sh"
       - "scripts/ferric-ci/check-kernel-ibt.sh"
+      - "scripts/ferric-ci/check-kernel-shstk.sh"
       - "features.toml"
       - "tools/ferric-config/**"
       - ".github/workflows/kernel-lints.yml"
+      - ".github/actions/prepare-cargo-git/**"
 
 jobs:
   docs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        iommu: [never, auto]
+        # Two configurations, so doc links break neither with optional modules compiled
+        # out nor with them in: `never` without rings, `auto` with them.
+        include:
+          - iommu: never
+            features: regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info
+          - iommu: auto
+            features: regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
@@ -58,7 +69,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features ${{ matrix.features }} \
             --target targets/x86_64-unknown-kernel.json \
             -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
             -Z json-target-spec
@@ -67,6 +78,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       # The kernel's build script assembles the AP trampoline with nasm.
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
@@ -93,6 +105,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - name: Install nasm
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
       - name: Install the kernel toolchain
@@ -123,3 +136,68 @@ jobs:
         run: make -C crates/kernel BUILD="$RUNNER_TEMP/kernel-ibt" OBJCOPY=objcopy all
       - name: Check endbr64 at entry points
         run: scripts/ferric-ci/check-kernel-ibt.sh "$RUNNER_TEMP/kernel-ibt/kernel.all"
+
+  # Shadow stacks cannot be booted on the runners either (no CET), so check the
+  # binary: the switch/SYSCALL alternatives, the per-CPU enable sequence and the
+  # #CP handler. Built with IBT on and off, since shadow stacks are a separate
+  # option and must not lean on IBT (the #CP handler once did).
+  shstk:
+    name: shstk (ibt ${{ matrix.ibt }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ibt: [auto, never]
+    env:
+      # The kernel source tree; the only place this job names it.
+      KERNEL_DIR: crates/kernel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
+      - name: Install nasm
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nasm
+      - name: Install the kernel toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$KERNEL_DIR/rust-toolchain.toml")"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ${{ env.KERNEL_DIR }}/target
+          key: kernel-shstk-ibt-${{ matrix.ibt }}-${{ hashFiles(format('{0}/Cargo.lock', env.KERNEL_DIR), format('{0}/rust-toolchain.toml', env.KERNEL_DIR), 'Cargo.lock') }}
+          restore-keys: kernel-shstk-ibt-${{ matrix.ibt }}-
+      # shstk "auto" needs the self_modifying kernel feature, which the catalog
+      # defaults include; take the feature list from ferric-config as image.yml does.
+      - name: Kernel config with shadow stacks on, IBT ${{ matrix.ibt }}
+        run: |
+          out="$RUNNER_TEMP/ferric-shstk"
+          mkdir -p "$out"
+          printf '[kernel.cpu]\nshstk = "auto"\nibt = "%s"\n' "${{ matrix.ibt }}" > "$out/ferric.toml"
+          cargo run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          cp "$out/kernel-config.toml" "$KERNEL_DIR/config.toml"
+          cat "$KERNEL_DIR/config.toml"
+          features="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
+          echo "Kernel features: $features"
+          echo "KERNEL_CARGO_FEATURES=$features" >> "$GITHUB_ENV"
+      - name: Build the kernel
+        run: make -C "$KERNEL_DIR" BUILD="$RUNNER_TEMP/kernel-shstk" OBJCOPY=objcopy KERNEL_CARGO_FEATURES="$KERNEL_CARGO_FEATURES" all
+      - name: Check the shadow-stack sequences
+        run: scripts/ferric-ci/check-kernel-shstk.sh "$RUNNER_TEMP/kernel-shstk/kernel.all"
+      - name: Document the enabled shadow-stack APIs
+        if: matrix.ibt == 'never'
+        working-directory: crates/kernel
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps \
+            --features "$KERNEL_CARGO_FEATURES" \
+            --target targets/x86_64-unknown-kernel.json \
+            -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+            -Z json-target-spec
+      - name: Check endbr64 at entry points
+        if: matrix.ibt != 'never'
+        run: scripts/ferric-ci/check-kernel-ibt.sh "$RUNNER_TEMP/kernel-shstk/kernel.all"

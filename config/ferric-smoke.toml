@@ -29,6 +29,10 @@ ferric-iommu-test = "source"
 ferric-regbuf-test = "source"
 # Needs a kernel built with kernel.trace (CI turns it on); skips otherwise.
 ferric-trace-test = "source"
+# The trace tool: the smoke script saves a capture with it and reads it back.
+ferric-trace = "source"
+# Times file I/O and system calls with tracing off and on, for the trace-overhead CI job.
+ferric-trace-bench = "source"
 # Needs a kernel built with kernel.rings (CI turns it on); skips otherwise.
 ferric-ring-test = "source"
 # Reads and writes the NVMe disk through a registered-buffer grant (drivers.grant_dma,
@@ -65,6 +69,14 @@ ferric-regbuf-test || echo FERRIC_TEST_FAIL regbuf exited with an error
 ferric-blkgrant-test || echo FERRIC_TEST_FAIL nvme-grant exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
+# Saves a capture and reads it back, on a kernel with kernel.trace. The /scheme listing says
+# whether it has one, as in ferric-trace-test; the trace-overhead baseline image has none.
+if contains "$(ls /scheme)" kernel.trace
+    ferric-trace capture /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
+else
+    echo FERRIC_TEST_SKIP trace-capture: no kernel.trace scheme
+end
+ferric-trace-bench || echo FERRIC_TEST_FAIL trace-bench exited with an error
 ferric-ring-test || echo FERRIC_TEST_FAIL ring exited with an error
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error

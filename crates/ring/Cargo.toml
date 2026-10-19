@@ -10,3 +10,5 @@ bitflags = { version = "2", default-features = false }
 
 [features]
 default = []
+# The ring's file table (`files`), which needs a heap.
+alloc = []

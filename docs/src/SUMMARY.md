@@ -12,6 +12,7 @@
   - [Kernel Tracing](./ferric-tracing.md)
   - [Package Tooling: fox](./ferric-packaging.md)
   - [Validation and Debugging](./ferric-testing.md)
+- [Roadmap](./ferric-roadmap.md)
 
 # Introduction
 

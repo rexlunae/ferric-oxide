@@ -84,6 +84,8 @@ use std::path::{Path, PathBuf};
 
 use fox_core::archive::{Archive, ArchiveError, MetadataSource};
 use fox_core::keys::TRUSTED_KEYS_DIR;
+use fox_core::policy::POLICY_FILE;
+use fox_core::registries::REGISTRIES_FILE;
 use fox_core::trust::TRUST_FILE;
 use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
@@ -92,16 +94,23 @@ pub use adopt::{
     AdoptOptions, AdoptReport, AdoptedPackage, PKG_HEADS_DIR, PKG_STATE, SkipReason, SkippedPackage,
 };
 use db::Database;
-pub use db::{InstalledPackage, MetadataKind, PackageState};
+pub use db::{InstalledPackage, MetadataKind, Origin, PackageState};
 use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
 
 /// Directory, relative to the root, of the store's own state.
 pub const STATE_DIR: &str = "var/lib/fox";
 
 /// Paths no package may write into, replace or redirect: the store's own
-/// state (which also holds the local builder key), the trusted signer keys
-/// and the trust store file.
-pub const RESERVED_DIRS: [&str; 3] = [STATE_DIR, TRUSTED_KEYS_DIR, TRUST_FILE];
+/// state (which also holds the local builder key and the registry
+/// checkouts), the trusted signer keys, the trust store, the install policy
+/// and the registry list.
+pub const RESERVED_DIRS: [&str; 5] = [
+    STATE_DIR,
+    TRUSTED_KEYS_DIR,
+    TRUST_FILE,
+    POLICY_FILE,
+    REGISTRIES_FILE,
+];
 
 /// Mode bits the store sets and checks on installed files (permissions,
 /// setuid, setgid and sticky), the bits pkgar signs.
@@ -494,6 +503,23 @@ impl Store {
         archive: &Archive,
         options: InstallOptions,
     ) -> Result<InstallReport, StoreError> {
+        self.install_from(archive, options, None)
+    }
+
+    /// Installs a verified archive as [`Store::install`] does, recording
+    /// `origin` as the registry it came from. The record replaces the
+    /// previous version's, so reinstalling from anywhere else clears the
+    /// origin.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::install`].
+    pub fn install_from(
+        &self,
+        archive: &Archive,
+        options: InstallOptions,
+        origin: Option<Origin>,
+    ) -> Result<InstallReport, StoreError> {
         let _lock = self.lock()?;
         let db_path = self.db_path();
         let mut db = Database::load(&db_path)?;
@@ -552,7 +578,10 @@ impl Store {
         // fox owns the name now: pkg's stale entry for it must not be
         // retried by adoption, even after this package is removed.
         db.legacy_pending.remove(manifest.name.as_str());
-        db.packages.push(record(archive));
+        db.packages.push(InstalledPackage {
+            origin,
+            ..record(archive)
+        });
         db.save(&db_path)?;
 
         Ok(InstallReport {
@@ -838,6 +867,7 @@ fn record(archive: &Archive) -> InstalledPackage {
             _ => MetadataKind::Sidecar,
         },
         state: PackageState::Installed,
+        origin: None,
         files: archive.files().to_vec(),
     }
 }
@@ -854,6 +884,9 @@ mod tests {
             "var/lib/fox/heads/x.pkgar_head",
             "etc/fox/keys/attacker.toml",
             "etc/fox/trust.toml",
+            "etc/fox/policy.toml",
+            "etc/fox/registries.toml",
+            "var/lib/fox/registries/ferric/state.json",
             "var/lib/fox/local-builder.pub.toml",
             "var",
             "var/lib",

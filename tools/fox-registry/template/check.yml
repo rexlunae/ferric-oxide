@@ -1,0 +1,16 @@
+# Checks every pull request: recorded releases must match their
+# owner-signed tags. Signatures are completed after the merge.
+name: check
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fox-registry
+        run: cargo install --locked --git https://github.com/rexlunae/ferric-oxide fox-registry
+      - name: Check releases
+        run: fox-registry check

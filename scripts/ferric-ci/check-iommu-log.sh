@@ -107,6 +107,13 @@ check_irq_faults() {
         || fail "the kernel's interrupt remapping faults differ from the one the test caused"
 }
 
+# Every CI image has kernel.irq_percpu on: edu's MSI, sent to a CPU other than the BSP while
+# the same vector number is held on the BSP, must be counted on that CPU only, with or without
+# interrupt remapping.
+need "FERRIC_TEST_PASS iommu-msi-percpu: vector 0x[0-9a-f]+ reached CPU [0-9]+, and the same vector held on CPU [0-9]+ counted nothing; low vector 0x[0-9a-f]+ reached CPU [0-9]+"
+# Root moves edu's vector to another CPU while the device fires, and the descriptor follows it.
+need "FERRIC_TEST_PASS iommu-msi-steer: vector 0x[0-9a-f]+ on CPU [0-9]+ moved to vector 0x[0-9a-f]+ on CPU [0-9]+ while the device fired"
+
 case "$mode" in
     none)
         need "IOMMU: no DMAR or IVRS table, IOMMU not enabled"
@@ -121,6 +128,7 @@ case "$mode" in
         # pcid answers MsiMessage with the compatibility-format message, which still works.
         need "FERRIC_TEST_PASS iommu-msi: .*\(compatibility format, no interrupt remapping\)"
         need "FERRIC_TEST_SKIP iommu-irq-fault"
+        need "FERRIC_TEST_PASS iommu-msi-steer: .*the test reprogrammed the device's message"
         if grep -aF "IOMMU: interrupt remapping" <<< "$clean"; then
             fail "interrupt remapping without an IOMMU"
         fi
@@ -172,6 +180,7 @@ if [ "$vendor" = amdvi ]; then
     # through, and the forged-MSI test skips.
     need "FERRIC_TEST_PASS iommu-msi: .*\(compatibility format, no interrupt remapping\)"
     need "FERRIC_TEST_SKIP iommu-irq-fault"
+    need "FERRIC_TEST_PASS iommu-msi-steer: .*the test reprogrammed the device's message"
     if grep -aF "IOMMU: interrupt remapping" <<< "$clean"; then
         fail "interrupt remapping lines on AMD-Vi, which does not remap interrupts yet"
     fi
@@ -192,6 +201,9 @@ need "IOMMU: interrupt remapping entry [0-9]+ for 0000:00:04\.0: vector"
 need "IOMMU: interrupt remapping entry [0-9]+ for 0000:00:10\.0: vector"
 need "FERRIC_TEST_PASS iommu-msi: .*\(remappable format\)"
 need "FERRIC_TEST_PASS iommu-irq-fault"
+# Steering rewrote edu's remapping entry in place and logged the move.
+need "FERRIC_TEST_PASS iommu-msi-steer: .*the kernel rewrote [1-9][0-9]* interrupt remapping entry"
+need "IOMMU: [1-9][0-9]* interrupt remapping entr(y|ies) moved from vector 0x[0-9a-f]+ on CPU [0-9]+ to vector 0x[0-9a-f]+ on CPU [0-9]+"
 if grep -aE "IOMMU: (interrupt remapping not enabled|enforce mode: unit .* cannot remap interrupts|cannot check I/O APIC)" <<< "$clean"; then
     fail "interrupt remapping was not set up"
 fi

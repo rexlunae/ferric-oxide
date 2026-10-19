@@ -19,15 +19,22 @@
 //! Without the scheme (`kernel.iommu = "never"`, upstream's behaviour) none of this runs:
 //! `GetDmaDomain` answers `NoDmaDomain`, and `MsiMessage` answers the compatibility-format
 //! message upstream drivers computed themselves.
+//!
+//! A compatibility-format message names an APIC id, while drivers ask for a logical CPU (the
+//! number `irq:cpu-XX` takes). When the kernel has the root-only `irq:cpus` map
+//! (`kernel.irq_percpu`), pcid looks the APIC id up there, and refuses a CPU whose APIC id the
+//! format cannot carry. Without the map it takes them to be the same number, as upstream did.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
 
 use ferric_iommu::abi::{
-    Bridge, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH, SCHEME_NAME,
+    Bridge, IrteTarget, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH,
+    SCHEME_NAME,
 };
 use ferric_iommu::alias::{requester_ids, BridgeKind, UpstreamBridge};
+use ferric_iommu::irte::{IrteBook, Route};
 use log::{debug, info, warn};
 use pci_types::{ConfigRegionAccess, PciAddress, PciPciBridgeHeader};
 use pcid_interface::msi::MsiAddrAndData;
@@ -53,9 +60,117 @@ pub struct Iommu {
     /// Channels that already got a domain.
     given: BTreeSet<usize>,
     /// The interrupt remapping entries made for each channel, by channel handle.
-    irtes: BTreeMap<usize, Vec<u32>>,
+    irtes: IrteBook<MsiMessage>,
     /// The scheme socket, which moves descriptors to a client.
     pub socket: Option<Rc<Socket>>,
+    /// The kernel's logical CPU to APIC id map, for compatibility-format messages.
+    cpus: CpuMap,
+}
+
+/// Where the APIC id of a logical CPU comes from.
+#[derive(Debug, Default)]
+enum CpuMap {
+    /// `irq:cpus` has not been read yet.
+    #[default]
+    Unread,
+    /// The kernel has no `irq:cpus` (built without `irq-percpu`): logical and APIC ids are taken
+    /// to be the same, as upstream drivers took them.
+    Same,
+    /// The text of `irq:cpus`.
+    Listed(String),
+}
+
+/// The path of the kernel's CPU map.
+const CPUS_PATH: &str = "/scheme/irq/cpus";
+
+/// Why there is no compatibility-format destination for a logical CPU.
+#[derive(Debug)]
+enum DestinationError {
+    /// Reading `irq:cpus` failed.
+    Read(std::io::Error),
+    /// `irq:cpus` has a malformed line.
+    Parse(ferric_irq::ParseError),
+    /// `irq:cpus` does not list the CPU.
+    UnknownCpu(u32),
+    /// The CPU's APIC id cannot be named by a compatibility-format MSI address.
+    Unrepresentable { cpu: u32, apic: ferric_irq::ApicId },
+}
+
+impl fmt::Display for DestinationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(_) => write!(f, "cannot read {CPUS_PATH}"),
+            Self::Parse(_) => write!(f, "{CPUS_PATH} is malformed"),
+            Self::UnknownCpu(cpu) => write!(f, "{CPUS_PATH} does not list CPU {cpu}"),
+            Self::Unrepresentable { cpu, apic } => write!(
+                f,
+                "CPU {cpu} has APIC id {}, which a compatibility-format MSI address cannot name",
+                apic.get()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DestinationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(err) => Some(err),
+            Self::Parse(err) => Some(err),
+            Self::UnknownCpu(_) | Self::Unrepresentable { .. } => None,
+        }
+    }
+}
+
+/// `err` and its sources, for a log line.
+fn chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(next) = source {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        source = next.source();
+    }
+    text
+}
+
+impl CpuMap {
+    /// Reads the kernel's map.
+    fn read() -> std::result::Result<Self, DestinationError> {
+        match std::fs::read_to_string(CPUS_PATH) {
+            Ok(text) => Ok(Self::Listed(text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::Same),
+            Err(err) => Err(DestinationError::Read(err)),
+        }
+    }
+
+    /// The APIC id of logical CPU `cpu`, reading the map first when it has not been read or
+    /// does not list `cpu` yet (an AP that came up after the last read).
+    fn apic_id(&mut self, cpu: u32) -> std::result::Result<ferric_irq::ApicId, DestinationError> {
+        if matches!(self, Self::Unread) || self.lookup(cpu)?.is_none() {
+            *self = Self::read()?;
+        }
+        self.lookup(cpu)?.ok_or(DestinationError::UnknownCpu(cpu))
+    }
+
+    /// The APIC id of `cpu` in the map as read, `None` when it is unread or does not list it.
+    fn lookup(
+        &self,
+        cpu: u32,
+    ) -> std::result::Result<Option<ferric_irq::ApicId>, DestinationError> {
+        match self {
+            Self::Unread => Ok(None),
+            Self::Same => Ok(Some(ferric_irq::ApicId::new(cpu))),
+            Self::Listed(text) => ferric_irq::apic_of(text, ferric_irq::CpuId::new(cpu))
+                .map_err(DestinationError::Parse),
+        }
+    }
+
+    /// The compatibility-format destination of logical CPU `cpu`.
+    fn destination(&mut self, cpu: u32) -> std::result::Result<u8, DestinationError> {
+        let apic = self.apic_id(cpu)?;
+        apic.compatibility_destination()
+            .ok_or(DestinationError::Unrepresentable { cpu, apic })
+    }
 }
 
 /// Why a domain could not be set up for a function.
@@ -96,12 +211,12 @@ fn call(fds: &[usize], request: Request) -> libredox::error::Result<usize> {
     libredox::call::call_ro(fds, &mut [], CallFlags::empty(), &words[..len])
 }
 
-/// The compatibility-format message for `vector` on the CPU whose APIC ID is `cpu`, as upstream
-/// drivers computed it: fixed delivery, edge-triggered, physical destination.
+/// The compatibility-format message for `vector` on the CPU whose APIC id is `apic` (a
+/// [`CpuMap::destination`]), as upstream drivers computed it: fixed delivery, edge-triggered,
+/// physical destination.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn compatibility_message(cpu: u32, vector: u8) -> Option<MsiAddrAndData> {
+fn compatibility_message(apic: u8, vector: u8) -> Option<MsiAddrAndData> {
     use pcid_interface::msi::x86::{message_address, message_data_edge_triggered, DeliveryMode};
-    let apic = u8::try_from(cpu).ok()?;
     Some(MsiAddrAndData {
         addr: message_address(apic, false, false),
         data: message_data_edge_triggered(DeliveryMode::Fixed, vector),
@@ -109,7 +224,7 @@ fn compatibility_message(cpu: u32, vector: u8) -> Option<MsiAddrAndData> {
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn compatibility_message(_cpu: u32, _vector: u8) -> Option<MsiAddrAndData> {
+fn compatibility_message(_apic: u8, _vector: u8) -> Option<MsiAddrAndData> {
     None
 }
 
@@ -324,6 +439,19 @@ impl Iommu {
         Ok((id, message))
     }
 
+    /// Asks the kernel where remapping entry `id` delivers now. Root may have steered it to
+    /// another CPU and vector since pcid made it.
+    fn irte_target(&self, id: u32) -> libredox::error::Result<Route> {
+        let cap = self
+            .cap
+            .as_ref()
+            .ok_or(libredox::error::Error::new(libredox::errno::ENODEV))?;
+        let word = call(&[cap.raw()], Request::IrteTarget(id))?;
+        let IrteTarget { cpu, vector } = IrteTarget::from_word(word as u64)
+            .ok_or(libredox::error::Error::new(libredox::errno::EIO))?;
+        Ok(Route { cpu, vector })
+    }
+
     /// Answers `MsiMessage` on channel `id` for function `addr`: a remappable-format message
     /// when the kernel remaps the function's interrupts, otherwise the compatibility-format one.
     pub fn msi_message(
@@ -337,9 +465,20 @@ impl Iommu {
         let Some(function) = device(addr) else {
             return no_message;
         };
-        match self.alloc_irte(function, cpu, vector) {
+        // A route the channel already has keeps its entry, so a driver that gave a vector back
+        // and reserved it again does not use up another one. The entry is reused only if it
+        // was not steered elsewhere since.
+        let route = Route { cpu, vector };
+        let mut irtes = core::mem::take(&mut self.irtes);
+        let made = irtes.get_or_alloc(
+            id,
+            route,
+            |entry| self.irte_target(entry),
+            || self.alloc_irte(function, cpu, vector),
+        );
+        self.irtes = irtes;
+        match made {
             Ok((entry, message)) => {
-                self.irtes.entry(id).or_default().push(entry);
                 debug!("pcid: {function} vector {vector} on CPU {cpu} through interrupt remapping entry {entry:#x}");
                 PcidClientResponse::MsiMessage(MsiAddrAndData {
                     addr: message.address,
@@ -349,8 +488,17 @@ impl Iommu {
             // No remapping unit remaps this function's interrupts, so the compatibility format
             // reaches the CPU as upstream.
             Err(err) if err.errno() == libredox::errno::ENODEV => {
-                compatibility_message(cpu, vector)
-                    .map_or(no_message, PcidClientResponse::MsiMessage)
+                match self.cpus.destination(cpu) {
+                    Ok(apic) => compatibility_message(apic, vector)
+                        .map_or(no_message, PcidClientResponse::MsiMessage),
+                    Err(err) => {
+                        warn!(
+                            "pcid: no MSI message for {function} vector {vector} on CPU {cpu}: {}",
+                            chain(&err)
+                        );
+                        no_message
+                    }
+                }
             }
             Err(err) => {
                 warn!("pcid: no interrupt remapping entry for {function} vector {vector} on CPU {cpu}: {err}");
@@ -364,9 +512,7 @@ impl Iommu {
     pub fn on_close(&mut self, id: usize) {
         self.pending.remove(&id);
         self.given.remove(&id);
-        let Some(entries) = self.irtes.remove(&id) else {
-            return;
-        };
+        let entries = self.irtes.close(id);
         let Some(cap) = &self.cap else {
             return;
         };

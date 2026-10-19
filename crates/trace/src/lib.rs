@@ -13,12 +13,16 @@
 //! - [`record`] is the binary format: a two-word header (length, argument count, event id;
 //!   timestamp) followed by one 64-bit word per argument. The kernel never formats text.
 //! - [`ring::Ring`] is a single-producer, single-consumer ring of 64-bit words: the CPU that owns
-//!   it pushes records, one reader drains them. It is built from atomics only, so this crate has
-//!   no `unsafe` code.
+//!   it pushes records, one reader drains them. Its counters live either in the ring or, in
+//!   the shared layout the kernel maps into readers, in a header ahead of the data, which a
+//!   [`ring::View`] reads in place. It is built from atomics only, so this crate has no
+//!   `unsafe` code.
 //! - [`select()`] parses event selections (`all`, a subsystem name, an event name) into an
 //!   [`EventSet`], for the boot environment and the trace scheme.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
+//! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
+//!   `init` starts.
 //!
 //! # Examples
 //!
@@ -51,6 +55,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod abi;
+#[cfg(feature = "config")]
+pub mod config;
 mod event;
 pub mod kernel;
 mod level;

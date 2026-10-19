@@ -27,11 +27,17 @@ use syscall::dirent::DirentBuf;
 use syscall::schemev2::NewFdFlags;
 use syscall::{
     Error, FmoveFdFlags, Result, Stat, TimeSpec, EACCES, EAGAIN, EBADF, EINTR, EINVAL, EISDIR,
-    ENOENT, ENOLCK, EOPNOTSUPP, EOVERFLOW, EWOULDBLOCK, MODE_DIR, MODE_FILE, O_DIRECTORY, O_STAT,
+    ENOENT, ENOLCK, ENOSYS, EOPNOTSUPP, EOVERFLOW, EWOULDBLOCK, MODE_DIR, MODE_FILE, O_DIRECTORY,
+    O_STAT,
 };
 use zerocopy::TryFromBytes;
 
 use super::Disk;
+
+// Ferric Oxide: reads and writes served as concurrent tasks.
+mod concurrent;
+pub use concurrent::{CloseReady, SharedGate};
+
 use crate::{EventSource, PhysAddr};
 
 struct RingEventSource<'a, Ev: EventSource>(Mutex<Pin<&'a mut Ev>>);
@@ -211,13 +217,15 @@ impl<T: Disk> RingDiskWrapper<T> {
         }
     }
 
-    pub async fn read(
-        &mut self,
-        part_num: Option<usize>,
-        start_lba: u64,
-        buf: &mut [u8],
-    ) -> syscall::Result<usize> {
-        if buf.len() as u64 % u64::from(self.disk.block_size()) != 0 {
+    /// The disk block a transfer of `len` bytes at block `start_lba` of partition `part_num`
+    /// (or of the whole disk) starts at.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when `len` is not a whole number of blocks, `EBADF` for a partition the disk
+    /// does not have, and `EOVERFLOW` past the partition's end.
+    fn locate(&self, part_num: Option<usize>, start_lba: u64, len: usize) -> syscall::Result<u64> {
+        if len as u64 % u64::from(self.disk.block_size()) != 0 {
             return Err(Error::new(EINVAL));
         }
 
@@ -230,17 +238,26 @@ impl<T: Disk> RingDiskWrapper<T> {
                 .get(part_num)
                 .ok_or(syscall::Error::new(EBADF))?;
 
-            let num_sectors = buf.len() as u32 / self.disk.block_size();
+            let num_sectors = len as u32 / self.disk.block_size();
             let end_lba = start_lba + num_sectors as u64;
             if end_lba > part.size {
                 return Err(syscall::Error::new(EOVERFLOW));
             }
 
-            let abs_block = part.start_lba + start_lba;
-            self.disk.read(abs_block, buf).await
+            Ok(part.start_lba + start_lba)
         } else {
-            self.disk.read(start_lba, buf).await
+            Ok(start_lba)
         }
+    }
+
+    pub async fn read(
+        &mut self,
+        part_num: Option<usize>,
+        start_lba: u64,
+        buf: &mut [u8],
+    ) -> syscall::Result<usize> {
+        let block = self.locate(part_num, start_lba, buf.len())?;
+        self.disk.read(block, buf).await
     }
 
     pub async fn write(
@@ -249,30 +266,8 @@ impl<T: Disk> RingDiskWrapper<T> {
         start_lba: u64,
         buf: &[u8],
     ) -> syscall::Result<usize> {
-        if buf.len() as u64 % u64::from(self.disk.block_size()) != 0 {
-            return Err(Error::new(EINVAL));
-        }
-
-        if let Some(part_num) = part_num {
-            let part = self
-                .pt
-                .as_ref()
-                .ok_or(syscall::Error::new(EBADF))?
-                .partitions
-                .get(part_num)
-                .ok_or(syscall::Error::new(EBADF))?;
-
-            let num_sectors = buf.len() as u32 / self.disk.block_size();
-            let end_lba = start_lba + num_sectors as u64;
-            if end_lba > part.size {
-                return Err(syscall::Error::new(EOVERFLOW));
-            }
-
-            let abs_block = part.start_lba + start_lba;
-            self.disk.write(abs_block, buf).await
-        } else {
-            self.disk.write(start_lba, buf).await
-        }
+        let block = self.locate(part_num, start_lba, buf.len())?;
+        self.disk.write(block, buf).await
     }
 }
 
@@ -311,18 +306,20 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         executor: Rc<LocalExecutor<Hw>>,
     ) -> Self {
         assert!(scheme_name.starts_with("disk"));
-        let socket = Socket::nonblock().expect("failed to create disk scheme");
+        let socket = Rc::new(Socket::nonblock().expect("failed to create disk scheme"));
         let shm_dir_name = format!("/scheme/shm/{scheme_name}");
 
         let mut inner = RingDiskSchemeInner {
             scheme_name,
             socket,
+            gate: concurrent::SharedGate::default(),
             disks: BTreeMap::from_iter(
                 disks
                     .into_iter()
                     .map(|(k, disk)| (k, RingDiskWrapper::new(disk, &executor))),
             ),
             handles: HandleMap::new(),
+            openers: ferric_blkqueue::openers::Openers::new(),
             executor,
             #[cfg(feature = "grant-dma")]
             grants: None,
@@ -350,6 +347,14 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         self.inner.socket.inner()
     }
 
+    /// Ferric Oxide: the gate that holds closes back while their descriptors' concurrent
+    /// requests run. A driver whose disks serve requests concurrently ([`Disk::concurrent`])
+    /// waits on [`SharedGate::ready`] beside the scheme's events, and calls [`Self::tick`]
+    /// when either fires, so that a close becoming ready on an idle disk still runs.
+    pub fn close_gate(&self) -> SharedGate {
+        self.inner.gate.clone()
+    }
+
     /// Ferric Oxide: lets applications attach registered-buffer grants to their disk
     /// descriptors (`ferric_blkgrant::abi`), mapped into the driver's DMA domain with `dma`.
     #[cfg(feature = "grant-dma")]
@@ -363,6 +368,11 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
     pub async fn tick(&mut self) -> io::Result<()> {
         // Handle new scheme requests
         loop {
+            // Ferric Oxide: closes that waited for their descriptors' concurrent requests.
+            let ready = self.inner.gate.take_ready();
+            for id in ready {
+                self.inner.on_close(id);
+            }
             let request = match self.inner.socket.next_request(SignalBehavior::Interrupt) {
                 Ok(Some(request)) => request,
                 Ok(None) => {
@@ -377,13 +387,20 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
 
             let response = match request.kind() {
                 RequestKind::Call(call_request) => {
-                    // TODO: Spawn a separate task for each scheme call. This would however require the
-                    // use of a smarter buffer pool (or direct IO, or a buffer per fd) in order to do
-                    // parallel IO. It might also require async-aware locks so that a close() is
-                    // correctly ordered wrt IO on the same fd.
-                    call_request
-                        .handle_async(&mut self.inner, &mut self.state)
-                        .await
+                    // Ferric Oxide: a disk whose clones may serve requests at once gets its
+                    // reads and writes as tasks of their own (`concurrent`); everything else
+                    // is served here, one call at a time.
+                    let caller = call_request.caller();
+                    match call_request.op() {
+                        Ok(op) => match self.inner.spawn_io(op) {
+                            Ok(()) => continue,
+                            Err(op) => {
+                                op.handle_async(caller, &mut self.inner, &mut self.state)
+                                    .await
+                            }
+                        },
+                        Err(call_request) => Response::err(ENOSYS, call_request),
+                    }
                 }
                 // Ferric Oxide: a registered-buffer grant attached to a disk descriptor.
                 #[cfg(feature = "grant-dma")]
@@ -403,7 +420,10 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
                     unreachable!()
                 }
                 RequestKind::OnClose { id } => {
-                    self.inner.on_close(id);
+                    // Ferric Oxide: not while the descriptor's requests still run.
+                    if self.inner.gate.close(id) {
+                        self.inner.on_close(id);
+                    }
                     continue;
                 }
                 RequestKind::OnDetach { .. } => continue,
@@ -419,9 +439,14 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
 
 struct RingDiskSchemeInner<T: Disk, Hw: Hardware> {
     scheme_name: String,
-    socket: Socket,
+    socket: Rc<Socket>,
+    /// Ferric Oxide: in-flight concurrent requests per descriptor, and the closes they hold.
+    gate: concurrent::SharedGate,
     disks: BTreeMap<u32, RingDiskWrapper<T>>,
     handles: HandleMap<Handle<Hw, T>>,
+    /// Ferric Oxide: the process that opened each disk descriptor, the only one that may set
+    /// the queue policy through it.
+    openers: ferric_blkqueue::openers::Openers,
     executor: Rc<LocalExecutor<Hw>>,
     /// Ferric Oxide: grants attached to disk descriptors, when the driver can map them.
     #[cfg(feature = "grant-dma")]
@@ -463,6 +488,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
         let Some(handle) = self.handles.remove(id) else {
             return;
         };
+        self.openers.closed(id);
         #[cfg(feature = "grant-dma")]
         if let Some(grants) = &mut self.grants {
             grants.close(id);
@@ -657,7 +683,11 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
             Handle::Disk { num: nsid, pt }
         };
 
+        let is_disk = matches!(handle, Handle::Disk { .. });
         let id = self.handles.insert(handle);
+        if is_disk {
+            self.openers.opened(id, ctx.pid);
+        }
         Ok(OpenResult::ThisScheme {
             number: id,
             flags: NewFdFlags::POSITIONED,
@@ -689,8 +719,21 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
         id: usize,
         payload: &mut [u8],
         metadata: &[u64],
-        _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
+        ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
+        // Ferric Oxide: the per-CPU queue policy call, on a disk or partition descriptor, from
+        // the process that opened it (as root: see openat), not one it was passed to.
+        if let Handle::Disk { num, .. } = *self.handles.get(id)? {
+            if let Some(policy) =
+                ferric_blkqueue::abi::decode(metadata).map_err(|_| Error::new(EINVAL))?
+            {
+                self.openers
+                    .check(id, ctx.pid)
+                    .map_err(|_| Error::new(syscall::EPERM))?;
+                let disk = self.disks.get_mut(&num).ok_or(Error::new(EBADF))?;
+                return disk.disk_mut().set_queue_policy(policy).map(|()| 0);
+            }
+        }
         #[cfg(feature = "grant-dma")]
         if let Handle::Disk { num, pt } = *self.handles.get(id)? {
             return self.grant_call(id, num, pt, metadata).await;

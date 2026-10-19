@@ -162,6 +162,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,6 +1291,10 @@ name = "ferric-blkgrant"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-blkqueue"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-cet"
 version = "0.1.0"
 
@@ -1287,6 +1303,7 @@ name = "ferric-config"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ferric-trace",
  "ratatui",
  "redox_installer",
  "serde",
@@ -1313,6 +1330,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-irq"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-luks"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "argon2 0.5.3",
+ "base64ct",
+ "pbkdf2",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.17",
+ "xts-mode",
+ "zeroize",
+]
+
+[[package]]
+name = "ferric-lvm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-netq"
 version = "0.1.0"
 dependencies = [
@@ -1322,6 +1367,10 @@ dependencies = [
 
 [[package]]
 name = "ferric-nospec"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-pcache"
 version = "0.1.0"
 
 [[package]]
@@ -1338,6 +1387,23 @@ dependencies = [
 [[package]]
 name = "ferric-trace"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "ferric-trace-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ferric-trace",
+ "redox_syscall 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ferric-vtd"
@@ -1452,15 +1518,20 @@ dependencies = [
  "fox-build",
  "fox-core",
  "fox-git",
+ "fox-index",
  "fox-sbom",
  "fox-store",
  "pkgar 0.2.4",
+ "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
+ "semver",
  "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -1514,6 +1585,44 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "fox-index"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fox-core",
+ "fox-sbom",
+ "pkgar-core 0.2.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "fox-registry"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "fox-build",
+ "fox-core",
+ "fox-git",
+ "fox-index",
+ "pkgar-keys 0.2.4",
+ "semver",
+ "serde",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -3583,6 +3692,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4201,6 +4331,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "uuid",
@@ -4260,7 +4391,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a66d0c043a5768739851a7e5775192a70fdffdbf3418c22fd7927415d41a87c3"
 dependencies = [
  "aes",
- "argon2",
+ "argon2 0.4.1",
  "base64ct",
  "bitflags 2.13.2",
  "endian-num",
@@ -4710,6 +4841,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

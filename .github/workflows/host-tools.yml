@@ -1,7 +1,7 @@
 name: host-tools
 
 # Tests and lints the host workspace: tools/* and the shared crates in crates/.
-# Also runs RedoxFS's own unit tests, which build on the host.
+# Also runs RedoxFS's own unit tests and driver-block's, which build on the host.
 
 on:
   push:
@@ -16,13 +16,16 @@ on:
       - "features.toml"
       - "config/**"
       - "userspace/redoxfs/**"
+      - "userspace/base/drivers/storage/driver-block/**"
       - ".github/workflows/host-tools.yml"
+      - ".github/actions/prepare-cargo-git/**"
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |
@@ -36,7 +39,7 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-iommu -p ferric-netq -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-trace -p ferric-trace-cli -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -44,7 +47,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-netq -p ferric-nospec -p ferric-trace -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox -p cargo-fox -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-trace -p ferric-trace-cli -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)
@@ -78,17 +81,50 @@ jobs:
           cargo clippy --locked -p ferric-blkgrant -- -D warnings
           cargo test --locked -p ferric-blkgrant --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
+      # ferric-blkqueue's close gate sits behind its `alloc` feature (driver-block turns it on).
+      - name: ferric-blkqueue
+        run: |
+          cargo clippy --locked --all-targets -p ferric-blkqueue -- -D warnings
+          cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
+          cargo test --locked -p ferric-blkqueue --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
+      # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
+      # kernel turns it on; file systems do not).
+      - name: ferric-pcache
+        run: |
+          cargo clippy --locked --all-targets --all-features -p ferric-pcache -- -D warnings
+          cargo clippy --locked -p ferric-pcache -- -D warnings
+          cargo test --locked -p ferric-pcache --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-pcache
       # ferric-ring: the shared ring format, its queues and chain rules, and the
       # kernel.ring scheme's calls (kernel, bootstrap and ferric-ring-test use it).
       - name: ferric-ring
         run: |
           cargo clippy --locked --all-targets --all-features -p ferric-ring -- -D warnings
+          cargo clippy --locked -p ferric-ring -- -D warnings  # without the alloc file table
           cargo test --locked -p ferric-ring --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-ring
       # ferric-vtd's allocators sit behind its default `alloc` feature; check the
       # crate builds without them too.
       - name: Clippy (ferric-vtd without alloc)
         run: cargo clippy --locked -p ferric-vtd --no-default-features -- -D warnings
+      # ferric-lvm: read-only LVM2 labels, metadata and LV mapping; no_std, so check it
+      # builds for a bare-metal target as the kernel and the bootloader would use it.
+      - name: ferric-lvm
+        run: |
+          cargo clippy --locked --all-targets -p ferric-lvm -- -D warnings
+          cargo test --locked -p ferric-lvm
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-lvm
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-lvm --target x86_64-unknown-none
+      # ferric-luks runs in the bootloader (soft-float UEFI, with `force-soft`) as well as
+      # in user space; check both builds, and its docs and lints.
+      - name: ferric-luks
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-luks -- -D warnings
+          cargo clippy --locked --no-deps --all-targets --all-features -p ferric-luks -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-luks
+          RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-luks --features force-soft -Zbuild-std=core,alloc --target x86_64-unknown-uefi
 
   redoxfs:
     runs-on: ubuntu-24.04
@@ -97,6 +133,7 @@ jobs:
         working-directory: userspace/redoxfs
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
       - uses: actions/cache@v4
         with:
           path: |
@@ -107,3 +144,23 @@ jobs:
           restore-keys: redoxfs-
       - name: Test
         run: cargo test --locked --lib
+
+  # driver-block's concurrent-request and close-ordering tests run on the host.
+  driver-block:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: userspace/base
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/base/target
+          key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
+          restore-keys: userspace-base-
+      - name: Test
+        run: cargo test --locked -p driver-block

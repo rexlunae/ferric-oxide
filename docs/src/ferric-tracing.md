@@ -21,10 +21,12 @@ what is on at run time.
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
+| `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
+| `kernel.trace_initfs_disable` | `[]` | Selections bootstrap turns off after those, from the same file |
 
-The last four options take effect only with `kernel.trace`. They map to the
-kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme` and
-`trace_level_*`.
+The options below `kernel.trace` take effect only with it. The next four map
+to the kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme`
+and `trace_level_*`.
 `ferric-config` rejects `kernel.trace` together with `kernel.profiling`, because
 the profiler takes a CPU out of the system and that CPU would never answer the
 interrupt that live patching waits for.
@@ -41,6 +43,41 @@ bootstrap processor before the other CPUs start, and the kernel logs
 trace = true
 trace_boot = "sched"
 ```
+
+### The initfs trace configuration
+
+`kernel.trace_initfs_enable` and `kernel.trace_initfs_disable` are applied
+from user space instead, by bootstrap, before it starts `init`. Changing them
+rebuilds only the base package's initfs, not the kernel. System calls made
+before bootstrap applies them are not traced.
+
+`ferric-config` writes the selections to `trace.toml` in its output directory
+and checks them as the kernel and bootstrap will, so a mistake fails when the
+configuration is generated rather than being logged at boot:
+
+- every name must be an event or subsystem of the catalog;
+- every selection must include an event the configured kernel compiles in
+  (`kernel.trace_<subsystem>` and `kernel.trace_max_level`). A selection that
+  also names events left out is kept, as the kernel applies the rest of it;
+- each command must fit the kernel's 4096-byte limit, and the file must fit
+  bootstrap's 64 KiB.
+
+It also exports `FERRIC_INITFS_TRACE`,
+and the base package copies the file into the initfs as `lib/trace.toml`.
+The format is `ferric_trace::config`:
+
+```toml
+enable = ["syscall", "scheme.request"]
+disable = ["syscall.exit"]
+```
+
+Both keys are optional lists of selections, and any other key is an error.
+Bootstrap writes `enable <selection>` for each `enable` entry and then
+`disable <selection>` for each `disable` entry to `/scheme/kernel.trace/events`,
+as a root shell could. The kernel logs each change, for example
+`trace: enable syscall (2 event(s) changed)`. A missing file does nothing.
+Bootstrap logs a warning and boots on when the file does not parse, when a
+command is refused, or when the kernel has no `kernel.trace` scheme.
 
 ## How a tracepoint works
 
@@ -68,7 +105,7 @@ The first events are:
 | Event | Arguments |
 | --- | --- |
 | `syscall.enter` | `nr`, `a`, `b`, `c`, `d` (the system call number and first four arguments) |
-| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`) |
+| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`). A call that ends its context (`exit`, or a pending `SIGKILL`) has none |
 | `sched.switch` | `prev_pid`, `next_pid`, `prev_id`, `next_id` |
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
@@ -123,6 +160,10 @@ that same catalog, and `ferric_trace::record::Records` decodes a buffer.
 
 Each CPU has a 64 KiB ring, created when the CPUs are counted or on the first
 run-time enable. When a ring is full, new records are dropped and counted.
+The ring sits in kernel-allocated pages in the shared layout of
+`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
+data length, and `head`, `tail` and `lost` on cache lines of their own), then
+the data pages.
 Timestamps assume an invariant TSC that is synchronized across CPUs.
 
 ## The `kernel.trace` scheme
@@ -135,7 +176,7 @@ The paths are defined in `ferric_trace::abi`.
 | --- | --- | --- |
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
-| `cpu/<n>` | Drains whole records from CPU n's ring | — |
+| `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 
 `events` and `stats` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
@@ -150,42 +191,260 @@ open. A `cpu/<n>` read follows these rules:
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
 
+### Mapping a ring
+
+A reader can map a CPU's ring instead of reading it, and read records in place
+without a system call per batch:
+
+- `mmap` of a `cpu/<n>` descriptor must ask for `abi::CPU_MAP_BYTES` from
+  offset 0 with `PROT_READ` and `MAP_SHARED`. The kernel refuses `PROT_WRITE`
+  (`EACCES`), a mapping without `PROT_READ`, a partial or a private mapping
+  (`EINVAL`) and a fixed address (`EOPNOTSUPP`). `mprotect` cannot make the
+  mapping writable later.
+- `ferric_trace::ring::View` checks the header and copies whole records from
+  the mapping. Each copy reports its end position.
+- Writing `commit <end>` to the descriptor lets the kernel reuse the words up
+  to `end`. The kernel accepts only the end of a record between its own `tail`
+  and `head`, and returns `EINVAL` otherwise. Like a read, a commit returns
+  `EAGAIN` while another reader is using that CPU.
+
+The kernel is the only writer of a mapped ring. It never takes a value from
+the mapping that it did not store itself: the ring's size is kept in the
+kernel, every position is masked to the data before use, and `commit`'s `end`
+is checked against the kernel's own counters. The reader sees `head` and
+`tail` change under it, so `View` copies a record before decoding it.
+
+A `read` of the same CPU can consume records while a mapped reader is copying
+them, and the kernel can then reuse those words. After each copy, `View`
+checks `tail` again and starts over if it moved past the copy, so a copy never
+mixes two records. Two readers of one CPU can still both see a record. A
+collector that needs each record exactly once should be the CPU's only
+reader.
+
+## Reading a capture on the host
+
+To capture a trace on the target, run as root:
+
+```sh
+cat /scheme/kernel.trace/stats > stats.before
+echo "enable syscall scheme" > /scheme/kernel.trace/events
+# ... run the workload ...
+echo "disable syscall scheme" > /scheme/kernel.trace/events
+ferric-trace capture capture/
+```
+
+`ferric-trace capture <dir>` (the `ferric-trace` recipe; the smoke image has
+it) works as follows:
+
+- It reads `stats` for the list of CPUs and saves it as `<dir>/stats.start`.
+- It drains each CPU's ring into `<dir>/cpu<n>`, stopping once it has the
+  bytes `stats.start` listed as pending for that CPU, or earlier if a read
+  returns 0 bytes. The capture is a snapshot of what was pending when it
+  started. Draining until the ring is empty would never end while tracing is
+  on, because the capture's own writes are traced and refill the ring as fast
+  as it is read.
+  A read that fails with `EAGAIN`, because another reader is draining the same
+  CPU, is retried after a short wait.
+- It reads `stats` again into `<dir>/stats.end`.
+- Any other error, or a CPU that stays busy, stops the capture with a message
+  naming the file.
+
+A read drains a ring, so each record lands in exactly one file and nothing
+drained is ever deleted:
+
+- `<dir>` is created by the command, with any missing parents, and must not
+  exist yet, so an earlier capture is never overwritten. It must not overlap the scheme path.
+- An `INCOMPLETE` file is written into it first and removed only after
+  `stats.end` is saved.
+- If the capture fails or is killed, everything drained so far stays in
+  `<dir>` with the marker, and the command says the capture is partial.
+  `text` and `perfetto` refuse such a directory unless they are given
+  `--partial`, because CPUs may be missing or cut short. With `--partial`, a
+  record cut off at the end of a file is dropped and the whole records before
+  it are kept.
+
+`--scheme <path>` reads another scheme path.
+
+Each ring holds 64 KiB, and a full ring drops new records. For each CPU the
+command prints the records lost before the capture started and those lost
+while it ran. The first count runs from boot, so compare it with
+`stats.before`. If either shows new losses, the capture is missing records, and
+slices may be cut short or left unmatched. For a long or busy workload, run
+`ferric-trace capture` more than once while it runs, into separate
+directories, or capture a shorter window.
+
+Copy the directory to the host and use the same tool (`tools/ferric-trace/`)
+on it:
+
+```sh
+cargo run -p ferric-trace-cli -- text capture/
+cargo run -p ferric-trace-cli -- perfetto --tsc-mhz 3000 -o trace.json capture/
+```
+
+`text` prints one line per record in timestamp order: the CPU, the cycles
+since the first record, the event and its named arguments.
+
+`perfetto` writes Chrome trace event JSON. Open it at <https://ui.perfetto.dev>
+or in `chrome://tracing`.
+
+- **CPU tracks.** With `sched.switch` captured, each CPU track shows which
+  context ran when, including the context that ran from the CPU's first
+  record up to its first captured switch.
+- **Context tracks.** Each context has a track (a process per kernel pid, a
+  thread per context). It shows that context's system calls as slices, even
+  when the context moved to another CPU while it was blocked. Records from
+  before a CPU's first captured switch belong to the context that switch takes
+  off the CPU, and are shown on its track.
+- **Scheme requests.** Each request is an async slice on the caller's track,
+  from `scheme.request` to the `scheme.response` with the same scheme and tag.
+  The slice is named with the scheme id and opcode, and the end carries the
+  responder's pid. A `scheme.cancel` is an instant on the slice, not its end.
+- **Unmatched records.** A record whose start was not captured is an instant.
+
+`--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
+frequency; the default, 1000, shows one cycle as one nanosecond. A value below
+1 MHz, or not a finite number, is refused: real TSCs run at hundreds of MHz or
+more, and a tinier divisor would overflow timestamps to infinity. The format and
+the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
   - the compile-time catalog checks;
   - record encoding and decoding, including truncated and corrupt input;
   - ring wrap-around, loss counting, too-small buffers and uncommitted reads;
-  - a two-thread test with a million records.
+  - the shared layout's header, `View` reads that store nothing, header
+    checks, and `commit_to` refusing positions past `head` or inside a
+    record;
+  - a two-thread test with a million records;
+  - `trace.toml` parsing, refusal of unknown keys and wrong types, catalog,
+    compiled-in and size checks of the selections, command order, and a TOML
+    round trip.
+- **Configuration.** `cargo test --locked -p ferric-config` checks the
+  generated `trace.toml` and `FERRIC_INITFS_TRACE`, that nothing is generated
+  without the options or without `kernel.trace`, and that a misspelt event,
+  a selection with no compiled-in event, an oversize command and an oversize
+  file fail generation.
+- **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
+  (including bad and unknown records, records with too few or too many
+  arguments, and duplicate CPUs), checks the text lines, checks the JSON
+  mapping (slices on the right context across CPUs, records from before a
+  CPU's first switch moved to the outgoing context with its CPU slice, async
+  request slices matched by tag through cancels, instants for unmatched
+  records, finite timestamps at the frequency limits), refuses bad
+  `--tsc-mhz` values, runs the binary on a capture directory, and runs
+  `capture` against a stand-in scheme directory (CPU list from `stats`,
+  `EAGAIN` and `EINTR` retries, a CPU that stays busy, other errors, start and
+  end snapshots and losses during the capture, refusing an existing or
+  overlapping output, keeping what was drained with the `INCOMPLETE` marker
+  when a capture fails, and loaders refusing such a capture without
+  `--partial`).
 - **Kernel builds.** `kernel-lints.yml` builds kernel Rustdoc with the trace
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
   following:
-  1. checks that `sched.switch` is on from boot;
-  2. enables `syscall` and `scheme`;
-  3. makes a `write` to a closed descriptor, a `read` of `stats`, a `write` to
+  1. reads the initfs `trace.toml` (CI's image turns on `scheme.cancel` there),
+     checks that the events it leaves on are on, and turns off again the ones
+     the later steps test;
+  2. checks that `sched.switch` is on from boot;
+  3. enables `syscall` and `scheme`;
+  4. makes a `write` to a closed descriptor, a `read` of `stats`, a `write` to
      the null scheme and a `yield`;
-  4. disables them;
-  5. drains and decodes every CPU's ring;
-  6. checks the enter/exit pairs, the results, the timestamp order, that
+  5. disables them;
+  6. drains and decodes every CPU's ring;
+  7. checks the enter/exit pairs, the results, the timestamp order, that
      `sched.switch` records are present, that the null-scheme write has a
      request (the first one on its CPU after the program's own
      `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
      result, another process as responder), and that `disable` stops the
-     stream.
+     stream;
+  7. maps every CPU's ring, checks that writable, unreadable, partial and
+     private mappings and an `mprotect` to writable are refused, finds the
+     `write` to a closed descriptor by reading the mappings, and checks that
+     `commit` refuses a position past `head` or inside a record and accepts
+     the end of what was read.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
-  `FERRIC_TEST_SKIP trace` without the scheme.
-- **Image workflow.** `image.yml` builds the smoke image with `trace = true`
-  and `trace_boot = "sched"`. It requires all ten step markers and the boot
-  log line.
+  `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
+  `ferric-trace capture` and `ferric-trace text` on the result, and prints
+  `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
+  `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
+  `trace-overhead` job's baseline image, which requires that skip.
+- **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
+  [Overhead budget](#overhead-budget)).
+- **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
+  `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
+  requires all twelve step markers, the `trace-capture` marker, the boot log
+  line and the kernel's log of bootstrap's `enable scheme.cancel`.
+
+## Overhead budget
+
+Tracing must stay cheap enough to leave compiled in. The roadmap budget, which
+the `trace-overhead` job in `image.yml` enforces on the workloads below, is:
+
+| Comparison | Workload | Budget |
+| --- | --- | --- |
+| Compiled in, every event off, against compiled out | `syscall` | at most 1% slower |
+| Every compiled-in event on (`enable all`), against all off | `io` | at most 5% slower |
+
+Every workload and comparison is reported; the table says which ones fail the
+job. The two kernels of the first comparison are built separately, so it also
+measures where the linker put the hot code, and which runner the job got.
+On the null system call that is small and repeatable: +0.53% and +0.54% in
+two runs. There a disabled tracepoint is the largest share of the work, so any
+cost it has shows first. On `io`, which runs through far more kernel code, the
+same comparison went from -4.25% to +1.12% between those two runs with no
+tracepoint changed, so judging it would judge the layout. The second comparison runs on one kernel, so `io` is
+judged there.
+
+`ferric-trace-bench`, in `config/ferric-smoke.toml`, times two workloads in
+rounds:
+
+- `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system. Each
+  call is a request to RedoxFS through its scheme, so a round crosses system
+  call entry and exit, the scheme request path and context switches.
+- `syscall`: a `write` to a descriptor that is not open, the cheapest system
+  call that reaches the kernel's dispatch. Its tracepoints are a large share of
+  its time, so it is where a compiled-in, disabled tracepoint is judged. With
+  every event on it is reported but not budgeted: a record per entry and exit
+  is far more than 5% of a call that does nothing else.
+
+On a kernel without `kernel.trace` every round runs as state `out`. With it,
+the program runs a block of back-to-back rounds with all events off (`off`),
+exactly as the `out` rounds run. Then it alternates rounds with all off
+(`pairoff`) and with `enable all` (`on`), draining the rings after each `on`
+round. Toggling tracepoints (live patching and its IPIs) and draining disturb
+the caches of the round that follows. So `off` is compared with `out`, and `on`
+with `pairoff`, and the two are never compared across. The program prints
+`FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` for each
+workload and state, and `FERRIC_BENCH lost records=<n>` for records dropped
+during the `on` rounds.
+
+The image workflow builds a second smoke image whose kernel differs only in
+leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
+image ten times each, interleaved (a boot takes about 20 seconds).
+`scripts/ferric-ci/check-trace-overhead.sh` takes each boot's fastest round of
+each workload and state, and compares the medians of those over the boots.
+The fastest round keeps scheduling noise within a boot out. The median over
+boots handles the variation between boots: kernel image KASLR moves the code
+and runner load changes, and the first runs showed a spread of about 3%,
+three times the budget.
+
+Every boot's bench and trace result lines go into a few workflow annotations
+per image (GitHub keeps ten notices per step and 4 KiB of each). A boot that
+fails, or lacks `FERRIC_TEST_PASS trace-bench`, fails the job, with an
+annotation that puts its test results and crash lines ahead of the serial
+tail, so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
+`ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
+medians. The script fails, naming the logs, when a boot lacks a result or a
+traced boot lacks its `lost records` line. It warns when records were dropped,
+since a dropped record costs less than a written one, and prints every result
+as a notice on the run.
 
 ## Not implemented yet
 
 - Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
   process lifecycle).
-- Read-only mapping of the rings.
-- An initfs trace configuration.
-- A viewer and Perfetto export.
-- The CI overhead budget.
+- A reader that maps the rings in the `ferric-trace` tool (it still reads them).
+- Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
 - Architectures other than x86_64.
