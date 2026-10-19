@@ -1,0 +1,10 @@
+[package]
+name = "ferric-lvm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only LVM2 physical-volume labels, metadata and logical-volume mapping, no_std, written from published format documentation"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
