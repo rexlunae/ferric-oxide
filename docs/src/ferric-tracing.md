@@ -546,8 +546,10 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   fault needs a record of its own. AMD-Vi events of two faults are identical,
   and the kernel merges identical events drained in one pass, so the test
   waits for the previous fault's record to come back from the rings before it
-  causes the next fault; the kernel drains the event log on every event
-  interrupt, so that record comes promptly. It prints
+  causes the next fault. The kernel drains the event log from its event
+  interrupt and after every command batch, but under QEMU the events have been
+  seen to wait for the next command, so while it waits the test maps a page
+  into its domain and unmaps it, which sends one. It prints
   `FERRIC_TEST_PASS iommu-trace`, which `check-iommu-log.sh` requires with
   either IOMMU, and a skip without one. It also turns the `irq` events on
   around the interrupt of `iommu-msi`, which it acknowledges itself as a driver

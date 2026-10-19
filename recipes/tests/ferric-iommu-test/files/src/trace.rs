@@ -20,10 +20,14 @@
 //! announcements. On AMD-Vi the events of two faults look the same, and the kernel merges
 //! identical events it drains in one pass into one record, so before announcing the next
 //! fault [`expect`] waits until the faults announced so far have their records, read back from
-//! the rings. The kernel drains the event log on every event interrupt (and a call that finds
-//! it busy makes the drainer go round again), so a fault's events are drained, and their
-//! record written, before the test moves on; the next fault's events then start a new
-//! record. A fault's events can still be split over several records, which only adds records.
+//! the rings; the next fault's events then start a new record. A fault's events can be split
+//! over several records, which only adds records.
+//!
+//! The kernel drains the AMD-Vi event log from its event interrupt and after every command
+//! batch, but under QEMU's emulation the events of a fault have been seen to wait in the log
+//! until the next command. So while a record is missing, the wait makes the kernel send a
+//! command ([`kick_event_log`]: a page mapped into this program's DMA domain and unmapped
+//! again, which invalidates it), and the records come without depending on the interrupt.
 //!
 //! The `irq` events are on only around `iommu-msi`'s interrupt ([`watch_interrupt`],
 //! [`interrupt_handled`]): the test reserves a vector, has the device raise its MSI, and
@@ -443,11 +447,36 @@ impl Tracer {
 fn expect(expected: Expected) {
     if let Some(tracer) = lock().as_mut() {
         let deadline = Instant::now() + PREVIOUS_WAIT;
+        let mut polls = 0u32;
         while tracer.drain().is_ok() && tracer.missing().is_some() && Instant::now() < deadline {
+            // Every 100 ms: the kernel logs each unmap, so a missing record should not flood
+            // the log.
+            if polls.is_multiple_of(10) {
+                kick_event_log();
+            }
+            polls += 1;
             std::thread::sleep(Duration::from_millis(10));
         }
         tracer.expected.push(expected);
     }
+}
+
+/// Makes the kernel send the IOMMU a command, after which it drains the IOMMU's event log:
+/// maps a fresh page into this program's DMA domain by translating it, and unmaps it, which
+/// invalidates the mapping. Without a bound domain the translation maps nothing and this does
+/// nothing. Failures are ignored: the wait it serves ends at its deadline anyway.
+fn kick_event_log() {
+    let Ok(page) = crate::Mapped::dma(crate::PAGE) else {
+        return;
+    };
+    if let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/scheme/memory/translation")
+    {
+        let _ = crate::Translator { file }.translate(page.addr(0));
+    }
+    let _ = page.unmap();
 }
 
 /// Announces a DMA fault the device is about to cause: prints the line the boot check reads
@@ -522,6 +551,9 @@ pub fn finish() -> Result<Report, Error> {
     let deadline = Instant::now() + WAIT;
     let mut result = tracer.drain();
     while result.is_ok() && tracer.waiting() && Instant::now() < deadline {
+        if tracer.missing().is_some() {
+            kick_event_log();
+        }
         std::thread::sleep(Duration::from_millis(50));
         result = tracer.drain();
     }
