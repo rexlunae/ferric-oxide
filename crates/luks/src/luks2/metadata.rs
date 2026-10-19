@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use super::binary::BINARY_HEADER_LEN;
+use crate::cipher::KEY_MATERIAL_SECTOR;
 use crate::hash::HashAlg;
 
 /// The only anti-forensic stripe count the specification supports (section 3.2.4).
@@ -300,15 +301,25 @@ impl Metadata {
         Ok(metadata)
     }
 
-    /// The digest that checks `keyslot`'s key, if any.
+    /// The digest that checks `keyslot`'s key, if any. When more than one digest names the
+    /// keyslot, one bound to a segment is preferred, so an extra unbound digest cannot hide a
+    /// keyslot from [`Luks2::unlock`](crate::luks2::Luks2::unlock).
     pub fn digest_of(&self, keyslot: u32) -> Option<&Digest> {
-        self.digests
+        let mut naming = self
+            .digests
             .values()
-            .find(|d| d.keyslots.contains(&keyslot))
+            .filter(|d| d.keyslots.contains(&keyslot));
+        let first = naming.next()?;
+        if !first.segments.is_empty() {
+            return Some(first);
+        }
+        Some(naming.find(|d| !d.segments.is_empty()).unwrap_or(first))
     }
 
     fn check(&self, hdr_size: u64) -> Result<(), MetadataError> {
-        let json_size = hdr_size - BINARY_HEADER_LEN as u64;
+        let json_size = hdr_size
+            .checked_sub(BINARY_HEADER_LEN as u64)
+            .ok_or(MetadataError::HeaderSize(hdr_size))?;
         if self.config.json_size != json_size {
             return Err(MetadataError::JsonSize {
                 header: json_size,
@@ -336,7 +347,10 @@ impl Metadata {
                 if self.digest_of(id).is_none() {
                     return Err(MetadataError::NoDigest { keyslot: id });
                 }
-                if u64::from(k.key_size) * u64::from(k.af.stripes) > size {
+                // Key material is read and decrypted in whole 512-byte sectors.
+                let material = (u64::from(k.key_size) * u64::from(k.af.stripes))
+                    .next_multiple_of(KEY_MATERIAL_SECTOR as u64);
+                if material > size {
                     return Err(MetadataError::AreaTooSmall { keyslot: id });
                 }
             }
@@ -388,7 +402,10 @@ fn named<T>(
     let mut out = BTreeMap::new();
     for (name, value) in object(root, Location::Root, field)? {
         let id = decimal(name).ok_or(MetadataError::ObjectId { field })?;
-        out.insert(id, parse(as_object(value, at(id), field)?, id)?);
+        let parsed = parse(as_object(value, at(id), field)?, id)?;
+        if out.insert(id, parsed).is_some() {
+            return Err(MetadataError::ObjectId { field });
+        }
     }
     Ok(out)
 }
@@ -495,12 +512,22 @@ fn parse_kdf(o: &Object, at: Location) -> Result<Kdf, MetadataError> {
 fn parse_digest(o: &Object, id: u32) -> Result<Digest, MetadataError> {
     let at = Location::Digest(id);
     let kind = match string(o, at, "type")? {
-        "pbkdf2" => DigestKind::Pbkdf2 {
-            hash: HashAlg::from_name(string(o, at, "hash")?),
-            iterations: nonzero(o, at, "iterations")?,
-            salt: base64(o, at, "salt")?,
-            digest: base64(o, at, "digest")?,
-        },
+        "pbkdf2" => {
+            let hash = HashAlg::from_name(string(o, at, "hash")?);
+            let digest = base64(o, at, "digest")?;
+            // PBKDF2's work grows with its output length, one block of `iterations` per
+            // hash-output-sized chunk, so a long digest would multiply the work past what
+            // `Limits` allow. Allow at most one block; LUKS1-style 20-byte digests stay valid.
+            if digest.is_empty() || hash.output_len().is_some_and(|max| digest.len() > max) {
+                return Err(MetadataError::DigestLength { digest: id });
+            }
+            DigestKind::Pbkdf2 {
+                hash,
+                iterations: nonzero(o, at, "iterations")?,
+                salt: base64(o, at, "salt")?,
+                digest,
+            }
+        }
         other => DigestKind::Other(other.into()),
     };
     Ok(Digest {
@@ -571,8 +598,13 @@ fn parse_config(o: &Object) -> Result<Config, MetadataError> {
     })
 }
 
+/// A decimal object name or reference in canonical form: digits only, and no leading zero
+/// unless the number is 0, so that two different names never mean the same object.
 fn decimal(text: &str) -> Option<u32> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
         return None;
     }
     text.parse().ok()
@@ -783,6 +815,15 @@ pub enum MetadataError {
         /// The segment named.
         segment: u32,
     },
+    /// The `hdr_size` given is smaller than the binary header.
+    #[error("LUKS2 hdr_size {0} is smaller than the binary header")]
+    HeaderSize(u64),
+    /// A `pbkdf2` digest is empty or longer than its hash's output.
+    #[error("LUKS2 digest {digest} is empty or longer than its hash output")]
+    DigestLength {
+        /// The digest.
+        digest: u32,
+    },
     /// A crypt segment's sector size is not 512, 1024, 2048 or 4096.
     #[error("LUKS2 segment {segment} has sector size {size}")]
     SectorSize {
@@ -903,7 +944,7 @@ pub(crate) mod tests {
     #[test]
     fn invalid_metadata_is_named() {
         type Edit = fn(&mut Value);
-        let cases: [(Edit, &str); 18] = [
+        let cases: [(Edit, &str); 23] = [
             (
                 |j| {
                     j.as_object_mut().unwrap().remove("tokens");
@@ -963,6 +1004,28 @@ pub(crate) mod tests {
                 "SectorSize",
             ),
             (|j| j["keyslots"]["0"]["kdf"]["time"] = 0.into(), "Integer"),
+            (
+                |j| j["keyslots"]["00"] = j["keyslots"]["0"].clone(),
+                "ObjectId",
+            ),
+            (
+                |j| j["digests"]["0"]["keyslots"] = serde_json::json!(["00"]),
+                "Integer",
+            ),
+            (
+                // 33 bytes for SHA-256: more than one PBKDF2 block.
+                |j| j["digests"]["0"]["digest"] = "A".repeat(44).into(),
+                "DigestLength",
+            ),
+            (|j| j["digests"]["0"]["digest"] = "".into(), "DigestLength"),
+            (
+                // Key size 1: 4000 bytes of material, read as 4096.
+                |j| {
+                    j["keyslots"]["0"]["key_size"] = 1.into();
+                    j["keyslots"]["0"]["area"]["size"] = "4000".into();
+                },
+                "AreaTooSmall",
+            ),
         ];
         for (edit, variant) in cases {
             let mut j = json();
@@ -978,9 +1041,25 @@ pub(crate) mod tests {
             Err(MetadataError::NotTerminated)
         ));
         assert!(matches!(
+            Metadata::parse(&area(&json()), 100),
+            Err(MetadataError::HeaderSize(100))
+        ));
+        assert!(matches!(
             Metadata::parse(b"{\0", HDR),
             Err(MetadataError::Json(_))
         ));
+    }
+
+    #[test]
+    fn a_bound_digest_is_preferred() {
+        let mut j = json();
+        j["digests"]["1"] = j["digests"]["0"].clone();
+        j["digests"]["0"]["segments"] = serde_json::json!([]);
+        let m = parse(&j).expect("valid");
+        assert_eq!(m.digest_of(0).map(|d| d.segments.clone()), Some(vec![0]));
+        j["digests"]["1"]["segments"] = serde_json::json!([]);
+        let m = parse(&j).expect("valid");
+        assert_eq!(m.digest_of(0).map(|d| d.segments.len()), Some(0));
     }
 
     #[test]

@@ -64,7 +64,7 @@ mod unlock;
 
 use thiserror::Error;
 
-pub use unlock::{Limits, UnlockError, Unlocked, VolumeKey};
+pub use unlock::{DEFAULT_MAX_ARGON2_MEMORY_KIB, Limits, UnlockError, Unlocked, VolumeKey};
 
 use crate::luks1::{Luks1, Luks1Error};
 use crate::luks2::binary::{BINARY_HEADER_LEN, HeaderCopy};
@@ -157,9 +157,10 @@ where
     match luks2::choose(read_at, primary).map_err(io)? {
         Ok(header) => Ok(Header::V2(header)),
         // Nothing that looks like LUKS at either place: not a LUKS device at all.
-        Err((CopyError::Binary(luks2::binary::BinaryHeaderError::Magic), CopyError::NotFound)) => {
-            Err(ReadError::NotLuks)
-        }
+        Err((
+            CopyError::Binary(luks2::binary::BinaryHeaderError::Magic),
+            CopyError::NotFound | CopyError::Unreadable { .. },
+        )) => Err(ReadError::NotLuks),
         Err((primary, secondary)) => Err(ReadError::NoValidCopy { primary, secondary }),
     }
 }

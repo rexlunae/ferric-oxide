@@ -5,7 +5,7 @@
 //! copy is valid when its binary header parses, its checksum matches, it sits where it says it
 //! does, and its JSON metadata parses. When both are valid the one with the higher `seqid` wins
 //! (the primary on a tie); when one is damaged the other is used and the damage is reported
-//! through [`Luks2::other_copy_error`]. When the primary binary header is unreadable, the
+//! through [`Luks2::other_copy_error`], including a secondary copy that cannot be read. When the primary binary header is unreadable, the
 //! secondary is searched for at each offset table 1 allows.
 
 pub mod binary;
@@ -77,6 +77,13 @@ pub enum CopyError {
     /// No secondary copy was found at any allowed offset.
     #[error("no secondary LUKS2 header was found")]
     NotFound,
+    /// Reading the copy failed (for the secondary copy of a valid primary), or the search for
+    /// the secondary copy stopped at a read that failed before finding one.
+    #[error("reading the LUKS2 header copy at {offset:#x} failed")]
+    Unreadable {
+        /// Where the failed read started.
+        offset: u64,
+    },
 }
 
 pub(crate) type Copy = (BinaryHeader, Metadata);
@@ -145,7 +152,9 @@ where
     F: FnMut(u64, &mut [u8]) -> Result<(), E>,
 {
     let secondary = match &primary {
-        Ok((binary, _)) => load_copy(read_at, binary.hdr_size, HeaderCopy::Secondary)?,
+        // A valid primary is enough: a secondary that cannot be read is reported, not fatal.
+        Ok((binary, _)) => load_copy(read_at, binary.hdr_size, HeaderCopy::Secondary)
+            .unwrap_or_else(|(offset, _)| Err(CopyError::Unreadable { offset })),
         // A rejected primary's hdr_size cannot be trusted, so search every allowed offset.
         Err(_) => scan_secondary(read_at)?,
     };
@@ -172,8 +181,12 @@ where
     let mut last = CopyError::NotFound;
     for offset in SECONDARY_OFFSETS {
         let mut sector = [0u8; BINARY_HEADER_LEN];
-        // Offsets past the end of a small device fail to read; that ends the search.
+        // Offsets past the end of a small device fail to read; that ends the search. When
+        // nothing was found, the failed read is what is reported.
         if read_at(offset, &mut sector).is_err() {
+            if matches!(last, CopyError::NotFound) {
+                last = CopyError::Unreadable { offset };
+            }
             break;
         }
         if sector[..6] != binary::MAGIC_SECONDARY {

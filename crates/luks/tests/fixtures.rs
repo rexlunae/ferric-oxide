@@ -192,6 +192,48 @@ fn a_damaged_copy_falls_back_to_the_other() {
 }
 
 #[test]
+fn an_unreadable_secondary_does_not_block_a_valid_primary() {
+    let image = fixture("luks2-pbkdf2.img");
+    // Reads that touch the secondary copy (0x4000..0x8000) fail.
+    let mut failing = |offset: u64, buf: &mut [u8]| -> io::Result<()> {
+        let end = offset + buf.len() as u64;
+        if offset < 0x8000 && end > 0x4000 {
+            return Err(io::ErrorKind::Other.into());
+        }
+        reader(&image)(offset, buf)
+    };
+    let Header::V2(header) = read(&mut failing).expect("the primary is enough") else {
+        panic!("LUKS2");
+    };
+    assert_eq!(header.binary.copy, HeaderCopy::Primary);
+    assert!(matches!(
+        header.other_copy_error(),
+        Some(CopyError::Unreadable { offset: 0x4000 })
+    ));
+    let key = header
+        .unlock(&mut failing, PASSPHRASE, &Limits::default())
+        .expect("unlocks");
+    assert_eq!(key.key.as_bytes(), hex(PBKDF2_KEY));
+
+    // With the primary damaged too, nothing is usable; the failed read is what is reported.
+    let mut damaged = image.clone();
+    damaged[0x1000 + 10] ^= 1;
+    let mut failing = |offset: u64, buf: &mut [u8]| -> io::Result<()> {
+        if offset == 0x4000 {
+            return Err(io::ErrorKind::Other.into());
+        }
+        reader(&damaged)(offset, buf)
+    };
+    assert!(matches!(
+        read(&mut failing),
+        Err(ReadError::NoValidCopy {
+            primary: CopyError::Binary(BinaryHeaderError::Checksum),
+            secondary: CopyError::Unreadable { offset: 0x4000 },
+        })
+    ));
+}
+
+#[test]
 fn misplaced_and_mismatched_copies_are_refused() {
     let image = fixture("luks2-pbkdf2.img");
     // The secondary claims another offset.

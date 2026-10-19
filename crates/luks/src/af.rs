@@ -12,15 +12,15 @@ use zeroize::Zeroizing;
 use crate::hash::{HashAlg, MAX_DIGEST_LEN};
 
 /// Recovers a `key_len`-byte key from `split`, which holds `stripes` blocks of `key_len` bytes
-/// (any bytes after them are ignored). Returns `None` when `hash` is not implemented or `split`
-/// is too short.
+/// (any bytes after them are ignored). Returns `None` when `hash` is not implemented, `key_len`
+/// or `stripes` is 0, or `split` is too short.
 pub fn merge(
     hash: &HashAlg,
     split: &[u8],
     key_len: usize,
     stripes: usize,
 ) -> Option<Zeroizing<alloc::vec::Vec<u8>>> {
-    if stripes == 0 || split.len() < key_len.checked_mul(stripes)? {
+    if key_len == 0 || stripes == 0 || split.len() < key_len.checked_mul(stripes)? {
         return None;
     }
     let mut value = Zeroizing::new(vec![0u8; key_len]);
@@ -122,6 +122,7 @@ mod tests {
     fn bad_input_is_refused() {
         assert!(merge(&HashAlg::Sha256, &[0; 10], 32, 1).is_none());
         assert!(merge(&HashAlg::Sha256, &[0; 64], 32, 0).is_none());
+        assert!(merge(&HashAlg::Sha256, &[0; 64], 0, 2).is_none());
         assert!(merge(&HashAlg::from_name("md5"), &[0; 64], 32, 2).is_none());
     }
 }

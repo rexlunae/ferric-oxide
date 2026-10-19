@@ -58,7 +58,14 @@ pub struct Unlocked {
     pub key: VolumeKey,
 }
 
+/// The default Argon2 memory limit, in KiB: 1 GiB.
+pub const DEFAULT_MAX_ARGON2_MEMORY_KIB: u32 = 1 << 20;
+
 /// Upper bounds on the work one keyslot may ask for.
+///
+/// The header is not authenticated before unlocking, so its KDF parameters are attacker
+/// controlled; the limits are checked before any derivation starts. Callers with less memory
+/// to spare (an early boot stage, for instance) should lower `max_argon2_memory_kib`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The most PBKDF2 iterations, for keyslots and digests.
@@ -72,12 +79,15 @@ pub struct Limits {
 }
 
 impl Default for Limits {
-    /// 2^24 PBKDF2 iterations, and Argon2 up to 4 GiB, 64 passes and 16 lanes: above what
-    /// interactive formatting chooses on current hardware, below what would stall a boot.
+    /// 2^24 PBKDF2 iterations, and Argon2 up to 1 GiB ([`DEFAULT_MAX_ARGON2_MEMORY_KIB`]),
+    /// 64 passes and 16 lanes: at or above what cryptsetup's benchmark chooses when it formats
+    /// a device, and below what would exhaust memory during a boot. A header formatted with
+    /// more Argon2 memory than this (cryptsetup allows up to 4 GiB when asked) is refused with
+    /// [`UnlockError::OverLimits`] until the caller raises the limit.
     fn default() -> Self {
         Self {
             max_pbkdf2_iterations: 1 << 24,
-            max_argon2_memory_kib: 4 << 20,
+            max_argon2_memory_kib: DEFAULT_MAX_ARGON2_MEMORY_KIB,
             max_argon2_time: 64,
             max_argon2_lanes: 16,
         }
@@ -499,6 +509,18 @@ mod tests {
             variant: Argon2Variant::Id,
             time: 1,
             memory_kib: u32::MAX,
+            cpus: 1,
+            salt: vec![0; 32],
+        };
+        assert!(matches!(
+            derive::<()>(&kdf, b"p", &Limits::default(), &mut out),
+            Err(UnlockError::OverLimits)
+        ));
+        assert_eq!(Limits::default().max_argon2_memory_kib, 1 << 20);
+        let kdf = Kdf::Argon2 {
+            variant: Argon2Variant::Id,
+            time: 1,
+            memory_kib: (1 << 20) + 1,
             cpus: 1,
             salt: vec![0; 32],
         };
