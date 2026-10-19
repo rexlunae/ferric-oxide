@@ -159,11 +159,14 @@ pub enum TxReject {
     /// The source MAC address is not the NIC's.
     #[error("the source MAC address is not the NIC's")]
     SourceMac,
-    /// The frame carries a VLAN tag.
+    /// The frame carries a VLAN header, a priority tag (VLAN ID 0) included.
     #[error("the frame carries a VLAN tag")]
     Tagged,
-    /// The frame is not TCP or UDP over IP.
-    #[error("the frame is not TCP or UDP")]
+    /// The frame is not TCP or UDP over IP with its ports. IP fragments are refused too, the
+    /// first one included: a fragment's ports cannot be checked without reassembly, so
+    /// validated TX does not send fragments. A socket that must send them binds with
+    /// `BindFlags::RAW_TX`, the supported path for anything validation does not cover.
+    #[error("the frame is not TCP or UDP with its ports (fragments are not sent)")]
     NotTransport,
     /// The source port (or address) is not one the socket owns.
     #[error("the source port is not one the socket owns")]
@@ -187,14 +190,16 @@ impl Ownership {
         }
     }
 
-    /// Adds `port`. Owning a port twice is not an error.
+    /// Adds `port`, and returns whether it was new. Owning a port twice is not an error, but
+    /// returns `false`, so a caller keeping something per owned port (a driver keeps the
+    /// netstack socket that reserves it) keeps only one.
     ///
     /// # Errors
     ///
     /// [`OwnError::Full`] when the socket already owns [`MAX_PORTS`](Self::MAX_PORTS) ports.
-    pub fn own(&mut self, port: OwnedPort) -> Result<(), OwnError> {
+    pub fn own(&mut self, port: OwnedPort) -> Result<bool, OwnError> {
         if self.ports.contains(&Some(port)) {
-            return Ok(());
+            return Ok(false);
         }
         let slot = self
             .ports
@@ -202,7 +207,7 @@ impl Ownership {
             .find(|slot| slot.is_none())
             .ok_or(OwnError::Full)?;
         *slot = Some(port);
-        Ok(())
+        Ok(true)
     }
 
     /// Whether the socket owns `transport` port `port` at `addr`.
@@ -239,7 +244,10 @@ impl Ownership {
         }
     }
 
-    /// TX validation of a frame with `headers` on a NIC with MAC address `nic`.
+    /// TX validation of a frame with `headers` on a NIC with MAC address `nic`: the NIC's
+    /// source MAC, no VLAN header (not even a priority tag), and TCP or UDP from an owned port.
+    /// IP fragments, the first one included, are refused ([`TxReject::NotTransport`]); raw TX
+    /// (`BindFlags::RAW_TX`) is the path for them.
     ///
     /// # Errors
     ///
@@ -248,7 +256,8 @@ impl Ownership {
         if headers.src_mac != nic {
             return Err(TxReject::SourceMac);
         }
-        if headers.vlan.is_some() {
+        // A priority tag has no VLAN ID, but it is a VLAN header all the same.
+        if headers.tagged {
             return Err(TxReject::Tagged);
         }
         let ip = headers.ip.as_ref().ok_or(TxReject::NotTransport)?;
@@ -352,11 +361,13 @@ mod tests {
     fn the_table_holds_a_bounded_set_of_ports() {
         let mut owned = Ownership::new();
         assert!(!owned.owns(Transport::Udp, 1, None));
-        owned.own(udp_port(1)).expect("room");
-        owned.own(udp_port(1)).expect("owning twice is fine");
+        assert_eq!(owned.own(udp_port(1)), Ok(true));
+        // Owning twice is fine, reports nothing new, and takes no second slot.
+        assert_eq!(owned.own(udp_port(1)), Ok(false));
         for port in 2..=Ownership::MAX_PORTS as u16 {
-            owned.own(udp_port(port)).expect("room");
+            assert_eq!(owned.own(udp_port(port)), Ok(true));
         }
+        assert_eq!(owned.own(udp_port(1)), Ok(false));
         assert_eq!(owned.own(udp_port(999)), Err(OwnError::Full));
         assert!(owned.owns(Transport::Udp, 16, None));
         assert!(
@@ -429,6 +440,28 @@ mod tests {
         assert_eq!(
             owned.check_tx(&headers(&udp_from([10, 0, 2, 15], 5353, &[7])), nic),
             Err(TxReject::Tagged)
+        );
+        // A priority tag (VLAN ID 0) names no VLAN, but it is a VLAN header: refused too.
+        let priority = headers(&udp_from([10, 0, 2, 15], 5353, &[0]));
+        assert_eq!(priority.vlan, None);
+        assert!(priority.tagged);
+        assert_eq!(owned.check_tx(&priority, nic), Err(TxReject::Tagged));
+        // Validated TX sends no fragments, not even the first (more-fragments set, offset
+        // 0), whose UDP header is there: raw TX is the path for them.
+        let first_fragment = ethernet(
+            &[],
+            ETHERTYPE_IPV4,
+            &ipv4(
+                IP_PROTOCOL_UDP,
+                [10, 0, 2, 15],
+                [10, 0, 0, 1],
+                0x2000,
+                &udp(5353, 53),
+            ),
+        );
+        assert_eq!(
+            owned.check_tx(&headers(&first_fragment), nic),
+            Err(TxReject::NotTransport)
         );
         let icmp = ethernet(
             &[],

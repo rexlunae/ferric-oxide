@@ -173,12 +173,13 @@ impl CopyQueue {
         self.stats
     }
 
-    /// Records that the socket owns `port` ([`crate::own`]).
+    /// Records that the socket owns `port` ([`crate::own`]), and returns whether it was new
+    /// ([`Ownership::own`]).
     ///
     /// # Errors
     ///
     /// [`OwnError::Full`] when it already owns [`Ownership::MAX_PORTS`] ports.
-    pub fn own(&mut self, port: OwnedPort) -> Result<(), OwnError> {
+    pub fn own(&mut self, port: OwnedPort) -> Result<bool, OwnError> {
         self.owned.own(port)
     }
 

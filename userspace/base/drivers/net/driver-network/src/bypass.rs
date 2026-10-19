@@ -426,7 +426,7 @@ impl<T: NetworkAdapter> Queue<T> {
     /// as it may.
     fn own(&mut self, data: &mut NetworkSchemeData<T>, request: &SendFdRequest) -> Result<usize> {
         let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
-        if bound.stopped {
+        if !bound.check_grants() {
             return Err(Error::new(EIO));
         }
         let mut fds = [usize::MAX; 1];
@@ -437,8 +437,12 @@ impl<T: NetworkAdapter> Queue<T> {
         let port = core::str::from_utf8(&path[..len])
             .map_err(|_| Error::new(EINVAL))
             .and_then(|path| OwnedPort::from_fpath(path).map_err(own_errno))?;
-        bound.queue.own(port).map_err(own_errno)?;
-        bound._owners.push(owner);
+        // One netstack socket per owned port is enough to keep it reserved: a repeated `Own`
+        // of a port already owned closes its descriptor here (when `owner` drops), so repeated
+        // calls cannot pile up descriptors in the driver.
+        if bound.queue.own(port).map_err(own_errno)? {
+            bound._owners.push(owner);
+        }
         Ok(1)
     }
 

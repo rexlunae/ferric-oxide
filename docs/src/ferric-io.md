@@ -614,11 +614,15 @@ netstack.
 - `own`: port ownership and TX validation. `Own` passes a netstack `udp` or
   `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
   reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
-  keeps the socket open, so netstack keeps the port reserved. A filter on a
+  keeps the socket open, so netstack keeps the port reserved; an `Own` of a
+  port the socket already owns keeps no second descriptor. A filter on a
   TCP or UDP destination port needs that port owned (on the filter's address,
   when the netstack socket is bound to one). TX validation drops a frame
-  unless it has the NIC's source MAC, no VLAN tag, and is TCP or UDP from an
-  owned port (and address); `BindFlags::RAW_TX` skips it. Dropped frames still
+  unless it has the NIC's source MAC, no VLAN header (a priority tag counts),
+  and is TCP or UDP from an owned port (and address). Validated TX sends no IP
+  fragments, the first one included, since a fragment's ports cannot be
+  checked without reassembly; `BindFlags::RAW_TX` skips validation and is the
+  supported path for fragments and anything else it does not cover. Dropped frames still
   come back on Completion and are counted in `Stats::tx_rejected`. The path
   check guards against mistakes, not a hostile root, since queue sockets are
   root's and root can serve any scheme. Unprivileged sockets will need the

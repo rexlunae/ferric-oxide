@@ -73,6 +73,10 @@ const BENCH_FRAMES: u64 = 20_000;
 /// The UDP payload of a benchmark frame: 18 bytes make a 60-byte frame, the Ethernet minimum
 /// without the frame check sequence.
 const BENCH_PAYLOAD: [u8; 18] = *b"ferric-netq bench!";
+/// Bytes netstack puts on the wire for one `BENCH_PAYLOAD` datagram: an Ethernet header (14),
+/// an IPv4 header without options (20) and a UDP header (8). The benchmark compares the
+/// bypass and netstack only if the bypass frame has this same size.
+const NETSTACK_FRAME: usize = 14 + 20 + 8 + BENCH_PAYLOAD.len();
 /// How long either side of the benchmark may take before the step fails.
 const BENCH_LIMIT: Duration = Duration::from_secs(60);
 /// The discard port (RFC 863), where the benchmark sends.
@@ -1059,6 +1063,11 @@ fn per_second(frames: u64, elapsed: Duration) -> u64 {
 fn bench_step(t: &mut Test) -> Result<(), Failure> {
     let gateway = t.gateway;
     let frame = t.udp_frame(t.mac, OWNED_PORT, gateway, DISCARD_PORT, &BENCH_PAYLOAD)?;
+    if frame.len() != NETSTACK_FRAME {
+        return Err(Failure::Data {
+            what: "bypass benchmark frame the same size as netstack's",
+        });
+    }
     let owned = t.owned()?;
     let batch = (FRAMES - RX_FRAMES) as usize;
     let start = Instant::now();
@@ -1093,7 +1102,8 @@ fn bench_step(t: &mut Test) -> Result<(), Failure> {
     let bypass_fps = per_second(BENCH_FRAMES, bypass);
     let netstack_fps = per_second(BENCH_FRAMES, netstack);
     println!(
-        "FERRIC_BENCH netq-tx-udp60 frames={BENCH_FRAMES} bypass_fps={bypass_fps} \
+        "FERRIC_BENCH netq-tx-udp60 frames={BENCH_FRAMES} frame_bytes={NETSTACK_FRAME} \
+         bypass_fps={bypass_fps} \
          netstack_fps={netstack_fps} bypass_vs_netstack={:.2}",
         bypass_fps as f64 / netstack_fps.max(1) as f64
     );
