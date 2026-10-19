@@ -1084,8 +1084,27 @@ fn wait_sync_once() -> Result<bool, Failure> {
     Ok(overlapped)
 }
 
-/// How long `ring-async-close` waits for the closed ring's worker to post its cancellations.
+/// How long `ring-async-close` waits for the closed ring's worker to start the chain, and
+/// then to post its completions.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// Waits for the byte the worker writes to `started_rd`'s pipe when it starts a chain.
+fn wait_started(started_rd: c_int) -> Result<(), Failure> {
+    let start = Instant::now();
+    let mut byte = [0u8; 1];
+    loop {
+        // SAFETY: a non-blocking read end from pipe(), and a buffer of 1 byte.
+        let got = unsafe { libc::read(started_rd, byte.as_mut_ptr().cast(), 1) } as i64;
+        if got == 1 || start.elapsed() >= CLOSE_WAIT {
+            return expect(
+                "the byte the worker writes when it starts the chain",
+                1,
+                got,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 fn async_close() -> Result<(), Failure> {
     let mut ring = Ring::new(8, 16)?;
@@ -1101,22 +1120,38 @@ fn async_close() -> Result<(), Failure> {
     )?;
 
     let [rd, wr] = pipe()?;
+    // The chain's first SQE writes a byte to `started`, so the test can see that the worker
+    // is running the chain before it closes the ring. Close interrupts the running chain
+    // (`EINTR` for the read, whether the worker is already waiting in it or reaches it after
+    // the close) and cancels the queued Nop (`ECANCELED`). Closing before the worker has
+    // taken the chain would cancel it whole instead, which is also by design but would leave
+    // the interruption untested.
+    let [started_rd, started_wr] = pipe()?;
+    set_nonblocking(started_rd, true)?;
+    let mark = [0x5a_u8; 1];
     let mut buf = [0u8; 16];
     ring.submit(&[
-        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 2).run_async(),
-        Sqe::nop(3).run_async(),
+        Sqe::write(
+            started_wr as u32,
+            CURRENT_POSITION,
+            mark.as_ptr() as u64,
+            1,
+            2,
+        )
+        .linked()
+        .run_async(),
+        Sqe::read(rd as u32, CURRENT_POSITION, buf.as_mut_ptr() as u64, 16, 3),
+        Sqe::nop(4).run_async(),
     ])?;
-    expect("Enter of a blocked read and a Nop", 2, ring.enter(2))?;
-    // Closing the ring's descriptor (the mapping stays) interrupts the read and cancels the
-    // Nop; it must not wait for the pipe. The worker posts both, so it saw the close whether
-    // it was already blocked in the read or not yet.
+    expect("Enter of a blocked chain and a Nop", 3, ring.enter(3))?;
+    wait_started(started_rd)?;
     let Ring {
         fd, map, mut cq, ..
     } = ring;
     drop(fd);
     let start = Instant::now();
     let mut cqes = Vec::new();
-    while cqes.len() < 2 && start.elapsed() < CLOSE_WAIT {
+    while cqes.len() < 3 && start.elapsed() < CLOSE_WAIT {
         match cq.pop(map.words()) {
             Ok(Some(cqe)) => cqes.push(cqe),
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
@@ -1124,10 +1159,12 @@ fn async_close() -> Result<(), Failure> {
         }
     }
     check_cqes(
-        "the closed ring's cancelled jobs",
+        "the closed ring's interrupted and cancelled jobs",
         &cqes,
-        &[(2, neg(EINTR)), (3, neg(ECANCELED))],
+        &[(2, 1), (3, neg(EINTR)), (4, neg(ECANCELED))],
     )?;
+    close_fd(started_rd);
+    close_fd(started_wr);
     drop(map);
     let mut other = Ring::new(8, 16)?;
     let cqes = other.run(&[Sqe::nop(4)])?;
