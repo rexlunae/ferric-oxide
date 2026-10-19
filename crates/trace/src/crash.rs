@@ -188,9 +188,19 @@ pub struct MapArea {
     pub start: usize,
     /// The physical address after the last byte.
     pub end: usize,
-    /// Whether the area is free RAM; every other kind (reserved, ACPI, device memory, the
-    /// kernel, the boot loader's data) is not.
-    pub free: bool,
+    /// Whether the crash region may use the area.
+    pub availability: Availability,
+}
+
+/// Whether a [`MapArea`] is RAM the crash region may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Availability {
+    /// Free RAM.
+    Free,
+    /// Anything else: reserved memory, ACPI tables, device memory, the kernel, the boot
+    /// loader's data.
+    Unavailable,
 }
 
 /// Whether the region `start..end` can hold a crash dump: it is not empty, lies wholly inside
@@ -200,20 +210,24 @@ pub struct MapArea {
 /// # Examples
 ///
 /// ```
-/// use ferric_trace::crash::{MapArea, region_is_free};
+/// use ferric_trace::crash::{Availability, MapArea, region_is_free};
 ///
-/// let ram = MapArea { start: 0, end: 0x1000_0000, free: true };
-/// let acpi = MapArea { start: 0x400_8000, end: 0x400_9000, free: false };
+/// let ram = MapArea { start: 0, end: 0x1000_0000, availability: Availability::Free };
+/// let acpi = MapArea {
+///     start: 0x400_8000,
+///     end: 0x400_9000,
+///     availability: Availability::Unavailable,
+/// };
 /// assert!(region_is_free(0x400_0000, 0x401_0000, [ram]));
 /// assert!(!region_is_free(0x400_0000, 0x401_0000, [ram, acpi]));
 /// ```
 pub fn region_is_free(start: usize, end: usize, map: impl IntoIterator<Item = MapArea>) -> bool {
     let mut covered = false;
     for area in map {
-        if area.free {
-            covered |= area.start <= start && end <= area.end;
-        } else if area.start < end && start < area.end {
-            return false;
+        match area.availability {
+            Availability::Free => covered |= area.start <= start && end <= area.end,
+            Availability::Unavailable if area.start < end && start < area.end => return false,
+            Availability::Unavailable => {}
         }
     }
     start < end && covered
@@ -486,12 +500,12 @@ mod tests {
         let free = |start, end| MapArea {
             start,
             end,
-            free: true,
+            availability: Availability::Free,
         };
         let taken = |start, end| MapArea {
             start,
             end,
-            free: false,
+            availability: Availability::Unavailable,
         };
         let (start, end) = (0x4000, 0x8000);
         assert!(region_is_free(start, end, [free(0, 0x10000)]));

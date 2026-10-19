@@ -670,7 +670,11 @@ pub unsafe fn init(
                 .map(|entry| ferric_trace::crash::MapArea {
                     start: entry.start,
                     end: entry.end,
-                    free: entry.kind == BootloaderMemoryKind::Free,
+                    availability: if entry.kind == BootloaderMemoryKind::Free {
+                        ferric_trace::crash::Availability::Free
+                    } else {
+                        ferric_trace::crash::Availability::Unavailable
+                    },
                 });
             ferric_trace::crash::region_is_free(start, end, map)
         });
