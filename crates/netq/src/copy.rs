@@ -240,8 +240,11 @@ impl CopyQueue {
     /// Sends up to `budget` packets from the TX ring, calling `send` with each frame's bytes,
     /// and hands each frame back on Completion. It takes a TX entry only when Completion has
     /// room for its frame, so no frame is lost; an entry that is not a valid packet is dropped
-    /// and counted. When TX runs empty it sets `NEED_WAKEUP` on it, so the application kicks
-    /// for the next packets. Returns the packets `send` took.
+    /// and counted. The driver sends only when kicked, so whenever it stops it leaves
+    /// `NEED_WAKEUP` set on TX: when TX ran empty, so the application kicks for the next
+    /// packets, and also when it stopped with entries left (the budget was used up, or
+    /// Completion was full until the application reaps it), so they are not left waiting for
+    /// a kick that never comes. A call clears the flag first. Returns the packets `send` took.
     ///
     /// `send` returns whether the NIC took the frame; a frame it refused still goes back on
     /// Completion, unsent.
@@ -257,8 +260,10 @@ impl CopyQueue {
     ) -> Result<usize, RingError> {
         let mut sent = 0;
         let mut buf = [0u8; MAX_FRAME_BYTES];
+        self.rings.tx.woken(mem.rings)?;
         for _ in 0..budget {
             if self.rings.completion.free(mem.rings)? == 0 {
+                self.rings.tx.request_wakeup(mem.rings)?;
                 return Ok(sent);
             }
             let Some(slot) = self.next_tx(mem)? else {
@@ -284,6 +289,9 @@ impl CopyQueue {
                 return Err(err);
             }
         }
+        // The budget is used up: ask for a kick, whether entries are left or not, so none
+        // waits for a kick the application would not send.
+        self.rings.tx.request_wakeup(mem.rings)?;
         Ok(sent)
     }
 
@@ -299,6 +307,64 @@ impl CopyQueue {
             }
         }
     }
+}
+
+/// A socket a driver offers received frames to, in [`offer`]: in practice a bound
+/// [`CopyQueue`] with its shared memory.
+pub trait Receiver {
+    /// Whether the socket takes frames now. A socket stopped earlier in the same pass (its
+    /// rings turned out corrupt) must answer `false`, so it gets none of the later frames.
+    fn active(&self) -> bool;
+    /// Whether the socket's filters match `headers` ([`CopyQueue::wants`]).
+    fn wants(&self, headers: &Headers) -> bool;
+    /// Delivers `frame` ([`CopyQueue::receive`]): what became of it, or `None` when a ring
+    /// error stopped the socket.
+    fn deliver(&mut self, frame: &[u8]) -> Option<Received>;
+}
+
+/// Where [`offer`] put a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offered {
+    /// No active socket wants it (or it does not parse): it is netstack's.
+    Unclaimed,
+    /// The socket at `index` wanted it, and [`Receiver::deliver`] said what became of it.
+    /// Only [`Received::Delivered`] put anything on RX, so only that is worth a wakeup.
+    Taken {
+        /// The socket's index in the slice.
+        index: usize,
+        /// What the delivery did, or `None` when it stopped the socket.
+        received: Option<Received>,
+    },
+}
+
+impl Offered {
+    /// The index of the socket to wake: one that got the frame on its RX ring.
+    pub const fn woken(self) -> Option<usize> {
+        match self {
+            Self::Taken {
+                index,
+                received: Some(Received::Delivered),
+            } => Some(index),
+            _ => None,
+        }
+    }
+}
+
+/// Gives `frame` to the first active socket of `sockets` whose filters match it.
+pub fn offer<R: Receiver>(sockets: &mut [R], frame: &[u8]) -> Offered {
+    let Ok(headers) = Headers::parse(frame) else {
+        return Offered::Unclaimed;
+    };
+    let Some(index) = sockets
+        .iter()
+        .position(|socket| socket.active() && socket.wants(&headers))
+    else {
+        return Offered::Unclaimed;
+    };
+    let received = sockets
+        .get_mut(index)
+        .and_then(|socket| socket.deliver(frame));
+    Offered::Taken { index, received }
 }
 
 /// Copies `bytes` into `frame` of the UMEM `words`, with atomic word stores. The tail of the
@@ -611,6 +677,9 @@ mod tests {
             umem: &t.umem,
         };
         assert_eq!(t.queue.transmit(mem, 3, |_| true), Ok(3));
+        // The budget ran out with entries left: the driver still asks to be kicked, or they
+        // would wait for good.
+        assert!(t.app.tx.needs_wakeup(&t.rings[..]).expect("valid"));
         // A refused frame still comes back, unsent.
         assert_eq!(t.queue.transmit(mem, 1, |_| false), Ok(0));
         assert_eq!(t.queue.transmit(mem, 16, |_| true), Ok(4));
@@ -624,6 +693,109 @@ mod tests {
         assert_eq!(t.queue.transmit(mem, 16, |_| true), Ok(0));
         assert_eq!(t.app.tx.free(&t.rings[..]).expect("valid"), 7);
         assert_eq!(t.queue.stats().tx_packets, 7);
+        // It stopped with an entry left: the application is asked to kick again, and once it
+        // reaps Completion the next kick sends the entry.
+        assert!(t.app.tx.needs_wakeup(&t.rings[..]).expect("valid"));
+        while t.app.completion.pop(&t.rings[..]).expect("valid").is_some() {}
+        assert_eq!(t.queue.transmit(mem, 16, |_| true), Ok(1));
+        assert_eq!(t.queue.stats().tx_packets, 8);
+        assert!(t.app.tx.needs_wakeup(&t.rings[..]).expect("valid"));
+    }
+
+    /// A socket for [`offer`]: wants one port, and stops on the frame `stop_on`.
+    struct FakeSocket {
+        port: u16,
+        stopped: bool,
+        full: bool,
+        stop_on: Option<usize>,
+        got: Vec<u16>,
+        seen: usize,
+    }
+
+    impl FakeSocket {
+        fn new(port: u16) -> Self {
+            Self {
+                port,
+                stopped: false,
+                full: false,
+                stop_on: None,
+                got: Vec::new(),
+                seen: 0,
+            }
+        }
+    }
+
+    impl Receiver for FakeSocket {
+        fn active(&self) -> bool {
+            !self.stopped
+        }
+        fn wants(&self, headers: &Headers) -> bool {
+            port_filter(self.port).matches(headers)
+        }
+        fn deliver(&mut self, _frame: &[u8]) -> Option<Received> {
+            self.seen += 1;
+            if self.stop_on == Some(self.seen) {
+                self.stopped = true;
+                return None;
+            }
+            if self.full {
+                return Some(Received::FillEmpty);
+            }
+            self.got.push(self.port);
+            Some(Received::Delivered)
+        }
+    }
+
+    #[test]
+    fn offer_skips_a_socket_stopped_earlier_in_the_pass() {
+        // Two sockets want port 7; the first stops on its second frame.
+        let mut first = FakeSocket::new(7);
+        first.stop_on = Some(2);
+        let mut sockets = [first, FakeSocket::new(7), FakeSocket::new(9)];
+        let frames = [
+            udp_frame(7),
+            udp_frame(7),
+            udp_frame(7),
+            udp_frame(9),
+            udp_frame(8),
+        ];
+        let offered: Vec<Offered> = frames
+            .iter()
+            .map(|frame| offer(&mut sockets, frame))
+            .collect();
+        assert_eq!(offered[0].woken(), Some(0));
+        // The frame that stopped socket 0 woke nobody.
+        assert_eq!(
+            offered[1],
+            Offered::Taken {
+                index: 0,
+                received: None
+            }
+        );
+        assert_eq!(offered[1].woken(), None);
+        // Later frames of the same pass go past the stopped socket.
+        assert_eq!(offered[2].woken(), Some(1));
+        assert_eq!(offered[3].woken(), Some(2));
+        assert_eq!(offered[4], Offered::Unclaimed);
+        assert_eq!(sockets[0].seen, 2);
+        assert_eq!(sockets[1].got, [7]);
+        assert_eq!(offer(&mut sockets, b"not a frame"), Offered::Unclaimed);
+    }
+
+    #[test]
+    fn a_dropped_frame_wakes_nobody() {
+        let mut socket = FakeSocket::new(7);
+        socket.full = true;
+        let mut sockets = [socket];
+        let offered = offer(&mut sockets, &udp_frame(7));
+        assert_eq!(
+            offered,
+            Offered::Taken {
+                index: 0,
+                received: Some(Received::FillEmpty)
+            }
+        );
+        assert_eq!(offered.woken(), None);
     }
 
     #[test]
