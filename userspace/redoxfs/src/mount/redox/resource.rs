@@ -442,6 +442,13 @@ impl FileMmapInfo {
         }
     }
 
+    /// Ferric Oxide: marks every cached range out of date, so the next `fmap` of it reads the
+    /// file again and reads stop using the cache. Called when an idle node is opened: its id
+    /// may now name a different file, as RedoxFS reuses the blocks of deleted nodes.
+    pub fn invalidate(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
     pub fn in_use(&self) -> bool {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
     }
@@ -663,6 +670,10 @@ impl<D: Disk> Resource<D> for FileResource {
         for (range, v_opt) in affected_fmaps {
             //dbg!(&range);
             let range_size = range.end - range.start;
+            // Ferric Oxide: an unmapped range kept from an older version of the file (written
+            // since, or a deleted file whose node id was reused) is read again, not handed out
+            // with the old contents.
+            let v_opt = v_opt.filter(|fmap| fmap.rc > 0 || fmap.version == fmap_info.version);
             if let Some(mut fmap) = v_opt {
                 fmap.rc += 1;
                 fmap.flags |= flags;
