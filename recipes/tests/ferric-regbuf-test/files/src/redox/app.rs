@@ -52,8 +52,8 @@ enum Failure {
     Payload(ferric_regbuf::abi::BytesError),
     /// Pages the scheme only borrows reached this process through it: the re-share gap.
     Reshared { what: &'static str },
-    /// The probe child of `regbuf-revoke-prot` ended other than by `SIGSEGV` on the
-    /// `PROT_NONE` page (`status` as `waitpid` gave it).
+    /// A probe child of `regbuf-revoke-prot` ended other than the step expects: by `SIGSEGV`
+    /// on a `PROT_NONE` page, or a clean exit (`status` as `waitpid` gave it).
     Probe { status: c_int },
 }
 
@@ -76,8 +76,7 @@ impl fmt::Display for Failure {
             Self::Reshared { what } => write!(f, "{what}: borrowed pages were shared onward"),
             Self::Probe { status } => write!(
                 f,
-                "the protection probe ended with wait status {status:#x}, not SIGSEGV on its \
-                 PROT_NONE page"
+                "a protection probe ended with wait status {status:#x}, not as expected"
             ),
         }
     }
@@ -943,8 +942,16 @@ const PROBE_RAN: u8 = 2;
 /// A revoke keeps each holder mapping's protection: the zeroed replacement of an executable
 /// mapping still runs code written there, and that of a `PROT_NONE` mapping still faults
 /// (rather than turning into readable zeros). A forked probe holds both mappings, so the fault
-/// ends only the probe.
+/// ends only the probe. The `PROT_NONE` half needs a kernel that enforces `PROT_NONE`
+/// (`kernel.prot_none`); on one that maps it readable, as upstream does, it is skipped.
 fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
+    let check_none = prot_none_enforced()?;
+    if !check_none {
+        println!(
+            "FERRIC_TEST_SKIP regbuf-revoke-prot-none: PROT_NONE memory is readable on this \
+             kernel (kernel.prot_none is off)"
+        );
+    }
     // Shared, so the fork below leaves the registered pages shared rather than copy-on-write,
     // which a grant mapping cannot take.
     let buffer = Buffer::shared()?;
@@ -968,6 +975,7 @@ fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
             none_fd.raw() as c_int,
             to_parent[1],
             to_child[0],
+            check_none,
         );
         // SAFETY: ends the child at once, as `fork` requires.
         unsafe { libc::_exit(code) }
@@ -1006,7 +1014,12 @@ fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
             what: "code in the zeroed replacement of an executable mapping",
         });
     }
-    if !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV) {
+    let ended_right = if check_none {
+        killed_by_sigsegv(status)
+    } else {
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    };
+    if !ended_right {
         return Err(Failure::Probe { status });
     }
     drop((exec_fd, none_fd));
@@ -1016,9 +1029,10 @@ fn revoke_prot(t: &mut Test) -> Result<(), Failure> {
 
 /// The probe child of [`revoke_prot`]: maps the `exec` grant readable, writable and
 /// executable and the `none` grant `PROT_NONE`, reports, waits for the revoke, then runs a
-/// `ret` written in the first and reads the second, which must kill it with `SIGSEGV`. The
-/// exit code says where it stopped otherwise.
-fn prot_probe(exec: c_int, none: c_int, report: c_int, wait: c_int) -> c_int {
+/// `ret` written in the first and, with `check_none`, reads the second, which must kill it with
+/// `SIGSEGV`. Without `check_none` it exits 0 after the `ret`; otherwise the exit code says
+/// where it stopped.
+fn prot_probe(exec: c_int, none: c_int, report: c_int, wait: c_int, check_none: bool) -> c_int {
     // SAFETY: fresh shared mappings of the grants at addresses the kernel chooses.
     let (code, guard) = unsafe {
         (
@@ -1054,6 +1068,9 @@ fn prot_probe(exec: c_int, none: c_int, report: c_int, wait: c_int) -> c_int {
     let ret: extern "C" fn() = unsafe { core::mem::transmute(code) };
     ret();
     write_byte(report, PROBE_RAN);
+    if !check_none {
+        return 0;
+    }
     // SAFETY: deliberately touches the PROT_NONE page; the fault ends this child, which is
     // what the parent checks.
     unsafe { core::ptr::read_volatile(guard.cast::<u8>()) };
@@ -1084,4 +1101,59 @@ fn read_byte(fd: c_int) -> Option<u8> {
 fn write_byte(fd: c_int, byte: u8) {
     // SAFETY: writes one byte from a local.
     unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+}
+
+/// Whether a wait status is that of a process `SIGSEGV` killed.
+fn killed_by_sigsegv(status: c_int) -> bool {
+    libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV
+}
+
+/// Whether this kernel makes `PROT_NONE` memory inaccessible (`kernel.prot_none`): a forked
+/// child reads an anonymous `PROT_NONE` page, and dies of `SIGSEGV` only if it does.
+///
+/// # Errors
+///
+/// [`Failure::Errno`] when the fork fails, [`Failure::Probe`] when the child ends any other
+/// way than by `SIGSEGV` or a clean exit.
+fn prot_none_enforced() -> Result<bool, Failure> {
+    // SAFETY: the program is single-threaded here; the child only maps and reads a page of its
+    // own and leaves with `_exit`.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(Failure::Errno {
+            what: "fork the PROT_NONE check",
+            errno: super::last_errno(),
+        });
+    }
+    if child == 0 {
+        // SAFETY: a fresh anonymous mapping at an address the kernel chooses.
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            // SAFETY: ends the child at once, as `fork` requires.
+            unsafe { libc::_exit(2) }
+        }
+        // SAFETY: deliberately reads the PROT_NONE page; enforced, the fault ends this child.
+        unsafe { core::ptr::read_volatile(page.cast::<u8>()) };
+        // SAFETY: ends the child at once, as `fork` requires.
+        unsafe { libc::_exit(0) }
+    }
+    let mut status = 0;
+    // SAFETY: `status` is a live integer for the call to fill in.
+    unsafe { libc::waitpid(child, &mut status, 0) };
+    if killed_by_sigsegv(status) {
+        Ok(true)
+    } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        Ok(false)
+    } else {
+        Err(Failure::Probe { status })
+    }
 }

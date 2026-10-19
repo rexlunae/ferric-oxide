@@ -50,7 +50,8 @@
 //! - `regbuf-revoke-prot`: a revoke keeps each mapping's protection. A forked probe maps one
 //!   grant readable, writable and executable and another `PROT_NONE`; after the revoke, a
 //!   `ret` it writes in the first still runs, and reading the second still kills it with
-//!   `SIGSEGV`.
+//!   `SIGSEGV`. That half needs `kernel.prot_none`; on a kernel that maps `PROT_NONE`
+//!   readable it prints `FERRIC_TEST_SKIP regbuf-revoke-prot-none` and checks only the first.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.regbuf` scheme (a kernel built
