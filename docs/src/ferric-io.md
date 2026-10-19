@@ -143,8 +143,61 @@ Drivers give MSI-X table entries to CPUs through `pcid_interface`:
 Without `irq:cpus` these calls put every vector on the BSP, like upstream's
 `Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
 `percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
-logical id. `nvmed` uses them for its per-CPU queue pairs (below); IRQ
-steering is a later step of roadmap Phase 2.4.
+logical id. `nvmed` uses them for its per-CPU queue pairs (below), and
+root can steer a vector to another CPU; progress on roadmap Phase 2.4 is in the
+status table in `ROADMAP.md`.
+
+### Steering a vector to another CPU
+
+Root moves a reserved vector to another CPU with a `SYS_CALL` on its `irq:`
+handle: `ferric_irq::call::Call::Move { cpu }` (metadata `[1, cpu]`). The
+kernel:
+
+1. reserves a free vector (48 or above, not 0x80) on the target CPU;
+2. with interrupt remapping (VT-d), rewrites every remapping entry that
+   delivered the old vector to the old CPU: one 64-bit store of the entry's
+   low half (vector and destination; the source-id check in the high half is
+   untouched), then an interrupt entry cache invalidation for each entry;
+3. re-keys every handle of the old (CPU, vector) to the new one, so the
+   caller keeps its descriptor, and gives the old vector back;
+4. reports one interrupt pending on the moved handles, so one that arrived
+   on the old vector during the move is not lost (it may be one spurious
+   wakeup).
+
+A vector given back this way (or by closing its handle) can be reserved again.
+The new reservation starts with the count read just before it was made
+acknowledged, so it does not report the interrupts the previous owner
+received but does report one that arrives right after. Reserving, moving and
+giving back vectors take one lock, so two moves of the same vector run one
+after the other (the second from where the first left it), and the owner's
+close waits for a move in progress. A remapping unit has to be able to name
+the target CPU's APIC only if it holds an entry to move; that is checked for
+every unit before any entry changes.
+
+The call returns `ferric_irq::call::Moved`: the new IRQ number and how many
+remapping entries moved. When none moved, the device's interrupts are not
+remapped and its MSI or MSI-X message names the CPU and vector itself, so
+the driver must program the message for the new vector.
+`pcid_interface::irq_helpers::Msix::retarget(index, cpu)` does all of this for
+one MSI-X table entry (`percpu::move_vector` is the bare call). It goes by the
+entry's own message rather than by the count, which can include other
+devices' entries for the same vector: a remappable-format message is left to
+the kernel, and a compatibility-format one is masked before the move (so the
+device holds an interrupt pending instead of sending it to the vector given
+back), reprogrammed, and restored to its earlier mask state. A handle
+opened with `O_STAT`, which reserves nothing, can move a vector only when
+remapping entries carry it. Errors: `EINVAL` (a legacy IRQ, an unreserved
+vector, or the same CPU), `ENOENT` (no such CPU), `EEXIST` (no free vector on
+the target), `EOPNOTSUPP` (an `O_STAT` handle without remapping, or a kernel
+without `kernel.irq_percpu`) and `EIO` (an invalidation failed).
+
+pcid remembers the remapping entry it made for each (CPU, vector) a driver
+asked for, to hand it out again. Before it does, it asks the kernel where the
+entry delivers now (`IrteTarget` on its IOMMU capability), and makes a new
+entry when root steered the old one elsewhere. Policy, such as balancing
+vectors across CPUs, is left to user space. `ferric-iommu-test` checks
+steering with `iommu-msi-steer`, which moves edu's vector while the device
+fires.
 
 ### Per-CPU NVMe queue pairs
 

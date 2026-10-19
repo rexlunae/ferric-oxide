@@ -126,6 +126,31 @@ impl RemapTable {
             clflush(self.phys.saturating_add(offset), 16);
         }
     }
+
+    /// Ferric Oxide: entry `index`'s two words, low first (not-present past the table).
+    fn read(&mut self, index: u16) -> [u64; 2] {
+        let at = usize::from(index).saturating_mul(2);
+        match self.words().get(at..at.saturating_add(2)) {
+            Some(&[low, high]) => [low, high],
+            _ => Irte::NOT_PRESENT,
+        }
+    }
+
+    /// Ferric Oxide: replaces entry `index`'s low word in one 64-bit store, so the unit sees
+    /// either the old entry or the new one, never a mix or a not-present entry. For a change
+    /// that leaves the high word (the source check) as it is ([`Irte::retarget_low`]).
+    fn write_low(&mut self, index: u16, lo: u64) {
+        let at = usize::from(index).saturating_mul(2);
+        if let Some(low) = self.words().get_mut(at) {
+            // An aligned `u64` store is one 64-bit write on x86_64, as `write` relies on too.
+            *low = lo;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        if !self.coherent {
+            let offset = u64::from(index).saturating_mul(16);
+            clflush(self.phys.saturating_add(offset), 16);
+        }
+    }
 }
 
 /// Why interrupt remapping could not be set up, or an entry could not be made or freed.
@@ -413,6 +438,142 @@ pub fn free(id: u32) -> Result<(), IrqError> {
         table.entries.free(entry).map_err(IrqError::NotAllocated)?;
     }
     Ok(())
+}
+
+/// More entries than this moved on one unit are invalidated with one global interrupt entry
+/// cache invalidation rather than one per entry.
+const MOVE_INDEX_INVALIDATIONS: usize = 8;
+
+/// Ferric Oxide (steering, roadmap Phase 2.4 PR 3): rewrites every interrupt remapping entry
+/// that delivers `from_vector` to logical CPU `from_cpu` so it delivers `to_vector` to `to_cpu`,
+/// invalidates the units' cached copies, and returns how many entries moved (0 when no unit
+/// remaps the vector, for example because its device sends compatibility-format messages).
+///
+/// Each entry changes in one 64-bit write of its low word ([`Irte::retarget_low`]), so the
+/// device keeps its message and its source check, and an interrupt is delivered either the old
+/// way or the new way. The caller must have reserved `to_vector` on `to_cpu` and must keep
+/// `from_vector` reserved on `from_cpu` until this returns, since requests the unit already
+/// took the old way can still arrive there.
+///
+/// # Errors
+///
+/// [`IrqError::Vector`] when `to_vector` is the kernel's on `to_cpu`, [`IrqError::NoCpu`] for
+/// a CPU that is not running, [`IrqError::Destination`] when a unit with entries cannot name
+/// `to_cpu`'s APIC (nothing is changed then), and [`IrqError::Hardware`] when an invalidation
+/// fails (the entries are rewritten, but a unit may still use cached copies of them).
+pub fn move_vector(
+    from_cpu: u32,
+    from_vector: u8,
+    to_cpu: u32,
+    to_vector: u8,
+) -> Result<u32, IrqError> {
+    if kernel_vector(to_vector, to_cpu) {
+        return Err(IrqError::Vector { vector: to_vector });
+    }
+    let from = (apic_id(from_cpu)?, from_vector);
+    let to_apic = apic_id(to_cpu)?;
+    // Every unit's lock is held from the check to the last write, in `units()` order (nothing
+    // else holds two at once), so no entry can be allocated or freed in between: a move either
+    // changes nothing or rewrites every matching entry.
+    let mut states: Vec<_> = units()
+        .iter()
+        .map(|unit| (unit, unit.state.lock()))
+        .collect();
+    // Every unit with an entry to move must be able to name the new destination before any
+    // entry changes; a unit without one (in xAPIC format, say) does not matter.
+    for (_, state) in &mut states {
+        if let Some(table) = state.interrupts.as_mut()
+            && Destination::for_apic(to_apic, table.extended).is_none()
+            && holds(table, from)
+        {
+            return Err(IrqError::Destination { apic_id: to_apic });
+        }
+    }
+    let mut moved: u32 = 0;
+    let mut result: Result<(), IrqError> = Ok(());
+    for (unit, state) in &mut states {
+        let Some(table) = state.interrupts.as_mut() else {
+            continue;
+        };
+        let Some(destination) = Destination::for_apic(to_apic, table.extended) else {
+            // The check above found nothing to move here, and the lock keeps it so.
+            continue;
+        };
+        let used: Vec<u16> = table.entries.used().collect();
+        let mut requests = Vec::new();
+        for index in used {
+            let words = table.read(index);
+            if let Some(lo) =
+                Irte::retarget_low(words, table.extended, from, to_vector, destination)
+            {
+                table.write_low(index, lo);
+                requests.push(Request::IecIndex {
+                    index,
+                    index_mask: 0,
+                });
+            }
+        }
+        if requests.is_empty() {
+            continue;
+        }
+        moved = moved.saturating_add(u32::try_from(requests.len()).unwrap_or(u32::MAX));
+        if requests.len() > MOVE_INDEX_INVALIDATIONS {
+            requests = alloc::vec![Request::IecGlobal];
+        }
+        // Keep going on a failure, so every unit's entries agree on where the vector is.
+        if let Err(err) = unit.invalidate(state, &requests) {
+            result = Err(IrqError::Hardware(err));
+        }
+    }
+    drop(states);
+    result?;
+    if moved != 0 {
+        info!(
+            "IOMMU: {moved} interrupt remapping entr{} moved from vector {from_vector:#x} on CPU {from_cpu} to vector {to_vector:#x} on CPU {to_cpu} (APIC {to_apic})",
+            if moved == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(moved)
+}
+
+/// Whether any entry in use in `table` delivers `from.1` to physical APIC `from.0`.
+fn holds(table: &mut RemapTable, from: (u32, u8)) -> bool {
+    let used: Vec<u16> = table.entries.used().collect();
+    used.into_iter()
+        .any(|index| Irte::delivers(table.read(index), table.extended, from))
+}
+
+/// Ferric Oxide: the logical CPU and vector the entry [`alloc_msi`] returned as `id` delivers to
+/// now, which [`move_vector`] may have changed.
+///
+/// # Errors
+///
+/// [`IrqError::BadId`] or [`IrqError::NotAllocated`] when `id` names no entry in use, and
+/// [`IrqError::NoCpu`] when its destination is no running CPU's APIC (it delivers in a way
+/// [`alloc_msi`] does not make, such as to a logical destination).
+pub fn target(id: u32) -> Result<(u32, u8), IrqError> {
+    let unit = units()
+        .get(usize::try_from(id >> 16).map_err(|_| IrqError::BadId { id })?)
+        .ok_or(IrqError::BadId { id })?;
+    let entry = (id & 0xffff) as u16;
+    let mut state = unit.state.lock();
+    let table = state.interrupts.as_mut().ok_or(IrqError::BadId { id })?;
+    if !table.entries.is_used(entry) {
+        return Err(IrqError::NotAllocated(IrteFreeError { index: entry }));
+    }
+    let words = table.read(entry);
+    let irte = Irte::decode(words, table.extended)
+        .ok()
+        .flatten()
+        .filter(|irte| !irte.logical)
+        .ok_or(IrqError::BadId { id })?;
+    drop(state);
+    let apic = irte.destination.apic_id();
+    let cpu = crate::percpu::all_percpu_blocks()
+        .find(|block| block.misc_arch_info.apic_id_opt.get().map(|a| a.get()) == Some(apic))
+        .map(|block| block.cpu_id.get())
+        .ok_or(IrqError::NoCpu { cpu: apic })?;
+    Ok((cpu, irte.vector))
 }
 
 /// How many entries are in use on all units.

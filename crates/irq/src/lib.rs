@@ -20,6 +20,9 @@
 //! - [`affinity::AffinityMask`], the CPU mask of a thread's `sched-affinity` handle, with which
 //!   a driver pins the thread that serves a queue to the CPU its vector interrupts.
 //!
+//! - [`call`], the `SYS_CALL`s on an `irq:` handle: [`call::Call::Move`] steers a vector to
+//!   another CPU.
+//!
 //! The crate is `no_std`, has no unsafe code and no dependencies, and is tested on the host.
 //!
 //! # Examples
@@ -47,6 +50,7 @@
 extern crate std;
 
 pub mod affinity;
+pub mod call;
 
 use core::{
     fmt,
