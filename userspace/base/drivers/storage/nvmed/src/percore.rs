@@ -141,20 +141,15 @@ impl Dispatcher {
         perf.2 += 1;
         if perf.2 % 512 == 0 {
             let names = ["disp-pick", "pick-done", "done-drain", "drain-ready"];
-            let mut line = format!(
-                "nvmed: PERF n={} inflight_avg={:.2}",
-                perf.2,
-                perf.1 as f64 / 512.0
-            );
+            log::info!("nvmed: PERF n={} in={:.2}", perf.2, perf.1 as f64 / 512.0);
             for (name, stat) in names.iter().zip(perf.0.iter()) {
-                line.push_str(&format!(
-                    " {name}={}/{}/{}",
+                log::info!(
+                    "nvmed: PS {name} {} {} {}",
                     stat[1] / stat[0].max(1),
                     stat[2],
                     stat[3]
-                ));
+                );
             }
-            log::info!("{line}");
             perf.0 = [[0; 4]; 4];
             perf.1 = 0;
         }

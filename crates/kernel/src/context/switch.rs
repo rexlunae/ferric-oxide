@@ -506,7 +506,12 @@ fn schedule(
         ArcContextLockWriteGuard::rwlock(&prev_context_guard),
         &percpu.switch_internals.idle_context(),
     );
-    crate::context::wakelat::picked(&mut next_sched_context, prev_is_idle, schedule_time);
+    crate::context::wakelat::picked(
+        &mut next_sched_context,
+        &prev_context_guard,
+        prev_is_idle,
+        schedule_time,
+    );
 
     *percpu.switch_internals.sched_ctxt.borrow_mut() = Some(Arc::clone(
         ArcContextLockWriteGuard::rwlock(&next_sched_context),

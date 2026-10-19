@@ -14,6 +14,8 @@ static COUNT: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static SUM: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static MAX: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static OVER_1M: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
+static TSC_PER_US: AtomicU64 = AtomicU64::new(2500);
+static SLOW_PRINTED: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static LAST_TSC: AtomicU64 = AtomicU64::new(0);
 static LAST_NS: AtomicU64 = AtomicU64::new(0);
@@ -28,7 +30,7 @@ pub fn set_in_tick(on: bool) {
     IN_TICK[crate::cpu_id().get() as usize % CPUS].store(on, Relaxed);
 }
 
-pub fn picked(next: &mut Context, prev_is_idle: bool, now_ns: u128) {
+pub fn picked(next: &mut Context, prev: &Context, prev_is_idle: bool, now_ns: u128) {
     let woke = core::mem::replace(&mut next.wake_tsc, 0);
     if woke == 0 || !next.userspace {
         return;
@@ -47,34 +49,42 @@ pub fn picked(next: &mut Context, prev_is_idle: bool, now_ns: u128) {
     SUM[bin].fetch_add(lat, Relaxed);
     MAX[bin].fetch_max(lat, Relaxed);
     // ~1 ms at the CI hosts' ~2-3 GHz TSC; the summary prints the TSC rate to be exact.
-    if lat > 2_500_000 {
+    if lat > TSC_PER_US.load(Relaxed) * 1000 {
         OVER_1M[bin].fetch_add(1, Relaxed);
+    }
+    if lat > TSC_PER_US.load(Relaxed) * 1000
+        && next.name.contains("nvmed")
+        && SLOW_PRINTED.fetch_add(1, Relaxed) < 400
+    {
+        let per_us = TSC_PER_US.load(Relaxed);
+        println!(
+            "WL slow cpu{} {}us {} r{} prev={}/{} next={}/{}",
+            crate::cpu_id().get(),
+            lat / per_us,
+            NAMES[bin],
+            u8::from(next.wake_remote),
+            prev.name,
+            prev.prio,
+            next.name,
+            next.prio
+        );
     }
     let total = TOTAL.fetch_add(1, Relaxed) + 1;
     if total % 5_000 == 0 {
         let ns = now_ns as u64;
         let dt = now.saturating_sub(LAST_TSC.swap(now, Relaxed));
         let dns = ns.saturating_sub(LAST_NS.swap(ns, Relaxed)).max(1);
-        let mut line = alloc::string::String::new();
-        use core::fmt::Write;
-        let _ = write!(
-            line,
-            "WAKELAT n={total} tsc_per_us={}",
-            dt.saturating_mul(1000) / dns
-        );
+        let per_us = (dt.saturating_mul(1000) / dns).max(1);
+        TSC_PER_US.store(per_us, Relaxed);
+        println!("WAKELAT n={total} tsc_per_us={per_us}");
         for b in 0..BINS {
             let c = COUNT[b].swap(0, Relaxed);
             let s = SUM[b].swap(0, Relaxed);
             let m = MAX[b].swap(0, Relaxed);
             let o = OVER_1M[b].swap(0, Relaxed);
-            let _ = write!(
-                line,
-                " {}={c}/avg{}/max{}/slow{o}",
-                NAMES[b],
-                s / c.max(1),
-                m
-            );
+            if c > 0 {
+                println!("WL {} {c} {} {} {o}", NAMES[b], s / c / per_us, m / per_us);
+            }
         }
-        info!("{line}");
     }
 }

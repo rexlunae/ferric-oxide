@@ -37,10 +37,13 @@ fi
 nvmed_lines="$(grep -aE 'nvmed: ' <<< "$clean" | grep -v 'nvmed: PERF' | head -n 20 || true)"
 # EXPERIMENT (ci/percore-latency): the latency probes from the threaded benchmark on, in
 # notices of under 3.8 KB each.
-probe="$(sed -n '/FERRIC_PHASE threads start/,$p' <<< "$clean" | grep -aoE '(WAKELAT|nvmed: PERF|FERRIC_BENCH nvme-read-4k-t)[^\r]*' | sed -E 's/^FERRIC_BENCH (nvme-read-4k-t[0-9]+).*copy_iops=([0-9]+).*/== \1 iops=\2/' || true)"
+probe="$(sed -n '/FERRIC_PHASE threads start/,/nvme-read-4k-t4/p' <<< "$clean" | grep -aoE '(WAKELAT|WL |nvmed: PERF|nvmed: PS|FERRIC_BENCH nvme-read-4k-t).*' | sed -E 's/\x1b\[[0-9;]*m//g' | sed -E 's/^FERRIC_BENCH (nvme-read-4k-t[0-9]+).*copy_iops=([0-9]+).*/== \1 iops=\2/' || true)"
+slow="$(grep -a '^WL slow' <<< "$probe" | head -n 45 || true)"
+probe="$(grep -av '^WL slow' <<< "$probe" || true)"
+[ -n "$slow" ] && echo "::notice title=probe slow::$(sed ':a;N;$!ba;s/\n/%0A/g' <<< "$slow")"
 chunk=""; n=0
 while IFS= read -r line; do
-    if [ $(( ${#chunk} + ${#line} )) -gt 3700 ] && [ $n -lt 6 ]; then
+    if [ $(( ${#chunk} + ${#line} )) -gt 3700 ] && [ $n -lt 5 ]; then
         echo "::notice title=probe $n::$(sed ':a;N;$!ba;s/\n/%0A/g' <<< "$chunk")"; chunk=""; n=$((n+1))
     fi
     chunk="${chunk:+$chunk
