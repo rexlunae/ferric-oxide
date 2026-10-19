@@ -11,7 +11,7 @@ use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
-    CATALOG, IRQ_ACK, IRQ_DELIVER, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
+    CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
     SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
 use ferric_trace::record::{Records, WORD_BYTES};
@@ -795,105 +795,6 @@ fn check_fault(cpus: &[u32]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// How many rounds of disk writes `trace-irq` tries before it gives up.
-const IRQ_ROUNDS: usize = 40;
-
-/// An interrupt `trace-irq` saw handled: its `irq.deliver`, and the `irq.ack` of the same IRQ,
-/// CPU and count with the CPU whose ring had it.
-struct Handled {
-    deliver: Entry,
-    ack: Entry,
-    ack_cpu: u32,
-}
-
-/// `trace-irq`: with the `irq` events on, writes and syncs a file until some driver's
-/// interrupt has an `irq.deliver` that woke a handle and the `irq.ack` with the same IRQ, CPU
-/// and count. The sync makes RedoxFS write to the disk, whose driver takes an interrupt for
-/// it.
-fn check_irq(cpus: &[u32]) -> Result<(), Failure> {
-    let step = "trace-irq";
-    if !has_event(step, &IRQ_DELIVER)? {
-        return Ok(());
-    }
-    let file_path = "/tmp/ferric-trace-irq";
-    drain(step, cpus)?;
-    command(step, "enable irq")?;
-    let mut seen = Vec::new();
-    let found = irq_rounds(step, cpus, file_path, &mut seen);
-    command(step, "disable irq")?;
-    let _ = std::fs::remove_file(file_path);
-    let deliveries = seen.iter().filter(|(_, e)| e.is(&IRQ_DELIVER)).count();
-    let handled = found?.ok_or_else(|| {
-        check(
-            step,
-            format!("{deliveries} irq.deliver records, none acknowledged by an irq.ack"),
-        )
-    })?;
-    println!(
-        "FERRIC_TEST_PASS trace-irq (irq {} on cpu {} count {}, {deliveries} deliveries; acknowledged on cpu {}, {} TSC cycles later)",
-        handled.deliver.arg(0).unwrap_or(0),
-        handled.deliver.arg(1).unwrap_or(0),
-        handled.deliver.arg(3).unwrap_or(0),
-        handled.ack_cpu,
-        handled
-            .ack
-            .timestamp
-            .saturating_sub(handled.deliver.timestamp),
-    );
-    Ok(())
-}
-
-/// The rounds of [`check_irq`], collecting the `irq` records of every CPU in `seen` until one
-/// interrupt was delivered and acknowledged.
-fn irq_rounds(
-    step: &'static str,
-    cpus: &[u32],
-    file_path: &str,
-    seen: &mut Vec<(u32, Entry)>,
-) -> Result<Option<Handled>, Failure> {
-    let block = vec![0xa5u8; 64 * 1024];
-    for _ in 0..IRQ_ROUNDS {
-        let mut file = File::create(file_path).map_err(io_failure(step, file_path))?;
-        file.write_all(&block)
-            .and_then(|()| file.sync_all())
-            .map_err(io_failure(step, file_path))?;
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        for (cpu, entries) in cpus.iter().zip(drain(step, cpus)?) {
-            seen.extend(
-                entries
-                    .into_iter()
-                    .filter(|e| e.is(&IRQ_DELIVER) || e.is(&IRQ_ACK))
-                    .map(|e| (*cpu, e)),
-            );
-        }
-        if let Some(handled) = acknowledged(seen) {
-            return Ok(Some(handled));
-        }
-    }
-    Ok(None)
-}
-
-/// The first delivery in `seen` that woke a handle and has an acknowledgement of the same IRQ,
-/// CPU and count.
-fn acknowledged(seen: &[(u32, Entry)]) -> Option<Handled> {
-    seen.iter()
-        .filter(|(_, e)| e.is(&IRQ_DELIVER) && e.arg(4).is_some_and(|handles| handles > 0))
-        .find_map(|(_, deliver)| {
-            seen.iter()
-                .find(|(_, ack)| {
-                    ack.is(&IRQ_ACK)
-                        && ack.arg(0) == deliver.arg(0)
-                        && ack.arg(1) == deliver.arg(1)
-                        && ack.arg(2) == deliver.arg(3)
-                })
-                .map(|(cpu, ack)| Handled {
-                    deliver: deliver.clone(),
-                    ack: ack.clone(),
-                    ack_cpu: *cpu,
-                })
-        })
-}
-
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     check_initfs()?;
@@ -1020,7 +921,6 @@ fn run() -> Result<(), Failure> {
     println!("FERRIC_TEST_PASS trace-mmap");
 
     check_fault(&cpus)?;
-    check_irq(&cpus)?;
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 //! Kernel tracing test for Ferric Oxide (`kernel.trace`).
 //!
 //! The image is built with `kernel.trace = true` and `kernel.trace_boot = "sched"`, so the
-//! kernel has the `syscall.*`, `sched.switch`, `scheme.*`, `mm.*` and `irq.*` tracepoints and turned
-//! `sched.switch` on at boot. Through the `kernel.trace` scheme the program checks, in order:
+//! kernel has the `syscall.*`, `sched.switch`, `scheme.*` and `mm.*` tracepoints and turned
+//! `sched.switch` on at boot (`ferric-iommu-test` checks the `irq.*` ones, `trace-irq`). Through the `kernel.trace` scheme the program checks, in order:
 //!
 //! - `trace-initfs`: the events the initfs `lib/trace.toml` leaves on (CI's image turns on
 //!   `scheme.cancel` there, through ferric-config's `kernel.trace_initfs_enable`) are on and
@@ -43,13 +43,10 @@
 //!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
 //!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
 //!   failed`.
-//! - `trace-irq`: with the `irq` events on, it writes and syncs a file, which makes the disk
-//!   driver take an interrupt, until some interrupt has an `irq.deliver` that woke a handle and
-//!   the `irq.ack` with the same IRQ, CPU and count.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
-//! the first failure and exits non-zero. The last two print `FERRIC_TEST_SKIP <name>` on a
-//! kernel without their events. Without a `kernel.trace` scheme (a kernel built without
+//! the first failure and exits non-zero. `trace-fault` prints `FERRIC_TEST_SKIP trace-fault` on a
+//! kernel without `mm.page_fault`. Without a `kernel.trace` scheme (a kernel built without
 //! the `trace` feature) it prints `FERRIC_TEST_SKIP trace` and exits zero.
 
 #[cfg(target_os = "redox")]

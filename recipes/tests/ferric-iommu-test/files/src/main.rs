@@ -68,9 +68,11 @@
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
 //! checks the kernel logged exactly those faults, from this device. With kernel tracing
 //! (`kernel.trace_iommu`) it also turns the `iommu.fault` event on and checks the kernel
-//! recorded those faults ([`trace`], `iommu-trace`). When the program exits the
-//! domain closes and the kernel blocks the device, and pcid frees its interrupt remapping
-//! entries.
+//! recorded those faults ([`trace`], `iommu-trace`). With `kernel.trace_irq` it turns the
+//! `irq` events on around `iommu-msi`'s interrupt, which it acknowledges itself, and checks
+//! the kernel recorded its delivery and the acknowledgement (`trace-irq`). When the program
+//! exits the domain closes and the kernel blocks the device, and pcid frees its interrupt
+//! remapping entries.
 //!
 //! Each test prints `FERRIC_TEST_PASS <name>`, `FERRIC_TEST_FAIL <name>`, or
 //! `FERRIC_TEST_SKIP <name>` when pcid has no domain to give (no IOMMU, or a kernel built with
@@ -877,9 +879,11 @@ fn msi_delivered(setup: &mut Setup) -> Result<Msi, Failure> {
         .ok_or(Failure::NoMsiMessage(vector.vector))?;
     setup.channel.set_msi(message)?;
     setup.channel.enable_msi()?;
+    trace::watch_interrupt();
     setup.edu.raise_interrupt();
     let count = vector.wait(IRQ_WAIT);
     setup.edu.ack_interrupt();
+    trace::interrupt_handled(count.as_ref().is_ok_and(|&count| count != 0));
     if count? == 0 {
         return Err(Failure::NoInterrupt(vector.vector));
     }
@@ -1521,6 +1525,19 @@ fn report_msi(msi: MsiOutcome) -> bool {
     delivered && forged && percpu && steer
 }
 
+/// Prints the result of the tracing step `name`; returns whether it did not fail.
+fn report_trace(name: &str, step: trace::Step) -> bool {
+    match step {
+        trace::Step::Pass(detail) => println!("FERRIC_TEST_PASS {name}: {detail}"),
+        trace::Step::Skip(why) => println!("FERRIC_TEST_SKIP {name}: {why}"),
+        trace::Step::Fail(err) => {
+            println!("FERRIC_TEST_FAIL {name}: {err}");
+            return false;
+        }
+    }
+    true
+}
+
 fn main() -> ExitCode {
     let fds = env_fd("PCID_CLIENT_CHANNEL").and_then(|c| Ok((c, env_fd("INIT_NOTIFY")?)));
     let (channel_fd, notify_fd) = match fds {
@@ -1544,24 +1561,21 @@ fn main() -> ExitCode {
     // Before the notify: the next drivers and the smoke script must find the rings as they
     // would without this program.
     let traced = tracing.and_then(|start| match start {
-        trace::Start::Watching => trace::finish().map(|passed| {
-            passed.ok_or("no IOMMU fault was announced (no domain, no interrupt remapping)")
+        trace::Start::Watching => trace::finish(),
+        trace::Start::Skip(why) => Ok(trace::Report {
+            iommu: trace::Step::Skip(why),
+            irq: trace::Step::Skip(why),
         }),
-        trace::Start::Skip(why) => Ok(Err(why)),
     });
     // pcid-spawner waits for this before it starts the next driver.
     let _ = notify.write_all(&[0]);
     let trace_ok = match traced {
-        Ok(Ok(detail)) => {
-            println!("FERRIC_TEST_PASS iommu-trace: {detail}");
-            true
-        }
-        Ok(Err(why)) => {
-            println!("FERRIC_TEST_SKIP iommu-trace: {why}");
-            true
+        Ok(report) => {
+            report_trace("iommu-trace", report.iommu) & report_trace("trace-irq", report.irq)
         }
         Err(err) => {
             println!("FERRIC_TEST_FAIL iommu-trace: {err}");
+            println!("FERRIC_TEST_FAIL trace-irq: {err}");
             false
         }
     };

@@ -350,10 +350,11 @@ jobs:
           done
           # The page fault and interrupt steps' details: record counts, and the interrupt
           # seen delivered and acknowledged.
-          grep -aE "FERRIC_TEST_PASS trace-(fault|irq) " "$LOG" | tr -d '\r' | while read -r line; do
+          grep -aE "FERRIC_TEST_PASS trace-(fault|irq)[: ]" "$LOG" | tr -d '\r' | while read -r line; do
             echo "::notice::$line"
           done
-          echo "::notice::ferric-trace-test passed all 14 steps"
+          # trace-irq comes from ferric-iommu-test, which acknowledges an interrupt itself.
+          echo "::notice::ferric-trace-test passed all 13 steps, ferric-iommu-test trace-irq"
           # The ferric-trace tool saved a capture of every CPU and decoded it.
           grep -aF "FERRIC_TEST_PASS trace-capture" "$LOG"
           if [ "$CONFIG_NAME" = ferric-smoke ]; then

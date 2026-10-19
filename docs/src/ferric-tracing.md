@@ -433,14 +433,11 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   9. with `mm` on, writes to each page of a fresh anonymous mapping, unmaps
      it and `read`s into it, which fails with `EFAULT`: each page must have a
      `mm.page_fault` from user mode, a write, ending `mapped`, and the read one
-     from the kernel ending `copy failed` (`trace-fault`);
-  10. with `irq` on, writes and syncs a file until a disk interrupt has an
-      `irq.deliver` that woke a handle and the `irq.ack` with the same IRQ,
-      CPU and count (`trace-irq`).
+     from the kernel ending `copy failed` (`trace-fault`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
-  `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP` for the
-  last two steps on a kernel without their events).
+  `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
+  trace-fault` on a kernel without `mm.page_fault`).
 - **IOMMU faults.** `ferric-iommu-test`, which makes QEMU's `edu` device DMA
   where its domain does not allow it, turns `iommu.fault` on before its tests.
   Before each fault it announces it drains the rings, keeping the
@@ -450,7 +447,13 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   `ferric-vtd`; on AMD-Vi an I/O page fault event, decoded with
   `ferric-amdvi`, since QEMU leaves the address out of those. It prints
   `FERRIC_TEST_PASS iommu-trace`, which `check-iommu-log.sh` requires with
-  either IOMMU, and a skip without one. It runs before `pcid-spawner` starts
+  either IOMMU, and a skip without one. It also turns the `irq` events on
+  around the interrupt of `iommu-msi`, which it acknowledges itself as a driver
+  would, and requires an `irq.deliver` that woke a handle and the `irq.ack`
+  with the same IRQ, CPU and count (`FERRIC_TEST_PASS trace-irq`, in every
+  boot mode, since that interrupt needs no IOMMU). No driver of the smoke image
+  serves for this: `nvmed` does not acknowledge its MSI-X interrupts on the
+  handle, and `e1000d` acknowledges only received packets. It runs before `pcid-spawner` starts
   the next driver, so the rings it drains are not yet anyone else's. The smoke script then runs
   `ferric-trace capture` and `ferric-trace text` on the result, and prints
   `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
