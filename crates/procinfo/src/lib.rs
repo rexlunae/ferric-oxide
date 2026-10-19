@@ -2,7 +2,7 @@
 //!
 //! Reading the file (as root) gives one block of lines per context, written by the kernel's
 //! `sys` scheme with this crate's [`fmt::Display`] implementations and read back by tools
-//! with [`Line::parse`] (or [`processes`], with the `alloc` feature). One definition serves
+//! with [`Line::parse`] (or `processes`, with the `alloc` feature). One definition serves
 //! both sides, so the format cannot drift between them.
 //!
 //! ```text
