@@ -96,17 +96,22 @@ tracing features enabled, in two configurations: `kernel.iommu = "never"`
 without `rings`, and `"auto"` with `rings`. Between them they cover the common
 kernel documentation, the optional DMA-grant APIs and the ring scheme, and
 catch links to items that a feature compiles out. After generating and copying
-the desired kernel configuration, reproduce the check from `crates/kernel/`,
-with `FEATURES` set to the matching list:
+the desired kernel configuration for each, run the matching command from
+`crates/kernel/`:
 
 ```sh
-# iommu = "never":
-FEATURES=regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info
-# iommu = "auto":
-FEATURES=regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info
-
+# With kernel.iommu = "never" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
-  cargo doc --locked --no-deps --features "$FEATURES" \
+  cargo doc --locked --no-deps \
+  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --target targets/x86_64-unknown-kernel.json \
+  -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+
+# With kernel.iommu = "auto" generated and copied:
+RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
+  cargo doc --locked --no-deps \
+  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec

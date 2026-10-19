@@ -104,3 +104,42 @@ fn no_wakeup_is_lost() {
         assert!(sleeps <= COUNT / 10);
     });
 }
+
+/// The kernel's `Enter` coordination: a waiter sleeps under a lock while SQEs are in flight
+/// and too few completions are pending ([`wait_done`]), and a submitter that counts a chain
+/// and then fails to consume it takes it out again. The [`Drained`] that `end` returns is
+/// what the submitter wakes the waiter on; without it the waiter would sleep for ever.
+#[test]
+fn a_failed_submission_wakes_a_waiter() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    use ferric_ring::notify::{InFlight, wait_done};
+
+    for _ in 0..1000 {
+        let state = Arc::new((Mutex::new(InFlight::new()), Condvar::new()));
+        state.0.lock().unwrap().start(3);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                let (lock, completed) = &*state;
+                let mut work = lock.lock().unwrap();
+                // One completion wanted, none pending.
+                while !wait_done(0, 1, work.get()) {
+                    work = completed.wait(work).unwrap();
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        thread::yield_now();
+        // The consumption failed: the chain is taken out of the count.
+        let drained = state.0.lock().unwrap().end(3);
+        if drained.is_some() {
+            state.1.notify_all();
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiter was woken");
+        waiter.join().unwrap();
+    }
+}

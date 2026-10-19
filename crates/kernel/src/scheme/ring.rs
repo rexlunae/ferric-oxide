@@ -64,7 +64,7 @@ use ferric_ring::{
     chain::{Chain, Completions, Next, SqReader},
     entry::{Buffer, FileRef, Op, SqeError, CURRENT_POSITION},
     files::{FileTable, Refused, TableError},
-    notify::wait_done,
+    notify::{wait_done, Drained},
     queue::{HeaderInfo, Memory, RingError},
     Consumer, Cqe, Reserving, Sqe,
 };
@@ -190,6 +190,12 @@ impl Ring {
     fn notify_completed(&self, token: &mut CleanLockToken) {
         self.completed.notify(token);
         event::trigger(GlobalSchemes::Ring.scheme_id(), self.id, EVENT_READ, token);
+    }
+
+    /// Wakes `Enter`s waiting for completions after the last SQEs in flight ended without
+    /// posting any. Event queues are not told: there is no new CQE to read.
+    fn wake_waiters(&self, _drained: Drained, token: &mut CleanLockToken) {
+        self.completed.notify(token);
     }
 }
 
@@ -401,11 +407,13 @@ fn submit(
         // from the SQ also sees it in flight.
         ring.work.lock().start_sync(chain.len());
         if let Err(err) = sq.consume(mem, &next) {
-            ring.work.lock().end_sync(chain.len());
+            let drained = ring.work.lock().end_sync(chain.len());
             ring.unreserve(chain.len());
-            // A waiting `Enter` may have seen the chain in flight; with it gone, wake it to
-            // check again, or it could sleep until some later completion.
-            ring.notify_completed(token);
+            // A waiting `Enter` may have seen the chain in flight; with nothing left in flight,
+            // it must wake to check again, or it could sleep until some later completion.
+            if let Some(drained) = drained {
+                ring.wake_waiters(drained, token);
+            }
             return Err(ring_errno(err));
         }
         consumed = consumed.saturating_add(chain.len());
@@ -418,8 +426,11 @@ fn submit(
         } else if chain.is_async() {
             match worker::queue(ring, chain, token) {
                 Ok(()) => {
-                    // The worker counts the chain now.
-                    ring.work.lock().end_sync(chain.len());
+                    // The worker counts the chain now, so some stay in flight until it posts.
+                    let drained = ring.work.lock().end_sync(chain.len());
+                    if let Some(drained) = drained {
+                        ring.wake_waiters(drained, token);
+                    }
                     continue;
                 }
                 Err(errno) => chain.refuse(errno_result(errno), |cqe| {
@@ -435,7 +446,8 @@ fn submit(
         // The room was set aside, so posting fails only if the application moved its CQ head
         // out of range meanwhile.
         let posted = ring.post(mem, &done);
-        ring.work.lock().end_sync(chain.len());
+        // `notify_completed` wakes the waiters, drained or not.
+        let _ = ring.work.lock().end_sync(chain.len());
         ring.notify_completed(token);
         posted?;
     }
