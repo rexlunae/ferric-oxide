@@ -1362,6 +1362,7 @@ name = "ferric-netq"
 version = "0.1.0"
 dependencies = [
  "etherparse",
+ "ferric-ring",
  "thiserror 2.0.17",
 ]
 

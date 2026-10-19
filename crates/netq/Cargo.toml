@@ -9,4 +9,5 @@ description = "The kernel-bypass network queue ABI: UMEM frames, ring descriptor
 # versions are written here rather than taken from [workspace.dependencies].
 [dependencies]
 etherparse = { version = "0.21", default-features = false }
+ferric-ring = { path = "../ring" }
 thiserror = { version = "2", default-features = false }
