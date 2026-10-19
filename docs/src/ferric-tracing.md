@@ -52,8 +52,17 @@ rebuilds only the base package's initfs, not the kernel. System calls made
 before bootstrap applies them are not traced.
 
 `ferric-config` writes the selections to `trace.toml` in its output directory
-and checks every name against the event catalog, so a misspelt event fails
-when the configuration is generated. It also exports `FERRIC_INITFS_TRACE`,
+and checks them as the kernel and bootstrap will, so a mistake fails when the
+configuration is generated rather than being logged at boot:
+
+- every name must be an event or subsystem of the catalog;
+- every selection must include an event the configured kernel compiles in
+  (`kernel.trace_<subsystem>` and `kernel.trace_max_level`). A selection that
+  also names events left out is kept, as the kernel applies the rest of it;
+- each command must fit the kernel's 4096-byte limit, and the file must fit
+  bootstrap's 64 KiB.
+
+It also exports `FERRIC_INITFS_TRACE`,
 and the base package copies the file into the initfs as `lib/trace.toml`.
 The format is `ferric_trace::config`:
 
@@ -308,12 +317,14 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
     checks, and `commit_to` refusing positions past `head` or inside a
     record;
   - a two-thread test with a million records;
-  - `trace.toml` parsing, refusal of unknown keys and wrong types, catalog
-    checks of the selections, command order, and a TOML round trip.
+  - `trace.toml` parsing, refusal of unknown keys and wrong types, catalog,
+    compiled-in and size checks of the selections, command order, and a TOML
+    round trip.
 - **Configuration.** `cargo test --locked -p ferric-config` checks the
   generated `trace.toml` and `FERRIC_INITFS_TRACE`, that nothing is generated
-  without the options or without `kernel.trace`, and that a misspelt event
-  fails generation.
+  without the options or without `kernel.trace`, and that a misspelt event,
+  a selection with no compiled-in event, an oversize command and an oversize
+  file fail generation.
 - **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
   (including bad and unknown records, records with too few or too many
   arguments, and duplicate CPUs), checks the text lines, checks the JSON

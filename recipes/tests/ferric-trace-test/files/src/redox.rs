@@ -368,9 +368,10 @@ fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `trace-initfs`: the events the initfs `trace.toml` leaves on are on, as bootstrap applied
-/// it before init started. Those of them the later steps turn on and off are turned off again
-/// here, so those steps start from the state they expect. Without the file it prints a skip.
+/// `trace-initfs`: the events the initfs `trace.toml` leaves on are on and the events it turns
+/// off are off, as bootstrap applied it before init started. Then the state the later steps
+/// expect is restored: the events they test are turned off and `sched.switch`, on from boot,
+/// is turned on again if the file turned it off. Without the file it prints a skip.
 fn check_initfs() -> Result<(), Failure> {
     let step = "trace-initfs";
     let path = format!("/scheme/initfs/{INITFS_PATH}");
@@ -383,31 +384,55 @@ fn check_initfs() -> Result<(), Failure> {
         Err(source) => return Err(io_failure(step, &path)(source)),
     };
     let config = BootConfig::parse(&bytes).map_err(|err| check(step, format!("{path}: {err}")))?;
-    let on = config
-        .check(&CATALOG)
-        .map_err(|err| check(step, format!("{path}: {err}")))?;
+    let invalid = |err| check(step, format!("{path}: {err}"));
+    let on = config.check(&CATALOG).map_err(invalid)?;
+    let off = config.disabled(&CATALOG).map_err(invalid)?;
     let list = listing(step)?;
-    let mut checked = 0;
-    for event in CATALOG.events().iter().filter(|e| on.contains(e.id())) {
+    let (mut checked_on, mut checked_off) = (0, 0);
+    for event in CATALOG.events() {
+        let expected = if on.contains(event.id()) {
+            true
+        } else if off.contains(event.id()) {
+            false
+        } else {
+            continue;
+        };
         // Only compiled-in events are listed, and only those can be on.
         let Some(&(_, enabled)) = list.iter().find(|(name, _)| name == event.name()) else {
             continue;
         };
-        if !enabled {
+        if enabled != expected {
+            let (is, turns) = if expected {
+                ("off", "on")
+            } else {
+                ("on", "off")
+            };
             return Err(check(
                 step,
-                format!("{} is off, but {path} turns it on", event.name()),
+                format!("{} is {is}, but {path} turns it {turns}", event.name()),
             ));
         }
-        checked += 1;
-        if TESTED.iter().any(|tested| tested.id() == event.id()) {
-            command(step, &format!("disable {}", event.name()))?;
+        if expected {
+            checked_on += 1;
+            if TESTED.iter().any(|tested| tested.id() == event.id()) {
+                command(step, &format!("disable {}", event.name()))?;
+            }
+        } else {
+            checked_off += 1;
+            if event.id() == SCHED_SWITCH.id() {
+                command(step, &format!("enable {}", event.name()))?;
+            }
         }
     }
-    if checked == 0 {
-        return Err(check(step, format!("{path} turns on no compiled-in event")));
+    if checked_on + checked_off == 0 {
+        return Err(check(
+            step,
+            format!("{path} turns no compiled-in event on or off"),
+        ));
     }
-    println!("FERRIC_TEST_PASS trace-initfs ({checked} events on from {path})");
+    println!(
+        "FERRIC_TEST_PASS trace-initfs ({checked_on} events on and {checked_off} off from {path})"
+    );
     Ok(())
 }
 

@@ -11,16 +11,13 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use ferric_trace::abi::{EVENTS_PATH, SCHEME_NAME};
-use ferric_trace::config::{BootConfig, INITFS_PATH};
+use ferric_trace::config::{BootConfig, INITFS_PATH, MAX_FILE_BYTES};
 use libredox::protocol::O_CLOEXEC;
 use redox_rt::proc::{FdGuard, FdGuardUpper};
 use syscall::flag::{O_DIRECTORY, O_RDONLY, O_WRONLY};
 use syscall::{ENOENT, Error};
 
-/// The largest `trace.toml` read; a configuration of selections is a few hundred bytes.
-const MAX_LEN: usize = 64 * 1024;
-
-/// Reads the whole of `file`, or fails with `EFBIG` past [`MAX_LEN`].
+/// Reads the whole of `file`, or fails with `EFBIG` past [`MAX_FILE_BYTES`].
 fn read_all(file: &FdGuardUpper) -> syscall::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -29,7 +26,7 @@ fn read_all(file: &FdGuardUpper) -> syscall::Result<Vec<u8>> {
         if len == 0 {
             return Ok(bytes);
         }
-        if bytes.len() + len > MAX_LEN {
+        if bytes.len() + len > MAX_FILE_BYTES {
             return Err(Error::new(syscall::EFBIG));
         }
         bytes.extend_from_slice(chunk.get(..len).unwrap_or_default());

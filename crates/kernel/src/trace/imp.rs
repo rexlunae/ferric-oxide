@@ -47,7 +47,7 @@ pub const MAX_LEVEL: Level = if cfg!(feature = "trace_level_trace") {
     Level::Error
 };
 
-/// Whether `subsystem`'s tracepoints are compiled in.
+/// Whether `subsystem`'s tracepoints are compiled in (its `Subsystem::kernel_feature`).
 const fn subsystem_compiled(subsystem: Subsystem) -> bool {
     (matches!(subsystem, Subsystem::Syscall) && cfg!(feature = "trace_syscall"))
         || (matches!(subsystem, Subsystem::Sched) && cfg!(feature = "trace_sched"))
@@ -55,9 +55,9 @@ const fn subsystem_compiled(subsystem: Subsystem) -> bool {
 }
 
 /// Whether `event`'s tracepoints are compiled in: its subsystem is, and its level is within
-/// [`MAX_LEVEL`].
+/// [`MAX_LEVEL`] (the rule host tools apply with `Catalog::compiled_for`).
 pub const fn compiled_in(event: &Event) -> bool {
-    subsystem_compiled(event.subsystem()) && event.level().within(MAX_LEVEL)
+    event.compiled_with(subsystem_compiled(event.subsystem()), MAX_LEVEL)
 }
 
 /// The events compiled into this kernel.

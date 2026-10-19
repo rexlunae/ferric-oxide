@@ -52,6 +52,10 @@ pub const EVENTS_PATH: &str = "events";
 /// The per-CPU statistics file.
 pub const STATS_PATH: &str = "stats";
 
+/// The longest command, in bytes, one write to [`EVENTS_PATH`] may carry; the kernel refuses
+/// longer writes.
+pub const MAX_COMMAND_BYTES: usize = 4096;
+
 /// The directory of per-CPU record files, `cpu/<n>`.
 ///
 /// A read of `cpu/<n>` returns whole records ([`crate::record`]) and consumes them; 0 bytes means
