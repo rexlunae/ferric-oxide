@@ -638,6 +638,11 @@ fn fixed() -> Result<(), Failure> {
         neg(EINVAL),
         outcome(call(&ring.fd, Request::RegisterFiles { first: 4 })),
     )?;
+    expect(
+        "RegisterFiles as an FD call with an empty payload",
+        neg(EINVAL),
+        register(&ring.fd, 4, &[]),
+    )?;
     let cqes = ring.run(&[Sqe::fsize(4, 5).fixed()])?;
     check_cqes("a slot a refused call named", &cqes, &[(5, neg(EBADF))])?;
 

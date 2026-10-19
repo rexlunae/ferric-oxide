@@ -41,8 +41,8 @@
 //! that is not `MAP_SHARED`. `Enter`: `EINVAL` before `Setup` or when the ring's indices are
 //! corrupt, `EBUSY` when another `Enter` on the ring is running or when the CQ has no room for
 //! the next chain's completions and nothing was consumed. `RegisterFiles`: `EINVAL` for slots
-//! past [`MAX_FIXED_FILES`] or a ring descriptor (a ring may not hold itself or another ring
-//! open), `EBUSY` when a slot already holds a file; nothing is registered then, and the
+//! past [`MAX_FIXED_FILES`], for no descriptors, or for a ring descriptor (a ring may not hold
+//! itself or another ring open), `EBUSY` when a slot already holds a file; nothing is registered then, and the
 //! descriptors sent are closed. `UnregisterFiles`: `EINVAL` for slots past
 //! [`MAX_FIXED_FILES`].
 
