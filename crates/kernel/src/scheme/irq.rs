@@ -278,7 +278,7 @@ impl IrqScheme {
                 };
                 (
                     Handle::Irq {
-                        ack: AtomicUsize::new(0),
+                        ack: AtomicUsize::new(fresh_ack(cpu_id, irq_number, reservation.is_some())),
                         irq: irq_number,
                         cpu: cpu_id,
                         reservation,
@@ -524,6 +524,20 @@ fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -
         let _ = (from, from_vector, to, to_vector);
         Ok(0)
     }
+}
+
+/// Ferric Oxide: the acknowledged count a new handle starts with. With `kernel.irq_percpu` a
+/// vector can be reserved again after its owner gave it back (or after it was steered
+/// elsewhere), and its row still holds the old owner's interrupts; a new reservation starts
+/// acknowledged at that count, so it reports only interrupts that arrive for it. Everything
+/// else starts at 0, as upstream.
+fn fresh_ack(cpu: LogicalCpuId, irq: u8, reserves: bool) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if reserves {
+        return interrupt_count(cpu, irq);
+    }
+    let _ = (cpu, irq, reserves);
+    0
 }
 
 const fn irq_to_vector(irq: u8) -> u8 {

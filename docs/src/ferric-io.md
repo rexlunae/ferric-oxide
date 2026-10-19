@@ -163,6 +163,10 @@ kernel:
    on the old vector during the move is not lost (it may be one spurious
    wakeup).
 
+A vector given back this way (or by closing its handle) can be reserved again.
+The new reservation starts with its count already acknowledged, so it does not
+report the interrupts the previous owner received.
+
 The call returns `ferric_irq::call::Moved`: the new IRQ number and how many
 remapping entries moved. When none moved, the device's interrupts are not
 remapped and its MSI or MSI-X message names the CPU and vector itself, so
