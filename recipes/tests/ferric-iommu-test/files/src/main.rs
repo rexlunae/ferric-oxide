@@ -54,7 +54,15 @@
 //!   with the message for the other CPU, and has it raise an interrupt: the other CPU's handle
 //!   must count it and the BSP's must not, so the kernel counts interrupts per (CPU, vector)
 //!   and not by vector number alone. It then does the same with a vector below 48 on that
-//!   CPU, which on an AP is an ordinary vector and not a legacy IRQ (`iommu-msi-percpu`).
+//!   CPU, which on an AP is an ordinary vector and not a legacy IRQ (`iommu-msi-percpu`);
+//! - also with `kernel.irq_percpu`, it aims the device at a vector on the BSP and, while a
+//!   second thread keeps raising interrupts, moves that vector to another CPU with the `irq:`
+//!   handle's `Move` call. With interrupt remapping the kernel rewrites the entry and the
+//!   device's message stays as it is; without it the test programs pcid's message for the new
+//!   vector, as a driver would. Once the device is quiet, one interrupt must reach the same
+//!   descriptor, the old vector on the BSP must be free again and count nothing, and pcid must
+//!   give the old (CPU, vector) a message of its own that reaches it, not the moved entry
+//!   (`iommu-msi-steer`).
 //!
 //! For each DMA fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`,
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
@@ -220,6 +228,11 @@ enum Failure {
     /// An interrupt for one CPU was counted by the same vector on another: the vector, the
     /// CPU it was held on, and the count there.
     CrossCpu(u8, u32, usize),
+    /// The kernel's answer to a `Move` call did not decode.
+    BadMove(usize),
+    /// After a move, a vector is still reserved (or not reserved) where it should not be (or
+    /// should be): the CPU, the vector, and what was expected.
+    Reservation(u32, u8, &'static str),
     /// The test did not run because an earlier step failed.
     NotRun,
 }
@@ -261,6 +274,10 @@ impl fmt::Display for Failure {
                 f,
                 "vector {vector:#x} held on CPU {cpu} counted {count} interrupt(s) sent to another CPU"
             ),
+            Self::BadMove(word) => write!(f, "the kernel answered Move with {word:#x}"),
+            Self::Reservation(cpu, vector, expected) => {
+                write!(f, "vector {vector:#x} on CPU {cpu} should be {expected}")
+            }
             Self::NotRun => f.write_str("not run: an earlier step failed"),
         }
     }
@@ -619,6 +636,10 @@ struct Edu {
     regs: Mapped,
 }
 
+// SAFETY: `Edu` only reads and writes the device's registers with volatile accesses, which
+// any thread may do at once; `iommu-msi-steer` raises interrupts from a second thread.
+unsafe impl Sync for Edu {}
+
 impl Edu {
     /// Reads the 32-bit register at `offset`.
     fn read32(&self, offset: usize) -> u32 {
@@ -893,11 +914,9 @@ fn forged_msi_blocked(setup: &mut Setup, msi: &mut Msi) -> Result<(), Failure> {
     }
 }
 
-/// Runs `iommu-msi-percpu`: the device's interrupt goes to a CPU other than the BSP while the
-/// same vector number is held on the BSP, and only the target's handle may count it. `Ok(None)`
-/// when skipped: the kernel has no `irq:cpus` (built without `kernel.irq_percpu`), or runs one
-/// CPU.
-fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
+/// The BSP and another CPU, or `None` when the kernel has no `irq:cpus` (built without
+/// `kernel.irq_percpu`) or runs one CPU.
+fn bsp_and_other() -> Result<Option<(u32, u32)>, Failure> {
     let text = match std::fs::read_to_string("/scheme/irq/cpus") {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -907,11 +926,18 @@ fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(Failure::Cpus)?;
     let bsp = bsp()?;
-    let Some(other) = cpus
+    Ok(cpus
         .iter()
         .map(|entry| entry.cpu.get())
         .find(|&cpu| cpu != bsp)
-    else {
+        .map(|other| (bsp, other)))
+}
+
+/// Runs `iommu-msi-percpu`: the device's interrupt goes to a CPU other than the BSP while the
+/// same vector number is held on the BSP, and only the target's handle may count it. `Ok(None)`
+/// when skipped ([`bsp_and_other`]).
+fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
+    let Some((bsp, other)) = bsp_and_other()? else {
         return Ok(None);
     };
     let (mut target, mut decoy) = Vector::reserve_pair(other, bsp)?;
@@ -933,6 +959,116 @@ fn msi_percpu(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
         ))),
         count => Err(Failure::CrossCpu(decoy.vector, bsp, count)),
     }
+}
+
+/// How long the second thread of `iommu-msi-steer` raises interrupts before and after the move.
+const STEER_FIRE: Duration = Duration::from_millis(50);
+
+/// Runs `iommu-msi-steer`: moves the device's vector from the BSP to another CPU while the
+/// device fires, and checks the descriptor follows it. `Ok(None)` when skipped
+/// ([`bsp_and_other`]).
+fn msi_steer(setup: &mut Setup, msi: &Msi) -> Result<Option<String>, Failure> {
+    let Some((bsp, other)) = bsp_and_other()? else {
+        return Ok(None);
+    };
+    let mut steered = Vector::reserve(bsp)?;
+    let result = steer_while_firing(setup, &mut steered, other);
+    // Back to the message of the vector `iommu-msi` reserved, for whatever runs next.
+    setup.channel.set_msi(msi.message)?;
+    let (from, remapped) = result?;
+    let how = if remapped == 0 {
+        "the test reprogrammed the device's message (no interrupt remapping)".to_owned()
+    } else {
+        format!("the kernel rewrote {remapped} interrupt remapping entry(s)")
+    };
+    Ok(Some(format!(
+        "vector {from:#x} on CPU {bsp} moved to vector {:#x} on CPU {other} while the device fired; {how}; the same descriptor counted the next interrupt, and the old vector was free and got a message of its own",
+        steered.vector
+    )))
+}
+
+/// The body of [`msi_steer`]: aims the device at `steered`, moves it to CPU `to` while a
+/// second thread raises interrupts, then checks where the next interrupts land. Returns the
+/// old vector and how many remapping entries the kernel moved; `steered` is updated to its new
+/// place.
+fn steer_while_firing(
+    setup: &mut Setup,
+    steered: &mut Vector,
+    to: u32,
+) -> Result<(u8, u32), Failure> {
+    fire(setup, steered)?;
+    let (from_cpu, from) = (steered.cpu, steered.vector);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let edu = &setup.edu;
+    let channel = &mut setup.channel;
+    let moved = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                edu.raise_interrupt();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        std::thread::sleep(STEER_FIRE);
+        let moved = move_vector(&steered.file, to).and_then(|moved| {
+            if moved.remapped == 0 {
+                // The message names the CPU and vector, so it is the driver's to rewrite.
+                let vector = moved.irq.get() + 32;
+                let message = channel
+                    .msi_message(to, vector)?
+                    .ok_or(Failure::NoMsiMessage(vector))?;
+                channel.set_msi(message)?;
+            }
+            Ok(moved)
+        });
+        std::thread::sleep(STEER_FIRE);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        moved
+    })?;
+    setup.edu.ack_interrupt();
+    steered.cpu = to;
+    steered.vector = moved.irq.get() + 32;
+    // What arrived during the move, and the one interrupt the kernel reports pending after it.
+    steered.wait(IRQ_BLOCKED_WAIT)?;
+    // The new vector is held, and the old one was given back.
+    if !reserved(to, steered.vector)? {
+        return Err(Failure::Reservation(to, steered.vector, "reserved"));
+    }
+    let mut old = Vector::reserve_where(from_cpu, |irq| irq + 32 == from)
+        .map_err(|_| Failure::Reservation(from_cpu, from, "free"))?;
+    setup.edu.raise_interrupt();
+    let count = steered.wait(IRQ_WAIT);
+    setup.edu.ack_interrupt();
+    if count? == 0 {
+        return Err(Failure::NoInterrupt(steered.vector));
+    }
+    match old.wait(IRQ_BLOCKED_WAIT)? {
+        0 => {}
+        count => return Err(Failure::CrossCpu(from, from_cpu, count)),
+    }
+    // pcid must not hand out the moved entry for the old (CPU, vector).
+    fire(setup, &mut old)?;
+    Ok((from, moved.remapped))
+}
+
+/// Whether vector `vector` on CPU `cpu` is reserved: creating it again fails with `EEXIST`.
+fn reserved(cpu: u32, vector: u8) -> Result<bool, Failure> {
+    match File::create(format!("/scheme/irq/cpu-{cpu:02x}/{}", vector - 32)) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Steers the vector of `irq` handle `file` to CPU `cpu` with the handle's `Move` call.
+fn move_vector(file: &File, cpu: u32) -> Result<ferric_irq::call::Moved, Failure> {
+    let call = ferric_irq::call::Call::Move {
+        cpu: ferric_irq::CpuId::new(cpu),
+    };
+    let (words, len) = call.encode();
+    let fd = usize::try_from(file.as_raw_fd()).map_err(|_| Failure::NotRun)?;
+    let word =
+        sys::call(fd, &mut [], 0, &words[..len]).map_err(|errno| Failure::Call("Move", errno))?;
+    ferric_irq::call::Moved::from_word(word as u64).ok_or(Failure::BadMove(word))
 }
 
 /// Aims the device's MSI at `target` with pcid's message for it, raises an interrupt, and
@@ -959,6 +1095,8 @@ struct MsiOutcome {
     forged: Result<Option<()>, Failure>,
     /// `Ok(None)` when skipped ([`msi_percpu`]).
     percpu: Result<Option<String>, Failure>,
+    /// `Ok(None)` when skipped ([`msi_steer`]).
+    steer: Result<Option<String>, Failure>,
 }
 
 impl MsiOutcome {
@@ -968,6 +1106,7 @@ impl MsiOutcome {
             msi: Err(Failure::NotRun),
             forged: Err(Failure::NotRun),
             percpu: Err(Failure::NotRun),
+            steer: Err(Failure::NotRun),
         }
     }
 }
@@ -989,10 +1128,12 @@ fn msi_tests(setup: &mut Setup) -> MsiOutcome {
         Ok(None)
     };
     let percpu = msi_percpu(setup, &msi);
+    let steer = msi_steer(setup, &msi);
     MsiOutcome {
         msi: Ok(msi_detail(&msi)),
         forged,
         percpu,
+        steer,
     }
 }
 
@@ -1364,7 +1505,17 @@ fn report_msi(msi: MsiOutcome) -> bool {
         Ok(Some(detail)) => report("iommu-msi-percpu", Ok(()), &detail),
         Err(err) => report("iommu-msi-percpu", Err(err), ""),
     };
-    delivered && forged && percpu
+    let steer = match msi.steer {
+        Ok(None) => {
+            println!(
+                "FERRIC_TEST_SKIP iommu-msi-steer: no irq:cpus (kernel.irq_percpu off) or one CPU"
+            );
+            true
+        }
+        Ok(Some(detail)) => report("iommu-msi-steer", Ok(()), &detail),
+        Err(err) => report("iommu-msi-steer", Err(err), ""),
+    };
+    delivered && forged && percpu && steer
 }
 
 fn main() -> ExitCode {
