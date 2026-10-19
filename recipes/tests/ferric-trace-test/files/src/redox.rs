@@ -11,14 +11,14 @@ use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
-    CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
-    SYSCALL_EXIT,
+    CATALOG, IRQ_ACK, IRQ_DELIVER, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
+    SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
 use ferric_trace::record::{Records, WORD_BYTES};
 use ferric_trace::ring::View;
 use ferric_trace::{Event, EventId};
 use syscall::schemev2::Opcode;
-use syscall::{EACCES, EBADF, EINVAL, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
+use syscall::{EACCES, EBADF, EFAULT, EINVAL, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -672,6 +672,228 @@ fn check_mmap(cpus: &[u32]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Whether the kernel has `event` compiled in (the listing names only those); prints a skip for
+/// `step` when it does not.
+fn has_event(step: &'static str, event: &Event) -> Result<bool, Failure> {
+    let compiled = listing(step)?.iter().any(|(name, _)| name == event.name());
+    if !compiled {
+        println!(
+            "FERRIC_TEST_SKIP {step}: {} is not compiled in",
+            event.name()
+        );
+    }
+    Ok(compiled)
+}
+
+/// The pages `trace-fault` touches.
+const FAULT_PAGES: usize = 4;
+
+/// The page size.
+const PAGE: usize = 4096;
+
+/// `trace-fault`: with the `mm` events on, writes to each page of a fresh anonymous mapping,
+/// which the kernel maps on first touch, then unmaps it and has the kernel copy into it with
+/// a `read`, which fails with `EFAULT`. The writes must have `mm.page_fault` records from user
+/// mode, writes, ending `mapped`; the read one from the kernel at the unmapped buffer, ending
+/// `copy failed`.
+fn check_fault(cpus: &[u32]) -> Result<(), Failure> {
+    let step = "trace-fault";
+    if !has_event(step, &MM_PAGE_FAULT)? {
+        return Ok(());
+    }
+    let len = FAULT_PAGES * PAGE;
+    let map = syscall::Map {
+        offset: 0,
+        size: len,
+        flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_PRIVATE,
+        address: 0,
+    };
+    // Opened first: nothing between the unmap and the read may allocate, or the allocator
+    // could map memory at the unmapped address again.
+    let stats_path = path(abi::STATS_PATH);
+    let stats = File::open(&stats_path).map_err(io_failure(step, &stats_path))?;
+    let stats_fd = stats.as_raw_fd() as usize;
+    drain(step, cpus)?;
+    command(step, "enable mm")?;
+    // SAFETY: an anonymous mapping (no file) at an address the kernel picks; nothing in this
+    // process refers to that memory yet.
+    let addr = unsafe { syscall::fmap(!0, &map) }.map_err(|err| Failure {
+        step,
+        why: Why::Call {
+            call: "anonymous mmap",
+            result: Err(err),
+        },
+    })?;
+    for page in 0..FAULT_PAGES {
+        // SAFETY: inside the mapping made above, which is readable and writable and which
+        // nothing else uses; the write is volatile so it happens, one per page.
+        unsafe { ((addr + page * PAGE) as *mut u64).write_volatile(0x5a) };
+    }
+    // SAFETY: the mapping made above, which nothing refers to after this.
+    let unmapped = unsafe { syscall::funmap(addr, len) };
+    // SAFETY: the kernel writes to `addr`, which is not mapped any more, so the call fails
+    // with EFAULT and writes nothing; no memory of this process changes.
+    let copy = unsafe { syscall::syscall3(SYS_READ, stats_fd, addr, PAGE) };
+    command(step, "disable mm")?;
+    if unmapped.is_err() {
+        return Err(Failure {
+            step,
+            why: Why::Call {
+                call: "munmap",
+                result: unmapped,
+            },
+        });
+    }
+    expect_errno(step, "read into an unmapped buffer", copy, EFAULT)?;
+    let trace = drain(step, cpus)?;
+    let faults: Vec<&Entry> = trace
+        .iter()
+        .flatten()
+        .filter(|e| e.is(&MM_PAGE_FAULT))
+        .collect();
+    let in_page = |e: &Entry, page: usize| {
+        e.arg(0)
+            .is_some_and(|a| (a as usize) / PAGE == addr / PAGE + page)
+    };
+    let flags = |e: &Entry| PageFaultFlags::from_raw(e.arg(2).unwrap_or(0));
+    for page in 0..FAULT_PAGES {
+        faults
+            .iter()
+            .find(|e| {
+                in_page(e, page)
+                    && flags(e).contains(PageFaultFlags::WRITE.with(PageFaultFlags::USER, true))
+                    && e.arg(3) == Some(PageFaultOutcome::Mapped.raw())
+            })
+            .ok_or_else(|| {
+                check(
+                    step,
+                    format!(
+                        "no user write fault ending mapped for page {page} at {:#x} ({} mm.page_fault records)",
+                        addr + page * PAGE,
+                        faults.len()
+                    ),
+                )
+            })?;
+    }
+    faults
+        .iter()
+        .find(|e| {
+            in_page(e, 0)
+                && !flags(e).contains(PageFaultFlags::USER)
+                && e.arg(3) == Some(PageFaultOutcome::CopyFailed.raw())
+        })
+        .ok_or_else(|| {
+            check(
+                step,
+                format!("no kernel fault ending copy failed at {addr:#x}"),
+            )
+        })?;
+    println!(
+        "FERRIC_TEST_PASS trace-fault ({} mm.page_fault records)",
+        faults.len()
+    );
+    Ok(())
+}
+
+/// How many rounds of disk writes `trace-irq` tries before it gives up.
+const IRQ_ROUNDS: usize = 40;
+
+/// An interrupt `trace-irq` saw handled: its `irq.deliver`, and the `irq.ack` of the same IRQ,
+/// CPU and count with the CPU whose ring had it.
+struct Handled {
+    deliver: Entry,
+    ack: Entry,
+    ack_cpu: u32,
+}
+
+/// `trace-irq`: with the `irq` events on, writes and syncs a file until some driver's
+/// interrupt has an `irq.deliver` that woke a handle and the `irq.ack` with the same IRQ, CPU
+/// and count. The sync makes RedoxFS write to the disk, whose driver takes an interrupt for
+/// it.
+fn check_irq(cpus: &[u32]) -> Result<(), Failure> {
+    let step = "trace-irq";
+    if !has_event(step, &IRQ_DELIVER)? {
+        return Ok(());
+    }
+    let file_path = "/tmp/ferric-trace-irq";
+    drain(step, cpus)?;
+    command(step, "enable irq")?;
+    let mut seen = Vec::new();
+    let found = irq_rounds(step, cpus, file_path, &mut seen);
+    command(step, "disable irq")?;
+    let _ = std::fs::remove_file(file_path);
+    let deliveries = seen.iter().filter(|(_, e)| e.is(&IRQ_DELIVER)).count();
+    let handled = found?.ok_or_else(|| {
+        check(
+            step,
+            format!("{deliveries} irq.deliver records, none acknowledged by an irq.ack"),
+        )
+    })?;
+    println!(
+        "FERRIC_TEST_PASS trace-irq (irq {} on cpu {} count {}, {deliveries} deliveries; acknowledged on cpu {}, {} TSC cycles later)",
+        handled.deliver.arg(0).unwrap_or(0),
+        handled.deliver.arg(1).unwrap_or(0),
+        handled.deliver.arg(3).unwrap_or(0),
+        handled.ack_cpu,
+        handled
+            .ack
+            .timestamp
+            .saturating_sub(handled.deliver.timestamp),
+    );
+    Ok(())
+}
+
+/// The rounds of [`check_irq`], collecting the `irq` records of every CPU in `seen` until one
+/// interrupt was delivered and acknowledged.
+fn irq_rounds(
+    step: &'static str,
+    cpus: &[u32],
+    file_path: &str,
+    seen: &mut Vec<(u32, Entry)>,
+) -> Result<Option<Handled>, Failure> {
+    let block = vec![0xa5u8; 64 * 1024];
+    for _ in 0..IRQ_ROUNDS {
+        let mut file = File::create(file_path).map_err(io_failure(step, file_path))?;
+        file.write_all(&block)
+            .and_then(|()| file.sync_all())
+            .map_err(io_failure(step, file_path))?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for (cpu, entries) in cpus.iter().zip(drain(step, cpus)?) {
+            seen.extend(
+                entries
+                    .into_iter()
+                    .filter(|e| e.is(&IRQ_DELIVER) || e.is(&IRQ_ACK))
+                    .map(|e| (*cpu, e)),
+            );
+        }
+        if let Some(handled) = acknowledged(seen) {
+            return Ok(Some(handled));
+        }
+    }
+    Ok(None)
+}
+
+/// The first delivery in `seen` that woke a handle and has an acknowledgement of the same IRQ,
+/// CPU and count.
+fn acknowledged(seen: &[(u32, Entry)]) -> Option<Handled> {
+    seen.iter()
+        .filter(|(_, e)| e.is(&IRQ_DELIVER) && e.arg(4).is_some_and(|handles| handles > 0))
+        .find_map(|(_, deliver)| {
+            seen.iter()
+                .find(|(_, ack)| {
+                    ack.is(&IRQ_ACK)
+                        && ack.arg(0) == deliver.arg(0)
+                        && ack.arg(1) == deliver.arg(1)
+                        && ack.arg(2) == deliver.arg(3)
+                })
+                .map(|(cpu, ack)| Handled {
+                    deliver: deliver.clone(),
+                    ack: ack.clone(),
+                    ack_cpu: *cpu,
+                })
+        })
+}
+
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     check_initfs()?;
@@ -796,6 +1018,9 @@ fn run() -> Result<(), Failure> {
 
     check_mmap(&cpus)?;
     println!("FERRIC_TEST_PASS trace-mmap");
+
+    check_fault(&cpus)?;
+    check_irq(&cpus)?;
     Ok(())
 }
 

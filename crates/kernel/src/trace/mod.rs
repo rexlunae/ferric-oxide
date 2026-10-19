@@ -5,9 +5,9 @@
 //! tracepoints exist, turns them on and off, and writes their records:
 //!
 //! - **Build time.** Without the `trace` feature the macro expands to nothing. With it, an event
-//!   is compiled in when its subsystem's feature (`trace_syscall`, `trace_sched`, `trace_scheme`) is on and its
-//!   level is within the `trace_level_*` maximum; other events also expand to nothing, and their
-//!   arguments are never evaluated.
+//!   is compiled in when its subsystem's feature (`trace_syscall`, `trace_sched`, `trace_scheme`,
+//!   `trace_mm`, `trace_irq`, `trace_iommu`) is on and its level is within the `trace_level_*`
+//!   maximum; other events also expand to nothing, and their arguments are never evaluated.
 //! - **Static keys.** A compiled-in tracepoint is a 5-byte NOP until its event is enabled, when it
 //!   is patched to a jump to the code that records it (`arch::static_key`).
 //! - **Boot time.** `FERRIC_TRACE=<selection>` in the boot environment, or the build-time default
@@ -17,8 +17,10 @@
 //!
 //! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
 //! records after a header page). Tracepoints may only sit
-//! where interrupts are off, as in the system call path and the scheduler: then nothing else
-//! runs on the CPU while a record is written, and the CPU's ring has a single producer.
+//! where interrupts are off, as in the system call path, the scheduler and the interrupt and
+//! exception handlers (every IDT entry is an interrupt gate): then nothing else runs on the CPU
+//! while a record is written, and the CPU's ring has a single producer. A record that would
+//! be written with interrupts on is counted as lost instead.
 
 #[cfg(feature = "trace")]
 mod imp;

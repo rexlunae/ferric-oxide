@@ -399,6 +399,15 @@ impl Unit {
 
 /// Logs one run of identical events.
 fn report(base: u64, run: Run) {
+    // Ferric Oxide (`kernel.trace_iommu`): the entry as the IOMMU wrote it.
+    trace_event!(
+        ferric_trace::kernel::IOMMU_FAULT,
+        base,
+        ferric_trace::kernel::IommuFormat::AmdViEvent.raw(),
+        run.event.0[0],
+        run.event.0[1],
+        run.count
+    );
     let kind = run.event.decode();
     let times = Times(run.count);
     if run.event.is_dma_fault() {

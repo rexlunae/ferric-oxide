@@ -10,6 +10,8 @@
 //! - [`capture`] loads and decodes the files against the kernel's event catalog
 //!   ([`ferric_trace::kernel::CATALOG`]) and merges them in timestamp order.
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
+//! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
+//!   sources, IOMMU fault reports) into words, for both views.
 //! - [`perfetto`] converts a capture to the Chrome trace event JSON format, which the Perfetto
 //!   UI (<https://ui.perfetto.dev>) and `chrome://tracing` open. The format is described in
 //!   Google's "Trace Event Format" document; Perfetto's JSON importer accepts the subset used
@@ -38,6 +40,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
+pub mod describe;
 pub mod drain;
 pub mod perfetto;
 pub mod text;

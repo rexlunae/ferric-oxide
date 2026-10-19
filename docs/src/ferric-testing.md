@@ -165,7 +165,7 @@ the desired kernel configuration for each, run the matching command from
 # With kernel.iommu = "never" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -173,7 +173,7 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
 # With kernel.iommu = "auto" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
