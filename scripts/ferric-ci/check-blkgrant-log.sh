@@ -34,7 +34,19 @@ fi
 
 # nvmed's own lines (its setup and any error) as one notice, so a failed check below can be
 # read without the job log.
-nvmed_lines="$(grep -aE 'nvmed: ' <<< "$clean" | head -n 20 || true)"
+nvmed_lines="$(grep -aE 'nvmed: ' <<< "$clean" | grep -v 'nvmed: PERF' | head -n 20 || true)"
+# EXPERIMENT (ci/percore-latency): the latency probes from the threaded benchmark on, in
+# notices of under 3.8 KB each.
+probe="$(sed -n '/FERRIC_PHASE threads start/,$p' <<< "$clean" | grep -aoE '(WAKELAT|nvmed: PERF|FERRIC_BENCH nvme-read-4k-t)[^\r]*' | sed -E 's/^FERRIC_BENCH (nvme-read-4k-t[0-9]+).*copy_iops=([0-9]+).*/== \1 iops=\2/' || true)"
+chunk=""; n=0
+while IFS= read -r line; do
+    if [ $(( ${#chunk} + ${#line} )) -gt 3700 ] && [ $n -lt 6 ]; then
+        echo "::notice title=probe $n::$(sed ':a;N;$!ba;s/\n/%0A/g' <<< "$chunk")"; chunk=""; n=$((n+1))
+    fi
+    chunk="${chunk:+$chunk
+}$line"
+done <<< "$probe"
+[ -n "$chunk" ] && echo "::notice title=probe $n::$(sed ':a;N;$!ba;s/\n/%0A/g' <<< "$chunk")"
 if [ -n "$nvmed_lines" ]; then
     echo "::notice title=nvmed lines::$(sed 's/%/%25/g' <<< "$nvmed_lines" | sed ':a;N;$!ba;s/\n/%0A/g')"
 fi

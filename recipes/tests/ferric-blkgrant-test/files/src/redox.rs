@@ -447,6 +447,7 @@ fn time_reads(
 fn bench_threads(read: &Disk) -> Result<(), Failure> {
     const SIZE: usize = 4 << 10;
     let span = (read.len / SIZE as u64).max(1) * SIZE as u64;
+    println!("FERRIC_PHASE threads start");
     for threads in BENCH_THREADS {
         let per_thread = BENCH_THREADS_TOTAL / threads / SIZE;
         let start = Instant::now();

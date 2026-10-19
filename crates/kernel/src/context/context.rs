@@ -170,6 +170,10 @@ pub struct Context {
     /// ring worker is cancelled when its ring closes; such a context has no signal state, so
     /// this is how an interruption that comes before the wait is not lost.
     pub cancelled: bool,
+    /// EXPERIMENT: TSC at the last unblock, 0 when none pending.
+    pub wake_tsc: u64,
+    /// EXPERIMENT: the unblock came from another CPU.
+    pub wake_remote: bool,
     pub fmap_ret: Option<Frame>,
     /// Priority
     pub prio: usize,
@@ -258,6 +262,8 @@ impl Context {
             queue_key: None,
             being_sigkilled: false,
             cancelled: false,
+            wake_tsc: 0,
+            wake_remote: false,
             owner_proc_id,
 
             euid: 0,

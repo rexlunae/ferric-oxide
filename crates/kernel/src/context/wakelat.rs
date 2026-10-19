@@ -1,0 +1,80 @@
+//! EXPERIMENT (ci/percore-latency, never merged): wake-to-run latency of contexts, split by
+//! whether the waker ran on another CPU and by what made the target CPU reschedule.
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+use crate::context::Context;
+
+const CPUS: usize = 64;
+static IN_TICK: [AtomicBool; CPUS] = [const { AtomicBool::new(false) }; CPUS];
+
+/// local/remote x idle/tick/voluntary
+const BINS: usize = 6;
+static COUNT: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
+static SUM: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
+static MAX: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
+static OVER_1M: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+static LAST_TSC: AtomicU64 = AtomicU64::new(0);
+static LAST_NS: AtomicU64 = AtomicU64::new(0);
+const NAMES: [&str; BINS] = ["l-idle", "l-tick", "l-vol", "r-idle", "r-tick", "r-vol"];
+
+pub fn tsc() -> u64 {
+    // SAFETY: rdtsc has no preconditions.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+pub fn set_in_tick(on: bool) {
+    IN_TICK[crate::cpu_id().get() as usize % CPUS].store(on, Relaxed);
+}
+
+pub fn picked(next: &mut Context, prev_is_idle: bool, now_ns: u128) {
+    let woke = core::mem::replace(&mut next.wake_tsc, 0);
+    if woke == 0 || !next.userspace {
+        return;
+    }
+    let now = tsc();
+    let lat = now.saturating_sub(woke);
+    let reason = if prev_is_idle {
+        0
+    } else if IN_TICK[crate::cpu_id().get() as usize % CPUS].load(Relaxed) {
+        1
+    } else {
+        2
+    };
+    let bin = reason + if next.wake_remote { 3 } else { 0 };
+    COUNT[bin].fetch_add(1, Relaxed);
+    SUM[bin].fetch_add(lat, Relaxed);
+    MAX[bin].fetch_max(lat, Relaxed);
+    // ~1 ms at the CI hosts' ~2-3 GHz TSC; the summary prints the TSC rate to be exact.
+    if lat > 2_500_000 {
+        OVER_1M[bin].fetch_add(1, Relaxed);
+    }
+    let total = TOTAL.fetch_add(1, Relaxed) + 1;
+    if total % 5_000 == 0 {
+        let ns = now_ns as u64;
+        let dt = now.saturating_sub(LAST_TSC.swap(now, Relaxed));
+        let dns = ns.saturating_sub(LAST_NS.swap(ns, Relaxed)).max(1);
+        let mut line = alloc::string::String::new();
+        use core::fmt::Write;
+        let _ = write!(
+            line,
+            "WAKELAT n={total} tsc_per_us={}",
+            dt.saturating_mul(1000) / dns
+        );
+        for b in 0..BINS {
+            let c = COUNT[b].swap(0, Relaxed);
+            let s = SUM[b].swap(0, Relaxed);
+            let m = MAX[b].swap(0, Relaxed);
+            let o = OVER_1M[b].swap(0, Relaxed);
+            let _ = write!(
+                line,
+                " {}={c}/avg{}/max{}/slow{o}",
+                NAMES[b],
+                s / c.max(1),
+                m
+            );
+        }
+        info!("{line}");
+    }
+}

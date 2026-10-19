@@ -145,6 +145,8 @@ pub fn contexts_mut(token: LockToken<'_, L1>) -> RwLockWriteGuard<'_, L2, BTreeS
     CONTEXTS.write(token)
 }
 
+pub mod wakelat;
+
 pub fn unblock_context(context_lock: &Arc<ContextLock>, token: &mut LockToken<'_, L3>) -> bool {
     let cpu_id = {
         let mut guard = context_lock.write(token.token());
@@ -158,6 +160,9 @@ pub fn unblock_context(context_lock: &Arc<ContextLock>, token: &mut LockToken<'_
             }
             return false;
         }
+        // EXPERIMENT: wake-to-run latency probe.
+        guard.wake_tsc = crate::context::wakelat::tsc();
+        guard.wake_remote = guard.cpu_id.is_some_and(|c| c != crate::cpu_id());
         guard.cpu_id
     };
 

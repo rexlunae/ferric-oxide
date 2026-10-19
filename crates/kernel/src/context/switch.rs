@@ -121,7 +121,9 @@ pub fn tick(token: &mut CleanLockToken) {
 
     // Trigger a context switch after every 3 ticks (approx. 6.75 ms).
     if new_ticks >= TICK_INTERVAL as usize {
+        crate::context::wakelat::set_in_tick(true);
         switch(token);
+        crate::context::wakelat::set_in_tick(false);
         crate::context::signal::signal_handler(token);
     }
 }
@@ -500,6 +502,11 @@ fn schedule(
     let Some((mut next_sched_context, next_address_space)) = next else {
         return ScheduleResult::AllContextsIdle;
     };
+    let prev_is_idle = Arc::ptr_eq(
+        ArcContextLockWriteGuard::rwlock(&prev_context_guard),
+        &percpu.switch_internals.idle_context(),
+    );
+    crate::context::wakelat::picked(&mut next_sched_context, prev_is_idle, schedule_time);
 
     *percpu.switch_internals.sched_ctxt.borrow_mut() = Some(Arc::clone(
         ArcContextLockWriteGuard::rwlock(&next_sched_context),

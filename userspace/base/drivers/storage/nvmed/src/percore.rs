@@ -60,6 +60,8 @@ pub enum Op {
 struct Slot {
     result: Mutex<Option<syscall::Result<usize>>>,
     done: AtomicBool,
+    /// EXPERIMENT: when the worker picked the job up and finished it.
+    times: Mutex<(Option<Instant>, Option<Instant>)>,
 }
 
 /// One read or write for a worker.
@@ -101,9 +103,63 @@ pub struct Dispatcher {
     /// When each unfinished job was handed out, to which worker, and its result slot, for the
     /// watchdog.
     started: RefCell<HashMap<u64, Started>>,
+    /// EXPERIMENT: when drain saw each job's report.
+    perf_drained: RefCell<HashMap<u64, Instant>>,
+    /// EXPERIMENT: per stage [count, sum us, max us, over 1 ms]; stages: dispatch->pickup,
+    /// pickup->done, done->drain, drain->ready; plus in-flight sum.
+    perf: RefCell<([[u64; 4]; 4], u64, u64)>,
 }
 
 impl Dispatcher {
+    /// EXPERIMENT: records one job's stage times and prints a summary every 4096 jobs.
+    fn perf_record(&self, id: u64, t_dispatch: Instant, slot: &Slot) {
+        let now = Instant::now();
+        let drained = self.perf_drained.borrow_mut().remove(&id);
+        let (pick, done) = slot.times.lock().map(|t| *t).unwrap_or((None, None));
+        let (Some(pick), Some(done)) = (pick, done) else {
+            return;
+        };
+        let drained = drained.unwrap_or(now);
+        let stages = [
+            pick.saturating_duration_since(t_dispatch),
+            done.saturating_duration_since(pick),
+            drained.saturating_duration_since(done),
+            now.saturating_duration_since(drained),
+        ];
+        let in_flight = self.started.borrow().len() as u64 + 1;
+        let mut perf = self.perf.borrow_mut();
+        for (stat, d) in perf.0.iter_mut().zip(stages) {
+            let us = d.as_micros() as u64;
+            stat[0] += 1;
+            stat[1] += us;
+            stat[2] = stat[2].max(us);
+            if us > 1000 {
+                stat[3] += 1;
+            }
+        }
+        perf.1 += in_flight;
+        perf.2 += 1;
+        if perf.2 % 512 == 0 {
+            let names = ["disp-pick", "pick-done", "done-drain", "drain-ready"];
+            let mut line = format!(
+                "nvmed: PERF n={} inflight_avg={:.2}",
+                perf.2,
+                perf.1 as f64 / 512.0
+            );
+            for (name, stat) in names.iter().zip(perf.0.iter()) {
+                line.push_str(&format!(
+                    " {name}={}/{}/{}",
+                    stat[1] / stat[0].max(1),
+                    stat[2],
+                    stat[3]
+                ));
+            }
+            log::info!("{line}");
+            perf.0 = [[0; 4]; 4];
+            perf.1 = 0;
+        }
+    }
+
     /// Runs `op` on the next worker and returns its result.
     ///
     /// # Safety
@@ -121,7 +177,9 @@ impl Dispatcher {
         let slot = Arc::new(Slot {
             result: Mutex::new(None),
             done: AtomicBool::new(false),
+            times: Mutex::new((None, None)),
         });
+        let t_dispatch = Instant::now();
         let index = self.next_worker.get();
         self.next_worker.set((index + 1) % self.workers.len());
         let worker = &self.workers[index];
@@ -148,6 +206,7 @@ impl Dispatcher {
         self.started
             .borrow_mut()
             .insert(id, (Instant::now(), index, Arc::clone(&slot)));
+        let slot_times = Arc::clone(&slot);
         let result = JobFuture {
             dispatcher: Rc::clone(self),
             id,
@@ -155,6 +214,7 @@ impl Dispatcher {
         }
         .await;
         self.started.borrow_mut().remove(&id);
+        self.perf_record(id, t_dispatch, &slot_times);
         result
     }
 
@@ -168,6 +228,7 @@ impl Dispatcher {
                 Ok(len) => {
                     for id in ids[..len - len % 8].chunks_exact(8) {
                         let id = u64::from_ne_bytes(id.try_into().expect("8-byte chunk"));
+                        self.perf_drained.borrow_mut().insert(id, Instant::now());
                         if let Some(waker) = self.waiting.borrow_mut().remove(&id) {
                             waker.wake();
                             woken += 1;
@@ -493,6 +554,8 @@ pub fn start(
         done,
         waiting: RefCell::new(HashMap::new()),
         started: RefCell::new(HashMap::new()),
+        perf_drained: RefCell::new(HashMap::new()),
+        perf: RefCell::new(([[0; 4]; 4], 0, 0)),
     }))
 }
 
@@ -625,6 +688,9 @@ fn serve(
                     Ok(job) => {
                         let id = job.id;
                         in_flight.set(Some((id, Instant::now())));
+                        if let Ok(mut t) = job.slot.times.lock() {
+                            t.0 = Some(Instant::now());
+                        }
                         run(&nvme, job).await;
                         in_flight.set(None);
                         if done_tx.write_all(&id.to_ne_bytes()).is_err() {
@@ -671,6 +737,9 @@ async fn run(nvme: &Nvme, job: Job) {
     };
     if let Ok(mut stored) = slot.result.lock() {
         *stored = Some(result);
+    }
+    if let Ok(mut t) = slot.times.lock() {
+        t.1 = Some(Instant::now());
     }
     slot.done.store(true, Ordering::Release);
 }
