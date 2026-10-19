@@ -2,6 +2,11 @@
 
 PREFIX=prefix/$(TARGET)
 
+# Ferric Oxide: downloads retry. static.redox-os.org has sometimes resolved to
+# IPv6 addresses only, which hosts without IPv6 (GitHub's runners) cannot
+# reach, so prefer IPv4 and resolve again on each try.
+WGET=wget --prefer-family=IPv4 --no-dns-cache --tries=20 --retry-connrefused --retry-on-host-error --waitretry=5
+
 PREFIX_INSTALL=$(PREFIX)/sysroot/
 PREFIX_PATH=$(ROOT)/$(PREFIX_INSTALL)/bin
 LIBTOOL_PATH=$(ROOT)/$(PREFIX)/libtool-install
@@ -115,7 +120,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.redox-os.org/toolchain/$(HOST_TARGET)/$(TARGET)/$(@F)"
+	$(WGET) -O $@.partial "https://static.redox-os.org/toolchain/$(HOST_TARGET)/$(TARGET)/$(@F)"
 	mv $@.partial $@
 endif
 
@@ -138,7 +143,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.redox-os.org/pkg/id_ed25519.pub.toml"
+	$(WGET) -O $@.partial "https://static.redox-os.org/pkg/id_ed25519.pub.toml"
 	mv $@.partial $@
 endif
 
@@ -147,7 +152,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.redox-os.org/pkg/$(TARGET)/$(@F)"
+	$(WGET) -O $@.partial "https://static.redox-os.org/pkg/$(TARGET)/$(@F)"
 	mv $@.partial $@
 endif
 
@@ -342,7 +347,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/$*-nightly-$(HOST_TARGET).tar.xz"
+	$(WGET) -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/$*-nightly-$(HOST_TARGET).tar.xz"
 	mv $@.partial $@
 endif
 
@@ -351,7 +356,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-std-nightly-$(HOST_TARGET).tar.xz"
+	$(WGET) -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-std-nightly-$(HOST_TARGET).tar.xz"
 	mv $@.partial $@
 endif
 
@@ -361,7 +366,7 @@ ifeq ($(PODMAN_BUILD),1)
 else
 	mkdir -p "$(@D)"
 ifeq ($(TARGET),x86_64-unknown-redox)
-	wget -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-std-nightly-$(TARGET).tar.xz"
+	$(WGET) -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-std-nightly-$(TARGET).tar.xz"
 	mv $@.partial $@
 else
 	touch $@
@@ -373,7 +378,7 @@ ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p "$(@D)"
-	wget -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-src-nightly.tar.xz"
+	$(WGET) -O $@.partial "https://static.rust-lang.org/dist/$(UPSTREAM_RUSTC_VERSION)/rust-src-nightly.tar.xz"
 	mv $@.partial $@
 endif
 
