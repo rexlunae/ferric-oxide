@@ -255,7 +255,10 @@ manner of Linux's pstore/ramoops:
   reader stores `tail` too) and counts them in `lost` before it reuses their
   words. A reader checks `tail` again after each copy, and keeps the part of
   its copy from the new `tail` on, so it never returns a torn record and is not
-  starved by a producer that keeps overwriting. In this mode `lost` is an upper
+  starved by a producer that keeps overwriting. The dump's copy checks the same
+  way: records overwritten while it copies are dropped (or, if the producer
+  overtook the whole copy, it copies again, up to four times), and the `lost`
+  count is stored after the records, so it counts them. In this mode `lost` is an upper
   bound: a record copied just before it was overwritten is delivered and
   counted. Without `kernel.trace_crash`, a full ring drops new records as
   before.
@@ -445,7 +448,9 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   reads them back: the newest records that fit, a region too small for them,
   refusal of an incomplete dump, of a bad version and of every flipped bit,
   sections that run past the payload, and message truncation on a character
-  boundary; and `Ring::copy_latest` with wrap-around and a corrupt record.
+  boundary; and `Ring::copy_latest` with wrap-around, a corrupt record, and a
+  flight-recorder producer that overwrites records during the copy (it drops
+  the overwritten ones, or copies again).
   `cargo test -p ferric-trace-cli` reads a dump with a torn record into a
   capture and saves it. On the target, the `crash` job boots a third image,
   whose kernel also has `kernel.trace_crash_test`, with `BOOT_REBOOT=1`

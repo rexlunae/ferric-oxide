@@ -31,7 +31,9 @@
 //! not, so the copy keeps the records from there on, when the walk it made lands on that
 //! position, and starts over at the new `tail` otherwise. So a copy never holds a torn record,
 //! and a reader that falls behind an overwriting producer still gets the newest records instead
-//! of retrying for ever. With [`WhenFull::DropNewest`] and one reader, `tail` never moves under
+//! of retrying for ever. [`Ring::copy_latest`], the crash dump's copy of the newest records,
+//! checks the same way, so a dump taken while other CPUs keep writing holds no record the
+//! producer overwrote. With [`WhenFull::DropNewest`] and one reader, `tail` never moves under
 //! the copy and the check never fires.
 //!
 //! There must be one producer and one consumer at a time. The kernel guarantees the first by
@@ -664,17 +666,56 @@ impl<S: Storage> Ring<S> {
         self.storage.tail().fetch_max(peek.end, Ordering::Release);
     }
 
-    /// Copies the newest whole records that fit in `max_words` words, oldest first, through
-    /// `out`, one word at a time, without consuming them, and returns the number of words
-    /// copied. Any CPU may call it; it is meant for a crash dump, taken while the producer may
-    /// still be running. A record the producer has not published is not copied, and a record
-    /// that does not decode ends the walk with what came before it. If the consumer commits at
-    /// the same time, the producer can reuse the words being copied and the copy can hold torn
-    /// records, which a decoder rejects; it never reads out of bounds.
-    pub fn copy_latest(&self, max_words: usize, mut out: impl FnMut(u64)) -> usize {
-        let tail = self.storage.tail().load(Ordering::Acquire);
+    /// Copies the newest whole records that fit in `out`, oldest first, to the start of `out`
+    /// without consuming them, and returns the number of words copied. Any CPU may call it; it
+    /// is meant for a crash dump, taken while the producer may still be running. A record the
+    /// producer has not published is not copied, and a record that does not decode ends the
+    /// walk with what came before it.
+    ///
+    /// The producer can reuse the oldest words while they are copied: a consumer commits, or a
+    /// [`WhenFull::OverwriteOldest`] ring makes room. `tail` is read again after the copy, as
+    /// [`Ring::peek`] does. When it moved into the copy, the records before it are dropped and
+    /// the rest moved to the start of `out`; when it moved past the copy, or only past records
+    /// the walk had to read to find the first one kept, the copy is made again, up to
+    /// [`COPY_LATEST_TRIES`] times, after which nothing is copied. A copy therefore never
+    /// holds a record the producer rewrote under it, and is never out of order; only its last
+    /// record can be cut short when the producer kept rewriting the words the walk went
+    /// through. It never reads out of bounds and does not allocate.
+    pub fn copy_latest(&self, out: &[AtomicU64]) -> usize {
+        for _ in 0..COPY_LATEST_TRIES {
+            let tail = self.storage.tail().load(Ordering::Acquire);
+            let (start, end) = self.latest(tail, out.len() as u64);
+            for (slot, pos) in out.iter().zip(start..end) {
+                slot.store(self.slot(pos).load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            // Pairs with the release fence in `Ring::push`: if a copied word was rewritten, the
+            // `tail` that allowed the rewrite is visible now.
+            fence(Ordering::Acquire);
+            let now = self.storage.tail().load(Ordering::Relaxed);
+            if now == tail {
+                return (end - start) as usize;
+            }
+            // `tail` moved in whole records, so `now` starts one. The words from it on were
+            // read before the producer could reuse them, and so were the headers the walk read
+            // there; the headers before it may not have been, so `start` is only known to be a
+            // record when `now` is at or after it.
+            if (start..end).contains(&now) {
+                let skip = (now - start) as usize;
+                let kept = (end - now) as usize;
+                // Forwards, so each word is read before anything is stored over it.
+                for (to, from) in out.iter().zip(&out[skip..skip + kept]) {
+                    to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                return kept;
+            }
+        }
+        0
+    }
+
+    /// The positions `start..end` of the newest whole records from `tail` that fit in `max`
+    /// words, by walking their headers.
+    fn latest(&self, tail: u64, max: u64) -> (u64, u64) {
         let head = self.storage.head().load(Ordering::Acquire);
-        let max = max_words as u64;
         let words_at = |pos: u64| {
             Header::decode(self.slot(pos).load(Ordering::Relaxed))
                 .ok()
@@ -696,10 +737,7 @@ impl<S: Storage> Ring<S> {
                 }
             }
         }
-        for pos in start..end {
-            out(self.slot(pos).load(Ordering::Relaxed));
-        }
-        (end - start) as usize
+        (start, end)
     }
 
     /// [`Ring::peek`] and [`Ring::commit`] in one step: moves as many whole records as fit into
@@ -716,6 +754,10 @@ impl<S: Storage> Ring<S> {
         Ok(len)
     }
 }
+
+/// How many times [`Ring::copy_latest`] copies again when the producer reused words under the
+/// copy, before it gives up and copies nothing.
+pub const COPY_LATEST_TRIES: usize = 4;
 
 /// The part of `copy`, made from position `start` into `out`, from position `tail` on, moved
 /// to the front of `out`: the records whose words were not reused, if the copy's walk lands on
@@ -962,6 +1004,13 @@ mod tests {
         assert!(Ring::new(words(16)).is_ok());
     }
 
+    /// [`Ring::copy_latest`] into `max` words: the words copied.
+    fn latest<S: Storage>(ring: &Ring<S>, max: usize) -> Vec<u64> {
+        let out = words(max);
+        let n = ring.copy_latest(&out);
+        out[..n].iter().map(|w| w.load(Ordering::Relaxed)).collect()
+    }
+
     /// The timestamps of the records in `words`.
     fn timestamps(words: &[u64]) -> Vec<u64> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -987,15 +1036,15 @@ mod tests {
             ring.push(EventId::new(1), t, &[t]).expect("room");
         }
         let pending = ring.pending();
-        let mut copied = Vec::new();
-        assert_eq!(ring.copy_latest(10, |w| copied.push(w)), 9);
+        let copied = latest(&ring, 10);
+        assert_eq!(copied.len(), 9);
         assert_eq!(timestamps(&copied), [11, 12, 13]);
         // Nothing was consumed.
         assert_eq!(ring.pending(), pending);
-        copied.clear();
-        assert_eq!(ring.copy_latest(usize::MAX, |w| copied.push(w)), pending);
+        let copied = latest(&ring, 64);
+        assert_eq!(copied.len(), pending);
         assert_eq!(timestamps(&copied), [8, 9, 10, 11, 12, 13]);
-        assert_eq!(ring.copy_latest(2, |_| panic!("no record fits")), 0);
+        assert!(latest(&ring, 2).is_empty(), "no record fits");
     }
 
     #[test]
@@ -1006,8 +1055,8 @@ mod tests {
         ring.push(EventId::new(1), 3, &[]).expect("room");
         // Scribble over the second record's header.
         ring.slot(2).store(u64::MAX, Ordering::Relaxed);
-        let mut copied = Vec::new();
-        assert_eq!(ring.copy_latest(usize::MAX, |w| copied.push(w)), 2);
+        let copied = latest(&ring, 64);
+        assert_eq!(copied.len(), 2);
         assert_eq!(timestamps(&copied), [1]);
     }
 
@@ -1095,10 +1144,68 @@ mod tests {
         for i in 0..100 {
             ring.push(EventId::new(1), i, &[i, i]).expect("room");
         }
-        let mut copied = Vec::new();
-        assert_eq!(ring.copy_latest(12, |w| copied.push(w)), 12);
-        let bytes: Vec<u8> = copied.iter().flat_map(|w| w.to_le_bytes()).collect();
-        assert_eq!(byte_timestamps(&bytes), [97, 98, 99]);
+        let copied = latest(&ring, 12);
+        assert_eq!(copied.len(), 12);
+        assert_eq!(timestamps(&copied), [97, 98, 99]);
+    }
+
+    /// Two rings over the same shared words: one that copies through [`Hooked`], whose `hook`
+    /// pushes on the other (the producer, a flight recorder) partway through the copy.
+    fn overtaken_copy(at: usize, pushes: u64, max: usize) -> (Vec<u64>, u64) {
+        let mem = words(SHARED_HEADER_WORDS + 16);
+        let producer = std::sync::OnceLock::new();
+        let reader = Ring::shared(Hooked {
+            words: &mem[..],
+            at,
+            fired: core::sync::atomic::AtomicBool::new(false),
+            hook: || {
+                let producer: &Ring<Shared<&[AtomicU64]>> = producer.get().expect("made");
+                for t in 4..4 + pushes {
+                    producer.push(EventId::new(1), t, &[t, t]).expect("room");
+                }
+            },
+        })
+        .expect("valid");
+        let ring = producer.get_or_init(|| {
+            Ring::shared(&mem[..])
+                .expect("valid")
+                .when_full(WhenFull::OverwriteOldest)
+        });
+        // Four 4-word records fill the 16 data words.
+        for t in 0..4 {
+            ring.push(EventId::new(1), t, &[t, t]).expect("room");
+        }
+        (latest(&reader, max), ring.lost())
+    }
+
+    /// The producer overwrites the oldest record while it is copied (after its header, before
+    /// its timestamp): the copy drops it instead of keeping its old header with the new
+    /// record's timestamp, which would put timestamp 4 first.
+    #[test]
+    fn copy_latest_drops_what_the_producer_overwrote() {
+        let (copied, lost) = overtaken_copy(SHARED_HEADER_WORDS + 1, 1, 16);
+        assert_eq!(lost, 1);
+        assert_eq!(copied.len(), 12);
+        assert_eq!(timestamps(&copied), [1, 2, 3]);
+    }
+
+    /// The producer overwrites every record under the copy: the copy is made again, of the
+    /// records that are there now.
+    #[test]
+    fn copy_latest_copies_again_when_overtaken() {
+        let (copied, lost) = overtaken_copy(SHARED_HEADER_WORDS + 1, 4, 16);
+        assert_eq!(lost, 4);
+        assert_eq!(timestamps(&copied), [4, 5, 6, 7]);
+    }
+
+    /// The producer overwrites only records older than those the copy keeps, which the walk
+    /// read to find the first one kept: the copy is made again.
+    #[test]
+    fn copy_latest_rewalks_when_the_records_before_it_change() {
+        // Room for two records: the copy starts at the third record's header (data word 8).
+        let (copied, lost) = overtaken_copy(SHARED_HEADER_WORDS + 9, 1, 8);
+        assert_eq!(lost, 1);
+        assert_eq!(timestamps(&copied), [3, 4]);
     }
 
     /// The consumer's position is a record boundary below the overwriting producer's new

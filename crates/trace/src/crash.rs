@@ -279,29 +279,22 @@ impl<'a> Writer<'a> {
         self.words.len() - self.pos
     }
 
-    /// Appends a section of `kind` for `cpu` whose data `fill` writes, given at most `max`
-    /// data words and a store for each word, and which returns its length in bytes.
+    /// Appends a section of `kind` for `cpu` whose data `fill` writes into the words it is
+    /// given (at most `max`, fewer when the region is nearly full), and which returns its
+    /// length in bytes.
     fn section(
         &mut self,
         kind: u8,
         cpu: u32,
         max: usize,
-        fill: impl FnOnce(usize, &mut dyn FnMut(u64)) -> usize,
+        fill: impl FnOnce(&[AtomicU64]) -> usize,
     ) -> usize {
         let Some(max) = self.remaining().checked_sub(1).map(|room| room.min(max)) else {
             return 0;
         };
         let header = self.pos;
-        let mut next = header + 1;
-        let end = next + max;
-        let words = self.words;
-        let bytes = fill(max, &mut |word| {
-            if let Some(slot) = words.get(next).filter(|_| next < end) {
-                slot.store(word, Ordering::Relaxed);
-                next += 1;
-            }
-        });
-        let bytes = bytes.min((next - header - 1) * WORD_BYTES);
+        let data = &self.words[header + 1..header + 1 + max];
+        let bytes = fill(data).min(max * WORD_BYTES);
         self.words[header].store(section_word(kind, cpu, bytes), Ordering::Relaxed);
         self.pos = header + 1 + data_words(bytes);
         bytes
@@ -311,20 +304,15 @@ impl<'a> Writer<'a> {
     /// and returns the bytes kept.
     pub fn message(&mut self, cpu: u32, message: &[u8]) -> usize {
         let message = message.get(..MESSAGE_MAX).unwrap_or(message);
-        self.section(
-            SECTION_MESSAGE,
-            cpu,
-            data_words(message.len()),
-            |max, store| {
-                let kept = message.get(..max * WORD_BYTES).unwrap_or(message);
-                for chunk in kept.chunks(WORD_BYTES) {
-                    let mut word = [0u8; WORD_BYTES];
-                    word[..chunk.len()].copy_from_slice(chunk);
-                    store(u64::from_le_bytes(word));
-                }
-                kept.len()
-            },
-        )
+        self.section(SECTION_MESSAGE, cpu, data_words(message.len()), |data| {
+            let kept = message.get(..data.len() * WORD_BYTES).unwrap_or(message);
+            for (chunk, slot) in kept.chunks(WORD_BYTES).zip(data) {
+                let mut word = [0u8; WORD_BYTES];
+                word[..chunk.len()].copy_from_slice(chunk);
+                slot.store(u64::from_le_bytes(word), Ordering::Relaxed);
+            }
+            kept.len()
+        })
     }
 
     /// Appends the newest records of `cpu`'s `ring` that fit in `max` words (the section's two
@@ -333,12 +321,15 @@ impl<'a> Writer<'a> {
         let Some(max) = max.checked_sub(1) else {
             return 0;
         };
-        let bytes = self.section(SECTION_CPU, cpu, max, |max, store| {
-            let Some(records) = max.checked_sub(1) else {
+        let bytes = self.section(SECTION_CPU, cpu, max, |data| {
+            let Some((lost, records)) = data.split_first() else {
                 return 0;
             };
-            store(ring.lost());
-            (1 + ring.copy_latest(records, &mut *store)) * WORD_BYTES
+            // The records first: a flight-recorder ring counts the ones it overwrites during
+            // the copy as lost.
+            let copied = ring.copy_latest(records);
+            lost.store(ring.lost(), Ordering::Relaxed);
+            (1 + copied) * WORD_BYTES
         });
         data_words(bytes).saturating_sub(1)
     }
