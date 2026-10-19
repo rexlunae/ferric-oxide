@@ -151,6 +151,10 @@ that same catalog, and `ferric_trace::record::Records` decodes a buffer.
 
 Each CPU has a 64 KiB ring, created when the CPUs are counted or on the first
 run-time enable. When a ring is full, new records are dropped and counted.
+The ring sits in kernel-allocated pages in the shared layout of
+`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
+data length, and `head`, `tail` and `lost` on cache lines of their own), then
+the data pages.
 Timestamps assume an invariant TSC that is synchronized across CPUs.
 
 ## The `kernel.trace` scheme
@@ -163,7 +167,7 @@ The paths are defined in `ferric_trace::abi`.
 | --- | --- | --- |
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
-| `cpu/<n>` | Drains whole records from CPU n's ring | — |
+| `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 
 `events` and `stats` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
@@ -177,6 +181,36 @@ open. A `cpu/<n>` read follows these rules:
 
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
+
+### Mapping a ring
+
+A reader can map a CPU's ring instead of reading it, and read records in place
+without a system call per batch:
+
+- `mmap` of a `cpu/<n>` descriptor must ask for `abi::CPU_MAP_BYTES` from
+  offset 0 with `PROT_READ` and `MAP_SHARED`. The kernel refuses `PROT_WRITE`
+  (`EACCES`), a mapping without `PROT_READ`, a partial or a private mapping
+  (`EINVAL`) and a fixed address (`EOPNOTSUPP`). `mprotect` cannot make the
+  mapping writable later.
+- `ferric_trace::ring::View` checks the header and copies whole records from
+  the mapping. Each copy reports its end position.
+- Writing `commit <end>` to the descriptor lets the kernel reuse the words up
+  to `end`. The kernel accepts only the end of a record between its own `tail`
+  and `head`, and returns `EINVAL` otherwise. Like a read, a commit returns
+  `EAGAIN` while another reader is using that CPU.
+
+The kernel is the only writer of a mapped ring. It never takes a value from
+the mapping that it did not store itself: the ring's size is kept in the
+kernel, every position is masked to the data before use, and `commit`'s `end`
+is checked against the kernel's own counters. The reader sees `head` and
+`tail` change under it, so `View` copies a record before decoding it.
+
+A `read` of the same CPU can consume records while a mapped reader is copying
+them, and the kernel can then reuse those words. After each copy, `View`
+checks `tail` again and starts over if it moved past the copy, so a copy never
+mixes two records. Two readers of one CPU can still both see a record. A
+collector that needs each record exactly once should be the CPU's only
+reader.
 
 ## Reading a capture on the host
 
@@ -270,6 +304,9 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   - the compile-time catalog checks;
   - record encoding and decoding, including truncated and corrupt input;
   - ring wrap-around, loss counting, too-small buffers and uncommitted reads;
+  - the shared layout's header, `View` reads that store nothing, header
+    checks, and `commit_to` refusing positions past `head` or inside a
+    record;
   - a two-thread test with a million records;
   - `trace.toml` parsing, refusal of unknown keys and wrong types, catalog
     checks of the selections, command order, and a TOML round trip.
@@ -309,7 +346,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      request (the first one on its CPU after the program's own
      `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
      result, another process as responder), and that `disable` stops the
-     stream.
+     stream;
+  7. maps every CPU's ring, checks that writable, unreadable, partial and
+     private mappings and an `mprotect` to writable are refused, finds the
+     `write` to a closed descriptor by reading the mappings, and checks that
+     `commit` refuses a position past `head` or inside a record and accepts
+     the end of what was read.
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
@@ -321,7 +363,7 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
-  requires all eleven step markers, the `trace-capture` marker, the boot log
+  requires all twelve step markers, the `trace-capture` marker, the boot log
   line and the kernel's log of bootstrap's `enable scheme.cancel`.
 
 ## Overhead budget
@@ -392,6 +434,6 @@ as a notice on the run.
 
 - Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
   process lifecycle).
-- Read-only mapping of the rings.
+- A reader that maps the rings in the `ferric-trace` tool (it still reads them).
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
 - Architectures other than x86_64.

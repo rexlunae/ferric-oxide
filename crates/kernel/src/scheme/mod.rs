@@ -85,6 +85,10 @@ pub mod pipe;
 /// `proc:` - allows tracing processes and reading/writing their memory
 pub mod proc;
 
+/// Ferric Oxide: mapping kernel-owned frames into a process (`rings`, `trace`)
+#[cfg(any(feature = "rings", feature = "trace"))]
+pub mod shared_frames;
+
 /// `serio:` - provides access to ps/2 devices
 pub mod serio;
 

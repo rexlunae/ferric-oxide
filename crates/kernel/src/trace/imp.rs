@@ -1,11 +1,21 @@
 //! The parts of tracing that exist with the `trace` feature: what is compiled in, turning events
 //! on and off, the per-CPU rings and writing records.
+//!
+//! Each CPU's ring is in the shared layout of `ferric_trace::ring` (a header page, then the
+//! data pages), in frames the kernel allocates once and keeps, so `kernel.trace` can map them
+//! read-only into a reader. The kernel is the only writer of those words: the ring's size
+//! lives in the `Ring` itself, and the counters it reads back from the header are ones it
+//! stored, masked to the data before use. A reader that hands back a position goes through
+//! `Ring::commit_to`, which takes only a record boundary between `tail` and `head`.
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, sync::atomic::AtomicU64};
 
 use ferric_trace::{
-    kernel::CATALOG, ring::Ring, select, Event, EventSet, Level, SelectError, Subsystem,
+    abi::CPU_RING_WORDS,
+    kernel::CATALOG,
+    ring::{Ring, RingError, Shared, Words, SHARED_HEADER_WORDS},
+    select, Event, EventSet, Level, SelectError, Subsystem,
 };
 use spin::Once;
 
@@ -13,6 +23,7 @@ pub use crate::arch::static_key::{interrupts_enabled, is_on, key as enabled, Mod
 use crate::{
     arch::static_key,
     cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
+    memory::{RaiiFrame, PAGE_SIZE},
 };
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -135,23 +146,90 @@ pub fn init_boot(env: &[u8]) {
     }
 }
 
-/// A CPU's ring.
-pub type CpuRing = Ring<Box<[AtomicU64]>>;
+/// The words in a page.
+const WORDS_PER_PAGE: usize = PAGE_SIZE / 8;
 
-/// The size of each CPU's ring in words: 64 KiB.
-const RING_WORDS: usize = 8192;
+/// The pages of a CPU's ring: the header page, then the data.
+const RING_PAGES: usize = (SHARED_HEADER_WORDS + CPU_RING_WORDS) / WORDS_PER_PAGE;
+
+const _: () = assert!(SHARED_HEADER_WORDS.is_multiple_of(WORDS_PER_PAGE));
+const _: () = assert!(CPU_RING_WORDS.is_multiple_of(WORDS_PER_PAGE));
+
+/// A CPU ring's memory: zeroed frames allocated once and kept for the kernel's life, reached
+/// through the linear map one page at a time.
+pub struct FramePages {
+    /// The frames, for mapping into a reader.
+    frames: &'static [RaiiFrame],
+    /// Each frame's words, looked up once so a push does not redo it.
+    pages: Box<[&'static [AtomicU64; WORDS_PER_PAGE]]>,
+}
+
+/// Why a CPU's ring could not be made.
+#[derive(Clone, Copy, Debug)]
+pub enum RingInitError {
+    /// No free frames.
+    NoMemory,
+    /// The layout constants do not make a ring.
+    Layout(RingError),
+}
+
+impl fmt::Display for RingInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RingInitError::NoMemory => f.write_str("no memory for the ring"),
+            RingInitError::Layout(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl FramePages {
+    /// [`RING_PAGES`] zeroed frames, kept for the kernel's life.
+    fn allocate() -> Result<Self, RingInitError> {
+        let frames = (0..RING_PAGES)
+            .map(|_| RaiiFrame::allocate().map_err(|_| RingInitError::NoMemory))
+            .collect::<Result<Vec<_>, _>>()?;
+        // A ring lives as long as the kernel, so its frames are never freed.
+        let frames: &'static [RaiiFrame] = Box::leak(frames.into_boxed_slice());
+        let pages = frames.iter().map(RaiiFrame::words).collect();
+        Ok(Self { frames, pages })
+    }
+
+    /// The frames, header first.
+    pub fn frames(&self) -> &'static [RaiiFrame] {
+        self.frames
+    }
+}
+
+impl Words for FramePages {
+    fn len(&self) -> usize {
+        self.pages.len().saturating_mul(WORDS_PER_PAGE)
+    }
+
+    // `Words::word` may panic past the end, and a ring never asks for such a word: it masks
+    // every position to the data first. The word within the page is always in bounds.
+    #[expect(clippy::indexing_slicing)]
+    fn word(&self, index: usize) -> &AtomicU64 {
+        &self.pages[index / WORDS_PER_PAGE][index % WORDS_PER_PAGE]
+    }
+}
+
+/// A CPU's ring.
+pub type CpuRing = Ring<Shared<FramePages>>;
 
 /// Each CPU's ring, made by [`init_rings`].
 static RINGS: [Once<CpuRing>; MAX_CPU_COUNT as usize] =
     [const { Once::new() }; MAX_CPU_COUNT as usize];
 
 /// Makes a ring for every CPU that is up and has none. Called from `kmain`, once the CPUs are
-/// counted, and before an event is turned on at run time.
+/// counted, and before an event is turned on at run time. A CPU whose ring cannot be made
+/// stays without one, counting nothing, until the next call.
 pub fn init_rings() {
-    for ring in RINGS.iter().take(crate::cpu_count() as usize) {
-        ring.call_once(|| {
-            Ring::with_capacity(RING_WORDS).expect("RING_WORDS is a power of two above a record")
-        });
+    for (cpu, ring) in RINGS.iter().enumerate().take(crate::cpu_count() as usize) {
+        let made = ring
+            .try_call_once(|| Ring::shared(FramePages::allocate()?).map_err(RingInitError::Layout));
+        if let Err(err) = made {
+            warn!("trace: no ring for CPU {cpu}: {err}");
+        }
     }
 }
 

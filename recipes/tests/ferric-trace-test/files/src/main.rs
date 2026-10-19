@@ -31,6 +31,12 @@
 //!   and, with the same scheme id and SQE tag, a `scheme.response` from another process with the
 //!   byte count as its result.
 //! - `trace-disable`: once `disable syscall scheme` returns, the same calls leave no record.
+//! - `trace-mmap`: every CPU's ring maps read-only (`PROT_READ`, `MAP_SHARED`), and the kernel
+//!   refuses a writable, unreadable, partial or private mapping and an `mprotect` to writable. With the
+//!   `syscall` events on again, the marker `write` is found by reading the mappings through a
+//!   `ferric_trace::ring::View`; `commit <end>` past `head` or inside a record is refused
+//!   and leaves `tail` alone, and `commit` of the end read moves `tail` there, after which a
+//!   read of the ring no longer gives the call.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without
