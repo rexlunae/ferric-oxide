@@ -194,6 +194,35 @@ ifeq ($(REPO_BINARY),1)
 INSTALLER_OPTS+=--repo-binary
 COOKBOOK_OPTS+=--repo-binary
 endif
+## Ferric Oxide: finish the image root with fox (features.toml
+## packages.manager = "fox" sets FERRIC_FOX_IMAGE=1). fox adopts the packages
+## the installer placed, syncs the package set FERRIC_FOX_PACKAGES if one is
+## given (packages.set; fox.lock is written beside it, and
+## FERRIC_FOX_LOCKED=1 from packages.locked refuses anything it does not pin),
+## and writes the image SBOM to $(FERRIC_FOX_SBOM). FERRIC_FOX_LEVEL (v3 or v4,
+## from cpu.x86_64_level) is the x86-64 level the set's packages are
+## installed for; without it fox uses the set's policy, else v3.
+FERRIC_FOX_IMAGE?=0
+FERRIC_FOX_PACKAGES?=
+FERRIC_FOX_LOCKED?=0
+FERRIC_FOX_LEVEL?=
+FERRIC_FOX_BIN?=target/release/fox
+ifeq ($(HOSTED_REDOX),1)
+FERRIC_FOX_BIN=fox
+endif
+FERRIC_FOX_SBOM=$(BUILD)/image.cdx.json
+ifeq ($(FERRIC_FOX_IMAGE),1)
+INSTALLER_OPTS+=--fox=$(FERRIC_FOX_BIN) --fox-sbom=$(FERRIC_FOX_SBOM)
+ifneq ($(FERRIC_FOX_PACKAGES),)
+INSTALLER_OPTS+=--fox-packages=$(FERRIC_FOX_PACKAGES)
+ifeq ($(FERRIC_FOX_LOCKED),1)
+INSTALLER_OPTS+=--fox-locked
+endif
+ifneq ($(FERRIC_FOX_LEVEL),)
+INSTALLER_OPTS+=--fox-level=$(FERRIC_FOX_LEVEL)
+endif
+endif
+endif
 ifeq ($(FSTOOLS_NO_MOUNT),1)
 INSTALLER_OPTS+=--no-mount
 INSTALLER_FEATURES=--no-default-features --features installer

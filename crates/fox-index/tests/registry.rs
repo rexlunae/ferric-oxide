@@ -810,6 +810,81 @@ fn editing_a_pending_root_drops_every_signature_on_it() {
 }
 
 #[test]
+fn packages_are_admitted_together_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let other = |name: &str| {
+        let mut entry = entry();
+        entry.name = PackageName::new(name).unwrap();
+        entry
+    };
+    // One package already admitted refuses the whole batch.
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), entry()]),
+        Err(EditError::AlreadyAdmitted { .. })
+    ));
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("fd")]),
+        Err(EditError::AlreadyAdmitted { .. })
+    ));
+    assert!(!dir.path().join("packages/fd/fd.toml").exists());
+
+    registry.admit_all(&[other("fd"), other("bat")]).unwrap();
+    // The delegations persist for another process to sign.
+    let mut reopened = Registry::open(dir.path()).unwrap();
+    let report = reopened
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    let mut state = client(&reopened);
+    let verified = verify::update(dir.path(), &mut state, now()).unwrap();
+    assert_eq!(verified.package_names().len(), 3);
+}
+
+#[test]
+fn a_failed_batch_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = admitted(dir.path());
+    let other = |name: &str| {
+        let mut entry = entry();
+        entry.name = PackageName::new(name).unwrap();
+        entry
+    };
+    let fd = dir.path().join("packages/fd/fd.toml");
+    let targets = fs::read(dir.path().join("metadata/targets.json")).unwrap();
+
+    // A later entry that is invalid stops the batch before any write.
+    let mut ownerless = other("bat");
+    ownerless.owners.clear();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), ownerless]),
+        Err(EditError::Layout { .. })
+    ));
+    assert!(!fd.exists());
+
+    // A later write that fails takes the earlier files back out.
+    fs::write(dir.path().join("packages/ba"), "in the way").unwrap();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("bat")]),
+        Err(EditError::Io { .. })
+    ));
+    assert!(!fd.exists());
+    assert_eq!(
+        fs::read(dir.path().join("metadata/targets.json")).unwrap(),
+        targets
+    );
+
+    // So the same batch can be retried.
+    fs::remove_file(dir.path().join("packages/ba")).unwrap();
+    registry.admit_all(&[other("fd"), other("bat")]).unwrap();
+    assert!(fd.exists());
+}
+
+#[test]
 fn a_delegation_name_is_one_path_component() {
     let dir = tempfile::tempdir().unwrap();
     let registry = admitted(dir.path());

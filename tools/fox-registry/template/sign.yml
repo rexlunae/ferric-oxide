@@ -32,8 +32,12 @@ jobs:
           printf '%s' "$BUILDER_KEY" > "$RUNNER_TEMP/keys/builder.key"
       - name: Build missing artifacts
         run: |
-          fox-registry build --key "$RUNNER_TEMP/keys/builder.key" --label ci \
-            --blobs "$RUNNER_TEMP/blobs"
+          # One artifact per x86-64 level: v3 is the baseline, v4 is
+          # picked by machines with AVX-512.
+          for level in v3 v4; do
+            fox-registry build --key "$RUNNER_TEMP/keys/builder.key" --label ci \
+              --blobs "$RUNNER_TEMP/blobs" --level "$level"
+          done
       - name: Upload blobs
         env:
           GH_TOKEN: ${{ github.token }}

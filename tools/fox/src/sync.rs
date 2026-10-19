@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{self, CliError, print_json};
 use crate::source::{SourceError, SourceSpec};
-use crate::{Cli, SourceArgs};
+use crate::{Cli, SourceArgs, cpu};
 
 /// The lock's `target` for an archive whose manifest names no target.
 const NO_TARGET: &str = "none";
@@ -330,6 +330,12 @@ impl Want {
         // once built; the lock records it and later builds must match.
         let target = self.target.as_deref().or(base.target.as_deref());
         hash_field(&mut hasher, target.map(str::as_bytes));
+        // The x86-64 level matters only to x86-64 builds and variants; an
+        // implicit target may turn out to be one.
+        let level = base
+            .cpu_level
+            .filter(|_| target.is_none_or(fox_core::CpuLevel::applies_to));
+        hash_field(&mut hasher, level.map(|level| level.as_str().as_bytes()));
         Ok(Request {
             git,
             rev,
@@ -451,9 +457,17 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         Path::to_path_buf,
     );
     let previous = previous_lock(&lock_path, options.update)?;
+    // The level is part of each request, so it is settled first, under the
+    // policy the set is about to install.
+    let level_policy = match &set.policy {
+        Some(policy) => policy.clone(),
+        None => Policy::load(&cli.root)?,
+    };
+    let mut source = options.source.clone();
+    source.cpu_level = Some(cpu::for_root(source.cpu_level, &cli.root, &level_policy));
     let mut chosen = BTreeMap::new();
     for (name, want) in &set.packages {
-        let request = want.request(name, options.source)?;
+        let request = want.request(name, &source)?;
         let locked = previous
             .get(name)
             .filter(|locked| !options.update && want.accepts(locked, &request));
@@ -473,7 +487,7 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
             .map_err(|source| SyncError::Write { path, source })?;
     }
     let policy = Policy::load(&root)?;
-    let mut base = options.source.clone();
+    let mut base = source;
     base.allow_unsigned |= policy.allow_unsigned_git;
 
     let mut lock = Lock::default();
@@ -719,6 +733,7 @@ mod tests {
             trust_new_key: false,
             allow_unsigned: false,
             target: None,
+            cpu_level: None,
             package: None,
             path: None,
             features: Vec::new(),
@@ -860,6 +875,30 @@ mod tests {
         cross.target = Some("x86_64-unknown-redox".into());
         let cross_request = want.request(&name, &cross).unwrap();
         assert!(!want.accepts(&pinned, &cross_request));
+    }
+
+    #[test]
+    fn the_cpu_level_is_part_of_x86_64_requests_only() {
+        let name = PackageName::new("tiny").unwrap();
+        let at = |target: Option<&str>, level| {
+            let want = Want {
+                target: target.map(str::to_owned),
+                default_features: true,
+                ..Want::default()
+            };
+            let mut args = base();
+            args.cpu_level = level;
+            want.request(&name, &args).unwrap()
+        };
+        let v3 = Some(fox_core::CpuLevel::X86_64V3);
+        let v4 = Some(fox_core::CpuLevel::X86_64V4);
+        let x86 = Some("x86_64-unknown-redox");
+        assert_ne!(at(x86, v3), at(x86, v4));
+        // An implicit target may be x86-64.
+        assert_ne!(at(None, v3), at(None, v4));
+        // Another target's lock survives moving to a new x86-64 machine.
+        let arm = Some("aarch64-unknown-redox");
+        assert_eq!(at(arm, v3), at(arm, v4));
     }
 
     #[test]

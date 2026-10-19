@@ -332,6 +332,104 @@ fn a_builder_records_attested_artifacts() {
 
     // Nothing is left to build.
     assert!(!env.ok(&build).contains("built"));
+
+    // An independent rebuilder, in another work directory, reproduces the
+    // archive and adds its own attestation to the same artifact.
+    let rebuilder = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(tempfile::tempdir().unwrap().path())
+        .args(["init", "--name", "r", "--single-key", "--keys"])
+        .arg(rebuilder.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rebuilder_key = rebuilder.path().join("registry.key").display().to_string();
+    let rebuilder_pub = rebuilder.path().join("registry.pub").display().to_string();
+    let rework = tempfile::tempdir().unwrap();
+    let rebuild = [
+        "rebuild",
+        "--key",
+        &rebuilder_key,
+        "--label",
+        "rebuilder",
+        "--blobs",
+        blobs_arg,
+        "--work-dir",
+        rework.path().to_str().unwrap(),
+    ];
+    let output = env.run(&rebuild);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not listed"),
+        "{}",
+        stderr(&output)
+    );
+    let rebuilder_arg = format!("rebuilder={rebuilder_pub}");
+    env.ok(&["configure", "--builder", &rebuilder_arg]);
+    let out = env.ok(&rebuild);
+    assert!(out.contains("reproduced tiny 0.1.0"), "{out}");
+    let artifacts =
+        fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+    assert_eq!(artifacts.matches("[[artifact]]").count(), 1, "{artifacts}");
+    assert!(artifacts.contains("builder = \"rebuilder\""), "{artifacts}");
+    assert!(env.sign(&[&targets, &snapshot, &timestamp]));
+    env.ok(&["verify"]);
+    // Nothing is left to rebuild, and naming the release again fails.
+    assert!(!env.ok(&rebuild).contains("reproduced"));
+    let mut again: Vec<&str> = rebuild.to_vec();
+    again.push("tiny@0.1.0");
+    let output = env.run(&again);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no artifact of tiny 0.1.0"),
+        "{}",
+        stderr(&output)
+    );
+
+    // Replacing the rebuilder's key makes its attestation stale: clients
+    // would no longer count it, so the rebuilder attests again.
+    let rotated = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(tempfile::tempdir().unwrap().path())
+        .args(["init", "--name", "r2", "--single-key", "--keys"])
+        .arg(rotated.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rotated_key = rotated.path().join("registry.key").display().to_string();
+    let rotated_arg = format!(
+        "rebuilder={}",
+        rotated.path().join("registry.pub").display()
+    );
+    env.ok(&["configure", "--builder", &rotated_arg]);
+    let mut rotated_rebuild: Vec<&str> = rebuild.to_vec();
+    rotated_rebuild[2] = &rotated_key;
+    let out = env.ok(&rotated_rebuild);
+    assert!(out.contains("reproduced tiny 0.1.0"), "{out}");
+    let artifacts =
+        fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+    assert_eq!(
+        artifacts.matches("builder = \"rebuilder\"").count(),
+        1,
+        "{artifacts}"
+    );
+    assert!(env.sign(&[&targets, &snapshot, &timestamp]));
+    env.ok(&["verify"]);
+    assert!(!env.ok(&rotated_rebuild).contains("reproduced"));
+
+    // Each x86-64 level is its own artifact.
+    if cfg!(target_arch = "x86_64") {
+        let v4: Vec<&str> = build.iter().copied().chain(["--level", "v4"]).collect();
+        let out = env.ok(&v4);
+        assert!(out.contains("built tiny 0.1.0"), "{out}");
+        let artifacts =
+            fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+        assert!(artifacts.contains("\"x86_64-v4\""), "{artifacts}");
+        assert!(!env.ok(&v4).contains("built"));
+        assert!(!env.ok(&build).contains("built"));
+    }
 }
 
 #[test]
@@ -369,4 +467,122 @@ fn advisories_are_published_and_signed() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn vex_documents_are_published_signed_and_removed() {
+    let env = Env::new();
+    let file = env.keys.path().join("tiny-dos.cdx.json");
+    let vex = r#"{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+        "vulnerabilities": [{"id": "RUSTSEC-2026-0001",
+          "analysis": {"state": "not_affected", "justification": "code_not_present"},
+          "affects": [{"ref": "pkg:generic/tiny@0.1.0"}]}]}"#;
+    fs::write(&file, vex).unwrap();
+    let out = env.ok(&["vex", file.to_str().unwrap()]);
+    assert!(out.contains("vex/tiny-dos.cdx.json"), "{out}");
+    let signing = [
+        env.key("targets"),
+        env.key("snapshot"),
+        env.key("timestamp"),
+    ];
+    let signing: Vec<&str> = signing.iter().map(String::as_str).collect();
+    assert!(env.sign(&signing));
+    env.ok(&["verify"]);
+    let stored = fs::read_to_string(env.registry.path().join("vex/tiny-dos.cdx.json")).unwrap();
+    assert_eq!(stored, vex);
+
+    // A document fox could not use is refused, as is an unusable id.
+    fs::write(&file, vex.replace("pkg:generic/tiny", "pkg:cargo/tiny")).unwrap();
+    let output = env.run(&["vex", file.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not a fox package"),
+        "{}",
+        stderr(&output)
+    );
+    let output = env.run(&["vex", file.to_str().unwrap(), "--id", "../x"]);
+    assert!(
+        stderr(&output).contains("may only hold"),
+        "{}",
+        stderr(&output)
+    );
+
+    let out = env.ok(&["vex", "--remove", "tiny-dos"]);
+    assert!(out.contains("vex/tiny-dos.cdx.json"), "{out}");
+    assert!(env.sign(&signing));
+    env.ok(&["verify"]);
+    let output = env.run(&["vex", "--remove", "tiny-dos"]);
+    assert!(
+        stderr(&output).contains("no VEX document"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn cookbook_recipes_become_recipe_packages() {
+    let env = Env::new();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    for (dir, text) in [
+        (
+            "recipes/core/hello",
+            "[source]\ngit = \"https://example.com/hello.git\"\n\n[build]\ntemplate = \"cargo\"\n",
+        ),
+        (
+            "recipes/libs/zlib",
+            "[source]\ntar = \"https://example.com/zlib.tar.gz\"\n\n[package]\ndescription = \"Compression library\"\n",
+        ),
+        ("recipes/libs/bad@name", "[build]\ntemplate = \"custom\"\n"),
+    ] {
+        fs::create_dir_all(repo.path().join(dir)).unwrap();
+        fs::write(repo.path().join(dir).join("recipe.toml"), text).unwrap();
+    }
+    let owner = owner_key(5);
+    let owner_path = env.keys.path().join("owner_ed25519");
+    fs::write(
+        &owner_path,
+        owner.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+    )
+    .unwrap();
+    let owner_arg = format!("me={}", owner.public_key().to_openssh().unwrap());
+    let recipes = repo.path().join("recipes");
+    let import = [
+        "import-recipes",
+        recipes.to_str().unwrap(),
+        "--git",
+        "https://example.com/ferric-oxide.git",
+        "--owner",
+        &owner_arg,
+    ];
+    let output = env.run(&import);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("admitted 2 recipes (0 already"), "{out}");
+    assert!(stderr(&output).contains("bad@name"), "{}", stderr(&output));
+
+    let hello = fs::read_to_string(env.registry.path().join("packages/he/hello.toml")).unwrap();
+    assert!(hello.contains("kind = \"recipe\""), "{hello}");
+    assert!(hello.contains("path = \"recipes/core/hello\""), "{hello}");
+    assert!(
+        hello.contains("Cookbook recipe for https://example.com/hello.git"),
+        "{hello}"
+    );
+    let zlib = fs::read_to_string(env.registry.path().join("packages/zl/zlib.toml")).unwrap();
+    assert!(zlib.contains("Compression library"), "{zlib}");
+
+    let owner_path = owner_path.display().to_string();
+    assert!(env.sign(&[
+        &owner_path,
+        &env.key("targets"),
+        &env.key("snapshot"),
+        &env.key("timestamp")
+    ]));
+    env.ok(&["verify"]);
+    // Without releases there is nothing to check against the (unreachable)
+    // repository, so check passes without fetching it.
+    let checked = env.ok(&["check"]);
+    assert!(checked.contains("hello: no releases"), "{checked}");
+    // Importing again admits nothing new.
+    assert!(env.ok(&import).contains("admitted 0 recipes (2 already"));
 }

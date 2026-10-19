@@ -6,6 +6,7 @@
 //! allow-unsigned-git = false    # build unsigned tags and commits
 //! allow-yanked = false          # pick yanked releases when resolving names
 //! require-fresh-metadata = "24h"
+//! max-cpu-level = "v4"          # highest x86-64 level installed (unset: see below)
 //! ```
 //!
 //! Every key is optional and a missing file is the defaults above, which
@@ -16,7 +17,11 @@
 //! `min-builder-signatures` applies when it is higher than the policy's.
 //! `require-fresh-metadata` is how old a registry checkout may be before
 //! installing from it updates it first: a number followed by `m`, `h` or
-//! `d`.
+//! `d`. `max-cpu-level` caps the x86-64 level of prebuilt artifacts and
+//! source builds; on the running system the level is also kept to what the
+//! CPU supports, and for another root (an image), whose CPU `fox` cannot
+//! see, it is the level used. Unset, the running system uses the CPU's
+//! level and another root the x86-64-v3 baseline.
 
 use core::fmt;
 use core::str::FromStr;
@@ -25,6 +30,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::CpuLevel;
 use crate::config::{ConfigError, load_toml};
 
 /// The policy file, relative to the install root.
@@ -125,6 +131,9 @@ pub struct Policy {
     pub allow_yanked: bool,
     /// How old registry metadata may be before an install refreshes it.
     pub require_fresh_metadata: MaxAge,
+    /// The highest x86-64 level to install; see the module docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_level: Option<CpuLevel>,
 }
 
 impl Default for Policy {
@@ -135,6 +144,7 @@ impl Default for Policy {
             allow_unsigned_git: false,
             allow_yanked: false,
             require_fresh_metadata: MaxAge::default(),
+            max_cpu_level: None,
         }
     }
 }
@@ -175,5 +185,16 @@ mod tests {
         assert!(toml::from_str::<Policy>("other = 1").is_err());
         assert_eq!(policy.builder_threshold(2), 2);
         assert_eq!(Policy::default().builder_threshold(0), 1);
+    }
+
+    #[test]
+    fn the_cpu_level_cap_is_optional() {
+        assert_eq!(Policy::default().max_cpu_level, None);
+        let policy: Policy = toml::from_str("max-cpu-level = \"v4\"\n").unwrap();
+        assert_eq!(policy.max_cpu_level, Some(CpuLevel::X86_64V4));
+        let text = toml::to_string(&policy).unwrap();
+        assert!(text.contains("max-cpu-level = \"x86_64-v4\""), "{text}");
+        assert!(!toml::to_string(&Policy::default()).unwrap().contains("cpu"));
+        assert!(toml::from_str::<Policy>("max-cpu-level = \"v9\"\n").is_err());
     }
 }

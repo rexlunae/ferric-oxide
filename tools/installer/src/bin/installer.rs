@@ -29,6 +29,13 @@ Using redox_installer as an installer:
     --no-mount            Use RedoxFS AR instead of FUSE to write files
     --cookbook            Use local Redox OS build system rather than downloading packages
     --config-name         Name of the filesystem configuration used for os-release VARIANT
+    --fox                 Host fox binary: adopt the installed packages into fox's
+                          database (fox adopt-pkg) once the image root is complete
+    --fox-packages        With --fox: fox package set to sync into the image
+                          (fox sync --target <image target>, fox.lock beside it)
+    --fox-locked          With --fox-packages: fail unless fox.lock pins every package
+    --fox-level           With --fox-packages: x86-64 level (v3 or v4) to install for
+    --fox-sbom            With --fox: write the image's CycloneDX SBOM to this path
 
 Using redox_installer as a configuration parser:
   redox_installer --config=file.toml [--list-packages|--filesystem-size|--output-config path]
@@ -107,8 +114,54 @@ fn append_os_release_metadata(
     }
 }
 
+/// The system name in the image SBOM: the product, and the configuration
+/// when one is named.
+fn sbom_name(config_name: Option<&str>) -> String {
+    match config_name.filter(|name| !name.is_empty()) {
+        Some(name) => format!("ferric-oxide-{name}"),
+        None => "ferric-oxide".to_string(),
+    }
+}
+
+/// `parser` with the `--fox` options added.
+fn with_fox_options(parser: ArgParser) -> ArgParser {
+    parser
+        .add_opt("", "fox")
+        .add_opt("", "fox-packages")
+        .add_opt("", "fox-sbom")
+        .add_opt("", "fox-level")
+        .add_flag(&["fox-locked"])
+}
+
+/// The `--fox` options, or an error message if they are inconsistent.
+fn fox_image(parser: &ArgParser) -> Result<Option<redox_installer::FoxImage>, &'static str> {
+    let Some(fox) = parser.get_opt("fox") else {
+        if parser.get_opt("fox-packages").is_some() || parser.get_opt("fox-sbom").is_some() {
+            return Err("--fox-packages and --fox-sbom need --fox");
+        }
+        return Ok(None);
+    };
+    let packages = parser.get_opt("fox-packages");
+    if parser.found("fox-locked") && packages.is_none() {
+        return Err("--fox-locked needs --fox-packages");
+    }
+    let level = parser.get_opt("fox-level");
+    if level.is_some() && packages.is_none() {
+        return Err("--fox-level needs --fox-packages");
+    }
+    Ok(Some(redox_installer::FoxImage {
+        fox: fox.into(),
+        packages: packages.map(Into::into),
+        locked: parser.found("fox-locked"),
+        target: redox_installer::get_target(),
+        level,
+        name: sbom_name(parser.get_opt("config-name").as_deref()),
+        sbom: parser.get_opt("fox-sbom").map(Into::into),
+    }))
+}
+
 fn main() {
-    let mut parser = ArgParser::new(4)
+    let mut parser = with_fox_options(ArgParser::new(4))
         .add_opt("b", "cookbook")
         .add_opt("", "config-name")
         .add_opt("c", "config")
@@ -205,6 +258,13 @@ fn main() {
         if write_bootloader.is_some() {
             config.general.write_bootloader = write_bootloader;
         }
+        match fox_image(&parser) {
+            Ok(fox) => config.fox = fox,
+            Err(message) => {
+                eprintln!("installer: {message}");
+                process::exit(1);
+            }
+        }
 
         if let Some(path) = parser.args.first() {
             if let Err(err) = redox_installer::install(config, path) {
@@ -215,5 +275,45 @@ fn main() {
             eprint!("{}", HELP_STR);
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> ArgParser {
+        let mut parser = with_fox_options(ArgParser::new(4).add_opt("", "config-name"));
+        parser.parse(
+            std::iter::once("redox_installer")
+                .chain(args.iter().copied())
+                .map(str::to_string),
+        );
+        parser
+    }
+
+    #[test]
+    fn fox_options_need_fox() {
+        assert_eq!(fox_image(&parse(&["image.img"])), Ok(None));
+        assert!(fox_image(&parse(&["--fox-packages=set.toml"])).is_err());
+        assert!(fox_image(&parse(&["--fox=fox", "--fox-locked"])).is_err());
+        assert!(fox_image(&parse(&["--fox=fox", "--fox-level=v4"])).is_err());
+        let fox = fox_image(&parse(&[
+            "--fox=target/release/fox",
+            "--fox-packages=set.toml",
+            "--fox-locked",
+            "--fox-level=v4",
+            "--fox-sbom=build/image.cdx.json",
+            "--config-name=desktop",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(fox.fox, Path::new("target/release/fox"));
+        assert_eq!(fox.packages.as_deref(), Some(Path::new("set.toml")));
+        assert!(fox.locked);
+        assert_eq!(fox.level.as_deref(), Some("v4"));
+        assert_eq!(fox.name, "ferric-oxide-desktop");
+        assert_eq!(fox.target, redox_installer::get_target());
+        assert_eq!(sbom_name(None), "ferric-oxide");
     }
 }

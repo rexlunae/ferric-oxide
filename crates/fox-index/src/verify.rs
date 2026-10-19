@@ -42,12 +42,13 @@ use time::OffsetDateTime;
 use crate::advisory::{Advisory, AdvisoryError};
 use crate::layout::{
     ADVISORIES_DIR, ArtifactList, LayoutError, PACKAGES_DIR, PackageEntry, REGISTRY_FILE,
-    RegistryConfig, artifacts_path, package_path,
+    RegistryConfig, VEX_DIR, artifacts_path, package_path,
 };
 use crate::metadata::{
     FileMeta, MetadataError, RoleKeys, RoleName, Root, Signed, Snapshot, Targets, Timestamp,
     VersionMeta, Versioned,
 };
+use crate::vex::{VexDocument, VexFileError, parse_vex};
 
 /// The metadata directory.
 pub const METADATA_DIR: &str = "metadata";
@@ -173,6 +174,15 @@ pub enum VerifyError {
         /// What is wrong.
         #[source]
         source: Box<LayoutError>,
+    },
+    /// A verified VEX document is invalid.
+    #[error("invalid VEX document {path}")]
+    Vex {
+        /// The file.
+        path: String,
+        /// What is wrong.
+        #[source]
+        source: Box<VexFileError>,
     },
     /// A verified advisory is invalid.
     #[error("invalid advisory {path}")]
@@ -769,10 +779,38 @@ impl VerifiedRegistry {
 
     /// The signed paths under `advisories/`.
     pub fn advisory_paths(&self) -> Vec<&str> {
+        self.paths_under(ADVISORIES_DIR)
+    }
+
+    /// Every VEX document the registry signs, in path order.
+    ///
+    /// # Errors
+    ///
+    /// As [`VerifiedRegistry::read`], and [`VerifyError::Vex`] if one is
+    /// invalid.
+    pub fn vex_documents(&self) -> Result<Vec<VexDocument>, VerifyError> {
+        self.paths_under(VEX_DIR)
+            .into_iter()
+            .map(|path| {
+                let statements =
+                    parse_vex(&self.read(path)?).map_err(|source| VerifyError::Vex {
+                        path: path.to_owned(),
+                        source: Box::new(source),
+                    })?;
+                Ok(VexDocument {
+                    path: path.to_owned(),
+                    statements,
+                })
+            })
+            .collect()
+    }
+
+    /// The signed paths under directory `dir`.
+    fn paths_under(&self, dir: &str) -> Vec<&str> {
         self.files
             .keys()
             .filter(|path| {
-                path.strip_prefix(ADVISORIES_DIR)
+                path.strip_prefix(dir)
                     .is_some_and(|rest| rest.starts_with('/'))
             })
             .map(String::as_str)

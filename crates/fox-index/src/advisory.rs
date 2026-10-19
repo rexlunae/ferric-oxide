@@ -233,14 +233,19 @@ pub fn advisory_path(id: &str) -> Result<String, AdvisoryError> {
 }
 
 fn check_id(id: &str) -> Result<(), AdvisoryError> {
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
+    if !valid_id(id) {
         return Err(AdvisoryError::Id { id: id.to_owned() });
     }
     Ok(())
+}
+
+/// Whether `id` is usable as a registry file name: non-empty ASCII
+/// letters, digits and `-`.
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 #[cfg(test)]

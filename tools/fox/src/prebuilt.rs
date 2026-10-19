@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use fox_core::archive::{Archive, ArchiveError};
 use fox_core::attested::artifact_facts;
-use fox_core::{Attestation, AttestationSignature, GitUrl, KeyId, verify_attestation};
+use fox_core::{Attestation, AttestationSignature, CpuLevel, GitUrl, KeyId, verify_attestation};
 use fox_git::{DownloadError, download_blob};
 use fox_index::layout::{Artifact, PackageEntry, RegistryConfig, Release};
 
@@ -42,30 +42,43 @@ impl From<DownloadError> for PrebuiltError {
 /// The variant a request needs.
 pub(crate) struct Wanted<'a> {
     pub(crate) target: &'a str,
+    /// The highest x86-64 level the machine runs; ignored for other
+    /// targets.
+    pub(crate) cpu_level: CpuLevel,
     pub(crate) default_features: bool,
     pub(crate) features: &'a [String],
 }
 
-/// The artifacts of `artifacts` that match `wanted`. CPU-level variants
-/// other than the x86-64-v3 baseline are not picked yet.
+/// The artifacts of `artifacts` that match `wanted`, best first: for an
+/// x86-64 target, the highest CPU level not above the wanted one (an
+/// artifact naming no level is the baseline); for another target, only
+/// artifacts naming no level.
 pub(crate) fn candidates<'a>(artifacts: &'a [Artifact], wanted: &Wanted<'_>) -> Vec<&'a Artifact> {
     let mut features: Vec<&str> = wanted.features.iter().map(String::as_str).collect();
     features.sort_unstable();
     features.dedup();
-    artifacts
+    let x86_64 = CpuLevel::applies_to(wanted.target);
+    let level = |artifact: &Artifact| artifact.cpu_level.unwrap_or(CpuLevel::BASELINE);
+    let mut found: Vec<&Artifact> = artifacts
         .iter()
         .filter(|artifact| {
             let mut built: Vec<&str> = artifact.features.iter().map(String::as_str).collect();
             built.sort_unstable();
             built.dedup();
+            let level_ok = if x86_64 {
+                level(artifact) <= wanted.cpu_level
+            } else {
+                artifact.cpu_level.is_none()
+            };
             artifact.target == wanted.target
-                && artifact
-                    .cpu_level
-                    .is_none_or(|level| level == fox_core::CpuLevel::X86_64V3)
+                && level_ok
                 && artifact.default_features == wanted.default_features
                 && built == features
         })
-        .collect()
+        .collect();
+    // Stable, so equal levels keep the registry's order.
+    found.sort_by_key(|artifact| std::cmp::Reverse(level(artifact)));
+    found
 }
 
 /// Downloads `artifact` into `work_dir` and accepts it if at least
@@ -170,6 +183,10 @@ fn source_mismatch(
         (source.path == entry.path, "package directory"),
         (attestation.build.target == artifact.target, "target"),
         (
+            attestation.build.cpu_level == artifact.cpu_level,
+            "CPU level",
+        ),
+        (
             attestation.build.feature_set_hash == artifact.feature_set_hash,
             "feature set",
         ),
@@ -250,8 +267,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_artifact_of_another_package_from_the_same_source_is_refused() {
+    /// The registry's entry for `cli` and its release that [`attested`]
+    /// describes.
+    fn cli_release() -> (PackageEntry, Release) {
         let pair = ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]);
         let owner = ssh_key::PublicKey::from(pair.public).to_openssh().unwrap();
         let text = format!(
@@ -266,6 +284,12 @@ mod tests {
             tree_blake3: Blake3Digest::of(b"x"),
             yanked: false,
         };
+        (entry, release)
+    }
+
+    #[test]
+    fn an_artifact_of_another_package_from_the_same_source_is_refused() {
+        let (entry, release) = cli_release();
         let same = attested("cli");
         let artifact = Artifact::from_attestation(&same, true, Vec::new());
         assert_eq!(source_mismatch(&same, &entry, &release, &artifact), None);
@@ -285,6 +309,7 @@ mod tests {
         ];
         let wanted = |target, features: &'static [String]| Wanted {
             target,
+            cpu_level: CpuLevel::BASELINE,
             default_features: true,
             features,
         };
@@ -297,6 +322,7 @@ mod tests {
             &artifacts,
             &Wanted {
                 target: "x86_64-unknown-redox",
+                cpu_level: CpuLevel::BASELINE,
                 default_features: true,
                 features: &features,
             },
@@ -304,5 +330,78 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].features.len(), 2);
         assert!(candidates(&artifacts, &wanted("aarch64-unknown-redox", &[])).is_empty());
+    }
+
+    fn at_level(target: &str, level: Option<CpuLevel>, tag: &[u8]) -> Artifact {
+        let mut artifact = artifact(target, true, &[]);
+        artifact.cpu_level = level;
+        artifact.pkgar_blake3 = Blake3Digest::of(tag);
+        artifact
+    }
+
+    #[test]
+    fn the_highest_level_the_machine_runs_comes_first() {
+        let v3 = Some(CpuLevel::X86_64V3);
+        let v4 = Some(CpuLevel::X86_64V4);
+        let x86 = "x86_64-unknown-redox";
+        let artifacts = [
+            at_level(x86, v3, b"v3"),
+            at_level(x86, v4, b"v4"),
+            at_level(x86, None, b"none"),
+        ];
+        let pick = |cpu_level| {
+            candidates(
+                &artifacts,
+                &Wanted {
+                    target: x86,
+                    cpu_level,
+                    default_features: true,
+                    features: &[],
+                },
+            )
+            .into_iter()
+            .map(|artifact| artifact.pkgar_blake3)
+            .collect::<Vec<_>>()
+        };
+        let hash = |tag: &[u8]| Blake3Digest::of(tag);
+        // A v4 machine prefers v4 and falls back to the baseline builds.
+        assert_eq!(
+            pick(CpuLevel::X86_64V4),
+            [hash(b"v4"), hash(b"v3"), hash(b"none")]
+        );
+        // A v3 machine never gets a v4 build.
+        assert_eq!(pick(CpuLevel::X86_64V3), [hash(b"v3"), hash(b"none")]);
+    }
+
+    #[test]
+    fn other_targets_take_only_artifacts_without_a_level() {
+        let arm = "aarch64-unknown-redox";
+        let artifacts = [
+            at_level(arm, Some(CpuLevel::X86_64V3), b"odd"),
+            at_level(arm, None, b"plain"),
+        ];
+        let found = candidates(
+            &artifacts,
+            &Wanted {
+                target: arm,
+                cpu_level: CpuLevel::X86_64V4,
+                default_features: true,
+                features: &[],
+            },
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pkgar_blake3, Blake3Digest::of(b"plain"));
+    }
+
+    #[test]
+    fn an_attestation_of_another_level_is_refused() {
+        let (entry, release) = cli_release();
+        let mut attestation = attested("cli");
+        let artifact = Artifact::from_attestation(&attestation, true, Vec::new());
+        attestation.build.cpu_level = Some(CpuLevel::X86_64V4);
+        assert_eq!(
+            source_mismatch(&attestation, &entry, &release, &artifact),
+            Some("CPU level")
+        );
     }
 }
