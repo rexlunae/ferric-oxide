@@ -406,9 +406,9 @@ jobs:
           path: ${{ env.LOG }}
           retention-days: 14
 
-  # Tracing overhead budget (roadmap Phase T). ferric-trace-bench times RedoxFS
-  # requests on the image without kernel.trace and, with all events off and then
-  # alternating off and on, on the image with it. Ten boots of each, interleaved, and
+  # Tracing overhead budget (roadmap Phase T). ferric-trace-bench times null system
+  # calls and RedoxFS requests on the image without kernel.trace and, with all events
+  # off and then alternating off and on, on the image with it. Ten boots of each, interleaved, and
   # the median of each boot's fastest round of each kind keep boot-to-boot noise out
   # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
   trace-overhead:

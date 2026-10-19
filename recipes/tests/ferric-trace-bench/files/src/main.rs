@@ -4,10 +4,10 @@
 //!
 //! - `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system, one operation per
 //!   pair. Each call is a request to RedoxFS through its scheme, so this is the storage path the
-//!   budget is about.
+//!   budget for every event on is judged on.
 //! - `syscall`: a one-byte `write` to a file descriptor that is not open, the cheapest system
-//!   call that reaches the kernel's dispatch. It shows the per-call cost of a tracepoint and is
-//!   reported, not budgeted.
+//!   call that reaches the kernel's dispatch. It shows the per-call cost of a tracepoint, and the
+//!   budget for tracing compiled in but off is judged on it.
 //!
 //! On a kernel without `kernel.trace` (no `kernel.trace` in the `/scheme` listing) every round
 //! runs as state `out`. With it, the program first turns every event off and runs a block of

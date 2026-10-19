@@ -185,12 +185,22 @@ are not compiled in gives `EOPNOTSUPP`.
 ## Overhead budget
 
 Tracing must stay cheap enough to leave compiled in. The roadmap budget, which
-the `trace-overhead` job in `image.yml` enforces on the `io` workload below, is:
+the `trace-overhead` job in `image.yml` enforces on the workloads below, is:
 
-| Comparison | Budget |
-| --- | --- |
-| Compiled in, every event off, against compiled out | at most 1% slower |
-| Every compiled-in event on (`enable all`), against all off | at most 5% slower |
+| Comparison | Workload | Budget |
+| --- | --- | --- |
+| Compiled in, every event off, against compiled out | `syscall` | at most 1% slower |
+| Every compiled-in event on (`enable all`), against all off | `io` | at most 5% slower |
+
+Every workload and comparison is reported; the table says which ones fail the
+job. The two kernels of the first comparison are built separately, so it also
+measures where the linker put the hot code, and which runner the job got.
+On the null system call that is small and repeatable: +0.53% and +0.54% in
+two runs. There a disabled tracepoint is the largest share of the work, so any
+cost it has shows first. On `io`, which runs through far more kernel code, the
+same comparison went from -4.25% to +1.12% between those two runs with no
+tracepoint changed, so judging it would judge the layout. The second comparison runs on one kernel, so `io` is
+judged there.
 
 `ferric-trace-bench`, in `config/ferric-smoke.toml`, times two workloads in
 rounds:
@@ -200,7 +210,9 @@ rounds:
   call entry and exit, the scheme request path and context switches.
 - `syscall`: a `write` to a descriptor that is not open, the cheapest system
   call that reaches the kernel's dispatch. Its tracepoints are a large share of
-  its time, so it is reported but not budgeted.
+  its time, so it is where a compiled-in, disabled tracepoint is judged. With
+  every event on it is reported but not budgeted: a record per entry and exit
+  is far more than 5% of a call that does nothing else.
 
 On a kernel without `kernel.trace` every round runs as state `out`. With it,
 the program runs a block of back-to-back rounds with all events off (`off`),

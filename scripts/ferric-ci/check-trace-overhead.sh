@@ -11,14 +11,22 @@
 # median of those over all given boots counts: boot-to-boot variation (kernel
 # image KASLR moves the code, the runner's neighbours come and go) is several
 # times the budget, and the median of many boots keeps one lucky or unlucky
-# boot from deciding. The budgets apply to the "io" workload, requests to
-# RedoxFS:
+# boot from deciding. The budgets:
 #   compiled in, all off ("off") at most OFF_BUDGET_PCT (default 1) percent
-#   slower than compiled out ("out");
+#   slower than compiled out ("out"), on the "syscall" workload, a null system
+#   call;
 #   every compiled-in event on ("on") at most ON_BUDGET_PCT (default 5)
-#   percent slower than all off in the rounds paired with it ("pairoff").
-# The "syscall" workload, a null system call, is reported but not budgeted:
-# with nothing else to do, its tracepoints are a large share of its time.
+#   percent slower than all off in the rounds paired with it ("pairoff"), on
+#   the "io" workload, requests to RedoxFS.
+# Every result is reported. "off" and "out" run on two kernels built
+# separately, so their comparison also measures where the linker put the hot
+# code, and which runner the job got. On the null system call that is small
+# and repeatable (+0.53% and +0.54% in two runs), and the tracepoints are the
+# largest share of the work, so a disabled tracepoint that costs anything
+# shows there first. On "io", which runs through far more kernel code, the
+# same comparison went from -4.25% to +1.12% between those two runs with no
+# tracepoint changed. It is reported, not judged, because judging it would
+# judge the layout. "on" and "pairoff" run on the same kernel.
 set -euo pipefail
 
 off_budget="${OFF_BUDGET_PCT:-1}"
@@ -104,11 +112,11 @@ for workload in io syscall; do
     summary="$workload (median of ${#out_logs[@]}+${#in_logs[@]} boots' fastest rounds): out ${out} ns, off ${off} ns (${off_pct}% vs out), pairoff ${pairoff} ns, on ${on} ns (${on_pct}% vs pairoff)"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
+    if [ "$workload" = syscall ] && over_budget "$off" "$out" "$off_budget"; then
+        echo "::error title=trace overhead::a system call with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%): $summary"
+        status=1
+    fi
     if [ "$workload" = io ]; then
-        if over_budget "$off" "$out" "$off_budget"; then
-            echo "::error title=trace overhead::io with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%): $summary"
-            status=1
-        fi
         if over_budget "$on" "$pairoff" "$on_budget"; then
             echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
             status=1
