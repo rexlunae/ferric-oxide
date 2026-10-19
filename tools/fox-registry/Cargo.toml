@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 blake3 = { workspace = true, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
+fox-build = { path = "../../crates/fox-build" }
 fox-core = { path = "../../crates/fox-core", features = ["std"] }
 fox-git = { path = "../../crates/fox-git" }
 fox-index = { path = "../../crates/fox-index" }

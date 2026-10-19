@@ -1,6 +1,6 @@
 //! `fox-registry` end to end: create a registry, admit a package, record a
 //! signed release from a local repository, sign as the owner and as CI,
-//! check, verify and rotate keys. Tags are signed in Rust with fox-git,
+//! check, verify and rotate keys, and build artifacts as a registry builder. Tags are signed in Rust with fox-git,
 //! since `ssh-keygen` may be missing.
 
 use std::fs;
@@ -69,7 +69,7 @@ impl Env {
     fn run(&self, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fox-registry"));
         command.arg("-C").arg(self.registry.path()).args(args);
-        if matches!(args.first(), Some(&"release" | &"check")) {
+        if matches!(args.first(), Some(&"release" | &"check" | &"build")) {
             command.arg("--cache").arg(self.cache.path());
         }
         command.output().unwrap()
@@ -141,7 +141,7 @@ fn a_release_goes_from_tag_to_verified_registry() {
     let output = env.run(&["release", "tiny", "v0.1.0"]);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("not an owner"),
+        stderr(&output).contains("may not sign"),
         "{}",
         stderr(&output)
     );
@@ -195,4 +195,178 @@ fn keys_rotate_through_a_new_root() {
     assert!(env.sign(&[&root, &new_key, &snapshot, &timestamp]));
     let out = env.ok(&["verify"]);
     assert!(out.contains("root v2"), "{out}");
+}
+
+/// Makes the source repository a buildable crate at `version`.
+fn commit_crate(dir: &Path, version: &str) {
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"tiny\"\nversion = \"{version}\"\nedition = \"2021\"\nlicense = \"MIT\"\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let status = Command::new("cargo")
+        .current_dir(dir)
+        .args(["generate-lockfile", "--offline"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", version]);
+}
+
+#[test]
+fn init_github_writes_the_repository_template() {
+    let registry = tempfile::tempdir().unwrap();
+    let keys = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(registry.path())
+        .args(["init", "--name", "gh", "--github", "--keys"])
+        .arg(keys.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    for file in ["check", "sign", "timestamp"] {
+        let path = registry
+            .path()
+            .join(format!(".github/workflows/{file}.yml"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fox-registry"), "{}", path.display());
+    }
+    let readme = fs::read_to_string(registry.path().join("README.md")).unwrap();
+    assert!(readme.contains("BUILDER_KEY"));
+}
+
+#[test]
+fn a_builder_records_attested_artifacts() {
+    let env = Env::new();
+    commit_crate(env.src.path(), "0.1.0");
+    let owner = owner_key(5);
+    let owner_path = env.keys.path().join("owner_ed25519");
+    fs::write(
+        &owner_path,
+        owner.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+    )
+    .unwrap();
+    let owner_path = owner_path.display().to_string();
+    let url = format!("file://{}", env.src.path().display());
+    let owner_arg = format!("me={}", owner.public_key().to_openssh().unwrap());
+    env.ok(&["admit", &url, "--name", "tiny", "--owner", &owner_arg]);
+    tag(env.src.path(), "v0.1.0", 5);
+    env.ok(&["release", "tiny", "v0.1.0"]);
+    let (targets, snapshot, timestamp) = (
+        env.key("targets"),
+        env.key("snapshot"),
+        env.key("timestamp"),
+    );
+    assert!(env.sign(&[&owner_path, &targets, &snapshot, &timestamp]));
+
+    // A `pkgar-keys` pair from another registry serves as the builder key.
+    let builder = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fox-registry"))
+        .arg("-C")
+        .arg(tempfile::tempdir().unwrap().path())
+        .args(["init", "--name", "b", "--single-key", "--keys"])
+        .arg(builder.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let builder_key = builder.path().join("registry.key").display().to_string();
+    let builder_pub = builder.path().join("registry.pub").display().to_string();
+    let blobs = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let blobs_arg = blobs.path().to_str().unwrap();
+    let work_arg = work.path().to_str().unwrap();
+    let build = [
+        "build",
+        "--key",
+        &builder_key,
+        "--label",
+        "ci",
+        "--blobs",
+        blobs_arg,
+        "--work-dir",
+        work_arg,
+    ];
+
+    // Only builders listed in registry.toml may record artifacts.
+    let output = env.run(&build);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not listed"),
+        "{}",
+        stderr(&output)
+    );
+    let output = env.run(&["configure", "--remove-builder", "ci"]);
+    assert!(
+        stderr(&output).contains("no builder ci"),
+        "{}",
+        stderr(&output)
+    );
+    let builder_arg = format!("ci={builder_pub}");
+    let blob_url = format!("file://{blobs_arg}");
+    env.ok(&[
+        "configure",
+        "--builder",
+        &builder_arg,
+        "--artifact-url",
+        &blob_url,
+    ]);
+
+    let out = env.ok(&build);
+    assert!(out.contains("built tiny 0.1.0"), "{out}");
+    // The archive, the attestation and its signature.
+    assert_eq!(
+        fs::read_dir(blobs.path().join("blake3")).unwrap().count(),
+        3
+    );
+    let artifacts =
+        fs::read_to_string(env.registry.path().join("artifacts/ti/tiny/0.1.0.toml")).unwrap();
+    assert!(artifacts.contains("builder = \"ci\""), "{artifacts}");
+    assert!(env.sign(&[&targets, &snapshot, &timestamp]));
+    env.ok(&["verify"]);
+
+    // Nothing is left to build.
+    assert!(!env.ok(&build).contains("built"));
+}
+
+#[test]
+fn advisories_are_published_and_signed() {
+    let env = Env::new();
+    let file = env.keys.path().join("advisory.toml");
+    fs::write(
+        &file,
+        "[advisory]\nid = \"FOX-2026-0001\"\npackage = \"tiny\"\ndate = \"2026-10-01\"\n\
+         title = \"tiny is too small\"\n\n[versions]\npatched = [\">= 0.2.0\"]\n",
+    )
+    .unwrap();
+    let out = env.ok(&["advise", file.to_str().unwrap()]);
+    assert!(out.contains("advisories/FOX-2026-0001.toml"), "{out}");
+    assert!(!env.sign(&[&env.key("snapshot"), &env.key("timestamp")]));
+    assert!(env.sign(&[
+        &env.key("targets"),
+        &env.key("snapshot"),
+        &env.key("timestamp")
+    ]));
+    env.ok(&["verify"]);
+    let stored =
+        fs::read_to_string(env.registry.path().join("advisories/FOX-2026-0001.toml")).unwrap();
+    assert!(stored.contains("tiny is too small"));
+
+    fs::write(
+        &file,
+        "[advisory]\nid = \"../escape\"\npackage = \"tiny\"\ndate = \"2026-10-01\"\n",
+    )
+    .unwrap();
+    let output = env.run(&["advise", file.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("may only hold"),
+        "{}",
+        stderr(&output)
+    );
 }

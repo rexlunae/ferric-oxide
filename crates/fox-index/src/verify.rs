@@ -39,6 +39,7 @@ use fox_core::{KeyId, PackageName};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::advisory::{Advisory, AdvisoryError};
 use crate::layout::{
     ADVISORIES_DIR, ArtifactList, LayoutError, PACKAGES_DIR, PackageEntry, REGISTRY_FILE,
     RegistryConfig, artifacts_path, package_path,
@@ -172,6 +173,15 @@ pub enum VerifyError {
         /// What is wrong.
         #[source]
         source: Box<LayoutError>,
+    },
+    /// A verified advisory is invalid.
+    #[error("invalid advisory {path}")]
+    Advisory {
+        /// The file.
+        path: String,
+        /// What is wrong.
+        #[source]
+        source: Box<AdvisoryError>,
     },
     /// The root names a different registry than the trusted one.
     #[error("the registry is now called {found}, not {trusted}")]
@@ -736,6 +746,25 @@ impl VerifiedRegistry {
                 path,
                 source: Box::new(source),
             })
+    }
+
+    /// Every advisory the registry signs, in path order.
+    ///
+    /// # Errors
+    ///
+    /// As [`VerifiedRegistry::read`], and [`VerifyError::Advisory`] if one
+    /// is invalid.
+    pub fn advisories(&self) -> Result<Vec<Advisory>, VerifyError> {
+        self.advisory_paths()
+            .into_iter()
+            .map(|path| {
+                let text = self.read_text(path)?;
+                Advisory::from_toml(&text, path).map_err(|source| VerifyError::Advisory {
+                    path: path.to_owned(),
+                    source: Box::new(source),
+                })
+            })
+            .collect()
     }
 
     /// The signed paths under `advisories/`.
