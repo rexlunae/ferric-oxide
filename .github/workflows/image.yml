@@ -469,8 +469,10 @@ jobs:
           BOOT_REBOOT: "1"
           BOOT_TIMEOUT: "600"
         run: |
+          set -o pipefail
           zstd -d harddrive.img.zst -o harddrive.img
-          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" host
+          # boot-smoke.sh's verdict goes to the failure annotations too.
+          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" host 2>&1 | tee boot-smoke.out
 
       - name: Check the crash dump
         run: |
@@ -493,8 +495,18 @@ jobs:
         if: failure()
         run: |
           [ -f "$LOG" ] || exit 0
-          tail -n 120 "$LOG" | tr -d '\r' | sed -e 's/%/%25/g' \
-            | awk 'BEGIN { printf "::error title=crash boot serial log (tail)::" } { printf "%s%%0A", $0 } END { print "" }'
+          # An annotation keeps only its first few KiB, so each one is short: the test results,
+          # the kernel's crash-dump and reset lines, then the end of the log.
+          annotate() {
+            tr -d '\r' | tail -c 3500 | sed -e 's/%/%25/g' \
+              | awk -v title="$1" 'BEGIN { printf "::error title=%s::", title } { printf "%s%%0A", $0 } END { print "" }'
+          }
+          grep -aoE 'FERRIC_(TEST_(FAIL|SKIP)|SMOKE_[A-Z]+|TEST_PASS trace-crash)[^\r]*' "$LOG" \
+            | annotate "crash boot results" || true
+          grep -aE 'trace: |KERNEL PANIC|panicked at|^RESET|^HALT|kreset|Reset with|UNHANDLED|boot-smoke' "$LOG" \
+            | annotate "crash boot kernel lines" || true
+          tail -n 30 "$LOG" | annotate "crash boot serial log (tail)"
+          [ -f boot-smoke.out ] && grep -a '^boot-smoke:' boot-smoke.out | annotate "boot-smoke verdict" || true
 
       - uses: actions/upload-artifact@v4
         if: always()
