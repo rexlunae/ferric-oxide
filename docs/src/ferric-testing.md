@@ -115,6 +115,7 @@ IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -166,8 +167,18 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
+
+`ferric-tlb-test` also covers a relibc join race: an exiting thread stores its
+return value and then wakes the joiner, but the joiner can see the value, return
+and unmap the thread's control block before that wake runs. relibc's
+`Waitval::post` takes the futex address before the store and treats `EFAULT`
+from the wake as nobody left to wake, instead of panicking (`RELIBC PANIC` in
+`sync/mod.rs`, which boot-smoke fails on). relibc's own `pthread/join_race`
+test joins 2000 short-lived threads; neither test can force the window, so a
+pass only shows the fix did not break joins.
 
 The edu driver is started through `pcid-spawner`, separately from the console
 test script. Its PCI matching configuration is in the IOMMU test recipe.
@@ -177,7 +188,8 @@ Tests may skip absent optional features; do not interpret a skip as coverage.
 enables IOMMU `auto`, shadow-stack preparation `auto`, registered buffers,
 `nvmed` grant DMA (`drivers.grant_dma`) and kernel tracing (with
 `sched.switch` on from boot),
-and builds a second kernel/image with IOMMU `enforce`. Its five boot variants
+and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
+a third without kernel tracing. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer and tracing result markers, the trace boot log line,
 KASLR/KPTI logs, shadow-stack detection and
@@ -185,6 +197,9 @@ futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
 posts the benchmark as a notice. Read that script for the exact required marker set.
+The `trace-overhead` job boots the images with and without tracing ten times
+each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
 
 The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
 `cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a

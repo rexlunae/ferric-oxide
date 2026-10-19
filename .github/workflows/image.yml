@@ -200,6 +200,39 @@ jobs:
           path: enforce/harddrive.img.zst
           retention-days: 7
 
+      # The same image with a kernel built without kernel.trace, the baseline the
+      # trace-overhead job compares the traced kernel against. Only the kernel differs.
+      - name: Build the notrace image
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          out="$RUNNER_TEMP/ferric-notrace"
+          mkdir -p "$out"
+          # The catalog-defaults config above, without the tracing lines. Only the kernel
+          # changes, and make cr.kernel rebuilds it, so no other recipe is marked stale.
+          grep -v -e '^trace = ' -e '^trace_boot = ' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
+          cat "$out/ferric.toml"
+          "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate --no-touch
+          FERRIC_KERNEL_FEATURES="$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
+          echo "FERRIC_KERNEL_FEATURES=$FERRIC_KERNEL_FEATURES"
+          # The container runs steps with sh, so no bash here-strings.
+          case "$FERRIC_KERNEL_FEATURES" in
+            *trace*) echo "::error::the notrace kernel still has a trace feature"; exit 1 ;;
+          esac
+          export FERRIC_KERNEL_FEATURES FERRIC_KERNEL_CONFIG="$out/kernel-config.toml"
+          make cr.kernel CONFIG_NAME="$CONFIG_NAME"
+          rm -f "build/x86_64/$CONFIG_NAME/harddrive.img"
+          make all CONFIG_NAME="$CONFIG_NAME"
+          mkdir -p notrace
+          zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o notrace/harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        with:
+          name: ferric-smoke-image-notrace
+          path: notrace/harddrive.img.zst
+          retention-days: 7
+
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -333,6 +366,9 @@ jobs:
           echo "::notice::ferric-trace-test passed all 10 steps"
           # The ferric-trace tool saved a capture of every CPU and decoded it.
           grep -aF "FERRIC_TEST_PASS trace-capture" "$LOG"
+          if [ "$CONFIG_NAME" = ferric-smoke ]; then
+            grep -aF "FERRIC_TEST_PASS trace-bench" "$LOG"
+          fi
 
       # The image has kernel.rings on, so ferric-ring-test must run every step, not skip.
       - name: Check rings
@@ -371,4 +407,99 @@ jobs:
         with:
           name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}
           path: ${{ env.LOG }}
+          retention-days: 14
+
+  # Tracing overhead budget (roadmap Phase T). ferric-trace-bench times null system
+  # calls and RedoxFS requests on the image without kernel.trace and, with all events
+  # off and then alternating off and on, on the image with it. Ten boots of each, interleaved, and
+  # the median of each boot's fastest round of each kind keep boot-to-boot noise out
+  # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
+  trace-overhead:
+    needs: build
+    if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf zstd
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-smoke-image
+          path: trace
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-smoke-image-notrace
+          path: notrace
+
+      # Log downloads are not always readable, so every result and failure is an annotation.
+      - name: Boot both images ten times
+        env:
+          # A boot takes about 20 seconds. The check takes the median over boots, and the
+          # spread between boots (about 3% here) is larger than the 1% budget.
+          BENCH_BOOTS: "10"
+        run: |
+          for image in notrace trace; do
+            zstd -q -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
+          done
+          failed=0
+          for run in $(seq 1 "$BENCH_BOOTS"); do
+            for image in notrace trace; do
+              log="bench-$image-$run.log"
+              status=0
+              scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "$log" host > /dev/null || status=$?
+              tr -d '\r' < "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$log.clean" || true
+              results="$(grep -aoE 'FERRIC_BENCH (io|syscall|lost) .*|FERRIC_TEST_[A-Z]+ trace(-bench|-capture|:).*' "$log.clean" || true)"
+              # GitHub keeps ten notices per step and 4 KiB of each, so the boots' results
+              # are collected and printed in parts, below.
+              printf 'boot %s exit %s\n%s\n' "$run" "$status" "$results" >> "results-$image.txt"
+              # Test results and crash lines first: an unhandled exception's process name
+              # is printed above its register dump, out of reach of a short tail.
+              tail="$({ grep -aE 'FERRIC_TEST_|EXCEPTION|panic|PANIC' "$log.clean" | grep -av 'funmap passed' | tail -n 40
+                grep -av 'funmap passed' "$log.clean" | tail -n 30; } | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+              if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
+                failed=1
+                echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
+              fi
+              # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
+              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then
+                failed=1
+                echo "::error title=$image boot $run::ferric-trace-test did not skip on the kernel without kernel.trace"
+              fi
+              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace-capture: no" "$log.clean"; then
+                failed=1
+                echo "::error title=$image boot $run::the trace capture check did not skip on the kernel without kernel.trace"
+              fi
+            done
+          done
+          for image in notrace trace; do
+            split -C 3500 "results-$image.txt" "results-$image.part."
+            for part in results-"$image".part.*; do
+              body="$(sed 's/%/%25/g' "$part" | sed ':a;N;$!ba;s/\n/%0A/g')"
+              echo "::notice title=$image boots ($part)::$body"
+            done
+          done
+          exit "$failed"
+
+      - name: Check the overhead budget
+        run: |
+          scripts/ferric-ci/check-trace-overhead.sh --out bench-notrace-*.log --in bench-trace-*.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-overhead-logs
+          path: bench-*.log
           retention-days: 14
