@@ -101,6 +101,12 @@ impl KernelScheme for DebugScheme {
 
         let id = HANDLES.write(token.token()).insert(Handle { num });
 
+        // Ferric Oxide: ctl-profiling is read at an offset (see kreadoff).
+        #[cfg(feature = "profiling")]
+        if num == SpecialFds::CtlProfiling as usize {
+            return Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED));
+        }
+
         Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()))
     }
 
@@ -164,6 +170,50 @@ impl KernelScheme for DebugScheme {
             "DebugScheme::read",
             token,
         )
+    }
+
+    // Ferric Oxide: a read of ctl-profiling gives the kernel's run-time text address, so that
+    // ferric-trace can symbolize kernel samples under KASLR. Other handles are unpositioned.
+    #[cfg(feature = "profiling")]
+    fn kreadoff(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if HANDLES.read(token.token()).get(id)?.num == SpecialFds::CtlProfiling as usize {
+            let line = alloc::string::ToString::to_string(&ferric_trace::profile::ControlLine {
+                text_start: crate::kernel_executable_offsets::__text_start() as u64,
+            });
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            return buf.copy_common_bytes_from_slice(line.as_bytes().get(start..).unwrap_or(&[]));
+        }
+        if offset != u64::MAX {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kread(id, buf, flags, stored_flags, token)
+    }
+
+    // Ferric Oxide: ctl-profiling is positioned for its read; its writes ignore the offset.
+    #[cfg(feature = "profiling")]
+    fn kwriteoff(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if offset != u64::MAX
+            && HANDLES.read(token.token()).get(id)?.num != SpecialFds::CtlProfiling as usize
+        {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kwrite(id, buf, flags, stored_flags, token)
     }
 
     fn kwrite(
