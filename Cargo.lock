@@ -1316,6 +1316,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-irq"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-luks"
 version = "0.1.0"
 dependencies = [

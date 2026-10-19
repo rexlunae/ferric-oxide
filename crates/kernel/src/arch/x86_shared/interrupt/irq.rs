@@ -12,7 +12,10 @@ use crate::{
     },
     context::{self, timeout},
     percpu::PercpuBlock,
-    scheme::{irq::irq_trigger, serio::serio_input},
+    scheme::{
+        irq::{irq_trigger, vector_trigger},
+        serio::serio_input,
+    },
     sync::CleanLockToken,
     time,
 };
@@ -327,7 +330,8 @@ interrupt_error!(generic_irq, |_stack, code| {
     // The reason why 128 is subtracted and added from the code, is that PUSH imm8 sign-extends the
     // value, and the longer PUSH imm32 would make the generic_interrupts table twice as large
     // (containing lots of useless NOPs).
-    irq_trigger((code as i32).wrapping_add(128) as u8, &mut token);
+    // Ferric Oxide: a vector reserved on this CPU, so it is this CPU's interrupt.
+    vector_trigger((code as i32).wrapping_add(128) as u8, &mut token);
 
     lapic_eoi();
 });

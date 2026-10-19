@@ -6,11 +6,9 @@ use crate::{sync::CleanLockToken, syscall::error::Result};
 pub fn resource(_token: &mut CleanLockToken) -> Result<Vec<u8>> {
     let mut string = String::new();
 
-    {
-        let counts = crate::scheme::irq::COUNTS.lock();
-        for (i, count) in counts.iter().enumerate() {
-            let _ = writeln!(string, "{}: {}", i, count);
-        }
+    // Ferric Oxide: through `total_count`, which adds up the per-CPU counts with `irq-percpu`.
+    for i in 0..224_u8 {
+        let _ = writeln!(string, "{}: {}", i, crate::scheme::irq::total_count(i));
     }
 
     Ok(string.into_bytes())

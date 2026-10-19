@@ -12,6 +12,7 @@ description = "DMA domain test driver for Ferric Oxide"
 # this recipe's source/, at the same depth, so the relative paths hold there too.
 [dependencies]
 ferric-iommu = { path = "../../../../crates/iommu" }
+ferric-irq = { path = "../../../../crates/irq" }
 ferric-regbuf = { path = "../../../../crates/regbuf" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
