@@ -356,18 +356,23 @@ pub fn alloc_msi(
     cpu: u32,
     vector: u8,
 ) -> Result<MsiEntry, IrqError> {
-    // Without a VT-d unit for the device the answer is ENODEV, whatever the CPU or vector, so
-    // pcid falls back to the compatibility format. AMD-Vi units do not remap interrupts yet, so
-    // on them pcid gets ENODEV too and programs a compatibility-format message, which they
-    // pass through unchanged.
-    let index = domain::vtd_unit_index(device).map_err(|err| match err {
-        DomainError::NotEnabled => IrqError::NotEnabled,
-        err => IrqError::Unit(err),
-    })?;
+    // The CPU and vector are checked first, with or without remapping: ENODEV tells pcid to
+    // program a compatibility-format message itself, so it must mean only that no unit remaps
+    // the device, never that the route is allowed. A kernel vector (on an AP without
+    // `irq-percpu`, 0x20-0x2f, whose interrupts would count for the BSP's legacy handles) is
+    // refused whatever the unit.
     if kernel_vector(vector, cpu) {
         return Err(IrqError::Vector { vector });
     }
     let apic_id = apic_id(cpu)?;
+    // Without a VT-d unit for the device the answer is ENODEV, so pcid falls back to the
+    // compatibility format. AMD-Vi units do not remap interrupts yet, so on them pcid gets
+    // ENODEV too and programs a compatibility-format message, which they pass through
+    // unchanged.
+    let index = domain::vtd_unit_index(device).map_err(|err| match err {
+        DomainError::NotEnabled => IrqError::NotEnabled,
+        err => IrqError::Unit(err),
+    })?;
     let entry = alloc_entry(index, source, apic_id, vector)?;
     let in_use = in_use();
     info!(
