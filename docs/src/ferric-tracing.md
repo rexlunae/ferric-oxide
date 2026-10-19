@@ -152,7 +152,7 @@ A record is a sequence of little-endian 64-bit words:
 | Word | Contents |
 | --- | --- |
 | 0 | Length in words (bits 7:0), argument count (15:8), event id (31:16), reserved zero (63:32) |
-| 1 | Timestamp: the TSC |
+| 1 | Timestamp, from the clock the kernel picked at boot (see [Timestamps](#timestamps)) |
 | 2.. | One word per argument |
 
 Event ids and names come from `ferric_trace::kernel::CATALOG`. Decoders use
@@ -164,7 +164,31 @@ The ring sits in kernel-allocated pages in the shared layout of
 `ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
 data length, and `head`, `tail` and `lost` on cache lines of their own), then
 the data pages.
-Timestamps assume an invariant TSC that is synchronized across CPUs.
+
+### Timestamps
+
+Records on different CPUs are merged by timestamp, so the clock must agree
+across CPUs. The kernel picks one clock for the whole boot, before the first
+ring exists (`crates/kernel/src/trace/clock.rs`, with the rule in
+`ferric_trace::clock::choose`):
+
+1. **`tsc`**, when CPUID leaf `0x8000_0007` reports an invariant TSC (EDX bit
+   8; Intel SDM Vol. 3B, 18.17.1, and AMD APM Vol. 3, `Fn8000_0007_EDX`
+   `TscInvariant`). One `RDTSC` per record.
+2. **`kvmclock`**, when the TSC is not invariant but KVM offers a stable
+   paravirtual clock, in nanoseconds. Hosts usually hide the invariant TSC bit
+   from guests because it does not survive migration, so this is the common
+   clock in a VM.
+3. **`hpet`**, when neither is there but the HPET's main counter is 64 bits
+   wide and running. It is one counter for all CPUs, read through MMIO, so it
+   is the slowest.
+4. Otherwise **`tsc`** anyway, with a warning in the log that timestamps of
+   different CPUs may disagree.
+
+The kernel logs its choice (`trace: clock kvmclock (the TSC is not invariant;
+the KVM clock is stable)`), and the scheme's `clock` file says it as `clock
+<name> period_fs <femtoseconds|unknown>`. The tick length is unknown for the
+TSC, because the kernel does not calibrate it.
 
 ## The `kernel.trace` scheme
 
@@ -176,9 +200,10 @@ The paths are defined in `ferric_trace::abi`.
 | --- | --- | --- |
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
+| `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 
-`events` and `stats` are read from a snapshot taken at the first read of each
+`events`, `stats` and `clock` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
 
 - It consumes records only after they have been copied to the caller, so a
@@ -246,6 +271,7 @@ it) works as follows:
   A read that fails with `EAGAIN`, because another reader is draining the same
   CPU, is retried after a short wait.
 - It reads `stats` again into `<dir>/stats.end`.
+- It copies the `clock` file into `<dir>/clock`, when the kernel has one.
 - Any other error, or a CPU that stays busy, stops the capture with a message
   naming the file.
 
@@ -301,8 +327,10 @@ or in `chrome://tracing`.
   responder's pid. A `scheme.cancel` is an instant on the slice, not its end.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
-`--tsc-mhz` converts TSC cycles to time. Pass the traced machine's TSC
-frequency; the default, 1000, shows one cycle as one nanosecond. A value below
+A capture whose `clock` names the KVM clock or the HPET carries its own tick
+length, and `perfetto` converts with that. Two inputs with different clocks are
+refused. For TSC timestamps, and for captures without a `clock` file,
+`--tsc-mhz` converts cycles to time. Pass the traced machine's TSC frequency; the default, 1000, shows one cycle as one nanosecond. A value below
 1 MHz, or not a finite number, is refused: real TSCs run at hundreds of MHz or
 more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
@@ -362,7 +390,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      private mappings and an `mprotect` to writable are refused, finds the
      `write` to a closed descriptor by reading the mappings, and checks that
      `commit` refuses a position past `head` or inside a record and accepts
-     the end of what was read.
+     the end of what was read;
+  8. reads the `clock` file and, with `syscall` on, makes two marker writes
+     200 ms apart: when the clock's tick length is known (the KVM clock, the
+     HPET), the time between their timestamps must be within a factor of two
+     of the wall time; for the TSC it prints the frequency they imply
+     (`trace-clock`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
@@ -374,7 +407,7 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
-  requires all twelve step markers, the `trace-capture` marker, the boot log
+  requires all thirteen step markers, the kernel's `trace: clock` line, the `trace-capture` marker, the boot log
   line and the kernel's log of bootstrap's `enable scheme.cancel`.
 
 ## Overhead budget

@@ -21,8 +21,10 @@
 //!   request (the scheme still answers it): it is an async instant (`n`) on the same slice.
 //! - A record that has no matching start (its start was not captured) is an instant (`i`).
 //!
-//! Timestamps are microseconds since the first record, from TSC cycles and the TSC frequency
-//! the caller gives as a [`TscMhz`].
+//! Timestamps are microseconds since the first record. The rate ticks are divided by is a
+//! [`TscMhz`]: for TSC cycles the TSC frequency the caller gives, and for a capture whose
+//! `clock` names a clock with a known tick length (the KVM clock, the HPET) that clock's own
+//! rate ([`TscMhz::for_clock`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -30,6 +32,7 @@ use std::num::ParseFloatError;
 use std::str::FromStr;
 
 use ferric_trace::Event;
+use ferric_trace::clock::ClockLine;
 use ferric_trace::kernel::{
     SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
@@ -88,6 +91,16 @@ impl TscMhz {
     /// The frequency in MHz.
     pub fn get(self) -> f64 {
         self.0
+    }
+
+    /// The rate to turn timestamps of `clock` into time: the clock's ticks per microsecond
+    /// when its tick length is known, otherwise `tsc` (TSC cycles, or a capture from a kernel
+    /// that does not say).
+    pub fn for_clock(clock: Option<ClockLine>, tsc: Self) -> Self {
+        clock
+            .and_then(|line| line.ticks_per_us())
+            .and_then(|rate| Self::new(rate).ok())
+            .unwrap_or(tsc)
     }
 }
 
@@ -443,6 +456,28 @@ mod tests {
 
     fn mhz(value: f64) -> TscMhz {
         TscMhz::new(value).expect("a valid frequency")
+    }
+
+    #[test]
+    fn rate_follows_the_clock() {
+        use ferric_trace::clock::Clock;
+        let tsc = mhz(2400.0);
+        assert_eq!(TscMhz::for_clock(None, tsc), tsc);
+        let line = |clock, period_fs| ClockLine { clock, period_fs };
+        assert_eq!(TscMhz::for_clock(Some(line(Clock::Tsc, None)), tsc), tsc);
+        assert_eq!(
+            TscMhz::for_clock(Some(line(Clock::KvmClock, Some(1_000_000))), tsc),
+            mhz(1000.0)
+        );
+        assert_eq!(
+            TscMhz::for_clock(Some(line(Clock::Hpet, Some(10_000_000))), tsc),
+            mhz(100.0)
+        );
+        // A tick longer than a microsecond is below the lowest rate: the given one is used.
+        assert_eq!(
+            TscMhz::for_clock(Some(line(Clock::Hpet, Some(2_000_000_000))), tsc),
+            tsc
+        );
     }
 
     fn events(json: &str) -> Vec<Value> {

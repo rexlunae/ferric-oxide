@@ -19,6 +19,8 @@
 //!   `unsafe` code.
 //! - [`select()`] parses event selections (`all`, a subsystem name, an event name) into an
 //!   [`EventSet`], for the boot environment and the trace scheme.
+//! - [`clock`] names the clock record timestamps come from (an invariant TSC, the KVM clock or
+//!   the HPET) and holds the rule the kernel picks it by.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
 //! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
@@ -55,6 +57,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod abi;
+pub mod clock;
 #[cfg(feature = "config")]
 pub mod config;
 mod event;

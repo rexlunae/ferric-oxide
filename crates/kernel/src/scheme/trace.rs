@@ -5,6 +5,8 @@
 //!   `enable <selection>` or `disable <selection>` turns events on or off, patching their
 //!   tracepoints live (`arch::static_key`).
 //! - `stats`: one line per CPU with the words waiting in its ring and the records it lost.
+//! - `clock`: the clock record timestamps come from and its tick length
+//!   (`ferric_trace::clock::ClockLine`), chosen once at boot (`trace::clock`).
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
@@ -23,7 +25,7 @@
 //! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
 //! The mapping needs `PROT_READ`: a mapping without it would still be readable.
 //!
-//! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
+//! `events`, `stats` and `clock` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
 //! addresses, and a Phase 4 capability will replace the uid check.
 
@@ -69,12 +71,13 @@ pub struct TraceScheme;
 enum Text {
     Events,
     Stats,
+    Clock,
 }
 
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events` or `stats`, with the snapshot its reads come from once taken.
+    /// `events`, `stats` or `clock`, with the snapshot its reads come from once taken.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
@@ -110,6 +113,9 @@ fn render(text: Text) -> Arc<[u8]> {
                     .map_or((0, 0), |ring| (ring.pending() as u64, ring.lost()));
                 let _ = write!(out, "{}", StatsLine { cpu, pending, lost });
             }
+        }
+        Text::Clock => {
+            let _ = write!(out, "{}", trace::clock::choice().line());
         }
     }
     Arc::from(out.into_bytes())
@@ -203,6 +209,7 @@ impl KernelScheme for TraceScheme {
             Path::Root => return Err(Error::new(ENOENT)),
             Path::Events => (Text::Events, InternalFlags::POSITIONED),
             Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
+            Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
             Path::Cpu(cpu) if cpu < crate::cpu_count() => {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 HANDLES
@@ -288,7 +295,8 @@ impl KernelScheme for TraceScheme {
             } => events_command(buf),
             Handle::Cpu(cpu) => cpu_command(cpu, buf),
             Handle::Text {
-                text: Text::Stats, ..
+                text: Text::Stats | Text::Clock,
+                ..
             } => Err(Error::new(EBADF)),
         }
     }
@@ -357,6 +365,9 @@ impl KernelScheme for TraceScheme {
             Handle::Text {
                 text: Text::Stats, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::STATS_PATH),
+            Handle::Text {
+                text: Text::Clock, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CLOCK_PATH),
             Handle::Cpu(cpu) => alloc::format!(
                 "/scheme/kernel.trace/{}/{}",
                 ferric_trace::abi::CPU_DIR,
