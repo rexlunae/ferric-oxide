@@ -52,10 +52,16 @@ use crate::verify::{
 use crate::vex::{VexFileError, parse_vex, vex_path};
 
 /// Where [`write_file`] stages its temporary files, at the top of the
-/// registry and outside every signed directory. It exists only while a
-/// write is in progress or after one was interrupted, and [`Registry::open`]
-/// clears it.
+/// registry and outside every signed directory. Git does not track the
+/// directory itself, and it holds files only while writes are in progress
+/// or after one was interrupted; [`Registry::open`] removes those older
+/// than [`STALE_STAGING`].
 const STAGING_DIR: &str = ".fox-staging";
+
+/// How old a staging file must be before [`Registry::open`] takes it for
+/// the leftover of a killed write rather than one still in progress in
+/// another process.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// How long each kind of metadata stays valid, in days.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1309,28 +1315,83 @@ fn write_file(dir: &Path, relative: impl AsRef<Path>, bytes: &[u8]) -> Result<()
     }
     let staging = dir.join(STAGING_DIR);
     create_dir(&staging)?;
-    // One flat name per target, so no subdirectories are needed.
-    let temp = staging.join(relative.to_string_lossy().replace('/', "%"));
+    let temp = staging.join(staging_name(relative));
     fox_core::config::replace_file_via(&path, bytes, &temp).map_err(|source| EditError::Io {
         path: path.clone(),
         source,
-    })?;
-    // Leave no empty directory behind; it is still in use if not empty.
-    let _ = fs::remove_dir(&staging);
+    })
+}
+
+/// A staging file name for `relative` that no other write, in this
+/// process or another, uses: the path flattened reversibly (`%` and `/`
+/// escaped, so two paths never share a name), then the process id and a
+/// per-call random value.
+fn staging_name(relative: &Path) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
+    let flat = relative
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+    format!("{flat}.{}.{:016x}", std::process::id(), hasher.finish())
+}
+
+/// Removes what killed writes left in [`STAGING_DIR`]: files older than
+/// [`STALE_STAGING`]. Only [`write_file`] writes there, and each write
+/// renames or removes its own file within moments, so a younger file may
+/// belong to a write still running in another process and is kept.
+fn clear_staging(dir: &Path) -> Result<(), EditError> {
+    let staging = dir.join(STAGING_DIR);
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| EditError::Io { path, source }
+    };
+    let entries = match fs::read_dir(&staging) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(&staging)(source)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error(&staging))?;
+        let path = entry.path();
+        let age = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map_err(io_error(&path))?
+            .elapsed()
+            .unwrap_or_default();
+        if age < STALE_STAGING {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            // Another process cleared it first.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path)(source)),
+        }
+    }
     Ok(())
 }
 
-/// Removes what interrupted writes left in [`STAGING_DIR`]. Only
-/// [`write_file`] writes there, and each write finishes or removes its own
-/// file, so anything still there belongs to a write that was killed.
-fn clear_staging(dir: &Path) -> Result<(), EditError> {
-    let staging = dir.join(STAGING_DIR);
-    match fs::remove_dir_all(&staging) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(EditError::Io {
-            path: staging,
-            source,
-        }),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_names_are_unique_and_keep_paths_apart() {
+        let flat = |name: &str| name.rsplitn(3, '.').nth(2).unwrap().to_owned();
+        let a = staging_name(Path::new("packages/fd/fd.toml"));
+        let b = staging_name(Path::new("packages/fd/fd.toml"));
+        assert_ne!(a, b);
+        assert_eq!(flat(&a), "packages%2Ffd%2Ffd.toml");
+        // A `%` in a path cannot make it look like another path's `/`.
+        assert_ne!(
+            flat(&staging_name(Path::new("a%2Fb"))),
+            flat(&staging_name(Path::new("a/b")))
+        );
+        assert!(!a.contains('/'));
     }
 }

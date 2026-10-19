@@ -458,9 +458,11 @@ metadata/timestamp.json           hash of the snapshot; expires after a day
 `fox-registry` writes every file through a temporary file in
 `.fox-staging/` at the top of the repository and a rename, so an
 interrupted write leaves the old file whole and no stray file in a signed
-directory (every file there is a target). The directory exists only while
-a write is in progress or after one was interrupted, and opening the
-registry clears it.
+directory (every file there is a target). Each write's temporary file has
+its own name (the target path, the process id and a random value), so
+concurrent writers never share one, and opening the registry removes only
+staging files more than an hour old, the leftovers of killed writes. Git
+does not track the empty directory.
 
 `<xx>` is the name's first two characters (`_` pads one-character names).
 Package files keep `[[owners]]` (an id and an OpenSSH Ed25519 key) and
@@ -856,11 +858,9 @@ release was built), and a statement applies only when both match the
 configured registry. One registry therefore cannot clear a same-named
 package from another, nor a package installed from an archive file or git
 source, adopted from `pkg`, or recorded before the database kept origins
-(`fox-installed/1`). Reinstalling such a package from the registry gives it
-an origin, and so does a `fox sync` that finds it unchanged when the lock
-names the registry and the registry's verified index lists the locked
-release and archive (a locked archive built from source is listed nowhere,
-so it gets an origin only when reinstalled). A finding covered
+(`fox-installed/1`). Only reinstalling such a package from the registry
+gives it an origin; a matching archive hash is not proof of where a copy
+came from. A finding covered
 by a `not_affected`, `false_positive`, `resolved` or
 `resolved_with_pedigree` statement moves from `findings` to `suppressed`
 (with the registry, document, state, justification and detail) and no

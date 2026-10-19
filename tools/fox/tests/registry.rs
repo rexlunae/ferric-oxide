@@ -266,37 +266,6 @@ fn installs_prebuilt_artifacts_attested_by_enough_builders() {
     let verified = env.fox(&["verify", "--installed"]);
     assert!(verified.status.success(), "{}", stderr(&verified));
 
-    // A store from before origins were recorded loses tiny's; a sync that
-    // finds the locked prebuilt unchanged records it again, because the
-    // registry lists that archive for the locked release.
-    let set = env.work.path().join("set/packages.toml");
-    fs::create_dir_all(set.parent().unwrap()).unwrap();
-    fs::write(
-        &set,
-        format!(
-            "[[registry]]\nname = \"test\"\ngit = \"{}\"\nroot-blake3 = \"{}\"\n\n\
-             [packages]\ntiny = {{ version = \"^0.3\" }}\n",
-            reg.url(),
-            reg.root_blake3()
-        ),
-    )
-    .unwrap();
-    let set_arg = set.to_str().unwrap();
-    let synced = env.fox(&["sync", "--config", set_arg]);
-    assert!(synced.status.success(), "{}", stderr(&synced));
-    let db = env.root.path().join("var/lib/fox/installed.toml");
-    let text = fs::read_to_string(&db).unwrap();
-    assert!(text.contains("[package.origin]"), "{text}");
-    fs::write(&db, text.replace("fox-installed/2", "fox-installed/1")).unwrap();
-    let again = json(&env.fox(&["--json", "sync", "--locked", "--config", set_arg]));
-    assert_eq!(again[0]["action"], "unchanged");
-    let restored = fs::read_to_string(&db).unwrap();
-    assert!(
-        restored.starts_with("format = \"fox-installed/2\""),
-        "{restored}"
-    );
-    assert!(restored.contains("[package.origin]"), "{restored}");
-
     // A tampered blob is refused, and with building forbidden nothing
     // else will do.
     let pkgar = built["pkgar_blake3"].as_str().unwrap();
@@ -468,23 +437,6 @@ fn sync_installs_locks_and_removes_a_package_set() {
     // The lock is satisfied and the archive is the locked one.
     let again = json(&env.fox(&["--json", "sync", "--locked", "--config", set_arg]));
     assert_eq!(again[0]["action"], "unchanged");
-
-    // tiny was built from source, an archive no registry lists, so a sync
-    // of a store that lost its origin (format 1) does not invent one.
-    let db = env.root.path().join("var/lib/fox/installed.toml");
-    let text = fs::read_to_string(&db).unwrap();
-    assert!(text.contains("[package.origin]"), "{text}");
-    fs::write(&db, text.replace("fox-installed/2", "fox-installed/1")).unwrap();
-    let again = json(&env.fox(&["--json", "sync", "--locked", "--config", set_arg]));
-    assert_eq!(again[0]["action"], "unchanged");
-    // The database is not rewritten, so it stays format 1 and its
-    // `origin` stays ignored.
-    assert!(
-        fs::read_to_string(&db)
-            .unwrap()
-            .starts_with("format = \"fox-installed/1\"")
-    );
-    fs::write(&db, text).unwrap();
 
     // A package the set drops is removed; one installed by hand is not.
     fs::write(&set, format!("{registry}[packages]\n")).unwrap();

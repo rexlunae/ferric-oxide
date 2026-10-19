@@ -663,39 +663,6 @@ impl Store {
         Ok(())
     }
 
-    /// Records `origin` for the installed package `name` when it has none
-    /// and is still the archive `archive_blake3`, without reinstalling it.
-    /// For a package installed before the database kept origins, once the
-    /// caller has checked that the registry lists that archive. Returns
-    /// whether the origin was recorded.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Io`], [`StoreError::Database`] or
-    /// [`StoreError::DatabaseSerialize`] for state-file errors.
-    pub fn restore_origin(
-        &self,
-        name: &PackageName,
-        archive_blake3: Blake3Digest,
-        origin: Origin,
-    ) -> Result<bool, StoreError> {
-        let _lock = self.lock()?;
-        let db_path = self.db_path();
-        let mut db = Database::load(&db_path)?;
-        let Some(package) = db.get_mut(name) else {
-            return Ok(false);
-        };
-        if package.origin.is_some()
-            || package.archive_blake3 != Some(archive_blake3)
-            || package.state != PackageState::Installed
-        {
-            return Ok(false);
-        }
-        package.origin = Some(origin);
-        db.save(&db_path)?;
-        Ok(true)
-    }
-
     /// Removes an installed package's files and its database entry.
     ///
     /// Files changed since installation are kept and listed in the report.
