@@ -8,6 +8,17 @@
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
+//!   `mmap` of the descriptor (`PROT_READ`, `MAP_SHARED`, the whole `CPU_MAP_BYTES` from offset
+//!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
+//!   consumes it up to `end`, under the same one-reader lock as a read.
+//!
+//! A mapped ring is never writable by its reader: `PROT_WRITE` is refused, and `mprotect`
+//! cannot add it to a shared grant later. So the kernel stays the only writer of those words,
+//! and it never trusts what they say beyond its own stores: the ring's size is kept in the
+//! kernel, every position is masked to the data before use, and the one value a reader passes
+//! back, `commit`'s `end`, is accepted only as a record boundary between the kernel's `tail`
+//! and `head` (`Ring::commit_to`). The reader, for its part, sees `head` and `tail` move under
+//! it and must copy before it decodes (`ferric_trace::ring::View`).
 //!
 //! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
@@ -19,16 +30,22 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ferric_trace::abi::{Command, EventLine, Path, StatsLine};
-use spin::Mutex;
-use syscall::error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP};
+use ferric_trace::abi::{Command, CpuCommand, EventLine, Path, StatsLine, CPU_MAP_BYTES};
+use spin::{Mutex, MutexGuard};
+use syscall::{
+    error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP},
+    flag::MapFlags,
+};
 
-use super::{CallerCtx, KernelScheme, OpenResult, StrOrBytes};
+use super::{shared_frames::map_frames, CallerCtx, KernelScheme, OpenResult, StrOrBytes};
 use crate::{
-    context::file::InternalFlags,
+    context::{file::InternalFlags, memory::AddrSpaceWrapper},
     cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
     sync::CleanLockToken,
-    syscall::usercopy::{UserSliceRo, UserSliceWo},
+    syscall::{
+        data::Map,
+        usercopy::{UserSliceRo, UserSliceWo},
+    },
     trace::{self, ControlError, Mode},
 };
 
@@ -93,6 +110,60 @@ fn render(text: Text) -> Arc<[u8]> {
         }
     }
     Arc::from(out.into_bytes())
+}
+
+/// Becomes `cpu`'s ring's one consumer, or fails with `EAGAIN` while another reader is: the
+/// copy to the caller can fault and block, so a second reader does not spin.
+fn consumer(cpu: LogicalCpuId) -> Result<MutexGuard<'static, ()>> {
+    READERS
+        .get(cpu.get() as usize)
+        .and_then(Mutex::try_lock)
+        .ok_or(Error::new(EAGAIN))
+}
+
+/// Reads a command of at most [`MAX_COMMAND`] bytes from `buf`, and returns it with its
+/// length.
+fn command_bytes(buf: UserSliceRo) -> Result<(Vec<u8>, usize)> {
+    if buf.len() > MAX_COMMAND {
+        return Err(Error::new(EINVAL));
+    }
+    let mut bytes: Vec<u8> = vec![0; buf.len()];
+    let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
+    bytes.truncate(len);
+    Ok((bytes, len))
+}
+
+/// Runs a command written to `events`.
+fn events_command(buf: UserSliceRo) -> Result<usize> {
+    let (bytes, len) = command_bytes(buf)?;
+    let command = Command::parse(&bytes).map_err(|_| Error::new(EINVAL))?;
+    let (spec, on) = match command {
+        Command::Enable(spec) => (spec, true),
+        Command::Disable(spec) => (spec, false),
+    };
+    match trace::control(spec, on, Mode::Live) {
+        Ok(changed) => {
+            info!("trace: {command} ({changed} event(s) changed)");
+            Ok(len)
+        }
+        Err(err) => {
+            warn!("trace: {command}: {err}");
+            Err(control_errno(&err))
+        }
+    }
+}
+
+/// Runs a command written to `cpu/<n>`: `commit <end>` consumes the mapped ring up to `end`,
+/// which must be a record boundary the kernel can check (`Ring::commit_to`).
+fn cpu_command(cpu: LogicalCpuId, buf: UserSliceRo) -> Result<usize> {
+    let (bytes, len) = command_bytes(buf)?;
+    let CpuCommand::Commit(end) = CpuCommand::parse(&bytes).map_err(|_| Error::new(EINVAL))? else {
+        return Err(Error::new(EINVAL));
+    };
+    let ring = trace::ring(cpu).ok_or(Error::new(EINVAL))?;
+    let _consumer = consumer(cpu)?;
+    ring.commit_to(end).map_err(|_| Error::new(EINVAL))?;
+    Ok(len)
 }
 
 /// The errno for a failed `enable` or `disable`.
@@ -188,12 +259,8 @@ impl KernelScheme for TraceScheme {
                 };
                 let mut records = vec![0u8; buf.len().min(MAX_READ)];
                 // One reader at a time, from the copy to the commit. The records are consumed
-                // only once they reached the caller, so a failed copy loses none. The copy can
-                // fault and block, so a second reader gets EAGAIN instead of spinning.
-                let _reader = READERS
-                    .get(cpu.get() as usize)
-                    .and_then(Mutex::try_lock)
-                    .ok_or(Error::new(EAGAIN))?;
+                // only once they reached the caller, so a failed copy loses none.
+                let _consumer = consumer(cpu)?;
                 let peek = ring.peek(&mut records).map_err(|_| Error::new(EINVAL))?;
                 let len =
                     buf.copy_common_bytes_from_slice(records.get(..peek.len()).unwrap_or(&[]))?;
@@ -211,33 +278,15 @@ impl KernelScheme for TraceScheme {
         _stored_flags: u32,
         _token: &mut CleanLockToken,
     ) -> Result<usize> {
-        match HANDLES.lock().get(&id) {
-            Some(Handle::Text {
+        let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
+        match handle {
+            Handle::Text {
                 text: Text::Events, ..
-            }) => {}
-            Some(_) => return Err(Error::new(EBADF)),
-            None => return Err(Error::new(EBADF)),
-        }
-        if buf.len() > MAX_COMMAND {
-            return Err(Error::new(EINVAL));
-        }
-        let mut bytes: Vec<u8> = vec![0; buf.len()];
-        let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
-        let command =
-            Command::parse(bytes.get(..len).unwrap_or(&[])).map_err(|_| Error::new(EINVAL))?;
-        let (spec, on) = match command {
-            Command::Enable(spec) => (spec, true),
-            Command::Disable(spec) => (spec, false),
-        };
-        match trace::control(spec, on, Mode::Live) {
-            Ok(changed) => {
-                info!("trace: {command} ({changed} event(s) changed)");
-                Ok(len)
-            }
-            Err(err) => {
-                warn!("trace: {command}: {err}");
-                Err(control_errno(&err))
-            }
+            } => events_command(buf),
+            Handle::Cpu(cpu) => cpu_command(cpu, buf),
+            Handle::Text {
+                text: Text::Stats, ..
+            } => Err(Error::new(EBADF)),
         }
     }
 
@@ -252,6 +301,44 @@ impl KernelScheme for TraceScheme {
     ) -> Result<usize> {
         // `events` is positioned for its reads; a command ignores the offset.
         self.kwrite(id, buf, flags, stored_flags, token)
+    }
+
+    fn kfmap(
+        &self,
+        id: usize,
+        addr_space: &Arc<AddrSpaceWrapper>,
+        map: &Map,
+        _consume: bool,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let Some(Handle::Cpu(cpu)) = HANDLES.lock().get(&id).cloned() else {
+            return Err(Error::new(EBADF));
+        };
+        if map
+            .flags
+            .intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
+        {
+            return Err(Error::new(EOPNOTSUPP));
+        }
+        // Read-only, so the kernel stays the only writer of the ring's words.
+        if map
+            .flags
+            .intersects(MapFlags::PROT_WRITE | MapFlags::PROT_EXEC)
+        {
+            return Err(Error::new(EACCES));
+        }
+        if !map.flags.contains(MapFlags::MAP_SHARED) || map.offset != 0 || map.size != CPU_MAP_BYTES
+        {
+            return Err(Error::new(EINVAL));
+        }
+        trace::init_rings();
+        let ring = trace::ring(cpu).ok_or(Error::new(EINVAL))?;
+        map_frames(
+            addr_space,
+            ring.words().frames(),
+            MapFlags::PROT_READ,
+            token,
+        )
     }
 
     fn kfpath(&self, id: usize, buf: UserSliceWo, _token: &mut CleanLockToken) -> Result<usize> {

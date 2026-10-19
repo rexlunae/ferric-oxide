@@ -5,16 +5,19 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicU64;
 
 use ferric_trace::abi::{self, EventLine, StatsLine};
+use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::kernel::{
     CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
     SYSCALL_EXIT,
 };
-use ferric_trace::record::Records;
+use ferric_trace::record::{Records, WORD_BYTES};
+use ferric_trace::ring::View;
 use ferric_trace::{Event, EventId};
 use syscall::schemev2::Opcode;
-use syscall::{EBADF, SYS_READ, SYS_WRITE, SYS_YIELD};
+use syscall::{EACCES, EBADF, EINVAL, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -364,6 +367,236 @@ fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
     Ok(())
 }
 
+/// A CPU's ring mapped into this process, until dropped.
+struct Mapped {
+    addr: usize,
+}
+
+impl Mapped {
+    /// Maps [`CPU_MAP_BYTES`] of `fd` from offset 0 with `flags`, or returns the error.
+    fn new(fd: usize, size: usize, flags: MapFlags) -> syscall::Result<Self> {
+        let map = syscall::Map {
+            offset: 0,
+            size,
+            flags,
+            address: 0,
+        };
+        // SAFETY: a fresh mapping at an address the kernel picks; nothing in this process
+        // refers to that memory yet.
+        let addr = unsafe { syscall::fmap(fd, &map) }?;
+        Ok(Self { addr })
+    }
+
+    /// The ring's words.
+    fn words(&self) -> &[AtomicU64] {
+        // SAFETY: the mapping is CPU_MAP_BYTES of page-aligned shared memory, mapped until
+        // `drop`, which needs `&mut self`, so it outlives this borrow. `AtomicU64` has the size
+        // and alignment of a `u64` and any bit pattern is valid, and the kernel writes the
+        // same memory only atomically.
+        unsafe {
+            core::slice::from_raw_parts(self.addr as *const AtomicU64, CPU_MAP_BYTES / WORD_BYTES)
+        }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made by `new`; no borrow of it outlives `&mut self`.
+        let _ = unsafe { syscall::funmap(self.addr, CPU_MAP_BYTES) };
+    }
+}
+
+/// Checks that `result` failed with `errno`.
+fn expect_errno(
+    step: &'static str,
+    call: &'static str,
+    result: syscall::Result<usize>,
+    errno: i32,
+) -> Result<(), Failure> {
+    if result.map_err(|e| e.errno) == Err(errno) {
+        Ok(())
+    } else {
+        Err(Failure {
+            step,
+            why: Why::Call { call, result },
+        })
+    }
+}
+
+/// Writes `commit <end>` to a CPU's descriptor.
+fn commit(fd: usize, end: u64) -> syscall::Result<usize> {
+    syscall::write(fd, CpuCommand::Commit(end).to_string().as_bytes())
+}
+
+/// A CPU's ring, open and mapped.
+struct CpuMap {
+    cpu: u32,
+    file: File,
+    map: Mapped,
+}
+
+impl CpuMap {
+    fn fd(&self) -> usize {
+        // File descriptors are never negative.
+        self.file.as_raw_fd() as usize
+    }
+}
+
+/// Opens and maps every CPU's ring, checking that only a read-only shared mapping of the
+/// whole ring is allowed and that it cannot be made writable.
+fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
+    let read_shared = MapFlags::PROT_READ | MapFlags::MAP_SHARED;
+    cpus.iter()
+        .map(|&cpu| {
+            let path = path(&format!("{}/{cpu}", abi::CPU_DIR));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(io_failure(step, &path))?;
+            let fd = file.as_raw_fd() as usize;
+            let refused = |flags, size| Mapped::new(fd, size, flags).map(|map| map.addr);
+            expect_errno(
+                step,
+                "writable mmap of a ring",
+                refused(read_shared | MapFlags::PROT_WRITE, CPU_MAP_BYTES),
+                EACCES,
+            )?;
+            expect_errno(
+                step,
+                "mmap of part of a ring",
+                refused(read_shared, CPU_MAP_BYTES / 2),
+                EINVAL,
+            )?;
+            expect_errno(
+                step,
+                "private mmap of a ring",
+                refused(MapFlags::PROT_READ | MapFlags::MAP_PRIVATE, CPU_MAP_BYTES),
+                EINVAL,
+            )?;
+            let map = Mapped::new(fd, CPU_MAP_BYTES, read_shared).map_err(|err| Failure {
+                step,
+                why: Why::Call {
+                    call: "mmap of a ring",
+                    result: Err(err),
+                },
+            })?;
+            // SAFETY: changes only the protection of the mapping made above, which nothing
+            // writes through; the kernel must refuse it anyway.
+            let result = unsafe {
+                syscall::mprotect(
+                    map.addr,
+                    CPU_MAP_BYTES,
+                    MapFlags::PROT_READ | MapFlags::PROT_WRITE,
+                )
+            };
+            expect_errno(step, "mprotect of a ring to writable", result, EACCES)?;
+            Ok(CpuMap { cpu, file, map })
+        })
+        .collect()
+}
+
+/// Reads one mapped ring through a [`View`] without consuming it, and returns the records
+/// and the position after them.
+fn read_mapped(step: &'static str, ring: &CpuMap) -> Result<(Vec<Entry>, u64, u64), Failure> {
+    let cpu = ring.cpu;
+    let view =
+        View::new(ring.map.words()).map_err(|err| check(step, format!("cpu {cpu}: {err}")))?;
+    let start = view.tail();
+    let mut pos = start;
+    let mut entries = Vec::new();
+    let mut buf = vec![0u8; READ_LEN];
+    loop {
+        let peek = view
+            .peek(pos, &mut buf)
+            .map_err(|err| check(step, format!("cpu {cpu}: {err}")))?;
+        if peek.is_corrupt() {
+            return Err(check(step, format!("cpu {cpu}: a corrupt record")));
+        }
+        if peek.is_empty() {
+            return Ok((entries, start, pos));
+        }
+        decode(
+            step,
+            cpu,
+            buf.get(..peek.len()).unwrap_or_default(),
+            &mut entries,
+        )?;
+        pos = peek.end();
+    }
+}
+
+/// `trace-mmap`: maps every CPU's ring, makes the marker calls again, finds them by reading
+/// the mappings, and consumes what it read with `commit`, which takes only a record boundary
+/// the kernel published.
+fn check_mmap(cpus: &[u32]) -> Result<(), Failure> {
+    let step = "trace-mmap";
+    let rings = map_cpus(step, cpus)?;
+    drain(step, cpus)?;
+    command(step, "enable syscall")?;
+    let marks = mark(step)?;
+    command(step, "disable syscall")?;
+    let mut trace = Vec::new();
+    for ring in &rings {
+        let (entries, start, end) = read_mapped(step, ring)?;
+        let fd = ring.fd();
+        let view = View::new(ring.map.words())
+            .map_err(|err| check(step, format!("cpu {}: {err}", ring.cpu)))?;
+        expect_errno(
+            step,
+            "commit past head",
+            commit(fd, view.head() + 1),
+            EINVAL,
+        )?;
+        if end > start {
+            // The shortest record is two words, so one word in is never a boundary.
+            expect_errno(
+                step,
+                "commit inside a record",
+                commit(fd, start + 1),
+                EINVAL,
+            )?;
+        }
+        if view.tail() != start {
+            return Err(check(
+                step,
+                format!("cpu {}: a refused commit moved tail", ring.cpu),
+            ));
+        }
+        let result = commit(fd, end);
+        if result.is_err() {
+            return Err(Failure {
+                step,
+                why: Why::Call {
+                    call: "commit of a mapped read",
+                    result,
+                },
+            });
+        }
+        if view.tail() < end {
+            return Err(check(
+                step,
+                format!("cpu {}: tail {} after commit {end}", ring.cpu, view.tail()),
+            ));
+        }
+        trace.push(entries);
+    }
+    let write = [
+        SYS_WRITE as u64,
+        BAD_FD as u64,
+        marks.write_buf,
+        MARK_LEN as u64,
+    ];
+    find_pair(&trace, &write, errno_result(EBADF))
+        .ok_or_else(|| check(step, "no enter/exit pair for the write in the mapped rings"))?;
+    // What was committed is gone: reading the rings does not give the calls again.
+    let after = drain(step, cpus)?;
+    if find_pair(&after, &write, errno_result(EBADF)).is_some() {
+        return Err(check(step, "a read gave records the commit consumed"));
+    }
+    Ok(())
+}
+
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     let list = listing("trace-boot")?;
@@ -484,6 +717,9 @@ fn run() -> Result<(), Failure> {
         ));
     }
     println!("FERRIC_TEST_PASS trace-disable");
+
+    check_mmap(&cpus)?;
+    println!("FERRIC_TEST_PASS trace-mmap");
     Ok(())
 }
 
