@@ -135,8 +135,9 @@ jobs:
           # Registered buffers, kernel tracing and rings are off by default; turn them on so
           # ferric-regbuf-test, ferric-trace-test (with sched.switch on from boot) and
           # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
-          # ferric-blkgrant-test does.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
+          # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
+          # ferric-iommu-test's iommu-msi-percpu runs.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\nirq_percpu = true\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
