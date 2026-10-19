@@ -468,6 +468,8 @@ pub enum GlobalSchemes {
     /// Ferric Oxide: `kernel.trace`, tracepoint control and trace rings (ferric-trace's
     /// `abi::SCHEME_ID`).
     Trace = 14,
+    /// Ferric Oxide: `kernel.ring`, submission/completion rings (ferric-ring's `abi::SCHEME_ID`).
+    Ring = 15,
 }
 impl GlobalSchemes {
     pub fn try_from_raw(raw: u8) -> Option<Self> {
@@ -486,6 +488,7 @@ impl GlobalSchemes {
             12 => Some(Self::Iommu),
             13 => Some(Self::RegBuf),
             14 => Some(Self::Trace),
+            15 => Some(Self::Ring),
             _ => None,
         }
     }
@@ -505,6 +508,7 @@ impl GlobalSchemes {
             Self::Iommu => "kernel.iommu",
             Self::RegBuf => "kernel.regbuf",
             Self::Trace => "kernel.trace",
+            Self::Ring => "kernel.ring",
         }
     }
 }
