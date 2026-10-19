@@ -1,9 +1,11 @@
 //! Reading a crash dump: the file `/scheme/kernel.trace/crash` that the kernel keeps after a
 //! panic on the previous boot (`kernel.trace_crash`, [`ferric_trace::crash`]).
 //!
-//! [`CrashReport::load`] reads the panic message and each CPU's newest records as a
-//! [`Capture`], which [`text`](crate::text) and [`perfetto`](crate::perfetto) print like any
-//! other, and [`CrashReport::save`] writes the records as a capture directory of `cpu<n>` files.
+//! [`CrashReport::load`] reads the panic message, the clock of the timestamps and each CPU's
+//! newest records as a [`Capture`], which [`text`](crate::text) and [`perfetto`](crate::perfetto)
+//! print like any other, and [`CrashReport::save`] writes the records as a capture directory of
+//! `cpu<n>` files and a [`CLOCK`] file. A dump from a kernel that did not record its clock has
+//! TSC timestamps and is saved without a `clock` file, like a capture from such a kernel.
 //! The dump was taken while the other CPUs kept running, so a CPU's records can end in a torn
 //! one; its records are kept up to the first that does not decode, and the rest are counted in
 //! [`CpuCrash::dropped`].
@@ -12,11 +14,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ferric_trace::clock::ClockLine;
 use ferric_trace::crash::{CrashError, Dump};
 use ferric_trace::kernel::CATALOG;
 use ferric_trace::record::{Records, WORD_BYTES};
 
-use crate::capture::{Capture, CaptureError, CpuCapture, INCOMPLETE};
+use crate::capture::{CLOCK, Capture, CaptureError, CpuCapture, INCOMPLETE};
 
 /// Why a crash dump could not be read or saved.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +74,9 @@ pub struct CrashReport {
     /// The CPU that panicked and its panic message, if the dump has one (invalid UTF-8 is
     /// replaced).
     pub message: Option<(u32, String)>,
+    /// The clock the timestamps come from, if the dump records it (dumps from older kernels
+    /// do not, and count TSC cycles).
+    pub clock: Option<ClockLine>,
     /// Each CPU's records, in the dump's order.
     pub cpus: Vec<CpuCrash>,
 }
@@ -98,7 +104,11 @@ impl CrashReport {
                 }
             })
             .collect();
-        Ok(Self { message, cpus })
+        Ok(Self {
+            message,
+            clock: dump.clock(),
+            cpus,
+        })
     }
 
     /// Reads the dump in the file at `path`.
@@ -130,11 +140,11 @@ impl CrashReport {
             .iter()
             .map(|cpu| CpuCapture::decode(cpu.cpu, &cpu.records))
             .collect::<Result<_, _>>()?;
-        Ok(Capture::from_cpus(cpus))
+        Ok(Capture::from_cpus(cpus).with_clock(self.clock))
     }
 
-    /// Writes the records as a capture directory `out` of `cpu<n>` files, which must not
-    /// exist yet. As `ferric-trace capture` does, it marks the directory
+    /// Writes the records as a capture directory `out` of `cpu<n>` files, with a [`CLOCK`]
+    /// file when the dump records its clock, which must not exist yet. As `ferric-trace capture` does, it marks the directory
     /// [`INCOMPLETE`] until every file is written, so a save cut
     /// short is not loaded as a whole capture.
     ///
@@ -163,6 +173,10 @@ impl CrashReport {
         for cpu in &self.cpus {
             let path = out.join(format!("cpu{}", cpu.cpu));
             write(&path, &cpu.records).map_err(io(&path))?;
+        }
+        if let Some(clock) = self.clock {
+            let path = out.join(CLOCK);
+            write(&path, clock.to_string().as_bytes()).map_err(io(&path))?;
         }
         fs::remove_file(&marker).map_err(io(&marker))
     }
@@ -201,6 +215,11 @@ mod tests {
 
     /// A dump of `message` and two CPUs, the second with a torn last record.
     fn dump_bytes(message: &[u8]) -> Vec<u8> {
+        dump_with_clock(message, None)
+    }
+
+    /// [`dump_bytes`] recording `clock`, when given.
+    fn dump_with_clock(message: &[u8], clock: Option<ClockLine>) -> Vec<u8> {
         let words: Vec<AtomicU64> = (0..REGION_WORDS).map(|_| AtomicU64::new(0)).collect();
         let ring0 = Ring::new(ring_words()).expect("valid");
         ring0
@@ -215,6 +234,9 @@ mod tests {
         writer.message(1, message);
         writer.cpu(0, &ring0, 1000);
         writer.cpu(1, &ring1, 1000);
+        if let Some(clock) = clock {
+            writer.clock(clock);
+        }
         writer.finish();
         let len = Dump::len_in(&words).expect("complete");
         words
@@ -252,7 +274,29 @@ mod tests {
         assert!(!out.join(INCOMPLETE).exists());
         let capture = Capture::load(std::slice::from_ref(&out)).expect("a capture");
         assert_eq!(capture.entries().len(), 3);
+        assert_eq!(capture.clock(), None);
+        assert!(!out.join(CLOCK).exists());
         assert!(matches!(report.save(&out), Err(CrashDumpError::Io { .. })));
+    }
+
+    #[test]
+    fn keeps_the_clock_of_the_dump() {
+        use ferric_trace::clock::Clock;
+        let hpet = ClockLine {
+            clock: Clock::Hpet,
+            period_fs: Some(69_841_279),
+        };
+        let report = CrashReport::parse(&dump_with_clock(b"x", Some(hpet))).expect("a dump");
+        assert_eq!(report.clock, Some(hpet));
+        assert_eq!(report.capture().expect("decodes").clock(), Some(hpet));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("crash");
+        report.save(&out).expect("saved");
+        let capture = Capture::load(std::slice::from_ref(&out)).expect("a capture");
+        assert_eq!(capture.clock(), Some(hpet));
+        // An older dump has no clock: its timestamps are TSC cycles.
+        let old = CrashReport::parse(&dump_bytes(b"x")).expect("a dump");
+        assert_eq!(old.clock, None);
     }
 
     /// A save that fails after the first CPU leaves a capture that does not load.
