@@ -9,6 +9,8 @@
 //!   into a directory (the `ferric-trace capture` command).
 //! - [`capture`] loads and decodes the files against the kernel's event catalog
 //!   ([`ferric_trace::kernel::CATALOG`]) and merges them in timestamp order.
+//! - [`crash`] reads the crash dump a kernel panic left for the next boot
+//!   (`/scheme/kernel.trace/crash`, the `ferric-trace crash` command) as a capture.
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
 //! - [`perfetto`] converts a capture to the Chrome trace event JSON format, which the Perfetto
 //!   UI (<https://ui.perfetto.dev>) and `chrome://tracing` open. The format is described in
@@ -38,6 +40,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
+pub mod crash;
 pub mod drain;
 pub mod perfetto;
 pub mod text;
