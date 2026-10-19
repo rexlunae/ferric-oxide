@@ -24,6 +24,8 @@
 //!   invalidation queue, AMD-Vi's command buffer).
 //! - `iova` (with the `alloc` feature) allocates naturally aligned IOVA ranges for a domain and
 //!   hands out domain IDs, for either vendor.
+//! - `irte` (with the `alloc` feature) is pcid's record of the interrupt remapping entries it
+//!   made for each driver channel, one per (CPU, vector), freed when the channel closes.
 //! - `dma` (with the `alloc` feature) is the kernel's bookkeeping for the IOVA mappings that
 //!   `memory:translation` makes in a bound domain: one IOVA per frame range, kept while some
 //!   virtual mapping of the driver still reaches it.
@@ -59,5 +61,7 @@ pub mod alias;
 pub mod dma;
 #[cfg(feature = "alloc")]
 pub mod iova;
+#[cfg(feature = "alloc")]
+pub mod irte;
 pub mod ring;
 pub mod table;

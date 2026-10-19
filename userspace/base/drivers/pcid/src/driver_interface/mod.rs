@@ -23,6 +23,8 @@ pub mod config;
 mod id;
 pub mod irq_helpers;
 pub mod msi;
+// Ferric Oxide: vectors on a chosen CPU.
+pub mod percpu;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LegacyInterruptLine {
