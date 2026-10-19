@@ -1,5 +1,6 @@
 //! `ferric-trace`: saves kernel trace captures on the target (the `cpu<n>` files drained from
-//! `/scheme/kernel.trace`), and prints them as text or exports them for Perfetto.
+//! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto, and reads the
+//! crash dump a kernel panic left for the next boot.
 
 use std::error::Error;
 use std::fs;
@@ -9,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
+use ferric_trace_cli::crash::CrashReport;
 use ferric_trace_cli::{drain, perfetto, text};
 
 #[derive(Parser)]
@@ -37,6 +39,17 @@ enum Cmd {
         #[arg(long)]
         partial: bool,
     },
+    /// Print the panic message and the records of a crash dump (`/scheme/kernel.trace/crash`
+    /// after a panic, or a copy of it), and optionally save the records as a capture
+    Crash {
+        /// The dump
+        #[arg(default_value = "/scheme/kernel.trace/crash")]
+        dump: PathBuf,
+        /// Save the records as a capture directory, which must not exist yet, for `text` or
+        /// `perfetto`
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Write Chrome trace event JSON, which ui.perfetto.dev and chrome://tracing open
     Perfetto {
         /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
@@ -62,6 +75,8 @@ enum CliError {
     Capture(#[from] ferric_trace_cli::capture::CaptureError),
     #[error("capture failed")]
     Drain(#[from] ferric_trace_cli::drain::DrainError),
+    #[error(transparent)]
+    Crash(#[from] ferric_trace_cli::crash::CrashDumpError),
     #[error("cannot write {}", path.display())]
     Write {
         path: PathBuf,
@@ -89,6 +104,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Cmd::Crash { dump, out } => crash(&dump, out.as_deref()),
         Cmd::Text { inputs, partial } => {
             let capture = loader(partial)(&inputs)?;
             let stdout = io::stdout();
@@ -121,6 +137,44 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
     }
+}
+
+/// `ferric-trace crash`.
+fn crash(dump: &std::path::Path, out: Option<&std::path::Path>) -> Result<(), CliError> {
+    let report = CrashReport::load(dump)?;
+    let capture = report
+        .capture()
+        .map_err(ferric_trace_cli::crash::CrashDumpError::from)?;
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    let write_error = |source| CliError::Write {
+        path: PathBuf::from("<stdout>"),
+        source,
+    };
+    match &report.message {
+        Some((cpu, message)) => writeln!(w, "panic on CPU {cpu}: {message}"),
+        None => writeln!(w, "no panic message"),
+    }
+    .map_err(write_error)?;
+    for cpu in &report.cpus {
+        writeln!(
+            w,
+            "cpu {}: {} records ({} bytes), {} lost before the panic, {} bytes torn",
+            cpu.cpu,
+            cpu.record_count(),
+            cpu.records.len(),
+            cpu.lost,
+            cpu.dropped
+        )
+        .map_err(write_error)?;
+    }
+    text::write(&capture, &mut w)
+        .and_then(|()| w.flush())
+        .map_err(write_error)?;
+    if let Some(out) = out {
+        report.save(out)?;
+    }
+    Ok(())
 }
 
 /// The capture loader the `--partial` flag picks.

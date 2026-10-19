@@ -240,11 +240,10 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   every request on the main queue (`MainQueue`) or send every request to a
   worker (`Workers`). Only the process that opened the descriptor, which must
   be root, may make this call: driver-block refuses it with `EPERM` on a
-  descriptor passed to another process (`ferric_blkqueue::openers`). The scheme cannot see the caller's CPU yet, so worker requests
-  are spread round-robin. driver-block still serves one scheme call at a time,
-  so until it serves calls concurrently, requests never overlap. Native rings
-  with a home CPU (later steps of the plan) are what route a request to the
-  queue of the core it came from.
+  descriptor passed to another process (`ferric_blkqueue::openers`). The
+  scheme cannot see the caller's CPU yet, so worker requests are spread
+  round-robin. Native rings with a home CPU (later steps of the plan) are what
+  route a request to the queue of the core it came from.
 - Each job's result goes through a `ferric_blkqueue::slot::JobSlot`, which
   the worker settles exactly once: done, or abandoned if it drops the job
   unfinished. When a worker thread ends, even by a panic, it marks itself
@@ -254,6 +253,30 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   requests skip dead workers, and run on the main queue once none is left.
   The pipe's reader keeps the part of an id that a read splits for the next
   read (`ferric_blkqueue::ids::IdStream`).
+- driver-block (roadmap Phase 2.4, #133) serves a disk's plain reads and
+  writes as concurrent tasks when the disk says its clones may run at once
+  (`Disk::concurrent`). nvmed says so
+  only with per-CPU workers under the `Workers` policy
+  (`QueuePolicy::serves_concurrently`). Each request is checked and located at once, and then
+  runs on a clone of the disk, which writes the response itself. Every other
+  call, and every call on other disks, is still served one at a time, as
+  upstream. A descriptor closed while its requests run stays open until the
+  last one ends (`driver_block::SharedGate`, over
+  `ferric_blkqueue::order::CloseGate`). The close then runs before the next
+  request is served, and the request that makes it ready wakes the scheme's
+  loop (`SharedGate::ready`, which nvmed waits on beside the scheme's events),
+  so it runs on an idle disk too. So a later exclusive open cannot see
+  the lock released before the writes land. On nvmed's side, the main
+  thread's queue pair still serves one request at a time (its thread context
+  and bounce buffer are shared): `MainQueue` requests queue for it on an
+  async lock.
+- On QEMU, spilling overlapping requests to per-CPU workers cannot beat one
+  queue. The emulated controller serves all its queues from one thread, and
+  each hand-off costs two cross-CPU wake-ups. With `Adaptive` served
+  concurrently, two-thread reads reached 0.78 of the single queue and
+  four-thread reads 0.67. So `Adaptive` and `MainQueue` are served one call at
+  a time, as before, and the benchmark's `workers_iops` rows (true overlap)
+  are the signal to watch for changes that could make spilling pay.
 - A watchdog ticks once a second on each worker and on the main thread. It
   logs `nvmed: watchdog ...` when a job has waited a second or more, saying
   whether its completion queue holds an entry nobody was woken for, or when

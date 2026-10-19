@@ -121,6 +121,12 @@ irq-percpu = ["dep:ferric-irq"]
 trace_syscall = ["trace"]
 trace_sched = ["trace"]
 trace_scheme = ["trace"]
+# Ferric Oxide: a panic leaves its message and the newest trace records in reserved memory that
+# survives a warm reboot, served by kernel.trace/crash on the next boot.
+trace_crash = ["trace"]
+# Ferric Oxide: writing `panic` to kernel.trace/crash panics the kernel and resets the machine
+# after the dump, for testing it in CI.
+trace_crash_test = ["trace_crash"]
 # Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
 trace_level_warn = ["trace"]
 trace_level_info = ["trace_level_warn"]

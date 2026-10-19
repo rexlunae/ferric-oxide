@@ -20,6 +20,8 @@ use ferric_trace::{Event, EventId};
 use syscall::schemev2::Opcode;
 use syscall::{EACCES, EBADF, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
+mod crash;
+
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
 
@@ -905,7 +907,12 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    match run() {
+    // `ferric-trace-test crash` runs the crash-dump step alone (see `crash`).
+    let steps = match std::env::args().nth(1).as_deref() {
+        Some("crash") => crash::run,
+        _ => run,
+    };
+    match steps() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             println!("FERRIC_TEST_FAIL {failure}");

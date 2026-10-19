@@ -16,6 +16,8 @@
 //!   id that one read splits for the next, and reserves the id a worker reports as it exits.
 //! - `openers` (with the `alloc` feature) records which process opened each disk
 //!   descriptor, so only that process may set the policy through it.
+//! - `order` (with the `alloc` feature) holds a descriptor's close back until its in-flight
+//!   requests are done, for a scheme that serves requests concurrently.
 //! - `slot` (with the `std` feature) is a job's result slot between the thread that waits
 //!   and the worker that runs it, which settles once, done or abandoned.
 //!
@@ -41,6 +43,8 @@ pub mod abi;
 pub mod ids;
 #[cfg(feature = "alloc")]
 pub mod openers;
+#[cfg(feature = "alloc")]
+pub mod order;
 #[cfg(feature = "std")]
 pub mod slot;
 
@@ -79,6 +83,18 @@ impl QueuePolicy {
             Self::MainQueue => Route::Main,
         }
     }
+
+    /// Whether the disk scheme should serve requests concurrently under this policy.
+    ///
+    /// Only [`Workers`](Self::Workers) does. Measured in the same-boot A/B on QEMU, sending
+    /// overlapping requests to workers lost to queueing them on the receiving thread's pair
+    /// (two-thread reads at 0.78 of the single queue, four-thread at 0.67): each hand-off
+    /// costs two cross-CPU wake-ups, and the emulated controller serves its queues from one
+    /// thread. So [`Adaptive`](Self::Adaptive) and [`MainQueue`](Self::MainQueue) are served
+    /// one call at a time, which keeps every request on the receiving thread's pair.
+    pub const fn serves_concurrently(self) -> bool {
+        matches!(self, Self::Workers)
+    }
 }
 
 /// Where one request runs.
@@ -93,6 +109,13 @@ pub enum Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_workers_policy_serves_concurrently() {
+        assert!(QueuePolicy::Workers.serves_concurrently());
+        assert!(!QueuePolicy::Adaptive.serves_concurrently());
+        assert!(!QueuePolicy::MainQueue.serves_concurrently());
+    }
 
     #[test]
     fn adaptive_hands_off_only_overlapping_requests() {

@@ -28,23 +28,23 @@ struct NvmeDisk {
 
 /// Ferric Oxide: where one request runs (see [`NvmeDisk::claim`]).
 #[cfg(feature = "percore")]
-enum Claim {
-    /// On the main thread's queue pair, counted in flight until the guard (if any) drops.
-    Inline(Option<percore::InFlightGuard>),
+enum Claim<'a> {
+    /// On the main thread's queue pair, holding it until the guard (if any) drops.
+    Inline(Option<percore::InlineGuard<'a>>),
     /// On a worker, through the dispatcher.
-    Worker(Rc<percore::Dispatcher>),
+    Worker(&'a Rc<percore::Dispatcher>),
 }
 
 #[cfg(feature = "percore")]
 impl NvmeDisk {
     /// Where the next request runs: inline without per-CPU workers or when the queue policy
     /// keeps it on the main thread's queue pair, on a worker otherwise.
-    fn claim(&self) -> Claim {
+    async fn claim(&self) -> Claim<'_> {
         match &self.workers {
             None => Claim::Inline(None),
-            Some(workers) => match workers.claim_inline() {
+            Some(workers) => match workers.claim_inline().await {
                 Some(guard) => Claim::Inline(Some(guard)),
-                None => Claim::Worker(Rc::clone(workers)),
+                None => Claim::Worker(workers),
             },
         }
     }
@@ -61,6 +61,17 @@ impl Disk for NvmeDisk {
         Ok(())
     }
 
+    /// With per-CPU workers and a policy that serves requests concurrently
+    /// ([`QueuePolicy::serves_concurrently`](ferric_blkqueue::QueuePolicy::serves_concurrently)).
+    /// The main thread's queue pair serves one request at a time either way (see
+    /// `percore::Dispatcher::claim_inline`).
+    #[cfg(feature = "percore")]
+    fn concurrent(&self) -> bool {
+        self.workers
+            .as_ref()
+            .is_some_and(|workers| workers.policy().serves_concurrently())
+    }
+
     fn block_size(&self) -> u32 {
         self.ns.block_size.try_into().unwrap()
     }
@@ -71,7 +82,7 @@ impl Disk for NvmeDisk {
 
     async fn read(&mut self, block: u64, buffer: &mut [u8]) -> syscall::Result<usize> {
         #[cfg(feature = "percore")]
-        let _inline = match self.claim() {
+        let _inline = match self.claim().await {
             Claim::Inline(guard) => guard,
             Claim::Worker(workers) => {
                 let op = percore::Op::Read {
@@ -87,7 +98,7 @@ impl Disk for NvmeDisk {
 
     async fn write(&mut self, block: u64, buffer: &[u8]) -> syscall::Result<usize> {
         #[cfg(feature = "percore")]
-        let _inline = match self.claim() {
+        let _inline = match self.claim().await {
             Claim::Inline(guard) => guard,
             Claim::Worker(workers) => {
                 let op = percore::Op::Write {
@@ -108,7 +119,7 @@ impl Disk for NvmeDisk {
         num_sectors: u32,
     ) -> syscall::Result<()> {
         #[cfg(feature = "percore")]
-        let _inline = match self.claim() {
+        let _inline = match self.claim().await {
             Claim::Inline(guard) => guard,
             Claim::Worker(workers) => {
                 let op = percore::Op::WriteDma {
@@ -138,7 +149,7 @@ impl Disk for NvmeDisk {
         num_sectors: u32,
     ) -> syscall::Result<()> {
         #[cfg(feature = "percore")]
-        let _inline = match self.claim() {
+        let _inline = match self.claim().await {
             Claim::Inline(guard) => guard,
             Claim::Worker(workers) => {
                 let op = percore::Op::ReadDma {
@@ -343,13 +354,17 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     log::debug!("Starting to listen for scheme events");
 
+    // Ferric Oxide: a close held back for concurrent requests becomes ready when the last of
+    // them ends, which is no scheme event, so the loop also wakes for that.
+    let closes = scheme.borrow().close_gate();
     executor.block_on(async {
         loop {
             log::trace!("new event iteration");
             if let Err(err) = scheme.borrow_mut().tick().await {
                 log::error!("scheme error: {err}");
             }
-            let _ = scheme_events.as_mut().next().await;
+            let event = std::pin::pin!(scheme_events.as_mut().next());
+            futures::future::select(event, closes.ready()).await;
         }
     });
 

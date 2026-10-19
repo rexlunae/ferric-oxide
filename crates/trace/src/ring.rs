@@ -523,6 +523,44 @@ impl<S: Storage> Ring<S> {
         self.storage.tail().fetch_max(peek.end, Ordering::Release);
     }
 
+    /// Copies the newest whole records that fit in `max_words` words, oldest first, through
+    /// `out`, one word at a time, without consuming them, and returns the number of words
+    /// copied. Any CPU may call it; it is meant for a crash dump, taken while the producer may
+    /// still be running. A record the producer has not published is not copied, and a record
+    /// that does not decode ends the walk with what came before it. If the consumer commits at
+    /// the same time, the producer can reuse the words being copied and the copy can hold torn
+    /// records, which a decoder rejects; it never reads out of bounds.
+    pub fn copy_latest(&self, max_words: usize, mut out: impl FnMut(u64)) -> usize {
+        let tail = self.storage.tail().load(Ordering::Acquire);
+        let head = self.storage.head().load(Ordering::Acquire);
+        let max = max_words as u64;
+        let words_at = |pos: u64| {
+            Header::decode(self.slot(pos).load(Ordering::Relaxed))
+                .ok()
+                .map(|header| header.words() as u64)
+        };
+        // Walk the records from `tail`, keeping `start` on the oldest record that still fits
+        // with every newer one in `max` words.
+        let (mut start, mut end) = (tail, tail);
+        while end < head {
+            let Some(words) = words_at(end).filter(|&words| end + words <= head) else {
+                break;
+            };
+            end += words;
+            while end - start > max {
+                match words_at(start) {
+                    Some(words) if start + words <= end => start += words,
+                    // The words at `start` changed under the walk: keep nothing older.
+                    _ => start = end,
+                }
+            }
+        }
+        for pos in start..end {
+            out(self.slot(pos).load(Ordering::Relaxed));
+        }
+        (end - start) as usize
+    }
+
     /// [`Ring::peek`] and [`Ring::commit`] in one step: moves as many whole records as fit into
     /// `out` and returns the number of bytes written, 0 only when the ring is empty (or held only
     /// a corrupt record, which is dropped). Only the consumer may call this.
@@ -765,6 +803,51 @@ mod tests {
             Err(RingError::TooSmall { len: 8 })
         );
         assert!(Ring::new(words(16)).is_ok());
+    }
+
+    /// The timestamps of the records in `words`.
+    fn timestamps(words: &[u64]) -> Vec<u64> {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Records::new(&bytes)
+            .map(|r| r.expect("whole records").timestamp())
+            .collect()
+    }
+
+    #[test]
+    fn copy_latest_keeps_the_newest_records() {
+        let ring = Ring::new(words(32)).expect("valid");
+        // Three-word records; read some so the newest wrap round the end of the data.
+        for t in 0..8 {
+            ring.push(EventId::new(1), t, &[t]).expect("room");
+        }
+        let mut buf = [0u8; 192];
+        assert_eq!(ring.read(&mut buf), Ok(192));
+        for t in 8..14 {
+            ring.push(EventId::new(1), t, &[t]).expect("room");
+        }
+        let pending = ring.pending();
+        let mut copied = Vec::new();
+        assert_eq!(ring.copy_latest(10, |w| copied.push(w)), 9);
+        assert_eq!(timestamps(&copied), [11, 12, 13]);
+        // Nothing was consumed.
+        assert_eq!(ring.pending(), pending);
+        copied.clear();
+        assert_eq!(ring.copy_latest(usize::MAX, |w| copied.push(w)), pending);
+        assert_eq!(timestamps(&copied), [8, 9, 10, 11, 12, 13]);
+        assert_eq!(ring.copy_latest(2, |_| panic!("no record fits")), 0);
+    }
+
+    #[test]
+    fn copy_latest_stops_at_a_corrupt_record() {
+        let ring = Ring::new(words(32)).expect("valid");
+        ring.push(EventId::new(1), 1, &[]).expect("room");
+        ring.push(EventId::new(1), 2, &[]).expect("room");
+        ring.push(EventId::new(1), 3, &[]).expect("room");
+        // Scribble over the second record's header.
+        ring.slot(2).store(u64::MAX, Ordering::Relaxed);
+        let mut copied = Vec::new();
+        assert_eq!(ring.copy_latest(usize::MAX, |w| copied.push(w)), 2);
+        assert_eq!(timestamps(&copied), [1]);
     }
 
     #[test]
