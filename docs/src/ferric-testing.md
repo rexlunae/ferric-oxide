@@ -171,6 +171,15 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
+`ferric-tlb-test` also covers a relibc join race: an exiting thread stores its
+return value and then wakes the joiner, but the joiner can see the value, return
+and unmap the thread's control block before that wake runs. relibc's
+`Waitval::post` takes the futex address before the store and treats `EFAULT`
+from the wake as nobody left to wake, instead of panicking (`RELIBC PANIC` in
+`sync/mod.rs`, which boot-smoke fails on). relibc's own `pthread/join_race`
+test joins 2000 short-lived threads; neither test can force the window, so a
+pass only shows the fix did not break joins.
+
 The edu driver is started through `pcid-spawner`, separately from the console
 test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
