@@ -113,17 +113,22 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     replace_file(path, bytes).map_err(io_error)
 }
 
-/// Replaces `path` with `bytes` atomically: writes and syncs `<path>.new`
-/// in the same directory, then renames it over `path`. A failure at any
-/// step leaves the old file whole and removes the temporary file. The
-/// directory must exist.
+/// The suffix [`replace_file`] appends to a path for its temporary file.
+/// A file with it is left behind only when a write was interrupted (the
+/// process killed, the machine down) before the rename.
+pub const STAGING_SUFFIX: &str = ".new";
+
+/// Replaces `path` with `bytes` atomically: writes and syncs
+/// `<path>`[`STAGING_SUFFIX`] in the same directory, then renames it over
+/// `path`. A failure at any step leaves the old file whole and removes
+/// the temporary file. The directory must exist.
 ///
 /// # Errors
 ///
 /// The I/O error of the step that failed.
 pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".new");
+    temp.push(STAGING_SUFFIX);
     let temp = PathBuf::from(temp);
     let result = fs::File::create(&temp)
         .and_then(|mut file| {

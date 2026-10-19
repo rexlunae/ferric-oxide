@@ -898,6 +898,24 @@ fn a_failed_batch_leaves_nothing_behind() {
     registry.admit_all(&[other("fd"), other("bat")]).unwrap();
     assert!(fd.exists());
     assert!(!blocker.exists());
+
+    // The temporary file of a write that was killed before its rename is
+    // not signed as a target: the next signing removes it.
+    let leftover = fd.with_file_name("fd.toml.new");
+    fs::write(&leftover, "half written").unwrap();
+    let report = registry
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(!leftover.exists());
+    for file in ["metadata/targets.json", "metadata/snapshot.json"] {
+        let text = fs::read_to_string(dir.path().join(file)).unwrap();
+        assert!(!text.contains(".new"), "{file}");
+    }
 }
 
 #[test]

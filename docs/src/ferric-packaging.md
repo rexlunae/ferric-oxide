@@ -121,7 +121,7 @@ under [Adopting pkg's packages](#adopting-pkgs-packages).
 
 | Path beneath the install root | Contents |
 | --- | --- |
-| `var/lib/fox/installed.toml` | `fox-installed/1` database: package metadata, signer/hash information, file records and removal state |
+| `var/lib/fox/installed.toml` | `fox-installed/2` database: package metadata, signer/hash information, the registry each package was installed from (its name and pinned root), file records and removal state. A `fox-installed/1` database is still read, with no registry recorded for its packages, and is saved as format 2 on the next change |
 | `var/lib/fox/heads/<name>.pkgar_head` | Retained signed header and entry table for installed verification |
 | `var/lib/fox/lock` | Writer lock for database changes |
 | `etc/pkg/packages.toml`, `var/lib/packages/` | `pkg`'s state, read by `adopt-pkg` and never written by `fox` |
@@ -841,12 +841,16 @@ or one of its aliases, and it covers the installed package and version.
 `fox-registry vex` rejects a document that `fox` could not use, and the
 targets role signs it like every other top-level file.
 
-`fox audit` applies a registry's statements only to installed packages
-that registry published: the installed archive is one of the artifacts it
-lists for that release, or the build SBOM's source tree is the tree it
-records for that release. One registry therefore cannot clear a same-named
-package from another registry, and packages adopted from `pkg` (which keep
-no archive hash or build SBOM) get no VEX. A finding covered
+`fox audit` applies a registry's statements only to packages installed
+from that registry. `fox install <name>` and `fox sync` record, in the
+installed-package database, the registry a package came from (its name and
+the root BLAKE3 its entry pins, whether a prebuilt was installed or the
+release was built), and a statement applies only when both match the
+configured registry. One registry therefore cannot clear a same-named
+package from another, nor a package installed from an archive file or git
+source, adopted from `pkg`, or recorded before the database kept origins
+(`fox-installed/1`); reinstalling such a package from the registry gives it
+an origin. A finding covered
 by a `not_affected`, `false_positive`, `resolved` or
 `resolved_with_pedigree` statement moves from `findings` to `suppressed`
 (with the registry, document, state, justification and detail) and no

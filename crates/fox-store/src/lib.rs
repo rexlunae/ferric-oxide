@@ -94,7 +94,7 @@ pub use adopt::{
     AdoptOptions, AdoptReport, AdoptedPackage, PKG_HEADS_DIR, PKG_STATE, SkipReason, SkippedPackage,
 };
 use db::Database;
-pub use db::{InstalledPackage, MetadataKind, PackageState};
+pub use db::{InstalledPackage, MetadataKind, Origin, PackageState};
 use fsutil::{OnDisk, Removal, inspect, remove_if_unchanged, symlinked_parent};
 
 /// Directory, relative to the root, of the store's own state.
@@ -503,6 +503,23 @@ impl Store {
         archive: &Archive,
         options: InstallOptions,
     ) -> Result<InstallReport, StoreError> {
+        self.install_from(archive, options, None)
+    }
+
+    /// Installs a verified archive as [`Store::install`] does, recording
+    /// `origin` as the registry it came from. The record replaces the
+    /// previous version's, so reinstalling from anywhere else clears the
+    /// origin.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::install`].
+    pub fn install_from(
+        &self,
+        archive: &Archive,
+        options: InstallOptions,
+        origin: Option<Origin>,
+    ) -> Result<InstallReport, StoreError> {
         let _lock = self.lock()?;
         let db_path = self.db_path();
         let mut db = Database::load(&db_path)?;
@@ -561,7 +578,10 @@ impl Store {
         // fox owns the name now: pkg's stale entry for it must not be
         // retried by adoption, even after this package is removed.
         db.legacy_pending.remove(manifest.name.as_str());
-        db.packages.push(record(archive));
+        db.packages.push(InstalledPackage {
+            origin,
+            ..record(archive)
+        });
         db.save(&db_path)?;
 
         Ok(InstallReport {
@@ -847,6 +867,7 @@ fn record(archive: &Archive) -> InstalledPackage {
             _ => MetadataKind::Sidecar,
         },
         state: PackageState::Installed,
+        origin: None,
         files: archive.files().to_vec(),
     }
 }

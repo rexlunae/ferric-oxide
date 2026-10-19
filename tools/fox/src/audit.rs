@@ -15,14 +15,14 @@
 //! Each registry's signed VEX documents (`vex/*.cdx.json`, see
 //! [`fox_index::vex`]) can set findings aside. A statement applies to a
 //! finding when it names the advisory's id or one of its aliases and
-//! covers the installed package and version, and only when that registry
-//! published what is installed: the installed archive's BLAKE3 is among
-//! the registry's artifacts for that package and version, or the build
-//! SBOM's source tree (`fox:tree_blake3`) is the tree the registry records
-//! for that release. A registry can therefore vouch only for its own
-//! archives and its own source, not for a same-named package from another
-//! registry, a package adopted from `pkg` or a build of other source
-//! (whose findings stay findings). A `not_affected`,
+//! covers the installed package and version, and only when the package
+//! was installed from that registry: the store records each package's
+//! origin (the registry's name and pinned root) when `fox install` or
+//! `fox sync` takes it from a registry. A registry can therefore vouch
+//! only for packages installed from it, not for a same-named package from
+//! another registry, a local archive or git build, a package adopted from
+//! `pkg`, or one recorded before the store kept origins (whose findings
+//! stay findings). A `not_affected`,
 //! `false_positive` or `resolved` statement moves the finding to
 //! `suppressed`; an `exploitable` or `in_triage` one keeps it a finding
 //! and wins over a clearing statement from any registry. `--no-vex`
@@ -35,12 +35,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fox_core::policy::Policy;
-use fox_core::registries::Registries;
-use fox_core::{Blake3Digest, PackageName};
+use fox_core::registries::{Registries, RegistryEntry};
 use fox_index::advisory::{Advisory, AdvisoryError, Ecosystem};
-use fox_index::verify::{VerifiedRegistry, VerifyError};
+use fox_index::verify::VerifiedRegistry;
+use fox_sbom::cargo_crates;
 use fox_sbom::vex::VexStatement;
-use fox_sbom::{cargo_crates, source_tree};
 use fox_store::Store;
 use semver::Version;
 use serde::Serialize;
@@ -173,7 +172,7 @@ fn load(
     for entry in registries.entries() {
         let verified = registry::open(root, entry, &policy, now)?;
         if let Some(inventory) = vex_for {
-            vex.extend(registry_vex(&verified, entry.name.as_ref(), inventory)?);
+            vex.extend(registry_vex(&verified, entry, inventory)?);
         }
         let advisories = verified
             .advisories()
@@ -203,27 +202,30 @@ fn load(
     })
 }
 
-/// The registry's VEX statements about installed packages it published
-/// (see the module docs).
+/// The registry's VEX statements about installed packages that were
+/// installed from it (see the module docs). Its VEX documents are read
+/// only when some package was.
 fn registry_vex(
     verified: &VerifiedRegistry,
-    source: &str,
+    entry: &RegistryEntry,
     inventory: &[Inventoried],
 ) -> Result<Vec<SourcedVex>, CliError> {
-    let verify_error = |error| RegistryError::Verify {
-        name: source.to_owned(),
-        source: Box::new(error),
-    };
-    let published = published_by(inventory, |name, version| {
-        release_of(verified, name, version)
-    })
-    .map_err(verify_error)?;
+    let from_here = installed_from(inventory, entry);
+    if from_here.is_empty() {
+        return Ok(Vec::new());
+    }
+    let documents = verified
+        .vex_documents()
+        .map_err(|error| RegistryError::Verify {
+            name: entry.name.to_string(),
+            source: Box::new(error),
+        })?;
     let mut statements = Vec::new();
-    for document in verified.vex_documents().map_err(verify_error)? {
+    for document in documents {
         for statement in document.statements {
-            if published.contains(statement.package.as_str()) {
+            if from_here.contains(statement.package.as_str()) {
                 statements.push(SourcedVex {
-                    source: source.to_owned(),
+                    source: entry.name.to_string(),
                     path: document.path.clone(),
                     statement,
                 });
@@ -233,65 +235,18 @@ fn registry_vex(
     Ok(statements)
 }
 
-/// What a registry published for one release of a package.
-#[derive(Debug, Default)]
-struct Published {
-    /// The `fox-tree/1` hash of the release's source, if it lists the
-    /// release.
-    tree: Option<Blake3Digest>,
-    /// The BLAKE3 of each prebuilt archive it lists for the release.
-    archives: Vec<Blake3Digest>,
-}
-
-/// The release `name` `version` as `verified` records it.
-fn release_of(
-    verified: &VerifiedRegistry,
-    name: &PackageName,
-    version: &Version,
-) -> Result<Published, VerifyError> {
-    let tree = verified.package(name)?.and_then(|entry| {
-        entry
-            .releases
-            .into_iter()
-            .find(|release| release.version == *version)
-            .map(|release| release.tree_blake3)
-    });
-    let archives = verified
-        .artifacts(name, version)?
-        .map(|list| list.artifacts.into_iter().map(|a| a.pkgar_blake3).collect())
-        .unwrap_or_default();
-    Ok(Published { tree, archives })
-}
-
-/// The names of the installed packages a registry published, as `lookup`
-/// describes its releases: those installed from one of the release's
-/// archives, or built from the release's source tree as their build SBOM
-/// records it. A package with neither (adopted from `pkg`, or built from
-/// other source) or with a non-semver version is never included.
-fn published_by<E>(
-    inventory: &[Inventoried],
-    mut lookup: impl FnMut(&PackageName, &Version) -> Result<Published, E>,
-) -> Result<BTreeSet<String>, E> {
-    let mut published = BTreeSet::new();
-    for item in inventory {
-        let package = &item.package;
-        let Ok(version) = package.version.parse::<Version>() else {
-            continue;
-        };
-        let tree = item.build_sbom.as_ref().and_then(source_tree);
-        if package.archive_blake3.is_none() && tree.is_none() {
-            continue;
-        }
-        let release = lookup(&package.name, &version)?;
-        let from_archive = package
-            .archive_blake3
-            .is_some_and(|archive| release.archives.contains(&archive));
-        let from_source = tree.is_some() && tree == release.tree;
-        if from_archive || from_source {
-            published.insert(package.name.to_string());
-        }
-    }
-    Ok(published)
+/// The names of the installed packages whose recorded origin is `entry`:
+/// the same registry name and pinned root.
+fn installed_from<'a>(inventory: &'a [Inventoried], entry: &RegistryEntry) -> BTreeSet<&'a str> {
+    inventory
+        .iter()
+        .filter(|item| {
+            item.package.origin.as_ref().is_some_and(|origin| {
+                origin.registry == entry.name && origin.root_blake3 == entry.root_blake3
+            })
+        })
+        .map(|item| item.package.name.as_str())
+        .collect()
 }
 
 /// Every `crates/<crate>/*.md` advisory in a RustSec database checkout.
@@ -497,7 +452,7 @@ mod tests {
     use super::*;
     use fox_core::{Blake3Digest, KeyId, Manifest, PackageName, Profile};
     use fox_sbom::{BuildInfo, BuildSbom, CrateDependency, CrateSource, read_build_sbom};
-    use fox_store::{InstalledPackage, MetadataKind, PackageState};
+    use fox_store::{InstalledPackage, MetadataKind, Origin, PackageState};
 
     fn rustsec(id: &str, krate: &str, patched: &str, extra: &str) -> String {
         format!(
@@ -550,6 +505,7 @@ mod tests {
                 signer_label: "ci".to_owned(),
                 metadata: MetadataKind::Embedded,
                 state: PackageState::Installed,
+                origin: None,
                 files: Vec::new(),
             },
             build_sbom: Some(read_build_sbom(&json).unwrap()),
@@ -710,49 +666,34 @@ mod tests {
     }
 
     #[test]
-    fn vex_applies_only_to_packages_the_registry_published() {
-        // Every inventoried package below was built from tree b"tree";
-        // `without_sbom` drops that record.
-        let package = |name: &str, archive: Option<&[u8]>, with_sbom: bool| {
+    fn vex_applies_only_to_packages_installed_from_the_registry() {
+        let entry = RegistryEntry {
+            name: PackageName::new("ferric").unwrap(),
+            git: "https://example.com/registry.git".parse().unwrap(),
+            root_blake3: Blake3Digest::of(b"root"),
+        };
+        let package = |name: &str, registry: &str, root: &[u8]| {
             let mut item = inventoried(name, "1.0.0", &[]);
-            item.package.archive_blake3 = archive.map(Blake3Digest::of);
-            if !with_sbom {
-                item.build_sbom = None;
-            }
+            item.package.origin = Some(Origin {
+                registry: PackageName::new(registry).unwrap(),
+                root_blake3: Blake3Digest::of(root),
+            });
             item
         };
+        let mut local = inventoried("local", "1.0.0", &[]);
+        local.package.origin = None;
         let inventory = [
-            package("archive", Some(b"ours.pkgar"), false),
-            package("source", None, true),
-            package("other-source", None, true),
-            package("other-archive", Some(b"theirs.pkgar"), false),
-            package("adopted", None, false),
+            package("ours", "ferric", b"root"),
+            package("theirs", "other", b"root"),
+            // A different registry later configured under the same name.
+            package("renamed", "ferric", b"another root"),
+            local,
         ];
-        let mut asked = Vec::new();
-        let published = published_by(&inventory, |name, _version| {
-            asked.push(name.to_string());
-            let ours = Published {
-                tree: Some(Blake3Digest::of(b"tree")),
-                archives: vec![Blake3Digest::of(b"ours.pkgar")],
-            };
-            Ok::<_, std::convert::Infallible>(match name.as_str() {
-                "other-source" => Published {
-                    tree: Some(Blake3Digest::of(b"another tree")),
-                    ..ours
-                },
-                _ => ours,
-            })
-        })
-        .unwrap();
         assert_eq!(
-            published.into_iter().collect::<Vec<_>>(),
-            ["archive", "source"]
-        );
-        // A package with neither an archive nor a source tree cannot be
-        // matched, so the registry is not asked about it.
-        assert_eq!(
-            asked,
-            ["archive", "source", "other-source", "other-archive"]
+            installed_from(&inventory, &entry)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["ours"]
         );
     }
 }

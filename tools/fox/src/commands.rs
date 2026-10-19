@@ -15,7 +15,8 @@ use fox_core::trust::TrustStore;
 use fox_core::{NameError, PackageName, TrustedKeys};
 use fox_sbom::{PackageSbom, SbomError};
 use fox_store::{
-    AdoptOptions, InstallOptions, MetadataKind, PackageState, ProblemKind, Store, StoreError,
+    AdoptOptions, InstallOptions, MetadataKind, Origin, PackageState, ProblemKind, Store,
+    StoreError,
 };
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -634,9 +635,12 @@ fn from_registry(
     spec: &PackageSpec,
     args: &SourceArgs,
     policy: &Policy,
-) -> Result<(Pending, PackageName), CliError> {
+) -> Result<(Pending, Origin), CliError> {
     let found = crate::registry::find(root, spec, policy, OffsetDateTime::now_utc())?;
-    let registry = found.registry.name.clone();
+    let registry = Origin {
+        registry: found.registry.name.clone(),
+        root_blake3: found.registry.root_blake3,
+    };
     let release = found
         .entry
         .select_release(&spec.req, policy.allow_yanked)
@@ -751,7 +755,7 @@ pub(crate) fn prepare(
     target: &str,
     args: &SourceArgs,
     policy: &Policy,
-) -> Result<(Pending, Option<PackageName>), CliError> {
+) -> Result<(Pending, Option<Origin>), CliError> {
     match classify(target)? {
         Target::Archive(path) => Ok((Pending::Path(path), None)),
         Target::Registry(spec) => {
@@ -779,15 +783,17 @@ pub(crate) fn trusted_keys_for(cli: &Cli, root: &Path) -> Result<TrustedKeys, Cl
     trusted_keys_in(cli, root)
 }
 
-/// Installs a verified archive, reporting it as `install` does.
+/// Installs a verified archive, reporting it as `install` does, and
+/// records `origin` as the registry it came from.
 pub(crate) fn install_archive(
     cli: &Cli,
     store: &Store,
     archive: &Archive,
     options: InstallOptions,
+    origin: Option<Origin>,
 ) -> Result<InstallJson, CliError> {
     sidecar_warning(archive);
-    let report = store.install(archive, options)?;
+    let report = store.install_from(archive, options, origin)?;
     if !cli.json {
         match &report.previous {
             Some(old) => println!("upgraded {} {old} -> {}", report.name, report.version),
@@ -854,11 +860,12 @@ fn install(
     for spec in specs {
         let spec = match spec {
             Target::Archive(path) => {
-                pending.push(Pending::Path(path));
+                pending.push((Pending::Path(path), None));
                 continue;
             }
             Target::Registry(spec) => {
-                pending.push(from_registry(&root, &spec, source_args, &policy)?.0);
+                let (archive, origin) = from_registry(&root, &spec, source_args, &policy)?;
+                pending.push((archive, Some(origin)));
                 continue;
             }
             Target::Git(spec) => spec,
@@ -868,22 +875,22 @@ fn install(
             Some(path) => {
                 let keys = trusted_keys_in(cli, &root)?;
                 let archive = source::prebuilt(&root, &resolved, path, &keys)?;
-                pending.push(Pending::Opened(Box::new(archive)));
+                pending.push((Pending::Opened(Box::new(archive)), None));
             }
             None => {
                 let packaged = source::build(&root, &resolved, source_args, None)?;
-                pending.push(Pending::Path(packaged.archive));
+                pending.push((Pending::Path(packaged.archive), None));
             }
         }
     }
     let keys = trusted_keys_in(cli, &root)?;
     let archives = pending
         .into_iter()
-        .map(|pending| open_pending(pending, &keys))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(pending, origin)| Ok((open_pending(pending, &keys)?, origin)))
+        .collect::<Result<Vec<_>, CliError>>()?;
     let mut results = Vec::new();
-    for archive in &archives {
-        results.push(install_archive(cli, &store, archive, options)?);
+    for (archive, origin) in archives {
+        results.push(install_archive(cli, &store, &archive, options, origin)?);
     }
     if cli.json {
         print_json(&results)?;

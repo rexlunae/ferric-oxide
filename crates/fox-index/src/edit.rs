@@ -31,6 +31,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use fox_core::config::STAGING_SUFFIX;
 use fox_core::{KeyId, PackageName};
 use semver::Version;
 use serde::Serialize;
@@ -1204,6 +1205,10 @@ fn load<T: for<'de> serde::Deserialize<'de>>(
 }
 
 /// Collects the regular files under `dir`, as paths relative to `base`.
+///
+/// A file ending in [`STAGING_SUFFIX`] is the temporary file of a
+/// [`write_file`] that was interrupted, never a target (no target name
+/// ends in it), so it is removed instead of being signed.
 fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) -> Result<(), EditError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1227,6 +1232,18 @@ fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) -> Result<(), EditErro
         })?;
         if kind.is_dir() {
             walk(base, &path, found)?;
+            continue;
+        }
+        if kind.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(STAGING_SUFFIX))
+        {
+            fs::remove_file(&path).map_err(|source| EditError::Io {
+                path: path.clone(),
+                source,
+            })?;
             continue;
         }
         let relative = path

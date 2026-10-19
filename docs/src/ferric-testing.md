@@ -90,10 +90,11 @@ variables the `packages.*` options and `cpu.x86_64_level` generate. Building and
 through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning, a registry VEX statement that sets the
-finding aside, `--no-vex` skipping a broken VEX document, and a changed
-SBOM), and in unit tests for VEX matching by id and alias, other versions,
-an `exploitable` statement winning over a clearing one, and VEX applying
-only to packages whose archive or source tree the registry published; and
+finding aside, no VEX for a `fox-installed/1` store without recorded
+origins, `--no-vex` skipping a broken VEX document, and a changed SBOM),
+and in unit tests for VEX matching by id and alias, other versions, an
+`exploitable` statement winning over a clearing one, and VEX applying only
+to packages whose recorded origin is that registry's name and root; and
 against a RustSec-layout directory of advisories for crates inside build
 SBOMs, with withdrawn, build-only and non-semver cases. `fox-sbom`'s VEX
 reader is unit tested on purl and component references, versions (including
