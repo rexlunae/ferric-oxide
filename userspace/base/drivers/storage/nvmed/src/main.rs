@@ -61,11 +61,15 @@ impl Disk for NvmeDisk {
         Ok(())
     }
 
-    /// With per-CPU workers, overlapping requests go to them, and the main thread's queue pair
-    /// serves one request at a time (see `percore::Dispatcher::claim_inline`).
+    /// With per-CPU workers and a policy that serves requests concurrently
+    /// ([`QueuePolicy::serves_concurrently`](ferric_blkqueue::QueuePolicy::serves_concurrently)).
+    /// The main thread's queue pair serves one request at a time either way (see
+    /// `percore::Dispatcher::claim_inline`).
     #[cfg(feature = "percore")]
     fn concurrent(&self) -> bool {
-        self.workers.is_some()
+        self.workers
+            .as_ref()
+            .is_some_and(|workers| workers.policy().serves_concurrently())
     }
 
     fn block_size(&self) -> u32 {

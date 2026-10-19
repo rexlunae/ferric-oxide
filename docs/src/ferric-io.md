@@ -254,8 +254,9 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   The pipe's reader keeps the part of an id that a read splits for the next
   read (`ferric_blkqueue::ids::IdStream`).
 - driver-block serves a disk's plain reads and writes as concurrent tasks when
-  the disk says its clones may run at once (`Disk::concurrent`; nvmed with
-  per-CPU workers). Each request is checked and located at once, and then
+  the disk says its clones may run at once (`Disk::concurrent`). nvmed says so
+  only with per-CPU workers under the `Workers` policy
+  (`QueuePolicy::serves_concurrently`). Each request is checked and located at once, and then
   runs on a clone of the disk, which writes the response itself. Every other
   call, and every call on other disks, is still served one at a time, as
   upstream. A descriptor closed while its requests run stays open until the
@@ -264,7 +265,14 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   the lock released before the writes land. On nvmed's side, the main
   thread's queue pair still serves one request at a time (its thread context
   and bounce buffer are shared): `MainQueue` requests queue for it on an
-  async lock, and under `Adaptive` a second request goes to a worker.
+  async lock.
+- On QEMU, spilling overlapping requests to per-CPU workers cannot beat one
+  queue. The emulated controller serves all its queues from one thread, and
+  each hand-off costs two cross-CPU wake-ups. With `Adaptive` served
+  concurrently, two-thread reads reached 0.78 of the single queue and
+  four-thread reads 0.67. So `Adaptive` and `MainQueue` are served one call at
+  a time, as before, and the benchmark's `workers_iops` rows (true overlap)
+  are the signal to watch for changes that could make spilling pay.
 - A watchdog ticks once a second on each worker and on the main thread. It
   logs `nvmed: watchdog ...` when a job has waited a second or more, saying
   whether its completion queue holds an entry nobody was woken for, or when

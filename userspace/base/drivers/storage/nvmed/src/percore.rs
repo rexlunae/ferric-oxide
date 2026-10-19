@@ -165,6 +165,11 @@ impl Dispatcher {
         self.policy.set(policy);
     }
 
+    /// How requests are placed now.
+    pub fn policy(&self) -> QueuePolicy {
+        self.policy.get()
+    }
+
     /// Claims a new request for the main thread's queue pair when the policy routes it there,
     /// waiting for the request already on it (only `MainQueue` sends one while another runs):
     /// the caller runs it inline while holding the guard. `None` means it goes to a worker
