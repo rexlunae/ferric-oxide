@@ -68,7 +68,7 @@ The first events are:
 | Event | Arguments |
 | --- | --- |
 | `syscall.enter` | `nr`, `a`, `b`, `c`, `d` (the system call number and first four arguments) |
-| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`) |
+| `syscall.exit` | `nr`, `ret` (the result as the kernel returns it: an error is `-errno`). A call that ends its context (`exit`, or a pending `SIGKILL`) has none |
 | `sched.switch` | `prev_pid`, `next_pid`, `prev_id`, `next_id` |
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
@@ -277,10 +277,78 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
   `ferric-trace capture` and `ferric-trace text` on the result, and prints
-  `FERRIC_TEST_PASS trace-capture` if both succeed.
+  `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
+  `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
+  `trace-overhead` job's baseline image, which requires that skip.
+- **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
+  [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`
   and `trace_boot = "sched"`. It requires all ten step markers, the
   `trace-capture` marker and the boot log line.
+
+## Overhead budget
+
+Tracing must stay cheap enough to leave compiled in. The roadmap budget, which
+the `trace-overhead` job in `image.yml` enforces on the workloads below, is:
+
+| Comparison | Workload | Budget |
+| --- | --- | --- |
+| Compiled in, every event off, against compiled out | `syscall` | at most 1% slower |
+| Every compiled-in event on (`enable all`), against all off | `io` | at most 5% slower |
+
+Every workload and comparison is reported; the table says which ones fail the
+job. The two kernels of the first comparison are built separately, so it also
+measures where the linker put the hot code, and which runner the job got.
+On the null system call that is small and repeatable: +0.53% and +0.54% in
+two runs. There a disabled tracepoint is the largest share of the work, so any
+cost it has shows first. On `io`, which runs through far more kernel code, the
+same comparison went from -4.25% to +1.12% between those two runs with no
+tracepoint changed, so judging it would judge the layout. The second comparison runs on one kernel, so `io` is
+judged there.
+
+`ferric-trace-bench`, in `config/ferric-smoke.toml`, times two workloads in
+rounds:
+
+- `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system. Each
+  call is a request to RedoxFS through its scheme, so a round crosses system
+  call entry and exit, the scheme request path and context switches.
+- `syscall`: a `write` to a descriptor that is not open, the cheapest system
+  call that reaches the kernel's dispatch. Its tracepoints are a large share of
+  its time, so it is where a compiled-in, disabled tracepoint is judged. With
+  every event on it is reported but not budgeted: a record per entry and exit
+  is far more than 5% of a call that does nothing else.
+
+On a kernel without `kernel.trace` every round runs as state `out`. With it,
+the program runs a block of back-to-back rounds with all events off (`off`),
+exactly as the `out` rounds run. Then it alternates rounds with all off
+(`pairoff`) and with `enable all` (`on`), draining the rings after each `on`
+round. Toggling tracepoints (live patching and its IPIs) and draining disturb
+the caches of the round that follows. So `off` is compared with `out`, and `on`
+with `pairoff`, and the two are never compared across. The program prints
+`FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` for each
+workload and state, and `FERRIC_BENCH lost records=<n>` for records dropped
+during the `on` rounds.
+
+The image workflow builds a second smoke image whose kernel differs only in
+leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
+image ten times each, interleaved (a boot takes about 20 seconds).
+`scripts/ferric-ci/check-trace-overhead.sh` takes each boot's fastest round of
+each workload and state, and compares the medians of those over the boots.
+The fastest round keeps scheduling noise within a boot out. The median over
+boots handles the variation between boots: kernel image KASLR moves the code
+and runner load changes, and the first runs showed a spread of about 3%,
+three times the budget.
+
+Every boot's bench and trace result lines go into a few workflow annotations
+per image (GitHub keeps ten notices per step and 4 KiB of each). A boot that
+fails, or lacks `FERRIC_TEST_PASS trace-bench`, fails the job, with an
+annotation that puts its test results and crash lines ahead of the serial
+tail, so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
+`ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
+medians. The script fails, naming the logs, when a boot lacks a result or a
+traced boot lacks its `lost records` line. It warns when records were dropped,
+since a dropped record costs less than a written one, and prints every result
+as a notice on the run.
 
 ## Not implemented yet
 
@@ -289,5 +357,4 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 - Read-only mapping of the rings.
 - An initfs trace configuration.
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
-- The CI overhead budget.
 - Architectures other than x86_64.
