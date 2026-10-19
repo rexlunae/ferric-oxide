@@ -9,7 +9,8 @@ description = "Per-CPU disk queue routing: which queue pair a disk request runs 
 
 [features]
 default = []
-## The table of descriptor openers (`openers`).
+## The table of descriptor openers (`openers`) and the close gate (`order`), which need a
+## heap.
 alloc = []
 ## The job result slot (`slot`), which needs threads and locks.
 std = ["alloc"]

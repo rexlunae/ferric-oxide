@@ -34,6 +34,10 @@ fn panic_handler(info: &PanicInfo) -> ! {
 
 #[cfg_attr(test, expect(dead_code))]
 fn panic_handler_inner(info: &PanicInfo) -> ! {
+    // Ferric Oxide: the crash dump first, before anything here can fault.
+    #[cfg(feature = "trace_crash")]
+    crate::trace::crash::dump(info);
+
     println!("KERNEL PANIC: {}", info);
 
     unsafe {
@@ -44,12 +48,7 @@ fn panic_handler_inner(info: &PanicInfo) -> ! {
     let Some(context_lock) = &*current_ref else {
         println!("CPU {}, CID <none>", cpu_id());
 
-        println!("HALT");
-        loop {
-            unsafe {
-                interrupt::halt();
-            }
-        }
+        halt()
     };
 
     println!("CPU {}, CID {:p}", cpu_id(), context_lock);
@@ -68,9 +67,27 @@ fn panic_handler_inner(info: &PanicInfo) -> ! {
         }
     }
 
-    println!("HALT");
-    loop {
-        unsafe {
+    halt()
+}
+
+/// Halts this CPU for good, or (Ferric Oxide) resets the machine after a crash test's dump.
+fn halt() -> ! {
+    #[cfg(feature = "trace_crash")]
+    let reset = crate::trace::crash::reset_after_panic();
+    #[cfg(not(feature = "trace_crash"))]
+    let reset = false;
+    if reset {
+        println!("RESET");
+    } else {
+        println!("HALT");
+    }
+    // SAFETY: the kernel is going down: halting this CPU forever, or resetting the machine when
+    // the crash test asked for it, is all that is left to do.
+    unsafe {
+        if reset {
+            crate::stop::kreset();
+        }
+        loop {
             interrupt::halt();
         }
     }

@@ -23,6 +23,8 @@
 //!   the HPET) and holds the rule the kernel picks it by.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
+//! - [`crash`] is the crash dump a panic writes to reserved memory for the next boot to
+//!   read: its layout, a writer that copies the newest records of each ring, and a parser.
 //! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
 //!   `init` starts.
 //!
@@ -60,6 +62,7 @@ pub mod abi;
 pub mod clock;
 #[cfg(feature = "config")]
 pub mod config;
+pub mod crash;
 mod event;
 pub mod kernel;
 mod level;

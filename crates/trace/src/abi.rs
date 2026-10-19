@@ -56,6 +56,18 @@ pub const STATS_PATH: &str = "stats";
 /// The file naming the clock record timestamps come from ([`crate::clock`]).
 pub const CLOCK_PATH: &str = "clock";
 
+/// The crash dump the previous boot's panic left ([`crate::crash`]), with `kernel.trace_crash`.
+///
+/// It exists only when there is a dump: opening it otherwise fails with `ENOENT`. Reads give
+/// the dump's bytes, from the offset given. On a kernel with `kernel.trace_crash_test`, writing
+/// [`CRASH_TEST_COMMAND`] to it panics the kernel on purpose, so CI can test the dump across a
+/// reboot.
+pub const CRASH_PATH: &str = "crash";
+
+/// The command that, written to [`CRASH_PATH`], panics a kernel built for testing the crash
+/// dump; the kernel resets the machine once the dump is written.
+pub const CRASH_TEST_COMMAND: &str = "panic";
+
 /// The longest command, in bytes, one write to [`EVENTS_PATH`] may carry; the kernel refuses
 /// longer writes.
 pub const MAX_COMMAND_BYTES: usize = 4096;
@@ -92,6 +104,8 @@ pub enum Path {
     Clock,
     /// `cpu/<n>`: the records of CPU `n`.
     Cpu(u32),
+    /// [`CRASH_PATH`].
+    Crash,
 }
 
 impl Path {
@@ -102,6 +116,7 @@ impl Path {
             EVENTS_PATH => Some(Path::Events),
             STATS_PATH => Some(Path::Stats),
             CLOCK_PATH => Some(Path::Clock),
+            CRASH_PATH => Some(Path::Crash),
             other => {
                 let n = other.strip_prefix(CPU_DIR)?.strip_prefix('/')?;
                 // `u32::from_str` takes a leading `+`; a path does not.
@@ -385,6 +400,7 @@ mod tests {
         assert_eq!(Path::parse("events"), Some(Path::Events));
         assert_eq!(Path::parse("/stats/"), Some(Path::Stats));
         assert_eq!(Path::parse("clock"), Some(Path::Clock));
+        assert_eq!(Path::parse("crash"), Some(Path::Crash));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));
         assert_eq!(Path::parse("cpu/17"), Some(Path::Cpu(17)));
         assert_eq!(Path::parse("cpu"), None);

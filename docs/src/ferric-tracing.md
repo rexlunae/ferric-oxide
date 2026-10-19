@@ -23,6 +23,9 @@ what is on at run time.
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
 | `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
 | `kernel.trace_initfs_disable` | `[]` | Selections bootstrap turns off after those, from the same file |
+| `kernel.trace_crash` | `false` | Reserves the crash region: a panic leaves its message and the newest records for the next boot ([Crash dump](#crash-dump)) |
+| `kernel.trace_crash_base` | `"0x4000000"` | The crash region's physical address, written to the kernel `config.toml` as `trace.crash_base` |
+| `kernel.trace_crash_test` | `false` | Testing only: writing `panic` to `kernel.trace/crash` panics the kernel and resets the machine after the dump |
 
 The options below `kernel.trace` take effect only with it. The next four map
 to the kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme`
@@ -202,6 +205,7 @@ The paths are defined in `ferric_trace::abi`.
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
 | `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
+| `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 
 `events`, `stats` and `clock` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
@@ -245,6 +249,56 @@ checks `tail` again and starts over if it moved past the copy, so a copy never
 mixes two records. Two readers of one CPU can still both see a record. A
 collector that needs each record exactly once should be the CPU's only
 reader.
+
+## Crash dump
+
+With `kernel.trace_crash`, a kernel panic leaves its message and the newest
+records of every CPU's ring in memory that the next boot finds again, in the
+manner of Linux's pstore/ramoops:
+
+- **The region.** 64 KiB of RAM at a fixed physical address
+  (`kernel.trace_crash_base`, 64 MiB by default). During memory setup the
+  kernel takes it out of the free memory, if all of it is free RAM in the boot
+  memory map, and maps it with the boot-time identity-mapped areas; otherwise
+  it logs a warning and keeps no dumps. Firmware does not clear RAM on a warm
+  reset (QEMU's `system_reset`, a reboot through the 8042 or ACPI), and boot
+  loaders allocate from the top of memory, so the same bytes are there on the
+  next boot. A cold boot finds random bits, which never pass as a dump.
+- **The dump.** The panic handler's first act is to write the panic message
+  (up to 512 bytes) and, for each CPU, its ring's `lost` count and the newest
+  whole records that fit in an equal share of the room left, oldest first. It
+  copies records with atomic loads and consumes nothing, since the other CPUs
+  are still running; a record a producer was writing at that moment can come
+  out torn, and readers keep a CPU's records up to the first that does not
+  decode. A panic inside the dump does not start another. The records are the
+  ones still in the ring: a ring that nobody reads fills up and then drops new
+  records (its `lost` count says how many), so the dump only holds the last
+  records before the panic while a reader keeps the rings from filling, as
+  `ferric-trace capture` does. A flight-recorder mode that overwrites the
+  oldest records instead is not implemented yet.
+- **The format** (`ferric_trace::crash`): a header of eight words (magic
+  `FOCRASH1`, version 1, state, payload length, checksum), then sections, each
+  a word `kind | cpu << 8 | bytes << 32` and its data: the message, or a CPU's
+  `lost` count and records. The state is set to complete last, and the checksum
+  (64-bit FNV-1a over every other word) is checked before anything is read, so
+  a dump cut short by a reset or a second panic is not used.
+- **The next boot.** `kmain` copies a complete dump to the heap, logs
+  `trace: the previous boot panicked on CPU <n>: <message>`, and arms the region
+  for this boot. `/scheme/kernel.trace/crash` then serves the copy (root only,
+  like the rest of the scheme) until the next reboot.
+
+On the target or on the host:
+
+```sh
+ferric-trace crash                         # reads /scheme/kernel.trace/crash
+ferric-trace crash dump.bin --out crash/   # also saves the records as a capture
+ferric-trace perfetto crash/ -o crash.json
+```
+
+`ferric-trace crash` prints the message, each CPU's record count and bytes,
+`lost` count and torn bytes, and the records as text. `--out` saves the
+capture the way `ferric-trace capture` does, marked `INCOMPLETE` until every
+file is written.
 
 ## Reading a capture on the host
 
@@ -406,9 +460,27 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 - **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
-  `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
-  requires all thirteen step markers, the kernel's `trace: clock` line, the `trace-capture` marker, the boot log
-  line and the kernel's log of bootstrap's `enable scheme.cancel`.
+  `trace_boot = "sched"`, `trace_initfs_enable = ["scheme.cancel"]` and
+  `trace_crash = true`. It requires all thirteen step markers, the kernel's
+  `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
+  `enable scheme.cancel`, the crash region's log line, and
+  `FERRIC_TEST_SKIP trace-crash` (a clean boot has no dump).
+- **Crash dump.** `cargo test -p ferric-trace` writes dumps into a region and
+  reads them back: the newest records that fit, a region too small for them,
+  refusal of an incomplete dump, of a bad version and of every flipped bit,
+  sections that run past the payload, and message truncation on a character
+  boundary; and `Ring::copy_latest` with wrap-around and a corrupt record.
+  `cargo test -p ferric-trace-cli` reads a dump with a torn record into a
+  capture and saves it. On the target, the `crash` job boots a third image,
+  whose kernel also has `kernel.trace_crash_test`, with `BOOT_REBOOT=1`
+  (`boot-smoke.sh` without `-no-reboot`). On the first boot
+  `ferric-trace-test crash` turns on the `syscall` events, makes a marker
+  `write`, prints `FERRIC_TEST_PASS trace-crash-armed` and writes `panic` to
+  `kernel.trace/crash`; the kernel dumps and resets. On the second boot it
+  checks that the dump parses, that its message is the test's panic and that
+  its records hold the marker `write` and the `write` of `panic`
+  (`FERRIC_TEST_PASS trace-crash-read`). The job also requires the kernel's
+  lines for the dump, the reset and the dump found, and exactly two boots.
 
 ## Overhead budget
 
@@ -480,4 +552,6 @@ as a notice on the run.
   process lifecycle).
 - A reader that maps the rings in the `ferric-trace` tool (it still reads them).
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
+- A flight-recorder ring mode, so a crash dump keeps the last records even
+  when nobody reads the rings.
 - Architectures other than x86_64.
