@@ -100,12 +100,13 @@ jobs:
           # Shadow stacks are off by default; "auto" logs what the CPU reports and, on CET
           # hardware, allocates them without turning CET on.
           # Registered buffers, kernel tracing and rings are off by default; turn them on so
-          # ferric-regbuf-test, ferric-trace-test (with sched.switch on from boot) and
+          # ferric-regbuf-test, ferric-trace-test (with sched.switch on from boot, and
+          # scheme.cancel on from the initfs trace.toml bootstrap applies) and
           # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
           # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
           # ferric-iommu-test's iommu-msi-percpu runs, and nvmed's per-CPU queue pairs
           # (also off by default) are on so the boot disk runs through them.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\n' > "$out/ferric.toml"
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -119,6 +120,11 @@ jobs:
           if [ -f "$out/kernel-config.toml" ]; then
             cat "$out/kernel-config.toml"
             echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
+          fi
+          # The initfs trace.toml bootstrap applies (userspace/base/Makefile).
+          if [ -f "$out/trace.toml" ]; then
+            cat "$out/trace.toml"
+            echo "FERRIC_INITFS_TRACE=$out/trace.toml" >> "$GITHUB_ENV"
           fi
 
       - name: Build image
@@ -177,7 +183,8 @@ jobs:
           mkdir -p "$out"
           # The catalog-defaults config above, without the tracing lines. Only the kernel
           # changes, and make cr.kernel rebuilds it, so no other recipe is marked stale.
-          grep -v -e '^trace = ' -e '^trace_boot = ' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
+          # The initfs keeps its trace.toml; bootstrap logs that there is no kernel.trace.
+          grep -v -e '^trace = ' -e '^trace_boot = ' -e '^trace_initfs_' "$RUNNER_TEMP/ferric-defaults/ferric.toml" > "$out/ferric.toml"
           cat "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate --no-touch
@@ -336,10 +343,12 @@ jobs:
       - name: Check kernel tracing
         run: |
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
-          for step in boot enable decode order write read yield sched scheme disable; do
+          # Bootstrap applied the initfs trace.toml; the kernel logs the command.
+          grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
-          echo "::notice::ferric-trace-test passed all 10 steps"
+          echo "::notice::ferric-trace-test passed all 12 steps"
           # The ferric-trace tool saved a capture of every CPU and decoded it.
           grep -aF "FERRIC_TEST_PASS trace-capture" "$LOG"
           if [ "$CONFIG_NAME" = ferric-smoke ]; then

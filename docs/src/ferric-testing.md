@@ -98,12 +98,15 @@ variables the `packages.*` options and `cpu.x86_64_level` generate. Building and
 through `fox` (`make all`, `make qemu`) is not covered by these tests.
 `fox audit` is tested end to end against a registry advisory
 (including the install warning, a registry VEX statement that sets the
-finding aside, `--no-vex` and a changed SBOM), and in unit tests
-for VEX matching by id and alias, other versions, and an `exploitable`
-statement winning over a clearing one; and
+finding aside, no VEX for a `fox-installed/1` store without recorded
+origins, `--no-vex` skipping a broken VEX document, and a changed SBOM),
+and in unit tests for VEX matching by id and alias, other versions, an
+`exploitable` statement winning over a clearing one, and VEX applying only
+to packages whose recorded origin is that registry's name and root; and
 against a RustSec-layout directory of advisories for crates inside build
 SBOMs, with withdrawn, build-only and non-semver cases. `fox-sbom`'s VEX
-reader is unit tested on purl and component references, versions and every
+reader is unit tested on purl and component references, versions (including
+an `affected` version the purl also names) and every
 rejected document, and `fox-registry`'s CLI test publishes, refuses and
 removes VEX documents and signs the result. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
@@ -115,6 +118,24 @@ fixed-seed Ed25519 keys rather than with `ssh-keygen`, and `git fsck
 hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
+
+`ferric-lvm` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/lvm/tests/fixtures.rs` reads PVs
+that lvm2 wrote (`crates/lvm/tests/fixtures/README` has the commands): a
+two-PV striped group, metadata text that wraps round its area, and a volume
+extended after another one. It checks the parsed groups and mappings against
+`vgcfgbackup`, flips a bit in every byte the reader depends on, and edits labels
+and metadata-area headers to test areas that are empty, broken or past the
+device.
+
+`ferric-luks` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/luks/tests/fixtures.rs` reads LUKS1
+and LUKS2 headers that cryptsetup wrote (`crates/luks/tests/fixtures/README`
+has the commands) and checks the recovered volume keys against
+`cryptsetup luksDump --dump-volume-key`, header-copy fallback and random
+corruption. Because the bootloader is a soft-float UEFI target, CI also builds
+it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
+`x86_64-unknown-uefi`; check that build when changing its dependencies.
 
 ## Kernel lint and binary checks
 
@@ -174,7 +195,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, disable, and read-only mapping of the rings with `commit` checks |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |

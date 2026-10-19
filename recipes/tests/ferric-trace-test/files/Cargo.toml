@@ -9,7 +9,7 @@ description = "Kernel tracing test for Ferric Oxide"
 [workspace]
 
 [dependencies]
-ferric-trace = { path = "../../../../crates/trace" }
+ferric-trace = { path = "../../../../crates/trace", features = ["config"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 redox_syscall = "0.9.5"

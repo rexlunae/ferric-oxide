@@ -339,6 +339,35 @@ fn audit_reports_advised_packages_and_system_sboms_list_them() {
     );
     assert!(!env.fox(&["audit", "--no-vex"]).status.success());
 
+    // --no-vex does not read VEX, so a broken document only fails the
+    // audit that uses it.
+    fs::write(reg.dir.path().join("vex/broken.cdx.json"), b"not json").unwrap();
+    reg.sign_and_commit();
+    assert!(env.fox(&["registry", "update"]).status.success());
+    let audit = env.fox(&["--json", "audit", "--no-vex"]);
+    assert!(!audit.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(report["findings"][0]["advisory"], "FOX-2026-0001");
+    fails_with(&env.fox(&["audit"]), "broken.cdx.json");
+    fs::remove_file(reg.dir.path().join("vex/broken.cdx.json")).unwrap();
+    reg.sign_and_commit();
+    assert!(env.fox(&["registry", "update"]).status.success());
+
+    // The VEX applies because the store recorded tiny's registry. A store
+    // from before origins were recorded (format 1) has none, so the
+    // registry's VEX does not apply to its packages.
+    let db = env.root.path().join("var/lib/fox/installed.toml");
+    let text = fs::read_to_string(&db).unwrap();
+    assert!(text.starts_with("format = \"fox-installed/2\""), "{text}");
+    assert!(text.contains("[package.origin]") && text.contains("registry = \"test\""));
+    fs::write(&db, text.replace("fox-installed/2", "fox-installed/1")).unwrap();
+    let audit = env.fox(&["--json", "audit"]);
+    assert!(!audit.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(report["findings"][0]["advisory"], "FOX-2026-0001");
+    assert_eq!(report["suppressed"].as_array().map_or(0, Vec::len), 0);
+    fs::write(&db, text).unwrap();
+
     let sbom = json(&env.fox(&["sbom", "--system", "--name", "test-image"]));
     assert_eq!(sbom["metadata"]["component"]["name"], "test-image");
     let tiny = &sbom["components"][0];

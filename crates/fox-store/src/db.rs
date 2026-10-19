@@ -1,7 +1,7 @@
 //! The installed-package database, `<root>/var/lib/fox/installed.toml`.
 //!
 //! ```toml
-//! format = "fox-installed/1"
+//! format = "fox-installed/2"
 //!
 //! [[package]]
 //! name = "hello"
@@ -11,6 +11,10 @@
 //! signer = "a1b2…"
 //! signer-label = "ferric-ci-1"
 //! metadata = "embedded"
+//!
+//! [package.origin]
+//! registry = "ferric"
+//! root-blake3 = "9c41…"
 //!
 //! [[package.files]]
 //! path = "usr/bin/hello"
@@ -22,6 +26,11 @@
 //!
 //! The file is rewritten whole on every change, through a temporary file
 //! and a rename, so a crash leaves either the old or the new version.
+//!
+//! Format 2 added `origin`, the registry a package was installed from.
+//! A format 1 database is still read, and its packages have no origin
+//! (format 1 never recorded one, so any `origin` it holds is dropped); the
+//! next write saves format 2.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -36,9 +45,25 @@ use crate::StoreError;
 /// Database format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum Format {
-    #[default]
+    /// Before `origin`.
     #[serde(rename = "fox-installed/1")]
     V1,
+    /// Adds each package's `origin`.
+    #[default]
+    #[serde(rename = "fox-installed/2")]
+    V2,
+}
+
+/// The registry a package was installed from: its release or one of its
+/// prebuilt artifacts, selected through that registry's verified index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Origin {
+    /// The registry's local name, as configured when it was installed.
+    pub registry: PackageName,
+    /// The BLAKE3 of the root the registry entry pinned, so a different
+    /// registry later configured under the same name is not taken for it.
+    pub root_blake3: Blake3Digest,
 }
 
 /// Where an installed package's metadata came from.
@@ -105,6 +130,11 @@ pub struct InstalledPackage {
     /// Whether a removal is in progress.
     #[serde(default, skip_serializing_if = "PackageState::is_installed")]
     pub state: PackageState,
+    /// The registry it was installed from. `None` for a package installed
+    /// from an archive file or a git source, adopted from `pkg`, or
+    /// recorded by a format 1 database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     /// Every installed file.
     #[serde(default)]
     pub files: Vec<FileRecord>,
@@ -142,14 +172,21 @@ impl Database {
             }
             Err(source) => return Err(StoreError::io(path, source)),
         };
-        toml::from_str(&text).map_err(|source| StoreError::Database {
+        let mut db: Self = toml::from_str(&text).map_err(|source| StoreError::Database {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        if db.format == Format::V1 {
+            for package in &mut db.packages {
+                package.origin = None;
+            }
+        }
+        Ok(db)
     }
 
     /// Writes the database atomically.
     pub(crate) fn save(&mut self, path: &Path) -> Result<(), StoreError> {
+        self.format = Format::V2;
         self.packages.sort_by(|a, b| a.name.cmp(&b.name));
         let text = toml::to_string(self).map_err(StoreError::DatabaseSerialize)?;
         let tmp = path.with_extension("toml.tmp");
@@ -200,6 +237,10 @@ mod tests {
             signer_label: "ci".into(),
             metadata: MetadataKind::Embedded,
             state: PackageState::Removing,
+            origin: Some(Origin {
+                registry: PackageName::new("ferric").unwrap(),
+                root_blake3: Blake3Digest::of(b"root"),
+            }),
             files: vec![FileRecord {
                 path: "usr/bin/hello".into(),
                 kind: FileKind::File,
@@ -210,11 +251,38 @@ mod tests {
         });
         db.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("format = \"fox-installed/1\""));
+        assert!(text.starts_with("format = \"fox-installed/2\""));
+        assert!(text.contains("[package.origin]"));
         assert!(text.contains("state = \"removing\""));
         let loaded = Database::load(&path).unwrap();
         assert_eq!(loaded.packages, db.packages);
         assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn a_format_1_database_has_no_origins_and_is_saved_as_format_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.toml");
+        let digest = Blake3Digest::of(b"x");
+        let signer = KeyId::from_bytes([9; 32]);
+        // Format 1 never wrote an origin; one found there is not trusted.
+        fs::write(
+            &path,
+            format!(
+                "format = \"fox-installed/1\"\n\n[[package]]\nname = \"hello\"\n\
+                 version = \"1.0\"\nentries-blake3 = \"{digest}\"\nsigner = \"{signer}\"\n\
+                 signer-label = \"ci\"\nmetadata = \"embedded\"\n\n[package.origin]\n\
+                 registry = \"ferric\"\nroot-blake3 = \"{digest}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut db = Database::load(&path).unwrap();
+        assert_eq!(db.packages.len(), 1);
+        assert_eq!(db.packages[0].origin, None);
+        db.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("format = \"fox-installed/2\""));
+        assert!(!text.contains("origin"));
     }
 
     #[test]

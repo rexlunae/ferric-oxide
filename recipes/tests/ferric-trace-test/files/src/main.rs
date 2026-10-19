@@ -4,6 +4,11 @@
 //! kernel has the `syscall.*`, `sched.switch` and `scheme.*` tracepoints and turned
 //! `sched.switch` on at boot. Through the `kernel.trace` scheme the program checks, in order:
 //!
+//! - `trace-initfs`: the events the initfs `lib/trace.toml` leaves on (CI's image turns on
+//!   `scheme.cancel` there, through ferric-config's `kernel.trace_initfs_enable`) are on and
+//!   those it turns off are off, as bootstrap applied the file before init. The state the
+//!   steps below expect is then restored: the events they test are turned off, and
+//!   `sched.switch` on again. Without the file this step prints `FERRIC_TEST_SKIP trace-initfs`.
 //! - `trace-boot`: the event listing has the kernel events, with `sched.switch` on and the
 //!   `syscall` and `scheme` events off.
 //! - `trace-enable`: `enable syscall scheme` turns the `syscall` and `scheme` events on (the
@@ -27,6 +32,12 @@
 //!   and, with the same scheme id and SQE tag, a `scheme.response` from another process with the
 //!   byte count as its result.
 //! - `trace-disable`: once `disable syscall scheme` returns, the same calls leave no record.
+//! - `trace-mmap`: every CPU's ring maps read-only (`PROT_READ`, `MAP_SHARED`), and the kernel
+//!   refuses a writable, unreadable, partial or private mapping and an `mprotect` to writable. With the
+//!   `syscall` events on again, the marker `write` is found by reading the mappings through a
+//!   `ferric_trace::ring::View`; `commit <end>` past `head` or inside a record is refused
+//!   and leaves `tail` alone, and `commit` of the end read moves `tail` there, after which a
+//!   read of the ring no longer gives the call.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without

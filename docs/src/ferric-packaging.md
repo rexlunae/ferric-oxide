@@ -121,7 +121,7 @@ under [Adopting pkg's packages](#adopting-pkgs-packages).
 
 | Path beneath the install root | Contents |
 | --- | --- |
-| `var/lib/fox/installed.toml` | `fox-installed/1` database: package metadata, signer/hash information, file records and removal state |
+| `var/lib/fox/installed.toml` | `fox-installed/2` database: package metadata, signer/hash information, the registry each package was installed from (its name and pinned root), file records and removal state. A `fox-installed/1` database is still read, with no registry recorded for its packages, and is saved as format 2 on the next change |
 | `var/lib/fox/heads/<name>.pkgar_head` | Retained signed header and entry table for installed verification |
 | `var/lib/fox/lock` | Writer lock for database changes |
 | `etc/pkg/packages.toml`, `var/lib/packages/` | `pkg`'s state, read by `adopt-pkg` and never written by `fox` |
@@ -454,6 +454,15 @@ metadata/delegations/<name>.json  each package's file, signed by its owners
 metadata/snapshot.json            versions and hashes of targets and delegations
 metadata/timestamp.json           hash of the snapshot; expires after a day
 ```
+
+`fox-registry` writes every file through a temporary file in
+`.fox-staging/` at the top of the repository and a rename, so an
+interrupted write leaves the old file whole and no stray file in a signed
+directory (every file there is a target). Each write's temporary file has
+its own name (the target path, the process id and a random value), so
+concurrent writers never share one, and opening the registry removes only
+staging files more than an hour old, the leftovers of killed writes. Git
+does not track the empty directory.
 
 `<xx>` is the name's first two characters (`_` pads one-character names).
 Package files keep `[[owners]]` (an id and an OpenSSH Ed25519 key) and
@@ -833,23 +842,32 @@ with `fox-registry vex`:
 Each `affects[].ref` names a fox package by the purl its SBOM uses,
 `pkg:generic/<name>` (every version) or `pkg:generic/<name>@<version>`,
 directly or through the `bom-ref` of a component in the document with that
-purl. `versions` entries list more exact versions; entries marked
-`affected` are left out, and `vers:` ranges are refused. A statement
+purl. `versions` entries list more exact versions; a version an entry marks
+`affected` is never covered, even when the purl names it, and `vers:`
+ranges are refused. A statement
 matches a finding when its `id` or a `references[].id` is the advisory's id
 or one of its aliases, and it covers the installed package and version.
 `fox-registry vex` rejects a document that `fox` could not use, and the
 targets role signs it like every other top-level file.
 
-`fox audit` applies a registry's statements only to packages that registry
-lists, so one registry cannot clear another's packages. A finding covered
+`fox audit` applies a registry's statements only to packages installed
+from that registry. `fox install <name>` and `fox sync` record, in the
+installed-package database, the registry a package came from (its name and
+the root BLAKE3 its entry pins, whether a prebuilt was installed or the
+release was built), and a statement applies only when both match the
+configured registry. One registry therefore cannot clear a same-named
+package from another, nor a package installed from an archive file or git
+source, adopted from `pkg`, or recorded before the database kept origins
+(`fox-installed/1`). Only reinstalling such a package from the registry
+gives it an origin; a matching archive hash is not proof of where a copy
+came from. A finding covered
 by a `not_affected`, `false_positive`, `resolved` or
 `resolved_with_pedigree` statement moves from `findings` to `suppressed`
 (with the registry, document, state, justification and detail) and no
 longer fails the audit. An `exploitable` or `in_triage` statement keeps the
 finding and is shown with it, and it wins over a clearing statement from any
-registry. `fox audit --no-vex` ignores VEX. The installed-package database
-does not record a package's registry, so a registry's statements apply to
-any installed package with a name it lists.
+registry. `fox audit --no-vex` ignores VEX without reading it, so a
+broken VEX document does not stop that audit.
 
 ### System and image SBOMs
 

@@ -477,3 +477,26 @@ calls, chains across RedoxFS, the pipe scheme and the null scheme, the file
 table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
 blocked, the refusals, back-pressure and a corrupt tail, and prints ring
 versus system call timings, by descriptor, by slot and on the worker.
+
+## Page cache (prepared)
+
+`ferric-pcache` holds the interface and the policies of a planned kernel page
+cache, kept in a host-tested crate before any kernel code uses them. Nothing in
+the kernel or the image uses it yet: there is no `kernel.pcache` scheme, and
+file systems still serve every read through their own scheme.
+
+- `abi`: the scheme's paths, the `SYS_CALL` requests on queues and objects,
+  and the 32-byte records the kernel would put on a file system's fill queue.
+  A fill or writeback record names 1 to `MAX_RECORD_PAGES` (1024) pages, which
+  `RecordPages` enforces; longer runs are split into several records. A failed
+  answer carries a non-zero errno, since errno 0 means done.
+- `page`: the state of one cached page and the transitions fills, writes,
+  writeback and truncation make.
+- `readahead`: a per-description window that starts small and doubles on
+  sequential reads, up to a maximum that fits one record.
+- `clock` and `rmap` (with the `alloc` feature): two-list CLOCK replacement
+  for reclaim, and the reverse map from a file page to the mappings that show
+  it.
+
+The host-tools workflow runs its tests, Clippy and Rustdoc with and without
+`alloc`.

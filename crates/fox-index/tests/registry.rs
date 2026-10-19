@@ -878,10 +878,61 @@ fn a_failed_batch_leaves_nothing_behind() {
         targets
     );
 
-    // So the same batch can be retried.
+    // A write whose temporary file cannot be staged (here a file stands
+    // where the staging directory goes) fails without touching the file
+    // it replaces, so the old targets stay whole, not truncated.
     fs::remove_file(dir.path().join("packages/ba")).unwrap();
+    let blocker = dir.path().join(".fox-staging");
+    fs::remove_dir_all(&blocker).unwrap();
+    fs::write(&blocker, "in the way").unwrap();
+    assert!(matches!(
+        registry.admit_all(&[other("fd"), other("bat")]),
+        Err(EditError::Io { .. })
+    ));
+    assert!(!fd.exists());
+    assert_eq!(
+        fs::read(dir.path().join("metadata/targets.json")).unwrap(),
+        targets
+    );
+
+    // So the same batch can be retried.
+    fs::remove_file(&blocker).unwrap();
     registry.admit_all(&[other("fd"), other("bat")]).unwrap();
     assert!(fd.exists());
+    assert!(blocker.read_dir().unwrap().next().is_none());
+
+    // Opening the registry removes a staging file a killed write left an
+    // hour or more ago, but not a younger one that another process may
+    // still be writing. A file in a signed directory is a target whatever
+    // its name.
+    let staging = dir.path().join(".fox-staging");
+    let stale = staging.join("packages%2Ffd%2Ffd.toml.1.0");
+    let active = staging.join("packages%2Ffd%2Ffd.toml.2.0");
+    fs::write(&stale, "half written").unwrap();
+    fs::write(&active, "being written").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60))
+        .unwrap();
+    let named_new = dir.path().join("advisories/notes.new");
+    fs::write(&named_new, "kept").unwrap();
+    let mut registry = Registry::open(dir.path()).unwrap();
+    assert!(!stale.exists());
+    assert!(active.exists());
+    let report = registry
+        .sign(
+            &keyring(&[MAINTAINER, OWNER]),
+            now(),
+            &SignOptions::default(),
+        )
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(named_new.exists());
+    let targets = fs::read_to_string(dir.path().join("metadata/targets.json")).unwrap();
+    assert!(targets.contains("advisories/notes.new"));
+    assert!(!targets.contains(".fox-staging"));
 }
 
 #[test]

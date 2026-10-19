@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use crate::Level;
+use crate::{EventSet, Level};
 
 /// The most arguments an event can carry; each is one 64-bit word in a record.
 pub const MAX_ARGS: usize = 8;
@@ -42,6 +42,15 @@ impl Subsystem {
     /// The subsystem named `name`, if there is one.
     pub fn from_name(name: &str) -> Option<Self> {
         Subsystem::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// The kernel Cargo feature that compiles the subsystem's tracepoints in, `trace_<name>`.
+    pub const fn kernel_feature(self) -> &'static str {
+        match self {
+            Subsystem::Syscall => "trace_syscall",
+            Subsystem::Sched => "trace_sched",
+            Subsystem::Scheme => "trace_scheme",
+        }
     }
 }
 
@@ -122,6 +131,13 @@ impl Event {
         self.id
     }
 
+    /// Whether a kernel has the event's tracepoints: when its subsystem is compiled in
+    /// (`subsystem_compiled`) and its level is within `max_level`, the most verbose level
+    /// compiled in.
+    pub const fn compiled_with(&self, subsystem_compiled: bool, max_level: Level) -> bool {
+        subsystem_compiled && self.level.within(max_level)
+    }
+
     /// The event's full name, `<subsystem>.<event>`.
     pub const fn name(&self) -> &'static str {
         self.name
@@ -195,6 +211,26 @@ impl Catalog {
     /// Every event, in id order.
     pub fn events(&self) -> &'static [Event] {
         self.events
+    }
+
+    /// The events a kernel built with the Cargo features for which `has_feature` is true has:
+    /// see [`Subsystem::kernel_feature`], [`Level::kernel_feature`] and
+    /// [`Event::compiled_with`]. Host tools use it to check selections against a configured
+    /// kernel; the kernel itself decides with `cfg!` by the same rule.
+    pub fn compiled_for(&self, has_feature: impl Fn(&str) -> bool) -> EventSet {
+        let max_level = Level::ALL
+            .into_iter()
+            .rev()
+            .find(|level| level.kernel_feature().is_none_or(&has_feature))
+            .unwrap_or(Level::Error);
+        let mut set = EventSet::new();
+        for event in self.events {
+            let subsystem = has_feature(event.subsystem.kernel_feature());
+            if event.compiled_with(subsystem, max_level) {
+                set.insert(event.id);
+            }
+        }
+        set
     }
 
     /// The number of events.
@@ -383,5 +419,27 @@ mod tests {
             assert_eq!(Subsystem::from_name(s.name()), Some(s));
         }
         assert_eq!(Subsystem::from_name("mm"), None);
+    }
+
+    #[test]
+    fn compiled_for_features() {
+        let all = TEST.compiled_for(|_| true);
+        assert_eq!(all.len(), TEST.len());
+        let none = TEST.compiled_for(|_| false);
+        assert!(
+            none.iter()
+                .all(|id| TEST.get(id).is_some_and(|e| e.level() == Level::Error))
+        );
+        let no_sched = TEST.compiled_for(|f| f != Subsystem::Sched.kernel_feature());
+        assert!(no_sched.contains(FIRST.id()));
+        assert!(!no_sched.contains(SECOND.id()));
+        // Without trace_level_info, Info events are out even with their subsystem.
+        let warn_only = TEST.compiled_for(|f| {
+            !matches!(
+                f,
+                "trace_level_info" | "trace_level_debug" | "trace_level_trace"
+            )
+        });
+        assert!(!warn_only.contains(FIRST.id()));
     }
 }

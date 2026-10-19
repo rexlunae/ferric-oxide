@@ -80,6 +80,14 @@ jobs:
           cargo clippy --locked -p ferric-blkgrant -- -D warnings
           cargo test --locked -p ferric-blkgrant --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-blkgrant
+      # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
+      # kernel turns it on; file systems do not).
+      - name: ferric-pcache
+        run: |
+          cargo clippy --locked --all-targets --all-features -p ferric-pcache -- -D warnings
+          cargo clippy --locked -p ferric-pcache -- -D warnings
+          cargo test --locked -p ferric-pcache --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features -p ferric-pcache
       # ferric-ring: the shared ring format, its queues and chain rules, and the
       # kernel.ring scheme's calls (kernel, bootstrap and ferric-ring-test use it).
       - name: ferric-ring
@@ -92,6 +100,23 @@ jobs:
       # crate builds without them too.
       - name: Clippy (ferric-vtd without alloc)
         run: cargo clippy --locked -p ferric-vtd --no-default-features -- -D warnings
+      # ferric-lvm: read-only LVM2 labels, metadata and LV mapping; no_std, so check it
+      # builds for a bare-metal target as the kernel and the bootloader would use it.
+      - name: ferric-lvm
+        run: |
+          cargo clippy --locked --all-targets -p ferric-lvm -- -D warnings
+          cargo test --locked -p ferric-lvm
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-lvm
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-lvm --target x86_64-unknown-none
+      # ferric-luks runs in the bootloader (soft-float UEFI, with `force-soft`) as well as
+      # in user space; check both builds, and its docs and lints.
+      - name: ferric-luks
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-luks -- -D warnings
+          cargo clippy --locked --no-deps --all-targets --all-features -p ferric-luks -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-luks
+          RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-luks --features force-soft -Zbuild-std=core,alloc --target x86_64-unknown-uefi
 
   redoxfs:
     runs-on: ubuntu-24.04

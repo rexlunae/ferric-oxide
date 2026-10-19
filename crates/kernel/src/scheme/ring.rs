@@ -54,10 +54,7 @@
 //! notify modes (`EOPNOTSUPP`), and rings served natively by user schemes.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::{
-    num::NonZeroUsize,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ferric_ring::{
     abi::{header, Layout, NotifyMode, Request, PAGE_SIZE as RING_PAGE_SIZE, RING_PATH},
@@ -77,14 +74,17 @@ use syscall::{
     flag::{CallFlags, EventFlags, MapFlags, EVENT_READ},
 };
 
-use super::{CallerCtx, FileHandle, KernelScheme, OpenResult, SchemeExt, StrOrBytes};
+use super::{
+    shared_frames::map_frames, CallerCtx, FileHandle, KernelScheme, OpenResult, SchemeExt,
+    StrOrBytes,
+};
 use crate::{
     context::{
         file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
-        memory::{handle_notify_files, AddrSpaceWrapper, Grant, PageSpan},
+        memory::AddrSpaceWrapper,
     },
     event,
-    memory::{Frame, RaiiFrame, PAGE_SIZE},
+    memory::{RaiiFrame, PAGE_SIZE},
     sync::{CleanLockToken, WaitCondition, L1},
     syscall::{
         data::{GlobalSchemes, Map},
@@ -677,48 +677,6 @@ fn run_op(
         }),
         _ => Err(Error::new(EOPNOTSUPP)),
     }
-}
-
-/// Maps the ring's `frames` into `space`, anywhere, as one shared grant the process may unmap.
-///
-/// # Errors
-///
-/// `ENOMEM` when the address space or its page tables have no room.
-fn map_frames(
-    space: &Arc<AddrSpaceWrapper>,
-    frames: &[RaiiFrame],
-    prot: MapFlags,
-    token: &mut CleanLockToken,
-) -> Result<usize> {
-    let frames: Vec<Frame> = frames.iter().map(RaiiFrame::get).collect();
-    let count = NonZeroUsize::new(frames.len()).ok_or(Error::new(EINVAL))?;
-    let span = {
-        let mut lock_token = token.token();
-        let mut guard = space.acquire_write(lock_token.downgrade());
-        let base = guard.mmap(
-            space,
-            None,
-            count,
-            prot | MapFlags::MAP_SHARED,
-            None,
-            |base, flags, mapper, flusher| {
-                let is_pinned = false;
-                Grant::allocated_shared(&frames, base, flags, mapper, flusher, is_pinned)
-            },
-        )?;
-        let pages = guard
-            .grants
-            .contains(base)
-            .map_or(0, |(_, info)| info.page_count());
-        PageSpan::new(base, pages)
-    };
-    if span.count == frames.len() {
-        return Ok(span.base.start_address().data());
-    }
-    // The page tables ran out part way: undo the part that was mapped.
-    let notify = space.munmap(span, false, token)?;
-    handle_notify_files(notify, token);
-    Err(Error::new(ENOMEM))
 }
 
 impl KernelScheme for RingScheme {
