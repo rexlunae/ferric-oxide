@@ -8,6 +8,65 @@ use crate::{
 use core::mem::offset_of;
 use x86::{bits64::rflags::RFlags, msr, segmentation::SegmentSelector};
 
+// Ferric Oxide (shadow stacks): SYSCALL does not switch SSP, so on entry the kernel loads its own
+// supervisor shadow stack with SETSSBSY (SSP <- IA32_PL0_SSP, which `set_entry_ssp` points at the
+// running context's kernel shadow stack, and the token is marked busy) and on return clears it
+// with CLRSSBSY (verifies the busy token, clears it, SSP <- 0). Both are patched in only when CET
+// shadow stacks are enabled (the "shstk" alternative); they raise #UD while CET is off, and are
+// NOPs otherwise, so the default build is byte-for-byte unchanged. See arch/x86_64/shstk.rs.
+#[cfg(shstk_compiled)]
+macro_rules! shstk_syscall_entry {
+    () => {
+        alternative!(feature: "shstk", then: ["setssbsy"], default: [""])
+    };
+}
+#[cfg(not(shstk_compiled))]
+macro_rules! shstk_syscall_entry {
+    () => {
+        ""
+    };
+}
+#[cfg(shstk_compiled)]
+macro_rules! shstk_syscall_exit {
+    // CLRSSBSY takes the token's address (the current SSP) as a memory operand; RAX is dead here
+    // (it is reloaded by `pop_scratch!` further down), so it is free scratch. This clears the
+    // busy bit left by the entry SETSSBSY (or by a new context's `install_initial`), leaving the
+    // token ready for the next entry, and sets SSP to 0.
+    //
+    // Only for the SYSRETQ exit: SYSRETQ leaves SSP and the token alone, so the kernel must free
+    // the token itself. When the saved RFLAGS has the trap flag set (byte 1, bit 0 of RFLAGS at
+    // `SYSCALL_EXIT_TF_BYTE`, checked below), the return goes through the IRETQ fallback instead,
+    // and SSP stays at the busy token. That is the state a hardware interrupt from ring 3 leaves
+    // at its IRETQ: IRETQ to ring 3 pops no shadow frame (the CPU pushes one only for interrupts
+    // from ring 0) and frees the busy supervisor token at SSP itself. Running CLRSSBSY first would
+    // leave SSP at 0, and IRETQ would then try to free a token at address 0. The jump stays inside
+    // the alternative, so it is position-independent when copied over the NOP slot.
+    () => {
+        alternative!(feature: "shstk", then: ["
+            test BYTE PTR [rsp + 137], 1
+            jnz 1f
+            rdsspq rax
+            clrssbsy [rax]
+        1:
+        "], default: [""])
+    };
+}
+/// Offset from RSP at `enter_usermode` (the start of the `InterruptStack`) of the saved RFLAGS
+/// byte holding the trap flag (RFLAGS bit 8), written as a literal in `shstk_syscall_exit!`.
+#[cfg(shstk_compiled)]
+const SYSCALL_EXIT_TF_BYTE: usize = 137;
+#[cfg(shstk_compiled)]
+const _: () = assert!(
+    SYSCALL_EXIT_TF_BYTE
+        == offset_of!(InterruptStack, iret) + offset_of!(super::handler::IretRegisters, rflags) + 1
+);
+#[cfg(not(shstk_compiled))]
+macro_rules! shstk_syscall_exit {
+    () => {
+        ""
+    };
+}
+
 pub unsafe fn init() {
     unsafe {
         // IA32_STAR[31:0] are reserved.
@@ -123,6 +182,8 @@ pub unsafe extern "C" fn syscall_instruction() {
         mov cr3, rsp
     "),
     "mov rsp, gs:[{ksp}];",       // Load kernel stack pointer
+    // Ferric Oxide (shadow stacks): load this context's kernel shadow stack (NOP unless enabled).
+    shstk_syscall_entry!(),
     "push QWORD PTR {ss_sel};",   // Push fake userspace SS (resembling iret frame)
     "push QWORD PTR gs:[{sp}];",  // Push userspace rsp
     "push r11;",                  // Push rflags
@@ -142,6 +203,13 @@ pub unsafe extern "C" fn syscall_instruction() {
     .globl enter_usermode
     enter_usermode:
     ",
+
+    // Ferric Oxide (shadow stacks): free this context's supervisor shadow-stack token before a
+    // SYSRETQ return to user space (NOP unless enabled; skipped for the single-step IRETQ
+    // fallback, see the macro). SSP is at the busy supervisor token here, whether reached from
+    // __inner_syscall_instruction or a new context's first `enter_usermode`; RAX is still dead
+    // (reloaded by pop_scratch below).
+    shstk_syscall_exit!(),
 
     // Pop context registers
     pop_preserved!(),
@@ -194,7 +262,14 @@ pub unsafe extern "C" fn syscall_instruction() {
     "pop rsp;",                 // Restore userspace stack pointer
     "sysretq;",                 // Return into userspace; RCX=>RIP,R11=>RFLAGS
 
-    // IRETQ fallback:
+    // IRETQ fallback (single-step: the Trap Flag is set, so IRETQ is used to return *after* the
+    // instruction, as debuggers expect, rather than SYSRETQ's return to before it).
+    //
+    // Ferric Oxide (shadow stacks): with CET shadow stacks on, `shstk_syscall_exit!` skipped
+    // CLRSSBSY for this path, so SSP is still at this context's busy supervisor token, as after
+    // an interrupt from ring 3. IRETQ to ring 3 checks no shadow frame (none is pushed for
+    // interrupts from ring 3, and SYSCALL pushes none either) and frees that token, so no frame
+    // needs building here. Not yet run on CET hardware.
     "
     .p2align 4
 2:

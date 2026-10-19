@@ -15,7 +15,7 @@
 //! - **Run time.** The `kernel.trace` scheme (`scheme::trace`) enables and disables events and
 //!   drains the rings.
 //!
-//! Records go to a ring per CPU ([`ferric_trace::ring::Ring`], 64 KiB). Tracepoints may only sit
+//! Records go to a ring per CPU (`ferric_trace::ring::Ring`, 64 KiB). Tracepoints may only sit
 //! where interrupts are off, as in the system call path and the scheduler: then nothing else
 //! runs on the CPU while a record is written, and the CPU's ring has a single producer.
 

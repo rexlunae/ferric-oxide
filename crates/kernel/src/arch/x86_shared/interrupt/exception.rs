@@ -87,7 +87,20 @@ interrupt_stack!(breakpoint, |stack| {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        let after_int3 = stack.iret.rip;
         stack.iret.rip -= 1;
+        // Ferric Oxide (shadow stacks): a ring-3 int3 pushes no shadow-stack frame, so only a
+        // ring-0 int3 (which IDT entry 3 also accepts) needs the frame's return address moved
+        // with the saved RIP, or IRETQ raises #CP. No-op while CET shadow stacks are off.
+        if stack.iret.cs & 3 == 0
+            && let Err(err) = crate::arch::shstk::retarget_kernel_return(
+                stack.iret.cs,
+                after_int3,
+                stack.iret.rip,
+            )
+        {
+            panic!("CET: cannot rewind a kernel int3: {err}");
+        }
     }
 
     let mut token = unsafe { CleanLockToken::new() };
@@ -191,7 +204,16 @@ interrupt_error!(protection, |stack, code| {
 
         if was_failing_msr {
             // 0F 30 (WRMSR) or 0F 32 (RDMSR)
-            stack.iret.rip += 2;
+            let resume = stack.iret.rip + 2;
+            // Ferric Oxide (shadow stacks): the ring-0 #GP pushed a shadow-stack frame whose
+            // return address is the faulting instruction; IRETQ raises #CP unless it is moved
+            // past it along with the saved RIP. No-op while CET shadow stacks are off.
+            if let Err(err) =
+                crate::arch::shstk::retarget_kernel_return(stack.iret.cs, stack.iret.rip, resume)
+            {
+                panic!("CET: cannot resume after a failed MSR access: {err}");
+            }
+            stack.iret.rip = resume;
             stack.scratch.rsi = usize::MAX;
         }
     };
@@ -214,6 +236,10 @@ interrupt_error!(protection, |stack, code| {
 
 interrupt_error!(page, |stack, code| {
     let cr2 = VirtualAddress::new(unsafe { x86::controlregs::cr2() });
+    #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+    if crate::arch::shstk::recover_pool_probe(stack, code, cr2.data()) {
+        return;
+    }
     let arch_flags = PageFaultError::from_bits_truncate(code as u32);
     let mut generic_flags = GenericPfFlags::empty();
 
@@ -325,9 +351,11 @@ interrupt_error!(security, |stack, _code| {
     }
 });
 
-// Ferric Oxide (IBT, see arch/x86_64/ibt.rs): with kernel indirect branch tracking on, an
-// indirect branch that misses `endbr64` lands here. User-mode CET is never enabled, so a #CP from
-// user space is unexpected; it is handled like other faults there.
+// Ferric Oxide (CET, see arch/x86_64/ibt.rs and shstk.rs): with kernel indirect branch tracking
+// on, an indirect branch that misses `endbr64` lands here; with kernel shadow stacks on, so does a
+// `ret`/`iretq` whose return address differs from the shadow-stack copy, or a bad SSP token.
+// User-mode CET is never enabled, so a #CP from user space is unexpected; it is handled like other
+// faults there.
 #[cfg(target_arch = "x86_64")]
 interrupt_error!(control_protection, |stack, code| {
     let fault = ferric_cet::ControlProtectionError::from_error_code(code as u64);
@@ -343,9 +371,10 @@ interrupt_error!(control_protection, |stack, code| {
     }
     println!("Control protection fault code={:#x}", code);
     stack.trace();
-    // RIP is the branch target that lacks `endbr64`; the trace above shows who branched there.
+    // For an IBT fault RIP is the branch target that lacks `endbr64`; for a shadow-stack fault it
+    // is the `ret`/`iretq` or token instruction. The trace above shows how execution got there.
     panic!(
-        "IBT: control protection fault (#CP) in the kernel at {:#x}: {}",
+        "CET: control protection fault (#CP) in the kernel at {:#x}: {}",
         stack.iret.rip, fault
     );
 });

@@ -851,7 +851,7 @@ choices = ["always", "auto", "never"]
 id = "kernel.cpu.shstk"
 menu = "kernel.cpu"
 type = "choice"
-title = "Shadow stacks (CET SS) in the kernel: prepared, not yet enabled"
+title = "Shadow stacks (CET SS) in the kernel"
 default = "never"
 depends = "target.arch == 'x86_64'"
 kernel_config = "arch.x86_64.features.shstk"
@@ -859,14 +859,20 @@ rebuild = ["kernel"]
 help = """
 Intel CET supervisor shadow stacks keep a second, write-protected copy of every
 return address and stop the kernel with a control-protection fault (#CP) when a
-`ret` does not match it, which defeats return-oriented gadget chains. They are
-not turned on yet: "auto" logs at boot whether the CPU reports CET_SS (Intel
-Tiger Lake, AMD Zen 3 and newer) and what the policy decided, and on such CPUs
-allocates a shadow stack for every kernel stack and keeps the shadow-stack
-pointer registers up to date, with CET itself left off. Like the other "auto"
-CPU options it acts as "never" without kernel.self_modifying. "always" will be
-added once the kernel can enable them."""
-choices = ["auto", "never"]
+`ret` does not match it, which defeats return-oriented gadget chains. "auto"
+turns them on when the CPU reports CET_SS (Intel Tiger Lake, AMD Zen 3 and
+newer) and logs a boot self-test; "always" additionally panics at boot on CPUs
+without it. On a CPU without CET_SS, or with more than 1 TiB of RAM, "auto"
+stays off and logs that it is skipping. Enabling alongside kernel.cpu.kpti is
+not yet supported: with KPTI on, shadow stacks are allocated but left off
+("always" then panics, so use "auto"). Independent of kernel.cpu.ibt. Compiled
+shadow-stack support reserves a private 32 MiB frame pool (4096 stacks), excluded
+from the writable physical map. Pool exhaustion fails allocation without a
+writable fallback. Like the
+other "auto" CPU options it acts as "never" without kernel.self_modifying. Off
+by default because CI cannot test it: KVM on the runners does not expose CET and
+QEMU's emulator does not implement it."""
+choices = ["always", "auto", "never"]
 
 # ---------------------------------------------------------------- image
 
@@ -1160,6 +1166,16 @@ message = "Kernel CPU features set to \"auto\" act as \"never\" without self-mod
 level = "warn"
 when = "target.arch == 'x86_64' && kernel.cpu.pcid == 'always' && kernel.cpu.kpti == 'never'"
 message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" it does nothing."
+
+[[rule]]
+level = "error"
+when = "target.arch == 'x86_64' && kernel.cpu.shstk == 'always' && kernel.cpu.kpti != 'never'"
+message = "kernel.cpu.shstk = \"always\" cannot be met with KPTI on (enabling shadow stacks alongside KPTI is not yet supported); use \"auto\", or set kernel.cpu.kpti = \"never\"."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && kernel.cpu.shstk != 'never' && kernel.cpu.kpti == 'auto'"
+message = "With kernel.cpu.kpti = \"auto\" (on for Meltdown-affected Intel CPUs), shadow stacks are allocated but left off on those CPUs; enabling shadow stacks alongside KPTI is not yet supported."
 
 [[rule]]
 level = "error"
