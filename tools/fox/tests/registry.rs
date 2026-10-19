@@ -335,3 +335,118 @@ fn audit_needs_advisories() {
     let env = Env::new();
     fails_with(&env.fox(&["audit"]), "no advisories");
 }
+
+#[test]
+fn sync_installs_locks_and_removes_a_package_set() {
+    let env = Env::new();
+    tag(env.src.path(), "v0.3.0", OWNER);
+    let reg = Reg::new(env.src.path());
+    let set = env.work.path().join("set/packages.toml");
+    fs::create_dir_all(set.parent().unwrap()).unwrap();
+    let registry = format!(
+        "[[registry]]\nname = \"test\"\ngit = \"{}\"\nroot-blake3 = \"{}\"\n\n\
+         [policy]\nallow-yanked = false\n\n",
+        reg.url(),
+        reg.root_blake3()
+    );
+    let set_arg = set.to_str().unwrap();
+    let lock = set.with_file_name("fox.lock");
+
+    fs::write(
+        &set,
+        format!("{registry}[packages]\ntiny = {{ version = \"^0.3\" }}\n"),
+    )
+    .unwrap();
+    // Nothing locked yet, so --locked refuses.
+    fails_with(
+        &env.fox(&["sync", "--locked", "--config", set_arg]),
+        "not pinned",
+    );
+    // ...before it adds a registry or writes the policy.
+    assert!(!env.root.path().join("etc/fox/policy.toml").exists());
+    assert!(
+        json(&env.fox(&["--json", "registry", "list"]))
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let first = json(&env.fox(&["--json", "sync", "--config", set_arg]));
+    assert_eq!(first[0]["action"], "installed");
+    assert!(env.root.path().join("etc/fox/policy.toml").exists());
+    let text = fs::read_to_string(&lock).unwrap();
+    assert!(text.contains("registry = \"test\""), "{text}");
+    assert!(text.contains("version = \"0.3.0\""), "{text}");
+    // The target the toolchain built for is recorded, though none was asked.
+    assert!(text.contains("target = "), "{text}");
+
+    // The lock is satisfied and the archive is the locked one.
+    let again = json(&env.fox(&["--json", "sync", "--locked", "--config", set_arg]));
+    assert_eq!(again[0]["action"], "unchanged");
+
+    // A package the set drops is removed; one installed by hand is not.
+    fs::write(&set, format!("{registry}[packages]\n")).unwrap();
+    let removed = json(&env.fox(&["--json", "sync", "--config", set_arg]));
+    assert_eq!(removed[0]["action"], "removed");
+    let list = json(&env.fox(&["--json", "list"]));
+    assert!(list.as_array().unwrap().is_empty());
+    assert!(!fs::read_to_string(&lock).unwrap().contains("tiny"));
+
+    // A package replaced by hand after the sync is not sync's to remove.
+    fs::write(
+        &set,
+        format!("{registry}[packages]\ntiny = {{ version = \"^0.3\" }}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        json(&env.fox(&["--json", "sync", "--config", set_arg]))[0]["action"],
+        "installed"
+    );
+    fs::write(env.src.path().join("NOTES"), "by hand\n").unwrap();
+    git(env.src.path(), &["add", "NOTES"]);
+    git(env.src.path(), &["commit", "-q", "-m", "by hand"]);
+    git(env.src.path(), &["branch", "by-hand"]);
+    let by_hand = env.fox(&[
+        "install",
+        "--allow-unsigned",
+        &format!("{}#by-hand", env.src()),
+    ]);
+    assert!(by_hand.status.success(), "{}", stderr(&by_hand));
+    fs::write(&set, format!("{registry}[packages]\n")).unwrap();
+    let kept = json(&env.fox(&["--json", "sync", "--config", set_arg]));
+    assert_eq!(kept[0]["action"], "kept");
+    assert_eq!(json(&env.fox(&["--json", "list"]))[0]["name"], "tiny");
+    assert!(env.fox(&["remove", "tiny"]).status.success());
+
+    // The same package from git is pinned to its commit.
+    fs::write(
+        &set,
+        format!(
+            "[packages]\ntiny = {{ git = \"{}\", rev = \"v0.3.0\" }}\n",
+            env.src()
+        ),
+    )
+    .unwrap();
+    let built = json(&env.fox(&["--json", "sync", "--trust-new-key", "--config", set_arg]));
+    assert_eq!(built[0]["action"], "installed");
+    let text = fs::read_to_string(&lock).unwrap();
+    assert!(text.contains("commit = "), "{text}");
+    fails_with(
+        &env.fox(&["sync", "--config", set_arg, "--locked", "--update"]),
+        "cannot be used with",
+    );
+
+    // A moved tag no longer gives the locked commit once the package has
+    // to be installed again.
+    fs::write(env.src.path().join("README"), "moved\n").unwrap();
+    git(env.src.path(), &["add", "README"]);
+    git(env.src.path(), &["commit", "-q", "-m", "moved"]);
+    git(env.src.path(), &["tag", "-d", "v0.3.0"]);
+    tag(env.src.path(), "v0.3.0", OWNER);
+    let unchanged = json(&env.fox(&["--json", "sync", "--config", set_arg]));
+    assert_eq!(unchanged[0]["action"], "unchanged");
+    assert!(env.fox(&["remove", "tiny"]).status.success());
+    fails_with(&env.fox(&["sync", "--config", set_arg]), "the lock pins");
+    // --update takes the new commit.
+    let updated = json(&env.fox(&["--json", "sync", "--update", "--config", set_arg]));
+    assert_eq!(updated[0]["action"], "installed");
+}

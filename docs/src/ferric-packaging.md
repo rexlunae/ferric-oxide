@@ -102,6 +102,7 @@ fox --root ./image-root search hello
 fox --root ./image-root install hello@^1
 fox --root ./image-root sbom --system --name my-image --output ./image.cdx.json
 fox --root ./image-root audit [--rustsec ./advisory-db]                # see Advisories
+fox --root ./image-root sync --config ./packages.toml   # see Package sets
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify` also checks
@@ -592,6 +593,92 @@ The builder threshold is the larger of the policy's and the registry's
 `min-builder-signatures`, and never less than one. `allow-unsigned-git`
 has the effect of `install --allow-unsigned` for git sources.
 
+### Package sets and `fox sync`
+
+A package set (`fox-packages/1`) says what a root should have:
+
+```toml
+format = "fox-packages/1"
+
+[[registry]]
+name = "ferric"
+git = "https://github.com/rexlunae/ferric-registry"
+root-blake3 = "<BLAKE3 of its metadata/root/1.json>"
+
+[policy]                      # optional; written to etc/fox/policy.toml
+build = "auto"
+
+[packages]
+ripgrep = {}                                   # newest release, any registry
+nginx = { version = "^1.27", registry = "ferric", features = ["http2"] }
+mytool = { git = "https://github.com/me/mytool", rev = "v0.3.0" }
+```
+
+A package entry takes `version` and `registry`, or `git` with an optional
+`rev` (a tag or commit; the newest release tag otherwise), plus `features`,
+`default-features`, `target`, `path` and `package` as for `fox install`.
+
+`fox sync --config FILE` adds the set's registries that are missing (and
+refuses one configured with another URL or pin), writes `[policy]` if
+present, installs every package and then writes the lock file, `fox.lock`
+beside the set unless `--lock` names another. The lock (`fox-lock/1`)
+records each package's version, its registry or its git URL and commit, a
+digest of its build request, the target the archive was built for
+(`"none"` for an archive that names no target; the field is required) and
+the BLAKE3 of the archive installed:
+
+```toml
+format = "fox-lock/1"
+
+[[package]]
+name = "nginx"
+version = "1.27.3"
+registry = "ferric"
+request-blake3 = "<BLAKE3 of the build request>"
+target = "x86_64-unknown-redox"
+pkgar-blake3 = "<BLAKE3 of the archive>"
+```
+
+The build request is what changes the archive built: the git source's
+normalized URL (a local directory becomes the `file://` URL of its
+canonical path, so the same checkout always has the same identity), the
+revision (`rev`, or a `#` fragment of the URL; the two must agree if both
+are given), `path`, `package`, the features (sorted, without repeats),
+`default-features` and the target asked for (the entry's, else
+`--target`'s, else none). Without one, the target an archive gets depends
+on the host: the toolchain the source's `rust-toolchain.toml` selects for a
+build, `fox`'s own target for a prebuilt. So it cannot be known before the
+build and is not part of the request. The lock instead records the
+target the archive was actually built for, and when a locked package
+has to be installed again, an archive for another target is refused
+(name a target, or use `--update`), as a different commit or archive is.
+A git
+source that is neither a git URL nor an existing directory is an error,
+not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
+on any incompatible change to its fields.
+
+On the next sync a locked package is kept while the lock still satisfies
+the set (same source and build request, version still matching), so
+changing a package's `rev`, features, target, `path` or `package` resolves
+it again; a kept package is skipped if the
+installed archive is the locked one, and otherwise installed again at the
+locked version, which for a registry package must be the locked archive.
+Git packages are pinned to their commit instead, since an archive built
+locally is signed with that root's own builder key and so differs between
+roots. Packages that the previous lock listed and the set no longer does
+are removed if the installed archive is still the locked one; packages
+installed by hand, or replaced by hand since the last sync, are left alone
+(reported as `kept`). `--locked` fails on any package the lock does not pin
+(for reproducible image builds), and checks every package before it adds a
+registry or writes the policy, so a refused sync changes nothing;
+`--update` resolves every package again, and replaces a lock file whose
+contents do not parse instead of failing on it. The warning says why, and
+that the packages the old lock installed are no longer known to sync, so
+they are not removed automatically and need checking with `fox list`.
+Without `--update` such a lock is an error, and a lock that cannot be read,
+or a lock path that is not a regular file, is always an error before
+anything in the root changes.
+
 ### Advisories and `fox audit`
 
 A registry's `advisories/<id>.toml` files use the RustSec advisory format
@@ -668,7 +755,9 @@ Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
 No official registry is published, and `fox` resolves only the requested
-package, not its dependencies. Downloading artifacts over HTTPS is not
+package, not its dependencies. `ferric.toml` does not yet feed a package set
+to the image build, so images are still assembled by the installer and
+adopted on first boot. Downloading artifacts over HTTPS is not
 built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging

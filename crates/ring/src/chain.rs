@@ -66,6 +66,14 @@ impl Chain {
         self.len == 0
     }
 
+    /// Whether the chain runs on the ring's worker: its first entry has
+    /// [`SqeFlags::ASYNC`](crate::SqeFlags::ASYNC).
+    pub fn is_async(&self) -> bool {
+        self.entries()
+            .first()
+            .is_some_and(|sqe| sqe.flags.contains(crate::SqeFlags::ASYNC))
+    }
+
     /// Whether the last entry links on: the chain goes on past these entries.
     fn open(&self) -> bool {
         self.entries().last().is_some_and(Sqe::is_linked)
@@ -101,6 +109,45 @@ impl Chain {
         for sqe in self.entries() {
             complete(Cqe::new(sqe.user_data, result));
         }
+    }
+}
+
+/// The CQEs of one chain, gathered so they can be posted together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completions {
+    cqes: [Cqe; MAX_CHAIN],
+    len: usize,
+}
+
+impl Default for Completions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Completions {
+    /// None yet.
+    pub const fn new() -> Self {
+        Self {
+            cqes: [Cqe::new(0, 0); MAX_CHAIN],
+            len: 0,
+        }
+    }
+
+    /// Adds `cqe`; a chain has at most [`MAX_CHAIN`] entries, so one more than that is
+    /// dropped and reported with `false`.
+    pub fn push(&mut self, cqe: Cqe) -> bool {
+        let Some(slot) = self.cqes.get_mut(self.len) else {
+            return false;
+        };
+        *slot = cqe;
+        self.len += 1;
+        true
+    }
+
+    /// The CQEs, in order.
+    pub fn entries(&self) -> &[Cqe] {
+        self.cqes.get(..self.len).unwrap_or(&[])
     }
 }
 
@@ -256,6 +303,50 @@ mod tests {
         };
         assert_eq!(tags(&second), [2]);
         assert_eq!(ring.next(), Next::Empty);
+    }
+
+    #[test]
+    fn the_first_entry_makes_a_chain_async() {
+        let mut ring = Ring::new(8);
+        ring.submit(&[
+            Sqe::nop(1).run_async().linked(),
+            Sqe::nop(2),
+            Sqe::nop(3).linked(),
+            Sqe::nop(4).run_async(),
+        ]);
+        let Next::Chain(first) = ring.next() else {
+            panic!("a chain");
+        };
+        assert!(first.is_async());
+        let Next::Chain(second) = ring.next() else {
+            panic!("a chain");
+        };
+        assert!(!second.is_async());
+    }
+
+    #[test]
+    fn completions_gather_a_whole_chain() {
+        let mut ring = Ring::new(64);
+        let sqes: Vec<Sqe> = (0..MAX_CHAIN as u64)
+            .map(|i| {
+                let sqe = Sqe::nop(i);
+                if i + 1 < MAX_CHAIN as u64 {
+                    sqe.linked()
+                } else {
+                    sqe
+                }
+            })
+            .collect();
+        ring.submit(&sqes);
+        let Next::Chain(chain) = ring.next() else {
+            panic!("a chain");
+        };
+        let mut done = Completions::new();
+        chain.run(|_| 0, -125, |cqe| assert!(done.push(cqe)));
+        assert_eq!(done.entries().len(), MAX_CHAIN);
+        assert_eq!(done.entries()[5], Cqe::new(5, 0));
+        assert!(!done.push(Cqe::new(99, 0)));
+        assert!(Completions::default().entries().is_empty());
     }
 
     #[test]

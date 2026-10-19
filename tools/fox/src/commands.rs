@@ -25,7 +25,7 @@ use crate::source::{self, SourceError, SourceSpec};
 use crate::{Cli, Command, SbomFormat, SourceArgs, prebuilt};
 
 /// The target `fox` was built for: the default for prebuilt artifacts.
-const HOST_TARGET: &str = env!("FOX_HOST_TARGET");
+pub(crate) const HOST_TARGET: &str = env!("FOX_HOST_TARGET");
 
 /// Why a command failed.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +82,8 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Audit(#[from] crate::audit::AuditError),
     #[error(transparent)]
+    Sync(#[from] crate::sync::SyncError),
+    #[error(transparent)]
     Inventory(#[from] crate::inventory::InventoryError),
     #[error("invalid author key {key:?}")]
     AuthorKey {
@@ -123,6 +125,22 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
             Some(archive) if !*system => sbom(cli, archive, *format, output.as_deref()),
             _ => system_sbom(cli, name, *format, output.as_deref()),
         },
+        Command::Sync {
+            config,
+            lock,
+            locked,
+            update,
+            source,
+        } => crate::sync::run(
+            cli,
+            &crate::sync::SyncOptions {
+                config,
+                lock: lock.as_deref(),
+                locked: *locked,
+                update: *update,
+                source,
+            },
+        ),
         Command::Audit { rustsec } => crate::audit::run(cli, rustsec.as_deref()),
         Command::Install {
             force,
@@ -577,7 +595,7 @@ fn write_sbom(
 }
 
 #[derive(Serialize)]
-struct InstallJson {
+pub(crate) struct InstallJson {
     name: String,
     version: String,
     previous: Option<String>,
@@ -616,8 +634,9 @@ fn from_registry(
     spec: &PackageSpec,
     args: &SourceArgs,
     policy: &Policy,
-) -> Result<Pending, CliError> {
+) -> Result<(Pending, PackageName), CliError> {
     let found = crate::registry::find(root, spec, policy, OffsetDateTime::now_utc())?;
+    let registry = found.registry.name.clone();
     let release = found
         .entry
         .select_release(&spec.req, policy.allow_yanked)
@@ -629,7 +648,7 @@ fn from_registry(
     warn_advised(&found, &release.version)?;
     if policy.build != BuildPolicy::Always {
         if let Some(archive) = trusted_prebuilt(&found, &release, args, policy)? {
-            return Ok(Pending::Opened(Box::new(archive)));
+            return Ok((Pending::Opened(Box::new(archive)), registry));
         }
         if policy.build == BuildPolicy::Never {
             return Err(CliError::NoTrustedArtifact {
@@ -640,7 +659,7 @@ fn from_registry(
     }
     let resolved = source::resolve_release(root, &found.entry, &release)?;
     let packaged = source::build(root, &resolved, args, None)?;
-    Ok(Pending::Path(packaged.archive))
+    Ok((Pending::Path(packaged.archive), registry))
 }
 
 /// Warns about the registry's active advisories that affect the release
@@ -717,9 +736,85 @@ fn trusted_prebuilt(
 }
 
 /// An `install` argument once its git source, if any, is built.
-enum Pending {
+/// An archive to install: a file still to verify, or one already verified.
+pub(crate) enum Pending {
     Path(PathBuf),
     Opened(Box<Archive>),
+}
+
+/// Builds or fetches one `install` target that is not an archive file or
+/// prebuilt: a registry package (also returning its registry) or a git
+/// source.
+pub(crate) fn prepare(
+    root: &Path,
+    target: &str,
+    args: &SourceArgs,
+    policy: &Policy,
+) -> Result<(Pending, Option<PackageName>), CliError> {
+    match classify(target)? {
+        Target::Archive(path) => Ok((Pending::Path(path), None)),
+        Target::Registry(spec) => {
+            let (pending, registry) = from_registry(root, &spec, args, policy)?;
+            Ok((pending, Some(registry)))
+        }
+        Target::Git(spec) => {
+            let resolved = source::resolve(root, &spec, args)?;
+            let packaged = source::build(root, &resolved, args, None)?;
+            Ok((Pending::Path(packaged.archive), None))
+        }
+    }
+}
+
+/// Verifies a pending archive against `keys`.
+pub(crate) fn open_pending(pending: Pending, keys: &TrustedKeys) -> Result<Archive, CliError> {
+    Ok(match pending {
+        Pending::Path(path) => Archive::open(&path, keys)?,
+        Pending::Opened(archive) => *archive,
+    })
+}
+
+/// The keys `install` verifies archives against under `root`.
+pub(crate) fn trusted_keys_for(cli: &Cli, root: &Path) -> Result<TrustedKeys, CliError> {
+    trusted_keys_in(cli, root)
+}
+
+/// Installs a verified archive, reporting it as `install` does.
+pub(crate) fn install_archive(
+    cli: &Cli,
+    store: &Store,
+    archive: &Archive,
+    options: InstallOptions,
+) -> Result<InstallJson, CliError> {
+    sidecar_warning(archive);
+    let report = store.install(archive, options)?;
+    if !cli.json {
+        match &report.previous {
+            Some(old) => println!("upgraded {} {old} -> {}", report.name, report.version),
+            None => println!("installed {} {}", report.name, report.version),
+        }
+        for path in &report.kept {
+            println!("  kept locally changed {path}");
+        }
+    }
+    for dep in &report.missing_depends {
+        eprintln!(
+            "fox: warning: {} needs {dep}, which is not installed",
+            report.name
+        );
+    }
+    Ok(InstallJson {
+        name: report.name.to_string(),
+        version: report.version,
+        previous: report.previous,
+        installed: report.installed,
+        removed: report.removed,
+        kept: report.kept,
+        missing_depends: report
+            .missing_depends
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    })
 }
 
 fn install(
@@ -761,7 +856,7 @@ fn install(
                 continue;
             }
             Target::Registry(spec) => {
-                pending.push(from_registry(&root, &spec, source_args, &policy)?);
+                pending.push(from_registry(&root, &spec, source_args, &policy)?.0);
                 continue;
             }
             Target::Git(spec) => spec,
@@ -782,43 +877,11 @@ fn install(
     let keys = trusted_keys_in(cli, &root)?;
     let archives = pending
         .into_iter()
-        .map(|pending| match pending {
-            Pending::Path(path) => Archive::open(&path, &keys),
-            Pending::Opened(archive) => Ok(*archive),
-        })
+        .map(|pending| open_pending(pending, &keys))
         .collect::<Result<Vec<_>, _>>()?;
     let mut results = Vec::new();
     for archive in &archives {
-        sidecar_warning(archive);
-        let report = store.install(archive, options)?;
-        if !cli.json {
-            match &report.previous {
-                Some(old) => println!("upgraded {} {old} -> {}", report.name, report.version),
-                None => println!("installed {} {}", report.name, report.version),
-            }
-            for path in &report.kept {
-                println!("  kept locally changed {path}");
-            }
-        }
-        for dep in &report.missing_depends {
-            eprintln!(
-                "fox: warning: {} needs {dep}, which is not installed",
-                report.name
-            );
-        }
-        results.push(InstallJson {
-            name: report.name.to_string(),
-            version: report.version,
-            previous: report.previous,
-            installed: report.installed,
-            removed: report.removed,
-            kept: report.kept,
-            missing_depends: report
-                .missing_depends
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        });
+        results.push(install_archive(cli, &store, archive, options)?);
     }
     if cli.json {
         print_json(&results)?;
