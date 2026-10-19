@@ -286,14 +286,16 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
 
 `ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
 throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once. It is a
-same-boot A/B: three rounds of each queue policy, in alternating order. It
-reports the medians (`copy_iops` for the default policy, `single_iops` for
+same-boot A/B: three rounds of each queue policy in alternating order, or
+nine when the first three fail (see below). It reports the medians (`copy_iops` for the default policy, `single_iops` for
 `MainQueue`, `workers_iops` for `Workers`) and the verdict of
 `ferric_blkqueue::ab`. Rounds are paired: the median of the default's
 per-round ratio to the single queue (`ab_ratio`, which cancels drift during
 the boot) must reach 1 less the rounds' spread (`ab_tolerance`, between 5%
-and 15%). When the first three rounds fail, the benchmark runs six more and
-decides on all nine (`ab_rounds`). While the scheme serves one call at a
+and 15%). When the first three rounds fail, the benchmark runs six more
+rounds of each policy and decides on all nine (`ab_rounds` says how many ran).
+A round whose single queue measured nothing counts as a tie if the default
+measured nothing too, and as a win for the default otherwise. While the scheme serves one call at a
 time, `Adaptive` runs exactly the `MainQueue` path, and one unlucky round
 used to fail the boot. With the extra rounds, identical code passes, while a
 default that is slower in every round still fails. Runner hardware varies

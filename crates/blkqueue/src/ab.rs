@@ -59,6 +59,17 @@ fn permille(part: u32, whole: u32) -> u32 {
     u32::try_from(u64::from(part) * 1000 / u64::from(whole)).unwrap_or(u32::MAX)
 }
 
+/// Round `i`'s ratio, candidate over baseline, in permille. A round whose baseline measured
+/// nothing has no ratio to take, so it counts as a tie when the candidate measured nothing too,
+/// and as the candidate being as fast as can be when it measured something.
+fn round_ratio(baseline: u32, candidate: u32) -> u32 {
+    match (baseline, candidate) {
+        (0, 0) => 1000,
+        (0, _) => u32::MAX,
+        (baseline, candidate) => permille(candidate, baseline),
+    }
+}
+
 /// What to do with a comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -78,7 +89,8 @@ pub struct Comparison {
     pub baseline: u32,
     /// The candidate's median.
     pub candidate: u32,
-    /// The median of the per-round ratios, candidate over baseline, in permille.
+    /// The median of the per-round ratios, candidate over baseline, in permille (see
+    /// [`Comparison::new`] for rounds whose baseline measured nothing).
     pub ratio: u32,
     /// The noise allowed, in permille.
     pub tolerance: u32,
@@ -89,7 +101,8 @@ pub struct Comparison {
 impl Comparison {
     /// Compares `candidate` against `baseline`, where `baseline[i]` and `candidate[i]` were
     /// measured in the same round. Rounds past the shorter slice, and past [`MAX_ROUNDS`], are
-    /// left out.
+    /// left out. A round whose baseline is 0 counts as a tie when its candidate is 0 too, and
+    /// as a win for the candidate otherwise, since a zero baseline gives no ratio to take.
     pub fn new(baseline: &[u32], candidate: &[u32]) -> Self {
         let rounds = baseline.len().min(candidate.len()).min(MAX_ROUNDS);
         let mut base = [0; MAX_ROUNDS];
@@ -98,7 +111,7 @@ impl Comparison {
         base[..rounds].copy_from_slice(&baseline[..rounds]);
         cand[..rounds].copy_from_slice(&candidate[..rounds]);
         for ((ratio, &b), &c) in ratios.iter_mut().zip(&base).zip(&cand).take(rounds) {
-            *ratio = permille(c, b);
+            *ratio = round_ratio(b, c);
         }
         let (base, cand, ratios) = (
             &mut base[..rounds],
@@ -218,10 +231,31 @@ mod tests {
 
     #[test]
     fn edge_cases() {
-        // No rounds, unequal lengths and a zero baseline do not panic.
+        // No rounds, unequal lengths and too many rounds do not panic.
         assert_eq!(Comparison::new(&[], &[]).rounds, 0);
         assert_eq!(Comparison::new(&[1, 2, 3], &[1]).rounds, 1);
-        assert_eq!(Comparison::new(&[0, 0, 0], &[5, 5, 5]).ratio, 0);
         assert_eq!(Comparison::new(&[1; 20], &[1; 20]).rounds, MAX_ROUNDS);
+    }
+
+    #[test]
+    fn zero_baseline_rounds() {
+        // All rounds zero on both sides: a tie, which passes.
+        let c = Comparison::new(&[0, 0, 0], &[0, 0, 0]);
+        assert_eq!(c.ratio, 1000);
+        assert_eq!(c.verdict(), Verdict::Pass);
+        // A positive candidate against a baseline that measured nothing passes.
+        let c = Comparison::new(&[0, 0, 0], &[5, 5, 5]);
+        assert_eq!(c.ratio, u32::MAX);
+        assert_eq!(c.verdict(), Verdict::Pass);
+        // One zero baseline round among ordinary ones does not decide the median.
+        let c = Comparison::new(&[0, 6000, 6000], &[5900, 5950, 6010]);
+        assert_eq!(c.verdict(), Verdict::Pass);
+        // Nor does it hide a regression in the other rounds.
+        let baseline = [0, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000];
+        let c = Comparison::new(&baseline, &[4000; MAX_ROUNDS]);
+        assert_eq!(c.verdict(), Verdict::Fail);
+        // A zero candidate against a working baseline fails.
+        let c = Comparison::new(&[6000; MAX_ROUNDS], &[0; MAX_ROUNDS]);
+        assert_eq!(c.verdict(), Verdict::Fail);
     }
 }
