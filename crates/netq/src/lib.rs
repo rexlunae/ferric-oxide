@@ -18,7 +18,8 @@
 //! - [`frame`]: the header fields of a received Ethernet frame that filters match on.
 //! - [`filter`]: steering filters, their validation, their fixed-size encoding and the software
 //!   match copy mode uses.
-//! - [`call`]: the queue socket's path and `SYS_CALL` requests, and the statistics record.
+//! - [`call`]: the queue socket's path, its `SYS_CALL` requests (within the three metadata
+//!   words the kernel passes a scheme) and the bind and statistics records.
 //!
 //! The ring index protocol itself is `ferric-ring`'s, generalized to these slot widths in a
 //! later change. Everything here is plain data: nothing touches memory or hardware.
