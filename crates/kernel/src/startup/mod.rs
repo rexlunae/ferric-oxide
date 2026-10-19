@@ -256,6 +256,12 @@ fn run_userspace(token: &mut CleanLockToken) -> ! {
                     // Enable interrupts, then halt CPU (to save power) until the next interrupt is actually fired.
                     interrupt::enable_and_halt();
                 }
+                // Ferric Oxide: a runnable context is waiting on a lock another CPU holds for
+                // a moment; halting would leave it until the next timer interrupt.
+                SwitchResult::Contended => {
+                    interrupt::enable_and_nop();
+                    core::hint::spin_loop();
+                }
             }
         }
     }

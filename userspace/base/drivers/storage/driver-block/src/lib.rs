@@ -114,6 +114,17 @@ pub trait Disk {
     ) -> syscall::Result<()> {
         Err(Error::new(EOPNOTSUPP))
     }
+
+    /// Ferric Oxide: sets how a disk with per-CPU queue pairs places its requests
+    /// (`ferric-blkqueue`'s set-policy call).
+    ///
+    /// # Errors
+    ///
+    /// `EOPNOTSUPP` (the default) when the disk has no per-CPU queue pairs.
+    #[allow(unused_variables)]
+    fn set_queue_policy(&mut self, policy: ferric_blkqueue::QueuePolicy) -> syscall::Result<()> {
+        Err(Error::new(EOPNOTSUPP))
+    }
 }
 
 impl<T: Disk + ?Sized> Disk for Box<T> {
@@ -131,6 +142,10 @@ impl<T: Disk + ?Sized> Disk for Box<T> {
 
     async fn write(&mut self, block: u64, buffer: &[u8]) -> syscall::Result<usize> {
         (**self).write(block, buffer).await
+    }
+
+    fn set_queue_policy(&mut self, policy: ferric_blkqueue::QueuePolicy) -> syscall::Result<()> {
+        (**self).set_queue_policy(policy)
     }
 }
 

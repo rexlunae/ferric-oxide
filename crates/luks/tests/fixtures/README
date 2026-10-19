@@ -1,0 +1,12 @@
+LUKS headers made with cryptsetup 2.7 (Ubuntu 24.04) on 4 MiB files, then cut after the last
+keyslot area. Volume keys were read back with `cryptsetup luksDump --dump-volume-key`.
+
+luks2-pbkdf2.img    luksFormat --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000
+                      --hash sha256 --key-size 256 --luks2-metadata-size 16k
+                      --luks2-keyslots-size 512k --label ferric-test   (passphrase "correct horse")
+                    luksAddKey --pbkdf pbkdf2 --pbkdf-force-iterations 1000 (passphrase "second slot")
+luks2-argon2id.img  luksFormat --type luks2 --pbkdf argon2id --pbkdf-memory 32
+                      --pbkdf-force-iterations 4 --pbkdf-parallel 1 --key-size 256
+                      --luks2-metadata-size 16k --luks2-keyslots-size 256k ("correct horse")
+luks1.img           luksFormat --type luks1 --pbkdf-force-iterations 1000 --hash sha256
+                      --key-size 256 ("correct horse")

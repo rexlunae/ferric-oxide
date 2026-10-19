@@ -13,6 +13,9 @@
 //! Root can steer a vector to another CPU with [`move_vector`] (the `irq:` handle's
 //! [`ferric_irq::call::Call::Move`]); [`crate::irq_helpers::Msix::retarget`] does it for an
 //! MSI-X table entry and reprograms the entry when the kernel does not remap its interrupts.
+//!
+//! [`pin_current_thread`] keeps the calling thread on one CPU, so the thread that serves a
+//! queue runs where the queue's vector interrupts.
 
 use std::fs::{self, File};
 use std::io;
@@ -109,6 +112,63 @@ pub enum VectorError {
         /// The entry asked for.
         index: u16,
     },
+}
+
+/// Why a thread could not be pinned to a CPU.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PinError {
+    /// The affinity mask cannot name the CPU.
+    #[error("CPU {} is beyond the {} CPUs an affinity mask names", cpu.get(), ferric_irq::affinity::MAX_CPUS)]
+    OutOfRange {
+        /// The CPU asked for.
+        cpu: CpuId,
+    },
+    /// Opening the thread's `sched-affinity` handle failed.
+    #[error("cannot open the thread's sched-affinity handle")]
+    Open(#[source] io::Error),
+    /// The kernel refused the mask.
+    #[error("cannot set the thread's affinity to CPU {}", cpu.get())]
+    Write {
+        /// The CPU asked for.
+        cpu: CpuId,
+        /// What the kernel answered.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Lets the calling thread run on logical CPU `cpu` only, through its `sched-affinity` handle
+/// in the kernel's proc scheme, then yields so it moves there.
+///
+/// # Errors
+///
+/// [`PinError::OutOfRange`] for a CPU the mask cannot name, [`PinError::Open`] and
+/// [`PinError::Write`] when the kernel refuses.
+pub fn pin_current_thread(cpu: CpuId) -> Result<(), PinError> {
+    unsafe extern "C" {
+        /// relibc: the calling thread's handle in the process manager.
+        fn redox_cur_thrfd_v0() -> usize;
+    }
+    let mask = ferric_irq::affinity::AffinityMask::only(cpu).ok_or(PinError::OutOfRange { cpu })?;
+    let errno = |err: libredox::error::Error| io::Error::from_raw_os_error(err.errno());
+    // SAFETY: relibc's call takes no arguments and returns a descriptor this thread owns.
+    let thread = unsafe { redox_cur_thrfd_v0() };
+    let context = libredox::call::dup(thread, b"open_via_dup")
+        .map(libredox::Fd::new)
+        .map_err(|err| PinError::Open(errno(err)))?;
+    let affinity = context
+        .dup(b"sched-affinity")
+        .map(libredox::Fd::new)
+        .map_err(|err| PinError::Open(errno(err)))?;
+    affinity
+        .write(&mask.to_bytes())
+        .map_err(|err| PinError::Write {
+            cpu,
+            source: errno(err),
+        })?;
+    std::thread::yield_now();
+    Ok(())
 }
 
 /// The logical id of the bootstrap processor, which `irq:bsp` holds.

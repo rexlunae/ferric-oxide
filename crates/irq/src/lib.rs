@@ -17,6 +17,8 @@
 //! - [`apic_of`] and [`ApicId::compatibility_destination`], with which pcid builds
 //!   compatibility-format MSI messages for a logical CPU, and [`spread`], the order in which a
 //!   driver gives its MSI-X vectors to CPUs.
+//! - [`affinity::AffinityMask`], the CPU mask of a thread's `sched-affinity` handle, with which
+//!   a driver pins the thread that serves a queue to the CPU its vector interrupts.
 //!
 //! - [`call`], the `SYS_CALL`s on an `irq:` handle: [`call::Call::Move`] steers a vector to
 //!   another CPU.
@@ -47,6 +49,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod affinity;
 pub mod call;
 
 use core::{
@@ -395,9 +398,96 @@ pub fn spread_from<'a>(
         .take(count)
 }
 
+/// Where [`verify_spread`] found a vector that is not where [`spread_from`] puts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Misplaced {
+    /// The vector's index among all the driver's vectors (its MSI-X table entry, say).
+    pub index: usize,
+    /// The CPU it is on.
+    pub got: CpuId,
+    /// The CPU [`spread_from`] gives for it.
+    pub want: CpuId,
+}
+
+impl fmt::Display for Misplaced {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "vector {} is on CPU {}, not CPU {}",
+            self.index,
+            self.got.get(),
+            self.want.get()
+        )
+    }
+}
+
+impl core::error::Error for Misplaced {}
+
+/// Checks that `placed`, the CPUs of a driver's vectors from index `given` on, are the CPUs
+/// [`spread_from`] gives for them and all in `cpus`: what a driver checks after spreading its
+/// vectors, against `irq:cpus`.
+///
+/// # Errors
+///
+/// The first [`Misplaced`] vector.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_irq::{verify_spread, ApicId, CpuEntry, CpuId};
+///
+/// let cpu = |cpu| CpuEntry { cpu: CpuId::new(cpu), apic: ApicId::new(cpu), node: None };
+/// let cpus = [cpu(0), cpu(1), cpu(2)];
+/// let on = [CpuId::new(1), CpuId::new(2), CpuId::new(0)];
+/// assert!(verify_spread(&cpus, None, 1, &on).is_ok());
+/// assert_eq!(verify_spread(&cpus, None, 0, &on).unwrap_err().index, 0);
+/// ```
+pub fn verify_spread(
+    cpus: &[CpuEntry],
+    node: Option<u32>,
+    given: usize,
+    placed: &[CpuId],
+) -> Result<(), Misplaced> {
+    let expected = spread_from(Some(cpus), node, given, placed.len());
+    for (i, (&got, want)) in placed.iter().zip(expected).enumerate() {
+        if got != want || !cpus.iter().any(|entry| entry.cpu == got) {
+            return Err(Misplaced {
+                index: given + i,
+                got,
+                want,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_spread_follows_spread_from() {
+        let cpus: Vec<CpuEntry> = (0..4)
+            .map(|cpu| CpuEntry {
+                cpu: CpuId::new(cpu),
+                apic: ApicId::new(cpu),
+                node: None,
+            })
+            .collect();
+        let on = |ids: &[u32]| ids.iter().copied().map(CpuId::new).collect::<Vec<_>>();
+        // Entry 0 is taken, so entries 1 to 4 go to CPUs 1, 2, 3 and then 0.
+        assert_eq!(verify_spread(&cpus, None, 1, &on(&[1, 2, 3, 0])), Ok(()));
+        assert_eq!(
+            verify_spread(&cpus, None, 1, &on(&[1, 1])),
+            Err(Misplaced {
+                index: 2,
+                got: CpuId::new(1),
+                want: CpuId::new(2)
+            })
+        );
+        // An empty map spreads to the BSP, which is then not in the map.
+        assert!(verify_spread(&[], None, 0, &on(&[0])).is_err());
+    }
     use std::{string::ToString, sync::Arc, thread, vec::Vec};
 
     fn irq(n: u8) -> Irq {

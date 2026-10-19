@@ -143,8 +143,9 @@ Drivers give MSI-X table entries to CPUs through `pcid_interface`:
 Without `irq:cpus` these calls put every vector on the BSP, like upstream's
 `Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
 `percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
-logical id. No driver uses these calls yet; per-core NVMe queues are the next
-step of roadmap Phase 2.4, whose progress is in the status table in `ROADMAP.md`.
+logical id. `nvmed` uses them for its per-CPU queue pairs (below), and
+root can steer a vector to another CPU; progress on roadmap Phase 2.4 is in the
+status table in `ROADMAP.md`.
 
 ### Steering a vector to another CPU
 
@@ -197,6 +198,87 @@ entry when root steered the old one elsewhere. Policy, such as balancing
 vectors across CPUs, is left to user space. `ferric-iommu-test` checks
 steering with `iommu-msi-steer`, which moves edu's vector while the device
 fires.
+
+### Per-CPU NVMe queue pairs
+
+With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
+`nvmed` gives each online CPU an I/O queue pair of its own:
+
+- The admin queue and the first I/O queue pair stay on MSI-X entry 0, on the
+  BSP, as upstream. Before it creates that first pair, it asks the controller
+  for one more pair per CPU (Set Features, Number of Queues), since the
+  specification allows that request only before any I/O queue exists, and
+  takes as many as the controller grants and the MSI-X table has entries for.
+  A pair counts only once the controller accepts both its Create I/O
+  Completion Queue and Create I/O Submission Queue commands. If the
+  submission queue fails, nvmed deletes the completion queue again and
+  carries on with the pairs it already has. The log then says
+  `nvmed: N I/O queue pairs (controller grants G): pair 1 on the main thread,
+  N-1 per-CPU, workers on CPUs [...]`.
+- It programs one MSI-X entry per pair with `Msix::alloc_spread`, in two
+  batches, and checks each vector's CPU against `irq:cpus` and the order
+  `ferric_irq::spread` promises (`ferric_irq::verify_spread`). The log says
+  `nvmed: MSI-X entries 1..=N spread over CPUs [...]`.
+- Each pair's completion queue interrupts through its own entry, and a worker
+  thread pinned to that CPU (`pcid_interface::percpu::pin_current_thread`,
+  which writes the thread's `sched-affinity` mask from `ferric_irq::affinity`)
+  serves it with its own executor, `irq:` handle and bounce buffer. The
+  scheduler queues a woken context on the CPU it last ran on, which a thread
+  that just pinned itself elsewhere may no longer be allowed to use. The
+  kernel then hands such a context to a CPU in its affinity
+  (`context::switch`), instead of leaving it in a queue that never runs it.
+  A context that is running when its affinity stops including its CPU is
+  switched out at the next schedule and handed on the same way.
+- The disk scheme stays on the main thread. A read or write that arrives while
+  no other is in flight runs there, on the first I/O queue pair, exactly as
+  with one queue: a hand-off costs two cross-CPU wake-ups (about 40 us a
+  request on CI runners) and gains nothing without overlap. Requests that
+  overlap go to the workers in turn, and the main thread waits for each
+  worker to report its job done on a pipe. This rule is
+  `ferric_blkqueue::QueuePolicy::Adaptive`. The disk scheme's set-policy call
+  (`ferric_blkqueue::abi`, on a disk or partition descriptor) can instead keep
+  every request on the main queue (`MainQueue`) or send every request to a
+  worker (`Workers`). Only the process that opened the descriptor, which must
+  be root, may make this call: driver-block refuses it with `EPERM` on a
+  descriptor passed to another process (`ferric_blkqueue::openers`). The scheme cannot see the caller's CPU yet, so worker requests
+  are spread round-robin. driver-block still serves one scheme call at a time,
+  so until it serves calls concurrently, requests never overlap. Native rings
+  with a home CPU (later steps of the plan) are what route a request to the
+  queue of the core it came from.
+- Each job's result goes through a `ferric_blkqueue::slot::JobSlot`, which
+  the worker settles exactly once: done, or abandoned if it drops the job
+  unfinished. When a worker thread ends, even by a panic, it marks itself
+  dead, abandons the jobs still queued for it, and reports
+  `ferric_blkqueue::ids::WORKER_GONE` on the pipe. That wakes every waiting
+  request, and the abandoned ones fail with `EIO` instead of hanging. Later
+  requests skip dead workers, and run on the main queue once none is left.
+  The pipe's reader keeps the part of an id that a read splits for the next
+  read (`ferric_blkqueue::ids::IdStream`).
+- A watchdog ticks once a second on each worker and on the main thread. It
+  logs `nvmed: watchdog ...` when a job has waited a second or more, saying
+  whether its completion queue holds an entry nobody was woken for, or when
+  it finds finished jobs whose report never arrived. The tick also wakes the
+  executor, so a lost wake-up shows up as a stall rather than a hang. CI fails
+  on any watchdog line.
+
+`ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
+throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once. It is a
+same-boot A/B: three rounds of each queue policy, in alternating order. It
+reports the medians (`copy_iops` for the default policy, `single_iops` for
+`MainQueue`, `workers_iops` for `Workers`) and the verdict of
+`ferric_blkqueue::ab`: the default must reach the single queue's median,
+less the rounds' spread (between 5% and 15%). Runner hardware varies about
+2x between CI jobs, so numbers from different runs make a poor gate. CI fails
+a boot whose line says `ab=fail`.
+
+The kernel fix this work turned up is not specific to NVMe. When `schedule`
+passes a runnable context over because its lock or its address space's lock
+is held elsewhere for a moment, `switch` now returns
+`SwitchResult::Contended` and the idle loop tries again instead of halting.
+Before, the context waited for the CPU's next timer interrupt (up to about
+4 ms). With two threads reading at once, nvmed's main thread mapping the next
+client's buffer kept tripping this on the CPU of the worker it had just
+woken, which held two-thread reads to about 400 IOPS.
 
 ## From PCI discovery to a driver's DMA address
 

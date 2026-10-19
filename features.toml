@@ -483,6 +483,29 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/grant-dma" }
 
 [[option]]
+id = "drivers.nvme_percore"
+menu = "drivers"
+type = "bool"
+title = "Per-CPU NVMe queue pairs"
+default = false
+depends = "kernel.irq_percpu"
+rebuild = ["base"]
+help = """
+Give nvmed one I/O queue pair per online CPU (Phase 2.4), as many as the
+controller grants (Set Features, Number of Queues) and its MSI-X table has
+entries for. Each pair's completion queue interrupts its own CPU through its own
+MSI-X entry, spread over the CPUs in irq:cpus, and a worker thread pinned to
+that CPU serves it with its own executor and bounce buffer. The admin queue
+stays on the BSP. The disk scheme hands reads and writes to the workers in turn;
+it cannot see the caller's CPU yet. Needs Kernel > Per-CPU interrupt delivery.
+Builds nvmed with its percore Cargo feature. Off by default; without it nvmed
+has one I/O queue pair on the BSP, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
+
+[[option]]
 id = "kernel.self_modifying"
 menu = "kernel"
 type = "bool"

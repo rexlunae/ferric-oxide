@@ -128,6 +128,15 @@ extended after another one. It checks the parsed groups and mappings against
 and metadata-area headers to test areas that are empty, broken or past the
 device.
 
+`ferric-luks` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/luks/tests/fixtures.rs` reads LUKS1
+and LUKS2 headers that cryptsetup wrote (`crates/luks/tests/fixtures/README`
+has the commands) and checks the recovered volume keys against
+`cryptsetup luksDump --dump-volume-key`, header-copy fallback and random
+corruption. Because the bootloader is a soft-float UEFI target, CI also builds
+it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
+`x86_64-unknown-uefi`; check that build when changing its dependencies.
+
 ## Kernel lint and binary checks
 
 | Check | Purpose |
