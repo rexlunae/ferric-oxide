@@ -247,8 +247,7 @@ rebuild = ["*"]
 help = """
 Build every userspace package with frame pointers (-fno-omit-frame-pointer for
 C and C++, and -C force-frame-pointers=yes for Rust), so the kernel profiler
-(kernel.profiling) can walk user stacks and `ferric-trace flamegraph` can show
-whole call chains. Costs a register and a few instructions per call in C code.
+(kernel.profiling) can walk user stacks and record whole call chains. Costs a register and a few instructions per call in C code.
 Rust packages built by the cookbook already keep frame pointers on 64-bit
 targets (redoxer adds the flag), so with this off only C and C++ code omits
 them. Only packages built locally are covered: prebuilt packages

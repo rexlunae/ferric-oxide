@@ -173,7 +173,7 @@ the generated QEMU model for v3/v4 is `max`. The catalog retains older choices
 from upstream, but new Ferric development targets v3 or v4.
 
 `cpu.frame_pointers` (off by default) keeps frame pointers in user space, so
-the kernel profiler can walk user stacks for `ferric-trace flamegraph`. It adds
+the kernel profiler (`kernel.profiling`) can walk user stacks. It adds
 `-fno-omit-frame-pointer` to the target CPPFLAGS and `-C
 force-frame-pointers=yes` to the target RUSTFLAGS. Rust packages built by the
 cookbook already keep frame pointers on 64-bit targets, because redoxer adds the
