@@ -109,6 +109,14 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-lvm
           rustup target add x86_64-unknown-none
           cargo build --locked -p ferric-lvm --target x86_64-unknown-none
+      # ferric-luks runs in the bootloader (soft-float UEFI, with `force-soft`) as well as
+      # in user space; check both builds, and its docs and lints.
+      - name: ferric-luks
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-luks -- -D warnings
+          cargo clippy --locked --no-deps --all-targets --all-features -p ferric-luks -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-luks
+          RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-luks --features force-soft -Zbuild-std=core,alloc --target x86_64-unknown-uefi
 
   redoxfs:
     runs-on: ubuntu-24.04
