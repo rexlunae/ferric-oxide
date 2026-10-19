@@ -135,6 +135,28 @@ image overrides. CI's forced test features remain separate. See
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.
 
+## Dependency sources
+
+Ferric Oxide keeps its build inputs independent of upstream Redox services.
+Redox components that it consumes through Cargo or git submodules resolve from
+this repository or from Ferric-maintained mirrors under
+[github.com/rexlunae](https://github.com/rexlunae); no lockfile or submodule
+fetches from upstream Redox at build time.
+
+- Components with an in-tree subtree (`crates/kernel/`, `crates/bootloader/`,
+  `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/`) are consumed by
+  path. That includes relibc's `redox-ioctl` and `redox-rt` and the kernel's
+  `redox_syscall`.
+- Redox-maintained crates without an in-tree copy (`pkgar`, `pkgutils`,
+  `redox-rings`, `redox-buffer-pool`, `redox-log`, `rehid`, `acpi`, `uefi`,
+  `ring` and relibc's `object` fork) come from full-history mirror repositories.
+  Each `Cargo.lock` pins the exact revision; when updating a mirror, keep the
+  pinned revision so only the source moves.
+- The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
+- The subtree-sync workflow still reads upstream Redox to open synced pull
+  requests and never writes there. Recipes that fetch their own component
+  trees from upstream Redox are outside this list and remain to be migrated.
+
 ## CPU baseline and rebuilds
 
 Configured x86-64 user-space compilation defaults to x86-64-v3. v4 is optional
