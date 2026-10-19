@@ -21,6 +21,8 @@
 //!   [`EventSet`], for the boot environment and the trace scheme.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
+//! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
+//!   `init` starts.
 //!
 //! # Examples
 //!
@@ -53,6 +55,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod abi;
+#[cfg(feature = "config")]
+pub mod config;
 mod event;
 pub mod kernel;
 mod level;

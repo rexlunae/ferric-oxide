@@ -694,6 +694,38 @@ names (syscall, sched) or event names (sched.switch), separated by commas.
 FERRIC_TRACE= in the boot environment (press e in the bootloader) adds to it."""
 
 [[option]]
+id = "kernel.trace_initfs_enable"
+menu = "kernel.tracing"
+type = "list"
+title = "Events bootstrap turns on"
+default = []
+depends = "kernel.trace"
+trace_config = "enable"
+rebuild = ["base"]
+help = """
+Events to turn on from user space's first process, before init starts: a
+list of selections such as "syscall", "scheme.request" or "all". They go in
+the initfs as /scheme/initfs/lib/trace.toml, which bootstrap reads and writes
+to /scheme/kernel.trace/events as enable commands. Unlike kernel.trace_boot,
+changing them rebuilds only the initfs, not the kernel; system calls made
+before bootstrap applies them are not traced. Names are checked against the
+event catalog when the configuration is generated."""
+
+[[option]]
+id = "kernel.trace_initfs_disable"
+menu = "kernel.tracing"
+type = "list"
+title = "Events bootstrap turns off"
+default = []
+depends = "kernel.trace"
+trace_config = "disable"
+rebuild = ["base"]
+help = """
+Events bootstrap turns off after the ones above are on, from the same
+initfs trace.toml: use it to leave out single events of a subsystem turned on
+above, or events kernel.trace_boot or FERRIC_TRACE= turned on."""
+
+[[option]]
 id = "kernel.sys_fdstat"
 menu = "kernel"
 type = "bool"

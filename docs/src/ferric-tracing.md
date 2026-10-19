@@ -21,10 +21,12 @@ what is on at run time.
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
+| `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
+| `kernel.trace_initfs_disable` | `[]` | Selections bootstrap turns off after those, from the same file |
 
-The last four options take effect only with `kernel.trace`. They map to the
-kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme` and
-`trace_level_*`.
+The options below `kernel.trace` take effect only with it. The next four map
+to the kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme`
+and `trace_level_*`.
 `ferric-config` rejects `kernel.trace` together with `kernel.profiling`, because
 the profiler takes a CPU out of the system and that CPU would never answer the
 interrupt that live patching waits for.
@@ -41,6 +43,41 @@ bootstrap processor before the other CPUs start, and the kernel logs
 trace = true
 trace_boot = "sched"
 ```
+
+### The initfs trace configuration
+
+`kernel.trace_initfs_enable` and `kernel.trace_initfs_disable` are applied
+from user space instead, by bootstrap, before it starts `init`. Changing them
+rebuilds only the base package's initfs, not the kernel. System calls made
+before bootstrap applies them are not traced.
+
+`ferric-config` writes the selections to `trace.toml` in its output directory
+and checks them as the kernel and bootstrap will, so a mistake fails when the
+configuration is generated rather than being logged at boot:
+
+- every name must be an event or subsystem of the catalog;
+- every selection must include an event the configured kernel compiles in
+  (`kernel.trace_<subsystem>` and `kernel.trace_max_level`). A selection that
+  also names events left out is kept, as the kernel applies the rest of it;
+- each command must fit the kernel's 4096-byte limit, and the file must fit
+  bootstrap's 64 KiB.
+
+It also exports `FERRIC_INITFS_TRACE`,
+and the base package copies the file into the initfs as `lib/trace.toml`.
+The format is `ferric_trace::config`:
+
+```toml
+enable = ["syscall", "scheme.request"]
+disable = ["syscall.exit"]
+```
+
+Both keys are optional lists of selections, and any other key is an error.
+Bootstrap writes `enable <selection>` for each `enable` entry and then
+`disable <selection>` for each `disable` entry to `/scheme/kernel.trace/events`,
+as a root shell could. The kernel logs each change, for example
+`trace: enable syscall (2 event(s) changed)`. A missing file does nothing.
+Bootstrap logs a warning and boots on when the file does not parse, when a
+command is refused, or when the kernel has no `kernel.trace` scheme.
 
 ## How a tracepoint works
 
@@ -279,7 +316,15 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   - the shared layout's header, `View` reads that store nothing, header
     checks, and `commit_to` refusing positions past `head` or inside a
     record;
-  - a two-thread test with a million records.
+  - a two-thread test with a million records;
+  - `trace.toml` parsing, refusal of unknown keys and wrong types, catalog,
+    compiled-in and size checks of the selections, command order, and a TOML
+    round trip.
+- **Configuration.** `cargo test --locked -p ferric-config` checks the
+  generated `trace.toml` and `FERRIC_INITFS_TRACE`, that nothing is generated
+  without the options or without `kernel.trace`, and that a misspelt event,
+  a selection with no compiled-in event, an oversize command and an oversize
+  file fail generation.
 - **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
   (including bad and unknown records, records with too few or too many
   arguments, and duplicate CPUs), checks the text lines, checks the JSON
@@ -298,13 +343,16 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   features.
 - **Smoke test.** `ferric-trace-test`, in `config/ferric-smoke.toml`, does the
   following:
-  1. checks that `sched.switch` is on from boot;
-  2. enables `syscall` and `scheme`;
-  3. makes a `write` to a closed descriptor, a `read` of `stats`, a `write` to
+  1. reads the initfs `trace.toml` (CI's image turns on `scheme.cancel` there),
+     checks that the events it leaves on are on, and turns off again the ones
+     the later steps test;
+  2. checks that `sched.switch` is on from boot;
+  3. enables `syscall` and `scheme`;
+  4. makes a `write` to a closed descriptor, a `read` of `stats`, a `write` to
      the null scheme and a `yield`;
-  4. disables them;
-  5. drains and decodes every CPU's ring;
-  6. checks the enter/exit pairs, the results, the timestamp order, that
+  5. disables them;
+  6. drains and decodes every CPU's ring;
+  7. checks the enter/exit pairs, the results, the timestamp order, that
      `sched.switch` records are present, that the null-scheme write has a
      request (the first one on its CPU after the program's own
      `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
@@ -324,9 +372,10 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   `trace-overhead` job's baseline image, which requires that skip.
 - **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
   [Overhead budget](#overhead-budget)).
-- **Image workflow.** `image.yml` builds the smoke image with `trace = true`
-  and `trace_boot = "sched"`. It requires all eleven step markers, the
-  `trace-capture` marker and the boot log line.
+- **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
+  `trace_boot = "sched"` and `trace_initfs_enable = ["scheme.cancel"]`. It
+  requires all twelve step markers, the `trace-capture` marker, the boot log
+  line and the kernel's log of bootstrap's `enable scheme.cancel`.
 
 ## Overhead budget
 
@@ -397,6 +446,5 @@ as a notice on the run.
 - Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
   process lifecycle).
 - A reader that maps the rings in the `ferric-trace` tool (it still reads them).
-- An initfs trace configuration.
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
 - Architectures other than x86_64.

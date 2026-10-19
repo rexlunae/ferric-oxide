@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU64;
 
 use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
+use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
     CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
     SYSCALL_EXIT,
@@ -367,6 +368,74 @@ fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `trace-initfs`: the events the initfs `trace.toml` leaves on are on and the events it turns
+/// off are off, as bootstrap applied it before init started. Then the state the later steps
+/// expect is restored: the events they test are turned off and `sched.switch`, on from boot,
+/// is turned on again if the file turned it off. Without the file it prints a skip.
+fn check_initfs() -> Result<(), Failure> {
+    let step = "trace-initfs";
+    let path = format!("/scheme/initfs/{INITFS_PATH}");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("FERRIC_TEST_SKIP trace-initfs: no {path}");
+            return Ok(());
+        }
+        Err(source) => return Err(io_failure(step, &path)(source)),
+    };
+    let config = BootConfig::parse(&bytes).map_err(|err| check(step, format!("{path}: {err}")))?;
+    let invalid = |err| check(step, format!("{path}: {err}"));
+    let on = config.check(&CATALOG).map_err(invalid)?;
+    let off = config.disabled(&CATALOG).map_err(invalid)?;
+    let list = listing(step)?;
+    let (mut checked_on, mut checked_off) = (0, 0);
+    for event in CATALOG.events() {
+        let expected = if on.contains(event.id()) {
+            true
+        } else if off.contains(event.id()) {
+            false
+        } else {
+            continue;
+        };
+        // Only compiled-in events are listed, and only those can be on.
+        let Some(&(_, enabled)) = list.iter().find(|(name, _)| name == event.name()) else {
+            continue;
+        };
+        if enabled != expected {
+            let (is, turns) = if expected {
+                ("off", "on")
+            } else {
+                ("on", "off")
+            };
+            return Err(check(
+                step,
+                format!("{} is {is}, but {path} turns it {turns}", event.name()),
+            ));
+        }
+        if expected {
+            checked_on += 1;
+            if TESTED.iter().any(|tested| tested.id() == event.id()) {
+                command(step, &format!("disable {}", event.name()))?;
+            }
+        } else {
+            checked_off += 1;
+            if event.id() == SCHED_SWITCH.id() {
+                command(step, &format!("enable {}", event.name()))?;
+            }
+        }
+    }
+    if checked_on + checked_off == 0 {
+        return Err(check(
+            step,
+            format!("{path} turns no compiled-in event on or off"),
+        ));
+    }
+    println!(
+        "FERRIC_TEST_PASS trace-initfs ({checked_on} events on and {checked_off} off from {path})"
+    );
+    Ok(())
+}
+
 /// A CPU's ring mapped into this process, until dropped.
 struct Mapped {
     addr: usize,
@@ -605,6 +674,7 @@ fn check_mmap(cpus: &[u32]) -> Result<(), Failure> {
 
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
+    check_initfs()?;
     let list = listing("trace-boot")?;
     if !is_on("trace-boot", &list, &SCHED_SWITCH)? {
         return Err(check("trace-boot", "sched.switch is not on from boot"));

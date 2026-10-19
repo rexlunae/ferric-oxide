@@ -56,7 +56,7 @@ use crate::{
 const ROOT: usize = 0;
 
 /// The longest command `events` accepts.
-const MAX_COMMAND: usize = 4096;
+const MAX_COMMAND: usize = ferric_trace::abi::MAX_COMMAND_BYTES;
 
 /// The most bytes one read of `cpu/<n>` copies.
 const MAX_READ: usize = 64 * 1024;

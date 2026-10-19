@@ -1278,6 +1278,7 @@ name = "ferric-config"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ferric-trace",
  "ratatui",
  "redox_installer",
  "serde",
@@ -1336,6 +1337,10 @@ dependencies = [
 [[package]]
 name = "ferric-trace"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml 1.1.8+spec-1.1.0",
+]
 
 [[package]]
 name = "ferric-trace-cli"

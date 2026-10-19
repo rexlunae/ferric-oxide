@@ -43,6 +43,19 @@ impl Level {
         }
     }
 
+    /// The kernel Cargo feature that compiles events of this level in (`trace_level_<name>`,
+    /// which also turns on the less verbose levels' features), or `None` for
+    /// [`Level::Error`], which is always compiled in.
+    pub const fn kernel_feature(self) -> Option<&'static str> {
+        match self {
+            Level::Error => None,
+            Level::Warn => Some("trace_level_warn"),
+            Level::Info => Some("trace_level_info"),
+            Level::Debug => Some("trace_level_debug"),
+            Level::Trace => Some("trace_level_trace"),
+        }
+    }
+
     /// Whether an event of this level is within `max`: `self <= max`, usable in `const` code.
     pub const fn within(self, max: Level) -> bool {
         self as u8 <= max as u8

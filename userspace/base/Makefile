@@ -38,6 +38,9 @@ INITFS_CARGO_ARGS = $(foreach bin,$(INITFS_BINS),-p $(bin))
 # nvmed/grant-dma), passed in the environment. Unset, the build is upstream's.
 FERRIC_INITFS_FEATURES ?=
 FERRIC_INITFS_FEATURE_ARGS = $(if $(strip $(FERRIC_INITFS_FEATURES)),--features "$(strip $(FERRIC_INITFS_FEATURES))")
+# Ferric Oxide: the kernel trace configuration bootstrap applies (ferric-config's
+# kernel.trace_initfs_* options write it), passed in the environment. Unset, there is none.
+FERRIC_INITFS_TRACE ?=
 INITFS_DRIVERS_CARGO_ARGS = $(foreach bin,$(INITFS_DRIVERS_BINS),-p $(bin))
 BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
@@ -120,6 +123,7 @@ install-base: base $(SYSROOT)/bin/redoxfs
 	@mkdir -p "$(BUILD_DIR)/initfs/lib/init.d" "$(BUILD_DIR)/initfs/lib/pcid.d"
 	cp "$(SRC_DIR)/init.initfs.d"/* "$(BUILD_DIR)/initfs/lib/init.d/"
 	cp "$(SRC_DIR)/drivers/initfs.toml" "$(BUILD_DIR)/initfs/lib/pcid.d/initfs.toml"
+	$(if $(strip $(FERRIC_INITFS_TRACE)),cp "$(FERRIC_INITFS_TRACE)" "$(BUILD_DIR)/initfs/lib/trace.toml")
 # Build initfs
 	$(CARGO_HOST) run --manifest-path "$(SRC_DIR)/initfs/tools/Cargo.toml" --bin redox-initfs-ar -- \
 		"$(BUILD_DIR)/initfs" "$(TARGET_DIR)/bootstrap" -o "$(BUILD_DIR)/initfs.img"
