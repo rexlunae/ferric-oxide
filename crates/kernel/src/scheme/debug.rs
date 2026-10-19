@@ -30,6 +30,43 @@ fn control_line() -> alloc::string::String {
     })
 }
 
+/// Ferric Oxide: the `ctl-profiling` handle that owns the profiler (its id plus one), or 0.
+#[cfg(feature = "profiling")]
+static PROFILER_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Ferric Oxide: a write of `byte` to the `ctl-profiling` handle `id`. `1` and `0` start and
+/// stop sampling, as upstream. `x` makes the handle the profiler's owner and stops sampling;
+/// while it is owned, other handles' writes fail with `EBUSY`, and closing the owner stops
+/// sampling and frees the profiler. So one recorder (`ferric-trace profile`) cannot have its
+/// samples taken or its sampling stopped by a second one, and a killed recorder leaves
+/// sampling off.
+#[cfg(feature = "profiling")]
+fn profiler_control(id: usize, byte: u8) -> Result<()> {
+    let mine = id.wrapping_add(1);
+    let on = match byte {
+        b'x' => {
+            if let Err(owner) =
+                PROFILER_OWNER.compare_exchange(0, mine, Ordering::SeqCst, Ordering::SeqCst)
+                && owner != mine
+            {
+                return Err(Error::new(EBUSY));
+            }
+            false
+        }
+        b'0' | b'1' => {
+            let owner = PROFILER_OWNER.load(Ordering::SeqCst);
+            if owner != 0 && owner != mine {
+                return Err(Error::new(EBUSY));
+            }
+            byte == b'1'
+        }
+        _ => return Err(Error::new(EINVAL)),
+    };
+    info!("Wrote {on} to IS_PROFILING");
+    crate::profiling::IS_PROFILING.store(on, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Add to the input queue
 pub fn debug_input(data: u8, token: &mut CleanLockToken) {
     INPUT.send(data, token);
@@ -137,6 +174,15 @@ impl KernelScheme for DebugScheme {
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
         HANDLES.write(token.token()).remove(id)?;
+
+        // Ferric Oxide: the profiler's owner going away stops sampling (`profiler_control`).
+        #[cfg(feature = "profiling")]
+        if PROFILER_OWNER
+            .compare_exchange(id.wrapping_add(1), 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            crate::profiling::IS_PROFILING.store(false, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -250,14 +296,7 @@ impl KernelScheme for DebugScheme {
         if handle.num == SpecialFds::CtlProfiling as usize {
             let mut dst = [0];
             buf.copy_to_slice(&mut dst)?;
-
-            let is_profiling = match dst[0] {
-                b'0' => false,
-                b'1' => true,
-                _ => return Err(Error::new(EINVAL)),
-            };
-            info!("Wrote {is_profiling} to IS_PROFILING");
-            crate::profiling::IS_PROFILING.store(is_profiling, Ordering::Relaxed);
+            profiler_control(id, dst[0])?;
 
             return Ok(1);
         }

@@ -6,7 +6,9 @@
 //! `/scheme/debug/profiling-<n>` by root. Writing `1` or `0` to `/scheme/debug/ctl-profiling`
 //! starts or stops sampling. Ferric Oxide adds a read of `ctl-profiling`, which gives one
 //! [`ControlLine`]: the address the kernel's text was loaded at, so that a host tool can
-//! symbolize kernel addresses under KASLR (`kernel.kaslr_image`).
+//! symbolize kernel addresses under KASLR (`kernel.kaslr_image`). It also adds an owner:
+//! writing `x` takes the profiler for that open file (and stops sampling), other files'
+//! writes then fail with `EBUSY`, and closing the owner's file stops sampling and frees it.
 //!
 //! A sample is a run of native-endian machine words (`u64` on x86_64):
 //!
@@ -18,7 +20,10 @@
 //! | 3 | the interrupted context's debug id (as `sched.switch` records name it) |
 //! | 4.. | return addresses, innermost first: kernel frames, and for a sample taken in the kernel during a system call, then the user instruction pointer and user frames |
 //!
-//! [`Samples`] splits a buffer into [`Sample`]s.
+//! [`Samples`] splits a buffer into [`Sample`]s. A buffer can hold words that are not a whole
+//! sample (one torn by a kernel that wrote part of a sample into a nearly full buffer, before
+//! Ferric Oxide made it write whole samples only), so [`Samples`] reports such words as one
+//! error and carries on at the next whole sample.
 
 use core::fmt;
 
@@ -87,7 +92,8 @@ impl fmt::Display for SampleError {
 
 impl core::error::Error for SampleError {}
 
-/// The samples of a buffer, in order. Iteration stops at the first error.
+/// The samples of a buffer, in order. Words that do not start a whole sample give one error
+/// for the run of them, and iteration resumes at the next word that does.
 #[derive(Clone, Debug)]
 pub struct Samples<'a> {
     words: &'a [u64],
@@ -107,20 +113,17 @@ impl<'a> Iterator for Samples<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let at = self.at;
         let header = *self.words.get(at)?;
-        if header & !LENGTH_MASK != SAMPLE_MAGIC {
-            self.at = self.words.len();
-            return Some(Err(SampleError::BadHeader { at }));
-        }
-        let len = (header & LENGTH_MASK) as usize;
-        let Some(sample) = self
-            .words
-            .get(at..at.saturating_add(len))
-            .filter(|_| len >= SAMPLE_FIXED_WORDS)
-        else {
-            self.at = self.words.len();
-            return Some(Err(SampleError::BadLength { at }));
+        let Some(sample) = whole_sample(self.words, at) else {
+            self.at = (at + 1..self.words.len())
+                .find(|&next| whole_sample(self.words, next).is_some())
+                .unwrap_or(self.words.len());
+            return Some(Err(if header & !LENGTH_MASK != SAMPLE_MAGIC {
+                SampleError::BadHeader { at }
+            } else {
+                SampleError::BadLength { at }
+            }));
         };
-        self.at = at + len;
+        self.at = at + sample.len();
         Some(Ok(Sample {
             ip: sample[1],
             tsc: sample[2],
@@ -129,6 +132,20 @@ impl<'a> Iterator for Samples<'a> {
             frames: &sample[SAMPLE_FIXED_WORDS..],
         }))
     }
+}
+
+/// The whole sample starting at word `at`, if one does: a header, and a length that covers
+/// the fixed words and fits in `words`.
+fn whole_sample(words: &[u64], at: usize) -> Option<&[u64]> {
+    let header = *words.get(at)?;
+    if header & !LENGTH_MASK != SAMPLE_MAGIC {
+        return None;
+    }
+    let len = (header & LENGTH_MASK) as usize;
+    if len < SAMPLE_FIXED_WORDS {
+        return None;
+    }
+    words.get(at..at.saturating_add(len))
 }
 
 /// What a read of `ctl-profiling` gives: `kernel_text <address>\n`, the run-time address of
@@ -215,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_samples_stop_the_split() {
+    fn bad_samples_are_errors() {
         assert_eq!(
             Samples::new(&[1, 2, 3, 4]).collect::<std::vec::Vec<_>>(),
             [Err(SampleError::BadHeader { at: 0 })]
@@ -229,6 +246,32 @@ mod tests {
             [Err(SampleError::BadLength { at: 0 })]
         );
         assert_eq!(Samples::new(&[]).count(), 0);
+    }
+
+    /// A sample torn by a full buffer (its header promises more words than were written)
+    /// takes in the start of the next one, so the words after it do not line up; that run is
+    /// one error, and the samples after it still decode.
+    #[test]
+    fn a_torn_sample_does_not_hide_the_ones_after_it() {
+        let words = [
+            SAMPLE_MAGIC | 5,
+            0x40_1000,
+            7,
+            SAMPLE_MAGIC | 4,
+            0x40_2000,
+            8,
+            3,
+            SAMPLE_MAGIC | 4,
+            0x40_3000,
+            9,
+            4,
+        ];
+        let samples: std::vec::Vec<_> = Samples::new(&words).collect();
+        assert_eq!(samples.len(), 3);
+        assert!(samples[0].is_ok());
+        assert_eq!(samples[1], Err(SampleError::BadHeader { at: 5 }));
+        let last = samples[2].unwrap();
+        assert_eq!((last.ip, last.context), (0x40_3000, 4));
     }
 
     #[test]
