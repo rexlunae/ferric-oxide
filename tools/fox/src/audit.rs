@@ -15,20 +15,27 @@
 //! Each registry's signed VEX documents (`vex/*.cdx.json`, see
 //! [`fox_index::vex`]) can set findings aside. A statement applies to a
 //! finding when it names the advisory's id or one of its aliases and
-//! covers the installed package and version, and only when the registry
-//! that published it lists that package, so one registry cannot vouch for
-//! another's packages. A `not_affected`, `false_positive` or `resolved`
-//! statement moves the finding to `suppressed`; an `exploitable` or
-//! `in_triage` one keeps it a finding and wins over a clearing statement
-//! from any registry. `--no-vex` ignores VEX.
+//! covers the installed package and version, and only when the package
+//! was installed from that registry: the store records each package's
+//! origin (the registry's name and pinned root) when `fox install` or
+//! `fox sync` takes it from a registry. A registry can therefore vouch
+//! only for packages installed from it, not for a same-named package from
+//! another registry, a local archive or git build, a package adopted from
+//! `pkg`, or one recorded before the store kept origins (whose findings
+//! stay findings). A `not_affected`,
+//! `false_positive` or `resolved` statement moves the finding to
+//! `suppressed`; an `exploitable` or `in_triage` one keeps it a finding
+//! and wins over a clearing statement from any registry. `--no-vex`
+//! ignores VEX without reading it, so a broken VEX document cannot stop
+//! an audit that does not use it.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use fox_core::PackageName;
 use fox_core::policy::Policy;
-use fox_core::registries::Registries;
+use fox_core::registries::{Registries, RegistryEntry};
 use fox_index::advisory::{Advisory, AdvisoryError, Ecosystem};
 use fox_index::verify::VerifiedRegistry;
 use fox_sbom::cargo_crates;
@@ -130,12 +137,10 @@ struct AuditJson {
 
 /// `fox audit [--rustsec <dir>] [--no-vex]`.
 pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>, no_vex: bool) -> Result<ExitCode, CliError> {
-    let mut sources = load(&cli.root, rustsec)?;
-    if no_vex {
-        sources.vex.clear();
-    }
     let store = Store::open(&cli.root)?;
     let inventory = inventory::take(&store)?;
+    let vex_for = (!no_vex).then_some(inventory.as_slice());
+    let sources = load(&cli.root, rustsec, vex_for)?;
     let report = check(&inventory, &sources.advisories, &sources.vex);
     if cli.json {
         print_json(&report)?;
@@ -149,7 +154,13 @@ pub(crate) fn run(cli: &Cli, rustsec: Option<&Path>, no_vex: bool) -> Result<Exi
     })
 }
 
-fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
+/// Loads every source's advisories and, when `vex_for` is given, the VEX
+/// statements that apply to those installed packages.
+fn load(
+    root: &Path,
+    rustsec: Option<&Path>,
+    vex_for: Option<&[Inventoried]>,
+) -> Result<Sources, CliError> {
     let registries = Registries::load(root)?;
     if registries.entries().is_empty() && rustsec.is_none() {
         return Err(AuditError::NoSources.into());
@@ -160,7 +171,9 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
     let mut vex = Vec::new();
     for entry in registries.entries() {
         let verified = registry::open(root, entry, &policy, now)?;
-        vex.extend(registry_vex(&verified, entry.name.as_ref())?);
+        if let Some(inventory) = vex_for {
+            vex.extend(registry_vex(&verified, entry, inventory)?);
+        }
         let advisories = verified
             .advisories()
             .map_err(|source| RegistryError::Verify {
@@ -189,21 +202,30 @@ fn load(root: &Path, rustsec: Option<&Path>) -> Result<Sources, CliError> {
     })
 }
 
-/// The registry's VEX statements about packages it lists.
-fn registry_vex(verified: &VerifiedRegistry, source: &str) -> Result<Vec<SourcedVex>, CliError> {
-    let verify_error = |error| RegistryError::Verify {
-        name: source.to_owned(),
-        source: Box::new(error),
-    };
+/// The registry's VEX statements about installed packages that were
+/// installed from it (see the module docs). Its VEX documents are read
+/// only when some package was.
+fn registry_vex(
+    verified: &VerifiedRegistry,
+    entry: &RegistryEntry,
+    inventory: &[Inventoried],
+) -> Result<Vec<SourcedVex>, CliError> {
+    let from_here = installed_from(inventory, entry);
+    if from_here.is_empty() {
+        return Ok(Vec::new());
+    }
+    let documents = verified
+        .vex_documents()
+        .map_err(|error| RegistryError::Verify {
+            name: entry.name.to_string(),
+            source: Box::new(error),
+        })?;
     let mut statements = Vec::new();
-    for document in verified.vex_documents().map_err(verify_error)? {
+    for document in documents {
         for statement in document.statements {
-            let Ok(name) = PackageName::new(statement.package.as_str()) else {
-                continue;
-            };
-            if verified.package(&name).map_err(verify_error)?.is_some() {
+            if from_here.contains(statement.package.as_str()) {
                 statements.push(SourcedVex {
-                    source: source.to_owned(),
+                    source: entry.name.to_string(),
                     path: document.path.clone(),
                     statement,
                 });
@@ -211,6 +233,20 @@ fn registry_vex(verified: &VerifiedRegistry, source: &str) -> Result<Vec<Sourced
         }
     }
     Ok(statements)
+}
+
+/// The names of the installed packages whose recorded origin is `entry`:
+/// the same registry name and pinned root.
+fn installed_from<'a>(inventory: &'a [Inventoried], entry: &RegistryEntry) -> BTreeSet<&'a str> {
+    inventory
+        .iter()
+        .filter(|item| {
+            item.package.origin.as_ref().is_some_and(|origin| {
+                origin.registry == entry.name && origin.root_blake3 == entry.root_blake3
+            })
+        })
+        .map(|item| item.package.name.as_str())
+        .collect()
 }
 
 /// Every `crates/<crate>/*.md` advisory in a RustSec database checkout.
@@ -416,7 +452,7 @@ mod tests {
     use super::*;
     use fox_core::{Blake3Digest, KeyId, Manifest, PackageName, Profile};
     use fox_sbom::{BuildInfo, BuildSbom, CrateDependency, CrateSource, read_build_sbom};
-    use fox_store::{InstalledPackage, MetadataKind, PackageState};
+    use fox_store::{InstalledPackage, MetadataKind, Origin, PackageState};
 
     fn rustsec(id: &str, krate: &str, patched: &str, extra: &str) -> String {
         format!(
@@ -469,6 +505,7 @@ mod tests {
                 signer_label: "ci".to_owned(),
                 metadata: MetadataKind::Embedded,
                 state: PackageState::Installed,
+                origin: None,
                 files: Vec::new(),
             },
             build_sbom: Some(read_build_sbom(&json).unwrap()),
@@ -506,7 +543,7 @@ mod tests {
         }
         fs::write(db.path().join("crates/smallcrate/README.txt"), "skipped").unwrap();
         let root = tempfile::tempdir().unwrap();
-        let sources = load(root.path(), Some(db.path())).unwrap();
+        let sources = load(root.path(), Some(db.path()), Some(&[])).unwrap();
         let advisories = sources.advisories;
         // The withdrawn advisory is dropped.
         assert_eq!(advisories.len(), 2);
@@ -626,5 +663,37 @@ mod tests {
         assert_eq!(report.unchecked, ["app 2024.1"]);
         let report = check(&[inventoried("app", "1.0.0", &[])], &advisories, &[]);
         assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn vex_applies_only_to_packages_installed_from_the_registry() {
+        let entry = RegistryEntry {
+            name: PackageName::new("ferric").unwrap(),
+            git: "https://example.com/registry.git".parse().unwrap(),
+            root_blake3: Blake3Digest::of(b"root"),
+        };
+        let package = |name: &str, registry: &str, root: &[u8]| {
+            let mut item = inventoried(name, "1.0.0", &[]);
+            item.package.origin = Some(Origin {
+                registry: PackageName::new(registry).unwrap(),
+                root_blake3: Blake3Digest::of(root),
+            });
+            item
+        };
+        let mut local = inventoried("local", "1.0.0", &[]);
+        local.package.origin = None;
+        let inventory = [
+            package("ours", "ferric", b"root"),
+            package("theirs", "other", b"root"),
+            // A different registry later configured under the same name.
+            package("renamed", "ferric", b"another root"),
+            local,
+        ];
+        assert_eq!(
+            installed_from(&inventory, &entry)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["ours"]
+        );
     }
 }

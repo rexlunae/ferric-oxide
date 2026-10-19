@@ -509,11 +509,12 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         }
         let args = want.source_args(&base);
         let target = want.target(name, request, locked);
-        let (pending, registry) = commands::prepare(&root, &target, &args, &policy)?;
+        let (pending, origin) = commands::prepare(&root, &target, &args, &policy)?;
         let keys = commands::trusted_keys_for(cli, &root)?;
         let archive = commands::open_pending(pending, &keys)?;
+        let registry = origin.as_ref().map(|origin| origin.registry.clone());
         let entry = lock_entry(name, request, &archive, registry, locked)?;
-        commands::install_archive(cli, &store, &archive, InstallOptions::default())?;
+        commands::install_archive(cli, &store, &archive, InstallOptions::default(), origin)?;
         actions.push(ActionJson {
             name: name.to_string(),
             action: if installed.is_some() {
