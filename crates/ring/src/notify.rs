@@ -24,6 +24,13 @@ use crate::queue::{Consumer, Memory, Producer, RingError, word};
 /// The consumer's flag: it is about to sleep, or sleeping, and must be woken for new entries.
 pub const NEED_WAKEUP: u64 = 1 << 0;
 
+/// Whether an `Enter` waiting for `min_complete` completions may return: the CQ holds that many
+/// the submitter has not taken (`pending`), or no SQE it could be waiting for is still running
+/// (`in_flight`), so waiting longer could only wait for ever.
+pub const fn wait_done(pending: u32, min_complete: u32, in_flight: u32) -> bool {
+    pending >= min_complete || in_flight == 0
+}
+
 /// What a consumer that wants to sleep should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sleep {
@@ -84,6 +91,14 @@ mod tests {
     use super::*;
     use crate::abi::Layout;
     use crate::entry::Sqe;
+
+    #[test]
+    fn a_wait_ends_with_enough_completions_or_nothing_running() {
+        assert!(wait_done(3, 3, 5));
+        assert!(!wait_done(2, 3, 5));
+        assert!(wait_done(2, 3, 0));
+        assert!(wait_done(0, 0, 9));
+    }
 
     #[test]
     fn a_sleeping_consumer_asks_for_a_wakeup() {

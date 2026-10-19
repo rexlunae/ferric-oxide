@@ -4,7 +4,7 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/luks", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/fox"]
+default-members = ["crates/amdvi", "crates/blkgrant", "crates/cet", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iommu", "crates/luks", "crates/nospec", "crates/regbuf", "crates/ring", "crates/trace", "crates/vtd", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/fox", "tools/fox-registry"]
 members = [
     "crates/amdvi",
     "crates/blkgrant",
@@ -13,6 +13,7 @@ members = [
     "crates/fox-build",
     "crates/fox-core",
     "crates/fox-git",
+    "crates/fox-index",
     "crates/fox-sbom",
     "crates/fox-store",
     "crates/hwrand",
@@ -27,6 +28,7 @@ members = [
     "tools/cookbook",
     "tools/ferric-config",
     "tools/fox",
+    "tools/fox-registry",
     "tools/installer",
     "tools/redoxer",
 ]
@@ -64,6 +66,8 @@ toml = { version = "1", default-features = false }
 # Release-tag signatures for fox: OpenSSH Ed25519 keys and SSHSIG.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 semver = "1.0.27"
+# RFC 3339 times in build records and registry metadata.
+time = { version = "0.3.44", default-features = false, features = ["std"] }
 
 [profile.release.package.ferric-config]
 opt-level = 2

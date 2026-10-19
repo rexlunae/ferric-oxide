@@ -85,6 +85,11 @@ impl WaitCondition {
                 {
                     return false;
                 }
+                // Ferric Oxide: a cancelled context (a ring worker whose ring closed) waits no
+                // more, as if a signal were pending.
+                if context.cancelled {
+                    return false;
+                }
                 context.upgrade().block(reason);
             }
 

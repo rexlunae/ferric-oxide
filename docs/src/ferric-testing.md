@@ -45,9 +45,28 @@ a baseline or disabling a check.
 
 Package coverage is in `crates/fox-core/tests/archive.rs`,
 `crates/fox-store/tests/store.rs`, `tools/fox/tests/cli.rs`,
-`tools/fox/tests/git_sources.rs`, `crates/fox-git/tests/repo.rs`,
-`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs` and
-`tools/cargo-fox/tests/cli.rs`. Tests construct real signed pkgar fixtures
+`tools/fox/tests/git_sources.rs`, `tools/fox/tests/registry.rs`, `crates/fox-git/tests/repo.rs`,
+`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs`,
+`tools/cargo-fox/tests/cli.rs`, `crates/fox-index/tests/registry.rs` and
+`tools/fox-registry/tests/cli.rs`. The registry tests sign metadata with
+fixed-seed keys and attack it: rollback, expiry, a changed file, a delegation
+claiming another path, and a key rotation signed by the new keys only.
+`tools/fox/tests/registry.rs` installs by name from a local registry: from
+the owner-signed tag, from a prebuilt artifact with too few and then enough
+builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
+and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
+registry builder, unlisted and then listed in `registry.toml`, and publishes
+an advisory. `fox sync` is tested end to end with a registry package (installed,
+locked, unchanged under `--locked`, removed when the set drops it, kept when
+it was replaced by hand, and a refused `--locked` sync leaving the registries
+and policy untouched) and a git package pinned to its commit (a moved tag
+fails until `--update`); unit tests check that changing `rev`, features,
+`default-features`, target, `path` or `package` invalidates a pin and that
+local git sources lock by their canonical `file://` URL.
+`fox audit` is tested end to end against a registry advisory
+(including the install warning and a changed SBOM), and in unit tests
+against a RustSec-layout directory of advisories for crates inside build
+SBOMs, with withdrawn, build-only and non-semver cases. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no
@@ -112,7 +131,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
-| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsync` through a ring, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 

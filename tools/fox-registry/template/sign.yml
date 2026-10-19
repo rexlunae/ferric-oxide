@@ -1,0 +1,55 @@
+# After a merge: build releases that have no artifact from this builder yet,
+# upload the blobs to the `blake3` release, then sign targets, snapshot and
+# timestamp and push the result.
+name: sign
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sign
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fox-registry
+        run: cargo install --locked --git https://github.com/rexlunae/ferric-oxide fox-registry
+      - name: Write keys
+        env:
+          TARGETS_KEY: ${{ secrets.TARGETS_KEY }}
+          SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+          TIMESTAMP_KEY: ${{ secrets.TIMESTAMP_KEY }}
+          BUILDER_KEY: ${{ secrets.BUILDER_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          umask 077
+          printf '%s' "$TARGETS_KEY" > "$RUNNER_TEMP/keys/targets.key"
+          printf '%s' "$SNAPSHOT_KEY" > "$RUNNER_TEMP/keys/snapshot.key"
+          printf '%s' "$TIMESTAMP_KEY" > "$RUNNER_TEMP/keys/timestamp.key"
+          printf '%s' "$BUILDER_KEY" > "$RUNNER_TEMP/keys/builder.key"
+      - name: Build missing artifacts
+        run: |
+          fox-registry build --key "$RUNNER_TEMP/keys/builder.key" --label ci \
+            --blobs "$RUNNER_TEMP/blobs"
+      - name: Upload blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -d "$RUNNER_TEMP/blobs/blake3" ]; then
+            gh release view blake3 >/dev/null 2>&1 || gh release create blake3 --title blake3 --notes "Content-addressed artifact store"
+            gh release upload blake3 --clobber "$RUNNER_TEMP"/blobs/blake3/*
+          fi
+      - name: Sign
+        run: |
+          k="$RUNNER_TEMP/keys"
+          fox-registry sign --complete --key "$k/targets.key" --key "$k/snapshot.key" --key "$k/timestamp.key"
+          fox-registry verify
+      - name: Push
+        run: |
+          git config user.name "registry CI"
+          git config user.email "registry-ci@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "Sign metadata"; git push; }
