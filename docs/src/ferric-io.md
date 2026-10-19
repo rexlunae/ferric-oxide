@@ -277,7 +277,7 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   (`QueuePolicy::serves_concurrently`). Each request is checked and located
   at once, and becomes a `driver_block::PendingIo`: the request together with
   what it needs to answer itself, from any thread. The disk can take it with
-  `Disk::submit`. nvmed hands it to a worker, which runs it on its own queue
+  `Disk::submit`. nvmed hands it to a worker (#134), which runs it on its own queue
   pair and writes the scheme's response itself, so the reply skips the main
   thread (no completion pipe, no main-thread wake-up). Otherwise it runs as a
   task on the scheme's thread, on a clone of the disk. A `PendingIo` dropped
