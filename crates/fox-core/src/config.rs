@@ -129,16 +129,27 @@ pub const STAGING_SUFFIX: &str = ".new";
 pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
     temp.push(STAGING_SUFFIX);
-    let temp = PathBuf::from(temp);
-    let result = fs::File::create(&temp)
+    replace_file_via(path, bytes, Path::new(&temp))
+}
+
+/// Replaces `path` with `bytes` atomically as [`replace_file`] does, but
+/// stages the bytes in `temp`, which must be on the same file system (so
+/// the rename is atomic) and whose directory must exist. Use it to keep
+/// temporary files out of a directory whose every file is significant.
+///
+/// # Errors
+///
+/// The I/O error of the step that failed.
+pub fn replace_file_via(path: &Path, bytes: &[u8], temp: &Path) -> std::io::Result<()> {
+    let result = fs::File::create(temp)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()
         })
-        .and_then(|()| fs::rename(&temp, path));
+        .and_then(|()| fs::rename(temp, path));
     if result.is_err() {
         // Best effort: the error that matters is the one returned.
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(temp);
     }
     result
 }

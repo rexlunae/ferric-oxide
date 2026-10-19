@@ -31,7 +31,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fox_core::config::STAGING_SUFFIX;
 use fox_core::{KeyId, PackageName};
 use semver::Version;
 use serde::Serialize;
@@ -51,6 +50,12 @@ use crate::verify::{
     check_path,
 };
 use crate::vex::{VexFileError, parse_vex, vex_path};
+
+/// Where [`write_file`] stages its temporary files, at the top of the
+/// registry and outside every signed directory. It exists only while a
+/// write is in progress or after one was interrupted, and [`Registry::open`]
+/// clears it.
+const STAGING_DIR: &str = ".fox-staging";
 
 /// How long each kind of metadata stays valid, in days.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +373,7 @@ impl Registry {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
         })?;
-        write_file(&dir.join(REGISTRY_FILE), text.as_bytes())?;
+        write_file(dir, REGISTRY_FILE, text.as_bytes())?;
         for sub in [
             PACKAGES_DIR,
             ARTIFACTS_DIR,
@@ -417,7 +422,8 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Opens the registry in `dir`.
+    /// Opens the registry in `dir`, removing the temporary files of any
+    /// write that was interrupted.
     ///
     /// # Errors
     ///
@@ -431,6 +437,7 @@ impl Registry {
                 path: dir.to_path_buf(),
             });
         }
+        clear_staging(dir)?;
         while dir.join(root_file(version + 1)).is_file() {
             version += 1;
         }
@@ -510,7 +517,7 @@ impl Registry {
             path: REGISTRY_FILE.to_owned(),
             source: Box::new(source),
         })?;
-        write_file(&self.dir.join(REGISTRY_FILE), text.as_bytes())
+        write_file(&self.dir, REGISTRY_FILE, text.as_bytes())
     }
 
     /// The package file of `name`, if there is one.
@@ -541,7 +548,7 @@ impl Registry {
     /// if it cannot be written.
     pub fn write_package(&self, entry: &PackageEntry) -> Result<(), EditError> {
         let (path, text) = package_text(entry)?;
-        write_file(&self.dir.join(path), text.as_bytes())
+        write_file(&self.dir, path, text.as_bytes())
     }
 
     /// Adds a package: writes its file and delegates that file to its
@@ -623,11 +630,11 @@ impl Registry {
             .iter()
             .try_for_each(|(path, text)| {
                 let full = self.dir.join(path);
-                write_file(&full, text.as_bytes())?;
+                write_file(&self.dir, path, text.as_bytes())?;
                 written.push(full);
                 Ok(())
             })
-            .and_then(|()| write_file(&self.dir.join(&file), &bytes));
+            .and_then(|()| write_file(&self.dir, &file, &bytes));
         if let Err(error) = result {
             for path in &written {
                 remove_new_file(path);
@@ -723,7 +730,7 @@ impl Registry {
             path: path.clone(),
             source: Box::new(source),
         })?;
-        write_file(&self.dir.join(&path), text.as_bytes())
+        write_file(&self.dir, &path, text.as_bytes())
     }
 
     /// Writes an advisory to `advisories/<id>.toml`, replacing one with
@@ -737,7 +744,7 @@ impl Registry {
         let advisory_error = |source| EditError::Advisory(Box::new(source));
         let path = advisory_path(&advisory.advisory.id).map_err(advisory_error)?;
         let text = advisory.to_toml().map_err(advisory_error)?;
-        write_file(&self.dir.join(path), text.as_bytes())
+        write_file(&self.dir, path, text.as_bytes())
     }
 
     /// Writes VEX document `id` to `vex/<id>.cdx.json`, replacing one with
@@ -752,7 +759,7 @@ impl Registry {
         let vex_error = |source| EditError::Vex(Box::new(source));
         let path = vex_path(id).map_err(vex_error)?;
         parse_vex(json).map_err(vex_error)?;
-        write_file(&self.dir.join(&path), json)?;
+        write_file(&self.dir, &path, json)?;
         Ok(path)
     }
 
@@ -888,7 +895,7 @@ impl Registry {
                 targets.targets = wanted;
                 targets.delegations.clear();
             })?;
-            write_file(&self.dir.join(metadata_file(&name)), &bytes)?;
+            write_file(&self.dir, metadata_file(&name), &bytes)?;
             snapshot_meta.insert(name, version_meta(metadata.signed.version, &bytes));
             report.files.push(signed);
         }
@@ -904,7 +911,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.targets, TARGETS_FILE, |targets| {
             targets.targets = wanted;
         })?;
-        write_file(&self.dir.join(metadata_file(TARGETS_FILE)), &bytes)?;
+        write_file(&self.dir, metadata_file(TARGETS_FILE), &bytes)?;
         snapshot_meta.insert(
             TARGETS_FILE.to_owned(),
             version_meta(self.targets.signed.version, &bytes),
@@ -921,7 +928,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.snapshot, SNAPSHOT_FILE, |snapshot| {
             snapshot.meta = snapshot_meta;
         })?;
-        write_file(&self.dir.join(SNAPSHOT_FILE), &bytes)?;
+        write_file(&self.dir, SNAPSHOT_FILE, &bytes)?;
         let snapshot_meta = version_meta(self.snapshot.signed.version, &bytes);
         report.files.push(signed);
 
@@ -935,7 +942,7 @@ impl Registry {
         let (signed, bytes) = step.apply(&mut self.timestamp, TIMESTAMP_FILE, |timestamp| {
             timestamp.snapshot = snapshot_meta;
         })?;
-        write_file(&self.dir.join(TIMESTAMP_FILE), &bytes)?;
+        write_file(&self.dir, TIMESTAMP_FILE, &bytes)?;
         report.files.push(signed);
         Ok(report)
     }
@@ -1012,7 +1019,7 @@ impl Registry {
             file: file.clone(),
             source,
         })?;
-        write_file(&self.dir.join(file), &bytes)
+        write_file(&self.dir, file, &bytes)
     }
 
     /// Every file under the signed directories that no delegation covers.
@@ -1205,10 +1212,6 @@ fn load<T: for<'de> serde::Deserialize<'de>>(
 }
 
 /// Collects the regular files under `dir`, as paths relative to `base`.
-///
-/// A file ending in [`STAGING_SUFFIX`] is the temporary file of a
-/// [`write_file`] that was interrupted, never a target (no target name
-/// ends in it), so it is removed instead of being signed.
 fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) -> Result<(), EditError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1232,18 +1235,6 @@ fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) -> Result<(), EditErro
         })?;
         if kind.is_dir() {
             walk(base, &path, found)?;
-            continue;
-        }
-        if kind.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(STAGING_SUFFIX))
-        {
-            fs::remove_file(&path).map_err(|source| EditError::Io {
-                path: path.clone(),
-                source,
-            })?;
             continue;
         }
         let relative = path
@@ -1302,15 +1293,44 @@ fn remove_new_file(path: &Path) {
     }
 }
 
-/// Writes `bytes` to `path` through a temporary file and a rename, so a
-/// failed write (a full disk, say) leaves the old file whole instead of
-/// truncated, and a batch that fails part-way can be retried.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
+/// Writes `bytes` to `relative` under the registry `dir` through a
+/// temporary file and a rename, so a failed write (a full disk, say)
+/// leaves the old file whole instead of truncated, and a batch that fails
+/// part-way can be retried.
+///
+/// The temporary file is in [`STAGING_DIR`], never beside the file: every
+/// file in the signed directories is a target, so a write interrupted
+/// there would leave a stray file that the next signing signs.
+fn write_file(dir: &Path, relative: impl AsRef<Path>, bytes: &[u8]) -> Result<(), EditError> {
+    let relative = relative.as_ref();
+    let path = dir.join(relative);
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
-    fox_core::config::replace_file(path, bytes).map_err(|source| EditError::Io {
-        path: path.to_path_buf(),
+    let staging = dir.join(STAGING_DIR);
+    create_dir(&staging)?;
+    // One flat name per target, so no subdirectories are needed.
+    let temp = staging.join(relative.to_string_lossy().replace('/', "%"));
+    fox_core::config::replace_file_via(&path, bytes, &temp).map_err(|source| EditError::Io {
+        path: path.clone(),
         source,
-    })
+    })?;
+    // Leave no empty directory behind; it is still in use if not empty.
+    let _ = fs::remove_dir(&staging);
+    Ok(())
+}
+
+/// Removes what interrupted writes left in [`STAGING_DIR`]. Only
+/// [`write_file`] writes there, and each write finishes or removes its own
+/// file, so anything still there belongs to a write that was killed.
+fn clear_staging(dir: &Path) -> Result<(), EditError> {
+    let staging = dir.join(STAGING_DIR);
+    match fs::remove_dir_all(&staging) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(EditError::Io {
+            path: staging,
+            source,
+        }),
+    }
 }

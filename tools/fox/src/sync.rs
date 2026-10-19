@@ -51,7 +51,7 @@ use fox_core::config::ConfigError;
 use fox_core::policy::{POLICY_FILE, Policy};
 use fox_core::registries::{Registries, RegistryEntry};
 use fox_core::{Blake3Digest, GitUrl, PackageName};
-use fox_store::{InstallOptions, Store};
+use fox_store::{InstallOptions, Origin, Store};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
@@ -253,6 +253,49 @@ pub(crate) struct Locked {
     pub(crate) target: String,
     /// The archive installed.
     pub(crate) pkgar_blake3: Blake3Digest,
+}
+
+/// The origin to record for a locked package that is installed but has
+/// none (it was installed before the store kept origins): the registry
+/// the lock names, when that registry is configured and its verified
+/// index lists the locked release and, among that release's artifacts,
+/// the locked archive. `None` otherwise, including for an archive built
+/// from source, which no registry lists; reinstalling it records one.
+/// A registry that cannot be read is warned about and gives no origin,
+/// since the package itself is unchanged.
+fn locked_origin(root: &Path, policy: &Policy, locked: &Locked) -> Option<Origin> {
+    let registry = locked.registry.as_ref()?;
+    let version = locked.version.parse::<Version>().ok()?;
+    let registries = Registries::load(root).ok()?;
+    let entry = registries.get(registry.as_str())?;
+    let warn = |error: &dyn std::error::Error| {
+        eprintln!(
+            "fox: warning: not recording {} as from {registry}: {}",
+            locked.name,
+            commands::chain(error)
+        );
+    };
+    let verified = crate::registry::open(root, entry, policy, time::OffsetDateTime::now_utc())
+        .map_err(|error| warn(&error))
+        .ok()?;
+    let released = verified
+        .package(&locked.name)
+        .map_err(|error| warn(&error))
+        .ok()?
+        .is_some_and(|package| package.releases.iter().any(|r| r.version == version));
+    let listed = verified
+        .artifacts(&locked.name, &version)
+        .map_err(|error| warn(&error))
+        .ok()?
+        .is_some_and(|list| {
+            list.artifacts
+                .iter()
+                .any(|artifact| artifact.pkgar_blake3 == locked.pkgar_blake3)
+        });
+    (released && listed).then(|| Origin {
+        registry: entry.name.clone(),
+        root_blake3: entry.root_blake3,
+    })
 }
 
 /// A want's normalized build request.
@@ -499,6 +542,11 @@ pub(crate) fn run(cli: &Cli, options: &SyncOptions<'_>) -> Result<ExitCode, CliE
         if let (Some(locked), Some(installed)) = (locked, &installed)
             && installed.archive_blake3 == Some(locked.pkgar_blake3)
         {
+            if installed.origin.is_none()
+                && let Some(origin) = locked_origin(&root, &policy, locked)
+            {
+                store.restore_origin(name, locked.pkgar_blake3, origin)?;
+            }
             lock.packages.push(locked.clone());
             actions.push(ActionJson {
                 name: name.to_string(),

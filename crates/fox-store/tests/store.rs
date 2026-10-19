@@ -219,11 +219,49 @@ fn records_the_registry_a_package_came_from_until_it_is_replaced() {
         .unwrap();
     assert_eq!(
         env.store.get(&name("hello")).unwrap().unwrap().origin,
-        Some(origin)
+        Some(origin.clone())
     );
     // An archive from anywhere else is not that registry's package.
     env.install(&v2, false).unwrap();
     assert_eq!(env.store.get(&name("hello")).unwrap().unwrap().origin, None);
+
+    // An origin is restored only for the archive that is installed, and
+    // never over one already recorded.
+    let v2_blake3 = env
+        .store
+        .get(&name("hello"))
+        .unwrap()
+        .unwrap()
+        .archive_blake3
+        .unwrap();
+    let other = Origin {
+        registry: name("other"),
+        ..origin.clone()
+    };
+    assert!(
+        !env.store
+            .restore_origin(&name("hello"), Blake3Digest::of(b"v1"), origin.clone())
+            .unwrap()
+    );
+    assert!(
+        !env.store
+            .restore_origin(&name("absent"), v2_blake3, origin.clone())
+            .unwrap()
+    );
+    assert!(
+        env.store
+            .restore_origin(&name("hello"), v2_blake3, origin.clone())
+            .unwrap()
+    );
+    assert!(
+        !env.store
+            .restore_origin(&name("hello"), v2_blake3, other)
+            .unwrap()
+    );
+    assert_eq!(
+        env.store.get(&name("hello")).unwrap().unwrap().origin,
+        Some(origin)
+    );
 }
 
 #[test]

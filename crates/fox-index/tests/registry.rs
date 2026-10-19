@@ -879,10 +879,11 @@ fn a_failed_batch_leaves_nothing_behind() {
     );
 
     // A failed write of the targets metadata itself (here its temporary
-    // file cannot be created) leaves the old targets whole, not truncated.
+    // file, staged outside the signed directories, cannot be created)
+    // leaves the old targets whole, not truncated.
     fs::remove_file(dir.path().join("packages/ba")).unwrap();
-    let blocker = dir.path().join("metadata/targets.json.new");
-    fs::create_dir(&blocker).unwrap();
+    let blocker = dir.path().join(".fox-staging/metadata%targets.json");
+    fs::create_dir_all(&blocker).unwrap();
     assert!(matches!(
         registry.admit_all(&[other("fd"), other("bat")]),
         Err(EditError::Io { .. })
@@ -900,9 +901,15 @@ fn a_failed_batch_leaves_nothing_behind() {
     assert!(!blocker.exists());
 
     // The temporary file of a write that was killed before its rename is
-    // not signed as a target: the next signing removes it.
-    let leftover = fd.with_file_name("fd.toml.new");
+    // in the staging directory, which opening the registry clears; a file
+    // in a signed directory is a target whatever its name.
+    let leftover = dir.path().join(".fox-staging/packages%fd%fd.toml");
+    fs::create_dir_all(leftover.parent().unwrap()).unwrap();
     fs::write(&leftover, "half written").unwrap();
+    let named_new = dir.path().join("advisories/notes.new");
+    fs::write(&named_new, "kept").unwrap();
+    let mut registry = Registry::open(dir.path()).unwrap();
+    assert!(!dir.path().join(".fox-staging").exists());
     let report = registry
         .sign(
             &keyring(&[MAINTAINER, OWNER]),
@@ -911,11 +918,10 @@ fn a_failed_batch_leaves_nothing_behind() {
         )
         .unwrap();
     assert!(report.complete(), "{report:?}");
-    assert!(!leftover.exists());
-    for file in ["metadata/targets.json", "metadata/snapshot.json"] {
-        let text = fs::read_to_string(dir.path().join(file)).unwrap();
-        assert!(!text.contains(".new"), "{file}");
-    }
+    assert!(named_new.exists());
+    assert!(!dir.path().join(".fox-staging").exists());
+    let targets = fs::read_to_string(dir.path().join("metadata/targets.json")).unwrap();
+    assert!(targets.contains("advisories/notes.new"));
 }
 
 #[test]
