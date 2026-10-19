@@ -391,6 +391,52 @@ impl Msix {
         Ok(vectors)
     }
 
+    /// Ferric Oxide: steers MSI-X table entry `index` to logical CPU `cpu` (root only), keeping
+    /// its `irq:` handles: the kernel moves the vector and re-keys every handle for it.
+    ///
+    /// When the kernel does not remap the device's interrupts, the entry is masked, given pcid's
+    /// message for the new vector and unmasked again. The [`InterruptVector::cpu`] that
+    /// [`Self::alloc_on`] returned for the entry is not updated; this call returns the new CPU's
+    /// result instead.
+    ///
+    /// # Errors
+    ///
+    /// [`VectorError::NoEntry`] when `index` has no vector, [`VectorError::UnknownCpu`] when
+    /// `cpu` is not online or the kernel has no per-CPU delivery, [`VectorError::Move`] when
+    /// the kernel refuses, and [`VectorError::NoMessage`] when pcid has no message for the new
+    /// vector (the entry then stays masked).
+    pub fn retarget(
+        &mut self,
+        index: u16,
+        cpu: CpuId,
+    ) -> Result<ferric_irq::call::Moved, VectorError> {
+        if !self
+            .cpus()
+            .is_some_and(|cpus| cpus.iter().any(|entry| entry.cpu == cpu))
+        {
+            return Err(VectorError::UnknownCpu { cpu });
+        }
+        let (handle, held) = self
+            .handles
+            .get_mut(usize::from(index))
+            .ok_or(VectorError::NoEntry { index })?;
+        let moved = percpu::move_vector(handle, cpu)?;
+        *held = cpu;
+        if moved.remapped == 0 {
+            // The message names the CPU and vector itself, so it is the driver's to rewrite.
+            let vector = moved.irq.get() + 32;
+            let entry = self.mapped.table_entry_pointer(usize::from(index));
+            entry.mask();
+            let message = self
+                .channel
+                .msi_message(cpu.get() as usize, vector)
+                .ok_or(VectorError::NoMessage { cpu, vector })?;
+            entry.write_addr_and_data(message);
+            entry.unmask();
+        }
+        Ok(moved)
+    }
+
     /// Ferric Oxide: masks the table entries from `first` on and gives them back, closing the
     /// handles this `Msix` keeps for them, so the next allocation programs `first` again.
     fn release_from(&mut self, first: u16) {
@@ -450,6 +496,15 @@ impl Msix {
         _node: Option<u32>,
     ) -> Result<Vec<InterruptVector>, VectorError> {
         unimplemented!("MSI-X is not implemented on this architecture")
+    }
+
+    /// Ferric Oxide: see the x86 [`Msix::retarget`].
+    pub fn retarget(
+        &mut self,
+        _index: u16,
+        cpu: CpuId,
+    ) -> Result<ferric_irq::call::Moved, VectorError> {
+        Err(VectorError::UnknownCpu { cpu })
     }
 }
 

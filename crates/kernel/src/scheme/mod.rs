@@ -176,6 +176,12 @@ impl<T> HandleMap<T> {
     fn iter(&self) -> hash_map::Iter<'_, usize, T> {
         self.handles.iter()
     }
+
+    // Ferric Oxide: for the irq scheme, which re-keys every handle of a vector it steers.
+    #[allow(dead_code)]
+    fn iter_mut(&mut self) -> hash_map::IterMut<'_, usize, T> {
+        self.handles.iter_mut()
+    }
 }
 
 enum Handle {

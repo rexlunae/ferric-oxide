@@ -413,7 +413,8 @@ so a vector reserved on one CPU (irq:cpu-XX/N) is a different interrupt from
 the same vector number on another, and each CPU counts its interrupts without
 a shared lock. Adds the root-only irq:cpus file, which maps each running
 logical CPU to its APIC id and NUMA node, and lists CPUs under irq: by logical
-id. The groundwork for per-core NVMe and NIC queues. Off by default; without
+id. Root can move a reserved vector to another CPU with the irq: handle's
+Move call. The groundwork for per-core NVMe and NIC queues. Off by default; without
 it, irq: counts interrupts by vector number alone, as upstream."""
 
 [[option]]

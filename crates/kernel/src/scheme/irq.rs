@@ -29,8 +29,10 @@ use crate::{
     syscall::{
         data::Stat,
         error::*,
-        flag::{EventFlags, EVENT_READ, MODE_CHR, MODE_DIR, O_CREAT, O_DIRECTORY, O_STAT},
-        usercopy::{UserSliceRo, UserSliceWo},
+        flag::{
+            CallFlags, EventFlags, EVENT_READ, MODE_CHR, MODE_DIR, O_CREAT, O_DIRECTORY, O_STAT,
+        },
+        usercopy::{UserSliceRo, UserSliceRw, UserSliceWo},
     },
 };
 
@@ -379,6 +381,151 @@ fn cpus_file() -> Vec<u8> {
     text.into_bytes()
 }
 
+/// Ferric Oxide (`irq-percpu`, roadmap Phase 2.4 PR 3): steers the vector of handle `id` to
+/// logical CPU `to`, as [`ferric_irq::call::Call::Move`] describes.
+///
+/// The steps keep every interrupt accounted for:
+///
+/// 1. A free vector is reserved on `to`, so the move cannot fail for want of one later.
+/// 2. Every interrupt remapping entry that delivered the old vector to the old CPU is rewritten
+///    to deliver the new one ([`crate::arch::iommu::interrupt::move_vector`]); the device's
+///    message stays as it is. The old vector stays reserved meanwhile, so what the unit had
+///    already sent the old way is still counted on the old CPU's row.
+/// 3. Every handle of the old (CPU, vector) is re-keyed to the new one, with an interrupt
+///    pending, so whatever arrived on the old vector during the move wakes its reader (at worst
+///    one spurious wakeup). Then the old vector is given back.
+///
+/// Without remapping entries for the vector (`Moved::remapped` is 0), only the reservation and
+/// the handles move: the device still sends the old vector until its driver programs the new
+/// message, which only the owner can do, so a handle that reserved nothing is refused then.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn steer(
+    id: usize,
+    to: LogicalCpuId,
+    token: &mut CleanLockToken,
+) -> Result<ferric_irq::call::Moved> {
+    let (from, irq, owns) = {
+        let handles = HANDLES.read(token.token());
+        let Handle::Irq {
+            irq,
+            cpu,
+            reservation,
+            ..
+        } = *handles.get(id)?
+        else {
+            return Err(Error::new(EBADF));
+        };
+        // The vector must be one an `irq:` handle reserved: not a legacy IRQ, not the kernel's.
+        let reserved = handles.iter().any(|(_, handle)| {
+            matches!(handle, Handle::Irq { cpu: c, irq: i, reservation: Some(_), .. }
+                if *c == cpu && *i == irq)
+        });
+        if !reserved || (cpu == LogicalCpuId::BSP && irq < BASE_IRQ_COUNT) {
+            return Err(Error::new(EINVAL));
+        }
+        (cpu, irq, reservation.is_some())
+    };
+    if to == from {
+        return Err(Error::new(EINVAL));
+    }
+    if crate::percpu::get_percpu_block(to).is_none() {
+        return Err(Error::new(ENOENT));
+    }
+    let from_vector = irq_to_vector(irq);
+    // IRQs 16 and up, as drivers reserve them; 0x80 stays the kernel's, as for AllocIrte.
+    let to_vector = available_irqs_iter(to)
+        .find(|&vector| vector >= irq_to_vector(BASE_IRQ_COUNT) && vector != 0x80)
+        .ok_or(Error::new(EEXIST))?;
+    set_reserved(to, to_vector, true);
+    let remapped = match remap(from, from_vector, to, to_vector) {
+        Ok(0) if !owns => Err(Error::new(EOPNOTSUPP)),
+        result => result,
+    };
+    let remapped = match remapped {
+        Ok(remapped) => remapped,
+        Err(err) => {
+            set_reserved(to, to_vector, false);
+            return Err(err);
+        }
+    };
+    let new_irq = vector_to_irq(to_vector);
+    let (fds, moved_reservation) = {
+        let mut handles = HANDLES.write(token.token());
+        let pending = interrupt_count(to, new_irq).wrapping_sub(1);
+        let mut fds: SmallVec<[usize; 4]> = SmallVec::new();
+        let mut moved_reservation = false;
+        for (&fd, handle) in handles.iter_mut() {
+            let Handle::Irq {
+                ack,
+                irq: handle_irq,
+                cpu,
+                reservation,
+            } = handle
+            else {
+                continue;
+            };
+            if *cpu != from || *handle_irq != irq {
+                continue;
+            }
+            *cpu = to;
+            *handle_irq = new_irq;
+            ack.store(pending, Ordering::SeqCst);
+            if let Some(reservation) = reservation {
+                *reservation = IrqReservation {
+                    cpu_id: to,
+                    index: to_vector,
+                };
+                moved_reservation = true;
+            }
+            fds.push(fd);
+        }
+        (fds, moved_reservation)
+    };
+    if moved_reservation {
+        set_reserved(from, from_vector, false);
+    } else {
+        // The owner closed its handle meanwhile, which gave the old vector back already.
+        set_reserved(to, to_vector, false);
+    }
+    for fd in fds {
+        event::trigger(GlobalSchemes::Irq.scheme_id(), fd, EVENT_READ, token);
+    }
+    ferric_irq::Irq::new(new_irq)
+        .map(|irq| ferric_irq::call::Moved { irq, remapped })
+        .ok_or(Error::new(EIO))
+}
+
+/// Ferric Oxide: has the IOMMU move the interrupt remapping entries of `from_vector` on `from`
+/// to `to_vector` on `to`, and returns how many moved; 0 without IOMMU support.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -> Result<u32> {
+    #[cfg(iommu_enabled)]
+    {
+        use crate::arch::iommu::interrupt::{move_vector, IrqError};
+        move_vector(from.get(), from_vector, to.get(), to_vector).map_err(|err| {
+            warn!(
+                "irq: cannot move vector {from_vector:#x} from CPU {} to CPU {}: {err}",
+                from.get(),
+                to.get()
+            );
+            if matches!(err, IrqError::Hardware(_)) {
+                // Best effort: point the entries back where the old vector is still reserved.
+                let _ = move_vector(to.get(), to_vector, from.get(), from_vector);
+            }
+            Error::new(match err {
+                IrqError::Hardware(_) => EIO,
+                IrqError::NoCpu { .. } => ENOENT,
+                _ => EINVAL,
+            })
+        })
+    }
+    #[cfg(not(iommu_enabled))]
+    {
+        let _ = (from, from_vector, to, to_vector);
+        Ok(0)
+    }
+}
+
 const fn irq_to_vector(irq: u8) -> u8 {
     irq + 32
 }
@@ -587,6 +734,34 @@ impl crate::scheme::KernelScheme for IrqScheme {
             _ => return Err(Error::new(ENOTDIR)),
         }
         Ok(buf.finalize())
+    }
+
+    // Ferric Oxide: `SYS_CALL` on an irq handle (`ferric_irq::call`).
+    fn kcall(
+        &self,
+        fds: &[usize],
+        _payload: UserSliceRw,
+        _flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let [id]: [usize; 1] = fds.try_into().map_err(|_| Error::new(EINVAL))?;
+        #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+        {
+            use ferric_irq::call::Call;
+            match Call::decode(metadata).map_err(|_| Error::new(EINVAL))? {
+                Call::Move { cpu } => {
+                    let moved = steer(id, LogicalCpuId::new(cpu.get()), token)?;
+                    usize::try_from(moved.to_word()).map_err(|_| Error::new(EIO))
+                }
+                _ => Err(Error::new(EINVAL)),
+            }
+        }
+        #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+        {
+            let _ = (id, metadata, token);
+            Err(Error::new(EOPNOTSUPP))
+        }
     }
 
     fn fcntl(

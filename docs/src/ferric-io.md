@@ -143,8 +143,45 @@ Drivers give MSI-X table entries to CPUs through `pcid_interface`:
 Without `irq:cpus` these calls put every vector on the BSP, like upstream's
 `Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
 `percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
-logical id. No driver uses these calls yet; IRQ steering and per-core NVMe
-queues are later steps of roadmap Phase 2.4.
+logical id. No driver uses these calls yet; per-core NVMe queues are a later
+step of roadmap Phase 2.4.
+
+### Steering a vector to another CPU
+
+Root moves a reserved vector to another CPU with a `SYS_CALL` on its `irq:`
+handle: `ferric_irq::call::Call::Move { cpu }` (metadata `[1, cpu]`). The
+kernel:
+
+1. reserves a free vector (48 or above, not 0x80) on the target CPU;
+2. with interrupt remapping (VT-d), rewrites every remapping entry that
+   delivered the old vector to the old CPU: one 64-bit store of the entry's
+   low half (vector and destination; the source-id check in the high half is
+   untouched), then an interrupt entry cache invalidation for each entry;
+3. re-keys every handle of the old (CPU, vector) to the new one, so the
+   caller keeps its descriptor, and gives the old vector back;
+4. reports one interrupt pending on the moved handles, so one that arrived
+   on the old vector during the move is not lost (it may be one spurious
+   wakeup).
+
+The call returns `ferric_irq::call::Moved`: the new IRQ number and how many
+remapping entries moved. When none moved, the device's interrupts are not
+remapped and its MSI or MSI-X message names the CPU and vector itself, so
+the driver must program the message for the new vector.
+`pcid_interface::irq_helpers::Msix::retarget(index, cpu)` does all of this for
+one MSI-X table entry (`percpu::move_vector` is the bare call). A handle
+opened with `O_STAT`, which reserves nothing, can move a vector only when
+remapping entries carry it. Errors: `EINVAL` (a legacy IRQ, an unreserved
+vector, or the same CPU), `ENOENT` (no such CPU), `EEXIST` (no free vector on
+the target), `EOPNOTSUPP` (an `O_STAT` handle without remapping, or a kernel
+without `kernel.irq_percpu`) and `EIO` (an invalidation failed).
+
+pcid remembers the remapping entry it made for each (CPU, vector) a driver
+asked for, to hand it out again. Before it does, it asks the kernel where the
+entry delivers now (`IrteTarget` on its IOMMU capability), and makes a new
+entry when root steered the old one elsewhere. Policy, such as balancing
+vectors across CPUs, is left to user space. `ferric-iommu-test` checks
+steering with `iommu-msi-steer`, which moves edu's vector while the device
+fires.
 
 ## From PCI discovery to a driver's DMA address
 

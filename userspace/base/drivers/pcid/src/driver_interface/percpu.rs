@@ -9,10 +9,16 @@
 //!
 //! CPUs are logical ids ([`CpuId`]), the numbers `irq:cpu-XX` takes. pcid turns them into APIC
 //! ids or interrupt remapping entries when it builds the MSI message.
+//!
+//! Root can steer a vector to another CPU with [`move_vector`] (the `irq:` handle's
+//! [`ferric_irq::call::Call::Move`]); [`crate::irq_helpers::Msix::retarget`] does it for an
+//! MSI-X table entry and reprograms the entry when the kernel does not remap its interrupts.
 
 use std::fs::{self, File};
 use std::io;
+use std::os::fd::AsRawFd;
 
+use ferric_irq::call::{Call, Moved};
 pub use ferric_irq::{CpuEntry, CpuId};
 
 /// The kernel's CPU map.
@@ -79,6 +85,21 @@ pub enum VectorError {
         /// The number of entries in the table.
         size: u16,
     },
+    /// The kernel refused to move the vector (see [`ferric_irq::call`] for its errors).
+    #[error("cannot move the interrupt vector to CPU {}", cpu.get())]
+    Move {
+        /// The CPU asked for.
+        cpu: CpuId,
+        /// What the `irq` scheme answered.
+        #[source]
+        source: io::Error,
+    },
+    /// The MSI-X table has no entry with this index, or it has no vector yet.
+    #[error("MSI-X table entry {index} has no vector")]
+    NoEntry {
+        /// The entry asked for.
+        index: u16,
+    },
 }
 
 /// The logical id of the bootstrap processor, which `irq:bsp` holds.
@@ -129,6 +150,27 @@ pub(crate) fn allocate_msi(
         .msi_message(index, vector)
         .ok_or(VectorError::NoMessage { cpu, vector })?;
     Ok((message, handle))
+}
+
+/// Steers the vector of `irq` handle `handle` to logical CPU `cpu` (root only). The kernel picks
+/// the new vector and re-keys `handle` (and its duplicates) to it.
+///
+/// When [`Moved::remapped`] is 0 the device's interrupts are not remapped, and the caller must
+/// program the device's message for the new vector on `cpu`.
+///
+/// # Errors
+///
+/// [`VectorError::Move`] with the kernel's answer, or `EIO` in it when the kernel's reply is
+/// malformed.
+pub fn move_vector(handle: &File, cpu: CpuId) -> Result<Moved, VectorError> {
+    let move_error = |source| VectorError::Move { cpu, source };
+    let (words, len) = Call::Move { cpu }.encode();
+    let fd = usize::try_from(handle.as_raw_fd())
+        .map_err(|_| move_error(io::Error::from_raw_os_error(libredox::errno::EBADF)))?;
+    let word = libredox::call::call_ro(fd, &mut [], syscall::CallFlags::empty(), &words[..len])
+        .map_err(|err| move_error(io::Error::from_raw_os_error(err.errno())))?;
+    Moved::from_word(word as u64)
+        .ok_or_else(|| move_error(io::Error::from_raw_os_error(libredox::errno::EIO)))
 }
 
 /// `err` and its sources, for a log line or a panic message.
