@@ -226,6 +226,26 @@ impl From<RecordPages> for PageRange {
     }
 }
 
+/// A readahead maximum a file system may set: 1 to [`MAX_RECORD_PAGES`] pages, so a window fits
+/// in one record ([`crate::readahead::ReadaheadConfig::new`] has the same bound).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadaheadMax(u32);
+
+impl ReadaheadMax {
+    /// `pages`, or `None` when it is 0 or above [`MAX_RECORD_PAGES`].
+    pub const fn new(pages: u32) -> Option<Self> {
+        if pages == 0 || pages > MAX_RECORD_PAGES {
+            return None;
+        }
+        Some(Self(pages))
+    }
+
+    /// The number of pages.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// How a file system finished a fill or a writeback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
@@ -294,9 +314,8 @@ pub enum Request {
     },
     /// On a queue: read ahead at most `pages` pages for this file system's objects.
     SetReadaheadMax {
-        /// The largest readahead window, in pages: 1 to [`MAX_RECORD_PAGES`], so a window
-        /// fits in one record ([`crate::readahead::ReadaheadConfig::new`] has the same bound).
-        pages: u32,
+        /// The largest readahead window, in pages.
+        pages: ReadaheadMax,
     },
 }
 
@@ -364,7 +383,7 @@ impl Request {
                 5,
             ),
             Self::SetReadaheadMax { pages } => {
-                ([Verb::SetReadaheadMax as u64, pages as u64, 0, 0, 0], 2)
+                ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0, 0, 0], 2)
             }
         }
     }
@@ -399,12 +418,11 @@ impl Request {
                     outcome,
                 })
             }
-            (Verb::SetReadaheadMax, &[pages]) => match u32::try_from(pages) {
-                Ok(pages) if pages > 0 && pages <= MAX_RECORD_PAGES => {
-                    Ok(Self::SetReadaheadMax { pages })
-                }
-                _ => Err(DecodeError::Value),
-            },
+            (Verb::SetReadaheadMax, &[pages]) => u32::try_from(pages)
+                .ok()
+                .and_then(ReadaheadMax::new)
+                .map(|pages| Self::SetReadaheadMax { pages })
+                .ok_or(DecodeError::Value),
             _ => Err(DecodeError::Length),
         }
     }
@@ -722,9 +740,11 @@ mod tests {
                 pages: record(0, MAX_RECORD_PAGES),
                 outcome: Outcome::Failed(errno(5)),
             },
-            Request::SetReadaheadMax { pages: 64 },
             Request::SetReadaheadMax {
-                pages: MAX_RECORD_PAGES,
+                pages: ReadaheadMax::new(64).expect("in range"),
+            },
+            Request::SetReadaheadMax {
+                pages: ReadaheadMax::new(MAX_RECORD_PAGES).expect("in range"),
             },
         ];
         for request in all {
@@ -753,6 +773,13 @@ mod tests {
         assert_eq!(Request::decode(&[6, 0]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[6, 1 << 32]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[6, long]), Err(DecodeError::Value));
+        // So the encoder cannot produce what the decoder refuses: 1024 is the largest maximum.
+        assert_eq!(
+            ReadaheadMax::new(MAX_RECORD_PAGES).map(ReadaheadMax::get),
+            Some(1024)
+        );
+        assert_eq!(ReadaheadMax::new(MAX_RECORD_PAGES + 1), None);
+        assert_eq!(ReadaheadMax::new(0), None);
     }
 
     #[test]
