@@ -15,6 +15,29 @@ static SUM: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static MAX: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static OVER_1M: [AtomicU64; BINS] = [const { AtomicU64::new(0) }; BINS];
 static TSC_PER_US: AtomicU64 = AtomicU64::new(2500);
+static LAST_IPI: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+static LAST_IPI_NONEMPTY: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+static LAST_SCHED: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+static PREV_SCHED: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+
+fn cpu() -> usize {
+    crate::cpu_id().get() as usize % CPUS
+}
+
+pub fn ipi_drain(nonempty: bool) {
+    let now = tsc();
+    LAST_IPI[cpu()].store(now, Relaxed);
+    if nonempty {
+        LAST_IPI_NONEMPTY[cpu()].store(now, Relaxed);
+    }
+}
+
+pub fn schedule_entry() {
+    let now = tsc();
+    let last = LAST_SCHED[cpu()].swap(now, Relaxed);
+    PREV_SCHED[cpu()].store(last, Relaxed);
+}
+
 static SLOW_PRINTED: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static LAST_TSC: AtomicU64 = AtomicU64::new(0);
@@ -58,9 +81,12 @@ pub fn picked(next: &mut Context, prev: &Context, prev_is_idle: bool, now_ns: u1
     {
         let per_us = TSC_PER_US.load(Relaxed);
         println!(
-            "WL slow cpu{} {}us {} r{} prev={}/{} next={}/{}",
+            "WL slow cpu{} {}us ipi{} ipine{} psched{} {} r{} prev={}/{} next={}/{}",
             crate::cpu_id().get(),
             lat / per_us,
+            now.saturating_sub(LAST_IPI[cpu()].load(Relaxed)) / per_us,
+            now.saturating_sub(LAST_IPI_NONEMPTY[cpu()].load(Relaxed)) / per_us,
+            now.saturating_sub(PREV_SCHED[cpu()].load(Relaxed)) / per_us,
             NAMES[bin],
             u8::from(next.wake_remote),
             prev.name,

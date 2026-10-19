@@ -158,6 +158,7 @@ pub fn drain_ipi_context_wakeups(token: &mut CleanLockToken) {
         .switch_internals
         .ipi_context_wakeup_list
         .lock(token.token());
+    crate::context::wakelat::ipi_drain(!cross_cpu_wake.is_empty());
     if cross_cpu_wake.is_empty() {
         return;
     }
@@ -285,6 +286,7 @@ fn schedule(
     token: &mut CleanLockToken,
 ) -> ScheduleResult {
     percpu.stats.add_context_switch(percpu.inside_syscall.get());
+    crate::context::wakelat::schedule_entry();
 
     //set PIT Interrupt counter to 0, giving each process same amount of PIT ticks
     percpu.switch_internals.pit_ticks.set(0);
