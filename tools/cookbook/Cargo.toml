@@ -41,10 +41,10 @@ globset = "0.4"
 libc = "0.2"
 ignore = "0.4"
 object = { version = "0.38", features = ["build_core"] }
-pkgar = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
-pkgar-core = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
-pkgar-keys = { git = "https://gitlab.redox-os.org/redox-os/pkgar.git" }
-redox-pkg = { git = "https://gitlab.redox-os.org/redox-os/pkgutils.git", default-features = false }
+pkgar = { git = "https://github.com/rexlunae/pkgar.git" } # Ferric mirror of redox-os/pkgar
+pkgar-core = { git = "https://github.com/rexlunae/pkgar.git" }
+pkgar-keys = { git = "https://github.com/rexlunae/pkgar.git" }
+redox-pkg = { git = "https://github.com/rexlunae/pkgutils.git", default-features = false } # Ferric mirror of redox-os/pkgutils
 redox_installer.workspace = true
 redoxer = { workspace = true, default-features = false }
 regex = "1.11"

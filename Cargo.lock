@@ -3733,7 +3733,7 @@ dependencies = [
 [[package]]
 name = "pkgar"
 version = "0.2.3"
-source = "git+https://gitlab.redox-os.org/redox-os/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
+source = "git+https://github.com/rexlunae/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -3760,7 +3760,7 @@ dependencies = [
 [[package]]
 name = "pkgar-core"
 version = "0.2.3"
-source = "git+https://gitlab.redox-os.org/redox-os/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
+source = "git+https://github.com/rexlunae/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
 dependencies = [
  "bitflags 2.13.2",
  "blake3",
@@ -3783,7 +3783,7 @@ dependencies = [
 [[package]]
 name = "pkgar-keys"
 version = "0.2.3"
-source = "git+https://gitlab.redox-os.org/redox-os/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
+source = "git+https://github.com/rexlunae/pkgar.git#a7b65343e856d4b16f9e788a7c49fffb05822dab"
 dependencies = [
  "hex",
  "pkgar-core 0.2.3",
@@ -4125,7 +4125,7 @@ checksum = "436d45c2b6a5b159d43da708e62b25be3a4a3d5550d654b72216ade4c4bfd717"
 [[package]]
 name = "redox-pkg"
 version = "0.3.2"
-source = "git+https://gitlab.redox-os.org/redox-os/pkgutils.git#5de8f295fdce141aa76ddba6f787b5589db18783"
+source = "git+https://github.com/rexlunae/pkgutils.git#5de8f295fdce141aa76ddba6f787b5589db18783"
 dependencies = [
  "hex",
  "serde",
