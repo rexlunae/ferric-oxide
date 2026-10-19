@@ -7,7 +7,7 @@
 //! | --- | --- | --- |
 //! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>`, `disable <selection>`, or `filter <event> <filter\|none>` |
 //! | [`STATS_PATH`] | one [`StatsLine`] per CPU | — |
-//! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it | — |
+//! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it (a [`FilterBusyLine`] for one that could not be read) | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
@@ -388,6 +388,24 @@ impl fmt::Display for FilterLine<'_> {
     }
 }
 
+/// The line of the [`FILTERS_PATH`] file for an event whose filter is set but could not be
+/// read because a replacement kept overlapping the read
+/// ([`Loaded::Busy`](crate::filter::Loaded::Busy)): `# filter <event> is being replaced`.
+/// It starts with `#` so it is not read back as a command. The kernel reads the filters with
+/// their writer excluded, so it does not write this line in practice.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterBusyLine<'a> {
+    /// The filtered event.
+    pub event: &'a Event,
+}
+
+impl fmt::Display for FilterBusyLine<'_> {
+    /// The line, with its `\n`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "# filter {} is being replaced", self.event.name())
+    }
+}
+
 /// One line of the [`STATS_PATH`] file: `cpu <n> pending <words> lost <records>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatsLine {
@@ -451,6 +469,16 @@ mod tests {
         assert_eq!(Path::parse("cpu/x"), None);
         assert_eq!(Path::parse("cpus/1"), None);
         assert_eq!(Path::parse("other"), None);
+    }
+
+    #[test]
+    fn a_busy_filter_line_is_not_a_command() {
+        let line = FilterBusyLine {
+            event: &SCHED_SWITCH,
+        }
+        .to_string();
+        assert_eq!(line, "# filter sched.switch is being replaced\n");
+        assert!(Command::parse(line.as_bytes()).is_err());
     }
 
     #[test]

@@ -41,8 +41,11 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ferric_trace::abi::{
-    Command, CpuCommand, EventLine, FilterLine, Path, StatsLine, CPU_MAP_BYTES,
+use ferric_trace::{
+    abi::{
+        Command, CpuCommand, EventLine, FilterBusyLine, FilterLine, Path, StatsLine, CPU_MAP_BYTES,
+    },
+    filter::Loaded,
 };
 use spin::{Mutex, MutexGuard};
 use syscall::{
@@ -125,15 +128,19 @@ fn render(text: Text) -> Arc<[u8]> {
             }
         }
         Text::Filters => {
-            for (event, filter) in trace::filters() {
-                let _ = write!(
-                    out,
-                    "{}",
-                    FilterLine {
-                        event,
-                        filter: &filter
-                    }
-                );
+            for (event, loaded) in trace::filters() {
+                let _ = match loaded {
+                    Loaded::Set(filter) => write!(
+                        out,
+                        "{}",
+                        FilterLine {
+                            event,
+                            filter: &filter
+                        }
+                    ),
+                    Loaded::Busy => write!(out, "{}", FilterBusyLine { event }),
+                    Loaded::Empty => Ok(()),
+                };
             }
         }
     }

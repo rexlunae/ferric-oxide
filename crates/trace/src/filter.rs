@@ -333,9 +333,21 @@ fn parse_value(text: &str) -> Result<u64, FilterError> {
 /// The words of an encoded filter.
 const ENCODED_WORDS: usize = 1 + 2 * MAX_CONDITIONS;
 
-/// How many times [`Slot::admits`] rereads a filter that a store overlapped before it lets
-/// the record through.
+/// How many times [`Slot::load`] rereads a filter that a store overlapped before it gives
+/// [`Loaded::Busy`], so [`Slot::admits`] stays bounded on the tracepoint path.
 const READ_RETRIES: u32 = 8;
+
+/// What [`Slot::load`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loaded {
+    /// No filter is set.
+    Empty,
+    /// The filter that is set.
+    Set(Filter),
+    /// A filter is set, but every reread overlapped a store replacing it. A reader that
+    /// excludes the writer (as the kernel's `filters` listing does) never sees this.
+    Busy,
+}
 
 /// One event's filter, shared between one writer and lock-free readers on every CPU.
 ///
@@ -385,11 +397,11 @@ impl Slot {
         self.active.store(true, Ordering::Release);
     }
 
-    /// The stored filter, or `None` when the slot is empty or a store kept overlapping the
-    /// read.
-    pub fn load(&self) -> Option<Filter> {
+    /// The stored filter: [`Loaded::Set`], [`Loaded::Empty`], or [`Loaded::Busy`] when a
+    /// store overlapped each of a few rereads.
+    pub fn load(&self) -> Loaded {
         if !self.active.load(Ordering::Acquire) {
-            return None;
+            return Loaded::Empty;
         }
         for _ in 0..READ_RETRIES {
             let before = self.sequence.load(Ordering::Acquire);
@@ -401,10 +413,12 @@ impl Slot {
                 core::array::from_fn(|i| self.words[i].load(Ordering::Relaxed));
             fence(Ordering::Acquire);
             if self.sequence.load(Ordering::Relaxed) == before {
-                return Filter::decode(&words);
+                // A consistent read of what `store` encoded always decodes; anything else is
+                // treated as a read that did not settle.
+                return Filter::decode(&words).map_or(Loaded::Busy, Loaded::Set);
             }
         }
-        None
+        Loaded::Busy
     }
 
     /// Whether a record with `args` passes the stored filter. An empty slot, or a filter
@@ -415,7 +429,10 @@ impl Slot {
         if !self.active.load(Ordering::Relaxed) {
             return true;
         }
-        self.load().is_none_or(|filter| filter.admits(args))
+        match self.load() {
+            Loaded::Set(filter) => filter.admits(args),
+            Loaded::Empty | Loaded::Busy => true,
+        }
     }
 }
 
@@ -512,10 +529,10 @@ mod tests {
     fn slots_store_load_and_clear() {
         let slot = Slot::new();
         assert!(slot.admits(&[0, 0]));
-        assert_eq!(slot.load(), None);
+        assert_eq!(slot.load(), Loaded::Empty);
         let filter = parse(&SCHED_SWITCH, "next_pid == 9");
         slot.store(Some(&filter));
-        assert_eq!(slot.load(), Some(filter));
+        assert_eq!(slot.load(), Loaded::Set(filter));
         let next_pid = SCHED_SWITCH
             .args()
             .iter()
@@ -528,7 +545,23 @@ mod tests {
         assert!(!slot.admits(&args[..SCHED_SWITCH.args().len()]));
         slot.store(None);
         assert!(slot.admits(&args[..SCHED_SWITCH.args().len()]));
-        assert_eq!(slot.load(), None);
+        assert_eq!(slot.load(), Loaded::Empty);
+    }
+
+    #[test]
+    fn a_store_in_progress_reads_as_busy() {
+        let slot = Slot::new();
+        let filter = parse(&SYSCALL_EXIT, "nr == 1");
+        slot.store(Some(&filter));
+        // What a store looks like to a reader between its two sequence updates.
+        let settled = slot.sequence.load(Ordering::Relaxed);
+        slot.sequence.store(settled + 1, Ordering::Relaxed);
+        assert_eq!(slot.load(), Loaded::Busy);
+        // The record passes: a filter never removes what it could not read.
+        assert!(slot.admits(&[2, 0]));
+        slot.sequence.store(settled + 2, Ordering::Relaxed);
+        assert_eq!(slot.load(), Loaded::Set(filter));
+        assert!(!slot.admits(&[2, 0]));
     }
 
     #[test]
@@ -547,8 +580,10 @@ mod tests {
             })
         };
         for _ in 0..20_000 {
-            if let Some(seen) = slot.load() {
-                assert!(seen == a || seen == b, "{seen:?}");
+            match slot.load() {
+                Loaded::Set(seen) => assert!(seen == a || seen == b, "{seen:?}"),
+                Loaded::Busy => {}
+                Loaded::Empty => panic!("the slot always holds a filter"),
             }
         }
         writer.join().expect("writer");

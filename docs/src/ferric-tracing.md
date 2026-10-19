@@ -226,7 +226,12 @@ Each event's filter sits in a sequence-locked slot of atomics
 (`ferric_trace::filter::Slot`). A tracepoint checks it without a lock: an event
 without a filter costs one relaxed load more, and a record that races with a
 filter being replaced is kept rather than dropped, so a filter only ever
-removes records.
+removes records. A tracepoint rereads a slot at most eight times before it
+gives up and keeps the record. The `filters` listing reads the slots while
+holding the lock that serializes setting them, so it never meets a replacement
+in progress and lists every filter that is set. If a slot still cannot be read,
+the listing says so in a comment line, `# filter <event> is being replaced`,
+rather than leaving the filter out.
 
 ### Mapping a ring
 

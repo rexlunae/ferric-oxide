@@ -13,7 +13,7 @@ use core::{fmt, sync::atomic::AtomicU64};
 
 use ferric_trace::{
     abi::CPU_RING_WORDS,
-    filter::{Filter, FilterError, Slot},
+    filter::{Filter, FilterError, Loaded, Slot},
     kernel::CATALOG,
     ring::{Ring, RingError, Shared, Words, SHARED_HEADER_WORDS},
     select, Event, EventSet, Level, SelectError, Subsystem,
@@ -299,13 +299,20 @@ pub fn set_filter<'a>(
     Ok((event, filter))
 }
 
-/// The filters that are set, with their events.
-pub fn filters() -> impl Iterator<Item = (&'static Event, Filter)> {
+/// The filters that are set, with their events: [`Loaded::Set`], or [`Loaded::Busy`] for one
+/// that could not be read. The events without a filter are left out.
+///
+/// It holds [`FILTER_WRITER`] while reading, so no store overlaps a read and every set filter
+/// is listed as it is.
+pub fn filters() -> Vec<(&'static Event, Loaded)> {
+    let _writer = FILTER_WRITER.lock();
     CATALOG
         .events()
         .iter()
         .zip(FILTERS.iter())
-        .filter_map(|(event, slot)| Some((event, slot.load()?)))
+        .map(|(event, slot)| (event, slot.load()))
+        .filter(|(_, loaded)| *loaded != Loaded::Empty)
+        .collect()
 }
 
 /// Writes a record of `event` with `args` to this CPU's ring. The slow path of `trace_event!`.
