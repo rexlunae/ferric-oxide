@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+use ferric_irq::CpuId;
+use ferric_irq::affinity::AffinityMask;
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, SignalBehavior, Socket};
 use syscall::error::{EBADF, ENOENT, Error, Result as SysResult};
@@ -19,6 +21,8 @@ const FILE_PATH: &str = "file";
 const CONTENTS: &[u8] = b"served by the other thread";
 const ROOT: usize = 0;
 const FILE: usize = 1;
+/// The CPU both threads are pinned to: CPU 0, which every system has.
+const CPU: u32 = 0;
 /// How long the open and the read may take. A regression may stop this thread from running
 /// too (it shares the stuck CPU's queue), in which case the boot's timeout fails the run.
 const WATCHDOG: Duration = Duration::from_secs(30);
@@ -116,6 +120,8 @@ enum Failure {
     },
     /// The read returned other bytes than the scheme serves.
     Contents(Vec<u8>),
+    /// Pinning a thread to [`CPU`] failed.
+    Pin { errno: i32 },
 }
 
 impl fmt::Display for Failure {
@@ -124,6 +130,7 @@ impl fmt::Display for Failure {
             Self::Scheme { what, errno } => write!(f, "{what} failed with errno {errno}"),
             Self::Io { what, source } => write!(f, "{what}: {source}"),
             Self::Contents(got) => write!(f, "read {got:?}, expected {CONTENTS:?}"),
+            Self::Pin { errno } => write!(f, "pin a thread to CPU {CPU}: errno {errno}"),
         }
     }
 }
@@ -132,7 +139,7 @@ impl std::error::Error for Failure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Scheme { .. } | Self::Contents(_) => None,
+            Self::Scheme { .. } | Self::Contents(_) | Self::Pin { .. } => None,
         }
     }
 }
@@ -150,7 +157,18 @@ fn run() -> Result<(), Failure> {
     let mut scheme = OneFile;
     register_sync_scheme(&socket, SCHEME, &mut scheme)
         .map_err(scheme_err("register the scheme"))?;
-    thread::spawn(move || serve(socket, scheme));
+    pin_current_thread()?;
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let pinned = pin_current_thread();
+        let ok = pinned.is_ok();
+        let _ = pinned_tx.send(pinned);
+        if ok {
+            serve(socket, scheme);
+        }
+    });
+    // The serving thread is on this CPU before the open, so only this CPU can run it.
+    pinned_rx.recv().unwrap_or(Err(Failure::Pin { errno: 0 }))?;
     let mut file =
         File::open(format!("/scheme/{SCHEME}/{FILE_PATH}")).map_err(io_err("open the file"))?;
     let mut contents = Vec::new();
@@ -159,5 +177,38 @@ fn run() -> Result<(), Failure> {
     if contents != CONTENTS {
         return Err(Failure::Contents(contents));
     }
+    Ok(())
+}
+
+/// The calling thread's process-manager handle (relibc's, owned by the thread; not closed).
+#[allow(unsafe_code)]
+fn current_thread_fd() -> usize {
+    unsafe extern "C" {
+        /// relibc: the calling thread's handle in the process manager.
+        fn redox_cur_thrfd_v0() -> usize;
+    }
+    // SAFETY: relibc's call takes no arguments, has no preconditions and returns a descriptor
+    // the calling thread owns, which is only borrowed here.
+    unsafe { redox_cur_thrfd_v0() }
+}
+
+/// Lets the calling thread run on [`CPU`] only, through its `sched-affinity` handle, and
+/// yields so it moves there.
+///
+/// # Errors
+///
+/// [`Failure::Pin`] when the kernel refuses to open the handle or take the mask.
+fn pin_current_thread() -> Result<(), Failure> {
+    let pin = |err: libredox::error::Error| Failure::Pin { errno: err.errno() };
+    let mask = AffinityMask::only(CpuId::new(CPU)).ok_or(Failure::Pin { errno: 0 })?;
+    let context = libredox::call::dup(current_thread_fd(), b"open_via_dup")
+        .map(libredox::Fd::new)
+        .map_err(pin)?;
+    let affinity = context
+        .dup(b"sched-affinity")
+        .map(libredox::Fd::new)
+        .map_err(pin)?;
+    affinity.write(&mask.to_bytes()).map_err(pin)?;
+    thread::yield_now();
     Ok(())
 }
