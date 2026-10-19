@@ -84,7 +84,8 @@ impl Pv {
     ///
     /// - [`ReadError::Io`] when the label sectors cannot be read.
     /// - [`ReadError::Label`] when there is no valid label.
-    /// - [`ReadError::Metadata`] with the first area's error when no metadata area is good.
+    /// - [`ReadError::Metadata`] with the first failed area's error when an area failed and no
+    ///   area holds good metadata, even if another area is empty.
     pub fn read<F, E>(read_at: &mut F) -> Result<Self, ReadError<E>>
     where
         F: FnMut(u64, &mut [u8]) -> Result<(), E>,
@@ -94,7 +95,6 @@ impl Pv {
         let label = PvLabel::find(&start)?;
         let mut newest: Option<VolumeGroup> = None;
         let mut first_error = None;
-        let mut empty = 0;
         for (index, area) in label.metadata_areas.iter().enumerate() {
             match read_area(read_at, area, &label) {
                 Ok(Some(vg)) => {
@@ -102,7 +102,7 @@ impl Pv {
                         newest = Some(vg);
                     }
                 }
-                Ok(None) => empty += 1,
+                Ok(None) => {}
                 Err(source) => {
                     first_error.get_or_insert(ReadError::Metadata {
                         area: index,
@@ -111,8 +111,11 @@ impl Pv {
                 }
             }
         }
+        // An empty area does not excuse a failed one: the failed area may have held the
+        // group's only metadata, so "no group" would be a wrong answer rather than a missing
+        // one.
         match (newest, first_error) {
-            (None, Some(error)) if empty == 0 => Err(error),
+            (None, Some(error)) => Err(error),
             (vg, _) => Ok(Self { label, vg }),
         }
     }
@@ -135,6 +138,14 @@ where
     let header = MdaHeader::parse(&sector, area.offset)?;
     if header.size != area.size {
         return Err(MetadataError::Mda(MdaError::Size(header.size)));
+    }
+    // `parse` checked that the end fits in a u64.
+    let end = header.start.saturating_add(header.size);
+    if end > label.device_size {
+        return Err(MetadataError::Mda(MdaError::PastDevice {
+            end,
+            device_size: label.device_size,
+        }));
     }
     let Some(location) = header.current() else {
         return Ok(None);
@@ -166,7 +177,8 @@ pub enum ReadError<E> {
     /// There is no valid label.
     #[error(transparent)]
     Label(#[from] LabelError),
-    /// No metadata area is good; this is the first area's error.
+    /// No metadata area holds good metadata and at least one failed; this is the first failed
+    /// area's error.
     #[error("LVM metadata area {area} is not usable")]
     Metadata {
         /// The index of the area in [`PvLabel::metadata_areas`].

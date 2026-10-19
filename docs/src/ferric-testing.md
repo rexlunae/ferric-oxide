@@ -108,6 +108,15 @@ hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
 
+`ferric-lvm` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/lvm/tests/fixtures.rs` reads PVs
+that lvm2 wrote (`crates/lvm/tests/fixtures/README` has the commands): a
+two-PV striped group, metadata text that wraps round its area, and a volume
+extended after another one. It checks the parsed groups and mappings against
+`vgcfgbackup`, flips a bit in every byte the reader depends on, and edits labels
+and metadata-area headers to test areas that are empty, broken or past the
+device.
+
 ## Kernel lint and binary checks
 
 | Check | Purpose |

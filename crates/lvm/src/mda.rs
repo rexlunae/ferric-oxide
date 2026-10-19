@@ -85,7 +85,7 @@ impl MdaHeader {
             });
         }
         let size = le64(sector, 32);
-        if size <= MDA_HEADER_LEN {
+        if size <= MDA_HEADER_LEN || start.checked_add(size).is_none() {
             return Err(MdaError::Size(size));
         }
         let mut locations = Vec::new();
@@ -119,10 +119,14 @@ impl MdaHeader {
     ///
     /// # Errors
     ///
-    /// [`MdaError::Location`] when the location is not inside the text buffer, or the text is
-    /// larger than the buffer or [`MAX_TEXT_LEN`].
+    /// [`MdaError::Location`] when the location is not inside the text buffer, the text is
+    /// larger than the buffer or [`MAX_TEXT_LEN`], or a device offset would not fit in a `u64`
+    /// (a header built by hand rather than by [`MdaHeader::parse`]).
     pub fn text_ranges(&self, location: &RawLocation) -> Result<TextRanges, MdaError> {
-        let buffer = self.size - MDA_HEADER_LEN;
+        let buffer = self
+            .size
+            .checked_sub(MDA_HEADER_LEN)
+            .ok_or(MdaError::Location)?;
         if location.offset < MDA_HEADER_LEN
             || location.offset >= self.size
             || location.size > buffer
@@ -131,9 +135,14 @@ impl MdaHeader {
             return Err(MdaError::Location);
         }
         let first_len = location.size.min(self.size - location.offset);
-        let first = (self.start + location.offset, first_len);
+        // The offset is below `size`, so this only overflows when `start + size` does.
+        let device_offset = |offset: u64| self.start.checked_add(offset).ok_or(MdaError::Location);
+        let first = (device_offset(location.offset)?, first_len);
         let rest = location.size - first_len;
-        let wrapped = (rest > 0).then_some((self.start + MDA_HEADER_LEN, rest));
+        let wrapped = match rest {
+            0 => None,
+            _ => Some((device_offset(MDA_HEADER_LEN)?, rest)),
+        };
         Ok(TextRanges { first, wrapped })
     }
 
@@ -190,9 +199,17 @@ pub enum MdaError {
         /// The header's own offset.
         found: u64,
     },
-    /// The area is too small to hold any text.
-    #[error("the LVM metadata area size {0} is too small")]
+    /// The area is too small to hold any text, or so large that its end is past `u64::MAX`.
+    #[error("the LVM metadata area size {0} is not valid")]
     Size(u64),
+    /// The area ends past the end of the device the PV label records.
+    #[error("the LVM metadata area ends at {end:#x}, past the device's {device_size:#x} bytes")]
+    PastDevice {
+        /// Where the area ends.
+        end: u64,
+        /// The device size in the PV label.
+        device_size: u64,
+    },
     /// A raw location is not inside the text buffer.
     #[error("an LVM metadata location is outside its area")]
     Location,
@@ -336,5 +353,28 @@ mod tests {
         let mut s = good;
         s[32..40].copy_from_slice(&512u64.to_le_bytes());
         assert_eq!(MdaHeader::parse(&reseal(s), 4096), Err(MdaError::Size(512)));
+        // A checksum-valid size whose end is past u64::MAX is refused, not wrapped.
+        let mut s = good;
+        s[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            MdaHeader::parse(&reseal(s), 4096),
+            Err(MdaError::Size(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn text_ranges_do_not_overflow() {
+        let h = MdaHeader {
+            start: u64::MAX - 1000,
+            size: u64::MAX,
+            locations: Vec::new(),
+        };
+        let at_end = location(u64::MAX - 100, 50, 0);
+        assert_eq!(h.text_ranges(&at_end), Err(MdaError::Location));
+        let tiny = MdaHeader {
+            size: 0,
+            ..h.clone()
+        };
+        assert_eq!(tiny.text_ranges(&at_end), Err(MdaError::Location));
     }
 }

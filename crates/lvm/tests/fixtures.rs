@@ -186,3 +186,66 @@ fn a_blank_device_has_no_label() {
         Err(ReadError::Label(ferric_lvm::LabelError::NotFound))
     ));
 }
+
+/// Rewrites the PV label of `image` with `device_size` and `metadata_areas`, keeping its data
+/// areas, and reseals its checksum.
+fn relabel(image: &mut [u8], device_size: u64, metadata_areas: &[ferric_lvm::Area]) {
+    let label = read(image).expect("valid PV").label;
+    let sector = &mut image[usize::from(label.sector) * 512..][..512];
+    let header = u32::from_le_bytes(sector[20..24].try_into().unwrap()) as usize;
+    let mut at = header + 32;
+    sector[at..at + 8].copy_from_slice(&device_size.to_le_bytes());
+    at += 8;
+    let terminator = ferric_lvm::Area { offset: 0, size: 0 };
+    let areas = label.data_areas.iter().chain([&terminator]);
+    for area in areas.chain(metadata_areas).chain([&terminator]) {
+        sector[at..at + 8].copy_from_slice(&area.offset.to_le_bytes());
+        sector[at + 8..at + 16].copy_from_slice(&area.size.to_le_bytes());
+        at += 16;
+    }
+    let sum = ferric_lvm::crc::checksum(&sector[20..]);
+    sector[16..20].copy_from_slice(&sum.to_le_bytes());
+}
+
+#[test]
+fn a_metadata_area_past_the_device_is_refused() {
+    let mut image = fixture("two-lvs.img");
+    let label = read(&image).unwrap().label;
+    let area = label.metadata_areas[0];
+    relabel(&mut image, area.offset + area.size - 1, &[area]);
+    assert!(matches!(
+        read(&image),
+        Err(ReadError::Metadata {
+            area: 0,
+            source: ferric_lvm::MetadataError::Mda(ferric_lvm::MdaError::PastDevice { .. }),
+        })
+    ));
+}
+
+/// An empty area next to a failed one is an error, not "no group": the failed one may have
+/// held the only metadata.
+#[test]
+fn an_empty_area_does_not_hide_a_failed_one() {
+    let mut image = fixture("two-lvs.img");
+    let label = read(&image).unwrap().label;
+    let area = label.metadata_areas[0];
+    // Empty the real area: clear its raw locations and reseal its header.
+    let header = &mut image[area.offset as usize..][..512];
+    header[40..136].fill(0);
+    let sum = ferric_lvm::crc::checksum(&header[4..]);
+    header[..4].copy_from_slice(&sum.to_le_bytes());
+    assert_eq!(read(&image).unwrap().vg, None);
+    // A second area with no header at all (zeros, past the fixture's end) fails.
+    let broken = ferric_lvm::Area {
+        offset: area.offset + area.size,
+        size: area.size,
+    };
+    relabel(&mut image, label.device_size, &[area, broken]);
+    assert!(matches!(
+        read(&image),
+        Err(ReadError::Metadata {
+            area: 1,
+            source: ferric_lvm::MetadataError::Mda(ferric_lvm::MdaError::Checksum),
+        })
+    ));
+}

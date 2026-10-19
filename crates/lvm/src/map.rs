@@ -59,6 +59,9 @@ impl VolumeGroup {
         };
         let in_segment = offset - segment.start_extent * self.extent_bytes;
         let segment_bytes = segment.extent_count * self.extent_bytes;
+        // `vg::striped` only builds segments with at least one stripe and, for more than one, a
+        // non-zero chunk size, so the indexing and division below cannot panic.
+        debug_assert!(!stripes.is_empty() && stripe_bytes.is_none_or(|c| c != 0));
         let (stripe, on_stripe, len) = match stripe_bytes {
             None => (stripes[0], in_segment, segment_bytes - in_segment),
             Some(chunk) => {
