@@ -546,6 +546,24 @@ impl RaiiFrame {
         // access through it while the borrow lasts.
         unsafe { &mut *(RmmA::phys_to_virt(self.inner.base()).data() as *mut [u8; PAGE_SIZE]) }
     }
+
+    /// Ferric Oxide: the frame as 64-bit atomic words, for memory the kernel shares with user
+    /// space as a protocol (`kernel.ring` rings): each access is one atomic load or store, so
+    /// whatever another CPU or process writes, the kernel only ever reads some value.
+    #[cfg(feature = "rings")]
+    pub fn words(&self) -> &[core::sync::atomic::AtomicU64; PAGE_SIZE / 8] {
+        const _: () = assert!(
+            core::mem::size_of::<[core::sync::atomic::AtomicU64; PAGE_SIZE / 8]>() == PAGE_SIZE
+        );
+        // SAFETY: as for `bytes`: the frame stays allocated for the borrow and its linear-map
+        // page is valid. The page is page-aligned, so aligned for `AtomicU64`, and the array
+        // is exactly a page (checked above). Every bit pattern is a valid `AtomicU64`, and all
+        // accesses through the reference are atomic, so concurrent writers are sound.
+        unsafe {
+            &*(RmmA::phys_to_virt(self.inner.base()).data()
+                as *const [core::sync::atomic::AtomicU64; PAGE_SIZE / 8])
+        }
+    }
 }
 
 #[cfg(not(test))]

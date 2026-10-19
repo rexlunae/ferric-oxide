@@ -415,6 +415,26 @@ everyone together a quarter of memory. Off by default; without it the kernel
 has no such scheme, as upstream."""
 
 [[option]]
+id = "kernel.rings"
+menu = "kernel"
+type = "bool"
+title = "Submission/completion rings for every scheme"
+default = false
+kernel_feature = "rings"
+rebuild = ["kernel"]
+help = """
+Provide the kernel.ring scheme (Phase 2.3). An application maps a ring, a
+submission queue and a completion queue in memory it shares with the kernel,
+writes requests (read, write, fsync) into it, and submits a whole batch with
+one system call; each request gets a completion entry. Requests can be linked
+so that the next one runs only if the previous one succeeded, across different
+schemes (read a file, write it to a pipe) without returning to the
+application in between. The kernel runs each request as the ordinary system
+call on the application's descriptor, so every existing scheme works with it
+unchanged. Off by default; without it the kernel has no such scheme, as
+upstream."""
+
+[[option]]
 id = "drivers.grant_dma"
 menu = "drivers"
 type = "bool"

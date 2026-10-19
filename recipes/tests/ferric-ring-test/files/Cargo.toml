@@ -1,0 +1,20 @@
+[package]
+name = "ferric-ring-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Submission/completion ring test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-ring = { path = "../../../../crates/ring" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+libredox = "0.1.25"
+redox_syscall = "0.9.5"
+
+[profile.release]
+debug = false
