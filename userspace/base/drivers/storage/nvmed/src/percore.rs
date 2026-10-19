@@ -129,6 +129,17 @@ pub struct Dispatcher {
     policy: Cell<QueuePolicy>,
     /// Requests in flight on any queue pair, the main thread's included.
     in_flight: Rc<Cell<usize>>,
+    /// Held by the request running on the main thread's queue pair: its thread context (and
+    /// bounce buffer) serves one request at a time, and its lock is reentrant, so concurrent
+    /// requests on the scheme's thread must queue here instead.
+    main_queue: futures::lock::Mutex<()>,
+}
+
+/// A request running inline on the main thread's queue pair: counted in flight, and holding
+/// the main queue, until it is dropped.
+pub struct InlineGuard<'a> {
+    _counted: InFlightGuard,
+    _main: futures::lock::MutexGuard<'a, ()>,
 }
 
 /// One request counted in [`Dispatcher`]'s in-flight total until it is dropped.
@@ -154,16 +165,30 @@ impl Dispatcher {
         self.policy.set(policy);
     }
 
-    /// Claims a new request for the main thread's queue pair when the policy routes it there:
+    /// How requests are placed now.
+    pub fn policy(&self) -> QueuePolicy {
+        self.policy.get()
+    }
+
+    /// Claims a new request for the main thread's queue pair when the policy routes it there,
+    /// waiting for the request already on it (only `MainQueue` sends one while another runs):
     /// the caller runs it inline while holding the guard. `None` means it goes to a worker
     /// through [`run`](Self::run).
-    pub fn claim_inline(&self) -> Option<InFlightGuard> {
+    pub async fn claim_inline(&self) -> Option<InlineGuard<'_>> {
         let route = match self.policy.get().route(self.in_flight.get()) {
             Route::Worker if !self.workers.iter().any(Worker::is_alive) => Route::Main,
             route => route,
         };
         match route {
-            Route::Main => Some(InFlightGuard::new(&self.in_flight)),
+            Route::Main => {
+                // Counted before waiting, so that requests arriving meanwhile see this one.
+                let counted = InFlightGuard::new(&self.in_flight);
+                let main = self.main_queue.lock().await;
+                Some(InlineGuard {
+                    _counted: counted,
+                    _main: main,
+                })
+            }
             Route::Worker => None,
         }
     }
@@ -581,6 +606,7 @@ pub fn start(
         next_worker: Cell::new(0),
         policy: Cell::new(QueuePolicy::default()),
         in_flight: Rc::new(Cell::new(0)),
+        main_queue: futures::lock::Mutex::new(()),
         next_id: Cell::new(0),
         done,
         reports: RefCell::new(IdStream::new()),

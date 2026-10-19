@@ -9,6 +9,8 @@
 //!   into a directory (the `ferric-trace capture` command).
 //! - [`capture`] loads and decodes the files against the kernel's event catalog
 //!   ([`ferric_trace::kernel::CATALOG`]) and merges them in timestamp order.
+//! - [`crash`] reads the crash dump a kernel panic left for the next boot
+//!   (`/scheme/kernel.trace/crash`, the `ferric-trace crash` command) as a capture.
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
 //! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
 //!   sources, IOMMU fault reports) into words, for both views.
@@ -40,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
+pub mod crash;
 pub mod describe;
 pub mod drain;
 pub mod perfetto;

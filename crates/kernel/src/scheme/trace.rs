@@ -12,6 +12,11 @@
 //!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
 //!   consumes it up to `end`, under the same one-reader lock as a read.
 //!
+//! - `crash` (`kernel.trace_crash`): the crash dump the previous boot's panic left
+//!   (`trace::crash`), read from any offset; it exists only when there is one. With
+//!   `kernel.trace_crash_test` it always exists (empty without a dump), and writing `panic` to it
+//!   panics the kernel, which writes the dump and resets the machine.
+//!
 //! A mapped ring is never writable by its reader: `PROT_WRITE` is refused, and `mprotect`
 //! cannot add it to a shared grant later. So the kernel stays the only writer of those words,
 //! and it never trusts what they say beyond its own stores: the ring's size is kept in the
@@ -69,6 +74,7 @@ pub struct TraceScheme;
 enum Text {
     Events,
     Stats,
+    Crash,
 }
 
 /// An open handle.
@@ -104,6 +110,7 @@ fn render(text: Text) -> Arc<[u8]> {
                 }
             }
         }
+        Text::Crash => return crash_dump().unwrap_or_else(|| Arc::from([])),
         Text::Stats => {
             for cpu in 0..crate::cpu_count() {
                 let (pending, lost) = trace::ring(LogicalCpuId::new(cpu))
@@ -113,6 +120,32 @@ fn render(text: Text) -> Arc<[u8]> {
         }
     }
     Arc::from(out.into_bytes())
+}
+
+/// The previous boot's crash dump, if this kernel keeps one and there is one.
+fn crash_dump() -> Option<Arc<[u8]>> {
+    #[cfg(feature = "trace_crash")]
+    return trace::crash::saved();
+    #[cfg(not(feature = "trace_crash"))]
+    None
+}
+
+/// Whether `crash` exists: when there is a dump, and always on a crash-test kernel, which needs
+/// it for the `panic` command.
+fn crash_exists() -> bool {
+    cfg!(feature = "trace_crash_test") || crash_dump().is_some()
+}
+
+/// Runs a command written to `crash`: `panic`, on a crash-test kernel.
+fn crash_command(buf: UserSliceRo) -> Result<usize> {
+    let (bytes, _len) = command_bytes(buf)?;
+    if bytes.trim_ascii() != ferric_trace::abi::CRASH_TEST_COMMAND.as_bytes() {
+        return Err(Error::new(EINVAL));
+    }
+    #[cfg(feature = "trace_crash_test")]
+    trace::crash::test_panic();
+    #[cfg(not(feature = "trace_crash_test"))]
+    Err(Error::new(EOPNOTSUPP))
 }
 
 /// Becomes `cpu`'s ring's one consumer, or fails with `EAGAIN` while another reader is: the
@@ -203,6 +236,8 @@ impl KernelScheme for TraceScheme {
             Path::Root => return Err(Error::new(ENOENT)),
             Path::Events => (Text::Events, InternalFlags::POSITIONED),
             Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
+            Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
+            Path::Crash => return Err(Error::new(ENOENT)),
             Path::Cpu(cpu) if cpu < crate::cpu_count() => {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 HANDLES
@@ -288,6 +323,9 @@ impl KernelScheme for TraceScheme {
             } => events_command(buf),
             Handle::Cpu(cpu) => cpu_command(cpu, buf),
             Handle::Text {
+                text: Text::Crash, ..
+            } => crash_command(buf),
+            Handle::Text {
                 text: Text::Stats, ..
             } => Err(Error::new(EBADF)),
         }
@@ -357,6 +395,9 @@ impl KernelScheme for TraceScheme {
             Handle::Text {
                 text: Text::Stats, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::STATS_PATH),
+            Handle::Text {
+                text: Text::Crash, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CRASH_PATH),
             Handle::Cpu(cpu) => alloc::format!(
                 "/scheme/kernel.trace/{}/{}",
                 ferric_trace::abi::CPU_DIR,

@@ -15,6 +15,9 @@
 //! - **Run time.** The `kernel.trace` scheme (`scheme::trace`) enables and disables events and
 //!   drains the rings, or maps them read-only into a reader.
 //!
+//! - **Crash dump.** With `trace_crash`, a panic leaves its message and the newest records in
+//!   memory that survives a warm reboot, for the next boot to hand out (`crash`).
+//!
 //! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
 //! records after a header page). Tracepoints may only sit
 //! where interrupts are off, as in the system call path, the scheduler and the interrupt and
@@ -22,6 +25,8 @@
 //! while a record is written, and the CPU's ring has a single producer. A record that would
 //! be written with interrupts on is counted as lost instead.
 
+#[cfg(feature = "trace_crash")]
+pub mod crash;
 #[cfg(feature = "trace")]
 mod imp;
 

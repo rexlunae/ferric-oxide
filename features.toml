@@ -796,6 +796,54 @@ initfs trace.toml: use it to leave out single events of a subsystem turned on
 above, or events kernel.trace_boot or FERRIC_TRACE= turned on."""
 
 [[option]]
+id = "kernel.trace_crash"
+menu = "kernel.tracing"
+type = "bool"
+title = "Crash dump across a warm reboot"
+default = false
+depends = "kernel.trace"
+kernel_feature = "trace_crash"
+rebuild = ["kernel"]
+help = """
+Keep 64 KiB of RAM at a fixed address (kernel.trace_crash_base) out of use. A
+kernel panic writes its message and the newest records of every CPU's trace
+ring there. Firmware leaves RAM alone across a warm reboot, so the next boot
+finds the dump, logs the message, and serves the dump as
+/scheme/kernel.trace/crash, which `ferric-trace crash` prints or saves as a
+capture. A cold boot finds nothing, and a region that is not free RAM in the
+boot memory map turns the feature off with a warning."""
+
+[[option]]
+id = "kernel.trace_crash_base"
+menu = "kernel.tracing"
+type = "string"
+title = "Crash region address"
+default = "0x4000000"
+depends = "kernel.trace_crash"
+kernel_config = "trace.crash_base"
+rebuild = ["kernel"]
+help = """
+The physical address of the crash region, page aligned. Pick RAM that neither
+the firmware nor the bootloader uses; the default, 64 MiB, is free on QEMU
+with OVMF and on most PCs, whose firmware and boot loaders allocate from the
+top of memory."""
+
+[[option]]
+id = "kernel.trace_crash_test"
+menu = "kernel.tracing"
+type = "bool"
+title = "Crash dump test hook"
+default = false
+depends = "kernel.trace_crash"
+kernel_feature = "trace_crash_test"
+rebuild = ["kernel"]
+help = """
+For testing only: writing `panic` to /scheme/kernel.trace/crash (as root)
+panics the kernel on purpose, and the panic handler resets the machine once
+the dump is written, so the next boot can read it back. CI's crash-dump image
+turns it on; never turn it on elsewhere."""
+
+[[option]]
 id = "kernel.sys_fdstat"
 menu = "kernel"
 type = "bool"
