@@ -18,7 +18,10 @@
 //! kernel, every position is masked to the data before use, and the one value a reader passes
 //! back, `commit`'s `end`, is accepted only as a record boundary between the kernel's `tail`
 //! and `head` (`Ring::commit_to`). The reader, for its part, sees `head` and `tail` move under
-//! it and must copy before it decodes (`ferric_trace::ring::View`).
+//! it and must copy before it decodes (`ferric_trace::ring::View`). A `read` of the same CPU
+//! can consume records while a mapped reader copies them, and the producer can then reuse
+//! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
+//! The mapping needs `PROT_READ`: a mapping without it would still be readable.
 //!
 //! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
@@ -327,7 +330,11 @@ impl KernelScheme for TraceScheme {
         {
             return Err(Error::new(EACCES));
         }
-        if !map.flags.contains(MapFlags::MAP_SHARED) || map.offset != 0 || map.size != CPU_MAP_BYTES
+        if !map
+            .flags
+            .contains(MapFlags::PROT_READ | MapFlags::MAP_SHARED)
+            || map.offset != 0
+            || map.size != CPU_MAP_BYTES
         {
             return Err(Error::new(EINVAL));
         }

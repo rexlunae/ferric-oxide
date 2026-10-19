@@ -30,7 +30,9 @@
 //!   into a reader (`fmap` of `cpu/<n>` in [`abi`](crate::abi)): the reader sees the counters
 //!   and the records, and a [`View`] reads them without storing anything. It hands the words it
 //!   has consumed back through the kernel, which checks the position with [`Ring::commit_to`]
-//!   before storing `tail`.
+//!   before storing `tail`. Since the view is not the consumer, another reader can consume
+//!   the words it is copying and the producer can reuse them; [`View::peek`] checks `tail`
+//!   after each copy and retries a copy it overtook.
 //!
 //! The header, in words: [`SHARED_MAGIC`] at [`MAGIC_WORD`], [`SHARED_VERSION`] at
 //! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail` and `lost` at
@@ -45,7 +47,7 @@
 //! accepts only a record boundary between the kernel's own `tail` and `head`.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::EventId;
 use crate::record::{Header, MAX_RECORD_WORDS, WORD_BYTES};
@@ -441,6 +443,10 @@ impl<S: Storage> Ring<S> {
             self.count_lost();
             return Err(PushError::Full);
         }
+        // Pairs with the acquire fence in `View::peek`: a reader that sees one of the stores
+        // below then sees a `tail` at least this one, so it knows the words may be reused
+        // under it. On x86_64 this emits no instruction.
+        fence(Ordering::Release);
         self.slot(head).store(header.encode(), Ordering::Relaxed);
         self.slot(head.wrapping_add(1))
             .store(timestamp, Ordering::Relaxed);
@@ -622,11 +628,30 @@ impl<W: Words> View<W> {
     /// [`Peek::end`] of the previous copy, or [`View::tail`] at first). Nothing is stored. A
     /// `from` below the ring's `tail` starts at `tail`.
     ///
+    /// The view is not the ring's consumer, so the consumer can move `tail` while it copies
+    /// (another reader draining the ring through the kernel, say), and the producer can then
+    /// reuse the words being copied. A word at a position at or after the copy's start is
+    /// reused only once `tail` has passed that start, so after copying the view loads `tail`
+    /// again and, if it moved past the start, drops the copy and starts over at the new `tail`
+    /// (as a seqlock reader retries). A returned copy therefore never mixes two records, and
+    /// never holds records consumed before it was checked. Records consumed after the check
+    /// can still reach both readers: a reader that needs each record exactly once must be the
+    /// ring's only reader.
+    ///
     /// # Errors
     ///
-    /// As [`Ring::peek`].
+    /// As [`Ring::peek`], for a copy that `tail` did not overtake.
     pub fn peek(&self, from: u64, out: &mut [u8]) -> Result<Peek, ReadError> {
-        self.ring.peek_from(from.max(self.tail()), out)
+        loop {
+            let start = from.max(self.tail());
+            let copy = self.ring.peek_from(start, out);
+            // Pairs with the release fence in `Ring::push`: if a copied word was rewritten,
+            // the `tail` that allowed the rewrite is visible now.
+            fence(Ordering::Acquire);
+            if self.ring.storage.tail().load(Ordering::Relaxed) <= start {
+                return copy;
+            }
+        }
     }
 
     /// The ring's `tail`: where the owner will let the producer reuse words from.
@@ -1016,6 +1041,71 @@ mod tests {
             ring.commit_to(peek.end()).expect("a boundary");
         }
         assert_eq!(ring.lost(), 0);
+    }
+
+    /// Words that run `hook` the first time word `at` is read, to act between two loads of a
+    /// copy.
+    struct Hooked<'a, F: Fn()> {
+        words: &'a [AtomicU64],
+        at: usize,
+        fired: core::sync::atomic::AtomicBool,
+        hook: F,
+    }
+
+    impl<F: Fn()> Words for Hooked<'_, F> {
+        fn len(&self) -> usize {
+            self.words.len()
+        }
+
+        fn word(&self, index: usize) -> &AtomicU64 {
+            if index == self.at && !self.fired.swap(true, Ordering::Relaxed) {
+                (self.hook)();
+            }
+            &self.words[index]
+        }
+    }
+
+    /// Another reader drains the ring while a view copies it, and the producer reuses the
+    /// words: the view retries instead of returning a record made of two.
+    #[test]
+    fn view_retries_when_overtaken() {
+        let mem = words(SHARED_HEADER_WORDS + 16);
+        let ring = Ring::shared(&mem[..]).expect("valid");
+        // Two 6-word records: 12 of the 16 data words.
+        ring.push(EventId::new(1), 10, &[1, 1, 1, 1]).expect("room");
+        ring.push(EventId::new(2), 20, &[2, 2, 2, 2]).expect("room");
+        let view = View::new(Hooked {
+            words: &mem[..],
+            // The first record's last argument: the copy is half done.
+            at: SHARED_HEADER_WORDS + 5,
+            fired: core::sync::atomic::AtomicBool::new(false),
+            hook: || {
+                let mut drained = [0u8; 256];
+                assert_eq!(ring.read(&mut drained), Ok(96));
+                // Positions 12..24 wrap over the first record's words.
+                ring.push(EventId::new(3), 30, &[3, 3, 3, 3]).expect("room");
+                ring.push(EventId::new(4), 40, &[4, 4, 4, 4]).expect("room");
+            },
+        })
+        .expect("valid header");
+        let mut buf = [0u8; 256];
+        let peek = view.peek(0, &mut buf).expect("fits");
+        assert!(!peek.is_corrupt());
+        assert_eq!(peek.end(), 24);
+        let records: Vec<_> = Records::new(&buf[..peek.len()])
+            .collect::<Result<_, _>>()
+            .expect("valid");
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| (r.event(), r.timestamp(), r.args().collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (EventId::new(3), 30, std::vec![3; 4]),
+                (EventId::new(4), 40, std::vec![4; 4]),
+            ]
+        );
     }
 
     #[cfg(feature = "alloc")]

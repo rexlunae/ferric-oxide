@@ -161,8 +161,9 @@ without a system call per batch:
 
 - `mmap` of a `cpu/<n>` descriptor must ask for `abi::CPU_MAP_BYTES` from
   offset 0 with `PROT_READ` and `MAP_SHARED`. The kernel refuses `PROT_WRITE`
-  (`EACCES`), a partial or private mapping (`EINVAL`) and a fixed address
-  (`EOPNOTSUPP`). `mprotect` cannot make the mapping writable later.
+  (`EACCES`), a mapping without `PROT_READ`, a partial or a private mapping
+  (`EINVAL`) and a fixed address (`EOPNOTSUPP`). `mprotect` cannot make the
+  mapping writable later.
 - `ferric_trace::ring::View` checks the header and copies whole records from
   the mapping. Each copy reports its end position.
 - Writing `commit <end>` to the descriptor lets the kernel reuse the words up
@@ -175,6 +176,13 @@ the mapping that it did not store itself: the ring's size is kept in the
 kernel, every position is masked to the data before use, and `commit`'s `end`
 is checked against the kernel's own counters. The reader sees `head` and
 `tail` change under it, so `View` copies a record before decoding it.
+
+A `read` of the same CPU can consume records while a mapped reader is copying
+them, and the kernel can then reuse those words. After each copy, `View`
+checks `tail` again and starts over if it moved past the copy, so a copy never
+mixes two records. Two readers of one CPU can still both see a record. A
+collector that needs each record exactly once should be the CPU's only
+reader.
 
 ## Reading a capture on the host
 
@@ -302,8 +310,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
      result, another process as responder), and that `disable` stops the
      stream;
-  7. maps every CPU's ring, checks that writable, partial and private
-     mappings and an `mprotect` to writable are refused, finds the
+  7. maps every CPU's ring, checks that writable, unreadable, partial and
+     private mappings and an `mprotect` to writable are refused, finds the
      `write` to a closed descriptor by reading the mappings, and checks that
      `commit` refuses a position past `head` or inside a record and accepts
      the end of what was read.

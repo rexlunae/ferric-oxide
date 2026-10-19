@@ -470,6 +470,12 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
             )?;
             expect_errno(
                 step,
+                "mmap of a ring without PROT_READ",
+                refused(MapFlags::MAP_SHARED, CPU_MAP_BYTES),
+                EINVAL,
+            )?;
+            expect_errno(
+                step,
                 "private mmap of a ring",
                 refused(MapFlags::PROT_READ | MapFlags::MAP_PRIVATE, CPU_MAP_BYTES),
                 EINVAL,

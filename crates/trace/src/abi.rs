@@ -26,7 +26,11 @@
 //! The kernel stays the only writer of the mapped words, and it never takes a value from them
 //! that it did not store itself: the ring's size and its counters are kept in the kernel, so
 //! nothing a reader sees, or holds on to, can steer it. The reader in turn must treat every
-//! word as a snapshot that can change under it, which [`View`](crate::ring::View) does.
+//! word as a snapshot that can change under it, which [`View`](crate::ring::View) does: a
+//! read of the same CPU through the kernel can consume records while the mapped reader copies
+//! them, so `View::peek` checks `tail` after each copy and starts over if it moved past the
+//! copy. Two readers of one CPU can still both see a record; a collector that wants each
+//! record once should be the CPU's only reader.
 //!
 //! [`Peek::end`]: crate::ring::Peek::end
 
