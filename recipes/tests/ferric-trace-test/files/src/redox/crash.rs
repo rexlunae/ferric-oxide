@@ -4,7 +4,9 @@
 //!
 //! - Missing: the kernel keeps no dump, or has none from the previous boot. It prints a skip.
 //! - Empty: a crash-test kernel (`kernel.trace_crash_test`) with no dump yet, so this is the
-//!   first boot. It turns the `syscall` events on, makes a marker `write` of [`CRASH_MARK_LEN`]
+//!   first boot. It drains the rings, which `sched.switch` from boot has filled (a full ring
+//!   drops new records, so the dump would hold only old ones), turns the `syscall` events on,
+//!   makes a marker `write` of [`CRASH_MARK_LEN`]
 //!   bytes to a closed descriptor, prints `FERRIC_TEST_PASS trace-crash-armed`, and writes
 //!   `panic` to the file. The kernel writes the dump and resets the machine.
 //! - A dump: the second boot. `trace-crash-read` checks that it parses, that its message is the
@@ -20,7 +22,7 @@ use ferric_trace::kernel::{CATALOG, SYSCALL_ENTER};
 use ferric_trace::record::Records;
 use syscall::{EBADF, SYS_WRITE};
 
-use super::{BAD_FD, Entry, Failure, Why, check, command, io_failure, path};
+use super::{BAD_FD, Entry, Failure, Why, check, command, cpus, drain, io_failure, path};
 
 /// The length of the marker `write` before the panic.
 const CRASH_MARK_LEN: usize = 1931;
@@ -45,6 +47,8 @@ pub fn run() -> Result<(), Failure> {
 /// `trace-crash-armed`: marks the trace and panics the kernel. Returns only on failure.
 fn trigger(path: &str) -> Result<(), Failure> {
     let step = "trace-crash-armed";
+    // Room in every ring, so the records from here on are the newest the dump keeps.
+    drain(step, &cpus(step)?)?;
     command(step, "enable syscall")?;
     let buf = vec![0x5au8; CRASH_MARK_LEN];
     let result = syscall::write(BAD_FD, &buf);
@@ -85,11 +89,20 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
         ));
     }
     let mut entries = Vec::new();
-    let mut cpus = 0;
+    // Each CPU's decoded records and `lost` count, for the failure messages.
+    let mut per_cpu = Vec::new();
     for cpu in dump.cpus() {
-        cpus += 1;
-        entries.extend(decode_whole(cpu.records));
+        let decoded = decode_whole(cpu.records);
+        per_cpu.push(format!(
+            "cpu {}: {} records, {} lost",
+            cpu.cpu,
+            decoded.len(),
+            cpu.lost
+        ));
+        entries.extend(decoded);
     }
+    let cpus = per_cpu.len();
+    let per_cpu = per_cpu.join("; ");
     let write_of = |len: usize, fd: Option<usize>| {
         entries.iter().any(|entry| {
             entry.is(&SYSCALL_ENTER)
@@ -99,12 +112,15 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
         })
     };
     if !write_of(CRASH_MARK_LEN, Some(BAD_FD)) {
-        return Err(check(step, "the dump has no record of the marker write"));
+        return Err(check(
+            step,
+            format!("the dump has no record of the marker write ({per_cpu})"),
+        ));
     }
     if !write_of(CRASH_TEST_COMMAND.len(), None) {
         return Err(check(
             step,
-            "the dump has no record of the write that panicked",
+            format!("the dump has no record of the write that panicked ({per_cpu})"),
         ));
     }
     println!(

@@ -501,10 +501,11 @@ jobs:
             tr -d '\r' | tail -c 3500 | sed -e 's/%/%25/g' \
               | awk -v title="$1" 'BEGIN { printf "::error title=%s::", title } { printf "%s%%0A", $0 } END { print "" }'
           }
-          grep -aoE 'FERRIC_(TEST_(FAIL|SKIP)|SMOKE_[A-Z]+|TEST_PASS trace-crash)[^\r]*' "$LOG" \
+          # boot-smoke.sh prints the markers from the log with the console's CRs removed.
+          [ -f boot-smoke.out ] && grep -a '^FERRIC_\(TEST_FAIL\|TEST_PASS trace-crash\|SMOKE_\)' boot-smoke.out \
             | annotate "crash boot results" || true
-          grep -aE 'trace: |KERNEL PANIC|panicked at|^RESET|^HALT|kreset|Reset with|UNHANDLED|boot-smoke' "$LOG" \
-            | annotate "crash boot kernel lines" || true
+          tr -d '\r' < "$LOG" | grep -aE 'trace: |KERNEL PANIC|panicked at|RESET|HALT|kreset|Reset with|UNHANDLED' \
+            | grep -avE 'trace: (enable|disable) ' | annotate "crash boot kernel lines" || true
           tail -n 30 "$LOG" | annotate "crash boot serial log (tail)"
           [ -f boot-smoke.out ] && grep -a '^boot-smoke:' boot-smoke.out | annotate "boot-smoke verdict" || true
 

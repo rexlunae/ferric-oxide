@@ -245,7 +245,12 @@ manner of Linux's pstore/ramoops:
   copies records with atomic loads and consumes nothing, since the other CPUs
   are still running; a record a producer was writing at that moment can come
   out torn, and readers keep a CPU's records up to the first that does not
-  decode. A panic inside the dump does not start another.
+  decode. A panic inside the dump does not start another. The records are the
+  ones still in the ring: a ring that nobody reads fills up and then drops new
+  records (its `lost` count says how many), so the dump only holds the last
+  records before the panic while a reader keeps the rings from filling, as
+  `ferric-trace capture` does. A flight-recorder mode that overwrites the
+  oldest records instead is not implemented yet.
 - **The format** (`ferric_trace::crash`): a header of eight words (magic
   `FOCRASH1`, version 1, state, payload length, checksum), then sections, each
   a word `kind | cpu << 8 | bytes << 32` and its data: the message, or a CPU's
@@ -512,4 +517,6 @@ as a notice on the run.
   process lifecycle).
 - A reader that maps the rings in the `ferric-trace` tool (it still reads them).
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
+- A flight-recorder ring mode, so a crash dump keeps the last records even
+  when nobody reads the rings.
 - Architectures other than x86_64.
