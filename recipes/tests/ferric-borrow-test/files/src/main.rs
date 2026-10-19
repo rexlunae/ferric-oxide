@@ -17,6 +17,16 @@
 //!   writes less than both pages, and the mapping can then be unmapped. The process then
 //!   exits, which panicked the kernel before the fix.
 //!
+//! Running these right before `ferric-regbuf-test` showed a RedoxFS bug: RedoxFS keeps the
+//! contents of a file's unmapped ranges cached, keyed by node id, and handed them out again on
+//! the next `mmap` even when the file had been written since or deleted and its node id
+//! reused by a new file. Two more checks cover it:
+//!
+//! - `remap-written`: a page mapped, unmapped, then written with `pwrite` maps with the new
+//!   contents;
+//! - `remap-reused`: once the mapped file is deleted, a new file maps and reads with its own
+//!   contents, not the deleted file's.
+//!
 //! Prints one `FERRIC_TEST_PASS borrow ...` or `FERRIC_TEST_FAIL borrow ...` line and exits
 //! non-zero on failure. It also runs on Linux, which helps check the test itself.
 
@@ -34,6 +44,10 @@ const MAP_PATH: &str = "/tmp/ferric-borrow-test.map";
 const OUT_PATH: &str = "/tmp/ferric-borrow-test.out";
 /// What the mapped file holds.
 const FILL: u8 = 0x5A;
+/// The file `remap-written` maps, writes and maps again, then deletes.
+const REMAP_PATH: &str = "/tmp/ferric-borrow-test.remap";
+/// The file `remap-reused` creates after that one is deleted.
+const NEW_PATH: &str = "/tmp/ferric-borrow-test.new";
 
 /// The few libc calls the test needs, with the constants of the platform.
 mod sys {
@@ -89,6 +103,12 @@ enum Error {
     WholeWrite,
     /// The mapping could not be unmapped after the failed write: its pin was leaked.
     Pinned(io::Error),
+    /// A mapping or a read showed contents the file no longer has.
+    Stale {
+        check: &'static str,
+        expected: u8,
+        found: u8,
+    },
 }
 
 impl fmt::Display for Error {
@@ -108,6 +128,11 @@ impl fmt::Display for Error {
                 f,
                 "borrow-fail: munmap after the failed write failed ({e}): a pin leaked"
             ),
+            Self::Stale {
+                check,
+                expected,
+                found,
+            } => write!(f, "{check}: found {found:#x}, not {expected:#x}"),
         }
     }
 }
@@ -212,11 +237,81 @@ fn run() -> Result<(), Error> {
     Ok(())
 }
 
+/// Maps the first page of `file` with `flags`, returns its first byte and unmaps it.
+fn first_mapped_byte(file: &File, flags: c_int, what: &'static str) -> Result<u8, Error> {
+    let page = map(0, PAGE_SIZE, flags, file.as_raw_fd(), what)?;
+    // SAFETY: just mapped readable, one page long.
+    let byte = unsafe { (page as *const u8).read_volatile() };
+    // SAFETY: the mapping is this test's own.
+    if unsafe { sys::munmap(page as *mut c_void, PAGE_SIZE) } != 0 {
+        return Err(Error::Mmap(what));
+    }
+    Ok(byte)
+}
+
+/// Fails with [`Error::Stale`] unless `found` is `expected`.
+fn expect_byte(check: &'static str, expected: u8, found: u8) -> Result<(), Error> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(Error::Stale {
+            check,
+            expected,
+            found,
+        })
+    }
+}
+
+/// `remap-written` and `remap-reused`.
+fn check_remap() -> Result<(), Error> {
+    const OLD: u8 = 0x11;
+    const NEW: u8 = 0x22;
+    const OTHER: u8 = 0x33;
+    fs::write(REMAP_PATH, [OLD; PAGE_SIZE]).map_err(file_error(REMAP_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(REMAP_PATH)
+        .map_err(file_error(REMAP_PATH))?;
+    let shared = sys::MAP_SHARED;
+    expect_byte(
+        "remap-written (first mapping)",
+        OLD,
+        first_mapped_byte(&file, shared, "the remap file")?,
+    )?;
+    std::os::unix::fs::FileExt::write_all_at(&file, &[NEW; PAGE_SIZE], 0)
+        .map_err(file_error(REMAP_PATH))?;
+    expect_byte(
+        "remap-written",
+        NEW,
+        first_mapped_byte(&file, shared, "the written remap file")?,
+    )?;
+    drop(file);
+    fs::remove_file(REMAP_PATH).map_err(file_error(REMAP_PATH))?;
+
+    fs::write(NEW_PATH, [OTHER; PAGE_SIZE]).map_err(file_error(NEW_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(NEW_PATH)
+        .map_err(file_error(NEW_PATH))?;
+    expect_byte(
+        "remap-reused (mapping)",
+        OTHER,
+        first_mapped_byte(&file, sys::MAP_PRIVATE, "the new file")?,
+    )?;
+    drop(file);
+    let read = fs::read(NEW_PATH).map_err(file_error(NEW_PATH))?;
+    let found = read.iter().copied().find(|&b| b != OTHER).unwrap_or(OTHER);
+    expect_byte("remap-reused (read)", OTHER, found)?;
+    fs::remove_file(NEW_PATH).map_err(file_error(NEW_PATH))
+}
+
 fn main() -> ExitCode {
-    match run() {
+    match run().and_then(|()| check_remap()) {
         Ok(()) => {
             println!(
-                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned"
+                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents"
             );
             ExitCode::SUCCESS
         }
