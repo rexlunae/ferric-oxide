@@ -219,6 +219,8 @@ pub fn main() -> ! {
     let cwd_fd = initfs_root_fd
         .openat_into_upper("", O_STAT, 0)
         .expect("failed to open cwd fd");
+    // Ferric Oxide: turn on the events the initfs trace.toml names, before init runs.
+    crate::initfs_trace::apply(&initfs_root_fd, &initns_fd);
     let filetable_binary_fd = init_thr_fd
         .dup_into_upper(b"filetable-binary")
         .expect("faild to create filetable-binary fd");

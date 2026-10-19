@@ -7,6 +7,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 use ferric_trace::abi::{self, EventLine, StatsLine};
+use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
     CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
     SYSCALL_EXIT,
@@ -364,8 +365,52 @@ fn check_scheme(trace: &[Vec<Entry>], marks: &Marks) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `trace-initfs`: the events the initfs `trace.toml` leaves on are on, as bootstrap applied
+/// it before init started. Those of them the later steps turn on and off are turned off again
+/// here, so those steps start from the state they expect. Without the file it prints a skip.
+fn check_initfs() -> Result<(), Failure> {
+    let step = "trace-initfs";
+    let path = format!("/scheme/initfs/{INITFS_PATH}");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("FERRIC_TEST_SKIP trace-initfs: no {path}");
+            return Ok(());
+        }
+        Err(source) => return Err(io_failure(step, &path)(source)),
+    };
+    let config = BootConfig::parse(&bytes).map_err(|err| check(step, format!("{path}: {err}")))?;
+    let on = config
+        .check(&CATALOG)
+        .map_err(|err| check(step, format!("{path}: {err}")))?;
+    let list = listing(step)?;
+    let mut checked = 0;
+    for event in CATALOG.events().iter().filter(|e| on.contains(e.id())) {
+        // Only compiled-in events are listed, and only those can be on.
+        let Some(&(_, enabled)) = list.iter().find(|(name, _)| name == event.name()) else {
+            continue;
+        };
+        if !enabled {
+            return Err(check(
+                step,
+                format!("{} is off, but {path} turns it on", event.name()),
+            ));
+        }
+        checked += 1;
+        if TESTED.iter().any(|tested| tested.id() == event.id()) {
+            command(step, &format!("disable {}", event.name()))?;
+        }
+    }
+    if checked == 0 {
+        return Err(check(step, format!("{path} turns on no compiled-in event")));
+    }
+    println!("FERRIC_TEST_PASS trace-initfs ({checked} events on from {path})");
+    Ok(())
+}
+
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
+    check_initfs()?;
     let list = listing("trace-boot")?;
     if !is_on("trace-boot", &list, &SCHED_SWITCH)? {
         return Err(check("trace-boot", "sched.switch is not on from boot"));

@@ -25,8 +25,8 @@ arrayvec = { version = "0.7.6", default-features = false }
 ferric-iommu = { path = "../../../crates/iommu" }
 # Ferric Oxide: the kernel regbuf scheme's number and name.
 ferric-regbuf = { path = "../../../crates/regbuf" }
-# Ferric Oxide: the kernel trace scheme's number and name.
-ferric-trace = { path = "../../../crates/trace" }
+# Ferric Oxide: the kernel trace scheme's number and name, and the initfs trace.toml format.
+ferric-trace = { path = "../../../crates/trace", features = ["config"] }
 # Ferric Oxide: the kernel ring scheme's number and name.
 ferric-ring = { path = "../../../crates/ring" }
 
