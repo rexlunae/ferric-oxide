@@ -13,11 +13,17 @@ use self::nvme::Nvme;
 use crate::nvme::NvmeNamespace;
 
 mod nvme;
+// Ferric Oxide: one I/O queue pair and worker thread per CPU (drivers.nvme_percore).
+#[cfg(feature = "percore")]
+mod percore;
 
 #[derive(Clone)]
 struct NvmeDisk {
     nvme: Arc<Nvme>,
     ns: NvmeNamespace,
+    /// Ferric Oxide: the per-CPU workers that run reads and writes, when there are any.
+    #[cfg(feature = "percore")]
+    workers: Option<Rc<percore::Dispatcher>>,
 }
 
 impl Disk for NvmeDisk {
@@ -30,10 +36,28 @@ impl Disk for NvmeDisk {
     }
 
     async fn read(&mut self, block: u64, buffer: &mut [u8]) -> syscall::Result<usize> {
+        #[cfg(feature = "percore")]
+        if let Some(workers) = &self.workers {
+            let op = percore::Op::Read {
+                buf: buffer.as_mut_ptr(),
+                len: buffer.len(),
+            };
+            // SAFETY: `buffer` is borrowed for as long as this future lives.
+            return unsafe { workers.run(self.ns, block, op) }.await;
+        }
         self.nvme.namespace_read(&self.ns, block, buffer).await
     }
 
     async fn write(&mut self, block: u64, buffer: &[u8]) -> syscall::Result<usize> {
+        #[cfg(feature = "percore")]
+        if let Some(workers) = &self.workers {
+            let op = percore::Op::Write {
+                buf: buffer.as_ptr(),
+                len: buffer.len(),
+            };
+            // SAFETY: as in `read`.
+            return unsafe { workers.run(self.ns, block, op) }.await;
+        }
         self.nvme.namespace_write(&self.ns, block, buffer).await
     }
 
@@ -43,6 +67,17 @@ impl Disk for NvmeDisk {
         addr: PhysAddr,
         num_sectors: u32,
     ) -> syscall::Result<()> {
+        #[cfg(feature = "percore")]
+        if let Some(workers) = &self.workers {
+            let op = percore::Op::WriteDma {
+                addr: addr.as_usize() as u64,
+                sectors: num_sectors as u64,
+            };
+            // SAFETY: a DMA job borrows no memory of this process.
+            return unsafe { workers.run(self.ns, start_lba, op) }
+                .await
+                .map(drop);
+        }
         self.nvme
             .namespace_write_zerocopy(
                 &self.ns,
@@ -59,6 +94,17 @@ impl Disk for NvmeDisk {
         addr: PhysAddr,
         num_sectors: u32,
     ) -> syscall::Result<()> {
+        #[cfg(feature = "percore")]
+        if let Some(workers) = &self.workers {
+            let op = percore::Op::ReadDma {
+                addr: addr.as_usize() as u64,
+                sectors: num_sectors as u64,
+            };
+            // SAFETY: as in `write_dma`.
+            return unsafe { workers.run(self.ns, start_lba, op) }
+                .await
+                .map(drop);
+        }
         self.nvme
             .namespace_read_zerocopy(
                 &self.ns,
@@ -113,6 +159,27 @@ fn main() {
     pcid_interface::pci_daemon(daemon);
 }
 
+/// Ferric Oxide: the admin queue's interrupt and, with MSI-X, the table the per-CPU queue
+/// pairs take their entries from (entry 0 is the admin queue's, on the BSP, as upstream).
+#[cfg(feature = "percore")]
+fn percore_interrupts(
+    pcid_handle: &mut PciFunctionHandle,
+) -> (irq_helpers::InterruptVector, Option<irq_helpers::Msix>) {
+    let has_msix = pcid_handle
+        .fetch_all_features()
+        .iter()
+        .any(|feature| feature.is_msix());
+    if has_msix {
+        let mut msix = irq_helpers::Msix::enable(pcid_handle, "nvmed");
+        (msix.alloc(), Some(msix))
+    } else {
+        (
+            irq_helpers::pci_allocate_interrupt_vector(pcid_handle, "nvmed"),
+            None,
+        )
+    }
+}
+
 fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     let pci_config = pcid_handle.config();
 
@@ -138,6 +205,10 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     let address = unsafe { pcid_handle.map_bar(0, MemoryType::Uncacheable).ptr };
 
+    // Ferric Oxide: with per-CPU queues, keep the MSI-X table for their entries.
+    #[cfg(feature = "percore")]
+    let (interrupt_vector, mut msix) = percore_interrupts(&mut pcid_handle);
+    #[cfg(not(feature = "percore"))]
     let interrupt_vector = irq_helpers::pci_allocate_interrupt_vector(&mut pcid_handle, "nvmed");
     let iv = interrupt_vector.vector();
     let irq_handle = interrupt_vector.irq_handle().try_clone().unwrap();
@@ -172,6 +243,17 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     });
     log::debug!("Initialized!");
 
+    // Ferric Oxide: per-CPU queue pairs and their workers, and the task that completes their
+    // jobs, which must run before the partition tables are read.
+    #[cfg(feature = "percore")]
+    let workers = msix
+        .as_mut()
+        .and_then(|msix| percore::start(&nvme, msix, &executor));
+    #[cfg(feature = "percore")]
+    if let Some(workers) = &workers {
+        executor.spawn(Rc::clone(workers).pump(Rc::clone(&executor)));
+    }
+
     let scheme = Rc::new(RefCell::new(RingDiskScheme::new(
         Some(daemon),
         scheme_name,
@@ -183,6 +265,8 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
                     NvmeDisk {
                         nvme: nvme.clone(),
                         ns,
+                        #[cfg(feature = "percore")]
+                        workers: workers.clone(),
                     },
                 )
             })

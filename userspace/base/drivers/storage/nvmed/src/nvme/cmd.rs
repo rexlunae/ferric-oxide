@@ -125,6 +125,20 @@ impl NvmeCmd {
         }
     }
 
+    /// Ferric Oxide: Set Features, Number of Queues (FID 07h, NVMe Base Specification 2.0,
+    /// 5.27.1.5): asks for `sqs_1 + 1` I/O submission and `cqs_1 + 1` I/O completion queues.
+    /// The completion's dword 0 holds what the controller allocated, also 0-based.
+    pub fn set_features_number_of_queues(cid: u16, sqs_1: u16, cqs_1: u16) -> Self {
+        const FID_NUMBER_OF_QUEUES: u32 = 0x07;
+        Self {
+            opcode: 0x9,
+            cid,
+            cdw10: FID_NUMBER_OF_QUEUES,
+            cdw11: (u32::from(cqs_1) << 16) | u32::from(sqs_1),
+            ..Default::default()
+        }
+    }
+
     pub fn io_read(cid: u16, nsid: u32, lba: u64, blocks_1: u16, ptr0: u64, ptr1: u64) -> Self {
         Self {
             opcode: 2,

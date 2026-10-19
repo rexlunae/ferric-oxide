@@ -23,6 +23,8 @@ partitionlib = { path = "../partitionlib" }
 pcid = { path = "../../pcid" }
 # Ferric Oxide: NVMe data pointers for grant DMA (../../crates from userspace/base/).
 ferric-blkgrant = { path = "../../../../../crates/blkgrant", optional = true }
+# Ferric Oxide: CPU ids, irq:cpus entries and the MSI-X spread order, for per-CPU queues.
+ferric-irq = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -30,6 +32,9 @@ default = []
 # slots, mapped with MapGrant), and transfers up to the controller's MDTS with PRP lists
 # (features.toml: drivers.storage_grant_dma).
 grant-dma = ["driver-block/grant-dma", "dep:ferric-blkgrant"]
+# Ferric Oxide: one I/O queue pair, MSI-X entry and pinned worker thread per CPU
+# (features.toml: drivers.nvme_percore).
+percore = ["dep:ferric-irq"]
 
 [lints]
 workspace = true

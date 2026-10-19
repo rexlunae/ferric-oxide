@@ -143,8 +143,35 @@ Drivers give MSI-X table entries to CPUs through `pcid_interface`:
 Without `irq:cpus` these calls put every vector on the BSP, like upstream's
 `Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
 `percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
-logical id. No driver uses these calls yet; IRQ steering and per-core NVMe
-queues are later steps of roadmap Phase 2.4.
+logical id. `nvmed` uses them for its per-CPU queue pairs (below); IRQ
+steering is a later step of roadmap Phase 2.4.
+
+### Per-CPU NVMe queue pairs
+
+With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
+`nvmed` gives each online CPU an I/O queue pair of its own:
+
+- After the admin queue and the first I/O queue pair (both on MSI-X entry 0,
+  on the BSP, as upstream), it asks the controller for one more pair per CPU
+  (Set Features, Number of Queues) and takes as many as the controller grants
+  and the MSI-X table has entries for.
+- It programs one MSI-X entry per pair with `Msix::alloc_spread`, in two
+  batches, and checks each vector's CPU against `irq:cpus` and the order
+  `ferric_irq::spread` promises (`ferric_irq::verify_spread`). The log says
+  `nvmed: MSI-X entries 1..=N spread over CPUs [...]`.
+- Each pair's completion queue interrupts through its own entry, and a worker
+  thread pinned to that CPU (`pcid_interface::percpu::pin_current_thread`,
+  which writes the thread's `sched-affinity` mask from `ferric_irq::affinity`)
+  serves it with its own executor, `irq:` handle and bounce buffer.
+- The disk scheme stays on the main thread and hands each read and write to
+  the workers in turn, then waits for the worker to report it done on a pipe.
+  It cannot see the caller's CPU yet, so requests are spread round-robin, and
+  it still serves one scheme call at a time. Native rings with a home CPU
+  (later steps of the plan) are what route a request to the queue of the core
+  it came from.
+
+`ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
+throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once.
 
 ## From PCI discovery to a driver's DMA address
 

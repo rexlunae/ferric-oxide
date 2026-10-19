@@ -1592,6 +1592,7 @@ dependencies = [
  "driver-block",
  "executor",
  "ferric-blkgrant",
+ "ferric-irq",
  "futures",
  "libc",
  "libredox",
