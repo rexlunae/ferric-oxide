@@ -4,11 +4,12 @@
 //!
 //! - Missing: the kernel keeps no dump, or has none from the previous boot. It prints a skip.
 //! - Empty: a crash-test kernel (`kernel.trace_crash_test`) with no dump yet, so this is the
-//!   first boot. It drains the rings, which `sched.switch` from boot has filled (a full ring
-//!   drops new records, so the dump would hold only old ones), turns the `syscall` events on,
-//!   makes a marker `write` of [`CRASH_MARK_LEN`]
-//!   bytes to a closed descriptor, prints `FERRIC_TEST_PASS trace-crash-armed`, and writes
-//!   `panic` to the file. The kernel writes the dump and resets the machine.
+//!   first boot. It turns the `syscall` events on, makes a marker `write` of
+//!   [`CRASH_MARK_LEN`] bytes to a closed descriptor, prints
+//!   `FERRIC_TEST_PASS trace-crash-armed`, and writes `panic` to the file. The kernel writes
+//!   the dump and resets the machine. The rings are not drained first: `sched.switch` has
+//!   filled them since boot, so the dump has the newest records only because the kernel's
+//!   rings overwrite their oldest when full.
 //! - A dump: the second boot. `trace-crash-read` checks that it parses, that its message is the
 //!   crash test's panic, and that its records hold the marker `write` and the `write` of
 //!   `panic` that ended the first boot.
@@ -22,7 +23,7 @@ use ferric_trace::kernel::{CATALOG, SYSCALL_ENTER};
 use ferric_trace::record::Records;
 use syscall::{EBADF, SYS_WRITE};
 
-use super::{BAD_FD, Entry, Failure, Why, check, command, cpus, drain, io_failure, path};
+use super::{BAD_FD, Entry, Failure, Why, check, command, io_failure, path};
 
 /// The length of the marker `write` before the panic.
 const CRASH_MARK_LEN: usize = 1931;
@@ -47,8 +48,9 @@ pub fn run() -> Result<(), Failure> {
 /// `trace-crash-armed`: marks the trace and panics the kernel. Returns only on failure.
 fn trigger(path: &str) -> Result<(), Failure> {
     let step = "trace-crash-armed";
-    // Room in every ring, so the records from here on are the newest the dump keeps.
-    drain(step, &cpus(step)?)?;
+    // The rings are not drained first: `sched.switch` has been filling them since boot, and
+    // the dump must still hold the newest records, which the kernel's rings keep by
+    // overwriting their oldest when they are full.
     command(step, "enable syscall")?;
     let buf = vec![0x5au8; CRASH_MARK_LEN];
     let result = syscall::write(BAD_FD, &buf);
@@ -124,7 +126,7 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
         ));
     }
     println!(
-        "FERRIC_TEST_PASS trace-crash-read ({} records of {cpus} CPUs, panic on CPU {cpu}: {})",
+        "FERRIC_TEST_PASS trace-crash-read ({} records of {cpus} CPUs, panic on CPU {cpu}: {}; {per_cpu})",
         entries.len(),
         message.lines().last().unwrap_or_default()
     );

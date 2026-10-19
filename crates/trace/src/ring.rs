@@ -10,9 +10,29 @@
 //! ordering, so it never overwrites words the consumer has not finished copying. The consumer
 //! loads `head` with acquire ordering, copies whole records, and stores the new `tail` with
 //! release ordering; [`Ring::peek`] copies without storing `tail`, and [`Ring::commit`] stores it
-//! once the copy has been passed on, so a reader that fails to deliver records keeps them. A full
-//! ring drops the new record (it does not overwrite old ones, which would
-//! need the producer to move `tail`).
+//! once the copy has been passed on, so a reader that fails to deliver records keeps them.
+//!
+//! # When the ring is full
+//!
+//! What the producer does with a record that does not fit is the ring's [`WhenFull`] policy:
+//!
+//! - [`WhenFull::DropNewest`] (the default) drops the new record and counts it in `lost`. The
+//!   consumer is then the only one that stores `tail`.
+//! - [`WhenFull::OverwriteOldest`] makes the ring a flight recorder, which always holds the
+//!   newest records, as a crash dump needs ([`crash`](crate::crash)): the producer moves `tail`
+//!   past the oldest whole records, with a compare-and-swap, until the new one fits, counts
+//!   them in `lost`, and only then writes over their words. Readers see the overwrite as `lost`
+//!   growing and `tail` moving under them. `lost` is then an upper bound: a record a reader
+//!   had copied and checked just before the producer overwrote it is delivered and counted.
+//!
+//! Either way a reader copies first and checks afterwards: after copying, [`Ring::peek`] (and
+//! [`View::peek`]) loads `tail` again, and if it moved past the copy's start, the words before
+//! the new `tail` may have been reused under the copy. Positions at or after the new `tail` were
+//! not, so the copy keeps the records from there on, when the walk it made lands on that
+//! position, and starts over at the new `tail` otherwise. So a copy never holds a torn record,
+//! and a reader that falls behind an overwriting producer still gets the newest records instead
+//! of retrying for ever. With [`WhenFull::DropNewest`] and one reader, `tail` never moves under
+//! the copy and the check never fires.
 //!
 //! There must be one producer and one consumer at a time. The kernel guarantees the first by
 //! pushing only on the ring's own CPU with interrupts off, and the second with a lock. Breaking
@@ -185,7 +205,21 @@ impl<W: Words> Storage for Shared<W> {
 #[derive(Debug)]
 pub struct Ring<S> {
     mask: u64,
+    when_full: WhenFull,
     storage: S,
+}
+
+/// What the producer does with a record that does not fit; see the
+/// [module docs](self#when-the-ring-is-full).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WhenFull {
+    /// Drop the new record and count it as lost.
+    #[default]
+    DropNewest,
+    /// Drop the oldest records, counting them as lost, until the new one fits: a flight
+    /// recorder.
+    OverwriteOldest,
 }
 
 /// Why words cannot be a ring.
@@ -308,6 +342,7 @@ impl<D: Words> Ring<Inline<D>> {
         let mask = data_mask(data.len())?;
         Ok(Self {
             mask,
+            when_full: WhenFull::default(),
             storage: Inline {
                 head: AtomicU64::new(0),
                 tail: AtomicU64::new(0),
@@ -349,6 +384,7 @@ impl<W: Words> Ring<Shared<W>> {
             .store(SHARED_MAGIC, Ordering::Release);
         Ok(Self {
             mask,
+            when_full: WhenFull::default(),
             storage: Shared { words, data_len },
         })
     }
@@ -370,30 +406,44 @@ impl<W: Words> Ring<Shared<W>> {
     /// producers raced) accepts `end` and counts one lost record, as [`Ring::commit`] does
     /// with a corrupt peek, whose end is past the bad record.
     pub fn commit_to(&self, end: u64) -> Result<(), CommitError> {
-        let tail = self.storage.tail().load(Ordering::Relaxed);
-        if end <= tail {
-            return Ok(());
-        }
-        let head = self.storage.head().load(Ordering::Acquire);
-        if end > head {
-            return Err(CommitError::BeyondHead { end, head });
-        }
-        let mut pos = tail;
-        while pos < end {
-            let Ok(header) = Header::decode(self.slot(pos).load(Ordering::Relaxed)) else {
+        loop {
+            let tail = self.storage.tail().load(Ordering::Acquire);
+            if end <= tail {
+                return Ok(());
+            }
+            let head = self.storage.head().load(Ordering::Acquire);
+            if end > head {
+                return Err(CommitError::BeyondHead { end, head });
+            }
+            let walk = self.walk_to(tail, end);
+            // Pairs with the release fence in `Ring::push`: an overwriting producer moves `tail`
+            // before it reuses the words the walk read, so an unchanged `tail` means they were
+            // whole. Otherwise walk again from the new `tail`.
+            fence(Ordering::Acquire);
+            if self.storage.tail().load(Ordering::Relaxed) != tail {
+                continue;
+            }
+            match walk {
+                Walk::Boundary => {}
                 // The reader met the same undecodable record and stopped there, with a
                 // corrupt peek: drop what it covers, as [`Ring::commit`] does.
-                self.count_lost();
-                break;
-            };
-            pos = pos.saturating_add(header.words() as u64);
-            if pos > end {
-                return Err(CommitError::NotBoundary { end });
+                Walk::Corrupt => self.count_lost(),
+                Walk::Over => return Err(CommitError::NotBoundary { end }),
             }
+            self.storage.tail().fetch_max(end, Ordering::Release);
+            return Ok(());
         }
-        self.storage.tail().fetch_max(end, Ordering::Release);
-        Ok(())
     }
+}
+
+/// Where walking the records from one position towards another ends.
+enum Walk {
+    /// On the position.
+    Boundary,
+    /// At a record that does not decode, before the position.
+    Corrupt,
+    /// Past the position: it is inside a record.
+    Over,
 }
 
 impl<S: Storage> Ring<S> {
@@ -426,13 +476,81 @@ impl<S: Storage> Ring<S> {
         self.storage.data((pos & self.mask) as usize)
     }
 
+    /// The ring with the policy `when_full` for records that do not fit.
+    #[must_use]
+    pub fn when_full(mut self, when_full: WhenFull) -> Self {
+        self.when_full = when_full;
+        self
+    }
+
+    /// The ring's policy for records that do not fit.
+    pub fn full_policy(&self) -> WhenFull {
+        self.when_full
+    }
+
+    /// Walks the records from `from` towards `to`.
+    fn walk_to(&self, from: u64, to: u64) -> Walk {
+        let mut pos = from;
+        while pos < to {
+            let Ok(header) = Header::decode(self.slot(pos).load(Ordering::Relaxed)) else {
+                return Walk::Corrupt;
+            };
+            pos = pos.saturating_add(header.words() as u64);
+        }
+        if pos == to {
+            Walk::Boundary
+        } else {
+            Walk::Over
+        }
+    }
+
+    /// Moves `tail` past the oldest whole records until `words` more fit before `head`, and
+    /// counts them as lost. Only the producer may call this.
+    fn make_room(&self, head: u64, words: u64) {
+        // `data_mask` checked that the ring holds the longest record, so this is at most `head`.
+        let needed = head
+            .wrapping_add(words)
+            .saturating_sub(self.capacity() as u64);
+        let mut tail = self.storage.tail().load(Ordering::Acquire);
+        while tail < needed {
+            // Only this producer writes records, so the headers from `tail` on are whole.
+            let mut pos = tail;
+            let mut dropped = 0;
+            while pos < needed {
+                match Header::decode(self.slot(pos).load(Ordering::Relaxed)) {
+                    Ok(header) => pos = pos.saturating_add(header.words() as u64),
+                    // Not a record (only possible if two producers raced): drop everything.
+                    Err(_) => pos = head,
+                }
+                // A scribbled length cannot take `tail` past `head`.
+                pos = pos.min(head);
+                dropped += 1;
+            }
+            // The consumer may commit meanwhile; then count from where it stopped. The release
+            // fence in `Ring::push` orders this store before the stores that reuse the words.
+            match self.storage.tail().compare_exchange_weak(
+                tail,
+                pos,
+                Ordering::Relaxed,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.storage.lost().fetch_add(dropped, Ordering::Relaxed);
+                    return;
+                }
+                Err(now) => tail = now,
+            }
+        }
+    }
+
     /// Appends the record of `event` at `timestamp` with `args`. Only the producer may call this.
     ///
     /// # Errors
     ///
-    /// [`PushError::Full`] when the ring has no room (the record is counted as lost), and
-    /// [`PushError::TooManyArgs`] when there are more than [`MAX_ARGS`](crate::MAX_ARGS)
-    /// arguments.
+    /// [`PushError::Full`] when the ring has no room and drops new records (the record is
+    /// counted as lost), and [`PushError::TooManyArgs`] when there are more than
+    /// [`MAX_ARGS`](crate::MAX_ARGS) arguments. A ring that overwrites its oldest records is
+    /// never full.
     pub fn push(&self, event: EventId, timestamp: u64, args: &[u64]) -> Result<(), PushError> {
         let header = Header::new(event, args.len()).ok_or(PushError::TooManyArgs)?;
         let words = header.words() as u64;
@@ -440,12 +558,18 @@ impl<S: Storage> Ring<S> {
         let head = self.storage.head().load(Ordering::Relaxed);
         let tail = self.storage.tail().load(Ordering::Acquire);
         if head.wrapping_sub(tail).saturating_add(words) > self.capacity() as u64 {
-            self.count_lost();
-            return Err(PushError::Full);
+            match self.when_full {
+                WhenFull::DropNewest => {
+                    self.count_lost();
+                    return Err(PushError::Full);
+                }
+                WhenFull::OverwriteOldest => self.make_room(head, words),
+            }
         }
-        // Pairs with the acquire fence in `View::peek`: a reader that sees one of the stores
-        // below then sees a `tail` at least this one, so it knows the words may be reused
-        // under it. On x86_64 this emits no instruction.
+        // Pairs with the acquire fence in `Ring::peek_checked`: a reader that sees one of the
+        // stores below then sees a `tail` at least this one (the consumer's, or the one
+        // `make_room` just stored), so it knows the words may be reused under it. On x86_64
+        // this emits no instruction.
         fence(Ordering::Release);
         self.slot(head).store(header.encode(), Ordering::Relaxed);
         self.slot(head.wrapping_add(1))
@@ -472,9 +596,26 @@ impl<S: Storage> Ring<S> {
     /// [`ReadError::BufferTooSmall`] when records are pending but the first one does not fit in
     /// `out`. An empty ring is not an error: it gives an empty [`Peek`].
     pub fn peek(&self, out: &mut [u8]) -> Result<Peek, ReadError> {
-        // Only the consumer stores `tail`.
-        let tail = self.storage.tail().load(Ordering::Relaxed);
-        self.peek_from(tail, out)
+        self.peek_checked(0, out)
+    }
+
+    /// [`Ring::peek_from`] at `from` or `tail`, whichever is later, checked against `tail`
+    /// moving under the copy; see the [module docs](self#when-the-ring-is-full).
+    fn peek_checked(&self, from: u64, out: &mut [u8]) -> Result<Peek, ReadError> {
+        loop {
+            let start = from.max(self.storage.tail().load(Ordering::Acquire));
+            let copy = self.peek_from(start, out);
+            // Pairs with the release fence in `Ring::push`: if a copied word was rewritten,
+            // the `tail` that allowed the rewrite is visible now.
+            fence(Ordering::Acquire);
+            let tail = self.storage.tail().load(Ordering::Relaxed);
+            if tail <= start {
+                return copy;
+            }
+            if let Some(kept) = copy.ok().and_then(|copy| keep_from(start, tail, out, copy)) {
+                return Ok(kept);
+            }
+        }
     }
 
     /// [`Ring::peek`] from position `tail`.
@@ -576,6 +717,28 @@ impl<S: Storage> Ring<S> {
     }
 }
 
+/// The part of `copy`, made from position `start` into `out`, from position `tail` on, moved
+/// to the front of `out`: the records whose words were not reused, if the copy's walk lands on
+/// `tail` and there are any.
+fn keep_from(start: u64, tail: u64, out: &mut [u8], copy: Peek) -> Option<Peek> {
+    let mut pos = start;
+    let mut offset = 0;
+    while pos < tail {
+        let word = out.get(offset..offset + WORD_BYTES)?;
+        let header = Header::decode(u64::from_le_bytes(word.try_into().ok()?)).ok()?;
+        pos = pos.saturating_add(header.words() as u64);
+        offset += header.words() * WORD_BYTES;
+    }
+    if pos != tail || offset >= copy.len {
+        return None;
+    }
+    out.copy_within(offset..copy.len, 0);
+    Some(Peek {
+        len: copy.len - offset,
+        ..copy
+    })
+}
+
 /// A reader's view of a shared ring it may only read, such as the kernel's mapping of a CPU's
 /// ring: it copies records without storing anything, and the reader hands [`Peek::end`] back to
 /// whoever owns `tail`.
@@ -654,6 +817,8 @@ impl<W: Words> View<W> {
         Ok(Self {
             ring: Ring {
                 mask,
+                // A view never pushes.
+                when_full: WhenFull::DropNewest,
                 storage: Shared {
                     words,
                     data_len: available,
@@ -667,12 +832,13 @@ impl<W: Words> View<W> {
     /// `from` below the ring's `tail` starts at `tail`.
     ///
     /// The view is not the ring's consumer, so the consumer can move `tail` while it copies
-    /// (another reader draining the ring through the kernel, say), and the producer can then
-    /// reuse the words being copied. A word at a position at or after the copy's start is
-    /// reused only once `tail` has passed that start, so after copying the view loads `tail`
-    /// again and, if it moved past the start, drops the copy and starts over at the new `tail`
-    /// (as a seqlock reader retries). A returned copy therefore never mixes two records, and
-    /// never holds records consumed before it was checked. Records consumed after the check
+    /// (another reader draining the ring through the kernel, say), as can a producer that
+    /// overwrites its oldest records, and the producer can then reuse the words being copied.
+    /// A word at a position is reused only once `tail` has passed that position, so after
+    /// copying the view loads `tail` again and, if it moved past the start, keeps the records
+    /// from the new `tail` on, or starts over there when its walk does not land on it (as a
+    /// seqlock reader retries). A returned copy therefore never mixes two records, and never
+    /// holds records consumed or overwritten before it was checked. Records consumed after the check
     /// can still reach both readers: a reader that needs each record exactly once must be the
     /// ring's only reader.
     ///
@@ -680,16 +846,7 @@ impl<W: Words> View<W> {
     ///
     /// As [`Ring::peek`], for a copy that `tail` did not overtake.
     pub fn peek(&self, from: u64, out: &mut [u8]) -> Result<Peek, ReadError> {
-        loop {
-            let start = from.max(self.tail());
-            let copy = self.ring.peek_from(start, out);
-            // Pairs with the release fence in `Ring::push`: if a copied word was rewritten,
-            // the `tail` that allowed the rewrite is visible now.
-            fence(Ordering::Acquire);
-            if self.ring.storage.tail().load(Ordering::Relaxed) <= start {
-                return copy;
-            }
-        }
+        self.ring.peek_checked(from, out)
     }
 
     /// The ring's `tail`: where the owner will let the producer reuse words from.
@@ -808,7 +965,11 @@ mod tests {
     /// The timestamps of the records in `words`.
     fn timestamps(words: &[u64]) -> Vec<u64> {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        Records::new(&bytes)
+        byte_timestamps(&bytes)
+    }
+
+    fn byte_timestamps(bytes: &[u8]) -> Vec<u64> {
+        Records::new(bytes)
             .map(|r| r.expect("whole records").timestamp())
             .collect()
     }
@@ -884,6 +1045,115 @@ mod tests {
         assert_eq!(ring.lost(), 1);
         ring.count_lost();
         assert_eq!(ring.lost(), 2);
+    }
+
+    #[test]
+    fn overwriting_ring_keeps_the_newest_records() {
+        let ring = Ring::new(words(16))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        assert_eq!(ring.full_policy(), WhenFull::OverwriteOldest);
+        // 6 words each: two fit, so each push from the third on drops the oldest.
+        for i in 0..5 {
+            assert_eq!(ring.push(EventId::new(0), i, &[i; 4]), Ok(()), "push {i}");
+        }
+        assert_eq!(ring.lost(), 3);
+        let mut buf = [0u8; 256];
+        let len = ring.read(&mut buf).expect("fits");
+        assert_eq!(byte_timestamps(&buf[..len]), [3, 4]);
+        // The ring empties as usual, and then takes records without dropping any.
+        assert_eq!(ring.read(&mut buf), Ok(0));
+        ring.push(EventId::new(0), 5, &[]).expect("room");
+        assert_eq!(ring.lost(), 3);
+    }
+
+    #[test]
+    fn overwriting_ring_drops_whole_records_of_any_length() {
+        let ring = Ring::new(words(16))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        // 2, 4, 6 and 3 words: 15 of 16.
+        ring.push(EventId::new(0), 0, &[]).expect("room");
+        ring.push(EventId::new(0), 1, &[1, 1]).expect("room");
+        ring.push(EventId::new(0), 2, &[2; 4]).expect("room");
+        ring.push(EventId::new(0), 3, &[3]).expect("room");
+        assert_eq!(ring.lost(), 0);
+        // 10 words: the first three records (12 words) make room for it, the fourth stays.
+        ring.push(EventId::new(0), 4, &[4; 8]).expect("room");
+        assert_eq!(ring.lost(), 3);
+        assert_eq!(ring.pending(), 13);
+        let mut buf = [0u8; 256];
+        let len = ring.read(&mut buf).expect("fits");
+        assert_eq!(byte_timestamps(&buf[..len]), [3, 4]);
+    }
+
+    #[test]
+    fn copy_latest_of_an_overwriting_ring() {
+        let ring = Ring::new(words(32))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        for i in 0..100 {
+            ring.push(EventId::new(1), i, &[i, i]).expect("room");
+        }
+        let mut copied = Vec::new();
+        assert_eq!(ring.copy_latest(12, |w| copied.push(w)), 12);
+        let bytes: Vec<u8> = copied.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(byte_timestamps(&bytes), [97, 98, 99]);
+    }
+
+    /// The consumer's position is a record boundary below the overwriting producer's new
+    /// `tail`: committing it changes nothing.
+    #[test]
+    fn commit_to_after_an_overwrite() {
+        let mem = words(SHARED_HEADER_WORDS + 16);
+        let ring = Ring::shared(&mem[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        for i in 0..4 {
+            ring.push(EventId::new(1), i, &[i, i]).expect("room");
+        }
+        let view = View::new(&mem[..]).expect("valid header");
+        let mut buf = [0u8; 256];
+        let peek = view.peek(0, &mut buf).expect("fits");
+        assert_eq!(peek.end(), 16);
+        // Two more records overwrite the first two, which moves `tail` to 8.
+        ring.push(EventId::new(1), 4, &[4, 4]).expect("room");
+        ring.push(EventId::new(1), 5, &[5, 5]).expect("room");
+        assert_eq!(view.tail(), 8);
+        assert_eq!(ring.commit_to(4), Ok(()));
+        assert_eq!(view.tail(), 8);
+        assert_eq!(ring.commit_to(peek.end()), Ok(()));
+        assert_eq!(view.tail(), 16);
+        let peek = view.peek(16, &mut buf).expect("fits");
+        assert_eq!(byte_timestamps(&buf[..peek.len()]), [4, 5]);
+    }
+
+    /// An overwriting producer reuses the first record's words while a view copies them: the
+    /// view keeps the records after it, which are whole.
+    #[test]
+    fn view_keeps_what_an_overwrite_left() {
+        let mem = words(SHARED_HEADER_WORDS + 16);
+        let ring = Ring::shared(&mem[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        // Four 4-word records fill the 16 data words.
+        for i in 0..4 {
+            ring.push(EventId::new(1), i, &[i, i]).expect("room");
+        }
+        let view = View::new(Hooked {
+            words: &mem[..],
+            // The first record's timestamp: its header is copied, the rest is not yet.
+            at: SHARED_HEADER_WORDS + 1,
+            fired: core::sync::atomic::AtomicBool::new(false),
+            hook: || ring.push(EventId::new(1), 4, &[4, 4]).expect("room"),
+        })
+        .expect("valid header");
+        let mut buf = [0u8; 256];
+        let peek = view.peek(0, &mut buf).expect("fits");
+        assert!(!peek.is_corrupt());
+        assert_eq!(peek.end(), 16);
+        assert_eq!(byte_timestamps(&buf[..peek.len()]), [1, 2, 3]);
+        assert_eq!(view.lost(), 1);
     }
 
     #[test]
@@ -1203,8 +1473,72 @@ mod tests {
     /// every record arrives whole and in order, and the gaps add up to the lost count.
     #[test]
     fn concurrent_producer_and_consumer() {
+        producer_and_consumer(WhenFull::DropNewest);
+    }
+
+    /// As `concurrent_producer_and_consumer`, with the producer overwriting the records the
+    /// consumer has not read yet.
+    #[test]
+    fn concurrent_overwriting_producer_and_consumer() {
+        producer_and_consumer(WhenFull::OverwriteOldest);
+    }
+
+    /// A mapped reader (a [`View`] that commits through [`Ring::commit_to`]) keeps up with a
+    /// producer that overwrites what it has not read: every record it gets is whole and in
+    /// order, and commits it passes back are accepted.
+    #[test]
+    fn concurrent_overwriting_producer_and_view() {
+        const RECORDS: u64 = 300_000;
+        let mem = words(SHARED_HEADER_WORDS + 1024);
+        let ring = Ring::shared(&mem[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        let view = View::new(&mem[..]).expect("valid header");
+        let done = core::sync::atomic::AtomicBool::new(false);
+        let seen = std::thread::scope(|s| {
+            s.spawn(|| {
+                for seq in 0..RECORDS {
+                    let n = (seq % 9) as usize;
+                    let args = [seq, !seq, seq, seq, seq, seq, seq, seq];
+                    ring.push(EventId::new(1), seq, &args[..n])
+                        .expect("an overwriting ring is never full");
+                }
+                done.store(true, Ordering::Release);
+            });
+            let mut buf = [0u8; 2048];
+            let (mut seen, mut next, mut from) = (0u64, 0u64, 0u64);
+            loop {
+                let finished = done.load(Ordering::Acquire);
+                let peek = view
+                    .peek(from, &mut buf)
+                    .expect("a 2 KiB buffer holds any record");
+                for record in Records::new(&buf[..peek.len()]) {
+                    let record = record.expect("whole, valid records");
+                    let seq = record.timestamp();
+                    assert!(seq >= next, "out of order: {seq} after {next}");
+                    assert_eq!(record.arg_count(), (seq % 9) as usize);
+                    if let Some(a) = record.arg(1) {
+                        assert_eq!(a, !seq);
+                    }
+                    next = seq + 1;
+                    seen += 1;
+                }
+                ring.commit_to(peek.end())
+                    .expect("a record boundary within head");
+                from = peek.end();
+                if finished && peek.is_empty() {
+                    break;
+                }
+            }
+            seen
+        });
+        assert!(seen > 0);
+        assert!(seen + ring.lost() >= RECORDS);
+    }
+
+    fn producer_and_consumer(when_full: WhenFull) {
         const RECORDS: u64 = 1_000_000;
-        let ring = Ring::new(words(1024)).expect("valid");
+        let ring = Ring::new(words(1024)).expect("valid").when_full(when_full);
         let done = core::sync::atomic::AtomicBool::new(false);
 
         let (seen, gaps) = std::thread::scope(|s| {
@@ -1248,8 +1582,18 @@ mod tests {
             (seen, gaps)
         });
 
-        assert_eq!(seen + ring.lost(), RECORDS);
-        assert_eq!(gaps, ring.lost());
+        match when_full {
+            WhenFull::OverwriteOldest => {
+                // A record overwritten after the consumer checked its copy is both seen and
+                // counted as lost.
+                assert!(seen + ring.lost() >= RECORDS);
+                assert!(gaps <= ring.lost());
+            }
+            _ => {
+                assert_eq!(seen + ring.lost(), RECORDS);
+                assert_eq!(gaps, ring.lost());
+            }
+        }
         assert!(seen > 0);
     }
 }

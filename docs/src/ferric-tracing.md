@@ -162,7 +162,9 @@ Event ids and names come from `ferric_trace::kernel::CATALOG`. Decoders use
 that same catalog, and `ferric_trace::record::Records` decodes a buffer.
 
 Each CPU has a 64 KiB ring, created when the CPUs are counted or on the first
-run-time enable. When a ring is full, new records are dropped and counted.
+run-time enable. When a ring is full, new records are dropped and counted, or,
+with `kernel.trace_crash`, the oldest are overwritten and counted (see
+[Crash dump](#crash-dump)).
 The ring sits in kernel-allocated pages in the shared layout of
 `ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
 data length, and `head`, `tail` and `lost` on cache lines of their own), then
@@ -245,12 +247,18 @@ manner of Linux's pstore/ramoops:
   copies records with atomic loads and consumes nothing, since the other CPUs
   are still running; a record a producer was writing at that moment can come
   out torn, and readers keep a CPU's records up to the first that does not
-  decode. A panic inside the dump does not start another. The records are the
-  ones still in the ring: a ring that nobody reads fills up and then drops new
-  records (its `lost` count says how many), so the dump only holds the last
-  records before the panic while a reader keeps the rings from filling, as
-  `ferric-trace capture` does. A flight-recorder mode that overwrites the
-  oldest records instead is not implemented yet.
+  decode. A panic inside the dump does not start another.
+- **Flight-recorder rings.** With `kernel.trace_crash`, a full ring overwrites
+  its oldest records instead of dropping the new one, so the dump holds the
+  last records before the panic even when nobody reads the rings. The producer
+  moves `tail` past the oldest whole records (a compare-and-swap, since the
+  reader stores `tail` too) and counts them in `lost` before it reuses their
+  words. A reader checks `tail` again after each copy, and keeps the part of
+  its copy from the new `tail` on, so it never returns a torn record and is not
+  starved by a producer that keeps overwriting. In this mode `lost` is an upper
+  bound: a record copied just before it was overwritten is delivered and
+  counted. Without `kernel.trace_crash`, a full ring drops new records as
+  before.
 - **The format** (`ferric_trace::crash`): a header of eight words (magic
   `FOCRASH1`, version 1, state, payload length, checksum), then sections, each
   a word `kind | cpu << 8 | bytes << 32` and its data: the message, or a CPU's
@@ -319,7 +327,8 @@ drained is ever deleted:
 
 `--scheme <path>` reads another scheme path.
 
-Each ring holds 64 KiB, and a full ring drops new records. For each CPU the
+Each ring holds 64 KiB, and a full ring drops new records (or overwrites the
+oldest, with `kernel.trace_crash`). For each CPU the
 command prints the records lost before the capture started and those lost
 while it ran. The first count runs from boot, so compare it with
 `stats.before`. If either shows new losses, the capture is missing records, and
@@ -519,6 +528,4 @@ as a notice on the run.
   process lifecycle).
 - A reader that maps the rings in the `ferric-trace` tool (it still reads them).
 - Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
-- A flight-recorder ring mode, so a crash dump keeps the last records even
-  when nobody reads the rings.
 - Architectures other than x86_64.
