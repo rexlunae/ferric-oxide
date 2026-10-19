@@ -12,8 +12,11 @@
 //!
 //! Little-endian 64-bit words. A header of [`HEADER_WORDS`]: [`MAGIC`], [`VERSION`], the
 //! state ([`STATE_EMPTY`], [`STATE_WRITING`] or [`STATE_COMPLETE`]), the payload length in
-//! words, and a checksum (64-bit FNV-1a, one word at a time, over every other header word and
-//! the payload). The rest of the header is zero.
+//! words, a checksum (64-bit FNV-1a, one word at a time, over every other header word and
+//! the payload), and the clock the records' timestamps come from ([`crate::clock`]): one word
+//! holding `1 + `[`Clock::raw`] and one holding the tick length in femtoseconds, `0` when it is
+//! unknown. A clock word of `0` means the dump does not say, as in dumps from kernels before
+//! the clock was recorded, whose timestamps are TSC cycles. The rest of the header is zero.
 //!
 //! The payload is a run of sections, each a word `kind | cpu << 8 | bytes << 32` and then
 //! `bytes` of data padded to whole words:
@@ -35,6 +38,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::clock::{Clock, ClockLine};
 use crate::record::WORD_BYTES;
 use crate::ring::{Ring, Storage};
 
@@ -73,6 +77,8 @@ const VERSION_WORD: usize = 1;
 const STATE_WORD: usize = 2;
 const USED_WORD: usize = 3;
 const CHECKSUM_WORD: usize = 4;
+const CLOCK_WORD: usize = 5;
+const PERIOD_WORD: usize = 6;
 
 /// The largest CPU number a section holds.
 const MAX_CPU: u32 = (1 << 24) - 1;
@@ -179,6 +185,16 @@ fn check(len: usize, word: impl Fn(usize) -> u64) -> Result<usize, CrashError> {
         at += words;
     }
     Ok(total)
+}
+
+/// The clock a header's clock and period words describe; `None` for a clock word of `0` (not
+/// recorded) or of a clock this crate does not know.
+fn clock_line(clock: u64, period_fs: u64) -> Option<ClockLine> {
+    let raw = u8::try_from(clock.checked_sub(1)?).ok()?;
+    Some(ClockLine {
+        clock: Clock::from_raw(raw)?,
+        period_fs: (period_fs != 0).then_some(period_fs),
+    })
 }
 
 /// An area of the boot memory map, as [`region_is_free`] needs it.
@@ -334,6 +350,12 @@ impl<'a> Writer<'a> {
         data_words(bytes).saturating_sub(1)
     }
 
+    /// Records the clock the dump's timestamps come from, in the header.
+    pub fn clock(&mut self, line: ClockLine) {
+        self.words[CLOCK_WORD].store(1 + u64::from(line.clock.raw()), Ordering::Relaxed);
+        self.words[PERIOD_WORD].store(line.period_fs.unwrap_or(0), Ordering::Relaxed);
+    }
+
     /// Completes the dump: stores its length and checksum, then marks it complete.
     pub fn finish(self) {
         let used = (self.pos - HEADER_WORDS) as u64;
@@ -409,6 +431,7 @@ pub struct CpuDump<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dump<'a> {
     payload: &'a [u8],
+    clock: Option<ClockLine>,
 }
 
 impl<'a> Dump<'a> {
@@ -439,7 +462,14 @@ impl<'a> Dump<'a> {
         let total = check(bytes.len() / WORD_BYTES, word)?;
         Ok(Self {
             payload: &bytes[HEADER_WORDS * WORD_BYTES..total * WORD_BYTES],
+            clock: clock_line(word(CLOCK_WORD), word(PERIOD_WORD)),
         })
+    }
+
+    /// The clock the dump's timestamps come from, when the dump records it. A dump without
+    /// one comes from a kernel whose timestamps are TSC cycles.
+    pub fn clock(&self) -> Option<ClockLine> {
+        self.clock
     }
 
     /// The sections, as (kind, cpu, data).
@@ -569,11 +599,17 @@ mod tests {
         assert_eq!(writer.message(1, b"panicked at src/x.rs: oops"), 26);
         assert_eq!(writer.cpu(0, &ring0, 100), 20);
         assert_eq!(writer.cpu(1, &ring1, 100), 8);
+        let kvm = ClockLine {
+            clock: Clock::KvmClock,
+            period_fs: Some(1_000_000),
+        };
+        writer.clock(kvm);
         writer.finish();
 
         let len = Dump::len_in(&words).expect("complete");
         let all = bytes(&words);
         let dump = Dump::parse(&all[..len]).expect("complete");
+        assert_eq!(dump.clock(), Some(kvm));
         assert_eq!(
             dump.message(),
             Some((1, &b"panicked at src/x.rs: oops"[..]))
@@ -606,6 +642,30 @@ mod tests {
             .collect();
         assert_eq!(stamps, [8, 9]);
         assert_eq!(dump.message(), None);
+        // A dump that does not record its clock, like one from an older kernel.
+        assert_eq!(dump.clock(), None);
+    }
+
+    #[test]
+    fn reads_the_clock_words() {
+        assert_eq!(clock_line(0, 0), None);
+        assert_eq!(clock_line(0, 1_000_000), None);
+        assert_eq!(clock_line(1 + 200, 0), None);
+        assert_eq!(clock_line(1 + (1 << 8), 0), None);
+        for (clock, period_fs) in [
+            (Clock::Tsc, None),
+            (Clock::KvmClock, Some(1_000_000)),
+            (Clock::Hpet, Some(10_000_000)),
+            (Clock::Hpet, None),
+        ] {
+            let words = region(REGION_WORDS);
+            let mut writer = Writer::begin(&words).expect("big enough");
+            writer.clock(ClockLine { clock, period_fs });
+            writer.finish();
+            let all = bytes(&words);
+            let dump = Dump::parse(&all).expect("complete");
+            assert_eq!(dump.clock(), Some(ClockLine { clock, period_fs }));
+        }
     }
 
     #[test]

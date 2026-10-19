@@ -236,6 +236,8 @@ static RINGS: [Once<CpuRing>; MAX_CPU_COUNT as usize] =
 /// counted, and before an event is turned on at run time. A CPU whose ring cannot be made
 /// stays without one, counting nothing, until the next call.
 pub fn init_rings() {
+    // The clock is picked before the first ring exists, so every record has its timestamps.
+    super::clock::choice();
     for (cpu, ring) in RINGS.iter().enumerate().take(crate::cpu_count() as usize) {
         let made = ring
             .try_call_once(|| {
@@ -254,12 +256,6 @@ pub fn ring(cpu: LogicalCpuId) -> Option<&'static CpuRing> {
     RINGS.get(cpu.get() as usize)?.get()
 }
 
-/// The timestamp of a record: the TSC.
-fn timestamp() -> u64 {
-    // SAFETY: RDTSC reads a counter; it has no side effects and every x86_64 CPU has it.
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
 /// Writes a record of `event` with `args` to this CPU's ring. The slow path of `trace_event!`.
 #[cold]
 #[inline(never)]
@@ -274,5 +270,5 @@ pub fn emit(event: &Event, args: &[u64]) {
         return;
     }
     // A full ring counts the record (or the oldest it overwrote) as lost itself.
-    let _ = ring.push(event.id(), timestamp(), args);
+    let _ = ring.push(event.id(), super::clock::now(), args);
 }

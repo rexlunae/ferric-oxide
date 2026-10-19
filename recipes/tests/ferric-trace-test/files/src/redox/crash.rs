@@ -11,19 +11,21 @@
 //!   filled them since boot, so the dump has the newest records only because the kernel's
 //!   rings overwrite their oldest when full.
 //! - A dump: the second boot. `trace-crash-read` checks that it parses, that its message is the
-//!   crash test's panic, and that its records hold the marker `write` and the `write` of
-//!   `panic` that ended the first boot.
+//!   crash test's panic, that it records the clock this boot's `clock` file names (the same
+//!   machine picks the same clock), and that its records hold the marker `write` and the
+//!   `write` of `panic` that ended the first boot.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 
-use ferric_trace::abi::{CRASH_PATH, CRASH_TEST_COMMAND};
+use ferric_trace::abi::{CLOCK_PATH, CRASH_PATH, CRASH_TEST_COMMAND};
+use ferric_trace::clock::ClockLine;
 use ferric_trace::crash::Dump;
 use ferric_trace::kernel::{CATALOG, SYSCALL_ENTER};
 use ferric_trace::record::Records;
 use syscall::{EBADF, SYS_WRITE};
 
-use super::{BAD_FD, Entry, Failure, Why, check, command, io_failure, path};
+use super::{BAD_FD, Entry, Failure, Why, check, command, io_failure, path, read_text};
 
 /// The length of the marker `write` before the panic.
 const CRASH_MARK_LEN: usize = 1931;
@@ -90,6 +92,18 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
             format!("the panic was not the test's: {message:?}"),
         ));
     }
+    let text = read_text(step, CLOCK_PATH)?;
+    let clock = ClockLine::parse(&text)
+        .map_err(|err| check(step, format!("clock line {text:?}: {err}")))?;
+    if dump.clock() != Some(clock) {
+        return Err(check(
+            step,
+            format!(
+                "the dump's clock {:?} is not this boot's {clock:?}",
+                dump.clock()
+            ),
+        ));
+    }
     let mut entries = Vec::new();
     // Each CPU's decoded records and `lost` count, for the failure messages.
     let mut per_cpu = Vec::new();
@@ -126,8 +140,9 @@ fn read_back(path: &str, bytes: &[u8]) -> Result<(), Failure> {
         ));
     }
     println!(
-        "FERRIC_TEST_PASS trace-crash-read ({} records of {cpus} CPUs, panic on CPU {cpu}: {}; {per_cpu})",
+        "FERRIC_TEST_PASS trace-crash-read ({} records of {cpus} CPUs, clock {}, panic on CPU {cpu}: {}; {per_cpu})",
         entries.len(),
+        clock.clock,
         message.lines().last().unwrap_or_default()
     );
     Ok(())
