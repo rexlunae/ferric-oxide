@@ -153,6 +153,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
+| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsync` through a ring, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
@@ -172,6 +173,15 @@ futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
 posts the benchmark as a notice. Read that script for the exact required marker set.
+
+The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
+`cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a
+git dependency only when its locked revision is missing from the database, so
+a GitLab outage no longer fails a build whose locked revisions are already
+cached. The key covers this repository's lockfiles; a dependency the cookbook
+fetches during a build carries its own lockfile and is not part of the key, so
+the `cargo-git-` restore key falls back to an earlier cache and Cargo retries
+the fetch (`CARGO_NET_RETRY`).
 
 The workflow exports recipe-facing kernel/relibc/bootloader settings from its
 temporary generated config. It does not install a root `ferric.toml` or

@@ -8,6 +8,8 @@ Redox OS is distributed under the MIT License. This fork keeps that license and 
 
 Third-party software built by the recipes in this repository keeps its own license.
 
+Components that this fork consumes as Cargo dependencies or git submodules are mirrored with full history under [github.com/rexlunae](https://github.com/rexlunae) so builds do not depend on upstream infrastructure. The mirrors keep their original MIT license and copyright notices.
+
 ## Trademarks
 
 "Redox OS" and the Redox OS logo are trademarks of the Redox OS nonprofit. Ferric Oxide does not use them as its own name or logo, and nothing in this project implies endorsement by, or affiliation with, the Redox OS nonprofit. References to Redox OS in this repository describe where the code came from, or name upstream components (such as RedoxFS, relibc and the `redox` target triple) whose names are kept for technical compatibility.
