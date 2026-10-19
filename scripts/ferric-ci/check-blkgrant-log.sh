@@ -32,6 +32,13 @@ if grep -aE "FERRIC_TEST_FAIL nvme-grant" <<< "$clean"; then
     fail "ferric-blkgrant-test failed"
 fi
 
+# nvmed's own lines (its setup and any error) as one notice, so a failed check below can be
+# read without the job log.
+nvmed_lines="$(grep -aE 'nvmed: ' <<< "$clean" | head -n 20 || true)"
+if [ -n "$nvmed_lines" ]; then
+    echo "::notice title=nvmed lines::$(sed 's/%/%25/g' <<< "$nvmed_lines" | sed ':a;N;$!ba;s/\n/%0A/g')"
+fi
+
 # drivers.nvme_percore is on in every CI image: nvmed spreads its I/O completion queues' MSI-X
 # entries over the CPUs in two batches, checks them against irq:cpus, and serves each pair from
 # a worker thread on its CPU.

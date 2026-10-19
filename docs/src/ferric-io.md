@@ -151,10 +151,11 @@ steering is a later step of roadmap Phase 2.4.
 With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
 `nvmed` gives each online CPU an I/O queue pair of its own:
 
-- After the admin queue and the first I/O queue pair (both on MSI-X entry 0,
-  on the BSP, as upstream), it asks the controller for one more pair per CPU
-  (Set Features, Number of Queues) and takes as many as the controller grants
-  and the MSI-X table has entries for.
+- The admin queue and the first I/O queue pair stay on MSI-X entry 0, on the
+  BSP, as upstream. Before it creates that first pair, it asks the controller
+  for one more pair per CPU (Set Features, Number of Queues), since the
+  specification allows that request only before any I/O queue exists, and
+  takes as many as the controller grants and the MSI-X table has entries for.
 - It programs one MSI-X entry per pair with `Msix::alloc_spread`, in two
   batches, and checks each vector's CPU against `irq:cpus` and the order
   `ferric_irq::spread` promises (`ferric_irq::verify_spread`). The log says

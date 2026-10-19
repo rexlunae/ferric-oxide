@@ -256,25 +256,46 @@ fn worker_count(cpus: usize, granted_pairs: u16, free_entries: u16) -> usize {
         .min(MAX_WORKERS)
 }
 
-/// Sets up the per-CPU queue pairs and their workers, or returns `None` (and logs why) to keep
-/// every request on the main thread's queue pair.
-pub fn start(
-    nvme: &Arc<Nvme>,
-    msix: &mut Msix,
-    executor: &Rc<NvmeExecutor>,
-) -> Option<Rc<Dispatcher>> {
+/// What the controller granted for per-CPU queue pairs, which [`request`] asks for before the
+/// first I/O queue exists and [`start`] then uses.
+pub struct Grant {
+    /// The CPUs, from `irq:cpus`.
+    cpus: Vec<CpuEntry>,
+    /// I/O queue pairs the controller grants, the main thread's pair included.
+    granted: u16,
+}
+
+/// Asks the controller for one I/O queue pair per CPU beyond the main thread's, or returns
+/// `None` (and logs why) to keep every request on the main thread's pair.
+///
+/// It must run before [`Nvme::init_with_queues`] creates I/O queue pair 1: the NVMe Base
+/// Specification allows Set Features, Number of Queues (feature 07h) only during
+/// initialization, before any I/O queue is created, and a controller may fail it afterwards
+/// (QEMU answers Command Sequence Error).
+pub fn request(nvme: &Arc<Nvme>, msix: &Msix, executor: &Rc<NvmeExecutor>) -> Option<Grant> {
     let Some(cpus) = msix.cpus().map(<[CpuEntry]>::to_vec) else {
         log::info!("nvmed: no irq:cpus (kernel.irq_percpu off): one I/O queue pair");
         return None;
     };
     let wanted = u16::try_from(cpus.len().min(MAX_WORKERS) + 1).unwrap_or(u16::MAX);
-    let granted = match executor.block_on(nvme.request_io_queues(wanted)) {
-        Ok(granted) => granted,
+    match executor.block_on(nvme.request_io_queues(wanted)) {
+        Ok(granted) => Some(Grant { cpus, granted }),
         Err(err) => {
             log::warn!("nvmed: one I/O queue pair: the controller refused more ({err})");
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Sets up the per-CPU queue pairs that `grant` allows and their workers, or returns `None`
+/// (and logs why) to keep every request on the main thread's queue pair.
+pub fn start(
+    nvme: &Arc<Nvme>,
+    msix: &mut Msix,
+    executor: &Rc<NvmeExecutor>,
+    grant: Grant,
+) -> Option<Rc<Dispatcher>> {
+    let Grant { cpus, granted } = grant;
     let free = msix.table_size().saturating_sub(1);
     let count = worker_count(cpus.len(), granted, free);
     if count == 0 {

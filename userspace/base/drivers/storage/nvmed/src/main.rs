@@ -229,6 +229,13 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         executor.register_external_event(time_handle.as_raw_fd() as usize, event::EventFlags::READ),
     );
 
+    // Ferric Oxide: the controller is asked for the per-CPU queue pairs before the first I/O
+    // queue exists, which is the only time it may be asked.
+    #[cfg(feature = "percore")]
+    let grant = msix
+        .as_ref()
+        .and_then(|msix| percore::request(&nvme, msix, &executor));
+
     // Try to init namespaces for 5 seconds
     time_arm(&mut time_handle, 5).expect("failed to arm timer");
     let namespaces = executor.block_on(async {
@@ -248,7 +255,8 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     #[cfg(feature = "percore")]
     let workers = msix
         .as_mut()
-        .and_then(|msix| percore::start(&nvme, msix, &executor));
+        .zip(grant)
+        .and_then(|(msix, grant)| percore::start(&nvme, msix, &executor, grant));
     #[cfg(feature = "percore")]
     if let Some(workers) = &workers {
         executor.spawn(Rc::clone(workers).pump(Rc::clone(&executor)));

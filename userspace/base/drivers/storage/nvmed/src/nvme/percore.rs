@@ -3,7 +3,7 @@
 //!
 //! The admin queue and the first I/O queue pair stay with the main thread, on MSI-X entry 0.
 //! [`Nvme::request_io_queues`] asks the controller how many more queue pairs it grants (Set
-//! Features, Number of Queues), and [`Nvme::add_queue_pair`] creates one with its own completion
+//! Features, Number of Queues, before the first I/O queue is created), and [`Nvme::add_queue_pair`] creates one with its own completion
 //! queue, MSI-X entry and thread context (bounce buffer included). The thread that serves it
 //! then calls [`Nvme::enter_queue_pair`], after which its reads and writes go to that pair and
 //! its executor polls only that pair's completion queue.
@@ -22,6 +22,10 @@ use super::{CqId, Iv, Nvme, NvmeCmd, SqId, ThreadCtxt, THREAD_CTXT};
 impl Nvme {
     /// Asks the controller for `wanted` I/O submission and completion queues in all (the first
     /// pair included), and returns how many pairs it grants: at most `wanted`, at least 1.
+    ///
+    /// Call it before any I/O queue is created: the NVMe Base Specification allows Number of
+    /// Queues (feature 07h) only then, and a controller may fail the command afterwards (QEMU
+    /// answers Command Sequence Error).
     ///
     /// # Errors
     ///
