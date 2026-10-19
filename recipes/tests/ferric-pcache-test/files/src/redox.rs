@@ -192,6 +192,7 @@ impl Cache {
     /// empty for [`QUIET`].
     fn records(&self) -> Result<Vec<Record>, Failure> {
         let queue = self.queue()?;
+        progress("read the queue");
         let mut records = Vec::new();
         let start = Instant::now();
         let mut last = start;
@@ -238,6 +239,7 @@ impl Cache {
             let eio = NonZeroU16::new(ERRNO_EIO as u16).expect("EIO is not zero");
             (Vec::new(), Outcome::Failed(eio))
         };
+        progress(&format!("Filled {:?}", pages.pages()));
         let (words, n) = Request::Filled { pages, outcome }.encode();
         ctx(
             "Filled",
@@ -364,6 +366,7 @@ fn time_preads(fd: &Fd) -> Result<u128, Failure> {
 /// The queue, bound to the scheme, and the file's object, sized; `None` without a
 /// `kernel.pcache` scheme.
 fn setup(socket: &Socket) -> Result<Option<(Fd, Fd)>, Failure> {
+    progress("open the queue");
     let queue = match Fd::open(
         &format!("/scheme/{SCHEME_NAME}/{QUEUE_PATH}"),
         O_RDWR | O_CLOEXEC | O_NONBLOCK,
@@ -380,6 +383,7 @@ fn setup(socket: &Socket) -> Result<Option<(Fd, Fd)>, Failure> {
             });
         }
     };
+    progress("Bind");
     let (words, n) = Request::Bind.encode();
     ctx(
         "Bind",
@@ -398,12 +402,14 @@ fn setup(socket: &Socket) -> Result<Option<(Fd, Fd)>, Failure> {
         &words[..n],
     );
     check(again.is_err(), || "a second Bind worked".into())?;
+    progress("SetReadaheadMax");
     let max = ReadaheadMax::new(READAHEAD_MAX).expect("in range");
     let (words, n) = Request::SetReadaheadMax { pages: max }.encode();
     ctx(
         "SetReadaheadMax",
         queue.call_wo(&[], CallFlags::empty(), &words[..n]),
     )?;
+    progress("create the object");
     let mut path = [0; ObjectId::PATH_MAX];
     let object = ctx(
         "create the object",
@@ -413,6 +419,7 @@ fn setup(socket: &Socket) -> Result<Option<(Fd, Fd)>, Failure> {
     check(duplicate.is_err(), || {
         "a second object with the same ID".into()
     })?;
+    progress("SetSize");
     let (words, n) = Request::SetSize { size: FILE_SIZE }.encode();
     ctx(
         "SetSize",
@@ -543,8 +550,27 @@ fn close(cache: &mut Cache) -> Result<(), Failure> {
     Ok(())
 }
 
+/// How long the whole test may take before the watchdog fails it.
+const WATCHDOG: Duration = Duration::from_secs(90);
+
+/// Prints where the test is, so a hang in the kernel shows the call it is stuck in.
+fn progress(what: &str) {
+    println!("pcache-test: {what}");
+}
+
+/// Fails the run and exits if it is still going after [`WATCHDOG`], so a stuck call does
+/// not stall the rest of the smoke script.
+fn start_watchdog() {
+    thread::spawn(|| {
+        thread::sleep(WATCHDOG);
+        println!("FERRIC_TEST_FAIL pcache-watchdog: still running after {WATCHDOG:?}");
+        std::process::exit(1);
+    });
+}
+
 /// Runs the test.
 pub fn main() -> ExitCode {
+    start_watchdog();
     match run() {
         Ok(code) => code,
         Err((step, failure)) => {
@@ -574,6 +600,7 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         next: ROOT,
         reads: Arc::clone(&reads),
     };
+    progress("register the scheme");
     register_sync_scheme(&socket, SCHEME, &mut scheme).map_err(|err| {
         (
             "pcache-setup",
@@ -584,6 +611,7 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         )
     })?;
     thread::spawn(move || serve(socket, scheme));
+    progress("open the file");
     let mut cache = Cache {
         queue: Some(queue),
         object,
@@ -599,6 +627,7 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         ("pcache-close", &close),
     ];
     for (name, step) in steps {
+        progress(name);
         step(&mut cache).map_err(|failure| (name, failure))?;
         println!("FERRIC_TEST_PASS {name}");
     }
