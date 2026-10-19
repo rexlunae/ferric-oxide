@@ -274,13 +274,16 @@ impl Msix {
             mapped.info.table_size
         );
 
-        let cpus = percpu::online_cpus().unwrap_or_else(|err| {
-            log::warn!(
-                "{driver}: MSI-X vectors stay on the BSP: {}",
-                percpu::report(&err)
-            );
-            None
-        });
+        let cpus = percpu::online_cpus()
+            .unwrap_or_else(|err| {
+                log::warn!(
+                    "{driver}: MSI-X vectors stay on the BSP: {}",
+                    percpu::report(&err)
+                );
+                None
+            })
+            // An empty map is no map: `alloc_on` would otherwise refuse even the BSP.
+            .filter(|cpus| !cpus.is_empty());
 
         Self {
             mapped,
@@ -370,19 +373,10 @@ impl Msix {
         let first = self.next;
         let free = self.table_size().saturating_sub(first);
         let count = usize::from(count.min(free));
-        let targets: Vec<CpuId> = match &self.cpus {
-            Some(cpus) => ferric_irq::spread(cpus, node)
-                .skip(usize::from(first))
-                .take(count)
-                .collect(),
-            None => Vec::new(),
-        };
-        // No per-CPU delivery (or an empty map): `alloc_on` falls back to the BSP.
-        let targets = if targets.len() < count {
-            vec![CpuId::BSP; count]
-        } else {
-            targets
-        };
+        // Without per-CPU delivery every target is the BSP.
+        let targets: Vec<CpuId> =
+            ferric_irq::spread_from(self.cpus.as_deref(), node, usize::from(first), count)
+                .collect();
         let mut vectors = Vec::with_capacity(count);
         for cpu in targets {
             match self.alloc_on(cpu) {

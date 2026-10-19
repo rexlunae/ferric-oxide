@@ -361,6 +361,35 @@ pub fn spread(cpus: &[CpuEntry], node: Option<u32>) -> impl Iterator<Item = CpuI
         .cycle()
 }
 
+/// The CPUs for the next `count` vectors of a device that has `given` already: [`spread`] over
+/// `cpus` from where the first `given` left off, or all on [`CpuId::BSP`] when there is no CPU
+/// map (no per-CPU delivery) or it is empty.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_irq::{spread_from, ApicId, CpuEntry, CpuId};
+///
+/// let cpu = |cpu| CpuEntry { cpu: CpuId::new(cpu), apic: ApicId::new(cpu), node: None };
+/// let cpus = [cpu(0), cpu(1), cpu(2)];
+/// let next: Vec<u32> = spread_from(Some(&cpus), None, 2, 2).map(CpuId::get).collect();
+/// assert_eq!(next, [2, 0]);
+/// let bsp: Vec<CpuId> = spread_from(Some(&[]), None, 0, 2).collect();
+/// assert_eq!(bsp, [CpuId::BSP, CpuId::BSP]);
+/// ```
+pub fn spread_from<'a>(
+    cpus: Option<&'a [CpuEntry]>,
+    node: Option<u32>,
+    given: usize,
+    count: usize,
+) -> impl Iterator<Item = CpuId> + 'a {
+    // `spread` over a non-empty map never ends, so the BSP only comes in when the map is empty.
+    spread(cpus.unwrap_or(&[]), node)
+        .skip(given)
+        .chain(core::iter::repeat(CpuId::BSP))
+        .take(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +444,22 @@ mod tests {
             .map(CpuId::get)
             .collect();
         assert_eq!([first, second].concat(), order(&cpus, None, 2));
+    }
+
+    #[test]
+    fn spread_from_falls_back_to_the_bsp_without_cpus() {
+        let cpus = [entry(1, None), entry(2, None)];
+        let next = |cpus, given, count| -> Vec<u32> {
+            spread_from(cpus, None, given, count)
+                .map(CpuId::get)
+                .collect()
+        };
+        assert_eq!(next(Some(&cpus[..]), 1, 3), [2, 1, 2]);
+        assert_eq!(next(Some(&cpus[..]), 0, 0), Vec::<u32>::new());
+        // No map and an empty map are the same: every vector on the BSP.
+        let bsp = CpuId::BSP.get();
+        assert_eq!(next(None, 5, 2), [bsp, bsp]);
+        assert_eq!(next(Some(&[]), 0, 3), [bsp, bsp, bsp]);
     }
 
     #[test]
