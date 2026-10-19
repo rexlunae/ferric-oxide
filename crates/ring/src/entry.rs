@@ -54,6 +54,11 @@ pub enum Opcode {
     Read = 5,
     /// Write `len` bytes of the buffer to `fd` at `offset` (`schemev2::Opcode::Write`).
     Write = 6,
+    /// Complete with the size of `fd` in bytes (`schemev2::Opcode::Fsize`).
+    Fsize = 7,
+    /// Write `fd`'s `Stat` into the buffer (`schemev2::Opcode::Fstat`); the buffer must hold a
+    /// whole `Stat`.
+    Fstat = 15,
     /// Flush `fd` to its device (`schemev2::Opcode::Fsync`).
     Fsync = 17,
 }
@@ -65,6 +70,8 @@ impl Opcode {
             0 => Self::Nop,
             5 => Self::Read,
             6 => Self::Write,
+            7 => Self::Fsize,
+            15 => Self::Fstat,
             17 => Self::Fsync,
             _ => return None,
         })
@@ -86,6 +93,9 @@ bitflags! {
         const FIXED_FILE = 1 << 1;
         /// `addr` names a grant slot and an offset in it ([`Buffer::Grant`]).
         const BUF_GRANT = 1 << 2;
+        /// On the first SQE of a chain: the chain runs on the ring's worker, after `Enter`
+        /// returns ([`abi`](crate::abi#asynchronous-chains)). Elsewhere it has no effect.
+        const ASYNC = 1 << 3;
     }
 }
 
@@ -191,6 +201,18 @@ pub enum Op {
         /// The buffer.
         buf: Buffer,
     },
+    /// [`Opcode::Fsize`].
+    Fsize {
+        /// The file.
+        file: FileRef,
+    },
+    /// [`Opcode::Fstat`] into `buf`.
+    Fstat {
+        /// The file.
+        file: FileRef,
+        /// The buffer for the `Stat`.
+        buf: Buffer,
+    },
     /// [`Opcode::Fsync`].
     Fsync {
         /// The file.
@@ -203,7 +225,11 @@ impl Op {
     pub const fn file(&self) -> Option<FileRef> {
         match *self {
             Self::Nop => None,
-            Self::Read { file, .. } | Self::Write { file, .. } | Self::Fsync { file } => Some(file),
+            Self::Read { file, .. }
+            | Self::Write { file, .. }
+            | Self::Fsize { file }
+            | Self::Fstat { file, .. }
+            | Self::Fsync { file } => Some(file),
         }
     }
 }
@@ -260,6 +286,16 @@ impl Sqe {
         Self::new(Opcode::Fsync, fd, 0, 0, 0, user_data)
     }
 
+    /// A [`Opcode::Fsize`] of descriptor `fd`.
+    pub const fn fsize(fd: u32, user_data: u64) -> Self {
+        Self::new(Opcode::Fsize, fd, 0, 0, 0, user_data)
+    }
+
+    /// A [`Opcode::Fstat`] of descriptor `fd` into the `len` bytes at `addr`.
+    pub const fn fstat(fd: u32, addr: u64, len: u32, user_data: u64) -> Self {
+        Self::new(Opcode::Fstat, fd, 0, addr, len, user_data)
+    }
+
     /// An SQE with no flags.
     const fn new(op: Opcode, fd: u32, offset: u64, addr: u64, len: u32, user_data: u64) -> Self {
         Self {
@@ -279,6 +315,19 @@ impl Sqe {
     /// This SQE with [`SqeFlags::LINK`]: the next one runs only if this one succeeds.
     pub const fn linked(mut self) -> Self {
         self.flags = self.flags.union(SqeFlags::LINK);
+        self
+    }
+
+    /// This SQE with [`SqeFlags::FIXED_FILE`]: `fd` is a slot of the ring's file table.
+    pub const fn fixed(mut self) -> Self {
+        self.flags = self.flags.union(SqeFlags::FIXED_FILE);
+        self
+    }
+
+    /// This SQE with [`SqeFlags::ASYNC`]: on a chain's first SQE, the chain runs on the ring's
+    /// worker.
+    pub const fn run_async(mut self) -> Self {
+        self.flags = self.flags.union(SqeFlags::ASYNC);
         self
     }
 
@@ -332,8 +381,12 @@ impl Sqe {
                 offset: self.offset,
                 buf,
             },
+            Opcode::Fsize if no_buf && self.offset == 0 => Op::Fsize { file },
+            Opcode::Fstat if self.offset == 0 => Op::Fstat { file, buf },
             Opcode::Fsync if no_buf && self.offset == 0 => Op::Fsync { file },
-            Opcode::Nop | Opcode::Fsync => return Err(SqeError::Reserved),
+            Opcode::Nop | Opcode::Fsize | Opcode::Fstat | Opcode::Fsync => {
+                return Err(SqeError::Reserved);
+            }
         })
     }
 
@@ -486,6 +539,10 @@ mod tests {
             Sqe::fsync(3, 1).op().map(|op| op.file()),
             Ok(Some(FileRef::Fd(3)))
         );
+        assert_eq!(
+            Sqe::fsize(3, 1).fixed().op().map(|op| op.file()),
+            Ok(Some(FileRef::Fixed(3)))
+        );
     }
 
     #[test]
@@ -558,6 +615,44 @@ mod tests {
     }
 
     #[test]
+    fn metadata_ops_are_checked() {
+        assert_eq!(
+            Sqe::fsize(3, 1).fixed().op(),
+            Ok(Op::Fsize {
+                file: FileRef::Fixed(3)
+            })
+        );
+        assert_eq!(
+            Sqe::fstat(4, 0x2000, 128, 1).op(),
+            Ok(Op::Fstat {
+                file: FileRef::Fd(4),
+                buf: Buffer::Addr {
+                    addr: 0x2000,
+                    len: 128
+                }
+            })
+        );
+        let mut fsize = Sqe::fsize(3, 1);
+        fsize.addr = 0x1000;
+        assert_eq!(fsize.op(), Err(SqeError::Reserved));
+        let mut fstat = Sqe::fstat(4, 0x2000, 128, 1);
+        fstat.offset = 1;
+        assert_eq!(fstat.op(), Err(SqeError::Reserved));
+        assert!(!Opcode::Fstat.transfers());
+        assert!(Sqe::nop(1).fixed().flags.contains(SqeFlags::FIXED_FILE));
+        assert_eq!(Sqe::nop(1).run_async().op(), Ok(Op::Nop));
+        assert_eq!(Op::Nop.file(), None);
+        assert_eq!(
+            Sqe::fsize(3, 1).fixed().op().map(|op| op.file()),
+            Ok(Some(FileRef::Fixed(3)))
+        );
+        assert_eq!(
+            Sqe::write(4, 0, 0x1000, 8, 1).op().map(|op| op.file()),
+            Ok(Some(FileRef::Fd(4)))
+        );
+    }
+
+    #[test]
     fn fixed_files_and_grant_buffers_decode() {
         let mut sqe = Sqe::read(2, 0, Sqe::grant_addr(5, 0x3000).expect("fits"), 512, 1);
         sqe.flags = SqeFlags::FIXED_FILE | SqeFlags::BUF_GRANT;
@@ -581,6 +676,8 @@ mod tests {
         // The numbers of `redox_syscall::schemev2::Opcode`, so a scheme decodes both alike.
         assert_eq!(Opcode::Read as u8, 5);
         assert_eq!(Opcode::Write as u8, 6);
+        assert_eq!(Opcode::Fsize as u8, 7);
+        assert_eq!(Opcode::Fstat as u8, 15);
         assert_eq!(Opcode::Fsync as u8, 17);
         for raw in 0..=u8::MAX {
             if let Some(op) = Opcode::from_raw(raw) {

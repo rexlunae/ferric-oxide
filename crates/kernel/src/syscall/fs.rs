@@ -314,12 +314,16 @@ pub fn call(
     metadata: UserSliceRo,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
+    // Ferric Oxide: the metadata words are copied in as bytes and decoded, with no raw view of
+    // the words as bytes.
+    let mut bytes = [0_u8; 3 * 8];
+    let copied = metadata.copy_common_bytes_to_slice(&mut bytes)?;
     let mut meta = [0_u64; 3];
-
-    // TODO: bytemuck/plain
-    let copied = metadata.copy_common_bytes_to_slice(unsafe {
-        core::slice::from_raw_parts_mut(meta.as_mut_ptr().cast(), meta.len() * 8)
-    })?;
+    for (word, chunk) in meta.iter_mut().zip(bytes.chunks_exact(8)) {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(chunk);
+        *word = u64::from_ne_bytes(raw);
+    }
 
     match flags {
         f if f.contains(CallFlags::WRITE | CallFlags::FD) => {

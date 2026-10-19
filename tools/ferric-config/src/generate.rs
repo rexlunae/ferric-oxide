@@ -600,6 +600,8 @@ mod tests {
             "{mk}"
         );
         assert!(mk.contains("QEMU_CPU?=max\n"), "{mk}");
+        // The level also picks fox's package variants.
+        assert!(mk.contains("export FERRIC_FOX_LEVEL:=v3\n"), "{mk}");
         assert!(
             mk.contains("export FERRIC_TARGET_FLAGS_EXCLUDE:=kernel bootloader\n"),
             "{mk}"
@@ -630,6 +632,27 @@ mod tests {
         assert!(fs.contains("pkgutils = \"ignore\"\n"), "{fs}");
         let mk = file(&plan_default, "config.mk");
         assert!(mk.contains("export FERRIC_FOX_MANIFEST:=1\n"), "{mk}");
+        // fox finishes the image root; no package set is synced by default.
+        assert!(mk.contains("FERRIC_FOX_IMAGE:=1\n"), "{mk}");
+        assert!(!mk.contains("FERRIC_FOX_LOCKED"), "{mk}");
+
+        let user: BTreeMap<String, Value> = [
+            ("packages.set", Value::Str("config/packages.toml".into())),
+            ("packages.locked", Value::Bool(true)),
+            ("cpu.x86_64_level", Value::Str("v4".into())),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let r = resolve(&s, &user);
+        let plan_set = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let mk = file(&plan_set, "config.mk");
+        assert!(
+            mk.contains("FERRIC_FOX_PACKAGES:=config/packages.toml\n"),
+            "{mk}"
+        );
+        assert!(mk.contains("FERRIC_FOX_LOCKED:=1\n"), "{mk}");
+        assert!(mk.contains("FERRIC_FOX_LEVEL:=v4\n"), "{mk}");
 
         let user: BTreeMap<String, Value> = [
             ("packages.manager", Value::Str("pkgutils".into())),
@@ -645,6 +668,8 @@ mod tests {
         assert!(!fs.contains("pkgutils"), "{fs}");
         let mk = file(&plan_pkg, "config.mk");
         assert!(mk.contains("export FERRIC_FOX_MANIFEST:=0\n"), "{mk}");
+        // pkgutils images are not finished with fox.
+        assert!(!mk.contains("FERRIC_FOX_IMAGE"), "{mk}");
 
         // Asking for fox by hand as well still writes it once, from source.
         let user: BTreeMap<String, Value> = [(

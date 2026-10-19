@@ -1,0 +1,23 @@
+[package]
+name = "fox-index"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The fox package registry: layout, signed fox-tuf/1 metadata and client verification"
+publish = false
+
+[dependencies]
+blake3 = { workspace = true, features = ["std"] }
+fox-core = { path = "../fox-core", features = ["std"] }
+fox-sbom = { path = "../fox-sbom" }
+pkgar-core.workspace = true
+semver = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+time = { workspace = true, features = ["formatting", "parsing"] }
+toml = { workspace = true, features = ["parse", "display", "serde"] }
+
+[dev-dependencies]
+ssh-key.workspace = true
+tempfile.workspace = true

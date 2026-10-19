@@ -18,7 +18,7 @@ pkgar-keys = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-time = { version = "0.3.44", default-features = false, features = ["std", "formatting"] }
+time = { workspace = true, features = ["formatting"] }
 toml = { workspace = true, features = ["parse", "display", "serde", "std"] }
 
 [dev-dependencies]

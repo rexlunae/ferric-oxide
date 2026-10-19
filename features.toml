@@ -147,7 +147,10 @@ checks at boot and halts with a list of the missing features.
 `make qemu` picks a matching emulated CPU when KVM is off.
 
 v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
-v4 turns on by default."""
+v4 turns on by default.
+
+With packages.manager = "fox", v3 and v4 also pick the level of the
+prebuilt and source-built fox packages synced into the image."""
 choices = [
   { value = "v1", title = "v1 (baseline)" },
   { value = "v2", title = "v2" },
@@ -172,12 +175,12 @@ make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v2", FERRIC_TARG
 
 [[option.effect]]
 when = "value == 'v3'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v3" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v3", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v3" }
 
 [[option.effect]]
 when = "value == 'v4'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v4" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v4", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v4" }
 
 [[option]]
@@ -943,6 +946,10 @@ The package manager on the target.
             --installed and fox remove cover the whole system.
             fox installs local .pkgar files; it does not fetch from
             package servers.
+            The image build finishes the root with the host fox: it
+            adopts the installed packages at build time, syncs
+            packages.set if one is given, and writes the image SBOM to
+            build/<arch>/<config>/image.cdx.json. Sets FERRIC_FOX_IMAGE=1.
   pkgutils  upstream Redox's pkg, which can fetch from package servers."""
 choices = [
   { value = "fox", title = "fox: verify, install and remove signed local packages" },
@@ -953,6 +960,38 @@ choices = [
 when = "value == 'fox'"
 source_packages = ["fox"]
 ignore_packages = ["pkgutils"]
+make = { FERRIC_FOX_IMAGE = "1" }
+
+[[option]]
+id = "packages.set"
+menu = "packages"
+type = "string"
+title = "Package set synced into the image"
+default = ""
+depends = "packages.manager == 'fox'"
+make_var = "FERRIC_FOX_PACKAGES"
+help = """
+A fox package set (fox-packages/1: registries, packages and policy; see
+the package tooling chapter of the book) that the image build installs
+with `fox sync --target <image target>` after the installer has placed
+the configuration's packages. The lock, fox.lock, is written beside the
+set; commit it to make image builds reproducible. Packages need prebuilt
+artifacts for the image target, or a source build that can cross-compile
+to it. Empty means no set. Sets FERRIC_FOX_PACKAGES."""
+
+[[option]]
+id = "packages.locked"
+menu = "packages"
+type = "bool"
+title = "Require every package to be locked"
+default = false
+depends = "packages.manager == 'fox' && packages.set != ''"
+make_var = "FERRIC_FOX_LOCKED"
+help = """
+Fail the image build unless fox.lock beside packages.set already pins
+every package (fox sync --locked), so a release image is built from
+exactly the archives and commits recorded there. Sets
+FERRIC_FOX_LOCKED."""
 
 [[option]]
 id = "packages.signed_manifests"
