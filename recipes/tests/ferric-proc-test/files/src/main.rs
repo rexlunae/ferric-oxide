@@ -9,10 +9,12 @@
 //!   counted in its private memory.
 //! - `proc-slice`: two reads in a row show this running context's CPU time growing, so the
 //!   current timeslice is counted and not only the ones that ended.
-//! - `proc-guard`: with a thread parked, the guard page below its stack (`PROT_NONE`) is a
-//!   grant with no permissions (`---`), as `kernel.prot_none` (on by default) maps it.
-//! - `proc-cap`: no descriptor on the scheme manager is shown naming the scheme creation
-//!   capability's entry (number 0) as `mgr`; it is `cap`.
+//! - `proc-guard`: with a thread parked, the grant right below the one holding its stack is
+//!   its guard (`PROT_NONE`), shown with no permissions (`---`), as `kernel.prot_none` (on by
+//!   default) maps it.
+//! - `proc-cap`: the scheme creation capability, which the init namespace manager holds for
+//!   its whole life, is listed as `cap`, and no scheme manager descriptor naming its entry
+//!   (number 0) is shown as `mgr`.
 //! - `proc-root-only`: the same program run as user 1000 cannot open the file (`EPERM`).
 //!
 //! Without the file (a kernel built without `sys_proc`) it prints
@@ -27,10 +29,13 @@ use std::io::{self, ErrorKind};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 
-use ferric_procinfo::{FileError, Process, Provider, SchemeRef, Status};
+use ferric_procinfo::{FileError, GrantLine, Process, Provider, SchemeRef, Status};
 
 /// The file.
 const PATH: &str = "/scheme/sys/proc";
+
+/// The page size the grant lines count in.
+const PAGE_BYTES: u64 = 4096;
 
 /// The allocation `proc-self` looks for: large enough that the allocator maps it on its own.
 const ALLOC_BYTES: usize = 8 << 20;
@@ -99,7 +104,7 @@ fn check_self(text: &str, held: &[u8]) -> Result<(), Failure> {
     {
         return Err(check("the open sys file is not among the descriptors"));
     }
-    let pages = (ALLOC_BYTES / 4096) as u64;
+    let pages = ALLOC_BYTES as u64 / PAGE_BYTES;
     let Some(grant) = me
         .grants
         .iter()
@@ -162,27 +167,44 @@ fn check_slice() -> Result<(), Failure> {
 /// `proc-guard` and `proc-cap`.
 fn check_guard_and_cap() -> Result<(), Failure> {
     let (parked, done) = std::sync::mpsc::channel::<()>();
+    let (sent, stack) = std::sync::mpsc::channel::<u64>();
     let thread = std::thread::spawn(move || {
+        let local = 0u8;
+        // An address on this thread's stack, which relibc mapped above a PROT_NONE guard.
+        let _ = sent.send(std::ptr::from_ref(&local).addr() as u64);
         let _ = done.recv();
+        std::hint::black_box(&local);
     });
-    let text = read();
+    let stack = stack
+        .recv()
+        .map_err(|_| check("the parked thread did not report its stack"));
+    let text = stack.and_then(|stack| Ok((stack, read()?)));
     drop(parked);
     let _ = thread.join();
-    let text = text?;
+    let (stack, text) = text?;
     let all = ferric_procinfo::processes(&text).map_err(Failure::Parse)?;
     let me = running(&all)?;
-    let Some(guard) = me
-        .grants
-        .iter()
-        .find(|g| !g.prot.read && !g.prot.write && !g.prot.execute)
-    else {
-        return Err(check(
-            "no grant without permissions (a thread stack's guard)",
-        ));
+    let end = |g: &GrantLine| g.base.saturating_add(g.pages.saturating_mul(PAGE_BYTES));
+    let Some(stack_grant) = me.grants.iter().find(|g| (g.base..end(g)).contains(&stack)) else {
+        return Err(check(format!(
+            "no grant holds the thread stack at {stack:#x}"
+        )));
     };
+    let Some(guard) = me.grants.iter().find(|g| end(g) == stack_grant.base) else {
+        return Err(check(format!(
+            "no grant right below the thread stack grant at {:#x}",
+            stack_grant.base
+        )));
+    };
+    if guard.prot.read || guard.prot.write || guard.prot.execute {
+        return Err(check(format!(
+            "the guard at {:#x} below the thread stack is {}",
+            guard.base, guard.prot
+        )));
+    }
     println!(
-        "FERRIC_TEST_PASS proc-guard ({} pages at {:#x})",
-        guard.pages, guard.base
+        "FERRIC_TEST_PASS proc-guard ({} pages at {:#x}, below the stack at {:#x})",
+        guard.pages, guard.base, stack_grant.base
     );
     let wrong = all
         .iter()
@@ -199,6 +221,11 @@ fn check_guard_and_cap() -> Result<(), Failure> {
         .flat_map(|p| p.fds.iter())
         .filter(|fd| fd.scheme == SchemeRef::Capability)
         .count();
+    if caps == 0 {
+        return Err(check(
+            "no cap descriptor, though the init namespace manager holds one",
+        ));
+    }
     println!("FERRIC_TEST_PASS proc-cap ({caps} cap descriptors)");
     Ok(())
 }
