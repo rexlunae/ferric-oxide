@@ -1,8 +1,10 @@
 //! `ferric-trace`: saves kernel trace captures on the target (the `cpu<n>` files drained from
 //! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto, and reads the
-//! crash dump a kernel panic left for the next boot.
+//! crash dump a kernel panic left for the next boot, and records profiles from the kernel's
+//! sampling profiler.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -11,6 +13,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::crash::CrashReport;
+use ferric_trace_cli::profile::{self, Run};
 use ferric_trace_cli::{drain, perfetto, text};
 
 #[derive(Parser)]
@@ -29,6 +32,21 @@ enum Cmd {
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
         scheme: PathBuf,
+    },
+    /// On the target, as root, with kernel.profiling: sample every CPU while a command runs
+    /// (or for --seconds) and save the samples into a profile directory
+    Profile {
+        /// The directory to save the profile in; it must not exist yet
+        out: PathBuf,
+        /// Sample for this many seconds instead of running a command
+        #[arg(long, conflicts_with = "command", required_unless_present = "command")]
+        seconds: Option<f64>,
+        /// The debug scheme
+        #[arg(long, default_value = "/scheme/debug")]
+        scheme: PathBuf,
+        /// The command to profile, after `--`
+        #[arg(last = true)]
+        command: Vec<OsString>,
     },
     /// Print every record, one line each, in timestamp order
     Text {
@@ -76,6 +94,10 @@ enum CliError {
     Capture(#[from] ferric_trace_cli::capture::CaptureError),
     #[error("capture failed")]
     Drain(#[from] ferric_trace_cli::drain::DrainError),
+    #[error("profile failed")]
+    Profile(#[from] ferric_trace_cli::profile::ProfileError),
+    #[error("--seconds must be a non-negative number, not {0}")]
+    Seconds(f64),
     #[error(transparent)]
     Crash(#[from] ferric_trace_cli::crash::CrashDumpError),
     #[error("cannot write {}", path.display())]
@@ -105,6 +127,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Cmd::Profile {
+            out,
+            seconds,
+            scheme,
+            command,
+        } => record_profile(&scheme, &out, seconds, command),
         Cmd::Crash { dump, out } => crash(&dump, out.as_deref()),
         Cmd::Text { inputs, partial } => {
             let capture = loader(partial)(&inputs)?;
@@ -139,6 +167,36 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
     }
+}
+
+/// `ferric-trace profile`.
+fn record_profile(
+    scheme: &std::path::Path,
+    out: &std::path::Path,
+    seconds: Option<f64>,
+    command: Vec<OsString>,
+) -> Result<(), CliError> {
+    let run = match seconds {
+        Some(s) => {
+            Run::For(std::time::Duration::try_from_secs_f64(s).map_err(|_| CliError::Seconds(s))?)
+        }
+        None => Run::Command(command),
+    };
+    let recorded = profile::record(scheme, out, &run)?;
+    for (cpu, bytes) in recorded.cpu_bytes.iter().enumerate() {
+        println!("cpu {cpu}: {bytes} bytes of samples");
+    }
+    println!(
+        "named {} contexts; saved to {}",
+        recorded.names,
+        out.display()
+    );
+    if let Some(status) = recorded.status
+        && !status.success()
+    {
+        eprintln!("ferric-trace: warning: the profiled command exited with {status}");
+    }
+    Ok(())
 }
 
 /// `ferric-trace crash`.

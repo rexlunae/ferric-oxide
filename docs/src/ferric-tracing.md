@@ -396,6 +396,32 @@ the TSC. For TSC timestamps, and for captures without a `clock` file,
 more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
+## Sampling profiles
+
+`kernel.profiling` is upstream's sampling profiler, separate from the
+tracepoints (and, for now, exclusive with them). It sets one CPU aside, which
+sends an NMI to every other CPU on a timer; each NMI saves the interrupted
+instruction pointer, the TSC, the context's debug id and the frame-pointer
+chain to that CPU's buffer, `/scheme/debug/profiling-<n>`. Writing `1` or `0` to
+`/scheme/debug/ctl-profiling` starts or stops sampling. Ferric Oxide adds a read
+of `ctl-profiling`, which gives `kernel_text 0x<address>`: where the kernel's
+text was loaded, so kernel addresses can be symbolized under KASLR. The sample
+format and that line are in `ferric_trace::profile`.
+
+```sh
+ferric-trace profile prof/ -- ion -c 'ls -R /usr > /dev/null'   # as root
+ferric-trace profile prof/ --seconds 5                          # or for a while
+```
+
+`ferric-trace profile` throws away whatever an earlier run left in the
+buffers, turns sampling on, runs the command (or waits), drains every buffer
+every 100 ms so none fills, turns sampling off and saves `kernel_text`, one
+`samples<n>` file per CPU and a `names` file with the kernel's name for each
+sampled context. Like a capture, the directory is marked `INCOMPLETE` until it
+is complete, and sampling is switched off on every way out, errors included.
+User stacks are only walked through frame pointers, so build the image with
+`cpu.frame_pointers` ([#149](https://github.com/rexlunae/ferric-oxide/pull/149)) for useful user frames.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:

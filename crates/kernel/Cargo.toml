@@ -136,7 +136,9 @@ trace_level_trace = ["trace_level_debug"]
 lpss_debug = []
 multi_core = ["acpi"]
 numa = ["multi_core"]
-profiling = []
+# Ferric Oxide: the ctl-profiling read of the kernel text address uses ferric-trace's
+# profile::ControlLine.
+profiling = ["dep:ferric-trace"]
 drop_panic = []
 busy_panic = []
 qemu_debug = []
