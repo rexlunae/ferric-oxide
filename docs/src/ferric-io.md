@@ -612,6 +612,17 @@ miss, a hit with no scheme read, readahead, a failed fill and a closed queue,
 and prints the time of a cached 4 KiB `pread` next to the same read through
 the scheme.
 
+The kernel fix this test turned up is not specific to the page cache. When a
+request is sent to a user scheme, the caller switches straight to the context
+that created the scheme, so the handler can answer without a trip through the
+scheduler. The test creates its scheme on its main thread, serves it from
+another thread, and opens the file from the main thread. The caller was then
+switching to itself. `direct_switch_to` returns at once in that case, so the
+caller spun in `UserInner::call_inner` without ever blocking. Its CPU never
+ran the serving thread, and no other CPU stole it, because work stealing does
+not take a lone context. The caller now direct-switches only when the handler
+context is a different context.
+
 ## Kernel-bypass network queues (ABI only)
 
 `ferric-netq` (`crates/netq`) is the ABI of the planned kernel-bypass network

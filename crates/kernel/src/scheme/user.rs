@@ -293,7 +293,14 @@ impl UserInner {
         }
 
         loop {
-            if allow_direct_switch && let Some(handler_context) = self.context.upgrade() {
+            // Ferric Oxide: not when the caller is the handler context itself (a process that
+            // created the scheme on this thread and serves it from another): switching to
+            // oneself returns at once, so the caller would spin here without ever blocking, and
+            // the thread that serves the request could not run on this CPU.
+            if allow_direct_switch
+                && let Some(handler_context) = self.context.upgrade()
+                && !context::is_current(&handler_context)
+            {
                 // Direct switching can fail if e.g. the target context is blocked or currently
                 // scheduled.
                 context::switch::direct_switch_to(handler_context, token);

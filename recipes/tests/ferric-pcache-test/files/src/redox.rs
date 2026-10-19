@@ -113,7 +113,6 @@ impl SchemeSync for FileScheme {
         if fd != ROOT || path.trim_matches('/') != FILE_PATH {
             return Err(Error::new(ENOENT));
         }
-        progress("scheme: openat");
         self.next += 1;
         let number = self.next;
         let (words, n) = Request::Attach {
@@ -122,7 +121,6 @@ impl SchemeSync for FileScheme {
         .encode();
         libredox::call::call_wo(self.object, &[], CallFlags::empty(), &words[..n])
             .map_err(|err| Error::new(err.errno()))?;
-        progress("scheme: Attach answered");
         // Positioned, so the kernel passes every read's offset.
         Ok(OpenResult::ThisScheme {
             number,
@@ -564,12 +562,7 @@ fn progress(what: &str) {
 /// not stall the rest of the smoke script.
 fn start_watchdog() {
     thread::spawn(|| {
-        // A line every few seconds shows whether user space still runs while a call is stuck.
-        let start = Instant::now();
-        while start.elapsed() < WATCHDOG {
-            thread::sleep(Duration::from_secs(10));
-            progress(&format!("alive after {:?}", start.elapsed()));
-        }
+        thread::sleep(WATCHDOG);
         println!("FERRIC_TEST_FAIL pcache-watchdog: still running after {WATCHDOG:?}");
         std::process::exit(1);
     });
@@ -617,6 +610,8 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
             },
         )
     })?;
+    // The scheme was created on this thread and is served from another, so opening it here
+    // is the case where the kernel must not direct-switch a caller to itself (#143).
     thread::spawn(move || serve(socket, scheme));
     progress("open the file");
     let mut cache = Cache {

@@ -721,14 +721,7 @@ impl KernelScheme for PcacheScheme {
                 object.state.lock().index.set_size(size);
                 Ok(0)
             }
-            (Request::Attach { handle }, Handle::Object(object)) => {
-                // Diagnostic for the #143 boot hang: shows whether an Attach reaches and leaves
-                // the kernel.
-                info!("pcache: Attach of handle {handle}");
-                let result = attach(&object, handle);
-                info!("pcache: Attach of handle {handle} returned {result:?}");
-                result
-            }
+            (Request::Attach { handle }, Handle::Object(object)) => attach(&object, handle),
             (Request::Detach { handle }, Handle::Object(object)) => detach(&object, handle),
             (Request::Filled { pages, outcome }, Handle::Object(object)) => {
                 filled(&object, pages, outcome, payload, token)
