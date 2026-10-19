@@ -104,8 +104,9 @@ jobs:
           # scheme.cancel on from the initfs trace.toml bootstrap applies) and
           # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
           # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
-          # ferric-iommu-test's iommu-msi-percpu runs.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\nirq_percpu = true\n[drivers]\ngrant_dma = true\n' > "$out/ferric.toml"
+          # ferric-iommu-test's iommu-msi-percpu runs, and nvmed's per-CPU queue pairs
+          # (also off by default) are on so the boot disk runs through them.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,

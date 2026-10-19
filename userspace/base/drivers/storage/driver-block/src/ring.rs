@@ -323,6 +323,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
                     .map(|(k, disk)| (k, RingDiskWrapper::new(disk, &executor))),
             ),
             handles: HandleMap::new(),
+            openers: ferric_blkqueue::openers::Openers::new(),
             executor,
             #[cfg(feature = "grant-dma")]
             grants: None,
@@ -422,6 +423,9 @@ struct RingDiskSchemeInner<T: Disk, Hw: Hardware> {
     socket: Socket,
     disks: BTreeMap<u32, RingDiskWrapper<T>>,
     handles: HandleMap<Handle<Hw, T>>,
+    /// Ferric Oxide: the process that opened each disk descriptor, the only one that may set
+    /// the queue policy through it.
+    openers: ferric_blkqueue::openers::Openers,
     executor: Rc<LocalExecutor<Hw>>,
     /// Ferric Oxide: grants attached to disk descriptors, when the driver can map them.
     #[cfg(feature = "grant-dma")]
@@ -463,6 +467,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
         let Some(handle) = self.handles.remove(id) else {
             return;
         };
+        self.openers.closed(id);
         #[cfg(feature = "grant-dma")]
         if let Some(grants) = &mut self.grants {
             grants.close(id);
@@ -657,7 +662,11 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
             Handle::Disk { num: nsid, pt }
         };
 
+        let is_disk = matches!(handle, Handle::Disk { .. });
         let id = self.handles.insert(handle);
+        if is_disk {
+            self.openers.opened(id, ctx.pid);
+        }
         Ok(OpenResult::ThisScheme {
             number: id,
             flags: NewFdFlags::POSITIONED,
@@ -689,8 +698,21 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
         id: usize,
         payload: &mut [u8],
         metadata: &[u64],
-        _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
+        ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
+        // Ferric Oxide: the per-CPU queue policy call, on a disk or partition descriptor, from
+        // the process that opened it (as root: see openat), not one it was passed to.
+        if let Handle::Disk { num, .. } = *self.handles.get(id)? {
+            if let Some(policy) =
+                ferric_blkqueue::abi::decode(metadata).map_err(|_| Error::new(EINVAL))?
+            {
+                self.openers
+                    .check(id, ctx.pid)
+                    .map_err(|_| Error::new(syscall::EPERM))?;
+                let disk = self.disks.get_mut(&num).ok_or(Error::new(EBADF))?;
+                return disk.disk_mut().set_queue_policy(policy).map(|()| 0);
+            }
+        }
         #[cfg(feature = "grant-dma")]
         if let Handle::Disk { num, pt } = *self.handles.get(id)? {
             return self.grant_call(id, num, pt, metadata).await;

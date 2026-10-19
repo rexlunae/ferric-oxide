@@ -17,11 +17,16 @@ name = "ferric-blkgrant-test"
 version = "0.1.0"
 dependencies = [
  "ferric-blkgrant",
+ "ferric-blkqueue",
  "ferric-regbuf",
  "libc",
  "libredox",
  "redox_syscall",
 ]
+
+[[package]]
+name = "ferric-blkqueue"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-regbuf"

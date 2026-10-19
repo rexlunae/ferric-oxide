@@ -8,6 +8,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ferric_blkgrant::abi::{EncodeError, Request as DiskRequest, Slot, Transfer};
+use ferric_blkqueue::QueuePolicy;
+use ferric_blkqueue::ab::{self, Comparison};
 use ferric_regbuf::abi::{
     Access, BytesError, GrantId, GrantInfo, GrantSpec, REGION_PATH, Request, SCHEME_NAME,
 };
@@ -26,6 +28,13 @@ const READ_LEN: usize = 1 << 20;
 const WRITE_LEN: usize = 64 << 10;
 /// Request sizes the benchmark times, with how many bytes it reads at each.
 const BENCH: [(usize, usize); 2] = [(128 << 10, 32 << 20), (4 << 10, 8 << 20)];
+/// Submitting threads for the concurrent 4 KiB `pread` benchmark (roadmap Phase 2.4, per-core
+/// NVMe queues), and the bytes each thread count reads in all.
+const BENCH_THREADS: [usize; 3] = [1, 2, 4];
+/// The bytes one round of the threaded benchmark reads, between its threads.
+const BENCH_ROUND_BYTES: usize = 4 << 20;
+/// Rounds of each queue policy in the threaded benchmark's same-boot A/B.
+const BENCH_ROUNDS: usize = 3;
 /// The slot of the read-write grant over the whole buffer.
 const SLOT_RW: u64 = 0;
 /// The slot of a read-only grant of the first page.
@@ -54,6 +63,8 @@ enum Failure {
     Encode(EncodeError),
     /// The disk has no partition the test can use.
     NoPartition,
+    /// A benchmark thread panicked.
+    Thread,
 }
 
 impl fmt::Display for Failure {
@@ -69,6 +80,7 @@ impl fmt::Display for Failure {
             Self::Payload(err) => write!(f, "bad payload from the kernel: {err}"),
             Self::Encode(err) => write!(f, "cannot encode a disk request: {err}"),
             Self::NoPartition => f.write_str("the NVMe disk has no partitions to test on"),
+            Self::Thread => f.write_str("a benchmark thread panicked"),
         }
     }
 }
@@ -434,6 +446,107 @@ fn time_reads(
     Ok(start.elapsed())
 }
 
+/// Sets the disk's per-CPU queue policy (`ferric_blkqueue::abi`); `false` when the driver
+/// has no per-CPU queue pairs (`EOPNOTSUPP`).
+fn set_policy(read: &Disk, policy: QueuePolicy) -> Result<bool, Failure> {
+    let words = ferric_blkqueue::abi::encode(policy);
+    match libredox::call::call_wo(read.raw(), &[], CallFlags::empty(), &words) {
+        Ok(_) => Ok(true),
+        Err(err) if err.errno() == EOPNOTSUPP => Ok(false),
+        Err(err) => Err(Failure::Errno {
+            what: "set the queue policy",
+            errno: err.errno(),
+        }),
+    }
+}
+
+/// Reads [`BENCH_ROUND_BYTES`] in 4 KiB `pread`s from `threads` threads at once, from
+/// disjoint parts of the partition through the same descriptor, and returns the IOPS.
+fn bench_round(read: &Disk, threads: usize) -> Result<u32, Failure> {
+    const SIZE: usize = 4 << 10;
+    let span = (read.len / SIZE as u64).max(1) * SIZE as u64;
+    let per_thread = BENCH_ROUND_BYTES / threads / SIZE;
+    let start = Instant::now();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let mut buf = vec![0; SIZE];
+                    let first = (t * per_thread) as u64;
+                    for i in 0..per_thread as u64 {
+                        let at = ((first + i) * SIZE as u64) % span;
+                        io("pread", read.file.read_at(&mut buf, at))?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|worker| worker.join().unwrap_or(Err(Failure::Thread)))
+    })?;
+    let iops = (per_thread * threads) as f64 / start.elapsed().as_secs_f64().max(1e-9);
+    Ok(iops as u32)
+}
+
+/// Prints one `FERRIC_BENCH nvme-read-4k-t<N>` line for each of [`BENCH_THREADS`]: `N`
+/// threads `pread` 4 KiB blocks at once.
+///
+/// With per-CPU queue pairs, it is a same-boot A/B: [`BENCH_ROUNDS`] rounds of each queue
+/// policy, in alternating order, then the medians (`copy_iops` is the default policy's,
+/// `single_iops` the main queue alone, `workers_iops` every request on a worker) and the
+/// verdict of `ferric_blkqueue::ab` for the default against the single queue (`ab=pass` or
+/// `ab=fail`). Without them, `ab=none` and every round is the one path there is.
+fn bench_threads(read: &Disk) -> Result<(), Failure> {
+    const POLICIES: [QueuePolicy; 3] = [
+        QueuePolicy::MainQueue,
+        QueuePolicy::Adaptive,
+        QueuePolicy::Workers,
+    ];
+    let percore = set_policy(read, QueuePolicy::Adaptive)?;
+    for threads in BENCH_THREADS {
+        // Per round, per policy in POLICIES order.
+        let mut rounds = [[0_u32; POLICIES.len()]; BENCH_ROUNDS];
+        for (round, samples) in rounds.iter_mut().enumerate() {
+            for step in 0..POLICIES.len() {
+                // Alternate the order, so drift during the run does not favour one policy.
+                let k = if round % 2 == 0 {
+                    step
+                } else {
+                    POLICIES.len() - 1 - step
+                };
+                if percore {
+                    set_policy(read, POLICIES[k])?;
+                }
+                samples[k] = bench_round(read, threads)?;
+            }
+        }
+        if percore {
+            set_policy(read, QueuePolicy::Adaptive)?;
+        }
+        let column = |k: usize| rounds.map(|samples| samples[k]);
+        let (mut single, mut adaptive, mut workers) = (column(0), column(1), column(2));
+        let cmp = Comparison::new(&mut single, &mut adaptive);
+        let verdict = match (percore, cmp.passes()) {
+            (false, _) => "none",
+            (true, true) => "pass",
+            (true, false) => "fail",
+        };
+        println!(
+            "FERRIC_BENCH nvme-read-4k-t{threads} bytes={} copy_mib_s={:.1} copy_iops={} \
+             single_iops={} workers_iops={} ab_ratio={} ab_tolerance={} ab={verdict}",
+            BENCH_ROUND_BYTES * BENCH_ROUNDS,
+            f64::from(cmp.candidate) * 4096.0 / f64::from(1 << 20),
+            cmp.candidate,
+            cmp.baseline,
+            ab::median(&mut workers),
+            cmp.ratio(),
+            cmp.tolerance,
+        );
+    }
+    Ok(())
+}
+
 /// Prints one `FERRIC_BENCH` line for reads of `size` bytes: with `pread` and, when `grant`
 /// is set, through the grant in [`SLOT_RW`].
 fn bench(read: &Disk, size: usize, total: usize, grant: bool) -> Result<(), Failure> {
@@ -573,6 +686,10 @@ pub fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+                if let Err(err) = bench_threads(&read) {
+                    println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
+                    return ExitCode::FAILURE;
+                }
             }
             return ExitCode::SUCCESS;
         }
@@ -597,6 +714,10 @@ pub fn main() -> ExitCode {
             println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
             return ExitCode::FAILURE;
         }
+    }
+    if let Err(err) = bench_threads(&t.read) {
+        println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
+        return ExitCode::FAILURE;
     }
     println!("FERRIC_TEST_PASS nvme-grant-bench");
     let steps: [(&str, Step); 2] = [
