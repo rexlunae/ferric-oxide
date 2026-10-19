@@ -3,8 +3,8 @@
 # listed here with its path in this repository.
 [submodule "relibc/openlibm"]
 	path = crates/relibc/openlibm
-	url = https://gitlab.redox-os.org/redox-os/openlibm.git
+	url = https://github.com/rexlunae/openlibm.git
 	branch = master
 [submodule "relibc/dlmalloc-rs"]
 	path = crates/relibc/dlmalloc-rs
-	url = https://gitlab.redox-os.org/redox-os/dlmalloc-rs.git
+	url = https://github.com/rexlunae/dlmalloc-rs.git
