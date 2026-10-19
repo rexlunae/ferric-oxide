@@ -84,7 +84,7 @@ jobs:
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
-          grep -q profiling <<< "$(sed -n 's/^export FERRIC_KERNEL_FEATURES:=//p' "$out/config.mk")"
+          grep -q "^export FERRIC_KERNEL_FEATURES:=.*profiling" "$out/config.mk"
           if [ -f "$out/kernel-config.toml" ]; then
             echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
           fi
