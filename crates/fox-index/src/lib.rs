@@ -12,6 +12,8 @@
 //!   paths they live at;
 //! - [`advisory`]: security advisories, in the RustSec format, from the
 //!   registry or the RustSec database;
+//! - [`vex`]: CycloneDX VEX documents saying whether vulnerabilities
+//!   affect the registry's packages;
 //! - [`verify`]: the client workflow that checks a checkout and reads only
 //!   files the metadata signs;
 //! - [`edit`]: the maintainer side, which creates a registry, admits
@@ -56,3 +58,4 @@ pub mod edit;
 pub mod layout;
 pub mod metadata;
 pub mod verify;
+pub mod vex;
