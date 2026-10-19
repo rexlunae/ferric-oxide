@@ -32,6 +32,11 @@ if grep -aE "FERRIC_TEST_FAIL nvme-grant" <<< "$clean"; then
     fail "ferric-blkgrant-test failed"
 fi
 
+# 4 KiB preads from 1, 2 and 4 threads at once, in every mode (per-core NVMe queues).
+for threads in 1 2 4; do
+    need "FERRIC_BENCH nvme-read-4k-t$threads .*copy_iops="
+done
+
 case "$mode" in
     none)
         need "FERRIC_TEST_SKIP nvme-grant: nvmed has no DMA domain \(no IOMMU\)"
@@ -59,6 +64,6 @@ case "$mode" in
         ;;
 esac
 
-bench="$(grep -aoE "FERRIC_BENCH nvme-read-[0-9a-z]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
+bench="$(grep -aoE "FERRIC_BENCH nvme-read-[0-9a-z-]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
 echo "::notice title=check-blkgrant-log ($mode)::OK; $bench"
 echo "check-blkgrant-log: $mode OK"

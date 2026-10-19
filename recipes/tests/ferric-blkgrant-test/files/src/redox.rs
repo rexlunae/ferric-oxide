@@ -26,6 +26,10 @@ const READ_LEN: usize = 1 << 20;
 const WRITE_LEN: usize = 64 << 10;
 /// Request sizes the benchmark times, with how many bytes it reads at each.
 const BENCH: [(usize, usize); 2] = [(128 << 10, 32 << 20), (4 << 10, 8 << 20)];
+/// Submitting threads for the concurrent 4 KiB `pread` benchmark (roadmap Phase 2.4, per-core
+/// NVMe queues), and the bytes each thread count reads in all.
+const BENCH_THREADS: [usize; 3] = [1, 2, 4];
+const BENCH_THREADS_TOTAL: usize = 8 << 20;
 /// The slot of the read-write grant over the whole buffer.
 const SLOT_RW: u64 = 0;
 /// The slot of a read-only grant of the first page.
@@ -54,6 +58,8 @@ enum Failure {
     Encode(EncodeError),
     /// The disk has no partition the test can use.
     NoPartition,
+    /// A benchmark thread panicked.
+    Thread,
 }
 
 impl fmt::Display for Failure {
@@ -69,6 +75,7 @@ impl fmt::Display for Failure {
             Self::Payload(err) => write!(f, "bad payload from the kernel: {err}"),
             Self::Encode(err) => write!(f, "cannot encode a disk request: {err}"),
             Self::NoPartition => f.write_str("the NVMe disk has no partitions to test on"),
+            Self::Thread => f.write_str("a benchmark thread panicked"),
         }
     }
 }
@@ -434,6 +441,44 @@ fn time_reads(
     Ok(start.elapsed())
 }
 
+/// Prints one `FERRIC_BENCH nvme-read-4k-t<N>` line for each of [`BENCH_THREADS`]: `N`
+/// threads `pread` 4 KiB blocks from disjoint parts of the partition at once, through the same
+/// descriptor, [`BENCH_THREADS_TOTAL`] bytes between them.
+fn bench_threads(read: &Disk) -> Result<(), Failure> {
+    const SIZE: usize = 4 << 10;
+    let span = (read.len / SIZE as u64).max(1) * SIZE as u64;
+    for threads in BENCH_THREADS {
+        let per_thread = BENCH_THREADS_TOTAL / threads / SIZE;
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    scope.spawn(move || {
+                        let mut buf = vec![0; SIZE];
+                        let first = (t * per_thread) as u64;
+                        for i in 0..per_thread as u64 {
+                            let at = ((first + i) * SIZE as u64) % span;
+                            io("pread", read.file.read_at(&mut buf, at))?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().unwrap_or(Err(Failure::Thread)))
+        })?;
+        let time = start.elapsed();
+        let bytes = per_thread * threads * SIZE;
+        println!(
+            "FERRIC_BENCH nvme-read-4k-t{threads} bytes={bytes} copy_mib_s={:.1} copy_iops={:.0}",
+            mib_s(bytes, time),
+            (per_thread * threads) as f64 / time.as_secs_f64().max(1e-9)
+        );
+    }
+    Ok(())
+}
+
 /// Prints one `FERRIC_BENCH` line for reads of `size` bytes: with `pread` and, when `grant`
 /// is set, through the grant in [`SLOT_RW`].
 fn bench(read: &Disk, size: usize, total: usize, grant: bool) -> Result<(), Failure> {
@@ -573,6 +618,10 @@ pub fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+                if let Err(err) = bench_threads(&read) {
+                    println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
+                    return ExitCode::FAILURE;
+                }
             }
             return ExitCode::SUCCESS;
         }
@@ -597,6 +646,10 @@ pub fn main() -> ExitCode {
             println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
             return ExitCode::FAILURE;
         }
+    }
+    if let Err(err) = bench_threads(&t.read) {
+        println!("FERRIC_TEST_FAIL nvme-grant-bench: {err}");
+        return ExitCode::FAILURE;
     }
     println!("FERRIC_TEST_PASS nvme-grant-bench");
     let steps: [(&str, Step); 2] = [

@@ -22,6 +22,8 @@
 //! Between `nvme-grant-checks` and the revoke it times sequential reads of 128 KiB and of
 //! 4 KiB, through the grant and with `pread` (the bytes copied through the kernel and the
 //! driver's bounce buffer), and prints `FERRIC_BENCH nvme-read-...` lines with both.
+//! It then times 4 KiB `pread`s from 1, 2 and 4 threads at once (`FERRIC_BENCH
+//! nvme-read-4k-t<N>`), the before-and-after numbers for per-core NVMe queues.
 //!
 //! Each step prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run
 //! stops at the first failure and exits non-zero. Without an NVMe disk, a `kernel.regbuf`
