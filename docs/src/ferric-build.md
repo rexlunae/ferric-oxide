@@ -172,6 +172,17 @@ requested level at boot and reports missing CPU features. With KVM disabled,
 the generated QEMU model for v3/v4 is `max`. The catalog retains older choices
 from upstream, but new Ferric development targets v3 or v4.
 
+`cpu.frame_pointers` (off by default) keeps frame pointers in user space, so
+the kernel profiler can walk user stacks for `ferric-trace flamegraph`. It adds
+`-fno-omit-frame-pointer` to the target CPPFLAGS and `-C
+force-frame-pointers=yes` to the target RUSTFLAGS. Rust packages built by the
+cookbook already keep frame pointers on 64-bit targets, because redoxer adds the
+same flag, so the option's real effect is on C and C++ code. Like the level, it
+reaches only packages compiled locally: prebuilt packages, prebuilt fox packages
+synced from `packages.set` and the prebuilt toolchain libraries (the Rust
+standard library, libgcc) keep their own flags, and a profiled call chain may
+stop inside them. The kernel and bootloader are left out, as for every CPU flag.
+
 Flags affect locally compiled packages. `build.repo_binary` selects prebuilt
 packages that ignore local compile-time choices, and the prebuilt toolchain's
 libraries retain their original baseline. Selecting v4 is not evidence that

@@ -158,6 +158,23 @@ v3). Notes:
 - With level v3 or v4, kernel XSAVE, XSAVEOPT and FSGSBASE default to
   `always`, and SMAP to `always` at v4 (Haswell lacks SMAP).
 
+## Frame pointers
+
+`cpu.frame_pointers = true` adds `-fno-omit-frame-pointer` to
+`FERRIC_TARGET_CPPFLAGS` and `-C force-frame-pointers=yes` to
+`FERRIC_TARGET_RUSTFLAGS`, so the kernel profiler (`kernel.profiling`) can walk
+user stacks. Its scope and limits:
+
+- Rust packages built by the cookbook keep frame pointers on 64-bit targets
+  even with the option off, because redoxer adds the same flag; the option's
+  real effect is on C and C++ code.
+- Only locally built packages are covered. Prebuilt packages
+  (`build.repo_binary`), prebuilt fox packages synced from `packages.set` and
+  the prebuilt toolchain libraries keep their own flags, so a profiled call
+  chain can stop inside them.
+- The kernel and bootloader are excluded, as for every flag in
+  `cpu.flags_exclude`.
+
 ## Adding an option
 
 Add an `[[option]]` to `features.toml`; no code changes are needed for the
