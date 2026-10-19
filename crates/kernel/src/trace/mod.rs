@@ -13,9 +13,10 @@
 //! - **Boot time.** `FERRIC_TRACE=<selection>` in the boot environment, or the build-time default
 //!   `trace.boot` in the kernel's `config.toml`, enables events before the other CPUs start.
 //! - **Run time.** The `kernel.trace` scheme (`scheme::trace`) enables and disables events and
-//!   drains the rings.
+//!   drains the rings, or maps them read-only into a reader.
 //!
-//! Records go to a ring per CPU ([`ferric_trace::ring::Ring`], 64 KiB). Tracepoints may only sit
+//! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
+//! records after a header page). Tracepoints may only sit
 //! where interrupts are off, as in the system call path and the scheduler: then nothing else
 //! runs on the CPU while a record is written, and the CPU's ring has a single producer.
 

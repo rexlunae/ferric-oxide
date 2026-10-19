@@ -18,6 +18,9 @@
 //!   compatibility-format MSI messages for a logical CPU, and [`spread`], the order in which a
 //!   driver gives its MSI-X vectors to CPUs.
 //!
+//! - [`call`], the `SYS_CALL`s on an `irq:` handle: [`call::Call::Move`] steers a vector to
+//!   another CPU.
+//!
 //! The crate is `no_std`, has no unsafe code and no dependencies, and is tested on the host.
 //!
 //! # Examples
@@ -43,6 +46,8 @@
 
 #[cfg(test)]
 extern crate std;
+
+pub mod call;
 
 use core::{
     fmt,

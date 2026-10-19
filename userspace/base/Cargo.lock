@@ -895,6 +895,13 @@ name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-vtd"
+version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1722,6 +1729,7 @@ dependencies = [
  "fdt 0.1.5",
  "ferric-iommu",
  "ferric-irq",
+ "ferric-vtd",
  "libc",
  "libredox",
  "log",

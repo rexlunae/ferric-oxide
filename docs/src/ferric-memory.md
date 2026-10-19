@@ -84,17 +84,44 @@ target raises the control-protection exception, decoded with `crates/cet/`.
 User-mode CET remains off. See `arch/x86_64/ibt.rs` and
 `scripts/ferric-ci/check-kernel-ibt.sh`.
 
-`kernel.cpu.shstk` accepts `never` (default) and `auto`. The automatic path
-detects support, allocates shadow stacks for kernel stacks, sets up tokens,
-and maintains SSP-related state. It does **not** enable shadow-stack checking;
-the shadow-stack context-switch instruction sequence remains inactive.
-Enabling supervisor shadow stacks across syscalls, non-local returns and KPTI
-still needs implementation. Writable physical-map aliases of their frames are
-another limitation of the prepared design. See `arch/x86_64/shstk.rs` and
-`crates/cet/src/shstk.rs`.
+`kernel.cpu.shstk` accepts `never` (default), `auto`, and `always`. With
+`kernel.self_modifying` enabled, it maintains kernel shadow stacks and enables
+supervisor return checking on supporting CPUs when KPTI is off. `always`
+requires CET support and `kernel.cpu.kpti=never`; `auto` leaves checking off
+when CET is missing or KPTI is on. User-mode CET and the KPTI entry shadow-stack
+switch remain unsupported. IBT is an independent choice.
 
-CI checks the IBT binary's entry points and boots shadow-stack detection and
-preparation. Those checks do not demonstrate CET enforcement on hardware.
+Compiled shadow-stack support reserves 32 MiB at boot for 4096 simultaneous
+8 KiB shadow stacks, including boot and per-CPU stacks. The pool is excluded
+from both the ordinary frame allocator and the writable physical-memory map;
+exhaustion returns an allocation failure, with no writable fallback. The kernel
+checks every reserved page after constructing its boot mappings and invalidates
+old bootloader translations before AP startup. Pool frames are mapped only with
+read-only shadow-stack PTEs and an unmapped guard below each stack.
+
+Live CPUs write entries with `WRSS`. Pre-enable initialization makes a bounded
+store through the same read-only mapping while interrupts are masked and the
+CPU's CET/WP state is temporarily disabled. It restores CR0, CR4 and RFLAGS
+before returning, with no calls while protection is off and no writable PTE
+that another CPU could cache. The sequence follows Intel SDM Volume 3A sections
+2.5 and 4.6. Once a CPU has a live shadow stack it always uses `WRSS`.
+
+Host tests cover slot bounds, reservation exclusion, pool exhaustion and reuse.
+The boot self-test also checks PTEs, attempts ordinary writes to the shadow
+mapping and both physical-map addresses, and requires page faults without
+changing the entries. Its narrowly scoped fault recovery restarts the same
+`rep stosq` with zero count, preserving the return RIP and CET shadow frame.
+It checks clearing and reuse before enable, and repeats with real `WRSS` after
+the BSP enables CET. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
+If no complete reserved key fits the supported window, it retains the boot
+mapping checks and explicitly skips the window-dependent probe. This preserves
+the CET-disabled `auto` boot when the pool is above the 1 TiB window limit.
+
+CI checks IBT and shadow-stack binary sequences and runs the pool isolation
+self-test even on CPUs without CET. Those boots do not validate CET enforcement.
+An older Kleya image enabled CET and passed its initial self-test, then panicked
+during syscall fuzzing; [#78](https://github.com/rexlunae/ferric-oxide/issues/78)
+tracks the required fresh hardware rerun.
 
 ## Speculation hardening and lifetime rules
 

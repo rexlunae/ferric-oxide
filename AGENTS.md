@@ -21,6 +21,7 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Select checks, debug a failure, reproduce a boot or run fuzzing | [Validation and debugging](docs/src/ferric-testing.md), [CI workflows](.github/workflows/), [CI scripts](scripts/ferric-ci/) and [kernel lint baseline](ci/kernel-lints.json) |
 | Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
 | Report hardware results | [HARDWARE.md](HARDWARE.md); inherited reports are not proof of current Ferric support |
+| See what is planned, which phase a change belongs to, or what is in progress | [Roadmap chapter](docs/src/ferric-roadmap.md) for the plan and exit criteria; [ROADMAP.md](ROADMAP.md) for per-phase status and pull requests |
 | Contribute, review or handle upstream imports | [CONTRIBUTING.md](CONTRIBUTING.md), [AI_POLICY.md](AI_POLICY.md), [PR template](.github/pull_request_template.md), [subtree-sync workflow](.github/workflows/subtree-sync.yml) |
 | Check licensing or user-facing names | [LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md) |
 | Add or render book pages | [Book README](docs/README.md), [writing docs](docs/src/writing-docs-correctly.md) and [documentation checks](docs/src/ferric-testing.md#documentation-checks) |
@@ -33,6 +34,7 @@ Source and tests establish what is implemented; `features.toml` establishes conf
 - Document the implemented behavior, enabling configuration, constraints and relevant checks. Distinguish prepared interfaces or planned work from active enforcement; do not claim a successful test, boot, benchmark or hardware result without evidence.
 - Keep the [system status table](docs/src/ferric-oxide.md#implementation-status) and this document map accurate when adding components or completing previously unfinished work. Prefer links to authoritative catalog/API/workflow details over copying lists that will diverge.
 - Put system documentation in `docs/`. Add Ferric-specific pages locally and list them in `docs/src/SUMMARY.md`; preserve inherited upstream content and avoid unrelated reorganization of the book subtree.
+- When you land work that belongs to a roadmap phase, update the status table in [ROADMAP.md](ROADMAP.md) in the same pull request: add the pull request to its phase and move finished items. Change the [Roadmap chapter](docs/src/ferric-roadmap.md) only when the plan itself changes.
 - Run the book checks described in [Validation and debugging](docs/src/ferric-testing.md#documentation-checks) when changing its pages. Report unavailable tooling and validation limits. Never commit generated `docs/book/` output.
 
 ## Repository layout

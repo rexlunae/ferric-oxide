@@ -1,6 +1,12 @@
 # Configuration file with the commands configuration of the Redox image
 
-$(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES)
+# fox sync writes fox.lock beside the package set and pins the image to it,
+# so a change to the lock alone must rebuild the image. wildcard keeps the
+# first build working before any lock exists. The installer can rewrite the
+# lock while it builds, so each image is touched after it is moved into place.
+FERRIC_FOX_LOCK=$(if $(FERRIC_FOX_PACKAGES),$(wildcard $(dir $(FERRIC_FOX_PACKAGES))fox.lock))
+
+$(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -15,9 +21,10 @@ else
 	truncate -s "$$FILESYSTEM_SIZE"m $@.partial
 	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) $@.partial
 	mv $@.partial $@
+	touch $@
 endif
 
-$(BUILD)/redox-live.iso: $(FSTOOLS) $(REPO_TAG) redox.ipxe $(FERRIC_FOX_PACKAGES)
+$(BUILD)/redox-live.iso: $(FSTOOLS) $(REPO_TAG) redox.ipxe $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -31,10 +38,11 @@ else
 	truncate -s "$$FILESYSTEM_SIZE"m $@.partial
 	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
 	mv $@.partial $@
+	touch $@
 	cp redox.ipxe $(BUILD)/redox.ipxe
 endif
 
-$(BUILD)/filesystem.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES)
+$(BUILD)/filesystem.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -57,6 +65,7 @@ else
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	rm -rf $(MOUNT_DIR)
 	mv $@.partial $@
+	touch $@
 endif
 
 mount: $(FSTOOLS) FORCE

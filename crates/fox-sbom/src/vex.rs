@@ -289,6 +289,7 @@ fn target_of(
         .map_or(reference.as_str(), AsRef::as_ref);
     let (package, version) = parse_purl(purl).ok_or_else(not_a_package)?;
     let mut versions: Vec<String> = version.into_iter().collect();
+    let mut affected = Vec::new();
     let listed = target
         .versions
         .as_ref()
@@ -296,10 +297,10 @@ fn target_of(
         .unwrap_or_default();
     for entry in listed {
         match &entry.version_range {
-            VersionRange::Version(version) if entry.status != Status::Affected => {
-                versions.push(version.to_string());
+            VersionRange::Version(version) if entry.status == Status::Affected => {
+                affected.push(version.to_string());
             }
-            VersionRange::Version(_) => {}
+            VersionRange::Version(version) => versions.push(version.to_string()),
             VersionRange::Range(range) => {
                 return Err(VexError::Range {
                     id: id.to_owned(),
@@ -314,6 +315,9 @@ fn target_of(
             }
         }
     }
+    // A version listed as affected is never covered, even when the purl
+    // names it too.
+    versions.retain(|version| !affected.contains(version));
     let versions = if versions.is_empty() && listed.is_empty() {
         VexVersions::All
     } else {
@@ -397,6 +401,21 @@ mod tests {
         assert_eq!(exploitable.state.as_str(), "exploitable");
         assert!(exploitable.covers("hello", "1.0.0"));
         assert!(!exploitable.covers("hello", "1.0.1"));
+    }
+
+    #[test]
+    fn a_version_listed_as_affected_is_not_covered_even_in_the_purl() {
+        let json = document(
+            r#"{"id": "FOX-2026-0003", "analysis": {"state": "not_affected"},
+                "affects": [{"ref": "pkg:generic/hello@1.0.0", "versions": [
+                  {"version": "1.0.0", "status": "affected"},
+                  {"version": "1.1.0", "status": "unaffected"}]}]}"#,
+            "",
+        );
+        let statements = read_vex(&json).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert!(!statements[0].covers("hello", "1.0.0"));
+        assert!(statements[0].covers("hello", "1.1.0"));
     }
 
     #[test]

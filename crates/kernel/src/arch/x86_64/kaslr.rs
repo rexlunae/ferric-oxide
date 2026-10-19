@@ -1,6 +1,6 @@
 //! Ferric Oxide: randomized base for the linear map of physical memory (KASLR, part 1).
 //!
-//! The bootloader maps physical memory at the fixed address [`Arch::PHYS_OFFSET`] (PML4 slot
+//! The bootloader maps physical memory at the fixed address [`rmm::Arch::PHYS_OFFSET`] (PML4 slot
 //! 256). An attacker who knows a physical address then also knows its kernel virtual address,
 //! which helps exploits that need to point the kernel at their data. At boot the kernel builds its
 //! own page table anyway (`startup::memory::map_memory`), so it places the map at a random
