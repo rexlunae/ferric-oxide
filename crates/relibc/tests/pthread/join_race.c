@@ -18,7 +18,9 @@ static void *routine(void *arg) {
 int main(void) {
     for (uintptr_t round = 0; round < ROUNDS; round++) {
         pthread_t thread;
-        int status = pthread_create(&thread, NULL, routine, (void *)round);
+        const pthread_attr_t *attr = NULL;
+        void *arg = (void *)round;
+        int status = pthread_create(&thread, attr, routine, arg);
         if (status != 0) {
             return fail(status, "pthread_create");
         }

@@ -41,6 +41,10 @@ impl<T> Waitval<T> {
         // treat EFAULT (the page is gone) as nobody left to wake instead of panicking.
         let state = self.state.ptr();
         self.state.store(1, Ordering::Release);
+        // SAFETY: FUTEX_WAKE only names the word; nothing here dereferences `state`. Both
+        // kernels look the address up before using it and fail with EFAULT if it is no longer
+        // mapped (Redox: `validate_and_translate_virt` in `syscall/futex.rs`; Linux: the futex
+        // key lookup), so a freed thread control block cannot fault this thread.
         match unsafe { Sys::futex_wake(state, i32::MAX as u32) } {
             Ok(_) | Err(Errno(EFAULT)) => {}
             Err(Errno(errno)) => panic!("futex wake failed with errno {errno}"),
