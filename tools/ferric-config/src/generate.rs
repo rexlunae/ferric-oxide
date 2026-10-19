@@ -844,7 +844,9 @@ mod tests {
             mk.contains("FERRIC_TARGET_CPPFLAGS:=-march=x86-64-v3 -fno-omit-frame-pointer\n"),
             "{mk}"
         );
-        // Off by default: no flag at all.
+        // Off by default, config.mk adds neither flag. That is all this checks: Rust packages
+        // still get frame pointers on 64-bit targets from redoxer, so off only means C and C++
+        // code omits them.
         let r = resolve(&s, &BTreeMap::new());
         let off = super::plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
         assert!(!file(&off, "config.mk").contains("frame-pointer"));

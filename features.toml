@@ -245,12 +245,16 @@ title = "Keep frame pointers in user space"
 default = false
 rebuild = ["*"]
 help = """
-Build every userspace package with frame pointers (-C force-frame-pointers=yes
-for Rust, -fno-omit-frame-pointer for C and C++), so the kernel profiler
+Build every userspace package with frame pointers (-fno-omit-frame-pointer for
+C and C++, and -C force-frame-pointers=yes for Rust), so the kernel profiler
 (kernel.profiling) can walk user stacks and `ferric-trace flamegraph` can show
-whole call chains. Costs a register and a few instructions per call. The Rust
-standard library comes prebuilt with the toolchain and is not rebuilt, so a
-chain may stop inside it."""
+whole call chains. Costs a register and a few instructions per call in C code.
+Rust packages built by the cookbook already keep frame pointers on 64-bit
+targets (redoxer adds the flag), so with this off only C and C++ code omits
+them. Only packages built locally are covered: prebuilt packages
+(build.repo_binary), prebuilt fox packages synced from packages.set, and the
+toolchain's prebuilt libraries (the Rust standard library, libgcc) keep the
+flags they were built with, so a chain may stop inside them."""
 
 [[option.effect]]
 when = "value"
