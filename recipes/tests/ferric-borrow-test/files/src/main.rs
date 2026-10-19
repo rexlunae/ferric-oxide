@@ -25,10 +25,14 @@
 //! - `remap-written`: a page mapped, unmapped, then written with `pwrite` maps with the new
 //!   contents;
 //! - `remap-reused`: once the mapped file is deleted, a new file maps and reads with its own
-//!   contents, not the deleted file's.
+//!   contents, not the deleted file's;
+//! - `shared-read`: a store through a live shared mapping is what `pread` of the file returns.
 //!
 //! Prints one `FERRIC_TEST_PASS borrow ...` or `FERRIC_TEST_FAIL borrow ...` line and exits
 //! non-zero on failure. It also runs on Linux, which helps check the test itself.
+
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::{c_int, c_long, c_void};
 use std::fmt;
@@ -48,6 +52,8 @@ const FILL: u8 = 0x5A;
 const REMAP_PATH: &str = "/tmp/ferric-borrow-test.remap";
 /// The file `remap-reused` creates after that one is deleted.
 const NEW_PATH: &str = "/tmp/ferric-borrow-test.new";
+/// The file `shared-read` stores to through a shared mapping and reads.
+const SHARED_PATH: &str = "/tmp/ferric-borrow-test.shared";
 
 /// The few libc calls the test needs, with the constants of the platform.
 mod sys {
@@ -307,11 +313,47 @@ fn check_remap() -> Result<(), Error> {
     fs::remove_file(NEW_PATH).map_err(file_error(NEW_PATH))
 }
 
+/// `shared-read`: a store through a live shared mapping shows in `pread` of the file.
+fn check_shared_read() -> Result<(), Error> {
+    const OLD: u8 = 0x11;
+    const STORED: u8 = 0x22;
+    fs::write(SHARED_PATH, [OLD; PAGE_SIZE]).map_err(file_error(SHARED_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(SHARED_PATH)
+        .map_err(file_error(SHARED_PATH))?;
+    let page = map(
+        0,
+        PAGE_SIZE,
+        sys::MAP_SHARED,
+        file.as_raw_fd(),
+        "the shared-read file",
+    )?;
+    // SAFETY: just mapped readable and writable, one page long.
+    unsafe { (page as *mut u8).write_volatile(STORED) };
+    let mut byte = [0u8];
+    let read = std::os::unix::fs::FileExt::read_exact_at(&file, &mut byte, 0)
+        .map_err(file_error(SHARED_PATH));
+    // SAFETY: the mapping is this test's own.
+    let unmapped = unsafe { sys::munmap(page as *mut c_void, PAGE_SIZE) } == 0;
+    read?;
+    if !unmapped {
+        return Err(Error::Mmap("the shared-read file (munmap)"));
+    }
+    expect_byte("shared-read", STORED, byte[0])?;
+    drop(file);
+    fs::remove_file(SHARED_PATH).map_err(file_error(SHARED_PATH))
+}
+
 fn main() -> ExitCode {
-    match run().and_then(|()| check_remap()) {
+    match run()
+        .and_then(|()| check_remap())
+        .and_then(|()| check_shared_read())
+    {
         Ok(()) => {
             println!(
-                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents"
+                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents; reads see stores through a shared mapping"
             );
             ExitCode::SUCCESS
         }
