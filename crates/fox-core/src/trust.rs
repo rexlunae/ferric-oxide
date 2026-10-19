@@ -27,20 +27,16 @@
 //! third-party prebuilts only after the user adds a builder explicitly.
 //! First-party signer keys stay in [`crate::keys::TRUSTED_KEYS_DIR`].
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 
+use crate::config::{ConfigError, load_toml, save_toml};
 use crate::{GitUrl, KeyId, TrustedKeys};
 
 /// The trust file, relative to the install root.
 pub const TRUST_FILE: &str = "etc/fox/trust.toml";
-
-/// Largest trust file read.
-const MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 /// The trust file format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,33 +52,9 @@ pub enum TrustFormat {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TrustError {
-    /// The file could not be read or written.
-    #[error("cannot access trust file {}", path.display())]
-    Io {
-        /// The file.
-        path: PathBuf,
-        /// The underlying error.
-        #[source]
-        source: io::Error,
-    },
-    /// The file is larger than 1 MiB.
-    #[error("trust file {} is larger than 1 MiB", path.display())]
-    TooLarge {
-        /// The file.
-        path: PathBuf,
-    },
-    /// The file is not a valid `fox-trust/1` file.
-    #[error("invalid trust file {}", path.display())]
-    Parse {
-        /// The file.
-        path: PathBuf,
-        /// The underlying error.
-        #[source]
-        source: toml::de::Error,
-    },
-    /// The store could not be serialized.
-    #[error("cannot serialize the trust store")]
-    Serialize(#[source] toml::ser::Error),
+    /// The trust file could not be read, parsed or written.
+    #[error("trust file")]
+    File(#[from] ConfigError),
     /// The repository is already pinned to a different author key.
     #[error("{git} is pinned to author key {pinned}, not {offered}")]
     AuthorKeyChanged {
@@ -154,6 +126,12 @@ impl AuthorKey {
     /// The key.
     pub fn public_key(&self) -> &PublicKey {
         &self.0
+    }
+
+    /// The raw 32-byte Ed25519 public key.
+    pub fn ed25519_bytes(&self) -> [u8; 32] {
+        // `new` admits only Ed25519 keys.
+        self.0.key_data().ed25519().map_or([0; 32], |key| key.0)
     }
 
     /// The `SHA256:…` fingerprint `ssh-keygen -l` shows.
@@ -256,24 +234,10 @@ impl TrustStore {
     ///
     /// # Errors
     ///
-    /// [`TrustError::Io`], [`TrustError::TooLarge`] or [`TrustError::Parse`]
-    /// if the file exists but cannot be read or is invalid.
+    /// [`TrustError::File`] if the file exists but cannot be read or is
+    /// invalid.
     pub fn load(root: &Path) -> Result<Self, TrustError> {
-        let path = root.join(TRUST_FILE);
-        let io_error = |source| TrustError::Io {
-            path: path.clone(),
-            source,
-        };
-        let size = match fs::metadata(&path) {
-            Ok(meta) => meta.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(io_error(error)),
-        };
-        if size > MAX_FILE_SIZE {
-            return Err(TrustError::TooLarge { path });
-        }
-        let text = fs::read_to_string(&path).map_err(io_error)?;
-        toml::from_str(&text).map_err(|source| TrustError::Parse { path, source })
+        Ok(load_toml(&root.join(TRUST_FILE))?)
     }
 
     /// Writes the store to `<root>/etc/fox/trust.toml`, replacing the file
@@ -281,22 +245,9 @@ impl TrustStore {
     ///
     /// # Errors
     ///
-    /// [`TrustError::Serialize`] or [`TrustError::Io`].
+    /// [`TrustError::File`] if it cannot be serialized or written.
     pub fn save(&self, root: &Path) -> Result<(), TrustError> {
-        let path = root.join(TRUST_FILE);
-        let text = toml::to_string(self).map_err(TrustError::Serialize)?;
-        let io_error = |source| TrustError::Io {
-            path: path.clone(),
-            source,
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(io_error)?;
-        }
-        let temp = path.with_extension("toml.new");
-        let mut file = fs::File::create(&temp).map_err(io_error)?;
-        file.write_all(text.as_bytes()).map_err(io_error)?;
-        file.sync_all().map_err(io_error)?;
-        fs::rename(&temp, &path).map_err(io_error)
+        Ok(save_toml(&root.join(TRUST_FILE), self)?)
     }
 
     /// The pinned authors.
@@ -398,6 +349,7 @@ impl TrustStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const KEY_A: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti a@x";
@@ -483,7 +435,10 @@ mod tests {
         ] {
             fs::write(&path, text).unwrap();
             assert!(
-                matches!(TrustStore::load(root.path()), Err(TrustError::Parse { .. })),
+                matches!(
+                    TrustStore::load(root.path()),
+                    Err(TrustError::File(ConfigError::Parse { .. }))
+                ),
                 "{text}"
             );
         }

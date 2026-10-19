@@ -76,9 +76,10 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::str::FromStr;
 
-use pkgar_core::dryoc::classic::crypto_sign::{crypto_sign_detached, crypto_sign_verify_detached};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
+pub use crate::signing::{Ed25519Signature, SignatureParseError};
+use crate::signing::{public_key_of, sign_detached, verify_detached};
 use crate::{Blake3Digest, FileRecord, KeyId, PackageName, TrustedKey, TrustedKeys, sbom_path};
 
 /// Bytes signed before the attestation itself, for domain separation.
@@ -127,10 +128,10 @@ pub enum SignatureFormat {
 #[non_exhaustive]
 pub enum CpuLevel {
     /// x86-64-v3 (AVX2, BMI2, FMA): the baseline.
-    #[serde(rename = "x86_64-v3")]
+    #[serde(rename = "x86_64-v3", alias = "v3", alias = "x86-64-v3")]
     X86_64V3,
     /// x86-64-v4 (AVX-512).
-    #[serde(rename = "x86_64-v4")]
+    #[serde(rename = "x86_64-v4", alias = "v4", alias = "x86-64-v4")]
     X86_64V4,
 }
 
@@ -140,6 +141,24 @@ pub enum CpuLevel {
 pub struct CpuLevelError(String);
 
 impl CpuLevel {
+    /// The level every x86-64 build defaults to and every x86-64 machine
+    /// Ferric Oxide runs on has.
+    pub const BASELINE: Self = Self::X86_64V3;
+
+    /// Whether CPU levels apply to `target`: true for x86-64 triples.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fox_core::CpuLevel;
+    ///
+    /// assert!(CpuLevel::applies_to("x86_64-unknown-redox"));
+    /// assert!(!CpuLevel::applies_to("aarch64-unknown-redox"));
+    /// ```
+    pub fn applies_to(target: &str) -> bool {
+        target.starts_with("x86_64-")
+    }
+
     /// The name used in attestations and file names, such as `x86_64-v3`.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -313,67 +332,6 @@ pub struct Attestation {
     pub output: OutputRecord,
 }
 
-/// An Ed25519 signature.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Ed25519Signature([u8; 64]);
-
-impl Ed25519Signature {
-    /// Wraps raw signature bytes.
-    pub const fn from_bytes(bytes: [u8; 64]) -> Self {
-        Self(bytes)
-    }
-
-    /// The raw signature bytes.
-    pub const fn as_bytes(&self) -> &[u8; 64] {
-        &self.0
-    }
-}
-
-impl fmt::Display for Ed25519Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut hex = [0u8; 128];
-        // Encoding into a buffer of exactly twice the input length cannot fail.
-        hex::encode_to_slice(self.0, &mut hex).map_err(|_| fmt::Error)?;
-        f.write_str(core::str::from_utf8(&hex).map_err(|_| fmt::Error)?)
-    }
-}
-
-impl fmt::Debug for Ed25519Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Ed25519Signature({self})")
-    }
-}
-
-/// A string that is not 128 hex digits.
-// `hex::FromHexError` implements `Error` only with `std`, so it is kept as a
-// field and shown in the message rather than chained as a source.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-#[error("expected 128 hex digits: {0}")]
-pub struct SignatureParseError(hex::FromHexError);
-
-impl FromStr for Ed25519Signature {
-    type Err = SignatureParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut bytes = [0u8; 64];
-        hex::decode_to_slice(s, &mut bytes).map_err(SignatureParseError)?;
-        Ok(Self(bytes))
-    }
-}
-
-impl Serialize for Ed25519Signature {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for Ed25519Signature {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 /// A detached signature over an attestation file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationSignature {
@@ -394,15 +352,12 @@ impl AttestationSignature {
     ///
     /// [`AttestationError::Sign`] if the signing primitive fails.
     pub fn sign(attestation: &[u8], secret_key: &[u8; 64]) -> Result<Self, AttestationError> {
-        let mut signature = [0u8; 64];
-        crypto_sign_detached(&mut signature, &signed_message(attestation), secret_key)
-            .map_err(|error| AttestationError::Sign(error.into()))?;
-        let mut public = [0u8; 32];
-        public.copy_from_slice(&secret_key[32..]);
+        let signature = sign_detached(SIGNING_CONTEXT, attestation, secret_key)
+            .map_err(AttestationError::Sign)?;
         Ok(Self {
             format: SignatureFormat::V1,
-            key: KeyId::from_bytes(public),
-            signature: Ed25519Signature(signature),
+            key: public_key_of(secret_key),
+            signature,
         })
     }
 
@@ -653,12 +608,13 @@ pub fn verify_attestation(
     let signer = builders
         .get(&signature.key)
         .ok_or(AttestationError::UntrustedBuilder { key: signature.key })?;
-    crypto_sign_verify_detached(
-        signature.signature.as_bytes(),
-        &signed_message(attestation),
-        signature.key.as_bytes(),
+    verify_detached(
+        SIGNING_CONTEXT,
+        attestation,
+        &signature.signature,
+        &signature.key,
     )
-    .map_err(|error| AttestationError::BadSignature(error.into()))?;
+    .map_err(AttestationError::BadSignature)?;
     let text = core::str::from_utf8(attestation).map_err(|_| AttestationError::NotUtf8)?;
     let attestation = Attestation::from_toml(text)?;
     if attestation.build.builder_key != signature.key {
@@ -671,13 +627,6 @@ pub fn verify_attestation(
         attestation,
         signer,
     })
-}
-
-fn signed_message(attestation: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(SIGNING_CONTEXT.len() + attestation.len());
-    message.extend_from_slice(SIGNING_CONTEXT);
-    message.extend_from_slice(attestation);
-    message
 }
 
 /// The feature-set part of an artifact's identity: BLAKE3 over the sorted,
@@ -718,7 +667,7 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
-    use pkgar_core::dryoc::classic::crypto_sign::crypto_sign_seed_keypair;
+    use pkgar_core::dryoc::classic::crypto_sign::{crypto_sign_detached, crypto_sign_seed_keypair};
 
     use crate::FileKind;
 

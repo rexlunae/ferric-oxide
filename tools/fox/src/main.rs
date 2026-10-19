@@ -9,8 +9,11 @@
 //!                                       build attestation beside the archive
 //! fox verify --installed [<name>...]    re-check installed packages
 //! fox sbom <file.pkgar>                 CycloneDX JSON for a package
+//! fox sbom --system [--name <name>]     CycloneDX JSON for the whole root
+//! fox audit [--rustsec <dir>]           installed packages and crates that
+//!                                       an advisory names
 //! fox install [--force] [--allow-unsigned-metadata] [source options]
-//!             <file.pkgar | git-url[#ref] | dir[#ref]>...
+//!             <file.pkgar | git-url[#ref] | dir[#ref] | [registry/]name[@req]>...
 //!                                       verify (building git sources from
 //!                                       their signed release tag), then
 //!                                       install into --root
@@ -21,6 +24,13 @@
 //!         | remove-author <git-url> | remove-builder <label>
 //!                                       pinned author keys and trusted
 //!                                       builders (etc/fox/trust.toml)
+//! fox registry add <name> <git-url> --root-blake3 <hash>
+//!            | list | update [<name>...] | remove <name>
+//!                                       configured package registries
+//! fox search <query>                    packages in the registries
+//! fox info [registry/]name              owners, releases and artifacts
+//! fox sync --config <set.toml> [--lock <fox.lock>] [--locked | --update]
+//!                                       make the root match a package set
 //! fox list                              installed packages
 //! fox remove [--force] <name>...        remove installed packages
 //! fox adopt-pkg [--allow-unsigned-metadata] [--again]
@@ -41,12 +51,25 @@
 //! `fox-build` and signed with the root's local builder key, or, with
 //! `--prebuilt`, a prebuilt archive of the same commit and tree from a
 //! builder listed in the trust store is installed instead.
+//!
+//! A package name is looked up in the registries of
+//! `<root>/etc/fox/registries.toml`, verified against their signed
+//! metadata. Its newest matching release is installed from a prebuilt
+//! artifact that enough of the registry's builders attest to, or built from
+//! its tag, which must be signed by one of the package's owners;
+//! `<root>/etc/fox/policy.toml` decides which.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod audit;
 mod commands;
+mod cpu;
+mod inventory;
+mod prebuilt;
+mod registry;
 mod source;
+mod sync;
 mod trust;
 
 use std::path::PathBuf;
@@ -88,10 +111,19 @@ enum Command {
         /// Archives to check, or package names with `--installed`.
         targets: Vec<String>,
     },
-    /// Write a CycloneDX SBOM for an archive.
+    /// Write a CycloneDX SBOM for an archive, or with `--system` for every
+    /// package installed in the root.
     Sbom {
         /// The archive.
-        archive: PathBuf,
+        #[arg(required_unless_present = "system", conflicts_with = "system")]
+        archive: Option<PathBuf>,
+        /// Describe the installed system instead: every package, its files
+        /// and the crates in its build SBOM.
+        #[arg(long)]
+        system: bool,
+        /// The system's name in the SBOM.
+        #[arg(long, requires = "system", default_value = "ferric-oxide")]
+        name: String,
         /// Output format.
         #[arg(long, value_enum, default_value_t = SbomFormat::Cyclonedx)]
         format: SbomFormat,
@@ -117,9 +149,29 @@ enum Command {
         #[command(flatten)]
         source: SourceArgs,
         /// Archives (`.pkgar` files), git URLs or local repositories, each
-        /// optionally followed by `#<tag or commit>`.
+        /// optionally followed by `#<tag or commit>`, or registry package
+        /// names, `[registry/]name[@version requirement]`.
         #[arg(required = true)]
         targets: Vec<String>,
+    },
+    /// Make the root match a package set (`fox-packages/1`): add its
+    /// registries, write its policy, install its packages and remove those
+    /// the previous lock had that it no longer lists; then write the lock.
+    Sync {
+        /// The package set.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        /// The lock file (default: `fox.lock` beside the package set).
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+        /// Install only what the lock pins; fail on anything else.
+        #[arg(long, conflicts_with = "update")]
+        locked: bool,
+        /// Resolve every package again, ignoring the lock.
+        #[arg(long)]
+        update: bool,
+        #[command(flatten)]
+        source: SourceArgs,
     },
     /// Build a git source into a signed archive, attestation and SBOM,
     /// without installing it.
@@ -155,6 +207,31 @@ enum Command {
         #[arg(long)]
         again: bool,
     },
+    /// Manage package registries.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+    /// List installed packages, and crates inside them, that a security
+    /// advisory names; fails if there are any.
+    Audit {
+        /// Also check a checkout of the RustSec advisory database.
+        #[arg(long, value_name = "DIR")]
+        rustsec: Option<PathBuf>,
+        /// Report every finding, ignoring the registries' VEX statements.
+        #[arg(long)]
+        no_vex: bool,
+    },
+    /// Search the registries' package names and summaries.
+    Search {
+        /// Text to look for.
+        query: String,
+    },
+    /// Show a registry package's owners, releases and artifacts.
+    Info {
+        /// `[registry/]name`.
+        name: String,
+    },
     /// Remove installed packages.
     Remove {
         /// Remove even if other packages depend on it.
@@ -167,7 +244,7 @@ enum Command {
 }
 
 /// How git sources are chosen, checked and built.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct SourceArgs {
     /// Accept the source's author key without asking, and pin it, when the
     /// repository has no pinned key yet.
@@ -179,6 +256,13 @@ struct SourceArgs {
     /// Rust target triple (default: the toolchain's host).
     #[arg(long)]
     target: Option<String>,
+    /// x86-64 level to build at and to pick prebuilt variants for: `v3`
+    /// or `v4`. Ignored for other targets. Default for `install` and
+    /// `sync`: this CPU's, capped by the policy's `max-cpu-level`, when the
+    /// root is the running system, else the policy's level or v3; for
+    /// `build`, v3.
+    #[arg(long = "level", value_name = "LEVEL")]
+    cpu_level: Option<fox_core::CpuLevel>,
     /// Package to build, when the manifest holds several.
     #[arg(long, short)]
     package: Option<String>,
@@ -225,6 +309,34 @@ enum TrustCommand {
     RemoveBuilder {
         /// The builder's name.
         label: String,
+    },
+}
+
+/// `fox registry` subcommands.
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    /// Add a registry, fetching and verifying it.
+    Add {
+        /// A local name for it.
+        name: String,
+        /// Its git repository.
+        git: String,
+        /// BLAKE3 of its `metadata/root/1.json`, as its maintainers
+        /// publish it.
+        #[arg(long)]
+        root_blake3: fox_core::Blake3Digest,
+    },
+    /// List the configured registries.
+    List,
+    /// Fetch and verify registries (all of them by default).
+    Update {
+        /// Registries to update.
+        names: Vec<String>,
+    },
+    /// Remove a registry and its checkout.
+    Remove {
+        /// The registry.
+        name: String,
     },
 }
 

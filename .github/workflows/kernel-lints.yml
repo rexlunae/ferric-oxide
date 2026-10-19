@@ -31,7 +31,13 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        iommu: [never, auto]
+        # Two configurations, so doc links break neither with optional modules compiled
+        # out nor with them in: `never` without rings, `auto` with them.
+        include:
+          - iommu: never
+            features: regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info
+          - iommu: auto
+            features: regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/prepare-cargo-git
@@ -63,7 +69,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+          RUST_TARGET_PATH="$PWD/targets" cargo doc --locked --no-deps --features ${{ matrix.features }} \
             --target targets/x86_64-unknown-kernel.json \
             -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
             -Z json-target-spec

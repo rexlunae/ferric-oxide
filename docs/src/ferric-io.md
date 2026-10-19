@@ -1,4 +1,4 @@
-# Registered buffers and IOMMUs
+# Registered buffers, IOMMUs and rings
 
 The implemented I/O extensions expose registered memory and DMA domains
 through kernel schemes. Their ABI definitions live in shared crates so the
@@ -102,6 +102,49 @@ requester validation, and the kernel routes the I/O APIC through remapping.
 On those units compatibility-format interrupts are blocked. AMD-Vi currently
 implements DMA remapping only and uses compatibility-format interrupts.
 Neither the `enforce` policy nor DMA tests establish AMD interrupt isolation.
+
+## Per-CPU interrupt delivery
+
+The `irq:` scheme lets a driver reserve vector `N + 32` on one CPU by
+opening `irq:cpu-XX/N` with `O_CREAT`. Upstream counts interrupts and wakes
+handles by vector number only, so the same vector held on two CPUs shows up
+on both handles. With `kernel.irq_percpu` (off by default, x86_64 only):
+
+- Interrupts are keyed by (logical CPU, vector). Each CPU increments its own
+  row of atomic counters (`ferric_irq::Counts`), without a global lock, and
+  only handles opened for that CPU and vector are woken. Interrupts from the
+  PIC or I/O APIC belong to the BSP's `irq:N` handles. On an AP, IRQ numbers
+  0 to 15 are ordinary vectors and can be reserved there.
+- The top-level listing names CPUs by logical id, the number `cpu-XX` takes.
+- The root-only file `irq:cpus` lists each online CPU as
+  `cpu=<logical hex> apic=<APIC id> node=<NUMA node or ->`. `ferric-irq`
+  holds the writer and parser, so user space reads it with
+  `ferric_irq::parse_cpus`. The file appears in directory listings of
+  `/scheme/irq`.
+- Without interrupt remapping, pcid looks up the APIC id of the CPU a driver
+  asks for in `irq:cpus` when it builds a compatibility-format MSI message,
+  instead of using the logical id as one. It refuses a CPU whose APIC id the
+  format cannot name (0xFF or above). Without `irq:cpus`, pcid uses the
+  logical id, as upstream did.
+
+In every build, opening `cpu-XX` for a CPU that does not exist returns
+`ENOENT` instead of panicking the kernel. `ferric-iommu-test` checks
+delivery with `iommu-msi-percpu`.
+
+Drivers give MSI-X table entries to CPUs through `pcid_interface`:
+
+- `Msix::alloc_on(cpu)` programs the next entry with a vector on that logical
+  CPU.
+- `Msix::alloc_spread(count, node)` programs up to `count` entries, one per CPU
+  before any CPU gets a second, with CPUs on the device's NUMA node first
+  (`ferric_irq::spread`).
+- `InterruptVector::cpu` says where each vector went.
+
+Without `irq:cpus` these calls put every vector on the BSP, like upstream's
+`Msix::alloc`. Errors are typed (`pcid_interface::percpu::VectorError`).
+`percpu::online_cpus` and `percpu::bsp_cpu` read the CPU map and the BSP's
+logical id. No driver uses these calls yet; IRQ steering and per-core NVMe
+queues are later steps of roadmap Phase 2.4.
 
 ## From PCI discovery to a driver's DMA address
 
@@ -258,3 +301,88 @@ These are available primitives and tested integration paths. Apart from the
 drivers use an end-to-end registered-buffer protocol. The dedicated image tests exercise CPU
 grants, forwarding, sub-grants, device DMA and revocation; see
 [Validation and debugging](ferric-testing.md).
+
+## Submission/completion rings
+
+`kernel.rings = true` (Kernel menu, default `false`) enables `/scheme/kernel.ring`.
+`crates/ring` (ferric-ring) is the one definition of the ring format: the
+memory layout, the 64-byte SQE and 32-byte CQE, opcodes (the kernel's scheme
+request numbers, so `Read` is 5 in both), flags, notify modes, chain rules and
+the scheme's calls. It is `no_std` with no `unsafe` code, and the kernel,
+bootstrap and clients all use it. The kernel side is
+`crates/kernel/src/scheme/ring.rs`.
+
+1. Open `ring` beneath the scheme root. `Request::Setup` allocates the ring:
+   one header page, then the SQ and CQ slots, each on pages of its own. Entry
+   counts are powers of two, at most 4096 SQ and 8192 CQ entries, with a CQ at
+   least as large as the SQ (twice the SQ by default). Map the whole
+   `Layout::map_len()` with `MAP_SHARED`.
+2. Write SQEs with a `Producer<Sqe>` and publish them, then call
+   `Request::Enter`. The kernel takes complete chains from the SQ and runs
+   each SQE in the caller's context as the system call it stands for, on the
+   caller's descriptor and buffer: `Read`/`Write` at an offset as
+   `SYS_READ2`/`SYS_WRITE2`, at `CURRENT_POSITION` as `read`/`write`, and
+   `Fsize`, `Fstat` and `Fsync` as the system calls of those names. A user
+   scheme receives an ordinary scheme request, so every scheme works with
+   rings unchanged.
+3. Read one CQE per SQE with a `Consumer<Cqe>`: the SQE's `user_data` and the
+   result, or minus the errno. `fevent` on the ring descriptor reports
+   `EVENT_READ` while completions are waiting, and `Enter` triggers it.
+
+Linked SQEs (`SqeFlags::LINK`) form a chain that runs in order, possibly
+across schemes. A failure, or a `Read`/`Write` that moves fewer bytes than
+asked, cancels the rest of the chain with `ECANCELED`. A chain is taken only
+once its last SQE is published and only when the CQ has room for all of its
+completions, so completions are never dropped: `Enter` returns `EBUSY` when
+not even the first chain fits. Chains of more than 32 SQEs, or ones that fill
+the SQ without ending, complete with `EINVAL`.
+
+`Enter` looks up every descriptor a chain names when it takes the chain, before
+any SQE runs, and holds those open file descriptions until the chain is done.
+If another thread closes a descriptor, or replaces it with `dup2`, while the
+chain waits, the chain still acts on the files it named when it was taken, as
+one system call would. Whichever holder lets go of a description last (the
+descriptor table, the ring, or a file system call still running on it, through
+`syscall::fs::release_description`) closes it, so a description closed while a
+ring or a call holds it is still closed exactly once.
+
+The ring memory is shared with the application, which may write any of it at
+any time. The kernel reads it atomically through its own mapping, keeps its
+own indices, copies each SQE once before checking it, and fails `Enter` with
+`EINVAL` when the application's SQ tail is out of range. One `Enter` runs on
+a ring at a time; a concurrent one gets `EBUSY`.
+
+Each ring has a file table of 1024 slots. `Request::RegisterFiles { first }`
+is a `SYS_CALL` with `CallFlags::FD` whose payload holds descriptors (add
+`FD_CLONE` to keep them open in the caller); they go into consecutive slots
+from `first`, all or none. An SQE with `SqeFlags::FIXED_FILE` names a slot
+instead of a descriptor, which skips the descriptor lookup and keeps working
+after the application closes its descriptor. A slot keeps its file until
+`Request::UnregisterFiles { first, count }` or until the ring is closed. A
+full slot is refused with `EBUSY`; slots past the table and ring descriptors
+(a ring may not hold a ring open) with `EINVAL`; the descriptors of a
+refused call are closed. An empty slot completes with `EBADF`.
+
+A chain whose first SQE has `SqeFlags::ASYNC` runs on the ring's worker, a
+kernel context the ring starts on first use. `Enter` takes the chain, sets
+aside room in the CQ for its completions, looks up the files it names
+(refusing rings with `EINVAL`, since a chain holding its ring would keep the
+ring from closing), and returns without waiting; the worker runs asynchronous chains in order, with
+the submitter's address space and credentials, and posts each chain's CQEs
+together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+min_complete }` waits after submitting until the CQ holds `min_complete`
+completions or nothing submitted is still running, on the worker or in
+another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
+`Enter` announces each chain it runs itself as soon as its CQEs are posted.
+Closing the ring cancels the worker for good, as a signal that never clears:
+the wait the running chain is in ends, as does any it starts later, and the
+queued chains complete with `ECANCELED`.
+
+Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
+notification, and rings served natively by user schemes come later (see the design in
+`io/rings-design.md` in the project files). Their flags and modes already
+have encodings and return `EOPNOTSUPP` today. `ferric-ring-test` covers the
+calls, chains across RedoxFS, the pipe scheme and the null scheme, the file
+table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
+blocked, the refusals, back-pressure and a corrupt tail, and prints ring
+versus system call timings, by descriptor, by slot and on the worker.

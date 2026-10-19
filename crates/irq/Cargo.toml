@@ -1,0 +1,8 @@
+[package]
+name = "ferric-irq"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Per-CPU interrupt delivery: CPU numbering, the irq:cpus format and per-CPU interrupt counts"
+
+[dependencies]

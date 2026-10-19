@@ -70,6 +70,12 @@ pub mod irq;
 #[cfg(feature = "regbuf")]
 pub mod regbuf;
 
+// Ferric Oxide: `kernel.ring` - submission/completion rings brokered to any scheme (`rings`).
+// Its docs are all inner (`//!`): with an outer doc as well, rustdoc resolves the inner docs'
+// links here, where the module's imports are not in scope.
+#[cfg(feature = "rings")]
+pub mod ring;
+
 /// `memory:` - a scheme for accessing physical memory
 pub mod memory;
 
@@ -222,6 +228,10 @@ fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
         // Ferric Oxide: the trace scheme exists only with the `trace` feature.
         if cfg!(feature = "trace") {
             insert_globals(&[Trace]);
+        }
+        // Ferric Oxide: the ring scheme exists only with the `rings` feature.
+        if cfg!(feature = "rings") {
+            insert_globals(&[Ring]);
         }
     }
     let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -561,6 +571,9 @@ pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
     // Ferric Oxide: see `trace`.
     #[cfg(feature = "trace")]
     GlobalSchemes::Trace,
+    // Ferric Oxide: see `ring`.
+    #[cfg(feature = "rings")]
+    GlobalSchemes::Ring,
 ];
 
 pub const MAX_GLOBAL_SCHEMES: usize = 16;
@@ -605,6 +618,11 @@ impl SchemeExt for GlobalSchemes {
             Self::Trace => &trace::TraceScheme,
             #[cfg(not(feature = "trace"))]
             Self::Trace => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
+            // Ferric Oxide: the ring scheme.
+            #[cfg(feature = "rings")]
+            Self::Ring => &ring::RingScheme,
+            #[cfg(not(feature = "rings"))]
+            Self::Ring => &AcpiScheme, // unreachable: not in ALL_KERNEL_SCHEMES
         }
     }
     fn scheme_id(self) -> SchemeId {

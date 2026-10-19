@@ -68,11 +68,23 @@ const TABLE_ORDER: u32 = 4;
 /// How many timer interrupts the I/O APIC check waits for before it masks the pin again.
 const PIN_CHECK_TICKS: u32 = 4;
 
-/// The vectors user space must not route a device's interrupt to: the exceptions, the legacy
-/// IRQs 0-15 the 8259 delivers on the BSP, the kernel's IPIs and IOMMU fault vector
-/// (0x40-0x45), the system call gate and the spurious vector.
-fn kernel_vector(vector: u8) -> bool {
-    vector < 0x30 || (0x40..=FAULT_VECTOR).contains(&vector) || vector == 0x80 || vector == 0xff
+/// The vectors user space must not route a device's interrupt to on logical CPU `cpu`: the
+/// exceptions, the legacy IRQs 0-15 (0x20-0x2f) the 8259 and I/O APIC deliver on the BSP, the
+/// kernel's IPIs and IOMMU fault vector (0x40-0x45), the system call gate and the spurious
+/// vector.
+///
+/// Ferric Oxide: with `irq-percpu`, 0x20-0x2f on an AP are ordinary vectors that the irq
+/// scheme reserves per CPU (`irq:cpu-XX/N` for N below 16) and delivers to that CPU's handles,
+/// so they are the driver's to route there. Without it they stay the kernel's everywhere, as
+/// an interrupt on them would count for the BSP's legacy handles.
+fn kernel_vector(vector: u8, cpu: u32) -> bool {
+    let legacy = (0x20..0x30).contains(&vector);
+    let ap_vector = cfg!(feature = "irq-percpu") && cpu != LogicalCpuId::BSP.get();
+    vector < 0x20
+        || (legacy && !ap_vector)
+        || (0x40..=FAULT_VECTOR).contains(&vector)
+        || vector == 0x80
+        || vector == 0xff
 }
 
 /// A unit's interrupt remapping table and the entries in use.
@@ -344,17 +356,23 @@ pub fn alloc_msi(
     cpu: u32,
     vector: u8,
 ) -> Result<MsiEntry, IrqError> {
-    if kernel_vector(vector) {
+    // The CPU and vector are checked first, with or without remapping: ENODEV tells pcid to
+    // program a compatibility-format message itself, so it must mean only that no unit remaps
+    // the device, never that the route is allowed. A kernel vector (on an AP without
+    // `irq-percpu`, 0x20-0x2f, whose interrupts would count for the BSP's legacy handles) is
+    // refused whatever the unit.
+    if kernel_vector(vector, cpu) {
         return Err(IrqError::Vector { vector });
     }
-    // Without a VT-d unit for the device the answer is ENODEV, whatever the CPU. AMD-Vi units
-    // do not remap interrupts yet, so on them pcid gets ENODEV too and programs a
-    // compatibility-format message, which they pass through unchanged.
+    let apic_id = apic_id(cpu)?;
+    // Without a VT-d unit for the device the answer is ENODEV, so pcid falls back to the
+    // compatibility format. AMD-Vi units do not remap interrupts yet, so on them pcid gets
+    // ENODEV too and programs a compatibility-format message, which they pass through
+    // unchanged.
     let index = domain::vtd_unit_index(device).map_err(|err| match err {
         DomainError::NotEnabled => IrqError::NotEnabled,
         err => IrqError::Unit(err),
     })?;
-    let apic_id = apic_id(cpu)?;
     let entry = alloc_entry(index, source, apic_id, vector)?;
     let in_use = in_use();
     info!(

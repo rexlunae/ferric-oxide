@@ -7,7 +7,9 @@ build a git commit hermetically into a signed archive with a build SBOM and a
 signed build attestation (see [Hermetic builds and
 attestations](#hermetic-builds-and-attestations)), and `cargo fox release` to
 make the SSH-signed release tag that `fox install <git-url>` checks before it
-builds a source itself (see [Git sources](#git-sources)). With `ferric.toml`, images ship
+builds a source itself (see [Git sources](#git-sources)). Registry
+maintainers use `fox-registry` to keep a signed package registry (see
+[Registries](#registries)). With `ferric.toml`, images ship
 `fox` instead of upstream `pkgutils` by default (see
 [Target images](#target-images)). The image build itself still uses the
 cookbook and the installer.
@@ -18,11 +20,13 @@ cookbook and the installer.
 | --- | --- |
 | `crates/fox-core/` | Names, manifests, BLAKE3 digests, trusted Ed25519 keys, signed-head and full archive verification, normalized git URLs and the trust store |
 | `crates/fox-store/` | In-place file installation, ownership checks, installed database and re-verification |
-| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, and build SBOMs with the crate graph |
+| `crates/fox-sbom/` | Reproducible CycloneDX 1.5 JSON from verified package information, build SBOMs with the crate graph, and system SBOMs of a whole root |
 | `crates/fox-git/` | Git through `gix`: resolving revisions, the `fox-tree/1` BLAKE3 tree hash, tree export, fetching into a bare cache, and SSH-signed release tags |
 | `crates/fox-build/` | The hermetic Cargo build, staging, pkgar packing and attestation writing |
+| `crates/fox-index/` | The registry layout, `fox-tuf/1` signed metadata, client verification, the maintainer-side editing, and RustSec-format advisories |
 | `tools/fox/` | CLI and text/JSON reporting |
 | `tools/cargo-fox/` | `cargo fox build`, `package`, `keygen` and `release` for package authors |
+| `tools/fox-registry/` | `fox-registry` for registry maintainers, package owners and registry CI |
 
 The archive format is upstream pkgar. A trusted Ed25519 signature covers the
 header and its BLAKE3 entry-table hash; entries carry hashes for file content.
@@ -92,6 +96,13 @@ fox --root ./image-root --key ./signer.pub verify --installed
 fox --root ./image-root remove hello
 fox --root ./image-root adopt-pkg
 fox --root ./image-root install https://example.com/hello.git   # see Git sources
+fox --root ./image-root registry add ferric https://example.com/registry.git \
+    --root-blake3 <hash>                                            # see Registries
+fox --root ./image-root search hello
+fox --root ./image-root install hello@^1
+fox --root ./image-root sbom --system --name my-image --output ./image.cdx.json
+fox --root ./image-root audit [--rustsec ./advisory-db]                # see Advisories
+fox --root ./image-root sync --config ./packages.toml   # see Package sets
 ```
 
 All commands accept `--root`, `--key` and `--json`. `verify` also checks
@@ -100,7 +111,7 @@ the build attestation beside an archive (`<stem>.attest.toml` and its
 archives without one; see [Attestations](#attestations). `verify --installed`
 accepts optional package names; without them it checks all installed packages.
 `install` and `remove` accept multiple inputs; `install` takes git sources
-as well as archives. Verification failures produce
+and `[registry/]name[@requirement]` package names as well as archives. Verification failures produce
 a failing exit status. `install --force` permits replacement of otherwise
 conflicting unowned files; `remove --force` bypasses dependent-package refusal.
 Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
@@ -170,8 +181,10 @@ makes the command exit with a failing status.
 | --- | --- | --- |
 | `packages.manager` | `fox` | `fox`: the image gets the `fox` package, built from source even with `REPO_BINARY`, and no `pkgutils`. `pkgutils`: upstream `pkg` as before |
 | `packages.signed_manifests` | on | Sets `FERRIC_FOX_MANIFEST=1`: the cookbook writes `usr/share/fox/manifest/<name>.toml` into each target package's stage before packing it, so the signature covers the name, version, target, dependencies and git source. Changing it repacks every package |
+| `packages.set` | empty | With `fox`: a package set (see [Package sets and `fox sync`](#package-sets-and-fox-sync)) that the image build syncs into the image. Sets `FERRIC_FOX_PACKAGES` |
+| `packages.locked` | off | With a set: build with `fox sync --locked`, so the image fails to build unless `fox.lock` pins every package. Sets `FERRIC_FOX_LOCKED=1` |
 
-Without `ferric.toml` neither applies, and the build matches upstream.
+Without `ferric.toml` none of these apply, and the build matches upstream.
 
 Remote (`REPO_BINARY`) packages are unpacked and signed again with the
 cookbook's key, so they get manifests too. Packages already packed keep
@@ -180,12 +193,41 @@ what they had until they are repacked.
 When an image includes `fox`, the installer copies the cookbook's public
 key (`build/id_ed25519.pub.toml`) to `/etc/fox/keys/cookbook.toml`, so the
 target trusts the key that signed its packages. The installer still places
-packages with `pkg`'s library. On first boot, `fox`'s
-`/usr/lib/init.d/05_fox-adopt.service` runs
-`fox adopt-pkg --allow-unsigned-metadata`. The unsigned names it accepts are
-the ones the installer took from the image configuration. After that,
+packages with `pkg`'s library.
+
+With `packages.manager = "fox"` (`FERRIC_FOX_IMAGE=1`), the image build then
+finishes the root with the host `fox` (`target/release/fox`, built with the
+other host tools; `fox` itself on a self-hosted Redox build). Once the
+packages, files and accounts are in place, the installer runs, against the
+image root:
+
+1. `fox adopt-pkg --allow-unsigned-metadata`, so the image boots with its
+   packages already in `fox`'s database. The unsigned names it accepts are
+   the ones the installer took from the image configuration.
+2. With `packages.set`, `fox sync --config <set> --target <image target>`
+   (with `--level v3` or `v4` from `cpu.x86_64_level`, and `--locked` with
+   `packages.locked`). The set's registries, policy and
+   packages are installed into the image, and `fox.lock` is written beside
+   the set. Commit it, and turn on `packages.locked` for release builds, so
+   an image is built from exactly the pinned archives and commits. Changing
+   the set rebuilds the image.
+3. `fox sbom --system --name ferric-oxide-<config>`, writing the image SBOM
+   to `build/<arch>/<config>/image.cdx.json`.
+
+A failing step fails the image build. `fox`'s
+`/usr/lib/init.d/05_fox-adopt.service` still runs
+`fox adopt-pkg --allow-unsigned-metadata` on first boot. On an image built
+this way it finds the packages already adopted, so it only matters for
+images whose root was assembled some other way. After adoption,
 `fox list`, `fox verify --installed`, `fox install` and `fox remove` cover the
 whole system.
+
+The set's packages are installed for the image target, so they need
+prebuilt artifacts for it from enough registry builders, or a git source
+the host can cross-compile. The set's policy (`build = "never"`, say) can
+forbid source builds. Registry checkouts and git source caches stay under
+the image's `var/lib/fox/`, where the target's `fox` can use them. The
+image SBOM is not signed yet.
 
 On the target, `fox` installs local `.pkgar` files only. It does not fetch
 from package servers or resolve dependencies, which `pkg` does. Choose
@@ -296,7 +338,10 @@ a kind byte and length-prefixed path and contents, so git's SHA-1 ids are
 not the only thing naming the source. `feature_set_hash` is BLAKE3 over the
 sorted enabled features and the `Cargo.lock` hash. `entries_blake3` does not
 depend on the signing key, so a rebuilder signing with its own key can still
-show it produced the same files.
+show it produced the same files. `fox_build::reattest` does that: it
+compares a rebuild's staged files with a published archive and, when they
+match, writes the rebuilder's attestation of the published archive, whose
+`output` names the original header signer.
 
 The `.sig` file (`fox-signature/1`) holds the Ed25519 key and a signature
 over `fox-attestation-signature/1\0` followed by the attestation's exact
@@ -390,6 +435,437 @@ back, verifies its signature and prints the key's fingerprint, which users
 see when they first install the source. It refuses a dirty work tree or an
 existing tag, and pushes nothing.
 
+## Registries
+
+A registry is a git repository of TOML files whose integrity comes from
+signed metadata, not from the git host. `crates/fox-index` implements both
+sides, `fox-registry` is the maintainer and builder tool, and `fox registry`,
+`fox search`, `fox info` and `fox install <name>` are the client.
+
+```text
+registry.toml                     name, artifact URLs, builder keys
+packages/<xx>/<name>.toml         one file per package: git URL, owners, releases
+artifacts/<xx>/<name>/<ver>.toml  prebuilt artifacts of one release
+advisories/                       security advisories
+vex/<id>.cdx.json                 CycloneDX VEX statements about its packages
+metadata/root/<N>.json            every root version, kept for key rotation
+metadata/targets.json             hashes of every file above, and the delegations
+metadata/delegations/<name>.json  each package's file, signed by its owners
+metadata/snapshot.json            versions and hashes of targets and delegations
+metadata/timestamp.json           hash of the snapshot; expires after a day
+```
+
+`<xx>` is the name's first two characters (`_` pads one-character names).
+Package files keep `[[owners]]` (an id and an OpenSSH Ed25519 key) and
+`[[release]]` (version, tag, commit, `fox-tree/1` `tree_blake3`, `yanked`).
+Artifact lists live apart from package files so CI can add them under the
+targets key without the owners' signatures.
+
+### Signed metadata: `fox-tuf/1`
+
+The metadata follows the role model of The Update Framework (TUF
+specification 1.0): root, targets, snapshot and timestamp roles, delegations
+by exact path, version numbers and expiry dates. `fox-index` implements this
+subset itself rather than using the `tough` crate, whose async runtime and
+dependency set do not suit the target. Each file is
+`{"signed": ..., "signatures": [{"keyid", "sig"}]}`; a signature is Ed25519
+over `fox-tuf-metadata/1\0` followed by the OLPC canonical JSON of `signed`,
+key ids are the raw public keys in hex, and file hashes are BLAKE3.
+
+| Role | Signs | Default expiry |
+| --- | --- | --- |
+| root | the keys and thresholds of every role | 365 days |
+| targets | `registry.toml`, `artifacts/`, `advisories/`, undelegated package files, and the delegations | 90 days |
+| package delegation | that package's file only; keys are its owners' SSH keys, threshold 1 | 365 days |
+| snapshot | the version, length and hash of `targets.json` and every delegation | 7 days |
+| timestamp | the version, length and hash of `snapshot.json` | 1 day |
+
+A client starts from a root it trusts (shipped with the image or pinned by
+its BLAKE3) and keeps the versions it has seen. `fox_index::verify::update`
+then checks, in order: each newer root against the old and its own root keys;
+the timestamp; the snapshot against the timestamp's hash; that no version
+went backwards (rollback); that nothing has expired (freeze); targets and
+every delegation against the snapshot; and that a delegation lists only the
+paths it was given. Files are read only through the verified registry, which
+checks each against its signed length and hash; a file no metadata lists
+cannot be read. Top-level targets win over a delegation for the same path.
+
+The client also refuses a delegation whose name is not a single path
+component, any read that would leave the checkout (including through a
+symbolic link), a metadata length above 16 MiB whatever the signed
+descriptor claims, and a `registry.toml` whose `name` differs from the
+signed root's. It pins the BLAKE3 of the trusted timestamp's signed payload
+in its saved state (`timestamp_payload`), so a timestamp with the trusted
+version but different content is refused as an equivocation, while
+signatures re-made over the same payload are accepted. A package file supplied by its
+delegation must list as owners exactly the delegation's keys, so tag
+authority cannot drift from update authority.
+
+### Running a registry
+
+```sh
+fox-registry -C reg init --name ferric --keys ./keys
+fox-registry -C reg admit https://example.com/hello.git --name hello \
+    --owner alice="ssh-ed25519 AAAA... alice@example.com"
+fox-registry -C reg sign --key keys/targets.key --key keys/snapshot.key \
+    --key keys/timestamp.key
+```
+
+`init` generates a `pkgar-keys` pair per role (`--single-key` uses one key
+for all four, for a personal registry) and prints the BLAKE3 of
+`metadata/root/1.json` for clients to pin. Edits (`admit`, `release`,
+`yank`, `set-role`) only change files; `sign` then recomputes every role in
+order (root, delegations, targets, snapshot, timestamp), gives a role whose
+content changed a new version and expiry, and signs with whichever `--key`
+files the role lists. A version nobody has signed yet is updated in place.
+A role that has used up half its lifetime is renewed when its key is given,
+so a scheduled `fox-registry sign --key timestamp.key` keeps the timestamp
+fresh. A role is only renewed when the given keys can sign the replacement
+to its threshold, so a scheduled run holding one of two keys leaves the
+still-valid metadata in place. A new root is complete only when its own
+root keys meet their threshold and, separately, the previous root's root
+keys meet theirs (`sign` prints both counts), and a root that is not yet complete is
+amended by `set-role` rather than followed by another version. Amending it
+drops every signature it already has, by old and new root keys alike, so
+each key set has to approve the content it actually signs.
+`sign --complete` fails if any file is short of its threshold, which
+is a normal intermediate state: an owner signs a delegation without the
+snapshot key, and CI adds snapshot and timestamp after the merge.
+
+`--key` takes a `pkgar-keys` secret key file or an OpenSSH Ed25519 private
+key (owners sign with the key their tags are signed with). Both must be
+unencrypted; keep them on offline or encrypted storage and use a decrypted
+copy only while signing.
+
+| Command | What it does |
+| --- | --- |
+| `admit <git-url> --name N --owner ID=KEY` | Writes the package file and a delegation to the owners (`--kind`, `--summary`, `--path` optional) |
+| `release <name> <tag>` | Fetches the repository, checks the tag is SSH-signed by an owner and names a version, and records its commit and tree hash |
+| `check [name...]` | What registry CI runs on a pull request: re-checks every recorded release's tag signature, commit and tree hash, and that the owners match the delegation's keys; a package with no releases yet is only checked against its delegation, without fetching its repository |
+| `import-recipes <dir> --git URL --owner ID=KEY...` | Admits every cookbook recipe under `dir` as a `kind = "recipe"` package whose source is its recipe directory (`path`) in the repository at `URL`, delegated to the owners; the summary is the recipe's `[package] description` or its upstream source. Recipes already in the registry, names that are not package names and recipes that are not valid TOML are skipped and reported. `targets.json` is written once for the whole import, after every package file has been checked, and a failed write removes the files already written, so the import can be retried. Imported recipes are listed and searchable, but `fox` does not build `kind = "recipe"` packages yet (see the `[package.metadata.fox]` notes), so releases recorded for them cannot be installed until recipe builds land |
+| `advise <file>` | Validates a RustSec-format advisory and stores it as `advisories/<id>.toml`, replacing one with that id (to update or withdraw it); signed by the targets key |
+| `vex <file> [--id ID]`, `vex --remove ID` | Validates a CycloneDX VEX document (see [VEX statements](#vex-statements)) and stores its bytes as `vex/<id>.cdx.json` (the id defaults to the file name without `.cdx.json`), replacing one with that id, or removes one; signed by the targets key |
+| `yank <name> <version>` | Marks a release yanked (`--undo` reverses it) |
+| `set-role <role> --key K... [--threshold N]` | Writes a new root that gives the role new keys; clients accept it once the old and the new root keys have signed |
+| `sign [--key F...] [--bump ROLE...] [--complete]` | Updates and signs the metadata |
+| `verify [--root FILE]` | Runs the client checks, trusting `metadata/root/1.json` or the given root |
+
+| `configure [--builder LABEL=KEY...] [--remove-builder LABEL...] [--artifact-url URL...] [--min-builders N]` | Edits `registry.toml`: the builders whose attestations count, the artifact store and how many builders an artifact needs |
+| `build [name@version...] --key F --label L --blobs DIR` | The registry builder: builds each release (by default every one with no artifact from `L` yet) from its checked tag with the hermetic pipeline (the Cargo package the registry names; the build fails if its name or version differs from the release), signs the archive and attestation, stores the three blobs as `DIR/blake3/<hash>` and records the attestation in the release's artifact list (`--target`, default this machine's, and `--level v3\|v4`, default v3 and only for x86-64, also decide which artifacts count as present, each level being its own artifact; `--work-dir` optional) |
+| `rebuild [name@version...] --key F --label L --blobs DIR` | The independent rebuilder: builds each release the same way (by default every release with a default-feature artifact for `--target` and `--level` that `L` has not attested), downloads the published archive from the artifact store, and only if the rebuild staged exactly the archive's files (paths, kinds, modes, sizes and BLAKE3 hashes, the SBOM and manifest included) signs its own attestation of that archive and adds it to the same artifact. The archive is not repacked, so its header stays signed by the original builder. If the rebuild does not reproduce one or more of a release's archives, it names each one with its first difference, keeps the attestations it did record, moves on to the next release and exits unsuccessfully at the end. `L` must be listed in `registry.toml` |
+| `init --github` | Also writes a README and GitHub Actions workflows: `check` on pull requests, `sign` after merges (build missing v3 and v4 artifacts, upload the blobs to a `blake3` release, sign and push) and `timestamp` every six hours |
+
+`release`, `check` and `build` fetch into `~/.cache/fox-registry/git` (or
+`$XDG_CACHE_HOME`; `--cache` overrides it). `build` refuses a key that
+`registry.toml` does not list under that label, and artifact lists merge:
+a second builder attesting to the same archive hash adds its attestation
+to the same artifact.
+
+When `build` and `rebuild` pick releases themselves, an attestation by `L`
+counts only if its signature verifies with `L`'s current key in
+`registry.toml`, as clients check it. After `configure --builder` replaces
+a builder's key, its old attestations are stale, and the next run attests
+again and replaces them. Attestation blobs are read from `DIR` when they are
+there with the right hash, and otherwise downloaded from the artifact store;
+a blob that cannot be read counts as missing, with a warning. Without
+`--work-dir`, each builder label, mode, target, level and package gets its
+own work directory under the system temporary directory, so builders that
+share a machine do not overwrite each other's source and stage.
+
+The `init --github` template runs only the registry's own builder. An
+independent rebuilder runs `rebuild` on its own infrastructure, publishes its
+blobs at its own URL (added with `--artifact-url`; clients try each URL in
+turn) and proposes the `artifacts/` change as a pull request. The template
+README describes this. No `rexlunae/ferric-registry` repository is
+published yet; `init --github` is the template for one.
+
+### Using registries
+
+```sh
+fox registry add ferric https://example.com/registry.git --root-blake3 <hash>
+fox registry list
+fox registry update [name...]
+fox search <text>
+fox info [registry/]name
+fox install [registry/]name[@requirement]
+fox registry remove ferric
+```
+
+`etc/fox/registries.toml` (`fox-registries/1`) lists each registry's name,
+git URL and the BLAKE3 of its first root. `registry add` fetches the
+repository, refuses it unless `metadata/root/1.json` has the pinned hash,
+and verifies it. Each registry keeps `var/lib/fox/registries/<name>/`: a
+bare mirror in `git/`, the verified checkout in `tree/`, and `state.json`
+with the trusted root, the metadata versions seen and the time of the last
+update. An update exports the head of the registry's default branch (the
+mirror's `HEAD` follows the remote's, so a renamed default branch is picked
+up) to `tree.new/`. Once that verifies, it writes the new state to
+`state.json.new`, moves `tree/` aside to `tree.old/` and the new tree into
+place, and then renames `state.json.new` over `state.json`, the commit
+point. A failure, or an interruption found by the next open, before the
+commit puts the old tree back and drops the new state; after it, only
+`tree.old/` is removed, and failing to remove it is a warning, not a
+failed update (the next open or update tries again). So the checkout and its state always stay a
+verified pair, and a failed update keeps the last good checkout and the
+rollback protection.
+
+Installing by name looks the package up in every configured registry (or
+the named one), updating any whose checkout is older than
+`require-fresh-metadata`, and picks the highest release matching the
+requirement (any version if none is given; yanked releases only with
+`allow-yanked`). It then:
+
+1. unless `build = "always"`, looks for an artifact of that release for the
+   target, [CPU level](#cpu-levels) and feature set, downloads its archive, attestation and signature
+   by hash from the registry's `artifact-base-urls`, and installs it when
+   enough distinct builders listed in `registry.toml` signed attestations of
+   that exact archive, naming the requested package and version and built
+   from the release's commit and tree;
+2. otherwise, unless `build = "never"`, fetches the package's repository,
+   checks that the release tag is SSH-signed by one of the owners the
+   registry lists and still names the recorded commit and tree, and builds
+   it as a [git source](#git-sources). The Cargo package built is the one
+   the registry names (so a workspace root can hold others), and the build
+   fails if its manifest names another package. The owners come from the signed
+   registry, so there is no trust-on-first-use prompt.
+
+`fox verify --installed` accepts the registries' builder keys (labelled
+`<registry>/<builder>`) for packages installed from them.
+
+#### Install policy
+
+`etc/fox/policy.toml` is optional; every key defaults as shown.
+
+```toml
+build = "auto"                # never | auto | always
+min-builder-signatures = 1    # builders an artifact needs
+allow-unsigned-git = false    # build unsigned tags and commits
+allow-yanked = false          # pick yanked releases when resolving names
+require-fresh-metadata = "24h"
+# max-cpu-level = "v3"        # highest x86-64 level to install (unset: no cap)
+```
+
+The builder threshold is the larger of the policy's and the registry's
+`min-builder-signatures`, and never less than one. Builders count by
+distinct key, so one builder listed under two labels counts once. Once
+independent rebuilders run `fox-registry rebuild`, a registry (`configure
+--min-builders 2`) or a client (`min-builder-signatures = 2`) can require
+two builders to have produced the same archive from the release's source;
+`fox info` lists who attested each artifact. `allow-unsigned-git`
+has the effect of `install --allow-unsigned` for git sources.
+
+#### CPU levels
+
+x86-64 artifacts come in levels: `x86_64-v3`, the baseline every Ferric
+Oxide machine has, and `x86_64-v4`, which adds AVX-512. Other targets,
+`aarch64` among them, have one variant each, chosen by target, and their
+artifacts name no level. `fox install` and `fox sync` pick the level from,
+in order:
+
+1. `--level v3|v4`;
+2. on the running system (`--root /`), the highest level the CPU supports
+   with the state the kernel saves (CPUID and XCR0, so a kernel without
+   AVX-512 state support, `kernel.cpu.avx512`, reads as v3), capped by
+   `max-cpu-level`;
+3. for any other root, such as an image being built, whose CPU `fox` cannot
+   see, `max-cpu-level`, else v3.
+
+From a registry, `fox` tries the artifacts of the highest level not above
+that one first and falls back to lower ones, so a v4 machine installs a v3
+build when no v4 build is attested, and a v3 machine never gets a v4 build.
+An artifact listed without a level counts as v3, and an attestation whose
+level differs from its artifact's listing is not counted. Source builds use
+the level for x86-64 targets and ignore it for others. `fox build` builds
+v3 unless given `--level`. The image build passes `cpu.x86_64_level` (v3
+or v4) through `FERRIC_FOX_LEVEL`; v1 and v2 images have no matching
+packages and get v3 ones. wasm32 and wasm64 variants, and the install-time
+compilation of wasm modules, are not implemented.
+
+### Package sets and `fox sync`
+
+A package set (`fox-packages/1`) says what a root should have:
+
+```toml
+format = "fox-packages/1"
+
+[[registry]]
+name = "ferric"
+git = "https://github.com/rexlunae/ferric-registry"
+root-blake3 = "<BLAKE3 of its metadata/root/1.json>"
+
+[policy]                      # optional; written to etc/fox/policy.toml
+build = "auto"
+
+[packages]
+ripgrep = {}                                   # newest release, any registry
+nginx = { version = "^1.27", registry = "ferric", features = ["http2"] }
+mytool = { git = "https://github.com/me/mytool", rev = "v0.3.0" }
+```
+
+A package entry takes `version` and `registry`, or `git` with an optional
+`rev` (a tag or commit; the newest release tag otherwise), plus `features`,
+`default-features`, `target`, `path` and `package` as for `fox install`.
+
+`fox sync --config FILE` adds the set's registries that are missing (and
+refuses one configured with another URL or pin), writes `[policy]` if
+present, installs every package and then writes the lock file, `fox.lock`
+beside the set unless `--lock` names another. The lock (`fox-lock/1`)
+records each package's version, its registry or its git URL and commit, a
+digest of its build request, the target the archive was built for
+(`"none"` for an archive that names no target; the field is required) and
+the BLAKE3 of the archive installed:
+
+```toml
+format = "fox-lock/1"
+
+[[package]]
+name = "nginx"
+version = "1.27.3"
+registry = "ferric"
+request-blake3 = "<BLAKE3 of the build request>"
+target = "x86_64-unknown-redox"
+pkgar-blake3 = "<BLAKE3 of the archive>"
+```
+
+The build request is what changes the archive built: the git source's
+normalized URL (a local directory becomes the `file://` URL of its
+canonical path, so the same checkout always has the same identity), the
+revision (`rev`, or a `#` fragment of the URL; the two must agree if both
+are given), `path`, `package`, the features (sorted, without repeats),
+`default-features`, the target asked for (the entry's, else
+`--target`'s, else none) and, unless that target is not x86-64, the
+[CPU level](#cpu-levels), so moving a lock to a machine with another level
+resolves its packages again. Without one, the target an archive gets depends
+on the host: the toolchain the source's `rust-toolchain.toml` selects for a
+build, `fox`'s own target for a prebuilt. So it cannot be known before the
+build and is not part of the request. The lock instead records the
+target the archive was actually built for, and when a locked package
+has to be installed again, an archive for another target is refused
+(name a target, or use `--update`), as a different commit or archive is.
+A git
+source that is neither a git URL nor an existing directory is an error,
+not an unpinned entry. The lock's `format` is bumped (`fox-lock/2`, ...)
+on any incompatible change to its fields.
+
+On the next sync a locked package is kept while the lock still satisfies
+the set (same source and build request, version still matching), so
+changing a package's `rev`, features, target, `path` or `package` resolves
+it again; a kept package is skipped if the
+installed archive is the locked one, and otherwise installed again at the
+locked version, which for a registry package must be the locked archive.
+Git packages are pinned to their commit instead, since an archive built
+locally is signed with that root's own builder key and so differs between
+roots. Packages that the previous lock listed and the set no longer does
+are removed if the installed archive is still the locked one; packages
+installed by hand, or replaced by hand since the last sync, are left alone
+(reported as `kept`). `--locked` fails on any package the lock does not pin
+(for reproducible image builds), and checks every package before it adds a
+registry or writes the policy, so a refused sync changes nothing;
+`--update` resolves every package again, and replaces a lock file whose
+contents do not parse instead of failing on it. The warning says why, and
+that the packages the old lock installed are no longer known to sync, so
+they are not removed automatically and need checking with `fox list`.
+Without `--update` such a lock is an error, and a lock that cannot be read,
+or a lock path that is not a regular file, is always an error before
+anything in the root changes.
+
+### Advisories and `fox audit`
+
+A registry's `advisories/<id>.toml` files use the RustSec advisory format
+(the `[advisory]` and `[versions]` tables of the RustSec advisory-db
+`README.md`), with the title and description as fields:
+
+```toml
+[advisory]
+id = "FOX-2026-0001"
+package = "hello"          # a fox package; ecosystem = "crates.io" names a crate
+date = "2026-10-01"
+title = "hello prints its input unescaped"
+aliases = ["CVE-2026-0001"]
+
+[versions]
+patched = [">= 1.2.1"]
+unaffected = ["< 1.0.0"]
+```
+
+A version is affected when it matches none of the `patched` and
+`unaffected` requirements (Cargo requirements); `withdrawn` and
+`informational` advisories are ignored. The targets role signs the
+directory like every other top-level file, and clients read advisories only
+through the verified checkout.
+
+`fox audit` checks what is installed under the root against the advisories
+of every configured registry and, with `--rustsec <dir>`, a checkout of the
+RustSec database (`crates/<crate>/*.md`, Markdown with TOML front matter).
+Package advisories match installed package names and versions; crate
+advisories match the crates listed in each package's build SBOM, so a
+vulnerable crate is reported in every package that links it, marked
+`build only` when it ran only at build time. Only crates whose
+`fox:registry` is crates.io are matched against RustSec; crates from other
+registries share the `pkg:cargo` purl type but not crates.io's names. The
+SBOM is read from the path the package itself installed, never through a
+symbolic link and no further than its recorded size (at most 64 MiB), and
+only if it still has the hash recorded at install time. Packages whose
+removal did not finish are left out. Package advisories match by name and
+version alone: the installed-package database does not record which
+registry a package came from, so with two registries publishing the same
+name, both registries' advisories apply. `audit` fails when anything matches; `--json` gives the
+findings, the packages whose versions are not semver (`unchecked`) and the
+number of advisories checked. Installing a registry release that an
+advisory affects prints a warning.
+
+#### VEX statements
+
+A registry can say that an advisory does not apply to one of its
+packages, for example a crate advisory for code a package never compiles.
+It publishes a CycloneDX VEX document (JSON, `specVersion` 1.4 or 1.5)
+with `fox-registry vex`:
+
+```json
+{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+ "vulnerabilities": [{
+   "id": "RUSTSEC-2026-0001",
+   "analysis": {"state": "not_affected", "justification": "code_not_present",
+                "detail": "built without the `http` feature"},
+   "affects": [{"ref": "pkg:generic/hello@1.2.0"}]}]}
+```
+
+Each `affects[].ref` names a fox package by the purl its SBOM uses,
+`pkg:generic/<name>` (every version) or `pkg:generic/<name>@<version>`,
+directly or through the `bom-ref` of a component in the document with that
+purl. `versions` entries list more exact versions; entries marked
+`affected` are left out, and `vers:` ranges are refused. A statement
+matches a finding when its `id` or a `references[].id` is the advisory's id
+or one of its aliases, and it covers the installed package and version.
+`fox-registry vex` rejects a document that `fox` could not use, and the
+targets role signs it like every other top-level file.
+
+`fox audit` applies a registry's statements only to packages that registry
+lists, so one registry cannot clear another's packages. A finding covered
+by a `not_affected`, `false_positive`, `resolved` or
+`resolved_with_pedigree` statement moves from `findings` to `suppressed`
+(with the registry, document, state, justification and detail) and no
+longer fails the audit. An `exploitable` or `in_triage` statement keeps the
+finding and is shown with it, and it wins over a clearing statement from any
+registry. `fox audit --no-vex` ignores VEX. The installed-package database
+does not record a package's registry, so a registry's statements apply to
+any installed package with a name it lists.
+
+### System and image SBOMs
+
+`fox sbom --system [--name N]` writes one CycloneDX 1.5 document for the
+whole root: an operating-system component named `N` (default
+`ferric-oxide`), one application component per installed package with its
+archive hash, signer, target and dependencies, and nested under each
+package its files and the crates from its build SBOM (their `bom-ref`s
+prefixed with `<package>/`). The dependency graph links the system to its
+packages, packages to the installed packages they depend on and to their
+root crates, and keeps each build's crate graph. Like the package SBOM it
+is reproducible; its serial number derives from everything the document
+lists, so a re-signed or changed package gives a new serial. Run against an image root (`--root`), it is that image's
+SBOM; packages adopted from `pkg` have no build SBOM, so they list files but
+no crates.
+
 ## SBOM scope and unfinished packaging work
 
 `fox sbom` output describes the verified package, archive hash, signer,
@@ -397,12 +873,20 @@ source, declared runtime dependencies and individual files/hashes. It is
 reproducible: there is no timestamp, and the serial number derives from the
 archive hash. It is built from the archive's own metadata; the crate graph
 is in the build SBOM that `cargo fox package` packs into archives it builds.
-Reading embedded `cargo auditable` data is not implemented.
+Reading embedded `cargo auditable` data, SPDX export, VEX documents other
+than a registry's (and VEX inside SBOMs), and
+listing the kernel, bootloader and initfs in the system SBOM are not
+implemented. The image build does not yet write `image.cdx.json` itself;
+that comes with images built through fox.
 
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
-Package repositories and search, a dependency solver, hermetic recipe builds,
+No official registry is published, and `fox` resolves only the requested
+package, not its dependencies. Images are still assembled by the installer
+with `pkg`'s library and then adopted by `fox`; only `packages.set` is
+installed by `fox` itself, and the image SBOM is unsigned. Downloading artifacts over HTTPS is not
+built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging
 design phases and `packaging/packaging-design.md`; that design file is not

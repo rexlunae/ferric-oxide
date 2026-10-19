@@ -1304,6 +1304,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-irq"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
@@ -1312,8 +1316,28 @@ name = "ferric-regbuf"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-ring"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "ferric-trace"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-trace-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ferric-trace",
+ "redox_syscall 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ferric-vtd"
@@ -1428,15 +1452,20 @@ dependencies = [
  "fox-build",
  "fox-core",
  "fox-git",
+ "fox-index",
  "fox-sbom",
  "fox-store",
  "pkgar 0.2.4",
+ "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
+ "semver",
  "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -1490,6 +1519,44 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "fox-index"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fox-core",
+ "fox-sbom",
+ "pkgar-core 0.2.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "fox-registry"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "fox-build",
+ "fox-core",
+ "fox-git",
+ "fox-index",
+ "pkgar-keys 0.2.4",
+ "semver",
+ "serde",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -4177,6 +4244,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "tempfile",
  "termion",
  "toml 0.8.23",
  "uuid",

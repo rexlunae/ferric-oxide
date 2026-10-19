@@ -16,11 +16,12 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Build an image, change feature options or add a recipe | [Build and configuration](docs/src/ferric-build.md), [ferric-config usage](tools/ferric-config/README.md), [feature catalog](features.toml), [build-system reference](docs/src/build-system-reference.md) and [application porting](docs/src/porting-applications.md) |
 | Change address spaces, CPU state or kernel hardening | [Memory and CPU protection](docs/src/ferric-memory.md), relevant Rustdoc in `crates/kernel/` and the shared crates under `crates/` |
 | Work on PCI drivers, DMA, IOMMU domains or registered buffers | [Registered buffers and IOMMUs](docs/src/ferric-io.md), ABI/module docs in `crates/{regbuf,iommu,vtd,amdvi}/src/`, and `userspace/base/drivers/pcid/` |
-| Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, and `crates/kernel/src/trace/` |
-| Change package verification, installation, manifests, SBOMs, attestations, hermetic builds, git sources or the trust store | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom,git,build}/`, `tools/fox/` and `tools/cargo-fox/`; manifest packing in `tools/cookbook/src/cook/fox_manifest.rs`; the boot check in `config/ferric-smoke.toml` |
+| Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, `crates/kernel/src/trace/` and `tools/ferric-trace/` |
+| Change package verification, installation, manifests, SBOMs, attestations, hermetic builds, git sources, the trust store, install policy, package registries, the registry client, advisories, VEX and `fox audit`, system SBOMs, or package sets, `fox sync` and `fox.lock` | [Package tooling](docs/src/ferric-packaging.md), Rustdoc and tests in `crates/fox-{core,store,sbom,git,build,index}/`, `tools/fox/`, `tools/cargo-fox/` and `tools/fox-registry/`; manifest packing in `tools/cookbook/src/cook/fox_manifest.rs`; the boot check in `config/ferric-smoke.toml` |
 | Select checks, debug a failure, reproduce a boot or run fuzzing | [Validation and debugging](docs/src/ferric-testing.md), [CI workflows](.github/workflows/), [CI scripts](scripts/ferric-ci/) and [kernel lint baseline](ci/kernel-lints.json) |
 | Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
 | Report hardware results | [HARDWARE.md](HARDWARE.md); inherited reports are not proof of current Ferric support |
+| See what is planned, which phase a change belongs to, or what is in progress | [Roadmap chapter](docs/src/ferric-roadmap.md) for the plan and exit criteria; [ROADMAP.md](ROADMAP.md) for per-phase status and pull requests |
 | Contribute, review or handle upstream imports | [CONTRIBUTING.md](CONTRIBUTING.md), [AI_POLICY.md](AI_POLICY.md), [PR template](.github/pull_request_template.md), [subtree-sync workflow](.github/workflows/subtree-sync.yml) |
 | Check licensing or user-facing names | [LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md) |
 | Add or render book pages | [Book README](docs/README.md), [writing docs](docs/src/writing-docs-correctly.md) and [documentation checks](docs/src/ferric-testing.md#documentation-checks) |
@@ -33,6 +34,7 @@ Source and tests establish what is implemented; `features.toml` establishes conf
 - Document the implemented behavior, enabling configuration, constraints and relevant checks. Distinguish prepared interfaces or planned work from active enforcement; do not claim a successful test, boot, benchmark or hardware result without evidence.
 - Keep the [system status table](docs/src/ferric-oxide.md#implementation-status) and this document map accurate when adding components or completing previously unfinished work. Prefer links to authoritative catalog/API/workflow details over copying lists that will diverge.
 - Put system documentation in `docs/`. Add Ferric-specific pages locally and list them in `docs/src/SUMMARY.md`; preserve inherited upstream content and avoid unrelated reorganization of the book subtree.
+- When you land work that belongs to a roadmap phase, update the status table in [ROADMAP.md](ROADMAP.md) in the same pull request: add the pull request to its phase and move finished items. Change the [Roadmap chapter](docs/src/ferric-roadmap.md) only when the plan itself changes.
 - Run the book checks described in [Validation and debugging](docs/src/ferric-testing.md#documentation-checks) when changing its pages. Report unavailable tooling and validation limits. Never commit generated `docs/book/` output.
 
 ## Repository layout
@@ -45,8 +47,10 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/cookbook/` | The recipe engine and `repo` binary | host |
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
-| `tools/fox/` | Package verification, installation (from archives or signed git sources), trust store, adoption and SBOM CLI; also built for the target by `recipes/core/fox` | host, and `x86_64-unknown-redox` through the recipe |
+| `tools/fox/` | Package verification, installation (from archives, signed git sources or registries), trust store, adoption, audit, SBOM and sync CLI; also built for the target by `recipes/core/fox` | host, and `x86_64-unknown-redox` through the recipe |
+| `tools/ferric-trace/` | Kernel trace tool: capture on the target (recipe `recipes/tools/ferric-trace`), text view and Perfetto/Chrome JSON export | host, and `x86_64-unknown-redox` through the recipe |
 | `tools/cargo-fox/` | `cargo fox`: hermetic builds, signed archives, build attestations and signed release tags for package authors | host |
+| `tools/fox-registry/` | `fox-registry`: package registry creation, admission, release checks, registry CI builds and rebuilds, advisories, VEX documents, recipe import and metadata signing | host |
 | `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
 | `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
 | `crates/relibc/` | C library. Upstream subtree | relibc |

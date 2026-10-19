@@ -33,6 +33,8 @@ If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot
 
 `make menuconfig` opens a menu, much like the Linux kernel's, for choosing the target, the processor baseline (x86-64-v3 by default), kernel features, image contents and build settings. Your choices are saved in `ferric.toml`, a short TOML file that you or an agent can also edit directly or change with `ferric-config set`; every option is described in [`features.toml`](features.toml). Without a `ferric.toml` the build behaves exactly like upstream. See [tools/ferric-config](tools/ferric-config/README.md).
 
+Where the project is heading, phase by phase, is in the [roadmap](ROADMAP.md).
+
 The in-tree [system documentation](docs/src/ferric-oxide.md) describes the implemented architecture, configuration, memory and CPU protection, registered buffers and DMA isolation, package tooling, and validation. See [docs/README.md](docs/README.md) to build or serve the book. The inherited Redox chapters remain useful background, alongside the upstream build guides:
 
 - [Building with Podman](https://doc.redox-os.org/book/podman-build.html)

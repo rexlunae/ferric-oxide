@@ -110,12 +110,23 @@ name = "ferric-iommu"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-irq"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-nospec"
 version = "0.1.0"
 
 [[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-ring"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.1",
+]
 
 [[package]]
 name = "ferric-trace"
@@ -187,8 +198,10 @@ dependencies = [
  "ferric-cet",
  "ferric-hwrand",
  "ferric-iommu",
+ "ferric-irq",
  "ferric-nospec",
  "ferric-regbuf",
+ "ferric-ring",
  "ferric-trace",
  "ferric-vtd",
  "hashbrown 0.14.5",
