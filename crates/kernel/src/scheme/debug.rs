@@ -22,6 +22,14 @@ struct Handle {
 
 static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
 
+/// Ferric Oxide: the line a read of `ctl-profiling` gives, the kernel's run-time text address.
+#[cfg(feature = "profiling")]
+fn control_line() -> alloc::string::String {
+    alloc::string::ToString::to_string(&ferric_trace::profile::ControlLine {
+        text_start: crate::kernel_executable_offsets::__text_start() as u64,
+    })
+}
+
 /// Add to the input queue
 pub fn debug_input(data: u8, token: &mut CleanLockToken) {
     INPUT.send(data, token);
@@ -185,9 +193,7 @@ impl KernelScheme for DebugScheme {
         token: &mut CleanLockToken,
     ) -> Result<usize> {
         if HANDLES.read(token.token()).get(id)?.num == SpecialFds::CtlProfiling as usize {
-            let line = alloc::string::ToString::to_string(&ferric_trace::profile::ControlLine {
-                text_start: crate::kernel_executable_offsets::__text_start() as u64,
-            });
+            let line = control_line();
             let start = usize::try_from(offset).unwrap_or(usize::MAX);
             return buf.copy_common_bytes_from_slice(line.as_bytes().get(start..).unwrap_or(&[]));
         }
@@ -195,6 +201,20 @@ impl KernelScheme for DebugScheme {
             return Err(Error::new(ESPIPE));
         }
         self.kread(id, buf, flags, stored_flags, token)
+    }
+
+    // Ferric Oxide: ctl-profiling is a regular file the size of its line, so tools that stat a
+    // path before reading it (uutils `cat`) can read it. Other handles have no stat.
+    #[cfg(feature = "profiling")]
+    fn kfstat(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        if HANDLES.read(token.token()).get(id)?.num != SpecialFds::CtlProfiling as usize {
+            return Err(Error::new(EBADF));
+        }
+        buf.copy_exactly(&::syscall::data::Stat {
+            st_mode: ::syscall::flag::MODE_FILE | 0o600,
+            st_size: control_line().len() as u64,
+            ..Default::default()
+        })
     }
 
     // Ferric Oxide: ctl-profiling is positioned for its read; its writes ignore the offset.
