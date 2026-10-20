@@ -317,14 +317,20 @@ impl Unit {
     /// is left in the log until the next interrupt or command batch.
     fn drain_events(&self) {
         self.drain_wanted.store(true, Ordering::Release);
-        // A call that finds the lock held leaves `drain_wanted` set for the holder, which
-        // checks it again after unlocking: one of the two always drains after the request.
-        while self.drain_wanted.load(Ordering::Acquire) {
+        // A call that finds the lock held leaves `drain_wanted` set for the holder. The holder
+        // checks it again only after giving the lock up, so a request made at the very end of
+        // its pass is either seen there or finds the lock free and drains itself: one of the
+        // two always drains after the request.
+        loop {
             let Some(events) = self.events.try_lock() else {
                 return;
             };
             while self.drain_wanted.swap(false, Ordering::AcqRel) {
                 self.drain_once(&events);
+            }
+            drop(events);
+            if !self.drain_wanted.load(Ordering::Acquire) {
+                return;
             }
         }
     }

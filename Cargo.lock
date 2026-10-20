@@ -1409,6 +1409,7 @@ dependencies = [
 name = "ferric-trace-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "ferric-amdvi",
  "ferric-procinfo",
