@@ -363,7 +363,7 @@ jobs:
       - name: Check registered buffers
         run: |
           steps="register file-backed grant-rw grant-ro pinned reshare-mmap reshare-register reshare-borrow
-            forward-borrow revoke unmap close shared bytes bounce-newer"
+            forward-borrow revoke unmap close shared bytes bounce-newer revoke-prot"
           for step in $steps; do
             grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
           done
