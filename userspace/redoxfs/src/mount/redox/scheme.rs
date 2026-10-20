@@ -19,8 +19,8 @@ use syscall::error::{
     ENOTEMPTY, EOPNOTSUPP, EPERM, EXDEV,
 };
 use syscall::flag::{
-    EventFlags, MapFlags, StdFsCallKind, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
-    O_RDONLY, O_RDWR, O_STAT, O_SYMLINK, O_TRUNC, O_WRONLY,
+    EventFlags, MapFlags, StdFsCallKind, F_GETFL, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY,
+    O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_STAT, O_SYMLINK, O_TRUNC, O_WRONLY,
 };
 use syscall::schemev2::NewFdFlags;
 use syscall::FobtainFdFlags;
@@ -104,6 +104,18 @@ pub struct FileScheme<'sock, D: Disk> {
 }
 
 impl<'sock, D: Disk> FileScheme<'sock, D> {
+    /// Ferric Oxide: tells the page cache how many writable mapped ranges of `node_ptr`
+    /// RedoxFS writes back now, after a mapping changed.
+    fn mappings_changed(&mut self, node_ptr: TreePtr<Node>) {
+        if let Some(pcache) = &mut self.pcache {
+            let writable = self
+                .fmap
+                .get(&node_ptr.id())
+                .map_or(0, |info| info.writable_mappings());
+            pcache.mappings_changed(node_ptr, writable);
+        }
+    }
+
     pub fn new(
         scheme_name: String,
         mounted_path: String,
@@ -795,10 +807,16 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             .and_then(|c| c.size_before(&mut self.fs, node_ptr));
         let written = self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx));
         if let (Some(pcache), Some(before)) = (pcache, before) {
+            // An append writes at the old end, whatever offset it was given.
+            let start = if file.fcntl(F_GETFL, 0).is_ok_and(|fl| fl & O_APPEND != 0) {
+                before
+            } else {
+                offset
+            };
             // A failed write may still have changed some of the bytes.
             let len = written.as_ref().map_or(buf.len(), |&n| n);
-            let end = offset.saturating_add(len as u64);
-            pcache.changed(&mut self.fs, node_ptr, before, offset, end);
+            let end = start.saturating_add(len as u64);
+            pcache.changed(&mut self.fs, node_ptr, before, start, end);
         }
         written
     }
@@ -983,11 +1001,11 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
-        // Ferric Oxide: a shared writable mapping ends the file's page caching.
-        if let Some(pcache) = &mut self.pcache {
-            pcache.mapped(file.node_ptr(), flags);
-        }
-        self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx))
+        let node_ptr = file.node_ptr();
+        let mapped = self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx));
+        // Ferric Oxide: a writable mapping ends the file's page caching while it lasts.
+        self.mappings_changed(node_ptr);
+        mapped
     }
     fn munmap(
         &mut self,
@@ -1000,7 +1018,11 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
-        self.fs.tx(|tx| file.funmap(fmaps, offset, size, tx))
+        let node_ptr = file.node_ptr();
+        let unmapped = self.fs.tx(|tx| file.funmap(fmaps, offset, size, tx));
+        // Ferric Oxide: the file may be cached again once its last writable mapping goes.
+        self.mappings_changed(node_ptr);
+        unmapped
     }
 
     fn on_close(&mut self, id: usize) {
@@ -1029,9 +1051,6 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             // Notify filesystem of close
             if let Err(err) = self.fs.tx(|tx| tx.on_close_node(node_ptr)) {
                 log::error!("failed to close node {}: {}", node_ptr.id(), err);
-            }
-            if let Some(pcache) = &mut self.pcache {
-                pcache.node_closed(node_ptr);
             }
 
             /*TODO: leaks memory, but why?

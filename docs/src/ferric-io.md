@@ -632,6 +632,10 @@ holds the policies, host-tested:
 - `client` (with the `client` feature, on Redox): the file system's side, the
   queue and object calls with typed errors, and `spawn_pump`, a thread that
   waits on the queue and hands each batch of records to the file system.
+- `pump`: what that thread does with a batch it cannot hand on. Taking a
+  record off the queue is final, so it answers every fill in the batch as
+  failed with `EIO` (the readers get `EIO` and the next read fills again); if
+  even that fails, it closes the queue, which fails every fill left.
 
 RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
 mounts and the kernel has the scheme. Each regular file with a description
@@ -643,9 +647,16 @@ namespace once mounted and cannot open its own path) as a
 call, so the main loop answers them in order with the writes it serves,
 reading the pages the way a `read` does (after decompression and decryption,
 and from a mapped buffer when there is one). Writes, appends, `ftruncate` and
-`O_TRUNC` invalidate the pages they change. A file mapped shared and writable
-is not cached until it is closed and unmapped everywhere, because stores
-through the mapping change its bytes without a write call.
+`O_TRUNC` invalidate the pages they change; an append invalidates from the old
+end, not from its descriptor's offset. A file with a writable mapping, private
+or shared, is not cached while the mapping lasts, because RedoxFS writes every
+writable mapping back on `fsync` and `munmap` without a write call. RedoxFS
+keeps a count per file of those mappings, updated on every `mmap` and `munmap`
+whatever happens to the descriptors; the first closes the file's object, which
+drops its pages, and once the count is back to 0 new read-only descriptions are
+cached again. (RedoxFS's `fsync` also no longer writes back ranges nothing maps
+any more: they were written when unmapped, and their retained buffers can be
+older than later writes.)
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
@@ -656,7 +667,11 @@ answered with the wrong bytes), generations across a reopened object, and a
 closed queue, and prints the time of a cached 4 KiB `pread` next to the same
 read through the scheme. Then,
 on RedoxFS, it checks that a read-only description sees writes, a write past
-the end and truncations made through another one, and benchmarks warm 4 KiB
+the end, truncations and an append made through another one (the append
+leaving the pages before it cached), that a writable mapping keeps the file out
+of the cache exactly while it lasts, even after its descriptor closes (the
+access time shows whether a read was served from the cache: RedoxFS moves it
+when it reads a file, the cache does not), and benchmarks warm 4 KiB
 `pread`s and 1 MiB sequential reads of one file through a read-only
 description (cached) against a read-write one (served by RedoxFS, as with the
 option off) in the same boot, with the paired A/B rule of

@@ -984,8 +984,9 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         step(&mut cache).map_err(|failure| (name, failure))?;
         println!("FERRIC_TEST_PASS {name}");
     }
-    let on_redoxfs: [(&'static str, FsStep); 2] = [
+    let on_redoxfs: [(&'static str, FsStep); 3] = [
         ("pcache-redoxfs", crate::redoxfs::coherence),
+        ("pcache-redoxfs-mmap", crate::redoxfs::mappings),
         ("pcache-redoxfs-bench", crate::redoxfs::bench),
     ];
     for (name, step) in on_redoxfs {

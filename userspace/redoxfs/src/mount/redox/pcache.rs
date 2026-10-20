@@ -7,29 +7,37 @@
 //! their `read` and `pread` from the cached pages without a round trip to RedoxFS. Everything
 //! else (writers, directories, `mmap`, `fstat`) still comes here.
 //!
-//! A file mapped shared and writable is not cached until it is closed and unmapped
-//! everywhere: stores through the mapping change the bytes RedoxFS reads without a write
-//! call, so cached pages could not follow them. (PR 3 moves mappings to the cache itself.)
+//! A file with a writable mapping, private or shared, is not cached while the mapping lasts:
+//! RedoxFS writes every writable mapping back to the file on `fsync` and `munmap`
+//! (`Fmap::sync`), which changes the bytes without a write call, so cached pages could not
+//! follow them. [`PageCache::mappings_changed`] keeps a count per file of those mappings,
+//! after every `mmap` and `munmap` whatever happens to the descriptors, and closes the
+//! file's object (dropping its pages) when the count leaves 0. Descriptions opened read-only
+//! once it is back to 0 are cached again. (PR 3 moves mappings to the cache itself.)
 //!
 //! A miss is a fill record on the queue. A pump thread (`ferric_pcache::client::spawn_pump`)
 //! waits on the queue and forwards the records to RedoxFS's own scheme as a call, so the main
 //! loop answers them in order with the writes it serves: [`PageCache::fill`] reads the pages
 //! through the same path a `read` takes (including mapped buffers) and hands them to the
-//! kernel. A write or truncation through the scheme drops the pages it changed
-//! ([`PageCache::changed`]) before it replies, so a read after a write sees the new bytes.
+//! kernel. When a forward fails, the pump fails the batch's fills with `EIO` itself, through
+//! the objects it shares with the main loop, and closes the queue if even that fails, so no
+//! reader waits on a record nobody will see. A write or truncation through the scheme drops
+//! the pages it changed ([`PageCache::changed`]) before it replies, so a read after a write
+//! sees the new bytes.
 //!
 //! Without a `kernel.pcache` scheme nothing here runs and RedoxFS behaves as upstream.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use ferric_pcache::abi::{ObjectId, Record, PAGE_SIZE};
-use ferric_pcache::client::{self, ClientError, Object, Queue, FORWARDED_RECORDS};
+use ferric_pcache::client::{self, Call, ClientError, Object, Pump, Queue, FORWARDED_RECORDS};
+use ferric_pcache::pump::FailedFill;
 use libredox::Fd;
 use redox_scheme::Socket;
 use syscall::error::EIO;
-use syscall::flag::{MapFlags, O_RDWR};
+use syscall::flag::O_RDWR;
 use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
@@ -74,21 +82,68 @@ impl std::error::Error for StartError {
 
 /// One cached file: its object and how many attached descriptions it has.
 struct Cached {
-    object: Object,
+    object: Arc<Object>,
     handles: usize,
 }
+
+/// The objects of the cached files by node ID, shared with the pump so it can fail the fills
+/// of a batch it could not forward. The main loop owns the objects; an entry whose object
+/// has closed no longer upgrades.
+type Objects = Arc<Mutex<BTreeMap<u32, Weak<Object>>>>;
 
 /// RedoxFS's queue and the objects of its cached files.
 pub struct PageCache {
     queue: Arc<Queue>,
     /// Cached files by node ID.
     files: BTreeMap<u32, Cached>,
+    /// The same objects, for the pump.
+    objects: Objects,
     /// The node of each attached handle.
     attached: BTreeMap<usize, u32>,
-    /// Nodes mapped shared and writable, which are not cached.
-    mapped: BTreeSet<u32>,
+    /// Per node with any, the references to its mapped ranges that `Fmap::sync` writes back:
+    /// the node is not cached while it has one.
+    writable: BTreeMap<u32, usize>,
     /// The buffer fills are read into.
     buf: Vec<u8>,
+}
+
+/// The pump's side: forwards records to RedoxFS's own scheme, and fails their fills when
+/// that does not work.
+struct RedoxPump {
+    /// The description of this scheme numbered [`PUMP_HANDLE`].
+    own: Fd,
+    objects: Objects,
+}
+
+impl Pump for RedoxPump {
+    fn forward(&mut self, records: &[u8]) -> Result<(), ClientError> {
+        self.own
+            .call_wo(records, CallFlags::empty(), &[FORWARDED_RECORDS])
+            .map(drop)
+            .map_err(|source| ClientError::Call {
+                call: Call::Forward,
+                source,
+            })
+    }
+
+    fn fail_fill(&mut self, fill: FailedFill) -> Result<(), ClientError> {
+        let object = u32::try_from(fill.object.get()).ok().and_then(|node_id| {
+            let objects = self.objects.lock().unwrap_or_else(|p| p.into_inner());
+            objects.get(&node_id).and_then(Weak::upgrade)
+        });
+        // An object RedoxFS closed failed its fills as it went.
+        match object {
+            Some(object) => object.fill_failed(fill.pages, fill.generation, fill.errno),
+            None => Ok(()),
+        }
+    }
+
+    fn forward_failed(&mut self, error: ClientError, answered: usize) {
+        log::error!(
+            "page cache: {}; failed its {answered} fill(s) with EIO",
+            Chain(&error)
+        );
+    }
 }
 
 impl PageCache {
@@ -118,14 +173,12 @@ impl PageCache {
         let own = Fd::new(own);
         queue.bind(socket.inner().raw())?;
         let queue = Arc::new(queue);
-        let pump = client::spawn_pump(Arc::clone(&queue), move |records| {
-            // A failed forward leaves those readers to the queue's close; it means the
-            // scheme's own socket is gone, so RedoxFS is exiting.
-            if let Err(err) = own.call_wo(records, CallFlags::empty(), &[FORWARDED_RECORDS]) {
-                log::error!("page cache: forwarding fills failed: {err}");
-            }
-            Ok(())
-        })?;
+        let objects = Objects::default();
+        let pump = RedoxPump {
+            own,
+            objects: Arc::clone(&objects),
+        };
+        let pump = client::spawn_pump(Arc::clone(&queue), pump)?;
         // A pump that stops leaves cached reads waiting, so say why where it can be seen.
         let watched = std::thread::Builder::new()
             .name("pcache-watch".into())
@@ -141,8 +194,9 @@ impl PageCache {
         Ok(Some(Self {
             queue,
             files: BTreeMap::new(),
+            objects,
             attached: BTreeMap::new(),
-            mapped: BTreeSet::new(),
+            writable: BTreeMap::new(),
             buf: Vec::new(),
         }))
     }
@@ -157,7 +211,7 @@ impl PageCache {
         node_ptr: TreePtr<Node>,
     ) {
         let node_id = node_ptr.id();
-        if self.mapped.contains(&node_id) {
+        if self.writable.contains_key(&node_id) {
             return;
         }
         let Ok(node) = fs.tx(|tx| tx.read_tree(node_ptr)) else {
@@ -173,8 +227,9 @@ impl PageCache {
 
     fn try_attach(&mut self, handle: usize, size: u64, node_id: u32) -> Result<(), ClientError> {
         if !self.files.contains_key(&node_id) {
-            let object = self.queue.create_object(ObjectId::new(node_id.into()))?;
+            let object = Arc::new(self.queue.create_object(ObjectId::new(node_id.into()))?);
             object.set_size(size)?;
+            self.objects_mut().insert(node_id, Arc::downgrade(&object));
             self.files.insert(node_id, Cached { object, handles: 0 });
         }
         let cached = self
@@ -196,7 +251,7 @@ impl PageCache {
         if let Some(cached) = self.files.get_mut(&node_id) {
             cached.handles -= 1;
             if cached.handles == 0 {
-                self.files.remove(&node_id);
+                self.forget(node_id);
             }
         }
     }
@@ -250,24 +305,32 @@ impl PageCache {
         }
     }
 
-    /// `node_ptr` was mapped with `flags`: a shared writable mapping ends its caching.
-    pub fn mapped(&mut self, node_ptr: TreePtr<Node>, flags: MapFlags) {
-        if flags.contains(MapFlags::PROT_WRITE) && flags.contains(MapFlags::MAP_SHARED) {
-            self.mapped.insert(node_ptr.id());
-            self.forget(node_ptr.id());
+    /// `node_ptr` was mapped or unmapped, and now has `writable` references to mapped ranges
+    /// that `Fmap::sync` writes back ([`super::resource::FileMmapInfo::writable_mappings`]).
+    /// While there are any the file is not cached: the first closes its object, dropping
+    /// every cached page, and its descriptions go back to RedoxFS. At 0, descriptions opened
+    /// read-only afterwards are cached again.
+    pub fn mappings_changed(&mut self, node_ptr: TreePtr<Node>, writable: usize) {
+        let node_id = node_ptr.id();
+        if writable == 0 {
+            self.writable.remove(&node_id);
+        } else if self.writable.insert(node_id, writable).is_none() {
+            self.forget(node_id);
         }
     }
 
-    /// `node_ptr` has no descriptions or mappings left: it may be cached again.
-    pub fn node_closed(&mut self, node_ptr: TreePtr<Node>) {
-        self.mapped.remove(&node_ptr.id());
-    }
-
-    /// Closes `node_id`'s object; its descriptions go back to RedoxFS.
+    /// Closes `node_id`'s object, failing its outstanding fills and dropping its pages; its
+    /// descriptions go back to RedoxFS.
     fn forget(&mut self, node_id: u32) {
+        self.objects_mut().remove(&node_id);
         if self.files.remove(&node_id).is_some() {
             self.attached.retain(|_, node| *node != node_id);
         }
+    }
+
+    /// The objects the pump sees. A poisoned lock still holds them.
+    fn objects_mut(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Weak<Object>>> {
+        self.objects.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Answers the fill records in `records` (forwarded by the pump) with the files' bytes.

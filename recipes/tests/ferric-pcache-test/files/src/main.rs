@@ -27,7 +27,12 @@
 //!
 //! - `pcache-redoxfs`: a read-only description of a file in `/tmp` reads the new bytes after
 //!   writes, a write past the end, a truncation and a growing truncation made through another
-//!   description.
+//!   description, and an append at the end leaves the pages before it cached.
+//! - `pcache-redoxfs-mmap`: a file with a writable mapping, private or shared, is not cached
+//!   while the mapping lasts, even after the descriptor it was made through closes, and is
+//!   cached again once unmapped; a reader cached before the mapping sees what it writes back.
+//!   Whether a read was served from the cache shows in the access time, which RedoxFS moves
+//!   when it reads a file and the cache does not.
 //! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
 //!   through a read-only description (cached) against a read-write one (served by RedoxFS,
 //!   as with the option off), in the same boot with `ferric_blkqueue::ab`'s paired rule.

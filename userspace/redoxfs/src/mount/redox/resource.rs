@@ -446,6 +446,17 @@ impl FileMmapInfo {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
     }
 
+    /// Ferric Oxide: the references to mapped ranges that `Fmap::sync` writes back to the
+    /// file, those mapped writable (private or shared); the page cache leaves the file
+    /// alone while there are any.
+    pub fn writable_mappings(&self) -> usize {
+        self.ranges
+            .iter()
+            .filter(|(_, fmap)| fmap.flags.contains(PROT_WRITE))
+            .map(|(_, fmap)| fmap.rc)
+            .sum()
+    }
+
     pub fn stale(&self) -> bool {
         // TODO: should this be any?
         // TODO: stale by duration/memory pressure
@@ -791,6 +802,11 @@ impl<D: Disk> Resource<D> for FileResource {
     fn sync(&mut self, fmaps: &mut Fmaps, tx: &mut Transaction<D>) -> Result<()> {
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
             for (range, fmap) in fmap_info.ranges.iter_mut() {
+                // Ferric Oxide: a range nothing maps any more was written back when it was
+                // unmapped, and its retained buffer may be older than later writes.
+                if fmap.rc == 0 {
+                    continue;
+                }
                 unsafe {
                     fmap.sync(
                         self.node_ptr,
