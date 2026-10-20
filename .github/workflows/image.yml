@@ -373,7 +373,7 @@ jobs:
       - name: Check registered buffers
         run: |
           steps="register file-backed grant-rw grant-ro pinned reshare-mmap reshare-register reshare-borrow
-            forward-borrow revoke unmap close shared bytes bounce-newer"
+            forward-borrow revoke unmap close shared bytes bounce-newer revoke-prot"
           for step in $steps; do
             grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
           done
@@ -384,6 +384,13 @@ jobs:
       # read benchmark, which the step repeats as a notice.
       - name: Check storage DMA into registered buffers
         run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
+      # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
+      # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
+      # in the same boot. The figures go to a notice and the job summary; the per-CPU default
+      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab).
+      - name: Check the disk benchmark
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
       # The image has kernel.trace on, so ferric-trace-test must run every step, not skip.
       - name: Check kernel tracing
         run: |
