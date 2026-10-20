@@ -1,0 +1,24 @@
+[package]
+name = "ferric-iobench-runner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Disk benchmark with fio-compatible job options, for Ferric Oxide's NVMe queue paths"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[[bin]]
+name = "ferric-iobench"
+path = "src/main.rs"
+
+[dependencies]
+ferric-blkqueue = { path = "../../../../crates/blkqueue" }
+ferric-iobench = { path = "../../../../crates/iobench" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "0.1.25"
+redox_syscall = "0.9.4"
+
+[profile.release]
+debug = false
