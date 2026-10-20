@@ -600,7 +600,8 @@ How a file system uses it:
    answered or was invalidated, and the pages may be filling again for a newer
    fill), or to a record of an earlier object with the same ID, is stale: the
    call returns 0 and changes nothing, however malformed the answer, so a late
-   answer never fails a newer fill or the queue. A queue read
+   answer never fails a newer fill or the queue. Any other answer returns how
+   many of its pages it acted on. A queue read
    that faults copying records out puts back those of objects still open and
    reports `EVENT_READ` again.
 5. Shrinking an object with `SetSize` drops the cached pages past the new end,

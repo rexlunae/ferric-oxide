@@ -628,7 +628,8 @@ fn detach(object: &Arc<Object>, handle: u64) -> Result<usize> {
 /// into new frames when it is done. It acts only on the pages the fill still owns
 /// ([`PageIndex::owned`]): an answer for a fill that owns none of them (it was failed or
 /// answered already, and the pages may be filling again for a newer fill) is stale and
-/// ignored, whatever it holds, and returns 0. An answer that is not stale but cannot be taken
+/// ignored, whatever it holds, and returns 0; any other answer returns how many pages it
+/// acted on, so a file system can tell the two apart. An answer that is not stale but cannot be taken
 /// (no memory for the frames, a payload that faults or has the wrong length) fails the fill's
 /// pages: the file system took the record off the queue and need not answer it again, so
 /// leaving them filling would leave their readers waiting for good.
@@ -664,8 +665,9 @@ fn filled(
         .index
         .complete_fill(fill, pages, outcome, frames);
     object.changed.notify(token);
-    result.map_err(|err| fill_errno(&err))?;
-    Ok(payload.len())
+    let taken = result.map_err(|err| fill_errno(&err))?;
+    // At most `MAX_RECORD_PAGES`; a `u32` always fits a `usize` here.
+    Ok(taken as usize)
 }
 
 /// The frames a Filled answer brings: none for a failed fill, or the payload copied into

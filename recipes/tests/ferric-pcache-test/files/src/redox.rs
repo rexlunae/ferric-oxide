@@ -230,7 +230,7 @@ impl Cache {
     }
 
     /// Answers a fill record: with the pages' bytes, or failed with `EIO`. Returns what the
-    /// call returned: the payload's length, or 0 for a stale answer.
+    /// call returned: how many of the record's pages it acted on, 0 for a stale answer.
     fn answer(&self, record: Record, ok: bool) -> Result<usize, Failure> {
         let Record::Fill {
             object,

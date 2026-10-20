@@ -26,8 +26,8 @@
 //! lookup. Opening an ID the queue already has fails with `EEXIST`. An ID may be reused once
 //! its object has closed, so each object also has a [`Generation`], which the kernel puts in
 //! every record and the file system copies into its answer: an answer to a record of an
-//! earlier object with the same ID is stale and ignored (see below), and closing an object drops the
-//! records of it still on the queue. Generations are 64 bits and never repeat on a queue: the
+//! earlier object with the same ID is stale and ignored (see below), and closing an object
+//! drops the records of it still on the queue. Generations are 64 bits and never repeat on a queue: the
 //! kernel refuses to open an object once they run out (`EOVERFLOW`), which at a billion opens
 //! a second takes centuries.
 //!
@@ -37,9 +37,9 @@
 //! still owns: once a fill has failed, been invalidated or been answered, a newer fill of the
 //! same pages is not touched by a late answer to the old one, however malformed. An answer
 //! whose fill owns none of its pages any more, or whose generation is not the object's, is
-//! stale and ignored: the call succeeds and takes nothing (it returns 0). So a file system
-//! never has to tell a late answer from a live one, and a stale answer never fails the
-//! queue or another fill.
+//! stale and ignored: the call succeeds and takes nothing (it returns 0). Any other answer
+//! returns how many of its pages it acted on. So a file system never has to tell a late
+//! answer from a live one, and a stale answer never fails the queue or another fill.
 //!
 //! Only the process that opened the queue may use it and its objects, binding included: a
 //! queue or object descriptor passed to another process is refused there (`EPERM`), so it
@@ -399,7 +399,8 @@ pub enum Request {
     /// object's frames; a failed fill has an empty payload. An answer the kernel cannot take
     /// (no memory for the frames, a payload that faults or has the wrong length) fails the
     /// fill, as a failed answer would: the call returns the error and the record need not be
-    /// answered again.
+    /// answered again. The answer acts only on the pages its fill still owns, and returns how
+    /// many that was; a stale one (see the module docs) returns 0 and changes nothing.
     Filled {
         /// The pages the record named.
         pages: RecordPages,
