@@ -358,6 +358,46 @@ impl AddrSpaceWrapper {
         crate::scheme::iommu::release(self, requested_span);
         result
     }
+    /// Ferric Oxide: replaces `span` with zeroed private anonymous memory mapped with `flags`,
+    /// letting pinned pages go, all under one hold of the address space lock, so no thread of
+    /// the process ever finds the range unmapped. A registered-buffer revoke uses it on a
+    /// holder's mapping (`scheme/regbuf.rs`): the holder may still be using the range, and must
+    /// read zeros there rather than fault.
+    ///
+    /// # Errors
+    ///
+    /// What unmapping the span returns; the span is then left as it was.
+    #[cfg(feature = "regbuf")]
+    pub fn replace_with_zeroed(
+        &self,
+        span: PageSpan,
+        flags: MapFlags,
+        token: &mut CleanLockToken,
+    ) -> Result<UnmapVec> {
+        let mut guard = self.acquire_write(token.downgrade());
+        let guard = &mut *guard;
+
+        let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+        let notify = AddrSpace::munmap_inner(
+            &mut guard.grants,
+            &mut guard.table.utable,
+            &mut flusher,
+            span,
+            true,
+        )?;
+        #[cfg(iommu_enabled)]
+        crate::scheme::iommu::release(self, span);
+        // Lazily backed by the shared zero frame, so this does not fail for want of memory.
+        let zeroed = Grant::zeroed(
+            span,
+            page_flags(flags),
+            &mut guard.table.utable,
+            &mut flusher,
+            false,
+        )?;
+        guard.grants.insert(zeroed);
+        Ok(notify)
+    }
     pub fn r#move(
         &self,
         src_opt: Option<(&AddrSpaceWrapper, &mut AddrSpace)>,
@@ -1865,14 +1905,6 @@ impl Grant {
             if !src_grant.can_have_flags(map_flags) {
                 return Err(Error::new(EPERM));
             }
-
-            if let Provider::FmapBorrowed {
-                ref mut pin_refcount,
-                ..
-            } = src_grant.provider
-            {
-                *pin_refcount += 1;
-            }
         }
 
         let Some(last_span) = prev_span else {
@@ -1926,6 +1958,19 @@ impl Grant {
                         TlbShootdownActions::NEW_MAPPING,
                     );
                 }
+            }
+        }
+
+        // Ferric Oxide: pin the source's fmap-borrowed grants only once nothing above can fail.
+        // `unmap` of the returned grant drops these pins again; a pin taken before an error
+        // return above was never dropped, and the source's exit then panicked unmapping it.
+        for (_, src_grant) in src_address_space.grants.conflicts_mut(src_span) {
+            if let Provider::FmapBorrowed {
+                ref mut pin_refcount,
+                ..
+            } = src_grant.provider
+            {
+                *pin_refcount += 1;
             }
         }
 
