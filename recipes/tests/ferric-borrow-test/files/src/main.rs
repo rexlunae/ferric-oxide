@@ -59,6 +59,8 @@ const NEW_PATH: &str = "/tmp/ferric-borrow-test.new";
 const MERGE_PATH: &str = "/tmp/ferric-borrow-test.merge";
 /// The file `shared-read` stores to through a shared mapping and reads.
 const SHARED_PATH: &str = "/tmp/ferric-borrow-test.shared";
+/// The file `sync-unmapped` stores to through a shared mapping, unmaps, writes and syncs.
+const SYNC_PATH: &str = "/tmp/ferric-borrow-test.sync";
 
 /// The few libc calls the test needs, with the constants of the platform.
 mod sys {
@@ -413,15 +415,52 @@ fn check_shared_read() -> Result<(), Error> {
     fs::remove_file(SHARED_PATH).map_err(file_error(SHARED_PATH))
 }
 
+/// `sync-unmapped`: a store through a shared mapping, `munmap`, then `pwrite` and `fsync`;
+/// the sync must not write the unmapped page's old bytes over the `pwrite`.
+fn check_sync_unmapped() -> Result<(), Error> {
+    const OLD: u8 = 0x66;
+    const STORED: u8 = 0x77;
+    const WRITTEN: u8 = 0x88;
+    fs::write(SYNC_PATH, [OLD; PAGE_SIZE]).map_err(file_error(SYNC_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(SYNC_PATH)
+        .map_err(file_error(SYNC_PATH))?;
+    let page = map(
+        0,
+        PAGE_SIZE,
+        sys::MAP_SHARED,
+        file.as_raw_fd(),
+        "the sync-unmapped file",
+    )?;
+    // SAFETY: just mapped readable and writable, one page long.
+    unsafe { (page as *mut u8).write_volatile(STORED) };
+    // SAFETY: the mapping is this test's own.
+    if unsafe { sys::munmap(page as *mut c_void, PAGE_SIZE) } != 0 {
+        return Err(Error::Mmap("the sync-unmapped file (munmap)"));
+    }
+    std::os::unix::fs::FileExt::write_all_at(&file, &[WRITTEN; PAGE_SIZE], 0)
+        .map_err(file_error(SYNC_PATH))?;
+    file.sync_all().map_err(file_error(SYNC_PATH))?;
+    let mut byte = [0u8];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut byte, 0)
+        .map_err(file_error(SYNC_PATH))?;
+    expect_byte("sync-unmapped", WRITTEN, byte[0])?;
+    drop(file);
+    fs::remove_file(SYNC_PATH).map_err(file_error(SYNC_PATH))
+}
+
 fn main() -> ExitCode {
     match run()
         .and_then(|()| check_remap())
         .and_then(|()| check_remap_merged())
         .and_then(|()| check_shared_read())
+        .and_then(|()| check_sync_unmapped())
     {
         Ok(()) => {
             println!(
-                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents; reads see stores through a shared mapping"
+                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents; reads see stores through a shared mapping; fsync keeps writes made after a munmap"
             );
             ExitCode::SUCCESS
         }
