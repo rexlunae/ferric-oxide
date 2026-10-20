@@ -443,10 +443,16 @@ fn check_sync_unmapped() -> Result<(), Error> {
     std::os::unix::fs::FileExt::write_all_at(&file, &[WRITTEN; PAGE_SIZE], 0)
         .map_err(file_error(SYNC_PATH))?;
     file.sync_all().map_err(file_error(SYNC_PATH))?;
-    let mut byte = [0u8];
-    std::os::unix::fs::FileExt::read_exact_at(&file, &mut byte, 0)
+    let mut page = [0u8; PAGE_SIZE];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut page, 0)
         .map_err(file_error(SYNC_PATH))?;
-    expect_byte("sync-unmapped", WRITTEN, byte[0])?;
+    // The whole page: a sync of the old buffer would bring back STORED at 0 and OLD after it.
+    let found = page
+        .iter()
+        .copied()
+        .find(|&b| b != WRITTEN)
+        .unwrap_or(WRITTEN);
+    expect_byte("sync-unmapped", WRITTEN, found)?;
     drop(file);
     fs::remove_file(SYNC_PATH).map_err(file_error(SYNC_PATH))
 }
