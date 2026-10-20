@@ -109,8 +109,9 @@ pub enum JobError<'a> {
         /// The value given.
         value: &'a str,
     },
-    /// The options do not fit together: `io_size` is not a whole number of blocks, or more
-    /// than [`MAX_SUBMITTERS`] reads would be in flight.
+    /// The options do not fit together: `io_size` is not a whole number of blocks, more
+    /// than [`MAX_SUBMITTERS`] reads would be in flight, or there are fewer blocks than reads
+    /// in flight (some submitters would have nothing to read, and the fio command fewer jobs).
     Shape,
 }
 
@@ -122,7 +123,8 @@ impl fmt::Display for JobError<'_> {
             Self::Value { option, value } => write!(f, "{option}: invalid value {value:?}"),
             Self::Unsupported { option, value } => write!(f, "{option}={value} is not supported"),
             Self::Shape => f.write_str(
-                "io_size must be a whole number of blocks, with at most 256 reads in flight",
+                "io_size must be a whole number of blocks, at least one per read in flight, \
+                 with at most 256 reads in flight",
             ),
         }
     }
@@ -190,7 +192,8 @@ impl Job {
 
     fn check<'a>(&self) -> Result<(), JobError<'a>> {
         let whole = self.io_size.is_multiple_of(u64::from(self.bs));
-        if whole && self.submitters() <= MAX_SUBMITTERS {
+        let fits = self.submitters() <= MAX_SUBMITTERS;
+        if whole && fits && self.ios() >= u64::from(self.submitters()) {
             Ok(())
         } else {
             Err(JobError::Shape)
@@ -585,6 +588,12 @@ mod tests {
             Job::parse(["--iodepth=32", "--numjobs=16"]),
             Err(JobError::Shape)
         );
+        // Fewer blocks than submitters: three 4k blocks for four threads.
+        assert_eq!(
+            Job::parse(["--bs=4k", "--io_size=12k", "--numjobs=4"]),
+            Err(JobError::Shape)
+        );
+        assert!(Job::parse(["--bs=4k", "--io_size=12k", "--numjobs=3"]).is_ok());
     }
 
     #[test]

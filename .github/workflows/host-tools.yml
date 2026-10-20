@@ -17,6 +17,7 @@ on:
       - "config/**"
       - "userspace/redoxfs/**"
       - "userspace/base/drivers/storage/driver-block/**"
+      - "recipes/tests/ferric-iobench/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 

@@ -324,7 +324,9 @@ benchmark is its own MIT code, in two parts:
   refuses by name what the runner does not do: writes, engines other than
   `psync`, and buffered I/O (`--direct=0`). Before a job runs, its block size
   is checked against the partition's logical block size (`st_blksize`), since
-  the disk scheme refuses reads that are not whole blocks. It has the block order, a
+  the disk scheme refuses reads that are not whole blocks. A job with fewer
+  blocks than reads in flight is refused too: some threads would have nothing
+  to read, and the fio command fewer jobs. It has the block order, a
   latency histogram with fio's bucket layout, the IOPS, bandwidth and
   percentile report, and the fio command line for running the same job on
   Linux.

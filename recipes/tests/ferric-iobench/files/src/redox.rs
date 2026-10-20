@@ -20,7 +20,7 @@ use syscall::CallFlags;
 use syscall::error::{EIO, EOPNOTSUPP};
 
 use crate::DEFAULT_JOBS;
-use crate::round::run_together;
+use crate::round::{SpawnError, run_together};
 
 /// The queue policies a round runs, with their names in the output. The first is the A/B
 /// baseline (the one-queue path) and the second the candidate (the default).
@@ -45,6 +45,8 @@ enum Failure {
     Thread,
     /// The job's block size does not suit the disk.
     BlockSize(BlockSizeMismatch),
+    /// A submitter thread could not be started.
+    Spawn(SpawnError),
 }
 
 impl fmt::Display for Failure {
@@ -61,6 +63,7 @@ impl fmt::Display for Failure {
             }
             Self::Thread => f.write_str("a submitter thread panicked"),
             Self::BlockSize(_) => f.write_str("the job does not suit the disk"),
+            Self::Spawn(_) => f.write_str("a round could not start its submitters"),
         }
     }
 }
@@ -69,6 +72,7 @@ impl std::error::Error for Failure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::BlockSize(err) => Some(err),
+            Self::Spawn(err) => Some(err),
             _ => None,
         }
     }
@@ -344,7 +348,8 @@ fn run_round(disk: &Disk, job: &Job) -> Result<(u64, Box<Histogram>), Failure> {
     let order = Order::of(job);
     let next = AtomicU64::new(0);
     let bs = job.bs as usize;
-    let timed = run_together(job.submitters(), || submit(disk, &order, &next, bs));
+    let timed = run_together(job.submitters(), || submit(disk, &order, &next, bs))
+        .map_err(Failure::Spawn)?;
     let mut latency = Box::new(Histogram::new());
     for result in timed.results {
         latency.merge(&*result.ok_or(Failure::Thread)??);
