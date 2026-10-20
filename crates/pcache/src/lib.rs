@@ -16,6 +16,8 @@
 //! - [`page`]: the state of one cached page and the transitions fills, writes, writeback and
 //!   truncation make.
 //! - [`readahead`]: how far ahead of a reader the kernel fills, per open file description.
+//! - [`copy`]: how the kernel splits a copy of cached bytes to a reader's buffer so it runs at
+//!   full speed whatever the buffer's alignment.
 //! - `object` (with the `alloc` feature): one object's page index, which says what a read
 //!   needs (fills to queue, fills to wait for) and applies the file system's answers.
 //! - `clock` (with the `alloc` feature): the two-list CLOCK replacement that picks pages to
@@ -72,6 +74,7 @@ pub mod abi;
 pub mod client;
 #[cfg(feature = "alloc")]
 pub mod clock;
+pub mod copy;
 #[cfg(feature = "alloc")]
 pub mod object;
 pub mod page;

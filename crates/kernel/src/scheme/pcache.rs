@@ -413,10 +413,27 @@ fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize
         let src = frame.bytes().get(at..).ok_or_else(overflow)?;
         let n = src.len().min(rest.len());
         let (dst, tail) = rest.split_at(n).ok_or_else(overflow)?;
-        dst.copy_from_slice(src.get(..n).ok_or_else(overflow)?)?;
+        copy_to_user(dst, src.get(..n).ok_or_else(overflow)?)?;
         rest = tail;
     }
     len.checked_sub(rest.len()).ok_or_else(overflow)
+}
+
+/// Copies `src` to `dst`, which has the same length, with the destination of the bulk of the
+/// copy aligned. See `ferric_pcache::copy`: page-aligned frames copied to a misaligned buffer
+/// run many times slower on some cores otherwise.
+fn copy_to_user(dst: UserSliceWo, src: &[u8]) -> Result<()> {
+    let (head, _) = ferric_pcache::copy::split_for_destination(dst.addr(), src.len());
+    let einval = || Error::new(EINVAL);
+    let (dst_head, dst_rest) = dst.split_at(head).ok_or_else(einval)?;
+    let (src_head, src_rest) = src.split_at_checked(head).ok_or_else(einval)?;
+    if head > 0 {
+        dst_head.copy_from_slice(src_head)?;
+    }
+    if !src_rest.is_empty() {
+        dst_rest.copy_from_slice(src_rest)?;
+    }
+    Ok(())
 }
 
 /// Opens a queue for `caller` (root only), owned by the calling process.
