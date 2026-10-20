@@ -32,8 +32,9 @@
 //! a second takes centuries.
 //!
 //! Each fill record also has a [`FillId`], which the file system copies into its answer too.
-//! The object numbers its fills from 1 up and never reuses a number, and each page being
-//! filled remembers the fill it is waiting for. An answer acts only on the pages its fill
+//! The object numbers its fills from 1 up and never reuses a number (once they run out, a
+//! read that needs a fill fails with `EOVERFLOW`), and each page being filled remembers the
+//! fill it is waiting for. An answer acts only on the pages its fill
 //! still owns: once a fill has failed, been invalidated or been answered, a newer fill of the
 //! same pages is not touched by a late answer to the old one, however malformed. An answer
 //! whose fill owns none of its pages any more, or whose generation is not the object's, is

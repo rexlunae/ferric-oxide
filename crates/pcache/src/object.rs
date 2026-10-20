@@ -152,6 +152,11 @@ pub enum Read {
     },
     /// A fill the reader waited for failed.
     Failed,
+    /// Some pages are absent, and the object has used every [`FillId`] there is, so no fill
+    /// of them can start (the kernel returns `EOVERFLOW`). Nothing changed. At a billion
+    /// fills a second this takes centuries; the file system must close and reopen the
+    /// object to fill it again.
+    OutOfFillIds,
 }
 
 /// A fill the index started: its pages, and the ID its record and answer carry.
@@ -192,8 +197,8 @@ pub struct PageIndex<F> {
     size: u64,
     /// Pages that are not absent: absent pages are not stored.
     pages: BTreeMap<u64, Entry<F>>,
-    /// The ID the next fill gets.
-    next_fill: FillId,
+    /// The ID the next fill gets; `None` once every ID has been used. IDs are never reused.
+    next_fill: Option<FillId>,
 }
 
 impl<F> Default for PageIndex<F> {
@@ -208,7 +213,7 @@ impl<F> PageIndex<F> {
         Self {
             size: 0,
             pages: BTreeMap::new(),
-            next_fill: FillId::new(1),
+            next_fill: Some(FillId::new(1)),
         }
     }
 
@@ -268,7 +273,9 @@ impl<F> PageIndex<F> {
         if attempt.take_failure() {
             return Read::Failed;
         }
-        let fills = self.start_fills(pages);
+        let Some(fills) = self.start_fills(pages) else {
+            return Read::OutOfFillIds;
+        };
         let mut busy = false;
         for entry in self.pages.range(pages.first()..pages.end()).map(|(_, e)| e) {
             if entry.state.busy() {
@@ -288,53 +295,61 @@ impl<F> PageIndex<F> {
     }
 
     /// Starts fills of the absent pages of `pages` that no reader waits for yet (readahead),
-    /// and returns their records.
+    /// and returns their records: none once the object is out of fill IDs.
     pub fn prefetch(&mut self, pages: PageRange) -> Vec<Fill> {
-        self.start_fills(pages)
+        self.start_fills(pages).unwrap_or_default()
     }
 
     /// Marks the absent pages of `pages` filling, and returns them as records, each with a
-    /// new [`FillId`] and an outcome its pages share.
-    fn start_fills(&mut self, pages: PageRange) -> Vec<Fill> {
-        let mut fills = Vec::new();
+    /// new [`FillId`] and an outcome its pages share. `None`, changing nothing, when there
+    /// are not enough IDs left for them all.
+    fn start_fills(&mut self, pages: PageRange) -> Option<Vec<Fill>> {
+        let mut runs = Vec::new();
         let mut run: Option<(u64, u64)> = None;
         for page in pages.first()..pages.end() {
-            let entry = self.pages.entry(page).or_insert_with(Entry::absent);
             // Pages being filled or holding data are left as they are.
-            if let Ok(next) = entry.state.apply(Event::FillStart) {
-                entry.state = next;
+            if self.state(page).apply(Event::FillStart).is_ok() {
                 run = match run {
                     Some((first, end)) if end == page => Some((first, page + 1)),
                     other => {
-                        push_run(&mut fills, other);
+                        push_run(&mut runs, other);
                         Some((page, page + 1))
                     }
                 };
             }
         }
-        push_run(&mut fills, run);
-        fills
-            .into_iter()
-            .map(|pages| {
-                let id = self.take_fill_id();
-                let outcome = Arc::new(FillOutcome::new(id, pages.pages().count()));
-                let range = pages.pages();
-                for page in range.first()..range.end() {
-                    if let Some(entry) = self.pages.get_mut(&page) {
-                        entry.fill = Some(Arc::clone(&outcome));
-                    }
-                }
-                Fill { id, pages }
-            })
-            .collect()
+        push_run(&mut runs, run);
+        if runs.len() as u64 > self.fill_ids_left() {
+            return None;
+        }
+        Some(
+            runs.into_iter()
+                .filter_map(|pages| self.start_fill(pages))
+                .collect(),
+        )
     }
 
-    /// A new fill ID. They run out only after 2^64 fills of one object; the last is then
-    /// reused rather than wrap round to the first.
-    fn take_fill_id(&mut self) -> FillId {
-        let id = self.next_fill;
-        self.next_fill = id.next().unwrap_or(id);
-        id
+    /// Starts one fill of the absent `pages`: marks them filling with a new ID and an outcome
+    /// they share. `None` when the IDs have run out (checked by the caller first).
+    fn start_fill(&mut self, pages: RecordPages) -> Option<Fill> {
+        let id = self.next_fill?;
+        self.next_fill = id.next();
+        let range = pages.pages();
+        let outcome = Arc::new(FillOutcome::new(id, range.count()));
+        for page in range.first()..range.end() {
+            let entry = self.pages.entry(page).or_insert_with(Entry::absent);
+            if let Ok(next) = entry.state.apply(Event::FillStart) {
+                entry.state = next;
+                entry.fill = Some(Arc::clone(&outcome));
+            }
+        }
+        Some(Fill { id, pages })
+    }
+
+    /// How many fill IDs are left.
+    fn fill_ids_left(&self) -> u64 {
+        self.next_fill
+            .map_or(0, |next| (u64::MAX - next.get()).saturating_add(1))
     }
 
     /// The frames of `pages`, in order, when every one is readable.
@@ -598,7 +613,7 @@ mod tests {
     fn wait_pages(read: Read) -> Option<Vec<RecordPages>> {
         match read {
             Read::Wait { fills } => Some(fills.iter().map(|fill| fill.pages).collect()),
-            Read::Ready | Read::Failed => None,
+            Read::Ready | Read::Failed | Read::OutOfFillIds => None,
         }
     }
 
@@ -797,6 +812,39 @@ mod tests {
             answer(&mut index, record(3, 1), EIO, Vec::new()).expect("filling");
         }
         assert_eq!(ids, [FillId::new(1), FillId::new(2), FillId::new(3)]);
+    }
+
+    /// The last fill ID is given out once; after it, reads that need a fill are refused
+    /// and change nothing, readahead starts nothing, and cached pages still read.
+    #[test]
+    fn fill_ids_run_out_instead_of_repeating() {
+        let mut index = index();
+        // Page 1 cached, so a read of pages 0..3 needs two fills.
+        let _ = index.start_read(range(1, 1), &mut Attempt::new());
+        answer(&mut index, record(1, 1), Outcome::Done, frames(1, 1)).expect("filling");
+        index.next_fill = Some(FillId::new(u64::MAX));
+        // One ID left is not enough for two fills: nothing starts.
+        assert_eq!(
+            index.start_read(range(0, 3), &mut Attempt::new()),
+            Read::OutOfFillIds
+        );
+        assert_eq!(index.state(0), PageState::Absent);
+        assert_eq!(index.state(2), PageState::Absent);
+        // One fill takes the last ID.
+        let _ = index.start_read(range(0, 1), &mut Attempt::new());
+        assert_eq!(owner(&index, 0), FillId::new(u64::MAX));
+        answer(&mut index, record(0, 1), EIO, Vec::new()).expect("filling");
+        assert_eq!(
+            index.start_read(range(0, 1), &mut Attempt::new()),
+            Read::OutOfFillIds
+        );
+        assert_eq!(index.state(0), PageState::Absent);
+        assert!(index.prefetch(range(2, 4)).is_empty());
+        assert_eq!(index.state(2), PageState::Absent);
+        assert_eq!(
+            index.start_read(range(1, 1), &mut Attempt::new()),
+            Read::Ready
+        );
     }
 
     /// A fill fails, a reader fills the pages again, and then a late, malformed answer to the

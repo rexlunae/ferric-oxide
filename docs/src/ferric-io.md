@@ -593,7 +593,9 @@ How a file system uses it:
    for the page by the time it wakes. Every record carries the
    object's 64-bit generation, which is new each time an object is opened and
    never repeats on a queue, and its answer must repeat it. Each fill record
-   also carries a fill ID, numbered from 1 up on each object and never reused,
+   also carries a fill ID, numbered from 1 up on each object and never reused
+   (an object that has used all 2^64 refuses reads that need a fill with
+   `EOVERFLOW`),
    which the answer repeats too; each page being filled remembers the fill it
    waits for, and an answer acts only on the pages its fill still owns. An
    answer to a fill that owns none of its pages any more (it failed, was

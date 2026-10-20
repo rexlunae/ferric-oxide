@@ -328,13 +328,14 @@ fn read(
         let read = state.index.start_read(pages, &mut attempt);
         let mut fills = match &read {
             Read::Wait { fills } => fills.clone(),
-            Read::Ready | Read::Failed => Vec::new(),
+            Read::Ready | Read::Failed | Read::OutOfFillIds => Vec::new(),
         };
         if first && let Some(ahead) = ahead {
             fills.extend(state.index.prefetch(ahead));
         }
         match read {
             Read::Failed => return Some(Err(Error::new(EIO))),
+            Read::OutOfFillIds => return Some(Err(Error::new(EOVERFLOW))),
             Read::Ready => {
                 let frames = state.index.frames(pages);
                 drop(state);
@@ -629,10 +630,11 @@ fn detach(object: &Arc<Object>, handle: u64) -> Result<usize> {
 /// ([`PageIndex::owned`]): an answer for a fill that owns none of them (it was failed or
 /// answered already, and the pages may be filling again for a newer fill) is stale and
 /// ignored, whatever it holds, and returns 0; any other answer returns how many pages it
-/// acted on, so a file system can tell the two apart. An answer that is not stale but cannot be taken
-/// (no memory for the frames, a payload that faults or has the wrong length) fails the fill's
-/// pages: the file system took the record off the queue and need not answer it again, so
-/// leaving them filling would leave their readers waiting for good.
+/// acted on, so a file system can tell the two apart. An answer that is not stale but cannot
+/// be taken (no memory for the frames, a payload that faults or has the wrong length) fails
+/// the fill's pages: the file system took the record off the queue and need not answer it
+/// again, so leaving them filling would leave their readers waiting for good. Its error is
+/// returned unless the fill turned stale while the payload was copied.
 fn filled(
     object: &Object,
     fill: FillId,
@@ -648,15 +650,20 @@ fn filled(
     let frames = match answer_frames(pages, outcome, payload) {
         Ok(frames) => frames,
         Err(err) => {
-            // Readers of the pages this fill owns get EIO and fill again.
-            let _ = object.state.lock().index.complete_fill(
+            // Readers of the pages this fill still owns get EIO and fill again. The lock was
+            // dropped for the copy, so the fill may have ended meanwhile (the object or its
+            // queue closed): then the answer is as stale as one found so up front.
+            let failed = object.state.lock().index.complete_fill(
                 fill,
                 pages,
                 Outcome::Failed(EIO_OUTCOME),
                 Vec::new(),
             );
             object.changed.notify(token);
-            return Err(err);
+            return match failed {
+                Ok(0) => Ok(0),
+                _ => Err(err),
+            };
         }
     };
     let result = object
