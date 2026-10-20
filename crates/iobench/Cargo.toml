@@ -1,0 +1,8 @@
+[package]
+name = "ferric-iobench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Block I/O benchmark jobs with fio-compatible options: offsets, latency histograms and reports"
+
+[dependencies]
