@@ -385,7 +385,7 @@ pub struct DSO {
 
     /// Ferric Oxide: the load bias and path recorded with the kernel (sys_proc), so that
     /// unloading the library takes its record away again.
-    pub recorded_image: Option<(usize, String)>,
+    recorded_image: Option<(usize, String)>,
 }
 
 impl DSO {
@@ -1402,6 +1402,13 @@ impl Drop for DSO {
             unsafe {
                 self.run_fini();
             }
+        }
+        // Ferric Oxide: the library's pages go when `mmap` drops, after this body, so its
+        // image record goes now, on every path that drops it (a failed load too), or a
+        // library later mapped at the same address is profiled under this one's name.
+        #[cfg(target_os = "redox")]
+        if let Some((bias, path)) = &self.recorded_image {
+            redox_rt::proc::unrecord_own_image(*bias, path.as_bytes());
         }
     }
 }

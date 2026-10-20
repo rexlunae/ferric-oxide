@@ -440,9 +440,17 @@ handle in the proc scheme). The kernel keeps up to 64 per address space,
 copies them on fork and starts empty on exec, so user addresses can be
 symbolized with ASLR on. A program that lives less than one drain interval may
 be missed, and its frames then show as `[unknown]`. `ld.so` takes a library's
-record back when `dlclose` unmaps it (the address space's `images-unload`
-handle), but the recorder keeps every image it saw, so samples taken before the
-unload still resolve; when two images were at one address, the newest wins.
+record back when a library is unloaded (in the library's drop, so a failed
+`dlopen` cleans up too; the address space's `images-unload` handle), but the
+recorder keeps every image it saw, so samples taken before the unload still
+resolve. Each snapshot is an epoch, and each sighting of an image an occurrence
+with the epochs it was seen in (`image-spans`); an image that comes back after
+missing from a snapshot is a new occurrence. The `batches` file gives the
+sample files' lengths after each drain, which dates every sample with the epoch
+of the snapshot that followed it. The symbolizer resolves a sample against the
+occurrence live at its epoch, so old samples keep their library when another
+(or the same one again) is later mapped at the same address, and falls back to
+the newest image that holds the address.
 `ferric-trace profile` prints what reading the file cost (`image snapshots: …
 ppm of the time between them`).
 

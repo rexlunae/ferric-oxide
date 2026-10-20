@@ -107,6 +107,12 @@ impl<'a> Samples<'a> {
     pub fn new(words: &'a [u64]) -> Self {
         Self { words, at: 0 }
     }
+
+    /// The index of the word the next item starts at: where in the buffer the sample (or the
+    /// run of bad words) that [`Iterator::next`] gives next begins.
+    pub fn position(&self) -> usize {
+        self.at
+    }
 }
 
 impl<'a> Iterator for Samples<'a> {
@@ -337,6 +343,19 @@ mod tests {
             [Err(SampleError::BadLength { at: 0 })]
         );
         assert_eq!(Samples::new(&[]).count(), 0);
+    }
+
+    #[test]
+    fn position_is_where_the_next_item_starts() {
+        let words = [SAMPLE_MAGIC | 4, 1, 2, 3, 7, SAMPLE_MAGIC | 5, 1, 2, 3, 9];
+        let mut samples = Samples::new(&words);
+        assert_eq!(samples.position(), 0);
+        assert!(samples.next().unwrap().is_ok());
+        assert_eq!(samples.position(), 4);
+        assert!(samples.next().unwrap().is_err());
+        assert_eq!(samples.position(), 5);
+        assert!(samples.next().unwrap().is_ok());
+        assert_eq!(samples.position(), words.len());
     }
 
     /// A sample torn by a full buffer (its header promises more words than were written)

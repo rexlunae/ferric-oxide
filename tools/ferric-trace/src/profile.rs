@@ -13,16 +13,25 @@
 //! - [`IMAGES`]: for each context that had any, its `context` line and `image` lines from
 //!   `/scheme/sys/proc` (`kernel.sys_proc`, in the `ferric-procinfo` format): where each ELF
 //!   image was loaded, which symbolizes user addresses under ASLR. Missing without `sys_proc`.
+//! - [`IMAGE_SPANS`]: for each `image` line of [`IMAGES`], in the same order, the
+//!   `<context> <first> <last>` snapshots it was seen in ([`Live`]);
+//! - [`BATCHES`]: one `<epoch> <words of CPU 0> <words of CPU 1> …` line for each drain, the
+//!   length of each `samples<n>` file after it, which dates every sample ([`Batch`]).
 //!
 //! [`record`] first takes the profiler for itself by writing `x` to `ctl-profiling`, which
 //! stops sampling and makes any other recorder's writes fail (`EBUSY`, reported as
 //! [`ProfileError::Busy`]) until this one closes its control file. It then drains whatever
 //! earlier runs left in the buffers and throws it away, turns sampling on, runs a command or
 //! waits, and drains every buffer every [`DRAIN_INTERVAL`] until sampling is off again, so the
-//! buffers never fill. It reads `/scheme/sys/proc` at the same times and keeps every image it
-//! saw for each context, in the order first seen, so programs that exit before the end, and
-//! libraries unloaded during the run, are still covered unless they lived less than one
-//! interval; [`Recorded::snapshots`] says what those reads cost. As with trace captures, the directory is created exclusively
+//! buffers never fill. It reads `/scheme/sys/proc` after each drain (a snapshot; the `n`th
+//! is epoch `n`, the first taken before sampling starts) and keeps every image it saw for each
+//! context, so programs that exit before the end, and libraries unloaded during the run, are
+//! still covered unless they lived less than one interval. Each sighting of an image is an
+//! occurrence with the snapshots it was live in; an image that comes back after missing from
+//! a snapshot is a new occurrence. The samples drained just before snapshot `n` were taken
+//! between snapshots `n - 1` and `n`, so they carry epoch `n`, and the symbolizer resolves a
+//! sample against the occurrences live around its epoch ([`LoadedImage::live`]).
+//! [`Recorded::snapshots`] says what the snapshots cost. As with trace captures, the directory is created exclusively
 //! (its parents as needed) and holds an `INCOMPLETE` marker ([`crate::capture::INCOMPLETE`])
 //! until everything is saved. Sampling is turned off on every path out of [`record`], including
 //! errors, and a command it started is killed and waited for if recording fails.
@@ -53,6 +62,12 @@ pub const NAMES: &str = "names";
 
 /// The file listing each context's loaded images.
 pub const IMAGES: &str = "images";
+
+/// The file giving the snapshots each line of [`IMAGES`] was seen in.
+pub const IMAGE_SPANS: &str = "image-spans";
+
+/// The file dating the samples: the sample files' lengths after each drain.
+pub const BATCHES: &str = "batches";
 
 /// How often [`record`] drains the buffers while sampling.
 pub const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
@@ -205,6 +220,23 @@ pub enum ProfileError {
         /// The line.
         line: String,
     },
+    /// A line of the image spans file is not `<context> <first> <last>` with
+    /// `first <= last`, or a batches line is not an epoch and one length per CPU.
+    #[error("{}: bad line {line:?}", path.display())]
+    Dates {
+        /// The file.
+        path: PathBuf,
+        /// The line.
+        line: String,
+    },
+    /// The image spans file does not give one span for each of a context's images.
+    #[error("{}: the spans of context {context} do not match its images", path.display())]
+    SpanCount {
+        /// The spans file.
+        path: PathBuf,
+        /// The context.
+        context: u32,
+    },
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ProfileError + '_ {
@@ -261,16 +293,21 @@ pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Record
         drain(buffer, &mut io::sink())?;
     }
     let mut images = ImageTracker::new(proc);
+    let mut batches = String::new();
     images.snapshot()?;
     sampling.start()?;
     let status = sample(run, &mut || {
         drain_all(&mut cpus, &mut files)?;
+        batches.push_str(&batch_line(images.epoch(), &files)?);
         images.snapshot()
     })?;
     sampling.stop()?;
     drain_all(&mut cpus, &mut files)?;
+    batches.push_str(&batch_line(images.epoch(), &files)?);
     images.snapshot()?;
     write_file(&out.join(IMAGES), images.text().as_bytes())?;
+    write_file(&out.join(IMAGE_SPANS), images.spans().as_bytes())?;
+    write_file(&out.join(BATCHES), batches.as_bytes())?;
     let cpu_bytes = files
         .iter()
         .map(|(path, file)| file.metadata().map(|m| m.len()).map_err(io_error(path)))
@@ -354,6 +391,18 @@ fn drain(buffer: &mut Buffer, out: &mut impl Write) -> Result<(), ProfileError> 
     }
 }
 
+/// The [`BATCHES`] line for a drain before snapshot `epoch`: the epoch, then each sample
+/// file's length in words.
+fn batch_line(epoch: u32, files: &[(PathBuf, File)]) -> Result<String, ProfileError> {
+    let mut line = epoch.to_string();
+    for (path, file) in files {
+        let bytes = file.metadata().map_err(io_error(path))?.len();
+        line.push_str(&format!(" {}", bytes / WORD_BYTES as u64));
+    }
+    line.push('\n');
+    Ok(line)
+}
+
 fn drain_all(cpus: &mut [Buffer], files: &mut [(PathBuf, File)]) -> Result<(), ProfileError> {
     for (buffer, (path, file)) in cpus.iter_mut().zip(files.iter_mut()) {
         drain(buffer, file)?;
@@ -417,16 +466,25 @@ impl Drop for Sampling {
     }
 }
 
-/// The image blocks of the per-process file: for each context, its line and every image it
-/// had in any snapshot, in the order first seen. A library unloaded during the recording keeps
-/// its line, for the samples taken while it was mapped; a later one mapped at the same address
-/// comes after it, and the symbolizer tries the newest first.
+/// The image blocks of the per-process file: for each context, its line and every occurrence
+/// of an image in the snapshots, in the order first seen. A library unloaded during the
+/// recording keeps its occurrence, for the samples taken while it was mapped; one that comes
+/// back after missing from a snapshot (A, then B, then A again at one address) is a new one.
 struct ImageTracker {
     path: PathBuf,
     /// Off once the file turned out not to exist (a kernel without `sys_proc`).
     on: bool,
-    blocks: BTreeMap<u32, (String, Vec<String>)>,
+    blocks: BTreeMap<u32, (String, Vec<Occurrence>)>,
+    /// Snapshots taken so far: the next one's epoch.
+    taken: u32,
     timing: Snapshots,
+}
+
+/// An image line seen in the snapshots `first..=last`, every one of them.
+#[derive(Debug)]
+struct Occurrence {
+    image: String,
+    live: Live,
 }
 
 impl ImageTracker {
@@ -435,16 +493,24 @@ impl ImageTracker {
             path: path.to_owned(),
             on: true,
             blocks: BTreeMap::new(),
+            taken: 0,
             timing: Snapshots::default(),
         }
     }
 
+    /// The epoch of the next snapshot.
+    fn epoch(&self) -> u32 {
+        self.taken
+    }
+
     fn snapshot(&mut self) -> Result<(), ProfileError> {
+        let epoch = self.taken;
+        self.taken = self.taken.saturating_add(1);
         if !self.on {
             return Ok(());
         }
         let started = Instant::now();
-        let taken = self.take();
+        let taken = self.take(epoch);
         let took = started.elapsed();
         self.timing.count = self.timing.count.saturating_add(1);
         self.timing.total = self.timing.total.saturating_add(took);
@@ -452,7 +518,7 @@ impl ImageTracker {
         taken
     }
 
-    fn take(&mut self) -> Result<(), ProfileError> {
+    fn take(&mut self, epoch: u32) -> Result<(), ProfileError> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -470,19 +536,43 @@ impl ImageTracker {
             *line = process.context.to_string();
             for image in &process.images {
                 let image = image.to_string();
-                if !seen.contains(&image) {
-                    seen.push(image);
+                // Still live if it was in the snapshot before (or already in this one).
+                let current = seen.iter_mut().rev().find(|o| {
+                    o.image == image && (o.live.last == epoch || o.live.last.checked_add(1) == Some(epoch))
+                });
+                match current {
+                    Some(occurrence) => occurrence.live.last = epoch,
+                    None => seen.push(Occurrence {
+                        image,
+                        live: Live {
+                            first: epoch,
+                            last: epoch,
+                        },
+                    }),
                 }
             }
         }
         Ok(())
     }
 
+    /// The [`IMAGES`] file: each context line, then a line for each occurrence.
     fn text(&self) -> String {
         self.blocks
             .values()
-            .flat_map(|(line, images)| core::iter::once(line).chain(images))
-            .map(String::as_str)
+            .flat_map(|(line, seen)| {
+                core::iter::once(line.as_str()).chain(seen.iter().map(|o| o.image.as_str()))
+            })
+            .collect()
+    }
+
+    /// The [`IMAGE_SPANS`] file, in the order of [`ImageTracker::text`]'s image lines.
+    fn spans(&self) -> String {
+        self.blocks
+            .iter()
+            .flat_map(|(context, (_, seen))| {
+                seen.iter()
+                    .map(move |o| format!("{context} {} {}\n", o.live.first, o.live.last))
+            })
             .collect()
     }
 }
@@ -670,8 +760,22 @@ pub struct Profile {
     pub cpus: Vec<Vec<u64>>,
     /// The contexts' names, by debug id.
     pub names: BTreeMap<u32, String>,
-    /// The images loaded into each context's address space, by debug id.
+    /// The images loaded into each context's address space, by debug id, oldest first.
     pub images: BTreeMap<u32, Vec<LoadedImage>>,
+    /// Each CPU's batches, which date its samples; empty for a profile saved without
+    /// [`BATCHES`].
+    pub batches: Vec<Vec<Batch>>,
+}
+
+/// One sample of a [`Profile`], or a run of words that is not one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileSample<'a> {
+    /// The CPU that took it.
+    pub cpu: usize,
+    /// The epoch of its batch, if the profile dates its samples.
+    pub epoch: Option<u32>,
+    /// The sample.
+    pub sample: Result<Sample<'a>, SampleError>,
 }
 
 /// An ELF image in a profiled context's address space.
@@ -681,6 +785,36 @@ pub struct LoadedImage {
     pub base: u64,
     /// The path it was loaded from, on the target.
     pub path: String,
+    /// The snapshots it was seen in, or `None` for a profile saved without [`IMAGE_SPANS`].
+    pub live: Option<Live>,
+}
+
+/// The snapshots `first..=last` an image occurrence was seen in, every one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Live {
+    /// The first snapshot that listed it.
+    pub first: u32,
+    /// The last one.
+    pub last: u32,
+}
+
+impl Live {
+    /// Whether a sample of epoch `epoch` (taken between snapshots `epoch - 1` and `epoch`)
+    /// may have run in the image: it was mapped some time after snapshot `first - 1` and
+    /// unmapped before snapshot `last + 1`.
+    pub fn covers(&self, epoch: u32) -> bool {
+        self.first <= epoch && epoch <= self.last.saturating_add(1)
+    }
+}
+
+/// The samples of one drain: the words of a CPU's file up to `end`, after the previous batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Batch {
+    /// The end of the batch, in words.
+    pub end: usize,
+    /// The snapshot taken right after the drain: the batch's samples were taken between
+    /// snapshot `epoch - 1` and this one.
+    pub epoch: u32,
 }
 
 fn parse_images(path: &Path, text: &str) -> Result<BTreeMap<u32, Vec<LoadedImage>>, ProfileError> {
@@ -697,11 +831,94 @@ fn parse_images(path: &Path, text: &str) -> Result<BTreeMap<u32, Vec<LoadedImage
                 .map(|image| LoadedImage {
                     base: image.base,
                     path: image.path.0.to_owned(),
+                    live: None,
                 })
                 .collect();
             (process.context.id, images)
         })
         .collect())
+}
+
+/// Gives each image in `images` its span from the [`IMAGE_SPANS`] file `text`.
+fn apply_spans(
+    path: &Path,
+    text: &str,
+    images: &mut BTreeMap<u32, Vec<LoadedImage>>,
+) -> Result<(), ProfileError> {
+    let bad = |line: &str| ProfileError::Dates {
+        path: path.to_owned(),
+        line: line.to_owned(),
+    };
+    let mut spans: BTreeMap<u32, Vec<Live>> = BTreeMap::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let mut fields = line.split(' ').map(str::parse::<u32>);
+        let (Some(Ok(context)), Some(Ok(first)), Some(Ok(last)), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(bad(line));
+        };
+        if first > last {
+            return Err(bad(line));
+        }
+        spans.entry(context).or_default().push(Live { first, last });
+    }
+    for (context, list) in images.iter_mut() {
+        let lives = spans.remove(context).unwrap_or_default();
+        if lives.len() != list.len() {
+            return Err(ProfileError::SpanCount {
+                path: path.to_owned(),
+                context: *context,
+            });
+        }
+        for (image, live) in list.iter_mut().zip(lives) {
+            image.live = Some(live);
+        }
+    }
+    match spans.into_keys().next() {
+        Some(context) => Err(ProfileError::SpanCount {
+            path: path.to_owned(),
+            context,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The [`BATCHES`] file `text`, for `cpus` CPUs: each CPU's batches in order.
+fn parse_batches(path: &Path, text: &str, cpus: usize) -> Result<Vec<Vec<Batch>>, ProfileError> {
+    let mut batches = vec![Vec::new(); cpus];
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let bad = || ProfileError::Dates {
+            path: path.to_owned(),
+            line: line.to_owned(),
+        };
+        let mut fields = line.split(' ');
+        let epoch = fields
+            .next()
+            .and_then(|f| f.parse::<u32>().ok())
+            .ok_or_else(bad)?;
+        let ends = fields
+            .map(|f| f.parse::<usize>().map_err(|_| bad()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if ends.len() != cpus {
+            return Err(bad());
+        }
+        for (cpu, end) in batches.iter_mut().zip(ends) {
+            cpu.push(Batch { end, epoch });
+        }
+    }
+    Ok(batches)
+}
+
+/// Reads `path`, or `None` when it does not exist.
+fn read_optional(path: &Path) -> Result<Option<String>, ProfileError> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ProfileError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 impl Profile {
@@ -747,31 +964,42 @@ impl Profile {
             }
         };
         let images_path = dir.join(IMAGES);
-        let images = match fs::read_to_string(&images_path) {
-            Ok(text) => parse_images(&images_path, &text)?,
-            Err(err) if err.kind() == ErrorKind::NotFound => BTreeMap::new(),
-            Err(source) => {
-                return Err(ProfileError::Io {
-                    path: images_path,
-                    source,
-                });
-            }
+        let mut images = match read_optional(&images_path)? {
+            Some(text) => parse_images(&images_path, &text)?,
+            None => BTreeMap::new(),
+        };
+        let spans_path = dir.join(IMAGE_SPANS);
+        if let Some(text) = read_optional(&spans_path)? {
+            apply_spans(&spans_path, &text, &mut images)?;
+        }
+        let batches_path = dir.join(BATCHES);
+        let batches = match read_optional(&batches_path)? {
+            Some(text) => parse_batches(&batches_path, &text, cpus.len())?,
+            None => Vec::new(),
         };
         Ok(Self {
             kernel_text,
             cpus,
             names,
             images,
+            batches,
         })
     }
 
-    /// Every sample with its CPU, CPU by CPU. Words that are not a whole sample come as one
-    /// error each run of them, and the samples after them follow ([`Samples`]).
-    pub fn samples(&self) -> impl Iterator<Item = (usize, Result<Sample<'_>, SampleError>)> {
-        self.cpus
-            .iter()
-            .enumerate()
-            .flat_map(|(cpu, words)| Samples::new(words).map(move |s| (cpu, s)))
+    /// Every sample with its CPU and epoch ([`Batch::epoch`]; `None` without [`BATCHES`]),
+    /// CPU by CPU. Words that are not a whole sample come as one error each run of them, and
+    /// the samples after them follow ([`Samples`]).
+    pub fn samples(&self) -> impl Iterator<Item = ProfileSample<'_>> {
+        self.cpus.iter().enumerate().flat_map(move |(cpu, words)| {
+            let batches = self.batches.get(cpu).map_or(&[][..], Vec::as_slice);
+            let mut samples = Samples::new(words);
+            core::iter::from_fn(move || {
+                let at = samples.position();
+                let sample = samples.next()?;
+                let epoch = batches.iter().find(|b| b.end > at).map(|b| b.epoch);
+                Some(ProfileSample { cpu, epoch, sample })
+            })
+        })
     }
 }
 
@@ -809,9 +1037,12 @@ mod tests {
         assert_eq!(profile.names[&8], "a name with spaces");
         let samples: Vec<_> = profile.samples().collect();
         assert_eq!(samples.len(), 2);
-        let (cpu, first) = &samples[0];
-        assert_eq!((*cpu, first.unwrap().frames), (0, &[0x40_2000][..]));
-        assert_eq!(samples[1].0, 1);
+        let first = &samples[0];
+        assert_eq!(
+            (first.cpu, first.epoch, first.sample.unwrap().frames),
+            (0, None, &[0x40_2000][..])
+        );
+        assert_eq!(samples[1].cpu, 1);
     }
 
     #[test]
@@ -880,13 +1111,18 @@ mod tests {
 
         let profile = Profile::load(&dir, false).unwrap();
         assert_eq!(profile.kernel_text.text_start, 0x1000);
-        let only = profile.samples().next().unwrap().1.unwrap();
+        let only = profile.samples().next().unwrap();
+        // Drained after sampling started, so after the first snapshot (epoch 0).
+        let last = recorded.snapshots.count - 1;
+        assert!(matches!(only.epoch, Some(1..)), "{:?}", only.epoch);
+        let only = only.sample.unwrap();
         assert_eq!((only.ip, only.context), (2, 9));
         assert_eq!(
             profile.images[&9],
             [LoadedImage {
                 base: 0x7000,
-                path: "/usr/bin/a b".to_owned()
+                path: "/usr/bin/a b".to_owned(),
+                live: Some(Live { first: 0, last }),
             }]
         );
         // The profiler was claimed, then sampling switched on and off (each write lands after
@@ -975,24 +1211,106 @@ mod tests {
         assert!(!out.exists());
     }
 
+    const CONTEXT: &str = "context 9 pid 4 euid 0 egid 0 status runnable cpu 0 running yes active_ns 1 sched_ns 1 name sh\n\
+                           memory private 0 shared 0 kernel 0\n";
+
+    /// Takes one snapshot with `lib` the image at 0x7000 (none for `None`).
+    fn snapshot_with(tracker: &mut ImageTracker, proc: &Path, lib: Option<&str>) {
+        let image = lib.map_or(String::new(), |lib| format!("image 0x7000 path {lib}\n"));
+        fs::write(proc, format!("{CONTEXT}{image}")).unwrap();
+        tracker.snapshot().unwrap();
+    }
+
     #[test]
-    fn the_tracker_keeps_unloaded_images_in_order() {
-        // Review 4320670165: A at 0x7000 is unloaded and B mapped there. Both stay, B after A.
+    fn the_tracker_keeps_each_occurrence_with_its_span() {
+        // Reviews 4320670165 and 4320761258: A at 0x7000, then B there, then A again. Each is
+        // its own occurrence, in order, with the snapshots it was live in.
         let dir = tempfile::tempdir().unwrap();
         let proc = dir.path().join("proc");
-        let context = "context 9 pid 4 euid 0 egid 0 status runnable cpu 0 running yes active_ns 1 sched_ns 1 name sh\n\
-                       memory private 0 shared 0 kernel 0\n";
-        fs::write(&proc, format!("{context}image 0x7000 path /usr/lib/a.so\n")).unwrap();
         let mut tracker = ImageTracker::new(&proc);
-        tracker.snapshot().unwrap();
-        fs::write(&proc, format!("{context}image 0x7000 path /usr/lib/b.so\n")).unwrap();
-        tracker.snapshot().unwrap();
-        tracker.snapshot().unwrap();
-        let images = parse_images(&proc, &tracker.text()).unwrap();
-        let paths: Vec<&str> = images[&9].iter().map(|i| i.path.as_str()).collect();
-        assert_eq!(paths, ["/usr/lib/a.so", "/usr/lib/b.so"]);
-        assert_eq!(tracker.timing.count, 3);
+        for lib in ["/a.so", "/a.so", "/b.so", "/b.so", "/a.so"] {
+            snapshot_with(&mut tracker, &proc, Some(lib));
+        }
+        // A context without images is not listed, so A is missing from that snapshot and
+        // comes back as a new occurrence.
+        snapshot_with(&mut tracker, &proc, None);
+        snapshot_with(&mut tracker, &proc, Some("/a.so"));
+        assert_eq!(tracker.epoch(), 7);
+        let mut images = parse_images(&proc, &tracker.text()).unwrap();
+        apply_spans(Path::new("spans"), &tracker.spans(), &mut images).unwrap();
+        let seen: Vec<(&str, Live)> = images[&9]
+            .iter()
+            .map(|i| (i.path.as_str(), i.live.unwrap()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("/a.so", Live { first: 0, last: 1 }),
+                ("/b.so", Live { first: 2, last: 3 }),
+                ("/a.so", Live { first: 4, last: 4 }),
+                ("/a.so", Live { first: 6, last: 6 }),
+            ]
+        );
+        assert_eq!(tracker.timing.count, 7);
         assert!(tracker.timing.longest <= tracker.timing.total);
+    }
+
+    #[test]
+    fn a_span_covers_the_batches_around_it() {
+        let live = Live { first: 2, last: 3 };
+        // Batch 2 ran from snapshot 1 to 2 (mapped some time in it); batch 4 from 3 to 4
+        // (unmapped some time in it).
+        let covered: Vec<u32> = (0..7).filter(|&e| live.covers(e)).collect();
+        assert_eq!(covered, [2, 3, 4]);
+    }
+
+    #[test]
+    fn spans_and_batches_are_checked() {
+        let image = |path: &str| LoadedImage {
+            base: 0,
+            path: path.to_owned(),
+            live: None,
+        };
+        let mut images = BTreeMap::from([(9, vec![image("/a"), image("/b")])]);
+        let spans = Path::new("spans");
+        assert!(matches!(
+            apply_spans(spans, "9 0 1\n", &mut images.clone()),
+            Err(ProfileError::SpanCount { context: 9, .. })
+        ));
+        assert!(matches!(
+            apply_spans(spans, "9 0 1\n9 2 3\n4 0 0\n", &mut images.clone()),
+            Err(ProfileError::SpanCount { context: 4, .. })
+        ));
+        for bad in ["9 3 1\n", "9 x 1\n", "9 0 1 2\n", "9 0\n"] {
+            assert!(
+                matches!(
+                    apply_spans(spans, bad, &mut images.clone()),
+                    Err(ProfileError::Dates { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        apply_spans(spans, "9 0 1\n9 2 3\n", &mut images).unwrap();
+        assert_eq!(images[&9][1].live, Some(Live { first: 2, last: 3 }));
+
+        let batches = parse_batches(spans, "1 4 0\n2 9 5\n", 2).unwrap();
+        assert_eq!(batches[1], [Batch { end: 0, epoch: 1 }, Batch { end: 5, epoch: 2 }]);
+        assert!(parse_batches(spans, "1 4\n", 2).is_err());
+        assert!(parse_batches(spans, "x 4 0\n", 2).is_err());
+    }
+
+    #[test]
+    fn samples_take_the_epoch_of_their_batch() {
+        let words = vec![SAMPLE_MAGIC | 4, 1, 1, 9, SAMPLE_MAGIC | 4, 2, 2, 9];
+        let profile = Profile {
+            kernel_text: ControlLine { text_start: 0 },
+            cpus: vec![words],
+            names: BTreeMap::new(),
+            images: BTreeMap::new(),
+            batches: vec![vec![Batch { end: 4, epoch: 1 }, Batch { end: 8, epoch: 3 }]],
+        };
+        let epochs: Vec<_> = profile.samples().map(|s| s.epoch).collect();
+        assert_eq!(epochs, [Some(1), Some(3)]);
     }
 
     #[test]

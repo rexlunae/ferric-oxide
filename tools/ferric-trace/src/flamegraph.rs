@@ -11,7 +11,11 @@
 //! - user addresses from the image of the context's address space that holds them, as
 //!   [`Profile::images`] lists them: the ELF is read from the given root directory (the
 //!   target's file system on the host, such as the cookbook's sysroot) at the image's path,
-//!   and the load bias is taken away.
+//!   and the load bias is taken away. When an image's address was reused during the
+//!   recording (one library unloaded and another, or the same one again, mapped there), the
+//!   sample is resolved against the occurrence that was live at its epoch
+//!   ([`crate::profile::Live::covers`]), and against the newest one that holds the address
+//!   when none was, or the profile does not date its samples.
 //!
 //! Return addresses point after their call, so they are looked up one byte earlier. An address
 //! no symbol covers is shown as `[kernel]`, `[<file name>]` inside a known image, or
@@ -144,7 +148,8 @@ impl Symbolizer {
     /// User ELF files that cannot be read are not an error: their frames show the file name.
     ///
     /// Image paths come from the target and are not trusted: a file is read only when its
-    /// path, with every symbolic link resolved, stays under `root` ([`contained`]).
+    /// path, with every symbolic link resolved, stays under `root`: `..` components are
+    /// refused, and no link is followed out of it.
     pub fn new(
         profile: &Profile,
         kernel: Option<&Path>,
@@ -175,8 +180,15 @@ impl Symbolizer {
         })
     }
 
-    /// The name of the frame at `addr` in a context with `images`; `ret` for a return address.
-    pub fn frame(&mut self, addr: u64, ret: bool, images: &[LoadedImage]) -> String {
+    /// The name of the frame at `addr` in a context with `images` (oldest first), for a
+    /// sample of `epoch` ([`crate::profile::Batch::epoch`]); `ret` for a return address.
+    pub fn frame(
+        &mut self,
+        addr: u64,
+        ret: bool,
+        images: &[LoadedImage],
+        epoch: Option<u32>,
+    ) -> String {
         let lookup = if ret { addr.wrapping_sub(1) } else { addr };
         if addr >= KERNEL_HALF {
             return self
@@ -186,21 +198,31 @@ impl Symbolizer {
                 .unwrap_or("[kernel]")
                 .to_owned();
         }
-        // Newest first: a library mapped where an unloaded one was is the one sampled now.
-        for image in images.iter().rev() {
-            let Some(symbols) = self.user(&image.path) else {
-                continue;
-            };
-            let elf_addr = lookup.wrapping_sub(image.base);
-            if elf_addr < symbols.span.0 || elf_addr >= symbols.span.1 {
-                continue;
+        // The images live when the sample was taken first, then any; newest first in each,
+        // as a library mapped where an unloaded one was is the likelier one.
+        let live = images
+            .iter()
+            .rev()
+            .filter(|image| matches!((image.live, epoch), (Some(live), Some(e)) if live.covers(e)));
+        for image in live.chain(images.iter().rev()) {
+            if let Some(name) = self.in_image(lookup, image) {
+                return name;
             }
-            return match symbols.lookup(elf_addr) {
-                Some(name) => name.to_owned(),
-                None => format!("[{}]", file_name(&image.path)),
-            };
         }
         "[unknown]".to_owned()
+    }
+
+    /// The frame at `lookup` if `image` holds it.
+    fn in_image(&mut self, lookup: u64, image: &LoadedImage) -> Option<String> {
+        let symbols = self.user(&image.path)?;
+        let elf_addr = lookup.wrapping_sub(image.base);
+        if elf_addr < symbols.span.0 || elf_addr >= symbols.span.1 {
+            return None;
+        }
+        Some(match symbols.lookup(elf_addr) {
+            Some(name) => name.to_owned(),
+            None => format!("[{}]", file_name(&image.path)),
+        })
     }
 
     fn user(&mut self, path: &str) -> Option<&Symbols> {
@@ -248,10 +270,10 @@ impl Folded {
     /// Folds every sample of `profile`.
     pub fn new(profile: &Profile, symbolizer: &mut Symbolizer) -> Self {
         let mut folded = Self::default();
-        for (_, sample) in profile.samples() {
-            match sample {
+        for item in profile.samples() {
+            match item.sample {
                 Ok(sample) => {
-                    let stack = stack(profile, symbolizer, &sample);
+                    let stack = stack(profile, symbolizer, &sample, item.epoch);
                     *folded.stacks.entry(stack).or_default() += 1;
                 }
                 Err(_) => folded.bad += 1,
@@ -274,7 +296,12 @@ impl Folded {
     }
 }
 
-fn stack(profile: &Profile, symbolizer: &mut Symbolizer, sample: &Sample<'_>) -> String {
+fn stack(
+    profile: &Profile,
+    symbolizer: &mut Symbolizer,
+    sample: &Sample<'_>,
+    epoch: Option<u32>,
+) -> String {
     let images = profile
         .images
         .get(&sample.context)
@@ -287,7 +314,7 @@ fn stack(profile: &Profile, symbolizer: &mut Symbolizer, sample: &Sample<'_>) ->
     let mut frames: Vec<String> = sample
         .stack()
         .enumerate()
-        .map(|(depth, addr)| symbolizer.frame(addr, depth > 0, images))
+        .map(|(depth, addr)| symbolizer.frame(addr, depth > 0, images, epoch))
         .collect();
     frames.push(root);
     frames.reverse();
@@ -303,6 +330,7 @@ mod tests {
     use ferric_trace::profile::{ControlLine, SAMPLE_MAGIC};
 
     use super::*;
+    use crate::profile::Live;
 
     #[inline(never)]
     fn marker_function() -> u64 {
@@ -331,6 +359,7 @@ mod tests {
             cpus: vec![words],
             names: BTreeMap::from([(7, "prog".to_owned())]),
             images: BTreeMap::from([(7, images)]),
+            batches: Vec::new(),
         }
     }
 
@@ -353,6 +382,7 @@ mod tests {
         let image = LoadedImage {
             base,
             path: path.to_str().expect("UTF-8").to_owned(),
+            live: None,
         };
         let profile = profile(words, slide + text, vec![image]);
         let mut symbolizer = Symbolizer::new(&profile, Some(&path), Some(Path::new("/"))).unwrap();
@@ -395,10 +425,11 @@ mod tests {
         let image = LoadedImage {
             base: 0,
             path: "/no/such/libfoo.so".to_owned(),
+            live: None,
         };
         let profile = profile(Vec::new(), 0, Vec::new());
         let mut symbolizer = Symbolizer::new(&profile, None, Some(Path::new("/"))).unwrap();
-        assert_eq!(symbolizer.frame(0x10, false, &[image]), "[unknown]");
+        assert_eq!(symbolizer.frame(0x10, false, &[image], None), "[unknown]");
     }
 
     #[test]
@@ -459,34 +490,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_newest_image_at_an_address_wins() {
-        // Review 4320670165: `old` was unloaded and `new` mapped at the same base.
+    /// Three hard links (or copies) of the test binary under a root, as `/a`, `/b`, `/c`, and
+    /// the frame name the first byte of its segments gets, which no function covers.
+    fn three_images() -> (tempfile::TempDir, u64) {
         let (exe_path, symbols) = exe();
         let dir = tempfile::tempdir().unwrap();
-        for name in ["old", "new"] {
+        for name in ["a", "b", "c"] {
             let to = dir.path().join(name);
             if fs::hard_link(&exe_path, &to).is_err() {
                 fs::copy(&exe_path, &to).unwrap();
             }
         }
-        let base = 0x5555_0000_0000;
+        (dir, symbols.span.0)
+    }
+
+    fn at(path: &str, live: Option<(u32, u32)>) -> LoadedImage {
+        LoadedImage {
+            base: 0x5555_0000_0000,
+            path: path.to_owned(),
+            live: live.map(|(first, last)| Live { first, last }),
+        }
+    }
+
+    #[test]
+    fn the_newest_image_at_an_address_wins_without_dates() {
+        // Review 4320670165: `a` was unloaded and `b` mapped at the same base.
+        let (dir, start) = three_images();
+        let images = [at("/a", None), at("/b", None)];
+        let profile = profile(Vec::new(), 0, Vec::new());
+        let mut symbolizer = Symbolizer::new(&profile, None, Some(dir.path())).unwrap();
+        let addr = 0x5555_0000_0000 + start;
+        assert_eq!(symbolizer.frame(addr, false, &images, None), "[b]");
+        assert_eq!(symbolizer.frame(addr, false, &images, Some(3)), "[b]");
+    }
+
+    #[test]
+    fn a_sample_resolves_against_the_image_live_at_its_epoch() {
+        // Reviews 4320761258 and 4320761392: `a`, then `b`, then `a` again at one base, and
+        // `c` after them. Old samples keep their own library.
+        let (dir, start) = three_images();
         let images = [
-            LoadedImage {
-                base,
-                path: "/old".to_owned(),
-            },
-            LoadedImage {
-                base,
-                path: "/new".to_owned(),
-            },
+            at("/a", Some((0, 2))),
+            at("/b", Some((4, 6))),
+            at("/a", Some((8, 9))),
+            at("/c", Some((12, 20))),
         ];
         let profile = profile(Vec::new(), 0, Vec::new());
         let mut symbolizer = Symbolizer::new(&profile, None, Some(dir.path())).unwrap();
-        // The file's first byte is in its segments but in no function: the frame names the file.
-        assert_eq!(
-            symbolizer.frame(base + symbols.span.0, false, &images),
-            "[new]"
-        );
+        let addr = 0x5555_0000_0000 + start;
+        let mut name = |epoch| symbolizer.frame(addr, false, &images, Some(epoch));
+        assert_eq!(name(1), "[a]", "before the reuse");
+        assert_eq!(name(5), "[b]", "between the two loads of a");
+        assert_eq!(name(9), "[a]", "A again, after B");
+        assert_eq!(name(15), "[c]");
+        // A batch no occurrence covers (nothing was mapped there in it) falls back to the
+        // newest.
+        assert_eq!(name(11), "[c]");
     }
 }
