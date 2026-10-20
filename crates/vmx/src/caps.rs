@@ -361,7 +361,13 @@ impl Capabilities {
     }
 
     /// Whether the CPU can run guests the hypervisor needs: EPT with 4-level walks and
-    /// write-back tables, VPID, unrestricted guest and MSR bitmaps.
+    /// write-back tables, VPID, unrestricted guest and MSR bitmaps, plus a single-context or
+    /// all-context form of both INVEPT and INVVPID (the kernel flushes with whichever exists,
+    /// preferring single-context).
+    ///
+    /// # Errors
+    ///
+    /// [`CapsError::Missing`] naming the first missing feature.
     pub const fn sufficient(&self) -> Result<(), CapsError> {
         use crate::controls::{primary, secondary};
         if !self
@@ -384,9 +390,19 @@ impl Capabilities {
         {
             return Err(CapsError::Missing { what: Missing::Ept });
         }
+        if !self.ept_vpid.invept_single_context() && !self.ept_vpid.invept_all_context() {
+            return Err(CapsError::Missing {
+                what: Missing::InveptType,
+            });
+        }
         if !self.secondary.supports(secondary::ENABLE_VPID) || !self.ept_vpid.invvpid() {
             return Err(CapsError::Missing {
                 what: Missing::Vpid,
+            });
+        }
+        if !self.ept_vpid.invvpid_single_context() && !self.ept_vpid.invvpid_all_context() {
+            return Err(CapsError::Missing {
+                what: Missing::InvvpidType,
             });
         }
         Ok(())
@@ -403,6 +419,10 @@ pub enum Missing {
     Ept,
     /// VPID and INVVPID.
     Vpid,
+    /// A single-context or all-context INVEPT type.
+    InveptType,
+    /// A single-context or all-context INVVPID type.
+    InvvpidType,
 }
 
 /// Why a CPU's VMX capabilities cannot be used.
@@ -521,6 +541,39 @@ pub(crate) mod tests {
             Capabilities::new(&raw),
             Err(CapsError::RegionSize { .. })
         ));
+    }
+
+    #[test]
+    fn flush_types_are_required() {
+        let check = |clear: &[u32]| {
+            let mut raw = modern();
+            for bit in clear {
+                raw.ept_vpid &= !(1u64 << bit);
+            }
+            Capabilities::new(&raw).expect("decodes").sufficient()
+        };
+        // The instructions are advertised, but none of the invalidation types.
+        assert_eq!(
+            check(&[25, 26]),
+            Err(CapsError::Missing {
+                what: Missing::InveptType
+            })
+        );
+        assert_eq!(
+            check(&[41, 42]),
+            Err(CapsError::Missing {
+                what: Missing::InvvpidType
+            })
+        );
+        assert_eq!(
+            check(&[25, 26, 41, 42]),
+            Err(CapsError::Missing {
+                what: Missing::InveptType
+            })
+        );
+        // Either type of each is enough.
+        assert_eq!(check(&[25, 42]), Ok(()));
+        assert_eq!(check(&[26, 41]), Ok(()));
     }
 
     #[test]

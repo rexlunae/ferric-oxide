@@ -82,16 +82,24 @@ impl CpuidEntry {
     }
 }
 
-/// Checks that `entries` is a valid table: at most [`MAX_ENTRIES`], sorted by (function,
-/// index), no duplicates, and each function either indexed throughout or a single unindexed
-/// entry.
+/// Checks that `entries` is a valid table: at most [`MAX_ENTRIES`], every entry one
+/// [`CpuidEntry::from_bytes`] would accept (an unindexed entry has index 0), sorted by
+/// (function, index), no duplicates, and each function either indexed throughout or a single
+/// unindexed entry.
 ///
 /// # Errors
 ///
-/// [`CpuidError::TooMany`], [`CpuidError::Order`] or [`CpuidError::MixedIndexing`].
+/// [`CpuidError::TooMany`], [`CpuidError::Reserved`], [`CpuidError::Order`] or
+/// [`CpuidError::MixedIndexing`].
 pub fn validate(entries: &[CpuidEntry]) -> Result<(), CpuidError> {
     if entries.len() > MAX_ENTRIES {
         return Err(CpuidError::TooMany);
+    }
+    if entries
+        .iter()
+        .any(|entry| !entry.indexed && entry.index != 0)
+    {
+        return Err(CpuidError::Reserved);
     }
     for pair in entries.windows(2) {
         if pair[0].key() >= pair[1].key() {
@@ -186,6 +194,23 @@ mod tests {
         assert_eq!(
             validate(&[entry(7, None, 0), entry(7, Some(1), 0)]),
             Err(CpuidError::MixedIndexing)
+        );
+        let unindexed_with_index = CpuidEntry {
+            index: 5,
+            ..entry(1, None, 0)
+        };
+        assert_eq!(
+            CpuidEntry::from_bytes(&unindexed_with_index.to_bytes()),
+            Err(CpuidError::Reserved)
+        );
+        assert_eq!(validate(&[unindexed_with_index]), Err(CpuidError::Reserved));
+        assert_eq!(
+            validate(&[
+                entry(0, None, 0),
+                unindexed_with_index,
+                entry(7, Some(0), 0)
+            ]),
+            Err(CpuidError::Reserved)
         );
         let many = [entry(0, None, 0); MAX_ENTRIES + 1];
         assert_eq!(validate(&many), Err(CpuidError::TooMany));

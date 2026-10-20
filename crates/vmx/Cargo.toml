@@ -6,4 +6,4 @@ license = "MIT"
 description = "Intel VMX encodings for the Ferric Oxide hypervisor: VMCS fields, control computation from capability MSRs, exit decoding, EPT entries and guest-state checks"
 
 [dependencies]
-thiserror = { version = "2", default-features = false }
+thiserror.workspace = true

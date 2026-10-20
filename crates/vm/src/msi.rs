@@ -40,6 +40,11 @@ pub struct Msi {
     pub delivery: DeliveryMode,
     /// Level-triggered rather than edge-triggered.
     pub level_triggered: bool,
+    /// The level bit (data bit 14). For a level-triggered message it tells assert (`true`)
+    /// from deassert (`false`): a level-triggered INIT deassert is the "INIT level
+    /// de-assert" message, which the virtual APIC must not treat as an INIT. Edge-triggered
+    /// messages ignore it.
+    pub assert: bool,
 }
 
 impl Msi {
@@ -75,6 +80,7 @@ impl Msi {
             vector: data as u8,
             delivery,
             level_triggered: data & (1 << 15) != 0,
+            assert: data & (1 << 14) != 0,
         })
     }
 }
@@ -119,6 +125,7 @@ mod tests {
                 vector: 0x31,
                 delivery: DeliveryMode::Fixed,
                 level_triggered: false,
+                assert: false,
             }
         );
         let nmi = Msi::decode(0xfee0_100c, 0x4400).expect("valid");
@@ -129,6 +136,13 @@ mod tests {
                 .expect("valid")
                 .level_triggered
         );
+        // A level-triggered INIT: assert and deassert decode differently.
+        let assert = Msi::decode(0xfee0_0000, 0xc500).expect("valid");
+        let deassert = Msi::decode(0xfee0_0000, 0x8500).expect("valid");
+        assert_eq!(assert.delivery, DeliveryMode::Init);
+        assert!(assert.level_triggered && assert.assert);
+        assert!(deassert.level_triggered && !deassert.assert);
+        assert_ne!(assert, deassert);
     }
 
     #[test]
