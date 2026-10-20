@@ -14,14 +14,18 @@
 //!
 //! Little-endian 64-bit words. A header of [`HEADER_WORDS`]: [`MAGIC`], [`VERSION`], the
 //! data length in bytes ([`DATA_BYTES`] for a region of [`REGION_BYTES`]), the number of bytes
-//! ever written this boot, and the boot's sequence number (`0` for the first boot after a
-//! cold one, one more than the previous boot's otherwise). The rest of the header is zero.
+//! ever written this boot, the boot's sequence number (`0` for the first boot after a
+//! cold one, one more than the previous boot's otherwise), and the count the write in
+//! progress will end at (no more than the written count when none is). The rest of the
+//! header is zero.
 //! The data follows, a byte ring: byte `n` of the log (counting from 0) is at data offset
 //! `n % data length`, packed eight to a word, low byte first.
 //!
-//! The written count is stored after the bytes it counts, so a reset in the middle of a
-//! write loses at most that write. The kept text can start in the middle of a line, or of a
-//! UTF-8 sequence, once older bytes have been overwritten.
+//! A write publishes the count it will end at before it stores a byte, and the written count
+//! after the bytes it counts. A reset in the middle of a write therefore loses that write,
+//! and the reader also drops the oldest bytes the write may already have overwritten, so the
+//! text it returns never mixes the two. The kept text can start in the middle of a line, or
+//! of a UTF-8 sequence, once older bytes have been overwritten.
 //!
 //! # Examples
 //!
@@ -45,7 +49,7 @@
 //! ```
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::record::WORD_BYTES;
 
@@ -76,6 +80,7 @@ const VERSION_WORD: usize = 1;
 const DATA_WORD: usize = 2;
 const WRITTEN_WORD: usize = 3;
 const BOOT_WORD: usize = 4;
+const PENDING_WORD: usize = 5;
 
 /// Why a region holds no log, or cannot be armed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +136,8 @@ fn byte(words: &[AtomicU64], pos: usize) -> u8 {
 pub struct Previous {
     boot: u64,
     written: u64,
+    /// Where the write a reset interrupted would have ended, or `written` when none was.
+    pending: u64,
     data_bytes: usize,
 }
 
@@ -155,9 +162,13 @@ impl Previous {
             .ok()
             .filter(|&bytes| bytes > 0 && bytes <= room)
             .ok_or(KlogError::BadLength { data_bytes, room })?;
+        let written = words[WRITTEN_WORD].load(Ordering::Acquire);
+        // Below the written count means no write was in progress (an armed region starts at 0).
+        let pending = words[PENDING_WORD].load(Ordering::Relaxed).max(written);
         Ok(Self {
             boot: words[BOOT_WORD].load(Ordering::Relaxed),
-            written: words[WRITTEN_WORD].load(Ordering::Acquire),
+            written,
+            pending,
             data_bytes,
         })
     }
@@ -173,9 +184,14 @@ impl Previous {
     }
 
     /// The bytes the region still holds: the newest [`Previous::written`], up to its data
-    /// length.
+    /// length, less any that a write a reset interrupted may have overwritten.
     pub fn kept(&self) -> usize {
-        usize::try_from(self.written).map_or(self.data_bytes, |w| w.min(self.data_bytes))
+        let full =
+            usize::try_from(self.written).map_or(self.data_bytes, |w| w.min(self.data_bytes));
+        // The interrupted write stored at most `pending - written` bytes over the oldest ones.
+        let torn = usize::try_from(self.pending - self.written).unwrap_or(usize::MAX);
+        let lost = torn.saturating_sub(self.data_bytes - full);
+        full.saturating_sub(lost)
     }
 
     /// The bytes logged before the kept ones, which the region no longer holds.
@@ -232,9 +248,22 @@ impl<'a> Log<'a> {
 
     /// Appends `bytes` to the log, overwriting the oldest bytes once the region is full.
     pub fn append(&self, bytes: &[u8]) {
+        let written = self.store_bytes(bytes);
+        // After the bytes it counts: a reset before this store loses only this write.
+        self.words[WRITTEN_WORD].store(written, Ordering::Release);
+    }
+
+    /// The first half of [`Log::append`]: publishes where the write will end, then stores the
+    /// bytes, and returns the new written count without publishing it.
+    fn store_bytes(&self, bytes: &[u8]) -> u64 {
         let mut written = self.written();
         // Only the last `data_bytes` of a long write can be kept.
         let skip = bytes.len().saturating_sub(self.data_bytes);
+        let end = written.wrapping_add(bytes.len() as u64);
+        // Before any byte: a reader after a reset here knows which old bytes may be gone.
+        self.words[PENDING_WORD].store(end, Ordering::Relaxed);
+        // Orders the pending count before the byte stores below.
+        fence(Ordering::Release);
         written = written.wrapping_add(skip as u64);
         for &b in &bytes[skip..] {
             // `written % data_bytes` is below `data_bytes`, which fits in a usize.
@@ -248,13 +277,86 @@ impl<'a> Log<'a> {
             );
             written = written.wrapping_add(1);
         }
-        // After the bytes it counts: a reset before this store loses only this write.
-        self.words[WRITTEN_WORD].store(written, Ordering::Release);
+        written
     }
 
     /// The bytes appended since the region was armed.
     pub fn written(&self) -> u64 {
         self.words[WRITTEN_WORD].load(Ordering::Relaxed)
+    }
+}
+
+/// A fixed-size byte ring for the log the kernel writes before it has a heap, and so before
+/// its in-memory log exists. It needs no allocation, so it can be a `static`; once the
+/// in-memory log exists the kernel moves the kept bytes into it, and from there into the
+/// persistent log.
+///
+/// Like [`Log`], it keeps the newest `N` bytes, and it is not synchronized: one writer at a
+/// time (the kernel uses it under the lock of its in-memory log).
+///
+/// # Examples
+///
+/// ```
+/// use ferric_trace::klog::EarlyLog;
+///
+/// let mut early = EarlyLog::<8>::new();
+/// early.push(b"0123456789");
+/// let (older, newer) = early.slices();
+/// assert_eq!([older, newer].concat(), b"23456789");
+/// assert_eq!(early.dropped(), 2);
+/// ```
+#[derive(Debug)]
+pub struct EarlyLog<const N: usize> {
+    bytes: [u8; N],
+    written: usize,
+}
+
+impl<const N: usize> EarlyLog<N> {
+    /// An empty buffer.
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            written: 0,
+        }
+    }
+
+    /// Appends `bytes`, overwriting the oldest ones once `N` are kept.
+    pub fn push(&mut self, bytes: &[u8]) {
+        if N == 0 {
+            self.written = self.written.saturating_add(bytes.len());
+            return;
+        }
+        let skip = bytes.len().saturating_sub(N);
+        self.written = self.written.saturating_add(skip);
+        for &b in &bytes[skip..] {
+            self.bytes[self.written % N] = b;
+            self.written = self.written.saturating_add(1);
+        }
+    }
+
+    /// The kept bytes, oldest first, as two slices to be read one after the other.
+    pub fn slices(&self) -> (&[u8], &[u8]) {
+        if N == 0 || self.written <= N {
+            return (&self.bytes[..self.written.min(N)], &[]);
+        }
+        let start = self.written % N;
+        (&self.bytes[start..], &self.bytes[..start])
+    }
+
+    /// The bytes pushed before the kept ones, which the buffer no longer holds.
+    pub fn dropped(&self) -> usize {
+        self.written.saturating_sub(N)
+    }
+
+    /// Empties the buffer.
+    pub fn clear(&mut self) {
+        self.written = 0;
+    }
+}
+
+impl<const N: usize> Default for EarlyLog<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -359,6 +461,84 @@ mod tests {
         words[DATA_WORD].store(DATA_BYTES as u64, Ordering::Relaxed);
         words[VERSION_WORD].store(9, Ordering::Relaxed);
         assert_eq!(Previous::find(&words), Err(KlogError::Version(9)));
+    }
+
+    #[test]
+    fn a_reset_mid_wrap_keeps_only_untouched_bytes() {
+        // The example from review: a full 16-byte ring, then `WXYZ` lands on slots 0-3 and
+        // the machine resets before the count is published.
+        let words = region(HEADER_WORDS + 2);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"0123456789abcdef");
+        log.store_bytes(b"WXYZ");
+        let (previous, text) = read(&words);
+        assert_eq!(text, b"456789abcdef");
+        assert_eq!((previous.written(), previous.overwritten()), (16, 4));
+    }
+
+    #[test]
+    fn a_reset_before_the_ring_is_full_loses_nothing_old() {
+        let words = region(HEADER_WORDS + 2);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"0123456789");
+        // Six free slots take the first six bytes; the last two overwrite `01`.
+        log.store_bytes(b"ABCDEFGH");
+        assert_eq!(read(&words).1, b"23456789");
+    }
+
+    #[test]
+    fn a_reset_in_a_write_longer_than_the_ring_keeps_nothing() {
+        let words = region(HEADER_WORDS + 1);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"abcdefgh");
+        log.store_bytes(b"0123456789");
+        let (previous, text) = read(&words);
+        assert_eq!((previous.written(), text.len()), (8, 0));
+    }
+
+    #[test]
+    fn a_published_write_clears_the_pending_count() {
+        let words = region(HEADER_WORDS + 2);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"0123456789abcdef");
+        log.append(b"WXYZ");
+        assert_eq!(read(&words).1, b"456789abcdefWXYZ");
+    }
+
+    fn early_text<const N: usize>(early: &EarlyLog<N>) -> Vec<u8> {
+        let (older, newer) = early.slices();
+        [older, newer].concat()
+    }
+
+    #[test]
+    fn the_early_log_keeps_the_newest_bytes_in_order() {
+        let mut early = EarlyLog::<8>::new();
+        assert_eq!(early_text(&early), b"");
+        early.push(b"abc");
+        early.push(b"def");
+        assert_eq!(
+            (early_text(&early), early.dropped()),
+            (b"abcdef".to_vec(), 0)
+        );
+        early.push(b"ghij");
+        assert_eq!(
+            (early_text(&early), early.dropped()),
+            (b"cdefghij".to_vec(), 2)
+        );
+        early.push(b"0123456789XY");
+        assert_eq!(
+            (early_text(&early), early.dropped()),
+            (b"456789XY".to_vec(), 14)
+        );
+        early.clear();
+        assert_eq!(early_text(&early), b"");
+    }
+
+    #[test]
+    fn an_empty_early_log_keeps_nothing() {
+        let mut early = EarlyLog::<0>::new();
+        early.push(b"abc");
+        assert_eq!((early_text(&early), early.dropped()), (Vec::new(), 3));
     }
 
     #[test]

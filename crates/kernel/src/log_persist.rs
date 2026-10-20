@@ -6,6 +6,9 @@
 //! ([`crate::reserved`]), and copies everything it logs there as well as to its in-memory log,
 //! so after a warm reboot the next boot finds the end of the previous boot's log:
 //!
+//! - [`early`], from `Writer::write` before the heap and the in-memory log exist, keeps the
+//!   newest [`EARLY_BYTES`] logged in a static buffer, and [`take_early`], from `log::init`,
+//!   moves them into the new in-memory log, so the lines of early boot reach the region too.
 //! - [`reserve`], during memory setup, takes the region out of the free memory.
 //! - [`init`], in `kmain`, copies the log the previous boot left to the heap (the `sys`
 //!   scheme's `log_previous` file serves it), arms the region for this boot, and copies the
@@ -15,8 +18,8 @@
 
 use alloc::{sync::Arc, vec};
 
-use ferric_trace::klog::{Log, Previous, REGION_BYTES};
-use spin::Once;
+use ferric_trace::klog::{EarlyLog, Log, Previous, REGION_BYTES};
+use spin::{Mutex, Once};
 
 use crate::reserved::Region;
 
@@ -32,6 +35,28 @@ static LOG: Once<Log<'static>> = Once::new();
 
 /// The log the previous boot left, if any.
 static PREVIOUS: Once<Arc<[u8]>> = Once::new();
+
+/// The bytes of early boot [`EARLY`] keeps: far more than the kernel logs before its heap.
+const EARLY_BYTES: usize = 16 * 1024;
+
+/// What the kernel logged before its in-memory log existed, until `log::init` takes it.
+static EARLY: Mutex<EarlyLog<EARLY_BYTES>> = Mutex::new(EarlyLog::new());
+
+/// Keeps `bytes`, logged before the in-memory log exists. Called by `Writer::write` with the
+/// in-memory log's lock held.
+pub fn early(bytes: &[u8]) {
+    EARLY.lock().push(bytes);
+}
+
+/// Moves what [`early`] kept into `log`, the new in-memory log, oldest first. Called by
+/// `log::init` with the in-memory log's lock held, so no line comes between.
+pub fn take_early(log: &mut crate::log::Log) {
+    let mut early = EARLY.lock();
+    let (older, newer) = early.slices();
+    log.write(older);
+    log.write(newer);
+    early.clear();
+}
 
 /// The region's physical address: `log.persist_base` (the build script checked it is a
 /// page-aligned number), or [`DEFAULT_BASE`].

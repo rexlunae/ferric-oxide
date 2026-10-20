@@ -7,7 +7,16 @@ use crate::devices::graphical_debug::{DebugDisplay, DEBUG_DISPLAY};
 pub static LOG: Mutex<Option<Log>> = Mutex::new(None);
 
 pub fn init() {
-    *LOG.lock() = Some(Log::new(1024 * 1024));
+    let mut guard = LOG.lock();
+    let log = Log::new(1024 * 1024);
+    // Ferric Oxide: what was logged before the heap existed (`kernel.log_persist`).
+    #[cfg(feature = "log_persist")]
+    let log = {
+        let mut log = log;
+        crate::log_persist::take_early(&mut log);
+        log
+    };
+    *guard = Some(log);
 }
 
 pub struct Log {
@@ -58,6 +67,11 @@ impl<'a> Writer<'a> {
     pub fn write(&mut self, buf: &[u8], preserve: bool) {
         if preserve && let Some(ref mut log) = *self.log {
             log.write(buf);
+        }
+        // Ferric Oxide: keep what is logged before the heap exists (`kernel.log_persist`).
+        #[cfg(feature = "log_persist")]
+        if preserve && self.log.is_none() {
+            crate::log_persist::early(buf);
         }
 
         if let Some(display) = &mut *self.display {

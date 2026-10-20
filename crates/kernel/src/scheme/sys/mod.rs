@@ -113,6 +113,13 @@ const FILES: &[(&str, Kind)] = &[
     ),
 ];
 
+/// Ferric Oxide: files only root may open, for reading too. Upstream lets anyone read `log`;
+/// `log_previous` holds a whole earlier boot, panics included, so it is root-only.
+const ROOT_ONLY: &[&str] = &[
+    #[cfg(feature = "log_persist")]
+    "log_previous",
+];
+
 impl KernelScheme for SysScheme {
     fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
         let id = HANDLES.write(token.token()).insert(Handle::SchemeRoot);
@@ -143,7 +150,7 @@ impl KernelScheme for SysScheme {
                 .find(|(entry_path, _)| *entry_path == path)
                 .ok_or(Error::new(ENOENT))?;
 
-            if matches!(entry.1, Wr(_)) && ctx.uid != 0 {
+            if (matches!(entry.1, Wr(_)) || ROOT_ONLY.contains(&entry.0)) && ctx.uid != 0 {
                 return Err(Error::new(EPERM));
             }
 

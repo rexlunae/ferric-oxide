@@ -928,6 +928,7 @@ pub fn main() -> ExitCode {
     // `ferric-trace-test crash` runs the crash-dump step alone (see `crash`).
     let steps = match std::env::args().nth(1).as_deref() {
         Some("crash") => crash::run,
+        Some(crash::DENIED_COMMAND) => return crash::denied(),
         _ => run,
     };
     match steps() {

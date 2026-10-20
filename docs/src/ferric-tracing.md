@@ -492,12 +492,18 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   lines for the dump, the reset and the dump found, and exactly two boots.
 - **Persistent log.** `cargo test -p ferric-trace` appends to a region and
   reads it back: order, wrap-around, a write longer than the region, re-arming,
-  short copies and headers that do not fit. Every image in `image.yml` has
+  short copies, headers that do not fit, and a reset in the middle of a write
+  (before the ring is full, while it wraps, and in a write longer than the
+  ring). It also tests the early-boot buffer. Every image in `image.yml` has
   `log_persist = true`. The boot job requires the region's `boot 0` line and no
   previous log. In the `crash` job, the second boot must log `boot 1` and the
   previous boot's log, and `ferric-trace-test crash` checks that
-  `/scheme/sys/log_previous` holds the test panic's `KERNEL PANIC` lines
-  (`FERRIC_TEST_PASS log-previous`).
+  `/scheme/sys/log_previous` holds the test panic's `KERNEL PANIC` lines, and
+  that this boot's `/scheme/sys/log` (and the previous boot's log, unless it
+  wrapped) holds `Redox OS starting`, which the kernel logs before its heap
+  exists (`FERRIC_TEST_PASS log-previous`). It then runs itself again as a
+  user other than root, which must get `EPERM` opening the file
+  (`FERRIC_TEST_PASS log-previous-root-only`).
 
 ## Persistent kernel log
 
@@ -513,14 +519,24 @@ need tracing.
   a region that is not wholly free RAM, or that overlaps the crash region,
   turns the feature off with a warning.
 - **The format** (`ferric_trace::klog`): a header of eight words (magic
-  `FOKLOG01`, version 1, the data length, the bytes written this boot and the
-  boot's sequence number), then a byte ring. The written count is stored after
-  the bytes, so a reset in the middle of a write loses only that write. Once
-  the ring is full the newest bytes replace the oldest, so the kept text can
-  start in the middle of a line.
+  `FOKLOG01`, version 1, the data length, the bytes written this boot, the
+  boot's sequence number and the count the write in progress will end at),
+  then a byte ring. A write stores the count it will end at before its bytes
+  and the written count after them. After a reset in the middle of a write,
+  the reader drops that write and the oldest bytes it may have overwritten,
+  so the text never mixes old and new bytes. Once the ring is full the newest
+  bytes replace the oldest, so the kept text can start in the middle of a
+  line.
 - **This boot.** `Log::write`, under the in-memory log's lock, appends every
-  byte to the region. `kmain` arms the region early, copying the in-memory log
-  so far, so the region holds the whole boot until it wraps.
+  byte to the region. Before the heap exists there is no in-memory log, so the
+  kernel keeps what it logs (the newest 16 KiB) in a static buffer,
+  `ferric_trace::klog::EarlyLog`, and `log::init` moves it into the new
+  in-memory log. `kmain` then arms the region, copying the in-memory log so
+  far, so the region holds the whole boot, early lines included, until it
+  wraps. With the feature, `/scheme/sys/log` holds the early lines too.
+- **Who can read it.** Only root can open `/scheme/sys/log_previous`
+  (`EPERM` otherwise). Upstream lets anyone read `/scheme/sys/log`, but the
+  previous boot's log holds a whole boot, panics included.
 - **The next boot.** Before arming, `kmain` copies what the previous boot left
   to the heap and logs `log: the previous boot's log (<n> bytes) is in
   /scheme/sys/log_previous`. That file serves the copy until the next reboot

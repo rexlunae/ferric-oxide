@@ -14,16 +14,20 @@
 //!   machine picks the same clock), and that its records hold the marker `write` and the
 //!   `write` of `panic` that ended the first boot. With `kernel.log_persist`, `log-previous`
 //!   then checks that the previous boot's kernel log ([`PREVIOUS_PATH`]) ends with that
-//!   panic.
+//!   panic and, when it did not wrap, the line the kernel logs before it has a heap
+//!   ([`EARLY_LINE`], which this boot's `/scheme/sys/log` must hold too), and
+//!   `log-previous-root-only` that a process that is not root cannot open it.
 
+use std::ffi::c_int;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::process::{Command, ExitCode};
 
 use ferric_trace::abi::{CLOCK_PATH, CRASH_PATH, CRASH_TEST_COMMAND};
 use ferric_trace::clock::ClockLine;
 use ferric_trace::crash::Dump;
 use ferric_trace::kernel::{CATALOG, SYSCALL_ENTER};
-use ferric_trace::klog::PREVIOUS_PATH;
+use ferric_trace::klog::{DATA_BYTES, PREVIOUS_PATH};
 use ferric_trace::record::Records;
 use syscall::{EBADF, SYS_WRITE};
 
@@ -33,6 +37,12 @@ use super::{
 
 /// The length of the marker `write` before the panic.
 const CRASH_MARK_LEN: usize = 1931;
+
+/// A line the kernel logs before its heap and in-memory log exist.
+const EARLY_LINE: &str = "Redox OS starting";
+
+/// This boot's in-memory kernel log.
+const LOG_PATH: &str = "/scheme/sys/log";
 
 /// What the kernel panics with in the crash test.
 const TEST_PANIC: &str = "ferric-trace crash test";
@@ -181,12 +191,95 @@ fn previous_log() -> Result<(), Failure> {
             format!("the logged panic is not the test's: {lines:?}"),
         ));
     };
+    let early = early_lines(step, &log)?;
     println!(
-        "FERRIC_TEST_PASS log-previous ({} bytes, {})",
+        "FERRIC_TEST_PASS log-previous ({} bytes, {}; {early})",
         log.len(),
         message.trim()
     );
-    Ok(())
+    root_only()
+}
+
+/// Checks that the kernel kept what it logged before its heap existed: this boot's log holds
+/// [`EARLY_LINE`], and so does `previous` unless it wrapped. Returns what it checked.
+fn early_lines(step: &'static str, previous: &str) -> Result<&'static str, Failure> {
+    let this_boot = std::fs::read(LOG_PATH).map_err(io_failure(step, LOG_PATH))?;
+    if !String::from_utf8_lossy(&this_boot).contains(EARLY_LINE) {
+        return Err(check(
+            step,
+            format!("this boot's {LOG_PATH} has no {EARLY_LINE:?} line from before the heap"),
+        ));
+    }
+    if previous.len() >= DATA_BYTES {
+        return Ok("early lines kept this boot; the previous log wrapped");
+    }
+    if !previous.contains(EARLY_LINE) {
+        return Err(check(
+            step,
+            format!(
+                "the previous boot's {} bytes of log have no {EARLY_LINE:?} line",
+                previous.len()
+            ),
+        ));
+    }
+    Ok("early lines kept")
+}
+
+/// The argument that runs [`denied`] in a child.
+pub const DENIED_COMMAND: &str = "log-previous-denied";
+
+/// The user [`denied`] switches to: anyone but root.
+const UNPRIVILEGED_UID: c_int = 1000;
+
+/// The exit code of a [`denied`] child that could open the file.
+const OPENED: u8 = 2;
+
+unsafe extern "C" {
+    // relibc's `setresuid(3)`.
+    fn setresuid(ruid: c_int, euid: c_int, suid: c_int) -> c_int;
+}
+
+/// `log-previous-root-only`: runs this program again as [`DENIED_COMMAND`], which drops root
+/// and must be refused [`PREVIOUS_PATH`].
+fn root_only() -> Result<(), Failure> {
+    let step = "log-previous-root-only";
+    let exe = std::env::current_exe().map_err(io_failure(step, "the test's own path"))?;
+    let status = Command::new(&exe)
+        .arg(DENIED_COMMAND)
+        .status()
+        .map_err(io_failure(step, "a child test"))?;
+    match status.code() {
+        Some(0) => {
+            println!("FERRIC_TEST_PASS log-previous-root-only (uid {UNPRIVILEGED_UID} is refused)");
+            Ok(())
+        }
+        Some(code) if code == i32::from(OPENED) => Err(check(
+            step,
+            format!("uid {UNPRIVILEGED_UID} could open {PREVIOUS_PATH}"),
+        )),
+        _ => Err(check(step, format!("the child test failed: {status}"))),
+    }
+}
+
+/// The child of `log-previous-root-only`: drops root, then exits 0 when opening
+/// [`PREVIOUS_PATH`] is refused, [`OPENED`] when it is not, and 1 when it cannot run the check.
+pub fn denied() -> ExitCode {
+    // SAFETY: `setresuid` takes plain integers and changes only this process's user IDs.
+    if unsafe { setresuid(UNPRIVILEGED_UID, UNPRIVILEGED_UID, UNPRIVILEGED_UID) } != 0 {
+        println!(
+            "log-previous-denied: setresuid({UNPRIVILEGED_UID}): {}",
+            io::Error::last_os_error()
+        );
+        return ExitCode::FAILURE;
+    }
+    match std::fs::File::open(PREVIOUS_PATH) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(OPENED),
+        Err(err) => {
+            println!("log-previous-denied: {PREVIOUS_PATH}: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The records at the start of `bytes` that decode as kernel events; the other CPUs ran on
