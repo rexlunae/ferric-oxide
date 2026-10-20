@@ -34,8 +34,8 @@ use syscall::CallFlags;
 use syscall::error::{ENODEV, ENOENT};
 
 use crate::abi::{
-    ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordError, RecordPages,
-    Request, SCHEME_NAME,
+    Generation, ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordError,
+    RecordPages, Request, SCHEME_NAME,
 };
 
 /// The first metadata word of a call that forwards queue records to the file system's own
@@ -282,35 +282,55 @@ impl Object {
         })
     }
 
-    /// Answers the fill of `pages` with their bytes, `pages.count()` whole pages (zero past
-    /// the end of the file).
+    /// Answers the fill record of `pages` in `generation` (both copied from the record) with
+    /// their bytes, `pages.count()` whole pages (zero past the end of the file).
     ///
     /// # Errors
     ///
     /// [`ClientError::Call`] when the kernel refuses (the pages are not being filled, the
-    /// payload has the wrong length, or there is no memory for it).
-    pub fn filled(&self, pages: RecordPages, bytes: &[u8]) -> Result<(), ClientError> {
+    /// record was for an earlier object with this ID, the payload has the wrong length, or
+    /// there is no memory for it).
+    pub fn filled(
+        &self,
+        pages: RecordPages,
+        generation: Generation,
+        bytes: &[u8],
+    ) -> Result<(), ClientError> {
         let outcome = Outcome::Done;
         send(
             &self.fd,
             Call::Filled,
-            Request::Filled { pages, outcome },
+            Request::Filled {
+                pages,
+                outcome,
+                generation,
+            },
             bytes,
         )
     }
 
-    /// Answers the fill of `pages` as failed with `errno`: the readers waiting for them get
-    /// `EIO`, and the next read fills again.
+    /// Answers the fill record of `pages` in `generation` as failed with `errno`: the readers
+    /// waiting for them get `EIO`, and the next read fills again.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Call`] when the kernel refuses (the pages are not being filled).
-    pub fn fill_failed(&self, pages: RecordPages, errno: NonZeroU16) -> Result<(), ClientError> {
+    /// [`ClientError::Call`] when the kernel refuses (the pages are not being filled, or the
+    /// record was for an earlier object with this ID).
+    pub fn fill_failed(
+        &self,
+        pages: RecordPages,
+        generation: Generation,
+        errno: NonZeroU16,
+    ) -> Result<(), ClientError> {
         let outcome = Outcome::Failed(errno);
         send(
             &self.fd,
             Call::Filled,
-            Request::Filled { pages, outcome },
+            Request::Filled {
+                pages,
+                outcome,
+                generation,
+            },
             &[],
         )
     }

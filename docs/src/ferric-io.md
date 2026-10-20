@@ -569,7 +569,10 @@ How a file system uses it:
 
 1. It opens `/scheme/kernel.pcache/queue` (root only) and binds the queue to
    its own scheme with `Bind`, passing its scheme socket as a `CallFlags::FD`
-   descriptor. The queue then serves only that scheme's descriptions.
+   descriptor. The queue then serves only that scheme's descriptions. Only the
+   process that opened the queue can use it or its objects, binding included:
+   calls from any other process, including a child that inherited the
+   descriptors, get `EPERM`.
 2. It opens `object/<hex id>` from the queue for each file it caches (an empty
    object, `EEXIST` if the ID is in use), sets its size with `SetSize`, and
    attaches each client description it opens with `Attach`, naming the handle
@@ -584,14 +587,25 @@ How a file system uses it:
    object: the pages' bytes as the payload, zero past the end of the file,
    which the kernel copies into new frames. A failed answer carries a non-zero
    errno and an empty payload; the readers waiting for those pages get `EIO`,
-   and the next read fills them again.
-5. When the file system changes a file's bytes itself (it served a write or a
+   and the next read fills them again. A reader that was already waiting when
+   the fill failed gets `EIO` even if a newer read has queued a new fill
+   for the page by the time it wakes. Every record carries the
+   object's 64-bit generation, which is new each time an object is opened and
+   never repeats on a queue, and its answer must repeat it: an answer to a
+   record of an earlier object with the same ID gets `ESTALE`. A queue read
+   that faults copying records out puts back those of objects still open and
+   reports `EVENT_READ` again.
+5. Shrinking an object with `SetSize` drops the cached pages past the new end,
+   including the page the end now falls in, so a later read fills it again
+   with zeros past the end, and forgets failed fills past the end.
+6. When the file system changes a file's bytes itself (it served a write or a
    truncation), it calls `Invalidate` on the object with the pages that
    changed, then `SetSize`, before it replies. The cached copies are dropped;
    a fill in flight over them is stale, so its answer is not taken and its
    readers fill again. A read after a write therefore sees the new bytes.
-6. Closing a description detaches it. Closing an object or its queue ends the
-   cache of it: outstanding fills fail with `EIO`, and later reads of its
+7. Closing a description detaches it. Closing an object or its queue ends the
+   cache of it: outstanding fills fail with `EIO`, its records still on the
+   queue are dropped, and later reads of its
    descriptions go to the file system's scheme as before.
 
 Every call fits the three metadata words the kernel passes a kernel scheme.
@@ -601,7 +615,8 @@ holds the policies, host-tested:
 - `abi`: the scheme's paths, the `SYS_CALL` requests on queues and objects,
   and the fill-queue records. A record names 1 to `MAX_RECORD_PAGES` (1024)
   pages, which `RecordPages` enforces; longer runs are split. An answer is
-  `[verb, first page, count | errno << 32]` on the object the record named.
+  `[verb | count << 16 | errno << 32, first page, generation]` on the object
+  the record named.
 - `page`: the state of one cached page and the transitions fills, writes,
   writeback and truncation make.
 - `object` (with the `alloc` feature): one object's page index, which turns a
@@ -618,7 +633,9 @@ RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
 mounts and the kernel has the scheme. Each regular file with a description
 opened `O_RDONLY` gets an object (the node ID is the object ID), and those
 descriptions are attached; writers, directories, `mmap` and `fstat` stay with
-RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme as a
+RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
+description it makes from the scheme socket, since RedoxFS runs in the null
+namespace once mounted and cannot open its own path) as a
 call, so the main loop answers them in order with the writes it serves,
 reading the pages the way a `read` does (after decompression and decryption,
 and from a mapped buffer when there is one). Writes, appends, `ftruncate` and
@@ -629,9 +646,11 @@ through the mapping change its bytes without a write call.
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
-miss, a hit with no scheme read, readahead, a failed fill, invalidation (with a
-stale fill answered with the wrong bytes) and a closed queue, and prints the
-time of a cached 4 KiB `pread` next to the same read through the scheme. Then,
+miss, a hit with no scheme read, readahead, a failed fill, records put back
+after a faulting queue read, the owner check, invalidation (with a stale fill
+answered with the wrong bytes), generations across a reopened object, and a
+closed queue, and prints the time of a cached 4 KiB `pread` next to the same
+read through the scheme. Then,
 on RedoxFS, it checks that a read-only description sees writes, a write past
 the end and truncations made through another one, and benchmarks warm 4 KiB
 `pread`s and 1 MiB sequential reads of one file through a read-only

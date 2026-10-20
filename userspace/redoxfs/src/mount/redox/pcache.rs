@@ -26,11 +26,10 @@ use std::sync::Arc;
 
 use ferric_pcache::abi::{ObjectId, Record, PAGE_SIZE};
 use ferric_pcache::client::{self, ClientError, Object, Queue, FORWARDED_RECORDS};
-use libredox::flag::{O_CLOEXEC, O_RDONLY, O_RDWR};
 use libredox::Fd;
 use redox_scheme::Socket;
 use syscall::error::EIO;
-use syscall::flag::MapFlags;
+use syscall::flag::{MapFlags, O_RDWR};
 use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
@@ -114,7 +113,7 @@ impl PageCache {
         // is mounted, and the root file system is not reachable by name until then anyway.
         // A description the socket makes of its own scheme needs no namespace.
         let own = socket
-            .create_this_scheme_fd(0, PUMP_HANDLE, O_RDWR | O_CLOEXEC, 0)
+            .create_this_scheme_fd(0, PUMP_HANDLE, O_RDWR, 0)
             .map_err(StartError::OwnHandle)?;
         let own = Fd::new(own);
         queue.bind(socket.inner().raw())?;
@@ -264,7 +263,11 @@ impl PageCache {
     pub fn fill<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, records: &[u8]) {
         for record in Record::decode_all(records) {
             match record {
-                Ok(Record::Fill { object, pages }) => {
+                Ok(Record::Fill {
+                    object,
+                    generation,
+                    pages,
+                }) => {
                     let Ok(node_id) = u32::try_from(object.get()) else {
                         continue;
                     };
@@ -279,11 +282,11 @@ impl PageCache {
                     let offset = range.first() * PAGE_SIZE;
                     let read = read_pages(fs, fmaps, node_id, offset, &mut self.buf);
                     let answer = match read {
-                        Ok(()) => cached.object.filled(pages, &self.buf),
+                        Ok(()) => cached.object.filled(pages, generation, &self.buf),
                         Err(err) => {
                             let errno = u16::try_from(err.errno).ok().and_then(NonZeroU16::new);
                             let errno = errno.unwrap_or(NonZeroU16::new(EIO as u16).expect("EIO"));
-                            cached.object.fill_failed(pages, errno)
+                            cached.object.fill_failed(pages, generation, errno)
                         }
                     };
                     if let Err(err) = answer {
