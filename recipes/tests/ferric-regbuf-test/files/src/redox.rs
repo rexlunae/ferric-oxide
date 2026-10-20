@@ -30,6 +30,7 @@ const FILL_BYTE: u8 = 0x42;
 /// The errno values the test expects, as relibc numbers them.
 mod errno {
     pub const EPERM: usize = 1;
+    pub const EINTR: usize = 4;
     pub const EIO: usize = 5;
     pub const EFAULT: usize = 14;
     pub const EBUSY: usize = 16;

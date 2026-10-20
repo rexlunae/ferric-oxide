@@ -1323,6 +1323,10 @@ name = "ferric-hwrand"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-iobench"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-iommu"
 version = "0.1.0"
 dependencies = [
