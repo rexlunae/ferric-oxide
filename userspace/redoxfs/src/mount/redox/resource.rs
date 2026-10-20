@@ -889,15 +889,25 @@ impl Drop for FileResource {
 impl range_tree::Value for Fmap {
     type K = u64;
 
+    // Ferric Oxide: ranges of different versions are not merged, or a range read before a
+    // write would take the newer version of its neighbour and be served as current.
     fn try_merge_forward(self, other: &Self) -> core::result::Result<Self, Self> {
-        if self.rc == other.rc && self.flags == other.flags && self.last_page_tail == 0 {
+        if self.rc == other.rc
+            && self.flags == other.flags
+            && self.version == other.version
+            && self.last_page_tail == 0
+        {
             Ok(self)
         } else {
             Err(self)
         }
     }
     fn try_merge_backwards(self, other: &Self) -> core::result::Result<Self, Self> {
-        if self.rc == other.rc && self.flags == other.flags && other.last_page_tail == 0 {
+        if self.rc == other.rc
+            && self.flags == other.flags
+            && self.version == other.version
+            && other.last_page_tail == 0
+        {
             Ok(self)
         } else {
             Err(self)
