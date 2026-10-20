@@ -26,6 +26,7 @@ use ferric_netq::umem::{Frame, FrameError, FrameSize, Umem};
 use ferric_regbuf::abi::{
     Access, BytesError, GrantInfo, GrantSpec, REGION_PATH, Request as RegbufRequest, SCHEME_NAME,
 };
+use ferric_ring::Entry;
 use ferric_ring::queue::{PushError, RingError};
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR};
@@ -81,6 +82,14 @@ const NETSTACK_FRAME: usize = 14 + 20 + 8 + BENCH_PAYLOAD.len();
 const BENCH_LIMIT: Duration = Duration::from_secs(60);
 /// The discard port (RFC 863), where the benchmark sends.
 const DISCARD_PORT: u16 = 9;
+/// A second port, which a netstack socket bound to every address must not give.
+const UNSPECIFIED_PORT: u16 = 47354;
+/// The echoes each side of the latency benchmark times.
+const LATENCY_ECHOES: u16 = 200;
+/// How long one timed echo may take before it counts as lost.
+const LATENCY_WAIT: Duration = Duration::from_secs(1);
+/// The first sequence number of the bypass latency echoes; the netstack ones follow.
+const LATENCY_SEQ: u16 = 1000;
 
 /// Why a step failed.
 #[derive(Debug)]
@@ -361,11 +370,13 @@ fn own(fd: &Fd, raw: usize) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A filter for UDP to `port`.
-fn udp_port(port: u16) -> MatchSpec {
+/// A filter for UDP to `addr` port `port`. Owned ports name one address, so a filter that
+/// takes a port's traffic must name it too.
+fn udp_port(addr: Ipv4Addr, port: u16) -> MatchSpec {
     MatchSpec {
         ip_protocol: Some(IP_PROTOCOL_UDP),
         dst_port: Some(port),
+        dst_addr: Some(IpAddr::V4(addr)),
         ..MatchSpec::default()
     }
 }
@@ -521,6 +532,36 @@ impl Socket {
         Ok(sent)
     }
 
+    /// Puts raw TX entries, `[offset, length and flags]` words as the ABI lays them out, on
+    /// TX and kicks once. Returns how many the driver sent.
+    fn send_slots(&mut self, buffer: &Buffer, slots: &[[u64; 2]]) -> Result<u64, Failure> {
+        for slot in slots {
+            self.rings
+                .tx
+                .push(buffer.rings(), &PacketSlot::from_words(slot))
+                .map_err(|source| Failure::Push { ring: "TX", source })?;
+        }
+        let sent = queue_call(&self.fd, "Kick", QueueRequest::Kick, &[])? as u64;
+        self.sent += sent;
+        Ok(sent)
+    }
+
+    /// How many entries are on Completion now, which it takes off; for entries the test put
+    /// on TX that were not frames of its own.
+    fn completed(&mut self, buffer: &Buffer) -> Result<usize, Failure> {
+        let mut n = 0;
+        while self
+            .rings
+            .completion
+            .pop(buffer.rings())
+            .map_err(Failure::Ring)?
+            .is_some()
+        {
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// TX frames not on TX, once Completion is drained.
     fn free_tx(&mut self, buffer: &Buffer) -> Result<usize, Failure> {
         self.reclaim(buffer)?;
@@ -663,6 +704,8 @@ struct Test {
     gateway_mac: [u8; 6],
     /// The ARP filter's ID, once added.
     arp_filter: Option<FilterId>,
+    /// The ICMP filter's ID, from the ping step.
+    icmp_filter: Option<FilterId>,
     /// The DNS server netstack is configured with.
     dns: Ipv4Addr,
     /// The second socket, from the own step.
@@ -687,8 +730,21 @@ impl Test {
         dst_port: u16,
         payload: &[u8],
     ) -> Result<Vec<u8>, Failure> {
+        self.udp_frame_from(src_mac, self.ip, src_port, to, dst_port, payload)
+    }
+
+    /// [`udp_frame`](Self::udp_frame) from source address `src_ip`.
+    fn udp_frame_from(
+        &self,
+        src_mac: [u8; 6],
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        to: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Failure> {
         let builder = PacketBuilder::ethernet2(src_mac, self.gateway_mac)
-            .ipv4(self.ip.octets(), to.octets(), 64)
+            .ipv4(src_ip.octets(), to.octets(), 64)
             .udp(src_port, dst_port);
         let mut out = Vec::with_capacity(builder.size(payload.len()));
         builder
@@ -866,7 +922,7 @@ fn ping_step(t: &mut Test) -> Result<(), Failure> {
         QueueRequest::RemoveFilter(arp),
         &[],
     )?;
-    add_filter(&socket.fd, icmp_from(gateway))?;
+    t.icmp_filter = Some(add_filter(&socket.fd, icmp_from(gateway))?);
     socket.exchange(buffer, "echo reply through the socket", &request, |f| {
         is_echo_reply(f, 1).then_some(())
     })
@@ -941,9 +997,11 @@ fn own_step(t: &mut Test) -> Result<(), Failure> {
     )?;
     let buffer = Buffer::new(UMEM_BYTES + t.layout.map_len())?;
     attach(&fd, &region, &buffer, &t.layout)?;
+    // Bound to the interface's address: an owned port names the one source address TX may
+    // use.
     let netstack = io(
         "bind a netstack UDP socket",
-        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, OWNED_PORT)),
+        UdpSocket::bind((t.ip, OWNED_PORT)),
     )?;
     let raw = netstack.as_raw_fd() as usize;
     expect_errno("Own before Bind", ENOTCONN, own(&fd, raw))?;
@@ -952,19 +1010,41 @@ fn own_step(t: &mut Test) -> Result<(), Failure> {
     expect_errno(
         "AddFilter on a port the socket does not own",
         EACCES,
-        add_filter(&fd, udp_port(OWNED_PORT)),
+        add_filter(&fd, udp_port(t.ip, OWNED_PORT)),
     )?;
     let file = ctx(
         "open a file",
         Fd::open("/etc/net/ip", O_RDONLY | O_CLOEXEC, 0),
     )?;
     expect_errno("Own with a file", EINVAL, own(&fd, file.raw()))?;
+    // A socket bound to every address would let TX use any source address, so it owns
+    // nothing.
+    let everywhere = io(
+        "bind a netstack UDP socket to 0.0.0.0",
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UNSPECIFIED_PORT)),
+    )?;
+    expect_errno(
+        "Own with a socket bound to 0.0.0.0",
+        EINVAL,
+        own(&fd, everywhere.as_raw_fd() as usize),
+    )?;
+    expect_errno(
+        "AddFilter on the 0.0.0.0 socket's port",
+        EACCES,
+        add_filter(&fd, udp_port(t.ip, UNSPECIFIED_PORT)),
+    )?;
+    drop(everywhere);
     own(&fd, raw)?;
-    add_filter(&fd, udp_port(OWNED_PORT))?;
+    expect_errno(
+        "AddFilter on the owned port at another address",
+        EACCES,
+        add_filter(&fd, udp_port(t.gateway, OWNED_PORT)),
+    )?;
+    add_filter(&fd, udp_port(t.ip, OWNED_PORT))?;
     expect_errno(
         "AddFilter on another port",
         EACCES,
-        add_filter(&fd, udp_port(OWNED_PORT + 1)),
+        add_filter(&fd, udp_port(t.ip, OWNED_PORT + 1)),
     )?;
     let socket = Socket::new(fd, &t.layout, &buffer)?;
     t.owned = Some(Owned {
@@ -1030,6 +1110,15 @@ fn spoof_step(t: &mut Test) -> Result<(), Failure> {
             b"spoof",
         )?,
         t.udp_frame(t.mac, OWNED_PORT + 1, gateway, DISCARD_PORT, b"spoof")?,
+        // The owned port, from an address the socket does not own.
+        t.udp_frame_from(
+            t.mac,
+            spoofed_ip(t.ip),
+            OWNED_PORT,
+            gateway,
+            DISCARD_PORT,
+            b"spoof",
+        )?,
         t.echo_request(200)?,
     ];
     let owned = t.owned()?;
@@ -1051,6 +1140,60 @@ fn spoof_step(t: &mut Test) -> Result<(), Failure> {
     } else {
         Err(Failure::Data {
             what: "TX validation of spoofed frames",
+        })
+    }
+}
+
+/// An address on the same network as `ip` that is not `ip`.
+fn spoofed_ip(ip: Ipv4Addr) -> Ipv4Addr {
+    let [a, b, c, d] = ip.octets();
+    Ipv4Addr::new(a, b, c, if d == 99 { 98 } else { 99 })
+}
+
+/// `netq-tx-bounds`: TX descriptors that do not name a frame of the socket's UMEM (past its
+/// end, not at a frame's start, longer than a frame) are counted as invalid and never sent,
+/// so a socket cannot have the driver read memory outside its registered pages.
+fn tx_bounds_step(t: &mut Test) -> Result<(), Failure> {
+    let owned = t.owned()?;
+    let frame = owned
+        .socket
+        .umem
+        .frame(RX_FRAMES)
+        .ok_or(Failure::Data {
+            what: "a TX frame of the UMEM",
+        })?
+        .offset();
+    let bad = [
+        // Past the end of the UMEM, at a frame-aligned offset.
+        [UMEM_BYTES as u64, 60],
+        // Far past it, where the arithmetic could wrap.
+        [u64::MAX - 2047, 60],
+        // Inside the UMEM but not at a frame's start.
+        [frame + 64, 60],
+        // A frame's start, but longer than a frame.
+        [frame, u64::from(FRAME_SIZE.bytes()) + 1],
+        // A frame's start, with a reserved flag set.
+        [frame, 60 | 1 << 32],
+    ];
+    let before = stats_call(&owned.socket.fd, Stats::BYTES)?;
+    let sent = owned.socket.send_slots(&owned.buffer, &bad)?;
+    let after = stats_call(&owned.socket.fd, Stats::BYTES)?;
+    let completed = owned.socket.completed(&owned.buffer)?;
+    println!(
+        "netq: invalid_descriptors {} -> {}, tx_packets {} -> {}, {sent} sent, {completed} \
+         completed",
+        before.invalid_descriptors, after.invalid_descriptors, before.tx_packets, after.tx_packets
+    );
+    let ok = after.invalid_descriptors == before.invalid_descriptors + bad.len() as u64
+        && after.tx_packets == before.tx_packets
+        && after.tx_rejected == before.tx_rejected
+        && sent == 0
+        && completed == 0;
+    if ok {
+        Ok(())
+    } else {
+        Err(Failure::Data {
+            what: "TX descriptors outside the UMEM",
         })
     }
 }
@@ -1107,6 +1250,154 @@ fn bench_step(t: &mut Test) -> Result<(), Failure> {
          netstack_fps={netstack_fps} bypass_vs_netstack={:.2}",
         bypass_fps as f64 / netstack_fps.max(1) as f64
     );
+    Ok(())
+}
+
+/// Round-trip times, sorted, and how many echoes were lost.
+struct Rtts {
+    sorted: Vec<Duration>,
+    lost: u16,
+}
+
+impl Rtts {
+    fn new(mut times: Vec<Duration>, lost: u16) -> Self {
+        times.sort_unstable();
+        Self {
+            sorted: times,
+            lost,
+        }
+    }
+
+    /// The `pct`th percentile in microseconds (nearest rank), or 0 with no samples.
+    fn percentile_us(&self, pct: usize) -> u128 {
+        let Some(last) = self.sorted.len().checked_sub(1) else {
+            return 0;
+        };
+        let rank = (self.sorted.len() * pct).div_ceil(100).saturating_sub(1);
+        self.sorted[rank.min(last)].as_micros()
+    }
+}
+
+/// One echo through the bypass socket: sends request `seq` and polls RX, without sleeping,
+/// for its reply. `None` when none came within [`LATENCY_WAIT`].
+fn bypass_echo(
+    socket: &mut Socket,
+    buffer: &Buffer,
+    request: &[u8],
+    seq: u16,
+) -> Result<Option<Duration>, Failure> {
+    let start = Instant::now();
+    socket.send(buffer, request)?;
+    while start.elapsed() < LATENCY_WAIT {
+        while let Some(frame) = socket.receive(buffer)? {
+            if is_echo_reply(&frame, seq) {
+                return Ok(Some(start.elapsed()));
+            }
+        }
+        std::hint::spin_loop();
+    }
+    Ok(None)
+}
+
+/// One echo through netstack's ICMP scheme on `fd` (non-blocking), polled without sleeping.
+fn netstack_rtt(fd: &Fd, seq: u16) -> Result<Option<Duration>, Failure> {
+    let mut request = seq.to_be_bytes().to_vec();
+    request.extend_from_slice(ECHO_PAYLOAD);
+    let mut reply = [0; 256];
+    let start = Instant::now();
+    loop {
+        match fd.write(&request) {
+            Ok(_) => break,
+            Err(e) if e.errno() == EAGAIN && start.elapsed() < LATENCY_WAIT => {}
+            Err(e) if e.errno() == EAGAIN => return Ok(None),
+            Err(e) => return ctx("send a timed echo through netstack", Err(e)),
+        }
+    }
+    while start.elapsed() < LATENCY_WAIT {
+        match fd.read(&mut reply) {
+            Ok(n) if reply[..n] == request[..] => return Ok(Some(start.elapsed())),
+            Ok(_) => {}
+            Err(e) if e.errno() == EAGAIN => {}
+            Err(e) => return ctx("receive a timed echo through netstack", Err(e)),
+        }
+        std::hint::spin_loop();
+    }
+    Ok(None)
+}
+
+/// `netq-latency`: ICMP echo round trips to the gateway, through the bypass socket's own rings
+/// and then through netstack's ICMP scheme (with the socket's ICMP filter removed, so netstack
+/// gets the replies), and prints the p50 and p99 of each. Both sides poll without sleeping, so
+/// the numbers compare the paths, not the schedulers' wake-ups.
+fn latency_step(t: &mut Test) -> Result<(), Failure> {
+    let mut requests = Vec::with_capacity(usize::from(LATENCY_ECHOES));
+    for n in 0..LATENCY_ECHOES {
+        requests.push(t.echo_request(LATENCY_SEQ + n)?);
+    }
+    let buffer = &t.buffer;
+    let socket = t.socket.as_mut().ok_or(Failure::Errno {
+        what: "the bound socket",
+        errno: ENOTCONN,
+    })?;
+    let mut times = Vec::with_capacity(requests.len());
+    let mut lost = 0;
+    for (n, request) in (0..).zip(&requests) {
+        match bypass_echo(socket, buffer, request, LATENCY_SEQ + n)? {
+            Some(rtt) => times.push(rtt),
+            None => lost += 1,
+        }
+    }
+    let bypass = Rtts::new(times, lost);
+
+    let icmp = t.icmp_filter.take().ok_or(Failure::Errno {
+        what: "the ICMP filter",
+        errno: ENOENT,
+    })?;
+    queue_call(
+        &socket.fd,
+        "RemoveFilter",
+        QueueRequest::RemoveFilter(icmp),
+        &[],
+    )?;
+    let fd = ctx(
+        "open an ICMP echo socket",
+        Fd::open(
+            &format!("/scheme/icmp/echo/{}", t.gateway),
+            O_RDWR | O_NONBLOCK | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    let mut times = Vec::with_capacity(requests.len());
+    let mut lost = 0;
+    for n in 0..LATENCY_ECHOES {
+        match netstack_rtt(&fd, LATENCY_SEQ + LATENCY_ECHOES + n)? {
+            Some(rtt) => times.push(rtt),
+            None => lost += 1,
+        }
+    }
+    let netstack = Rtts::new(times, lost);
+    drop(fd);
+    // The close step sends its echoes through the socket again.
+    t.icmp_filter = Some(add_filter(&socket.fd, icmp_from(t.gateway))?);
+
+    println!(
+        "FERRIC_BENCH netq-echo-rtt echoes={LATENCY_ECHOES} \
+         bypass_p50_us={} bypass_p99_us={} bypass_lost={} \
+         netstack_p50_us={} netstack_p99_us={} netstack_lost={}",
+        bypass.percentile_us(50),
+        bypass.percentile_us(99),
+        bypass.lost,
+        netstack.percentile_us(50),
+        netstack.percentile_us(99),
+        netstack.lost
+    );
+    // A few lost echoes are QEMU's user network's business; most lost is a broken path.
+    let enough = LATENCY_ECHOES / 2;
+    if bypass.lost >= enough || netstack.lost >= enough {
+        return Err(Failure::Data {
+            what: "echo replies for the latency benchmark",
+        });
+    }
     Ok(())
 }
 
@@ -1220,6 +1511,7 @@ fn setup() -> Result<Setup, Failure> {
         gateway,
         gateway_mac: [0; 6],
         arp_filter: None,
+        icmp_filter: None,
         dns,
         owned: None,
     })))
@@ -1238,7 +1530,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps: [(&str, Step); 12] = [
+    let steps: [(&str, Step); 14] = [
         ("netq-netstack", netstack_step),
         ("netq-attach", attach_step),
         ("netq-checks", checks_step),
@@ -1249,7 +1541,9 @@ pub fn main() -> ExitCode {
         ("netq-own", own_step),
         ("netq-udp", udp_step),
         ("netq-spoof", spoof_step),
+        ("netq-tx-bounds", tx_bounds_step),
         ("netq-bench", bench_step),
+        ("netq-latency", latency_step),
         ("netq-close", close_step),
     ];
     for (name, f) in steps {
