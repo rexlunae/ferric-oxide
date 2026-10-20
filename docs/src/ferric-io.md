@@ -692,15 +692,17 @@ file systems still serve every read through their own scheme.
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`.
 
-## Kernel-bypass network queues (ABI only)
+## Kernel-bypass network queues
 
-`ferric-netq` (`crates/netq`) is the ABI of the planned kernel-bypass network
-queues (roadmap Phase 2.5, design in `io/netbypass-design.md` in the project
-files). It is `no_std` with no `unsafe` code and is host-tested. **No driver
-uses it yet:** there is no `queue` path on any network scheme and no
-`drivers.net_bypass` option, so nothing in the image changes. Copy mode in
-`driver-network` (with an e1000 test), then `igbd` and zero-copy come in later
-changes.
+`ferric-netq` (`crates/netq`) is the ABI of the kernel-bypass network queues
+(roadmap Phase 2.5, design in `io/netbypass-design.md` in the project files),
+and the driver's side of copy mode. It is `no_std` with no `unsafe` code and
+is host-tested. `drivers.net_bypass = true` (Drivers menu, default `false`,
+needs `kernel.regbuf`) builds `driver-network` with its `bypass` feature
+(through `e1000d/bypass`), which adds the `queue` path in copy mode. Without
+the option the network schemes have no `queue` path, as upstream.
+Zero-copy mode, `igbd`, port ownership for unprivileged sockets, TX
+validation and an on-target test come in later changes.
 
 An application opens `queue` beneath a network scheme
 (`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
@@ -733,6 +735,32 @@ netstack.
   hands each side its producers and consumers. A peer's out-of-range index is
   `ferric-ring`'s `RingError::Corrupt`, and the driver sets `NEED_WAKEUP` before it sleeps on
   an empty Fill or TX ring, so the application only `Kick`s when asked.
+  `CopyQueue::transmit` also leaves `NEED_WAKEUP` set on TX when it stops with
+  entries still there, because its budget ran out or Completion was full: the
+  driver sends only when kicked, so the application must kick again (after
+  reaping Completion) for the rest. Each `transmit` clears the flag first.
+
+- `copy`: one socket in copy mode (`CopyQueue`): up to 16 filters, the copy
+  of a matched received frame into the next Fill frame and onto RX, and the
+  copy of TX frames out of the UMEM for the NIC, handed back on Completion
+  only when it has room, so no frame is lost. Frames that cannot be delivered
+  are dropped and counted in `Stats`. UMEM and ring memory are seen as atomic
+  words, so the application writing them at any time cannot cause undefined
+  behaviour.
+
+In `driver-network` (`src/bypass.rs`), `Attach` maps both grants read-write
+and shared; each must be a read-write grant of whole pages. `Bind` starts the
+socket in copy mode (`Mode::ZeroCopy` fails with `ENOSPC`). While any socket
+is bound, every tick drains the adapter, gives each frame to the first socket
+with a matching filter (`ferric_netq::copy::offer`; `EVENT_READ` is posted
+only when a frame reached the socket's RX ring), and keeps the rest, in
+order, for netstack's reads (up to 256 frames; the oldest is dropped beyond
+that). `Kick` sends up to 256 TX packets through the adapter. A socket whose
+rings turn out corrupt, or whose grant its owner revokes (checked on every
+tick and call), is stopped, and its calls fail with `EIO`; a socket stopped
+during a pass gets none of that pass's later frames. Closing a
+socket unmaps its grants. Every queue socket is root's, since the scheme
+root is root-only, and root may send raw frames.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.
