@@ -3,7 +3,7 @@ name = "ferric-trace-cli"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Reads Ferric Oxide kernel trace captures: a text view and Perfetto/Chrome trace JSON export"
+description = "Reads Ferric Oxide kernel trace captures: a text view, Perfetto/Chrome trace JSON and OpenTelemetry (OTLP/JSON) export"
 publish = false
 
 [[bin]]
@@ -13,6 +13,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ferric-trace = { path = "../../crates/trace" }
+# Maps the rings for `ferric-trace capture` on Redox; empty elsewhere.
+ferric-trace-map = { path = "../../crates/trace-map" }
+# To decode the hardware reports in `iommu.fault` records, as the kernel does.
+ferric-amdvi = { path = "../../crates/amdvi" }
+ferric-vtd = { path = "../../crates/vtd", default-features = false }
 ferric-procinfo = { path = "../../crates/procinfo", features = ["alloc"] }
 # ELF symbol tables for `flamegraph`.
 object = { version = "0.38", default-features = false, features = ["read_core", "elf", "std"] }

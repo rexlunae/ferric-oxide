@@ -12,6 +12,8 @@ description = "Kernel tracing test for Ferric Oxide"
 ferric-trace = { path = "../../../../crates/trace", features = ["config"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
+# Maps the rings for `trace-mmap`.
+ferric-trace-map = { path = "../../../../crates/trace-map" }
 redox_syscall = "0.9.5"
 
 [profile.release]

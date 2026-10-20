@@ -1,7 +1,7 @@
 //! `ferric-trace`: saves kernel trace captures on the target (the `cpu<n>` files drained from
-//! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto, and reads the
-//! crash dump a kernel panic left for the next boot, and records profiles from the kernel's
-//! sampling profiler.
+//! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto or OpenTelemetry,
+//! reads the crash dump a kernel panic left for the next boot, and records profiles from the
+//! kernel's sampling profiler.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -15,7 +15,7 @@ use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::crash::CrashReport;
 use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
 use ferric_trace_cli::profile::{self, Run};
-use ferric_trace_cli::{drain, perfetto, svg, text};
+use ferric_trace_cli::{drain, otlp, perfetto, svg, text};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -33,6 +33,11 @@ enum Cmd {
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
         scheme: PathBuf,
+        /// How to take the records out of the rings: `map` copies them out of the read-only
+        /// mapping and commits each copy once it is saved, `read` reads them, and `auto` maps
+        /// where the kernel allows it and reads otherwise
+        #[arg(long, default_value_t = drain::Via::Auto)]
+        via: drain::Via,
     },
     /// On the target, as root, with kernel.profiling: sample every CPU while a command runs
     /// (or for --seconds) and save the samples into a profile directory
@@ -113,6 +118,26 @@ enum Cmd {
         #[arg(long, default_value = "1000")]
         tsc_mhz: perfetto::TscMhz,
     },
+    /// Write OpenTelemetry traces as OTLP/JSON, for an OTLP/HTTP collector's /v1/traces or the
+    /// Collector's otlpjsonfile receiver
+    Otlp {
+        /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
+        #[arg(long)]
+        partial: bool,
+        /// Where to write the JSON (default: standard output)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// The TSC frequency of the traced machine in MHz, as for `perfetto`
+        #[arg(long, default_value = "1000")]
+        tsc_mhz: perfetto::TscMhz,
+        /// The Unix time of the first record in nanoseconds (default: 0, so times count from
+        /// the first record)
+        #[arg(long, default_value = "0")]
+        start_unix_ns: u64,
+    },
 }
 
 /// Why the command failed.
@@ -140,12 +165,16 @@ enum CliError {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Cmd::Capture { out, scheme } => {
-            let drained = drain::drain_scheme(&scheme, &out)?;
+        Cmd::Capture { out, scheme, via } => {
+            let drained = drain::drain_scheme(&scheme, &out, via)?;
             for cpu in &drained {
                 println!(
-                    "cpu {}: {} bytes, {} records lost before the capture, {} during it",
-                    cpu.cpu, cpu.bytes, cpu.lost_before, cpu.lost_during
+                    "cpu {}: {} bytes, {} records lost before the capture, {} during it ({})",
+                    cpu.cpu,
+                    cpu.bytes,
+                    cpu.lost_before,
+                    cpu.lost_during,
+                    if cpu.mapped { "mapped" } else { "read" }
                 );
             }
             println!("saved {} CPUs to {}", drained.len(), out.display());
@@ -219,19 +248,35 @@ fn run(cli: Cli) -> Result<(), CliError> {
         } => {
             let capture = loader(partial)(&inputs)?;
             let rate = perfetto::TickRate::for_clock(capture.clock(), tsc_mhz);
-            let json = perfetto::to_json(&capture, rate);
-            match output {
-                Some(path) => {
-                    fs::write(&path, json).map_err(|source| CliError::Write { path, source })
-                }
-                None => io::stdout()
-                    .write_all(json.as_bytes())
-                    .map_err(|source| CliError::Write {
-                        path: PathBuf::from("<stdout>"),
-                        source,
-                    }),
-            }
+            write_output(output, &perfetto::to_json(&capture, rate))
         }
+        Cmd::Otlp {
+            inputs,
+            partial,
+            output,
+            tsc_mhz,
+            start_unix_ns,
+        } => {
+            let capture = loader(partial)(&inputs)?;
+            let options = otlp::Options {
+                rate: perfetto::TickRate::for_clock(capture.clock(), tsc_mhz),
+                start_unix_ns,
+            };
+            write_output(output, &otlp::to_json(&capture, options))
+        }
+    }
+}
+
+/// Writes `text` to `output`, or to standard output.
+fn write_output(output: Option<PathBuf>, text: &str) -> Result<(), CliError> {
+    match output {
+        Some(path) => fs::write(&path, text).map_err(|source| CliError::Write { path, source }),
+        None => io::stdout()
+            .write_all(text.as_bytes())
+            .map_err(|source| CliError::Write {
+                path: PathBuf::from("<stdout>"),
+                source,
+            }),
     }
 }
 
