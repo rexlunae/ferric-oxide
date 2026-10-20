@@ -592,8 +592,15 @@ How a file system uses it:
    the fill failed gets `EIO` even if a newer read has queued a new fill
    for the page by the time it wakes. Every record carries the
    object's 64-bit generation, which is new each time an object is opened and
-   never repeats on a queue, and its answer must repeat it: an answer to a
-   record of an earlier object with the same ID gets `ESTALE`. A queue read
+   never repeats on a queue, and its answer must repeat it. Each fill record
+   also carries a fill ID, numbered from 1 up on each object and never reused,
+   which the answer repeats too; each page being filled remembers the fill it
+   waits for, and an answer acts only on the pages its fill still owns. An
+   answer to a fill that owns none of its pages any more (it failed, was
+   answered or was invalidated, and the pages may be filling again for a newer
+   fill), or to a record of an earlier object with the same ID, is stale: the
+   call returns 0 and changes nothing, however malformed the answer, so a late
+   answer never fails a newer fill or the queue. A queue read
    that faults copying records out puts back those of objects still open and
    reports `EVENT_READ` again.
 5. Shrinking an object with `SetSize` drops the cached pages past the new end,

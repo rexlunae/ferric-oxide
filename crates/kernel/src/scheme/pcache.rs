@@ -45,17 +45,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_pcache::{
     abi::{
-        Generation, ObjectId, Outcome, PathError, Record, RecordPages, Request, OBJECT_PREFIX,
-        QUEUE_PATH,
+        FillId, Generation, ObjectId, Outcome, PathError, Record, RecordPages, Request,
+        OBJECT_PREFIX, QUEUE_PATH,
     },
-    object::{Attempt, FillError, PageIndex, Read},
+    object::{Attempt, Fill, FillError, PageIndex, Read},
     readahead::{Readahead, ReadaheadConfig},
 };
 use spin::Mutex;
 use syscall::{
     error::{
         Error, Result, EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EIO, ENOENT, ENOMEM,
-        EOPNOTSUPP, EOVERFLOW, EPERM, ESTALE,
+        EOPNOTSUPP, EOVERFLOW, EPERM,
     },
     flag::{CallFlags, EventFlags, EVENT_READ, O_NONBLOCK},
 };
@@ -166,7 +166,7 @@ impl Queue {
         &self,
         object: ObjectId,
         generation: Generation,
-        fills: &[RecordPages],
+        fills: &[Fill],
         token: &mut CleanLockToken,
     ) -> Result<()> {
         {
@@ -178,13 +178,12 @@ impl Queue {
                 .records
                 .try_reserve(fills.len())
                 .map_err(|_| Error::new(ENOMEM))?;
-            state
-                .records
-                .extend(fills.iter().map(|&pages| Record::Fill {
-                    object,
-                    generation,
-                    pages,
-                }));
+            state.records.extend(fills.iter().map(|fill| Record::Fill {
+                object,
+                generation,
+                fill: fill.id,
+                pages: fill.pages,
+            }));
         }
         self.wake(token);
         Ok(())
@@ -240,7 +239,7 @@ fn handle(id: usize) -> Result<Handle> {
 /// The errno for a fill answer the object does not expect.
 fn fill_errno(err: &FillError) -> Error {
     Error::new(match err {
-        FillError::NotFilling { .. } | FillError::Frames { .. } => EINVAL,
+        FillError::Frames { .. } => EINVAL,
         _ => EIO,
     })
 }
@@ -365,7 +364,7 @@ fn read(
 
 /// Puts `fills` of `object` on its queue. If the queue cannot take them (it closed, or there
 /// is no memory), the fills fail at once, so nobody waits for them.
-fn queue_fills(object: &Object, fills: &[RecordPages], token: &mut CleanLockToken) -> Result<()> {
+fn queue_fills(object: &Object, fills: &[Fill], token: &mut CleanLockToken) -> Result<()> {
     if fills.is_empty() {
         return Ok(());
     }
@@ -377,11 +376,14 @@ fn queue_fills(object: &Object, fills: &[RecordPages], token: &mut CleanLockToke
     };
     {
         let mut state = object.state.lock();
-        for &pages in fills {
-            // The pages were marked filling above and nobody else answers them.
-            let _ = state
-                .index
-                .complete_fill(pages, Outcome::Failed(EIO_OUTCOME), Vec::new());
+        for fill in fills {
+            // The fill was started above and nobody else answers it.
+            let _ = state.index.complete_fill(
+                fill.id,
+                fill.pages,
+                Outcome::Failed(EIO_OUTCOME),
+                Vec::new(),
+            );
         }
     }
     object.changed.notify(token);
@@ -622,24 +624,32 @@ fn detach(object: &Arc<Object>, handle: u64) -> Result<usize> {
     }
 }
 
-/// [`Request::Filled`]: applies the answer to a fill of `pages`, copying the payload into new
-/// frames when it is done. An answer that cannot be taken (no memory for the frames, a payload
-/// that faults or has the wrong length) fails the fill: the file system took the record off
-/// the queue and need not answer it again, so leaving the pages being filled would leave
-/// their readers waiting for good.
+/// [`Request::Filled`]: applies the answer to fill `fill` of `pages`, copying the payload
+/// into new frames when it is done. It acts only on the pages the fill still owns
+/// ([`PageIndex::owned`]): an answer for a fill that owns none of them (it was failed or
+/// answered already, and the pages may be filling again for a newer fill) is stale and
+/// ignored, whatever it holds, and returns 0. An answer that is not stale but cannot be taken
+/// (no memory for the frames, a payload that faults or has the wrong length) fails the fill's
+/// pages: the file system took the record off the queue and need not answer it again, so
+/// leaving them filling would leave their readers waiting for good.
 fn filled(
     object: &Object,
+    fill: FillId,
     pages: RecordPages,
     outcome: Outcome,
     payload: UserSliceRw,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
-    let frames = match answer_frames(object, pages, outcome, payload) {
+    // Checked before copying, so a stale answer costs no frames and touches nothing.
+    if object.state.lock().index.owned(fill, pages) == 0 {
+        return Ok(0);
+    }
+    let frames = match answer_frames(pages, outcome, payload) {
         Ok(frames) => frames,
         Err(err) => {
-            // Readers get EIO and fill again. A stray answer, for pages not being filled,
-            // changes nothing here.
+            // Readers of the pages this fill owns get EIO and fill again.
             let _ = object.state.lock().index.complete_fill(
+                fill,
                 pages,
                 Outcome::Failed(EIO_OUTCOME),
                 Vec::new(),
@@ -652,7 +662,7 @@ fn filled(
         .state
         .lock()
         .index
-        .complete_fill(pages, outcome, frames);
+        .complete_fill(fill, pages, outcome, frames);
     object.changed.notify(token);
     result.map_err(|err| fill_errno(&err))?;
     Ok(payload.len())
@@ -663,10 +673,8 @@ fn filled(
 ///
 /// # Errors
 ///
-/// `EINVAL` for a payload of the wrong length, the fill error for pages not being filled,
-/// `ENOMEM` and `EFAULT` from the copy.
+/// `EINVAL` for a payload of the wrong length, `ENOMEM` and `EFAULT` from the copy.
 fn answer_frames(
-    object: &Object,
     pages: RecordPages,
     outcome: Outcome,
     payload: UserSliceRw,
@@ -679,13 +687,6 @@ fn answer_frames(
             if Some(payload.len()) != count.checked_mul(PAGE_SIZE) {
                 return Err(Error::new(EINVAL));
             }
-            // Check before copying, so a stray answer costs no frames.
-            object
-                .state
-                .lock()
-                .index
-                .check_filling(pages)
-                .map_err(|err| fill_errno(&err))?;
             copy_in(payload, count)
         }
     }
@@ -873,14 +874,17 @@ impl KernelScheme for PcacheScheme {
                     pages,
                     outcome,
                     generation,
+                    fill,
                 },
                 Handle::Object(object),
             ) => {
-                // An answer to a record of an earlier object with this ID.
+                // An answer to a record of an earlier object with this ID: that object's
+                // fills own nothing here, so it is as stale as an answer to a fill of this
+                // one that was already failed or answered.
                 if generation != object.generation {
-                    return Err(Error::new(ESTALE));
+                    return Ok(0);
                 }
-                filled(&object, pages, outcome, payload, token)
+                filled(&object, fill, pages, outcome, payload, token)
             }
             // Writeback comes with writes, a later step.
             (Request::WrittenBack { .. }, Handle::Object(_)) => Err(Error::new(EOPNOTSUPP)),

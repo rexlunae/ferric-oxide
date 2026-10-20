@@ -229,11 +229,13 @@ impl Cache {
         }
     }
 
-    /// Answers a fill record: with the pages' bytes, or failed with `EIO`.
-    fn answer(&self, record: Record, ok: bool) -> Result<(), Failure> {
+    /// Answers a fill record: with the pages' bytes, or failed with `EIO`. Returns what the
+    /// call returned: the payload's length, or 0 for a stale answer.
+    fn answer(&self, record: Record, ok: bool) -> Result<usize, Failure> {
         let Record::Fill {
             object,
             generation,
+            fill,
             pages,
         } = record
         else {
@@ -253,21 +255,21 @@ impl Cache {
             pages,
             outcome,
             generation,
+            fill,
         }
         .encode();
         ctx(
             "Filled",
             self.object
                 .call_wo(&payload, CallFlags::empty(), &words[..n]),
-        )?;
-        Ok(())
+        )
     }
 
     /// Answers every record in `records` with the pages' bytes.
     fn fill_all(&self, records: &[Record]) -> Result<(), Failure> {
         records
             .iter()
-            .try_for_each(|&record| self.answer(record, true))
+            .try_for_each(|&record| self.answer(record, true).map(drop))
     }
 }
 
@@ -336,6 +338,15 @@ fn finished_now(
 ) -> Result<Result<Vec<u8>, i32>, Failure> {
     read.recv_timeout(QUIET * 10)
         .map_err(|_| Failure::Check("a read of cached pages waited".into()))
+}
+
+/// Whether a threaded `pread` is still waiting a moment later: nothing it waits for has
+/// been answered or failed.
+fn still_waiting(read: &mpsc::Receiver<Result<Vec<u8>, i32>>) -> bool {
+    matches!(
+        read.recv_timeout(QUIET * 5),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    )
 }
 
 /// Checks a read returned the file's bytes at `offset`.
@@ -560,7 +571,10 @@ fn bad_answer(cache: &mut Cache) -> Result<(), Failure> {
     let records = cache.records()?;
     let &[
         record @ Record::Fill {
-            pages, generation, ..
+            pages,
+            generation,
+            fill,
+            ..
         },
     ] = &records[..]
     else {
@@ -575,20 +589,24 @@ fn bad_answer(cache: &mut Cache) -> Result<(), Failure> {
         pages,
         outcome: Outcome::Done,
         generation,
+        fill,
     }
     .encode();
     let len = pages.pages().count() as usize * PAGE_SIZE as usize;
     let hole = hole()?;
-    // SAFETY: the kernel checks the payload, which faults; nothing here dereferences it.
-    let answered = unsafe {
-        syscall::call::Call::raw_call(
-            &cache.object.raw(),
-            hole.cast::<u8>().cast_const(),
-            len,
-            CallFlags::WRITE,
-            &words[..n],
-        )
+    let faulting_answer = || {
+        // SAFETY: the kernel checks the payload, which faults; nothing here dereferences it.
+        unsafe {
+            syscall::call::Call::raw_call(
+                &cache.object.raw(),
+                hole.cast::<u8>().cast_const(),
+                len,
+                CallFlags::WRITE,
+                &words[..n],
+            )
+        }
     };
+    let answered = faulting_answer();
     check(answered == Err(Error::new(ERRNO_EFAULT)), || {
         format!("a done answer with a faulting payload returned {answered:?}")
     })?;
@@ -604,6 +622,15 @@ fn bad_answer(cache: &mut Cache) -> Result<(), Failure> {
     check(pages_of(&records).contains(&BAD_ANSWER_PAGE), || {
         format!("page {BAD_ANSWER_PAGE} was not filled again")
     })?;
+    // The same malformed answer to the old fill, arriving late: its fill owns nothing now,
+    // so it is ignored (before its payload is touched) and the retry is left alone.
+    let late = faulting_answer();
+    check(late == Ok(0), || {
+        format!("a late answer to a failed fill returned {late:?}, not 0")
+    })?;
+    check(still_waiting(&again), || {
+        "a late answer to a failed fill ended the retry's read".into()
+    })?;
     cache.fill_all(&records)?;
     check_bytes(finished(&again)?, BAD_ANSWER_PAGE * PAGE_SIZE, 64)
 }
@@ -612,10 +639,9 @@ fn bad_answer(cache: &mut Cache) -> Result<(), Failure> {
 const RESTORE_PAGE: u64 = 60;
 /// The pages `pcache-generation` reads; no earlier step reads them.
 const GENERATION_PAGES: [u64; 2] = [50, 52];
-/// relibc's EFAULT, EPERM and ESTALE.
+/// relibc's EFAULT and EPERM.
 const ERRNO_EFAULT: i32 = 14;
 const ERRNO_EPERM: i32 = 1;
-const ERRNO_ESTALE: i32 = 116;
 
 /// `pcache-restore`: a queue read that faults copying records out puts them back, so the
 /// fill is still there for the next read.
@@ -765,8 +791,9 @@ fn exec(_cache: &mut Cache) -> Result<(), Failure> {
     Err(Failure::Check(failure.into()))
 }
 
-/// `pcache-generation`: closing an object drops its records still on the queue, and a
-/// record already taken cannot fill a new object with the same ID.
+/// `pcache-generation`: closing an object drops its records still on the queue, and the
+/// answer to a record already taken is stale on a new object with the same ID: it neither
+/// fills nor fails the new object's fills.
 fn generation(cache: &mut Cache) -> Result<(), Failure> {
     let [taken, left] = GENERATION_PAGES;
     let file = open_file()?;
@@ -802,16 +829,16 @@ fn generation(cache: &mut Cache) -> Result<(), Failure> {
             .all(|record| record.generation() != old[0].generation()),
         || "the new object has the old one's generation".into(),
     )?;
-    // The old record's answer, on the new object, is refused.
-    match cache.answer(old[0], true) {
-        Err(Failure::Errno { errno, .. }) if errno == ERRNO_ESTALE => {}
-        Err(failure) => return Err(failure),
-        Ok(()) => {
-            return Err(Failure::Check(
-                "an answer to a closed object's record filled the new object".into(),
-            ));
-        }
-    }
+    // The old record's answer, on the new object, is stale: a failure answered for it (with
+    // the same page, and the same fill ID, as the new object's first fill) is ignored, and
+    // the new fill's reader is still waiting for its own answer.
+    let stale = cache.answer(old[0], false)?;
+    check(stale == 0, || {
+        format!("an answer to a closed object's record returned {stale}, not 0")
+    })?;
+    check(still_waiting(&read), || {
+        "an answer to a closed object's record ended a read of the new object".into()
+    })?;
     cache.fill_all(&new)?;
     check_bytes(finished(&read)?, taken * PAGE_SIZE, 64)
 }

@@ -36,7 +36,7 @@
 //! # Examples
 //!
 //! ```
-//! use ferric_pcache::abi::{Generation, ObjectId, PageRange, Record, RecordPages};
+//! use ferric_pcache::abi::{FillId, Generation, ObjectId, PageRange, Record, RecordPages};
 //! use ferric_pcache::page::{Event, PageState};
 //! use ferric_pcache::readahead::{Readahead, ReadaheadConfig};
 //!
@@ -51,6 +51,7 @@
 //! let fill = Record::Fill {
 //!     object: ObjectId::new(7),
 //!     generation: Generation::new(1),
+//!     fill: FillId::new(1),
 //!     pages,
 //! };
 //! assert_eq!(Record::from_bytes(&fill.to_bytes()), Ok(fill));
