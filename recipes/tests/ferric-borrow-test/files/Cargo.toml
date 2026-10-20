@@ -1,0 +1,9 @@
+[package]
+name = "ferric-borrow-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Scheme-call buffer borrow pinning test for Ferric Oxide"
+
+[profile.release]
+debug = false
