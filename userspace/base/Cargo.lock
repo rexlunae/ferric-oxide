@@ -911,6 +911,7 @@ version = "0.1.0"
 name = "ferric-netq"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.1",
  "etherparse",
  "ferric-ring",
  "thiserror 2.0.20",

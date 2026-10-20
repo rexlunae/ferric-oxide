@@ -10,7 +10,12 @@
 //!   frame to the first socket with a matching filter, and keeps the rest, in order, for
 //!   netstack's reads ([`State::take_pending`]). With no socket bound it does nothing, and
 //!   netstack reads straight from the adapter as upstream.
-//! - `Kick` sends what the application put on TX through the adapter.
+//! - `Kick` sends what the application put on TX through the adapter, after TX validation
+//!   (`ferric_netq::own`) unless the socket was bound with `BindFlags::RAW_TX`.
+//! - `Own` takes a netstack `udp` or `tcp` socket bound on a port. The driver keeps it open,
+//!   so netstack keeps the port reserved while the queue socket lives, and from then on the
+//!   socket may filter on that destination port and send from it. A filter on a port the
+//!   socket does not own fails with `EACCES`.
 //!
 //! A socket whose rings turn out corrupt, or whose grant its owner revokes (checked on every
 //! tick and call), is stopped: its calls fail with `EIO` and it takes no more frames. A revoke
@@ -18,9 +23,9 @@
 //! instead of unmapping them; until then a revoke between the check and an access faults the
 //! driver. Closing it unmaps both grants and closes the driver's descriptors of them.
 //!
-//! Not here yet: zero-copy mode (`Bind` with `Mode::ZeroCopy` fails with `ENOSPC`), port
-//! ownership for filters and TX validation (every queue socket is root's, as the scheme root
-//! is root-only, and root may send raw frames), and per-core workers.
+//! Not here yet: zero-copy mode (`Bind` with `Mode::ZeroCopy` fails with `ENOSPC`),
+//! unprivileged sockets (every queue socket is root's, as the scheme root is root-only, so any
+//! socket may ask for raw TX), and per-core workers.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -30,9 +35,10 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
 use ferric_netq::call::{Bind, Mode, Request, Stats};
-use ferric_netq::copy::{offer, CopyQueue, Offered, Received, Receiver, Shared};
+use ferric_netq::copy::{offer, CopyQueue, FilterTableError, Offered, Received, Receiver, Shared};
 use ferric_netq::filter::Filter;
-use ferric_netq::frame::Headers;
+use ferric_netq::frame::{Headers, MacAddr};
+use ferric_netq::own::{OwnError, OwnedPort};
 use ferric_regbuf::abi::{GrantInfo, Request as RegbufRequest};
 use libredox::call::MmapArgs;
 use libredox::flag::{MAP_SHARED, PROT_READ, PROT_WRITE};
@@ -52,6 +58,8 @@ const PENDING_MAX: usize = 256;
 const FRAME_MAX: usize = 16 << 10;
 /// Packets sent per `Kick` at most, so one socket cannot hold the driver.
 const KICK_BUDGET: usize = 256;
+/// The longest path a netstack socket's `fpath` gives (`/scheme/udp/[v6]:port/[v6]:port`).
+const SOCKET_PATH_MAX: usize = 128;
 
 /// The scheme's bypass state.
 pub(crate) struct State {
@@ -209,6 +217,8 @@ impl<T> fmt::Debug for Queue<T> {
 struct Bound {
     grants: Grants,
     queue: CopyQueue,
+    /// The netstack sockets that prove its owned ports, kept open so the ports stay reserved.
+    _owners: Vec<Fd>,
     /// Set once the application corrupted the rings.
     stopped: bool,
 }
@@ -331,10 +341,13 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
     type SchemeData = NetworkSchemeData<T>;
     type ResourceEnum = NetworkResource<T>;
 
-    /// `Attach`: takes the UMEM grant and the ring grant, in that order.
+    /// `Attach` (the UMEM grant and the ring grant, in that order) or `Own` (one netstack
+    /// socket).
     fn on_sendfd(&mut self, data: &mut Self::SchemeData, request: &SendFdRequest) -> Result<usize> {
-        if Request::decode(&[request.arg()]) != Ok(Request::Attach) || request.num_fds() != 2 {
-            return Err(Error::new(EINVAL));
+        match Request::decode(&[request.arg()]) {
+            Ok(Request::Attach) if request.num_fds() == 2 => {}
+            Ok(Request::Own) if request.num_fds() == 1 => return self.own(data, request),
+            _ => return Err(Error::new(EINVAL)),
         }
         if self.bound.is_some() {
             return Err(Error::new(EBUSY));
@@ -361,7 +374,7 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
             return Err(Error::new(EINVAL));
         }
         if let Request::Bind = request {
-            return self.bind(payload);
+            return self.bind(payload, MacAddr(data.adapter.mac_address()));
         }
         let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
         if !bound.check_grants() {
@@ -370,10 +383,10 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
         match request {
             Request::AddFilter => {
                 let filter = Filter::from_bytes(payload).map_err(|_| Error::new(EINVAL))?;
-                let id = bound
-                    .queue
-                    .add_filter(filter)
-                    .map_err(|_| Error::new(ENOSPC))?;
+                let id = bound.queue.add_filter(filter).map_err(|err| match err {
+                    FilterTableError::NotOwned(_) => Error::new(EACCES),
+                    _ => Error::new(ENOSPC),
+                })?;
                 usize::try_from(id.get()).map_err(|_| Error::new(ENOSPC))
             }
             Request::RemoveFilter(id) => bound
@@ -403,9 +416,38 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
     }
 }
 
-impl<T> Queue<T> {
-    /// `Bind`: starts the queue on the attached grants.
-    fn bind(&mut self, payload: &[u8]) -> Result<usize> {
+impl<T: NetworkAdapter> Queue<T> {
+    /// `Own`: takes the netstack socket and records the port it is bound on.
+    ///
+    /// # Errors
+    ///
+    /// `ENOTCONN` before `Bind`, `EIO` on a stopped socket, `EINVAL` for a descriptor that is
+    /// not a bound netstack TCP or UDP socket, and `ENOSPC` when the socket owns as many ports
+    /// as it may.
+    fn own(&mut self, data: &mut NetworkSchemeData<T>, request: &SendFdRequest) -> Result<usize> {
+        let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
+        if !bound.check_grants() {
+            return Err(Error::new(EIO));
+        }
+        let mut fds = [usize::MAX; 1];
+        request.obtain_fd(&data.bypass.socket, FobtainFdFlags::empty(), &mut fds)?;
+        let [owner] = fds.map(Fd::new);
+        let mut path = [0; SOCKET_PATH_MAX];
+        let len = owner.fpath(&mut path)?;
+        let port = core::str::from_utf8(&path[..len])
+            .map_err(|_| Error::new(EINVAL))
+            .and_then(|path| OwnedPort::from_fpath(path).map_err(own_errno))?;
+        // One netstack socket per owned port is enough to keep it reserved: a repeated `Own`
+        // of a port already owned closes its descriptor here (when `owner` drops), so repeated
+        // calls cannot pile up descriptors in the driver.
+        if bound.queue.own(port).map_err(own_errno)? {
+            bound._owners.push(owner);
+        }
+        Ok(1)
+    }
+
+    /// `Bind`: starts the queue on the attached grants, on the NIC with MAC address `mac`.
+    fn bind(&mut self, payload: &[u8], mac: MacAddr) -> Result<usize> {
         if self.bound.is_some() {
             return Err(Error::new(EBUSY));
         }
@@ -416,7 +458,7 @@ impl<T> Queue<T> {
         let grants = self.attached.take().ok_or(Error::new(ENOTCONN))?;
         let umem_bytes = grants.umem.words().len() as u64 * 8;
         let ring_bytes = grants.rings.words().len() * 8;
-        let queue = match CopyQueue::bind(&bind, umem_bytes, ring_bytes) {
+        let queue = match CopyQueue::bind(&bind, mac, umem_bytes, ring_bytes) {
             Ok(queue) => queue,
             Err(_) => {
                 self.attached = Some(grants);
@@ -426,9 +468,18 @@ impl<T> Queue<T> {
         self.bound = Some(Bound {
             grants,
             queue,
+            _owners: Vec::new(),
             stopped: false,
         });
         Ok(0)
+    }
+}
+
+/// The errno for an `Own` that failed.
+fn own_errno(err: OwnError) -> Error {
+    match err {
+        OwnError::Full => Error::new(ENOSPC),
+        _ => Error::new(EINVAL),
     }
 }
 

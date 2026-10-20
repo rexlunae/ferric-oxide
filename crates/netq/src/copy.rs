@@ -26,10 +26,11 @@ use ferric_ring::notify::Sleep;
 use ferric_ring::queue::{PushError, RingError};
 use thiserror::Error;
 
-use crate::call::{ActiveMode, Bind, FilterId, Stats};
+use crate::call::{ActiveMode, Bind, BindFlags, FilterId, Stats};
 use crate::desc::Packet;
 use crate::filter::Filter;
-use crate::frame::Headers;
+use crate::frame::{Headers, MacAddr};
+use crate::own::{FilterOwnError, OwnError, OwnedPort, Ownership, TxReject};
 use crate::ring::{DriverRings, FrameSlot, PacketSlot, RingLayout};
 use crate::umem::{Frame, Umem, UmemError};
 
@@ -72,6 +73,9 @@ pub enum FilterTableError {
     /// No filter of the socket has this ID.
     #[error("the socket has no such filter")]
     Unknown,
+    /// The filter names a destination port the socket does not own.
+    #[error("the socket does not own the filter's port")]
+    NotOwned(#[from] FilterOwnError),
 }
 
 /// What became of a received frame [`CopyQueue::receive`] was given.
@@ -99,21 +103,32 @@ pub struct CopyQueue {
     filters: [Option<(FilterId, Filter)>; Self::MAX_FILTERS],
     next_filter: u64,
     stats: Stats,
+    /// The NIC's MAC address, which TX validation requires as the source.
+    mac: MacAddr,
+    /// Whether TX frames go out unchecked ([`BindFlags::RAW_TX`]).
+    raw_tx: bool,
+    owned: Ownership,
 }
 
 impl CopyQueue {
     /// The most filters a socket may have.
     pub const MAX_FILTERS: usize = 16;
 
-    /// A socket bound with `bind` to a UMEM grant of `umem_bytes` bytes and a ring grant of
-    /// `ring_bytes` bytes. It starts with no filters, so it receives nothing until
-    /// [`add_filter`](Self::add_filter).
+    /// A socket bound with `bind` on the NIC with MAC address `mac`, to a UMEM grant of
+    /// `umem_bytes` bytes and a ring grant of `ring_bytes` bytes. It starts with no filters, so
+    /// it receives nothing until [`add_filter`](Self::add_filter), and owns no ports, so
+    /// without [`BindFlags::RAW_TX`] it sends nothing until [`own`](Self::own).
     ///
     /// # Errors
     ///
     /// [`BindError::Umem`] when the UMEM grant is not a whole number of frames (or holds too
     /// many), and [`BindError::RingsTooSmall`] when the ring grant cannot hold the rings.
-    pub fn bind(bind: &Bind, umem_bytes: u64, ring_bytes: usize) -> Result<Self, BindError> {
+    pub fn bind(
+        bind: &Bind,
+        mac: MacAddr,
+        umem_bytes: u64,
+        ring_bytes: usize,
+    ) -> Result<Self, BindError> {
         let umem = Umem::new(umem_bytes, bind.frame_size)?;
         let layout = RingLayout::new(bind.fill, bind.rx, bind.tx, bind.completion);
         if layout.map_len() > ring_bytes {
@@ -135,7 +150,11 @@ impl CopyQueue {
                 fill_empty_drops: 0,
                 overflow_drops: 0,
                 invalid_descriptors: 0,
+                tx_rejected: 0,
             },
+            mac,
+            raw_tx: bind.flags.contains(BindFlags::RAW_TX),
+            owned: Ownership::new(),
         })
     }
 
@@ -154,12 +173,25 @@ impl CopyQueue {
         self.stats
     }
 
+    /// Records that the socket owns `port` ([`crate::own`]), and returns whether it was new
+    /// ([`Ownership::own`]).
+    ///
+    /// # Errors
+    ///
+    /// [`OwnError::Full`] when it already owns [`Ownership::MAX_PORTS`] ports.
+    pub fn own(&mut self, port: OwnedPort) -> Result<bool, OwnError> {
+        self.owned.own(port)
+    }
+
     /// Adds `filter` and returns its ID. IDs are never reused on one socket.
     ///
     /// # Errors
     ///
-    /// [`FilterTableError::Full`] when the socket has [`MAX_FILTERS`](Self::MAX_FILTERS).
+    /// [`FilterTableError::NotOwned`] for a destination port the socket does not own
+    /// ([`Ownership::check_filter`]), and [`FilterTableError::Full`] when the socket has
+    /// [`MAX_FILTERS`](Self::MAX_FILTERS).
     pub fn add_filter(&mut self, filter: Filter) -> Result<FilterId, FilterTableError> {
+        self.owned.check_filter(&filter)?;
         let slot = self
             .filters
             .iter_mut()
@@ -246,6 +278,10 @@ impl CopyQueue {
     /// Completion was full until the application reaps it), so they are not left waiting for
     /// a kick that never comes. A call clears the flag first. Returns the packets `send` took.
     ///
+    /// Unless the socket was bound with [`BindFlags::RAW_TX`], each frame passes TX
+    /// validation first ([`Ownership::check_tx`]); one that fails is not sent, is counted in
+    /// [`Stats::tx_rejected`], and goes back on Completion like a sent one.
+    ///
     /// `send` returns whether the NIC took the frame; a frame it refused still goes back on
     /// Completion, unsent.
     ///
@@ -275,7 +311,9 @@ impl CopyQueue {
             };
             let bytes = &mut buf[..packet.len() as usize];
             read_frame(mem.umem, packet.frame(), bytes);
-            if send(bytes) {
+            if self.validate(bytes).is_err() {
+                self.stats.tx_rejected += 1;
+            } else if send(bytes) {
                 sent += 1;
                 self.stats.tx_packets += 1;
             }
@@ -293,6 +331,15 @@ impl CopyQueue {
         // waits for a kick the application would not send.
         self.rings.tx.request_wakeup(mem.rings)?;
         Ok(sent)
+    }
+
+    /// TX validation of `frame`, unless the socket sends raw frames.
+    fn validate(&self, frame: &[u8]) -> Result<(), TxReject> {
+        if self.raw_tx {
+            return Ok(());
+        }
+        let headers = Headers::parse(frame).map_err(|_| TxReject::Malformed)?;
+        self.owned.check_tx(&headers, self.mac)
     }
 
     /// The next TX entry, or `None` once TX is empty and `NEED_WAKEUP` is set on it.
@@ -427,8 +474,9 @@ mod tests {
     use super::*;
     use crate::call::{Mode, RingSize};
     use crate::filter::{FilterSpec, MatchSpec};
-    use crate::frame::tests::{ethernet, ipv4, udp};
+    use crate::frame::tests::{PEER, ethernet, ipv4, udp};
     use crate::frame::{ETHERTYPE_IPV4, IP_PROTOCOL_UDP};
+    use crate::own::{OwnedPort, Transport};
     use crate::ring::AppRings;
     use crate::umem::FrameSize;
     use ferric_ring::Entry;
@@ -448,6 +496,21 @@ mod tests {
             completion: size(8),
             mode: Mode::Copy,
             cpu: 0,
+            flags: BindFlags::empty(),
+        }
+    }
+
+    /// The NIC's MAC: the source of the frames the tests build, so they pass TX validation.
+    const NIC: MacAddr = MacAddr(PEER);
+
+    /// The source port of [`udp_frame`]s.
+    const SRC_PORT: u16 = 5000;
+
+    fn udp_port(port: u16) -> OwnedPort {
+        OwnedPort {
+            transport: Transport::Udp,
+            addr: None,
+            port,
         }
     }
 
@@ -459,10 +522,18 @@ mod tests {
     }
 
     impl App {
+        /// A socket owning the UDP ports the tests send from and filter on.
         fn new() -> Self {
-            let bind = bind();
+            let mut t = Self::unowned(bind());
+            for port in [SRC_PORT, 7, 8, 9] {
+                t.queue.own(udp_port(port)).expect("room");
+            }
+            t
+        }
+
+        fn unowned(bind: Bind) -> Self {
             let layout = RingLayout::new(bind.fill, bind.rx, bind.tx, bind.completion);
-            let queue = CopyQueue::bind(&bind, UMEM_BYTES, layout.map_len()).expect("binds");
+            let queue = CopyQueue::bind(&bind, NIC, UMEM_BYTES, layout.map_len()).expect("binds");
             Self {
                 queue,
                 app: layout.app(),
@@ -517,11 +588,11 @@ mod tests {
     fn binding_checks_the_grants() {
         let layout = RingLayout::new(size(8), size(8), size(8), size(8));
         assert_eq!(
-            CopyQueue::bind(&bind(), 3000, layout.map_len()).map(|_| ()),
+            CopyQueue::bind(&bind(), NIC, 3000, layout.map_len()).map(|_| ()),
             Err(BindError::Umem(UmemError::Unaligned { bytes: 3000 }))
         );
         assert_eq!(
-            CopyQueue::bind(&bind(), UMEM_BYTES, layout.map_len() - 1).map(|_| ()),
+            CopyQueue::bind(&bind(), NIC, UMEM_BYTES, layout.map_len() - 1).map(|_| ()),
             Err(BindError::RingsTooSmall {
                 need: layout.map_len(),
                 have: layout.map_len() - 1
@@ -662,8 +733,86 @@ mod tests {
     }
 
     #[test]
-    fn transmit_respects_the_budget_and_a_full_completion_ring() {
+    fn filters_need_the_port_owned() {
+        let mut t = App::unowned(bind());
+        assert_eq!(
+            t.queue.add_filter(port_filter(7)),
+            Err(FilterTableError::NotOwned(FilterOwnError::NotOwned))
+        );
+        t.queue.own(udp_port(7)).expect("room");
+        assert!(t.queue.add_filter(port_filter(7)).is_ok());
+    }
+
+    /// Puts `frames` on TX, transmits, and returns what reached the wire and how many frames
+    /// came back on Completion.
+    fn send_all(t: &mut App, frames: &[Vec<u8>]) -> (Vec<Vec<u8>>, usize) {
+        for (slot, bytes) in t.frames().into_iter().zip(frames) {
+            write_frame(&t.umem, slot, bytes);
+            let packet = Packet::new(t.queue.umem(), slot, bytes.len() as u32).expect("fits");
+            t.app
+                .tx
+                .push(&t.rings[..], &PacketSlot::new(&packet))
+                .expect("room");
+        }
+        let mut wire = Vec::new();
+        let mem = Shared {
+            rings: &t.rings,
+            umem: &t.umem,
+        };
+        t.queue
+            .transmit(mem, 16, |bytes| {
+                wire.push(bytes.to_vec());
+                true
+            })
+            .expect("valid rings");
+        let mut back = 0;
+        while t.app.completion.pop(&t.rings[..]).expect("valid").is_some() {
+            back += 1;
+        }
+        (wire, back)
+    }
+
+    #[test]
+    fn tx_validation_drops_what_the_socket_may_not_send() {
+        let good = udp_frame(7);
+        let mut spoofed_mac = good.clone();
+        spoofed_mac[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 0x66]);
+        let ip = ipv4(
+            IP_PROTOCOL_UDP,
+            [10, 0, 0, 9],
+            [10, 0, 0, 1],
+            0,
+            &udp(6000, 7),
+        );
+        let unowned_port = ethernet(&[], ETHERTYPE_IPV4, &ip);
+        let arp = ethernet(&[], 0x0806, &[0; 28]);
+        let runt = [0u8; 10].to_vec();
+        let frames = [good.clone(), spoofed_mac, unowned_port, arp, runt];
+
         let mut t = App::new();
+        let (wire, back) = send_all(&mut t, &frames);
+        assert_eq!(wire, [good]);
+        assert_eq!(back, frames.len(), "rejected frames still come back");
+        assert_eq!(t.queue.stats().tx_packets, 1);
+        assert_eq!(t.queue.stats().tx_rejected, 4);
+
+        let mut raw = App::unowned(Bind {
+            flags: BindFlags::RAW_TX,
+            ..bind()
+        });
+        let (wire, back) = send_all(&mut raw, &frames);
+        assert_eq!(wire, frames, "a raw socket sends everything");
+        assert_eq!(back, frames.len());
+        assert_eq!(raw.queue.stats().tx_rejected, 0);
+    }
+
+    #[test]
+    fn transmit_respects_the_budget_and_a_full_completion_ring() {
+        // The frames are zeros, not valid traffic, so the socket sends raw frames.
+        let mut t = App::unowned(Bind {
+            flags: BindFlags::RAW_TX,
+            ..bind()
+        });
         let frames = t.frames();
         for frame in &frames[..8] {
             let packet = Packet::new(t.queue.umem(), *frame, 60).expect("fits");
@@ -832,7 +981,8 @@ mod tests {
                     Ordering::Relaxed,
                 );
             }
-            let mut queue = CopyQueue::bind(&bind(), UMEM_BYTES, t.rings.len() * 8).expect("binds");
+            let mut queue =
+                CopyQueue::bind(&bind(), NIC, UMEM_BYTES, t.rings.len() * 8).expect("binds");
             let mem = Shared {
                 rings: &t.rings,
                 umem: &t.umem,
