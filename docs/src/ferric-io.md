@@ -320,8 +320,11 @@ benchmark is its own MIT code, in two parts:
 
 - `crates/iobench` (`ferric-iobench`, `no_std`, host-tested) holds the logic.
   It parses fio's options (`--rw`, `--bs`, `--iodepth`, `--numjobs`,
-  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct`) and
-  refuses writes and asynchronous engines by name. It has the block order, a
+  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct=1`) and
+  refuses by name what the runner does not do: writes, engines other than
+  `psync`, and buffered I/O (`--direct=0`). Before a job runs, its block size
+  is checked against the partition's logical block size (`st_blksize`), since
+  the disk scheme refuses reads that are not whole blocks. It has the block order, a
   latency histogram with fio's bucket layout, the IOPS, bandwidth and
   percentile report, and the fio command line for running the same job on
   Linux.
@@ -364,9 +367,11 @@ read. There are two engines, and they answer different questions:
   `--ioengine=psync --numjobs=N`, so there are N threads each doing one
   synchronous `pread`, which is exactly what the runner does. The runner
   shares a single block order between its threads. fio gives each job its own
-  region, so the command cuts the region into one slice per job
-  (`--size=S --offset_increment=S`) and `--group_reporting` adds the jobs
-  together. In both, every block is read once. The difference between the two
+  region, so the command cuts the region into one range of whole blocks per
+  job (`Job::ranges`, one `--name=… --offset=… --size=…` section each; when
+  the blocks do not divide evenly, the first jobs get one block more), and
+  `--group_reporting` adds the jobs together. In both, every block is read
+  once, and every offset and size is a multiple of `bs`, as direct I/O needs. The difference between the two
   numbers is the system's per-read cost: Ferric Oxide's system call, scheme
   IPC and nvmed against Linux's block layer and NVMe driver.
 - `FioEngine::IoUring` is the exit baseline. It uses
@@ -379,17 +384,18 @@ read. There are two engines, and they answer different questions:
 For the default jobs, with `DEV` as the partition device:
 
 ```sh
-fio --name=randread-4k-qd1 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=1 --size=4194304 --offset_increment=4194304 --group_reporting
-fio --name=randread-4k-qd32 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=32 --size=262144 --offset_increment=262144 --group_reporting
+fio --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=randread-4k-qd1-0 --offset=0 --size=4194304
+# 32 sections of 262144 bytes, from --offset=0 to --offset=8126464:
+fio --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=randread-4k-qd32-0 --offset=0 --size=262144 --name=randread-4k-qd32-1 --offset=262144 --size=262144 … --name=randread-4k-qd32-31 --offset=8126464 --size=262144
 fio --name=randread-4k-qd32 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=io_uring --iodepth=32 --numjobs=1 --size=8388608
-fio --name=read-128k-qd1 --filename=DEV --rw=read --bs=131072 --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=1 --size=33554432 --offset_increment=33554432 --group_reporting
+fio --filename=DEV --rw=read --bs=131072 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=read-128k-qd1-0 --offset=0 --size=33554432
 ```
 
 The figures map onto fio's output like this:
 
 | `ferric-iobench` | fio | Notes |
 | --- | --- | --- |
-| `iops` | `read: IOPS=` | Reads over the wall-clock time from the first submission to the last completion. The runner's time includes starting its threads (well under a millisecond against a round of thousands of reads); fio starts its jobs before its clock. |
+| `iops` | `read: IOPS=` | Reads over the wall-clock time from the first submission to the last completion. Like fio, the runner starts its threads before its clock: they wait at a barrier, and the clock starts when they are all there. |
 | `mib_s` | `BW=… MiB/s` | Both use `kb_base=1024`. |
 | `lat_*_ns` | `clat` (and `lat`) | Measured per read, from just before the `pread` to just after it returns. With a synchronous engine, fio's `slat` is close to zero, so `lat` and `clat` agree. fio prints microseconds by default. |
 | `lat_p50_ns`, `lat_p99_ns`, `lat_p999_ns` | `clat percentiles` 50.00th, 99.00th, 99.90th | The bucket layout is the same: exact below 128 ns, then 64 linear buckets per power of two, so each bucket is within 1/64 (1.6%). Like fio, the value reported is the middle of the bucket that holds the read of that rank, with the rank rounded up. |

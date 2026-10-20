@@ -95,6 +95,8 @@ jobs:
           cargo clippy --locked --all-targets -p ferric-iobench -- -D warnings
           cargo test --locked -p ferric-iobench
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-iobench
+          # The runner's own host tests (job parsing, round timing); it is its own workspace.
+          cargo test --locked --manifest-path recipes/tests/ferric-iobench/files/Cargo.toml
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
       # kernel turns it on; file systems do not).
       - name: ferric-pcache

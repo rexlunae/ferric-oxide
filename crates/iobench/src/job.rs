@@ -6,13 +6,13 @@
 //! | Option | Values | Default |
 //! | --- | --- | --- |
 //! | `--rw` (`--readwrite`) | `read` (sequential), `randread` | `read` |
-//! | `--bs` (`--blocksize`) | a size, a multiple of 512 | `4k` |
+//! | `--bs` (`--blocksize`) | a size, a multiple of 512 and of the disk's logical block size ([`Job::check_block_size`]) | `4k` |
 //! | `--iodepth` | 1 to [`MAX_SUBMITTERS`] | 1 |
 //! | `--numjobs` | 1 to [`MAX_SUBMITTERS`] | 1 |
 //! | `--io_size` (`--size`) | a size, a whole number of blocks | `4m` |
 //! | `--randseed` | a number | [`DEFAULT_SEED`] |
-//! | `--ioengine` | `psync`, `sync` or `pvsync` | `psync` |
-//! | `--direct` | `0` or `1` | `1` |
+//! | `--ioengine` | `psync` | `psync` |
+//! | `--direct` | `1` | `1` |
 //! | `--name` | anything (ignored; the runner names jobs itself) | |
 //!
 //! Sizes take fio's suffixes with its default `kb_base=1024`: `4k` is 4096 bytes, `1m` is
@@ -22,7 +22,9 @@
 //! running that many threads, each with one synchronous positioned read at a time
 //! ([`Job::submitters`]). On Linux that is `--ioengine=psync --numjobs=N`; the queue depth
 //! the disk sees is the same as `--ioengine=io_uring --iodepth=N` ([`FioEngine`]). Writes are
-//! refused: the runner reads the disk the system runs from.
+//! refused: the runner reads the disk the system runs from. Other engines, and buffered I/O
+//! (`--direct=0`), are refused too, since the runner always does positioned reads straight
+//! from the disk scheme, which has no cache.
 
 use core::fmt;
 
@@ -128,6 +130,27 @@ impl fmt::Display for JobError<'_> {
 
 impl core::error::Error for JobError<'_> {}
 
+/// [`Job::check_block_size`]: the job's block size does not suit the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockSizeMismatch {
+    /// The job's block size.
+    pub bs: u32,
+    /// The disk's logical block size.
+    pub logical: u32,
+}
+
+impl fmt::Display for BlockSizeMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bs={} is not a multiple of the disk's {}-byte logical blocks",
+            self.bs, self.logical
+        )
+    }
+}
+
+impl core::error::Error for BlockSizeMismatch {}
+
 impl Job {
     /// Parses a job from fio-style options, `--option=value` (the leading dashes may be left
     /// out). Options not given keep their defaults (the table in the module docs).
@@ -158,8 +181,7 @@ impl Job {
             "io_size" | "size" => self.io_size = parse_size(value).filter(|&n| n > 0).ok_or(bad)?,
             "randseed" => self.seed = value.parse().map_err(|_| bad)?,
             "ioengine" => check_engine(option, value)?,
-            "direct" if matches!(value, "0" | "1") => {}
-            "direct" => return Err(bad),
+            "direct" => check_direct(option, value)?,
             "name" => {}
             _ => return Err(JobError::Unknown(option)),
         }
@@ -184,6 +206,38 @@ impl Job {
     /// Reads in the job: `io_size / bs`.
     pub const fn ios(&self) -> u64 {
         self.io_size / self.bs as u64
+    }
+
+    /// Checks that the job's reads suit a disk whose logical block size is `logical` bytes:
+    /// the disk scheme refuses a read that is not a whole number of its blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockSizeMismatch`] when `bs` is not a multiple of `logical` (or `logical` is 0).
+    pub const fn check_block_size(&self, logical: u32) -> Result<(), BlockSizeMismatch> {
+        if logical != 0 && self.bs.is_multiple_of(logical) {
+            Ok(())
+        } else {
+            Err(BlockSizeMismatch {
+                bs: self.bs,
+                logical,
+            })
+        }
+    }
+
+    /// The job's blocks cut into `parts` byte ranges `(offset, len)` of whole blocks, in
+    /// order, together covering the job's `io_size` once: the first `ios() % parts` ranges
+    /// have one block more than the rest. Ranges that would be empty (fewer blocks than
+    /// parts) are left out.
+    pub fn ranges(&self, parts: u32) -> impl Iterator<Item = (u64, u64)> {
+        let bs = u64::from(self.bs);
+        let parts = u64::from(parts.max(1));
+        let (each, extra) = (self.ios() / parts, self.ios() % parts);
+        (0..parts).filter_map(move |i| {
+            let blocks = each + u64::from(i < extra);
+            let first = i * each + i.min(extra);
+            (blocks > 0).then_some((first * bs, blocks * bs))
+        })
     }
 
     /// A short name for the job, as in `randread-4k-qd32`: the pattern, the block size and
@@ -214,10 +268,20 @@ fn parse_rw<'a>(option: &'a str, value: &'a str) -> Result<Rw, JobError<'a>> {
     }
 }
 
+/// Only `psync` is what the runner does: one positioned read per thread at a time.
 fn check_engine<'a>(option: &'a str, value: &'a str) -> Result<(), JobError<'a>> {
     match value {
-        "psync" | "sync" | "pvsync" => Ok(()),
+        "psync" => Ok(()),
         _ => Err(JobError::Unsupported { option, value }),
+    }
+}
+
+/// Only direct I/O is what the runner does: the disk scheme has no cache to bypass or use.
+fn check_direct<'a>(option: &'a str, value: &'a str) -> Result<(), JobError<'a>> {
+    match value {
+        "1" => Ok(()),
+        "0" => Err(JobError::Unsupported { option, value }),
+        _ => Err(JobError::Value { option, value }),
     }
 }
 
@@ -314,30 +378,40 @@ impl fmt::Display for FioCommand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let job = self.job;
         let n = job.submitters();
-        write!(
-            f,
-            "fio --name={} --filename={} --rw={} --bs={} --direct=1 --randseed={} ",
-            job.label(),
-            self.filename,
-            job.rw.as_str(),
-            job.bs,
-            job.seed,
-        )?;
         match self.engine {
             // Each fio job has its own region and random map, so the region is cut into one
-            // slice per job: together they read every block once, as the runner's shared
-            // order does. fio rounds a slice that is not whole blocks down.
+            // range of whole blocks per job ([`Job::ranges`]): together they read every block
+            // once, as the runner's shared order does, and every offset and size stays a
+            // multiple of `bs`, which direct I/O needs. Options before the first `--name` are
+            // global.
             FioEngine::Psync => {
-                let slice = job.io_size / u64::from(n);
                 write!(
                     f,
-                    "--ioengine=psync --numjobs={n} --size={slice} --offset_increment={slice} \
-                     --group_reporting"
-                )
+                    "fio --filename={} --rw={} --bs={} --direct=1 --randseed={} \
+                     --ioengine=psync --group_reporting",
+                    self.filename,
+                    job.rw.as_str(),
+                    job.bs,
+                    job.seed,
+                )?;
+                for (i, (offset, size)) in job.ranges(n).enumerate() {
+                    write!(
+                        f,
+                        " --name={}-{i} --offset={offset} --size={size}",
+                        job.label()
+                    )?;
+                }
+                Ok(())
             }
             FioEngine::IoUring => write!(
                 f,
-                "--ioengine=io_uring --iodepth={n} --numjobs=1 --size={}",
+                "fio --name={} --filename={} --rw={} --bs={} --direct=1 --randseed={} \
+                 --ioengine=io_uring --iodepth={n} --numjobs=1 --size={}",
+                job.label(),
+                self.filename,
+                job.rw.as_str(),
+                job.bs,
+                job.seed,
                 job.io_size
             ),
         }
@@ -415,6 +489,66 @@ mod tests {
     }
 
     #[test]
+    fn options_the_runner_would_ignore_are_refused() {
+        // The runner does positioned, direct reads only.
+        for (arg, option, value) in [
+            ("--direct=0", "direct", "0"),
+            ("--ioengine=sync", "ioengine", "sync"),
+            ("--ioengine=pvsync", "ioengine", "pvsync"),
+        ] {
+            assert_eq!(
+                Job::parse([arg]),
+                Err(JobError::Unsupported { option, value })
+            );
+        }
+        assert!(Job::parse(["--direct=1", "--ioengine=psync"]).is_ok());
+    }
+
+    #[test]
+    fn block_sizes_must_suit_the_disk() {
+        let small = Job::parse(["--bs=512", "--io_size=4m"]).unwrap();
+        assert_eq!(small.check_block_size(512), Ok(()));
+        assert_eq!(
+            small.check_block_size(4096),
+            Err(BlockSizeMismatch {
+                bs: 512,
+                logical: 4096
+            })
+        );
+        let big = Job::parse(["--bs=128k"]).unwrap();
+        assert_eq!(big.check_block_size(512), Ok(()));
+        assert_eq!(big.check_block_size(4096), Ok(()));
+        assert!(big.check_block_size(0).is_err());
+        assert!(
+            !small
+                .check_block_size(4096)
+                .unwrap_err()
+                .to_string()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ranges_are_whole_blocks_covering_the_job_once() {
+        let job = Job::parse(["--bs=4k", "--io_size=12k", "--numjobs=2"]).unwrap();
+        let ranges: std::vec::Vec<_> = job.ranges(job.submitters()).collect();
+        assert_eq!(ranges, [(0, 8192), (8192, 4096)]);
+        // More parts than blocks: one block each, no empty ranges.
+        let ranges: std::vec::Vec<_> = job.ranges(5).collect();
+        assert_eq!(ranges, [(0, 4096), (4096, 4096), (8192, 4096)]);
+        for parts in 1..=40 {
+            let job = Job::parse(["--bs=4k", "--io_size=100k"]).unwrap();
+            let mut at = 0;
+            for (offset, size) in job.ranges(parts) {
+                assert_eq!(offset, at);
+                assert!(offset.is_multiple_of(4096) && size.is_multiple_of(4096) && size > 0);
+                at += size;
+            }
+            assert_eq!(at, job.io_size);
+        }
+    }
+
+    #[test]
     fn bad_options_name_themselves() {
         assert_eq!(Job::parse(["--bogus=1"]), Err(JobError::Unknown("bogus")));
         assert_eq!(Job::parse(["--bs"]), Err(JobError::NoValue("bs")));
@@ -456,12 +590,24 @@ mod tests {
     #[test]
     fn the_fio_command_runs_the_same_job_on_linux() {
         let job = Job::parse(["--rw=randread", "--bs=4k", "--iodepth=32", "--io_size=8m"]).unwrap();
+        let psync = job
+            .fio_command("/dev/nvme0n1", FioEngine::Psync)
+            .to_string();
+        assert!(psync.starts_with(
+            "fio --filename=/dev/nvme0n1 --rw=randread --bs=4096 --direct=1 \
+             --randseed=9223372040899026669 --ioengine=psync --group_reporting \
+             --name=randread-4k-qd32-0 --offset=0 --size=262144 \
+             --name=randread-4k-qd32-1 --offset=262144 --size=262144 "
+        ));
+        assert_eq!(psync.matches("--name=").count(), 32);
+        assert!(psync.ends_with("--name=randread-4k-qd32-31 --offset=8126464 --size=262144"));
+        // A shape that does not divide evenly still gets whole, aligned blocks.
+        let odd = Job::parse(["--bs=4k", "--io_size=12k", "--numjobs=2"]).unwrap();
         assert_eq!(
-            job.fio_command("/dev/nvme0n1", FioEngine::Psync)
-                .to_string(),
-            "fio --name=randread-4k-qd32 --filename=/dev/nvme0n1 --rw=randread --bs=4096 \
-             --direct=1 --randseed=9223372040899026669 --ioengine=psync --numjobs=32 \
-             --size=262144 --offset_increment=262144 --group_reporting"
+            odd.fio_command("f", FioEngine::Psync).to_string(),
+            "fio --filename=f --rw=read --bs=4096 --direct=1 --randseed=9223372040899026669 \
+             --ioengine=psync --group_reporting --name=read-4k-qd2-0 --offset=0 --size=8192 \
+             --name=read-4k-qd2-1 --offset=8192 --size=4096"
         );
         assert_eq!(
             job.fio_command("/dev/nvme0n1", FioEngine::IoUring)

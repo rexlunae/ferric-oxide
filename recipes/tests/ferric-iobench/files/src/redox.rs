@@ -3,14 +3,14 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ferric_blkqueue::QueuePolicy;
 use ferric_blkqueue::ab::{self, Comparison, Verdict};
-use ferric_iobench::job::{Job, JobError};
+use ferric_iobench::job::{BlockSizeMismatch, Job, JobError};
 use ferric_iobench::latency::Histogram;
 use ferric_iobench::offsets::Order;
 use ferric_iobench::report::Summary;
@@ -20,6 +20,7 @@ use syscall::CallFlags;
 use syscall::error::{EIO, EOPNOTSUPP};
 
 use crate::DEFAULT_JOBS;
+use crate::round::run_together;
 
 /// The queue policies a round runs, with their names in the output. The first is the A/B
 /// baseline (the one-queue path) and the second the candidate (the default).
@@ -42,6 +43,8 @@ enum Failure {
     ShortRead { at: u64, len: usize, got: usize },
     /// A submitter thread panicked.
     Thread,
+    /// The job's block size does not suit the disk.
+    BlockSize(BlockSizeMismatch),
 }
 
 impl fmt::Display for Failure {
@@ -57,11 +60,19 @@ impl fmt::Display for Failure {
                 write!(f, "a read of {len} bytes at {at} returned {got}")
             }
             Self::Thread => f.write_str("a submitter thread panicked"),
+            Self::BlockSize(_) => f.write_str("the job does not suit the disk"),
         }
     }
 }
 
-impl std::error::Error for Failure {}
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BlockSize(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 /// Wraps a `std::io` result with what it was doing.
 fn io<T>(what: &'static str, r: std::io::Result<T>) -> Result<T, Failure> {
@@ -90,9 +101,24 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            println!("FERRIC_TEST_FAIL iobench: {err}");
+            println!("FERRIC_TEST_FAIL iobench: {}", Chain(&err));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// An error and its sources, `: `-separated, for the one line a failure prints.
+struct Chain<'a>(&'a dyn std::error::Error);
+
+impl fmt::Display for Chain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(err) = source {
+            write!(f, ": {err}")?;
+            source = err.source();
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +138,8 @@ fn parse_jobs(args: &[String]) -> Result<Vec<Job>, JobError<'_>> {
 struct Disk {
     file: File,
     len: u64,
+    /// The disk's logical block size, which every read must be a multiple of.
+    block: u32,
 }
 
 /// The NVMe disk scheme's name, if there is one.
@@ -147,9 +175,12 @@ fn largest_partition(scheme: &str) -> Result<Disk, Failure> {
         }
         let path = format!("/scheme/{scheme}/{name}");
         let file = io("open a partition", OpenOptions::new().read(true).open(path))?;
-        let len = io("stat a partition", file.metadata())?.len();
+        let meta = io("stat a partition", file.metadata())?;
+        let len = meta.len();
+        // The disk scheme reports its logical block size as `st_blksize`.
+        let block = u32::try_from(meta.blksize()).unwrap_or(0);
         if best.as_ref().is_none_or(|disk| len > disk.len) {
-            best = Some(Disk { file, len });
+            best = Some(Disk { file, len, block });
         }
     }
     best.ok_or(Failure::NoPartition)
@@ -203,6 +234,8 @@ impl Totals {
 
 /// Runs `job` with every policy, in rounds, and prints its `FERRIC_BENCH` lines.
 fn bench_job(disk: &Disk, job: &Job, percore: bool) -> Result<(), Failure> {
+    job.check_block_size(disk.block)
+        .map_err(Failure::BlockSize)?;
     if disk.len < job.io_size {
         return Err(Failure::TooSmall {
             need: job.io_size,
@@ -305,27 +338,18 @@ fn print_job(
 }
 
 /// Reads every block of `job` once, with [`Job::submitters`] threads that share a counter
-/// of reads started, and returns the wall-clock time and the merged latencies.
+/// of reads started, and returns the wall-clock time and the merged latencies. The clock
+/// starts once every thread is ready ([`run_together`]).
 fn run_round(disk: &Disk, job: &Job) -> Result<(u64, Box<Histogram>), Failure> {
     let order = Order::of(job);
     let next = AtomicU64::new(0);
     let bs = job.bs as usize;
-    let start = Instant::now();
-    let results: Vec<Result<Box<Histogram>, Failure>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..job.submitters())
-            .map(|_| scope.spawn(|| submit(disk, &order, &next, bs)))
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap_or(Err(Failure::Thread)))
-            .collect()
-    });
-    let elapsed_ns = nanos(start.elapsed());
+    let timed = run_together(job.submitters(), || submit(disk, &order, &next, bs));
     let mut latency = Box::new(Histogram::new());
-    for result in results {
-        latency.merge(&*result?);
+    for result in timed.results {
+        latency.merge(&*result.ok_or(Failure::Thread)??);
     }
-    Ok((elapsed_ns, latency))
+    Ok((nanos(timed.elapsed), latency))
 }
 
 /// One submitter: takes the next read until the job has none left, one `pread` at a time.
