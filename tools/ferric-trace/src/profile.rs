@@ -556,7 +556,8 @@ impl ImageTracker {
                 let image = image.to_string();
                 // Still live if it was in the snapshot before (or already in this one).
                 let current = seen.iter_mut().rev().find(|o| {
-                    o.image == image && (o.live.last == epoch || o.live.last.checked_add(1) == Some(epoch))
+                    o.image == image
+                        && (o.live.last == epoch || o.live.last.checked_add(1) == Some(epoch))
                 });
                 match current {
                     Some(occurrence) => occurrence.live.last = epoch,
@@ -1312,7 +1313,10 @@ mod tests {
         assert_eq!(images[&9][1].live, Some(Live { first: 2, last: 3 }));
 
         let batches = parse_batches(spans, "1 4 0\n2 9 5\n", 2).unwrap();
-        assert_eq!(batches[1], [Batch { end: 0, epoch: 1 }, Batch { end: 5, epoch: 2 }]);
+        assert_eq!(
+            batches[1],
+            [Batch { end: 0, epoch: 1 }, Batch { end: 5, epoch: 2 }]
+        );
         assert!(parse_batches(spans, "1 4\n", 2).is_err());
         assert!(parse_batches(spans, "x 4 0\n", 2).is_err());
     }
@@ -1359,7 +1363,10 @@ mod tests {
         let out = scheme.path().join("profile");
         let length = DRAIN_INTERVAL * (2 * SNAPSHOT_DRAINS + 1);
         let recorded = record(scheme.path(), &proc, &out, &Run::For(length)).unwrap();
-        let drains = fs::read_to_string(out.join(BATCHES)).unwrap().lines().count() as u32;
+        let drains = fs::read_to_string(out.join(BATCHES))
+            .unwrap()
+            .lines()
+            .count() as u32;
         // Before sampling, after the first drain, each SNAPSHOT_DRAINSth, and after the last.
         let expected = 2 + drains / SNAPSHOT_DRAINS + 1;
         assert!(drains > SNAPSHOT_DRAINS, "{drains} drains");
