@@ -11,6 +11,7 @@ name = "ferric-trace"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ferric-trace = { path = "../../crates/trace" }
 # To decode the hardware reports in `iommu.fault` records, as the kernel does.

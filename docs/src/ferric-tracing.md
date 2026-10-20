@@ -547,8 +547,9 @@ A capture does not record the wall time, so `--start-unix-ns` gives the Unix
 time of its first record in nanoseconds; the default, 0, makes every time the
 time since the first record. Later times use the capture's clock and
 `--tsc-mhz` as `perfetto` does. Trace ids start with a hash of every record
-and the start time, so two captures sent to one backend keep separate traces. The
-mapping is described in `tools/ferric-trace/src/otlp.rs`.
+and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), so two
+captures sent to one backend keep separate traces. The mapping is described in
+`tools/ferric-trace/src/otlp.rs`.
 
 ## Validation
 
