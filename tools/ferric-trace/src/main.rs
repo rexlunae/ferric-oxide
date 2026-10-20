@@ -261,11 +261,12 @@ fn record_profile(
     );
     let snapshots = recorded.snapshots;
     println!(
-        "image snapshots: {} in {:?} (longest {:?}), {} ppm of the time between them",
+        "image snapshots: {} in {:?} (longest {:?}), {} ppm of the {:?} from the first to the last",
         snapshots.count,
         snapshots.total,
         snapshots.longest,
-        snapshots.duty_ppm()
+        snapshots.duty_ppm(),
+        snapshots.span
     );
     if recorded.images == 0 {
         eprintln!(

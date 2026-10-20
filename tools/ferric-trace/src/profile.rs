@@ -23,13 +23,14 @@
 //! [`ProfileError::Busy`]) until this one closes its control file. It then drains whatever
 //! earlier runs left in the buffers and throws it away, turns sampling on, runs a command or
 //! waits, and drains every buffer every [`DRAIN_INTERVAL`] until sampling is off again, so the
-//! buffers never fill. It reads `/scheme/sys/proc` after each drain (a snapshot; the `n`th
-//! is epoch `n`, the first taken before sampling starts) and keeps every image it saw for each
+//! buffers never fill. It reads `/scheme/sys/proc` before sampling starts, after the first
+//! drain, after every [`SNAPSHOT_DRAINS`]th and after the last (a snapshot; the `n`th is
+//! epoch `n`) and keeps every image it saw for each
 //! context, so programs that exit before the end, and libraries unloaded during the run, are
 //! still covered unless they lived less than one interval. Each sighting of an image is an
 //! occurrence with the snapshots it was live in; an image that comes back after missing from
-//! a snapshot is a new occurrence. The samples drained just before snapshot `n` were taken
-//! between snapshots `n - 1` and `n`, so they carry epoch `n`, and the symbolizer resolves a
+//! a snapshot is a new occurrence. The samples drained after snapshot `n - 1` and up to
+//! snapshot `n` were taken between the two, so they carry epoch `n`, and the symbolizer resolves a
 //! sample against the occurrences live around its epoch ([`LoadedImage::live`]).
 //! [`Recorded::snapshots`] says what the snapshots cost. As with trace captures, the directory is created exclusively
 //! (its parents as needed) and holds an `INCOMPLETE` marker ([`crate::capture::INCOMPLETE`])
@@ -71,6 +72,12 @@ pub const BATCHES: &str = "batches";
 
 /// How often [`record`] drains the buffers while sampling.
 pub const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// [`record`] takes an image snapshot after the first drain and then after every
+/// `SNAPSHOT_DRAINS`th, so about every half second. Reading `/scheme/sys/proc` took about
+/// 1.6 ms on the CI image (review 4320670273), 1.6% of the time at every drain; this keeps it
+/// near 0.3%. An image that lives less than the interval may be missed.
+pub const SNAPSHOT_DRAINS: u32 = 5;
 
 /// The read size for the buffers.
 const READ_BYTES: usize = 256 * 1024;
@@ -114,16 +121,18 @@ pub struct Snapshots {
     pub total: Duration,
     /// The longest one.
     pub longest: Duration,
+    /// The wall time from the start of the first to the end of the last.
+    pub span: Duration,
 }
 
 impl Snapshots {
-    /// The share of the wall time between snapshots spent taking them, in parts per million,
-    /// for snapshots every [`DRAIN_INTERVAL`].
+    /// The share of [`Snapshots::span`] spent taking snapshots, in parts per million; 0 when
+    /// the span is empty.
     pub fn duty_ppm(&self) -> u64 {
-        let Some(mean) = self.total.checked_div(self.count.max(1)) else {
+        if self.span.is_zero() {
             return 0;
-        };
-        (mean.as_nanos() * 1_000_000 / DRAIN_INTERVAL.as_nanos()) as u64
+        }
+        (self.total.as_nanos() * 1_000_000 / self.span.as_nanos()) as u64
     }
 }
 
@@ -294,12 +303,17 @@ pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Record
     }
     let mut images = ImageTracker::new(proc);
     let mut batches = String::new();
+    let mut drains = 0u32;
     images.snapshot()?;
     sampling.start()?;
     let status = sample(run, &mut || {
         drain_all(&mut cpus, &mut files)?;
         batches.push_str(&batch_line(images.epoch(), &files)?);
-        images.snapshot()
+        drains = drains.wrapping_add(1);
+        if drains == 1 || drains.is_multiple_of(SNAPSHOT_DRAINS) {
+            images.snapshot()?;
+        }
+        Ok(())
     })?;
     sampling.stop()?;
     drain_all(&mut cpus, &mut files)?;
@@ -478,6 +492,8 @@ struct ImageTracker {
     /// Snapshots taken so far: the next one's epoch.
     taken: u32,
     timing: Snapshots,
+    /// When the first snapshot started.
+    first: Option<Instant>,
 }
 
 /// An image line seen in the snapshots `first..=last`, every one of them.
@@ -495,6 +511,7 @@ impl ImageTracker {
             blocks: BTreeMap::new(),
             taken: 0,
             timing: Snapshots::default(),
+            first: None,
         }
     }
 
@@ -515,6 +532,7 @@ impl ImageTracker {
         self.timing.count = self.timing.count.saturating_add(1);
         self.timing.total = self.timing.total.saturating_add(took);
         self.timing.longest = self.timing.longest.max(took);
+        self.timing.span = self.first.get_or_insert(started).elapsed();
         taken
     }
 
@@ -1314,13 +1332,43 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_duty_is_the_mean_over_the_interval() {
+    fn snapshot_duty_is_the_share_of_the_span() {
         let snapshots = Snapshots {
             count: 4,
-            total: DRAIN_INTERVAL / 250, // 0.1 ms each on average of 100 ms is 0.1%
-            longest: DRAIN_INTERVAL / 500,
+            total: Duration::from_millis(2),
+            longest: Duration::from_micros(600),
+            span: Duration::from_secs(2), // 2 ms in 2 s is 0.1%
         };
         assert_eq!(snapshots.duty_ppm(), 1000);
         assert_eq!(Snapshots::default().duty_ppm(), 0);
+    }
+
+    /// A recording long enough for several drains snapshots after the first and every
+    /// [`SNAPSHOT_DRAINS`]th, not after each.
+    #[test]
+    fn record_snapshots_less_often_than_it_drains() {
+        let scheme = stand_in_scheme();
+        let proc = scheme.path().join("proc");
+        fs::write(
+            &proc,
+            "context 9 pid 4 euid 0 egid 0 status runnable cpu 0 running yes active_ns 1 sched_ns 1 name sh\n\
+             memory private 0 shared 0 kernel 0\n\
+             image 0x7000 path /usr/bin/a\n",
+        )
+        .unwrap();
+        let out = scheme.path().join("profile");
+        let length = DRAIN_INTERVAL * (2 * SNAPSHOT_DRAINS + 1);
+        let recorded = record(scheme.path(), &proc, &out, &Run::For(length)).unwrap();
+        let drains = fs::read_to_string(out.join(BATCHES)).unwrap().lines().count() as u32;
+        // Before sampling, after the first drain, each SNAPSHOT_DRAINSth, and after the last.
+        let expected = 2 + drains / SNAPSHOT_DRAINS + 1;
+        assert!(drains > SNAPSHOT_DRAINS, "{drains} drains");
+        assert!(
+            recorded.snapshots.count.abs_diff(expected) <= 1,
+            "{} snapshots for {drains} drains",
+            recorded.snapshots.count
+        );
+        assert!(recorded.snapshots.count < drains);
+        assert!(recorded.snapshots.span >= recorded.snapshots.total);
     }
 }

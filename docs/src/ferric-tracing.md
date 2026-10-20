@@ -430,7 +430,7 @@ kernel without the whole-sample writes) as one error and carries on after
 them.
 User stacks are only walked through frame pointers, so build the image with
 `cpu.frame_pointers` ([#149](https://github.com/rexlunae/ferric-oxide/pull/149)) for useful user frames.
-With `kernel.sys_proc` it also reads `/scheme/sys/proc` at each drain and saves
+With `kernel.sys_proc` it also reads `/scheme/sys/proc` as it drains and saves
 an `images` file: the `image` lines of every sampled context.
 
 Those lines come from the loaders. Exec (`redox-rt`) records the program and
@@ -451,8 +451,12 @@ of the snapshot that followed it. The symbolizer resolves a sample against the
 occurrence live at its epoch, so old samples keep their library when another
 (or the same one again) is later mapped at the same address, and falls back to
 the newest image that holds the address.
-`ferric-trace profile` prints what reading the file cost (`image snapshots: …
-ppm of the time between them`).
+The recorder reads the file before sampling, after the first drain, after
+every fifth (about every 500 ms) and after the last: one read took about
+1.6 ms on the CI image, 1.6% of the time when it was read at every drain, so
+an image that lives less than half a second may be missed. `ferric-trace
+profile` prints what the reads cost (`image snapshots: … ppm of the … from the
+first to the last`).
 
 ```sh
 ferric-trace flamegraph prof/ --kernel kernel.all --root build/x86_64/ferric-smoke/sysroot \
