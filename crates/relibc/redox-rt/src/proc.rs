@@ -700,6 +700,12 @@ pub fn munmap_transfer(
 /// profilers can symbolize user addresses under ASLR. Best effort: a kernel without
 /// `sys_proc` refuses the handle, and a path that is not UTF-8 or too long is not recorded.
 pub fn record_image(addrspace_fd: &FdGuardUpper, base: usize, path: &[u8]) {
+    image_call(addrspace_fd, ferric_procinfo::IMAGES_HANDLE, base, path);
+}
+
+/// Ferric Oxide: writes the image record of `base` and `path` to the address space's `handle`
+/// (recording or unloading it). Best effort, as [`record_image`].
+fn image_call(addrspace_fd: &FdGuardUpper, handle: &str, base: usize, path: &[u8]) {
     let Ok(path) = core::str::from_utf8(path) else {
         return;
     };
@@ -711,7 +717,7 @@ pub fn record_image(addrspace_fd: &FdGuardUpper, base: usize, path: &[u8]) {
     .encode(&mut record) else {
         return;
     };
-    if let Ok(images) = addrspace_fd.dup(ferric_procinfo::IMAGES_HANDLE.as_bytes()) {
+    if let Ok(images) = addrspace_fd.dup(handle.as_bytes()) {
         let _ = images.write(&record[..len]);
     }
 }
@@ -719,6 +725,17 @@ pub fn record_image(addrspace_fd: &FdGuardUpper, base: usize, path: &[u8]) {
 /// Ferric Oxide: [`record_image`] for the calling thread's own address space (`ld.so`'s
 /// libraries).
 pub fn record_own_image(base: usize, path: &[u8]) {
+    own_image_call(ferric_procinfo::IMAGES_HANDLE, base, path);
+}
+
+/// Ferric Oxide: takes back the record [`record_own_image`] made of `base` and `path`, when
+/// `ld.so` unmaps the library (`dlclose`).
+pub fn unrecord_own_image(base: usize, path: &[u8]) {
+    own_image_call(ferric_procinfo::IMAGES_UNLOAD_HANDLE, base, path);
+}
+
+/// Ferric Oxide: [`image_call`] for the calling thread's own address space.
+fn own_image_call(handle: &str, base: usize, path: &[u8]) {
     // SAFETY: the TCB pointer is checked by `current`; the thread fd is only replaced while
     // ld.so sets up the final TCB, after every startup library is mapped, and a dlopen runs
     // on a thread whose TCB is complete.
@@ -728,7 +745,7 @@ pub fn record_own_image(base: usize, path: &[u8]) {
         return;
     };
     if let Ok(addrspace) = thread_fd.dup_into_upper(b"addrspace") {
-        record_image(&addrspace, base, path);
+        image_call(&addrspace, handle, base, path);
     }
 }
 

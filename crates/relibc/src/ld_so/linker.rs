@@ -559,6 +559,12 @@ impl Linker {
                 }
             }
             self.name_to_object_id_map.remove(&obj.name);
+            // Ferric Oxide: the library's pages go with `obj`, so its image record goes too,
+            // or a library later mapped at the same address is profiled under this one's name.
+            #[cfg(target_os = "redox")]
+            if let Some((bias, path)) = &obj.recorded_image {
+                redox_rt::proc::unrecord_own_image(*bias, path.as_bytes());
+            }
             assert!(Arc::strong_count(&obj) == 1);
             drop(obj);
         }

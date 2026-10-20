@@ -439,7 +439,12 @@ its interpreter, and `ld.so` each library it maps: the load bias and path
 handle in the proc scheme). The kernel keeps up to 64 per address space,
 copies them on fork and starts empty on exec, so user addresses can be
 symbolized with ASLR on. A program that lives less than one drain interval may
-be missed, and its frames then show as `[unknown]`.
+be missed, and its frames then show as `[unknown]`. `ld.so` takes a library's
+record back when `dlclose` unmaps it (the address space's `images-unload`
+handle), but the recorder keeps every image it saw, so samples taken before the
+unload still resolve; when two images were at one address, the newest wins.
+`ferric-trace profile` prints what reading the file cost (`image snapshots: …
+ppm of the time between them`).
 
 ```sh
 ferric-trace flamegraph prof/ --kernel kernel.all --root build/x86_64/ferric-smoke/sysroot \
@@ -450,7 +455,9 @@ ferric-trace flamegraph prof/ --kernel kernel.all --root build/x86_64/ferric-smo
 from ELF symbol tables. Kernel addresses use the kernel ELF, with the KASLR
 slide taken from `kernel_text`. User addresses use the image that holds them,
 read from `--root` (unstripped binaries, such as the cookbook's build trees,
-give names; stripped ones show `[<file>]`). It writes the folded stacks
+give names; stripped ones show `[<file>]`). The paths come from the target and
+are not trusted: a path with `..`, or one that leaves `--root` through a
+symbolic link, is not read, and its frames show `[<file>]`. It writes the folded stacks
 (`root;frame;frame count`, the format other flame graph tools read) and its own
 self-contained SVG (`tools/ferric-trace/src/svg.rs`): root at the bottom,
 frames sorted by name, the name, count and share in each frame's tooltip.

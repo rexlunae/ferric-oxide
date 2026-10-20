@@ -39,7 +39,10 @@
 //! from the proc scheme handle of the address space and writes one [`ImageRecord`] to it:
 //! the load bias as a little-endian `u64`, then the path as UTF-8. The kernel keeps up to
 //! [`MAX_IMAGES`] per address space, copies them when the address space is cloned (fork),
-//! and starts a new one empty (exec).
+//! and starts a new one empty (exec). When `ld.so` unmaps a library (`dlclose`), it writes
+//! the same record to [`IMAGES_UNLOAD_HANDLE`], and the kernel forgets it. A tool reading
+//! the images over time should prefer the newest record for an address, as a library can be
+//! mapped where an unloaded one was.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -396,6 +399,10 @@ impl fmt::Display for ImageLine<'_> {
 
 /// The proc scheme handle a loader dups from an address-space handle to record an image.
 pub const IMAGES_HANDLE: &str = "images";
+
+/// The proc scheme handle a loader dups from an address-space handle to take back an image it
+/// recorded, when it unmaps it. It takes the same [`ImageRecord`].
+pub const IMAGES_UNLOAD_HANDLE: &str = "images-unload";
 
 /// The most images the kernel keeps for one address space; later records are dropped.
 pub const MAX_IMAGES: usize = 64;

@@ -19,9 +19,10 @@
 //! [`ProfileError::Busy`]) until this one closes its control file. It then drains whatever
 //! earlier runs left in the buffers and throws it away, turns sampling on, runs a command or
 //! waits, and drains every buffer every [`DRAIN_INTERVAL`] until sampling is off again, so the
-//! buffers never fill. It reads `/scheme/sys/proc` at the same times and keeps the last images
-//! it saw for each context, so programs that exit before the end are still covered unless they
-//! lived less than one interval. As with trace captures, the directory is created exclusively
+//! buffers never fill. It reads `/scheme/sys/proc` at the same times and keeps every image it
+//! saw for each context, in the order first seen, so programs that exit before the end, and
+//! libraries unloaded during the run, are still covered unless they lived less than one
+//! interval; [`Recorded::snapshots`] says what those reads cost. As with trace captures, the directory is created exclusively
 //! (its parents as needed) and holds an `INCOMPLETE` marker ([`crate::capture::INCOMPLETE`])
 //! until everything is saved. Sampling is turned off on every path out of [`record`], including
 //! errors, and a command it started is killed and waited for if recording fails.
@@ -82,8 +83,33 @@ pub struct Recorded {
     pub names: usize,
     /// How many contexts' images were saved (none without `/scheme/sys/proc`).
     pub images: usize,
+    /// How often `/scheme/sys/proc` was read for images, and the time that took in all: the
+    /// recorder's cost on the profiled system, beside draining.
+    pub snapshots: Snapshots,
     /// The command's exit status, for [`Run::Command`].
     pub status: Option<ExitStatus>,
+}
+
+/// The image snapshots of one recording.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Snapshots {
+    /// Reads of `/scheme/sys/proc`.
+    pub count: u32,
+    /// Their total time, the kernel writing the file included.
+    pub total: Duration,
+    /// The longest one.
+    pub longest: Duration,
+}
+
+impl Snapshots {
+    /// The share of the wall time between snapshots spent taking them, in parts per million,
+    /// for snapshots every [`DRAIN_INTERVAL`].
+    pub fn duty_ppm(&self) -> u64 {
+        let Some(mean) = self.total.checked_div(self.count.max(1)) else {
+            return 0;
+        };
+        (mean.as_nanos() * 1_000_000 / DRAIN_INTERVAL.as_nanos()) as u64
+    }
 }
 
 /// Why a profile could not be recorded or loaded.
@@ -261,6 +287,7 @@ pub fn record(debug: &Path, proc: &Path, out: &Path, run: &Run) -> Result<Record
         cpu_bytes,
         names: names.len(),
         images: images.blocks.len(),
+        snapshots: images.timing,
         status,
     })
 }
@@ -390,12 +417,16 @@ impl Drop for Sampling {
     }
 }
 
-/// The image blocks of the per-process file, the last seen for each context.
+/// The image blocks of the per-process file: for each context, its line and every image it
+/// had in any snapshot, in the order first seen. A library unloaded during the recording keeps
+/// its line, for the samples taken while it was mapped; a later one mapped at the same address
+/// comes after it, and the symbolizer tries the newest first.
 struct ImageTracker {
     path: PathBuf,
     /// Off once the file turned out not to exist (a kernel without `sys_proc`).
     on: bool,
-    blocks: BTreeMap<u32, String>,
+    blocks: BTreeMap<u32, (String, Vec<String>)>,
+    timing: Snapshots,
 }
 
 impl ImageTracker {
@@ -404,6 +435,7 @@ impl ImageTracker {
             path: path.to_owned(),
             on: true,
             blocks: BTreeMap::new(),
+            timing: Snapshots::default(),
         }
     }
 
@@ -411,6 +443,16 @@ impl ImageTracker {
         if !self.on {
             return Ok(());
         }
+        let started = Instant::now();
+        let taken = self.take();
+        let took = started.elapsed();
+        self.timing.count = self.timing.count.saturating_add(1);
+        self.timing.total = self.timing.total.saturating_add(took);
+        self.timing.longest = self.timing.longest.max(took);
+        taken
+    }
+
+    fn take(&mut self) -> Result<(), ProfileError> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -424,17 +466,24 @@ impl ImageTracker {
             source,
         })?;
         for process in processes.iter().filter(|p| !p.images.is_empty()) {
-            let mut block = process.context.to_string();
+            let (line, seen) = self.blocks.entry(process.context.id).or_default();
+            *line = process.context.to_string();
             for image in &process.images {
-                block.push_str(&image.to_string());
+                let image = image.to_string();
+                if !seen.contains(&image) {
+                    seen.push(image);
+                }
             }
-            self.blocks.insert(process.context.id, block);
         }
         Ok(())
     }
 
     fn text(&self) -> String {
-        self.blocks.values().map(String::as_str).collect()
+        self.blocks
+            .values()
+            .flat_map(|(line, images)| core::iter::once(line).chain(images))
+            .map(String::as_str)
+            .collect()
     }
 }
 
@@ -924,5 +973,36 @@ mod tests {
             Err(ProfileError::NoBuffers { .. })
         ));
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn the_tracker_keeps_unloaded_images_in_order() {
+        // Review 4320670165: A at 0x7000 is unloaded and B mapped there. Both stay, B after A.
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path().join("proc");
+        let context = "context 9 pid 4 euid 0 egid 0 status runnable cpu 0 running yes active_ns 1 sched_ns 1 name sh\n\
+                       memory private 0 shared 0 kernel 0\n";
+        fs::write(&proc, format!("{context}image 0x7000 path /usr/lib/a.so\n")).unwrap();
+        let mut tracker = ImageTracker::new(&proc);
+        tracker.snapshot().unwrap();
+        fs::write(&proc, format!("{context}image 0x7000 path /usr/lib/b.so\n")).unwrap();
+        tracker.snapshot().unwrap();
+        tracker.snapshot().unwrap();
+        let images = parse_images(&proc, &tracker.text()).unwrap();
+        let paths: Vec<&str> = images[&9].iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/usr/lib/a.so", "/usr/lib/b.so"]);
+        assert_eq!(tracker.timing.count, 3);
+        assert!(tracker.timing.longest <= tracker.timing.total);
+    }
+
+    #[test]
+    fn snapshot_duty_is_the_mean_over_the_interval() {
+        let snapshots = Snapshots {
+            count: 4,
+            total: DRAIN_INTERVAL / 250, // 0.1 ms each on average of 100 ms is 0.1%
+            longest: DRAIN_INTERVAL / 500,
+        };
+        assert_eq!(snapshots.duty_ppm(), 1000);
+        assert_eq!(Snapshots::default().duty_ppm(), 0);
     }
 }

@@ -78,13 +78,15 @@ jobs:
           printf '[cpu]\nframe_pointers = true\n[kernel]\nprofiling = true\nsys_proc = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          # The recipe-facing settings, as image.yml passes them, and the user-space flags that
+          # The recipe-facing settings, as image.yml passes them (signed fox manifests
+          # included, or the smoke image's fox verify fails), and the user-space flags that
           # carry the frame pointers.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_TARGET_RUSTFLAGS FERRIC_TARGET_CPPFLAGS FERRIC_TARGET_FLAGS_EXCLUDE; do
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_FOX_MANIFEST FERRIC_TARGET_RUSTFLAGS FERRIC_TARGET_CPPFLAGS FERRIC_TARGET_FLAGS_EXCLUDE; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
           grep -q "^export FERRIC_KERNEL_FEATURES:=.*profiling" "$out/config.mk"
+          grep -q "^export FERRIC_FOX_MANIFEST:=1" "$out/config.mk"
           if [ -f "$out/kernel-config.toml" ]; then
             echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
           fi
@@ -142,6 +144,17 @@ jobs:
 
       # The profile and flame graph were made, the kernel served its text address, and the
       # images of the profiled programs were recorded through exec and ld.so.
+      # The packages were adopted with signed manifests and verified, as in image.yml.
+      - name: Check fox
+        run: |
+          grep -aE "adopted ([0-9]+) of \1 packages" "$LOG"
+          grep -aE "fox 0\.1\.0 \([0-9]+ files, signed by cookbook\)" "$LOG"
+          if grep -aF "unsigned name" "$LOG"; then
+            echo "::error::packages were adopted without a signed manifest"
+            exit 1
+          fi
+          grep -aF "FERRIC_TEST_PASS fox-verify" "$LOG"
+
       - name: Check the profile
         run: |
           grep -aF "FERRIC_TEST_PASS profile" "$LOG"

@@ -259,6 +259,14 @@ fn record_profile(
         recorded.images,
         out.display()
     );
+    let snapshots = recorded.snapshots;
+    println!(
+        "image snapshots: {} in {:?} (longest {:?}), {} ppm of the time between them",
+        snapshots.count,
+        snapshots.total,
+        snapshots.longest,
+        snapshots.duty_ppm()
+    );
     if recorded.images == 0 {
         eprintln!(
             "ferric-trace: warning: no images recorded ({} missing or empty); user frames will \

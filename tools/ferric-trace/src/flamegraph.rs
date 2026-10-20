@@ -128,6 +128,7 @@ impl Symbols {
 #[derive(Debug)]
 pub struct Symbolizer {
     kernel: Option<(Symbols, u64)>,
+    /// The root, canonical, or `None` without one (or when it cannot be resolved).
     root: Option<PathBuf>,
     /// User ELF files by target path; `None` for one that cannot be read.
     users: HashMap<String, Option<Symbols>>,
@@ -141,6 +142,9 @@ impl Symbolizer {
     ///
     /// [`FlamegraphError::Io`] or [`FlamegraphError::Elf`] if the kernel ELF cannot be read.
     /// User ELF files that cannot be read are not an error: their frames show the file name.
+    ///
+    /// Image paths come from the target and are not trusted: a file is read only when its
+    /// path, with every symbolic link resolved, stays under `root` ([`contained`]).
     pub fn new(
         profile: &Profile,
         kernel: Option<&Path>,
@@ -165,7 +169,8 @@ impl Symbolizer {
             .transpose()?;
         Ok(Self {
             kernel,
-            root: root.map(Path::to_owned),
+            // A root that cannot be resolved holds no files, as one that is missing.
+            root: root.and_then(|root| root.canonicalize().ok()),
             users: HashMap::new(),
         })
     }
@@ -181,7 +186,8 @@ impl Symbolizer {
                 .unwrap_or("[kernel]")
                 .to_owned();
         }
-        for image in images {
+        // Newest first: a library mapped where an unloaded one was is the one sampled now.
+        for image in images.iter().rev() {
             let Some(symbols) = self.user(&image.path) else {
                 continue;
             };
@@ -202,11 +208,27 @@ impl Symbolizer {
         self.users
             .entry(path.to_owned())
             .or_insert_with(|| {
-                let data = fs::read(root.join(path.trim_start_matches('/'))).ok()?;
+                let data = fs::read(contained(root, path)?).ok()?;
                 Symbols::parse(&data).ok()
             })
             .as_ref()
     }
+}
+
+/// The host file for target path `path` under `root` (canonical), with every symbolic link
+/// resolved, or `None` when there is none or it is not under `root`. Image paths come from
+/// the target, which can write any path: `..` components are refused, and a link that leads
+/// out of `root` (absolute target links included) is not followed out of it.
+fn contained(root: &Path, path: &str) -> Option<PathBuf> {
+    let relative = Path::new(path.trim_start_matches('/'));
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let resolved = root.join(relative).canonicalize().ok()?;
+    resolved.starts_with(root).then_some(resolved)
 }
 
 fn file_name(path: &str) -> &str {
@@ -393,5 +415,78 @@ mod tests {
             Symbolizer::new(&profile, Some(&dir.path().join("none")), None),
             Err(FlamegraphError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn image_paths_stay_under_the_root() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("secret"), b"host file").expect("write");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        fs::create_dir_all(root.join("usr/bin")).expect("mkdir");
+        fs::write(root.join("usr/bin/app"), b"elf").expect("write");
+        assert_eq!(
+            contained(&root, "/usr/bin/app"),
+            Some(root.join("usr/bin/app"))
+        );
+        assert_eq!(
+            contained(&root, "usr/bin/app"),
+            Some(root.join("usr/bin/app"))
+        );
+        let escape = format!("/../{}", outside.path().display());
+        for forged in [
+            "/usr/bin/../../etc/passwd",
+            "../secret",
+            escape.as_str(),
+            "/usr/bin/missing",
+        ] {
+            assert_eq!(contained(&root, forged), None, "{forged}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A link out of the root is not followed, an absolute one or a relative one.
+            symlink(outside.path().join("secret"), root.join("usr/bin/out")).expect("link");
+            symlink("../../../secret", root.join("usr/bin/up")).expect("link");
+            assert_eq!(contained(&root, "/usr/bin/out"), None);
+            assert_eq!(contained(&root, "/usr/bin/up"), None);
+            // A link that stays inside is fine, and resolves to its target.
+            symlink("app", root.join("usr/bin/alias")).expect("link");
+            assert_eq!(
+                contained(&root, "/usr/bin/alias"),
+                Some(root.join("usr/bin/app"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_newest_image_at_an_address_wins() {
+        // Review 4320670165: `old` was unloaded and `new` mapped at the same base.
+        let (exe_path, symbols) = exe();
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["old", "new"] {
+            let to = dir.path().join(name);
+            if fs::hard_link(&exe_path, &to).is_err() {
+                fs::copy(&exe_path, &to).unwrap();
+            }
+        }
+        let base = 0x5555_0000_0000;
+        let images = [
+            LoadedImage {
+                base,
+                path: "/old".to_owned(),
+            },
+            LoadedImage {
+                base,
+                path: "/new".to_owned(),
+            },
+        ];
+        let profile = profile(Vec::new(), 0, Vec::new());
+        let mut symbolizer = Symbolizer::new(&profile, None, Some(dir.path())).unwrap();
+        // The file's first byte is in its segments but in no function: the frame names the file.
+        assert_eq!(
+            symbolizer.frame(base + symbols.span.0, false, &images),
+            "[new]"
+        );
     }
 }
