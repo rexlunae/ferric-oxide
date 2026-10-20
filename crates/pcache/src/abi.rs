@@ -33,7 +33,8 @@
 //!
 //! Only the process that opened the queue may use it and its objects, binding included: a
 //! queue or object descriptor passed to another process is refused there (`EPERM`), so it
-//! cannot bind the queue to its own scheme, or attach or fill another client's descriptions.
+//! cannot bind the queue to its own scheme, or attach or fill another client's descriptions. Every
+//! thread of that process may, and it keeps the queue across `exec`.
 //!
 //! [`Request::Attach`] ties a client's open file description to the object: `handle` is the
 //! number the file system's scheme gave the client's description. The kernel then serves that
