@@ -429,13 +429,13 @@ jobs:
       # skip, including the ones on RedoxFS, which then serves read-only files from the cache.
       - name: Check the page cache
         run: |
-          for step in miss hit readahead eio restore owner exec invalidate generation close redoxfs redoxfs-mmap redoxfs-bench; do
+          for step in miss hit readahead eio bad-answer restore owner exec invalidate generation close redoxfs redoxfs-mmap redoxfs-bench; do
             grep -aF "FERRIC_TEST_PASS pcache-$step" "$LOG"
           done
           grep -aF "FERRIC_BENCH pcache" "$LOG" | tr -d '\r' | while read -r line; do
             echo "::notice::$line"
           done
-          echo "::notice::ferric-pcache-test passed all 13 steps"
+          echo "::notice::ferric-pcache-test passed all 14 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

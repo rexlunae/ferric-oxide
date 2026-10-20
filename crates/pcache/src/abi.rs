@@ -375,7 +375,10 @@ pub enum Request {
     /// On the object a [`Record::Fill`] named: the answer to it. When the fill is
     /// [`Outcome::Done`], the call's payload is the pages' bytes, whole pages (`count` times
     /// [`PAGE_SIZE`], zero past the end of the file), which the kernel copies into the
-    /// object's frames; a failed fill has an empty payload.
+    /// object's frames; a failed fill has an empty payload. An answer the kernel cannot take
+    /// (no memory for the frames, a payload that faults or has the wrong length) fails the
+    /// fill, as a failed answer would: the call returns the error and the record need not be
+    /// answered again.
     Filled {
         /// The pages the record named.
         pages: RecordPages,

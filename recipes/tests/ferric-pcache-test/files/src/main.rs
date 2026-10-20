@@ -15,6 +15,8 @@
 //!   sequence, fills pages past it too, so the read after that is a hit.
 //! - `pcache-eio`: a fill the file system fails makes its reader's `pread` fail with `EIO`,
 //!   and the next read fills the page again and gets the bytes.
+//! - `pcache-bad-answer`: a done answer the kernel cannot take (its payload faults) fails the
+//!   fill, so the reader gets `EIO` rather than waiting, and the next read fills the page.
 //! - `pcache-close`: a reader waiting for a fill nobody answers gets `EIO` when the queue
 //!   closes, and reads after that go to the scheme, as without a cache. Prints the mean time
 //!   of the same `pread` through the scheme on the `FERRIC_BENCH` line.
