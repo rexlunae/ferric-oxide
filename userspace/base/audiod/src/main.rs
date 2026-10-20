@@ -58,6 +58,41 @@ fn scheme_thread(inner_mutex: Arc<Mutex<AudioSchemeInner>>, pid: usize, hw_file:
     }
 }
 
+/// Opens the analog audio driver, or the first digital-only driver by name.
+///
+/// The HDA driver gives analog codecs the `audiohw` scheme and registers
+/// HDMI/DisplayPort codecs as `audiohw.<pci-address>`. A machine with only
+/// HDMI audio therefore has no `audiohw` scheme, so fall back to the sorted
+/// `audiohw.*` names for a deterministic choice.
+fn open_audiohw() -> Result<Fd> {
+    let flags = flag::O_WRONLY | flag::O_CLOEXEC;
+
+    match Fd::open("/scheme/audiohw", flags, 0) {
+        Ok(fd) => Ok(fd),
+        Err(primary_err) => {
+            let mut candidates = std::fs::read_dir("/scheme")
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .filter_map(|entry| entry.file_name().to_str().map(|name| name.to_owned()))
+                        .filter(|name| name.starts_with("audiohw."))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            candidates.sort();
+
+            for name in candidates {
+                if let Ok(fd) = Fd::open(&format!("/scheme/{name}"), flags, 0) {
+                    println!("audiod: using {name}");
+                    return Ok(fd);
+                }
+            }
+
+            Err(primary_err)
+        }
+    }
+}
+
 fn daemon(daemon: SchemeDaemon) -> anyhow::Result<()> {
     // Handle signals from the hw thread
 
@@ -73,7 +108,7 @@ fn daemon(daemon: SchemeDaemon) -> anyhow::Result<()> {
 
     let pid = libredox::call::getpid()?;
 
-    let hw_file = Fd::open("/scheme/audiohw", flag::O_WRONLY | flag::O_CLOEXEC, 0)?;
+    let hw_file = open_audiohw()?;
 
     let socket = Socket::create().context("failed to create scheme")?;
 

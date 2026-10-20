@@ -66,6 +66,22 @@ enum Handle {
     SchemeRoot,
 }
 
+/// The kind of output the controller's codec exposes.
+///
+/// A machine can have several HDA controllers (the chipset codec and one per
+/// GPU for HDMI/DisplayPort audio). Only one process can register the
+/// `audiohw` scheme, so the driver uses this classification to give analog
+/// codecs the well-known name and digital-only codecs a unique one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    /// At least one line-out, speaker, headphone or CD output pin.
+    Analog,
+    /// Only S/PDIF or other digital output pins.
+    Digital,
+    /// No output pin that the driver recognises.
+    None,
+}
+
 #[repr(C, packed)]
 #[allow(dead_code)]
 struct Regs {
@@ -138,6 +154,7 @@ pub struct IntelHDA {
 
     output_pins: Vec<WidgetAddr>,
     input_pins: Vec<WidgetAddr>,
+    output_kind: OutputKind,
 
     beep_addr: WidgetAddr,
 
@@ -193,6 +210,7 @@ impl IntelHDA {
 
             output_pins: Vec::<WidgetAddr>::new(),
             input_pins: Vec::<WidgetAddr>::new(),
+            output_kind: OutputKind::None,
 
             buff_desc,
 
@@ -384,7 +402,39 @@ impl IntelHDA {
             }
         }
 
+        self.output_kind = self.classify_output_kind();
+
         Ok(())
+    }
+
+    /// Returns the kind of output pin that [`Self::enumerate`] found.
+    pub fn output_kind(&self) -> OutputKind {
+        self.output_kind
+    }
+
+    fn classify_output_kind(&self) -> OutputKind {
+        let mut digital = false;
+
+        for addr in &self.output_pins {
+            let Some(widget) = self.widget_map.get(addr) else {
+                continue;
+            };
+
+            match widget.configuration_default().default_device() {
+                DefaultDevice::LineOut
+                | DefaultDevice::Speaker
+                | DefaultDevice::HPOut
+                | DefaultDevice::CD => return OutputKind::Analog,
+                DefaultDevice::SPDIF | DefaultDevice::DigitalOtherOut => digital = true,
+                _ => {}
+            }
+        }
+
+        if digital {
+            OutputKind::Digital
+        } else {
+            OutputKind::None
+        }
     }
 
     pub fn find_best_output_pin(&mut self) -> Result<WidgetAddr> {
@@ -394,7 +444,11 @@ impl IntelHDA {
         } else if outs.len() > 1 {
             //TODO: change output based on "unsolicited response" interrupts
             // Check for devices in this order: Headphone, Speaker, Line Out
-            for supported_device in &[DefaultDevice::HPOut, DefaultDevice::Speaker] {
+            for supported_device in &[
+                DefaultDevice::HPOut,
+                DefaultDevice::Speaker,
+                DefaultDevice::LineOut,
+            ] {
                 for &out in outs {
                     let widget = self.widget_map.get(&out).unwrap();
                     let cd = widget.configuration_default();
