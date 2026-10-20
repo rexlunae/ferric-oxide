@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ferric_pcache::abi::{
-    ObjectId, Outcome, PAGE_SIZE, QUEUE_PATH, ReadaheadMax, Record, RecordPages, Request,
-    SCHEME_NAME,
+    ObjectId, Outcome, PAGE_SIZE, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordPages,
+    Request, SCHEME_NAME,
 };
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR};
@@ -56,7 +56,7 @@ fn file_bytes(offset: u64, len: usize) -> Vec<u8> {
 }
 
 /// Why a step failed.
-enum Failure {
+pub(crate) enum Failure {
     /// A call failed.
     Errno { what: &'static str, errno: i32 },
     /// Something was not as expected.
@@ -73,7 +73,7 @@ impl fmt::Display for Failure {
 }
 
 /// The result of a call, with what it was for when it failed.
-fn ctx<T>(what: &'static str, result: libredox::error::Result<T>) -> Result<T, Failure> {
+pub(crate) fn ctx<T>(what: &'static str, result: libredox::error::Result<T>) -> Result<T, Failure> {
     result.map_err(|err| Failure::Errno {
         what,
         errno: err.errno(),
@@ -81,7 +81,7 @@ fn ctx<T>(what: &'static str, result: libredox::error::Result<T>) -> Result<T, F
 }
 
 /// Fails with `why` unless `ok`.
-fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Failure> {
+pub(crate) fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Failure> {
     if ok {
         Ok(())
     } else {
@@ -229,9 +229,10 @@ impl Cache {
         }
     }
 
-    /// Answers a fill record: with the pages' bytes, or failed with `EIO`. Returns what the
-    /// call returned: how many of the record's pages it acted on, 0 for a stale answer.
-    fn answer(&self, record: Record, ok: bool) -> Result<usize, Failure> {
+    /// Answers a fill record: with the pages' bytes, wrong bytes, or failed with `EIO`.
+    /// Returns what the call returned: how many of the record's pages it acted on, 0 for a
+    /// stale answer.
+    fn answer(&self, record: Record, answer: Answer) -> Result<usize, Failure> {
         let Record::Fill {
             object,
             generation,
@@ -244,11 +245,16 @@ impl Cache {
         check(object == OBJECT, || {
             format!("a record for object {object:?}")
         })?;
-        let (payload, outcome) = if ok {
-            (page_bytes(pages), Outcome::Done)
-        } else {
-            let eio = NonZeroU16::new(ERRNO_EIO as u16).expect("EIO is not zero");
-            (Vec::new(), Outcome::Failed(eio))
+        let (payload, outcome) = match answer {
+            Answer::Bytes => (page_bytes(pages), Outcome::Done),
+            Answer::Wrong => {
+                let len = pages.pages().count() as usize * PAGE_SIZE as usize;
+                (vec![WRONG; len], Outcome::Done)
+            }
+            Answer::Eio => {
+                let eio = NonZeroU16::new(ERRNO_EIO as u16).expect("EIO is not zero");
+                (Vec::new(), Outcome::Failed(eio))
+            }
         };
         progress(&format!("Filled {:?}", pages.pages()));
         let (words, n) = Request::Filled {
@@ -269,9 +275,36 @@ impl Cache {
     fn fill_all(&self, records: &[Record]) -> Result<(), Failure> {
         records
             .iter()
-            .try_for_each(|&record| self.answer(record, true).map(drop))
+            .try_for_each(|&record| self.answer(record, Answer::Bytes).map(drop))
+    }
+
+    /// Tells the kernel the file's bytes `start..end` changed, as a file system does after a
+    /// write it served itself.
+    fn invalidate(&self, start: u64, end: u64) -> Result<(), Failure> {
+        let pages = PageRange::from_bounds(start / PAGE_SIZE, end.div_ceil(PAGE_SIZE))
+            .ok_or(Failure::Check(format!("no pages in {start}..{end}")))?;
+        let (words, n) = Request::Invalidate { pages }.encode();
+        ctx(
+            "Invalidate",
+            self.object.call_wo(&[], CallFlags::empty(), &words[..n]),
+        )
+        .map(drop)
     }
 }
+
+/// How [`Cache::answer`] answers a fill.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// With the file's bytes.
+    Bytes,
+    /// With bytes that are not the file's ([`WRONG`]), for a fill that must not be taken.
+    Wrong,
+    /// Failed with `EIO`.
+    Eio,
+}
+
+/// The byte a wrong answer is made of. No page of the file is all this byte.
+const WRONG: u8 = 0xEE;
 
 /// The bytes of whole pages `pages`, zero past the end of the file.
 fn page_bytes(pages: RecordPages) -> Vec<u8> {
@@ -522,7 +555,7 @@ fn eio(cache: &mut Cache) -> Result<(), Failure> {
         format!("a read of page 40 filled {:?}", pages_of(&records))
     })?;
     for &record in &records {
-        cache.answer(record, false)?;
+        cache.answer(record, Answer::Eio)?;
     }
     let failed = finished(&read)?;
     check(failed == Err(ERRNO_EIO), || {
@@ -539,6 +572,43 @@ fn eio(cache: &mut Cache) -> Result<(), Failure> {
     cache.fill_all(&records)?;
     check_bytes(finished(&again)?, 40 * PAGE_SIZE, 64)
 }
+
+/// `pcache-invalidate`.
+fn invalidate(cache: &mut Cache, file: &Fd) -> Result<(), Failure> {
+    // Page 0 is cached since pcache-miss; once invalidated, a read of it fills it again.
+    cache.invalidate(0, 10)?;
+    let read = spawn_pread(file.raw(), 0, 64);
+    let records = cache.records()?;
+    check(pages_of(&records).contains(&0), || {
+        "a read of page 0 after it was invalidated was served from the cache".into()
+    })?;
+    cache.fill_all(&records)?;
+    check_bytes(finished(&read)?, 0, 64)?;
+    // A fill in flight when its page is invalidated is stale: its answer, here bytes that are
+    // not the file's, is not taken, and the reader fills the page again.
+    let other = open_file()?;
+    let read = spawn_pread(other.raw(), STALE_PAGE * PAGE_SIZE, 64);
+    let records = cache.records()?;
+    check(pages_of(&records) == BTreeSet::from([STALE_PAGE]), || {
+        format!(
+            "a read of page {STALE_PAGE} filled {:?}",
+            pages_of(&records)
+        )
+    })?;
+    cache.invalidate(STALE_PAGE * PAGE_SIZE, (STALE_PAGE + 1) * PAGE_SIZE)?;
+    for &record in &records {
+        cache.answer(record, Answer::Wrong)?;
+    }
+    let again = cache.records()?;
+    check(pages_of(&again).contains(&STALE_PAGE), || {
+        "the reader of a stale fill did not fill again".into()
+    })?;
+    cache.fill_all(&again)?;
+    check_bytes(finished(&read)?, STALE_PAGE * PAGE_SIZE, 64)
+}
+
+/// The page `pcache-invalidate` fills while it is invalidated; no earlier step reads it.
+const STALE_PAGE: u64 = 48;
 
 /// The page `pcache-bad-answer` reads; no other step reads it.
 const BAD_ANSWER_PAGE: u64 = 44;
@@ -832,7 +902,7 @@ fn generation(cache: &mut Cache) -> Result<(), Failure> {
     // The old record's answer, on the new object, is stale: a failure answered for it (with
     // the same page, and the same fill ID, as the new object's first fill) is ignored, and
     // the new fill's reader is still waiting for its own answer.
-    let stale = cache.answer(old[0], false)?;
+    let stale = cache.answer(old[0], Answer::Eio)?;
     check(stale == 0, || {
         format!("an answer to a closed object's record returned {stale}, not 0")
     })?;
@@ -943,6 +1013,8 @@ pub fn main() -> ExitCode {
 
 /// A step on the test's own scheme.
 type CacheStep<'a> = dyn Fn(&mut Cache) -> Result<(), Failure> + 'a;
+/// A step on RedoxFS.
+type FsStep = fn() -> Result<(), Failure>;
 
 fn run() -> Result<ExitCode, (&'static str, Failure)> {
     let socket = Socket::create().map_err(|err| {
@@ -988,7 +1060,7 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
     };
     let file = open_file().map_err(|f| ("pcache-setup", f))?;
     progress("opened the file");
-    let steps: [(&'static str, &CacheStep<'_>); 10] = [
+    let steps: [(&'static str, &CacheStep<'_>); 11] = [
         ("pcache-miss", &|cache| miss(cache, &file)),
         ("pcache-hit", &|cache| hit(cache, &file)),
         ("pcache-readahead", &readahead),
@@ -997,12 +1069,23 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         ("pcache-restore", &restore),
         ("pcache-owner", &owner),
         ("pcache-exec", &exec),
+        ("pcache-invalidate", &|cache| invalidate(cache, &file)),
         ("pcache-generation", &generation),
         ("pcache-close", &close),
     ];
     for (name, step) in steps {
         progress(name);
         step(&mut cache).map_err(|failure| (name, failure))?;
+        println!("FERRIC_TEST_PASS {name}");
+    }
+    let on_redoxfs: [(&'static str, FsStep); 3] = [
+        ("pcache-redoxfs", crate::redoxfs::coherence),
+        ("pcache-redoxfs-mmap", crate::redoxfs::mappings),
+        ("pcache-redoxfs-bench", crate::redoxfs::bench),
+    ];
+    for (name, step) in on_redoxfs {
+        progress(name);
+        step().map_err(|failure| (name, failure))?;
         println!("FERRIC_TEST_PASS {name}");
     }
     Ok(ExitCode::SUCCESS)

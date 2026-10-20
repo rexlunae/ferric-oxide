@@ -20,6 +20,28 @@
 //! - `pcache-close`: a reader waiting for a fill nobody answers gets `EIO` when the queue
 //!   closes, and reads after that go to the scheme, as without a cache. Prints the mean time
 //!   of the same `pread` through the scheme on the `FERRIC_BENCH` line.
+//! - `pcache-invalidate` (before `pcache-close`): an invalidated page is filled again on the
+//!   next read, and a fill in flight over a page invalidated meanwhile is not taken, even
+//!   with bytes that are not the file's; its reader fills again and gets the right ones.
+//!
+//! Then on RedoxFS, which serves files opened read-only from the cache when the kernel has
+//! one:
+//!
+//! - `pcache-redoxfs`: a read-only description of a file in `/tmp` reads the new bytes after
+//!   writes, a write past the end, a truncation and a growing truncation made through another
+//!   description, and an append at the end leaves the pages before it cached.
+//! - `pcache-redoxfs-mmap`: a file with a shared writable mapping is not cached while the
+//!   mapping lasts, even after the descriptor it was made through closes or with a read-only
+//!   mapping beside it, and is cached again once unmapped; a reader cached before the mapping
+//!   sees what it writes back. A private writable mapping changes neither the file nor its
+//!   caching.
+//!   Whether a read was served from the cache shows in the access time, which RedoxFS moves
+//!   when it reads a file and the cache does not.
+//! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
+//!   through a read-only description (cached) against a read-write one (served by RedoxFS,
+//!   as with the option off), in the same boot with `ferric_blkqueue::ab`'s paired rule.
+//!   Prints `FERRIC_BENCH pcache-redoxfs-pread4k` and `pcache-redoxfs-seq1m` lines and fails
+//!   when the cache is slower.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.pcache` scheme (a kernel built
@@ -27,6 +49,8 @@
 
 #[cfg(target_os = "redox")]
 mod redox;
+#[cfg(target_os = "redox")]
+mod redoxfs;
 
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "redox")]

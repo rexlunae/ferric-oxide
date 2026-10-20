@@ -208,6 +208,24 @@ impl PageRange {
     pub const fn pages_for(bytes: u64) -> u64 {
         bytes.div_ceil(PAGE_SIZE)
     }
+
+    /// The pages that hold bytes `start..end` of a file, in runs of at most `u32::MAX` pages
+    /// (none when the range is empty). A file system invalidates these after it changed the
+    /// bytes itself.
+    pub fn covering(start: u64, end: u64) -> impl Iterator<Item = Self> {
+        let mut first = start / PAGE_SIZE;
+        let end = if end > start {
+            Self::pages_for(end)
+        } else {
+            first
+        };
+        core::iter::from_fn(move || {
+            let next = end.min(first.saturating_add(u64::from(u32::MAX)));
+            let run = Self::from_bounds(first, next)?;
+            first = next;
+            Some(run)
+        })
+    }
 }
 
 /// A run of pages one fill or writeback record may name: 1 to [`MAX_RECORD_PAGES`] pages.
@@ -426,6 +444,14 @@ pub enum Request {
         /// The largest readahead window, in pages.
         pages: ReadaheadMax,
     },
+    /// On an object: the file's bytes in `pages` changed outside the cache (the file system
+    /// served a write of them itself). Their cached copies are dropped, and a fill of them in
+    /// flight is stale: its answer is not taken, and the readers waiting for it fill again.
+    Invalidate {
+        /// The pages that changed. Unlike a record, any number of pages: a truncation drops
+        /// everything past the new end at once.
+        pages: PageRange,
+    },
 }
 
 #[repr(u64)]
@@ -438,6 +464,7 @@ enum Verb {
     WrittenBack = 5,
     SetReadaheadMax = 6,
     Bind = 7,
+    Invalidate = 8,
 }
 
 impl Verb {
@@ -450,6 +477,7 @@ impl Verb {
             5 => Self::WrittenBack,
             6 => Self::SetReadaheadMax,
             7 => Self::Bind,
+            8 => Self::Invalidate,
             _ => return None,
         })
     }
@@ -503,6 +531,10 @@ impl Request {
             Self::SetReadaheadMax { pages } => {
                 ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0, 0], 2)
             }
+            Self::Invalidate { pages } => (
+                [Verb::Invalidate as u64, pages.first, pages.count as u64, 0],
+                3,
+            ),
         }
     }
 
@@ -548,6 +580,11 @@ impl Request {
                 .ok()
                 .and_then(ReadaheadMax::new)
                 .map(|pages| Self::SetReadaheadMax { pages })
+                .ok_or(DecodeError::Value),
+            (Verb::Invalidate, &[first, count]) => u32::try_from(count)
+                .ok()
+                .and_then(|count| PageRange::new(first, count))
+                .map(|pages| Self::Invalidate { pages })
                 .ok_or(DecodeError::Value),
             _ => Err(DecodeError::Length),
         }
@@ -642,9 +679,54 @@ pub enum Record {
     },
 }
 
+/// What an answer to a [`Record::Fill`] repeats from it: the object's generation, the fill's
+/// ID and its pages ([`Record::fill`] takes them out of a record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillRef {
+    /// The generation of the object the record was for.
+    pub generation: Generation,
+    /// The fill's ID.
+    pub id: FillId,
+    /// The pages the record names.
+    pub pages: RecordPages,
+}
+
+impl FillRef {
+    /// The [`Request::Filled`] answer to this fill with `outcome`.
+    pub const fn answer(self, outcome: Outcome) -> Request {
+        Request::Filled {
+            pages: self.pages,
+            outcome,
+            generation: self.generation,
+            fill: self.id,
+        }
+    }
+}
+
 impl Record {
     /// The size of a record on the queue, in bytes.
     pub const BYTES: usize = 40;
+
+    /// The object a fill record is for, and what its answer repeats; `None` for other
+    /// records.
+    pub const fn fill(&self) -> Option<(ObjectId, FillRef)> {
+        match *self {
+            Self::Fill {
+                object,
+                generation,
+                fill,
+                pages,
+            } => Some((
+                object,
+                FillRef {
+                    generation,
+                    id: fill,
+                    pages,
+                },
+            )),
+            _ => None,
+        }
+    }
 
     const KIND_FILL: u16 = 1;
     const KIND_WRITEBACK: u16 = 2;
@@ -742,6 +824,21 @@ impl Record {
         }
     }
 
+    /// Decodes the records in `bytes`, as a queue read returns them: whole records one after
+    /// the other.
+    ///
+    /// # Errors
+    ///
+    /// Each malformed record is an error ([`Record::from_bytes`]), and so is a tail shorter
+    /// than a record ([`RecordError::Length`]).
+    pub fn decode_all(bytes: &[u8]) -> impl Iterator<Item = Result<Self, RecordError>> + '_ {
+        let tail = (!bytes.len().is_multiple_of(Self::BYTES)).then_some(Err(RecordError::Length));
+        bytes
+            .chunks_exact(Self::BYTES)
+            .map(Self::from_bytes)
+            .chain(tail)
+    }
+
     /// The object the record is about.
     pub const fn object(self) -> ObjectId {
         match self {
@@ -796,6 +893,7 @@ mod tests {
 
     use super::*;
     use std::string::ToString;
+    use std::vec::Vec;
 
     fn range(first: u64, count: u32) -> PageRange {
         PageRange::new(first, count).expect("a valid range")
@@ -807,6 +905,82 @@ mod tests {
 
     fn errno(n: u16) -> NonZeroU16 {
         NonZeroU16::new(n).expect("non-zero")
+    }
+
+    #[test]
+    fn a_fill_record_gives_what_its_answer_repeats() {
+        let fill = Record::Fill {
+            object: ObjectId::new(3),
+            generation: Generation::new(9),
+            fill: FillId::new(5),
+            pages: record(8, 2),
+        };
+        let (object, answer) = fill.fill().expect("a fill record");
+        assert_eq!(object, ObjectId::new(3));
+        assert_eq!(
+            answer.answer(Outcome::Done),
+            Request::Filled {
+                pages: record(8, 2),
+                outcome: Outcome::Done,
+                generation: Generation::new(9),
+                fill: FillId::new(5),
+            }
+        );
+        let release = Record::Release {
+            object: ObjectId::new(3),
+            generation: Generation::new(9),
+        };
+        assert_eq!(release.fill(), None);
+    }
+
+    #[test]
+    fn decode_all_takes_whole_records() {
+        let fill = Record::Fill {
+            object: ObjectId::new(3),
+            generation: Generation::new(1),
+            fill: FillId::new(5),
+            pages: record(8, 2),
+        };
+        let release = Record::Release {
+            object: ObjectId::new(4),
+            generation: Generation::new(2),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&fill.to_bytes());
+        bytes.extend_from_slice(&release.to_bytes());
+        let got: Vec<_> = Record::decode_all(&bytes).collect();
+        assert_eq!(got, [Ok(fill), Ok(release)]);
+        assert_eq!(Record::decode_all(&[]).count(), 0);
+        // A short tail and a bad record are errors; the good records around them still decode.
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let got: Vec<_> = Record::decode_all(&bytes).collect();
+        assert_eq!(got, [Ok(fill), Ok(release), Err(RecordError::Length)]);
+        let mut bad = fill.to_bytes();
+        bad[0] = 99;
+        assert_eq!(
+            Record::decode_all(&bad).collect::<Vec<_>>(),
+            [Err(RecordError::Kind)]
+        );
+    }
+
+    #[test]
+    fn covering_holds_every_byte() {
+        let pages = |start, end| PageRange::covering(start, end).collect::<Vec<_>>();
+        assert_eq!(pages(0, 0), []);
+        assert_eq!(pages(5000, 5000), []);
+        assert_eq!(pages(0, 1), [PageRange::new(0, 1).unwrap()]);
+        // A write of bytes 4095..4097 touches pages 0 and 1.
+        assert_eq!(pages(4095, 4097), [PageRange::new(0, 2).unwrap()]);
+        assert_eq!(pages(8192, 3 * 4096), [PageRange::new(2, 1).unwrap()]);
+        // More pages than one range holds come in several.
+        let huge = pages(0, (u64::from(u32::MAX) + 10) * 4096);
+        assert_eq!(
+            huge,
+            [
+                PageRange::new(0, u32::MAX).unwrap(),
+                PageRange::new(u64::from(u32::MAX), 10).unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -1008,6 +1182,12 @@ mod tests {
             Request::SetReadaheadMax {
                 pages: ReadaheadMax::new(MAX_RECORD_PAGES).expect("in range"),
             },
+            Request::Invalidate {
+                pages: PageRange::new(3, 1).expect("valid"),
+            },
+            Request::Invalidate {
+                pages: PageRange::new(u64::MAX - u64::from(u32::MAX), u32::MAX).expect("valid"),
+            },
         ];
         for request in all {
             let (words, len) = request.encode();
@@ -1043,6 +1223,11 @@ mod tests {
         assert_eq!(Request::decode(&[6, 0]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[6, 1 << 32]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[6, long]), Err(DecodeError::Value));
+        // An invalidation of no pages, of too many, or of a range past the last page.
+        assert_eq!(Request::decode(&[8, 0, 0]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[8, 0, 1 << 32]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[8, u64::MAX, 2]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[8, 0]), Err(DecodeError::Length));
         // So the encoder cannot produce what the decoder refuses: 1024 is the largest maximum.
         assert_eq!(
             ReadaheadMax::new(MAX_RECORD_PAGES).map(ReadaheadMax::get),
