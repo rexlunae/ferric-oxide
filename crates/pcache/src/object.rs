@@ -140,16 +140,13 @@ impl Attempt {
 }
 
 /// What a read needs before its pages can be copied.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Read {
     /// Every page holds the file's data.
     Ready,
-    /// Some pages are being filled. `fills` are the records this call started, to put on the
-    /// queue; empty when only fills already outstanding are waited for.
-    Wait {
-        /// The fill records to queue.
-        fills: Vec<Fill>,
-    },
+    /// Some pages are being filled: wait for their answers (after queueing
+    /// [`ReadStep::fills`]) and look again.
+    Wait,
     /// A fill the reader waited for failed.
     Failed,
     /// Some pages are absent, and the object has used every [`FillId`] there is, so no fill
@@ -157,6 +154,22 @@ pub enum Read {
     /// fills a second this takes centuries; the file system must close and reopen the
     /// object to fill it again.
     OutOfFillIds,
+}
+
+/// One look at a read's pages ([`PageIndex::start_read`]): what the reader does next, and
+/// every fill the look started, for the read and for readahead together.
+///
+/// Each fill in `fills` has its pages marked filling, and nothing else will start them
+/// again: the caller must put every one on the queue, or fail it, whatever `read` says.
+/// Keeping them in one list (rather than one per purpose) is what makes that a single step
+/// on every path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "every fill started must be queued or failed"]
+pub struct ReadStep {
+    /// What the reader does next.
+    pub read: Read,
+    /// The fill records to queue: the read's own, then readahead's.
+    pub fills: Vec<Fill>,
 }
 
 /// A fill the index started: its pages, and the ID its record and answer carry.
@@ -266,37 +279,70 @@ impl<F> PageIndex<F> {
         Some((pages, usize::try_from(end - offset).unwrap_or(len)))
     }
 
-    /// Looks at `pages` for a read: see [`Read`]. Absent pages become
+    /// Looks at `pages` for a read: see [`ReadStep`]. Absent pages become
     /// [`PageState::Filling`], in records of at most [`crate::abi::MAX_RECORD_PAGES`] pages,
-    /// and `attempt` keeps the outcome of every fill it now waits for.
-    pub fn start_read(&mut self, pages: PageRange, attempt: &mut Attempt) -> Read {
+    /// and `attempt` keeps the outcome of every fill it now waits for. On the attempt's
+    /// first look, and only when the read itself can go on (it is ready or waits), the
+    /// absent pages of `ahead` are filled too (readahead, which no reader waits for).
+    pub fn start_read(
+        &mut self,
+        pages: PageRange,
+        attempt: &mut Attempt,
+        ahead: Option<PageRange>,
+    ) -> ReadStep {
+        let first = attempt.is_first();
+        let read = self.look(pages, attempt);
+        let mut fills = match read {
+            Ok(fills) => fills,
+            Err(read) => {
+                return ReadStep {
+                    read,
+                    fills: Vec::new(),
+                };
+            }
+        };
+        let read = if fills.is_empty() && !self.busy(pages) {
+            Read::Ready
+        } else {
+            Read::Wait
+        };
+        if first && let Some(ahead) = ahead {
+            fills.extend(self.prefetch(ahead));
+        }
+        ReadStep { read, fills }
+    }
+
+    /// Whether any of `pages` is being filled or written back.
+    fn busy(&self, pages: PageRange) -> bool {
+        self.pages
+            .range(pages.first()..pages.end())
+            .any(|(_, entry)| entry.state.busy())
+    }
+
+    /// The read's own part of [`PageIndex::start_read`]: the fills it started, or why it
+    /// cannot go on ([`Read::Failed`] or [`Read::OutOfFillIds`], having started nothing).
+    fn look(&mut self, pages: PageRange, attempt: &mut Attempt) -> Result<Vec<Fill>, Read> {
         if attempt.take_failure() {
-            return Read::Failed;
+            return Err(Read::Failed);
         }
         let Some(fills) = self.start_fills(pages) else {
-            return Read::OutOfFillIds;
+            return Err(Read::OutOfFillIds);
         };
-        let mut busy = false;
         for entry in self.pages.range(pages.first()..pages.end()).map(|(_, e)| e) {
-            if entry.state.busy() {
-                busy = true;
-                if let Some(fill) = &entry.fill {
-                    attempt.wait_for(fill);
-                }
+            if entry.state.busy()
+                && let Some(fill) = &entry.fill
+            {
+                attempt.wait_for(fill);
             }
         }
         // Even a ready read is no longer a first look.
         attempt.waiting.get_or_insert_with(Vec::new);
-        if fills.is_empty() && !busy {
-            Read::Ready
-        } else {
-            Read::Wait { fills }
-        }
+        Ok(fills)
     }
 
     /// Starts fills of the absent pages of `pages` that no reader waits for yet (readahead),
     /// and returns their records: none once the object is out of fill IDs.
-    pub fn prefetch(&mut self, pages: PageRange) -> Vec<Fill> {
+    fn prefetch(&mut self, pages: PageRange) -> Vec<Fill> {
         self.start_fills(pages).unwrap_or_default()
     }
 
@@ -610,11 +656,8 @@ mod tests {
     const EIO: Outcome = Outcome::Failed(NonZeroU16::new(5).expect("non-zero"));
 
     /// The pages of the fills a [`Read::Wait`] started, `None` for another answer.
-    fn wait_pages(read: Read) -> Option<Vec<RecordPages>> {
-        match read {
-            Read::Wait { fills } => Some(fills.iter().map(|fill| fill.pages).collect()),
-            Read::Ready | Read::Failed | Read::OutOfFillIds => None,
-        }
+    fn wait_pages(step: ReadStep) -> Option<Vec<RecordPages>> {
+        (step.read == Read::Wait).then(|| step.fills.iter().map(|fill| fill.pages).collect())
     }
 
     /// The fill that owns `page` now, or ID 0 (never given out) when none does.
@@ -676,7 +719,7 @@ mod tests {
         let mut index = index();
         let (mut a, mut b) = (Attempt::new(), Attempt::new());
         assert_eq!(
-            wait_pages(index.start_read(range(2, 3), &mut a)),
+            wait_pages(index.start_read(range(2, 3), &mut a, None)),
             Some(vec![record(2, 3)])
         );
         assert_eq!(index.state(3), PageState::Filling);
@@ -684,15 +727,18 @@ mod tests {
         // A second reader of overlapping pages waits for the same fill and starts one only
         // for the page nobody fills.
         assert_eq!(
-            wait_pages(index.start_read(range(4, 2), &mut b)),
+            wait_pages(index.start_read(range(4, 2), &mut b, None)),
             Some(vec![record(5, 1)])
         );
         answer(&mut index, record(2, 3), Outcome::Done, frames(2, 3))
             .expect("pages 2..5 are filling");
-        assert_eq!(index.start_read(range(2, 3), &mut a), Read::Ready);
+        assert_eq!(
+            index.start_read(range(2, 3), &mut a, None).read,
+            Read::Ready
+        );
         assert_eq!(index.frames(range(2, 3)), Some(vec![2, 3, 4]));
         assert_eq!(
-            wait_pages(index.start_read(range(4, 2), &mut b)),
+            wait_pages(index.start_read(range(4, 2), &mut b, None)),
             Some(vec![])
         );
         assert_eq!(index.resident(), 3);
@@ -702,9 +748,9 @@ mod tests {
     fn fills_are_cut_into_records_around_present_pages() {
         let mut index: PageIndex<u64> = PageIndex::new();
         index.set_size(3000 * PAGE_SIZE);
-        let fills = wait_pages(index.start_read(range(5, 1), &mut Attempt::new()));
+        let fills = wait_pages(index.start_read(range(5, 1), &mut Attempt::new(), None));
         assert_eq!(fills, Some(vec![record(5, 1)]));
-        let fills = wait_pages(index.start_read(range(0, 2100), &mut Attempt::new()));
+        let fills = wait_pages(index.start_read(range(0, 2100), &mut Attempt::new(), None));
         assert_eq!(
             fills.as_deref(),
             Some(
@@ -722,18 +768,21 @@ mod tests {
     fn a_failed_fill_fails_its_waiters_and_is_retried_by_new_readers() {
         let mut index = index();
         let mut waiter = Attempt::new();
-        let _ = index.start_read(range(0, 2), &mut waiter);
+        let _ = index.start_read(range(0, 2), &mut waiter, None);
         answer(&mut index, record(0, 2), EIO, Vec::new()).expect("pages 0..2 are filling");
         assert_eq!(index.state(0), PageState::Absent);
-        assert_eq!(index.start_read(range(0, 2), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(0, 2), &mut waiter, None).read,
+            Read::Failed
+        );
         // A read that had not waited fills again; its retry then waits, not fails.
         let mut late = Attempt::new();
         assert_eq!(
-            wait_pages(index.start_read(range(1, 1), &mut late)),
+            wait_pages(index.start_read(range(1, 1), &mut late, None)),
             Some(vec![record(1, 1)])
         );
         assert_eq!(
-            wait_pages(index.start_read(range(1, 1), &mut late)),
+            wait_pages(index.start_read(range(1, 1), &mut late, None)),
             Some(vec![])
         );
     }
@@ -742,22 +791,31 @@ mod tests {
     fn a_new_fill_does_not_hide_a_failure_from_its_waiters() {
         let mut index = index();
         let mut waiter = Attempt::new();
-        let _ = index.start_read(range(1, 1), &mut waiter);
+        let _ = index.start_read(range(1, 1), &mut waiter, None);
         answer(&mut index, record(1, 1), EIO, Vec::new()).expect("page 1 is filling");
         // Before the waiter runs again, a new reader fills page 1 again.
         let mut late = Attempt::new();
         assert_eq!(
-            wait_pages(index.start_read(range(1, 1), &mut late)),
+            wait_pages(index.start_read(range(1, 1), &mut late, None)),
             Some(vec![record(1, 1)])
         );
         // The waiter still gets the failure of the fill it waited for.
-        assert_eq!(index.start_read(range(1, 1), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(1, 1), &mut waiter, None).read,
+            Read::Failed
+        );
         answer(&mut index, record(1, 1), Outcome::Done, frames(1, 1))
             .expect("page 1 is filling again");
-        assert_eq!(index.start_read(range(1, 1), &mut late), Read::Ready);
+        assert_eq!(
+            index.start_read(range(1, 1), &mut late, None).read,
+            Read::Ready
+        );
         // Invalidation does not hide the failure either.
         let _ = index.invalidate(range(1, 1));
-        assert_eq!(index.start_read(range(1, 1), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(1, 1), &mut waiter, None).read,
+            Read::Failed
+        );
     }
 
     #[test]
@@ -768,7 +826,7 @@ mod tests {
             index.complete_fill(FillId::new(1), record(0, 1), Outcome::Done, frames(0, 1)),
             Ok(0)
         );
-        let _ = index.start_read(range(0, 2), &mut Attempt::new());
+        let _ = index.start_read(range(0, 2), &mut Attempt::new(), None);
         let id = owner(&index, 0);
         assert_eq!(id, FillId::new(1));
         // A range past the fill's pages takes only the pages the fill owns.
@@ -807,7 +865,7 @@ mod tests {
         let mut index = index();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let _ = index.start_read(range(3, 1), &mut Attempt::new());
+            let _ = index.start_read(range(3, 1), &mut Attempt::new(), None);
             ids.push(owner(&index, 3));
             answer(&mut index, record(3, 1), EIO, Vec::new()).expect("filling");
         }
@@ -820,31 +878,98 @@ mod tests {
     fn fill_ids_run_out_instead_of_repeating() {
         let mut index = index();
         // Page 1 cached, so a read of pages 0..3 needs two fills.
-        let _ = index.start_read(range(1, 1), &mut Attempt::new());
+        let _ = index.start_read(range(1, 1), &mut Attempt::new(), None);
         answer(&mut index, record(1, 1), Outcome::Done, frames(1, 1)).expect("filling");
         index.next_fill = Some(FillId::new(u64::MAX));
         // One ID left is not enough for two fills: nothing starts.
         assert_eq!(
-            index.start_read(range(0, 3), &mut Attempt::new()),
+            index
+                .start_read(range(0, 3), &mut Attempt::new(), None)
+                .read,
             Read::OutOfFillIds
         );
         assert_eq!(index.state(0), PageState::Absent);
         assert_eq!(index.state(2), PageState::Absent);
         // One fill takes the last ID.
-        let _ = index.start_read(range(0, 1), &mut Attempt::new());
+        let _ = index.start_read(range(0, 1), &mut Attempt::new(), None);
         assert_eq!(owner(&index, 0), FillId::new(u64::MAX));
         answer(&mut index, record(0, 1), EIO, Vec::new()).expect("filling");
         assert_eq!(
-            index.start_read(range(0, 1), &mut Attempt::new()),
+            index
+                .start_read(range(0, 1), &mut Attempt::new(), None)
+                .read,
             Read::OutOfFillIds
         );
         assert_eq!(index.state(0), PageState::Absent);
         assert!(index.prefetch(range(2, 4)).is_empty());
         assert_eq!(index.state(2), PageState::Absent);
         assert_eq!(
-            index.start_read(range(1, 1), &mut Attempt::new()),
+            index
+                .start_read(range(1, 1), &mut Attempt::new(), None)
+                .read,
             Read::Ready
         );
+    }
+
+    /// The pages being filled, which must be exactly the pages of the fills handed out.
+    fn filling(index: &PageIndex<u64>) -> Vec<u64> {
+        let pages = index.pages.iter();
+        pages
+            .filter(|(_, entry)| entry.state == PageState::Filling)
+            .map(|(&page, _)| page)
+            .collect()
+    }
+
+    fn pages_of(fills: &[Fill]) -> Vec<u64> {
+        let ranges = fills.iter().map(|fill| fill.pages.pages());
+        ranges.flat_map(|r| r.first()..r.end()).collect()
+    }
+
+    /// The kernel's read path, with one fill ID left: a read missing two runs, with
+    /// readahead, starts nothing at all (so no page is left filling with no record to
+    /// queue); a read missing one run takes the last ID and readahead starts nothing; and
+    /// a read that cannot go on never starts readahead.
+    #[test]
+    fn a_read_out_of_fill_ids_leaves_no_page_filling_unqueued() {
+        let mut index = index();
+        let _ = index.start_read(range(1, 1), &mut Attempt::new(), None);
+        answer(&mut index, record(1, 1), Outcome::Done, frames(1, 1)).expect("filling");
+        index.next_fill = Some(FillId::new(u64::MAX));
+        let ahead = Some(range(4, 4));
+        // Pages 0 and 2 are two runs; one ID is not enough, and readahead does not run.
+        let step = index.start_read(range(0, 3), &mut Attempt::new(), ahead);
+        assert_eq!(step.read, Read::OutOfFillIds);
+        assert!(step.fills.is_empty());
+        assert_eq!(filling(&index), []);
+        // One run takes the last ID; readahead has none left and starts nothing.
+        let step = index.start_read(range(0, 1), &mut Attempt::new(), ahead);
+        assert_eq!(step.read, Read::Wait);
+        assert_eq!(pages_of(&step.fills), [0]);
+        assert_eq!(filling(&index), pages_of(&step.fills));
+        // A reader whose fill failed gets Failed and starts no readahead either.
+        let mut waiter = Attempt::new();
+        let _ = index.start_read(range(0, 1), &mut waiter, None);
+        index.next_fill = Some(FillId::new(7));
+        answer(&mut index, record(0, 1), EIO, Vec::new()).expect("filling");
+        let step = index.start_read(range(0, 1), &mut waiter, ahead);
+        assert_eq!(step.read, Read::Failed);
+        assert!(step.fills.is_empty());
+        assert_eq!(filling(&index), []);
+    }
+
+    /// Readahead's fills come in the same list as the read's own, on the first look only.
+    #[test]
+    fn readahead_fills_come_with_the_reads_own() {
+        let mut index = index();
+        let mut reader = Attempt::new();
+        let step = index.start_read(range(0, 1), &mut reader, Some(range(1, 3)));
+        assert_eq!(step.read, Read::Wait);
+        assert_eq!(pages_of(&step.fills), [0, 1, 2, 3]);
+        assert_eq!(filling(&index), [0, 1, 2, 3]);
+        // A second look (a retry) does not read ahead again.
+        let step = index.start_read(range(0, 1), &mut reader, Some(range(5, 2)));
+        assert!(step.fills.is_empty());
+        assert_eq!(index.state(5), PageState::Absent);
     }
 
     /// A fill fails, a reader fills the pages again, and then a late, malformed answer to the
@@ -853,14 +978,14 @@ mod tests {
     fn a_late_malformed_answer_to_an_old_fill_leaves_the_retry_alone() {
         let mut index = index();
         let mut first = Attempt::new();
-        let _ = index.start_read(range(0, 2), &mut first);
+        let _ = index.start_read(range(0, 2), &mut first, None);
         let old = owner(&index, 0);
         index
             .complete_fill(old, record(0, 2), EIO, Vec::new())
             .expect("filling");
         let mut retry = Attempt::new();
         assert_eq!(
-            wait_pages(index.start_read(range(0, 2), &mut retry)),
+            wait_pages(index.start_read(range(0, 2), &mut retry, None)),
             Some(vec![record(0, 2)])
         );
         let new = owner(&index, 0);
@@ -878,14 +1003,17 @@ mod tests {
         }
         assert_eq!(index.state(0), PageState::Filling);
         assert_eq!(
-            wait_pages(index.start_read(range(0, 2), &mut retry)),
+            wait_pages(index.start_read(range(0, 2), &mut retry, None)),
             Some(vec![])
         );
         assert_eq!(
             index.complete_fill(new, record(0, 2), Outcome::Done, frames(0, 2)),
             Ok(2)
         );
-        assert_eq!(index.start_read(range(0, 2), &mut retry), Read::Ready);
+        assert_eq!(
+            index.start_read(range(0, 2), &mut retry, None).read,
+            Read::Ready
+        );
         assert_eq!(index.frames(range(0, 2)), Some(vec![0, 1]));
     }
 
@@ -895,7 +1023,7 @@ mod tests {
     fn a_fill_that_owns_part_of_its_range_completes_that_part() {
         let mut index = index();
         let mut reader = Attempt::new();
-        let _ = index.start_read(range(0, 4), &mut reader);
+        let _ = index.start_read(range(0, 4), &mut reader, None);
         let old = owner(&index, 0);
         // Page 1 is invalidated, then the stale page is answered and filled anew.
         let _ = index.invalidate(range(1, 1));
@@ -904,7 +1032,7 @@ mod tests {
             .expect("page 1 is the old fill's");
         assert_eq!(index.state(1), PageState::Absent);
         assert_eq!(
-            wait_pages(index.start_read(range(1, 1), &mut Attempt::new())),
+            wait_pages(index.start_read(range(1, 1), &mut Attempt::new(), None)),
             Some(vec![record(1, 1)])
         );
         let new = owner(&index, 1);
@@ -931,9 +1059,9 @@ mod tests {
     #[test]
     fn prefetch_fills_only_absent_pages() {
         let mut index = index();
-        let _ = index.start_read(range(0, 2), &mut Attempt::new());
+        let _ = index.start_read(range(0, 2), &mut Attempt::new(), None);
         answer(&mut index, record(0, 2), Outcome::Done, frames(0, 2)).expect("filling");
-        let _ = index.start_read(range(4, 1), &mut Attempt::new());
+        let _ = index.start_read(range(4, 1), &mut Attempt::new(), None);
         let pages: Vec<RecordPages> = index
             .prefetch(range(0, 8))
             .iter()
@@ -947,17 +1075,20 @@ mod tests {
     fn closing_the_queue_fails_every_outstanding_fill() {
         let mut index = index();
         let mut waiter = Attempt::new();
-        let _ = index.start_read(range(0, 3), &mut waiter);
+        let _ = index.start_read(range(0, 3), &mut waiter, None);
         let _ = index.prefetch(range(5, 2));
         assert_eq!(index.fail_all(), 5);
-        assert_eq!(index.start_read(range(0, 1), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(0, 1), &mut waiter, None).read,
+            Read::Failed
+        );
         assert_eq!(index.fail_all(), 0);
     }
 
     #[test]
     fn shrinking_drops_pages_past_the_end_and_stales_busy_ones() {
         let mut index = index();
-        let _ = index.start_read(range(0, 10), &mut Attempt::new());
+        let _ = index.start_read(range(0, 10), &mut Attempt::new(), None);
         answer(&mut index, record(0, 8), Outcome::Done, frames(0, 8)).expect("filling");
         assert_eq!(index.set_size(4 * PAGE_SIZE), 4);
         assert_eq!(index.resident(), 4);
@@ -972,7 +1103,7 @@ mod tests {
         // Growing again shows none of them: they are filled anew.
         index.set_size(10 * PAGE_SIZE);
         assert_eq!(
-            wait_pages(index.start_read(range(4, 6), &mut Attempt::new())),
+            wait_pages(index.start_read(range(4, 6), &mut Attempt::new(), None)),
             Some(vec![record(4, 6)])
         );
     }
@@ -982,7 +1113,7 @@ mod tests {
         // A 4-page file, all cached.
         let mut index: PageIndex<u64> = PageIndex::new();
         index.set_size(4 * PAGE_SIZE);
-        let _ = index.start_read(range(0, 4), &mut Attempt::new());
+        let _ = index.start_read(range(0, 4), &mut Attempt::new(), None);
         answer(&mut index, record(0, 4), Outcome::Done, frames(0, 4)).expect("filling");
         // Cut inside page 2, then grown back: page 2's old bytes past the cut must not be
         // served, so it is filled again; pages 0 and 1 still hit.
@@ -990,11 +1121,13 @@ mod tests {
         assert_eq!(index.state(2), PageState::Absent);
         index.set_size(4 * PAGE_SIZE);
         assert_eq!(
-            index.start_read(range(0, 2), &mut Attempt::new()),
+            index
+                .start_read(range(0, 2), &mut Attempt::new(), None)
+                .read,
             Read::Ready
         );
         assert_eq!(
-            wait_pages(index.start_read(range(2, 2), &mut Attempt::new())),
+            wait_pages(index.start_read(range(2, 2), &mut Attempt::new(), None)),
             Some(vec![record(2, 2)])
         );
         // Growing alone drops nothing.
@@ -1007,20 +1140,23 @@ mod tests {
         let mut index = index();
         let mut waiter = Attempt::new();
         assert_eq!(
-            wait_pages(index.start_read(range(0, 3), &mut waiter)),
+            wait_pages(index.start_read(range(0, 3), &mut waiter, None)),
             Some(vec![record(0, 3)])
         );
         // Page 0 goes stale, then the whole record fails: pages 1 and 2 failed.
         let _ = index.invalidate(range(0, 1));
         answer(&mut index, record(0, 3), EIO, Vec::new()).expect("pages 0..3 are filling");
-        assert_eq!(index.start_read(range(0, 3), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(0, 3), &mut waiter, None).read,
+            Read::Failed
+        );
         // A record whose only failing page is stale has not failed: the reader fills again.
         let mut other = Attempt::new();
-        let _ = index.start_read(range(5, 2), &mut other);
+        let _ = index.start_read(range(5, 2), &mut other, None);
         let _ = index.invalidate(range(5, 2));
         answer(&mut index, record(5, 2), EIO, Vec::new()).expect("pages 5..7 are filling");
         assert_eq!(
-            wait_pages(index.start_read(range(5, 2), &mut other)),
+            wait_pages(index.start_read(range(5, 2), &mut other, None)),
             Some(vec![record(5, 2)])
         );
     }
@@ -1029,22 +1165,28 @@ mod tests {
     fn answers_for_part_of_a_record_decide_it_together() {
         let mut index = index();
         let mut waiter = Attempt::new();
-        let _ = index.start_read(range(0, 4), &mut waiter);
+        let _ = index.start_read(range(0, 4), &mut waiter, None);
         // The first half is answered; the record is still going for the rest.
         answer(&mut index, record(0, 2), Outcome::Done, frames(0, 2))
             .expect("pages 0..2 are filling");
         assert_eq!(
-            wait_pages(index.start_read(range(0, 4), &mut waiter)),
+            wait_pages(index.start_read(range(0, 4), &mut waiter, None)),
             Some(vec![])
         );
         // The second half fails: the reader that waited for the record sees it.
         answer(&mut index, record(2, 2), EIO, Vec::new()).expect("pages 2..4 are filling");
-        assert_eq!(index.start_read(range(0, 4), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(0, 4), &mut waiter, None).read,
+            Read::Failed
+        );
         // And when the queue goes, every outstanding record fails.
         let mut late = Attempt::new();
-        let _ = index.start_read(range(6, 3), &mut late);
+        let _ = index.start_read(range(6, 3), &mut late, None);
         assert_eq!(index.fail_all(), 3);
-        assert_eq!(index.start_read(range(6, 3), &mut late), Read::Failed);
+        assert_eq!(
+            index.start_read(range(6, 3), &mut late, None).read,
+            Read::Failed
+        );
     }
 
     #[test]
@@ -1052,17 +1194,20 @@ mod tests {
         let mut index: PageIndex<u64> = PageIndex::new();
         index.set_size(64 * PAGE_SIZE);
         let mut waiter = Attempt::new();
-        let _ = index.start_read(range(40, 1), &mut waiter);
+        let _ = index.start_read(range(40, 1), &mut waiter, None);
         answer(&mut index, record(40, 1), EIO, Vec::new()).expect("page 40 is filling");
         // The failed page is forgotten at once: the waiter holds the failure, not the index.
         assert!(index.pages.is_empty());
         // Cut below the page and grown back before the waiter runs again.
         index.set_size(3 * PAGE_SIZE);
         index.set_size(64 * PAGE_SIZE);
-        assert_eq!(index.start_read(range(40, 1), &mut waiter), Read::Failed);
+        assert_eq!(
+            index.start_read(range(40, 1), &mut waiter, None).read,
+            Read::Failed
+        );
         // A new reader fills the page again.
         assert_eq!(
-            wait_pages(index.start_read(range(40, 1), &mut Attempt::new())),
+            wait_pages(index.start_read(range(40, 1), &mut Attempt::new(), None)),
             Some(vec![record(40, 1)])
         );
     }
@@ -1073,21 +1218,21 @@ mod tests {
         index.set_size(64 * PAGE_SIZE);
         // A stale fill past a new end, answered with a failure, and many failed fills.
         let mut stale = Attempt::new();
-        let _ = index.start_read(range(50, 1), &mut stale);
+        let _ = index.start_read(range(50, 1), &mut stale, None);
         index.set_size(3 * PAGE_SIZE);
         answer(&mut index, record(50, 1), EIO, Vec::new()).expect("page 50 is filling");
         assert!(index.pages.is_empty());
         // A stale fill is not a failure for its reader, which goes on (the kernel would cut
         // its read at the new end; here it reads page 0 instead).
         assert_eq!(
-            wait_pages(index.start_read(range(0, 1), &mut stale)),
+            wait_pages(index.start_read(range(0, 1), &mut stale, None)),
             Some(vec![record(0, 1)])
         );
         answer(&mut index, record(0, 1), Outcome::Done, frames(0, 1)).expect("page 0 is filling");
         for round in 0..100 {
             index.set_size(64 * PAGE_SIZE);
             let page = 10 + round % 40;
-            let _ = index.start_read(range(page, 1), &mut Attempt::new());
+            let _ = index.start_read(range(page, 1), &mut Attempt::new(), None);
             answer(&mut index, record(page, 1), EIO, Vec::new()).expect("filling");
             index.set_size(3 * PAGE_SIZE);
         }
@@ -1097,7 +1242,7 @@ mod tests {
     #[test]
     fn invalidating_drops_cached_pages() {
         let mut index = index();
-        let _ = index.start_read(range(0, 4), &mut Attempt::new());
+        let _ = index.start_read(range(0, 4), &mut Attempt::new(), None);
         answer(&mut index, record(0, 4), Outcome::Done, frames(0, 4))
             .expect("pages 0..4 are filling");
         assert_eq!(
@@ -1111,11 +1256,13 @@ mod tests {
         assert_eq!(index.state(1), PageState::Absent);
         // The next read of them fills them again; the pages left alone still hit.
         assert_eq!(
-            index.start_read(range(0, 1), &mut Attempt::new()),
+            index
+                .start_read(range(0, 1), &mut Attempt::new(), None)
+                .read,
             Read::Ready
         );
         assert_eq!(
-            wait_pages(index.start_read(range(1, 2), &mut Attempt::new())),
+            wait_pages(index.start_read(range(1, 2), &mut Attempt::new(), None)),
             Some(vec![record(1, 2)])
         );
         // Absent pages and pages past the range are not counted.
@@ -1126,7 +1273,7 @@ mod tests {
     fn a_fill_in_flight_over_invalidated_pages_is_not_taken() {
         let mut index = index();
         let mut reader = Attempt::new();
-        let _ = index.start_read(range(0, 3), &mut reader);
+        let _ = index.start_read(range(0, 3), &mut reader, None);
         assert_eq!(
             index.invalidate(range(1, 1)),
             Invalidated {
@@ -1142,7 +1289,7 @@ mod tests {
         assert_eq!(index.state(1), PageState::Absent);
         assert_eq!(index.state(2), PageState::Uptodate);
         assert_eq!(
-            wait_pages(index.start_read(range(0, 3), &mut reader)),
+            wait_pages(index.start_read(range(0, 3), &mut reader, None)),
             Some(vec![record(1, 1)])
         );
         answer(&mut index, record(1, 1), Outcome::Done, vec![100])
@@ -1154,12 +1301,12 @@ mod tests {
     fn a_stale_fill_that_fails_does_not_fail_its_readers() {
         let mut index = index();
         let mut reader = Attempt::new();
-        let _ = index.start_read(range(4, 1), &mut reader);
+        let _ = index.start_read(range(4, 1), &mut reader, None);
         let _ = index.invalidate(range(4, 1));
         answer(&mut index, record(4, 1), EIO, Vec::new()).expect("page 4 is filling");
         assert_eq!(index.state(4), PageState::Absent);
         assert_eq!(
-            wait_pages(index.start_read(range(4, 1), &mut reader)),
+            wait_pages(index.start_read(range(4, 1), &mut reader, None)),
             Some(vec![record(4, 1)])
         );
     }

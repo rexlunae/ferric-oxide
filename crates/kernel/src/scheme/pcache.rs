@@ -323,40 +323,37 @@ fn read(
         let Some((pages, len)) = state.index.pages_for_read(offset, buf.len()) else {
             return Some(Ok(0));
         };
-        let first = attempt.is_first();
-        // This records the fills `attempt` waits for, and makes it a retry next round.
-        let read = state.index.start_read(pages, &mut attempt);
-        let mut fills = match &read {
-            Read::Wait { fills } => fills.clone(),
-            Read::Ready | Read::Failed | Read::OutOfFillIds => Vec::new(),
+        // This records the fills `attempt` waits for, and makes it a retry next round. Every
+        // fill it starts, the read's own and readahead's, is in `step.fills`, which is queued
+        // (or failed) below on every path before the step's outcome is acted on.
+        let step = state.index.start_read(pages, &mut attempt, ahead);
+        let frames = match step.read {
+            Read::Ready => state.index.frames(pages),
+            Read::Wait | Read::Failed | Read::OutOfFillIds => None,
         };
-        if first && let Some(ahead) = ahead {
-            fills.extend(state.index.prefetch(ahead));
+        if step.read == Read::Wait && step.fills.is_empty() {
+            let mut wait_token = token.downgrade::<L1>();
+            if !object.changed.wait(state, "pcache::read", &mut wait_token) {
+                return Some(Err(Error::new(EINTR)));
+            }
+            continue;
         }
-        match read {
+        drop(state);
+        let queued = queue_fills(object, &step.fills, token);
+        match step.read {
             Read::Failed => return Some(Err(Error::new(EIO))),
             Read::OutOfFillIds => return Some(Err(Error::new(EOVERFLOW))),
+            // Only readahead can have been queued: if the queue could not take it, the read
+            // itself still goes on.
             Read::Ready => {
-                let frames = state.index.frames(pages);
-                drop(state);
-                // Only readahead is queued here: if the queue cannot take it, the read itself
-                // can still go on.
-                let _ = queue_fills(object, &fills, token);
                 return Some(match frames {
                     Some(frames) => copy_out(&frames, buf, offset, len),
                     None => Err(Error::new(EIO)),
                 });
             }
-            Read::Wait { .. } if !fills.is_empty() => {
-                drop(state);
-                if let Err(err) = queue_fills(object, &fills, token) {
+            Read::Wait => {
+                if let Err(err) = queued {
                     return Some(Err(err));
-                }
-            }
-            Read::Wait { .. } => {
-                let mut wait_token = token.downgrade::<L1>();
-                if !object.changed.wait(state, "pcache::read", &mut wait_token) {
-                    return Some(Err(Error::new(EINTR)));
                 }
             }
         }
