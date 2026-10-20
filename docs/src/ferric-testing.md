@@ -294,17 +294,25 @@ BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log
 ```
 
 The script expects QEMU, OVMF and Linux utilities. It uses a copy of the image,
-q35, four CPUs, 2 GiB RAM, fixed PCI slots for NVMe, e1000 and edu, and serial
-output. It uses KVM with `host` when available and otherwise TCG with `max`.
-`BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
-interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
-later; the workflow uses a newer-QEMU container for that variant.
-`OVMF_FIRMWARE` selects a firmware file instead of searching the usual paths.
+q35, four CPUs, 2 GiB RAM, fixed PCI slots for NVMe, e1000 and edu, two HDA
+controllers, and serial output. It uses KVM with `host` when available and
+otherwise TCG with `max`. `BOOT_TIMEOUT` changes the default 300-second limit.
+`BOOT_IOMMU=vtd` requests interrupt remapping and a split irqchip. AMD DMA
+remapping requires QEMU 10 or later; the workflow uses a newer-QEMU container
+for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
+the usual paths.
+
+The two HDA controllers exercise the audio scheme naming in `ihdad` and
+`audiod`. The smoke script waits up to 30 seconds for the second controller's
+`audiohw.<pci-address>` scheme and reports `audio-second-controller`: the
+first driver keeps `audiohw`, so a machine with the chipset codec and GPU
+audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
 QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a missing test result and a missing marker.
-The host-tools workflow runs it before the Rust checks.
+failure, a crash after the marker, a missing test result, a missing marker,
+and that the runner adds both HDA controllers. The host-tools workflow runs
+it before the Rust checks.
 
 ### CET image and Kleya rerun
 
