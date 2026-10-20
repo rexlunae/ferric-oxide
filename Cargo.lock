@@ -1365,6 +1365,7 @@ dependencies = [
 name = "ferric-netq"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.2",
  "etherparse",
  "ferric-ring",
  "thiserror 2.0.17",
@@ -1402,7 +1403,9 @@ name = "ferric-trace-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ferric-amdvi",
  "ferric-trace",
+ "ferric-vtd",
  "redox_syscall 0.9.4",
  "serde",
  "serde_json",

@@ -19,6 +19,15 @@
 //!   the `scheme.response` with the same scheme id and tag, on the caller's track, with the
 //!   responder's pid in the end event's arguments. A `scheme.cancel` does not end the
 //!   request (the scheme still answers it): it is an async instant (`n`) on the same slice.
+//! - **Interrupts** are async slices (`b`/`e`, category `irq`) on the track of the CPU that
+//!   took them, from `irq.deliver` to the `irq.ack` with the same IRQ, CPU and count: the
+//!   time a driver took to handle the interrupt. A delivery that woke no handle, which nobody
+//!   will acknowledge, is an instant.
+//! - **Page faults** (`mm.page_fault`) are instants (category `mm`) on the faulting context's
+//!   track, with the access and the outcome in words among their arguments.
+//! - **IOMMU faults** (`iommu.fault`) are global instants (`s: "g"`, category `iommu`), a line
+//!   across every track, with the decoded report among their arguments
+//!   ([`describe::iommu_fault`]).
 //! - A record that has no matching start (its start was not captured) is an instant (`i`).
 //!
 //! Timestamps are microseconds since the first record. The rate ticks are divided by is a
@@ -34,13 +43,15 @@ use std::str::FromStr;
 use ferric_trace::Event;
 use ferric_trace::clock::ClockLine;
 use ferric_trace::kernel::{
-    SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
+    IOMMU_FAULT, IRQ_ACK, IRQ_DELIVER, MM_PAGE_FAULT, PageFaultFlags, SCHED_SWITCH, SCHEME_CANCEL,
+    SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
 use syscall::schemev2::Opcode;
 
 use crate::capture::{Capture, Entry};
+use crate::describe;
 
 /// The pid of the "CPUs" process, whose threads are the CPUs.
 pub const CPU_PID: u64 = 1 << 32;
@@ -226,6 +237,10 @@ struct Converter {
     syscalls: HashMap<Track, Vec<u64>>,
     /// Scheme requests by (scheme, tag).
     requests: HashMap<(u64, u64), OpenRequest>,
+    /// Interrupts delivered and not yet acknowledged, by (IRQ, CPU, count): their async id
+    /// and track.
+    interrupts: HashMap<(u64, u64, u64), (u64, Track)>,
+    /// The next async slice id, shared by requests and interrupts.
     next_request: u64,
     /// The context tracks seen, for their names.
     contexts: BTreeSet<Track>,
@@ -289,6 +304,14 @@ impl Converter {
             self.request(entry);
         } else if event.id() == SCHEME_RESPONSE.id() || event.id() == SCHEME_CANCEL.id() {
             self.response(entry);
+        } else if event.id() == IRQ_DELIVER.id() {
+            self.irq_deliver(entry);
+        } else if event.id() == IRQ_ACK.id() {
+            self.irq_ack(entry);
+        } else if event.id() == MM_PAGE_FAULT.id() {
+            self.page_fault(entry);
+        } else if event.id() == IOMMU_FAULT.id() {
+            self.iommu_fault(entry);
         } else {
             let track = self.track(entry);
             let i = self.push(entry, "i", event.name().to_owned(), track);
@@ -420,6 +443,78 @@ impl Converter {
         event.id = Some(format!("{id:#x}"));
     }
 
+    /// `irq.deliver`: begins the interrupt's slice on the CPU that took it, or an instant
+    /// when no handle woke.
+    fn irq_deliver(&mut self, entry: &Entry) {
+        let track = (CPU_PID, u64::from(entry.cpu));
+        let name = format!("irq {}", entry.arg(0));
+        let source = describe::source_name(entry.arg(2));
+        if entry.arg(4) == 0 {
+            let i = self.push(entry, "i", name, track);
+            let event = self.with_args(i, entry);
+            event.cat = Some("irq");
+            event.s = Some("t");
+            event
+                .args
+                .insert("source_name".to_owned(), Value::from(source));
+            return;
+        }
+        let id = self.next_request;
+        self.next_request += 1;
+        let i = self.push(entry, "b", name, track);
+        let event = self.with_args(i, entry);
+        event.cat = Some("irq");
+        event.id = Some(format!("{id:#x}"));
+        event
+            .args
+            .insert("source_name".to_owned(), Value::from(source));
+        // A later delivery of the same count can only follow an acknowledgement, which
+        // removes this one, so the key is free.
+        let key = (entry.arg(0), entry.arg(1), entry.arg(3));
+        self.interrupts.insert(key, (id, track));
+    }
+
+    /// `irq.ack`: ends the slice of the delivery it acknowledges, or is an instant.
+    fn irq_ack(&mut self, entry: &Entry) {
+        let key = (entry.arg(0), entry.arg(1), entry.arg(2));
+        let Some((id, track)) = self.interrupts.remove(&key) else {
+            let track = self.track(entry);
+            let i = self.push(entry, "i", "irq.ack".to_owned(), track);
+            let event = self.with_args(i, entry);
+            event.cat = Some("irq");
+            event.s = Some("t");
+            return;
+        };
+        let i = self.push(entry, "e", format!("irq {}", entry.arg(0)), track);
+        let event = self.with_args(i, entry);
+        event.cat = Some("irq");
+        event.id = Some(format!("{id:#x}"));
+    }
+
+    /// `mm.page_fault`: an instant on the faulting context, its access and outcome in words.
+    fn page_fault(&mut self, entry: &Entry) {
+        let track = self.track(entry);
+        let i = self.push(entry, "i", "page fault".to_owned(), track);
+        let event = self.with_args(i, entry);
+        event.cat = Some("mm");
+        event.s = Some("t");
+        let access = PageFaultFlags::from_raw(entry.arg(2)).to_string();
+        event.args.insert("access".to_owned(), Value::from(access));
+        let outcome = describe::outcome_name(entry.arg(3));
+        event.args.insert("result".to_owned(), Value::from(outcome));
+    }
+
+    /// `iommu.fault`: a global instant with the decoded report.
+    fn iommu_fault(&mut self, entry: &Entry) {
+        let track = (CPU_PID, u64::from(entry.cpu));
+        let i = self.push(entry, "i", "iommu fault".to_owned(), track);
+        let event = self.with_args(i, entry);
+        event.cat = Some("iommu");
+        event.s = Some("g");
+        let report = describe::iommu_fault(entry);
+        event.args.insert("report".to_owned(), Value::from(report));
+    }
+
     /// Ends the CPU slices still open at the last record, and adds the track names.
     fn finish(mut self, capture: &Capture) -> Vec<TraceEvent> {
         if let Some(last) = capture.entries().last() {
@@ -509,6 +604,7 @@ pub fn to_json(capture: &Capture, rate: impl Into<TickRate>) -> String {
         first_seen: HashMap::new(),
         syscalls: HashMap::new(),
         requests: HashMap::new(),
+        interrupts: HashMap::new(),
         next_request: 0,
         contexts: BTreeSet::new(),
     };
@@ -853,5 +949,91 @@ mod tests {
         assert_eq!((begin.len(), end.len(), phases(&all, "n").len()), (1, 1, 2));
         assert_eq!(end[0]["id"], begin[0]["id"]);
         assert_eq!(end[0]["ts"], 20.0);
+    }
+
+    #[test]
+    fn interrupts_are_slices_from_delivery_to_ack() {
+        // IRQ 11 is delivered on CPU 1 (count 5) and acknowledged by its driver on CPU 0; the
+        // next delivery (count 6) is not acknowledged in the capture, and IRQ 4 woke nobody.
+        let cpu1 = bytes(&[
+            (&IRQ_DELIVER, 100, &[11, 1, 1, 5, 1]),
+            (&IRQ_DELIVER, 300, &[11, 1, 1, 6, 1]),
+            (&IRQ_DELIVER, 310, &[4, 0, 0, 2, 0]),
+        ]);
+        let cpu0 = bytes(&[
+            (&SCHED_SWITCH, 150, &[0, 9, 1, 3]),
+            (&IRQ_ACK, 200, &[11, 1, 5]),
+            (&IRQ_ACK, 250, &[11, 1, 4]),
+        ]);
+        let capture = Capture::from_cpus(vec![
+            CpuCapture::decode(0, &cpu0).expect("valid"),
+            CpuCapture::decode(1, &cpu1).expect("valid"),
+        ]);
+        let all = events(&to_json(&capture, mhz(1.0)));
+        let begins: Vec<_> = phases(&all, "b")
+            .into_iter()
+            .filter(|e| e["cat"] == "irq")
+            .collect();
+        let ends: Vec<_> = phases(&all, "e")
+            .into_iter()
+            .filter(|e| e["cat"] == "irq")
+            .collect();
+        assert_eq!((begins.len(), ends.len()), (2, 1));
+        assert_eq!(begins[0]["name"], "irq 11");
+        assert_eq!(begins[0]["args"]["source_name"], "vector");
+        // The recorded code stays as it is beside its name.
+        assert_eq!(
+            begins[0]["args"]["source"],
+            ferric_trace::kernel::IrqSource::Vector.raw()
+        );
+        assert_eq!(
+            (begins[0]["pid"].clone(), begins[0]["tid"].clone()),
+            (CPU_PID.into(), 1.into())
+        );
+        // The end is on the slice's own track, at the acknowledgement.
+        assert_eq!(ends[0]["id"], begins[0]["id"]);
+        assert_eq!(ends[0]["tid"], 1);
+        assert_eq!(ends[0]["ts"], 100.0);
+        assert_ne!(begins[1]["id"], begins[0]["id"]);
+        // The stale acknowledgement and the delivery nobody waited for are instants.
+        let instants: Vec<_> = phases(&all, "i")
+            .into_iter()
+            .filter(|e| e["cat"] == "irq")
+            .map(|e| e["name"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(instants, ["irq.ack", "irq 4"]);
+    }
+
+    #[test]
+    fn faults_are_instants_with_their_meaning() {
+        let flags = PageFaultFlags::WRITE.with(PageFaultFlags::USER, true);
+        let (lo, hi) = crate::describe::tests::vtd_read_fault(0x3000);
+        let cpu0 = bytes(&[
+            (&SCHED_SWITCH, 0, &[0, 3, 1, 7]),
+            (&MM_PAGE_FAULT, 10, &[0x1000, 0x40, flags.raw(), 0]),
+            (&IOMMU_FAULT, 20, &[0xfed9_0000, 1, lo, hi, 1]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &cpu0).expect("valid")]);
+        let all = events(&to_json(&capture, mhz(1.0)));
+        let instant = |cat: &str| {
+            phases(&all, "i")
+                .into_iter()
+                .find(|e| e["cat"] == cat)
+                .cloned()
+                .expect("an instant")
+        };
+        let fault = instant("mm");
+        assert_eq!(fault["name"], "page fault");
+        assert_eq!(
+            (fault["pid"].clone(), fault["tid"].clone()),
+            (3.into(), 7.into())
+        );
+        assert_eq!(fault["args"]["access"], "write user");
+        assert_eq!(fault["args"]["result"], "mapped");
+        assert_eq!(fault["args"]["addr"], 0x1000);
+        let iommu = instant("iommu");
+        assert_eq!(iommu["s"], "g");
+        let report = iommu["args"]["report"].as_str().unwrap_or_default();
+        assert!(report.starts_with("00:10.0 read at 0x3000"), "{report}");
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "ferric-netq-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Kernel-bypass queue sockets in copy mode: on-target test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-netq = { path = "../../../../crates/netq" }
+ferric-regbuf = { path = "../../../../crates/regbuf" }
+ferric-ring = { path = "../../../../crates/ring" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+etherparse = "0.21"
+libc = "0.2"
+libredox = "0.1.25"
+redox_syscall = "0.9.4"
+
+[profile.release]
+debug = false
