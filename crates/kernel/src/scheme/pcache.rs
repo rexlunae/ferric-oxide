@@ -400,11 +400,22 @@ const EIO_OUTCOME: core::num::NonZeroU16 = match core::num::NonZeroU16::new(EIO 
 
 /// Copies `len` bytes from `offset` in the pages held by `frames` (the first holding the page
 /// `offset` is in) to `buf`.
+///
+/// A copy of more than one page stages each page whose copy would be 4K-aliased through a
+/// small bounce buffer (`ferric_pcache::copy`). On some cores, such as AMD Zen 3, copying a
+/// page frame straight to a buffer a few bytes into a page runs several times slower. A
+/// one-page read copies from a hot page and is left alone. The bounce buffer is on the
+/// stack (3 KiB of the 64 KiB kernel stack), so a read never allocates and cannot fail for
+/// want of heap memory.
 fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize) -> Result<usize> {
+    use ferric_pcache::copy::{aliased, stage, Bounce, BOUNCE_LEN};
+
     let overflow = || Error::new(EINVAL);
     let first = usize::try_from(offset.checked_rem(PAGE_SIZE as u64).ok_or_else(overflow)?)
         .map_err(|_| overflow())?;
     let mut rest = buf.limit(len).ok_or_else(overflow)?;
+    // Zeroed only by a read that needs it.
+    let mut bounce: Option<Bounce> = None;
     for (i, frame) in frames.iter().enumerate() {
         if rest.is_empty() {
             break;
@@ -413,27 +424,21 @@ fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize
         let src = frame.bytes().get(at..).ok_or_else(overflow)?;
         let n = src.len().min(rest.len());
         let (dst, tail) = rest.split_at(n).ok_or_else(overflow)?;
-        copy_to_user(dst, src.get(..n).ok_or_else(overflow)?)?;
+        let src = src.get(..n).ok_or_else(overflow)?;
+        if frames.len() > 1 && aliased(src.as_ptr() as usize, dst.addr()) {
+            let bounce = bounce.get_or_insert([0; BOUNCE_LEN]);
+            stage(src, dst.addr(), bounce, |at, bytes| {
+                dst.advance(at)
+                    .and_then(|piece| piece.limit(bytes.len()))
+                    .ok_or_else(overflow)?
+                    .copy_from_slice(bytes)
+            })?;
+        } else {
+            dst.copy_from_slice(src)?;
+        }
         rest = tail;
     }
     len.checked_sub(rest.len()).ok_or_else(overflow)
-}
-
-/// Copies `src` to `dst`, which has the same length, with the destination of the bulk of the
-/// copy aligned. See `ferric_pcache::copy`: page-aligned frames copied to a misaligned buffer
-/// run many times slower on some cores otherwise.
-fn copy_to_user(dst: UserSliceWo, src: &[u8]) -> Result<()> {
-    let (head, _) = ferric_pcache::copy::split_for_destination(dst.addr(), src.len());
-    let einval = || Error::new(EINVAL);
-    let (dst_head, dst_rest) = dst.split_at(head).ok_or_else(einval)?;
-    let (src_head, src_rest) = src.split_at_checked(head).ok_or_else(einval)?;
-    if head > 0 {
-        dst_head.copy_from_slice(src_head)?;
-    }
-    if !src_rest.is_empty() {
-        dst_rest.copy_from_slice(src_rest)?;
-    }
-    Ok(())
 }
 
 /// Opens a queue for `caller` (root only), owned by the calling process.
