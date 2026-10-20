@@ -162,6 +162,9 @@ jobs:
           grep -m1 -aE "image 0x[0-9a-f]+ path .*ferric-syscall-fuzz" "$LOG"
           grep -aF "FERRIC_TEST_PASS proc-images" "$LOG"
           echo "::notice::$(grep -aF 'ferric-trace: ' "$LOG" | grep samples | tr -d '\r' | tail -n 1)"
+          # What reading /scheme/sys/proc every drain cost (review 4320670273).
+          grep -aF "image snapshots: " "$LOG"
+          echo "::notice::$(grep -aF 'image snapshots: ' "$LOG" | tr -d '\r' | tail -n 1)"
 
       - uses: actions/upload-artifact@v4
         if: always()
