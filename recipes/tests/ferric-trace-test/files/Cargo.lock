@@ -17,10 +17,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-trace-map"
+version = "0.1.0"
+dependencies = [
+ "ferric-trace",
+ "redox_syscall",
+]
+
+[[package]]
 name = "ferric-trace-test"
 version = "0.1.0"
 dependencies = [
  "ferric-trace",
+ "ferric-trace-map",
  "redox_syscall",
 ]
 

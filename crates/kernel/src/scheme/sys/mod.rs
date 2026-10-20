@@ -33,6 +33,9 @@ mod fdstat;
 mod iostat;
 mod irq;
 mod log;
+// Ferric Oxide: per-process introspection.
+#[cfg(feature = "sys_proc")]
+mod proc;
 mod stat;
 mod syscall;
 mod uname;
@@ -50,13 +53,18 @@ enum Handle {
 #[derive(Clone, Copy)]
 enum Kind {
     Rd(fn(&mut CleanLockToken) -> Result<Vec<u8>>),
+    // Ferric Oxide: a file only root may open, as it shows other processes' addresses.
+    #[cfg_attr(not(feature = "sys_proc"), expect(dead_code))]
+    RdRoot(fn(&mut CleanLockToken) -> Result<Vec<u8>>),
     Wr(fn(&[u8], &mut CleanLockToken) -> Result<usize>),
 }
+#[cfg(feature = "sys_proc")]
+use Kind::RdRoot;
 use Kind::{Rd, Wr};
 impl Kind {
     fn generate_data(&self, token: &mut CleanLockToken) -> Result<Vec<u8>> {
         match self {
-            Rd(handler) => handler(token),
+            Rd(handler) | Kind::RdRoot(handler) => handler(token),
             Wr(_) => Err(Error::new(EISDIR)),
         }
     }
@@ -83,6 +91,8 @@ const FILES: &[(&str, Kind)] = &[
         "log_previous",
         Rd(|_| Ok(crate::log_persist::previous().map_or_else(Vec::new, |log| log.to_vec()))),
     ),
+    #[cfg(feature = "sys_proc")]
+    ("proc", RdRoot(proc::resource)),
     ("syscall", Rd(syscall::resource)),
     ("uname", Rd(uname::resource)),
     ("env", Rd(|_| Ok(Vec::from(crate::startup::init_env())))),
@@ -150,7 +160,7 @@ impl KernelScheme for SysScheme {
                 .find(|(entry_path, _)| *entry_path == path)
                 .ok_or(Error::new(ENOENT))?;
 
-            if (matches!(entry.1, Wr(_)) || ROOT_ONLY.contains(&entry.0)) && ctx.uid != 0 {
+            if (matches!(entry.1, Wr(_) | Kind::RdRoot(_)) || ROOT_ONLY.contains(&entry.0)) && ctx.uid != 0 {
                 return Err(Error::new(EPERM));
             }
 
@@ -253,7 +263,8 @@ impl KernelScheme for SysScheme {
         let (handler, intermediate, len) = match HANDLES.read(token.token()).get(id)? {
             Handle::TopLevel
             | Handle::Resource {
-                kind: Kind::Rd(_), ..
+                kind: Kind::Rd(_) | Kind::RdRoot(_),
+                ..
             } => return Err(Error::new(EISDIR)),
             Handle::Resource {
                 kind: Kind::Wr(handler),
@@ -317,7 +328,7 @@ impl KernelScheme for SysScheme {
             let data_guard = data_lock.read(token.token());
             let data = data_guard.as_ref().ok_or(Error::new(EIO))?;
             let size = match kind {
-                Kind::Rd(_) => data.len() as u64,
+                Kind::Rd(_) | Kind::RdRoot(_) => data.len() as u64,
                 Kind::Wr(_) => 0,
             };
             Stat {
