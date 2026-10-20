@@ -22,6 +22,43 @@ struct Handle {
 
 static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
 
+/// Ferric Oxide: the line a read of `ctl-profiling` gives, the kernel's run-time text address.
+#[cfg(feature = "profiling")]
+fn control_line() -> alloc::string::String {
+    alloc::string::ToString::to_string(&ferric_trace::profile::ControlLine {
+        text_start: crate::kernel_executable_offsets::__text_start() as u64,
+    })
+}
+
+/// Ferric Oxide: the `ctl-profiling` handle that owns the profiler. Held while the sampling
+/// switch is set, so that changes of owner and of sampling are one at a time (a closing owner
+/// cannot stop the next owner's sampling).
+#[cfg(feature = "profiling")]
+static PROFILER_OWNER: spin::Mutex<ferric_trace::profile::ProfilerOwner> =
+    spin::Mutex::new(ferric_trace::profile::ProfilerOwner::new());
+
+/// Ferric Oxide: a write of `byte` to the `ctl-profiling` handle `id`. `1` and `0` start and
+/// stop sampling, as upstream. `x` makes the handle the profiler's owner and stops sampling;
+/// while it is owned, other handles' writes fail with `EBUSY`, and closing the owner stops
+/// sampling and frees the profiler. So one recorder (`ferric-trace profile`) cannot have its
+/// samples taken or its sampling stopped by a second one, and a killed recorder leaves
+/// sampling off.
+#[cfg(feature = "profiling")]
+fn profiler_control(id: usize, byte: u8) -> Result<()> {
+    use ferric_trace::profile::ControlWriteError;
+
+    let mut owner = PROFILER_OWNER.lock();
+    let on = owner.write(id, byte).map_err(|err| match err {
+        ControlWriteError::Busy => Error::new(EBUSY),
+        _ => Error::new(EINVAL),
+    })?;
+    // Under the lock, so no other write or close comes between the decision and the switch.
+    crate::profiling::IS_PROFILING.store(on, Ordering::SeqCst);
+    drop(owner);
+    info!("Wrote {on} to IS_PROFILING");
+    Ok(())
+}
+
 /// Add to the input queue
 pub fn debug_input(data: u8, token: &mut CleanLockToken) {
     INPUT.send(data, token);
@@ -101,6 +138,12 @@ impl KernelScheme for DebugScheme {
 
         let id = HANDLES.write(token.token()).insert(Handle { num });
 
+        // Ferric Oxide: ctl-profiling is read at an offset (see kreadoff).
+        #[cfg(feature = "profiling")]
+        if num == SpecialFds::CtlProfiling as usize {
+            return Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED));
+        }
+
         Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()))
     }
 
@@ -123,6 +166,15 @@ impl KernelScheme for DebugScheme {
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
         HANDLES.write(token.token()).remove(id)?;
+
+        // Ferric Oxide: the profiler's owner going away stops sampling (`profiler_control`).
+        #[cfg(feature = "profiling")]
+        {
+            let mut owner = PROFILER_OWNER.lock();
+            if let Some(on) = owner.close(id) {
+                crate::profiling::IS_PROFILING.store(on, Ordering::SeqCst);
+            }
+        }
 
         Ok(())
     }
@@ -166,6 +218,62 @@ impl KernelScheme for DebugScheme {
         )
     }
 
+    // Ferric Oxide: a read of ctl-profiling gives the kernel's run-time text address, so that
+    // ferric-trace can symbolize kernel samples under KASLR. Other handles are unpositioned.
+    #[cfg(feature = "profiling")]
+    fn kreadoff(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if HANDLES.read(token.token()).get(id)?.num == SpecialFds::CtlProfiling as usize {
+            let line = control_line();
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            return buf.copy_common_bytes_from_slice(line.as_bytes().get(start..).unwrap_or(&[]));
+        }
+        if offset != u64::MAX {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kread(id, buf, flags, stored_flags, token)
+    }
+
+    // Ferric Oxide: ctl-profiling is a regular file the size of its line, so tools that stat a
+    // path before reading it (uutils `cat`) can read it. Other handles have no stat.
+    #[cfg(feature = "profiling")]
+    fn kfstat(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        if HANDLES.read(token.token()).get(id)?.num != SpecialFds::CtlProfiling as usize {
+            return Err(Error::new(EBADF));
+        }
+        buf.copy_exactly(&::syscall::data::Stat {
+            st_mode: ::syscall::flag::MODE_FILE | 0o600,
+            st_size: control_line().len() as u64,
+            ..Default::default()
+        })
+    }
+
+    // Ferric Oxide: ctl-profiling is positioned for its read; its writes ignore the offset.
+    #[cfg(feature = "profiling")]
+    fn kwriteoff(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if offset != u64::MAX
+            && HANDLES.read(token.token()).get(id)?.num != SpecialFds::CtlProfiling as usize
+        {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kwrite(id, buf, flags, stored_flags, token)
+    }
+
     fn kwrite(
         &self,
         id: usize,
@@ -180,14 +288,7 @@ impl KernelScheme for DebugScheme {
         if handle.num == SpecialFds::CtlProfiling as usize {
             let mut dst = [0];
             buf.copy_to_slice(&mut dst)?;
-
-            let is_profiling = match dst[0] {
-                b'0' => false,
-                b'1' => true,
-                _ => return Err(Error::new(EINVAL)),
-            };
-            info!("Wrote {is_profiling} to IS_PROFILING");
-            crate::profiling::IS_PROFILING.store(is_profiling, Ordering::Relaxed);
+            profiler_control(id, dst[0])?;
 
             return Ok(1);
         }

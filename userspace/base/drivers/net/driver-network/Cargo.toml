@@ -6,10 +6,19 @@ edition = "2021"
 
 [dependencies]
 libredox.workspace = true
+log.workspace = true
 daemon = { path = "../../../daemon" }
 redox-scheme.workspace = true
 scheme-utils = { path = "../../../scheme-utils" }
 redox_syscall = { workspace = true, features = ["std"] }
+# Ferric Oxide: the queue socket ABI and copy mode, and registered-buffer grants, for the
+# `bypass` feature.
+ferric-netq = { path = "../../../../../crates/netq", optional = true }
+ferric-regbuf = { path = "../../../../../crates/regbuf", optional = true }
+
+[features]
+# Ferric Oxide: kernel-bypass queue sockets in copy mode (drivers.net_bypass).
+bypass = ["dep:ferric-netq", "dep:ferric-regbuf"]
 
 [lints]
 workspace = true

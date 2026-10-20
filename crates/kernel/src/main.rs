@@ -69,6 +69,14 @@ mod event;
 /// Logging
 mod log;
 
+/// Ferric Oxide: the persistent kernel log (`kernel.log_persist`)
+#[cfg(feature = "log_persist")]
+mod log_persist;
+
+/// Ferric Oxide: RAM kept out of use at a fixed address across a warm reboot
+#[cfg(any(feature = "trace_crash", feature = "log_persist"))]
+mod reserved;
+
 /// Memory management
 mod memory;
 
