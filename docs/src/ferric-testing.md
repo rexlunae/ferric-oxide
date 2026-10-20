@@ -292,6 +292,12 @@ output. It uses KVM with `host` when available and otherwise TCG with `max`.
 `BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
 interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
 later; the workflow uses a newer-QEMU container for that variant.
+`OVMF_FIRMWARE` selects a firmware file instead of searching the usual paths.
+
+`scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
+QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
+failure, a crash after the marker, a missing test result and a missing marker.
+The host-tools workflow runs it before the Rust checks.
 
 ### CET image and Kleya rerun
 
