@@ -1,0 +1,69 @@
+# Ferric Oxide hardware bring-up image
+#
+# Boots on physical hardware (or QEMU) and prints a CPU, scheme and audio
+# inventory on the console before starting the login consoles. Build it with
+#
+#   make CONFIG_NAME=ferric-hardware REPO_BINARY=1 all
+#
+# so every package except the kernel, bootloader, relibc, redoxfs and base
+# comes prebuilt, while those five are compiled from this checkout. The audio
+# section waits for pcid to spawn the HDA drivers and reports whether an
+# `audiohw` scheme exists, which is what the multi-controller change in
+# ihdad/audiod is meant to guarantee.
+
+include = ["minimal.toml"]
+
+[general]
+filesystem_size = 256
+
+[packages]
+kernel = "source"
+bootloader = "source"
+relibc = "source"
+redoxfs = "source"
+base = "source"
+
+[[files]]
+path = "/usr/lib/ferric-hardware-check.ion"
+data = """
+#!/usr/bin/env ion
+# This script runs from the 30_console unit below, before the login consoles
+# start. See config/ferric-hardware.toml for what it is for.
+echo FERRIC_HARDWARE_BEGIN
+uname -a
+echo "--- cpu ---"
+cat /scheme/sys/cpu
+echo "--- schemes ---"
+ls /scheme
+
+# pcid spawns the HDA drivers asynchronously. Wait up to 30 seconds for an
+# audio scheme so this report also works on a machine whose codecs are
+# digital-only and therefore named audiohw.<pci-address>.
+let tries = 0
+while test $tries -lt 30
+    if contains "$(ls /scheme)" audiohw
+        break
+    end
+    sleep 1
+    let tries += 1
+end
+
+echo "--- audio ---"
+let schemes = "$(ls /scheme)"
+if contains "$schemes" audiohw
+    echo FERRIC_HARDWARE_PASS audio-scheme
+else
+    echo FERRIC_HARDWARE_FAIL audio-scheme
+end
+echo FERRIC_HARDWARE_END
+"""
+
+[[files]]
+path = "/usr/lib/init.d/30_console"
+data = """
+requires_weak 10_net.target 20_audiod.service
+inputd -A 2
+ion /usr/lib/ferric-hardware-check.ion
+nowait getty 2
+nowait getty /scheme/debug/no-preserve -J
+"""

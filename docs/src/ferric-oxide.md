@@ -18,6 +18,7 @@ descriptions may differ from this checkout.
 | See the prepared hypervisor formats and the `kernel.vm` ABI | [Virtualization (prepared)](ferric-virt.md) |
 | Verify or install a local package, install one from a signed git release, generate its SBOM, build, attest and release a package from git with `cargo fox`, run a signed package registry with `fox-registry`, search and install from registries by name, audit installed packages against advisories, write a system SBOM, sync a root to a package set with a lock file, import cookbook recipes into a registry, or see how images are finished with `fox` (adoption, a package set and the image SBOM) | [Package tooling](ferric-packaging.md) |
 | Find tests, reproduce a boot failure or understand CI | [Validation and debugging](ferric-testing.md) |
+| Map a machine's devices to drivers, or plan a hardware bring-up | [Hardware bring-up](ferric-hardware.md) |
 | See what is planned next and why | [Roadmap](ferric-roadmap.md) |
 
 Source paths in these chapters are relative to the repository root. Rustdoc

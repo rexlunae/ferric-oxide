@@ -14,6 +14,7 @@
   - [Package Tooling: fox](./ferric-packaging.md)
   - [WebAssembly Interfaces](./ferric-wasm.md)
   - [Validation and Debugging](./ferric-testing.md)
+  - [Hardware Bring-up](./ferric-hardware.md)
 - [Roadmap](./ferric-roadmap.md)
 
 # Introduction
