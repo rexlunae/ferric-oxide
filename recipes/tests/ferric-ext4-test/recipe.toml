@@ -1,0 +1,18 @@
+# Ferric Oxide: the on-target test for ext4d (features.toml fs.ext4). It mounts the ext4
+# fixture image from userspace/ext4d/tests/fixtures/ (built into the test) with ext4d, lists
+# directories, reads files, and checks that every change fails with EROFS. It prints
+# FERRIC_TEST_SKIP when the image has no ext4d. Only for test images. Source lives in
+# files/; as a path source (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-ext4-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The fixture is included from ../../../../../userspace/ext4d/tests/fixtures/ (from src/).
+# The cookbook builds a copy of files/ in this recipe's source/, at the same depth, so the
+# relative path holds there too.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

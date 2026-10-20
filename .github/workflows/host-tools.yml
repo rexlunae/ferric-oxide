@@ -1,7 +1,8 @@
 name: host-tools
 
 # Tests and lints the host workspace: tools/* and the shared crates in crates/.
-# Also runs RedoxFS's own unit tests and driver-block's, which build on the host.
+# Also runs RedoxFS's own unit tests and driver-block's, which build on the host, and
+# ext4d's (fs.ext4).
 
 on:
   push:
@@ -17,6 +18,8 @@ on:
       - "features.toml"
       - "config/**"
       - "userspace/redoxfs/**"
+      - "userspace/ext4d/**"
+      - "recipes/tests/ferric-ext4-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
       - "recipes/tests/ferric-iobench/**"
       - ".github/workflows/host-tools.yml"
@@ -166,6 +169,44 @@ jobs:
           restore-keys: redoxfs-
       - name: Test
         run: cargo test --locked --lib
+
+  # ext4d (fs.ext4): its tests on the committed ext4 image and on one mke2fs makes now, its
+  # lints and docs for the host and for Redox, and the on-target test's lints.
+  ext4d:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: userspace/ext4d
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            userspace/ext4d/target
+          key: ext4d-${{ hashFiles('userspace/ext4d/Cargo.lock', 'recipes/tests/ferric-ext4-test/files/Cargo.lock') }}
+          restore-keys: ext4d-
+      - name: Format
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml
+      - name: Test (committed image)
+        run: cargo test --locked
+      - name: Test (fresh image from mke2fs)
+        run: |
+          mke2fs -V
+          mkdir -p "$RUNNER_TEMP/ext4"
+          tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic
+      - name: Clippy and docs
+        run: |
+          rustup target add x86_64-unknown-redox
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
+          CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
+            --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
 
   # driver-block's concurrent-request and close-ordering tests run on the host.
   driver-block:

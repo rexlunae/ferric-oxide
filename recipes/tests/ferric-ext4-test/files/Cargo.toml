@@ -1,0 +1,18 @@
+[package]
+name = "ferric-ext4-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "On-target test for ext4d, the read-only ext4 file system daemon"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+thiserror = "2.0.17"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = false

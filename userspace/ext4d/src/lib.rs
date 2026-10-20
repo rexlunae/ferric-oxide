@@ -1,0 +1,57 @@
+//! `ext4d`: a read-only ext4 file system for Ferric Oxide, served as a scheme the way RedoxFS
+//! serves its own (features.toml option `fs.ext4`, off by default).
+//!
+//! The pieces, from the disk up:
+//!
+//! - [`device`]: where the file system's bytes come from. A [`device::Window`] is a byte
+//!   range of anything that reads at an offset ([`device::ReadAt`]): a whole disk, a
+//!   partition inside one, or an image file. Later, LUKS (`crates/luks`) and LVM
+//!   (`crates/lvm`) volumes plug in here by implementing [`device::ReadAt`].
+//! - [`superblock`]: the few superblock fields the daemon needs and the `ext4-view` crate does
+//!   not expose (block size and counts, for `statvfs`), read straight from the on-disk
+//!   format.
+//! - [`fs`]: the open-file table on top of the `ext4-view` crate, which does the real work
+//!   of reading ext4 (extents, hashed directories, checksums, the journal). Every call
+//!   that would change the file system fails with [`Error::ReadOnly`] (`EROFS`).
+//! - [`error`]: [`Error`], and the one place it becomes an errno.
+//! - `scheme` (Redox only): the scheme handler, a thin layer from scheme calls to [`fs`].
+//!
+//! Everything but `scheme` runs on the host, so `cargo test` covers it against ext4 images
+//! made by `mke2fs` (`tests/fixtures/`).
+//!
+//! # Specification
+//!
+//! The ext4 on-disk format is described in "Ext4 Disk Layout" on the ext4 wiki at kernel.org
+//! (<https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout>). [`superblock`] is written
+//! from its "The Super Block" section. Everything else is read by the `ext4-view` crate
+//! (MIT or Apache-2.0). No code here comes from the Linux kernel.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use ext4d::device::Window;
+//! use ext4d::fs::{Fs, OpenMode};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let image = std::fs::File::open("disk.ext4")?;
+//! let mut fs = Fs::new(Window::whole(image)?)?;
+//! let root = fs.root()?;
+//! let file = fs.open(Some(root), "hello.txt", OpenMode::read())?;
+//! let mut buf = [0; 64];
+//! let n = fs.read(file, 0, &mut buf)?;
+//! assert_eq!(&buf[..n], b"hello from ext4\n");
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+
+pub mod device;
+pub mod error;
+pub mod fs;
+#[cfg(target_os = "redox")]
+pub mod scheme;
+pub mod superblock;
+
+pub use error::Error;
