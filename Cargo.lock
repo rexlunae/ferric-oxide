@@ -1412,8 +1412,6 @@ dependencies = [
  "clap",
  "ferric-amdvi",
  "ferric-trace",
- "ferric-amdvi",
- "ferric-trace",
  "ferric-trace-map",
  "ferric-vtd",
  "redox_syscall 0.9.4",
