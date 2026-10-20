@@ -579,17 +579,41 @@ fn restore(cache: &mut Cache) -> Result<(), Failure> {
     check_bytes(finished(&read)?, RESTORE_PAGE * PAGE_SIZE, 64)
 }
 
-/// `pcache-owner`: the object's descriptor, inherited by a child process, is refused there,
-/// so another process cannot attach a client's description to pages it fills.
+/// `pcache-owner`: queue and object descriptors inherited by a child process are refused
+/// there, so another process can neither attach a client's description to pages it fills
+/// nor bind a queue it did not open to a scheme of its own.
 fn owner(cache: &mut Cache) -> Result<(), Failure> {
     let object = cache.object.raw();
-    let (words, n) = Request::Attach { handle: 4242 }.encode();
-    // SAFETY: the child makes one call and exits without returning to Rust code that would
-    // touch the parent's threads or locks.
+    let unbound = ctx(
+        "open a second queue",
+        Fd::open(
+            &format!("/scheme/{SCHEME_NAME}/{QUEUE_PATH}"),
+            O_RDWR | O_CLOEXEC,
+            0,
+        ),
+    )?;
+    let (attach, attach_len) = Request::Attach { handle: 4242 }.encode();
+    let (bind, bind_len) = Request::Bind.encode();
+    // SAFETY: the child makes a few system calls and exits without returning to Rust code
+    // that would touch the parent's threads or locks.
     let child = unsafe { libc::fork() };
     if child == 0 {
-        let code = match libredox::call::call_wo(object, &[], CallFlags::empty(), &words[..n]) {
-            Err(err) if err.errno() == ERRNO_EPERM => 0,
+        let attached =
+            libredox::call::call_wo(object, &[], CallFlags::empty(), &attach[..attach_len]);
+        let code = match attached {
+            Err(err) if err.errno() == ERRNO_EPERM => match Socket::create() {
+                Ok(socket) => match libredox::call::call_wo(
+                    unbound.raw(),
+                    &socket.inner().raw().to_ne_bytes(),
+                    CallFlags::FD | CallFlags::FD_CLONE,
+                    &bind[..bind_len],
+                ) {
+                    Err(err) if err.errno() == ERRNO_EPERM => 0,
+                    Err(_) => 4,
+                    Ok(_) => 3,
+                },
+                Err(_) => 5,
+            },
             Err(_) => 2,
             Ok(_) => 1,
         };
@@ -603,15 +627,15 @@ fn owner(cache: &mut Cache) -> Result<(), Failure> {
     check(waited == child && libc::WIFEXITED(status), || {
         "the child did not exit".into()
     })?;
-    match libc::WEXITSTATUS(status) {
-        0 => Ok(()),
-        1 => Err(Failure::Check(
-            "another process attached a description with the object's descriptor".into(),
-        )),
-        code => Err(Failure::Check(format!(
-            "another process's Attach failed with an error other than EPERM ({code})"
-        ))),
-    }
+    let failure = match libc::WEXITSTATUS(status) {
+        0 => return Ok(()),
+        1 => "another process attached a description with the object's descriptor",
+        2 => "another process's Attach failed with an error other than EPERM",
+        3 => "another process bound an unbound queue it inherited",
+        4 => "another process's Bind failed with an error other than EPERM",
+        _ => "the child could not create a scheme socket",
+    };
+    Err(Failure::Check(failure.into()))
 }
 
 /// `pcache-generation`: closing an object drops its records still on the queue, and a

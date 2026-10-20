@@ -23,7 +23,10 @@
 //!
 //! [`PageIndex::set_size`] shrinking the file drops the page the new end falls in too, so its
 //! bytes past the end are not served if the file grows again, and fills in flight past the
-//! end are stale (below).
+//! end are stale (below). Failure stamps past the end go too: the kernel cuts every read at
+//! the file's current size, retries included, so no reader looks at those pages again. The
+//! index therefore never holds more entries than the file has pages, plus the fills still in
+//! flight past its end.
 //!
 //! [`PageIndex::invalidate`] drops pages whose bytes changed outside the cache (the file
 //! system served a write itself). A page being filled then is marked stale: the answer to that
@@ -147,11 +150,16 @@ impl<F> PageIndex<F> {
     pub fn set_size(&mut self, size: u64) -> usize {
         let shrunk = size < self.size;
         self.size = size;
-        if shrunk {
-            self.invalidate_from(size / PAGE_SIZE, u64::MAX).dropped
-        } else {
-            0
+        if !shrunk {
+            return 0;
         }
+        let dropped = self.invalidate_from(size / PAGE_SIZE, u64::MAX).dropped;
+        // What is left past the end is fills in flight, now stale, and failure stamps, which
+        // no reader needs any more (see the module docs).
+        let end = self.file_pages();
+        self.pages
+            .retain(|&page, entry| page < end || entry.state != PageState::Absent);
+        dropped
     }
 
     /// The pages holding bytes `offset..offset + len` of the file, cut at its size, and the
@@ -346,14 +354,15 @@ impl<F> PageIndex<F> {
         Ok(true)
     }
 
-    /// Makes `page` absent, keeping only its failure stamp, if any; returns whether it had a
-    /// frame.
+    /// Makes `page` absent, keeping only its failure stamp, if any and the page is still in
+    /// the file; returns whether it had a frame.
     fn drop_page(&mut self, page: u64) -> bool {
+        let past_end = page >= self.file_pages();
         let Some(entry) = self.pages.get_mut(&page) else {
             return false;
         };
         let had_frame = entry.frame.take().is_some();
-        if entry.failed_at == 0 {
+        if entry.failed_at == 0 || past_end {
             self.pages.remove(&page);
         } else {
             entry.state = PageState::Absent;
@@ -721,6 +730,45 @@ mod tests {
         // Growing alone drops nothing.
         assert_eq!(index.set_size(8 * PAGE_SIZE), 0);
         assert_eq!(index.resident(), 2);
+    }
+
+    #[test]
+    fn shrinking_forgets_failures_past_the_end() {
+        let mut index: PageIndex<u64> = PageIndex::new();
+        index.set_size(64 * PAGE_SIZE);
+        // Pages 2 and 40 fail; page 50 is still being filled.
+        let mut near = Attempt::First;
+        let _ = index.start_read(range(2, 1), &mut near);
+        let _ = index.start_read(range(40, 1), &mut Attempt::First);
+        let _ = index.start_read(range(50, 1), &mut Attempt::First);
+        index
+            .complete_fill(record(2, 1), EIO, Vec::new())
+            .expect("filling");
+        index
+            .complete_fill(record(40, 1), EIO, Vec::new())
+            .expect("filling");
+        assert_eq!(index.pages.len(), 3);
+        // Cut to 3 pages: only page 2's stamp, which its waiter still needs, and the stale
+        // fill of page 50 are left.
+        index.set_size(3 * PAGE_SIZE);
+        assert_eq!(index.pages.keys().copied().collect::<Vec<_>>(), [2, 50]);
+        assert_eq!(index.start_read(range(2, 1), &mut near), Read::Failed);
+        // The stale fill's answer, even a failed one, leaves nothing behind.
+        index
+            .complete_fill(record(50, 1), EIO, Vec::new())
+            .expect("filling");
+        assert_eq!(index.pages.keys().copied().collect::<Vec<_>>(), [2]);
+        // Truncating and growing over and over does not pile up entries.
+        for round in 0..100 {
+            index.set_size(64 * PAGE_SIZE);
+            let page = 10 + round % 40;
+            let _ = index.start_read(range(page, 1), &mut Attempt::First);
+            index
+                .complete_fill(record(page, 1), EIO, Vec::new())
+                .expect("filling");
+            index.set_size(3 * PAGE_SIZE);
+            assert_eq!(index.pages.len(), 1);
+        }
     }
 
     #[test]

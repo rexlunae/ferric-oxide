@@ -58,7 +58,7 @@ use spin::Mutex;
 use syscall::{
     error::{
         Error, Result, EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EIO, ENOENT, ENOMEM,
-        EOPNOTSUPP, EPERM, ESTALE,
+        EOPNOTSUPP, EOVERFLOW, EPERM, ESTALE,
     },
     flag::{CallFlags, EventFlags, EVENT_READ, O_NONBLOCK},
 };
@@ -102,8 +102,6 @@ enum Handle {
 struct Bound {
     id: SchemeId,
     inner: Weak<UserInner>,
-    /// The process that bound the queue, the only one that may use it and its objects.
-    owner: Option<NonZeroUsize>,
 }
 
 /// The process the current context belongs to.
@@ -112,13 +110,13 @@ fn current_process(token: &mut CleanLockToken) -> Option<NonZeroUsize> {
 }
 
 /// Refuses a call on `queue`, or one of its objects, from a process other than the one that
-/// bound it: a descriptor passed on must not let another process attach or fill the file
-/// system's descriptions.
+/// opened it: a descriptor passed on must not let another process bind the queue to its own
+/// scheme, or attach or fill the file system's descriptions.
 fn check_owner(queue: &Queue, token: &mut CleanLockToken) -> Result<()> {
-    let caller = current_process(token);
-    match &queue.state.lock().bound {
-        Some(bound) if bound.owner != caller => Err(Error::new(EPERM)),
-        _ => Ok(()),
+    if current_process(token) == Some(queue.owner) {
+        Ok(())
+    } else {
+        Err(Error::new(EPERM))
     }
 }
 
@@ -126,6 +124,8 @@ fn check_owner(queue: &Queue, token: &mut CleanLockToken) -> Result<()> {
 struct Queue {
     /// Its handle number, for events.
     id: usize,
+    /// The process that opened the queue, the only one that may use it and its objects.
+    owner: NonZeroUsize,
     state: Mutex<QueueState>,
     /// Notified when records arrive or the queue closes.
     records_ready: WaitCondition,
@@ -138,8 +138,8 @@ struct QueueState {
     bound: Option<Bound>,
     /// The queue's live objects by ID.
     objects: BTreeMap<ObjectId, Weak<Object>>,
-    /// The generation the next object opened gets.
-    next_generation: Generation,
+    /// The generation the next object opened gets; `None` once they have run out.
+    next_generation: Option<Generation>,
     readahead: ReadaheadConfig,
 }
 
@@ -411,20 +411,22 @@ fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize
     len.checked_sub(rest.len()).ok_or_else(overflow)
 }
 
-/// Opens a queue for `caller` (root only).
-fn open_queue(caller: &CallerCtx) -> Result<Handle> {
+/// Opens a queue for `caller` (root only), owned by the calling process.
+fn open_queue(caller: &CallerCtx, token: &mut CleanLockToken) -> Result<Handle> {
     if caller.uid != 0 {
         return Err(Error::new(EACCES));
     }
+    let owner = current_process(token).ok_or(Error::new(EPERM))?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Ok(Handle::Queue(Arc::new(Queue {
         id,
+        owner,
         state: Mutex::new(QueueState {
             records: VecDeque::new(),
             closed: false,
             bound: None,
             objects: BTreeMap::new(),
-            next_generation: Generation::default(),
+            next_generation: Some(Generation::default()),
             readahead: ReadaheadConfig::DEFAULT,
         }),
         records_ready: WaitCondition::new(),
@@ -445,7 +447,8 @@ fn open_object(queue: &Arc<Queue>, path: &[u8]) -> Result<Handle> {
     {
         return Err(Error::new(EEXIST));
     }
-    let generation = state.next_generation;
+    // Generations never repeat on a queue, so an old answer can never pass for a new one.
+    let generation = state.next_generation.ok_or(Error::new(EOVERFLOW))?;
     state.next_generation = generation.next();
     let object = Arc::new(Object {
         id,
@@ -535,7 +538,6 @@ fn bind(
     let inner = SchemeList
         .get_user_inner(number, token)
         .ok_or(Error::new(EINVAL))?;
-    let owner = current_process(token);
     let mut state = queue.state.lock();
     if state.bound.is_some() {
         return Err(Error::new(EBUSY));
@@ -543,7 +545,6 @@ fn bind(
     state.bound = Some(Bound {
         id: inner.scheme_id,
         inner: Arc::downgrade(&inner),
-        owner,
     });
     Ok(0)
 }
@@ -688,7 +689,9 @@ fn read_records(
 
 /// Copies `records` to `buf`; if that fails, they go back to the front of the queue, so no
 /// fill is lost, and the queue signals that it has records again (another reader may have
-/// found it empty meanwhile and be waiting, or waiting for an event).
+/// found it empty meanwhile and be waiting, or waiting for an event). Only records of
+/// objects still open, in the same generation, go back: an object or queue that closed while
+/// the records were out failed their readers already, and its records must not come back.
 fn copy_records(
     queue: &Queue,
     records: &[Record],
@@ -709,16 +712,34 @@ fn copy_records(
             .checked_mul(Record::BYTES)
             .ok_or(Error::new(EINVAL)),
         Err(err) => {
-            {
+            let restored = {
                 let mut state = queue.state.lock();
-                for &record in records.iter().rev() {
-                    state.records.push_front(record);
+                let mut restored = false;
+                if !state.closed {
+                    for &record in records.iter().rev() {
+                        if live(&state, record) {
+                            state.records.push_front(record);
+                            restored = true;
+                        }
+                    }
                 }
+                restored
+            };
+            if restored {
+                queue.wake(token);
             }
-            queue.wake(token);
             Err(err)
         }
     }
+}
+
+/// Whether `record`'s object is open on the queue, in the record's generation.
+fn live(state: &QueueState, record: Record) -> bool {
+    state
+        .objects
+        .get(&record.object())
+        .and_then(Weak::upgrade)
+        .is_some_and(|object| object.generation == record.generation())
 }
 
 impl KernelScheme for PcacheScheme {
@@ -744,7 +765,7 @@ impl KernelScheme for PcacheScheme {
         };
         let opened = match from {
             Handle::Root if path.is_empty() => Handle::Root,
-            Handle::Root if path == QUEUE_PATH.as_bytes() => open_queue(&caller)?,
+            Handle::Root if path == QUEUE_PATH.as_bytes() => open_queue(&caller, token)?,
             Handle::Queue(queue) if path.starts_with(OBJECT_PREFIX.as_bytes()) => {
                 check_owner(&queue, token)?;
                 open_object(&queue, path)?
@@ -830,7 +851,9 @@ impl KernelScheme for PcacheScheme {
         token: &mut CleanLockToken,
     ) -> Result<usize> {
         let result = match (handle(id), Request::decode(metadata), descs.as_slice()) {
-            (Ok(Handle::Queue(queue)), Ok(Request::Bind), [socket]) => bind(&queue, socket, token),
+            (Ok(Handle::Queue(queue)), Ok(Request::Bind), [socket]) => {
+                check_owner(&queue, token).and_then(|()| bind(&queue, socket, token))
+            }
             (Err(err), _, _) => Err(err),
             _ => Err(Error::new(EINVAL)),
         };
