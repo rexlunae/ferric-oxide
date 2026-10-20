@@ -247,7 +247,8 @@ fn run() -> Result<(), Failure> {
     }
     if let (Some(trace), Some(before)) = (&trace, lost_before) {
         // A full ring drops records instead of writing them, which would make "on" look
-        // cheaper than it is, so the check script warns when this is not zero.
+        // cheaper than it is, or, with kernel.trace_crash, overwrites its oldest ones; either
+        // way the check script warns when this is not zero.
         println!("FERRIC_BENCH lost records={}", trace.lost()? - before);
     }
     drop(workloads);
