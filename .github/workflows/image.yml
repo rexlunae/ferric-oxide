@@ -423,6 +423,17 @@ jobs:
           done
           echo "::notice::ferric-ring-test passed all 19 steps"
 
+      # ferric-borrow-test times page writes to an unmapped file and to one with live shared
+      # mappings, which RedoxFS writes through to (QEMU numbers, for trend only). Only the
+      # smoke image runs it; the fuzz image's console script runs the fuzzer alone.
+      - name: Show the mapped-write benchmark
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          grep -aE "FERRIC_BENCH borrow-pwrite .*unmapped_ns=[0-9]+ mapped_ns=[0-9]+" "$LOG" \
+            | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and
         # that the disk, network and AHCI drivers each DMA through a domain they bound.
