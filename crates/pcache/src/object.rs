@@ -37,31 +37,55 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::abi::{Outcome, PAGE_SIZE, PageRange, RecordPages};
 use crate::page::{Event, PageState, TransitionError};
 
-/// How one fill record ended, shared by the pages it fills and the readers waiting for it.
-#[derive(Debug, Default)]
-struct FillOutcome(AtomicU8);
+/// How one fill record is going, shared by the pages it fills and the readers waiting for
+/// it. The record is decided page by page, in whatever order and however many answers its
+/// pages get: it has failed as soon as one of its pages failed (a stale page does not count),
+/// and it has ended once none of its pages is waiting for it any more.
+#[derive(Debug)]
+struct FillOutcome {
+    /// A page of the record failed.
+    failed: AtomicBool,
+    /// The record's pages still being filled by it.
+    pages: AtomicU32,
+}
 
 impl FillOutcome {
     const PENDING: u8 = 0;
     const ENDED: u8 = 1;
     const FAILED: u8 = 2;
 
-    fn get(&self) -> u8 {
-        // The index is only ever used under the object's lock, which orders these.
-        self.0.load(Ordering::Relaxed)
+    /// The outcome of a record of `pages` pages, all being filled.
+    const fn new(pages: u32) -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            pages: AtomicU32::new(pages),
+        }
     }
 
-    /// Records how the fill ended; a failure is never overwritten.
-    fn end(&self, failed: bool) {
-        let to = if failed { Self::FAILED } else { Self::ENDED };
+    fn get(&self) -> u8 {
+        // The index is only ever used under the object's lock, which orders these.
+        if self.failed.load(Ordering::Relaxed) {
+            Self::FAILED
+        } else if self.pages.load(Ordering::Relaxed) > 0 {
+            Self::PENDING
+        } else {
+            Self::ENDED
+        }
+    }
+
+    /// One of the record's pages is done with it, `failed` or not. A failure is never undone.
+    fn end_page(&self, failed: bool) {
+        if failed {
+            self.failed.store(true, Ordering::Relaxed);
+        }
         let _ = self
-            .0
-            .compare_exchange(Self::PENDING, to, Ordering::Relaxed, Ordering::Relaxed);
+            .pages
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 }
 
@@ -268,7 +292,7 @@ impl<F> PageIndex<F> {
         }
         push_run(&mut fills, run);
         for record in &fills {
-            let outcome = Arc::new(FillOutcome::default());
+            let outcome = Arc::new(FillOutcome::new(record.pages().count()));
             let range = record.pages();
             for page in range.first()..range.end() {
                 if let Some(entry) = self.pages.get_mut(&page) {
@@ -448,10 +472,10 @@ impl<F> PageIndex<F> {
     }
 }
 
-/// Ends the fill `entry` was waiting for, failed or not.
+/// Lets `entry` go of the fill it was waiting for, failed or not (see [`FillOutcome`]).
 fn end_fill<F>(entry: &mut Entry<F>, failed: bool) {
     if let Some(fill) = entry.fill.take() {
-        fill.end(failed);
+        fill.end_page(failed);
     }
 }
 
@@ -779,6 +803,62 @@ mod tests {
         // Growing alone drops nothing.
         assert_eq!(index.set_size(8 * PAGE_SIZE), 0);
         assert_eq!(index.resident(), 2);
+    }
+
+    #[test]
+    fn a_stale_page_does_not_mask_a_failure_of_its_record() {
+        let mut index = index();
+        let mut waiter = Attempt::new();
+        assert_eq!(
+            index.start_read(range(0, 3), &mut waiter),
+            Read::Wait {
+                fills: vec![record(0, 3)]
+            }
+        );
+        // Page 0 goes stale, then the whole record fails: pages 1 and 2 failed.
+        let _ = index.invalidate(range(0, 1));
+        index
+            .complete_fill(record(0, 3), EIO, Vec::new())
+            .expect("pages 0..3 are filling");
+        assert_eq!(index.start_read(range(0, 3), &mut waiter), Read::Failed);
+        // A record whose only failing page is stale has not failed: the reader fills again.
+        let mut other = Attempt::new();
+        let _ = index.start_read(range(5, 2), &mut other);
+        let _ = index.invalidate(range(5, 2));
+        index
+            .complete_fill(record(5, 2), EIO, Vec::new())
+            .expect("pages 5..7 are filling");
+        assert_eq!(
+            index.start_read(range(5, 2), &mut other),
+            Read::Wait {
+                fills: vec![record(5, 2)]
+            }
+        );
+    }
+
+    #[test]
+    fn answers_for_part_of_a_record_decide_it_together() {
+        let mut index = index();
+        let mut waiter = Attempt::new();
+        let _ = index.start_read(range(0, 4), &mut waiter);
+        // The first half is answered; the record is still going for the rest.
+        index
+            .complete_fill(record(0, 2), Outcome::Done, frames(0, 2))
+            .expect("pages 0..2 are filling");
+        assert_eq!(
+            index.start_read(range(0, 4), &mut waiter),
+            Read::Wait { fills: vec![] }
+        );
+        // The second half fails: the reader that waited for the record sees it.
+        index
+            .complete_fill(record(2, 2), EIO, Vec::new())
+            .expect("pages 2..4 are filling");
+        assert_eq!(index.start_read(range(0, 4), &mut waiter), Read::Failed);
+        // And when the queue goes, every outstanding record fails.
+        let mut late = Attempt::new();
+        let _ = index.start_read(range(6, 3), &mut late);
+        assert_eq!(index.fail_all(), 3);
+        assert_eq!(index.start_read(range(6, 3), &mut late), Read::Failed);
     }
 
     #[test]
