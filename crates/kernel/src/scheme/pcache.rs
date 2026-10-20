@@ -68,7 +68,6 @@ use crate::{
     context::{
         self,
         file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
-        memory::AddrSpaceWrapper,
     },
     event,
     memory::{RaiiFrame, PAGE_SIZE},
@@ -102,22 +101,24 @@ struct Bound {
     inner: Weak<UserInner>,
 }
 
-/// The process the current context belongs to, as the kernel knows it: its address space,
-/// which every thread of the process shares and `fork` does not. (`owner_proc_id` names
-/// one context, not the process: each thread is a context of its own.)
-fn current_process(token: &mut CleanLockToken) -> Option<Arc<AddrSpaceWrapper>> {
-    context::current().read(token.token()).addr_space.clone()
+/// The process the current context belongs to: the pid the process manager gives every
+/// thread of a process (`Context::pid`, set through `proc`'s attributes). It stays the same
+/// across `exec`, which replaces the address space, and differs after `fork`.
+/// (`owner_proc_id` names one context, not the process: each thread is a context of its
+/// own.)
+fn current_process(token: &mut CleanLockToken) -> usize {
+    context::current().read(token.token()).pid
 }
 
 /// Refuses a call on `queue`, or one of its objects, from a process other than the one that
 /// opened it: a descriptor passed on must not let another process bind the queue to its own
 /// scheme, or attach or fill the file system's descriptions. Any thread of the opener may
-/// call.
+/// call, before or after it `exec`s.
 fn check_owner(queue: &Queue, token: &mut CleanLockToken) -> Result<()> {
-    // The queue's `Weak` keeps the allocation, so no later address space has its address.
-    match current_process(token) {
-        Some(space) if Weak::as_ptr(&queue.owner) == Arc::as_ptr(&space) => Ok(()),
-        _ => Err(Error::new(EPERM)),
+    if current_process(token) == queue.owner {
+        Ok(())
+    } else {
+        Err(Error::new(EPERM))
     }
 }
 
@@ -125,9 +126,9 @@ fn check_owner(queue: &Queue, token: &mut CleanLockToken) -> Result<()> {
 struct Queue {
     /// Its handle number, for events.
     id: usize,
-    /// The address space of the process that opened the queue, the only one that may use it
-    /// and its objects ([`current_process`]).
-    owner: Weak<AddrSpaceWrapper>,
+    /// The pid of the process that opened the queue, the only one that may use it and its
+    /// objects ([`current_process`]).
+    owner: usize,
     state: Mutex<QueueState>,
     /// Notified when records arrive or the queue closes.
     records_ready: WaitCondition,
@@ -419,11 +420,11 @@ fn open_queue(caller: &CallerCtx, token: &mut CleanLockToken) -> Result<Handle> 
     if caller.uid != 0 {
         return Err(Error::new(EACCES));
     }
-    let owner = current_process(token).ok_or(Error::new(EPERM))?;
+    let owner = current_process(token);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Ok(Handle::Queue(Arc::new(Queue {
         id,
-        owner: Arc::downgrade(&owner),
+        owner,
         state: Mutex::new(QueueState {
             records: VecDeque::new(),
             closed: false,

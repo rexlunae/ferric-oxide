@@ -638,6 +638,68 @@ fn owner(cache: &mut Cache) -> Result<(), Failure> {
     Err(Failure::Check(failure.into()))
 }
 
+/// After `exec` (from [`exec`]): a call on the queue the process opened before it `exec`ed
+/// still works, since `exec` keeps the process. Exits 0 when it does, 3 on `EPERM`, 4 on
+/// another error.
+fn exec_owner() -> ExitCode {
+    let max = ReadaheadMax::new(READAHEAD_MAX).expect("in range");
+    let (words, n) = Request::SetReadaheadMax { pages: max }.encode();
+    let fd = EXEC_QUEUE_FD as usize;
+    match libredox::call::call_wo(fd, &[], CallFlags::empty(), &words[..n]) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) if err.errno() == ERRNO_EPERM => ExitCode::from(3),
+        Err(_) => ExitCode::from(4),
+    }
+}
+
+/// `pcache-exec`: a process that opens a queue and then `exec`s keeps it (the owner is the
+/// process, not its address space). A child opens a queue, `exec`s this program with
+/// [`EXEC_OWNER_ARG`], and the new image calls on the queue. (Sibling threads are covered by
+/// every step: the scheme's thread attaches descriptions to the queue the main thread
+/// opened.)
+fn exec(_cache: &mut Cache) -> Result<(), Failure> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let exe = std::env::current_exe().map_err(|err| Failure::Errno {
+        what: "find this program",
+        errno: err.raw_os_error().unwrap_or(ERRNO_EIO),
+    })?;
+    let exe = CString::new(exe.as_os_str().as_bytes())
+        .map_err(|_| Failure::Check("the program path has a NUL".into()))?;
+    let arg = CString::new(EXEC_OWNER_ARG).expect("no NUL");
+    let queue = CString::new(format!("/scheme/{SCHEME_NAME}/{QUEUE_PATH}")).expect("no NUL");
+    let argv = [exe.as_ptr(), arg.as_ptr(), std::ptr::null()];
+    // SAFETY: the child only makes system calls with what was prepared above, then `exec`s
+    // or exits.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: `queue` and `argv` are NUL-terminated and outlive the calls.
+        unsafe {
+            let fd = libc::open(queue.as_ptr(), libc::O_RDWR);
+            if fd < 0 || libc::dup2(fd, EXEC_QUEUE_FD) < 0 {
+                libc::_exit(5);
+            }
+            libc::execv(exe.as_ptr(), argv.as_ptr());
+            libc::_exit(6);
+        }
+    }
+    check(child > 0, || "fork failed".into())?;
+    let mut status = 0;
+    // SAFETY: `status` is a valid place for the child's status.
+    let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+    check(waited == child && libc::WIFEXITED(status), || {
+        "the exec'd child did not exit".into()
+    })?;
+    let failure = match libc::WEXITSTATUS(status) {
+        0 => return Ok(()),
+        3 => "a process lost its queue when it exec'd (EPERM)",
+        4 => "the exec'd process's call on its queue failed",
+        5 => "the child could not open a queue",
+        _ => "the child could not exec",
+    };
+    Err(Failure::Check(failure.into()))
+}
+
 /// `pcache-generation`: closing an object drops its records still on the queue, and a
 /// record already taken cannot fill a new object with the same ID.
 fn generation(cache: &mut Cache) -> Result<(), Failure> {
@@ -766,8 +828,17 @@ fn start_watchdog() {
     });
 }
 
+/// The argument `pcache-exec` runs this program with after `exec`: check that the queue
+/// it inherited at [`EXEC_QUEUE_FD`] still works.
+const EXEC_OWNER_ARG: &str = "--exec-owner";
+/// Where `pcache-exec`'s child puts the queue it opens before it `exec`s.
+const EXEC_QUEUE_FD: i32 = 100;
+
 /// Runs the test.
 pub fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(EXEC_OWNER_ARG) {
+        return exec_owner();
+    }
     start_watchdog();
     match run() {
         Ok(code) => code,
@@ -825,13 +896,14 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
     };
     let file = open_file().map_err(|f| ("pcache-setup", f))?;
     progress("opened the file");
-    let steps: [(&'static str, &CacheStep<'_>); 8] = [
+    let steps: [(&'static str, &CacheStep<'_>); 9] = [
         ("pcache-miss", &|cache| miss(cache, &file)),
         ("pcache-hit", &|cache| hit(cache, &file)),
         ("pcache-readahead", &readahead),
         ("pcache-eio", &eio),
         ("pcache-restore", &restore),
         ("pcache-owner", &owner),
+        ("pcache-exec", &exec),
         ("pcache-generation", &generation),
         ("pcache-close", &close),
     ];

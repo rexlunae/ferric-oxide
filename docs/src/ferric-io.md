@@ -571,7 +571,9 @@ How a file system uses it:
    descriptor. The queue then serves only that scheme's descriptions. Only the
    process that opened the queue can use it or its objects, binding included:
    calls from any other process, including a child that inherited the
-   descriptors, get `EPERM`.
+   descriptors, get `EPERM`. The process is its pid as the process manager
+   sets it on every thread, so all of its threads may call, before and after
+   it `exec`s.
 2. It opens `object/<hex id>` from the queue for each file it caches (an empty
    object, `EEXIST` if the ID is in use), sets its size with `SetSize`, and
    attaches each client description it opens with `Attach`, naming the handle
