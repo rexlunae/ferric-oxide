@@ -21,6 +21,8 @@
 //!   [`EventSet`], for the boot environment and the trace scheme.
 //! - [`clock`] names the clock record timestamps come from (an invariant TSC, the KVM clock or
 //!   the HPET) and holds the rule the kernel picks it by.
+//! - [`filter`] holds per-event argument filters (`nr == 3 && a < 0x1000`) and the lock-free
+//!   slot the kernel checks them in.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
 //! - [`crash`] is the crash dump a panic writes to reserved memory for the next boot to
@@ -64,6 +66,7 @@ pub mod clock;
 pub mod config;
 pub mod crash;
 mod event;
+pub mod filter;
 pub mod kernel;
 mod level;
 pub mod record;

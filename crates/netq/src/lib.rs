@@ -22,9 +22,13 @@
 //!   words the kernel passes a scheme) and the bind and statistics records.
 //! - [`ring`]: the four rings' layout in their shared region, and each side's handles, on
 //!   `ferric-ring`'s index protocol, hostile-peer checks and need-wakeup.
+//! - [`own`]: port ownership (a netstack socket proves a port is the application's) and TX
+//!   validation of the frames a socket sends.
+//! - [`copy`]: the driver's side of a socket in copy mode: software filters, and copies
+//!   between received or sent frames and the UMEM, with the socket's counters.
 //!
-//! Nothing here touches hardware, and the only memory it touches is ring memory, through
-//! `ferric-ring`'s atomic accesses.
+//! Nothing here touches hardware, and the only memory it touches is ring and UMEM memory,
+//! through atomic accesses.
 //!
 //! All multi-byte integers in shared memory and call payloads are little-endian; addresses and
 //! MAC addresses are octets in network order. Frame formats follow IEEE 802.3 (Ethernet II),
@@ -79,8 +83,10 @@
 #![forbid(unsafe_code)]
 
 pub mod call;
+pub mod copy;
 pub mod desc;
 pub mod filter;
 pub mod frame;
+pub mod own;
 pub mod ring;
 pub mod umem;

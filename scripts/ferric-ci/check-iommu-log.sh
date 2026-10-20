@@ -132,6 +132,11 @@ case "$mode" in
         if grep -aF "IOMMU: interrupt remapping" <<< "$clean"; then
             fail "interrupt remapping without an IOMMU"
         fi
+        # Nothing faults, so there is nothing for iommu.fault to record.
+        need "FERRIC_TEST_SKIP iommu-trace"
+        if grep -aF "FERRIC_TEST_FAIL iommu-trace" <<< "$clean"; then
+            fail "iommu-trace failed without an IOMMU"
+        fi
         echo "::notice title=check-iommu-log ($mode)::OK; no IOMMU, compatibility-format MSI delivered"
         exit 0
         ;;
@@ -171,6 +176,10 @@ esac
 # The boot self-test of DMA domains attaches an idle device: an empty slot or a host bridge,
 # neither of which initiates DMA.
 need "IOMMU: domain self-test passed \(attach/map/unmap/detach\)"
+
+# Every CI image has kernel.trace (and so kernel.trace_iommu): the kernel's iommu.fault
+# records must cover every fault ferric-iommu-test announced.
+need "FERRIC_TEST_PASS iommu-trace: [0-9]+ announced fault\(s\) have iommu.fault records"
 
 if [ "$vendor" = amdvi ]; then
     # QEMU's amd-iommu has IASup and an MSI capability, so the unit invalidates with

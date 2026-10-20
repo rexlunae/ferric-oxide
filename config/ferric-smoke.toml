@@ -20,6 +20,7 @@ ferric-xstate-test = "source"
 ferric-aslr-test = "source"
 ferric-guard-test = "source"
 ferric-tlb-test = "source"
+ferric-borrow-test = "source"
 ferric-futex-test = "source"
 # Reads /scheme/sys/proc (kernel.sys_proc, which CI turns on); skips otherwise.
 ferric-proc-test = "source"
@@ -40,9 +41,14 @@ ferric-ring-test = "source"
 # Reads and writes the NVMe disk through a registered-buffer grant (drivers.grant_dma,
 # which CI turns on) and times it against ordinary reads.
 ferric-blkgrant-test = "source"
+# Opens a scheme from the thread that created it (a kernel livelock regression test).
+ferric-scheme-self-test = "source"
 # The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each of nvmed's
 # queue policies (ferric_iobench), and the same-boot A/B of per-CPU queues against one.
 ferric-iobench = "source"
+# Opens a queue socket on e1000d and exchanges ARP and ICMP with QEMU's gateway through its
+# own rings, in copy mode (drivers.net_bypass and kernel.regbuf, which CI turns on).
+ferric-netq-test = "source"
 # fox replaces pkg, as features.toml packages.manager = "fox" does: it adopts
 # the image's packages on first boot (05_fox-adopt.service) and the script
 # below checks them against their signatures.
@@ -73,16 +79,19 @@ ferric-xstate-test || echo FERRIC_TEST_FAIL xstate exited with an error
 ferric-aslr-test || echo FERRIC_TEST_FAIL aslr exited with an error
 ferric-guard-test || echo FERRIC_TEST_FAIL guard exited with an error
 ferric-tlb-test || echo FERRIC_TEST_FAIL tlb exited with an error
+ferric-borrow-test || echo FERRIC_TEST_FAIL borrow exited with an error
 ferric-regbuf-test || echo FERRIC_TEST_FAIL regbuf exited with an error
 ferric-blkgrant-test || echo FERRIC_TEST_FAIL nvme-grant exited with an error
+ferric-netq-test || echo FERRIC_TEST_FAIL netq exited with an error
 ferric-iobench || echo FERRIC_TEST_FAIL iobench exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
 ferric-proc-test || echo FERRIC_TEST_FAIL proc exited with an error
+ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
-# Saves a capture and reads it back, on a kernel with kernel.trace. The /scheme listing says
+# Saves a capture through the ring mappings and reads it back, on a kernel with kernel.trace. The /scheme listing says
 # whether it has one, as in ferric-trace-test; the trace-overhead baseline image has none.
 if contains "$(ls /scheme)" kernel.trace
-    ferric-trace capture /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
+    ferric-trace capture --via map /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
 else
     echo FERRIC_TEST_SKIP trace-capture: no kernel.trace scheme
 end

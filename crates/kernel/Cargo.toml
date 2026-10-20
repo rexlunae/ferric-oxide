@@ -122,6 +122,9 @@ irq-percpu = ["dep:ferric-irq"]
 trace_syscall = ["trace"]
 trace_sched = ["trace"]
 trace_scheme = ["trace"]
+trace_mm = ["trace"]
+trace_irq = ["trace"]
+trace_iommu = ["trace"]
 # Ferric Oxide: a panic leaves its message and the newest trace records in reserved memory that
 # survives a warm reboot, served by kernel.trace/crash on the next boot.
 trace_crash = ["trace"]
