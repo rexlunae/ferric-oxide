@@ -7,13 +7,15 @@
 //! their `read` and `pread` from the cached pages without a round trip to RedoxFS. Everything
 //! else (writers, directories, `mmap`, `fstat`) still comes here.
 //!
-//! A file with a writable mapping, private or shared, is not cached while the mapping lasts:
-//! RedoxFS writes every writable mapping back to the file on `fsync` and `munmap`
-//! (`Fmap::sync`), which changes the bytes without a write call, so cached pages could not
-//! follow them. [`PageCache::mappings_changed`] keeps a count per file of those mappings,
-//! after every `mmap` and `munmap` whatever happens to the descriptors, and closes the
-//! file's object (dropping its pages) when the count leaves 0. Descriptions opened read-only
-//! once it is back to 0 are cached again. (PR 3 moves mappings to the cache itself.)
+//! A file with a shared writable mapping is not cached while the mapping lasts: RedoxFS
+//! writes such mappings back to the file on `fsync` and `munmap` (`Fmap::sync`), which
+//! changes the bytes without a write call, so cached pages could not follow them. (A private
+//! mapping never changes RedoxFS's buffer, since the kernel copies a page on its first
+//! store, so RedoxFS no longer writes it back, and it does not affect the cache.)
+//! [`PageCache::mappings_changed`] keeps a count per file of those mappings, after every
+//! `mmap` and `munmap` whatever happens to the descriptors, and closes the file's object
+//! (dropping its pages) when the count leaves 0. Descriptions opened read-only once it is
+//! back to 0 are cached again. (PR 3 moves mappings to the cache itself.)
 //!
 //! A miss is a fill record on the queue. A pump thread (`ferric_pcache::client::spawn_pump`)
 //! waits on the queue and forwards the records to RedoxFS's own scheme as a call, so the main
@@ -100,8 +102,8 @@ pub struct PageCache {
     objects: Objects,
     /// The node of each attached handle.
     attached: BTreeMap<usize, u32>,
-    /// Per node with any, the references to its mapped ranges that `Fmap::sync` writes back:
-    /// the node is not cached while it has one.
+    /// Per node with any, the references of shared writable mappings to its mapped ranges,
+    /// which `Fmap::sync` writes back: the node is not cached while it has one.
     writable: BTreeMap<u32, usize>,
     /// The buffer fills are read into.
     buf: Vec<u8>,

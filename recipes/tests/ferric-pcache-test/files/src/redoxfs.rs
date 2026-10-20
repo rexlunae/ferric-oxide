@@ -144,24 +144,26 @@ pub fn coherence() -> Result<(), Failure> {
     io("remove the test file", fs::remove_file(PATH))
 }
 
-/// Maps the first page of `file` writable, `MAP_SHARED` or `MAP_PRIVATE`.
-fn map_page(file: &File, shared: bool) -> Result<*mut u8, Failure> {
-    let kind = if shared {
-        libc::MAP_SHARED
-    } else {
-        libc::MAP_PRIVATE
+/// How [`map_page`] maps a page.
+#[derive(Clone, Copy)]
+enum Map {
+    /// `PROT_READ`, `MAP_SHARED`.
+    SharedRead,
+    /// `PROT_READ | PROT_WRITE`, `MAP_SHARED`.
+    SharedWrite,
+    /// `PROT_READ | PROT_WRITE`, `MAP_PRIVATE`.
+    PrivateWrite,
+}
+
+/// Maps the first page of `file`.
+fn map_page(file: &File, map: Map) -> Result<*mut u8, Failure> {
+    let (prot, kind) = match map {
+        Map::SharedRead => (libc::PROT_READ, libc::MAP_SHARED),
+        Map::SharedWrite => (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED),
+        Map::PrivateWrite => (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE),
     };
     // SAFETY: a new mapping of a page of an open file, at an address the kernel picks.
-    let page = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            kind,
-            file.as_raw_fd(),
-            0,
-        )
-    };
+    let page = unsafe { libc::mmap(std::ptr::null_mut(), 4096, prot, kind, file.as_raw_fd(), 0) };
     if page == libc::MAP_FAILED {
         return io("mmap", Err(std::io::Error::last_os_error()));
     }
@@ -186,10 +188,20 @@ fn open_and_check_cached(want: &[u8]) -> Result<(File, bool), Failure> {
     Ok((reader, cached))
 }
 
-/// `pcache-redoxfs-mmap`: a file with a writable mapping, private or shared, is not cached
-/// while the mapping lasts, whatever happens to the descriptor it was made through, and is
-/// cached again once it is unmapped. A reader cached before the mapping sees what the
-/// mapping writes back.
+/// Checks a read-only description opened now is cached, or is not.
+fn expect_cached(want: &[u8], cached: bool, when: &str) -> Result<(), Failure> {
+    let (_, is) = open_and_check_cached(want)?;
+    check(is == cached, || {
+        let not = if cached { " not" } else { "" };
+        format!("a read-only description was{not} cached {when}")
+    })
+}
+
+/// `pcache-redoxfs-mmap`: a file with a shared writable mapping is not cached while the
+/// mapping lasts, whatever happens to the descriptor it was made through or to read-only
+/// mappings beside it, and is cached again once it is unmapped; a reader cached before the
+/// mapping sees what it writes back. A private writable mapping changes neither the file nor
+/// its caching.
 pub fn mappings() -> Result<(), Failure> {
     let mut want = bytes(6, 0, LEN);
     io("create the test file", fs::write(PATH, &want))?;
@@ -205,28 +217,45 @@ pub fn mappings() -> Result<(), Failure> {
     let (reader, cached) = open_and_check_cached(&want)?;
     check(cached, || "a read-only description was not cached".into())?;
 
-    // A private writable mapping: RedoxFS writes it back on fsync, so the file leaves the
-    // cache while it lasts, and the reader reads what RedoxFS has.
-    let private = map_page(&writer, false)?;
+    // A private writable mapping: the kernel copies the page on the store, so neither
+    // fsync nor munmap changes the file, and the file stays cached.
+    let private = map_page(&writer, Map::PrivateWrite)?;
     // SAFETY: `private` maps a whole page, writable, and nothing else uses it.
     unsafe { private.add(7).write(!want[7]) };
     io("fsync", writer.sync_all())?;
-    let on_disk = read_all(&writer, want.len())?;
-    expect(&reader, &on_disk, "a private writable mapping and fsync")?;
-    let (_, cached) = open_and_check_cached(&on_disk)?;
-    check(!cached, || {
-        "a file with a private writable mapping was still cached".into()
-    })?;
+    expect(
+        &writer,
+        &want,
+        "a store through a private mapping and fsync",
+    )?;
+    expect(
+        &reader,
+        &want,
+        "a store through a private mapping and fsync",
+    )?;
+    expect_cached(&want, true, "with a private writable mapping")?;
     unmap_page(private)?;
-    want = read_all(&writer, want.len())?;
-    let (_, cached) = open_and_check_cached(&want)?;
-    check(cached, || "a file was not cached again after munmap".into())?;
+    expect(&writer, &want, "unmapping a private mapping")?;
+
+    // A read-only mapping, then a writable one beside it: the file leaves the cache with
+    // the writable one and comes back when it goes, though the read-only one stays.
+    let read_only = map_page(&writer, Map::SharedRead)?;
+    expect_cached(&want, true, "with a read-only mapping")?;
+    let writable = map_page(&writer, Map::SharedWrite)?;
+    expect_cached(&want, false, "with a shared writable mapping")?;
+    unmap_page(writable)?;
+    expect_cached(
+        &want,
+        true,
+        "after its writable mapping went, a read-only one left",
+    )?;
+    unmap_page(read_only)?;
 
     // A shared writable mapping whose descriptor closes first: the store reaches the file,
     // the reader cached before it sees it, and the file is cached again only after munmap.
-    let (reader, cached) = open_and_check_cached(&want)?;
+    let (reader2, cached) = open_and_check_cached(&want)?;
     check(cached, || "a read-only description was not cached".into())?;
-    let shared = map_page(&writer, true)?;
+    let shared = map_page(&writer, Map::SharedWrite)?;
     drop(writer);
     want[9] = !want[9];
     // SAFETY: `shared` maps a whole page, writable, and nothing else uses it.
@@ -237,17 +266,19 @@ pub fn mappings() -> Result<(), Failure> {
     )?;
     io("fsync", syncer.sync_all())?;
     drop(syncer);
-    expect(&reader, &want, "a store through a shared mapping and fsync")?;
-    let (_, cached) = open_and_check_cached(&want)?;
-    check(!cached, || {
-        "a file mapped writable, its descriptor closed, was still cached".into()
-    })?;
+    expect(
+        &reader2,
+        &want,
+        "a store through a shared mapping and fsync",
+    )?;
+    expect_cached(
+        &want,
+        false,
+        "with a shared writable mapping, its descriptor closed",
+    )?;
     unmap_page(shared)?;
-    let (again, cached) = open_and_check_cached(&want)?;
-    check(cached, || {
-        "a file unmapped after its descriptor closed was not cached again".into()
-    })?;
-    drop((reader, again));
+    expect_cached(&want, true, "after unmapping, the descriptor closed first")?;
+    drop((reader, reader2));
     io("remove the test file", fs::remove_file(PATH))
 }
 

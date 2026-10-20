@@ -648,15 +648,17 @@ call, so the main loop answers them in order with the writes it serves,
 reading the pages the way a `read` does (after decompression and decryption,
 and from a mapped buffer when there is one). Writes, appends, `ftruncate` and
 `O_TRUNC` invalidate the pages they change; an append invalidates from the old
-end, not from its descriptor's offset. A file with a writable mapping, private
-or shared, is not cached while the mapping lasts, because RedoxFS writes every
-writable mapping back on `fsync` and `munmap` without a write call. RedoxFS
-keeps a count per file of those mappings, updated on every `mmap` and `munmap`
-whatever happens to the descriptors; the first closes the file's object, which
-drops its pages, and once the count is back to 0 new read-only descriptions are
-cached again. (RedoxFS's `fsync` also no longer writes back ranges nothing maps
-any more: they were written when unmapped, and their retained buffers can be
-older than later writes.)
+end, not from its descriptor's offset. A file with a shared writable mapping
+is not cached while the mapping lasts, because RedoxFS writes those mappings
+back on `fsync` and `munmap` without a write call. Each of RedoxFS's mapped
+ranges counts its shared writable mappings (the kernel says on `munmap` which
+kind went), and the page cache keeps their total per file, updated on every
+`mmap` and `munmap` whatever happens to the descriptors or to read-only
+mappings beside them; the first closes the file's object, which drops its
+pages, and once the count is back to 0 new read-only descriptions are cached
+again. A private mapping never changes RedoxFS's buffer (the kernel copies a
+page on its first store), so RedoxFS no longer writes it back, nor ranges
+nothing maps any more, whose retained buffers can be older than later writes.
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
@@ -669,8 +671,10 @@ closed queue, and prints the time of a cached 4 KiB `pread` next to the same
 read through the scheme. Then,
 on RedoxFS, it checks that a read-only description sees writes, a write past
 the end, truncations and an append made through another one (the append
-leaving the pages before it cached), that a writable mapping keeps the file out
-of the cache exactly while it lasts, even after its descriptor closes (the
+leaving the pages before it cached), that a shared writable mapping keeps the
+file out of the cache exactly while it lasts, even after its descriptor closes
+or beside a read-only mapping, and a private one changes neither the file nor
+its caching (the
 access time shows whether a read was served from the cache: RedoxFS moves it
 when it reads a file, the cache does not), and benchmarks warm 4 KiB
 `pread`s and 1 MiB sequential reads of one file through a read-only

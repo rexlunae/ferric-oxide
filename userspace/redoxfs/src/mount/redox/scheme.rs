@@ -1003,7 +1003,7 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
 
         let node_ptr = file.node_ptr();
         let mapped = self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx));
-        // Ferric Oxide: a writable mapping ends the file's page caching while it lasts.
+        // Ferric Oxide: a shared writable mapping ends the file's page caching while it lasts.
         self.mappings_changed(node_ptr);
         mapped
     }
@@ -1012,15 +1012,19 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         id: usize,
         offset: u64,
         size: usize,
-        _flags: MunmapFlags,
+        flags: MunmapFlags,
         _ctx: &CallerCtx,
     ) -> Result<()> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
         let node_ptr = file.node_ptr();
-        let unmapped = self.fs.tx(|tx| file.funmap(fmaps, offset, size, tx));
-        // Ferric Oxide: the file may be cached again once its last writable mapping goes.
+        // Ferric Oxide: the kernel sets NEEDS_SYNC for a shared writable mapping.
+        let writes_back = flags.contains(MunmapFlags::NEEDS_SYNC);
+        let unmapped = self
+            .fs
+            .tx(|tx| file.funmap(fmaps, offset, size, writes_back, tx));
+        // Ferric Oxide: the file may be cached again once its last shared writable mapping goes.
         self.mappings_changed(node_ptr);
         unmapped
     }
