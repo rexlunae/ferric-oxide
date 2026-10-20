@@ -8,6 +8,7 @@ description = "The kernel-bypass network queue ABI: UMEM frames, ring descriptor
 # Shared crates are also consumed through recipe symlinks outside the host workspace, so the
 # versions are written here rather than taken from [workspace.dependencies].
 [dependencies]
+bitflags = { version = "2", default-features = false }
 etherparse = { version = "0.21", default-features = false }
 ferric-ring = { path = "../ring" }
 thiserror = { version = "2", default-features = false }

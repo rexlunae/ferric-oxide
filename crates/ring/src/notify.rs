@@ -107,6 +107,18 @@ impl<E: Entry> Consumer<E> {
         }
     }
 
+    /// Asks the producer for a wakeup even though entries remain: for a consumer that stops
+    /// with work left (a budget used up, or no room downstream) and is only run again when
+    /// kicked.
+    ///
+    /// # Errors
+    ///
+    /// [`RingError::OutOfBounds`] when the memory has no flags word.
+    pub fn request_wakeup<M: Memory + ?Sized>(&self, mem: &M) -> Result<(), RingError> {
+        word(mem, self.queue().flags)?.fetch_or(NEED_WAKEUP, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Withdraws the request for a wakeup, after waking up.
     ///
     /// # Errors

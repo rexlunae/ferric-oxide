@@ -12,14 +12,14 @@ use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::clock::ClockLine;
 use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
-    CATALOG, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER,
-    SYSCALL_EXIT,
+    CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
+    SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
 use ferric_trace::record::{Records, WORD_BYTES};
 use ferric_trace::ring::View;
 use ferric_trace::{Event, EventId};
 use syscall::schemev2::Opcode;
-use syscall::{EACCES, EBADF, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
+use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 mod crash;
 
@@ -675,6 +675,129 @@ fn check_mmap(cpus: &[u32]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Whether the kernel has `event` compiled in (the listing names only those); prints a skip for
+/// `step` when it does not.
+fn has_event(step: &'static str, event: &Event) -> Result<bool, Failure> {
+    let compiled = listing(step)?.iter().any(|(name, _)| name == event.name());
+    if !compiled {
+        println!(
+            "FERRIC_TEST_SKIP {step}: {} is not compiled in",
+            event.name()
+        );
+    }
+    Ok(compiled)
+}
+
+/// The pages `trace-fault` touches.
+const FAULT_PAGES: usize = 4;
+
+/// The page size.
+const PAGE: usize = 4096;
+
+/// `trace-fault`: with the `mm` events on, writes to each page of a fresh anonymous mapping,
+/// which the kernel maps on first touch, then unmaps it and has the kernel copy into it with
+/// a `read`, which fails with `EFAULT`. The writes must have `mm.page_fault` records from user
+/// mode, writes, ending `mapped`; the read one from the kernel at the unmapped buffer, ending
+/// `copy failed`.
+fn check_fault(cpus: &[u32]) -> Result<(), Failure> {
+    let step = "trace-fault";
+    if !has_event(step, &MM_PAGE_FAULT)? {
+        return Ok(());
+    }
+    let len = FAULT_PAGES * PAGE;
+    let map = syscall::Map {
+        offset: 0,
+        size: len,
+        flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_PRIVATE,
+        address: 0,
+    };
+    // Opened first: nothing between the unmap and the read may allocate, or the allocator
+    // could map memory at the unmapped address again.
+    let stats_path = path(abi::STATS_PATH);
+    let stats = File::open(&stats_path).map_err(io_failure(step, &stats_path))?;
+    let stats_fd = stats.as_raw_fd() as usize;
+    drain(step, cpus)?;
+    command(step, "enable mm")?;
+    // SAFETY: an anonymous mapping (no file) at an address the kernel picks; nothing in this
+    // process refers to that memory yet.
+    let addr = unsafe { syscall::fmap(!0, &map) }.map_err(|err| Failure {
+        step,
+        why: Why::Call {
+            call: "anonymous mmap",
+            result: Err(err),
+        },
+    })?;
+    for page in 0..FAULT_PAGES {
+        // SAFETY: inside the mapping made above, which is readable and writable and which
+        // nothing else uses; the write is volatile so it happens, one per page.
+        unsafe { ((addr + page * PAGE) as *mut u64).write_volatile(0x5a) };
+    }
+    // SAFETY: the mapping made above, which nothing refers to after this.
+    let unmapped = unsafe { syscall::funmap(addr, len) };
+    // SAFETY: the kernel writes to `addr`, which is not mapped any more, so the call fails
+    // with EFAULT and writes nothing; no memory of this process changes.
+    let copy = unsafe { syscall::syscall3(SYS_READ, stats_fd, addr, PAGE) };
+    command(step, "disable mm")?;
+    if unmapped.is_err() {
+        return Err(Failure {
+            step,
+            why: Why::Call {
+                call: "munmap",
+                result: unmapped,
+            },
+        });
+    }
+    expect_errno(step, "read into an unmapped buffer", copy, EFAULT)?;
+    let trace = drain(step, cpus)?;
+    let faults: Vec<&Entry> = trace
+        .iter()
+        .flatten()
+        .filter(|e| e.is(&MM_PAGE_FAULT))
+        .collect();
+    let in_page = |e: &Entry, page: usize| {
+        e.arg(0)
+            .is_some_and(|a| (a as usize) / PAGE == addr / PAGE + page)
+    };
+    let flags = |e: &Entry| PageFaultFlags::from_raw(e.arg(2).unwrap_or(0));
+    for page in 0..FAULT_PAGES {
+        faults
+            .iter()
+            .find(|e| {
+                in_page(e, page)
+                    && flags(e).contains(PageFaultFlags::WRITE.with(PageFaultFlags::USER, true))
+                    && e.arg(3) == Some(PageFaultOutcome::Mapped.raw())
+            })
+            .ok_or_else(|| {
+                check(
+                    step,
+                    format!(
+                        "no user write fault ending mapped for page {page} at {:#x} ({} mm.page_fault records)",
+                        addr + page * PAGE,
+                        faults.len()
+                    ),
+                )
+            })?;
+    }
+    faults
+        .iter()
+        .find(|e| {
+            in_page(e, 0)
+                && !flags(e).contains(PageFaultFlags::USER)
+                && e.arg(3) == Some(PageFaultOutcome::CopyFailed.raw())
+        })
+        .ok_or_else(|| {
+            check(
+                step,
+                format!("no kernel fault ending copy failed at {addr:#x}"),
+            )
+        })?;
+    println!(
+        "FERRIC_TEST_PASS trace-fault ({} mm.page_fault records)",
+        faults.len()
+    );
+    Ok(())
+}
+
 /// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     check_initfs()?;
@@ -799,6 +922,8 @@ fn run() -> Result<(), Failure> {
 
     check_mmap(&cpus)?;
     println!("FERRIC_TEST_PASS trace-mmap");
+
+    check_fault(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
     Ok(())
