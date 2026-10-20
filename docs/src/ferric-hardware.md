@@ -126,13 +126,13 @@ script does not shut the machine down, so the console stays available for the
 next check.
 
 QEMU can exercise the multi-controller audio path without the physical
-machine by adding three HDA controllers: the q35 `ich9-intel-hda` device plus
-two `intel-hda` devices, each paired with an `hda-output` codec. A boot with
-three controllers on 2026-10-19 initialized all of them, registered `audiohw`
-for the first and `audiohw.pci-0000-00-04.0`/`audiohw.pci-0000-00-05.0` for
-the other two, and `audiod` started and registered the `audio` scheme. This
-exercises the scheme collision and fallback path, not the analog-versus-
-digital classification of the physical codecs.
+machine by adding three HDA controllers: three `ich9-intel-hda` devices, each
+with its own bus-qualified `hda-output` codec. A boot with three controllers
+on 2026-10-19 initialized all of them, registered `audiohw` for the first and
+`audiohw.pci-0000-00-04.0`/`audiohw.pci-0000-00-05.0` for the other two, and
+`audiod` started and registered the `audio` scheme. This exercises the scheme
+collision and fallback path, not the analog-versus-digital classification of
+the physical codecs.
 
 ## Bring-up order
 
