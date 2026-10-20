@@ -7,6 +7,10 @@
 //! lives in the `Ring` itself, and the counters it reads back from the header are ones it
 //! stored, masked to the data before use. A reader that hands back a position goes through
 //! `Ring::commit_to`, which takes only a record boundary between `tail` and `head`.
+//!
+//! A full ring drops new records, unless the kernel keeps crash dumps (`kernel.trace_crash`):
+//! then it overwrites its oldest ones (`WhenFull::OverwriteOldest`), so a dump holds the last
+//! records before a panic even when nobody reads the rings.
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, sync::atomic::AtomicU64};
@@ -14,7 +18,7 @@ use core::{fmt, sync::atomic::AtomicU64};
 use ferric_trace::{
     abi::CPU_RING_WORDS,
     kernel::CATALOG,
-    ring::{Ring, RingError, Shared, Words, SHARED_HEADER_WORDS},
+    ring::{Ring, RingError, Shared, WhenFull, Words, SHARED_HEADER_WORDS},
     select, Event, EventSet, Level, SelectError, Subsystem,
 };
 use spin::Once;
@@ -219,6 +223,14 @@ impl Words for FramePages {
 /// A CPU's ring.
 pub type CpuRing = Ring<Shared<FramePages>>;
 
+/// What a full ring does: a crash dump wants the newest records, a reader that sees `lost`
+/// counted wants the oldest kept until it reads them.
+const WHEN_FULL: WhenFull = if cfg!(feature = "trace_crash") {
+    WhenFull::OverwriteOldest
+} else {
+    WhenFull::DropNewest
+};
+
 /// Each CPU's ring, made by [`init_rings`].
 static RINGS: [Once<CpuRing>; MAX_CPU_COUNT as usize] =
     [const { Once::new() }; MAX_CPU_COUNT as usize];
@@ -231,7 +243,11 @@ pub fn init_rings() {
     super::clock::choice();
     for (cpu, ring) in RINGS.iter().enumerate().take(crate::cpu_count() as usize) {
         let made = ring
-            .try_call_once(|| Ring::shared(FramePages::allocate()?).map_err(RingInitError::Layout));
+            .try_call_once(|| {
+                Ring::shared(FramePages::allocate()?)
+                    .map(|ring| ring.when_full(WHEN_FULL))
+                    .map_err(RingInitError::Layout)
+            });
         if let Err(err) = made {
             warn!("trace: no ring for CPU {cpu}: {err}");
         }
@@ -256,6 +272,6 @@ pub fn emit(event: &Event, args: &[u64]) {
         ring.count_lost();
         return;
     }
-    // A full ring counts the record as lost itself.
+    // A full ring counts the record (or the oldest it overwrote) as lost itself.
     let _ = ring.push(event.id(), super::clock::now(), args);
 }
