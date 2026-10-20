@@ -30,9 +30,12 @@ fn control_line() -> alloc::string::String {
     })
 }
 
-/// Ferric Oxide: the `ctl-profiling` handle that owns the profiler (its id plus one), or 0.
+/// Ferric Oxide: the `ctl-profiling` handle that owns the profiler. Held while the sampling
+/// switch is set, so that changes of owner and of sampling are one at a time (a closing owner
+/// cannot stop the next owner's sampling).
 #[cfg(feature = "profiling")]
-static PROFILER_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static PROFILER_OWNER: spin::Mutex<ferric_trace::profile::ProfilerOwner> =
+    spin::Mutex::new(ferric_trace::profile::ProfilerOwner::new());
 
 /// Ferric Oxide: a write of `byte` to the `ctl-profiling` handle `id`. `1` and `0` start and
 /// stop sampling, as upstream. `x` makes the handle the profiler's owner and stops sampling;
@@ -42,28 +45,17 @@ static PROFILER_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::Ato
 /// sampling off.
 #[cfg(feature = "profiling")]
 fn profiler_control(id: usize, byte: u8) -> Result<()> {
-    let mine = id.wrapping_add(1);
-    let on = match byte {
-        b'x' => {
-            if let Err(owner) =
-                PROFILER_OWNER.compare_exchange(0, mine, Ordering::SeqCst, Ordering::SeqCst)
-                && owner != mine
-            {
-                return Err(Error::new(EBUSY));
-            }
-            false
-        }
-        b'0' | b'1' => {
-            let owner = PROFILER_OWNER.load(Ordering::SeqCst);
-            if owner != 0 && owner != mine {
-                return Err(Error::new(EBUSY));
-            }
-            byte == b'1'
-        }
-        _ => return Err(Error::new(EINVAL)),
-    };
+    use ferric_trace::profile::ControlWriteError;
+
+    let mut owner = PROFILER_OWNER.lock();
+    let on = owner.write(id, byte).map_err(|err| match err {
+        ControlWriteError::Busy => Error::new(EBUSY),
+        _ => Error::new(EINVAL),
+    })?;
+    // Under the lock, so no other write or close comes between the decision and the switch.
+    crate::profiling::IS_PROFILING.store(on, Ordering::SeqCst);
+    drop(owner);
     info!("Wrote {on} to IS_PROFILING");
-    crate::profiling::IS_PROFILING.store(on, Ordering::Relaxed);
     Ok(())
 }
 
@@ -177,11 +169,11 @@ impl KernelScheme for DebugScheme {
 
         // Ferric Oxide: the profiler's owner going away stops sampling (`profiler_control`).
         #[cfg(feature = "profiling")]
-        if PROFILER_OWNER
-            .compare_exchange(id.wrapping_add(1), 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
         {
-            crate::profiling::IS_PROFILING.store(false, Ordering::Relaxed);
+            let mut owner = PROFILER_OWNER.lock();
+            if let Some(on) = owner.close(id) {
+                crate::profiling::IS_PROFILING.store(on, Ordering::SeqCst);
+            }
         }
 
         Ok(())

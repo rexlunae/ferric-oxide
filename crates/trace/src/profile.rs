@@ -9,6 +9,8 @@
 //! symbolize kernel addresses under KASLR (`kernel.kaslr_image`). It also adds an owner:
 //! writing `x` takes the profiler for that open file (and stops sampling), other files'
 //! writes then fail with `EBUSY`, and closing the owner's file stops sampling and frees it.
+//! [`ProfilerOwner`] is that rule; the kernel keeps it, and the sampling switch it sets, under
+//! one lock, so a closing owner cannot stop the sampling of the next.
 //!
 //! A sample is a run of native-endian machine words (`u64` on x86_64):
 //!
@@ -195,6 +197,95 @@ impl fmt::Display for ControlLine {
     }
 }
 
+/// Who owns the profiler, and what each write to or close of `ctl-profiling` does to
+/// sampling. The kernel holds it under one lock together with the sampling switch, and sets
+/// the switch to what [`ProfilerOwner::write`] and [`ProfilerOwner::close`] return before it
+/// lets go, so changes of owner and of sampling happen one at a time.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_trace::profile::{ControlWriteError, ProfilerOwner};
+///
+/// let mut owner = ProfilerOwner::new();
+/// assert_eq!(owner.write(1, b'x'), Ok(false)); // handle 1 takes the profiler
+/// assert_eq!(owner.write(1, b'1'), Ok(true)); // and starts sampling
+/// assert_eq!(owner.write(2, b'0'), Err(ControlWriteError::Busy));
+/// assert_eq!(owner.close(1), Some(false)); // its close stops sampling
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProfilerOwner {
+    owner: Option<usize>,
+}
+
+/// Why a write to `ctl-profiling` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlWriteError {
+    /// Another handle owns the profiler (`EBUSY`).
+    Busy,
+    /// Not `x`, `0` or `1` (`EINVAL`).
+    Invalid,
+}
+
+impl fmt::Display for ControlWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Busy => "another handle owns the profiler",
+            Self::Invalid => "a control write is x, 0 or 1",
+        })
+    }
+}
+
+impl core::error::Error for ControlWriteError {}
+
+impl ProfilerOwner {
+    /// Nobody owns the profiler.
+    pub const fn new() -> Self {
+        Self { owner: None }
+    }
+
+    /// The handle that owns the profiler, if one does.
+    pub const fn owner(&self) -> Option<usize> {
+        self.owner
+    }
+
+    /// A write of `byte` by handle `handle`, and whether sampling is on after it: `x` takes
+    /// the profiler (again, for its owner) and stops sampling, and `1` and `0` start and stop
+    /// it, for the owner or while nobody owns it.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlWriteError::Busy`] when another handle owns the profiler, and
+    /// [`ControlWriteError::Invalid`] for any other byte. Neither changes anything.
+    pub fn write(&mut self, handle: usize, byte: u8) -> Result<bool, ControlWriteError> {
+        let on = match byte {
+            b'x' | b'0' => false,
+            b'1' => true,
+            _ => return Err(ControlWriteError::Invalid),
+        };
+        if self.owner.is_some_and(|owner| owner != handle) {
+            return Err(ControlWriteError::Busy);
+        }
+        if byte == b'x' {
+            self.owner = Some(handle);
+        }
+        Ok(on)
+    }
+
+    /// Handle `handle` closed. Returns `Some(false)`, sampling off, when it owned the
+    /// profiler, which is then free, and `None`, sampling left as it is, otherwise: an old
+    /// owner closing after another handle took the profiler does not touch its sampling.
+    pub fn close(&mut self, handle: usize) -> Option<bool> {
+        if self.owner == Some(handle) {
+            self.owner = None;
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -294,5 +385,39 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_late_close_cannot_stop_the_next_owner() {
+        // Review 4320669936: A owns and samples, closes; B takes the profiler and starts. A
+        // close of A arriving late (or twice) must leave B sampling.
+        let mut owner = ProfilerOwner::new();
+        assert_eq!(owner.write(1, b'x'), Ok(false));
+        assert_eq!(owner.write(1, b'1'), Ok(true));
+        assert_eq!(owner.close(1), Some(false));
+        assert_eq!(owner.write(2, b'x'), Ok(false));
+        assert_eq!(owner.write(2, b'1'), Ok(true));
+        assert_eq!(owner.close(1), None);
+        assert_eq!(owner.owner(), Some(2));
+        // Handles that never owned it neither stop it nor take it.
+        assert_eq!(owner.close(3), None);
+        assert_eq!(owner.write(3, b'0'), Err(ControlWriteError::Busy));
+        assert_eq!(owner.write(3, b'x'), Err(ControlWriteError::Busy));
+        assert_eq!(owner.close(2), Some(false));
+        assert_eq!(owner.owner(), None);
+    }
+
+    #[test]
+    fn without_an_owner_writes_are_upstreams() {
+        let mut owner = ProfilerOwner::new();
+        assert_eq!(owner.write(7, b'1'), Ok(true));
+        assert_eq!(owner.write(8, b'0'), Ok(false));
+        assert_eq!(owner.write(8, b'2'), Err(ControlWriteError::Invalid));
+        assert_eq!(owner.owner(), None);
+        // Taking it twice is fine for the owner.
+        assert_eq!(owner.write(8, b'x'), Ok(false));
+        assert_eq!(owner.write(8, b'x'), Ok(false));
+        assert_eq!(owner.owner(), Some(8));
+        assert!(!ControlWriteError::Busy.to_string().is_empty());
     }
 }
