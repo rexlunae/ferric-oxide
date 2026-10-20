@@ -568,7 +568,9 @@ How a file system uses it:
 
 1. It opens `/scheme/kernel.pcache/queue` (root only) and binds the queue to
    its own scheme with `Bind`, passing its scheme socket as a `CallFlags::FD`
-   descriptor. The queue then serves only that scheme's descriptions.
+   descriptor. The queue then serves only that scheme's descriptions, and only
+   the process that bound it can use it or its objects: calls from any other
+   process, including a child that inherited the descriptors, get `EPERM`.
 2. It opens `object/<hex id>` from the queue for each file it caches (an empty
    object, `EEXIST` if the ID is in use), sets its size with `SetSize`, and
    attaches each client description it opens with `Attach`, naming the handle
@@ -583,9 +585,19 @@ How a file system uses it:
    object: the pages' bytes as the payload, zero past the end of the file,
    which the kernel copies into new frames. A failed answer carries a non-zero
    errno and an empty payload; the readers waiting for those pages get `EIO`,
-   and the next read fills them again.
-5. Closing a description detaches it. Closing an object or its queue ends the
-   cache of it: outstanding fills fail with `EIO`, and later reads of its
+   and the next read fills them again. A reader that was already waiting when
+   the fill failed gets `EIO` even if a newer read has queued a new fill
+   for the page by the time it wakes. Every record carries the
+   object's generation, which changes each time an object is opened, and its
+   answer must repeat it: an answer to a record of an earlier object with the
+   same ID gets `ESTALE`. A queue read that faults copying records out puts
+   them back and reports `EVENT_READ` again.
+5. Shrinking an object with `SetSize` drops the cached pages past the new end,
+   including the page the end now falls in, so a later read fills it again
+   with zeros past the end.
+6. Closing a description detaches it. Closing an object or its queue ends the
+   cache of it: outstanding fills fail with `EIO`, its records still on the
+   queue are dropped, and later reads of its
    descriptions go to the file system's scheme as before.
 
 Every call fits the three metadata words the kernel passes a kernel scheme.
@@ -595,7 +607,8 @@ holds the policies, host-tested:
 - `abi`: the scheme's paths, the `SYS_CALL` requests on queues and objects,
   and the fill-queue records. A record names 1 to `MAX_RECORD_PAGES` (1024)
   pages, which `RecordPages` enforces; longer runs are split. An answer is
-  `[verb, first page, count | errno << 32]` on the object the record named.
+  `[verb, first page, count | errno << 32 | generation << 48]` on the object
+  the record named.
 - `page`: the state of one cached page and the transitions fills, writes,
   writeback and truncation make.
 - `object` (with the `alloc` feature): one object's page index, which turns a
@@ -608,7 +621,9 @@ holds the policies, host-tested:
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
-miss, a hit with no scheme read, readahead, a failed fill and a closed queue,
+miss, a hit with no scheme read, readahead, a failed fill, records put back
+after a faulting queue read, the owner check, generations across a reopened
+object, and a closed queue,
 and prints the time of a cached 4 KiB `pread` next to the same read through
 the scheme.
 

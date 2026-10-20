@@ -92,7 +92,8 @@ fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Failure> {
 /// The file system scheme: it opens the file, attaching each description to the object, and
 /// serves reads that reach it (counted) from the same bytes.
 struct FileScheme {
-    object: usize,
+    /// The object's descriptor, which `pcache-generation` replaces.
+    object: Arc<AtomicUsize>,
     next: usize,
     reads: Arc<AtomicUsize>,
 }
@@ -119,7 +120,8 @@ impl SchemeSync for FileScheme {
             handle: number as u64,
         }
         .encode();
-        libredox::call::call_wo(self.object, &[], CallFlags::empty(), &words[..n])
+        let object = self.object.load(Ordering::Relaxed);
+        libredox::call::call_wo(object, &[], CallFlags::empty(), &words[..n])
             .map_err(|err| Error::new(err.errno()))?;
         // Positioned, so the kernel passes every read's offset.
         Ok(OpenResult::ThisScheme {
@@ -177,6 +179,8 @@ fn serve(socket: Socket, mut scheme: FileScheme) {
 struct Cache {
     queue: Option<Fd>,
     object: Fd,
+    /// The descriptor the scheme attaches to, kept equal to `object`'s.
+    scheme_object: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
     hit_ns: u128,
 }
@@ -227,7 +231,12 @@ impl Cache {
 
     /// Answers a fill record: with the pages' bytes, or failed with `EIO`.
     fn answer(&self, record: Record, ok: bool) -> Result<(), Failure> {
-        let Record::Fill { object, pages } = record else {
+        let Record::Fill {
+            object,
+            generation,
+            pages,
+        } = record
+        else {
             return Err(Failure::Check(format!("unexpected record {record:?}")));
         };
         check(object == OBJECT, || {
@@ -240,7 +249,12 @@ impl Cache {
             (Vec::new(), Outcome::Failed(eio))
         };
         progress(&format!("Filled {:?}", pages.pages()));
-        let (words, n) = Request::Filled { pages, outcome }.encode();
+        let (words, n) = Request::Filled {
+            pages,
+            outcome,
+            generation,
+        }
+        .encode();
         ctx(
             "Filled",
             self.object
@@ -515,6 +529,166 @@ fn eio(cache: &mut Cache) -> Result<(), Failure> {
     check_bytes(finished(&again)?, 40 * PAGE_SIZE, 64)
 }
 
+/// The page `pcache-restore` reads; no earlier step reads it.
+const RESTORE_PAGE: u64 = 60;
+/// The pages `pcache-generation` reads; no earlier step reads them.
+const GENERATION_PAGES: [u64; 2] = [50, 52];
+/// relibc's EFAULT, EPERM and ESTALE.
+const ERRNO_EFAULT: i32 = 14;
+const ERRNO_EPERM: i32 = 1;
+const ERRNO_ESTALE: i32 = 116;
+
+/// `pcache-restore`: a queue read that faults copying records out puts them back, so the
+/// fill is still there for the next read.
+fn restore(cache: &mut Cache) -> Result<(), Failure> {
+    let file = open_file()?;
+    let read = spawn_pread(file.raw(), RESTORE_PAGE * PAGE_SIZE, 64);
+    // Wait until the record is queued, without taking it: the reader is waiting by then.
+    thread::sleep(QUIET * 5);
+    let queue = cache.queue()?.raw();
+    // An address in user space with nothing mapped: the copy out faults.
+    // SAFETY: an anonymous private mapping of one page, unmapped again at once; nothing
+    // else uses the address.
+    let hole = unsafe {
+        let page = libc::mmap(
+            core::ptr::null_mut(),
+            PAGE_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        check(page != libc::MAP_FAILED, || "mmap failed".into())?;
+        libc::munmap(page, PAGE_SIZE as usize);
+        page
+    };
+    // SAFETY: the kernel checks the buffer; `hole` is not dereferenced here.
+    let n = unsafe { libc::read(queue as libc::c_int, hole, Record::BYTES) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    check(n < 0 && errno == Some(ERRNO_EFAULT), || {
+        format!("a queue read into an unmapped buffer returned {n} (errno {errno:?})")
+    })?;
+    let records = cache.records()?;
+    check(pages_of(&records).contains(&RESTORE_PAGE), || {
+        format!(
+            "the record a faulting read took was lost: the queue gave {:?}",
+            pages_of(&records)
+        )
+    })?;
+    cache.fill_all(&records)?;
+    check_bytes(finished(&read)?, RESTORE_PAGE * PAGE_SIZE, 64)
+}
+
+/// `pcache-owner`: the object's descriptor, inherited by a child process, is refused there,
+/// so another process cannot attach a client's description to pages it fills.
+fn owner(cache: &mut Cache) -> Result<(), Failure> {
+    let object = cache.object.raw();
+    let (words, n) = Request::Attach { handle: 4242 }.encode();
+    // SAFETY: the child makes one call and exits without returning to Rust code that would
+    // touch the parent's threads or locks.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let code = match libredox::call::call_wo(object, &[], CallFlags::empty(), &words[..n]) {
+            Err(err) if err.errno() == ERRNO_EPERM => 0,
+            Err(_) => 2,
+            Ok(_) => 1,
+        };
+        // SAFETY: ends the child at once.
+        unsafe { libc::_exit(code) };
+    }
+    check(child > 0, || "fork failed".into())?;
+    let mut status = 0;
+    // SAFETY: `status` is a valid place for the child's status.
+    let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+    check(waited == child && libc::WIFEXITED(status), || {
+        "the child did not exit".into()
+    })?;
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        1 => Err(Failure::Check(
+            "another process attached a description with the object's descriptor".into(),
+        )),
+        code => Err(Failure::Check(format!(
+            "another process's Attach failed with an error other than EPERM ({code})"
+        ))),
+    }
+}
+
+/// `pcache-generation`: closing an object drops its records still on the queue, and a
+/// record already taken cannot fill a new object with the same ID.
+fn generation(cache: &mut Cache) -> Result<(), Failure> {
+    let [taken, left] = GENERATION_PAGES;
+    let file = open_file()?;
+    let first = spawn_pread(file.raw(), taken * PAGE_SIZE, 64);
+    let old = cache.records()?;
+    check(pages_of(&old) == BTreeSet::from([taken]), || {
+        format!("a read of page {taken} filled {:?}", pages_of(&old))
+    })?;
+    // A second fill stays on the queue, not taken.
+    let second = spawn_pread(file.raw(), left * PAGE_SIZE, 64);
+    thread::sleep(QUIET * 5);
+    // A new object with the same ID replaces the old one, whose readers fail with EIO.
+    replace_object(cache)?;
+    for read in [&first, &second] {
+        let got = finished(read)?;
+        check(got == Err(ERRNO_EIO), || {
+            "a reader of a closed object did not get EIO".into()
+        })?;
+    }
+    // A description opened now reads the new object. The queue holds only its record: the
+    // closed object's fill of page `left` went with it.
+    let file = open_file()?;
+    let read = spawn_pread(file.raw(), taken * PAGE_SIZE, 64);
+    let new = cache.records()?;
+    check(pages_of(&new) == BTreeSet::from([taken]), || {
+        format!(
+            "after the object was replaced the queue gave {:?}",
+            pages_of(&new)
+        )
+    })?;
+    check(
+        new.iter()
+            .all(|record| record.generation() != old[0].generation()),
+        || "the new object has the old one's generation".into(),
+    )?;
+    // The old record's answer, on the new object, is refused.
+    match cache.answer(old[0], true) {
+        Err(Failure::Errno { errno, .. }) if errno == ERRNO_ESTALE => {}
+        Err(failure) => return Err(failure),
+        Ok(()) => {
+            return Err(Failure::Check(
+                "an answer to a closed object's record filled the new object".into(),
+            ));
+        }
+    }
+    cache.fill_all(&new)?;
+    check_bytes(finished(&read)?, taken * PAGE_SIZE, 64)
+}
+
+/// Closes the object and creates a new one with the same ID and size, which the scheme
+/// attaches its descriptions to from now on.
+fn replace_object(cache: &mut Cache) -> Result<(), Failure> {
+    // A placeholder that is never used or closed, so the old object closes before the new
+    // one opens (an ID in use cannot be opened again).
+    let old = std::mem::replace(&mut cache.object, Fd::new(usize::MAX));
+    drop(old);
+    let mut path = [0; ObjectId::PATH_MAX];
+    let object = ctx(
+        "create the replacement object",
+        cache
+            .queue()?
+            .openat(OBJECT.encode_path(&mut path), O_RDWR | O_CLOEXEC, 0),
+    )?;
+    let (words, n) = Request::SetSize { size: FILE_SIZE }.encode();
+    ctx(
+        "SetSize",
+        object.call_wo(&[], CallFlags::empty(), &words[..n]),
+    )?;
+    cache.scheme_object.store(object.raw(), Ordering::Relaxed);
+    std::mem::forget(std::mem::replace(&mut cache.object, object));
+    Ok(())
+}
+
 /// `pcache-close`, which also times reads through the scheme.
 fn close(cache: &mut Cache) -> Result<(), Failure> {
     let file = open_file()?;
@@ -580,6 +754,9 @@ pub fn main() -> ExitCode {
     }
 }
 
+/// A step on the test's own scheme.
+type CacheStep<'a> = dyn Fn(&mut Cache) -> Result<(), Failure> + 'a;
+
 fn run() -> Result<ExitCode, (&'static str, Failure)> {
     let socket = Socket::create().map_err(|err| {
         (
@@ -595,8 +772,9 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
         return Ok(ExitCode::SUCCESS);
     };
     let reads = Arc::new(AtomicUsize::new(0));
+    let scheme_object = Arc::new(AtomicUsize::new(object.raw()));
     let mut scheme = FileScheme {
-        object: object.raw(),
+        object: Arc::clone(&scheme_object),
         next: ROOT,
         reads: Arc::clone(&reads),
     };
@@ -617,16 +795,20 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
     let mut cache = Cache {
         queue: Some(queue),
         object,
+        scheme_object,
         reads,
         hit_ns: 0,
     };
     let file = open_file().map_err(|f| ("pcache-setup", f))?;
     progress("opened the file");
-    let steps: [(&'static str, &dyn Fn(&mut Cache) -> Result<(), Failure>); 5] = [
+    let steps: [(&'static str, &CacheStep<'_>); 8] = [
         ("pcache-miss", &|cache| miss(cache, &file)),
         ("pcache-hit", &|cache| hit(cache, &file)),
         ("pcache-readahead", &readahead),
         ("pcache-eio", &eio),
+        ("pcache-restore", &restore),
+        ("pcache-owner", &owner),
+        ("pcache-generation", &generation),
         ("pcache-close", &close),
     ];
     for (name, step) in steps {

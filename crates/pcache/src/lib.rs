@@ -34,7 +34,7 @@
 //! # Examples
 //!
 //! ```
-//! use ferric_pcache::abi::{ObjectId, PageRange, Record, RecordPages};
+//! use ferric_pcache::abi::{Generation, ObjectId, PageRange, Record, RecordPages};
 //! use ferric_pcache::page::{Event, PageState};
 //! use ferric_pcache::readahead::{Readahead, ReadaheadConfig};
 //!
@@ -46,7 +46,11 @@
 //!
 //! // The fill goes on the file system's queue as a record (at most 1024 pages each).
 //! let pages = RecordPages::new(wanted).expect("4 pages fit one record");
-//! let fill = Record::Fill { object: ObjectId::new(7), pages };
+//! let fill = Record::Fill {
+//!     object: ObjectId::new(7),
+//!     generation: Generation::new(1),
+//!     pages,
+//! };
 //! assert_eq!(Record::from_bytes(&fill.to_bytes()), Ok(fill));
 //!
 //! // Each page moves from absent to filling to up to date.

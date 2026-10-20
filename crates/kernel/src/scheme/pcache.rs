@@ -41,10 +41,16 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use ferric_pcache::{
-    abi::{ObjectId, Outcome, PathError, Record, RecordPages, Request, OBJECT_PREFIX, QUEUE_PATH},
+    abi::{
+        Generation, ObjectId, Outcome, PathError, Record, RecordPages, Request, OBJECT_PREFIX,
+        QUEUE_PATH,
+    },
     object::{Attempt, FillError, PageIndex, Read},
     readahead::{Readahead, ReadaheadConfig},
 };
@@ -52,7 +58,7 @@ use spin::Mutex;
 use syscall::{
     error::{
         Error, Result, EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EINTR, EINVAL, EIO, ENOENT, ENOMEM,
-        EOPNOTSUPP,
+        EOPNOTSUPP, EPERM, ESTALE,
     },
     flag::{CallFlags, EventFlags, EVENT_READ, O_NONBLOCK},
 };
@@ -62,7 +68,10 @@ use super::{
     StrOrBytes,
 };
 use crate::{
-    context::file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
+    context::{
+        self,
+        file::{InternalFlags, KernelSchemeRef, LockedFileDescription},
+    },
     event,
     memory::{RaiiFrame, PAGE_SIZE},
     sync::{CleanLockToken, WaitCondition, L1},
@@ -93,6 +102,24 @@ enum Handle {
 struct Bound {
     id: SchemeId,
     inner: Weak<UserInner>,
+    /// The process that bound the queue, the only one that may use it and its objects.
+    owner: Option<NonZeroUsize>,
+}
+
+/// The process the current context belongs to.
+fn current_process(token: &mut CleanLockToken) -> Option<NonZeroUsize> {
+    context::current().read(token.token()).owner_proc_id
+}
+
+/// Refuses a call on `queue`, or one of its objects, from a process other than the one that
+/// bound it: a descriptor passed on must not let another process attach or fill the file
+/// system's descriptions.
+fn check_owner(queue: &Queue, token: &mut CleanLockToken) -> Result<()> {
+    let caller = current_process(token);
+    match &queue.state.lock().bound {
+        Some(bound) if bound.owner != caller => Err(Error::new(EPERM)),
+        _ => Ok(()),
+    }
 }
 
 /// A file system's fill queue.
@@ -111,6 +138,8 @@ struct QueueState {
     bound: Option<Bound>,
     /// The queue's live objects by ID.
     objects: BTreeMap<ObjectId, Weak<Object>>,
+    /// The generation the next object opened gets.
+    next_generation: Generation,
     readahead: ReadaheadConfig,
 }
 
@@ -124,7 +153,8 @@ impl Queue {
             .is_some_and(|bound| Weak::as_ptr(&bound.inner) == Arc::as_ptr(inner))
     }
 
-    /// Puts fill records for `object` on the queue and wakes the file system.
+    /// Puts fill records for `object` (of `generation`) on the queue and wakes the file
+    /// system.
     ///
     /// # Errors
     ///
@@ -132,6 +162,7 @@ impl Queue {
     fn push(
         &self,
         object: ObjectId,
+        generation: Generation,
         fills: &[RecordPages],
         token: &mut CleanLockToken,
     ) -> Result<()> {
@@ -146,8 +177,18 @@ impl Queue {
                 .map_err(|_| Error::new(ENOMEM))?;
             state
                 .records
-                .extend(fills.iter().map(|&pages| Record::Fill { object, pages }));
+                .extend(fills.iter().map(|&pages| Record::Fill {
+                    object,
+                    generation,
+                    pages,
+                }));
         }
+        self.wake(token);
+        Ok(())
+    }
+
+    /// Wakes readers of the queue and signals `EVENT_READ`: records are there.
+    fn wake(&self, token: &mut CleanLockToken) {
         self.records_ready.notify(token);
         event::trigger(
             GlobalSchemes::Pcache.scheme_id(),
@@ -155,13 +196,14 @@ impl Queue {
             EVENT_READ,
             token,
         );
-        Ok(())
     }
 }
 
 /// A cache object.
 struct Object {
     id: ObjectId,
+    /// Which object of that ID on the queue this is; records and answers carry it.
+    generation: Generation,
     queue: Arc<Queue>,
     state: Mutex<ObjectState>,
     /// Notified when fills are answered or the object goes.
@@ -271,24 +313,23 @@ fn read(
         if state.gone {
             return match attempt {
                 Attempt::First => None,
-                Attempt::Retry => Some(Err(Error::new(EIO))),
+                Attempt::Retry(_) => Some(Err(Error::new(EIO))),
             };
         }
         // The size may have changed while the reader waited.
         let Some((pages, len)) = state.index.pages_for_read(offset, buf.len()) else {
             return Some(Ok(0));
         };
-        let read = state.index.start_read(pages, attempt);
+        let first = attempt == Attempt::First;
+        // This turns `attempt` into a retry for the next round.
+        let read = state.index.start_read(pages, &mut attempt);
         let mut fills = match &read {
             Read::Wait { fills } => fills.clone(),
             Read::Ready | Read::Failed => Vec::new(),
         };
-        if attempt == Attempt::First
-            && let Some(ahead) = ahead
-        {
+        if first && let Some(ahead) = ahead {
             fills.extend(state.index.prefetch(ahead));
         }
-        attempt = Attempt::Retry;
         match read {
             Read::Failed => return Some(Err(Error::new(EIO))),
             Read::Ready => {
@@ -324,7 +365,10 @@ fn queue_fills(object: &Object, fills: &[RecordPages], token: &mut CleanLockToke
     if fills.is_empty() {
         return Ok(());
     }
-    let Err(err) = object.queue.push(object.id, fills, token) else {
+    let Err(err) = object
+        .queue
+        .push(object.id, object.generation, fills, token)
+    else {
         return Ok(());
     };
     {
@@ -380,6 +424,7 @@ fn open_queue(caller: &CallerCtx) -> Result<Handle> {
             closed: false,
             bound: None,
             objects: BTreeMap::new(),
+            next_generation: Generation::default(),
             readahead: ReadaheadConfig::DEFAULT,
         }),
         records_ready: WaitCondition::new(),
@@ -400,8 +445,11 @@ fn open_object(queue: &Arc<Queue>, path: &[u8]) -> Result<Handle> {
     {
         return Err(Error::new(EEXIST));
     }
+    let generation = state.next_generation;
+    state.next_generation = generation.next();
     let object = Arc::new(Object {
         id,
+        generation,
         queue: Arc::clone(queue),
         state: Mutex::new(ObjectState {
             index: PageIndex::new(),
@@ -433,7 +481,9 @@ fn end_object(object: &Arc<Object>, token: &mut CleanLockToken) {
         .retain(|_, attachment| !Arc::ptr_eq(&attachment.object, object));
 }
 
-/// Closes `object`'s handle.
+/// Closes `object`'s handle. Its records still on the queue go with it, so a later object
+/// with the same ID never sees them; one the file system already took is refused by its
+/// generation.
 fn close_object(object: &Arc<Object>, token: &mut CleanLockToken) {
     {
         let mut queue = object.queue.state.lock();
@@ -444,6 +494,9 @@ fn close_object(object: &Arc<Object>, token: &mut CleanLockToken) {
         {
             queue.objects.remove(&object.id);
         }
+        queue.records.retain(|record| {
+            record.object() != object.id || record.generation() != object.generation
+        });
     }
     end_object(object, token);
 }
@@ -482,6 +535,7 @@ fn bind(
     let inner = SchemeList
         .get_user_inner(number, token)
         .ok_or(Error::new(EINVAL))?;
+    let owner = current_process(token);
     let mut state = queue.state.lock();
     if state.bound.is_some() {
         return Err(Error::new(EBUSY));
@@ -489,6 +543,7 @@ fn bind(
     state.bound = Some(Bound {
         id: inner.scheme_id,
         inner: Arc::downgrade(&inner),
+        owner,
     });
     Ok(0)
 }
@@ -613,7 +668,7 @@ fn read_records(
             let n = max.min(state.records.len());
             let records: Vec<Record> = state.records.drain(..n).collect();
             drop(state);
-            return copy_records(queue, &records, buf);
+            return copy_records(queue, &records, buf, token);
         }
         if state.closed {
             return Ok(0);
@@ -632,8 +687,14 @@ fn read_records(
 }
 
 /// Copies `records` to `buf`; if that fails, they go back to the front of the queue, so no
-/// fill is lost.
-fn copy_records(queue: &Queue, records: &[Record], buf: UserSliceWo) -> Result<usize> {
+/// fill is lost, and the queue signals that it has records again (another reader may have
+/// found it empty meanwhile and be waiting, or waiting for an event).
+fn copy_records(
+    queue: &Queue,
+    records: &[Record],
+    buf: UserSliceWo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
     // `read_records` takes no more records than whole chunks of `buf` hold.
     let mut copied = Ok(());
     for (record, dst) in records.iter().zip(buf.in_exact_chunks(Record::BYTES)) {
@@ -648,10 +709,13 @@ fn copy_records(queue: &Queue, records: &[Record], buf: UserSliceWo) -> Result<u
             .checked_mul(Record::BYTES)
             .ok_or(Error::new(EINVAL)),
         Err(err) => {
-            let mut state = queue.state.lock();
-            for &record in records.iter().rev() {
-                state.records.push_front(record);
+            {
+                let mut state = queue.state.lock();
+                for &record in records.iter().rev() {
+                    state.records.push_front(record);
+                }
             }
+            queue.wake(token);
             Err(err)
         }
     }
@@ -669,7 +733,7 @@ impl KernelScheme for PcacheScheme {
         _flags: usize,
         _fcntl_flags: u32,
         caller: CallerCtx,
-        _token: &mut CleanLockToken,
+        token: &mut CleanLockToken,
     ) -> Result<OpenResult> {
         let path = path.as_bytes();
         let path = path.strip_prefix(b"/").unwrap_or(path);
@@ -682,6 +746,7 @@ impl KernelScheme for PcacheScheme {
             Handle::Root if path.is_empty() => Handle::Root,
             Handle::Root if path == QUEUE_PATH.as_bytes() => open_queue(&caller)?,
             Handle::Queue(queue) if path.starts_with(OBJECT_PREFIX.as_bytes()) => {
+                check_owner(&queue, token)?;
                 open_object(&queue, path)?
             }
             _ => return Err(Error::new(ENOENT)),
@@ -716,14 +781,31 @@ impl KernelScheme for PcacheScheme {
         let &[fd] = fds else {
             return Err(Error::new(EINVAL));
         };
-        match (request, handle(fd)?) {
+        let target = handle(fd)?;
+        match &target {
+            Handle::Queue(queue) => check_owner(queue, token)?,
+            Handle::Object(object) => check_owner(&object.queue, token)?,
+            Handle::Root => {}
+        }
+        match (request, target) {
             (Request::SetSize { size }, Handle::Object(object)) => {
                 object.state.lock().index.set_size(size);
                 Ok(0)
             }
             (Request::Attach { handle }, Handle::Object(object)) => attach(&object, handle),
             (Request::Detach { handle }, Handle::Object(object)) => detach(&object, handle),
-            (Request::Filled { pages, outcome }, Handle::Object(object)) => {
+            (
+                Request::Filled {
+                    pages,
+                    outcome,
+                    generation,
+                },
+                Handle::Object(object),
+            ) => {
+                // An answer to a record of an earlier object with this ID.
+                if generation != object.generation {
+                    return Err(Error::new(ESTALE));
+                }
                 filled(&object, pages, outcome, payload, token)
             }
             // Writeback comes with writes, a later step.
@@ -770,6 +852,7 @@ impl KernelScheme for PcacheScheme {
         let Handle::Queue(queue) = handle(id)? else {
             return Err(Error::new(EBADF));
         };
+        check_owner(&queue, token)?;
         read_records(&queue, buf, flags & O_NONBLOCK as u32 != 0, token)
     }
 
