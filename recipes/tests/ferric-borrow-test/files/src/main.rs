@@ -31,6 +31,10 @@
 //!   range sits next to a newer one;
 //! - `shared-read`: a store through a live shared mapping is what `pread` of the file returns.
 //!
+//! After the checks it times `pwrite` of whole pages to a file with no mapping and to one whose
+//! pages all have a live shared mapping, which RedoxFS writes through to (review 4320761496),
+//! and prints one `FERRIC_BENCH borrow-pwrite ...` line with the mean time of each.
+//!
 //! Prints one `FERRIC_TEST_PASS borrow ...` or `FERRIC_TEST_FAIL borrow ...` line and exits
 //! non-zero on failure. It also runs on Linux, which helps check the test itself.
 
@@ -42,7 +46,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
+use std::time::Instant;
 
 const PAGE_SIZE: usize = 4096;
 /// The file mapped shared.
@@ -63,6 +69,14 @@ const SHARED_PATH: &str = "/tmp/ferric-borrow-test.shared";
 const LIVE_PATH: &str = "/tmp/ferric-borrow-test.live";
 /// The file `sync-unmapped` stores to through a shared mapping, unmaps, writes and syncs.
 const SYNC_PATH: &str = "/tmp/ferric-borrow-test.sync";
+/// The file the `pwrite` benchmark writes.
+const BENCH_PATH: &str = "/tmp/ferric-borrow-test.bench";
+/// The benchmark file's pages, each written in turn.
+const BENCH_PAGES: usize = 64;
+/// The writes timed in each round.
+const BENCH_WRITES: usize = 2048;
+/// Rounds of each case; the fastest is reported, which keeps out one-off stalls.
+const BENCH_ROUNDS: usize = 3;
 
 /// The few libc calls the test needs, with the constants of the platform.
 mod sys {
@@ -514,6 +528,50 @@ fn live_checks(file: &File, first: usize, old: u8, written: u8) -> Result<(), Er
     expect_byte("remap-live (pread)", written, found)
 }
 
+/// The fastest of [`BENCH_ROUNDS`] rounds of [`BENCH_WRITES`] page writes to `file`, cycling
+/// over its [`BENCH_PAGES`] pages, as the mean nanoseconds a write.
+fn time_pwrites(file: &File) -> Result<u128, Error> {
+    let page = [0xC3u8; PAGE_SIZE];
+    let mut best = u128::MAX;
+    for _ in 0..BENCH_ROUNDS {
+        let start = Instant::now();
+        for n in 0..BENCH_WRITES {
+            let offset = ((n % BENCH_PAGES) * PAGE_SIZE) as u64;
+            FileExt::write_all_at(file, &page, offset).map_err(file_error(BENCH_PATH))?;
+        }
+        best = best.min(start.elapsed().as_nanos() / BENCH_WRITES as u128);
+    }
+    Ok(best)
+}
+
+/// The `pwrite` benchmark: page writes to the file unmapped, then with every page mapped
+/// shared, so each write is also copied into the live mapping.
+fn bench_pwrite() -> Result<(), Error> {
+    let len = BENCH_PAGES * PAGE_SIZE;
+    fs::write(BENCH_PATH, vec![0u8; len]).map_err(file_error(BENCH_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(BENCH_PATH)
+        .map_err(file_error(BENCH_PATH))?;
+    let unmapped = time_pwrites(&file)?;
+    let base = map(0, len, sys::MAP_SHARED, file.as_raw_fd(), "the bench file")?;
+    let mapped = time_pwrites(&file);
+    // SAFETY: the mapping is this test's own.
+    let unmapped_ok = unsafe { sys::munmap(base as *mut c_void, len) } == 0;
+    let mapped = mapped?;
+    if !unmapped_ok {
+        return Err(Error::Mmap("the bench file (munmap)"));
+    }
+    println!(
+        "FERRIC_BENCH borrow-pwrite page_bytes={PAGE_SIZE} writes={BENCH_WRITES} \
+         unmapped_ns={unmapped} mapped_ns={mapped} mapped_vs_unmapped={:.2}",
+        mapped as f64 / unmapped.max(1) as f64
+    );
+    drop(file);
+    fs::remove_file(BENCH_PATH).map_err(file_error(BENCH_PATH))
+}
+
 fn main() -> ExitCode {
     match run()
         .and_then(|()| check_remap())
@@ -521,6 +579,7 @@ fn main() -> ExitCode {
         .and_then(|()| check_shared_read())
         .and_then(|()| check_sync_unmapped())
         .and_then(|()| check_remap_live())
+        .and_then(|()| bench_pwrite())
     {
         Ok(()) => {
             println!(
