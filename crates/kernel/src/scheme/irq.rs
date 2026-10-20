@@ -141,7 +141,7 @@ fn delivers_to(handle_cpu: LogicalCpuId, cpu: LogicalCpuId) -> bool {
 /// architectures), which belong to the BSP's `irq:N` handles wherever they are taken. A vector
 /// reserved on a CPU goes through [`vector_trigger`].
 pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
-    deliver(irq, LogicalCpuId::BSP, token);
+    deliver(irq, LogicalCpuId::BSP, Source::Line, token);
 }
 
 /// Ferric Oxide: adds an interrupt that arrived through a vector reserved on the running CPU
@@ -150,11 +150,23 @@ pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
 /// handle for the number.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn vector_trigger(irq: u8, token: &mut CleanLockToken) {
-    deliver(irq, crate::cpu_id(), token);
+    deliver(irq, crate::cpu_id(), Source::Vector, token);
+}
+
+/// Ferric Oxide: how an interrupt reached [`deliver`], for `irq.deliver`
+/// (`ferric_trace::kernel::IrqSource`).
+#[derive(Clone, Copy)]
+enum Source {
+    /// [`irq_trigger`]: a PIC or I/O APIC line.
+    Line,
+    /// `vector_trigger`: a vector reserved on the running CPU (MSI, MSI-X).
+    #[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), allow(dead_code))]
+    Vector,
 }
 
 /// Counts an interrupt of `irq` for `owner` and wakes the handles that get it.
-fn deliver(irq: u8, owner: LogicalCpuId, token: &mut CleanLockToken) {
+fn deliver(irq: u8, owner: LogicalCpuId, source: Source, token: &mut CleanLockToken) {
+    let _ = source;
     let cpu = count_interrupt(irq, owner);
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
@@ -168,6 +180,20 @@ fn deliver(irq: u8, owner: LogicalCpuId, token: &mut CleanLockToken) {
             .collect()
     };
 
+    // Ferric Oxide (`kernel.trace_irq`): recorded before the handles wake, so a driver's
+    // acknowledgement always comes after it.
+    trace_event!(
+        ferric_trace::kernel::IRQ_DELIVER,
+        irq,
+        cpu.get(),
+        match source {
+            Source::Line => ferric_trace::kernel::IrqSource::Line,
+            Source::Vector => ferric_trace::kernel::IrqSource::Vector,
+        }
+        .raw(),
+        interrupt_count(cpu, irq),
+        fds.len(),
+    );
     for fd in fds {
         event::trigger(GlobalSchemes::Irq.scheme_id(), fd, EVENT_READ, token);
     }
@@ -869,6 +895,12 @@ impl crate::scheme::KernelScheme for IrqScheme {
                     return Ok(0);
                 }
                 handle_ack.store(ack, Ordering::SeqCst);
+                trace_event!(
+                    ferric_trace::kernel::IRQ_ACK,
+                    handle_irq,
+                    handle_cpu.get(),
+                    ack
+                );
                 // Ferric Oxide: only a legacy line has a PIC or I/O APIC pin to unmask. A number
                 // below 16 reserved on an AP is an ordinary vector there, and acknowledging it
                 // must not unmask the BSP's line of the same number.

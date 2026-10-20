@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::{cmp, io};
 
 use libredox::flag::O_NONBLOCK;
@@ -9,6 +10,14 @@ use scheme_utils::{
 };
 use syscall::schemev2::NewFdFlags;
 use syscall::{Error, EventFlags, Result, Stat, EACCES, EAGAIN, EINVAL, EWOULDBLOCK, MODE_FILE};
+
+// Ferric Oxide: kernel-bypass queue sockets in copy mode (drivers.net_bypass), or a stand-in
+// that does nothing.
+#[cfg(feature = "bypass")]
+mod bypass;
+#[cfg(not(feature = "bypass"))]
+#[path = "bypass_off.rs"]
+mod bypass;
 
 pub trait NetworkAdapter {
     /// The [MAC address](https://en.wikipedia.org/wiki/MAC_address) of this
@@ -31,7 +40,7 @@ pub trait NetworkAdapter {
 
 pub struct NetworkScheme<T: NetworkAdapter> {
     scheme: NetworkSchemeImpl<T>,
-    handler: ReadinessBased<Box<Socket>>,
+    handler: ReadinessBased<Rc<Socket>>,
 }
 
 fn post_fevent(socket: &Socket, id: usize, flags: usize) -> Result<()> {
@@ -50,11 +59,11 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         scheme_name: String,
     ) -> Self {
         assert!(scheme_name.starts_with("network"));
-        let socket = Socket::nonblock().expect("failed to create network scheme");
+        let socket = Rc::new(Socket::nonblock().expect("failed to create network scheme"));
         let adapter = adapter_fn();
         let mut scheme = NetworkSchemeImpl::new(
             scheme_name.clone(),
-            NetworkSchemeData::new(adapter),
+            NetworkSchemeData::new(adapter, Rc::clone(&socket)),
             NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
         );
         redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme)
@@ -62,7 +71,7 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         daemon.ready();
         Self {
             scheme,
-            handler: ReadinessBased::new(Box::new(socket), 16),
+            handler: ReadinessBased::new(socket, 16),
         }
     }
 
@@ -87,6 +96,16 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
     // to call when an irq is received to indicate that blocked requests can
     // be processed.
     pub fn tick(&mut self) -> io::Result<()> {
+        // Ferric Oxide: give frames to bound queue sockets before netstack reads any.
+        let (handles, data) = self.scheme.handles_mut_and_scheme_data();
+        for handle_id in bypass::steer(handles, data) {
+            post_fevent(
+                self.handler.socket(),
+                handle_id,
+                syscall::flag::EVENT_READ.bits(),
+            )?;
+        }
+
         self.handler
             .read_and_process_requests(&mut self.scheme)
             .expect("driver-network: failed to read from socket");
@@ -98,7 +117,8 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
             .expect("driver-network: failed to write to socket");
 
         // Notify readers about incoming events
-        let available_for_read = self.scheme.scheme_data_mut().adapter.available_for_read();
+        let data = self.scheme.scheme_data_mut();
+        let available_for_read = data.adapter.available_for_read() + data.bypass.pending();
         if available_for_read > 0 {
             for &handle_id in self.scheme.handle_ids() {
                 post_fevent(
@@ -122,16 +142,21 @@ resource_scheme! {
         SchemeRoot(SchemeRoot<T>),
         Data(Data<T>),
         Mac(Mac<T>),
+        Queue(bypass::Queue<T>),
     }
 }
 
 struct NetworkSchemeData<T: NetworkAdapter> {
     adapter: T,
+    bypass: bypass::State,
 }
 
 impl<T: NetworkAdapter> NetworkSchemeData<T> {
-    pub fn new(adapter: T) -> Self {
-        Self { adapter }
+    pub fn new(adapter: T, socket: Rc<Socket>) -> Self {
+        Self {
+            adapter,
+            bypass: bypass::State::new(socket),
+        }
     }
 }
 
@@ -168,6 +193,10 @@ impl<T: NetworkAdapter> ResourceSync for SchemeRoot<T> {
                 NetworkResource::Mac(Mac(PhantomData)),
                 NewFdFlags::POSITIONED,
             ),
+            path if bypass::is_queue_path(path) => match bypass::Queue::new() {
+                Some(queue) => (NetworkResource::Queue(queue), NewFdFlags::empty()),
+                None => return Err(Error::new(EINVAL)),
+            },
             _ => return Err(Error::new(EINVAL)),
         };
 
@@ -198,7 +227,17 @@ impl<T: NetworkAdapter> ResourceSync for Data<T> {
         _offset: u64,
         fcntl_flags: u32,
     ) -> Result<usize> {
-        match scheme_data.adapter.read_packet(buf)? {
+        // Ferric Oxide: frames steering kept for netstack come first, in order, and while
+        // queue sockets are bound they are all netstack gets.
+        if let Some(count) = scheme_data.bypass.take_pending(buf) {
+            return Ok(count);
+        }
+        let packet = if scheme_data.bypass.steering() {
+            None
+        } else {
+            scheme_data.adapter.read_packet(buf)?
+        };
+        match packet {
             Some(count) => Ok(count),
             None => {
                 if fcntl_flags & O_NONBLOCK as u32 != 0 {

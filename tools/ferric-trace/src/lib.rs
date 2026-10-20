@@ -14,10 +14,14 @@
 //! - [`profile`] records a profile from the kernel's sampling profiler (`kernel.profiling`) on
 //!   the target (the `ferric-trace profile` command) and loads it back on the host.
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
+//! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
+//!   sources, IOMMU fault reports) into words, for both views.
 //! - [`perfetto`] converts a capture to the Chrome trace event JSON format, which the Perfetto
 //!   UI (<https://ui.perfetto.dev>) and `chrome://tracing` open. The format is described in
 //!   Google's "Trace Event Format" document; Perfetto's JSON importer accepts the subset used
 //!   here.
+//! - [`spans`] pairs a capture's records into system call and scheme request spans on the
+//!   contexts that made them, and [`otlp`] exports those as OpenTelemetry (OTLP/JSON) traces.
 //!
 //! # Examples
 //!
@@ -43,7 +47,10 @@
 
 pub mod capture;
 pub mod crash;
+pub mod describe;
 pub mod drain;
+pub mod otlp;
 pub mod perfetto;
 pub mod profile;
+pub mod spans;
 pub mod text;
