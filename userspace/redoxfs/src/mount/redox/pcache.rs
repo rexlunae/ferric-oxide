@@ -118,7 +118,7 @@ impl PageCache {
         let own = Fd::new(own);
         queue.bind(socket.inner().raw())?;
         let queue = Arc::new(queue);
-        client::spawn_pump(Arc::clone(&queue), move |records| {
+        let pump = client::spawn_pump(Arc::clone(&queue), move |records| {
             // A failed forward leaves those readers to the queue's close; it means the
             // scheme's own socket is gone, so RedoxFS is exiting.
             if let Err(err) = own.call_wo(records, CallFlags::empty(), &[FORWARDED_RECORDS]) {
@@ -126,6 +126,17 @@ impl PageCache {
             }
             Ok(())
         })?;
+        // A pump that stops leaves cached reads waiting, so say why where it can be seen.
+        let watched = std::thread::Builder::new()
+            .name("pcache-watch".into())
+            .spawn(move || match pump.join() {
+                Ok(Ok(())) => log::info!("page cache: the queue closed"),
+                Ok(Err(err)) => log::error!("page cache: the pump stopped: {}", Chain(&err)),
+                Err(_) => log::error!("page cache: the pump panicked"),
+            });
+        if let Err(err) = watched {
+            log::warn!("page cache: cannot watch the pump: {err}");
+        }
         log::info!("page cache on: reads of read-only files are served by the kernel");
         Ok(Some(Self {
             queue,
