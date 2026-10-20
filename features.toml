@@ -528,6 +528,31 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
+id = "drivers.net_bypass"
+menu = "drivers"
+type = "bool"
+title = "Kernel-bypass network queues (copy mode)"
+default = false
+depends = "kernel.regbuf"
+rebuild = ["base"]
+help = """
+Let root applications open a queue socket on a network driver
+(/scheme/network.<nic>/queue, Phase 2.5) and exchange Ethernet frames with it
+through four shared-memory rings over a UMEM of their own, in registered-buffer
+grants (ferric-netq). This is copy mode: the driver matches each received frame
+against the sockets' steering filters before netstack sees it, copies a match
+into the application's frame and publishes it on the RX ring, and sends the
+application's TX frames by copying them out of the UMEM. Frames no filter
+matches go to netstack as before. Zero-copy mode, port ownership for
+unprivileged sockets and TX validation come later. Builds e1000d with its
+bypass Cargo feature. Needs Kernel > Registered buffers. Off by default;
+without it the network schemes have no queue path, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BASE_FEATURES = "e1000d/bypass" }
+
+[[option]]
 id = "kernel.self_modifying"
 menu = "kernel"
 type = "bool"
@@ -695,6 +720,52 @@ another can be followed (an application's read through RedoxFS to the disk
 driver)."""
 
 [[option]]
+id = "kernel.trace_mm"
+menu = "kernel.tracing"
+type = "bool"
+title = "Page fault tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_mm"
+rebuild = ["kernel"]
+help = """Compile in mm.page_fault, one record per page fault the kernel handles: the
+faulting address, the instruction pointer, the kind of access (read, write or
+fetch; user or kernel; page present or not) and the outcome (mapped, a failed
+copy to or from user memory, or unhandled). Faults the kernel takes on purpose
+to probe memory are not recorded."""
+
+[[option]]
+id = "kernel.trace_irq"
+menu = "kernel.tracing"
+type = "bool"
+title = "Interrupt tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_irq"
+rebuild = ["kernel"]
+help = """Compile in irq.deliver and irq.ack for interrupts handed to user-space
+drivers. irq.deliver is recorded when the kernel counts an interrupt for the
+irq: handles and wakes them, with the IRQ, the CPU, whether it came on a PIC or
+I/O APIC line or on a vector reserved on the CPU (MSI and MSI-X), and the
+count. irq.ack is recorded when a driver acknowledges that count, so the two
+bound how long a driver took to handle the interrupt."""
+
+[[option]]
+id = "kernel.trace_iommu"
+menu = "kernel.tracing"
+type = "bool"
+title = "IOMMU fault tracepoints"
+default = true
+depends = "kernel.trace"
+kernel_feature = "trace_iommu"
+rebuild = ["kernel"]
+help = """Compile in iommu.fault, recorded for each fault an IOMMU reports (a DMA or
+interrupt request it blocked, or an error of its own) along with the kernel's
+log line. The record keeps the hardware's report as it is (a VT-d fault record
+or an AMD-Vi event log entry), and ferric-trace decodes it. These are
+error-level events, so any kernel.trace_max_level compiles them in."""
+
+[[option]]
 id = "kernel.trace_max_level"
 menu = "kernel.tracing"
 type = "choice"
@@ -704,8 +775,9 @@ depends = "kernel.trace"
 rebuild = ["kernel"]
 help = """
 Tracepoints above this level are left out of the build entirely, as with the
-tracing crate's max_level features. System calls and context switches are
-"info"; finer events of later subsystems use "debug" and "trace"."""
+tracing crate's max_level features. System calls, context switches, scheme
+requests, page faults and interrupts are "info", and IOMMU faults "error";
+finer events of later subsystems use "debug" and "trace"."""
 choices = ["error", "warn", "info", "debug", "trace"]
 
 [[option.effect]]
@@ -832,6 +904,21 @@ default = false
 kernel_feature = "sys_fdstat"
 rebuild = ["kernel"]
 help = "Expose per-process file descriptor statistics through the sys: scheme."
+
+[[option]]
+id = "kernel.sys_proc"
+menu = "kernel"
+type = "bool"
+title = "Per-process introspection in sys:"
+default = false
+kernel_feature = "sys_proc"
+rebuild = ["kernel"]
+help = """
+Serve /scheme/sys/proc: for every context, its process and user ids, state,
+CPU and CPU time, its memory, each open file descriptor (the scheme it is open
+on and the handle) and each grant of its address space (address, size, where
+the memory comes from, protection). Only root may read it, since it shows
+addresses. The format is the ferric-procinfo crate's."""
 
 [[option]]
 id = "kernel.busy_panic"

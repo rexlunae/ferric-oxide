@@ -66,9 +66,13 @@
 //!
 //! For each DMA fault it expects, it prints `FERRIC_IOMMU_EXPECT_FAULT <read|write> <address>`,
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
-//! checks the kernel logged exactly those faults, from this device. When the program exits the
-//! domain closes and the kernel blocks the device, and pcid frees its interrupt remapping
-//! entries.
+//! checks the kernel logged exactly those faults, from this device. With kernel tracing
+//! (`kernel.trace_iommu`) it also turns the `iommu.fault` event on and checks the kernel
+//! recorded those faults ([`trace`], `iommu-trace`). With `kernel.trace_irq` it turns the
+//! `irq` events on around `iommu-msi`'s interrupt, which it acknowledges itself, and checks
+//! the kernel recorded its delivery and the acknowledgement (`trace-irq`). When the program
+//! exits the domain closes and the kernel blocks the device, and pcid frees its interrupt
+//! remapping entries.
 //!
 //! Each test prints `FERRIC_TEST_PASS <name>`, `FERRIC_TEST_FAIL <name>`, or
 //! `FERRIC_TEST_SKIP <name>` when pcid has no domain to give (no IOMMU, or a kernel built with
@@ -90,6 +94,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "redox")]
 mod grant;
+mod trace;
 
 /// Without Redox there is no kernel to map grants into.
 #[cfg(not(target_os = "redox"))]
@@ -874,9 +879,12 @@ fn msi_delivered(setup: &mut Setup) -> Result<Msi, Failure> {
         .ok_or(Failure::NoMsiMessage(vector.vector))?;
     setup.channel.set_msi(message)?;
     setup.channel.enable_msi()?;
+    // The IRQ number of the vector: `irq:cpu-XX/N` names vector N + 32.
+    trace::watch_interrupt(vector.cpu, vector.vector - 32);
     setup.edu.raise_interrupt();
     let count = vector.wait(IRQ_WAIT);
     setup.edu.ack_interrupt();
+    trace::interrupt_handled(count.as_ref().is_ok_and(|&count| count != 0));
     if count? == 0 {
         return Err(Failure::NoInterrupt(vector.vector));
     }
@@ -903,7 +911,7 @@ fn msi_detail(msi: &Msi) -> String {
 /// checks the unit blocks the interrupt; then restores pcid's message.
 fn forged_msi_blocked(setup: &mut Setup, msi: &mut Msi) -> Result<(), Failure> {
     setup.channel.set_msi((MSI_ENTRY_0, 0))?;
-    println!("FERRIC_IOMMU_EXPECT_IRQ_FAULT {}", entry_of(MSI_ENTRY_0));
+    trace::expect_irq_fault(u16::try_from(entry_of(MSI_ENTRY_0)).unwrap_or(u16::MAX));
     setup.edu.raise_interrupt();
     let count = msi.vector.wait(IRQ_BLOCKED_WAIT);
     setup.edu.ack_interrupt();
@@ -1335,7 +1343,7 @@ fn dma_round_trip(setup: &mut Setup, iova: usize) -> Result<(), Failure> {
 /// never maps), which the domain does not map.
 fn dma_to_ungranted(setup: &mut Setup) -> Result<(), Failure> {
     let target = setup.victim_phys.unwrap_or(UNMAPPED_IOVA);
-    println!("FERRIC_IOMMU_EXPECT_FAULT write {target:#x}");
+    trace::expect_dma_fault(true, target as u64);
     setup.edu.dma(target as u64, true)?;
     check("the victim page", setup.victim.view(), |_| CANARY)
 }
@@ -1353,7 +1361,7 @@ fn dma_after_write_removed(setup: &mut Setup) -> Result<(), Failure> {
     )?;
     setup.victim.bytes().fill(CANARY);
     setup.victim.make_read_only()?;
-    println!("FERRIC_IOMMU_EXPECT_FAULT write {iova:#x}");
+    trace::expect_dma_fault(true, iova as u64);
     setup.edu.dma(iova as u64, true)?;
     check("the read-only victim", setup.victim.view(), |_| CANARY)
 }
@@ -1407,7 +1415,7 @@ fn forked_child_unbound(setup: &Setup) -> Result<&'static str, Failure> {
 fn dma_after_release(setup: Setup, iova: usize) -> Result<(), Failure> {
     let Setup { buffer, edu, .. } = setup;
     buffer.unmap()?;
-    println!("FERRIC_IOMMU_EXPECT_FAULT read {:#x}", iova + PAGE);
+    trace::expect_dma_fault(false, (iova + PAGE) as u64);
     edu.dma((iova + PAGE) as u64, false)
 }
 
@@ -1518,6 +1526,19 @@ fn report_msi(msi: MsiOutcome) -> bool {
     delivered && forged && percpu && steer
 }
 
+/// Prints the result of the tracing step `name`; returns whether it did not fail.
+fn report_trace(name: &str, step: trace::Step) -> bool {
+    match step {
+        trace::Step::Pass(detail) => println!("FERRIC_TEST_PASS {name}: {detail}"),
+        trace::Step::Skip(why) => println!("FERRIC_TEST_SKIP {name}: {why}"),
+        trace::Step::Fail(err) => {
+            println!("FERRIC_TEST_FAIL {name}: {err}");
+            return false;
+        }
+    }
+    true
+}
+
 fn main() -> ExitCode {
     let fds = env_fd("PCID_CLIENT_CHANNEL").and_then(|c| Ok((c, env_fd("INIT_NOTIFY")?)));
     let (channel_fd, notify_fd) = match fds {
@@ -1533,13 +1554,33 @@ fn main() -> ExitCode {
     };
     // SAFETY: as above.
     let mut notify = unsafe { File::from_raw_fd(notify_fd) };
+    let tracing = trace::start();
     let (outcome, msi) = match setup(channel) {
         Ok(setup) => run(setup),
         Err(err) => (Some(Outcome::all_failed(err)), MsiOutcome::not_run()),
     };
+    // Before the notify: the next drivers and the smoke script must find the rings as they
+    // would without this program.
+    let traced = tracing.and_then(|start| match start {
+        trace::Start::Watching => trace::finish(),
+        trace::Start::Skip(why) => Ok(trace::Report {
+            iommu: trace::Step::Skip(why),
+            irq: trace::Step::Skip(why),
+        }),
+    });
     // pcid-spawner waits for this before it starts the next driver.
     let _ = notify.write_all(&[0]);
-    let msi_ok = report_msi(msi);
+    let trace_ok = match traced {
+        Ok(report) => {
+            report_trace("iommu-trace", report.iommu) & report_trace("trace-irq", report.irq)
+        }
+        Err(err) => {
+            println!("FERRIC_TEST_FAIL iommu-trace: {err}");
+            println!("FERRIC_TEST_FAIL trace-irq: {err}");
+            false
+        }
+    };
+    let msi_ok = report_msi(msi) && trace_ok;
     let Some(outcome) = outcome else {
         for name in TESTS.iter().chain(&GRANT_TESTS) {
             println!("FERRIC_TEST_SKIP {name}: pcid has no DMA domain for the device");

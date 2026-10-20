@@ -1,0 +1,14 @@
+# Ferric Oxide: checks that a user scheme call whose buffer cannot be borrowed leaves the
+# caller's file mappings unpinned, so they can still be unmapped and the process can exit.
+# Source lives in files/; as a path source (relative to the repository root) edits there
+# rebuild it.
+[source]
+path = "recipes/tests/ferric-borrow-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

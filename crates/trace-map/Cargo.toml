@@ -1,0 +1,12 @@
+[package]
+name = "ferric-trace-map"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Maps a CPU's kernel trace ring read-only into a Redox process, for ferric_trace::ring::View"
+
+[dependencies]
+ferric-trace = { path = "../trace" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall = { version = "0.9.4", default-features = false, features = ["userspace"] }

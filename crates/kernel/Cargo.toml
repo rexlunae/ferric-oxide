@@ -22,6 +22,7 @@ ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
 ferric-nospec = { path = "../nospec" }
+ferric-procinfo = { path = "../procinfo", optional = true }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
 ferric-ring = { path = "../ring", optional = true, features = ["alloc"] }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
@@ -121,6 +122,9 @@ irq-percpu = ["dep:ferric-irq"]
 trace_syscall = ["trace"]
 trace_sched = ["trace"]
 trace_scheme = ["trace"]
+trace_mm = ["trace"]
+trace_irq = ["trace"]
+trace_iommu = ["trace"]
 # Ferric Oxide: a panic leaves its message and the newest trace records in reserved memory that
 # survives a warm reboot, served by kernel.trace/crash on the next boot.
 trace_crash = ["trace"]
@@ -147,6 +151,8 @@ debugger = ["syscall_debug"]
 syscall_debug = []
 
 sys_fdstat = []
+# Ferric Oxide: /scheme/sys/proc, per-process introspection (kernel.sys_proc).
+sys_proc = ["dep:ferric-procinfo"]
 
 [profile.dev]
 # Avoids having to define the eh_personality lang item and reduces kernel size

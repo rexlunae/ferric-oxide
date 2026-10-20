@@ -19,6 +19,9 @@ what is on at run time.
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault` |
+| `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
+| `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (an `error`-level event, so every `kernel.trace_max_level` keeps it) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
 | `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
@@ -27,15 +30,16 @@ what is on at run time.
 | `kernel.trace_crash_base` | `"0x4000000"` | The crash region's physical address, written to the kernel `config.toml` as `trace.crash_base` |
 | `kernel.trace_crash_test` | `false` | Testing only: writing `panic` to `kernel.trace/crash` panics the kernel and resets the machine after the dump |
 
-The options below `kernel.trace` take effect only with it. The next four map
-to the kernel Cargo features `trace_syscall`, `trace_sched`, `trace_scheme`
-and `trace_level_*`.
+The options below `kernel.trace` take effect only with it. The subsystem
+options map to the kernel Cargo features `trace_syscall`, `trace_sched`,
+`trace_scheme`, `trace_mm`, `trace_irq` and `trace_iommu`, and
+`kernel.trace_max_level` to `trace_level_*`.
 `ferric-config` rejects `kernel.trace` together with `kernel.profiling`, because
 the profiler takes a CPU out of the system and that CPU would never answer the
 interrupt that live patching waits for.
 
 A selection is a comma- or space-separated list. Each item is `all`, a
-subsystem (`syscall`, `sched`, `scheme`) or an event name (`sched.switch`). Besides
+subsystem (`syscall`, `sched`, `scheme`, `mm`, `irq`, `iommu`) or an event name (`sched.switch`). Besides
 `trace.boot`, the boot environment can set `FERRIC_TRACE=<selection>`, which
 the bootloader's environment editor can change. Both are applied on the
 bootstrap processor before the other CPUs start, and the kernel logs
@@ -101,9 +105,12 @@ The kernel writes the bytes with the same text-patching routine the CPU
 feature alternatives use.
 
 Tracepoints sit only where interrupts are off: in system call handling,
-including the kernel's side of scheme requests, and in the context switch. Each CPU's ring therefore has a single producer.
+including the kernel's side of scheme requests, in the context switch, and in
+the page fault and interrupt handlers (every IDT entry is an interrupt gate).
+Each CPU's ring therefore has a single producer. A record that would be
+written with interrupts on is counted as lost instead.
 
-The first events are:
+The events are:
 
 | Event | Arguments |
 | --- | --- |
@@ -113,6 +120,10 @@ The first events are:
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
 | `scheme.cancel` | `scheme`, `tag` |
+| `mm.page_fault` | `addr`, `ip`, `flags`, `outcome` |
+| `irq.deliver` | `irq`, `cpu`, `source`, `count`, `handles` |
+| `irq.ack` | `irq`, `cpu`, `count` |
+| `iommu.fault` | `unit`, `format`, `lo`, `hi`, `count` |
 
 The scheme events cover requests to user-space schemes
 (`crates/kernel/src/scheme/user.rs`).
@@ -147,6 +158,49 @@ with RedoxFS as `caller`, before it answers as `responder`.
 
 These events do not cover one-way messages (`close`, `detach`) or the kernel's
 own mmap requests.
+
+The codes in the last four events have one definition, next to the events in
+`crates/trace/src/kernel.rs`, which the kernel encodes with and decoders read.
+
+- `mm.page_fault` is recorded once per page fault, when the handler
+  (`crates/kernel/src/memory/mod.rs`) has decided, before an unhandled fault
+  becomes a signal or a panic. Faults the kernel takes on purpose to probe
+  memory (the shadow-stack pool check) are not recorded.
+  - `addr` is the faulting address and `ip` the instruction pointer.
+  - `flags` is a `PageFaultFlags`: `present` (a protection fault, not a missing
+    page), `write`, `user` (the access came from user mode), `fetch` and
+    `reserved` (a reserved bit in a page table entry).
+  - `outcome` is a `PageFaultOutcome`: 0 `mapped` (demand paging or copy on
+    write; the access is retried), 1 `copy failed` (the kernel faulted copying
+    to or from user memory, and the call fails with `EFAULT`), 2 `unhandled`.
+- `irq.deliver` is recorded when the irq scheme (`crates/kernel/src/scheme/irq.rs`)
+  counts an interrupt and wakes the `irq:` handles that get it.
+  - `cpu` is the CPU it is counted for: the one that took it with
+    `kernel.irq_percpu`, otherwise the BSP.
+  - `source` is an `IrqSource`: 0 `line` (PIC or I/O APIC) or 1 `vector` (a
+    vector reserved on the CPU, which MSI and MSI-X messages target).
+  - `count` is that CPU's count of the IRQ with this interrupt, the value a
+    driver writes back to acknowledge it, and `handles` how many handles woke.
+  Interrupts the kernel handles itself (the timer, IPIs) are not recorded.
+- `irq.ack` is recorded when the kernel accepts a driver's acknowledgement:
+  the IRQ, the handle's CPU and the count. An `irq.ack` with the IRQ, CPU and
+  count of an `irq.deliver` ends that interrupt's handling. An acknowledgement
+  of a stale count changes nothing and is not recorded.
+- `iommu.fault` is recorded, along with the kernel's log line, for each report
+  an IOMMU writes: a VT-d fault recording register (a blocked DMA or interrupt
+  request) or an AMD-Vi event log entry (any event, including the unit's own
+  command and table errors). Conditions without a report of their own are only
+  logged: VT-d invalidation queue errors and fault overflow, and a full AMD-Vi
+  event log.
+  - `unit` is the unit's register base.
+  - `format` is an `IommuFormat`: 1 for a VT-d fault record, 2 for an AMD-Vi
+    event log entry.
+  - `lo` and `hi` are the report's two 64-bit words as the hardware wrote
+    them, so nothing is lost. Decoders read them with `ferric-vtd`'s
+    `FaultRecord::decode` or `ferric-amdvi`'s `Event`, as the kernel does.
+  - `count` is how many identical reports in a row the record stands for
+    (AMD-Vi runs are folded; VT-d records are one each).
+  It is an `error`-level event: every maximum level keeps it.
 
 ## Records and rings
 
@@ -203,13 +257,14 @@ The paths are defined in `ferric_trace::abi`.
 
 | Path | Read | Write |
 | --- | --- | --- |
-| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
+| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live; `filter <event> <filter\|none>` sets or removes an argument filter ([Argument filters](#argument-filters)) |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
 | `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
+| `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 
-`events`, `stats` and `clock` are read from a snapshot taken at the first read of each
+`events`, `stats`, `clock` and `filters` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
 
 - It consumes records only after they have been copied to the caller, so a
@@ -221,6 +276,43 @@ open. A `cpu/<n>` read follows these rules:
 
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
+
+### Argument filters
+
+`filter <event> <filter>` keeps only the records of `<event>` whose arguments
+pass `<filter>`; other records are not written and not counted as lost. A
+filter is up to four conditions joined by `&&`, each `<arg> <op> <value>`:
+
+```sh
+echo "filter syscall.enter nr == 3 && a < 0x1000" > /scheme/kernel.trace/events
+echo "filter sched.switch next_pid == 42" > /scheme/kernel.trace/events
+echo "filter syscall.enter none" > /scheme/kernel.trace/events
+```
+
+- `<arg>` is one of the event's argument names, as the event table above
+  lists them.
+- `<op>` is `==`, `!=`, `<`, `<=`, `>`, `>=`, or `&` (any of the value's bits
+  set).
+- `<value>` is a decimal or `0x` hexadecimal 64-bit number.
+
+A filter is independent of whether the event is on: it is kept while the event
+is off and applies when it is turned on. Setting a filter replaces the event's
+previous one. A filter on an unknown event gives `ENOENT`, on an event that is
+not compiled in `EOPNOTSUPP`, and one that does not parse (an unknown argument
+or operator, a bad number, more than four conditions) `EINVAL`. The kernel logs
+each filter it sets, and `filters` lists them in the same syntax, with values
+in hexadecimal.
+
+Each event's filter sits in a sequence-locked slot of atomics
+(`ferric_trace::filter::Slot`). A tracepoint checks it without a lock: an event
+without a filter costs one relaxed load more, and a record that races with a
+filter being replaced is kept rather than dropped, so a filter only ever
+removes records. A tracepoint rereads a slot at most eight times before it
+gives up and keeps the record. The `filters` listing reads the slots while
+holding the lock that serializes setting them, so it never meets a replacement
+in progress and lists every filter that is set. If a slot still cannot be read,
+the listing says so in a comment line, `# filter <event> is being replaced`,
+rather than leaving the filter out.
 
 ### Mapping a ring
 
@@ -337,15 +429,23 @@ it) works as follows:
   started. Draining until the ring is empty would never end while tracing is
   on, because the capture's own writes are traced and refill the ring as fast
   as it is read.
-  A read that fails with `EAGAIN`, because another reader is draining the same
-  CPU, is retried after a short wait.
+  A read or commit that fails with `EAGAIN`, because another reader is
+  draining the same CPU, is retried after a short wait.
+- It takes the records out of each ring through its read-only mapping
+  ([Mapping a ring](#mapping-a-ring), the `ferric-trace-map` crate): it copies
+  whole records out with `View`, writes them to `<dir>/cpu<n>`, and only then
+  writes `commit <end>`, so the kernel reuses no word before it is saved. A
+  ring that cannot be mapped (a kernel before the mapping existed) is read
+  instead. `--via map` insists on the mapping, `--via read` always reads, and
+  the default, `--via auto`, maps where it can. The command prints `(mapped)`
+  or `(read)` after each CPU's counts.
 - It reads `stats` again into `<dir>/stats.end`.
 - It copies the `clock` file into `<dir>/clock`, when the kernel has one.
 - Any other error, or a CPU that stays busy, stops the capture with a message
   naming the file.
 
-A read drains a ring, so each record lands in exactly one file and nothing
-drained is ever deleted:
+Either way each record taken from a ring lands in exactly one file, and
+nothing drained is ever deleted:
 
 - `<dir>` is created by the command, with any missing parents, and must not
   exist yet, so an earlier capture is never overwritten. It must not overlap the scheme path.
@@ -378,7 +478,10 @@ cargo run -p ferric-trace-cli -- perfetto --tsc-mhz 3000 -o trace.json capture/
 ```
 
 `text` prints one line per record in timestamp order: the CPU, the cycles
-since the first record, the event and its named arguments.
+since the first record, the event and its named arguments. The page fault,
+`irq.deliver` and IOMMU fault lines end with the codes in words after ` | `,
+such as `write user, mapped`, or the decoded IOMMU report
+(`tools/ferric-trace/src/describe.rs`).
 
 `perfetto` writes Chrome trace event JSON. Open it at <https://ui.perfetto.dev>
 or in `chrome://tracing`.
@@ -395,6 +498,13 @@ or in `chrome://tracing`.
   from `scheme.request` to the `scheme.response` with the same scheme and tag.
   The slice is named with the scheme id and opcode, and the end carries the
   responder's pid. A `scheme.cancel` is an instant on the slice, not its end.
+- **Interrupts.** Each interrupt is an async slice on the track of the CPU
+  that took it, from `irq.deliver` to the `irq.ack` with the same IRQ, CPU and
+  count: how long the driver took to handle it. A delivery that woke no handle
+  is an instant.
+- **Faults.** A page fault is an instant on the faulting context's track, with
+  the access and outcome in words. An IOMMU fault is a global instant, a line
+  across every track, with the decoded report.
 - **Unmatched records.** A record whose start was not captured is an instant.
 
 A capture whose `clock` names the KVM clock or the HPET carries its own tick
@@ -408,10 +518,52 @@ the TSC. For TSC timestamps, and for captures without a `clock` file,
 more, and a tinier divisor would overflow timestamps to infinity. The format and
 the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
 
+### OpenTelemetry
+
+`otlp` writes the capture as OpenTelemetry traces, in the OTLP/JSON encoding
+of an `ExportTraceServiceRequest` (OTLP 1.x, "JSON Protobuf Encoding"):
+
+```sh
+cargo run -p ferric-trace-cli -- otlp --start-unix-ns 1760000000000000000 -o otlp.json capture/
+curl -H 'Content-Type: application/json' --data-binary @otlp.json http://collector:4318/v1/traces
+```
+
+An OTLP/HTTP collector, or a backend such as Jaeger that takes OTLP, accepts
+the file on `/v1/traces`; the OpenTelemetry Collector's `otlpjsonfile`
+receiver also reads it from disk.
+
+- **Spans.** Each system call is a span, and each scheme request a client span.
+  Records before a CPU's first `sched.switch` belong to the context that switch
+  puts out, so a call that moved CPUs still pairs. A request made during a
+  system call is the system call's child and shares its trace; one still open
+  when its call ends (its response was lost) is no later call's parent. Every
+  span without a parent starts a trace of its own.
+- **Resources.** The spans of each process are under a resource whose
+  `service.name` is `pid <n>` (with `process.pid` and `service.namespace`
+  `ferric-oxide`). `thread.id` is the context and `cpu.logical_number` the CPU.
+- **Arguments** of the opening and closing records are attributes named
+  `<event>.<argument>`, as hexadecimal strings. A cancel, and any other record
+  made while a span was open on its context, is a span event; a record outside
+  every span is a span of zero length. A `sched.switch` is a record of the
+  context it puts out, so a call that blocks shows its switches.
+- **Status.** A system call or request whose result is an error number has
+  status `ERROR` with the error's text. A span still open at the end of the
+  capture ends at its context's last record (on any CPU) and has
+  `ferric.unfinished` set.
+
+A capture does not record the wall time, so `--start-unix-ns` gives the Unix
+time of its first record in nanoseconds; the default, 0, makes every time the
+time since the first record. Later times use the capture's clock and
+`--tsc-mhz` as `perfetto` does. Trace ids start with a hash of every record
+and the start time, so two captures sent to one backend keep separate traces. The
+mapping is described in `tools/ferric-trace/src/otlp.rs`.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
-  - the compile-time catalog checks;
+  - the compile-time catalog checks, that every subsystem has events, the
+    levels of the new events, and the page fault, interrupt source and IOMMU
+    format codes;
   - record encoding and decoding, including truncated and corrupt input;
   - ring wrap-around, loss counting, too-small buffers and uncommitted reads;
   - the shared layout's header, `View` reads that store nothing, header
@@ -428,11 +580,15 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   file fail generation.
 - **Host tool.** `cargo test --locked -p ferric-trace-cli` decodes captures
   (including bad and unknown records, records with too few or too many
-  arguments, and duplicate CPUs), checks the text lines, checks the JSON
-  mapping (slices on the right context across CPUs, records from before a
-  CPU's first switch moved to the outgoing context with its CPU slice, async
-  request slices matched by tag through cancels, instants for unmatched
-  records, finite timestamps at the frequency limits), refuses bad
+  arguments, and duplicate CPUs), checks the text lines and the descriptions
+  of page faults, deliveries and VT-d and AMD-Vi fault reports, checks the
+  JSON mapping (slices on the right context across CPUs, records from before
+  a CPU's first switch moved to the outgoing context with its CPU slice, async
+  request slices matched by tag through cancels, interrupt slices from a
+  delivery to its acknowledgement on another CPU, instants for stale
+  acknowledgements, deliveries nobody waited for, page faults and global
+  IOMMU faults, instants for unmatched records, finite timestamps at the
+  frequency limits), refuses bad
   `--tsc-mhz` values, runs the binary on a capture directory, and runs
   `capture` against a stand-in scheme directory (CPU list from `stats`,
   `EAGAIN` and `EINTR` retries, a CPU that stays busy, other errors, start and
@@ -459,20 +615,55 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      `syscall.enter` for that write) and a matching response (same scheme and tag, the byte count as
      result, another process as responder), and that `disable` stops the
      stream;
-  7. maps every CPU's ring, checks that writable, unreadable, partial and
+  8. maps every CPU's ring, checks that writable, unreadable, partial and
      private mappings and an `mprotect` to writable are refused, finds the
      `write` to a closed descriptor by reading the mappings, and checks that
      `commit` refuses a position past `head` or inside a record and accepts
      the end of what was read;
-  8. reads the `clock` file and, with `syscall` on, makes two marker writes
-     200 ms apart: when the clock's tick length is known (the KVM clock, the
-     HPET), the time between their timestamps must be within a factor of two
-     of the wall time; for the TSC it prints the frequency they imply
-     (`trace-clock`).
+  9. with `mm` on, writes to each page of a fresh anonymous mapping, unmaps
+     it and `read`s into it, which fails with `EFAULT`: each page must have a
+     `mm.page_fault` from user mode, a write, ending `mapped`, and the read one
+     from the kernel ending `copy failed` (`trace-fault`).
+  10. sets `filter syscall.enter nr == <write> && a == <closed fd>`, checks the
+     `filters` listing, and repeats the marker calls with `syscall` on: only
+     the write keeps its `syscall.enter`, while `syscall.exit` (no filter)
+     records every call; then removes the filter and checks that unknown events
+     and arguments are refused (`trace-filter`).
+  11. reads the `clock` file and, with `syscall` on, makes two marker writes
+      200 ms apart: when the clock's tick length is known (the KVM clock, the
+      HPET), the time between their timestamps must be within a factor of two
+      of the wall time; for the TSC it prints the frequency they imply
+      (`trace-clock`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
-  `FERRIC_TEST_SKIP trace` without the scheme. The smoke script then runs
-  `ferric-trace capture` and `ferric-trace text` on the result, and prints
+  `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
+  trace-fault` on a kernel without `mm.page_fault`).
+- **IOMMU faults.** `ferric-iommu-test`, which makes QEMU's `edu` device DMA
+  where its domain does not allow it, turns `iommu.fault` on before its tests.
+  Before each fault it announces it drains the rings, keeping the
+  `iommu.fault` records, since `sched.switch` fills them from boot. At the end
+  it checks that every announced fault has a record: on VT-d each DMA fault by
+  page and access and the forged interrupt by its remapping entry, decoded with
+  `ferric-vtd`; on AMD-Vi an I/O page fault event, decoded with
+  `ferric-amdvi`, since QEMU leaves the address out of those. Each announced
+  fault needs a record of its own. AMD-Vi events of two faults are identical,
+  and the kernel merges identical events drained in one pass, so the test
+  waits for the previous fault's record to come back from the rings before it
+  causes the next fault. The kernel drains the event log from its event
+  interrupt and after every command batch, but under QEMU the events have been
+  seen to wait for the next command, so while it waits the test maps a page
+  into its domain and unmaps it, which sends one. It prints
+  `FERRIC_TEST_PASS iommu-trace`, which `check-iommu-log.sh` requires with
+  either IOMMU, and a skip without one. It also turns the `irq` events on
+  around the interrupt of `iommu-msi`, which it acknowledges itself as a driver
+  would, and requires an `irq.deliver` that woke a handle and the `irq.ack`
+  with the same IRQ, CPU and count (`FERRIC_TEST_PASS trace-irq`, in every
+  boot mode, since that interrupt needs no IOMMU). No driver of the smoke image
+  serves for this: `nvmed` does not acknowledge its MSI-X interrupts on the
+  handle, and `e1000d` acknowledges only received packets. It runs before `pcid-spawner` starts
+  the next driver, so the rings it drains are not yet anyone else's. The smoke script then runs
+  `ferric-trace capture --via map` (through the mapping, which fails if a
+  ring does not map) and `ferric-trace text` on the result, and prints
   `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
   `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
   `trace-overhead` job's baseline image, which requires that skip.
@@ -480,8 +671,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"`, `trace_initfs_enable = ["scheme.cancel"]` and
-  `trace_crash = true`. It requires all thirteen step markers, the kernel's
-  `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
+  `trace_crash = true`. It requires all sixteen step markers, the kernel's
+  log of the filter, its `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
   `enable scheme.cancel`, the crash region's log line, and
   `FERRIC_TEST_SKIP trace-crash` (a clean boot has no dump).
 - **Crash dump.** `cargo test -p ferric-trace` writes dumps into a region and
@@ -567,10 +758,69 @@ traced boot lacks its `lost records` line. It warns when records were dropped,
 since a dropped record costs less than a written one, and prints every result
 as a notice on the run.
 
+## Per-process introspection
+
+With `kernel.sys_proc` (Kernel menu, off by default; kernel feature
+`sys_proc`), the `sys` scheme serves `/scheme/sys/proc`: a snapshot of every
+context, read in one go. Only root may open it (`EPERM` otherwise), because it
+shows the address-space layout of every process. A capability will replace
+the uid check with Phase 4.
+
+Each context is a block of lines, in the format of the `ferric-procinfo`
+crate (`crates/procinfo`), which the kernel writes with and tools parse with:
+
+```text
+context 12 pid 9 euid 0 egid 0 status runnable cpu 1 running yes active_ns 5210000 sched_ns 61000 name /usr/bin/ferric-proc-test
+memory private 9670656 shared 65536 kernel 81920
+fd 0 scheme pipe number 3
+fd 3 scheme sys number 7
+fd 4 scheme user:7 number 1
+grant 0x400000 pages 12 provider allocated prot r-x
+```
+
+- `context`: the context's debug id (the id `sched.switch` records carry, so
+  a trace and this file name the same context), process id, effective user
+  and group, state (`runnable`, `sleeping`, `blocked`, `dead`), the CPU it is
+  on and whether it is running there, and its CPU time in nanoseconds
+  (`active_ns` running, `sched_ns` scheduled). A running context's times
+  include its current timeslice, so two reads in a row show them growing.
+  Each CPU's idle context (`[kmain]`) is never charged. The name comes last and runs to the end of the line; control characters in it
+  are printed as `?`, so a name cannot forge a line.
+- `memory`: bytes of grants the address space owns (`private`) and shares
+  with other address spaces or schemes (`shared`), and the kernel memory the
+  context uses itself (kernel stack and FPU state). Borrowed device memory is
+  in neither count.
+- `fd`: each open descriptor with the scheme it is open on and the scheme's
+  handle number. Kernel schemes are named. A user-space scheme has no name in
+  the kernel, so it shows as `user:<scheme id>`; descriptors open on the same
+  user scheme share the id. The scheme manager's descriptors show as `mgr`,
+  except the scheme creation capability, which is `cap`.
+- `grant`: each mapping of the address space, with its base address, size in
+  pages, where the memory comes from (`allocated`, `allocated_shared`,
+  `phys`, `external`, `fmap`) and its protection, as user space may use it:
+  a `PROT_NONE` guard page (`kernel.prot_none`) is `---`, not readable.
+  Threads of one process share an address space and list the same grants.
+
+The kernel builds the file in two passes, so it takes no lock out of order.
+First it copies each context, and its descriptors' scheme ids, under that
+context's lock. Then it reads each address space and the scheme table with
+the context locks released. A process that changes between the two passes is
+shown partly before and partly after the change.
+
+`ferric_procinfo::processes` groups the file into one record per context.
+`ferric-proc-test` (in the smoke image, with `sys_proc` on in CI) checks its
+own block (name, CPU time, a file it holds open, an 8 MiB allocation), that
+its CPU time grows between two reads, that a thread stack's guard page shows
+as `---`, that no `mgr` descriptor names the capability, and that user 1000
+is refused the file.
+
 ## Not implemented yet
 
-- Tracepoints for other subsystems (page faults, IRQs, IOMMU, futexes,
-  process lifecycle).
-- A reader that maps the rings in the `ferric-trace` tool (it still reads them).
-- Live viewing on the target, OpenTelemetry export and Perfetto's protobuf format.
+- Tracepoints for other subsystems (memory mappings, IOMMU map and unmap,
+  futexes, process lifecycle), and for the interrupts the kernel handles
+  itself (the timer, IPIs).
+- Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.
+- Per-descriptor detail in `/scheme/sys/proc` from the fork's own schemes
+  (ring sizes, IOMMU domain mappings), and flamegraphs from the profiler with
+  user frame pointers.
