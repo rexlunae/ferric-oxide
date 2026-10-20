@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use ferric_pcache::abi::{ObjectId, Record, PAGE_SIZE};
 use ferric_pcache::client::{self, ClientError, Object, Queue, FORWARDED_RECORDS};
-use libredox::flag::{O_CLOEXEC, O_RDONLY};
+use libredox::flag::{O_CLOEXEC, O_RDONLY, O_RDWR};
 use libredox::Fd;
 use redox_scheme::Socket;
 use syscall::error::EIO;
@@ -35,6 +35,43 @@ use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
 use crate::{Disk, FileSystem, Node, TreePtr};
+
+/// The handle number of the description the pump forwards records through. RedoxFS numbers
+/// the descriptions it opens from 1, so only the pump's has this one.
+pub const PUMP_HANDLE: usize = 0;
+
+/// Why the page cache could not start.
+#[derive(Debug)]
+enum StartError {
+    /// Opening or binding the queue, or starting the pump, failed.
+    Client(ClientError),
+    /// The description of this scheme the pump forwards records through could not be made.
+    OwnHandle(syscall::Error),
+}
+
+impl From<ClientError> for StartError {
+    fn from(err: ClientError) -> Self {
+        Self::Client(err)
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(_) => f.write_str("cannot start the queue"),
+            Self::OwnHandle(_) => f.write_str("cannot make the pump's description"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(err) => Some(err),
+            Self::OwnHandle(err) => Some(err),
+        }
+    }
+}
 
 /// One cached file: its object and how many attached descriptions it has.
 struct Cached {
@@ -56,10 +93,11 @@ pub struct PageCache {
 }
 
 impl PageCache {
-    /// Binds a queue to `socket` and starts the pump that forwards its records to the scheme
-    /// at `mounted_path`; `None` without a `kernel.pcache` scheme or when that fails (logged).
-    pub fn start(socket: &Socket, mounted_path: &str) -> Option<Self> {
-        match Self::try_start(socket, mounted_path) {
+    /// Binds a queue to `socket` and starts the pump that forwards its records to this
+    /// scheme through a description numbered [`PUMP_HANDLE`]; `None` without a
+    /// `kernel.pcache` scheme or when that fails (logged).
+    pub fn start(socket: &Socket) -> Option<Self> {
+        match Self::try_start(socket) {
             Ok(cache) => cache,
             Err(err) => {
                 log::warn!("page cache off: {}", Chain(&err));
@@ -68,29 +106,24 @@ impl PageCache {
         }
     }
 
-    fn try_start(socket: &Socket, mounted_path: &str) -> Result<Option<Self>, ClientError> {
+    fn try_start(socket: &Socket) -> Result<Option<Self>, StartError> {
         let Some(queue) = Queue::open()? else {
             return Ok(None);
         };
+        // The pump cannot open the mounted path: RedoxFS enters the null namespace once it
+        // is mounted, and the root file system is not reachable by name until then anyway.
+        // A description the socket makes of its own scheme needs no namespace.
+        let own = socket
+            .create_this_scheme_fd(0, PUMP_HANDLE, O_RDWR | O_CLOEXEC, 0)
+            .map_err(StartError::OwnHandle)?;
+        let own = Fd::new(own);
         queue.bind(socket.inner().raw())?;
         let queue = Arc::new(queue);
-        let mounted_path = mounted_path.to_string();
-        let mut own: Option<Fd> = None;
         client::spawn_pump(Arc::clone(&queue), move |records| {
-            // The scheme is registered and served by now: a record means a client read.
-            if own.is_none() {
-                match Fd::open(&mounted_path, O_RDONLY | O_CLOEXEC, 0) {
-                    Ok(fd) => own = Some(fd),
-                    Err(err) => {
-                        log::error!("page cache: cannot open {mounted_path}: {err}");
-                        return Ok(());
-                    }
-                }
-            }
-            if let Some(fd) = &own {
-                if let Err(err) = fd.call_wo(records, CallFlags::empty(), &[FORWARDED_RECORDS]) {
-                    log::error!("page cache: forwarding fills failed: {err}");
-                }
+            // A failed forward leaves those readers to the queue's close; it means the
+            // scheme's own socket is gone, so RedoxFS is exiting.
+            if let Err(err) = own.call_wo(records, CallFlags::empty(), &[FORWARDED_RECORDS]) {
+                log::error!("page cache: forwarding fills failed: {err}");
             }
             Ok(())
         })?;

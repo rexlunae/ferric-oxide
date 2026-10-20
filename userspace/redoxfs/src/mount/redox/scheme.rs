@@ -110,7 +110,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
         fs: FileSystem<D>,
         socket: &'sock Socket,
     ) -> Result<FileScheme<'sock, D>> {
-        let pcache = super::pcache::PageCache::start(socket, &mounted_path);
+        let pcache = super::pcache::PageCache::start(socket);
         Ok(FileScheme {
             scheme_name: RedoxScheme::new(scheme_name)
                 .expect("scheme name for FileScheme is not valid"),
@@ -1145,12 +1145,13 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         metadata: &[u64],
         ctx: &CallerCtx,
     ) -> Result<usize> {
-        // Ferric Oxide: fill records the page cache's pump thread forwards from the kernel.
-        // Only root (RedoxFS itself) may send them; even then they cannot put bytes in the
-        // cache that are not the file's, since RedoxFS reads the pages itself and the kernel
-        // takes an answer only for pages it is filling.
+        // Ferric Oxide: fill records the page cache's pump thread forwards from the kernel,
+        // through the one description numbered `PUMP_HANDLE`, which only RedoxFS's socket
+        // can make. They cannot put bytes in the cache that are not the file's anyway, since
+        // RedoxFS reads the pages itself and the kernel takes an answer only for pages it is
+        // filling.
         if metadata.first() == Some(&ferric_pcache::client::FORWARDED_RECORDS) {
-            if ctx.uid != 0 {
+            if id != super::pcache::PUMP_HANDLE || ctx.uid != 0 {
                 return Err(Error::new(EPERM));
             }
             if let Some(pcache) = &mut self.pcache {
