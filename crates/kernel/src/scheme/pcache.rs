@@ -311,21 +311,22 @@ fn read(
         }
     };
     let ahead = attachment.readahead.lock().on_read(pages, file_pages);
-    let mut attempt = Attempt::First;
+    let mut attempt = Attempt::new();
     loop {
         let mut state = object.state.lock();
         if state.gone {
-            return match attempt {
-                Attempt::First => None,
-                Attempt::Retry(_) => Some(Err(Error::new(EIO))),
+            return if attempt.is_first() {
+                None
+            } else {
+                Some(Err(Error::new(EIO)))
             };
         }
         // The size may have changed while the reader waited.
         let Some((pages, len)) = state.index.pages_for_read(offset, buf.len()) else {
             return Some(Ok(0));
         };
-        let first = attempt == Attempt::First;
-        // This turns `attempt` into a retry for the next round.
+        let first = attempt.is_first();
+        // This records the fills `attempt` waits for, and makes it a retry next round.
         let read = state.index.start_read(pages, &mut attempt);
         let mut fills = match &read {
             Read::Wait { fills } => fills.clone(),

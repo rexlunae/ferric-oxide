@@ -597,7 +597,9 @@ How a file system uses it:
    reports `EVENT_READ` again.
 5. Shrinking an object with `SetSize` drops the cached pages past the new end,
    including the page the end now falls in, so a later read fills it again
-   with zeros past the end, and forgets failed fills past the end.
+   with zeros past the end. A reader keeps the outcome of each fill it waits
+   for, so a failure reaches it whatever happens to the pages meanwhile, and
+   the cache keeps nothing for a failed page.
 6. When the file system changes a file's bytes itself (it served a write or a
    truncation), it calls `Invalidate` on the object with the pages that
    changed, then `SetSize`, before it replies. The cached copies are dropped;
