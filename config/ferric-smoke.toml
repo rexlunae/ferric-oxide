@@ -42,6 +42,10 @@ ferric-ring-test = "source"
 ferric-pcache-test = "source"
 # Mounts an ext4 image with ext4d (fs.ext4, which CI turns on); skips without it.
 ferric-ext4-test = "source"
+# ext4d, as features.toml fs.ext4 = true adds it. CI's ferric.toml turns fs.ext4 on, but this
+# image is built by name (CONFIG_NAME=ferric-smoke), so ferric-config's generated package
+# list does not apply to it and the package has to be named here, as fox is below.
+ext4d = "source"
 # Reads and writes the NVMe disk through a registered-buffer grant (drivers.grant_dma,
 # which CI turns on) and times it against ordinary reads.
 ferric-blkgrant-test = "source"
