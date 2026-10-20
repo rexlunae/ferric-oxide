@@ -13,6 +13,7 @@ on:
       - "mk/fstools.mk"
       - "tools/**"
       - "crates/**"
+      - "scripts/ferric-ci/**"
       - "features.toml"
       - "config/**"
       - "userspace/redoxfs/**"
@@ -35,6 +36,8 @@ jobs:
             target
           key: host-${{ hashFiles('Cargo.lock') }}
           restore-keys: host-
+      - name: Smoke runner regression tests
+        run: bash scripts/ferric-ci/test-boot-smoke.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
