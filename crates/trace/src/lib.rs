@@ -13,12 +13,20 @@
 //! - [`record`] is the binary format: a two-word header (length, argument count, event id;
 //!   timestamp) followed by one 64-bit word per argument. The kernel never formats text.
 //! - [`ring::Ring`] is a single-producer, single-consumer ring of 64-bit words: the CPU that owns
-//!   it pushes records, one reader drains them. It is built from atomics only, so this crate has
-//!   no `unsafe` code.
+//!   it pushes records, one reader drains them. Its counters live either in the ring or, in
+//!   the shared layout the kernel maps into readers, in a header ahead of the data, which a
+//!   [`ring::View`] reads in place. It is built from atomics only, so this crate has no
+//!   `unsafe` code.
 //! - [`select()`] parses event selections (`all`, a subsystem name, an event name) into an
 //!   [`EventSet`], for the boot environment and the trace scheme.
+//! - [`clock`] names the clock record timestamps come from (an invariant TSC, the KVM clock or
+//!   the HPET) and holds the rule the kernel picks it by.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
 //!   format.
+//! - [`crash`] is the crash dump a panic writes to reserved memory for the next boot to
+//!   read: its layout, a writer that copies the newest records of each ring, and a parser.
+//! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
+//!   `init` starts.
 //!
 //! # Examples
 //!
@@ -51,6 +59,10 @@ extern crate alloc;
 extern crate std;
 
 pub mod abi;
+pub mod clock;
+#[cfg(feature = "config")]
+pub mod config;
+pub mod crash;
 mod event;
 pub mod kernel;
 mod level;

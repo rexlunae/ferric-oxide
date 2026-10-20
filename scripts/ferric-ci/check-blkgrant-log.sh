@@ -32,6 +32,37 @@ if grep -aE "FERRIC_TEST_FAIL nvme-grant" <<< "$clean"; then
     fail "ferric-blkgrant-test failed"
 fi
 
+# nvmed's own lines (its setup and any error) as one notice, so a failed check below can be
+# read without the job log.
+nvmed_lines="$(grep -aE 'nvmed: ' <<< "$clean" | head -n 20 || true)"
+if [ -n "$nvmed_lines" ]; then
+    echo "::notice title=nvmed lines::$(sed 's/%/%25/g' <<< "$nvmed_lines" | sed ':a;N;$!ba;s/\n/%0A/g')"
+fi
+
+# drivers.nvme_percore is on in every CI image: nvmed spreads its I/O completion queues' MSI-X
+# entries over the CPUs in two batches, checks them against irq:cpus, and serves each pair from
+# a worker thread on its CPU.
+need "nvmed: MSI-X entries 1\.\.=[0-9]+ spread over CPUs \[[0-9, ]+\] in batches of [0-9]+ and [0-9]+, as irq:cpus and ferric_irq::spread give"
+need "nvmed: ([3-9]|[1-9][0-9]+) I/O queue pairs \(controller grants [0-9]+\): pair 1 on the main thread, ([2-9]|[1-9][0-9]+) per-CPU, workers on CPUs \[[0-9, ]+\]"
+# A watchdog line means a job's completion or report was not delivered by its event, and was
+# only picked up by the once-a-second tick.
+if grep -aE "nvmed: (MSI-X spread check failed|queue pair [0-9]+ worker (not pinned|panicked)|no worker for I/O queue pair|every worker has ended|Create I/O (Completion|Submission) Queue [0-9]+ failed|watchdog)" <<< "$clean"; then
+    fail "nvmed's per-CPU queue pairs were not set up as expected"
+fi
+
+# 4 KiB preads from 1, 2 and 4 threads at once, in every mode (per-core NVMe queues), as a
+# same-boot A/B of nvmed's queue policies. The default policy must reach the single queue's
+# IOPS within the rounds' noise, paired round by round, with confirmation rounds before a
+# failure (ferric_blkqueue::ab); the numbers go out as a notice first.
+for threads in 1 2 4; do
+    need "FERRIC_BENCH nvme-read-4k-t$threads .*copy_iops=.* ab=(pass|fail)"
+done
+if grep -aE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .* ab=fail" <<< "$clean"; then
+    ab="$(grep -aoE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
+    echo "::notice title=queue policy A/B ($mode)::$ab"
+    fail "nvmed's default queue policy is slower than its single queue in the same boot"
+fi
+
 case "$mode" in
     none)
         need "FERRIC_TEST_SKIP nvme-grant: nvmed has no DMA domain \(no IOMMU\)"
@@ -59,6 +90,6 @@ case "$mode" in
         ;;
 esac
 
-bench="$(grep -aoE "FERRIC_BENCH nvme-read-[0-9a-z]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
+bench="$(grep -aoE "FERRIC_BENCH nvme-read-[0-9a-z-]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
 echo "::notice title=check-blkgrant-log ($mode)::OK; $bench"
 echo "check-blkgrant-log: $mode OK"

@@ -6,8 +6,15 @@ license = "MIT"
 description = "Typed kernel tracepoints, their binary record format and per-CPU SPSC rings"
 
 [dependencies]
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
+
+[dev-dependencies]
+toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 
 [features]
 default = []
 ## `Ring::with_capacity`, which allocates the ring's words on the heap.
 alloc = []
+## `config`: the initfs `trace.toml` that bootstrap applies (`serde` and `toml`, no `std`).
+config = ["alloc", "dep:serde", "dep:toml"]

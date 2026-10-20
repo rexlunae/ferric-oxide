@@ -1,0 +1,15 @@
+# Ferric Oxide: the on-target regression test for a scheme opened by the thread that created
+# it. The test creates a scheme on its main thread, serves it from a second thread and opens a
+# file on it from the main thread; the kernel must block the caller rather than direct-switch
+# it to itself (which spun the CPU forever). Only for test images. Source lives in files/; as a
+# path source (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-scheme-self-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

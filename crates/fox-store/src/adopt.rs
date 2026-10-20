@@ -321,6 +321,7 @@ impl Store {
             signer_label: signer.label.clone(),
             metadata: identity.metadata,
             state: PackageState::Installed,
+            origin: None,
             files,
         };
         Ok(Ok((package, bytes)))

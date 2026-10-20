@@ -16,13 +16,13 @@ semver.workspace = true
 ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 
-# HTTPS fetching. reqwest's rustls backend defaults to aws-lc-rs, which does
+# HTTPS fetching of repositories and blobs. reqwest's rustls backend defaults to aws-lc-rs, which does
 # not build for Redox and is not under a license on the project's list, so
 # rustls uses ring and the transport is left out on Redox, where fox fetches
 # over file://, ssh:// and git:// only.
 [target.'cfg(not(target_os = "redox"))'.dependencies]
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]

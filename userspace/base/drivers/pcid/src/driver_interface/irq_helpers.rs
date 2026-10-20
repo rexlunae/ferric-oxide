@@ -9,7 +9,11 @@ use std::io::prelude::*;
 use std::io::{self};
 use std::num::NonZeroU8;
 
+use ferric_vtd::interrupt::MsiFormat;
+
 use crate::msi::{MsiAddrAndData, MsixTableEntry};
+// Ferric Oxide: vectors on a chosen CPU.
+use crate::percpu::{self, CpuEntry, CpuId, VectorError};
 use crate::PciFunctionHandle;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::{
@@ -17,6 +21,9 @@ use crate::{
 };
 
 /// Read the local APIC ID of the bootstrap processor.
+///
+/// Ferric Oxide: despite the name, `irq:bsp` holds the BSP's logical CPU id, the number the
+/// other helpers here take; see [`crate::percpu::bsp_cpu`].
 pub fn read_bsp_apic_id() -> io::Result<usize> {
     let mut buffer = [0u8; 8];
 
@@ -198,14 +205,9 @@ pub fn allocate_single_interrupt_vector_for_msi(
     channel: &PcidChannel,
     cpu_id: usize,
 ) -> (MsiAddrAndData, File) {
-    let (vector, interrupt_handle) = allocate_single_interrupt_vector(cpu_id)
-        .expect("failed to allocate interrupt vector")
-        .expect("no interrupt vectors left");
-    let message = channel
-        .msi_message(cpu_id, vector)
-        .unwrap_or_else(|| panic!("pcid has no MSI message for vector {vector} on CPU {cpu_id}"));
-
-    (message, interrupt_handle)
+    let cpu = u32::try_from(cpu_id).expect("CPU number above 32 bits");
+    percpu::allocate_msi(channel, CpuId::new(cpu))
+        .unwrap_or_else(|err| panic!("{}", percpu::report(&err)))
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -234,6 +236,8 @@ pub struct InterruptVector {
     irq_handle: File,
     vector: u16,
     kind: InterruptVectorKind,
+    // Ferric Oxide: the logical CPU the vector is on.
+    cpu: CpuId,
 }
 
 /// Sequential MSI-X table allocator. The first `alloc` takes table entry 0,
@@ -245,9 +249,12 @@ pub struct Msix {
     mapped: MappedMsixRegs,
     next: u16,
     bsp: usize,
-    handles: Vec<File>,
+    // Ferric Oxide: each entry's handle and CPU.
+    handles: Vec<(File, CpuId)>,
     // Ferric Oxide: for asking pcid for each entry's message.
     channel: PcidChannel,
+    // Ferric Oxide: the kernel's CPUs, `None` without per-CPU delivery (`kernel.irq_percpu`).
+    cpus: Option<Vec<CpuEntry>>,
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -269,39 +276,35 @@ impl Msix {
             mapped.info.table_size
         );
 
+        let cpus = percpu::online_cpus()
+            .unwrap_or_else(|err| {
+                log::warn!(
+                    "{driver}: MSI-X vectors stay on the BSP: {}",
+                    percpu::report(&err)
+                );
+                None
+            })
+            // An empty map is no map: `alloc_on` would otherwise refuse even the BSP.
+            .filter(|cpus| !cpus.is_empty());
+
         Self {
             mapped,
             next: 0,
             bsp,
             handles: Vec::new(),
             channel: pcid_handle.channel(),
+            cpus,
         }
     }
 
     pub fn alloc(&mut self) -> InterruptVector {
         if self.next < self.mapped.info.table_size {
-            let index = self.next;
-            self.next += 1;
-
-            let (msg_addr_and_data, irq_handle) =
-                allocate_single_interrupt_vector_for_msi(&self.channel, self.bsp);
-            let entry = self.mapped.table_entry_pointer(index as usize);
-            entry.write_addr_and_data(msg_addr_and_data);
-            entry.unmask();
-
-            self.handles.push(
-                irq_handle
-                    .try_clone()
-                    .expect("failed to clone MSI-X IRQ handle"),
-            );
-
-            InterruptVector {
-                irq_handle,
-                vector: index,
-                kind: InterruptVectorKind::MsiX { table_entry: entry },
-            }
+            let bsp = CpuId::new(u32::try_from(self.bsp).expect("BSP id above 32 bits"));
+            self.program_next(bsp)
+                .unwrap_or_else(|err| panic!("{}", percpu::report(&err)))
         } else {
-            let irq_handle = self.handles[0]
+            let (handle, cpu) = &self.handles[0];
+            let irq_handle = handle
                 .try_clone()
                 .expect("failed to clone MSI-X IRQ handle");
             let entry = self.mapped.table_entry_pointer(0);
@@ -309,8 +312,189 @@ impl Msix {
                 irq_handle,
                 vector: 0,
                 kind: InterruptVectorKind::MsiX { table_entry: entry },
+                cpu: *cpu,
             }
         }
+    }
+
+    /// Ferric Oxide: the number of entries in the MSI-X table.
+    pub fn table_size(&self) -> u16 {
+        self.mapped.info.table_size
+    }
+
+    /// Ferric Oxide: whether the kernel delivers interrupts per CPU (`kernel.irq_percpu`), so
+    /// [`Self::alloc_on`] can put a vector on a CPU other than the BSP.
+    pub fn per_cpu(&self) -> bool {
+        self.cpus.is_some()
+    }
+
+    /// Ferric Oxide: the kernel's online CPUs, `None` without per-CPU delivery.
+    pub fn cpus(&self) -> Option<&[CpuEntry]> {
+        self.cpus.as_deref()
+    }
+
+    /// Ferric Oxide: programs the next MSI-X table entry with a vector on logical CPU `cpu`, or
+    /// on the BSP when the kernel has no per-CPU delivery (check [`InterruptVector::cpu`]).
+    ///
+    /// Unlike [`Self::alloc`], it does not share entry 0 once the table is full.
+    ///
+    /// # Errors
+    ///
+    /// [`VectorError::TableFull`] when every entry has a vector, [`VectorError::UnknownCpu`] when
+    /// `cpu` is not online, and the errors of reserving the vector and getting its message.
+    pub fn alloc_on(&mut self, cpu: CpuId) -> Result<InterruptVector, VectorError> {
+        let size = self.table_size();
+        if self.next >= size {
+            return Err(VectorError::TableFull { size });
+        }
+        let target = match &self.cpus {
+            Some(cpus) if cpus.iter().any(|entry| entry.cpu == cpu) => cpu,
+            Some(_) => return Err(VectorError::UnknownCpu { cpu }),
+            None => CpuId::new(u32::try_from(self.bsp).expect("BSP id above 32 bits")),
+        };
+        self.program_next(target)
+    }
+
+    /// Ferric Oxide: programs up to `count` MSI-X table entries (no more than the table has
+    /// free), one per CPU before any CPU gets a second, CPUs on NUMA node `node` first
+    /// ([`ferric_irq::spread`]). Without per-CPU delivery every vector is on the BSP.
+    ///
+    /// Entry `i` of the table goes to the `i`-th CPU of that order, so separate calls carry on
+    /// the rotation where the entries programmed so far (by any call) left it.
+    ///
+    /// # Errors
+    ///
+    /// The first error of [`Self::alloc_on`]. The entries this call programmed before it are
+    /// masked and given back (their vectors are released and the next call reuses them), so a
+    /// failed call changes nothing.
+    pub fn alloc_spread(
+        &mut self,
+        count: u16,
+        node: Option<u32>,
+    ) -> Result<Vec<InterruptVector>, VectorError> {
+        let first = self.next;
+        let free = self.table_size().saturating_sub(first);
+        let count = usize::from(count.min(free));
+        // Without per-CPU delivery every target is the BSP.
+        let targets: Vec<CpuId> =
+            ferric_irq::spread_from(self.cpus.as_deref(), node, usize::from(first), count)
+                .collect();
+        let mut vectors = Vec::with_capacity(count);
+        for cpu in targets {
+            match self.alloc_on(cpu) {
+                Ok(vector) => vectors.push(vector),
+                Err(err) => {
+                    drop(vectors);
+                    self.release_from(first);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(vectors)
+    }
+
+    /// Ferric Oxide: steers MSI-X table entry `index` to logical CPU `cpu` (root only), keeping
+    /// its `irq:` handles: the kernel moves the vector and re-keys every handle for it.
+    ///
+    /// The entry's own message decides who moves it. A remappable-format message names an
+    /// interrupt remapping entry, which the kernel rewrites. A compatibility-format message
+    /// names the CPU and vector itself, so the entry is masked before the kernel moves the
+    /// vector (and gives the old one back), given pcid's message for the new vector, and then
+    /// left masked or unmasked as it was; an interrupt raised while it is masked stays pending
+    /// in the device and is sent the new way. The [`InterruptVector::cpu`] that
+    /// [`Self::alloc_on`] returned for the entry is not updated; this call returns the new
+    /// CPU's result instead.
+    ///
+    /// # Errors
+    ///
+    /// [`VectorError::NoEntry`] when `index` has no vector, [`VectorError::UnknownCpu`] when
+    /// `cpu` is not online or the kernel has no per-CPU delivery, [`VectorError::Move`] when
+    /// the kernel refuses (the entry is as it was), [`VectorError::NoMessage`] when pcid has no
+    /// message for the new vector (the entry then stays masked), and
+    /// [`VectorError::NotRemapped`] when the entry is remapped but the kernel found no
+    /// remapping entry to move.
+    pub fn retarget(
+        &mut self,
+        index: u16,
+        cpu: CpuId,
+    ) -> Result<ferric_irq::call::Moved, VectorError> {
+        if !self
+            .cpus()
+            .is_some_and(|cpus| cpus.iter().any(|entry| entry.cpu == cpu))
+        {
+            return Err(VectorError::UnknownCpu { cpu });
+        }
+        if usize::from(index) >= self.handles.len() {
+            return Err(VectorError::NoEntry { index });
+        }
+        let entry = self.mapped.table_entry_pointer(usize::from(index));
+        let remapped = matches!(MsiFormat::of(entry.addr()), MsiFormat::Remappable { .. });
+        let was_masked = entry.vec_ctl() & MsixTableEntry::VEC_CTL_MASK_BIT != 0;
+        if !remapped {
+            // Masked before the kernel gives the old vector back, so nothing reaches it after.
+            entry.mask();
+        }
+        let (handle, held) = &mut self.handles[usize::from(index)];
+        let moved = match percpu::move_vector(handle, cpu) {
+            Ok(moved) => moved,
+            Err(err) => {
+                // Nothing moved, so the old message is still right.
+                self.mapped
+                    .table_entry_pointer(usize::from(index))
+                    .set_masked(was_masked);
+                return Err(err);
+            }
+        };
+        *held = cpu;
+        if remapped {
+            return if moved.remapped == 0 {
+                Err(VectorError::NotRemapped { index })
+            } else {
+                Ok(moved)
+            };
+        }
+        let vector = moved.irq.get() + 32;
+        let message = self
+            .channel
+            .msi_message(cpu.get() as usize, vector)
+            .ok_or(VectorError::NoMessage { cpu, vector })?;
+        let entry = self.mapped.table_entry_pointer(usize::from(index));
+        entry.write_addr_and_data(message);
+        entry.set_masked(was_masked);
+        Ok(moved)
+    }
+
+    /// Ferric Oxide: masks the table entries from `first` on and gives them back, closing the
+    /// handles this `Msix` keeps for them, so the next allocation programs `first` again.
+    fn release_from(&mut self, first: u16) {
+        for index in first..self.next {
+            self.mapped.table_entry_pointer(usize::from(index)).mask();
+        }
+        self.handles.truncate(usize::from(first));
+        self.next = first;
+    }
+
+    /// Ferric Oxide: programs the next table entry with a vector on `cpu`.
+    fn program_next(&mut self, cpu: CpuId) -> Result<InterruptVector, VectorError> {
+        let index = self.next;
+        let (msg_addr_and_data, irq_handle) = percpu::allocate_msi(&self.channel, cpu)?;
+        // Before the entry is touched, so a failure leaves nothing to undo.
+        let kept = irq_handle
+            .try_clone()
+            .map_err(|source| VectorError::Clone { cpu, source })?;
+        self.next += 1;
+        let entry = self.mapped.table_entry_pointer(index as usize);
+        entry.write_addr_and_data(msg_addr_and_data);
+        entry.unmask();
+
+        self.handles.push((kept, cpu));
+
+        Ok(InterruptVector {
+            irq_handle,
+            vector: index,
+            kind: InterruptVectorKind::MsiX { table_entry: entry },
+            cpu,
+        })
     }
 }
 
@@ -325,6 +509,29 @@ impl Msix {
 
     pub fn alloc(&mut self) -> InterruptVector {
         unimplemented!("MSI-X is not implemented on this architecture")
+    }
+
+    /// Ferric Oxide: see the x86 [`Msix::alloc_on`].
+    pub fn alloc_on(&mut self, _cpu: CpuId) -> Result<InterruptVector, VectorError> {
+        unimplemented!("MSI-X is not implemented on this architecture")
+    }
+
+    /// Ferric Oxide: see the x86 [`Msix::alloc_spread`].
+    pub fn alloc_spread(
+        &mut self,
+        _count: u16,
+        _node: Option<u32>,
+    ) -> Result<Vec<InterruptVector>, VectorError> {
+        unimplemented!("MSI-X is not implemented on this architecture")
+    }
+
+    /// Ferric Oxide: see the x86 [`Msix::retarget`].
+    pub fn retarget(
+        &mut self,
+        _index: u16,
+        cpu: CpuId,
+    ) -> Result<ferric_irq::call::Moved, VectorError> {
+        Err(VectorError::UnknownCpu { cpu })
     }
 }
 
@@ -342,6 +549,11 @@ impl InterruptVector {
 
     pub fn vector(&self) -> u16 {
         self.vector
+    }
+
+    /// Ferric Oxide: the logical CPU the interrupt is delivered to.
+    pub fn cpu(&self) -> CpuId {
+        self.cpu
     }
 
     pub fn set_masked_if_fast(&mut self, masked: bool) -> bool {
@@ -377,6 +589,7 @@ pub fn pci_allocate_interrupt_vector(
             irq_handle: allocate_first_msi_interrupt_on_bsp(pcid_handle),
             vector: 0,
             kind: InterruptVectorKind::Msi,
+            cpu: CpuId::BSP,
         }
     } else if let Some(irq) = pcid_handle.config().func.legacy_interrupt_line {
         // INTx# pin based interrupts.
@@ -384,6 +597,7 @@ pub fn pci_allocate_interrupt_vector(
             irq_handle: irq.irq_handle(driver),
             vector: 0,
             kind: InterruptVectorKind::Legacy,
+            cpu: CpuId::BSP,
         }
     } else {
         panic!("{driver}: no interrupts supported at all")
@@ -402,6 +616,7 @@ pub fn pci_allocate_interrupt_vector(
             irq_handle: irq.irq_handle(driver),
             vector: 0,
             kind: InterruptVectorKind::Legacy,
+            cpu: CpuId::BSP,
         }
     } else {
         panic!("{driver}: no interrupts supported at all")

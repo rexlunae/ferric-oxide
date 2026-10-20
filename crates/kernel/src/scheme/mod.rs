@@ -70,7 +70,9 @@ pub mod irq;
 #[cfg(feature = "regbuf")]
 pub mod regbuf;
 
-/// Ferric Oxide: `kernel.ring` - submission/completion rings brokered to any scheme (`rings`)
+// Ferric Oxide: `kernel.ring` - submission/completion rings brokered to any scheme (`rings`).
+// Its docs are all inner (`//!`): with an outer doc as well, rustdoc resolves the inner docs'
+// links here, where the module's imports are not in scope.
 #[cfg(feature = "rings")]
 pub mod ring;
 
@@ -82,6 +84,10 @@ pub mod pipe;
 
 /// `proc:` - allows tracing processes and reading/writing their memory
 pub mod proc;
+
+/// Ferric Oxide: mapping kernel-owned frames into a process (`rings`, `trace`)
+#[cfg(any(feature = "rings", feature = "trace"))]
+pub mod shared_frames;
 
 /// `serio:` - provides access to ps/2 devices
 pub mod serio;
@@ -173,6 +179,12 @@ impl<T> HandleMap<T> {
 
     fn iter(&self) -> hash_map::Iter<'_, usize, T> {
         self.handles.iter()
+    }
+
+    // Ferric Oxide: for the irq scheme, which re-keys every handle of a vector it steers.
+    #[allow(dead_code)]
+    fn iter_mut(&mut self) -> hash_map::IterMut<'_, usize, T> {
+        self.handles.iter_mut()
     }
 }
 

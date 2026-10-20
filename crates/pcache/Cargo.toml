@@ -1,0 +1,13 @@
+[package]
+name = "ferric-pcache"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The kernel page cache's interface and policies: cache objects, fill and writeback records, page states, readahead, reclaim and the reverse map"
+
+[dependencies]
+
+[features]
+default = []
+## The reclaim lists and the reverse map (`clock`, `rmap`), which need a heap.
+alloc = []

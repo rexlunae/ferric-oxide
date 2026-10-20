@@ -363,6 +363,72 @@ impl Irte {
             fault_processing_disable: lo & (1 << 1) != 0,
         }))
     }
+
+    /// Ferric Oxide: whether entry `words` (of a table whose destinations are `extended` or
+    /// not) is present and delivers vector `from.1` to physical APIC `from.0`: the entries
+    /// [`Self::retarget_low`] moves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_vtd::interrupt::{Destination, Irte, SourceValidation};
+    ///
+    /// let source = SourceValidation::RequesterId { source_id: 0x0020, ignore_function_bits: 0 };
+    /// let words = Irte::fixed(0x30, Destination::XApic(1), source).encode();
+    /// assert!(Irte::delivers(words, false, (1, 0x30)));
+    /// assert!(!Irte::delivers(words, false, (1, 0x31)));
+    /// assert!(!Irte::delivers(Irte::NOT_PRESENT, false, (0, 0)));
+    /// ```
+    pub fn delivers(words: [u64; 2], extended: bool, from: (u32, u8)) -> bool {
+        Self::delivering(words, extended, from).is_some()
+    }
+
+    /// The decoded entry `words` when it delivers `from.1` to physical APIC `from.0`.
+    fn delivering(words: [u64; 2], extended: bool, from: (u32, u8)) -> Option<Self> {
+        let entry = Self::decode(words, extended).ok().flatten()?;
+        let (apic, vector) = from;
+        (!entry.logical && entry.vector == vector && entry.destination.apic_id() == apic)
+            .then_some(entry)
+    }
+
+    /// Ferric Oxide: the new low word that moves entry `words` (of a table whose destinations
+    /// are `extended` or not) from delivering `from.1` to physical APIC `from.0` to delivering
+    /// `vector` to `destination`, or `None` when the entry is not present, cannot be decoded,
+    /// or delivers anything else (another vector, APIC, or a logical destination).
+    ///
+    /// The vector and the destination are both in the low word, and the source check is in the
+    /// high word, which stays as it is. So one 64-bit write of the returned word moves the
+    /// entry atomically: the unit never sees a half-written or not-present entry, and the
+    /// device's message, which names the entry, does not change.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_vtd::interrupt::{Destination, Irte, SourceValidation};
+    ///
+    /// let source = SourceValidation::RequesterId { source_id: 0x0020, ignore_function_bits: 0 };
+    /// let words = Irte::fixed(0x30, Destination::X2Apic(1), source).encode();
+    /// let lo = Irte::retarget_low(words, true, (1, 0x30), 0x51, Destination::X2Apic(2));
+    /// assert_eq!(lo, Some(Irte::fixed(0x51, Destination::X2Apic(2), source).encode()[0]));
+    /// assert_eq!(Irte::retarget_low(words, true, (3, 0x30), 0x51, Destination::X2Apic(2)), None);
+    /// ```
+    pub fn retarget_low(
+        words: [u64; 2],
+        extended: bool,
+        from: (u32, u8),
+        vector: u8,
+        destination: Destination,
+    ) -> Option<u64> {
+        let entry = Self::delivering(words, extended, from)?;
+        let moved = Self {
+            vector,
+            destination,
+            ..entry
+        }
+        .encode();
+        // AVAIL (bits 11:8) is software's: keep whatever was there.
+        Some(moved[0] | (words[0] & 0xf00))
+    }
 }
 
 /// An MSI address and data pair.
@@ -668,6 +734,13 @@ mod allocator {
         pub fn in_use(&self) -> u32 {
             self.in_use
         }
+
+        /// Ferric Oxide: the indexes in use, lowest first.
+        pub fn used(&self) -> impl Iterator<Item = u16> + '_ {
+            (0..self.entries)
+                .filter_map(|index| u16::try_from(index).ok())
+                .filter(|&index| self.is_used(index))
+        }
     }
 }
 
@@ -749,6 +822,78 @@ mod tests {
         // AVAIL (bits 11:8) belongs to software.
         let avail = Irte::decode([1 | (0xf << 8), 0], true);
         assert!(matches!(avail, Ok(Some(_))));
+    }
+
+    #[test]
+    fn delivers_matches_what_retargeting_moves() {
+        let from = Irte::fixed(0x45, Destination::X2Apic(0x1_0000), EXACT);
+        let words = from.encode();
+        assert!(Irte::delivers(words, true, (0x1_0000, 0x45)));
+        assert!(!Irte::delivers(words, true, (0x1_0000, 0x46)));
+        assert!(!Irte::delivers(words, true, (0, 0x45)));
+        let logical = Irte {
+            logical: true,
+            ..from
+        };
+        assert!(!Irte::delivers(logical.encode(), true, (0x1_0000, 0x45)));
+        for (words, from) in [
+            (words, (0x1_0000, 0x45)),
+            (logical.encode(), (0x1_0000, 0x45)),
+        ] {
+            let to = Destination::X2Apic(2);
+            assert_eq!(
+                Irte::delivers(words, true, from),
+                Irte::retarget_low(words, true, from, 0x60, to).is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn retargeting_rewrites_only_the_low_word() {
+        let from = Irte::fixed(0x45, Destination::XApic(3), EXACT);
+        let words = from.encode();
+        let lo = Irte::retarget_low(words, false, (3, 0x45), 0x60, Destination::XApic(7))
+            .expect("the entry delivers 0x45 to APIC 3");
+        let moved = Irte::decode([lo, words[1]], false).unwrap().unwrap();
+        assert_eq!(
+            moved,
+            Irte {
+                vector: 0x60,
+                destination: Destination::XApic(7),
+                ..from
+            }
+        );
+        // Another vector, another APIC, a not-present or a logical entry is left alone.
+        let to = Destination::XApic(7);
+        assert_eq!(Irte::retarget_low(words, false, (3, 0x46), 0x60, to), None);
+        assert_eq!(Irte::retarget_low(words, false, (4, 0x45), 0x60, to), None);
+        assert_eq!(
+            Irte::retarget_low(Irte::NOT_PRESENT, false, (0, 0), 0x60, to),
+            None
+        );
+        let logical = Irte {
+            logical: true,
+            ..from
+        };
+        assert_eq!(
+            Irte::retarget_low(logical.encode(), false, (3, 0x45), 0x60, to),
+            None
+        );
+        // Software's AVAIL bits survive.
+        let avail = [words[0] | 0x500, words[1]];
+        let lo = Irte::retarget_low(avail, false, (3, 0x45), 0x60, to).unwrap();
+        assert_eq!(lo & 0xf00, 0x500);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn the_allocator_lists_used_entries() {
+        let mut irtes = IrteAllocator::new(TableSize::new(4).unwrap());
+        for _ in 0..3 {
+            irtes.alloc();
+        }
+        irtes.free(1).unwrap();
+        assert_eq!(irtes.used().collect::<alloc::vec::Vec<_>>(), [0, 2]);
     }
 
     #[test]

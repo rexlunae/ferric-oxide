@@ -57,11 +57,33 @@ impl TscPercpu {
 
 pub fn monotonic_absolute() -> Option<u128> {
     let inf = &PercpuBlock::current().misc_arch_info.tsc_info;
-    let ptr = inf.vcpu_page.get();
+    let time = pvclock_ns()?;
+    let prev = inf.prev.replace(time);
+    if prev > time {
+        // TODO
+        error!("TSC wraparound ({prev} > {time})");
+        return None;
+    }
+    assert!(prev <= time);
+    Some(time)
+}
+
+/// Ferric Oxide: the KVM paravirtual clock of this CPU in nanoseconds, or `None` when the CPU
+/// has none. Unlike [`monotonic_absolute`] it keeps no state and logs nothing, so a tracepoint
+/// can read it (`kernel.trace`'s fallback clock, `trace::clock`).
+pub fn pvclock_ns() -> Option<u128> {
+    let ptr = PercpuBlock::current()
+        .misc_arch_info
+        .tsc_info
+        .vcpu_page
+        .get();
     if ptr.is_null() {
         return None;
     }
     loop {
+        // SAFETY: `ptr` is this CPU's pvclock page, which `init` allocated, gave to the host
+        // and never frees; the host updates it under the version protocol this loop follows,
+        // and RDTSC has no side effects.
         unsafe {
             let cur_version = addr_of!((*ptr).version).read_volatile();
             if cur_version & 1 == 1 {
@@ -71,9 +93,9 @@ pub fn monotonic_absolute() -> Option<u128> {
                 x86::time::rdtsc().saturating_sub(addr_of!((*ptr).tsc_timestamp).read_volatile());
             let tsc_shift = addr_of!((*ptr).tsc_shift).read_volatile();
             let elapsed = if tsc_shift >= 0 {
-                elapsed_ticks.checked_shl(tsc_shift as u32).unwrap()
+                elapsed_ticks.checked_shl(tsc_shift as u32)?
             } else {
-                elapsed_ticks.checked_shr((-tsc_shift) as u32).unwrap()
+                elapsed_ticks.checked_shr((-tsc_shift) as u32)?
             };
             let system_time = addr_of!((*ptr).system_time).read_volatile();
             let tsc_to_system_mul = addr_of!((*ptr).tsc_to_system_mul).read_volatile();
@@ -82,15 +104,7 @@ pub fn monotonic_absolute() -> Option<u128> {
                 continue;
             }
             let delta = (u128::from(elapsed) * u128::from(tsc_to_system_mul)) >> 32;
-            let time = u128::from(system_time) + delta;
-            let prev = inf.prev.replace(time);
-            if prev > time {
-                // TODO
-                error!("TSC wraparound ({prev} > {time})");
-                return None;
-            }
-            assert!(prev <= time);
-            return Some(time);
+            return Some(u128::from(system_time) + delta);
         }
     }
 }

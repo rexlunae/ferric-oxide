@@ -32,6 +32,14 @@ including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test.
 
+Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
+running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
+rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining
+the lockfiles' exact commit IDs. Other mirrors can lack current commits, so their
+upstream URLs remain in use with increased retries. This also covers Cargo
+dependency resolution during feature generation; successful submodule checkout
+alone does not establish that Cargo can reach GitLab.
+
 `cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
@@ -46,9 +54,62 @@ a baseline or disabling a check.
 
 Package coverage is in `crates/fox-core/tests/archive.rs`,
 `crates/fox-store/tests/store.rs`, `tools/fox/tests/cli.rs`,
-`tools/fox/tests/git_sources.rs`, `crates/fox-git/tests/repo.rs`,
-`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs` and
-`tools/cargo-fox/tests/cli.rs`. Tests construct real signed pkgar fixtures
+`tools/fox/tests/git_sources.rs`, `tools/fox/tests/registry.rs`, `crates/fox-git/tests/repo.rs`,
+`crates/fox-git/tests/tags.rs`, `crates/fox-build/tests/build.rs`,
+`tools/cargo-fox/tests/cli.rs`, `crates/fox-index/tests/registry.rs` and
+`tools/fox-registry/tests/cli.rs`. The registry tests sign metadata with
+fixed-seed keys and attack it: rollback, expiry, a changed file, a delegation
+claiming another path, and a key rotation signed by the new keys only.
+`tools/fox/tests/registry.rs` installs by name from a local registry: from
+the owner-signed tag, from a prebuilt artifact with too few and then enough
+builders, under `build = "never"`, and refuses a moved tag, a wrong root pin
+and a tampered blob. `tools/fox-registry/tests/cli.rs` also runs `build` as a
+registry builder, unlisted and then listed in `registry.toml`, then again
+with `--level v4` as a second artifact (on x86-64 hosts), runs `rebuild`
+as an independent rebuilder in another work directory (refused until it is
+listed, then reproducing the archive and adding its attestation to the same
+artifact, after which nothing is left to rebuild, and attesting again once
+its key is replaced), publishes
+an advisory, and imports a small recipe tree (a git recipe, a tarball recipe
+with a description, and an invalid name). `fox sync` is tested end to end with a registry package (installed,
+locked, unchanged under `--locked`, removed when the set drops it, kept when
+it was replaced by hand, and a refused `--locked` sync leaving the registries
+and policy untouched) and a git package pinned to its commit (a moved tag
+fails until `--update`); unit tests check that changing `rev`, features,
+`default-features`, target, `path` or `package` invalidates a pin and that
+local git sources lock by their canonical `file://` URL, and that the
+x86-64 level is part of the request for x86-64 and implicit targets only.
+CPU-level selection is unit tested in `tools/fox/src/cpu.rs` (an explicit
+`--level`, the running CPU under the policy cap, the policy or baseline for
+another root) and `tools/fox/src/prebuilt.rs` (a v4 machine prefers v4 and
+falls back to v3, a v3 machine never gets v4, other targets take only
+artifacts without a level, and an attestation of another level is refused);
+`fox-registry`'s `is_variant` and `fox-build`'s level choice have unit tests
+too, and `fox-build`'s rebuild comparison is unit tested for a changed,
+missing or extra file, a changed mode and another version. `fox-registry`
+unit tests check that a rebuild with any divergent archive fails while
+keeping the ones it reproduced, and that an unlisted builder or unreadable
+attestation counts as not attested.
+The installer's `fox` image step (`tools/installer/src/fox.rs`) is unit
+tested with a stand-in `fox` script: adoption alone without a package set,
+then adoption, a `--locked` sync for the image target and level and the system SBOM in
+that order, a failing sync that stops before the SBOM, and a missing
+binary. `ferric-config`'s `package_manager_choice` test checks the make
+variables the `packages.*` options and `cpu.x86_64_level` generate. Building and booting an image
+through `fox` (`make all`, `make qemu`) is not covered by these tests.
+`fox audit` is tested end to end against a registry advisory
+(including the install warning, a registry VEX statement that sets the
+finding aside, no VEX for a `fox-installed/1` store without recorded
+origins, `--no-vex` skipping a broken VEX document, and a changed SBOM),
+and in unit tests for VEX matching by id and alias, other versions, an
+`exploitable` statement winning over a clearing one, and VEX applying only
+to packages whose recorded origin is that registry's name and root; and
+against a RustSec-layout directory of advisories for crates inside build
+SBOMs, with withdrawn, build-only and non-semver cases. `fox-sbom`'s VEX
+reader is unit tested on purl and component references, versions (including
+an `affected` version the purl also names) and every
+rejected document, and `fox-registry`'s CLI test publishes, refuses and
+removes VEX documents and signs the result. Tests construct real signed pkgar fixtures
 through `fox-core`'s `test-fixtures` feature. The git and build tests create
 repositories with the `git` command and build a small path-only workspace
 with Cargo, so they need `git` and the rustup default toolchain but no
@@ -59,6 +120,24 @@ hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
 
+`ferric-lvm` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/lvm/tests/fixtures.rs` reads PVs
+that lvm2 wrote (`crates/lvm/tests/fixtures/README` has the commands): a
+two-PV striped group, metadata text that wraps round its area, and a volume
+extended after another one. It checks the parsed groups and mappings against
+`vgcfgbackup`, flips a bit in every byte the reader depends on, and edits labels
+and metadata-area headers to test areas that are empty, broken or past the
+device.
+
+`ferric-luks` is a prepared library that nothing in the image uses yet, so its
+host tests are its only coverage. `crates/luks/tests/fixtures.rs` reads LUKS1
+and LUKS2 headers that cryptsetup wrote (`crates/luks/tests/fixtures/README`
+has the commands) and checks the recovered volume keys against
+`cryptsetup luksDump --dump-volume-key`, header-copy fallback and random
+corruption. Because the bootloader is a soft-float UEFI target, CI also builds
+it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
+`x86_64-unknown-uefi`; check that build when changing its dependencies.
+
 ## Kernel lint and binary checks
 
 | Check | Purpose |
@@ -66,6 +145,8 @@ IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -73,15 +154,27 @@ ordinary host `cargo test` is not a kernel boot test. When removing warnings,
 run the ratchet with `--update` and commit the lower baseline. The workflow
 contains the exact preparation for an IBT-configured binary.
 
-The workflow also builds kernel Rustdoc with warnings denied and `regbuf`
-and the tracing features enabled, for both `kernel.iommu = "never"` and `"auto"`. This covers common
-kernel documentation and the optional DMA-grant APIs. After generating and
-copying the desired kernel configuration, reproduce the check from
+The workflow also builds kernel Rustdoc with warnings denied, `regbuf` and the
+tracing features enabled, in two configurations: `kernel.iommu = "never"`
+without `rings`, and `"auto"` with `rings`. Between them they cover the common
+kernel documentation, the optional DMA-grant APIs and the ring scheme, and
+catch links to items that a feature compiles out. After generating and copying
+the desired kernel configuration for each, run the matching command from
 `crates/kernel/`:
 
 ```sh
+# With kernel.iommu = "never" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
-  cargo doc --locked --no-deps --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  cargo doc --locked --no-deps \
+  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --target targets/x86_64-unknown-kernel.json \
+  -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+
+# With kernel.iommu = "auto" generated and copied:
+RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
+  cargo doc --locked --no-deps \
+  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -100,30 +193,50 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-aslr-test` | Address variation between program executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
+| `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
+| `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order and disable |
-| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsync` through a ring, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, a DNS round trip from an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
+| `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, disable, and read-only mapping of the rings with `commit` checks |
+| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
+
+`ferric-tlb-test` also covers a relibc join race: an exiting thread stores its
+return value and then wakes the joiner, but the joiner can see the value, return
+and unmap the thread's control block before that wake runs. relibc's
+`Waitval::post` takes the futex address before the store and treats `EFAULT`
+from the wake as nobody left to wake, instead of panicking (`RELIBC PANIC` in
+`sync/mod.rs`, which boot-smoke fails on). relibc's own `pthread/join_race`
+test joins 2000 short-lived threads; neither test can force the window, so a
+pass only shows the fix did not break joins.
 
 The edu driver is started through `pcid-spawner`, separately from the console
 test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
-enables IOMMU `auto`, shadow-stack preparation `auto`, registered buffers,
+enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
 `nvmed` grant DMA (`drivers.grant_dma`) and kernel tracing (with
 `sched.switch` on from boot),
-and builds a second kernel/image with IOMMU `enforce`. Its five boot variants
+and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
+a third without kernel tracing. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer and tracing result markers, the trace boot log line,
 KASLR/KPTI logs, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
-posts the benchmark as a notice. Read that script for the exact required marker set.
+posts the benchmark as a notice, and `check-iobench-log.sh` checks the disk
+benchmark's lines and A/B and writes its figures to the job summary. Read those
+scripts for the exact required marker set.
+The `trace-overhead` job boots the images with and without tracing ten times
+each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
 
 The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
 `cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a
@@ -180,6 +293,40 @@ output. It uses KVM with `host` when available and otherwise TCG with `max`.
 `BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
 interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
 later; the workflow uses a newer-QEMU container for that variant.
+`OVMF_FIRMWARE` selects a firmware file instead of searching the usual paths.
+
+`scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
+QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
+failure, a crash after the marker, a missing test result and a missing marker.
+The host-tools workflow runs it before the Rust checks.
+
+### CET image and Kleya rerun
+
+`cet-image.yml` builds a separate smoke image with `kernel.cpu.shstk=auto`,
+`kernel.cpu.ibt=auto`, and KPTI `auto`. Its `ferric-cet-image` artifact contains
+`harddrive.img.zst`, the unstripped `kernel.all`, `kernel-config.toml`,
+`build-info.txt`, the two boot helper scripts, and `SHA256SUMS`. Build metadata distinguishes the checked-out
+PR merge commit from the PR head and records the run ID and kernel settings.
+Use all files from the same successful run; retain the symbols for #CP traces.
+
+On Kleya, download and extract the fresh artifact, then verify it and use its
+included rerun helper:
+
+```sh
+sha256sum -c SHA256SUMS
+zstd -d harddrive.img.zst -o harddrive.img
+bash boot-cet.sh harddrive.img serial-cet-kleya.log
+```
+
+The helper requires writable KVM and uses `-cpu host,migratable=off`, which
+exposed CET on Kleya where plain `host` hid it. It runs the existing disposable
+image smoke harness and requires CET detection **and enablement**, the pool
+isolation self-test, syscall fuzz success and clean smoke completion. A CET
+skip or KPTI preventing enablement does not count as a successful rerun.
+Preserve `build-info.txt`, `SHA256SUMS`, `kernel.all`, the serial log and QEMU
+version with the result for [#78](https://github.com/rexlunae/ferric-oxide/issues/78).
+The image workflow's ordinary CET-disabled CI boot validates the pool and
+fallback boot, not this hardware result.
 
 The harness rejects crashes and `FERRIC_TEST_FAIL` markers and requires the
 smoke completion marker. A completion marker alone is insufficient because

@@ -248,9 +248,22 @@ impl UserInner {
     ) -> Result<Response> {
         {
             let current_context = context::current();
-            current_context
-                .write(token.token())
-                .block("UserInner::call");
+            {
+                let mut context = current_context.write(token.token());
+                // Ferric Oxide: a cancelled context (a ring worker whose ring closed) sends no
+                // more requests; checked under the lock its cancellation takes.
+                if context.cancelled {
+                    drop(context);
+                    // The tag's slot was taken by `next_id` (for `call` and `call_generic`
+                    // alike); give it back, as a response would.
+                    let _ = self.states.lock(token.token()).try_remove(sqe.tag as usize);
+                    for description in fds {
+                        crate::syscall::fs::release_description(description, token);
+                    }
+                    return Err(Error::new(EINTR));
+                }
+                context.block("UserInner::call");
+            }
             {
                 let mut states = self.states.lock(token.token());
                 states[sqe.tag as usize] = State::Waiting {
@@ -280,7 +293,14 @@ impl UserInner {
         }
 
         loop {
-            if allow_direct_switch && let Some(handler_context) = self.context.upgrade() {
+            // Ferric Oxide: not when the caller is the handler context itself (a process that
+            // created the scheme on this thread and serves it from another): switching to
+            // oneself returns at once, so the caller would spin here without ever blocking, and
+            // the thread that serves the request could not run on this CPU.
+            if allow_direct_switch
+                && let Some(handler_context) = self.context.upgrade()
+                && !context::is_current(&handler_context)
+            {
                 // Direct switching can fail if e.g. the target context is blocked or currently
                 // scheduled.
                 context::switch::direct_switch_to(handler_context, token);

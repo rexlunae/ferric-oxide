@@ -176,6 +176,16 @@ pub unsafe fn early_init(bsp: bool) {
             enable |= KcpuFeatures::KPTI;
         }
 
+        // Ferric Oxide: kernel shadow stacks. Select the `switch_to_inner` save/restore sequence
+        // (RSTORSSP/SAVEPREVSSP, which #UD while CET is off) only when CET shadow stacks will
+        // actually be turned on for this boot; `enabled_for_cpu` is false when KPTI is on, and
+        // panics for `always` + KPTI. Decided here, before any context switch runs the patched
+        // code.
+        #[cfg(shstk_compiled)]
+        if super::shstk::enabled_for_cpu() {
+            enable |= KcpuFeatures::SHSTK;
+        }
+
         overwrite(relocs, enable);
 
         if cfg!(not(feature = "self_modifying")) {
@@ -186,6 +196,7 @@ pub unsafe fn early_init(bsp: bool) {
                     && cfg!(not(cpu_feature_auto = "xsaveopt"))
                     && cfg!(not(cpu_feature_auto = "avx512"))
                     && cfg!(not(cpu_feature_auto = "kpti"))
+                    && cfg!(not(cpu_feature_auto = "shstk"))
             );
         }
 
@@ -341,8 +352,9 @@ bitflags! {
         const XSAVEOPT = 8;
         const AVX512 = 16;
         const KPTI = 32;
-        /// Ferric Oxide: kernel shadow stacks are on (CR4.CET and IA32_S_CET.SH_STK_EN). Never
-        /// set yet; see arch/x86_64/shstk.rs.
+        /// Ferric Oxide: kernel shadow stacks are on (CR4.CET and IA32_S_CET.SH_STK_EN). Set by
+        /// early_init when `shstk::enabled_for_cpu()` holds; patches in the context-switch and
+        /// SYSCALL shadow-stack sequences. See arch/x86_64/shstk.rs.
         const SHSTK = 64;
     }
 }

@@ -12,6 +12,7 @@ use fox_core::keys::{LOCAL_BUILDER_KEY, LOCAL_BUILDER_LABEL, LOCAL_BUILDER_SECRE
 use fox_core::trust::{AuthorKey, AuthorTrust, TrustError, TrustStore};
 use fox_core::{GitUrl, GitUrlError, TrustedKeys};
 use fox_git::{GitError, Repository, Tag, TagSigner};
+use fox_index::layout::{PackageEntry, Release, ReleaseMismatch};
 use fox_store::STATE_DIR;
 
 use crate::SourceArgs;
@@ -66,11 +67,23 @@ pub(crate) enum SourceError {
     KeyRejected { git: GitUrl, fingerprint: String },
     #[error("cannot ask whether to trust the key")]
     Prompt(#[source] io::Error),
+    #[error("{name} {version} does not match its repository")]
+    Release {
+        name: String,
+        version: String,
+        #[source]
+        source: ReleaseMismatch,
+    },
     #[error("tag {tag} names version {tag_version}, but the package's version is {version}")]
     VersionMismatch {
         tag: String,
         tag_version: String,
         version: String,
+    },
+    #[error("the registry names package {expected}, but the build produced {found}")]
+    PackageMismatch {
+        expected: fox_core::PackageName,
+        found: fox_core::PackageName,
     },
 }
 
@@ -145,6 +158,17 @@ impl SourceSpec {
             rev,
         })
     }
+
+    /// The source's identity: its normalized URL, with a local directory
+    /// turned into a `file://` URL of its canonical path.
+    pub(crate) fn git(&self) -> &GitUrl {
+        &self.git
+    }
+
+    /// The tag or revision given after `#`, if any.
+    pub(crate) fn rev(&self) -> Option<&str> {
+        self.rev.as_deref()
+    }
 }
 
 /// A fetched source at the commit chosen for it.
@@ -155,6 +179,16 @@ pub(crate) struct Resolved {
     rev: String,
     commit: fox_git::Commit,
     tag: Option<Tag>,
+    /// The package's directory inside the repository.
+    path: Option<PathBuf>,
+    /// For a registry release, the package the registry names: the Cargo
+    /// package that is built, whose manifest must carry this name.
+    package: Option<fox_core::PackageName>,
+}
+
+fn cache_dir(root: &Path, git: &GitUrl) -> PathBuf {
+    let digest = blake3::hash(git.as_str().as_bytes()).to_hex();
+    root.join(STATE_DIR).join(GIT_CACHE).join(&digest[..16])
 }
 
 /// Fetches `spec` into the root's cache, picks its release tag (or the
@@ -165,8 +199,7 @@ pub(crate) fn resolve(
     spec: &SourceSpec,
     args: &SourceArgs,
 ) -> Result<Resolved, SourceError> {
-    let digest = blake3::hash(spec.git.as_str().as_bytes()).to_hex();
-    let cache = root.join(STATE_DIR).join(GIT_CACHE).join(&digest[..16]);
+    let cache = cache_dir(root, &spec.git);
     let repo = fox_git::fetch(&spec.fetch_url, &cache)?;
     let (rev, tag) = match &spec.rev {
         Some(rev) => match repo.tag(rev) {
@@ -194,6 +227,41 @@ pub(crate) fn resolve(
         rev,
         commit,
         tag,
+        path: args.path.clone(),
+        package: None,
+    })
+}
+
+/// Fetches a registry release's repository and checks its tag: signed by
+/// one of the package's owners (the registry's delegation, not the trust
+/// store, decides who may sign) and naming the recorded commit and tree.
+pub(crate) fn resolve_release(
+    root: &Path,
+    entry: &PackageEntry,
+    release: &Release,
+) -> Result<Resolved, SourceError> {
+    let cache = cache_dir(root, &entry.git);
+    let repo = fox_git::fetch(entry.git.as_str(), &cache)?;
+    let tag = repo.tag(&release.tag)?;
+    tag.verify_signed_by(entry.owners.iter().map(|owner| &owner.key))?;
+    let commit = tag.commit().clone();
+    let tree = repo.tree_blake3(&commit)?;
+    release
+        .check_source(&commit.id(), &tree)
+        .map_err(|source| SourceError::Release {
+            name: entry.name.to_string(),
+            version: release.version.to_string(),
+            source,
+        })?;
+    Ok(Resolved {
+        git: entry.git.clone(),
+        repo,
+        cache,
+        rev: release.tag.clone(),
+        commit,
+        tag: Some(tag),
+        path: entry.path.as_ref().map(PathBuf::from),
+        package: Some(entry.name.clone()),
     })
 }
 
@@ -301,9 +369,16 @@ pub(crate) fn build(
     let mut request = BuildRequest::new(&resolved.cache, &work_dir);
     request.rev = resolved.commit.id();
     request.git_url = Some(resolved.git.to_string());
-    request.package_dir = args.path.clone().unwrap_or_default();
-    request.package = args.package.clone();
+    request.package_dir = resolved.path.clone().unwrap_or_default();
+    // A registry names the package; a workspace root may hold another one.
+    request.package = resolved
+        .package
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| args.package.clone());
     request.target = args.target.clone();
+    // A level for the machine, which applies only if the target is x86-64.
+    request.x86_64_level = args.cpu_level;
     request.features = FeatureSelection {
         default_features: !args.no_default_features,
         features: args.features.clone(),
@@ -315,6 +390,14 @@ pub(crate) fn build(
     )?;
     let built = fox_build::build(&request)?;
     check_version(resolved, &built.manifest.version)?;
+    if let Some(expected) = &resolved.package
+        && &built.manifest.name != expected
+    {
+        return Err(SourceError::PackageMismatch {
+            expected: expected.clone(),
+            found: built.manifest.name.clone(),
+        });
+    }
     Ok(fox_build::package(&built, &signer, &out)?)
 }
 
@@ -341,7 +424,6 @@ fn check_version(resolved: &Resolved, version: &str) -> Result<(), SourceError> 
 pub(crate) fn prebuilt(
     root: &Path,
     resolved: &Resolved,
-    args: &SourceArgs,
     path: &Path,
     keys: &TrustedKeys,
 ) -> Result<Archive, SourceError> {
@@ -369,7 +451,7 @@ pub(crate) fn prebuilt(
     if source.tree_blake3 != resolved.repo.tree_blake3(&resolved.commit)? {
         return Err(mismatch("tree"));
     }
-    let wanted_path = args
+    let wanted_path = resolved
         .path
         .as_ref()
         .map(|dir| dir.to_string_lossy().into_owned());

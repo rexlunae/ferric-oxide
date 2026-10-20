@@ -20,6 +20,8 @@ pub mod arch;
 
 pub mod exec;
 pub mod initfs;
+// Ferric Oxide: the initfs trace configuration (lib/trace.toml).
+pub mod initfs_trace;
 pub mod initnsmgr;
 pub mod procmgr;
 pub mod start;

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use fox_core::archive::Archive;
 use fox_core::fixtures::{FixtureEntry, FixtureKey, build_package};
 use fox_core::{Blake3Digest, Manifest, PackageName, TrustedKeys, VerifyError};
-use fox_store::{InstallOptions, MetadataKind, PackageState, ProblemKind, Store, StoreError};
+use fox_store::{
+    InstallOptions, MetadataKind, Origin, PackageState, ProblemKind, Store, StoreError,
+};
 
 struct Env {
     work: tempfile::TempDir,
@@ -190,6 +192,38 @@ fn upgrade_replaces_files_and_drops_stale_ones() {
     let listed = env.store.list().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].version, "2.0");
+}
+
+#[test]
+fn records_the_registry_a_package_came_from_until_it_is_replaced() {
+    let env = Env::new();
+    let v1 = env.package(
+        "hello",
+        "1.0",
+        &[],
+        &[FixtureEntry::file("usr/bin/hello", b"v1", 0o755)],
+    );
+    let v2 = env.package(
+        "hello",
+        "2.0",
+        &[],
+        &[FixtureEntry::file("usr/bin/hello", b"v2", 0o755)],
+    );
+    let origin = Origin {
+        registry: name("ferric"),
+        root_blake3: Blake3Digest::of(b"root"),
+    };
+    let archive = Archive::open(&v1, &env.key.trusted()).unwrap();
+    env.store
+        .install_from(&archive, InstallOptions::default(), Some(origin.clone()))
+        .unwrap();
+    assert_eq!(
+        env.store.get(&name("hello")).unwrap().unwrap().origin,
+        Some(origin)
+    );
+    // An archive from anywhere else is not that registry's package.
+    env.install(&v2, false).unwrap();
+    assert_eq!(env.store.get(&name("hello")).unwrap().unwrap().origin, None);
 }
 
 #[test]

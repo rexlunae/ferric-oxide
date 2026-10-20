@@ -29,7 +29,10 @@
 //!   remappable-format message that names it into the payload; [`Request::FreeIrte`](ferric_iommu::abi::Request::FreeIrte) frees it
 //!   (`arch/x86_64/iommu/interrupt.rs`). pcid makes these calls when a driver asks it for an MSI
 //!   message, and frees the entries when the driver's channel closes. `ENODEV` means the unit
-//!   does not remap interrupts, so compatibility-format messages still work.
+//!   does not remap interrupts, so compatibility-format messages still work. Ferric Oxide:
+//!   steering a vector to another CPU (`irq:`, `ferric_irq::call::Call::Move`) rewrites the
+//!   entries that deliver it, and [`Request::IrteTarget`](ferric_iommu::abi::Request::IrteTarget)
+//!   tells pcid where an entry delivers now, so it does not reuse one that moved.
 //! - With the `regbuf` feature, [`Request::MapGrant`](ferric_iommu::abi::Request::MapGrant) on a domain the caller has bound maps a
 //!   page-aligned `kernel.regbuf` grant (named by the caller's descriptor number) at a fresh
 //!   contiguous IOVA range, with the grant's access, and returns the IOVA; the grant records
@@ -52,7 +55,9 @@ use alloc::{collections::BTreeMap, sync::Weak, vec::Vec};
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use ferric_iommu::abi::{MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH};
+use ferric_iommu::abi::{
+    IrteTarget, MsiMessage, MsiRoute, PciDevice, Request, SourceCheck, DOMAIN_PATH,
+};
 #[cfg(feature = "regbuf")]
 use ferric_iommu::dma::{grant::MapAttempt, links::DomainLinks};
 use ferric_vtd::{dmar::BusRange, interrupt::SourceValidation, plan::SelectError, Bdf};
@@ -300,6 +305,11 @@ impl KernelScheme for IommuScheme {
                 require_cap(cap)?;
                 interrupt::free(id).map_err(|err| irq_errno(&err))?;
                 Ok(0)
+            }
+            (Request::IrteTarget(id), &[cap]) => {
+                require_cap(cap)?;
+                let (cpu, vector) = interrupt::target(id).map_err(|err| irq_errno(&err))?;
+                usize::try_from(IrteTarget { cpu, vector }.to_word()).map_err(|_| Error::new(EIO))
             }
             (Request::MapGrant { grant_fd }, &[domain]) => map_grant(domain, grant_fd, token),
             (Request::UnmapGrant { iova }, &[domain]) => unmap_grant(domain, iova).map(|()| 0),

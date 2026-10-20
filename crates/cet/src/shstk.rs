@@ -19,11 +19,15 @@
 //!   first returns match the hand-built frames on its normal stack.
 //! - **Slot windows** ([`SlotWindow`]): one virtual slot per kernel stack, found from the stack's
 //!   physical address, with an unmapped guard below each shadow stack.
+//! - **Interrupt shadow frames** ([`find_supervisor_interrupt_frame`]). An interrupt or exception
+//!   taken in ring 0 without an SSP switch pushes `CS`, the return linear address (`LIP`) and the
+//!   old `SSP` to the shadow stack; `IRET` back to ring 0 pops and checks them. A handler that
+//!   resumes at a different RIP must rewrite that `LIP` too (with `WRSS`).
 //!
 //! Specification: Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 1,
 //! chapter 17 ("Control-flow Enforcement Technology", sections on shadow-stack pages, the
 //! supervisor shadow-stack token and switching shadow stacks); Volume 2, `RSTORSSP`,
-//! `SAVEPREVSSP` and `RDSSP`; Volume 3A, chapter 4 (shadow-stack accesses in paging) and
+//! `SAVEPREVSSP`, `RDSSP`, `WRSS`, `INT n` and `IRET` (shadow-stack frame push and pop); Volume 3A, chapter 4 (shadow-stack accesses in paging) and
 //! section 6.14.5 (interrupt SSP table); Volume 4, table 2-2 (`IA32_PL0_SSP`,
 //! `IA32_INTERRUPT_SSP_TABLE_ADDR`).
 //!
@@ -47,6 +51,8 @@
 //! ```
 
 use core::fmt;
+
+pub mod pool;
 
 /// `IA32_PL0_SSP`: the shadow-stack pointer the CPU loads on a transition to ring 0 that does not
 /// use an IST stack.
@@ -347,6 +353,99 @@ impl SlotWindow {
     }
 }
 
+impl SlotWindow {
+    /// The shadow stack holding `addr`: the top `stack_bytes` of `addr`'s slot, as `(base, top)`
+    /// with `top` exclusive. `None` when `addr` is outside the window or in the guard part of its
+    /// slot below the shadow stack, or `stack_bytes` is larger than a slot.
+    pub const fn stack_containing(&self, addr: u64, stack_bytes: u64) -> Option<(u64, u64)> {
+        let Some(offset) = addr.checked_sub(self.base) else {
+            return None;
+        };
+        if offset >= self.len {
+            return None;
+        }
+        let Some(slot_size) = 1u64.checked_shl(self.slot_shift) else {
+            return None;
+        };
+        if stack_bytes > slot_size {
+            return None;
+        }
+        // The slot's end: `offset` rounded up to the next multiple of the slot size, past `addr`.
+        let Some(end) = (offset >> self.slot_shift).checked_add(1) else {
+            return None;
+        };
+        let Some(end) = end.checked_mul(slot_size) else {
+            return None;
+        };
+        if end > self.len {
+            return None;
+        }
+        let Some(top) = self.base.checked_add(end) else {
+            return None;
+        };
+        // Cannot underflow: `stack_bytes <= slot_size <= end`, and `top = base + end`.
+        let stack_base = top - stack_bytes;
+        if addr < stack_base {
+            return None;
+        }
+        Some((stack_base, top))
+    }
+}
+
+/// Size in bytes of the shadow-stack frame the CPU pushes for an interrupt or exception taken in
+/// supervisor mode: the old `SSP`, the return linear address (`LIP`) and `CS`, 8 bytes each.
+pub const INTERRUPT_FRAME_BYTES: u64 = 3 * ENTRY_BYTES;
+
+/// Finds the innermost shadow-stack frame of an interrupt or exception taken in supervisor mode
+/// (with no interrupt-stack-table switch) whose return is `cs:lip`, and returns the index in
+/// `entries` of its `LIP` entry, the one to rewrite with `WRSS` when the handler resumes elsewhere.
+///
+/// `entries` are the shadow-stack entries from `ssp` upward (`entries[i]` is at
+/// `ssp + 8 * i`). Delivery of such an interrupt pushes, from high to low addresses, `CS`, `LIP`
+/// and the `SSP` from before the pushes, so a frame at address `f` reads
+/// `[f] = f + 24`, `[f + 8] = lip`, `[f + 16] = cs` (with `CS` zero-extended). The first field
+/// pointing just past its own frame is what keeps a return address from being mistaken for a
+/// frame: return addresses are code addresses, never shadow-stack addresses. Entries below the
+/// frame are the return addresses of the handler's own calls. `IRET` to supervisor mode pops this
+/// frame and raises #CP unless `CS` and `LIP` match what it returns to.
+///
+/// Returns `None` when no such frame lies in `entries`, for example when the interrupt came
+/// from user mode (which pushes no frame) or switched to an IST shadow stack (whose frame's old
+/// `SSP` points at another stack).
+///
+/// # Examples
+///
+/// ```
+/// use ferric_cet::shstk::find_supervisor_interrupt_frame;
+///
+/// let ssp = 0xFFFF_FF80_0000_3F00;
+/// let rip = 0xFFFF_FFFF_8012_3456; // the faulting instruction
+/// let entries = [
+///     0xFFFF_FFFF_8000_1000, // a return address pushed by the handler's own call
+///     ssp + 8 + 24,          // the frame: old SSP,
+///     rip,                   // LIP,
+///     0x08,                  // and CS
+/// ];
+/// assert_eq!(find_supervisor_interrupt_frame(ssp, &entries, 0x08, rip), Some(2));
+/// ```
+pub fn find_supervisor_interrupt_frame(
+    ssp: u64,
+    entries: &[u64],
+    cs: u16,
+    lip: u64,
+) -> Option<usize> {
+    entries.windows(3).enumerate().find_map(|(i, frame)| {
+        let addr = ssp.checked_add((i as u64).checked_mul(ENTRY_BYTES)?)?;
+        let [prev_ssp, frame_lip, frame_cs] = *frame else {
+            return None;
+        };
+        (prev_ssp == addr.checked_add(INTERRUPT_FRAME_BYTES)?
+            && frame_lip == lip
+            && frame_cs == u64::from(cs))
+        .then_some(i + 1)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -549,6 +648,148 @@ mod tests {
             LayoutError::OutsideWindow { key: 1 << 40 }
                 .to_string()
                 .contains("0x10000000000")
+        );
+    }
+
+    #[test]
+    fn partial_final_slot_does_not_extend_past_window() {
+        let window = SlotWindow {
+            base: 0x1000,
+            len: 0x1800,
+            key_shift: 12,
+            slot_shift: 12,
+        };
+        assert!(window.slot_top(0x1000).is_err());
+        for addr in [0x2000, 0x2400, 0x27FF] {
+            assert_eq!(window.stack_containing(addr, 0x1000), None);
+        }
+        assert_eq!(
+            window.stack_containing(0x1FFF, 0x1000),
+            Some((0x1000, 0x2000))
+        );
+    }
+
+    #[test]
+    fn stack_containing_finds_the_upper_half_of_the_slot() {
+        let window = SlotWindow {
+            base: 0xFFFF_FF80_0000_0000,
+            len: 1 << 30,
+            key_shift: 16,
+            slot_shift: 14,
+        };
+        let stack = 1 << 13;
+        let slot2 = window.base + 2 * (1 << 14);
+        let expected = Some((slot2 + stack, slot2 + (1 << 14)));
+        // Anywhere in the shadow-stack half, including its first and last entries.
+        assert_eq!(window.stack_containing(slot2 + stack, stack), expected);
+        assert_eq!(
+            window.stack_containing(slot2 + (1 << 14) - 8, stack),
+            expected
+        );
+        // The guard half below it and addresses outside the window have none.
+        assert_eq!(window.stack_containing(slot2 + stack - 8, stack), None);
+        assert_eq!(window.stack_containing(slot2, stack), None);
+        assert_eq!(window.stack_containing(window.base - 8, stack), None);
+        assert_eq!(
+            window.stack_containing(window.base + window.len, stack),
+            None
+        );
+        // A stack larger than a slot cannot fit.
+        assert_eq!(window.stack_containing(slot2 + stack, 1 << 15), None);
+        // The slot's top agrees with `slot_top` for the key of slot 2.
+        assert_eq!(window.slot_top(2 << 16).ok(), expected.map(|(_, top)| top));
+    }
+
+    /// A fixture shaped like the shadow stack of a ring-0 #GP handler: two return addresses from
+    /// its calls, the CPU's interrupt frame, then the interrupted code's own return addresses and
+    /// the supervisor token at the top.
+    fn gp_handler_shadow_stack(ssp: u64, rip: u64) -> [u64; 8] {
+        let frame = ssp + 16;
+        [
+            0xFFFF_FFFF_8000_2000,
+            0xFFFF_FFFF_8000_1000,
+            frame + INTERRUPT_FRAME_BYTES,
+            rip,
+            0x08,
+            0xFFFF_FFFF_8000_3000,
+            0xFFFF_FFFF_8000_4000,
+            supervisor_token(ssp + 7 * 8).unwrap() | SUPERVISOR_TOKEN_BUSY,
+        ]
+    }
+
+    #[test]
+    fn finds_the_interrupt_frame() {
+        let ssp = 0xFFFF_FF80_0000_7F00;
+        let rip = 0xFFFF_FFFF_8012_3456;
+        let entries = gp_handler_shadow_stack(ssp, rip);
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries, 0x08, rip),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn frame_fields_must_all_match() {
+        let ssp = 0xFFFF_FF80_0000_7F00;
+        let rip = 0xFFFF_FFFF_8012_3456;
+        let entries = gp_handler_shadow_stack(ssp, rip);
+        // Wrong return address or code segment.
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries, 0x08, rip + 2),
+            None
+        );
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries, 0x2B, rip),
+            None
+        );
+        // An old SSP pointing elsewhere (an IST switch) is not this stack's frame.
+        let mut ist = entries;
+        ist[2] = 0xFFFF_FF80_0001_0000;
+        assert_eq!(find_supervisor_interrupt_frame(ssp, &ist, 0x08, rip), None);
+        // Too few entries to hold a whole frame.
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries[..4], 0x08, rip),
+            None
+        );
+        assert_eq!(find_supervisor_interrupt_frame(ssp, &[], 0x08, rip), None);
+    }
+
+    #[test]
+    fn return_addresses_equal_to_lip_are_not_frames() {
+        // A call whose return address happens to equal LIP, followed by entries resembling CS,
+        // must not match: its "old SSP" is a code address.
+        let ssp = 0xFFFF_FF80_0000_7F00;
+        let rip = 0xFFFF_FFFF_8012_3456;
+        let entries = [
+            rip,
+            rip,
+            0x08,
+            ssp + 3 * 8 + INTERRUPT_FRAME_BYTES,
+            rip,
+            0x08,
+        ];
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries, 0x08, rip),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn innermost_frame_wins() {
+        // Two nested ring-0 interrupts with the same return: the lower (inner) frame is chosen.
+        let ssp = 0xFFFF_FF80_0000_7F00;
+        let rip = 0xFFFF_FFFF_8012_3456;
+        let entries = [
+            ssp + INTERRUPT_FRAME_BYTES,
+            rip,
+            0x08,
+            ssp + 3 * 8 + INTERRUPT_FRAME_BYTES,
+            rip,
+            0x08,
+        ];
+        assert_eq!(
+            find_supervisor_interrupt_frame(ssp, &entries, 0x08, rip),
+            Some(1)
         );
     }
 }

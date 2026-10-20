@@ -29,14 +29,23 @@ use crate::{
     syscall::{
         data::Stat,
         error::*,
-        flag::{EventFlags, EVENT_READ, MODE_CHR, MODE_DIR, O_CREAT, O_DIRECTORY, O_STAT},
-        usercopy::{UserSliceRo, UserSliceWo},
+        flag::{
+            CallFlags, EventFlags, EVENT_READ, MODE_CHR, MODE_DIR, O_CREAT, O_DIRECTORY, O_STAT,
+        },
+        usercopy::{UserSliceRo, UserSliceRw, UserSliceWo},
     },
 };
 
 ///
 /// IRQ queues
 pub(super) static COUNTS: Mutex<[usize; 224]> = Mutex::new([0; 224]);
+
+/// Ferric Oxide: serializes reserving, steering and giving back `irq:` vectors, so a move
+/// works from the route its handle has when it starts and keeps it until the handles are
+/// re-keyed: a second move of the same vector waits and then starts from where the first left
+/// it, and a close cannot give back the old vector while its remapping entries are being
+/// rewritten. Taken before [`HANDLES`], never while holding it, and never in interrupt context.
+static VECTORS: Mutex<()> = Mutex::new(());
 static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
 
 /// These are IRQs 0..=15 (corresponding to interrupt vectors 32..=47). They are opened without the
@@ -55,16 +64,106 @@ const INO_TOPLEVEL: u64 = 0x8002_0000_0000_0000;
 const INO_AVAIL: u64 = 0x8000_0000_0000_0000;
 const INO_BSP: u64 = 0x8001_0000_0000_0000;
 const INO_PHANDLE: u64 = 0x8003_0000_0000_0000;
+// Ferric Oxide: `irq:cpus`.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+const INO_CPUS: u64 = 0x8004_0000_0000_0000;
+/// Ferric Oxide: the root `getdents` position of `cpus`, after every `cpu-XX` (`XX` is a `u8`).
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+const CPUS_DIRENT: usize = 0x101;
+
+/// Ferric Oxide (`irq-percpu`): the interrupt counts per (logical CPU, IRQ), which replace
+/// [`COUNTS`] for counting and delivery, so the same vector number reserved on two CPUs is two
+/// interrupts, and each CPU counts in its own row without a lock.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+static PERCPU_COUNTS: ferric_irq::Counts<{ crate::cpu_set::MAX_CPU_COUNT as usize }> =
+    ferric_irq::Counts::new();
+
+/// Counts an interrupt of `irq` for the handles on `owner`, and returns the CPU whose handles get
+/// it (Ferric Oxide: the BSP, as upstream, without `irq-percpu`).
+fn count_interrupt(irq: u8, owner: LogicalCpuId) -> LogicalCpuId {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        // Every online CPU has a row: there are `MAX_CPU_COUNT` of them.
+        let _ = PERCPU_COUNTS.trigger(ferric_irq::CpuId::new(owner.get()), number);
+        return owner;
+    }
+    let _ = owner;
+    if let Some(count) = COUNTS.lock().get_mut(usize::from(irq)) {
+        *count = count.wrapping_add(1);
+    }
+    LogicalCpuId::BSP
+}
+
+/// Ferric Oxide: whether a handle for `irq` on `cpu` gets only the interrupts of a vector below
+/// 16 reserved on an AP (`irq:cpu-XX/N`), which no PIC or I/O APIC line backs: the legacy IRQs
+/// 0-15 exist only on the BSP.
+///
+/// Only with `irq-percpu`, where such a handle counts only its own CPU's interrupts. Without
+/// it, counts are per number as upstream, so the handle also sees the BSP's legacy IRQ of the
+/// same number and must unmask its line when acknowledging, or the line stays masked.
+const fn ap_low_vector(cpu: LogicalCpuId, irq: u8) -> bool {
+    cfg!(all(feature = "irq-percpu", target_arch = "x86_64"))
+        && irq < BASE_IRQ_COUNT
+        && cpu.get() != LogicalCpuId::BSP.get()
+}
+
+/// The interrupts of `irq` that handles on `cpu` have had (Ferric Oxide: `cpu` matters only
+/// with `irq-percpu`).
+fn interrupt_count(cpu: LogicalCpuId, irq: u8) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        return PERCPU_COUNTS
+            .get(ferric_irq::CpuId::new(cpu.get()), number)
+            .unwrap_or(0);
+    }
+    let _ = cpu;
+    total_count(irq)
+}
+
+/// The interrupts of `irq` so far on all CPUs, for `sys:irq`.
+pub(super) fn total_count(irq: u8) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    if let Some(number) = ferric_irq::Irq::new(irq) {
+        return PERCPU_COUNTS.total(number);
+    }
+    COUNTS.lock().get(usize::from(irq)).copied().unwrap_or(0)
+}
+
+/// Whether a handle for `irq` on `handle_cpu` gets an interrupt of `irq` counted for `cpu`
+/// (Ferric Oxide: every handle for `irq` does without `irq-percpu`, as upstream).
+fn delivers_to(handle_cpu: LogicalCpuId, cpu: LogicalCpuId) -> bool {
+    !cfg!(all(feature = "irq-percpu", target_arch = "x86_64")) || handle_cpu == cpu
+}
 
 /// Add to the input queue
+///
+/// Ferric Oxide: for interrupts from the PIC or I/O APIC (and the interrupt controllers of other
+/// architectures), which belong to the BSP's `irq:N` handles wherever they are taken. A vector
+/// reserved on a CPU goes through [`vector_trigger`].
 pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
-    COUNTS.lock()[irq as usize] += 1;
+    deliver(irq, LogicalCpuId::BSP, token);
+}
+
+/// Ferric Oxide: adds an interrupt that arrived through a vector reserved on the running CPU
+/// (`irq:cpu-XX/N`) to the input queue. With `irq-percpu` it belongs to that CPU's handles, even
+/// for numbers below 16, which on an AP are ordinary vectors; without it, as upstream, to every
+/// handle for the number.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn vector_trigger(irq: u8, token: &mut CleanLockToken) {
+    deliver(irq, crate::cpu_id(), token);
+}
+
+/// Counts an interrupt of `irq` for `owner` and wakes the handles that get it.
+fn deliver(irq: u8, owner: LogicalCpuId, token: &mut CleanLockToken) {
+    let cpu = count_interrupt(irq, owner);
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
             .read(token.token())
             .iter()
             .filter_map(|(fd, handle)| Some((fd, handle.as_irq_handle()?)))
-            .filter(|&(_, (_, handle_irq))| handle_irq == irq)
+            .filter(|&(_, (_, handle_irq, handle_cpu))| {
+                handle_irq == irq && delivers_to(handle_cpu, cpu)
+            })
             .map(|(f, _)| *f)
             .collect()
     };
@@ -80,8 +179,15 @@ enum Handle {
     Irq {
         ack: AtomicUsize,
         irq: u8,
+        // Ferric Oxide: the logical CPU whose interrupts this handle counts (the BSP for the
+        // legacy IRQs and `irq:N`).
+        cpu: LogicalCpuId,
         reservation: Option<IrqReservation>,
     },
+    // Ferric Oxide (`irq-percpu`): the root-only `irq:cpus` map of online logical CPUs to
+    // APIC ids and NUMA nodes, one `ferric_irq::CpuEntry` per line.
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    Cpus(Vec<u8>),
     Avail(LogicalCpuId),
     TopLevel,
     Phandle(u8, Vec<u8>),
@@ -95,9 +201,11 @@ struct IrqReservation {
 }
 
 impl Handle {
-    fn as_irq_handle(&self) -> Option<(&AtomicUsize, u8)> {
+    fn as_irq_handle(&self) -> Option<(&AtomicUsize, u8, LogicalCpuId)> {
         match self {
-            &Self::Irq { ref ack, irq, .. } => Some((ack, irq)),
+            &Self::Irq {
+                ref ack, irq, cpu, ..
+            } => Some((ack, irq, cpu)),
             _ => None,
         }
     }
@@ -151,6 +259,7 @@ impl IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation: None,
                     },
                     InternalFlags::empty(),
@@ -159,13 +268,18 @@ impl IrqScheme {
                 if flags & O_CREAT == 0 && flags & O_STAT == 0 {
                     return Err(Error::new(EINVAL));
                 }
+                let mut ack = 0;
                 let reservation = if flags & O_STAT == 0 {
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     {
                         let index = irq_to_vector(irq_number);
+                        let _vectors = VECTORS.lock();
                         if is_reserved(cpu_id, index) {
                             return Err(Error::new(EEXIST));
                         }
+                        // Taken before the vector is published as reserved, so an interrupt
+                        // that arrives for the new owner right after is reported to it.
+                        ack = fresh_ack(cpu_id, irq_number);
                         set_reserved(cpu_id, index, true);
                         Some(IrqReservation { cpu_id, index })
                     }
@@ -176,8 +290,9 @@ impl IrqScheme {
                 };
                 (
                     Handle::Irq {
-                        ack: AtomicUsize::new(0),
+                        ack: AtomicUsize::new(ack),
                         irq: irq_number,
+                        cpu: cpu_id,
                         reservation,
                     },
                     InternalFlags::empty(),
@@ -231,12 +346,213 @@ impl IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation,
                     },
                     InternalFlags::empty(),
                 )
             })
         }
+    }
+}
+
+/// The CPUs `irq:` lists as `cpu-XX` (Ferric Oxide: with `irq-percpu`, the running logical
+/// CPUs, which is what `cpu-XX` opens; upstream lists the MADT's ACPI processor UIDs).
+fn listed_cpus() -> Vec<u8> {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    {
+        crate::percpu::all_percpu_blocks()
+            .filter_map(|block| u8::try_from(block.cpu_id.get()).ok())
+            .collect()
+    }
+    #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+    {
+        CPUS.get().expect("IRQ scheme not initialized").clone()
+    }
+}
+
+/// Ferric Oxide (`irq-percpu`): the contents of `irq:cpus`, a [`ferric_irq::CpuEntry`] line for
+/// each running CPU that has an APIC id.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn cpus_file() -> Vec<u8> {
+    use core::fmt::Write;
+
+    let mut text = String::new();
+    for block in crate::percpu::all_percpu_blocks() {
+        let Some(apic) = block.misc_arch_info.apic_id_opt.get() else {
+            continue;
+        };
+        let entry = ferric_irq::CpuEntry {
+            cpu: ferric_irq::CpuId::new(block.cpu_id.get()),
+            apic: ferric_irq::ApicId::new(apic.get()),
+            node: block.numa_node.get().map(|(node, _)| node.get()),
+        };
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(text, "{entry}");
+    }
+    text.into_bytes()
+}
+
+/// Ferric Oxide (`irq-percpu`, roadmap Phase 2.4 PR 3): steers the vector of handle `id` to
+/// logical CPU `to`, as [`ferric_irq::call::Call::Move`] describes.
+///
+/// The steps keep every interrupt accounted for:
+///
+/// 1. A free vector is reserved on `to`, so the move cannot fail for want of one later.
+/// 2. Every interrupt remapping entry that delivered the old vector to the old CPU is rewritten
+///    to deliver the new one ([`crate::arch::iommu::interrupt::move_vector`]); the device's
+///    message stays as it is. The old vector stays reserved meanwhile, so what the unit had
+///    already sent the old way is still counted on the old CPU's row.
+/// 3. Every handle of the old (CPU, vector) is re-keyed to the new one, with an interrupt
+///    pending, so whatever arrived on the old vector during the move wakes its reader (at worst
+///    one spurious wakeup). Then the old vector is given back.
+///
+/// Without remapping entries for the vector (`Moved::remapped` is 0), only the reservation and
+/// the handles move: the device still sends the old vector until its driver programs the new
+/// message, which only the owner can do, so a handle that reserved nothing is refused then.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn steer(
+    id: usize,
+    to: LogicalCpuId,
+    token: &mut CleanLockToken,
+) -> Result<ferric_irq::call::Moved> {
+    let vectors = VECTORS.lock();
+    let (from, irq, owns) = {
+        let handles = HANDLES.read(token.token());
+        let Handle::Irq {
+            irq,
+            cpu,
+            reservation,
+            ..
+        } = *handles.get(id)?
+        else {
+            return Err(Error::new(EBADF));
+        };
+        // The vector must be one an `irq:` handle reserved: not a legacy IRQ, not the kernel's.
+        let reserved = handles.iter().any(|(_, handle)| {
+            matches!(handle, Handle::Irq { cpu: c, irq: i, reservation: Some(_), .. }
+                if *c == cpu && *i == irq)
+        });
+        if !reserved || (cpu == LogicalCpuId::BSP && irq < BASE_IRQ_COUNT) {
+            return Err(Error::new(EINVAL));
+        }
+        (cpu, irq, reservation.is_some())
+    };
+    if to == from {
+        return Err(Error::new(EINVAL));
+    }
+    if crate::percpu::get_percpu_block(to).is_none() {
+        return Err(Error::new(ENOENT));
+    }
+    let from_vector = irq_to_vector(irq);
+    // IRQs 16 and up, as drivers reserve them; 0x80 stays the kernel's, as for AllocIrte.
+    let to_vector = available_irqs_iter(to)
+        .find(|&vector| vector >= irq_to_vector(BASE_IRQ_COUNT) && vector != 0x80)
+        .ok_or(Error::new(EEXIST))?;
+    set_reserved(to, to_vector, true);
+    let remapped = match remap(from, from_vector, to, to_vector) {
+        Ok(0) if !owns => Err(Error::new(EOPNOTSUPP)),
+        result => result,
+    };
+    let remapped = match remapped {
+        Ok(remapped) => remapped,
+        Err(err) => {
+            set_reserved(to, to_vector, false);
+            return Err(err);
+        }
+    };
+    let new_irq = vector_to_irq(to_vector);
+    let (fds, moved_reservation) = {
+        let mut handles = HANDLES.write(token.token());
+        let pending = interrupt_count(to, new_irq).wrapping_sub(1);
+        let mut fds: SmallVec<[usize; 4]> = SmallVec::new();
+        let mut moved_reservation = false;
+        for (&fd, handle) in handles.iter_mut() {
+            let Handle::Irq {
+                ack,
+                irq: handle_irq,
+                cpu,
+                reservation,
+            } = handle
+            else {
+                continue;
+            };
+            if *cpu != from || *handle_irq != irq {
+                continue;
+            }
+            *cpu = to;
+            *handle_irq = new_irq;
+            ack.store(pending, Ordering::SeqCst);
+            if let Some(reservation) = reservation {
+                *reservation = IrqReservation {
+                    cpu_id: to,
+                    index: to_vector,
+                };
+                moved_reservation = true;
+            }
+            fds.push(fd);
+        }
+        (fds, moved_reservation)
+    };
+    if moved_reservation {
+        set_reserved(from, from_vector, false);
+    } else {
+        // Not reached: the owner was there when the move started, under `VECTORS`, and its
+        // close waits for the lock. Kept so the new vector is never left reserved by nobody.
+        set_reserved(to, to_vector, false);
+    }
+    drop(vectors);
+    for fd in fds {
+        event::trigger(GlobalSchemes::Irq.scheme_id(), fd, EVENT_READ, token);
+    }
+    ferric_irq::Irq::new(new_irq)
+        .map(|irq| ferric_irq::call::Moved { irq, remapped })
+        .ok_or(Error::new(EIO))
+}
+
+/// Ferric Oxide: has the IOMMU move the interrupt remapping entries of `from_vector` on `from`
+/// to `to_vector` on `to`, and returns how many moved; 0 without IOMMU support.
+#[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -> Result<u32> {
+    #[cfg(iommu_enabled)]
+    {
+        use crate::arch::iommu::interrupt::{move_vector, IrqError};
+        move_vector(from.get(), from_vector, to.get(), to_vector).map_err(|err| {
+            warn!(
+                "irq: cannot move vector {from_vector:#x} from CPU {} to CPU {}: {err}",
+                from.get(),
+                to.get()
+            );
+            if matches!(err, IrqError::Hardware(_)) {
+                // Best effort: point the entries back where the old vector is still reserved.
+                let _ = move_vector(to.get(), to_vector, from.get(), from_vector);
+            }
+            Error::new(match err {
+                IrqError::Hardware(_) => EIO,
+                IrqError::NoCpu { .. } => ENOENT,
+                _ => EINVAL,
+            })
+        })
+    }
+    #[cfg(not(iommu_enabled))]
+    {
+        let _ = (from, from_vector, to, to_vector);
+        Ok(0)
+    }
+}
+
+/// Ferric Oxide: the acknowledged count a new reservation of `irq` on `cpu` starts with. With
+/// `kernel.irq_percpu` a vector can be reserved again after its owner gave it back (or after it
+/// was steered elsewhere), and its row still holds the old owner's interrupts; the new handle
+/// starts acknowledged at that count, so it reports only interrupts that arrive for it. The
+/// caller reads it before marking the vector reserved. Without `irq_percpu`, 0, as upstream.
+fn fresh_ack(cpu: LogicalCpuId, irq: u8) -> usize {
+    #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+    return interrupt_count(cpu, irq);
+    #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+    {
+        let _ = (cpu, irq);
+        0
     }
 }
 
@@ -288,8 +604,10 @@ impl crate::scheme::KernelScheme for IrqScheme {
             use core::fmt::Write;
 
             writeln!(bytes, "bsp").unwrap();
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            let _ = writeln!(bytes, "cpus");
 
-            for cpu_id in CPUS.get().expect("IRQ scheme not initialized") {
+            for cpu_id in listed_cpus() {
                 writeln!(bytes, "cpu-{:02x}", cpu_id).unwrap();
             }
 
@@ -303,9 +621,22 @@ impl crate::scheme::KernelScheme for IrqScheme {
             (Handle::TopLevel, InternalFlags::POSITIONED)
         } else if path_str == "bsp" {
             (Handle::Bsp, InternalFlags::empty())
+        } else if cfg!(all(feature = "irq-percpu", target_arch = "x86_64")) && path_str == "cpus" {
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            {
+                (Handle::Cpus(cpus_file()), InternalFlags::POSITIONED)
+            }
+            #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+            unreachable!()
         } else if let Some(path_str) = path_str.strip_prefix("cpu-") {
-            let cpu_id = u8::from_str_radix(&path_str[..2], 16).or(Err(Error::new(ENOENT)))?;
+            let cpu_id = u8::from_str_radix(path_str.get(..2).ok_or(Error::new(ENOENT))?, 16)
+                .or(Err(Error::new(ENOENT)))?;
             let path_str = path_str[2..].trim_end_matches('/');
+            // Ferric Oxide: a CPU that is not running has no IDT to reserve vectors in (and
+            // looking for one used to panic).
+            if crate::percpu::get_percpu_block(LogicalCpuId::new(cpu_id.into())).is_none() {
+                return Err(Error::new(ENOENT));
+            }
 
             if path_str.is_empty() {
                 (
@@ -346,6 +677,7 @@ impl crate::scheme::KernelScheme for IrqScheme {
                     Handle::Irq {
                         ack: AtomicUsize::new(0),
                         irq: plain_irq_number,
+                        cpu: LogicalCpuId::BSP,
                         reservation: None,
                     },
                     InternalFlags::empty(),
@@ -378,7 +710,7 @@ impl crate::scheme::KernelScheme for IrqScheme {
 
         match *HANDLES.read(token.token()).get(id)? {
             Handle::TopLevel => {
-                let cpus = CPUS.get().expect("IRQ scheme not initialized");
+                let cpus = listed_cpus();
 
                 if opaque == 0 {
                     buf.entry(DirEntry {
@@ -398,6 +730,18 @@ impl crate::scheme::KernelScheme for IrqScheme {
                         name: &intermediate,
                         inode: 0,
                         next_opaque_id: u64::from(*cpu_id + 1),
+                    })?;
+                }
+
+                // Ferric Oxide: `cpus` comes after the CPU directories, whose next ids are at
+                // most 256, so its own id resumes after it without repeating or skipping.
+                #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+                if opaque <= CPUS_DIRENT {
+                    buf.entry(DirEntry {
+                        inode: INO_CPUS,
+                        next_opaque_id: CPUS_DIRENT as u64 + 1,
+                        kind: DirentKind::CharDev,
+                        name: "cpus",
                     })?;
                 }
             }
@@ -422,6 +766,34 @@ impl crate::scheme::KernelScheme for IrqScheme {
         Ok(buf.finalize())
     }
 
+    // Ferric Oxide: `SYS_CALL` on an irq handle (`ferric_irq::call`).
+    fn kcall(
+        &self,
+        fds: &[usize],
+        _payload: UserSliceRw,
+        _flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let [id]: [usize; 1] = fds.try_into().map_err(|_| Error::new(EINVAL))?;
+        #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+        {
+            use ferric_irq::call::Call;
+            match Call::decode(metadata).map_err(|_| Error::new(EINVAL))? {
+                Call::Move { cpu } => {
+                    let moved = steer(id, LogicalCpuId::new(cpu.get()), token)?;
+                    usize::try_from(moved.to_word()).map_err(|_| Error::new(EIO))
+                }
+                _ => Err(Error::new(EINVAL)),
+            }
+        }
+        #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
+        {
+            let _ = (id, metadata, token);
+            Err(Error::new(EOPNOTSUPP))
+        }
+    }
+
     fn fcntl(
         &self,
         _id: usize,
@@ -440,9 +812,10 @@ impl crate::scheme::KernelScheme for IrqScheme {
     ) -> Result<EventFlags> {
         let handles_guard = HANDLES.read(token.token());
         let handle = handles_guard.get(id)?;
-        let (handle_ack, handle_irq) = handle.as_irq_handle().ok_or(Error::new(EBADF))?;
+        let (handle_ack, handle_irq, handle_cpu) =
+            handle.as_irq_handle().ok_or(Error::new(EBADF))?;
 
-        let current = COUNTS.lock()[handle_irq as usize];
+        let current = interrupt_count(handle_cpu, handle_irq);
         if flags.contains(EVENT_READ) && handle_ack.load(Ordering::SeqCst) != current {
             Ok(EventFlags::EVENT_READ)
         } else {
@@ -455,6 +828,8 @@ impl crate::scheme::KernelScheme for IrqScheme {
     }
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        // Ferric Oxide: a move of this handle's vector finishes before it is given back.
+        let _vectors = VECTORS.lock();
         let handle = HANDLES.write(token.token()).remove(id)?;
 
         if let Handle::Irq {
@@ -481,20 +856,26 @@ impl crate::scheme::KernelScheme for IrqScheme {
             &Handle::Irq {
                 irq: handle_irq,
                 ack: ref handle_ack,
+                cpu: handle_cpu,
                 ..
             } => {
                 if buffer.len() < size_of::<usize>() {
                     return Err(Error::new(EINVAL));
                 }
                 let ack = buffer.read_usize()?;
-                let current = COUNTS.lock()[handle_irq as usize];
+                let current = interrupt_count(handle_cpu, handle_irq);
 
                 if ack != current {
                     return Ok(0);
                 }
                 handle_ack.store(ack, Ordering::SeqCst);
-                unsafe {
-                    acknowledge(handle_irq as usize);
+                // Ferric Oxide: only a legacy line has a PIC or I/O APIC pin to unmask. A number
+                // below 16 reserved on an AP is an ordinary vector there, and acknowledging it
+                // must not unmask the BSP's line of the same number.
+                if !ap_low_vector(handle_cpu, handle_irq) {
+                    unsafe {
+                        acknowledge(handle_irq as usize);
+                    }
                 }
                 Ok(size_of::<usize>())
             }
@@ -541,6 +922,14 @@ impl crate::scheme::KernelScheme for IrqScheme {
                 st_nlink: 2,
                 ..Default::default()
             },
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(ref text) => Stat {
+                st_mode: MODE_CHR | 0o400,
+                st_size: text.len() as u64,
+                st_ino: INO_CPUS,
+                st_nlink: 1,
+                ..Default::default()
+            },
             Handle::TopLevel => Stat {
                 st_mode: MODE_DIR | 0o500,
                 st_size: 0,
@@ -563,6 +952,8 @@ impl crate::scheme::KernelScheme for IrqScheme {
             Handle::Avail(cpu_id) => format!("irq:cpu-{:2x}", cpu_id.get()),
             Handle::Phandle(phandle, _) => format!("irq:phandle-{}", phandle),
             Handle::TopLevel => "irq:".to_owned(),
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(_) => "irq:cpus".to_owned(),
             _ => return Err(Error::new(EBADF)),
         }
         .into_bytes();
@@ -586,12 +977,13 @@ impl crate::scheme::KernelScheme for IrqScheme {
             Handle::Irq {
                 irq: handle_irq,
                 ack: ref handle_ack,
+                cpu: handle_cpu,
                 ..
             } => {
                 if buffer.len() < size_of::<usize>() {
                     return Err(Error::new(EINVAL));
                 }
-                let current = COUNTS.lock()[handle_irq as usize];
+                let current = interrupt_count(handle_cpu, handle_irq);
                 if handle_ack.load(Ordering::SeqCst) != current {
                     buffer.write_usize(current)?;
                     Ok(size_of::<usize>())
@@ -605,6 +997,11 @@ impl crate::scheme::KernelScheme for IrqScheme {
                 }
                 buffer.write_u32(LogicalCpuId::BSP.get())?;
                 Ok(size_of::<usize>())
+            }
+            #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
+            Handle::Cpus(ref text) => {
+                let start = usize::try_from(_offset).map_or(text.len(), |o| o.min(text.len()));
+                buffer.copy_common_bytes_from_slice(text.get(start..).unwrap_or_default())
             }
             Handle::Avail(_) | Handle::TopLevel | Handle::Phandle(_, _) | Handle::SchemeRoot => {
                 Err(Error::new(EISDIR))
