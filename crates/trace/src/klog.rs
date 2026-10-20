@@ -248,24 +248,30 @@ impl<'a> Log<'a> {
 
     /// Appends `bytes` to the log, overwriting the oldest bytes once the region is full.
     pub fn append(&self, bytes: &[u8]) {
-        let written = self.store_bytes(bytes);
+        let (start, kept) = self.begin(bytes);
+        let written = self.store_from(start, kept);
         // After the bytes it counts: a reset before this store loses only this write.
         self.words[WRITTEN_WORD].store(written, Ordering::Release);
     }
 
-    /// The first half of [`Log::append`]: publishes where the write will end, then stores the
-    /// bytes, and returns the new written count without publishing it.
-    fn store_bytes(&self, bytes: &[u8]) -> u64 {
-        let mut written = self.written();
-        // Only the last `data_bytes` of a long write can be kept.
+    /// The first step of [`Log::append`]: publishes where the write of `bytes` will end, and
+    /// returns the count its first kept byte goes at and the bytes to keep (only the last
+    /// data length of a long write).
+    fn begin<'b>(&self, bytes: &'b [u8]) -> (u64, &'b [u8]) {
+        let written = self.written();
         let skip = bytes.len().saturating_sub(self.data_bytes);
         let end = written.wrapping_add(bytes.len() as u64);
         // Before any byte: a reader after a reset here knows which old bytes may be gone.
         self.words[PENDING_WORD].store(end, Ordering::Relaxed);
-        // Orders the pending count before the byte stores below.
+        // Orders the pending count before the byte stores that follow.
         fence(Ordering::Release);
-        written = written.wrapping_add(skip as u64);
-        for &b in &bytes[skip..] {
+        (written.wrapping_add(skip as u64), &bytes[skip..])
+    }
+
+    /// The second step of [`Log::append`]: stores `bytes` from count `written` on, and returns
+    /// the count after them without publishing it.
+    fn store_from(&self, mut written: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
             // `written % data_bytes` is below `data_bytes`, which fits in a usize.
             let pos = (written % self.data_bytes as u64) as usize;
             let word = &self.words[HEADER_WORDS + pos / WORD_BYTES];
@@ -463,6 +469,40 @@ mod tests {
         assert_eq!(Previous::find(&words), Err(KlogError::Version(9)));
     }
 
+    /// An append of `bytes` that a reset stops after it has stored `stored` of the bytes it
+    /// keeps, before it publishes its count.
+    fn reset_during(log: &Log<'_>, bytes: &[u8], stored: usize) {
+        let (start, kept) = log.begin(bytes);
+        log.store_from(start, &kept[..stored.min(kept.len())]);
+    }
+
+    #[test]
+    fn a_reset_partway_through_the_bytes_reads_no_new_byte() {
+        // A full 16-byte ring; a reset stops `WXYZ` after `WX` landed on slots 0 and 1.
+        let words = region(HEADER_WORDS + 2);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"0123456789abcdef");
+        for stored in 0..=4 {
+            reset_during(&log, b"WXYZ", stored);
+            let (previous, text) = read(&words);
+            // Slots 0-3 may hold new bytes, whichever were stored; all four are dropped.
+            assert_eq!(text, b"456789abcdef", "{stored} bytes stored");
+            assert_eq!(previous.written(), 16);
+        }
+    }
+
+    #[test]
+    fn a_reset_partway_through_before_the_ring_is_full() {
+        let words = region(HEADER_WORDS + 2);
+        let log = Log::arm(&words, 0).expect("armed");
+        log.append(b"0123456789");
+        // Three of eight bytes land in free slots, so `01` is still intact, but the reader cannot
+        // tell how far the write got and drops the two old bytes it would have reached.
+        reset_during(&log, b"ABCDEFGH", 3);
+        let (previous, text) = read(&words);
+        assert_eq!((previous.written(), text), (10, b"23456789".to_vec()));
+    }
+
     #[test]
     fn a_reset_mid_wrap_keeps_only_untouched_bytes() {
         // The example from review: a full 16-byte ring, then `WXYZ` lands on slots 0-3 and
@@ -470,7 +510,7 @@ mod tests {
         let words = region(HEADER_WORDS + 2);
         let log = Log::arm(&words, 0).expect("armed");
         log.append(b"0123456789abcdef");
-        log.store_bytes(b"WXYZ");
+        reset_during(&log, b"WXYZ", usize::MAX);
         let (previous, text) = read(&words);
         assert_eq!(text, b"456789abcdef");
         assert_eq!((previous.written(), previous.overwritten()), (16, 4));
@@ -482,7 +522,7 @@ mod tests {
         let log = Log::arm(&words, 0).expect("armed");
         log.append(b"0123456789");
         // Six free slots take the first six bytes; the last two overwrite `01`.
-        log.store_bytes(b"ABCDEFGH");
+        reset_during(&log, b"ABCDEFGH", usize::MAX);
         assert_eq!(read(&words).1, b"23456789");
     }
 
@@ -491,7 +531,7 @@ mod tests {
         let words = region(HEADER_WORDS + 1);
         let log = Log::arm(&words, 0).expect("armed");
         log.append(b"abcdefgh");
-        log.store_bytes(b"0123456789");
+        reset_during(&log, b"0123456789", usize::MAX);
         let (previous, text) = read(&words);
         assert_eq!((previous.written(), text.len()), (8, 0));
     }
