@@ -805,7 +805,10 @@ impl<D: Disk> Resource<D> for FileResource {
 
     fn sync(&mut self, fmaps: &mut Fmaps, tx: &mut Transaction<D>) -> Result<()> {
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
-            for (range, fmap) in fmap_info.ranges.iter_mut() {
+            // Ferric Oxide: only ranges still mapped. An unmapped one was written back by its
+            // funmap, and the file may have been written since; writing its old bytes again
+            // would undo that write.
+            for (range, fmap) in fmap_info.ranges.iter_mut().filter(|(_, fmap)| fmap.rc > 0) {
                 unsafe {
                     fmap.sync(
                         self.node_ptr,
