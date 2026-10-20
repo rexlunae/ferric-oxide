@@ -59,6 +59,8 @@ const NEW_PATH: &str = "/tmp/ferric-borrow-test.new";
 const MERGE_PATH: &str = "/tmp/ferric-borrow-test.merge";
 /// The file `shared-read` stores to through a shared mapping and reads.
 const SHARED_PATH: &str = "/tmp/ferric-borrow-test.shared";
+/// The file `remap-live` writes with `pwrite` while a shared mapping of it is live.
+const LIVE_PATH: &str = "/tmp/ferric-borrow-test.live";
 /// The file `sync-unmapped` stores to through a shared mapping, unmaps, writes and syncs.
 const SYNC_PATH: &str = "/tmp/ferric-borrow-test.sync";
 
@@ -457,16 +459,72 @@ fn check_sync_unmapped() -> Result<(), Error> {
     fs::remove_file(SYNC_PATH).map_err(file_error(SYNC_PATH))
 }
 
+/// `remap-live`: `pwrite` a page while a shared mapping of it is live; the live mapping, a
+/// second mapping and `pread` must all show the written bytes.
+fn check_remap_live() -> Result<(), Error> {
+    const OLD: u8 = 0x99;
+    const WRITTEN: u8 = 0xAA;
+    fs::write(LIVE_PATH, [OLD; PAGE_SIZE]).map_err(file_error(LIVE_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(LIVE_PATH)
+        .map_err(file_error(LIVE_PATH))?;
+    let fd = file.as_raw_fd();
+    let first = map(0, PAGE_SIZE, sys::MAP_SHARED, fd, "the remap-live file")?;
+    let checked = live_checks(&file, first, OLD, WRITTEN);
+    // SAFETY: the mapping is this test's own.
+    let unmapped = unsafe { sys::munmap(first as *mut c_void, PAGE_SIZE) } == 0;
+    checked?;
+    if !unmapped {
+        return Err(Error::Mmap("the remap-live file (munmap)"));
+    }
+    drop(file);
+    fs::remove_file(LIVE_PATH).map_err(file_error(LIVE_PATH))
+}
+
+/// The checks of `remap-live` with the first mapping, at `first`, live.
+fn live_checks(file: &File, first: usize, old: u8, written: u8) -> Result<(), Error> {
+    // SAFETY: `first` is a live mapping of one readable page.
+    let before = unsafe { (first as *const u8).read_volatile() };
+    expect_byte("remap-live (before the write)", old, before)?;
+    std::os::unix::fs::FileExt::write_all_at(file, &[written; PAGE_SIZE], 0)
+        .map_err(file_error(LIVE_PATH))?;
+    // SAFETY: as above, and the last byte of the same page.
+    let (live, last) = unsafe {
+        (
+            (first as *const u8).read_volatile(),
+            (first as *const u8).add(PAGE_SIZE - 1).read_volatile(),
+        )
+    };
+    expect_byte("remap-live (the live mapping)", written, live)?;
+    expect_byte("remap-live (the live mapping's last byte)", written, last)?;
+    expect_byte(
+        "remap-live (a second mapping)",
+        written,
+        mapped_byte(file, sys::MAP_SHARED, 0, "the remap-live file again")?,
+    )?;
+    let mut page = [0u8; PAGE_SIZE];
+    std::os::unix::fs::FileExt::read_exact_at(file, &mut page, 0).map_err(file_error(LIVE_PATH))?;
+    let found = page
+        .iter()
+        .copied()
+        .find(|&b| b != written)
+        .unwrap_or(written);
+    expect_byte("remap-live (pread)", written, found)
+}
+
 fn main() -> ExitCode {
     match run()
         .and_then(|()| check_remap())
         .and_then(|()| check_remap_merged())
         .and_then(|()| check_shared_read())
         .and_then(|()| check_sync_unmapped())
+        .and_then(|()| check_remap_live())
     {
         Ok(()) => {
             println!(
-                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents; reads see stores through a shared mapping; fsync keeps writes made after a munmap"
+                "FERRIC_TEST_PASS borrow a failed scheme-call borrow of a shared file mapping left it unpinned; remapped and reused files map their own contents; reads see stores through a shared mapping; fsync keeps writes made after a munmap; writes reach live mappings"
             );
             ExitCode::SUCCESS
         }

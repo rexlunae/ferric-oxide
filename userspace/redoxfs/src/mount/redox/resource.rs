@@ -449,6 +449,38 @@ impl FileMmapInfo {
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Ferric Oxide: copies `bytes`, just written to the file at `offset`, into the ranges
+    /// still mapped, which are the pages processes see, so a live shared mapping and the
+    /// file stay the same. Bytes outside the write are left alone, stores through the
+    /// mapping included. Unmapped ranges are not updated: the write made them out of date,
+    /// and the next `fmap` reads them again.
+    fn write_through(&mut self, offset: u64, bytes: &[u8]) {
+        let Some(end) = offset.checked_add(bytes.len() as u64) else {
+            return;
+        };
+        for (range, fmap) in self.ranges.conflicts(offset..end) {
+            if fmap.rc == 0 {
+                continue;
+            }
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
+            if start >= stop {
+                continue;
+            }
+            let from = &bytes[(start - offset) as usize..(stop - offset) as usize];
+            // SAFETY: every range lies inside the buffer at `base`, which `fmap` sized to
+            // cover it, and `from` is `stop - start` bytes inside that range; `bytes` is the
+            // caller's buffer, not the mapping, so the two do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    from.as_ptr(),
+                    self.base.add(start as usize),
+                    from.len(),
+                );
+            }
+        }
+    }
+
     pub fn in_use(&self) -> bool {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
     }
@@ -584,13 +616,19 @@ impl<D: Disk> Resource<D> for FileResource {
             fmap_info.version += 1;
         }
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        tx.write_node(
+        let count = tx.write_node(
             self.node_ptr,
             effective_offset,
             buf,
             mtime.as_secs(),
             mtime.subsec_nanos(),
-        )
+        )?;
+        // Ferric Oxide: live mappings see the write, so a range reused while mapped holds the
+        // file's bytes when `fmap` marks it current.
+        if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
+            fmap_info.write_through(effective_offset, &buf[..count.min(buf.len())]);
+        }
+        Ok(count)
     }
 
     fn fsize(&mut self, tx: &mut Transaction<D>) -> Result<u64> {
