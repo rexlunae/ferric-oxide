@@ -17,11 +17,12 @@ use core::{fmt, sync::atomic::AtomicU64};
 
 use ferric_trace::{
     abi::CPU_RING_WORDS,
+    filter::{Filter, FilterError, Loaded, Slot},
     kernel::CATALOG,
     ring::{Ring, RingError, Shared, WhenFull, Words, SHARED_HEADER_WORDS},
     select, Event, EventSet, Level, SelectError, Subsystem,
 };
-use spin::Once;
+use spin::{Mutex, Once};
 
 pub use crate::arch::static_key::{interrupts_enabled, is_on, key as enabled, Mode};
 use crate::{
@@ -56,6 +57,9 @@ const fn subsystem_compiled(subsystem: Subsystem) -> bool {
     (matches!(subsystem, Subsystem::Syscall) && cfg!(feature = "trace_syscall"))
         || (matches!(subsystem, Subsystem::Sched) && cfg!(feature = "trace_sched"))
         || (matches!(subsystem, Subsystem::Scheme) && cfg!(feature = "trace_scheme"))
+        || (matches!(subsystem, Subsystem::Mm) && cfg!(feature = "trace_mm"))
+        || (matches!(subsystem, Subsystem::Irq) && cfg!(feature = "trace_irq"))
+        || (matches!(subsystem, Subsystem::Iommu) && cfg!(feature = "trace_iommu"))
 }
 
 /// Whether `event`'s tracepoints are compiled in: its subsystem is, and its level is within
@@ -256,6 +260,76 @@ pub fn ring(cpu: LogicalCpuId) -> Option<&'static CpuRing> {
     RINGS.get(cpu.get() as usize)?.get()
 }
 
+/// Each event's argument filter (`ferric_trace::filter`), by event index.
+static FILTERS: [Slot; CATALOG.len()] = [const { Slot::new() }; CATALOG.len()];
+
+/// Serializes [`set_filter`]: a `Slot` takes one writer at a time.
+static FILTER_WRITER: Mutex<()> = Mutex::new(());
+
+/// Why a filter could not be set.
+#[derive(Clone, Copy, Debug)]
+pub enum FilterControlError<'a> {
+    /// No event has this name.
+    UnknownEvent(&'a str),
+    /// The event is not compiled into this kernel.
+    NotCompiled(&'static Event),
+    /// The filter does not parse.
+    Filter(FilterError),
+}
+
+impl fmt::Display for FilterControlError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FilterControlError::UnknownEvent(name) => write!(f, "no event named {name:?}"),
+            FilterControlError::NotCompiled(event) => {
+                write!(f, "{} is not compiled in", event.name())
+            }
+            FilterControlError::Filter(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+/// Sets the argument filter of event `name` from `text` (`ferric_trace::filter::Filter::parse`,
+/// or `none` to remove it), and returns the event and the filter now set.
+///
+/// # Errors
+///
+/// [`FilterControlError::UnknownEvent`], [`FilterControlError::NotCompiled`], or
+/// [`FilterControlError::Filter`] when `text` does not parse.
+pub fn set_filter<'a>(
+    name: &'a str,
+    text: &str,
+) -> Result<(&'static Event, Option<Filter>), FilterControlError<'a>> {
+    let event = CATALOG
+        .find(name)
+        .ok_or(FilterControlError::UnknownEvent(name))?;
+    if !compiled_in(event) {
+        return Err(FilterControlError::NotCompiled(event));
+    }
+    let filter = Filter::parse(event, text).map_err(FilterControlError::Filter)?;
+    if let Some(slot) = FILTERS.get(event.id().index()) {
+        let _writer = FILTER_WRITER.lock();
+        slot.store(filter.as_ref());
+    }
+    Ok((event, filter))
+}
+
+/// The filters that are set, with their events: [`Loaded::Set`], or [`Loaded::Busy`] for one
+/// that could not be read. The events without a filter are left out.
+///
+/// It holds [`FILTER_WRITER`] while reading, so no store overlaps a read and every set filter
+/// is listed as it is.
+pub fn filters() -> Vec<(&'static Event, Loaded)> {
+    let _writer = FILTER_WRITER.lock();
+    CATALOG
+        .events()
+        .iter()
+        .zip(FILTERS.iter())
+        .map(|(event, slot)| (event, slot.load()))
+        .filter(|(_, loaded)| *loaded != Loaded::Empty)
+        .collect()
+}
+
 /// Writes a record of `event` with `args` to this CPU's ring. The slow path of `trace_event!`.
 #[cold]
 #[inline(never)]
@@ -267,6 +341,13 @@ pub fn emit(event: &Event, args: &[u64]) {
     if interrupts_enabled() {
         // An interrupt could switch contexts mid-record and leave the ring with two producers.
         ring.count_lost();
+        return;
+    }
+    // A filtered-out record is neither written nor lost: the reader asked not to see it.
+    if !FILTERS
+        .get(event.id().index())
+        .is_none_or(|slot| slot.admits(args))
+    {
         return;
     }
     // A full ring counts the record (or the oldest it overwrote) as lost itself.

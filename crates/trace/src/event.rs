@@ -24,11 +24,24 @@ pub enum Subsystem {
     Sched = 1,
     /// User-space scheme requests and responses, tagged with their ring SQE/CQE tags.
     Scheme = 2,
+    /// Memory management: page faults.
+    Mm = 3,
+    /// Interrupts the kernel hands to user-space drivers, and their acknowledgements.
+    Irq = 4,
+    /// Faults the IOMMU reports: blocked DMA and interrupt requests.
+    Iommu = 5,
 }
 
 impl Subsystem {
     /// Every subsystem.
-    pub const ALL: [Subsystem; 3] = [Subsystem::Syscall, Subsystem::Sched, Subsystem::Scheme];
+    pub const ALL: [Subsystem; 6] = [
+        Subsystem::Syscall,
+        Subsystem::Sched,
+        Subsystem::Scheme,
+        Subsystem::Mm,
+        Subsystem::Irq,
+        Subsystem::Iommu,
+    ];
 
     /// The subsystem's name: the first part of its events' names, and its Cargo feature's suffix.
     pub const fn name(self) -> &'static str {
@@ -36,6 +49,9 @@ impl Subsystem {
             Subsystem::Syscall => "syscall",
             Subsystem::Sched => "sched",
             Subsystem::Scheme => "scheme",
+            Subsystem::Mm => "mm",
+            Subsystem::Irq => "irq",
+            Subsystem::Iommu => "iommu",
         }
     }
 
@@ -50,6 +66,9 @@ impl Subsystem {
             Subsystem::Syscall => "trace_syscall",
             Subsystem::Sched => "trace_sched",
             Subsystem::Scheme => "trace_scheme",
+            Subsystem::Mm => "trace_mm",
+            Subsystem::Irq => "trace_irq",
+            Subsystem::Iommu => "trace_iommu",
         }
     }
 }
@@ -418,7 +437,7 @@ mod tests {
         for s in Subsystem::ALL {
             assert_eq!(Subsystem::from_name(s.name()), Some(s));
         }
-        assert_eq!(Subsystem::from_name("mm"), None);
+        assert_eq!(Subsystem::from_name("vm"), None);
     }
 
     #[test]

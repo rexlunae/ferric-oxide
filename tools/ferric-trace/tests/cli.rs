@@ -44,6 +44,31 @@ fn ferric_trace() -> Command {
 }
 
 #[test]
+fn exports_otlp_json() {
+    let dir = capture();
+    let output = ferric_trace()
+        .args(["otlp", "--start-unix-ns", "1000000000"])
+        .arg(dir.path())
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    // The first resource is pid 0, whose context the first switch put out (an instant); the
+    // second is pid 3's.
+    let spans = doc["resourceSpans"][1]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans");
+    // The system call, and the scheme request it made as its child.
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0]["name"], "syscall 0x21000004");
+    assert_eq!(spans[0]["startTimeUnixNano"], "1000001000");
+    assert_eq!(spans[0]["endTimeUnixNano"], "1000005000");
+    assert_eq!(spans[1]["name"], "scheme 2 Write");
+    assert_eq!(spans[1]["parentSpanId"], spans[0]["spanId"]);
+    assert_eq!(spans[1]["endTimeUnixNano"], "1000003000");
+}
+
+#[test]
 fn exports_perfetto_json() {
     let dir = capture();
     let out = dir.path().join("trace.json");
