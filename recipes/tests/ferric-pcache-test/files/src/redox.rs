@@ -529,6 +529,85 @@ fn eio(cache: &mut Cache) -> Result<(), Failure> {
     check_bytes(finished(&again)?, 40 * PAGE_SIZE, 64)
 }
 
+/// The page `pcache-bad-answer` reads; no other step reads it.
+const BAD_ANSWER_PAGE: u64 = 44;
+
+/// An address in user space with nothing mapped, for calls whose copy must fault.
+fn hole() -> Result<*mut libc::c_void, Failure> {
+    // SAFETY: an anonymous private mapping of one page, unmapped again at once; nothing
+    // else uses the address.
+    unsafe {
+        let page = libc::mmap(
+            core::ptr::null_mut(),
+            PAGE_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        check(page != libc::MAP_FAILED, || "mmap failed".into())?;
+        libc::munmap(page, PAGE_SIZE as usize);
+        Ok(page)
+    }
+}
+
+/// `pcache-bad-answer`: a done answer the kernel cannot take (its payload faults, as one it
+/// has no memory for would fail) fails the fill, so the reader gets `EIO` instead of waiting
+/// for an answer the file system will not send again, and the next read fills the page.
+fn bad_answer(cache: &mut Cache) -> Result<(), Failure> {
+    let file = open_file()?;
+    let read = spawn_pread(file.raw(), BAD_ANSWER_PAGE * PAGE_SIZE, 64);
+    let records = cache.records()?;
+    let &[
+        record @ Record::Fill {
+            pages, generation, ..
+        },
+    ] = &records[..]
+    else {
+        return Err(Failure::Check(format!(
+            "a read of page {BAD_ANSWER_PAGE} queued {records:?}"
+        )));
+    };
+    check(pages.pages().first() == BAD_ANSWER_PAGE, || {
+        format!("a read of page {BAD_ANSWER_PAGE} queued {record:?}")
+    })?;
+    let (words, n) = Request::Filled {
+        pages,
+        outcome: Outcome::Done,
+        generation,
+    }
+    .encode();
+    let len = pages.pages().count() as usize * PAGE_SIZE as usize;
+    let hole = hole()?;
+    // SAFETY: the kernel checks the payload, which faults; nothing here dereferences it.
+    let answered = unsafe {
+        syscall::call::Call::raw_call(
+            &cache.object.raw(),
+            hole.cast::<u8>().cast_const(),
+            len,
+            CallFlags::WRITE,
+            &words[..n],
+        )
+    };
+    check(answered == Err(Error::new(ERRNO_EFAULT)), || {
+        format!("a done answer with a faulting payload returned {answered:?}")
+    })?;
+    let failed = finished(&read)?;
+    check(failed == Err(ERRNO_EIO), || {
+        format!(
+            "a read whose answer could not be taken returned {:?}",
+            failed.map(|b| b.len())
+        )
+    })?;
+    let again = spawn_pread(file.raw(), BAD_ANSWER_PAGE * PAGE_SIZE, 64);
+    let records = cache.records()?;
+    check(pages_of(&records).contains(&BAD_ANSWER_PAGE), || {
+        format!("page {BAD_ANSWER_PAGE} was not filled again")
+    })?;
+    cache.fill_all(&records)?;
+    check_bytes(finished(&again)?, BAD_ANSWER_PAGE * PAGE_SIZE, 64)
+}
+
 /// The page `pcache-restore` reads; no earlier step reads it.
 const RESTORE_PAGE: u64 = 60;
 /// The pages `pcache-generation` reads; no earlier step reads them.
@@ -546,22 +625,8 @@ fn restore(cache: &mut Cache) -> Result<(), Failure> {
     // Wait until the record is queued, without taking it: the reader is waiting by then.
     thread::sleep(QUIET * 5);
     let queue = cache.queue()?.raw();
-    // An address in user space with nothing mapped: the copy out faults.
-    // SAFETY: an anonymous private mapping of one page, unmapped again at once; nothing
-    // else uses the address.
-    let hole = unsafe {
-        let page = libc::mmap(
-            core::ptr::null_mut(),
-            PAGE_SIZE as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        check(page != libc::MAP_FAILED, || "mmap failed".into())?;
-        libc::munmap(page, PAGE_SIZE as usize);
-        page
-    };
+    // The copy out faults.
+    let hole = hole()?;
     // SAFETY: the kernel checks the buffer; `hole` is not dereferenced here.
     let n = unsafe { libc::read(queue as libc::c_int, hole, Record::BYTES) };
     let errno = std::io::Error::last_os_error().raw_os_error();
@@ -896,11 +961,12 @@ fn run() -> Result<ExitCode, (&'static str, Failure)> {
     };
     let file = open_file().map_err(|f| ("pcache-setup", f))?;
     progress("opened the file");
-    let steps: [(&'static str, &CacheStep<'_>); 9] = [
+    let steps: [(&'static str, &CacheStep<'_>); 10] = [
         ("pcache-miss", &|cache| miss(cache, &file)),
         ("pcache-hit", &|cache| hit(cache, &file)),
         ("pcache-readahead", &readahead),
         ("pcache-eio", &eio),
+        ("pcache-bad-answer", &bad_answer),
         ("pcache-restore", &restore),
         ("pcache-owner", &owner),
         ("pcache-exec", &exec),

@@ -627,7 +627,8 @@ holds the policies, host-tested:
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
-miss, a hit with no scheme read, readahead, a failed fill, records put back
+miss, a hit with no scheme read, readahead, a failed fill, a done answer it
+cannot take (which fails the fill rather than leave its reader waiting), records put back
 after a faulting queue read, the owner check, generations across a reopened
 object, and a closed queue,
 and prints the time of a cached 4 KiB `pread` next to the same read through

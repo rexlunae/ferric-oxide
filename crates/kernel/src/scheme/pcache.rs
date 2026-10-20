@@ -623,8 +623,10 @@ fn detach(object: &Arc<Object>, handle: u64) -> Result<usize> {
 }
 
 /// [`Request::Filled`]: applies the answer to a fill of `pages`, copying the payload into new
-/// frames when it is done. A copy that fails (no memory, a bad payload) leaves the pages being
-/// filled, for the file system to answer again.
+/// frames when it is done. An answer that cannot be taken (no memory for the frames, a payload
+/// that faults or has the wrong length) fails the fill: the file system took the record off
+/// the queue and need not answer it again, so leaving the pages being filled would leave
+/// their readers waiting for good.
 fn filled(
     object: &Object,
     pages: RecordPages,
@@ -632,13 +634,46 @@ fn filled(
     payload: UserSliceRw,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
-    let frames = match outcome {
-        Outcome::Failed(_) => {
-            if !payload.is_empty() {
-                return Err(Error::new(EINVAL));
-            }
-            Vec::new()
+    let frames = match answer_frames(object, pages, outcome, payload) {
+        Ok(frames) => frames,
+        Err(err) => {
+            // Readers get EIO and fill again. A stray answer, for pages not being filled,
+            // changes nothing here.
+            let _ = object.state.lock().index.complete_fill(
+                pages,
+                Outcome::Failed(EIO_OUTCOME),
+                Vec::new(),
+            );
+            object.changed.notify(token);
+            return Err(err);
         }
+    };
+    let result = object
+        .state
+        .lock()
+        .index
+        .complete_fill(pages, outcome, frames);
+    object.changed.notify(token);
+    result.map_err(|err| fill_errno(&err))?;
+    Ok(payload.len())
+}
+
+/// The frames a Filled answer brings: none for a failed fill, or the payload copied into
+/// new frames.
+///
+/// # Errors
+///
+/// `EINVAL` for a payload of the wrong length, the fill error for pages not being filled,
+/// `ENOMEM` and `EFAULT` from the copy.
+fn answer_frames(
+    object: &Object,
+    pages: RecordPages,
+    outcome: Outcome,
+    payload: UserSliceRw,
+) -> Result<Vec<Arc<RaiiFrame>>> {
+    match outcome {
+        Outcome::Failed(_) if payload.is_empty() => Ok(Vec::new()),
+        Outcome::Failed(_) => Err(Error::new(EINVAL)),
         Outcome::Done => {
             let count = pages.pages().count() as usize;
             if Some(payload.len()) != count.checked_mul(PAGE_SIZE) {
@@ -651,17 +686,9 @@ fn filled(
                 .index
                 .check_filling(pages)
                 .map_err(|err| fill_errno(&err))?;
-            copy_in(payload, count)?
+            copy_in(payload, count)
         }
-    };
-    let result = object
-        .state
-        .lock()
-        .index
-        .complete_fill(pages, outcome, frames);
-    object.changed.notify(token);
-    result.map_err(|err| fill_errno(&err))?;
-    Ok(payload.len())
+    }
 }
 
 /// Copies `count` whole pages from `payload` into new frames.
