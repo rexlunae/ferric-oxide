@@ -3,8 +3,8 @@
 //! The output is the JSON encoding of OTLP's `ExportTraceServiceRequest`, as the
 //! OpenTelemetry Protocol specification (OTLP 1.x, "JSON Protobuf Encoding") defines it over
 //! `opentelemetry/proto/trace/v1/trace.proto`: field names in lowerCamelCase, trace and span
-//! ids as hexadecimal strings, enumerations as integers and 64-bit integers as decimal
-//! strings. An OTLP/HTTP collector takes it as is on `POST /v1/traces` with
+//! ids as base64 strings (the protobuf JSON mapping of `bytes` fields), enumerations as
+//! integers and 64-bit integers as decimal strings. An OTLP/HTTP collector takes it as is on `POST /v1/traces` with
 //! `Content-Type: application/json`, and the Collector's `otlpjsonfile` receiver reads it from
 //! a file.
 //!
@@ -33,6 +33,8 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ferric_trace::kernel::{SCHEME_RESPONSE, SYSCALL_EXIT};
 use serde::Serialize;
 use syscall::error::Error as Errno;
@@ -225,8 +227,11 @@ impl Exporter<'_> {
                 value: AnyValue::Bool(true),
             });
         }
+        let mut trace_id = [0; 16];
+        trace_id[..8].copy_from_slice(&self.seed.to_be_bytes());
+        trace_id[8..].copy_from_slice(&trace.to_be_bytes());
         OtlpSpan {
-            trace_id: format!("{:016x}{trace:016x}", self.seed),
+            trace_id: encode_id(&trace_id),
             span_id: span_id(index),
             parent_span_id: span.parent.map(span_id),
             name,
@@ -251,9 +256,15 @@ impl Exporter<'_> {
     }
 }
 
+/// The OTLP/JSON encoding of an id: standard base64, the protobuf JSON mapping of a `bytes`
+/// field. Collectors reject the hexadecimal text OTLP's binary encoding would print.
+fn encode_id(bytes: &[u8]) -> String {
+    BASE64.encode(bytes)
+}
+
 /// Span ids are the span's index plus one, since an all-zero id is invalid.
 fn span_id(index: usize) -> String {
-    format!("{:016x}", index as u64 + 1)
+    encode_id(&(index as u64 + 1).to_be_bytes())
 }
 
 fn context_attributes(context: Context) -> Vec<KeyValue> {
@@ -508,8 +519,8 @@ mod tests {
         );
         for span in [call, request] {
             let trace = span["traceId"].as_str().expect("a string");
-            assert_eq!(trace.len(), 32);
-            assert_eq!(span["spanId"].as_str().map(str::len), Some(16));
+            assert_eq!(trace.len(), 24);
+            assert_eq!(span["spanId"].as_str().map(str::len), Some(12));
         }
     }
 

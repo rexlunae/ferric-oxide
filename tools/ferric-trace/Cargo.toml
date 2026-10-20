@@ -11,6 +11,7 @@ name = "ferric-trace"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ferric-trace = { path = "../../crates/trace" }
 # Maps the rings for `ferric-trace capture` on Redox; empty elsewhere.
