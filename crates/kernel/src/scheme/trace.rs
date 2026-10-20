@@ -5,11 +5,32 @@
 //!   `enable <selection>` or `disable <selection>` turns events on or off, patching their
 //!   tracepoints live (`arch::static_key`).
 //! - `stats`: one line per CPU with the words waiting in its ring and the records it lost.
+//! - `clock`: the clock record timestamps come from and its tick length
+//!   (`ferric_trace::clock::ClockLine`), chosen once at boot (`trace::clock`).
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
+//!   `mmap` of the descriptor (`PROT_READ`, `MAP_SHARED`, the whole `CPU_MAP_BYTES` from offset
+//!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
+//!   consumes it up to `end`, under the same one-reader lock as a read.
 //!
-//! `events` and `stats` are read from a snapshot taken at the first read of each open, as in
+//! - `crash` (`kernel.trace_crash`): the crash dump the previous boot's panic left
+//!   (`trace::crash`), read from any offset; it exists only when there is one. With
+//!   `kernel.trace_crash_test` it always exists (empty without a dump), and writing `panic` to it
+//!   panics the kernel, which writes the dump and resets the machine.
+//!
+//! A mapped ring is never writable by its reader: `PROT_WRITE` is refused, and `mprotect`
+//! cannot add it to a shared grant later. So the kernel stays the only writer of those words,
+//! and it never trusts what they say beyond its own stores: the ring's size is kept in the
+//! kernel, every position is masked to the data before use, and the one value a reader passes
+//! back, `commit`'s `end`, is accepted only as a record boundary between the kernel's `tail`
+//! and `head` (`Ring::commit_to`). The reader, for its part, sees `head` and `tail` move under
+//! it and must copy before it decodes (`ferric_trace::ring::View`). A `read` of the same CPU
+//! can consume records while a mapped reader copies them, and the producer can then reuse
+//! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
+//! The mapping needs `PROT_READ`: a mapping without it would still be readable.
+//!
+//! `events`, `stats` and `clock` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
 //! addresses, and a Phase 4 capability will replace the uid check.
 
@@ -19,16 +40,22 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ferric_trace::abi::{Command, EventLine, Path, StatsLine};
-use spin::Mutex;
-use syscall::error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP};
+use ferric_trace::abi::{Command, CpuCommand, EventLine, Path, StatsLine, CPU_MAP_BYTES};
+use spin::{Mutex, MutexGuard};
+use syscall::{
+    error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP},
+    flag::MapFlags,
+};
 
-use super::{CallerCtx, KernelScheme, OpenResult, StrOrBytes};
+use super::{shared_frames::map_frames, CallerCtx, KernelScheme, OpenResult, StrOrBytes};
 use crate::{
-    context::file::InternalFlags,
+    context::{file::InternalFlags, memory::AddrSpaceWrapper},
     cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
     sync::CleanLockToken,
-    syscall::usercopy::{UserSliceRo, UserSliceWo},
+    syscall::{
+        data::Map,
+        usercopy::{UserSliceRo, UserSliceWo},
+    },
     trace::{self, ControlError, Mode},
 };
 
@@ -36,7 +63,7 @@ use crate::{
 const ROOT: usize = 0;
 
 /// The longest command `events` accepts.
-const MAX_COMMAND: usize = 4096;
+const MAX_COMMAND: usize = ferric_trace::abi::MAX_COMMAND_BYTES;
 
 /// The most bytes one read of `cpu/<n>` copies.
 const MAX_READ: usize = 64 * 1024;
@@ -49,12 +76,14 @@ pub struct TraceScheme;
 enum Text {
     Events,
     Stats,
+    Clock,
+    Crash,
 }
 
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events` or `stats`, with the snapshot its reads come from once taken.
+    /// `events`, `stats` or `clock`, with the snapshot its reads come from once taken.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
@@ -84,6 +113,7 @@ fn render(text: Text) -> Arc<[u8]> {
                 }
             }
         }
+        Text::Crash => return crash_dump().unwrap_or_else(|| Arc::from([])),
         Text::Stats => {
             for cpu in 0..crate::cpu_count() {
                 let (pending, lost) = trace::ring(LogicalCpuId::new(cpu))
@@ -91,8 +121,91 @@ fn render(text: Text) -> Arc<[u8]> {
                 let _ = write!(out, "{}", StatsLine { cpu, pending, lost });
             }
         }
+        Text::Clock => {
+            let _ = write!(out, "{}", trace::clock::choice().line());
+        }
     }
     Arc::from(out.into_bytes())
+}
+
+/// The previous boot's crash dump, if this kernel keeps one and there is one.
+fn crash_dump() -> Option<Arc<[u8]>> {
+    #[cfg(feature = "trace_crash")]
+    return trace::crash::saved();
+    #[cfg(not(feature = "trace_crash"))]
+    None
+}
+
+/// Whether `crash` exists: when there is a dump, and always on a crash-test kernel, which needs
+/// it for the `panic` command.
+fn crash_exists() -> bool {
+    cfg!(feature = "trace_crash_test") || crash_dump().is_some()
+}
+
+/// Runs a command written to `crash`: `panic`, on a crash-test kernel.
+fn crash_command(buf: UserSliceRo) -> Result<usize> {
+    let (bytes, _len) = command_bytes(buf)?;
+    if bytes.trim_ascii() != ferric_trace::abi::CRASH_TEST_COMMAND.as_bytes() {
+        return Err(Error::new(EINVAL));
+    }
+    #[cfg(feature = "trace_crash_test")]
+    trace::crash::test_panic();
+    #[cfg(not(feature = "trace_crash_test"))]
+    Err(Error::new(EOPNOTSUPP))
+}
+
+/// Becomes `cpu`'s ring's one consumer, or fails with `EAGAIN` while another reader is: the
+/// copy to the caller can fault and block, so a second reader does not spin.
+fn consumer(cpu: LogicalCpuId) -> Result<MutexGuard<'static, ()>> {
+    READERS
+        .get(cpu.get() as usize)
+        .and_then(Mutex::try_lock)
+        .ok_or(Error::new(EAGAIN))
+}
+
+/// Reads a command of at most [`MAX_COMMAND`] bytes from `buf`, and returns it with its
+/// length.
+fn command_bytes(buf: UserSliceRo) -> Result<(Vec<u8>, usize)> {
+    if buf.len() > MAX_COMMAND {
+        return Err(Error::new(EINVAL));
+    }
+    let mut bytes: Vec<u8> = vec![0; buf.len()];
+    let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
+    bytes.truncate(len);
+    Ok((bytes, len))
+}
+
+/// Runs a command written to `events`.
+fn events_command(buf: UserSliceRo) -> Result<usize> {
+    let (bytes, len) = command_bytes(buf)?;
+    let command = Command::parse(&bytes).map_err(|_| Error::new(EINVAL))?;
+    let (spec, on) = match command {
+        Command::Enable(spec) => (spec, true),
+        Command::Disable(spec) => (spec, false),
+    };
+    match trace::control(spec, on, Mode::Live) {
+        Ok(changed) => {
+            info!("trace: {command} ({changed} event(s) changed)");
+            Ok(len)
+        }
+        Err(err) => {
+            warn!("trace: {command}: {err}");
+            Err(control_errno(&err))
+        }
+    }
+}
+
+/// Runs a command written to `cpu/<n>`: `commit <end>` consumes the mapped ring up to `end`,
+/// which must be a record boundary the kernel can check (`Ring::commit_to`).
+fn cpu_command(cpu: LogicalCpuId, buf: UserSliceRo) -> Result<usize> {
+    let (bytes, len) = command_bytes(buf)?;
+    let CpuCommand::Commit(end) = CpuCommand::parse(&bytes).map_err(|_| Error::new(EINVAL))? else {
+        return Err(Error::new(EINVAL));
+    };
+    let ring = trace::ring(cpu).ok_or(Error::new(EINVAL))?;
+    let _consumer = consumer(cpu)?;
+    ring.commit_to(end).map_err(|_| Error::new(EINVAL))?;
+    Ok(len)
 }
 
 /// The errno for a failed `enable` or `disable`.
@@ -129,6 +242,9 @@ impl KernelScheme for TraceScheme {
             Path::Root => return Err(Error::new(ENOENT)),
             Path::Events => (Text::Events, InternalFlags::POSITIONED),
             Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
+            Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
+            Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
+            Path::Crash => return Err(Error::new(ENOENT)),
             Path::Cpu(cpu) if cpu < crate::cpu_count() => {
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 HANDLES
@@ -188,12 +304,8 @@ impl KernelScheme for TraceScheme {
                 };
                 let mut records = vec![0u8; buf.len().min(MAX_READ)];
                 // One reader at a time, from the copy to the commit. The records are consumed
-                // only once they reached the caller, so a failed copy loses none. The copy can
-                // fault and block, so a second reader gets EAGAIN instead of spinning.
-                let _reader = READERS
-                    .get(cpu.get() as usize)
-                    .and_then(Mutex::try_lock)
-                    .ok_or(Error::new(EAGAIN))?;
+                // only once they reached the caller, so a failed copy loses none.
+                let _consumer = consumer(cpu)?;
                 let peek = ring.peek(&mut records).map_err(|_| Error::new(EINVAL))?;
                 let len =
                     buf.copy_common_bytes_from_slice(records.get(..peek.len()).unwrap_or(&[]))?;
@@ -211,33 +323,19 @@ impl KernelScheme for TraceScheme {
         _stored_flags: u32,
         _token: &mut CleanLockToken,
     ) -> Result<usize> {
-        match HANDLES.lock().get(&id) {
-            Some(Handle::Text {
+        let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
+        match handle {
+            Handle::Text {
                 text: Text::Events, ..
-            }) => {}
-            Some(_) => return Err(Error::new(EBADF)),
-            None => return Err(Error::new(EBADF)),
-        }
-        if buf.len() > MAX_COMMAND {
-            return Err(Error::new(EINVAL));
-        }
-        let mut bytes: Vec<u8> = vec![0; buf.len()];
-        let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
-        let command =
-            Command::parse(bytes.get(..len).unwrap_or(&[])).map_err(|_| Error::new(EINVAL))?;
-        let (spec, on) = match command {
-            Command::Enable(spec) => (spec, true),
-            Command::Disable(spec) => (spec, false),
-        };
-        match trace::control(spec, on, Mode::Live) {
-            Ok(changed) => {
-                info!("trace: {command} ({changed} event(s) changed)");
-                Ok(len)
-            }
-            Err(err) => {
-                warn!("trace: {command}: {err}");
-                Err(control_errno(&err))
-            }
+            } => events_command(buf),
+            Handle::Cpu(cpu) => cpu_command(cpu, buf),
+            Handle::Text {
+                text: Text::Crash, ..
+            } => crash_command(buf),
+            Handle::Text {
+                text: Text::Stats | Text::Clock,
+                ..
+            } => Err(Error::new(EBADF)),
         }
     }
 
@@ -254,6 +352,48 @@ impl KernelScheme for TraceScheme {
         self.kwrite(id, buf, flags, stored_flags, token)
     }
 
+    fn kfmap(
+        &self,
+        id: usize,
+        addr_space: &Arc<AddrSpaceWrapper>,
+        map: &Map,
+        _consume: bool,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let Some(Handle::Cpu(cpu)) = HANDLES.lock().get(&id).cloned() else {
+            return Err(Error::new(EBADF));
+        };
+        if map
+            .flags
+            .intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
+        {
+            return Err(Error::new(EOPNOTSUPP));
+        }
+        // Read-only, so the kernel stays the only writer of the ring's words.
+        if map
+            .flags
+            .intersects(MapFlags::PROT_WRITE | MapFlags::PROT_EXEC)
+        {
+            return Err(Error::new(EACCES));
+        }
+        if !map
+            .flags
+            .contains(MapFlags::PROT_READ | MapFlags::MAP_SHARED)
+            || map.offset != 0
+            || map.size != CPU_MAP_BYTES
+        {
+            return Err(Error::new(EINVAL));
+        }
+        trace::init_rings();
+        let ring = trace::ring(cpu).ok_or(Error::new(EINVAL))?;
+        map_frames(
+            addr_space,
+            ring.words().frames(),
+            MapFlags::PROT_READ,
+            token,
+        )
+    }
+
     fn kfpath(&self, id: usize, buf: UserSliceWo, _token: &mut CleanLockToken) -> Result<usize> {
         let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
         let path = match handle {
@@ -263,6 +403,12 @@ impl KernelScheme for TraceScheme {
             Handle::Text {
                 text: Text::Stats, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::STATS_PATH),
+            Handle::Text {
+                text: Text::Clock, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CLOCK_PATH),
+            Handle::Text {
+                text: Text::Crash, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CRASH_PATH),
             Handle::Cpu(cpu) => alloc::format!(
                 "/scheme/kernel.trace/{}/{}",
                 ferric_trace::abi::CPU_DIR,

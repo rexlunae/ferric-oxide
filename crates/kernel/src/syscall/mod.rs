@@ -278,12 +278,9 @@ pub fn syscall(
     PercpuBlock::current().inside_syscall.set(true);
 
     debug_start([a, b, c, d, e, f, g], token);
-    // Ferric Oxide: the syscall tracepoints (`kernel.trace`).
-    trace_event!(ferric_trace::kernel::SYSCALL_ENTER, a, b, c, d, e);
 
     let result = inner(a, b, c, d, e, f, g, token);
 
-    trace_event!(ferric_trace::kernel::SYSCALL_EXIT, a, Error::mux(result));
     debug_end([a, b, c, d, e, f, g], result, token);
 
     let percpu = PercpuBlock::current();

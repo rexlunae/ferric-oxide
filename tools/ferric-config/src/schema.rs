@@ -65,6 +65,10 @@ pub struct Effect {
     pub kernel_features: Vec<String>,
     #[serde(default)]
     pub kernel_config: BTreeMap<String, String>,
+    /// Keys of the initfs `trace.toml` (`enable`, `disable`), each a list of selections;
+    /// `"{value}"` takes a list option's items.
+    #[serde(default)]
+    pub trace_config: BTreeMap<String, String>,
     #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
@@ -111,6 +115,7 @@ struct RawOption {
     make_false: Option<String>,
     kernel_feature: Option<String>,
     kernel_config: Option<String>,
+    trace_config: Option<String>,
     #[serde(default)]
     rebuild: Vec<String>,
     #[serde(default)]
@@ -366,6 +371,18 @@ impl Schema {
                     when: None,
                     def: Effect {
                         kernel_config: [(key.clone(), "{value}".into())].into(),
+                        ..Default::default()
+                    },
+                });
+            }
+            if let Some(key) = &o.trace_config {
+                if o.kind != Kind::List {
+                    return Err(format!("{ctx}: trace_config needs a list option"));
+                }
+                effects.push(CEffect {
+                    when: None,
+                    def: Effect {
+                        trace_config: [(key.clone(), "{value}".into())].into(),
                         ..Default::default()
                     },
                 });

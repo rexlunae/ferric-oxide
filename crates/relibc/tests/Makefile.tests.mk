@@ -323,6 +323,7 @@ VARIED_NAMES=\
 	pthread/cleanup \
 	pthread/exit \
 	pthread/extjoin \
+	pthread/join_race \
 	pthread/once \
 	pthread/barrier \
 	pthread/rwlock_trylock \

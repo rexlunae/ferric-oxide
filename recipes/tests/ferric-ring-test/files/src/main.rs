@@ -16,8 +16,8 @@
 //!   then holds the file's bytes.
 //! - `ring-cancel`: a failed SQE (a closed descriptor) and a short `Read` each cancel the rest
 //!   of their chain with `ECANCELED`, and the next chain runs.
-//! - `ring-refuse-sqe`: reserved fields, an unknown opcode, fixed files, a kernel address and
-//!   an overlong chain complete with their errnos.
+//! - `ring-refuse-sqe`: reserved fields, an unknown opcode, an empty file table slot, a kernel
+//!   address and an overlong chain complete with their errnos.
 //! - `ring-incomplete`: a chain whose end is not written yet stays in the SQ until it is.
 //! - `ring-backpressure`: a chain is taken only when the CQ has room for its completions
 //!   (`EBUSY` when nothing could be), so none is dropped.
@@ -25,14 +25,34 @@
 //!   nothing, and the ring works again once the tail is put back.
 //! - `ring-event`: an event queue watching the ring sees `EVENT_READ` once `Enter` posts a
 //!   completion, and not before.
+//! - `ring-fixed`: a RedoxFS file and the null scheme registered in the ring's file table are
+//!   read, written and sized through their slots, the file after its descriptor is closed; a
+//!   full slot (`EBUSY`), a slot past the table, a ring descriptor and a call without
+//!   descriptors (`EINVAL`) are refused and register nothing; an unregistered slot completes
+//!   with `EBADF`.
+//! - `ring-fstat`: `Fstat` gives the same `Stat` as `fstat`, `st_dev` included, and `Fsize`
+//!   the file's length.
 //! - `ring-hold`: a chain blocked in its first SQE still writes, in its second, to the pipe
 //!   its submitter named after another thread moves a different pipe onto that descriptor
 //!   number with `dup2`: `Enter` holds a chain's files from when it takes the chain.
 //! - `ring-release`: a pipe's write end, closed while a ring chain and a blocked `write` both
 //!   hold it, is closed for good by whichever lets go last (here the `write`), so the reader
 //!   sees the end of the file.
+//! - `ring-async`: an `ASYNC` read of an empty pipe leaves `Enter` without a completion and
+//!   without an event, keeps working after its descriptor is closed, and completes once the
+//!   pipe has data, which `Enter` with `min_complete` waits for and an event queue sees; an
+//!   asynchronous chain across write, fsync and read, and one broken by a closed descriptor,
+//!   complete by the chain rules; `min_complete` above the CQ is refused, and with nothing
+//!   running does not wait.
+//! - `ring-async-close`: an asynchronous chain naming its own ring completes with `EINVAL`;
+//!   closing a ring once its worker has started a chain that blocks in a pipe read, with a
+//!   `Nop` queued behind it, returns, the worker posts `EINTR` for the read and `ECANCELED`
+//!   for the `Nop`, and rings keep working.
+//! - `ring-wait-sync`: a wait-only `Enter` waits for a synchronous read that another thread's
+//!   `Enter` is blocked in, and returns once the read completes.
 //! - `ring-bench`: times 64-byte writes to the null scheme and 4 KiB reads of a file, as
-//!   system calls and as ring batches of 32, and prints `FERRIC_BENCH` lines.
+//!   system calls and as ring batches of 32, the reads again through a file table slot and
+//!   the writes again on the ring's worker, and prints `FERRIC_BENCH` lines.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. Without a `kernel.ring` scheme (a kernel built without

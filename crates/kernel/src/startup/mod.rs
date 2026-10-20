@@ -176,6 +176,9 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     // Ferric Oxide: a trace ring for each CPU, now that they are counted.
     #[cfg(feature = "trace")]
     crate::trace::init_rings();
+    // Ferric Oxide: save the previous boot's crash dump and arm the region for this one.
+    #[cfg(feature = "trace_crash")]
+    crate::trace::crash::init();
     debug!("Env: {:?}", ::core::str::from_utf8(bootstrap.env));
 
     BOOTSTRAP.call_once(|| bootstrap);
@@ -252,6 +255,12 @@ fn run_userspace(token: &mut CleanLockToken) -> ! {
                 SwitchResult::AllContextsIdle => {
                     // Enable interrupts, then halt CPU (to save power) until the next interrupt is actually fired.
                     interrupt::enable_and_halt();
+                }
+                // Ferric Oxide: a runnable context is waiting on a lock another CPU holds for
+                // a moment; halting would leave it until the next timer interrupt.
+                SwitchResult::Contended => {
+                    interrupt::enable_and_nop();
+                    core::hint::spin_loop();
                 }
             }
         }

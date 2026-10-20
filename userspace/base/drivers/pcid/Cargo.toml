@@ -28,6 +28,12 @@ serde.workspace = true
 common = { path = "../common" }
 # Ferric Oxide: the kernel iommu scheme's interface and requester-ID aliases.
 ferric-iommu = { workspace = true, features = ["alloc"] }
+# Ferric Oxide: the irq:cpus format, for the APIC id of a logical CPU.
+ferric-irq.workspace = true
+# Ferric Oxide: the MSI address formats, to tell a remapped MSI-X entry from one the driver
+# must reprogram when it steers it.
+ferric-vtd.workspace = true
+thiserror.workspace = true
 daemon = { path = "../../daemon" }
 libredox.workspace = true
 

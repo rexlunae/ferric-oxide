@@ -10,6 +10,7 @@ description = "Storage DMA into registered buffers: test and benchmark for Ferri
 
 [dependencies]
 ferric-blkgrant = { path = "../../../../crates/blkgrant" }
+ferric-blkqueue = { path = "../../../../crates/blkqueue" }
 ferric-regbuf = { path = "../../../../crates/regbuf" }
 
 [target.'cfg(target_os = "redox")'.dependencies]

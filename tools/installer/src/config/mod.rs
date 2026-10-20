@@ -51,6 +51,10 @@ pub struct Config {
     #[serde(default)]
     /// Groups, keyed by group name.
     pub groups: BTreeMap<String, user::GroupConfig>,
+    #[serde(skip)]
+    /// Ferric Oxide: run `fox` against the finished root (set by the
+    /// installer's `--fox` options, never read from a configuration file).
+    pub fox: Option<crate::FoxImage>,
 }
 
 impl Config {
@@ -118,7 +122,12 @@ impl Config {
             files: other_files,
             users: other_users,
             groups: other_groups,
+            fox: other_fox,
         } = other;
+
+        if other_fox.is_some() {
+            self.fox = other_fox;
+        }
 
         self.general.merge(other_general);
 

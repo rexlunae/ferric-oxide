@@ -438,6 +438,14 @@ unsafe fn map_memory<A: Arch>(
                 .expect("physical address beyond the end of the physical memory map"),
         )
     };
+    #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+    let phys_to_boot_virt = |phys: u64| {
+        VirtualAddress::new(
+            A::PHYS_OFFSET
+                .checked_add(phys as usize)
+                .expect("bootloader physical-map slot covers the reserved shadow-stack pool"),
+        )
+    };
 
     unsafe {
         let mut mapper = PageMapper::<A, _>::create(TableKind::Kernel, &mut *bump_allocator)
@@ -453,20 +461,30 @@ unsafe fn map_memory<A: Arch>(
             .write(true)
             .global(cfg!(target_arch = "x86_64"));
         for area in areas.iter() {
-            let page_count = area.size / PAGE_SIZE;
             if area.size % PAGE_SIZE != 0 || area.base.data() % PAGE_SIZE != 0 {
                 error!("Unaligned area: {area:?}");
             }
-            let virt_base = phys_to_new_virt(area.base);
-
-            map_phys_contiguous_inactive(
-                &mut mapper,
-                area.base,
-                virt_base,
-                physmap_flags,
-                page_count,
-                highest_huge_level,
-            );
+            let end = area
+                .base
+                .data()
+                .checked_add(area.size)
+                .expect("normalized boot memory area fits the physical address space");
+            #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+            let ranges =
+                crate::arch::shstk::pool_region().exclude(area.base.data() as u64..end as u64);
+            #[cfg(not(all(target_arch = "x86_64", shstk_compiled)))]
+            let ranges = [area.base.data() as u64..end as u64, 0..0];
+            for range in ranges.into_iter().filter(|range| !range.is_empty()) {
+                let phys = PhysicalAddress::new(range.start as usize);
+                map_phys_contiguous_inactive(
+                    &mut mapper,
+                    phys,
+                    phys_to_new_virt(phys),
+                    physmap_flags,
+                    range.end.saturating_sub(range.start) as usize / PAGE_SIZE,
+                    highest_huge_level,
+                );
+            }
         }
 
         // Map bootloader stack (also physically contiguous, but never in the memory map, as it
@@ -557,8 +575,31 @@ unsafe fn map_memory<A: Arch>(
         debug!("Table: {:X}", mapper.table().phys().data());
         mapper.table().debug_entries(|args| debug!("{args}"));
 
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        for phys in crate::arch::shstk::pool_region().range().step_by(PAGE_SIZE) {
+            // Check all pages after every boot mapping has been installed, including the old
+            // bootloader slot retained for the boot stack and the randomized physical map.
+            assert!(
+                mapper
+                    .translate(phys_to_new_virt(PhysicalAddress::new(phys as usize)))
+                    .is_none(),
+                "CET: writable physical-map alias of a reserved shadow-stack frame"
+            );
+            assert!(
+                mapper.translate(phys_to_boot_virt(phys)).is_none(),
+                "CET: bootloader-slot alias of a reserved shadow-stack frame"
+            );
+        }
+
         // Use the new table
         mapper.make_current();
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        for phys in crate::arch::shstk::pool_region().range().step_by(PAGE_SIZE) {
+            // CR3 alone need not evict global bootloader translations. APs only ever load the
+            // new table, so local invalidation here retires the last pre-reservation aliases.
+            A::invalidate(phys_to_boot_virt(phys));
+            A::invalidate(phys_to_new_virt(PhysicalAddress::new(phys as usize)));
+        }
     }
 }
 
@@ -619,6 +660,25 @@ pub unsafe fn init(
     register_memory_from_kernel_args(args);
 
     unsafe {
+        // Ferric Oxide: keep the trace crash region out of the free memory, if it lies inside
+        // one free area of the boot memory map (which only this CPU writes, now) and overlaps
+        // no other area.
+        #[cfg(feature = "trace_crash")]
+        crate::trace::crash::reserve(|start, end| {
+            let map = (*MEMORY_MAP.get())
+                .iter()
+                .map(|entry| ferric_trace::crash::MapArea {
+                    start: entry.start,
+                    end: entry.end,
+                    availability: if entry.kind == BootloaderMemoryKind::Free {
+                        ferric_trace::crash::Availability::Free
+                    } else {
+                        ferric_trace::crash::Availability::Unavailable
+                    },
+                });
+            ferric_trace::crash::region_is_free(start, end, map)
+        });
+
         let physmem_limit = MemoryEntry {
             start: align_up(low_limit.unwrap_or(0)),
             end: align_down(high_limit.unwrap_or(usize::MAX)),
@@ -656,6 +716,9 @@ pub unsafe fn init(
 
         // Create a basic allocator for the first pages
         let mut bump_allocator = BumpAllocator::<CurrentRmmArch>::new(areas, 0);
+
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        crate::arch::shstk::reserve_pool(&mut bump_allocator);
 
         let phys_offset = choose_phys_offset();
         // Ferric Oxide: the bootloader may have moved the kernel image (kernel image KASLR); say

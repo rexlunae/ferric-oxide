@@ -17,12 +17,17 @@ name = "ferric-iommu-test"
 version = "0.1.0"
 dependencies = [
  "ferric-iommu",
+ "ferric-irq",
  "ferric-regbuf",
  "libc",
  "libredox",
  "redox-scheme",
  "redox_syscall",
 ]
+
+[[package]]
+name = "ferric-irq"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-regbuf"

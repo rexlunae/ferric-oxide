@@ -16,6 +16,9 @@ use syscall::error::{Error, Result, EIO};
 pub mod cmd;
 pub mod executor;
 pub mod identify;
+// Ferric Oxide: one I/O queue pair per CPU (features.toml: drivers.nvme_percore).
+#[cfg(feature = "percore")]
+pub mod percore;
 pub mod queues;
 
 use self::executor::NvmeExecutor;
@@ -110,6 +113,16 @@ pub struct Nvme {
     /// list).
     #[cfg(feature = "grant-dma")]
     max_transfer: std::sync::atomic::AtomicU64,
+
+    /// Ferric Oxide: the MSI-X vectors of the per-CPU queue pairs, by table entry, for masking.
+    #[cfg(feature = "percore")]
+    percore_vectors: Mutex<HashMap<Iv, InterruptVector>>,
+}
+
+thread_local! {
+    /// Ferric Oxide: the key in `thread_ctxts` of this thread's context (its queue pair's
+    /// vector); 0, the admin and first I/O queue, unless a per-CPU worker set it.
+    static THREAD_CTXT: std::cell::Cell<Iv> = const { std::cell::Cell::new(0) };
 }
 
 pub struct ThreadCtxt {
@@ -119,6 +132,9 @@ pub struct ThreadCtxt {
     // Yes, technically NVME allows multiple submission queues to be mapped to the same completion
     // queue, but we don't use that feature.
     queues: RefCell<HashMap<u16, (NvmeCmdQueue, NvmeCompQueue)>>,
+
+    /// Ferric Oxide: the I/O submission queue this thread's reads and writes go to.
+    io_queue: SqId,
 }
 
 impl ThreadCtxt {
@@ -188,6 +204,7 @@ impl Nvme {
                         buffer: RefCell::new(unsafe { Dma::zeroed()?.assume_init() }),
                         buffer_prp: RefCell::new(unsafe { Dma::zeroed()?.assume_init() }),
                         queues: RefCell::new(HashMap::new()),
+                        io_queue: 1,
                     })),
                 ))
                 .collect(),
@@ -209,6 +226,8 @@ impl Nvme {
             prp_lists: Mutex::new(Vec::new()),
             #[cfg(feature = "grant-dma")]
             max_transfer: std::sync::atomic::AtomicU64::new(ZEROCOPY_CHUNK),
+            #[cfg(feature = "percore")]
+            percore_vectors: Mutex::new(HashMap::new()),
         })
     }
     /// # Locking
@@ -223,8 +242,9 @@ impl Nvme {
         &mut *(addr as *mut Mmio<u32>)
     }
     fn cur_thread_ctxt(&self) -> Arc<ReentrantMutex<ThreadCtxt>> {
-        // TODO: multi-threading
-        Arc::clone(self.thread_ctxts.read().get(&0).unwrap())
+        // Ferric Oxide: a per-CPU worker has its own context, keyed by its vector.
+        let key = THREAD_CTXT.with(|key| key.get());
+        Arc::clone(self.thread_ctxts.read().get(&key).unwrap())
     }
 
     pub unsafe fn init(&mut self) -> Result<()> {
@@ -314,6 +334,13 @@ impl Nvme {
     }
 
     pub fn set_vector_masked(&self, vector: u16, masked: bool) {
+        // Ferric Oxide: a per-CPU queue pair's own MSI-X entry.
+        #[cfg(feature = "percore")]
+        if let Some(own) = self.percore_vectors.lock().get_mut(&vector) {
+            if own.set_masked_if_fast(masked) {
+                return;
+            }
+        }
         let mut interrupt_vector_guard = (&self).interrupt_vector.lock();
 
         if !interrupt_vector_guard.set_masked_if_fast(masked) {
@@ -366,6 +393,18 @@ impl Nvme {
         io_cq_id: CqId,
         vector: Option<Iv>,
     ) -> NvmeCompQueue {
+        self.create_io_completion_queue_status(io_cq_id, vector)
+            .await
+            .0
+    }
+
+    /// Ferric Oxide: [`Self::create_io_completion_queue`], with the command's status field
+    /// (0 on success).
+    pub async fn create_io_completion_queue_status(
+        &self,
+        io_cq_id: CqId,
+        vector: Option<Iv>,
+    ) -> (NvmeCompQueue, u16) {
         let doorbell = unsafe { self.get_doorbell(2 * (io_cq_id as usize) + 1) };
         let queue =
             NvmeCompQueue::new(doorbell).expect("nvmed: failed to allocate I/O completion queue");
@@ -395,9 +434,21 @@ impl Nvme {
             _ => (),
         }*/
 
-        queue
+        (queue, comp.status >> 1)
     }
     pub async fn create_io_submission_queue(&self, io_sq_id: SqId, io_cq_id: CqId) -> NvmeCmdQueue {
+        self.create_io_submission_queue_status(io_sq_id, io_cq_id)
+            .await
+            .0
+    }
+
+    /// Ferric Oxide: [`Self::create_io_submission_queue`], with the command's status field
+    /// (0 on success).
+    pub async fn create_io_submission_queue_status(
+        &self,
+        io_sq_id: SqId,
+        io_cq_id: CqId,
+    ) -> (NvmeCmdQueue, u16) {
         let doorbell = unsafe { self.get_doorbell(2 * (io_sq_id as usize)) };
         let q = NvmeCmdQueue::new(doorbell).expect("failed to create submission queue");
 
@@ -425,7 +476,7 @@ impl Nvme {
             _ => (),
         }*/
 
-        q
+        (q, comp.status >> 1)
     }
 
     pub async fn init_with_queues(&self) -> BTreeMap<u32, NvmeNamespace> {
@@ -484,7 +535,7 @@ impl Nvme {
 
         let mut cmd = NvmeCmd::default();
         let comp = self
-            .submit_and_complete_command(1, |cid| {
+            .submit_and_complete_command(ctxt.io_queue, |cid| {
                 cmd = if write {
                     NvmeCmd::io_write(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 } else {
@@ -623,8 +674,10 @@ impl Nvme {
         };
 
         let mut cmd = NvmeCmd::default();
+        // Ferric Oxide: this thread's I/O queue.
+        let io_queue = self.cur_thread_ctxt().lock().io_queue;
         let comp = self
-            .submit_and_complete_command(1, |cid| {
+            .submit_and_complete_command(io_queue, |cid| {
                 cmd = if write {
                     NvmeCmd::io_write(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 } else {

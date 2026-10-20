@@ -640,6 +640,7 @@ dependencies = [
  "daemon",
  "executor",
  "ferric-blkgrant",
+ "ferric-blkqueue",
  "ferric-regbuf",
  "futures",
  "libredox",
@@ -883,12 +884,27 @@ name = "ferric-blkgrant"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-blkqueue"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-irq"
 version = "0.1.0"
 
 [[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-vtd"
+version = "0.1.0"
+dependencies = [
+ "ferric-iommu",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1588,6 +1604,8 @@ dependencies = [
  "driver-block",
  "executor",
  "ferric-blkgrant",
+ "ferric-blkqueue",
+ "ferric-irq",
  "futures",
  "libc",
  "libredox",
@@ -1717,6 +1735,8 @@ dependencies = [
  "daemon",
  "fdt 0.1.5",
  "ferric-iommu",
+ "ferric-irq",
+ "ferric-vtd",
  "libc",
  "libredox",
  "log",
@@ -1727,6 +1747,7 @@ dependencies = [
  "redox_syscall 0.9.4",
  "scheme-utils",
  "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -17,6 +17,8 @@
 //!   keeps its own index privately, and a corrupt peer index is an error, never undefined
 //!   behaviour. This crate has no `unsafe` code.
 //! - [`chain`] groups the SQ into chains ([`SqReader`]) and runs them by the break rules.
+//! - `files` (with the `alloc` feature) is the ring's file table, the slots that fixed-file
+//!   SQEs name.
 //! - [`notify`] is the need-wakeup protocol that lets both sides skip system calls while the
 //!   other is awake, without losing wakeups.
 //!
@@ -55,13 +57,18 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(any(feature = "alloc", test))]
+extern crate alloc;
+
 pub mod abi;
 pub mod chain;
 pub mod entry;
+#[cfg(any(feature = "alloc", test))]
+pub mod files;
 pub mod notify;
 pub mod queue;
 
 pub use abi::{Layout, NotifyMode};
 pub use chain::SqReader;
 pub use entry::{Cqe, Entry, Op, Sqe, SqeFlags};
-pub use queue::{Consumer, Memory, Producer};
+pub use queue::{Consumer, Memory, Producer, Reserving};

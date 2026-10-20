@@ -147,7 +147,10 @@ checks at boot and halts with a list of the missing features.
 `make qemu` picks a matching emulated CPU when KVM is off.
 
 v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
-v4 turns on by default."""
+v4 turns on by default.
+
+With packages.manager = "fox", v3 and v4 also pick the level of the
+prebuilt and source-built fox packages synced into the image."""
 choices = [
   { value = "v1", title = "v1 (baseline)" },
   { value = "v2", title = "v2" },
@@ -172,12 +175,12 @@ make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v2", FERRIC_TARG
 
 [[option.effect]]
 when = "value == 'v3'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v3" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v3", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v3" }
 
 [[option.effect]]
 when = "value == 'v4'"
-make = { QEMU_CPU = "max" }
+make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v4" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v4", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v4" }
 
 [[option]]
@@ -396,6 +399,25 @@ rebuild = ["kernel"]
 help = "Parse SRAT and keep per-node memory information. Experimental upstream."
 
 [[option]]
+id = "kernel.irq_percpu"
+menu = "kernel"
+type = "bool"
+title = "Per-CPU interrupt delivery"
+default = false
+depends = "target.arch == 'x86_64' && kernel.multi_core"
+kernel_feature = "irq-percpu"
+rebuild = ["kernel"]
+help = """
+Count and deliver interrupts per (CPU, vector) in the irq: scheme (Phase 2.4),
+so a vector reserved on one CPU (irq:cpu-XX/N) is a different interrupt from
+the same vector number on another, and each CPU counts its interrupts without
+a shared lock. Adds the root-only irq:cpus file, which maps each running
+logical CPU to its APIC id and NUMA node, and lists CPUs under irq: by logical
+id. Root can move a reserved vector to another CPU with the irq: handle's
+Move call. The groundwork for per-core NVMe and NIC queues. Off by default; without
+it, irq: counts interrupts by vector number alone, as upstream."""
+
+[[option]]
 id = "kernel.regbuf"
 menu = "kernel"
 type = "bool"
@@ -459,6 +481,29 @@ disk schemes refuse grants, as upstream."""
 [[option.effect]]
 when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/grant-dma" }
+
+[[option]]
+id = "drivers.nvme_percore"
+menu = "drivers"
+type = "bool"
+title = "Per-CPU NVMe queue pairs"
+default = false
+depends = "kernel.irq_percpu"
+rebuild = ["base"]
+help = """
+Give nvmed one I/O queue pair per online CPU (Phase 2.4), as many as the
+controller grants (Set Features, Number of Queues) and its MSI-X table has
+entries for. Each pair's completion queue interrupts its own CPU through its own
+MSI-X entry, spread over the CPUs in irq:cpus, and a worker thread pinned to
+that CPU serves it with its own executor and bounce buffer. The admin queue
+stays on the BSP. The disk scheme hands reads and writes to the workers in turn;
+it cannot see the caller's CPU yet. Needs Kernel > Per-CPU interrupt delivery.
+Builds nvmed with its percore Cargo feature. Off by default; without it nvmed
+has one I/O queue pair on the BSP, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
 id = "kernel.self_modifying"
@@ -672,6 +717,91 @@ names (syscall, sched) or event names (sched.switch), separated by commas.
 FERRIC_TRACE= in the boot environment (press e in the bootloader) adds to it."""
 
 [[option]]
+id = "kernel.trace_initfs_enable"
+menu = "kernel.tracing"
+type = "list"
+title = "Events bootstrap turns on"
+default = []
+depends = "kernel.trace"
+trace_config = "enable"
+rebuild = ["base"]
+help = """
+Events to turn on from user space's first process, before init starts: a
+list of selections such as "syscall", "scheme.request" or "all". They go in
+the initfs as /scheme/initfs/lib/trace.toml, which bootstrap reads and writes
+to /scheme/kernel.trace/events as enable commands. Unlike kernel.trace_boot,
+changing them rebuilds only the initfs, not the kernel; system calls made
+before bootstrap applies them are not traced. Names are checked against the
+event catalog when the configuration is generated."""
+
+[[option]]
+id = "kernel.trace_initfs_disable"
+menu = "kernel.tracing"
+type = "list"
+title = "Events bootstrap turns off"
+default = []
+depends = "kernel.trace"
+trace_config = "disable"
+rebuild = ["base"]
+help = """
+Events bootstrap turns off after the ones above are on, from the same
+initfs trace.toml: use it to leave out single events of a subsystem turned on
+above, or events kernel.trace_boot or FERRIC_TRACE= turned on."""
+
+[[option]]
+id = "kernel.trace_crash"
+menu = "kernel.tracing"
+type = "bool"
+title = "Crash dump across a warm reboot"
+default = false
+depends = "kernel.trace"
+kernel_feature = "trace_crash"
+rebuild = ["kernel"]
+help = """
+Keep 64 KiB of RAM at a fixed address (kernel.trace_crash_base) out of use. A
+kernel panic writes its message and the newest records of every CPU's trace
+ring there. Firmware leaves RAM alone across a warm reboot, so the next boot
+finds the dump, logs the message, and serves the dump as
+/scheme/kernel.trace/crash, which `ferric-trace crash` prints or saves as a
+capture. A cold boot finds nothing, and a region that is not free RAM in the
+boot memory map turns the feature off with a warning.
+
+It also makes every ring a flight recorder: a full ring overwrites its oldest
+records instead of dropping new ones, so the dump holds the last records before
+the panic even when nobody reads the rings. Readers see the overwritten records
+in each ring's lost count."""
+
+[[option]]
+id = "kernel.trace_crash_base"
+menu = "kernel.tracing"
+type = "string"
+title = "Crash region address"
+default = "0x4000000"
+depends = "kernel.trace_crash"
+kernel_config = "trace.crash_base"
+rebuild = ["kernel"]
+help = """
+The physical address of the crash region, page aligned. Pick RAM that neither
+the firmware nor the bootloader uses; the default, 64 MiB, is free on QEMU
+with OVMF and on most PCs, whose firmware and boot loaders allocate from the
+top of memory."""
+
+[[option]]
+id = "kernel.trace_crash_test"
+menu = "kernel.tracing"
+type = "bool"
+title = "Crash dump test hook"
+default = false
+depends = "kernel.trace_crash"
+kernel_feature = "trace_crash_test"
+rebuild = ["kernel"]
+help = """
+For testing only: writing `panic` to /scheme/kernel.trace/crash (as root)
+panics the kernel on purpose, and the panic handler resets the machine once
+the dump is written, so the next boot can read it back. CI's crash-dump image
+turns it on; never turn it on elsewhere."""
+
+[[option]]
 id = "kernel.sys_fdstat"
 menu = "kernel"
 type = "bool"
@@ -830,7 +960,7 @@ choices = ["always", "auto", "never"]
 id = "kernel.cpu.shstk"
 menu = "kernel.cpu"
 type = "choice"
-title = "Shadow stacks (CET SS) in the kernel: prepared, not yet enabled"
+title = "Shadow stacks (CET SS) in the kernel"
 default = "never"
 depends = "target.arch == 'x86_64'"
 kernel_config = "arch.x86_64.features.shstk"
@@ -838,14 +968,20 @@ rebuild = ["kernel"]
 help = """
 Intel CET supervisor shadow stacks keep a second, write-protected copy of every
 return address and stop the kernel with a control-protection fault (#CP) when a
-`ret` does not match it, which defeats return-oriented gadget chains. They are
-not turned on yet: "auto" logs at boot whether the CPU reports CET_SS (Intel
-Tiger Lake, AMD Zen 3 and newer) and what the policy decided, and on such CPUs
-allocates a shadow stack for every kernel stack and keeps the shadow-stack
-pointer registers up to date, with CET itself left off. Like the other "auto"
-CPU options it acts as "never" without kernel.self_modifying. "always" will be
-added once the kernel can enable them."""
-choices = ["auto", "never"]
+`ret` does not match it, which defeats return-oriented gadget chains. "auto"
+turns them on when the CPU reports CET_SS (Intel Tiger Lake, AMD Zen 3 and
+newer) and logs a boot self-test; "always" additionally panics at boot on CPUs
+without it. On a CPU without CET_SS, or with more than 1 TiB of RAM, "auto"
+stays off and logs that it is skipping. Enabling alongside kernel.cpu.kpti is
+not yet supported: with KPTI on, shadow stacks are allocated but left off
+("always" then panics, so use "auto"). Independent of kernel.cpu.ibt. Compiled
+shadow-stack support reserves a private 32 MiB frame pool (4096 stacks), excluded
+from the writable physical map. Pool exhaustion fails allocation without a
+writable fallback. Like the
+other "auto" CPU options it acts as "never" without kernel.self_modifying. Off
+by default because CI cannot test it: KVM on the runners does not expose CET and
+QEMU's emulator does not implement it."""
+choices = ["always", "auto", "never"]
 
 # ---------------------------------------------------------------- image
 
@@ -943,6 +1079,10 @@ The package manager on the target.
             --installed and fox remove cover the whole system.
             fox installs local .pkgar files; it does not fetch from
             package servers.
+            The image build finishes the root with the host fox: it
+            adopts the installed packages at build time, syncs
+            packages.set if one is given, and writes the image SBOM to
+            build/<arch>/<config>/image.cdx.json. Sets FERRIC_FOX_IMAGE=1.
   pkgutils  upstream Redox's pkg, which can fetch from package servers."""
 choices = [
   { value = "fox", title = "fox: verify, install and remove signed local packages" },
@@ -953,6 +1093,38 @@ choices = [
 when = "value == 'fox'"
 source_packages = ["fox"]
 ignore_packages = ["pkgutils"]
+make = { FERRIC_FOX_IMAGE = "1" }
+
+[[option]]
+id = "packages.set"
+menu = "packages"
+type = "string"
+title = "Package set synced into the image"
+default = ""
+depends = "packages.manager == 'fox'"
+make_var = "FERRIC_FOX_PACKAGES"
+help = """
+A fox package set (fox-packages/1: registries, packages and policy; see
+the package tooling chapter of the book) that the image build installs
+with `fox sync --target <image target>` after the installer has placed
+the configuration's packages. The lock, fox.lock, is written beside the
+set; commit it to make image builds reproducible. Packages need prebuilt
+artifacts for the image target, or a source build that can cross-compile
+to it. Empty means no set. Sets FERRIC_FOX_PACKAGES."""
+
+[[option]]
+id = "packages.locked"
+menu = "packages"
+type = "bool"
+title = "Require every package to be locked"
+default = false
+depends = "packages.manager == 'fox' && packages.set != ''"
+make_var = "FERRIC_FOX_LOCKED"
+help = """
+Fail the image build unless fox.lock beside packages.set already pins
+every package (fox sync --locked), so a release image is built from
+exactly the archives and commits recorded there. Sets
+FERRIC_FOX_LOCKED."""
 
 [[option]]
 id = "packages.signed_manifests"
@@ -1103,6 +1275,16 @@ message = "Kernel CPU features set to \"auto\" act as \"never\" without self-mod
 level = "warn"
 when = "target.arch == 'x86_64' && kernel.cpu.pcid == 'always' && kernel.cpu.kpti == 'never'"
 message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" it does nothing."
+
+[[rule]]
+level = "error"
+when = "target.arch == 'x86_64' && kernel.cpu.shstk == 'always' && kernel.cpu.kpti != 'never'"
+message = "kernel.cpu.shstk = \"always\" cannot be met with KPTI on (enabling shadow stacks alongside KPTI is not yet supported); use \"auto\", or set kernel.cpu.kpti = \"never\"."
+
+[[rule]]
+level = "warn"
+when = "target.arch == 'x86_64' && kernel.cpu.shstk != 'never' && kernel.cpu.kpti == 'auto'"
+message = "With kernel.cpu.kpti = \"auto\" (on for Meltdown-affected Intel CPUs), shadow stacks are allocated but left off on those CPUs; enabling shadow stacks alongside KPTI is not yet supported."
 
 [[rule]]
 level = "error"

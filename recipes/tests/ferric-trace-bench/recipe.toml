@@ -1,0 +1,20 @@
+# Ferric Oxide: the tracing overhead benchmark (roadmap Phase T, overhead
+# budget). It times file I/O through RedoxFS and a null system call, with the
+# kernel's tracepoints off and, when the kernel has kernel.trace, with every
+# compiled-in event on, and prints FERRIC_BENCH lines that the image workflow's
+# trace-overhead job compares across kernels built with and without tracing.
+# Only for test images. Source lives in files/; as a path source (relative to
+# the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-trace-bench/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The trace crate is a path dependency at ../../../../crates/trace from files/.
+# The cookbook builds a copy of files/ in this recipe's source/, at the same
+# depth, so the relative path holds there too.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

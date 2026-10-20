@@ -124,9 +124,10 @@ fn set_exceptions(idt: &mut [IdtEntry]) {
     idt[18].set_func(exception::machine_check);
     idt[19].set_func(exception::simd);
     idt[20].set_func(exception::virtualization);
-    // Ferric Oxide (IBT): control protection exception, only possible with IBT built in.
+    // Ferric Oxide (CET): control protection exception, raised by IBT and by shadow stacks, so
+    // installed when either is built in. Without it a #CP would escalate to a double fault.
     #[cfg(target_arch = "x86_64")]
-    if crate::arch::ibt::COMPILED
+    if (crate::arch::ibt::COMPILED || crate::arch::shstk::COMPILED)
         && let Some(entry) = idt.get_mut(21)
     {
         entry.set_func(exception::control_protection);
@@ -182,6 +183,17 @@ pub fn allocate_and_init_idt(cpu_id: LogicalCpuId, pcr: *mut ProcessorControlReg
 }
 
 const BACKUP_IST: u8 = 1;
+
+// Ferric Oxide (shadow stacks): IST indices for the three fatal vectors. With shadow stacks in
+// use they get separate ISTs, so each has its own stack and its own supervisor shadow-stack
+// token; a nested delivery (for example #MC inside an NMI) then lands on a different shadow stack
+// rather than finding the shared token already busy and escalating to a triple fault. Without
+// shadow stacks all three share IST 1, exactly as before.
+const NMI_IST: u8 = 1;
+#[cfg(target_arch = "x86_64")]
+const DOUBLE_FAULT_IST: u8 = 2;
+#[cfg(target_arch = "x86_64")]
+const MACHINE_CHECK_IST: u8 = 3;
 
 /// Initializes an IDT for any type of processor.
 fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
@@ -306,8 +318,11 @@ pub unsafe fn install_idt(idt_ptr: *mut Idt, cpu_id: LogicalCpuId) {
         *idt_guard = Some(unsafe { &mut *idt_ptr });
     }
 }
-/// Gives NMIs, double faults and machine checks the backup stack `backup` (IST 1), in `idt` and
-/// in the TSS of `pcr`.
+/// Gives NMIs, double faults and machine checks a dedicated interrupt stack, in `idt` and in the
+/// TSS of `pcr`. By default all three share `backup` (IST 1); with CET shadow stacks in use, the
+/// double fault and machine check get their own freshly allocated stacks (IST 2 and 3), so each
+/// of the three has its own shadow stack and a nested fatal exception cannot find the shared
+/// supervisor shadow-stack token busy.
 ///
 /// # Safety
 ///
@@ -326,24 +341,72 @@ pub unsafe fn install_backup_stack(
     // corrupt, and we want a separate stack.
     //
     // Note that each CPU has its own "backup interrupt stack".
-    idt.entries[2].set_ist(BACKUP_IST);
-    idt.entries[8].set_ist(BACKUP_IST);
-    idt.entries[18].set_ist(BACKUP_IST);
 
-    // Ferric Oxide: the IST goes in `pcr`, which upstream took to be the running CPU's even when
-    // setting up an AP. With shadow stacks, IST 1's entry in the interrupt SSP table too.
+    // Whether the three fatal vectors get separate ISTs. Only with shadow stacks in use; the
+    // default build keeps the historical shared IST 1 exactly.
+    #[cfg(target_arch = "x86_64")]
+    let separate = cfg!(shstk_compiled) && {
+        #[cfg(shstk_compiled)]
+        {
+            crate::arch::shstk::decision()
+        }
+        #[cfg(not(shstk_compiled))]
+        {
+            false
+        }
+    };
+
+    // NMI always uses the passed `backup` stack on IST 1.
+    idt.entries[2].set_ist(NMI_IST);
+
     #[cfg(target_arch = "x86_64")] // TODO: x86
     // SAFETY: the caller guarantees `pcr` is the PCR of the CPU loading `idt` and unused
     // elsewhere.
     unsafe {
-        (*pcr).tss.ist[usize::from(BACKUP_IST - 1)] = backup.initial_top() as u64;
-        #[cfg(shstk_compiled)]
-        crate::arch::shstk::set_ist_ssp(
-            &mut (*pcr).shstk_ist_ssp,
-            BACKUP_IST,
-            backup.shadow_stack(),
-        );
+        install_one_ist(&mut *pcr, NMI_IST, backup);
+
+        if separate {
+            // Double fault and machine check get their own stacks and shadow stacks, each
+            // freshly allocated and leaked (never freed, like `backup`). Mapped into the KPTI
+            // shadow tables (a no-op without KPTI, and the BSP's are also mapped from its TSS in
+            // kpti::init_bsp); the CPU reads an IST stack while the user page table is loaded.
+            idt.entries[8].set_ist(DOUBLE_FAULT_IST);
+            idt.entries[18].set_ist(MACHINE_CHECK_IST);
+            for (ist, vector) in [
+                (DOUBLE_FAULT_IST, "double fault"),
+                (MACHINE_CHECK_IST, "machine check"),
+            ] {
+                let stack = Kstack::new()
+                    .unwrap_or_else(|_| panic!("failed to allocate the {vector} IST stack"));
+                crate::arch::kpti::map_stack(stack.initial_top() as usize);
+                install_one_ist(&mut *pcr, ist, &stack);
+                core::mem::forget(stack);
+            }
+        } else {
+            idt.entries[8].set_ist(NMI_IST);
+            idt.entries[18].set_ist(NMI_IST);
+        }
     }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        idt.entries[8].set_ist(NMI_IST);
+        idt.entries[18].set_ist(NMI_IST);
+    }
+}
+
+/// Points IST index `ist` (1 to 7) at `stack`'s top in `pcr`'s TSS, and, with shadow stacks, at
+/// its shadow stack's supervisor token in the interrupt SSP table.
+///
+/// # Panics
+///
+/// If `ist` is 0, which is not an IST index (the callers pass the `*_IST` constants).
+#[cfg(target_arch = "x86_64")]
+fn install_one_ist(pcr: &mut ProcessorControlRegion, ist: u8, stack: &Kstack) {
+    let slot = ist.checked_sub(1).expect("IST indices start at 1");
+    pcr.tss.ist[usize::from(slot)] = stack.initial_top() as u64;
+    #[cfg(shstk_compiled)]
+    crate::arch::shstk::set_ist_ssp(&mut pcr.shstk_ist_ssp, ist, stack.shadow_stack());
 }
 
 bitflags! {
