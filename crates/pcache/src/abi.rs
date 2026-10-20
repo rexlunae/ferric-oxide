@@ -8,12 +8,12 @@
 //! | [`Request::SetSize`] | an object | `SYS_CALL`, metadata `[verb, size]` |
 //! | [`Request::Attach`] | an object | metadata `[verb, handle]` |
 //! | [`Request::Detach`] | an object | metadata `[verb, handle]` |
-//! | [`Request::Filled`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page, generation]`, payload the pages |
+//! | [`Request::Filled`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page, generation, fill]`, payload the pages |
 //! | [`Request::WrittenBack`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page, generation]` |
 //! | [`Request::SetReadaheadMax`] | a queue | metadata `[verb, pages]` |
 //! | read records | a queue | `read(queue, buf)`: whole [`Record::BYTES`]-byte records |
 //!
-//! Every call fits the three metadata words the kernel passes a kernel scheme
+//! Every call fits the four metadata words the kernel passes a kernel scheme
 //! ([`Request::MAX_WORDS`]).
 //!
 //! A file system opens one queue and binds it to its own scheme with [`Request::Bind`],
@@ -26,10 +26,21 @@
 //! lookup. Opening an ID the queue already has fails with `EEXIST`. An ID may be reused once
 //! its object has closed, so each object also has a [`Generation`], which the kernel puts in
 //! every record and the file system copies into its answer: an answer to a record of an
-//! earlier object with the same ID is refused (`ESTALE`), and closing an object drops the
-//! records of it still on the queue. Generations are 64 bits and never repeat on a queue: the
+//! earlier object with the same ID is stale and ignored (see below), and closing an object
+//! drops the records of it still on the queue. Generations are 64 bits and never repeat on a queue: the
 //! kernel refuses to open an object once they run out (`EOVERFLOW`), which at a billion opens
 //! a second takes centuries.
+//!
+//! Each fill record also has a [`FillId`], which the file system copies into its answer too.
+//! The object numbers its fills from 1 up and never reuses a number (once they run out, a
+//! read that needs a fill fails with `EOVERFLOW`), and each page being filled remembers the
+//! fill it is waiting for. An answer acts only on the pages its fill
+//! still owns: once a fill has failed, been invalidated or been answered, a newer fill of the
+//! same pages is not touched by a late answer to the old one, however malformed. An answer
+//! whose fill owns none of its pages any more, or whose generation is not the object's, is
+//! stale and ignored: the call succeeds and takes nothing (it returns 0). Any other answer
+//! returns how many of its pages it acted on. So a file system never has to tell a late
+//! answer from a live one, and a stale answer never fails the queue or another fill.
 //!
 //! Only the process that opened the queue may use it and its objects, binding included: a
 //! queue or object descriptor passed to another process is refused there (`EPERM`), so it
@@ -316,6 +327,35 @@ impl Generation {
     }
 }
 
+/// Which fill of an object a [`Record::Fill`] and its [`Request::Filled`] answer are about.
+/// An object numbers its fills from 1 up and never reuses a number, so an answer to a fill
+/// that has ended (failed, invalidated, answered) cannot be taken for a newer fill of the
+/// same pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FillId(u64);
+
+impl FillId {
+    /// The fill ID `raw`.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The ID after this one, or `None` after the last. At a billion fills a second an
+    /// object takes centuries to run out.
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+}
+
 /// How a file system finished a fill or a writeback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
@@ -378,7 +418,8 @@ pub enum Request {
     /// object's frames; a failed fill has an empty payload. An answer the kernel cannot take
     /// (no memory for the frames, a payload that faults or has the wrong length) fails the
     /// fill, as a failed answer would: the call returns the error and the record need not be
-    /// answered again.
+    /// answered again. The answer acts only on the pages its fill still owns, and returns how
+    /// many that was; a stale one (see the module docs) returns 0 and changes nothing.
     Filled {
         /// The pages the record named.
         pages: RecordPages,
@@ -386,6 +427,8 @@ pub enum Request {
         outcome: Outcome,
         /// The record's [`Generation`].
         generation: Generation,
+        /// The record's [`FillId`].
+        fill: FillId,
     },
     /// On the object a [`Record::Writeback`] named: the answer to it.
     WrittenBack {
@@ -442,7 +485,7 @@ impl Verb {
 
 impl Request {
     /// The most metadata words a request takes: what the kernel passes a kernel scheme.
-    pub const MAX_WORDS: usize = 3;
+    pub const MAX_WORDS: usize = 4;
 
     /// The metadata words, and how many of them are used.
     ///
@@ -450,25 +493,27 @@ impl Request {
     /// `[verb | count << 16 | errno << 32, first page, generation]`: the verb in the low 16
     /// bits of the first word, the page count in the 16 above it, the outcome's errno (0 for
     /// [`Outcome::Done`]) in the 16 above that, the top 16 zero, and the record's whole
-    /// [`Generation`] in the last word. Every other request has the verb alone in its first
-    /// word.
+    /// [`Generation`] in the third word. [`Self::Filled`] has the record's [`FillId`] in a
+    /// fourth. Every other request has the verb alone in its first word.
     pub const fn encode(self) -> ([u64; Self::MAX_WORDS], usize) {
         match self {
-            Self::Bind => ([Verb::Bind as u64, 0, 0], 1),
-            Self::SetSize { size } => ([Verb::SetSize as u64, size, 0], 2),
-            Self::Attach { handle } => ([Verb::Attach as u64, handle, 0], 2),
-            Self::Detach { handle } => ([Verb::Detach as u64, handle, 0], 2),
+            Self::Bind => ([Verb::Bind as u64, 0, 0, 0], 1),
+            Self::SetSize { size } => ([Verb::SetSize as u64, size, 0, 0], 2),
+            Self::Attach { handle } => ([Verb::Attach as u64, handle, 0, 0], 2),
+            Self::Detach { handle } => ([Verb::Detach as u64, handle, 0, 0], 2),
             Self::Filled {
                 pages,
                 outcome,
                 generation,
+                fill,
             } => (
                 [
                     answer_word(Verb::Filled, pages, outcome),
                     pages.0.first,
                     generation.0,
+                    fill.0,
                 ],
-                3,
+                4,
             ),
             Self::WrittenBack {
                 pages,
@@ -479,14 +524,15 @@ impl Request {
                     answer_word(Verb::WrittenBack, pages, outcome),
                     pages.0.first,
                     generation.0,
+                    0,
                 ],
                 3,
             ),
             Self::SetReadaheadMax { pages } => {
-                ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0], 2)
+                ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0, 0], 2)
             }
             Self::Invalidate { pages } => (
-                [Verb::Invalidate as u64, pages.first, pages.count as u64],
+                [Verb::Invalidate as u64, pages.first, pages.count as u64, 0],
                 3,
             ),
         }
@@ -512,13 +558,13 @@ impl Request {
             (Verb::SetSize, &[size]) => Ok(Self::SetSize { size }),
             (Verb::Attach, &[handle]) => Ok(Self::Attach { handle }),
             (Verb::Detach, &[handle]) => Ok(Self::Detach { handle }),
-            (Verb::Filled, &[first, generation]) => {
+            (Verb::Filled, &[first, generation, fill]) => {
                 let (pages, outcome) = answer(packed, first)?;
-                let generation = Generation(generation);
                 Ok(Self::Filled {
                     pages,
                     outcome,
-                    generation,
+                    generation: Generation(generation),
+                    fill: FillId(fill),
                 })
             }
             (Verb::WrittenBack, &[first, generation]) => {
@@ -601,6 +647,8 @@ pub enum Record {
         object: ObjectId,
         /// The object instance's generation, for the answer.
         generation: Generation,
+        /// Which of the object's fills this is, for the answer.
+        fill: FillId,
         /// The pages to fill.
         pages: RecordPages,
     },
@@ -631,9 +679,54 @@ pub enum Record {
     },
 }
 
+/// What an answer to a [`Record::Fill`] repeats from it: the object's generation, the fill's
+/// ID and its pages ([`Record::fill`] takes them out of a record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillRef {
+    /// The generation of the object the record was for.
+    pub generation: Generation,
+    /// The fill's ID.
+    pub id: FillId,
+    /// The pages the record names.
+    pub pages: RecordPages,
+}
+
+impl FillRef {
+    /// The [`Request::Filled`] answer to this fill with `outcome`.
+    pub const fn answer(self, outcome: Outcome) -> Request {
+        Request::Filled {
+            pages: self.pages,
+            outcome,
+            generation: self.generation,
+            fill: self.id,
+        }
+    }
+}
+
 impl Record {
     /// The size of a record on the queue, in bytes.
-    pub const BYTES: usize = 32;
+    pub const BYTES: usize = 40;
+
+    /// The object a fill record is for, and what its answer repeats; `None` for other
+    /// records.
+    pub const fn fill(&self) -> Option<(ObjectId, FillRef)> {
+        match *self {
+            Self::Fill {
+                object,
+                generation,
+                fill,
+                pages,
+            } => Some((
+                object,
+                FillRef {
+                    generation,
+                    id: fill,
+                    pages,
+                },
+            )),
+            _ => None,
+        }
+    }
 
     const KIND_FILL: u16 = 1;
     const KIND_WRITEBACK: u16 = 2;
@@ -641,8 +734,8 @@ impl Record {
     const KIND_ACCESSED: u16 = 4;
 
     /// The record's bytes: `kind: u16`, `count: u16`, a reserved zero `u32`, `object: u64`,
-    /// `first: u64`, `generation: u64`, all little-endian. Records without pages have `first`
-    /// and `count` zero.
+    /// `first: u64`, `generation: u64`, `fill: u64`, all little-endian. Records without pages
+    /// have `first` and `count` zero, and records other than fills have `fill` zero.
     pub fn to_bytes(self) -> [u8; Self::BYTES] {
         let pages = match self {
             Self::Fill { pages, .. } | Self::Writeback { pages, .. } => Some(pages),
@@ -663,6 +756,9 @@ impl Record {
         bytes[8..16].copy_from_slice(&object.0.to_le_bytes());
         bytes[16..24].copy_from_slice(&first.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.generation().0.to_le_bytes());
+        if let Self::Fill { fill, .. } = self {
+            bytes[32..40].copy_from_slice(&fill.0.to_le_bytes());
+        }
         bytes
     }
 
@@ -688,6 +784,14 @@ impl Record {
         let object = ObjectId(u64_at(8));
         let (first, count) = (u64_at(16), u16_at(2));
         let generation = Generation(u64_at(24));
+        let fill = u64_at(32);
+        let no_fill = || {
+            if fill == 0 {
+                Ok(())
+            } else {
+                Err(RecordError::Reserved)
+            }
+        };
         let pages = || record_range(first, u64::from(count)).ok_or(RecordError::Pages);
         let no_pages = || {
             if first == 0 && count == 0 {
@@ -700,15 +804,22 @@ impl Record {
             Self::KIND_FILL => Ok(Self::Fill {
                 object,
                 generation,
+                fill: FillId(fill),
                 pages: pages()?,
             }),
-            Self::KIND_WRITEBACK => Ok(Self::Writeback {
-                object,
-                generation,
-                pages: pages()?,
+            Self::KIND_WRITEBACK => no_fill().and_then(|()| {
+                Ok(Self::Writeback {
+                    object,
+                    generation,
+                    pages: pages()?,
+                })
             }),
-            Self::KIND_RELEASE => no_pages().map(|()| Self::Release { object, generation }),
-            Self::KIND_ACCESSED => no_pages().map(|()| Self::Accessed { object, generation }),
+            Self::KIND_RELEASE => no_pages()
+                .and_then(|()| no_fill())
+                .map(|()| Self::Release { object, generation }),
+            Self::KIND_ACCESSED => no_pages()
+                .and_then(|()| no_fill())
+                .map(|()| Self::Accessed { object, generation }),
             _ => Err(RecordError::Kind),
         }
     }
@@ -797,10 +908,37 @@ mod tests {
     }
 
     #[test]
+    fn a_fill_record_gives_what_its_answer_repeats() {
+        let fill = Record::Fill {
+            object: ObjectId::new(3),
+            generation: Generation::new(9),
+            fill: FillId::new(5),
+            pages: record(8, 2),
+        };
+        let (object, answer) = fill.fill().expect("a fill record");
+        assert_eq!(object, ObjectId::new(3));
+        assert_eq!(
+            answer.answer(Outcome::Done),
+            Request::Filled {
+                pages: record(8, 2),
+                outcome: Outcome::Done,
+                generation: Generation::new(9),
+                fill: FillId::new(5),
+            }
+        );
+        let release = Record::Release {
+            object: ObjectId::new(3),
+            generation: Generation::new(9),
+        };
+        assert_eq!(release.fill(), None);
+    }
+
+    #[test]
     fn decode_all_takes_whole_records() {
         let fill = Record::Fill {
             object: ObjectId::new(3),
             generation: Generation::new(1),
+            fill: FillId::new(5),
             pages: record(8, 2),
         };
         let release = Record::Release {
@@ -875,25 +1013,28 @@ mod tests {
             pages: record(0, 1),
             outcome: Outcome::Failed(errno(1)),
             generation: Generation::default(),
+            fill: FillId::new(1),
         };
         let (words, len) = failed.encode();
-        assert_eq!(len, 3);
+        assert_eq!(len, 4);
         assert_eq!(words[0], 4 | 1 << 16 | 1 << 32);
         assert_eq!(Request::decode(&words[..len]), Ok(failed));
         assert_eq!(
-            Request::decode(&[4 | 1 << 16, 0, 0]),
+            Request::decode(&[4 | 1 << 16, 0, 0, 2]),
             Ok(Request::Filled {
                 pages: record(0, 1),
                 outcome: Outcome::Done,
                 generation: Generation::default(),
+                fill: FillId::new(2),
             })
         );
         assert_eq!(
-            Request::decode(&[4 | 3 << 16 | 0xffff << 32, 7, 0]),
+            Request::decode(&[4 | 3 << 16 | 0xffff << 32, 7, 0, 3]),
             Ok(Request::Filled {
                 pages: record(7, 3),
                 outcome: Outcome::Failed(errno(0xffff)),
                 generation: Generation::default(),
+                fill: FillId::new(3),
             })
         );
     }
@@ -904,9 +1045,13 @@ mod tests {
             pages: record(2, 1),
             outcome: Outcome::Failed(errno(5)),
             generation: Generation::new(0xbeef_0000_0001),
+            fill: FillId::new(0x1234_5678_9abc),
         };
         let (words, len) = answer.encode();
-        assert_eq!(words, [4 | 1 << 16 | 5 << 32, 2, 0xbeef_0000_0001]);
+        assert_eq!(
+            words,
+            [4 | 1 << 16 | 5 << 32, 2, 0xbeef_0000_0001, 0x1234_5678_9abc]
+        );
         assert_eq!(Request::decode(&words[..len]), Ok(answer));
         // The errno field stays 16 bits: the top 16 bits of the first word are refused.
         assert_eq!(
@@ -929,6 +1074,7 @@ mod tests {
             pages: record(0, 1),
             outcome: Outcome::Done,
             generation,
+            fill: FillId::new(1),
         };
         let (words, len) = answer(first).encode();
         assert_eq!(Request::decode(&words[..len]), Ok(answer(first)));
@@ -936,6 +1082,7 @@ mod tests {
         let fill = |generation| Record::Fill {
             object: ObjectId::new(7),
             generation,
+            fill: FillId::new(1),
             pages: record(0, 1),
         };
         assert_ne!(fill(first).to_bytes(), fill(later).to_bytes());
@@ -953,16 +1100,18 @@ mod tests {
 
     #[test]
     fn every_request_fits_a_kernel_call() {
-        // The kernel hands a kernel scheme at most three metadata words.
-        assert_eq!(Request::MAX_WORDS, 3);
-        let widest = Request::WrittenBack {
+        // The kernel hands a kernel scheme at most four metadata words.
+        assert_eq!(Request::MAX_WORDS, 4);
+        let widest = Request::Filled {
             pages: record(u64::MAX - MAX_RECORD_PAGES as u64, MAX_RECORD_PAGES),
             outcome: Outcome::Failed(errno(u16::MAX)),
             generation: Generation::new(u64::MAX),
+            fill: FillId::new(u64::MAX),
         };
         let (words, len) = widest.encode();
+        assert_eq!(len, Request::MAX_WORDS);
         assert_eq!(Request::decode(&words[..len]), Ok(widest));
-        assert_eq!(Request::Bind.encode(), ([7, 0, 0], 1));
+        assert_eq!(Request::Bind.encode(), ([7, 0, 0, 0], 1));
     }
 
     #[test]
@@ -1020,6 +1169,7 @@ mod tests {
                 pages: record(8, 4),
                 outcome: Outcome::Done,
                 generation: Generation::new(3),
+                fill: FillId::new(17),
             },
             Request::WrittenBack {
                 pages: record(0, MAX_RECORD_PAGES),
@@ -1052,12 +1202,20 @@ mod tests {
         assert_eq!(Request::decode(&[1]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[1, 2, 3]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[7, 0]), Err(DecodeError::Length));
-        assert_eq!(Request::decode(&[4, 1, 0, 1]), Err(DecodeError::Length));
+        // A fill answer without its fill ID, and a writeback answer with one.
+        assert_eq!(
+            Request::decode(&[4 | 1 << 16, 1, 0]),
+            Err(DecodeError::Length)
+        );
+        assert_eq!(
+            Request::decode(&[5 | 1 << 16, 1, 0, 1]),
+            Err(DecodeError::Length)
+        );
         // An empty range, a too long one, a zero readahead maximum, bits above a plain verb.
-        assert_eq!(Request::decode(&[4, 0, 0]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[4, 0, 0, 1]), Err(DecodeError::Value));
         let long = u64::from(MAX_RECORD_PAGES) + 1;
         assert_eq!(
-            Request::decode(&[4 | long << 16, 0, 0]),
+            Request::decode(&[4 | long << 16, 0, 0, 1]),
             Err(DecodeError::Value)
         );
         assert_eq!(Request::decode(&[1 | 1 << 16, 0]), Err(DecodeError::Value));
@@ -1087,6 +1245,7 @@ mod tests {
             Record::Fill {
                 object,
                 generation,
+                fill: FillId::new(0x1122_3344),
                 pages: record(1, 2),
             },
             Record::Writeback {
@@ -1109,10 +1268,11 @@ mod tests {
         let fill = Record::Fill {
             object: ObjectId::new(1),
             generation: Generation::new(9),
+            fill: FillId::new(1),
             pages: record(4, 1),
         }
         .to_bytes();
-        assert_eq!(Record::from_bytes(&fill[..31]), Err(RecordError::Length));
+        assert_eq!(Record::from_bytes(&fill[..39]), Err(RecordError::Length));
         let mut bad = fill;
         bad[0] = 9;
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Kind));
@@ -1130,8 +1290,12 @@ mod tests {
             generation: Generation::default(),
         }
         .to_bytes();
+        let mut with_fill = release;
         release[16] = 1;
         assert_eq!(Record::from_bytes(&release), Err(RecordError::Reserved));
+        // Only a fill has a fill ID.
+        with_fill[32] = 1;
+        assert_eq!(Record::from_bytes(&with_fill), Err(RecordError::Reserved));
     }
 
     #[test]

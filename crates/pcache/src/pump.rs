@@ -14,7 +14,7 @@
 use core::fmt;
 use core::num::NonZeroU16;
 
-use crate::abi::{Generation, ObjectId, Record, RecordError, RecordPages};
+use crate::abi::{FillRef, ObjectId, Record, RecordError};
 
 /// `EIO`, the errno a fill the pump could not forward fails with.
 pub const EIO: NonZeroU16 = NonZeroU16::new(5).expect("5 is not zero");
@@ -24,10 +24,8 @@ pub const EIO: NonZeroU16 = NonZeroU16::new(5).expect("5 is not zero");
 pub struct FailedFill {
     /// The object the record named.
     pub object: ObjectId,
-    /// The record's generation, for the answer.
-    pub generation: Generation,
-    /// The pages the record named.
-    pub pages: RecordPages,
+    /// What the answer repeats from the record.
+    pub fill: FillRef,
     /// The errno to fail the fill with.
     pub errno: NonZeroU16,
 }
@@ -84,11 +82,16 @@ impl<E: core::error::Error + 'static> core::error::Error for FailFillsError<E> {
 /// # Examples
 ///
 /// ```
-/// use ferric_pcache::abi::{Generation, ObjectId, PageRange, Record, RecordPages};
+/// use ferric_pcache::abi::{FillId, Generation, ObjectId, PageRange, Record, RecordPages};
 /// use ferric_pcache::pump::{EIO, fail_fills};
 ///
 /// let pages = RecordPages::new(PageRange::new(0, 1).unwrap()).unwrap();
-/// let fill = Record::Fill { object: ObjectId::new(7), generation: Generation::new(1), pages };
+/// let fill = Record::Fill {
+///     object: ObjectId::new(7),
+///     generation: Generation::new(1),
+///     fill: FillId::new(1),
+///     pages,
+/// };
 /// let mut answered = Vec::new();
 /// let n = fail_fills(&fill.to_bytes(), |fill| {
 ///     answered.push(fill);
@@ -104,21 +107,16 @@ pub fn fail_fills<E>(
     let mut answered = 0;
     let mut first_error = None;
     for record in Record::decode_all(records) {
-        let result = match record {
-            Ok(Record::Fill {
+        let result = match record.as_ref().map(Record::fill) {
+            Ok(Some((object, fill))) => answer(FailedFill {
                 object,
-                generation,
-                pages,
-            }) => answer(FailedFill {
-                object,
-                generation,
-                pages,
+                fill,
                 errno: EIO,
             })
             .map(|()| answered += 1)
             .map_err(|source| FailFillsError::Answer { object, source }),
-            Ok(_) => Ok(()),
-            Err(err) => Err(FailFillsError::Record(err)),
+            Ok(None) => Ok(()),
+            Err(&err) => Err(FailFillsError::Record(err)),
         };
         if let Err(err) = result {
             first_error.get_or_insert(err);
@@ -133,13 +131,14 @@ pub fn fail_fills<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::PageRange;
+    use crate::abi::{FillId, Generation, PageRange, RecordPages};
 
     fn fill(object: u64, first: u64, count: u32) -> Record {
         let pages = PageRange::new(first, count).and_then(RecordPages::new);
         Record::Fill {
             object: ObjectId::new(object),
             generation: Generation::new(3),
+            fill: FillId::new(first + 1),
             pages: pages.expect("a valid record"),
         }
     }
@@ -167,10 +166,11 @@ mod tests {
         });
         assert_eq!(n, Ok(2));
         let [a, b] = seen.map(|s| s.expect("answered"));
-        assert_eq!((a.object.get(), a.pages.pages().first()), (1, 0));
-        assert_eq!((b.object.get(), b.pages.pages().first()), (2, 5));
+        assert_eq!((a.object.get(), a.fill.pages.pages().first()), (1, 0));
+        assert_eq!((b.object.get(), b.fill.pages.pages().first()), (2, 5));
         assert!(a.errno == EIO && b.errno == EIO);
-        assert_eq!(a.generation, Generation::new(3));
+        assert_eq!(a.fill.generation, Generation::new(3));
+        assert_eq!((a.fill.id, b.fill.id), (FillId::new(1), FillId::new(6)));
     }
 
     #[test]
@@ -219,39 +219,50 @@ mod tests {
     fn a_reader_of_an_unforwarded_fill_gets_eio_and_does_not_hang() {
         extern crate std;
         use crate::abi::{Outcome, PAGE_SIZE};
-        use crate::object::{Attempt, PageIndex, Read};
+        use crate::object::{Attempt, PageIndex, Read, ReadStep};
         use std::vec::Vec;
 
         let mut index: PageIndex<u64> = PageIndex::new();
         index.set_size(4 * PAGE_SIZE);
         let pages = PageRange::new(0, 2).expect("a valid range");
         let mut reader = Attempt::new();
-        let Read::Wait { fills } = index.start_read(pages, &mut reader) else {
-            panic!("an empty index needs fills");
-        };
+        let step = index.start_read(pages, &mut reader, None);
+        assert_eq!(step.read, Read::Wait, "an empty index needs fills");
+        let fills = step.fills;
         // The pump took the records off the queue, then forwarding them failed.
         let records: Vec<[u8; Record::BYTES]> = fills
             .iter()
-            .map(|&pages| {
+            .map(|fill| {
                 Record::Fill {
                     object: ObjectId::new(9),
                     generation: Generation::new(1),
-                    pages,
+                    fill: fill.id,
+                    pages: fill.pages,
                 }
                 .to_bytes()
             })
             .collect();
         let answered = fail_fills(records.as_flattened(), |fill| {
-            index.complete_fill(fill.pages, Outcome::Failed(fill.errno), Vec::new())
+            index
+                .complete_fill(
+                    fill.fill.id,
+                    fill.fill.pages,
+                    Outcome::Failed(fill.errno),
+                    Vec::new(),
+                )
+                .map(drop)
         });
         assert_eq!(answered, Ok(fills.len()));
         // Still waiting would be `Read::Wait`; the reader gets its EIO instead.
-        assert_eq!(index.start_read(pages, &mut reader), Read::Failed);
+        assert_eq!(
+            index.start_read(pages, &mut reader, None).read,
+            Read::Failed
+        );
         // A new read fills again.
         let mut next = Attempt::new();
         assert!(matches!(
-            index.start_read(pages, &mut next),
-            Read::Wait { fills } if !fills.is_empty()
+            index.start_read(pages, &mut next, None),
+            ReadStep { read: Read::Wait, fills } if !fills.is_empty()
         ));
     }
 }

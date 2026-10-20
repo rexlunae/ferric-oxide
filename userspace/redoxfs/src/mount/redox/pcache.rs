@@ -34,7 +34,9 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, Weak};
 
 use ferric_pcache::abi::{ObjectId, Record, PAGE_SIZE};
-use ferric_pcache::client::{self, Call, ClientError, Object, Pump, Queue, FORWARDED_RECORDS};
+use ferric_pcache::client::{
+    self, Answered, Call, ClientError, Object, Pump, Queue, FORWARDED_RECORDS,
+};
 use ferric_pcache::pump::FailedFill;
 use libredox::Fd;
 use redox_scheme::Socket;
@@ -133,9 +135,10 @@ impl Pump for RedoxPump {
             let objects = self.objects.lock().unwrap_or_else(|p| p.into_inner());
             objects.get(&node_id).and_then(Weak::upgrade)
         });
-        // An object RedoxFS closed failed its fills as it went.
+        // An object RedoxFS closed failed its fills as it went. A fill that ended otherwise,
+        // or one of an earlier object with this node's ID, comes back stale, which is fine.
         match object {
-            Some(object) => object.fill_failed(fill.pages, fill.generation, fill.errno),
+            Some(object) => object.fill_failed(fill.fill, fill.errno).map(drop),
             None => Ok(()),
         }
     }
@@ -338,12 +341,8 @@ impl PageCache {
     /// Answers the fill records in `records` (forwarded by the pump) with the files' bytes.
     pub fn fill<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, records: &[u8]) {
         for record in Record::decode_all(records) {
-            match record {
-                Ok(Record::Fill {
-                    object,
-                    generation,
-                    pages,
-                }) => {
+            match record.as_ref().map(Record::fill) {
+                Ok(Some((object, fill))) => {
                     let Ok(node_id) = u32::try_from(object.get()) else {
                         continue;
                     };
@@ -351,26 +350,32 @@ impl PageCache {
                     let Some(cached) = self.files.get(&node_id) else {
                         continue;
                     };
-                    let range = pages.pages();
+                    let range = fill.pages.pages();
                     let len = range.count() as usize * PAGE_SIZE as usize;
                     self.buf.clear();
                     self.buf.resize(len, 0);
                     let offset = range.first() * PAGE_SIZE;
                     let read = read_pages(fs, fmaps, node_id, offset, &mut self.buf);
                     let answer = match read {
-                        Ok(()) => cached.object.filled(pages, generation, &self.buf),
+                        Ok(()) => cached.object.filled(fill, &self.buf),
                         Err(err) => {
                             let errno = u16::try_from(err.errno).ok().and_then(NonZeroU16::new);
                             let errno = errno.unwrap_or(NonZeroU16::new(EIO as u16).expect("EIO"));
-                            cached.object.fill_failed(pages, generation, errno)
+                            cached.object.fill_failed(fill, errno)
                         }
                     };
-                    if let Err(err) = answer {
-                        log::warn!("page cache: fill of node {node_id}: {}", Chain(&err));
+                    match answer {
+                        Ok(Answered::Taken(_)) => {}
+                        Ok(Answered::Stale) => {
+                            log::debug!("page cache: fill of node {node_id} was stale");
+                        }
+                        Err(err) => {
+                            log::warn!("page cache: fill of node {node_id}: {}", Chain(&err));
+                        }
                     }
                 }
                 // Writeback, release and access records come with later steps.
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(err) => log::error!("page cache: bad record from the kernel: {err}"),
             }
         }

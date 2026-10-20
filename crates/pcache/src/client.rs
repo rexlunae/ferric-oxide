@@ -35,11 +35,11 @@ use std::thread::{self, JoinHandle};
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_RDWR};
 use syscall::CallFlags;
-use syscall::error::{EBADF, ENODEV, ENOENT};
+use syscall::error::{EBADF, EINTR, ENODEV, ENOENT};
 
 use crate::abi::{
-    Generation, ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordError,
-    RecordPages, Request, SCHEME_NAME,
+    FillRef, ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordError, Request,
+    SCHEME_NAME,
 };
 use crate::pump::{FailFillsError, FailedFill, fail_fills};
 
@@ -109,7 +109,7 @@ pub enum ClientError {
     Record(RecordError),
     /// The pump thread could not be started.
     Spawn(io::Error),
-    /// The queue was closed (by the pump, after a fill it could not answer).
+    /// The queue was closed (by the pump, when it stopped).
     Closed,
     /// The pump could not answer the fills of a batch it failed to forward, and closed the
     /// queue.
@@ -162,8 +162,35 @@ fn tag<T>(call: Call, result: libredox::error::Result<T>) -> Result<T, ClientErr
 
 /// Sends `request` (with `payload`) on `fd`.
 fn send(fd: &Fd, call: Call, request: Request, payload: &[u8]) -> Result<(), ClientError> {
+    call_with(fd, call, request, payload).map(drop)
+}
+
+/// Sends `request` (with `payload`) on `fd`, and returns what the kernel returned.
+fn call_with(fd: &Fd, call: Call, request: Request, payload: &[u8]) -> Result<usize, ClientError> {
     let (words, len) = request.encode();
-    tag(call, fd.call_wo(payload, CallFlags::empty(), &words[..len])).map(drop)
+    tag(call, fd.call_wo(payload, CallFlags::empty(), &words[..len]))
+}
+
+/// What the kernel did with a fill answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// It acted on this many of the record's pages (those its fill still owned).
+    Taken(u32),
+    /// The fill owned none of its pages any more (it was failed, answered or invalidated
+    /// already, or the record was for an earlier object with this ID): nothing changed.
+    Stale,
+}
+
+impl Answered {
+    /// What a `Filled` call's return value means.
+    fn from_return(n: usize) -> Self {
+        match u32::try_from(n) {
+            Ok(0) => Self::Stale,
+            Ok(pages) => Self::Taken(pages),
+            // The kernel acts on at most `MAX_RECORD_PAGES` pages.
+            Err(_) => Self::Taken(u32::MAX),
+        }
+    }
 }
 
 /// A file system's fill queue.
@@ -342,57 +369,37 @@ impl Object {
         })
     }
 
-    /// Answers the fill record of `pages` in `generation` (both copied from the record) with
-    /// their bytes, `pages.count()` whole pages (zero past the end of the file).
+    /// Answers fill `fill` (taken from its record with [`Record::fill`]) with its pages'
+    /// bytes, `pages.count()` whole pages (zero past the end of the file). A stale
+    /// answer is not an error: see [`Answered`].
     ///
     /// # Errors
     ///
-    /// [`ClientError::Call`] when the kernel refuses (the pages are not being filled, the
-    /// record was for an earlier object with this ID, the payload has the wrong length, or
-    /// there is no memory for it).
-    pub fn filled(
-        &self,
-        pages: RecordPages,
-        generation: Generation,
-        bytes: &[u8],
-    ) -> Result<(), ClientError> {
-        let outcome = Outcome::Done;
-        send(
-            &self.fd,
-            Call::Filled,
-            Request::Filled {
-                pages,
-                outcome,
-                generation,
-            },
-            bytes,
-        )
+    /// [`ClientError::Call`] when the kernel cannot take the answer (the payload has the
+    /// wrong length or faults, or there is no memory for it); the kernel then fails the
+    /// fill, so it need not be answered again.
+    pub fn filled(&self, fill: FillRef, bytes: &[u8]) -> Result<Answered, ClientError> {
+        self.answer(fill, Outcome::Done, bytes)
     }
 
-    /// Answers the fill record of `pages` in `generation` as failed with `errno`: the readers
-    /// waiting for them get `EIO`, and the next read fills again.
+    /// Answers fill `fill` as failed with `errno`: the readers waiting for its pages get
+    /// `EIO`, and the next read fills again. A stale answer is not an error: see
+    /// [`Answered`].
     ///
     /// # Errors
     ///
-    /// [`ClientError::Call`] when the kernel refuses (the pages are not being filled, or the
-    /// record was for an earlier object with this ID).
-    pub fn fill_failed(
+    /// [`ClientError::Call`] when the kernel refuses the call.
+    pub fn fill_failed(&self, fill: FillRef, errno: NonZeroU16) -> Result<Answered, ClientError> {
+        self.answer(fill, Outcome::Failed(errno), &[])
+    }
+
+    fn answer(
         &self,
-        pages: RecordPages,
-        generation: Generation,
-        errno: NonZeroU16,
-    ) -> Result<(), ClientError> {
-        let outcome = Outcome::Failed(errno);
-        send(
-            &self.fd,
-            Call::Filled,
-            Request::Filled {
-                pages,
-                outcome,
-                generation,
-            },
-            &[],
-        )
+        fill: FillRef,
+        outcome: Outcome,
+        payload: &[u8],
+    ) -> Result<Answered, ClientError> {
+        call_with(&self.fd, Call::Filled, fill.answer(outcome), payload).map(Answered::from_return)
     }
 }
 
@@ -422,14 +429,16 @@ pub trait Pump: Send + 'static {
 /// Starts a thread that waits on `queue` and hands each batch of records it reads (whole
 /// records, at most 64) to `pump`, until the queue ends. A batch [`Pump::forward`] fails on
 /// has every fill in it failed with `EIO` ([`crate::pump::fail_fills`] through
-/// [`Pump::fail_fill`]), so no reader waits on a record that was taken off the queue. The
-/// thread returns why it stopped.
+/// [`Pump::fail_fill`]), so no reader waits on a record that was taken off the queue. A
+/// queue read interrupted by a signal (`EINTR`) is retried. However the thread stops, it
+/// closes the queue first, which fails every fill still outstanding: a queue nobody reads
+/// would leave its readers waiting for good. The thread returns why it stopped.
 ///
 /// # Errors
 ///
 /// [`ClientError::Spawn`] when the thread cannot be started. The thread returns
-/// [`ClientError::Unanswered`] after closing the queue when it could not fail a batch's
-/// fills, and the error of a queue read that failed.
+/// [`ClientError::Unanswered`] when it could not fail a batch's fills, and the error of a
+/// queue read that failed.
 pub fn spawn_pump<P: Pump>(
     queue: Arc<Queue>,
     mut pump: P,
@@ -437,23 +446,29 @@ pub fn spawn_pump<P: Pump>(
     thread::Builder::new()
         .name("pcache-pump".into())
         .spawn(move || {
-            let mut buf = [0_u8; Record::BYTES * BATCH];
-            loop {
-                let records = match queue.read(&mut buf)? {
-                    0 => return Ok(()),
-                    n => &buf[..n],
-                };
-                let Err(error) = pump.forward(records) else {
-                    continue;
-                };
-                match fail_fills(records, |fill| pump.fail_fill(fill)) {
-                    Ok(answered) => pump.forward_failed(error, answered),
-                    Err(err) => {
-                        queue.close();
-                        return Err(ClientError::Unanswered(alloc::boxed::Box::new(err)));
-                    }
-                }
-            }
+            let result = pump_records(&queue, &mut pump);
+            queue.close();
+            result
         })
         .map_err(ClientError::Spawn)
+}
+
+/// [`spawn_pump`]'s loop: hands batches to `pump` until the queue ends or fails.
+fn pump_records<P: Pump>(queue: &Queue, pump: &mut P) -> Result<(), ClientError> {
+    let mut buf = [0_u8; Record::BYTES * BATCH];
+    loop {
+        let records = match queue.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => &buf[..n],
+            Err(err) if err.errno() == EINTR => continue,
+            Err(err) => return Err(err),
+        };
+        let Err(error) = pump.forward(records) else {
+            continue;
+        };
+        match fail_fills(records, |fill| pump.fail_fill(fill)) {
+            Ok(answered) => pump.forward_failed(error, answered),
+            Err(err) => return Err(ClientError::Unanswered(alloc::boxed::Box::new(err))),
+        }
+    }
 }

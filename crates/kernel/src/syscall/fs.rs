@@ -315,10 +315,12 @@ pub fn call(
     token: &mut CleanLockToken,
 ) -> Result<usize> {
     // Ferric Oxide: the metadata words are copied in as bytes and decoded, with no raw view of
-    // the words as bytes.
-    let mut bytes = [0_u8; 3 * 8];
+    // the words as bytes. Up to four words: the page cache's Filled answer has four (its fill
+    // ID is the fourth).
+    const MAX_WORDS: usize = 4;
+    let mut bytes = [0_u8; MAX_WORDS * 8];
     let copied = metadata.copy_common_bytes_to_slice(&mut bytes)?;
-    let mut meta = [0_u64; 3];
+    let mut meta = [0_u64; MAX_WORDS];
     for (word, chunk) in meta.iter_mut().zip(bytes.chunks_exact(8)) {
         let mut raw = [0_u8; 8];
         raw.copy_from_slice(chunk);
