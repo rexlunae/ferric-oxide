@@ -26,6 +26,9 @@
 //!   contents;
 //! - `remap-reused`: once the mapped file is deleted, a new file maps and reads with its own
 //!   contents, not the deleted file's;
+//! - `remap-merged`: page 0 mapped and unmapped, written with `pwrite`, then page 1 mapped and
+//!   unmapped next to it: page 0 still reads (`pread`) and maps as written, though its cached
+//!   range sits next to a newer one;
 //! - `shared-read`: a store through a live shared mapping is what `pread` of the file returns.
 //!
 //! Prints one `FERRIC_TEST_PASS borrow ...` or `FERRIC_TEST_FAIL borrow ...` line and exits
@@ -52,6 +55,8 @@ const FILL: u8 = 0x5A;
 const REMAP_PATH: &str = "/tmp/ferric-borrow-test.remap";
 /// The file `remap-reused` creates after that one is deleted.
 const NEW_PATH: &str = "/tmp/ferric-borrow-test.new";
+/// The file `remap-merged` maps a page of, writes, then maps the page next to it.
+const MERGE_PATH: &str = "/tmp/ferric-borrow-test.merge";
 /// The file `shared-read` stores to through a shared mapping and reads.
 const SHARED_PATH: &str = "/tmp/ferric-borrow-test.shared";
 
@@ -157,7 +162,7 @@ fn file_error(path: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::File { path, source }
 }
 
-/// Calls `mmap`, checking the result is `addr` when that is given.
+/// Calls `mmap` at file offset 0, checking the result is `addr` when that is given.
 fn map(
     addr: usize,
     len: usize,
@@ -165,6 +170,19 @@ fn map(
     fd: c_int,
     what: &'static str,
 ) -> Result<usize, Error> {
+    map_at(addr, len, flags, fd, 0, what)
+}
+
+/// Calls `mmap` at file offset `off`, checking the result is `addr` when that is given.
+fn map_at(
+    addr: usize,
+    len: usize,
+    flags: c_int,
+    fd: c_int,
+    off: usize,
+    what: &'static str,
+) -> Result<usize, Error> {
+    let off = c_long::try_from(off).map_err(|_| Error::Mmap(what))?;
     // SAFETY: anonymous memory, or a shared mapping of a file this test owns; with MAP_FIXED
     // it only replaces a page this test mapped itself.
     let got = unsafe {
@@ -174,7 +192,7 @@ fn map(
             sys::PROT_READ | sys::PROT_WRITE,
             flags,
             fd,
-            0 as c_long,
+            off,
         )
     } as usize;
     if got == sys::MAP_FAILED || (addr != 0 && got != addr) {
@@ -245,7 +263,19 @@ fn run() -> Result<(), Error> {
 
 /// Maps the first page of `file` with `flags`, returns its first byte and unmaps it.
 fn first_mapped_byte(file: &File, flags: c_int, what: &'static str) -> Result<u8, Error> {
-    let page = map(0, PAGE_SIZE, flags, file.as_raw_fd(), what)?;
+    mapped_byte(file, flags, 0, what)
+}
+
+/// Maps page `index` of `file` with `flags`, returns its first byte and unmaps it.
+fn mapped_byte(file: &File, flags: c_int, index: usize, what: &'static str) -> Result<u8, Error> {
+    let page = map_at(
+        0,
+        PAGE_SIZE,
+        flags,
+        file.as_raw_fd(),
+        index * PAGE_SIZE,
+        what,
+    )?;
     // SAFETY: just mapped readable, one page long.
     let byte = unsafe { (page as *const u8).read_volatile() };
     // SAFETY: the mapping is this test's own.
@@ -313,6 +343,43 @@ fn check_remap() -> Result<(), Error> {
     fs::remove_file(NEW_PATH).map_err(file_error(NEW_PATH))
 }
 
+/// `remap-merged`: page 0 mapped and unmapped, then written with `pwrite`, then page 1 mapped
+/// and unmapped next to it; page 0 must still read and map as written.
+fn check_remap_merged() -> Result<(), Error> {
+    const OLD: u8 = 0x44;
+    const NEW: u8 = 0x55;
+    fs::write(MERGE_PATH, [OLD; 2 * PAGE_SIZE]).map_err(file_error(MERGE_PATH))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(MERGE_PATH)
+        .map_err(file_error(MERGE_PATH))?;
+    let shared = sys::MAP_SHARED;
+    expect_byte(
+        "remap-merged (page 0)",
+        OLD,
+        mapped_byte(&file, shared, 0, "page 0 of the merge file")?,
+    )?;
+    std::os::unix::fs::FileExt::write_all_at(&file, &[NEW; PAGE_SIZE], 0)
+        .map_err(file_error(MERGE_PATH))?;
+    expect_byte(
+        "remap-merged (page 1)",
+        OLD,
+        mapped_byte(&file, shared, 1, "page 1 of the merge file")?,
+    )?;
+    let mut byte = [0u8];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut byte, 0)
+        .map_err(file_error(MERGE_PATH))?;
+    expect_byte("remap-merged (pread)", NEW, byte[0])?;
+    expect_byte(
+        "remap-merged (remap)",
+        NEW,
+        mapped_byte(&file, shared, 0, "page 0 of the merge file again")?,
+    )?;
+    drop(file);
+    fs::remove_file(MERGE_PATH).map_err(file_error(MERGE_PATH))
+}
+
 /// `shared-read`: a store through a live shared mapping shows in `pread` of the file.
 fn check_shared_read() -> Result<(), Error> {
     const OLD: u8 = 0x11;
@@ -349,6 +416,7 @@ fn check_shared_read() -> Result<(), Error> {
 fn main() -> ExitCode {
     match run()
         .and_then(|()| check_remap())
+        .and_then(|()| check_remap_merged())
         .and_then(|()| check_shared_read())
     {
         Ok(()) => {
