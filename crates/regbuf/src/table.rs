@@ -159,8 +159,29 @@ fn partial_window_pages(spec: &GrantSpec) -> [Option<(u64, u64, u64)>; 2] {
     [head, back]
 }
 
-/// A mapping the table handed back to be taken down, with the grant it belongs to. It stays in
-/// flight until the caller passes it to [`GrantTable::finish`] or [`GrantTable::restore`].
+/// Why a mapping is taken down, which decides what its holder is left with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Teardown {
+    /// The holder let go of it (an unmap request, its grant's close): the range is unmapped.
+    Holder,
+    /// The owner took it away (a revoke, the region's close), at a time the holder did not
+    /// choose and may still be using the range. A CPU mapping is replaced in place by zeroed
+    /// anonymous memory instead of being unmapped: the frames are unpinned and the TLBs shot
+    /// down as before, but the holder reads zeros and its writes go nowhere, and it never
+    /// faults on memory it was granted.
+    Revoked,
+}
+
+impl Teardown {
+    /// Whether the holder keeps a valid range where the mapping was ([`Teardown::Revoked`]).
+    pub const fn keeps_range(self) -> bool {
+        matches!(self, Self::Revoked)
+    }
+}
+
+/// A mapping the table handed back to be taken down, with the grant it belongs to and why. It
+/// stays in flight until the caller passes it to [`GrantTable::finish`] or
+/// [`GrantTable::restore`].
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "a taken mapping must be finished or restored"]
 pub struct Taken<M> {
@@ -168,6 +189,8 @@ pub struct Taken<M> {
     pub grant: GrantId,
     /// The mapping.
     pub mapping: M,
+    /// Why it is taken down.
+    pub teardown: Teardown,
 }
 
 /// One grant.
@@ -405,13 +428,16 @@ impl<M> GrantTable<M> {
         in_flight: &mut usize,
         id: GrantId,
         entry: &mut Entry<M>,
+        teardown: Teardown,
     ) -> impl Iterator<Item = Taken<M>> {
         let mappings = core::mem::take(&mut entry.mappings);
         entry.in_flight = entry.in_flight.saturating_add(mappings.len());
         *in_flight = in_flight.saturating_add(mappings.len());
-        mappings
-            .into_iter()
-            .map(move |mapping| Taken { grant: id, mapping })
+        mappings.into_iter().map(move |mapping| Taken {
+            grant: id,
+            mapping,
+            teardown,
+        })
     }
 
     /// Forgets grant `id` if its descriptor has closed and nothing of it is left.
@@ -596,7 +622,11 @@ impl<M> GrantTable<M> {
         let mapping = entry.mappings.swap_remove(index);
         entry.in_flight = entry.in_flight.saturating_add(1);
         self.in_flight = self.in_flight.saturating_add(1);
-        Ok(Taken { grant: id, mapping })
+        Ok(Taken {
+            grant: id,
+            mapping,
+            teardown: Teardown::Holder,
+        })
     }
 
     /// Revokes grant `id` and every grant derived from it, and returns their recorded
@@ -618,7 +648,12 @@ impl<M> GrantTable<M> {
         for (&own, entry) in &mut self.grants {
             if entry.under(own, id) {
                 entry.revoked = true;
-                gone.extend(Self::hand_out(&mut self.in_flight, own, entry));
+                gone.extend(Self::hand_out(
+                    &mut self.in_flight,
+                    own,
+                    entry,
+                    Teardown::Revoked,
+                ));
             }
         }
         Ok(gone)
@@ -650,7 +685,14 @@ impl<M> GrantTable<M> {
         let taken = match self.grants.get_mut(&id) {
             Some(entry) if !entry.closed => {
                 entry.closed = true;
-                Self::hand_out(&mut self.in_flight, id, entry).collect()
+                // A revoked grant's mappings were replaced already, or are failed teardowns a
+                // revoke restored; either way the owner took them, not the holder.
+                let teardown = if entry.revoked {
+                    Teardown::Revoked
+                } else {
+                    Teardown::Holder
+                };
+                Self::hand_out(&mut self.in_flight, id, entry, teardown).collect()
             }
             _ => return Vec::new(),
         };
@@ -668,7 +710,12 @@ impl<M> GrantTable<M> {
         let mut all = Vec::new();
         for (&id, entry) in &mut self.grants {
             entry.revoked = true;
-            all.extend(Self::hand_out(&mut self.in_flight, id, entry));
+            all.extend(Self::hand_out(
+                &mut self.in_flight,
+                id,
+                entry,
+                Teardown::Revoked,
+            ));
         }
         all
     }
@@ -676,7 +723,7 @@ impl<M> GrantTable<M> {
     /// Ends the teardown of `taken`: its mapping is unmapped. Returns the mapping, so the
     /// caller can finish with it (copy data back, drop it) under the same lock.
     pub fn finish(&mut self, taken: Taken<M>) -> M {
-        let Taken { grant, mapping } = taken;
+        let Taken { grant, mapping, .. } = taken;
         self.end_teardown(grant);
         self.drop_if_done(grant);
         mapping
@@ -686,7 +733,7 @@ impl<M> GrantTable<M> {
     /// recorded again. The grant was revoked or closed, so it stays blocked from new mappings,
     /// and the next [`GrantTable::revoke`] hands the mapping back for another try.
     pub fn restore(&mut self, taken: Taken<M>) {
-        let Taken { grant, mapping } = taken;
+        let Taken { grant, mapping, .. } = taken;
         self.end_teardown(grant);
         if let Some(entry) = self.grants.get_mut(&grant) {
             entry.mappings.push(mapping);
@@ -936,6 +983,53 @@ mod tests {
         );
     }
 
+    /// The teardown cause of every mapping in `taken`.
+    fn causes(taken: &[Taken<u32>]) -> Vec<Teardown> {
+        taken.iter().map(|taken| taken.teardown).collect()
+    }
+
+    #[test]
+    fn a_revoke_or_region_close_keeps_the_holder_range_and_a_holder_release_does_not() {
+        let mut t = table(4);
+        let parent = t.create(spec(Access::ReadWrite, 0, P)).expect("fits");
+        let child = t
+            .create_sub(parent, spec(Access::Read, 0, P))
+            .expect("fits");
+        let other = t.create(spec(Access::Read, P, P)).expect("fits");
+        let held = t.create(spec(Access::Read, 2 * P, P)).expect("fits");
+        for (grant, mapping) in [(parent, 1), (child, 2), (other, 3), (held, 4), (held, 5)] {
+            t.add_mapping(grant, mapping).expect("live");
+        }
+        // The holder unmaps one mapping and closes the grant with the other: both unmapped.
+        let unmapped = t.take_mapping(held, |&m| m == 4).expect("recorded");
+        assert_eq!(unmapped.teardown, Teardown::Holder);
+        assert!(!unmapped.teardown.keeps_range());
+        assert_eq!(t.finish(unmapped), 4);
+        let closed = t.remove(held);
+        assert_eq!(causes(&closed), [Teardown::Holder]);
+        for taken in closed {
+            let _ = t.finish(taken);
+        }
+        // The owner revokes the parent: it and its sub-grant are replaced, not unmapped.
+        let revoked = t.revoke(parent).expect("issued");
+        assert_eq!(causes(&revoked), [Teardown::Revoked, Teardown::Revoked]);
+        assert!(revoked.iter().all(|taken| taken.teardown.keeps_range()));
+        // A failed replacement is restored; the holder's later close still counts as a revoke.
+        let mut revoked = revoked.into_iter();
+        let failed = revoked.next().expect("two");
+        let failed_grant = failed.grant;
+        t.restore(failed);
+        for taken in revoked {
+            let _ = t.finish(taken);
+        }
+        assert_eq!(causes(&t.remove(failed_grant)), [Teardown::Revoked]);
+        // The region's close takes what is left the owner's way too.
+        let mut t = table(1);
+        let g = t.create(spec(Access::Read, 0, P)).expect("fits");
+        t.add_mapping(g, 7).expect("live");
+        assert_eq!(causes(&t.close()), [Teardown::Revoked]);
+    }
+
     #[test]
     fn take_mapping_finds_one() {
         let mut t = table(1);
@@ -947,7 +1041,8 @@ mod tests {
             taken,
             Taken {
                 grant: g,
-                mapping: 6
+                mapping: 6,
+                teardown: Teardown::Holder,
             }
         );
         assert_eq!(

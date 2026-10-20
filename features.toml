@@ -787,7 +787,12 @@ ring there. Firmware leaves RAM alone across a warm reboot, so the next boot
 finds the dump, logs the message, and serves the dump as
 /scheme/kernel.trace/crash, which `ferric-trace crash` prints or saves as a
 capture. A cold boot finds nothing, and a region that is not free RAM in the
-boot memory map turns the feature off with a warning."""
+boot memory map turns the feature off with a warning.
+
+It also makes every ring a flight recorder: a full ring overwrites its oldest
+records instead of dropping new ones, so the dump holds the last records before
+the panic even when nobody reads the rings. Readers see the overwritten records
+in each ring's lost count."""
 
 [[option]]
 id = "kernel.trace_crash_base"
