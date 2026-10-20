@@ -79,19 +79,30 @@ static PERCPU_COUNTS: ferric_irq::Counts<{ crate::cpu_set::MAX_CPU_COUNT as usiz
     ferric_irq::Counts::new();
 
 /// Counts an interrupt of `irq` for the handles on `owner`, and returns the CPU whose handles get
-/// it (Ferric Oxide: the BSP, as upstream, without `irq-percpu`).
-fn count_interrupt(irq: u8, owner: LogicalCpuId) -> LogicalCpuId {
+/// it (Ferric Oxide: the BSP, as upstream, without `irq-percpu`) together with the count this
+/// delivery made.
+///
+/// The count is returned here rather than read again afterwards: without `irq-percpu` another
+/// CPU can count the same number between the increment and a later read, and `irq.deliver` must
+/// name the count this delivery made for the driver's `irq.ack` to pair with it.
+fn count_interrupt(irq: u8, owner: LogicalCpuId) -> (LogicalCpuId, usize) {
     #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
     if let Some(number) = ferric_irq::Irq::new(irq) {
         // Every online CPU has a row: there are `MAX_CPU_COUNT` of them.
-        let _ = PERCPU_COUNTS.trigger(ferric_irq::CpuId::new(owner.get()), number);
-        return owner;
+        let count = PERCPU_COUNTS
+            .trigger(ferric_irq::CpuId::new(owner.get()), number)
+            .unwrap_or(0);
+        return (owner, count);
     }
     let _ = owner;
-    if let Some(count) = COUNTS.lock().get_mut(usize::from(irq)) {
-        *count = count.wrapping_add(1);
-    }
-    LogicalCpuId::BSP
+    let count = COUNTS
+        .lock()
+        .get_mut(usize::from(irq))
+        .map_or(0, |count| {
+            *count = count.wrapping_add(1);
+            *count
+        });
+    (LogicalCpuId::BSP, count)
 }
 
 /// Ferric Oxide: whether a handle for `irq` on `cpu` gets only the interrupts of a vector below
@@ -167,7 +178,7 @@ enum Source {
 /// Counts an interrupt of `irq` for `owner` and wakes the handles that get it.
 fn deliver(irq: u8, owner: LogicalCpuId, source: Source, token: &mut CleanLockToken) {
     let _ = source;
-    let cpu = count_interrupt(irq, owner);
+    let (cpu, count) = count_interrupt(irq, owner);
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
             .read(token.token())
@@ -191,7 +202,7 @@ fn deliver(irq: u8, owner: LogicalCpuId, source: Source, token: &mut CleanLockTo
             Source::Vector => ferric_trace::kernel::IrqSource::Vector,
         }
         .raw(),
-        interrupt_count(cpu, irq),
+        count,
         fds.len(),
     );
     for fd in fds {
