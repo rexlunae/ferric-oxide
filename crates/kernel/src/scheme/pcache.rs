@@ -397,18 +397,21 @@ const EIO_OUTCOME: core::num::NonZeroU16 = match core::num::NonZeroU16::new(EIO 
 /// Copies `len` bytes from `offset` in the pages held by `frames` (the first holding the page
 /// `offset` is in) to `buf`.
 ///
-/// A copy of more than one page goes through a bounce buffer for each page whose copy would
-/// be 4K-aliased (`ferric_pcache::copy`). On some cores, such as AMD Zen 3, copying a page
-/// frame straight to a buffer a few bytes into a page runs several times slower. A one-page
-/// read copies from a hot page and is left alone.
+/// A copy of more than one page stages each page whose copy would be 4K-aliased through a
+/// small bounce buffer (`ferric_pcache::copy`). On some cores, such as AMD Zen 3, copying a
+/// page frame straight to a buffer a few bytes into a page runs several times slower. A
+/// one-page read copies from a hot page and is left alone. The bounce buffer is on the
+/// stack (3 KiB of the 64 KiB kernel stack), so a read never allocates and cannot fail for
+/// want of heap memory.
 fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize) -> Result<usize> {
-    use ferric_pcache::copy::{BOUNCE_LEN, aliased, bounce_start};
+    use ferric_pcache::copy::{aliased, stage, Bounce, BOUNCE_LEN};
 
     let overflow = || Error::new(EINVAL);
     let first = usize::try_from(offset.checked_rem(PAGE_SIZE as u64).ok_or_else(overflow)?)
         .map_err(|_| overflow())?;
     let mut rest = buf.limit(len).ok_or_else(overflow)?;
-    let mut bounce: Option<Vec<u8>> = None;
+    // Zeroed only by a read that needs it.
+    let mut bounce: Option<Bounce> = None;
     for (i, frame) in frames.iter().enumerate() {
         if rest.is_empty() {
             break;
@@ -419,11 +422,13 @@ fn copy_out(frames: &[Arc<RaiiFrame>], buf: UserSliceWo, offset: u64, len: usize
         let (dst, tail) = rest.split_at(n).ok_or_else(overflow)?;
         let src = src.get(..n).ok_or_else(overflow)?;
         if frames.len() > 1 && aliased(src.as_ptr() as usize, dst.addr()) {
-            let page = bounce.get_or_insert_with(|| vec![0; BOUNCE_LEN]);
-            let start = bounce_start(page.as_ptr() as usize, src.as_ptr() as usize);
-            let staged = page.get_mut(start..start + n).ok_or_else(overflow)?;
-            staged.copy_from_slice(src);
-            dst.copy_from_slice(staged)?;
+            let bounce = bounce.get_or_insert([0; BOUNCE_LEN]);
+            stage(src, dst.addr(), bounce, |at, bytes| {
+                dst.advance(at)
+                    .and_then(|piece| piece.limit(bytes.len()))
+                    .ok_or_else(overflow)?
+                    .copy_from_slice(bytes)
+            })?;
         } else {
             dst.copy_from_slice(src)?;
         }

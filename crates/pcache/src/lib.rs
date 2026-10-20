@@ -16,8 +16,8 @@
 //! - [`page`]: the state of one cached page and the transitions fills, writes, writeback and
 //!   truncation make.
 //! - [`readahead`]: how far ahead of a reader the kernel fills, per open file description.
-//! - [`copy`]: when the kernel copies a cached page to a reader through a bounce buffer, so
-//!   the copy is not 4K-aliased.
+//! - [`copy`]: how the kernel copies a cached page to a reader through a small bounce buffer
+//!   on its stack, so the copy is not 4K-aliased and never allocates.
 //! - `object` (with the `alloc` feature): one object's page index, which says what a read
 //!   needs (fills to queue, fills to wait for) and applies the file system's answers.
 //! - `clock` (with the `alloc` feature): the two-list CLOCK replacement that picks pages to
