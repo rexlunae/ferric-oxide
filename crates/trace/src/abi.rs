@@ -1,7 +1,7 @@
 //! The `kernel.trace` scheme's interface.
 //!
-//! The scheme is open to root only for now; a Phase 4 capability replaces the check, because
-//! traces leak timing and kernel addresses.
+//! Traces leak timing and kernel addresses, so opening the scheme by path is for root only.
+//! Anyone else needs a [capability](#capabilities).
 //!
 //! | Path | Read | Write |
 //! | --- | --- | --- |
@@ -10,6 +10,8 @@
 //! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it (a [`FilterBusyLine`] for one that could not be read) | — |
 //! | [`CLOCK_PATH`] | one [`ClockLine`](crate::clock::ClockLine): the clock behind the timestamps | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
+//! | [`CRASH_PATH`] | the previous boot's crash dump | [`CRASH_TEST_COMMAND`], on a crash-test kernel |
+//! | `cap/read`, `cap/control` ([`Path::Cap`]) | — (a capability) | — |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
 //! are separated by single spaces.
@@ -33,6 +35,23 @@
 //! them, so `View::peek` checks `tail` after each copy and starts over if it moved past the
 //! copy. Two readers of one CPU can still both see a record; a collector that wants each
 //! record once should be the CPU's only reader.
+//!
+//! # Capabilities
+//!
+//! A capability is a descriptor of `cap/read` or `cap/control` ([`CAP_DIR`], [`Access`]),
+//! which only root can open. It cannot be read or written itself. Instead, `dup(cap, path)`
+//! opens `path` in the scheme with the capability's access, whatever the caller's user. The
+//! descriptor passes like any other: it is inherited across `fork` and `exec`, so a root
+//! process can open one, drop its privileges or start an unprivileged collector, and hand the
+//! collector exactly the access it needs. Root opening a path gets [`Access::Control`].
+//!
+//! - [`Access::Read`] reads every file, and drains, maps and commits the CPU rings.
+//! - [`Access::Control`] also writes: a [`Command`] to [`EVENTS_PATH`], and the crash test's
+//!   panic to [`CRASH_PATH`].
+//!
+//! Writing without control access fails with `EACCES`. `dup(cap, "cap/<access>")` gives
+//! another capability of the same or less access, and `EACCES` for more, so a capability can
+//! be narrowed before it is passed on, never widened.
 //!
 //! [`Peek::end`]: crate::ring::Peek::end
 
@@ -76,6 +95,49 @@ pub const CRASH_TEST_COMMAND: &str = "panic";
 /// longer writes.
 pub const MAX_COMMAND_BYTES: usize = 4096;
 
+/// The directory of capabilities, `cap/<access>` ([`Access`]).
+pub const CAP_DIR: &str = "cap";
+
+/// What a capability lets its holder do; see [Capabilities](self#capabilities).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// Read every file, and drain, map and commit the CPU rings: `cap/read`.
+    Read,
+    /// [`Access::Read`], and write control commands: `cap/control`.
+    Control,
+}
+
+impl Access {
+    /// The access's name in `cap/<name>`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Control => "control",
+        }
+    }
+
+    /// The access named `name`, or `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Access::Read, Access::Control]
+            .into_iter()
+            .find(|access| access.name() == name)
+    }
+
+    /// Whether this access includes everything `other` allows.
+    pub const fn includes(self, other: Access) -> bool {
+        matches!(
+            (self, other),
+            (Access::Control, _) | (Access::Read, Access::Read)
+        )
+    }
+}
+
+impl fmt::Display for Access {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{CAP_DIR}/{}", self.name())
+    }
+}
+
 /// The directory of per-CPU record files, `cpu/<n>`.
 ///
 /// A read of `cpu/<n>` returns whole records ([`crate::record`]) and consumes them; 0 bytes means
@@ -112,6 +174,8 @@ pub enum Path {
     Cpu(u32),
     /// [`CRASH_PATH`].
     Crash,
+    /// `cap/<access>`: a capability ([`Access`]).
+    Cap(Access),
 }
 
 impl Path {
@@ -125,6 +189,12 @@ impl Path {
             CLOCK_PATH => Some(Path::Clock),
             CRASH_PATH => Some(Path::Crash),
             other => {
+                if let Some(name) = other
+                    .strip_prefix(CAP_DIR)
+                    .and_then(|p| p.strip_prefix('/'))
+                {
+                    return Access::from_name(name).map(Path::Cap);
+                }
                 let n = other.strip_prefix(CPU_DIR)?.strip_prefix('/')?;
                 // `u32::from_str` takes a leading `+`; a path does not.
                 if !n.bytes().all(|b| b.is_ascii_digit()) {
@@ -480,6 +550,30 @@ mod tests {
         assert_eq!(Path::parse("cpu/x"), None);
         assert_eq!(Path::parse("cpus/1"), None);
         assert_eq!(Path::parse("other"), None);
+    }
+
+    #[test]
+    fn capability_paths() {
+        assert_eq!(Path::parse("cap/read"), Some(Path::Cap(Access::Read)));
+        assert_eq!(
+            Path::parse("/cap/control"),
+            Some(Path::Cap(Access::Control))
+        );
+        assert_eq!(Path::parse("cap"), None);
+        assert_eq!(Path::parse("cap/"), None);
+        assert_eq!(Path::parse("cap/write"), None);
+        assert_eq!(Path::parse("capread"), None);
+        for access in [Access::Read, Access::Control] {
+            assert_eq!(Path::parse(&access.to_string()), Some(Path::Cap(access)));
+        }
+    }
+
+    #[test]
+    fn control_includes_read_but_not_the_reverse() {
+        assert!(Access::Control.includes(Access::Read));
+        assert!(Access::Control.includes(Access::Control));
+        assert!(Access::Read.includes(Access::Read));
+        assert!(!Access::Read.includes(Access::Control));
     }
 
     #[test]

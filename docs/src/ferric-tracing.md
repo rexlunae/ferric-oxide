@@ -253,9 +253,10 @@ TSC, because the kernel does not calibrate it.
 
 ## The `kernel.trace` scheme
 
-Only root (uid 0) may open `/scheme/kernel.trace`, because traces expose
-timing and kernel behaviour. A capability is planned to replace this check.
-The paths are defined in `ferric_trace::abi`.
+Traces expose timing and kernel addresses, so only root (uid 0) may open
+`/scheme/kernel.trace` by path. Anyone else needs a capability that root hands
+over ([Capabilities](#capabilities)). The paths are defined in
+`ferric_trace::abi`.
 
 | Path | Read | Write |
 | --- | --- | --- |
@@ -265,6 +266,34 @@ The paths are defined in `ferric_trace::abi`.
 | `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
+| `cap/read`, `cap/control` | — (a capability, see below) | — |
+
+### Capabilities
+
+A capability is a descriptor of `cap/read` or `cap/control`. Only root can
+open one. It cannot be read or written itself; `dup(cap, "<path>")` opens
+`<path>` in the scheme with the capability's access, whatever the caller's
+user:
+
+| Access | Allows |
+| --- | --- |
+| `read` | Reading `events`, `stats`, `clock` and `crash`; draining, mapping and committing `cpu/<n>` |
+| `control` | Everything `read` does, plus writing commands to `events` and the crash test's `panic` to `crash` |
+
+A write that needs `control` fails with `EACCES` through a `read`
+capability. `dup(cap, "cap/read")` narrows a capability before it is passed
+on; asking for more access than the capability has fails with `EACCES`, so a
+capability is never widened. A capability passes like any descriptor: it is
+inherited across `fork` and `exec` and can be given to another process. So a
+root service can open `cap/read`, drop its privileges or start an
+unprivileged collector with it, and the collector can drain the rings but not
+turn tracepoints on. Root opening a path directly has `control` access.
+
+This is the Phase T piece of the Phase 4 capability model. Who may obtain a
+capability is still decided by uid 0. A capability-granting service (a
+device or trace manager handing them out by policy) comes with Phase 4.
+
+### Reading
 
 `events`, `stats`, `clock` and `filters` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
@@ -716,7 +745,14 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       200 ms apart: when the clock's tick length is known (the KVM clock, the
       HPET), the time between their timestamps must be within a factor of two
       of the wall time; for the TSC it prints the frequency they imply
-      (`trace-clock`).
+      (`trace-clock`);
+  12. opens `cap/read` and `cap/control` and runs itself twice as user 1000,
+     each time with one of them as its standard input. The child cannot open
+     `stats` by path (`EACCES`), but can open and parse it through the
+     capability. Writing `disable scheme.cancel` (a no-op by then) to `events`
+     through the capability is refused with `read` access and done with
+     `control`. Narrowing to `cap/read` works, and widening `read` to
+     `cap/control` is refused (`trace-cap`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
@@ -754,7 +790,7 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"`, `trace_initfs_enable = ["scheme.cancel"]` and
-  `trace_crash = true`. It requires all sixteen step markers, the kernel's
+  `trace_crash = true`. It requires all seventeen step markers, the kernel's
   log of the filter, its `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
   `enable scheme.cancel`, the crash region's log line, and
   `FERRIC_TEST_SKIP trace-crash` (a clean boot has no dump).
@@ -960,6 +996,8 @@ is refused the file.
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.
+- A `ferric-trace` option to work through a capability descriptor it was
+  given; the tool opens the scheme by path, as root.
 - Per-descriptor detail in `/scheme/sys/proc` from the fork's own schemes
   (ring sizes, IOMMU domain mappings), and flamegraphs from the profiler with
   user frame pointers.

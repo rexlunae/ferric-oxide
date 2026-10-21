@@ -21,6 +21,7 @@ use ferric_trace_map::Mapping;
 use syscall::schemev2::Opcode;
 use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
+mod cap;
 mod crash;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
@@ -887,7 +888,7 @@ fn run() -> Result<(), Failure> {
     check_fault(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
-    Ok(())
+    cap::check_cap()
 }
 
 /// The length of `trace-clock`'s first marker write to a closed descriptor; the second is one
@@ -1079,6 +1080,14 @@ fn check_filter(cpus: &[u32]) -> Result<(), Failure> {
 
 /// Runs the test.
 pub fn main() -> ExitCode {
+    // A child of `trace-cap`, run as another user with a capability on its stdin.
+    if let Some(access) = std::env::args()
+        .nth(1)
+        .as_deref()
+        .and_then(cap::child_access)
+    {
+        return cap::child(access);
+    }
     // The /scheme listing says whether the kernel has the scheme. Opening a missing scheme's
     // file fails with an errno that depends on the namespace manager, so it is no test.
     let listed = std::fs::read_dir("/scheme").map(|entries| {
