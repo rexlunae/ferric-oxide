@@ -179,6 +179,9 @@ enum Source {
 fn deliver(irq: u8, owner: LogicalCpuId, source: Source, token: &mut CleanLockToken) {
     let _ = source;
     let (cpu, count) = count_interrupt(irq, owner);
+    // Like `source`, `count` is only read by the record below, which is compiled out without
+    // `trace`.
+    let _ = count;
     let fds: SmallVec<[usize; 8]> = {
         HANDLES
             .read(token.token())
