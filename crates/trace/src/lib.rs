@@ -69,6 +69,7 @@ mod event;
 pub mod filter;
 pub mod kernel;
 mod level;
+pub mod profile;
 pub mod record;
 pub mod ring;
 mod select;

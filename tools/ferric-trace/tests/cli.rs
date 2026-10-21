@@ -234,6 +234,40 @@ fn captures_a_scheme_directory() {
 }
 
 #[test]
+fn profiles_for_some_seconds() {
+    let scheme = tempfile::tempdir().expect("temp dir");
+    fs::write(scheme.path().join("ctl-profiling"), "kernel_text 0x1000\n").expect("write");
+    fs::write(scheme.path().join("profiling-0"), []).expect("write");
+    fs::write(scheme.path().join("profiling-1"), []).expect("write");
+    let out = scheme.path().join("profile");
+    let output = ferric_trace()
+        .arg("profile")
+        .arg(&out)
+        .args(["--seconds", "0.2", "--scheme"])
+        .arg(scheme.path())
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(stdout.contains("cpu 1: 0 bytes of samples"), "{stdout}");
+    assert!(out.join("kernel_text").exists());
+    assert!(!out.join("INCOMPLETE").exists());
+
+    let without_profiler = tempfile::tempdir().expect("temp dir");
+    let output = ferric_trace()
+        .arg("profile")
+        .arg(without_profiler.path().join("p"))
+        .args(["--scheme"])
+        .arg(without_profiler.path())
+        .args(["--", "true"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("ctl-profiling"), "{stderr}");
+}
+
+#[test]
 fn capture_via_the_mapping_needs_a_ring_that_maps() {
     let scheme = tempfile::tempdir().expect("temp dir");
     fs::write(scheme.path().join("stats"), "cpu 0 pending 0 lost 0\n").expect("write");

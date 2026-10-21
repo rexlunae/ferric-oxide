@@ -25,6 +25,11 @@ redox_syscall = { version = "0.9.4", default-features = false }
 serde_json.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 
+# On the target, `ferric-trace profile` names the sampled contexts with a `call` on the
+# debug scheme.
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall = { version = "0.9.4", default-features = false, features = ["userspace"] }
+
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
