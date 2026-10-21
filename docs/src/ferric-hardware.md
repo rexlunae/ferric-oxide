@@ -74,7 +74,10 @@ TX queue, 1500-byte frames, and the single interrupt vector that `pcid`
 allocates (MSI-X, MSI or INTx). It does not implement jumbo frames, checksum or
 segmentation offload, VLAN stripping, multiple queues, per-queue MSI-X vectors,
 or wake-on-LAN. The firmware tables and the part of the initialisation that can
-be checked without MMIO live in the host-tested `crates/rtl8125` crate.
+be checked without MMIO live in the host-tested `crates/rtl8125` crate, and the
+driver's register-level sequence runs against a model of the controller in its
+own host tests, so the patch tables, the OCP encodings and the interrupt setup
+are checked before the driver ever sees the hardware.
 
 The receive descriptor length includes the Ethernet CRC, so the driver strips
 it before handing a frame to the network scheme. The scheme hands the frame to

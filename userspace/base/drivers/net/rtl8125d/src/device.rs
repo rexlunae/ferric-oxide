@@ -15,6 +15,10 @@
 //! beside them in the same crate, where they are covered by host tests. This
 //! module supplies the MMIO/DMA mechanics and the Redox network adapter.
 //!
+//! The register-level work lives in [`Controller`], which talks to the
+//! controller through the [`Regs`] trait, so the whole initialisation sequence
+//! runs against a model of the controller in the host tests below.
+//!
 //! The driver supports one RX queue and one TX queue, 1500-byte frames, and
 //! polled acknowledgement of the single interrupt vector that pcid allocates.
 //! It does not implement checksum or segmentation offload, jumbo frames, VLAN
@@ -24,9 +28,10 @@
 //! software.
 //!
 //! Hardware validation is still pending: QEMU does not emulate the RTL8125, so
-//! this path has only been compiled and reviewed against the reference
-//! sequence. The boot log must confirm that the MAC and PHY patch versions are
-//! accepted before the driver can be considered functional.
+//! this path has been compiled, reviewed against the reference sequence and
+//! exercised against a register model, but not run on the controller. The boot
+//! log must confirm that the MAC and PHY patch versions are accepted before the
+//! driver can be considered functional.
 
 use std::mem::size_of;
 use std::time::Duration;
@@ -64,12 +69,47 @@ struct Descriptor {
 
 const _: [(); desc::DESCRIPTOR_SIZE] = [(); size_of::<Descriptor>()];
 
+/// Access to the controller's register file.
+///
+/// The production implementation reads and writes the memory-mapped BAR. The
+/// host tests implement the trait with a model of the controller, so the
+/// initialisation sequence can be checked without hardware.
+trait Regs {
+    /// Read an 8-bit register.
+    fn read8(&self, offset: u16) -> u8;
+    /// Write an 8-bit register.
+    fn write8(&self, offset: u16, value: u8);
+    /// Read a 16-bit register.
+    fn read16(&self, offset: u16) -> u16;
+    /// Write a 16-bit register.
+    fn write16(&self, offset: u16, value: u16);
+    /// Read a 32-bit register.
+    fn read32(&self, offset: u16) -> u32;
+    /// Write a 32-bit register.
+    fn write32(&self, offset: u16, value: u32);
+
+    /// Clear some bits of an 8-bit register and set others.
+    fn update8(&self, offset: u16, clear: u8, set: u8) {
+        self.write8(offset, (self.read8(offset) & !clear) | set);
+    }
+
+    /// Clear some bits of a 16-bit register and set others.
+    fn update16(&self, offset: u16, clear: u16, set: u16) {
+        self.write16(offset, (self.read16(offset) & !clear) | set);
+    }
+
+    /// Clear some bits of a 32-bit register and set others.
+    fn update32(&self, offset: u16, clear: u32, set: u32) {
+        self.write32(offset, (self.read32(offset) & !clear) | set);
+    }
+}
+
 /// MMIO access to the RTL8125 register file.
-struct Registers {
+struct MmioRegisters {
     base: *mut u8,
 }
 
-impl Registers {
+impl MmioRegisters {
     /// Create an accessor for a mapped register BAR.
     ///
     /// # Safety
@@ -81,7 +121,9 @@ impl Registers {
             base: base as *mut u8,
         }
     }
+}
 
+impl Regs for MmioRegisters {
     #[inline]
     fn read8(&self, offset: u16) -> u8 {
         // SAFETY: the constructor guarantees a complete register mapping, and
@@ -120,175 +162,28 @@ impl Registers {
             (*(self.base.add(offset as usize).cast::<Mmio<u32>>())).write(value);
         }
     }
-
-    #[inline]
-    fn update8(&self, offset: u16, clear: u8, set: u8) {
-        self.write8(offset, (self.read8(offset) & !clear) | set);
-    }
-
-    #[inline]
-    fn update16(&self, offset: u16, clear: u16, set: u16) {
-        self.write16(offset, (self.read16(offset) & !clear) | set);
-    }
-
-    #[inline]
-    fn update32(&self, offset: u16, clear: u32, set: u32) {
-        self.write32(offset, (self.read32(offset) & !clear) | set);
-    }
 }
 
-/// An RTL8125B network adapter.
-pub struct Rtl8125 {
-    regs: Registers,
-    receive_buffer: [Dma<[Mmio<u8>; RX_BUFFER_SIZE]>; RX_RING_LEN],
-    receive_ring: Dma<[Descriptor; RX_RING_LEN]>,
-    receive_i: usize,
-    transmit_buffer: [Dma<[Mmio<u8>; TX_BUFFER_SIZE]>; TX_RING_LEN],
-    transmit_ring: Dma<[Descriptor; TX_RING_LEN]>,
-    transmit_i: usize,
+/// The controller's register-level state.
+///
+/// Everything the driver does that does not need DMA memory lives here: the
+/// out-of-box exit, the MAC and PHY patch sequences, the common register
+/// setup, and the interrupt status handling.
+struct Controller<R: Regs> {
+    regs: R,
     mac_address: [u8; 6],
     phy_page: u16,
     link_up: bool,
 }
 
-impl NetworkAdapter for Rtl8125 {
-    fn mac_address(&mut self) -> [u8; 6] {
-        self.mac_address
-    }
-
-    fn available_for_read(&mut self) -> usize {
-        self.next_read()
-    }
-
-    fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
-        if self.receive_i >= RX_RING_LEN {
-            self.receive_i = 0;
-        }
-
-        let index = self.receive_i;
-        let ctrl = self.receive_ring[index].ctrl.read();
-        if desc::is_owned(ctrl) {
-            return Ok(None);
-        }
-
-        let length = received_length(ctrl);
-        let mut copied = 0;
-        for (destination, source) in buf.iter_mut().zip(self.receive_buffer[index].iter()) {
-            if copied == length {
-                break;
-            }
-            *destination = source.read();
-            copied += 1;
-        }
-
-        self.receive_ring[index]
-            .ctrl
-            .write(desc::rx_command(RX_BUFFER_SIZE, index + 1 == RX_RING_LEN));
-        self.receive_i += 1;
-
-        if copied == 0 {
-            // A frame without a payload is dropped rather than reported as an
-            // empty read, which the network stack would treat as end of file.
-            return Ok(None);
-        }
-
-        Ok(Some(copied))
-    }
-
-    fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
-        if buf.len() > TX_BUFFER_SIZE {
-            return Err(Error::new(EMSGSIZE));
-        }
-
-        let timeout = Timeout::from_millis(100);
-        loop {
-            if self.transmit_i >= TX_RING_LEN {
-                self.transmit_i = 0;
-            }
-
-            let index = self.transmit_i;
-            let td = &mut self.transmit_ring[index];
-            if td.ctrl.readf(desc::OWN) {
-                // The transmit ring is full. Wait for the controller to release
-                // a descriptor instead of spinning forever, which would stall
-                // the network scheme if the link never comes up.
-                if timeout.run().is_err() {
-                    return Err(Error::new(EAGAIN));
-                }
-                continue;
-            }
-
-            for (destination, byte) in self.transmit_buffer[index].iter_mut().zip(buf) {
-                destination.write(*byte);
-            }
-
-            td.ctrl
-                .write(desc::tx_command(buf.len(), index + 1 == TX_RING_LEN));
-
-            // The RTL8125 uses a 16-bit normal-priority queue doorbell at 0x90.
-            self.regs.write16(regs::TPPOLL, regs::TPPOLL_NPQ);
-
-            self.transmit_i += 1;
-            return Ok(buf.len());
-        }
-    }
-}
-
-impl Rtl8125 {
-    /// Initialise the controller and its DMA rings.
-    ///
-    /// # Safety
-    ///
-    /// `base` must point to the uncacheable memory BAR of an RTL8125 function
-    /// that pcid has bound to this driver. The mapping must stay valid for the
-    /// lifetime of the returned adapter.
-    pub unsafe fn new(base: usize) -> Result<Self> {
-        // SAFETY: the caller guarantees the BAR mapping.
-        let regs = unsafe { Registers::new(base) };
-
-        let txcfg = regs.read32(regs::TXCFG);
-        let Some(mac_version) = version::detect(txcfg) else {
-            log::error!("unknown RTL8125 MAC version (TXCFG {txcfg:#010X})");
-            return Err(Error::new(ENODEV));
-        };
-        if !version::is_supported(mac_version) {
-            log::error!("RTL8125 MAC version {mac_version:?} is not supported yet");
-            return Err(Error::new(ENODEV));
-        }
-        log::info!("RTL8125B detected (TXCFG {txcfg:#010X})");
-
-        let receive_buffer = (0..RX_RING_LEN)
-            // SAFETY: zeroed DMA memory is valid for every byte value and is
-            // fully written before the controller is allowed to read it.
-            .map(|_| Ok(unsafe { Dma::zeroed()?.assume_init() }))
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| Error::new(EIO))?;
-        let transmit_buffer = (0..TX_RING_LEN)
-            // SAFETY: see the receive buffers above.
-            .map(|_| Ok(unsafe { Dma::zeroed()?.assume_init() }))
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| Error::new(EIO))?;
-
-        let mut adapter = Self {
+impl<R: Regs> Controller<R> {
+    fn new(regs: R) -> Self {
+        Self {
             regs,
-            receive_buffer,
-            // SAFETY: a zeroed descriptor has owner clear, so the controller
-            // will not touch it until `setup_rings` writes valid addresses.
-            receive_ring: unsafe { Dma::zeroed()?.assume_init() },
-            receive_i: 0,
-            transmit_buffer,
-            // SAFETY: see the receive ring.
-            transmit_ring: unsafe { Dma::zeroed()?.assume_init() },
-            transmit_i: 0,
             mac_address: [0; 6],
             phy_page: 0,
             link_up: false,
-        };
-
-        adapter.init()?;
-        Ok(adapter)
+        }
     }
 
     /// Read and acknowledge the interrupt status.
@@ -333,22 +228,10 @@ impl Rtl8125 {
         }
     }
 
-    fn next_read(&self) -> usize {
-        let index = if self.receive_i >= RX_RING_LEN {
-            0
-        } else {
-            self.receive_i
-        };
-        let ctrl = self.receive_ring[index].ctrl.read();
-        if desc::is_owned(ctrl) {
-            0
-        } else {
-            // A frame with no payload still has to be reported, or the ring
-            // would stall waiting for a read that never arrives.
-            received_length(ctrl).max(1)
-        }
-    }
-
+    /// Initialise the controller.
+    ///
+    /// The descriptor rings are programmed separately, because they need DMA
+    /// memory that this layer does not own.
     fn init(&mut self) -> Result<()> {
         self.mac_address = self.read_mac_address()?;
         log::info!(
@@ -383,8 +266,6 @@ impl Rtl8125 {
         self.hw_common();
 
         self.set_mac_address();
-        self.setup_rings();
-        self.start();
 
         Ok(())
     }
@@ -596,33 +477,6 @@ impl Rtl8125 {
         self.real_ocp_phy_write(address, (value & !clear) | set)
     }
 
-    /// Write an EPHY register through the `0x0080` access window.
-    ///
-    /// The RTL8125B's external PHY is also reachable through a legacy EPHY
-    /// register window used by the 8125B PHY tuning sequence. A write sets bit
-    /// 31 and completes when the controller clears it.
-    fn ephy_write(&self, address: u16, value: u16) -> Result<()> {
-        self.regs.write32(
-            regs::EPHY_ACCESS,
-            ocp::FLAG | (u32::from(address) << 16) | u32::from(value),
-        );
-
-        let timeout = Timeout::from_millis(10);
-        loop {
-            if self.regs.read32(regs::EPHY_ACCESS) & ocp::FLAG == 0 {
-                return Ok(());
-            }
-            timeout.run().map_err(|()| Error::new(EIO))?;
-        }
-    }
-
-    fn ephy_config(&self) -> Result<()> {
-        for &(address, value) in firmware::EPHY_CONFIG_8125B {
-            self.ephy_write(address, value)?;
-        }
-        Ok(())
-    }
-
     fn mdio_read(&self, register: u8) -> Result<u16> {
         let address = ocp::mapped_phy_address(self.phy_page, register);
         if !address.is_multiple_of(2) {
@@ -652,6 +506,33 @@ impl Rtl8125 {
         } else {
             self.real_ocp_phy_write(address, value)
         }
+    }
+
+    /// Write an EPHY register through the `0x0080` access window.
+    ///
+    /// The RTL8125B's external PHY is also reachable through a legacy EPHY
+    /// register window used by the 8125B PHY tuning sequence. A write sets bit
+    /// 31 and completes when the controller clears it.
+    fn ephy_write(&self, address: u16, value: u16) -> Result<()> {
+        self.regs.write32(
+            regs::EPHY_ACCESS,
+            ocp::FLAG | (u32::from(address) << 16) | u32::from(value),
+        );
+
+        let timeout = Timeout::from_millis(10);
+        loop {
+            if self.regs.read32(regs::EPHY_ACCESS) & ocp::FLAG == 0 {
+                return Ok(());
+            }
+            timeout.run().map_err(|()| Error::new(EIO))?;
+        }
+    }
+
+    fn ephy_config(&self) -> Result<()> {
+        for &(address, value) in firmware::EPHY_CONFIG_8125B {
+            self.ephy_write(address, value)?;
+        }
+        Ok(())
     }
 
     fn disable_mcu_bps(&self) {
@@ -901,40 +782,7 @@ impl Rtl8125 {
         self.cfg_lock();
     }
 
-    fn setup_rings(&mut self) {
-        for (index, descriptor) in self.receive_ring.iter_mut().enumerate() {
-            let physical = self.receive_buffer[index].physical();
-            descriptor.buffer_low.write(physical as u32);
-            descriptor.buffer_high.write((physical as u64 >> 32) as u32);
-            descriptor
-                .ctrl
-                .write(desc::rx_command(RX_BUFFER_SIZE, index + 1 == RX_RING_LEN));
-        }
-
-        for (index, descriptor) in self.transmit_ring.iter_mut().enumerate() {
-            let physical = self.transmit_buffer[index].physical();
-            descriptor.buffer_low.write(physical as u32);
-            descriptor.buffer_high.write((physical as u64 >> 32) as u32);
-            descriptor.ctrl.write(if index + 1 == TX_RING_LEN {
-                desc::EOR
-            } else {
-                0
-            });
-        }
-
-        let receive = self.receive_ring.physical();
-        self.regs.write32(regs::RDSAR, receive as u32);
-        self.regs
-            .write32(regs::RDSAR + 4, (receive as u64 >> 32) as u32);
-
-        let transmit = self.transmit_ring.physical();
-        self.regs.write32(regs::TNPDS, transmit as u32);
-        self.regs
-            .write32(regs::TNPDS + 4, (transmit as u64 >> 32) as u32);
-
-        self.regs.write16(regs::RX_MAX_SIZE, regs::RX_MAX_SIZE_1500);
-    }
-
+    /// Enable the transmitter and the receiver.
     fn start(&mut self) {
         self.regs.write32(regs::RXCFG, regs::RXCFG_INITIAL);
         self.regs
@@ -963,6 +811,10 @@ impl Rtl8125 {
         self.regs
             .write32(regs::IMR_V2_SET, regs::ISR_RXQ0_OK | regs::ISR_TXQ0_OK);
 
+        // The largest frame the controller may hand over, with room for the
+        // Ethernet header, a VLAN tag and the CRC.
+        self.regs.write16(regs::RX_MAX_SIZE, regs::RX_MAX_SIZE_1500);
+
         let phy_status = self.regs.read32(regs::PHY_STATUS);
         self.link_up = phy_status & regs::PHY_STATUS_LINK != 0;
         if self.link_up {
@@ -977,13 +829,447 @@ impl Rtl8125 {
     }
 }
 
+/// An RTL8125B network adapter.
+pub struct Rtl8125 {
+    controller: Controller<MmioRegisters>,
+    receive_buffer: [Dma<[Mmio<u8>; RX_BUFFER_SIZE]>; RX_RING_LEN],
+    receive_ring: Dma<[Descriptor; RX_RING_LEN]>,
+    receive_i: usize,
+    transmit_buffer: [Dma<[Mmio<u8>; TX_BUFFER_SIZE]>; TX_RING_LEN],
+    transmit_ring: Dma<[Descriptor; TX_RING_LEN]>,
+    transmit_i: usize,
+}
+
+impl NetworkAdapter for Rtl8125 {
+    fn mac_address(&mut self) -> [u8; 6] {
+        self.controller.mac_address
+    }
+
+    fn available_for_read(&mut self) -> usize {
+        self.next_read()
+    }
+
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        if self.receive_i >= RX_RING_LEN {
+            self.receive_i = 0;
+        }
+
+        let index = self.receive_i;
+        let ctrl = self.receive_ring[index].ctrl.read();
+        if desc::is_owned(ctrl) {
+            return Ok(None);
+        }
+
+        let length = received_length(ctrl);
+        let mut copied = 0;
+        for (destination, source) in buf.iter_mut().zip(self.receive_buffer[index].iter()) {
+            if copied == length {
+                break;
+            }
+            *destination = source.read();
+            copied += 1;
+        }
+
+        self.receive_ring[index]
+            .ctrl
+            .write(desc::rx_command(RX_BUFFER_SIZE, index + 1 == RX_RING_LEN));
+        self.receive_i += 1;
+
+        if copied == 0 {
+            // A frame without a payload is dropped rather than reported as an
+            // empty read, which the network stack would treat as end of file.
+            return Ok(None);
+        }
+
+        Ok(Some(copied))
+    }
+
+    fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
+        if buf.len() > TX_BUFFER_SIZE {
+            return Err(Error::new(EMSGSIZE));
+        }
+
+        let timeout = Timeout::from_millis(100);
+        loop {
+            if self.transmit_i >= TX_RING_LEN {
+                self.transmit_i = 0;
+            }
+
+            let index = self.transmit_i;
+            let td = &mut self.transmit_ring[index];
+            if td.ctrl.readf(desc::OWN) {
+                // The transmit ring is full. Wait for the controller to release
+                // a descriptor instead of spinning forever, which would stall
+                // the network scheme if the link never comes up.
+                if timeout.run().is_err() {
+                    return Err(Error::new(EAGAIN));
+                }
+                continue;
+            }
+
+            for (destination, byte) in self.transmit_buffer[index].iter_mut().zip(buf) {
+                destination.write(*byte);
+            }
+
+            td.ctrl
+                .write(desc::tx_command(buf.len(), index + 1 == TX_RING_LEN));
+
+            // The RTL8125 uses a 16-bit normal-priority queue doorbell at 0x90.
+            self.controller.regs.write16(regs::TPPOLL, regs::TPPOLL_NPQ);
+
+            self.transmit_i += 1;
+            return Ok(buf.len());
+        }
+    }
+}
+
+impl Rtl8125 {
+    /// Initialise the controller and its DMA rings.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to the uncacheable memory BAR of an RTL8125 function
+    /// that pcid has bound to this driver. The mapping must stay valid for the
+    /// lifetime of the returned adapter.
+    pub unsafe fn new(base: usize) -> Result<Self> {
+        // SAFETY: the caller guarantees the BAR mapping.
+        let regs = unsafe { MmioRegisters::new(base) };
+        check_mac_version(&regs)?;
+
+        let receive_buffer = (0..RX_RING_LEN)
+            // SAFETY: zeroed DMA memory is valid for every byte value and is
+            // fully written before the controller is allowed to read it.
+            .map(|_| Ok(unsafe { Dma::zeroed()?.assume_init() }))
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| Error::new(EIO))?;
+        let transmit_buffer = (0..TX_RING_LEN)
+            // SAFETY: see the receive buffers above.
+            .map(|_| Ok(unsafe { Dma::zeroed()?.assume_init() }))
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| Error::new(EIO))?;
+
+        let mut adapter = Self {
+            controller: Controller::new(regs),
+            receive_buffer,
+            // SAFETY: a zeroed descriptor has owner clear, so the controller
+            // will not touch it until `setup_rings` writes valid addresses.
+            receive_ring: unsafe { Dma::zeroed()?.assume_init() },
+            receive_i: 0,
+            transmit_buffer,
+            // SAFETY: see the receive ring.
+            transmit_ring: unsafe { Dma::zeroed()?.assume_init() },
+            transmit_i: 0,
+        };
+
+        adapter.controller.init()?;
+        adapter.setup_rings();
+        adapter.controller.start();
+
+        Ok(adapter)
+    }
+
+    /// Read and acknowledge the interrupt status.
+    ///
+    /// Returns true when the status contains a receive or transmit event that
+    /// the network scheme should service.
+    pub fn irq(&mut self) -> bool {
+        self.controller.irq()
+    }
+
+    fn next_read(&self) -> usize {
+        let index = if self.receive_i >= RX_RING_LEN {
+            0
+        } else {
+            self.receive_i
+        };
+        let ctrl = self.receive_ring[index].ctrl.read();
+        if desc::is_owned(ctrl) {
+            0
+        } else {
+            // A frame with no payload still has to be reported, or the ring
+            // would stall waiting for a read that never arrives.
+            received_length(ctrl).max(1)
+        }
+    }
+
+    fn setup_rings(&mut self) {
+        for (index, descriptor) in self.receive_ring.iter_mut().enumerate() {
+            let physical = self.receive_buffer[index].physical();
+            descriptor.buffer_low.write(physical as u32);
+            descriptor.buffer_high.write((physical as u64 >> 32) as u32);
+            descriptor
+                .ctrl
+                .write(desc::rx_command(RX_BUFFER_SIZE, index + 1 == RX_RING_LEN));
+        }
+
+        for (index, descriptor) in self.transmit_ring.iter_mut().enumerate() {
+            let physical = self.transmit_buffer[index].physical();
+            descriptor.buffer_low.write(physical as u32);
+            descriptor.buffer_high.write((physical as u64 >> 32) as u32);
+            descriptor.ctrl.write(if index + 1 == TX_RING_LEN {
+                desc::EOR
+            } else {
+                0
+            });
+        }
+
+        let receive = self.receive_ring.physical();
+        self.controller.regs.write32(regs::RDSAR, receive as u32);
+        self.controller
+            .regs
+            .write32(regs::RDSAR + 4, (receive as u64 >> 32) as u32);
+
+        let transmit = self.transmit_ring.physical();
+        self.controller.regs.write32(regs::TNPDS, transmit as u32);
+        self.controller
+            .regs
+            .write32(regs::TNPDS + 4, (transmit as u64 >> 32) as u32);
+    }
+}
+
 fn is_valid_mac(mac: &[u8; 6]) -> bool {
     *mac != [0; 6] && *mac != [0xFF; 6] && mac[0] & 1 == 0
 }
 
+/// Check that the controller is an RTL8125B.
+///
+/// The MAC version code sits in the upper bits of the transmit configuration
+/// register. The driver refuses to touch a controller it does not recognise,
+/// because the MAC and PHY patch tables are specific to the revision.
+fn check_mac_version<R: Regs>(regs: &R) -> Result<()> {
+    let txcfg = regs.read32(regs::TXCFG);
+    let Some(mac_version) = version::detect(txcfg) else {
+        log::error!("unknown RTL8125 MAC version (TXCFG {txcfg:#010X})");
+        return Err(Error::new(ENODEV));
+    };
+    if !version::is_supported(mac_version) {
+        log::error!("RTL8125 MAC version {mac_version:?} is not supported yet");
+        return Err(Error::new(ENODEV));
+    }
+    log::info!("RTL8125B detected (TXCFG {txcfg:#010X})");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
+
+    /// Size of the modelled register file.
+    const BAR_SIZE: usize = 0x1_0000;
+    /// Size of the modelled OCP address space.
+    const OCP_SIZE: usize = 0x1_0000;
+
+    /// The state of the modelled controller.
+    #[derive(Default)]
+    struct FakeState {
+        bar: Vec<u8>,
+        ocp: Vec<u16>,
+        mac_pending: Option<u16>,
+        mac_page: u16,
+        phy_pending: Option<(u16, bool)>,
+        ephy_pending: Option<(u16, bool)>,
+        /// The MAC OCP writes, with the MCU RAM page each one was made on.
+        mac_writes: Vec<(u16, u16, u16)>,
+        phy_writes: Vec<(u16, u16)>,
+        ephy_writes: Vec<(u16, u16)>,
+    }
+
+    impl FakeState {
+        fn put8(&mut self, offset: u16, value: u8) {
+            self.bar[usize::from(offset)] = value;
+        }
+
+        fn put16(&mut self, offset: u16, value: u16) {
+            let bytes = value.to_le_bytes();
+            self.bar[usize::from(offset)] = bytes[0];
+            self.bar[usize::from(offset) + 1] = bytes[1];
+        }
+
+        fn put32(&mut self, offset: u16, value: u32) {
+            let bytes = value.to_le_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                self.bar[usize::from(offset) + index] = *byte;
+            }
+        }
+
+        fn get16(&self, offset: u16) -> u16 {
+            u16::from_le_bytes([
+                self.bar[usize::from(offset)],
+                self.bar[usize::from(offset) + 1],
+            ])
+        }
+
+        fn get32(&self, offset: u16) -> u32 {
+            let mut bytes = [0u8; 4];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = self.bar[usize::from(offset) + index];
+            }
+            u32::from_le_bytes(bytes)
+        }
+    }
+
+    /// A model of the RTL8125B controller.
+    ///
+    /// The model answers the reads the driver makes, records every OCP write,
+    /// and models the two handshakes the driver waits for: the PHY MCU patch
+    /// request and the reset.
+    #[derive(Clone)]
+    struct FakeDevice {
+        state: Rc<RefCell<FakeState>>,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            let mut state = FakeState {
+                bar: vec![0; BAR_SIZE],
+                ocp: vec![0; OCP_SIZE],
+                ..FakeState::default()
+            };
+
+            // The RTL8125B reports its MAC version in the transmit
+            // configuration register.
+            state.put32(regs::TXCFG, 0x6410_0000);
+            // A 2.5 Gb/s full-duplex link.
+            state.put32(
+                regs::PHY_STATUS,
+                regs::PHY_STATUS_LINK | regs::PHY_STATUS_FULL_DUP | regs::PHY_STATUS_2500M,
+            );
+            // The station address in the backup registers.
+            state.put32(
+                regs::BACKUP_MAC_ADDR,
+                u32::from_le_bytes([0x10, 0x7B, 0x44, 0x11]),
+            );
+            state.put16(regs::BACKUP_MAC_ADDR + 4, u16::from_le_bytes([0x22, 0x33]));
+            // The out-of-box handshakes the driver waits for.
+            state.put16(0x00D2, 1 << 9);
+            state.put8(regs::MCU_COMMAND, regs::MCU_COMMAND_FIFO_EMPTY);
+            state.put16(regs::INTR_MITIGATE, regs::INTR_MITIGATE_IDLE);
+            // The PHY is powered up, but its patch version does not match the
+            // one the driver carries.
+            state.ocp[usize::from(regs::PHY_STATE)] = regs::PHY_STATE_READY;
+
+            Self {
+                state: Rc::new(RefCell::new(state)),
+            }
+        }
+
+        fn with_state<T>(&self, f: impl FnOnce(&FakeState) -> T) -> T {
+            f(&self.state.borrow())
+        }
+    }
+
+    impl Regs for FakeDevice {
+        fn read8(&self, offset: u16) -> u8 {
+            self.state.borrow().bar[usize::from(offset)]
+        }
+
+        fn write8(&self, offset: u16, value: u8) {
+            let mut state = self.state.borrow_mut();
+            let value = if offset == regs::COMMAND {
+                // The reset completes immediately.
+                value & !regs::COMMAND_RESET
+            } else {
+                value
+            };
+            state.bar[usize::from(offset)] = value;
+        }
+
+        fn read16(&self, offset: u16) -> u16 {
+            self.state.borrow().get16(offset)
+        }
+
+        fn write16(&self, offset: u16, value: u16) {
+            self.state.borrow_mut().put16(offset, value);
+        }
+
+        fn read32(&self, offset: u16) -> u32 {
+            let mut state = self.state.borrow_mut();
+            match offset {
+                regs::MAC_OCP => {
+                    let address = state.mac_pending.take().unwrap_or(0);
+                    u32::from(state.ocp[usize::from(address)])
+                }
+                regs::PHY_OCP => match state.phy_pending.take() {
+                    Some((address, false)) => {
+                        u32::from(state.ocp[usize::from(address)]) | ocp::FLAG
+                    }
+                    _ => 0,
+                },
+                regs::EPHY_ACCESS => match state.ephy_pending.take() {
+                    Some((address, false)) => {
+                        u32::from(state.ocp[usize::from(address)]) | ocp::FLAG
+                    }
+                    _ => 0,
+                },
+                _ => state.get32(offset),
+            }
+        }
+
+        fn write32(&self, offset: u16, value: u32) {
+            let mut state = self.state.borrow_mut();
+            match offset {
+                regs::MAC_OCP => {
+                    let address = (((value >> 16) & 0x7FFF) as u16) * 2;
+                    if value & ocp::FLAG != 0 {
+                        let data = value as u16;
+                        state.ocp[usize::from(address)] = data;
+                        let page = state.mac_page;
+                        state.mac_writes.push((page, address, data));
+                        if address == regs::MCU_PAGE_SELECT {
+                            state.mac_page = data & 0x3;
+                        }
+                        state.mac_pending = None;
+                    } else {
+                        state.mac_pending = Some(address);
+                    }
+                }
+                regs::PHY_OCP => {
+                    let address = (((value >> 16) & 0x7FFF) as u16) * 2;
+                    let is_write = value & ocp::FLAG != 0;
+                    if is_write {
+                        let data = value as u16;
+                        state.ocp[usize::from(address)] = data;
+                        state.phy_writes.push((address, data));
+                        if address == regs::PHY_MCU_REQUEST {
+                            // The patch request is answered by the status bit.
+                            let ready = data & regs::PHY_MCU_BIT != 0;
+                            state.ocp[usize::from(regs::PHY_MCU_STATUS)] =
+                                if ready { regs::PHY_MCU_READY } else { 0 };
+                        }
+                    }
+                    state.phy_pending = Some((address, is_write));
+                }
+                regs::EPHY_ACCESS => {
+                    let address = ((value >> 16) & 0x7FFF) as u16;
+                    let is_write = value & ocp::FLAG != 0;
+                    if is_write {
+                        let data = value as u16;
+                        state.ocp[usize::from(address)] = data;
+                        state.ephy_writes.push((address, data));
+                    }
+                    state.ephy_pending = Some((address, is_write));
+                }
+                _ => state.put32(offset, value),
+            }
+        }
+    }
+
+    /// A controller driven by the model, initialised the way the driver does.
+    fn initialised() -> (FakeDevice, Controller<FakeDevice>) {
+        let device = FakeDevice::new();
+        let handle = device.clone();
+        let mut controller = Controller::new(device);
+        controller
+            .init()
+            .expect("the modelled controller should initialise");
+        controller.start();
+        (handle, controller)
+    }
 
     #[test]
     fn accepts_unicast_station_addresses() {
@@ -1010,5 +1296,159 @@ mod tests {
         assert_eq!(received_length(64), 60);
         assert_eq!(received_length(4), 0);
         assert_eq!(received_length(0), 0);
+    }
+
+    #[test]
+    fn recognises_the_mac_version_in_the_transmit_configuration() {
+        let device = FakeDevice::new();
+        assert!(check_mac_version(&device).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_unknown_mac_version() {
+        let device = FakeDevice::new();
+        device.state.borrow_mut().put32(regs::TXCFG, 0x0000_0000);
+        assert!(check_mac_version(&device).is_err());
+    }
+
+    #[test]
+    fn writes_the_mac_patch_table_and_its_version() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            // The patch RAM is written one page at a time: the page register
+            // selects the page the window at 0xF800 refers to.
+            let expected: Vec<(u16, u16, u16)> = firmware::MAC_PATCH_8125B
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    let page = (index / regs::MCU_PAGE_WORDS) as u16;
+                    let offset = (index % regs::MCU_PAGE_WORDS) as u16 * 2;
+                    (page, regs::MCU_RAM_BASE + offset, *word)
+                })
+                .collect();
+
+            let written: Vec<(u16, u16, u16)> = state
+                .mac_writes
+                .iter()
+                .copied()
+                .filter(|&(_, address, _)| {
+                    (regs::MCU_RAM_BASE..regs::MCU_RAM_BASE + 0x200).contains(&address)
+                })
+                .collect();
+
+            assert_eq!(&written[..expected.len()], &expected[..]);
+
+            // The patch version follows the table, on page 2 and most
+            // significant half first.
+            let version: Vec<(u16, u16, u16)> = written[expected.len()..].to_vec();
+            assert_eq!(
+                version,
+                vec![
+                    (2, 0xF9FE, 0x1203),
+                    (2, 0xF9FC, 0x0604),
+                    (2, 0xF9FA, 0x0119),
+                    (2, 0xF9F8, 0x6637),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn writes_the_phy_patch_table_and_its_version() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            let start = state
+                .phy_writes
+                .iter()
+                .position(|&(address, value)| (address, value) == (0xA436, 0x8024))
+                .expect("the PHY patch table should be written");
+
+            let expected: Vec<(u16, u16)> = firmware::PHY_PATCH_8125B
+                .chunks_exact(2)
+                .take_while(|pair| *pair != [0xFFFF, 0xFFFF])
+                .map(|pair| (pair[0], pair[1]))
+                .collect();
+
+            let written: Vec<(u16, u16)> = state.phy_writes[start..start + expected.len()].to_vec();
+            assert_eq!(written, expected);
+
+            // The driver writes the version it carries after patching.
+            assert!(
+                state
+                    .phy_writes
+                    .contains(&(0xA438, firmware::PHY_PATCH_8125B_VERSION))
+            );
+        });
+    }
+
+    #[test]
+    fn writes_the_ephy_sequence() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            assert_eq!(state.ephy_writes, firmware::EPHY_CONFIG_8125B);
+        });
+    }
+
+    #[test]
+    fn selects_the_legacy_descriptor_format() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            let last = state
+                .mac_writes
+                .iter()
+                .rev()
+                .find(|&&(_, address, _)| address == 0xEB58)
+                .expect("the descriptor format register should be written");
+            assert_eq!(last.2 & 1, 0);
+        });
+    }
+
+    #[test]
+    fn leaves_the_controller_running_with_the_queue_interrupts_unmasked() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            assert_eq!(
+                state.bar[usize::from(regs::COMMAND)],
+                regs::COMMAND_TX_ENABLE | regs::COMMAND_RX_ENABLE
+            );
+            assert_eq!(
+                state.get32(regs::IMR_V2_SET),
+                regs::ISR_RXQ0_OK | regs::ISR_TXQ0_OK
+            );
+            assert_eq!(
+                state.get32(regs::INTR_MITIGATE_8125B),
+                regs::INTR_MITIGATE_VALUE
+            );
+            assert_eq!(
+                state.get32(regs::RXCFG),
+                regs::RXCFG_INITIAL & !regs::RXCFG_VLAN_TAG_MASK | regs::RXCFG_FILTER
+            );
+            assert_eq!(state.get32(regs::TXCFG), regs::TXCFG_CONFIG);
+            assert_eq!(state.get16(regs::RX_MAX_SIZE), regs::RX_MAX_SIZE_1500);
+        });
+    }
+
+    #[test]
+    fn programs_the_station_address() {
+        let (device, _) = initialised();
+
+        device.with_state(|state| {
+            let low = state.get32(regs::MAC_ADDR);
+            let high = state.get16(regs::MAC_ADDR + 4);
+            let address = [
+                low as u8,
+                (low >> 8) as u8,
+                (low >> 16) as u8,
+                (low >> 24) as u8,
+                high as u8,
+                (high >> 8) as u8,
+            ];
+            assert_eq!(address, [0x10, 0x7B, 0x44, 0x11, 0x22, 0x33]);
+        });
     }
 }
