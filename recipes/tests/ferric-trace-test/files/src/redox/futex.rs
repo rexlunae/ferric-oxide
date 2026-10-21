@@ -5,12 +5,16 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use ferric_trace::kernel::{SCHED_FUTEX_RESUME, SCHED_FUTEX_WAIT, SCHED_FUTEX_WAKE};
+use ferric_trace::{abi::CPU_RING_WORDS, record::HEADER_WORDS};
 use syscall::{EAGAIN, ETIMEDOUT, FUTEX_WAIT, FUTEX_WAIT64, FUTEX_WAKE, TimeSpec};
 
 use super::{Entry, Failure, check, command, drain, errno_result, listing};
 
 const EVENTS: &str = "sched.futex_wait sched.futex_resume sched.futex_wake";
 const VALUE: u64 = 0x1234_5678_9abc_def0;
+/// More empty wake records than one CPU ring can retain without collection.
+const EMPTY_WAKE_PROBES: usize =
+    CPU_RING_WORDS / (HEADER_WORDS + SCHED_FUTEX_WAKE.args().len()) + 1;
 
 /// All calls use a live, aligned word and either no timeout or a live timespec.
 fn call(
@@ -65,8 +69,33 @@ fn timeouts(word: &AtomicU64) -> Result<(), Failure> {
     expect(call(word, FUTEX_WAKE, 7, None), Ok(0))
 }
 
+/// Collects every polling wake promptly, so a late peer cannot fill the ring with empty wakes.
+fn poll_wake(
+    word: &AtomicU64,
+    cpus: &[u32],
+    trace: &mut Vec<Vec<Entry>>,
+) -> Result<usize, Failure> {
+    let woken = call(word, FUTEX_WAKE, 1, None)
+        .map_err(|err| check("trace-futex", format!("polling wake: {err}")))?;
+    trace.extend(drain("trace-futex", cpus)?);
+    Ok(woken)
+}
+
 /// Wakes an actual queued peer. Both the waiter and the wake loop have bounded deadlines.
-fn wake_peer(word: &Arc<AtomicU64>) -> Result<(), Failure> {
+fn wake_peer(
+    word: &Arc<AtomicU64>,
+    cpus: &[u32],
+    trace: &mut Vec<Vec<Entry>>,
+) -> Result<(), Failure> {
+    // Exercise the late-peer case without relying on timing: no waiter has started yet.
+    for _ in 0..EMPTY_WAKE_PROBES {
+        if poll_wake(word, cpus, trace)? != 0 {
+            return Err(check(
+                "trace-futex",
+                "wake before the peer started was not empty",
+            ));
+        }
+    }
     let mut deadline = TimeSpec::default();
     syscall::clock_gettime(syscall::CLOCK_MONOTONIC, &mut deadline)
         .map_err(|err| check("trace-futex", format!("clock_gettime: {err}")))?;
@@ -77,7 +106,7 @@ fn wake_peer(word: &Arc<AtomicU64>) -> Result<(), Failure> {
     let limit = Instant::now() + Duration::from_secs(5);
     let mut woke = false;
     while !peer.is_finished() && Instant::now() < limit {
-        if call(word, FUTEX_WAKE, 1, None) == Ok(1) {
+        if poll_wake(word, cpus, trace)? == 1 {
             woke = true;
             break;
         }
@@ -158,9 +187,10 @@ pub(super) fn check_futex(cpus: &[u32]) -> Result<(), Failure> {
     let timed_word = AtomicU64::new(VALUE);
     let peer_word = Arc::new(AtomicU64::new(VALUE));
     timeouts(&timed_word)?;
-    wake_peer(&peer_word)?;
+    let mut trace = drain(step, cpus)?;
+    wake_peer(&peer_word, cpus, &mut trace)?;
     command(step, &format!("disable {EVENTS}"))?;
-    let trace = drain(step, cpus)?;
+    trace.extend(drain(step, cpus)?);
     let timed = records_for(&trace, &timed_word);
     pairs(&timed, &[errno_result(ETIMEDOUT); 2])?;
     let waits: Vec<_> = timed.iter().filter(|e| e.is(&SCHED_FUTEX_WAIT)).collect();
@@ -181,17 +211,38 @@ pub(super) fn check_futex(cpus: &[u32]) -> Result<(), Failure> {
     }
     let peer = records_for(&trace, &peer_word);
     pairs(&peer, &[0])?;
+    let empty_wakes = peer
+        .iter()
+        .filter(|e| e.is(&SCHED_FUTEX_WAKE) && e.arg(3) == Some(0))
+        .count();
+    if empty_wakes < EMPTY_WAKE_PROBES {
+        return Err(check(
+            step,
+            format!("only {empty_wakes} of {EMPTY_WAKE_PROBES} empty probes retained"),
+        ));
+    }
     let wait = peer
         .iter()
         .find(|e| e.is(&SCHED_FUTEX_WAIT))
         .ok_or_else(|| check(step, "no peer wait"))?;
-    if !peer.iter().any(|e| {
-        e.is(&SCHED_FUTEX_WAKE)
-            && e.arg(0) == wait.arg(0)
-            && e.arg(2) == Some(1)
-            && e.arg(3) == Some(1)
-    }) {
-        return Err(check(step, "missing successful wake of the peer's key"));
+    let wake = peer
+        .iter()
+        .find(|e| {
+            e.is(&SCHED_FUTEX_WAKE)
+                && e.arg(0) == wait.arg(0)
+                && e.arg(2) == Some(1)
+                && e.arg(3) == Some(1)
+        })
+        .ok_or_else(|| check(step, "missing successful wake of the peer's key"))?;
+    let resume = peer
+        .iter()
+        .find(|e| e.is(&SCHED_FUTEX_RESUME))
+        .ok_or_else(|| check(step, "no peer resume"))?;
+    if wake.timestamp < wait.timestamp || wake.timestamp > resume.timestamp {
+        return Err(check(
+            step,
+            "successful wake was not between the peer's wait and resume",
+        ));
     }
     // Keep both words alive until the records were checked, so keys cannot be recycled.
     timeouts(&timed_word)?;
@@ -199,6 +250,8 @@ pub(super) fn check_futex(cpus: &[u32]) -> Result<(), Failure> {
     if !records_for(&disabled, &timed_word).is_empty() {
         return Err(check(step, "futex events after disable"));
     }
-    println!("FERRIC_TEST_PASS trace-futex (32/64-bit waits, timeout, wake, mismatch and disable)");
+    println!(
+        "FERRIC_TEST_PASS trace-futex (32/64-bit waits, timeout, ordered wake, {empty_wakes} empty probes retained, mismatch and disable)"
+    );
     Ok(())
 }

@@ -151,7 +151,9 @@ enable sched.futex_wait sched.futex_resume sched.futex_wake
   zero and a call that finds no waiters. `requested` is the requested count;
   `woken` is the count returned by the syscall. That counts live queue entries
   processed, which can include a context already made runnable by a timeout
-  or signal before its queue cleanup.
+  or signal before its queue cleanup. The wake is recorded before releasing
+  the queue lock, so a waiter processed by this call cannot record its resume
+  first on another CPU.
 
 `key` is the physical byte address used by the futex table, so callers mapping
 the same word at different virtual addresses share a key; `addr` is each

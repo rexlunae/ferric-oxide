@@ -164,6 +164,8 @@ crate::events! {
     /// A valid futex wake finished: the physical word key, the waker's virtual address,
     /// requested wake count and returned count. Calls that find no waiters, including
     /// requests to wake zero, are recorded too.
+    /// The record is written before releasing the queue lock, so a waiter processed by
+    /// this call cannot record its resume before this wake is recorded.
     ///
     /// The returned count is the number of live queue entries processed by the syscall;
     /// a timeout or signal can already have made an entry runnable before its cleanup.

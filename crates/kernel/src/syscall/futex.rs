@@ -251,15 +251,17 @@ pub fn futex(
                 if is_empty {
                     futexes_map.remove(&target_physaddr);
                 }
-            }
 
-            trace_event!(
-                ferric_trace::kernel::SCHED_FUTEX_WAKE,
-                target_physaddr.data(),
-                addr,
-                val,
-                woken,
-            );
+                // A resumed waiter must take this lock in finish_wait before recording
+                // completion, so publish the wake before it can publish its resume.
+                trace_event!(
+                    ferric_trace::kernel::SCHED_FUTEX_WAKE,
+                    target_physaddr.data(),
+                    addr,
+                    val,
+                    woken,
+                );
+            }
             Ok(woken)
         }
         _ => Err(Error::new(EINVAL)),
