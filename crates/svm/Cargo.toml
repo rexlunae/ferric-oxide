@@ -1,0 +1,9 @@
+[package]
+name = "ferric-svm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "AMD SVM encodings for the Ferric Oxide hypervisor: the VMCB layout, intercepts, exit codes, event injection and permission maps"
+
+[dependencies]
+thiserror.workspace = true
