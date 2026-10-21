@@ -24,6 +24,7 @@ use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRI
 mod cap;
 mod crash;
 mod futex;
+mod lifecycle;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -158,6 +159,15 @@ fn command(step: &'static str, text: &str) -> Result<(), Failure> {
         .open(&path)
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(io_failure(step, &path))
+}
+
+/// Whether the current namespace lists a scheme (opening absent schemes has varying errnos).
+fn has_scheme(name: &str) -> io::Result<bool> {
+    std::fs::read_dir("/scheme").map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == name)
+    })
 }
 
 /// The CPUs, from the `stats` file.
@@ -888,6 +898,7 @@ fn run() -> Result<(), Failure> {
 
     check_fault(&cpus)?;
     futex::check_futex(&cpus)?;
+    lifecycle::check_lifecycle(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
     cap::check_cap()
@@ -1082,6 +1093,9 @@ fn check_filter(cpus: &[u32]) -> Result<(), Failure> {
 
 /// Runs the test.
 pub fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(lifecycle::CHILD_ARG) {
+        return ExitCode::from(lifecycle::CHILD_STATUS);
+    }
     // A child of `trace-cap`, run as another user with a capability on its stdin.
     if let Some(access) = std::env::args()
         .nth(1)
@@ -1092,11 +1106,7 @@ pub fn main() -> ExitCode {
     }
     // The /scheme listing says whether the kernel has the scheme. Opening a missing scheme's
     // file fails with an errno that depends on the namespace manager, so it is no test.
-    let listed = std::fs::read_dir("/scheme").map(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name() == abi::SCHEME_NAME)
-    });
+    let listed = has_scheme(abi::SCHEME_NAME);
     match listed {
         Ok(true) => {}
         Ok(false) => {

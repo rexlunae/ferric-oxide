@@ -58,6 +58,15 @@ pub fn exit_this_context(excp: Option<syscall::Exception>, token: &mut CleanLock
         let mut guard = context_lock.write(token.token());
         guard.status = context::Status::Dead { excp };
 
+        trace_event!(
+            ferric_trace::kernel::SCHED_CONTEXT_EXIT,
+            guard.pid,
+            guard.debug_id,
+            excp.is_some(),
+            excp.map_or(0, |e| e.kind),
+            excp.map_or(0, |e| e.code),
+            excp.map_or(0, |e| e.address),
+        );
         guard.owner_proc_id
     };
     if let Some(owner) = owner {

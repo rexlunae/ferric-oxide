@@ -17,7 +17,7 @@ what is on at run time.
 | --- | --- | --- |
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
-| `kernel.trace_sched` | `true` | Compiles in `sched.switch` and `sched.futex_wait`/`futex_resume`/`futex_wake` |
+| `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, and `sched.context_create`/`context_start`/`context_exit` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_mm` | `true` | Compiles in `mm.page_fault` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
@@ -129,6 +129,52 @@ The events are:
 | `sched.futex_wait` | `key`, `addr`, `context`, `bits`, `expected`, `timed` |
 | `sched.futex_resume` | `key`, `addr`, `context`, `ret` |
 | `sched.futex_wake` | `key`, `addr`, `requested`, `woken` |
+| `sched.context_create` | `context`, `user_mode` |
+| `sched.context_start` | `pid`, `context` |
+| `sched.context_exit` | `pid`, `context`, `exception`, `kind`, `code`, `addr` |
+
+### Kernel context lifecycle
+
+The lifecycle events describe kernel execution contexts, the scheduling units
+identified by the debug ids in `sched.switch`. A process can have multiple
+contexts. User-space `procmgr` manages process creation, exec, signals, wait
+statuses and PID assignment; these records are not replacements for those
+process-level operations.
+
+- `sched.context_create` records a successful `context::spawn`, after its
+  resources and scheduler registration exist and before its caller can start
+  it. The PID is not yet assigned. `user_mode` says whether the initial entry
+  allows user mode (0 for ring workers, 1 for user contexts).
+- `sched.context_start` records an accepted transition from `NotYetStarted`
+  to runnable, under the context lock, before the context can run. It covers
+  the proc scheme's `start` operation, bootstrap and ring workers. `pid` is
+  the current assigned PID; 0 means unassigned or a kernel worker. Rejected
+  starts do not record anything. This is a start transition, not a guarantee of one unique
+  process birth or an exec event.
+- `sched.context_exit` records completed context resource cleanup while
+  marking it dead, before notifying its owner. `exception` is 1 only when an
+  unhandled exception ended the context, with raw `redox_syscall::Exception`
+  `kind`, `code` and `addr`; otherwise all four arguments are zero. The
+  x86-64 kind is the exception vector. These fields are not a process exit
+  status or a signal number. An exception delivered to a user handler does
+  not produce this exit record.
+
+Join records by `context`; the start supplies the PID that creation did not
+yet have. Create and start records are emitted on the creator or manager's
+CPU, and generic exporters attribute them to that producer; the target
+context is in the arguments. An exit is emitted by the exiting context.
+Ring workers temporarily use the submitter's PID and credentials while
+servicing a chain, then restore their kernel identity before becoming idle
+or exiting. Their lifecycle start and exit both carry PID 0.
+Idle contexts are outside `context::spawn`, and a context dropped before
+starting need not have an exit. Record loss and partial selections also leave
+incomplete lifecycles. Enable all three with:
+
+```text
+enable sched.context_create sched.context_start sched.context_exit
+```
+
+### Futex waits and wakes
 
 The futex events cover the kernel's queued waits and wake calls
 (`crates/kernel/src/syscall/futex.rs`). Enable them together, without other
@@ -167,6 +213,8 @@ their arguments; they do not construct a futex duration or a per-waiter wake
 edge automatically. Trace access is capability-gated because these records,
 like other tracepoints, expose addresses.
 
+### Scheme requests
+
 The scheme events cover requests to user-space schemes
 (`crates/kernel/src/scheme/user.rs`).
 
@@ -200,6 +248,8 @@ with RedoxFS as `caller`, before it answers as `responder`.
 
 These events do not cover one-way messages (`close`, `detach`) or the kernel's
 own mmap requests.
+
+### Faults and interrupts
 
 The codes in the memory, IRQ and IOMMU events have one definition, next to the events in
 `crates/trace/src/kernel.rs`, which the kernel encodes with and decoders read.
@@ -793,6 +843,15 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
      through the capability is refused with `read` access and done with
      `control`. Narrowing to `cap/read` works, and widening `read` to
      `cap/control` is refused (`trace-cap`).
+  13. checks 32/64-bit queued futex waits with timeout and peer wake, mismatched
+      comparisons, zero-count and empty wakes, and disable. A successful wake
+      must precede its matching resume. It drains all CPU rings while polling
+      and retains more empty probes than one ring can hold (`trace-futex`).
+  14. joins a child process's and a thread's context create/start/exit records
+      by debug id, checks timestamps and normal cleanup, and checks disable.
+      When rings are available, it runs `ferric-ring-test --async-only` and
+      checks the same lifecycle for kernel workers after normal requests and
+      cancellation, with PID 0 at both start and exit (`trace-lifecycle`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
@@ -1032,7 +1091,7 @@ is refused the file.
 ## Not implemented yet
 
 - Tracepoints for other subsystems (memory mappings, IOMMU map and unmap,
-  futexes, process lifecycle), and for the interrupts the kernel handles
+  user-space process creation/exec/wait), and for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.

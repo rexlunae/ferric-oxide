@@ -1158,15 +1158,10 @@ impl ContextHandle {
             ContextHandle::Start => {
                 let cpu_id = {
                     let mut guard = context.write(token.token());
-                    match guard.status {
-                        ref mut status @ Status::HardBlocked {
-                            reason: HardBlockedReason::NotYetStarted,
-                        } => {
-                            *status = Status::Runnable;
-                            guard.cpu_id
-                        }
-                        _ => return Err(Error::new(EINVAL)),
+                    if !guard.start() {
+                        return Err(Error::new(EINVAL));
                     }
+                    guard.cpu_id
                 };
 
                 wakeup_context(&context, cpu_id, &mut token.downgrade());

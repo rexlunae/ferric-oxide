@@ -108,4 +108,29 @@ mod tests {
              [002]           40: sched.futex_resume key=0x8000 addr=0x4000 context=0x1b ret=0x0\n"
         );
     }
+
+    #[test]
+    fn context_lifecycle_preserves_identity_and_raw_exception_fields() {
+        use ferric_trace::kernel::{SCHED_CONTEXT_CREATE, SCHED_CONTEXT_EXIT, SCHED_CONTEXT_START};
+        let b = bytes(&[
+            (&SCHED_CONTEXT_CREATE, 10, &[27, 1]),
+            (&SCHED_CONTEXT_START, 20, &[42, 27]),
+            (
+                &SCHED_CONTEXT_EXIT,
+                30,
+                &[42, 27, 1, 14, 7, 0xffff_ffff_1234_5000],
+            ),
+            (&SCHED_CONTEXT_EXIT, 40, &[43, 28, 0, 0, 0, 0]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(2, &b).unwrap()]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("sched.context_create context=0x1b user_mode=0x1"));
+        assert!(text.contains("sched.context_start pid=0x2a context=0x1b"));
+        assert!(text.contains("sched.context_exit pid=0x2a context=0x1b exception=0x1 kind=0xe code=0x7 addr=0xffffffff12345000"));
+        assert!(text.contains(
+            "sched.context_exit pid=0x2b context=0x1c exception=0x0 kind=0x0 code=0x0 addr=0x0"
+        ));
+    }
 }

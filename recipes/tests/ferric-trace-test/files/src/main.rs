@@ -49,6 +49,12 @@
 //!   recording them. The check uses the shared physical key and context id across CPUs.
 //!   A successful wake must precede the peer's resume; polling collects records as it
 //!   goes and must retain more empty probes than one CPU ring can hold.
+//! - `trace-lifecycle`: a child process (exiting 23) and a thread have ordered kernel
+//!   context creation, start and exit records, joined by debug id, with normal cleanup
+//!   rather than an exception. Disabling these events suppresses a second child's records.
+//!   The kernel records do not carry the child's process exit status; `wait` checks it.
+//!   When kernel rings are available, asynchronous chain and close probes also require
+//!   kernel worker create/start/exit records with PID 0 after serving user requests.
 //! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
 //!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
 //!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
