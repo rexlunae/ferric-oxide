@@ -149,7 +149,10 @@ impl BootConfig {
         for command in self.commands() {
             let len = command.to_string().len();
             if len > MAX_COMMAND_BYTES {
-                let (Command::Enable(selection) | Command::Disable(selection)) = command;
+                // `commands` makes only enables and disables.
+                let (Command::Enable(selection) | Command::Disable(selection)) = command else {
+                    continue;
+                };
                 return Err(ConfigError::TooLong {
                     selection: selection.into(),
                     len,

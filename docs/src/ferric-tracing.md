@@ -257,13 +257,14 @@ The paths are defined in `ferric_trace::abi`.
 
 | Path | Read | Write |
 | --- | --- | --- |
-| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live |
+| `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live; `filter <event> <filter\|none>` sets or removes an argument filter ([Argument filters](#argument-filters)) |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
 | `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
+| `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 
-`events`, `stats` and `clock` are read from a snapshot taken at the first read of each
+`events`, `stats`, `clock` and `filters` are read from a snapshot taken at the first read of each
 open. A `cpu/<n>` read follows these rules:
 
 - It consumes records only after they have been copied to the caller, so a
@@ -275,6 +276,43 @@ open. A `cpu/<n>` read follows these rules:
 
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
+
+### Argument filters
+
+`filter <event> <filter>` keeps only the records of `<event>` whose arguments
+pass `<filter>`; other records are not written and not counted as lost. A
+filter is up to four conditions joined by `&&`, each `<arg> <op> <value>`:
+
+```sh
+echo "filter syscall.enter nr == 3 && a < 0x1000" > /scheme/kernel.trace/events
+echo "filter sched.switch next_pid == 42" > /scheme/kernel.trace/events
+echo "filter syscall.enter none" > /scheme/kernel.trace/events
+```
+
+- `<arg>` is one of the event's argument names, as the event table above
+  lists them.
+- `<op>` is `==`, `!=`, `<`, `<=`, `>`, `>=`, or `&` (any of the value's bits
+  set).
+- `<value>` is a decimal or `0x` hexadecimal 64-bit number.
+
+A filter is independent of whether the event is on: it is kept while the event
+is off and applies when it is turned on. Setting a filter replaces the event's
+previous one. A filter on an unknown event gives `ENOENT`, on an event that is
+not compiled in `EOPNOTSUPP`, and one that does not parse (an unknown argument
+or operator, a bad number, more than four conditions) `EINVAL`. The kernel logs
+each filter it sets, and `filters` lists them in the same syntax, with values
+in hexadecimal.
+
+Each event's filter sits in a sequence-locked slot of atomics
+(`ferric_trace::filter::Slot`). A tracepoint checks it without a lock: an event
+without a filter costs one relaxed load more, and a record that races with a
+filter being replaced is kept rather than dropped, so a filter only ever
+removes records. A tracepoint rereads a slot at most eight times before it
+gives up and keeps the record. The `filters` listing reads the slots while
+holding the lock that serializes setting them, so it never meets a replacement
+in progress and lists every filter that is set. If a slot still cannot be read,
+the listing says so in a comment line, `# filter <event> is being replaced`,
+rather than leaving the filter out.
 
 ### Mapping a ring
 
@@ -538,7 +576,12 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
      it and `read`s into it, which fails with `EFAULT`: each page must have a
      `mm.page_fault` from user mode, a write, ending `mapped`, and the read one
      from the kernel ending `copy failed` (`trace-fault`).
-  10. reads the `clock` file and, with `syscall` on, makes two marker writes
+  10. sets `filter syscall.enter nr == <write> && a == <closed fd>`, checks the
+     `filters` listing, and repeats the marker calls with `syscall` on: only
+     the write keeps its `syscall.enter`, while `syscall.exit` (no filter)
+     records every call; then removes the filter and checks that unknown events
+     and arguments are refused (`trace-filter`).
+  11. reads the `clock` file and, with `syscall` on, makes two marker writes
       200 ms apart: when the clock's tick length is known (the KVM clock, the
       HPET), the time between their timestamps must be within a factor of two
       of the wall time; for the TSC it prints the frequency they imply
@@ -579,8 +622,8 @@ the mapping are described in `tools/ferric-trace/src/perfetto.rs`.
   [Overhead budget](#overhead-budget)).
 - **Image workflow.** `image.yml` builds the smoke image with `trace = true`,
   `trace_boot = "sched"`, `trace_initfs_enable = ["scheme.cancel"]` and
-  `trace_crash = true`. It requires all fifteen step markers, the kernel's
-  `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
+  `trace_crash = true`. It requires all sixteen step markers, the kernel's
+  log of the filter, its `trace: clock` line, the `trace-capture` marker, the boot log line, the kernel's log of bootstrap's
   `enable scheme.cancel`, the crash region's log line, and
   `FERRIC_TEST_SKIP trace-crash` (a clean boot has no dump).
 - **Crash dump.** `cargo test -p ferric-trace` writes dumps into a region and

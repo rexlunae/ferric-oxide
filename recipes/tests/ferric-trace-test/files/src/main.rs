@@ -43,6 +43,10 @@
 //!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
 //!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
 //!   failed`.
+//! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
+//!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
+//!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
+//!   unknown events or arguments are refused.
 //! - `trace-clock`: the `clock` file names the clock timestamps come from
 //!   (`ferric_trace::clock`), and two marker writes 200 ms apart have timestamps that agree
 //!   with the wall time between them, within a factor of two, when the clock's tick length is
