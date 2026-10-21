@@ -1,8 +1,8 @@
 //! Kernel tracing test for Ferric Oxide (`kernel.trace`).
 //!
 //! The image is built with `kernel.trace = true` and `kernel.trace_boot = "sched"`, so the
-//! kernel has the `syscall.*`, `sched.switch` and `scheme.*` tracepoints and turned
-//! `sched.switch` on at boot. Through the `kernel.trace` scheme the program checks, in order:
+//! kernel has the `syscall.*`, `sched.switch`, `scheme.*` and `mm.*` tracepoints and turned
+//! `sched.switch` on at boot (`ferric-iommu-test` checks the `irq.*` ones, `trace-irq`). Through the `kernel.trace` scheme the program checks, in order:
 //!
 //! - `trace-initfs`: the events the initfs `lib/trace.toml` leaves on (CI's image turns on
 //!   `scheme.cancel` there, through ferric-config's `kernel.trace_initfs_enable`) are on and
@@ -38,14 +38,27 @@
 //!   `ferric_trace::ring::View`; `commit <end>` past `head` or inside a record is refused
 //!   and leaves `tail` alone, and `commit` of the end read moves `tail` there, after which a
 //!   read of the ring no longer gives the call.
+//! - `trace-fault`: with the `mm` events on, it writes to each page of a fresh anonymous
+//!   mapping (the kernel maps a page on first touch), unmaps it and `read`s `stats` into it,
+//!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
+//!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
+//!   failed`.
+//! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
+//!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
+//!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
+//!   unknown events or arguments are refused.
 //! - `trace-clock`: the `clock` file names the clock timestamps come from
 //!   (`ferric_trace::clock`), and two marker writes 200 ms apart have timestamps that agree
 //!   with the wall time between them, within a factor of two, when the clock's tick length is
 //!   known (the KVM clock, the HPET); for the TSC only their order is checked, and the
 //!   frequency they imply is printed.
+//! - `trace-cap`: a process that is not root cannot open the scheme by path, but can through
+//!   a capability (`cap/read`, `cap/control`) root handed it, with that capability's access
+//!   and no more; see `redox::cap`.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
-//! the first failure and exits non-zero. Without a `kernel.trace` scheme (a kernel built without
+//! the first failure and exits non-zero. `trace-fault` prints `FERRIC_TEST_SKIP trace-fault` on a
+//! kernel without `mm.page_fault`. Without a `kernel.trace` scheme (a kernel built without
 //! the `trace` feature) it prints `FERRIC_TEST_SKIP trace` and exits zero.
 //!
 //! `ferric-trace-test crash` runs the crash-dump test instead (`kernel.trace_crash`): on a

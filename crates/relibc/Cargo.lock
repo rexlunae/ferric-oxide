@@ -202,6 +202,10 @@ name = "ferric-hwrand"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-procinfo"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -499,6 +503,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "ferric-hwrand",
+ "ferric-procinfo",
  "generic-rt",
  "goblin",
  "ioslice",

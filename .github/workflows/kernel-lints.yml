@@ -35,9 +35,9 @@ jobs:
         # out nor with them in: `never` without rings, `auto` with them.
         include:
           - iommu: never
-            features: regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info
+            features: regbuf,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info
           - iommu: auto
-            features: regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info
+            features: regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/prepare-cargo-git

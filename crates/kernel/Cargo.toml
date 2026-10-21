@@ -22,6 +22,7 @@ ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
 ferric-nospec = { path = "../nospec" }
+ferric-procinfo = { path = "../procinfo", features = ["alloc"], optional = true }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
 ferric-ring = { path = "../ring", optional = true, features = ["alloc"] }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
@@ -121,12 +122,18 @@ irq-percpu = ["dep:ferric-irq"]
 trace_syscall = ["trace"]
 trace_sched = ["trace"]
 trace_scheme = ["trace"]
+trace_mm = ["trace"]
+trace_irq = ["trace"]
+trace_iommu = ["trace"]
 # Ferric Oxide: a panic leaves its message and the newest trace records in reserved memory that
 # survives a warm reboot, served by kernel.trace/crash on the next boot.
 trace_crash = ["trace"]
 # Ferric Oxide: writing `panic` to kernel.trace/crash panics the kernel and resets the machine
 # after the dump, for testing it in CI.
 trace_crash_test = ["trace_crash"]
+# Ferric Oxide: everything the kernel logs is also kept in reserved memory that survives a warm
+# reboot, served by sys:log_previous on the next boot.
+log_persist = ["dep:ferric-trace"]
 # Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
 trace_level_warn = ["trace"]
 trace_level_info = ["trace_level_warn"]
@@ -135,7 +142,9 @@ trace_level_trace = ["trace_level_debug"]
 lpss_debug = []
 multi_core = ["acpi"]
 numa = ["multi_core"]
-profiling = []
+# Ferric Oxide: the ctl-profiling read of the kernel text address uses ferric-trace's
+# profile::ControlLine.
+profiling = ["dep:ferric-trace"]
 drop_panic = []
 busy_panic = []
 qemu_debug = []
@@ -147,6 +156,8 @@ debugger = ["syscall_debug"]
 syscall_debug = []
 
 sys_fdstat = []
+# Ferric Oxide: /scheme/sys/proc, per-process introspection (kernel.sys_proc).
+sys_proc = ["dep:ferric-procinfo"]
 
 [profile.dev]
 # Avoids having to define the eh_personality lang item and reduces kernel size

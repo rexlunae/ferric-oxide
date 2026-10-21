@@ -166,7 +166,7 @@ the desired kernel configuration for each, run the matching command from
 # With kernel.iommu = "never" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -174,7 +174,7 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
 # With kernel.iommu = "auto" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -203,7 +203,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, disable, and read-only mapping of the rings with `commit` checks |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
-| `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
+| `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
 `ferric-tlb-test` also covers a relibc join race: an exiting thread stores its

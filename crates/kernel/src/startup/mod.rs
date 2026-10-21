@@ -179,6 +179,9 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     // Ferric Oxide: save the previous boot's crash dump and arm the region for this one.
     #[cfg(feature = "trace_crash")]
     crate::trace::crash::init();
+    // Ferric Oxide: save the previous boot's log and keep this one's in the same memory.
+    #[cfg(feature = "log_persist")]
+    crate::log_persist::init();
     debug!("Env: {:?}", ::core::str::from_utf8(bootstrap.env));
 
     BOOTSTRAP.call_once(|| bootstrap);

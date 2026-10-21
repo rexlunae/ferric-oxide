@@ -1,0 +1,17 @@
+[package]
+name = "ferric-procinfo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The line format of the kernel's per-process introspection file, /scheme/sys/proc"
+
+[dependencies]
+
+[features]
+default = []
+## `processes`, which groups a whole file into one record per context (needs a heap).
+alloc = []
+
+[dev-dependencies]
+# The tests and examples cover `processes` too.
+ferric-procinfo = { path = ".", features = ["alloc"] }
