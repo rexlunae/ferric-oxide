@@ -843,6 +843,15 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
      through the capability is refused with `read` access and done with
      `control`. Narrowing to `cap/read` works, and widening `read` to
      `cap/control` is refused (`trace-cap`).
+  13. checks 32/64-bit queued futex waits with timeout and peer wake, mismatched
+      comparisons, zero-count and empty wakes, and disable. A successful wake
+      must precede its matching resume. It drains all CPU rings while polling
+      and retains more empty probes than one ring can hold (`trace-futex`).
+  14. joins a child process's and a thread's context create/start/exit records
+      by debug id, checks timestamps and normal cleanup, and checks disable.
+      When rings are available, it runs `ferric-ring-test --async-only` and
+      checks the same lifecycle for kernel workers after normal requests and
+      cancellation, with PID 0 at both start and exit (`trace-lifecycle`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
@@ -1082,7 +1091,7 @@ is refused the file.
 ## Not implemented yet
 
 - Tracepoints for other subsystems (memory mappings, IOMMU map and unmap,
-  futexes, process lifecycle), and for the interrupts the kernel handles
+  user-space process creation/exec/wait), and for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.
