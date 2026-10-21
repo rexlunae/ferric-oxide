@@ -160,6 +160,9 @@ pub struct AddrSpace {
     /// the exception that we have a memory safe kernel which doesn't have to protect itself
     /// against null pointers, so fixed mmaps to address zero are still allowed.
     pub mmap_min: usize,
+    /// Ferric Oxide: the ELF images its loaders recorded, for `/scheme/sys/proc`.
+    #[cfg(feature = "sys_proc")]
+    pub images: Vec<ferric_procinfo::Image>,
 }
 impl AddrSpaceWrapper {
     /// Attempt to clone an existing address space so that all mappings are copied (CoW).
@@ -253,6 +256,8 @@ impl AddrSpaceWrapper {
 
             new.inner.get_mut().grants.insert(new_grant);
         }
+        #[cfg(feature = "sys_proc")]
+        new.inner.get_mut().images.clone_from(&guard.images);
         Ok(new_arc)
     }
     pub fn mprotect(
@@ -726,6 +731,8 @@ impl AddrSpace {
             grants: UserGrants::new(),
             table: Table { utable, kpti },
             mmap_min: MMAP_MIN_DEFAULT,
+            #[cfg(feature = "sys_proc")]
+            images: Vec::new(),
         })
     }
     fn munmap_inner(
@@ -1905,14 +1912,6 @@ impl Grant {
             if !src_grant.can_have_flags(map_flags) {
                 return Err(Error::new(EPERM));
             }
-
-            if let Provider::FmapBorrowed {
-                ref mut pin_refcount,
-                ..
-            } = src_grant.provider
-            {
-                *pin_refcount += 1;
-            }
         }
 
         let Some(last_span) = prev_span else {
@@ -1966,6 +1965,19 @@ impl Grant {
                         TlbShootdownActions::NEW_MAPPING,
                     );
                 }
+            }
+        }
+
+        // Ferric Oxide: pin the source's fmap-borrowed grants only once nothing above can fail.
+        // `unmap` of the returned grant drops these pins again; a pin taken before an error
+        // return above was never dropped, and the source's exit then panicked unmapping it.
+        for (_, src_grant) in src_address_space.grants.conflicts_mut(src_span) {
+            if let Provider::FmapBorrowed {
+                ref mut pin_refcount,
+                ..
+            } = src_grant.provider
+            {
+                *pin_refcount += 1;
             }
         }
 

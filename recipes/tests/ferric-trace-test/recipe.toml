@@ -2,7 +2,8 @@
 # sched.switch was turned on at boot, turns the syscall tracepoints on through
 # the kernel.trace scheme, makes known system calls, turns them off, drains
 # every CPU's ring, decodes the records with the shared ferric-trace catalog and
-# checks the events. It prints FERRIC_TEST_SKIP when the kernel has no
+# checks the events, then checks page fault and interrupt records of faults and
+# disk interrupts it causes. It prints FERRIC_TEST_SKIP when the kernel has no
 # kernel.trace scheme. Only for test images. Source lives in files/; as a path
 # source (relative to the repository root) edits there rebuild it.
 [source]
@@ -18,3 +19,6 @@ script = """
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
 cookbook_cargo
 """
+
+[package]
+dependencies = ["ferric-ring-test"]

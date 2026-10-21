@@ -158,6 +158,14 @@ enum ContextHandle {
     SchedAffinity,
 
     MmapMinAddr(Arc<AddrSpaceWrapper>),
+
+    /// Ferric Oxide: records an image loaded into the address space, or (`unload`) forgets
+    /// one unmapped from it (sys_proc).
+    #[cfg(feature = "sys_proc")]
+    Images {
+        addrspace: Arc<AddrSpaceWrapper>,
+        unload: bool,
+    },
 }
 #[derive(Clone)]
 struct Handle {
@@ -475,6 +483,15 @@ impl KernelScheme for ProcScheme {
             }
             Handle {
                 kind: ContextHandle::AddrSpace { addrspace } | ContextHandle::MmapMinAddr(addrspace),
+                ..
+            } => {
+                if let Some(addrspace) = Arc::into_inner(addrspace) {
+                    addrspace.into_drop(token);
+                }
+            }
+            #[cfg(feature = "sys_proc")]
+            Handle {
+                kind: ContextHandle::Images { addrspace, .. },
                 ..
             } => {
                 if let Some(addrspace) = Arc::into_inner(addrspace) {
@@ -845,6 +862,16 @@ impl KernelScheme for ProcScheme {
                             addrspace: addrspace.try_clone(token)?,
                         },
                         b"mmap-min-addr" => ContextHandle::MmapMinAddr(Arc::clone(addrspace)),
+                        #[cfg(feature = "sys_proc")]
+                        b"images" => ContextHandle::Images {
+                            addrspace: Arc::clone(addrspace),
+                            unload: false,
+                        },
+                        #[cfg(feature = "sys_proc")]
+                        b"images-unload" => ContextHandle::Images {
+                            addrspace: Arc::clone(addrspace),
+                            unload: true,
+                        },
 
                         _ if buf.starts_with(GRANT_FD_PREFIX) => {
                             let string = core::str::from_utf8(&buf[GRANT_FD_PREFIX.len()..])
@@ -1131,15 +1158,10 @@ impl ContextHandle {
             ContextHandle::Start => {
                 let cpu_id = {
                     let mut guard = context.write(token.token());
-                    match guard.status {
-                        ref mut status @ Status::HardBlocked {
-                            reason: HardBlockedReason::NotYetStarted,
-                        } => {
-                            *status = Status::Runnable;
-                            guard.cpu_id
-                        }
-                        _ => return Err(Error::new(EINVAL)),
+                    if !guard.start() {
+                        return Err(Error::new(EINVAL));
                     }
+                    guard.cpu_id
                 };
 
                 wakeup_context(&context, cpu_id, &mut token.downgrade());
@@ -1239,6 +1261,36 @@ impl ContextHandle {
                 let mut lock_token = token.token();
                 addrspace.acquire_write(lock_token.downgrade()).mmap_min = val;
                 Ok(size_of::<usize>())
+            }
+            #[cfg(feature = "sys_proc")]
+            Self::Images {
+                ref addrspace,
+                unload,
+            } => {
+                let mut record = [0u8; ferric_procinfo::MAX_IMAGE_RECORD];
+                let len = buf.copy_common_bytes_to_slice(&mut record)?;
+                let record = record.get(..len).ok_or(Error::new(EINVAL))?;
+                let record =
+                    ferric_procinfo::ImageRecord::decode(record).map_err(|_| Error::new(EINVAL))?;
+                let mut lock_token = token.token();
+                let mut addrspace = addrspace.acquire_write(lock_token.downgrade());
+                if unload {
+                    addrspace.images.retain(|image| {
+                        !(image.base == record.base && *image.path == *record.path)
+                    });
+                    return Ok(len);
+                }
+                let known = addrspace
+                    .images
+                    .iter()
+                    .any(|image| image.base == record.base && *image.path == *record.path);
+                // A loader that records more images than this loses the rest, not its exec.
+                if !known && addrspace.images.len() < ferric_procinfo::MAX_IMAGES {
+                    addrspace
+                        .images
+                        .push(ferric_procinfo::Image::from_record(&record));
+                }
+                Ok(len)
             }
             Self::SchedAffinity => {
                 let mask = unsafe { buf.read_exact::<crate::cpu_set::RawMask>()? };

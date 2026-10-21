@@ -12,6 +12,7 @@
   - [Kernel Tracing](./ferric-tracing.md)
   - [Virtualization (prepared)](./ferric-virt.md)
   - [Package Tooling: fox](./ferric-packaging.md)
+  - [WebAssembly Interfaces](./ferric-wasm.md)
   - [Validation and Debugging](./ferric-testing.md)
 - [Roadmap](./ferric-roadmap.md)
 

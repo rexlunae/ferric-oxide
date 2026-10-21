@@ -826,6 +826,33 @@ mod tests {
     }
 
     #[test]
+    fn frame_pointers_reach_every_target_package() {
+        let s = real_schema();
+        let user: BTreeMap<String, Value> = [("cpu.frame_pointers".to_owned(), Value::Bool(true))]
+            .into_iter()
+            .collect();
+        let r = resolve(&s, &user);
+        let plan = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let mk = file(&plan, "config.mk");
+        assert!(
+            mk.contains(
+                "FERRIC_TARGET_RUSTFLAGS:=-C target-cpu=x86-64-v3 -C force-frame-pointers=yes\n"
+            ),
+            "{mk}"
+        );
+        assert!(
+            mk.contains("FERRIC_TARGET_CPPFLAGS:=-march=x86-64-v3 -fno-omit-frame-pointer\n"),
+            "{mk}"
+        );
+        // Off by default, config.mk adds neither flag. That is all this checks: Rust packages
+        // still get frame pointers on 64-bit targets from redoxer, so off only means C and C++
+        // code omits them.
+        let r = resolve(&s, &BTreeMap::new());
+        let off = super::plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        assert!(!file(&off, "config.mk").contains("frame-pointer"));
+    }
+
+    #[test]
     fn kernel_features_without_defaults() {
         let s = real_schema();
         let user: BTreeMap<String, Value> = [
@@ -1043,6 +1070,27 @@ mod tests {
         user.insert("kernel.trace_crash".into(), Value::Bool(true));
         let out = collect(&s, &resolve(&s, &user)).unwrap();
         assert!(!out.kernel_features.iter().any(|f| f.starts_with("trace")));
+    }
+
+    #[test]
+    fn log_persist_options() {
+        let s = real_schema();
+        // Off by default, with no region address.
+        let out = collect(&s, &resolve(&s, &BTreeMap::new())).unwrap();
+        assert!(!out.kernel_features.contains("log_persist"));
+        assert!(!out.kernel_config.contains_key("log.persist_base"));
+        // On without tracing, its region right after the crash region's default.
+        let mut user = trace_user(&[], &[], false);
+        user.insert("kernel.log_persist".into(), Value::Bool(true));
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert!(out.kernel_features.contains("log_persist"));
+        assert_eq!(out.kernel_config["log.persist_base"], "0x4010000");
+        user.insert(
+            "kernel.log_persist_base".into(),
+            Value::Str("0x8000000".into()),
+        );
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert_eq!(out.kernel_config["log.persist_base"], "0x8000000");
     }
 
     #[test]

@@ -73,7 +73,13 @@ impl RingBuffer {
     }
     pub unsafe fn extend(&self, mut slice: &[usize]) -> usize {
         let mut n = 0;
-        for mut sender_slice in unsafe { self.sender_owned() } {
+        let owned = unsafe { self.sender_owned() };
+        // Ferric Oxide: a sample goes in whole or not at all, so a reader never finds a torn
+        // one, and one word stays free, so a full buffer never looks empty (head == tail).
+        if owned.iter().map(|part| part.len()).sum::<usize>() <= slice.len() {
+            return 0;
+        }
+        for mut sender_slice in owned {
             while !slice.is_empty() && !sender_slice.is_empty() {
                 unsafe { sender_slice[0].get().write(slice[0]) };
                 slice = &slice[1..];

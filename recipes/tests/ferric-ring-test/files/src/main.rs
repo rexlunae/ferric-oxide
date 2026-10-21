@@ -58,6 +58,9 @@
 //! the first failure and exits non-zero. Without a `kernel.ring` scheme (a kernel built without
 //! the `rings` feature) it prints `FERRIC_TEST_SKIP ring` and exits zero.
 
+//! `--async-only` runs the asynchronous chain and close steps without the other tests or
+//! benchmarks; the trace lifecycle test uses it to exercise worker identity restoration.
+
 #[cfg(target_os = "redox")]
 mod redox;
 

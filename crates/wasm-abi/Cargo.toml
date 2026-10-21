@@ -1,0 +1,13 @@
+[package]
+name = "ferric-wasm-abi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The ferric:sys WebAssembly import ABI: import names and signatures, guest memory checks, flags, errors and the per-instance handle table"
+
+[dependencies]
+
+[features]
+default = []
+## `handles::HandleTable`, which keeps its slots on the heap.
+alloc = []

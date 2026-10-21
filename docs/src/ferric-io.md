@@ -651,7 +651,10 @@ aside room in the CQ for its completions, looks up the files it names
 (refusing rings with `EINVAL`, since a chain holding its ring would keep the
 ring from closing), and returns without waiting; the worker runs asynchronous chains in order, with
 the submitter's address space and credentials, and posts each chain's CQEs
-together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+together, then triggers `EVENT_READ`. After each chain and address-space cleanup,
+the worker restores its original PID and credentials before becoming idle
+or exiting; its lifecycle start and exit therefore both identify a kernel
+worker (PID 0). `Request::Enter { to_submit,
 min_complete }` waits after submitting until the CQ holds `min_complete`
 completions or nothing submitted is still running, on the worker or in
 another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
@@ -692,15 +695,16 @@ file systems still serve every read through their own scheme.
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`.
 
-## Kernel-bypass network queues (ABI only)
+## Kernel-bypass network queues
 
-`ferric-netq` (`crates/netq`) is the ABI of the planned kernel-bypass network
-queues (roadmap Phase 2.5, design in `io/netbypass-design.md` in the project
-files). It is `no_std` with no `unsafe` code and is host-tested. **No driver
-uses it yet:** there is no `queue` path on any network scheme and no
-`drivers.net_bypass` option, so nothing in the image changes. Copy mode in
-`driver-network` (with an e1000 test), then `igbd` and zero-copy come in later
-changes.
+`ferric-netq` (`crates/netq`) is the ABI of the kernel-bypass network queues
+(roadmap Phase 2.5, design in `io/netbypass-design.md` in the project files),
+and the driver's side of copy mode. It is `no_std` with no `unsafe` code and
+is host-tested. `drivers.net_bypass = true` (Drivers menu, default `false`,
+needs `kernel.regbuf`) builds `driver-network` with its `bypass` feature
+(through `e1000d/bypass`), which adds the `queue` path in copy mode. Without
+the option the network schemes have no `queue` path, as upstream.
+Zero-copy mode, `igbd` and unprivileged sockets come in later changes.
 
 An application opens `queue` beneath a network scheme
 (`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
@@ -724,15 +728,81 @@ netstack.
   `Attach` passes the UMEM grant and the ring grant as `CallFlags::FD`
   descriptors (the kernel gives a scheme only the first metadata word of such
   a call), then `Bind` starts the queue with its parameters (frame size, ring
-  sizes, mode, CPU) in a 32-byte payload. `AddFilter`, `RemoveFilter`, `Kick`
-  and `Stats` follow. Every request fits the three metadata words the kernel
-  passes on a plain call.
+  sizes, mode, CPU, and `BindFlags`) in a 32-byte payload. `Own`,
+  `AddFilter`, `RemoveFilter`, `Kick` and `Stats` follow. Every request fits
+  the three metadata words the kernel passes on a plain call.
+- `own`: port ownership and TX validation. `Own` passes a netstack `udp` or
+  `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
+  reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
+  keeps the socket open, so netstack keeps the port reserved; an `Own` of a
+  port the socket already owns keeps no second descriptor. A filter on a
+  TCP or UDP destination port needs that port owned (on the filter's address,
+  when the netstack socket is bound to one). TX validation drops a frame
+  unless it has the NIC's source MAC, no VLAN header (a priority tag counts),
+  and is TCP or UDP from an owned port (and address). Validated TX sends no IP
+  fragments, the first one included, since a fragment's ports cannot be
+  checked without reassembly; `BindFlags::RAW_TX` skips validation and is the
+  supported path for fragments and anything else it does not cover. Dropped frames still
+  come back on Completion and are counted in `Stats::tx_rejected`. The path
+  check guards against mistakes, not a hostile root, since queue sockets are
+  root's and root can serve any scheme. Unprivileged sockets will need the
+  kernel to vouch for the scheme that answered.
 - `ring`: the four rings on `ferric-ring`'s index protocol. `RingLayout`
   places them in the ring grant (one header page of indices and flags, then
   each ring's slots on pages of their own, Fill, RX, TX, Completion), and
   hands each side its producers and consumers. A peer's out-of-range index is
   `ferric-ring`'s `RingError::Corrupt`, and the driver sets `NEED_WAKEUP` before it sleeps on
   an empty Fill or TX ring, so the application only `Kick`s when asked.
+  `CopyQueue::transmit` also leaves `NEED_WAKEUP` set on TX when it stops with
+  entries still there, because its budget ran out or Completion was full: the
+  driver sends only when kicked, so the application must kick again (after
+  reaping Completion) for the rest. Each `transmit` clears the flag first.
+
+- `copy`: one socket in copy mode (`CopyQueue`): up to 16 filters, the copy
+  of a matched received frame into the next Fill frame and onto RX, and the
+  copy of TX frames out of the UMEM for the NIC, handed back on Completion
+  only when it has room, so no frame is lost. Frames that cannot be delivered
+  are dropped and counted in `Stats`. UMEM and ring memory are seen as atomic
+  words, so the application writing them at any time cannot cause undefined
+  behaviour. `write_frame` and `read_frame` are those copies; applications
+  use them for their side too.
+
+In `driver-network` (`src/bypass.rs`), `Attach` maps both grants read-write
+and shared; each must be a read-write grant of whole pages. `Bind` starts the
+socket in copy mode (`Mode::ZeroCopy` fails with `ENOSPC`). While any socket
+is bound, every tick drains the adapter, gives each frame to the first socket
+with a matching filter (`ferric_netq::copy::offer`; `EVENT_READ` is posted
+only when a frame reached the socket's RX ring), and keeps the rest, in
+order, for netstack's reads (up to 256 frames; the oldest is dropped beyond
+that). `Kick` sends up to 256 TX packets through the adapter, after TX
+validation unless the socket was bound with `RAW_TX`. A filter on a port the
+socket does not own fails with `EACCES`, and an `Own` with anything but a
+bound netstack TCP or UDP socket with `EINVAL`. A socket whose rings turn
+out corrupt, or whose grant its owner revokes (checked on every tick and
+call), is stopped, and its calls fail with `EIO`; a socket stopped during a
+pass gets none of that pass's later frames. Closing a socket unmaps its
+grants and closes its netstack sockets. Every queue socket is root's, since
+the scheme root is root-only, so any socket may ask for raw TX.
+
+`ferric-netq-test` (`recipes/tests/ferric-netq-test`, in the CI smoke image)
+is the on-target test. It checks netstack answers an ICMP echo to the
+gateway, attaches a UMEM and a ring region to a queue socket on e1000d, and
+checks the refusals (calls before `Bind`, a zero-copy `Bind`, a second
+`Bind`, an unknown filter, a short `Stats` payload) and that `Mode::Auto`
+runs in copy mode. With an ARP filter it sends an ARP request for the
+gateway through its TX ring and receives the reply on RX, while netstack's
+echo still works beside it; with an ICMP filter it sends its own echo
+request and receives the reply; this socket is bound with `RAW_TX`. A second
+socket, bound without it, owns a UDP port through a netstack socket. Filters
+on unowned ports and an `Own` with a file are refused. It exchanges a DNS
+query with the configured server from that port, and has three spoofed
+frames dropped and counted: a foreign source MAC, an unowned source port,
+and ICMP. A TX benchmark then sends 20,000 60-byte UDP frames through the
+socket and the same number through netstack's UDP socket, and prints both
+rates (`FERRIC_BENCH netq-tx-udp60`; QEMU numbers, for trend only). Last, it
+checks the counters, closes both sockets with requests in flight, and checks
+netstack answers again. It skips when the driver has no queue sockets or
+there is no `kernel.regbuf` scheme.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.
