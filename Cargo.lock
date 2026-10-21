@@ -1441,7 +1441,14 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
+name = "ferric-trace-map"
+version = "0.1.0"
+dependencies = [
+ "ferric-trace",
+ "redox_syscall 0.9.4",
+]
+
+[[package]]
 name = "ferric-vm"
 version = "0.1.0"
 dependencies = [
@@ -1453,13 +1460,6 @@ name = "ferric-vmx"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.17",
-=======
-name = "ferric-trace-map"
-version = "0.1.0"
-dependencies = [
- "ferric-trace",
- "redox_syscall 0.9.4",
->>>>>>> origin/main
 ]
 
 [[package]]
