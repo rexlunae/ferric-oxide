@@ -16,6 +16,7 @@ cargo test --locked -p ferric-regbuf --all-features
 cargo test --locked -p ferric-blkgrant --all-features
 cargo test --locked -p ferric-trace --all-features
 cargo test --locked -p ferric-iommu --all-features
+cargo test --locked -p ferric-wasm-abi --all-features
 ```
 
 The workspace command includes members such as `ferric-hwrand`, installer
