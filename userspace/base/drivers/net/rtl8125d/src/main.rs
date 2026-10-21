@@ -132,10 +132,14 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
                 irq_file
                     .read_exact(&mut irq)
                     .expect("rtl8125d: failed to read interrupt vector");
-                if scheme.adapter_mut().irq() {
-                    irq_file
-                        .write_all(&irq)
-                        .expect("rtl8125d: failed to acknowledge interrupt");
+                // Acknowledge the interrupt either way: the write is what
+                // unmasks the controller's interrupt line, and the device
+                // raises interrupts for events the driver does not handle.
+                let work = scheme.adapter_mut().irq();
+                irq_file
+                    .write_all(&irq)
+                    .expect("rtl8125d: failed to acknowledge interrupt");
+                if work {
                     scheme
                         .tick()
                         .expect("rtl8125d: failed to service received packets");
