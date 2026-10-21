@@ -163,6 +163,9 @@ Join records by `context`; the start supplies the PID that creation did not
 yet have. Create and start records are emitted on the creator or manager's
 CPU, and generic exporters attribute them to that producer; the target
 context is in the arguments. An exit is emitted by the exiting context.
+Ring workers temporarily use the submitter's PID and credentials while
+servicing a chain, then restore their kernel identity before becoming idle
+or exiting. Their lifecycle start and exit both carry PID 0.
 Idle contexts are outside `context::spawn`, and a context dropped before
 starting need not have an exit. Record loss and partial selections also leave
 incomplete lifecycles. Enable all three with:

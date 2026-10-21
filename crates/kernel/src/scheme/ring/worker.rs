@@ -8,7 +8,8 @@
 //! - The worker ([`worker_main`]) takes jobs in order. For each it installs the submitter's
 //!   address space and credentials on itself, so a job's buffers and the requests it sends to
 //!   user schemes are the submitter's, runs the chain by the usual break rules with the files
-//!   `queue` found, removes the address space again, and posts the chain's CQEs. It holds no
+//!   `queue` found, removes the address space again, restores its original PID and
+//!   credentials, and posts the chain's CQEs. It holds no
 //!   descriptor table: a job reaches only the files `queue` resolved, so the worker never keeps
 //!   another process's descriptors open. `queue` refuses rings among them (`EINVAL`), so a job
 //!   never keeps its own ring, or another, from closing.
@@ -333,7 +334,7 @@ fn run_job(job: Job, token: &mut CleanLockToken) -> Completions {
         caller,
         ..
     } = job;
-    set_caller(caller, token);
+    let previous_caller = set_caller(caller, token);
     drop_space(install(Some(space), token), token);
 
     let mut done = Completions::new();
@@ -343,16 +344,23 @@ fn run_job(job: Job, token: &mut CleanLockToken) -> Completions {
 
     let space = install(None, token);
     drop_space(space, token);
+    let _ = set_caller(previous_caller, token);
     done
 }
 
-/// Takes on `caller`'s credentials, which requests to user schemes carry.
-fn set_caller(caller: CallerCtx, token: &mut CleanLockToken) {
+/// Takes on `caller`'s request identity, returning the worker identity to restore after cleanup.
+fn set_caller(caller: CallerCtx, token: &mut CleanLockToken) -> CallerCtx {
     let current = Arc::clone(&*context::current());
     let mut context = current.write(token.token());
+    let previous = CallerCtx {
+        pid: context.pid,
+        uid: context.euid,
+        gid: context.egid,
+    };
     context.euid = caller.uid;
     context.egid = caller.gid;
     context.pid = caller.pid;
+    previous
 }
 
 /// Installs `space` as the worker's address space and returns the one it replaces.

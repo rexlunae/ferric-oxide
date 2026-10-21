@@ -161,6 +161,15 @@ fn command(step: &'static str, text: &str) -> Result<(), Failure> {
         .map_err(io_failure(step, &path))
 }
 
+/// Whether the current namespace lists a scheme (opening absent schemes has varying errnos).
+fn has_scheme(name: &str) -> io::Result<bool> {
+    std::fs::read_dir("/scheme").map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == name)
+    })
+}
+
 /// The CPUs, from the `stats` file.
 fn cpus(step: &'static str) -> Result<Vec<u32>, Failure> {
     read_text(step, abi::STATS_PATH)?
@@ -1097,11 +1106,7 @@ pub fn main() -> ExitCode {
     }
     // The /scheme listing says whether the kernel has the scheme. Opening a missing scheme's
     // file fails with an errno that depends on the namespace manager, so it is no test.
-    let listed = std::fs::read_dir("/scheme").map(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name() == abi::SCHEME_NAME)
-    });
+    let listed = has_scheme(abi::SCHEME_NAME);
     match listed {
         Ok(true) => {}
         Ok(false) => {

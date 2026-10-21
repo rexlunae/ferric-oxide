@@ -1,4 +1,4 @@
-//! Records the kernel contexts of a child process and a thread, including their cleanup.
+//! Records child, thread and ring-worker contexts, including their cleanup.
 
 use std::collections::BTreeSet;
 use std::process::Command;
@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ferric_trace::kernel::{SCHED_CONTEXT_CREATE, SCHED_CONTEXT_EXIT, SCHED_CONTEXT_START};
 
-use super::{Entry, Failure, check, command, drain, io_failure, listing};
+use super::{Entry, Failure, check, command, drain, has_scheme, io_failure, listing};
 
 /// Selects the child that exits immediately without running the tracing suite.
 pub(super) const CHILD_ARG: &str = "lifecycle-child";
@@ -49,7 +49,7 @@ fn exited(trace: &[Vec<Entry>], pid: u32) -> bool {
         })
 }
 
-fn verify(trace: &[Vec<Entry>], pid: u32) -> Result<usize, Failure> {
+fn verify(trace: &[Vec<Entry>], pid: u32, user_mode: u64) -> Result<usize, Failure> {
     let mut count = 0;
     for start in starts(trace, pid) {
         let id = start.arg(1);
@@ -65,7 +65,7 @@ fn verify(trace: &[Vec<Entry>], pid: u32) -> Result<usize, Failure> {
             .ok_or_else(|| check("trace-lifecycle", format!("no exit for {id:?}")))?;
         if create.timestamp > start.timestamp
             || start.timestamp > exit.timestamp
-            || create.arg(1) != Some(1)
+            || create.arg(1) != Some(user_mode)
             || exit.arg(0) != Some(u64::from(pid))
             || exit.args.get(2..) != Some(&[0, 0, 0, 0][..])
         {
@@ -82,7 +82,41 @@ fn verify(trace: &[Vec<Entry>], pid: u32) -> Result<usize, Failure> {
     Ok(count)
 }
 
-/// Checks child and thread lifecycle records and their suppression after live disable.
+/// Runs the existing asynchronous ring tests while continuously collecting worker lifecycles.
+fn worker_probe(cpus: &[u32], trace: &mut Vec<Vec<Entry>>) -> Result<bool, Failure> {
+    let step = "trace-lifecycle";
+    if !has_scheme("kernel.ring").map_err(io_failure(step, "/scheme"))? {
+        return Ok(false);
+    }
+    let mut child = Command::new("/usr/bin/ferric-ring-test")
+        .arg("--async-only")
+        .spawn()
+        .map_err(io_failure(step, "spawn ring worker probe"))?;
+    let limit = Instant::now() + Duration::from_secs(30);
+    loop {
+        trace.extend(drain(step, cpus)?);
+        if let Some(status) = child
+            .try_wait()
+            .map_err(io_failure(step, "poll ring worker probe"))?
+        {
+            if !status.success() {
+                return Err(check(
+                    step,
+                    format!("ring worker probe exited with {status}"),
+                ));
+            }
+            return Ok(true);
+        }
+        if Instant::now() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(check(step, "ring worker probe timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Checks child, thread and worker lifecycles and suppression after live disable.
 ///
 /// # Errors
 ///
@@ -109,21 +143,26 @@ pub(super) fn check_lifecycle(cpus: &[u32]) -> Result<(), Failure> {
         .join()
         .map_err(|_| check(step, "thread panicked"))?;
     let mut trace = Vec::new();
+    let workers = worker_probe(cpus, &mut trace)?;
     let limit = Instant::now() + Duration::from_secs(5);
     loop {
         trace.extend(drain(step, cpus)?);
-        if exited(&trace, child) && exited(&trace, parent) {
+        if exited(&trace, child) && exited(&trace, parent) && (!workers || exited(&trace, 0)) {
             break;
         }
         if Instant::now() >= limit {
-            return Err(check(step, "child or thread cleanup did not finish"));
+            return Err(check(
+                step,
+                "child, thread or worker cleanup did not finish",
+            ));
         }
         std::thread::sleep(Duration::from_millis(1));
     }
     command(step, &format!("disable {EVENTS}"))?;
     trace.extend(drain(step, cpus)?);
-    let child_count = verify(&trace, child)?;
-    let thread_count = verify(&trace, parent)?;
+    let child_count = verify(&trace, child, 1)?;
+    let thread_count = verify(&trace, parent, 1)?;
+    let worker_count = if workers { verify(&trace, 0, 0)? } else { 0 };
     let untraced_child = spawn_child()?;
     let disabled = drain(step, cpus)?;
     if disabled.iter().flatten().any(|e| {
@@ -134,7 +173,7 @@ pub(super) fn check_lifecycle(cpus: &[u32]) -> Result<(), Failure> {
         return Err(check(step, "context lifecycle records after disable"));
     }
     println!(
-        "FERRIC_TEST_PASS trace-lifecycle ({child_count} child contexts, {thread_count} thread contexts, ordered create/start/exit and disable)"
+        "FERRIC_TEST_PASS trace-lifecycle ({child_count} child contexts, {thread_count} thread contexts, {worker_count} kernel workers, ordered create/start/exit and disable)"
     );
     Ok(())
 }

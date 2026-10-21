@@ -19,3 +19,6 @@ script = """
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
 cookbook_cargo
 """
+
+[package]
+dependencies = ["ferric-ring-test"]

@@ -651,7 +651,10 @@ aside room in the CQ for its completions, looks up the files it names
 (refusing rings with `EINVAL`, since a chain holding its ring would keep the
 ring from closing), and returns without waiting; the worker runs asynchronous chains in order, with
 the submitter's address space and credentials, and posts each chain's CQEs
-together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+together, then triggers `EVENT_READ`. After each chain and address-space cleanup,
+the worker restores its original PID and credentials before becoming idle
+or exiting; its lifecycle start and exit therefore both identify a kernel
+worker (PID 0). `Request::Enter { to_submit,
 min_complete }` waits after submitting until the CQ holds `min_complete`
 completions or nothing submitted is still running, on the worker or in
 another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
