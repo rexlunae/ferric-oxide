@@ -56,6 +56,9 @@ const fn subsystem_compiled(subsystem: Subsystem) -> bool {
     (matches!(subsystem, Subsystem::Syscall) && cfg!(feature = "trace_syscall"))
         || (matches!(subsystem, Subsystem::Sched) && cfg!(feature = "trace_sched"))
         || (matches!(subsystem, Subsystem::Scheme) && cfg!(feature = "trace_scheme"))
+        || (matches!(subsystem, Subsystem::Mm) && cfg!(feature = "trace_mm"))
+        || (matches!(subsystem, Subsystem::Irq) && cfg!(feature = "trace_irq"))
+        || (matches!(subsystem, Subsystem::Iommu) && cfg!(feature = "trace_iommu"))
 }
 
 /// Whether `event`'s tracepoints are compiled in: its subsystem is, and its level is within

@@ -11,9 +11,12 @@ description = "DMA domain test driver for Ferric Oxide"
 # The ABI crates are path dependencies from files/; the cookbook builds a copy of files/ in
 # this recipe's source/, at the same depth, so the relative paths hold there too.
 [dependencies]
+ferric-amdvi = { path = "../../../../crates/amdvi" }
 ferric-iommu = { path = "../../../../crates/iommu" }
 ferric-irq = { path = "../../../../crates/irq" }
 ferric-regbuf = { path = "../../../../crates/regbuf" }
+ferric-trace = { path = "../../../../crates/trace" }
+ferric-vtd = { path = "../../../../crates/vtd" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libc = "0.2"

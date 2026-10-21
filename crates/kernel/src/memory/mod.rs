@@ -1455,6 +1455,51 @@ pub fn page_fault_handler(
     code: GenericPfFlags,
     faulting_address: VirtualAddress,
 ) -> Result<(), Segv> {
+    // Ferric Oxide (`kernel.trace_mm`): what `mm.page_fault` records, taken before the handler
+    // consumes `code` and a usercopy recovery moves the instruction pointer.
+    #[cfg(feature = "trace")]
+    let (ip, flags) = (stack.ip(), trace_fault_flags(&code));
+    let handled = handle_page_fault(stack, code, faulting_address);
+    trace_event!(
+        ferric_trace::kernel::MM_PAGE_FAULT,
+        faulting_address.data(),
+        ip,
+        flags.raw(),
+        match handled {
+            Ok(Handled::Mapped) => ferric_trace::kernel::PageFaultOutcome::Mapped,
+            Ok(Handled::CopyFailed) => ferric_trace::kernel::PageFaultOutcome::CopyFailed,
+            Err(Segv) => ferric_trace::kernel::PageFaultOutcome::Unhandled,
+        }
+        .raw(),
+    );
+    handled.map(|_| ())
+}
+
+/// Ferric Oxide: how [`handle_page_fault`] dealt with a fault it could handle.
+enum Handled {
+    /// The page tables were corrected; the access is retried.
+    Mapped,
+    /// A kernel copy to or from user memory faulted; the copy returns `EFAULT`.
+    CopyFailed,
+}
+
+/// Ferric Oxide: `code` as `mm.page_fault`'s flags.
+#[cfg(feature = "trace")]
+fn trace_fault_flags(code: &GenericPfFlags) -> ferric_trace::kernel::PageFaultFlags {
+    use ferric_trace::kernel::PageFaultFlags as F;
+    F::empty()
+        .with(F::PRESENT, code.contains(GenericPfFlags::PRESENT))
+        .with(F::WRITE, code.contains(GenericPfFlags::INVOLVED_WRITE))
+        .with(F::USER, code.contains(GenericPfFlags::USER_NOT_SUPERVISOR))
+        .with(F::INSTRUCTION, code.contains(GenericPfFlags::INSTR_NOT_DATA))
+        .with(F::RESERVED, code.contains(GenericPfFlags::INVL))
+}
+
+fn handle_page_fault(
+    stack: &mut impl ArchIntCtx,
+    code: GenericPfFlags,
+    faulting_address: VirtualAddress,
+) -> Result<Handled, Segv> {
     let faulting_page = Page::containing_address(faulting_address);
 
     let usercopy_region = __usercopy_start()..__usercopy_end();
@@ -1487,7 +1532,7 @@ pub fn page_fault_handler(
     if address_is_user && (caused_by_user || is_usercopy) {
         let mut token = unsafe { CleanLockToken::new() };
         match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(Handled::Mapped),
             Err(PfError::Oom) => todo!("oom"),
             Err(PfError::Segv | PfError::RecursionLimitExceeded) => (),
             Err(PfError::NonfatalInternalError) => todo!(),
@@ -1496,7 +1541,7 @@ pub fn page_fault_handler(
 
     if address_is_user && caused_by_kernel && mode != AccessMode::InstrFetch && is_usercopy {
         stack.recover_and_efault();
-        return Ok(());
+        return Ok(Handled::CopyFailed);
     }
 
     Err(Segv)
