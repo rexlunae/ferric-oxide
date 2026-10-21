@@ -702,7 +702,7 @@ default = true
 depends = "kernel.trace"
 kernel_feature = "trace_sched"
 rebuild = ["kernel"]
-help = "Compile in sched.switch (previous and next process and context) at every context switch."
+help = "Compile in sched.switch (previous and next process and context), sched.futex_wait, sched.futex_resume and sched.futex_wake (queued waits, their results and wake counts)."
 
 [[option]]
 id = "kernel.trace_scheme"

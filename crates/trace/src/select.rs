@@ -187,7 +187,13 @@ mod tests {
         assert_eq!(ids("all").len(), CATALOG.len());
         assert_eq!(
             ids("syscall.exit sched\tsyscall.exit"),
-            [SYSCALL_EXIT.id(), SCHED_SWITCH.id()]
+            [
+                SYSCALL_EXIT.id(),
+                SCHED_SWITCH.id(),
+                crate::kernel::SCHED_FUTEX_WAIT.id(),
+                crate::kernel::SCHED_FUTEX_RESUME.id(),
+                crate::kernel::SCHED_FUTEX_WAKE.id(),
+            ]
         );
     }
 

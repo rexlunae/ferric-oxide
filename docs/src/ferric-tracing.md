@@ -17,7 +17,7 @@ what is on at run time.
 | --- | --- | --- |
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
-| `kernel.trace_sched` | `true` | Compiles in `sched.switch` |
+| `kernel.trace_sched` | `true` | Compiles in `sched.switch` and `sched.futex_wait`/`futex_resume`/`futex_wake` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_mm` | `true` | Compiles in `mm.page_fault` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
@@ -126,6 +126,46 @@ The events are:
 | `irq.deliver` | `irq`, `cpu`, `source`, `count`, `handles` |
 | `irq.ack` | `irq`, `cpu`, `count` |
 | `iommu.fault` | `unit`, `format`, `lo`, `hi`, `count` |
+| `sched.futex_wait` | `key`, `addr`, `context`, `bits`, `expected`, `timed` |
+| `sched.futex_resume` | `key`, `addr`, `context`, `ret` |
+| `sched.futex_wake` | `key`, `addr`, `requested`, `woken` |
+
+The futex events cover the kernel's queued waits and wake calls
+(`crates/kernel/src/syscall/futex.rs`). Enable them together, without other
+scheduler events, with:
+
+```text
+enable sched.futex_wait sched.futex_resume sched.futex_wake
+```
+
+- `sched.futex_wait` is recorded after a successful comparison and queue
+  insertion, while the queue lock still excludes a racing wake. A mismatch,
+  invalid argument or pending signal that prevents insertion has no wait or
+  resume record. `bits` is 32 or 64, `expected` is the compared value at that
+  width, and `timed` is 1 when a timeout was supplied, otherwise 0.
+- `sched.futex_resume` is recorded after the queued caller runs again and
+  removes any remaining queue entry. `ret` is the actual syscall result:
+  0 for a wake, or `-ETIMEDOUT`/`-EINTR`. The timestamp includes scheduling
+  delay after the wake. A context terminated before returning has no resume.
+- `sched.futex_wake` records valid wake calls, including a request to wake
+  zero and a call that finds no waiters. `requested` is the requested count;
+  `woken` is the count returned by the syscall. That counts live queue entries
+  processed, which can include a context already made runnable by a timeout
+  or signal before its queue cleanup. The wake is recorded before releasing
+  the queue lock, so a waiter processed by this call cannot record its resume
+  first on another CPU.
+
+`key` is the physical byte address used by the futex table, so callers mapping
+the same word at different virtual addresses share a key; `addr` is each
+caller's virtual address. `context` is the waiter's context debug id, also
+used by `sched.switch`. Match a wait with the next resume having the same
+key and context, even on a different CPU. Physical keys may be reused after
+memory is freed; a wake count alone does not identify which waiters resumed.
+Lost records or enabling only one event can leave unmatched waits or resumes.
+The text, Perfetto and OTLP exporters retain these as individual events with
+their arguments; they do not construct a futex duration or a per-waiter wake
+edge automatically. Trace access is capability-gated because these records,
+like other tracepoints, expose addresses.
 
 The scheme events cover requests to user-space schemes
 (`crates/kernel/src/scheme/user.rs`).
@@ -161,7 +201,7 @@ with RedoxFS as `caller`, before it answers as `responder`.
 These events do not cover one-way messages (`close`, `detach`) or the kernel's
 own mmap requests.
 
-The codes in the last four events have one definition, next to the events in
+The codes in the memory, IRQ and IOMMU events have one definition, next to the events in
 `crates/trace/src/kernel.rs`, which the kernel encodes with and decoders read.
 
 - `mm.page_fault` is recorded once per page fault, when the handler

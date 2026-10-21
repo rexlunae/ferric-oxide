@@ -11,8 +11,8 @@ use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::clock::ClockLine;
 use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
-    CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
-    SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
+    CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH, SCHEME_CANCEL,
+    SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
 use ferric_trace::record::Records;
 use ferric_trace::ring::View;
@@ -23,6 +23,7 @@ use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRI
 
 mod cap;
 mod crash;
+mod futex;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -886,6 +887,7 @@ fn run() -> Result<(), Failure> {
     println!("FERRIC_TEST_PASS trace-mmap");
 
     check_fault(&cpus)?;
+    futex::check_futex(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
     cap::check_cap()
