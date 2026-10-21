@@ -1410,6 +1410,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-svm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-trace"
 version = "0.1.0"
 dependencies = [
@@ -1443,6 +1450,20 @@ version = "0.1.0"
 dependencies = [
  "ferric-trace",
  "redox_syscall 0.9.4",
+]
+
+[[package]]
+name = "ferric-vm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ferric-vmx"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
 ]
 
 [[package]]

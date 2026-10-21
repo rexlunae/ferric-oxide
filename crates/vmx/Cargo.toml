@@ -1,0 +1,9 @@
+[package]
+name = "ferric-vmx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Intel VMX encodings for the Ferric Oxide hypervisor: VMCS fields, control computation from capability MSRs, exit decoding, EPT entries and guest-state checks"
+
+[dependencies]
+thiserror.workspace = true
