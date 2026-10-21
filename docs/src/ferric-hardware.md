@@ -4,7 +4,10 @@ This chapter maps the current development machine to the drivers in this
 repository. It is an inventory and a work plan, not a compatibility report:
 the machine has not yet booted a Ferric Oxide image, so an entry saying a
 driver binds describes the matching configuration, not a successful probe.
-The status of each device still has to be confirmed from a boot log.
+The status of each device still has to be confirmed from a boot log. The image
+itself does boot under QEMU with emulated versions of the machine's devices,
+which is described under [Booting the image in QEMU](#booting-the-image-in-qemu);
+that is a check of the image, not of the hardware.
 
 The inventory was taken from Linux on 2026-10-19 with `lspci -nn` and
 `dmidecode`. Update this page when a driver is added, a binding changes, or a
@@ -57,7 +60,7 @@ since there is no PS/2 port to fall back to.
 
 | Device | ID | Driver and match | Status | Notes |
 | --- | --- | --- | --- | --- |
-| Realtek RTL8125 2.5GbE | `10ec:8125` rev 05 | `rtl8125d`, ID `10ec:8125` | binds | New driver for the RTL8125B. It compiles for `x86_64-unknown-redox` but has not been booted on the machine; QEMU does not emulate this controller. |
+| Realtek RTL8125 2.5GbE | `10ec:8125` rev 05 | `rtl8125d`, ID `10ec:8125` | binds | New driver for the RTL8125B. It compiles for `x86_64-unknown-redox` and its register map was checked against the real card, but it has not run on it; QEMU does not emulate this controller. |
 | Realtek RTL8922AE Wi-Fi 7 | `10ec:8922` | none | missing | Also supplies Bluetooth on this board. This is a Phase 5 effort and needs a firmware strategy and a native-versus-compatibility-layer decision. |
 
 Ethernet is the highest-impact gap for a usable machine: without it the test
@@ -97,6 +100,28 @@ valid MAC address, and link-up after the PHY completes auto-negotiation. The
 first bare-metal boot is also the first test of the DMA mapping and interrupt
 path; until that log exists, the device-map entry means "the configuration
 matches", not "the driver works".
+
+### What the real card says
+
+The card in the machine can be read from the host, because the Linux `r8169`
+driver can dump its registers (`ethtool -d enp9s0`). The dump confirms the
+assumptions the driver is built on:
+
+| Register | Value on the machine | What the driver expects |
+| --- | --- | --- |
+| `0x0040` (TXCFG) | `0x6710_0F00` | `0x6710_0F00 & 0xFCF0_0000 = 0x6410_0000`, the RTL8125B |
+| `0x006C` (PHY status) | `0x7080_0483` | bit 0 full duplex, bit 1 link up, bit 10 2.5 Gb/s |
+| `0x0037` (command) | `0x0C` | transmit and receive enabled |
+| `0x0053` (config 2) | `0xBC` | bit 5 set, the RTL8125 config bit, and bit 7, the ASPM lock |
+| `0x0054` (config 3) | `0x60` | bit 4 clear, wake-on-LAN off |
+| `0x0056` (config 5) | `0x03` | bit 0 set, the ASPM lock, and the wake-on-LAN bits clear |
+| `0x0000` (station address) | `9c:6b:00:dd:f4:59` | the same address the host uses |
+
+The version bits in the transmit configuration register survive the host
+driver's writes, so the identification the driver performs at start-up does not
+depend on the card being untouched. The register dump is a snapshot of a card
+that the host's driver owns, so it confirms the register map and the status
+bits, not the driver's own sequence.
 
 ### Audio
 
@@ -167,12 +192,54 @@ on 2026-10-19 initialized all of them, registered `audiohw` for the first and
 collision and fallback path, not the analog-versus-digital classification of
 the physical codecs.
 
+### Booting the image in QEMU
+
+The image boots under QEMU with a device set that mirrors the machine, so the
+image and the drivers in it can be checked before the machine is touched:
+
+```sh
+qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -smp 4 -m 4096 \
+    -bios /usr/share/ovmf/OVMF.fd \
+    -device amd-iommu,intremap=off,dma-remap=on \
+    -drive file=harddrive.img,format=raw,if=none,id=drv0 \
+    -device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0 \
+    -netdev user,id=net0 -device e1000,netdev=net0,addr=5.0 \
+    -device qemu-xhci,id=xhci0,addr=6.0 \
+    -device qemu-xhci,id=xhci1,addr=7.0 \
+    -device qemu-xhci,id=xhci2,addr=8.0 \
+    -device usb-kbd,bus=xhci0.0 \
+    -device ich9-intel-hda,id=hda0 -device hda-output,bus=hda0.0 \
+    -device ich9-intel-hda,id=hda1 -device hda-output,bus=hda1.0 \
+    -device ich9-intel-hda,id=hda2 -device hda-output,bus=hda2.0 \
+    -nographic -vga none -serial mon:stdio
+```
+
+That is the machine's NVMe disk, its three USB 3 controllers, its three audio
+controllers and its AMD-Vi IOMMU, with QEMU's `e1000` standing in for the
+network card, because QEMU has no RTL8125 model. The Ferric Oxide kernel has
+no VFIO support, so the real card cannot be passed through to the guest
+either; the RTL8125B only runs on the machine itself.
+
+A boot of the image this way on 2026-10-20 brought up the kernel on the
+machine's own CPU (an AMD Ryzen 9 9950X under KVM, with the x86-64-v3 feature
+set the image asks for), enumerated the NVMe disk as
+`disk.pci-0000-00-04.0-nvme`, registered the three xHCI controllers as
+`usb.pci-0000-00-06.0_xhci` and its two siblings with a USB keyboard attached
+to the first, registered `audiohw` for the first HDA controller and
+`audiohw.pci-0000-00-03.0`/`audiohw.pci-0000-00-09.0` for the other two, and
+brought up the emulated network card as `network.pci-0000-00-05.0_e1000`. The
+image's own check reported `FERRIC_HARDWARE_PASS audio-scheme`. The RTL8125B
+driver was in the image but had no device to bind to, which is the expected
+result.
+
 ## Bring-up order
 
 1. **Boot the test image on the machine.** Write it to a spare disk or USB
    device, boot it through UEFI, and capture the serial or screen log. Confirm
    the CPU feature check, the GOP framebuffer, NVMe enumeration, xHCI, USB
-   input and the audio controller before changing more drivers.
+   input and the audio controller before changing more drivers. The image has
+   booted under QEMU with emulated versions of these devices; the machine
+   itself is the first run on real hardware.
 2. **Validate RTL8125 Ethernet.** `rtl8125d` is in the tree but has only
    compiled, not run. Boot the hardware image and confirm that the driver finds
    the RTL8125B, reads a valid MAC address, accepts both firmware patch
