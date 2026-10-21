@@ -672,28 +672,161 @@ table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
 blocked, the refusals, back-pressure and a corrupt tail, and prints ring
 versus system call timings, by descriptor, by slot and on the worker.
 
-## Page cache (prepared)
+## Page cache (read path)
 
-`ferric-pcache` holds the interface and the policies of a planned kernel page
-cache, kept in a host-tested crate before any kernel code uses them. Nothing in
-the kernel or the image uses it yet: there is no `kernel.pcache` scheme, and
-file systems still serve every read through their own scheme.
+With `kernel.page_cache = true` in `ferric.toml` (Kernel menu, off by
+default), the kernel has a `kernel.pcache` scheme that caches file contents in
+kernel memory and serves `read` and `pread` from it, without a round trip to
+the file system once the pages are there (roadmap Phase 2.6, design in
+`io/pagecache-design.md` in the project files). This step is the read path:
+RedoxFS serves the files its clients open read-only from it, and writes stay
+with RedoxFS, which drops the pages they change. Mappings, cached writes,
+writeback and reclaim are later steps, so an object keeps every page it was
+given until it closes. Without the option the kernel has no such scheme and
+every read goes to the file system, as upstream.
+
+How a file system uses it:
+
+1. It opens `/scheme/kernel.pcache/queue` (root only) and binds the queue to
+   its own scheme with `Bind`, passing its scheme socket as a `CallFlags::FD`
+   descriptor. The queue then serves only that scheme's descriptions. Only the
+   process that opened the queue can use it or its objects, binding included:
+   calls from any other process, including a child that inherited the
+   descriptors, get `EPERM`. The process is its pid as the process manager
+   sets it on every thread, so all of its threads may call, before and after
+   it `exec`s.
+2. It opens `object/<hex id>` from the queue for each file it caches (an empty
+   object, `EEXIST` if the ID is in use), sets its size with `SetSize`, and
+   attaches each client description it opens with `Attach`, naming the handle
+   number its scheme gave the description.
+3. A positioned `read` or `pread` of an attached description is served from
+   the object. Pages that are there are copied to the reader. Absent ones
+   become 32-byte `Fill` records on the queue, with readahead past them (a
+   window that starts at 4 pages and doubles on sequential reads, up to the
+   queue's `SetReadaheadMax`, 32 pages by default); the reader waits.
+4. The file system reads records from the queue (`fevent` reports
+   `EVENT_READ` while there are some) and answers each with `Filled` on the
+   object: the pages' bytes as the payload, zero past the end of the file,
+   which the kernel copies into new frames. A failed answer carries a non-zero
+   errno and an empty payload; the readers waiting for those pages get `EIO`,
+   and the next read fills them again. A reader that was already waiting when
+   the fill failed gets `EIO` even if a newer read has queued a new fill
+   for the page by the time it wakes. Every record carries the
+   object's 64-bit generation, which is new each time an object is opened and
+   never repeats on a queue, and its answer must repeat it. Each fill record
+   also carries a fill ID, numbered from 1 up on each object and never reused
+   (an object that has used all 2^64 refuses reads that need a fill with
+   `EOVERFLOW`),
+   which the answer repeats too; each page being filled remembers the fill it
+   waits for, and an answer acts only on the pages its fill still owns. An
+   answer to a fill that owns none of its pages any more (it failed, was
+   answered or was invalidated, and the pages may be filling again for a newer
+   fill), or to a record of an earlier object with the same ID, is stale: the
+   call returns 0 and changes nothing, however malformed the answer, so a late
+   answer never fails a newer fill or the queue. Any other answer returns how
+   many of its pages it acted on. A queue read
+   that faults copying records out puts back those of objects still open and
+   reports `EVENT_READ` again.
+5. Shrinking an object with `SetSize` drops the cached pages past the new end,
+   including the page the end now falls in, so a later read fills it again
+   with zeros past the end. A reader keeps the outcome of each fill it waits
+   for, so a failure reaches it whatever happens to the pages meanwhile, and
+   the cache keeps nothing for a failed page.
+6. When the file system changes a file's bytes itself (it served a write or a
+   truncation), it calls `Invalidate` on the object with the pages that
+   changed, then `SetSize`, before it replies. The cached copies are dropped;
+   a fill in flight over them is stale, so its answer is not taken and its
+   readers fill again. A read after a write therefore sees the new bytes.
+7. Closing a description detaches it. Closing an object or its queue ends the
+   cache of it: outstanding fills fail with `EIO`, its records still on the
+   queue are dropped, and later reads of its
+   descriptions go to the file system's scheme as before.
+
+Every call fits the three metadata words the kernel passes a kernel scheme.
+`ferric-pcache` (`crates/pcache`) is the one definition of the interface and
+holds the policies, host-tested:
 
 - `abi`: the scheme's paths, the `SYS_CALL` requests on queues and objects,
-  and the 32-byte records the kernel would put on a file system's fill queue.
-  A fill or writeback record names 1 to `MAX_RECORD_PAGES` (1024) pages, which
-  `RecordPages` enforces; longer runs are split into several records. A failed
-  answer carries a non-zero errno, since errno 0 means done.
+  and the fill-queue records. A record names 1 to `MAX_RECORD_PAGES` (1024)
+  pages, which `RecordPages` enforces; longer runs are split. An answer is
+  `[verb | count << 16 | errno << 32, first page, generation]` on the object
+  the record named.
 - `page`: the state of one cached page and the transitions fills, writes,
   writeback and truncation make.
-- `readahead`: a per-description window that starts small and doubles on
-  sequential reads, up to a maximum that fits one record.
+- `object` (with the `alloc` feature): one object's page index, which turns a
+  read into fills to queue or wait for and applies the file system's answers.
+- `readahead`: the per-description window.
 - `clock` and `rmap` (with the `alloc` feature): two-list CLOCK replacement
   for reclaim, and the reverse map from a file page to the mappings that show
-  it.
+  it, for the later steps.
+- `client` (with the `client` feature, on Redox): the file system's side, the
+  queue and object calls with typed errors, and `spawn_pump`, a thread that
+  waits on the queue and hands each batch of records to the file system.
+- `pump`: what that thread does with a batch it cannot hand on. Taking a
+  record off the queue is final, so it answers every fill in the batch as
+  failed with `EIO` (the readers get `EIO` and the next read fills again); if
+  even that fails, it closes the queue, which fails every fill left. The
+  thread retries a queue read a signal interrupts (`EINTR`), and closes the
+  queue whenever it stops, so a queue is never left with nobody reading it.
+  An answer to a fill that has ended, including the pump's late failure of a
+  fill of an object RedoxFS has since reopened, is stale: the kernel ignores
+  it and returns 0 (`client::Answered::Stale`), so it closes nothing.
+
+RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
+mounts and the kernel has the scheme. Each regular file with a description
+opened `O_RDONLY` gets an object (the node ID is the object ID), and those
+descriptions are attached; writers, directories, `mmap` and `fstat` stay with
+RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
+description it makes from the scheme socket, since RedoxFS runs in the null
+namespace once mounted and cannot open its own path) as a
+call, so the main loop answers them in order with the writes it serves,
+reading the pages the way a `read` does (after decompression and decryption,
+and from a mapped buffer when there is one). Writes, appends, `ftruncate` and
+`O_TRUNC` invalidate the pages they change; an append invalidates from the old
+end, not from its descriptor's offset. A file with a shared writable mapping
+is not cached while the mapping lasts, because RedoxFS writes those mappings
+back on `fsync` and `munmap` without a write call. Each of RedoxFS's mapped
+ranges counts its shared writable mappings (the kernel says on `munmap` which
+kind went), and the page cache keeps their total per file, updated on every
+`mmap` and `munmap` whatever happens to the descriptors or to read-only
+mappings beside them; the first closes the file's object, which drops its
+pages, and once the count is back to 0 new read-only descriptions are cached
+again. A private mapping never changes RedoxFS's buffer (the kernel copies a
+page on its first store), so RedoxFS no longer writes it back, nor ranges
+nothing maps any more, whose retained buffers can be older than later writes.
 
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
-`alloc`.
+`alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
+the option on: it serves a small file system scheme of its own and checks a
+miss, a hit with no scheme read, readahead, a failed fill, a done answer it
+cannot take (which fails the fill rather than leave its reader waiting), records put back
+after a faulting queue read, the owner check, invalidation (with a stale fill
+answered with the wrong bytes), generations across a reopened object, and a
+closed queue, and prints the time of a cached 4 KiB `pread` next to the same
+read through the scheme. Then,
+on RedoxFS, it checks that a read-only description sees writes, a write past
+the end, truncations and an append made through another one (the append
+leaving the pages before it cached), that a shared writable mapping keeps the
+file out of the cache exactly while it lasts, even after its descriptor closes
+or beside a read-only mapping, and a private one changes neither the file nor
+its caching (the
+access time shows whether a read was served from the cache: RedoxFS moves it
+when it reads a file, the cache does not), and benchmarks warm 4 KiB
+`pread`s and 1 MiB sequential reads of one file through a read-only
+description (cached) against a read-write one (served by RedoxFS, as with the
+option off) in the same boot, with the paired A/B rule of
+`ferric_blkqueue::ab`; it fails if the cache is slower.
+
+The kernel fix this test turned up is not specific to the page cache. When a
+request is sent to a user scheme, the caller switches straight to the context
+that created the scheme, so the handler can answer without a trip through the
+scheduler. The test creates its scheme on its main thread, serves it from
+another thread, and opens the file from the main thread. The caller was then
+switching to itself. `direct_switch_to` returns at once in that case, so the
+caller spun in `UserInner::call_inner` without ever blocking. Its CPU never
+ran the serving thread, and no other CPU stole it, because work stealing does
+not take a lone context. The caller now direct-switches only when the handler
+context is a different context.
 
 ## Kernel-bypass network queues
 

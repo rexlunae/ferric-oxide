@@ -19,8 +19,8 @@ use syscall::error::{
     ENOTEMPTY, EOPNOTSUPP, EPERM, EXDEV,
 };
 use syscall::flag::{
-    EventFlags, MapFlags, StdFsCallKind, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
-    O_RDONLY, O_RDWR, O_STAT, O_SYMLINK, O_TRUNC, O_WRONLY,
+    EventFlags, MapFlags, StdFsCallKind, F_GETFL, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY,
+    O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_STAT, O_SYMLINK, O_TRUNC, O_WRONLY,
 };
 use syscall::schemev2::NewFdFlags;
 use syscall::FobtainFdFlags;
@@ -98,15 +98,31 @@ pub struct FileScheme<'sock, D: Disk> {
     other_scheme_fd_map: BTreeMap<u32, Fd>,
 
     proc_creds_capability: Fd,
+
+    // Ferric Oxide: the kernel's page cache, when it has one (see `pcache`).
+    pcache: Option<super::pcache::PageCache>,
 }
 
 impl<'sock, D: Disk> FileScheme<'sock, D> {
+    /// Ferric Oxide: tells the page cache how many writable mapped ranges of `node_ptr`
+    /// RedoxFS writes back now, after a mapping changed.
+    fn mappings_changed(&mut self, node_ptr: TreePtr<Node>) {
+        if let Some(pcache) = &mut self.pcache {
+            let writable = self
+                .fmap
+                .get(&node_ptr.id())
+                .map_or(0, |info| info.writable_mappings());
+            pcache.mappings_changed(node_ptr, writable);
+        }
+    }
+
     pub fn new(
         scheme_name: String,
         mounted_path: String,
         fs: FileSystem<D>,
         socket: &'sock Socket,
     ) -> Result<FileScheme<'sock, D>> {
+        let pcache = super::pcache::PageCache::start(socket);
         Ok(FileScheme {
             scheme_name: RedoxScheme::new(scheme_name)
                 .expect("scheme name for FileScheme is not valid"),
@@ -124,6 +140,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                     0,
                 )?
             },
+            pcache,
         })
     }
 
@@ -354,6 +371,9 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                         self.fs.tx(|tx| {
                             tx.truncate_node(node_ptr, 0, mtime.as_secs(), mtime.subsec_nanos())
                         })?;
+                        if let Some(pcache) = &mut self.pcache {
+                            pcache.changed(&mut self.fs, node_ptr, node.data().size(), 0, 0);
+                        }
                     }
 
                     Handle::ResourceFile((
@@ -441,6 +461,13 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.handles.insert(id, handle);
+
+        // Ferric Oxide: the kernel serves reads of files opened read-only from its page cache.
+        if let Some(pcache) = &mut self.pcache {
+            if flags & O_ACCMODE == O_RDONLY && flags & (O_STAT | O_SYMLINK) == 0 {
+                pcache.attach(&mut self.fs, id, node_ptr);
+            }
+        }
 
         Ok(OpenResult::ThisScheme {
             number: id,
@@ -774,7 +801,26 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     ) -> Result<usize> {
         // println!("Write {}, {:X} {}", id, buf.as_ptr() as usize, buf.len());
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
-        self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx))
+        // Ferric Oxide: drop the pages the write changes from the page cache before replying.
+        let node_ptr = file.node_ptr();
+        let pcache = self.pcache.as_mut();
+        let before = pcache
+            .as_ref()
+            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let written = self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx));
+        if let (Some(pcache), Some(before)) = (pcache, before) {
+            // An append writes at the old end, whatever offset it was given.
+            let start = if file.fcntl(F_GETFL, 0).is_ok_and(|fl| fl & O_APPEND != 0) {
+                before
+            } else {
+                offset
+            };
+            // A failed write may still have changed some of the bytes.
+            let len = written.as_ref().map_or(buf.len(), |&n| n);
+            let end = start.saturating_add(len as u64);
+            pcache.changed(&mut self.fs, node_ptr, before, start, end);
+        }
+        written
     }
 
     fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> Result<u64> {
@@ -917,7 +963,17 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     fn ftruncate(&mut self, id: usize, len: u64, _ctx: &CallerCtx) -> Result<()> {
         // println!("Ftruncate {}, {}", id, len);
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
-        self.fs.tx(|tx| file.truncate(len, tx))
+        let node_ptr = file.node_ptr();
+        let pcache = self.pcache.as_mut();
+        let before = pcache
+            .as_ref()
+            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let truncated = self.fs.tx(|tx| file.truncate(len, tx));
+        // Ferric Oxide: drop the pages between the old and the new end from the page cache.
+        if let (Some(pcache), Some(before)) = (pcache, before) {
+            pcache.changed(&mut self.fs, node_ptr, before, len, len);
+        }
+        truncated
     }
 
     fn futimens(&mut self, id: usize, times: &[TimeSpec], _ctx: &CallerCtx) -> Result<()> {
@@ -947,20 +1003,32 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
-        self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx))
+        let node_ptr = file.node_ptr();
+        let mapped = self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx));
+        // Ferric Oxide: a shared writable mapping ends the file's page caching while it lasts.
+        self.mappings_changed(node_ptr);
+        mapped
     }
     fn munmap(
         &mut self,
         id: usize,
         offset: u64,
         size: usize,
-        _flags: MunmapFlags,
+        flags: MunmapFlags,
         _ctx: &CallerCtx,
     ) -> Result<()> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let fmaps = &mut self.fmap;
 
-        self.fs.tx(|tx| file.funmap(fmaps, offset, size, tx))
+        let node_ptr = file.node_ptr();
+        // Ferric Oxide: the kernel sets NEEDS_SYNC for a shared writable mapping.
+        let writes_back = flags.contains(MunmapFlags::NEEDS_SYNC);
+        let unmapped = self
+            .fs
+            .tx(|tx| file.funmap(fmaps, offset, size, writes_back, tx));
+        // Ferric Oxide: the file may be cached again once its last shared writable mapping goes.
+        self.mappings_changed(node_ptr);
+        unmapped
     }
 
     fn on_close(&mut self, id: usize) {
@@ -968,6 +1036,9 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         let Some(file) = self.handles.remove(&id) else {
             return;
         };
+        if let Some(pcache) = &mut self.pcache {
+            pcache.closed(id);
+        }
         let Ok(resource) = file.resource() else {
             return;
         };
@@ -1099,8 +1170,22 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         id: usize,
         payload: &mut [u8],
         metadata: &[u64],
-        _ctx: &CallerCtx,
+        ctx: &CallerCtx,
     ) -> Result<usize> {
+        // Ferric Oxide: fill records the page cache's pump thread forwards from the kernel,
+        // through the one description numbered `PUMP_HANDLE`, which only RedoxFS's socket
+        // can make. They cannot put bytes in the cache that are not the file's anyway, since
+        // RedoxFS reads the pages itself and the kernel takes an answer only for pages it is
+        // filling.
+        if metadata.first() == Some(&ferric_pcache::client::FORWARDED_RECORDS) {
+            if id != super::pcache::PUMP_HANDLE || ctx.uid != 0 {
+                return Err(Error::new(EPERM));
+            }
+            if let Some(pcache) = &mut self.pcache {
+                pcache.fill(&mut self.fs, &mut self.fmap, payload);
+            }
+            return Ok(0);
+        }
         let Some(verb) = FsCall::try_from_raw(metadata[0] as usize) else {
             return Err(Error::new(EINVAL));
         };

@@ -20,6 +20,7 @@ version = "0.0.0"
 dependencies = [
  "arrayvec",
  "ferric-iommu",
+ "ferric-pcache",
  "ferric-regbuf",
  "ferric-ring",
  "ferric-trace",
@@ -38,6 +39,10 @@ dependencies = [
 
 [[package]]
 name = "ferric-iommu"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-pcache"
 version = "0.1.0"
 
 [[package]]

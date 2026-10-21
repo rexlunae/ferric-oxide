@@ -29,6 +29,8 @@ ferric-regbuf = { path = "../../../crates/regbuf" }
 ferric-trace = { path = "../../../crates/trace", features = ["config"] }
 # Ferric Oxide: the kernel ring scheme's number and name.
 ferric-ring = { path = "../../../crates/ring" }
+# Ferric Oxide: the kernel page cache scheme's number and name.
+ferric-pcache = { path = "../../../crates/pcache" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 redox-rt = { path = "../../../crates/relibc/redox-rt", default-features = false } # Ferric Oxide: in-tree relibc subtree

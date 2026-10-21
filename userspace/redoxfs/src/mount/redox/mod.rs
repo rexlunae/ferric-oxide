@@ -10,6 +10,7 @@ use crate::{Disk, FileSystem, IS_UMT};
 
 use self::scheme::FileScheme;
 
+mod pcache;
 pub mod resource;
 pub mod scheme;
 

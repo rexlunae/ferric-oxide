@@ -102,7 +102,8 @@ jobs:
           # The runner's own host tests (job parsing, round timing); it is its own workspace.
           cargo test --locked --manifest-path recipes/tests/ferric-iobench/files/Cargo.toml
       # ferric-pcache's reclaim lists and reverse map sit behind its `alloc` feature (the
-      # kernel turns it on; file systems do not).
+      # kernel turns it on). Its `client` feature (RedoxFS's side) only builds on Redox, so
+      # the image build checks it.
       - name: ferric-pcache
         run: |
           cargo clippy --locked --all-targets --all-features -p ferric-pcache -- -D warnings

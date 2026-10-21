@@ -16,10 +16,18 @@
 //! - [`page`]: the state of one cached page and the transitions fills, writes, writeback and
 //!   truncation make.
 //! - [`readahead`]: how far ahead of a reader the kernel fills, per open file description.
+//! - [`copy`]: how the kernel copies a cached page to a reader through a small bounce buffer
+//!   on its stack, so the copy is not 4K-aliased and never allocates.
+//! - `object` (with the `alloc` feature): one object's page index, which says what a read
+//!   needs (fills to queue, fills to wait for) and applies the file system's answers.
 //! - `clock` (with the `alloc` feature): the two-list CLOCK replacement that picks pages to
 //!   evict under memory pressure.
 //! - `rmap` (with the `alloc` feature): an object's reverse map, from a file page to the
 //!   mappings that show it, for unmapping on truncation and eviction.
+//! - `client` (with the `client` feature, on Redox): the file system's side, its queue,
+//!   objects and the thread that takes fill records off the queue.
+//! - [`pump`]: how that thread answers the fills of a batch it could not hand on, so no
+//!   reader is left waiting.
 //!
 //! Nothing here touches memory or hardware: the kernel feeds these types the facts and acts on
 //! their answers.
@@ -32,7 +40,7 @@
 //! # Examples
 //!
 //! ```
-//! use ferric_pcache::abi::{ObjectId, PageRange, Record, RecordPages};
+//! use ferric_pcache::abi::{FillId, Generation, ObjectId, PageRange, Record, RecordPages};
 //! use ferric_pcache::page::{Event, PageState};
 //! use ferric_pcache::readahead::{Readahead, ReadaheadConfig};
 //!
@@ -44,7 +52,12 @@
 //!
 //! // The fill goes on the file system's queue as a record (at most 1024 pages each).
 //! let pages = RecordPages::new(wanted).expect("4 pages fit one record");
-//! let fill = Record::Fill { object: ObjectId::new(7), pages };
+//! let fill = Record::Fill {
+//!     object: ObjectId::new(7),
+//!     generation: Generation::new(1),
+//!     fill: FillId::new(1),
+//!     pages,
+//! };
 //! assert_eq!(Record::from_bytes(&fill.to_bytes()), Ok(fill));
 //!
 //! // Each page moves from absent to filling to up to date.
@@ -60,9 +73,15 @@
 extern crate alloc;
 
 pub mod abi;
+#[cfg(all(feature = "client", target_os = "redox"))]
+pub mod client;
 #[cfg(feature = "alloc")]
 pub mod clock;
+pub mod copy;
+#[cfg(feature = "alloc")]
+pub mod object;
 pub mod page;
+pub mod pump;
 pub mod readahead;
 #[cfg(feature = "alloc")]
 pub mod rmap;

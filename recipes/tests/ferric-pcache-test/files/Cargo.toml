@@ -1,0 +1,22 @@
+[package]
+name = "ferric-pcache-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared page cache read path: on-target test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-blkqueue = { path = "../../../../crates/blkqueue" }
+ferric-pcache = { path = "../../../../crates/pcache" }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+libredox = "0.1.25"
+redox-scheme = "0.11.4"
+redox_syscall = "0.9.4"
+
+[profile.release]
+debug = false
