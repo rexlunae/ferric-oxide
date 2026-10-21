@@ -43,6 +43,9 @@
 //!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
 //!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
 //!   failed`.
+//! - `trace-mapping`: map/protect/unmap results retain the target page-table root and
+//!   order across a peer context, including overlap and permission refusals. Early
+//!   unaligned validation failures produce no API result; live disable stops recording.
 //! - `trace-futex`: 32/64-bit waits produce a queued wait and matching resume with the
 //!   timeout or wake result; mismatched waits produce neither. Empty, zero-count and
 //!   successful peer wakes record their returned counts, and disabling the events stops

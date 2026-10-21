@@ -133,4 +133,25 @@ mod tests {
             "sched.context_exit pid=0x2b context=0x1c exception=0x0 kind=0x0 code=0x0 addr=0x0"
         ));
     }
+
+    #[test]
+    fn mapping_operations_preserve_space_requests_and_failures() {
+        use ferric_trace::kernel::{MM_MAP, MM_PROTECT, MM_UNMAP};
+        let b = bytes(&[
+            (&MM_MAP, 10, &[0x1000, 0, 2, 3, 0x8000]),
+            (&MM_MAP, 20, &[0x1000, 0x8000, 2, 0x100003, u64::MAX - 16]),
+            (&MM_PROTECT, 30, &[0x1000, 0x8000, 1, 1, 0]),
+            (&MM_UNMAP, 40, &[0x1000, 0x8000, 2, 0, 0]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(2, &b).unwrap()]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("mm.map space=0x1000 addr=0x0 pages=0x2 flags=0x3 ret=0x8000"));
+        assert!(text.contains(
+            "mm.map space=0x1000 addr=0x8000 pages=0x2 flags=0x100003 ret=0xffffffffffffffef"
+        ));
+        assert!(text.contains("mm.protect space=0x1000 addr=0x8000 pages=0x1 flags=0x1 ret=0x0"));
+        assert!(text.contains("mm.unmap space=0x1000 addr=0x8000 pages=0x2 unpin=0x0 ret=0x0"));
+    }
 }
