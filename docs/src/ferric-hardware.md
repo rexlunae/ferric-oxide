@@ -70,14 +70,19 @@ interrupt map. The Linux and macOS drivers are GPL and were not used as
 references.
 
 The driver deliberately claims only the RTL8125B. It supports one RX queue, one
-TX queue, 1500-byte frames, and the single interrupt vector that `pcid`
-allocates (MSI-X, MSI or INTx). It does not implement jumbo frames, checksum or
-segmentation offload, VLAN stripping, multiple queues, per-queue MSI-X vectors,
-or wake-on-LAN. The firmware tables and the part of the initialisation that can
-be checked without MMIO live in the host-tested `crates/rtl8125` crate, and the
-driver's register-level sequence runs against a model of the controller in its
-own host tests, so the patch tables, the OCP encodings and the interrupt setup
-are checked before the driver ever sees the hardware.
+TX queue, 1500-byte frames, and the controller's legacy interrupt pin. It does
+not implement jumbo frames, checksum or segmentation offload, VLAN stripping,
+multiple queues, per-queue MSI-X vectors, or wake-on-LAN. The firmware tables
+and the part of the initialisation that can be checked without MMIO live in the
+host-tested `crates/rtl8125` crate, and the driver's register-level sequence
+runs against a model of the controller in its own host tests, so the patch
+tables, the OCP encodings and the interrupt setup are checked before the driver
+ever sees the hardware.
+
+The driver asks `pcid` for the legacy interrupt pin rather than a message
+interrupt: the RTL8125B's MSI-X vectors belong to the individual queues, and
+`pcid` hands out a single vector, so a queue's interrupt would be routed to a
+vector nobody programmed.
 
 The receive descriptor length includes the Ethernet CRC, so the driver strips
 it before handing a frame to the network scheme. The scheme hands the frame to

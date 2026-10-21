@@ -20,12 +20,11 @@
 //! runs against a model of the controller in the host tests below.
 //!
 //! The driver supports one RX queue and one TX queue, 1500-byte frames, and
-//! polled acknowledgement of the single interrupt vector that pcid allocates.
-//! It does not implement checksum or segmentation offload, jumbo frames, VLAN
-//! stripping, multiple queues, per-queue MSI-X vectors, or power-management
-//! wakeup. The receive path removes the Ethernet CRC, which the descriptor
-//! length includes, and the network stack filters multicast groups in
-//! software.
+//! the controller's legacy interrupt pin. It does not implement checksum or
+//! segmentation offload, jumbo frames, VLAN stripping, multiple queues,
+//! per-queue MSI-X vectors, or power-management wakeup. The receive path
+//! removes the Ethernet CRC, which the descriptor length includes, and the
+//! network stack filters multicast groups in software.
 //!
 //! Hardware validation is still pending: QEMU does not emulate the RTL8125, so
 //! this path has been compiled, reviewed against the reference sequence and

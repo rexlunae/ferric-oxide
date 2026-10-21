@@ -1,7 +1,7 @@
 //! PCI daemon for the Realtek RTL8125B 2.5GbE controller.
 //!
 //! pcid matches the function by PCI ID and runs this binary. The daemon maps the
-//! controller's memory BAR, allocates an interrupt vector, and wraps
+//! controller's memory BAR, takes an interrupt line, and wraps
 //! [`device::Rtl8125`] in the shared network scheme. Packet I/O and all
 //! controller initialisation live in the `device` module; this file only wires
 //! the Redox event loop to the adapter.
@@ -68,7 +68,23 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     log::info!("RTL8125 {}", pci_config.func.display());
 
     let bar = map_bar(&mut pcid_handle);
-    let irq_file = pci_allocate_interrupt_vector(&mut pcid_handle, "rtl8125d");
+
+    // The controller drives its legacy interrupt pin when the shared
+    // interrupt mask register is set. Its MSI-X vectors belong to the
+    // individual queues and pcid hands out only one of them, so the driver
+    // asks for the pin.
+    let legacy_line = pcid_handle.config().func.legacy_interrupt_line;
+    let mut irq_file = match legacy_line {
+        Some(line) => line.irq_handle("rtl8125d"),
+        None => {
+            log::warn!("rtl8125d: the controller has no legacy interrupt line");
+            let vector = pci_allocate_interrupt_vector(&mut pcid_handle, "rtl8125d");
+            vector
+                .irq_handle()
+                .try_clone()
+                .expect("rtl8125d: failed to clone the interrupt vector")
+        }
+    };
 
     let mut scheme = NetworkScheme::new(
         // SAFETY: `bar` is the uncacheable mapping of this function's register
@@ -90,7 +106,7 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     let event_queue = EventQueue::<Source>::new().expect("rtl8125d: could not create event queue");
     event_queue
         .subscribe(
-            irq_file.irq_handle().as_raw_fd() as usize,
+            irq_file.as_raw_fd() as usize,
             Source::Irq,
             event::EventFlags::READ,
         )
@@ -114,12 +130,10 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
             Source::Irq => {
                 let mut irq = [0; 8];
                 irq_file
-                    .irq_handle()
                     .read_exact(&mut irq)
                     .expect("rtl8125d: failed to read interrupt vector");
                 if scheme.adapter_mut().irq() {
                     irq_file
-                        .irq_handle()
                         .write_all(&irq)
                         .expect("rtl8125d: failed to acknowledge interrupt");
                     scheme
