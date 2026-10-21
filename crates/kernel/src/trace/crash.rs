@@ -4,9 +4,8 @@
 //! `config.toml`, 64 MiB by default) out of the frame allocator, so the same memory is found
 //! again after a warm reboot, where firmware leaves RAM as it was:
 //!
-//! - [`reserve`], during memory setup, takes the region out of the free memory, provided it is
-//!   wholly free RAM in the boot memory map, and has it mapped like the boot-time identity-mapped
-//!   areas.
+//! - [`reserve`], during memory setup, takes the region out of the free memory
+//!   ([`crate::reserved`]), provided it is wholly free RAM in the boot memory map.
 //! - [`init`], in `kmain`, copies a complete dump the previous boot left there to the heap (the
 //!   scheme's `crash` file serves it), logs its panic message, and arms the region again.
 //! - [`dump`], from the panic handler, writes the panic message, the timestamp clock and the
@@ -24,21 +23,16 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use ferric_trace::crash::{Dump, MessageBuf, Writer, REGION_BYTES, REGION_WORDS};
-use rmm::{Arch, PhysicalAddress};
+use ferric_trace::crash::{Dump, MessageBuf, Writer, REGION_BYTES};
 use spin::Once;
 
-use crate::{
-    cpu_set::LogicalCpuId,
-    memory::{RmmA, PAGE_SIZE},
-    startup::memory::{register_memory_region, BootloaderMemoryKind},
-};
+use crate::{cpu_set::LogicalCpuId, reserved::Region};
 
 /// The region's physical address without `trace.crash_base`.
 const DEFAULT_BASE: usize = 64 << 20;
 
-/// Whether [`reserve`] took the region out of the free memory.
-static RESERVED: AtomicBool = AtomicBool::new(false);
+/// The region, once [`reserve`] took it out of the free memory.
+static RESERVED: Once<Region> = Once::new();
 
 /// The region's words, once [`init`] armed it.
 static REGION: Once<&'static [AtomicU64]> = Once::new();
@@ -66,30 +60,24 @@ fn base() -> usize {
 /// registered and before the free areas are built from them.
 pub fn reserve(is_free: impl Fn(usize, usize) -> bool) {
     let base = base();
-    let end = base.saturating_add(REGION_BYTES);
-    if !base.is_multiple_of(PAGE_SIZE) || !is_free(base, end) {
-        warn!("trace: crash region {base:#x}..{end:#x} is not free RAM; no crash dumps");
-        return;
+    match Region::reserve(base, REGION_BYTES, is_free) {
+        Ok(region) => {
+            RESERVED.call_once(|| region);
+        }
+        Err(err) => {
+            let end = base.saturating_add(REGION_BYTES);
+            warn!("trace: crash region {base:#x}..{end:#x} is {err}; no crash dumps");
+        }
     }
-    // Identity-mapped areas are kept out of the frame allocator and mapped in the physical map.
-    register_memory_region(base, REGION_BYTES, BootloaderMemoryKind::IdentityMap);
-    RESERVED.store(true, Ordering::Release);
 }
 
 /// Saves the dump the previous boot left, if there is one, and arms the region for this boot.
 /// Called from `kmain` once the heap exists.
 pub fn init() {
-    if !RESERVED.load(Ordering::Acquire) {
+    let Some(region) = RESERVED.get() else {
         return;
-    }
-    let virt = RmmA::phys_to_virt(PhysicalAddress::new(base())).data();
-    // SAFETY: `reserve` took the REGION_BYTES at `base` out of the free memory and had them
-    // mapped in the physical map, where they stay for the kernel's life, and nothing else uses
-    // them. They are page aligned, so aligned for `AtomicU64`, and any bits are a valid
-    // `AtomicU64`. Every access through the slice is atomic, so the panic handler writing on one
-    // CPU while another reads is no data race.
-    let words: &'static [AtomicU64] =
-        unsafe { core::slice::from_raw_parts(virt as *const AtomicU64, REGION_WORDS) };
+    };
+    let words = region.words();
     match Dump::len_in(words) {
         Ok(len) => save(words, len),
         Err(err) => debug!("trace: no crash dump from the previous boot: {err}"),
@@ -101,8 +89,8 @@ pub fn init() {
     REGION.call_once(|| words);
     info!(
         "trace: crash region at {:#x} ({} KiB)",
-        base(),
-        REGION_BYTES / 1024
+        region.base(),
+        region.bytes() / 1024
     );
 }
 

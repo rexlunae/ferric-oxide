@@ -84,6 +84,13 @@ const FILES: &[(&str, Kind)] = &[
     ("iostat", Rd(iostat::resource)),
     ("irq", Rd(irq::resource)),
     ("log", Rd(log::resource)),
+    // Ferric Oxide: the end of the previous boot's log (`kernel.log_persist`), empty after a
+    // cold boot.
+    #[cfg(feature = "log_persist")]
+    (
+        "log_previous",
+        Rd(|_| Ok(crate::log_persist::previous().map_or_else(Vec::new, |log| log.to_vec()))),
+    ),
     #[cfg(feature = "sys_proc")]
     ("proc", RdRoot(proc::resource)),
     ("syscall", Rd(syscall::resource)),
@@ -116,6 +123,13 @@ const FILES: &[(&str, Kind)] = &[
     ),
 ];
 
+/// Ferric Oxide: files only root may open, for reading too. Upstream lets anyone read `log`;
+/// `log_previous` holds a whole earlier boot, panics included, so it is root-only.
+const ROOT_ONLY: &[&str] = &[
+    #[cfg(feature = "log_persist")]
+    "log_previous",
+];
+
 impl KernelScheme for SysScheme {
     fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
         let id = HANDLES.write(token.token()).insert(Handle::SchemeRoot);
@@ -146,7 +160,7 @@ impl KernelScheme for SysScheme {
                 .find(|(entry_path, _)| *entry_path == path)
                 .ok_or(Error::new(ENOENT))?;
 
-            if matches!(entry.1, Wr(_) | Kind::RdRoot(_)) && ctx.uid != 0 {
+            if (matches!(entry.1, Wr(_) | Kind::RdRoot(_)) || ROOT_ONLY.contains(&entry.0)) && ctx.uid != 0 {
                 return Err(Error::new(EPERM));
             }
 

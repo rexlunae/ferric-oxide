@@ -68,6 +68,7 @@ pub mod crash;
 mod event;
 pub mod filter;
 pub mod kernel;
+pub mod klog;
 mod level;
 pub mod profile;
 pub mod record;

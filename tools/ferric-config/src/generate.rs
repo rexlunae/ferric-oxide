@@ -1073,6 +1073,27 @@ mod tests {
     }
 
     #[test]
+    fn log_persist_options() {
+        let s = real_schema();
+        // Off by default, with no region address.
+        let out = collect(&s, &resolve(&s, &BTreeMap::new())).unwrap();
+        assert!(!out.kernel_features.contains("log_persist"));
+        assert!(!out.kernel_config.contains_key("log.persist_base"));
+        // On without tracing, its region right after the crash region's default.
+        let mut user = trace_user(&[], &[], false);
+        user.insert("kernel.log_persist".into(), Value::Bool(true));
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert!(out.kernel_features.contains("log_persist"));
+        assert_eq!(out.kernel_config["log.persist_base"], "0x4010000");
+        user.insert(
+            "kernel.log_persist_base".into(),
+            Value::Str("0x8000000".into()),
+        );
+        let out = collect(&s, &resolve(&s, &user)).unwrap();
+        assert_eq!(out.kernel_config["log.persist_base"], "0x8000000");
+    }
+
+    #[test]
     fn absolute_output_finds_the_base_config() {
         let s = real_schema();
         let r = resolve(&s, &BTreeMap::new());

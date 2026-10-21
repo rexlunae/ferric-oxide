@@ -897,6 +897,39 @@ the dump is written, so the next boot can read it back. CI's crash-dump image
 turns it on; never turn it on elsewhere."""
 
 [[option]]
+id = "kernel.log_persist"
+menu = "kernel"
+type = "bool"
+title = "Kernel log across a warm reboot"
+default = false
+kernel_feature = "log_persist"
+rebuild = ["kernel"]
+help = """
+Keep 64 KiB of RAM at a fixed address (kernel.log_persist_base) out of use and
+copy everything the kernel logs there too, the newest bytes replacing the
+oldest. Firmware leaves RAM alone across a warm reboot, so the next boot finds
+the end of the previous boot's log, a panic message included, and serves it as
+/scheme/sys/log_previous. A cold boot finds nothing, and a region that is not
+free RAM in the boot memory map turns the feature off with a warning. Needs no
+tracing (kernel.trace)."""
+
+[[option]]
+id = "kernel.log_persist_base"
+menu = "kernel"
+type = "string"
+title = "Persistent log region address"
+default = "0x4010000"
+depends = "kernel.log_persist"
+kernel_config = "log.persist_base"
+rebuild = ["kernel"]
+help = """
+The physical address of the persistent log's region, page aligned. Pick RAM
+that neither the firmware nor the bootloader uses; the default, right after
+the crash region's default (kernel.trace_crash_base), is free on QEMU with
+OVMF and on most PCs. The two regions must not overlap: the second one
+reserved is turned off."""
+
+[[option]]
 id = "kernel.sys_fdstat"
 menu = "kernel"
 type = "bool"
