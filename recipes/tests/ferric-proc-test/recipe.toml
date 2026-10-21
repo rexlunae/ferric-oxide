@@ -1,0 +1,17 @@
+# Ferric Oxide: the on-target test for per-process introspection (kernel.sys_proc).
+# It reads /scheme/sys/proc as root, finds its own block (its name, CPU time, an
+# open file and a large allocation) and checks that a non-root process cannot
+# open the file. It prints FERRIC_TEST_SKIP when the kernel has no
+# /scheme/sys/proc. Only for test images. Source lives in files/.
+[source]
+path = "recipes/tests/ferric-proc-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The procinfo crate is a path dependency at ../../../../crates/procinfo from
+# files/; the cookbook's copy in source/ sits at the same depth.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 use core::{
     fmt,
     ops::Range,
-    sync::atomic::{fence, Ordering},
+    sync::atomic::{fence, AtomicBool, Ordering},
 };
 
 use ferric_amdvi::{
@@ -167,6 +167,9 @@ struct Unit {
     reports_run: bool,
     state: Mutex<UnitState>,
     events: Mutex<Events>,
+    /// Set by every [`Unit::drain_events`] call; the context holding `events` drains again
+    /// while it is set, so a call that finds the log busy is not lost.
+    drain_wanted: AtomicBool,
 }
 
 /// The parts of a unit that change after it is enabled.
@@ -309,13 +312,40 @@ impl Unit {
         Err(Error::Timeout(Step::CompletionWait))
     }
 
-    /// Logs and consumes every event in the log, and acknowledges the status bits. Does
-    /// nothing when another context is draining it.
+    /// Logs and consumes every event in the log, and acknowledges the status bits. When
+    /// another context is draining it, that context drains again for this call, so no event
+    /// is left in the log until the next interrupt or command batch.
     fn drain_events(&self) {
-        let Some(events) = self.events.try_lock() else {
-            return;
-        };
+        self.drain_wanted.store(true, Ordering::Release);
+        // A call that finds the lock held leaves `drain_wanted` set for the holder. The holder
+        // checks it again only after giving the lock up, so a request made at the very end of
+        // its pass is either seen there or finds the lock free and drains itself: one of the
+        // two always drains after the request.
+        loop {
+            let Some(events) = self.events.try_lock() else {
+                return;
+            };
+            while self.drain_wanted.swap(false, Ordering::AcqRel) {
+                self.drain_once(&events);
+            }
+            drop(events);
+            if !self.drain_wanted.load(Ordering::Acquire) {
+                return;
+            }
+        }
+    }
+
+    /// One pass over the log. The status bits are acknowledged before `tail` is read: an event
+    /// the IOMMU writes after that sets them again and raises another interrupt, and one it
+    /// wrote before is below the `tail` read here. Acknowledging after the pass would clear
+    /// the interrupt of an event written during it, which then waited in the log for an
+    /// unrelated command batch and merged with the events logged in between.
+    fn drain_once(&self, events: &Events) {
         let st = self.regs.read(regs::STATUS);
+        if st & status::CLEAR & !status::EVENT_OVERFLOW != 0 {
+            self.regs
+                .write(regs::STATUS, st & status::CLEAR & !status::EVENT_OVERFLOW);
+        }
         let head = self.regs.read(regs::EVENT_HEAD);
         let tail = self.regs.read(regs::EVENT_TAIL);
         let mut coalescer = Coalescer::new();
@@ -334,11 +364,10 @@ impl Unit {
         }
         self.regs
             .write(regs::EVENT_HEAD, tail & regs::RING_POINTER_MASK);
+        // An overflow is acknowledged after the log is emptied (and restarted if it stopped).
         if st & status::EVENT_OVERFLOW != 0 {
             self.restart_event_log(st);
-        }
-        if st & status::CLEAR != 0 {
-            self.regs.write(regs::STATUS, st & status::CLEAR);
+            self.regs.write(regs::STATUS, status::EVENT_OVERFLOW);
         }
     }
 
@@ -399,6 +428,15 @@ impl Unit {
 
 /// Logs one run of identical events.
 fn report(base: u64, run: Run) {
+    // Ferric Oxide (`kernel.trace_iommu`): the entry as the IOMMU wrote it.
+    trace_event!(
+        ferric_trace::kernel::IOMMU_FAULT,
+        base,
+        ferric_trace::kernel::IommuFormat::AmdViEvent.raw(),
+        run.event.0[0],
+        run.event.0[1],
+        run.count
+    );
     let kind = run.event.decode();
     let times = Times(run.count);
     if run.event.is_dma_fault() {
@@ -793,6 +831,7 @@ fn init_unit(ivhd: Ivhd<'static>) -> Result<Unit, Error> {
         reports_run,
         state: Mutex::new(state),
         events: Mutex::new(events),
+        drain_wanted: AtomicBool::new(false),
     };
     {
         let mut state = unit.state.lock();

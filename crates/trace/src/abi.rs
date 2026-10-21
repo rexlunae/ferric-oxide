@@ -1,14 +1,17 @@
 //! The `kernel.trace` scheme's interface.
 //!
-//! The scheme is open to root only for now; a Phase 4 capability replaces the check, because
-//! traces leak timing and kernel addresses.
+//! Traces leak timing and kernel addresses, so opening the scheme by path is for root only.
+//! Anyone else needs a [capability](#capabilities).
 //!
 //! | Path | Read | Write |
 //! | --- | --- | --- |
-//! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>` or `disable <selection>` |
+//! | [`EVENTS_PATH`] | one [`EventLine`] per event | a [`Command`]: `enable <selection>`, `disable <selection>`, or `filter <event> <filter\|none>` |
 //! | [`STATS_PATH`] | one [`StatsLine`] per CPU | — |
+//! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it (a [`FilterBusyLine`] for one that could not be read) | — |
 //! | [`CLOCK_PATH`] | one [`ClockLine`](crate::clock::ClockLine): the clock behind the timestamps | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
+//! | [`CRASH_PATH`] | the previous boot's crash dump | [`CRASH_TEST_COMMAND`], on a crash-test kernel |
+//! | `cap/read`, `cap/control` ([`Path::Cap`]) | — (a capability) | — |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
 //! are separated by single spaces.
@@ -33,6 +36,23 @@
 //! copy. Two readers of one CPU can still both see a record; a collector that wants each
 //! record once should be the CPU's only reader.
 //!
+//! # Capabilities
+//!
+//! A capability is a descriptor of `cap/read` or `cap/control` ([`CAP_DIR`], [`Access`]),
+//! which only root can open. It cannot be read or written itself. Instead, `dup(cap, path)`
+//! opens `path` in the scheme with the capability's access, whatever the caller's user. The
+//! descriptor passes like any other: it is inherited across `fork` and `exec`, so a root
+//! process can open one, drop its privileges or start an unprivileged collector, and hand the
+//! collector exactly the access it needs. Root opening a path gets [`Access::Control`].
+//!
+//! - [`Access::Read`] reads every file, and drains, maps and commits the CPU rings.
+//! - [`Access::Control`] also writes: a [`Command`] to [`EVENTS_PATH`], and the crash test's
+//!   panic to [`CRASH_PATH`].
+//!
+//! Writing without control access fails with `EACCES`. `dup(cap, "cap/<access>")` gives
+//! another capability of the same or less access, and `EACCES` for more, so a capability can
+//! be narrowed before it is passed on, never widened.
+//!
 //! [`Peek::end`]: crate::ring::Peek::end
 
 use core::fmt;
@@ -53,6 +73,9 @@ pub const EVENTS_PATH: &str = "events";
 /// The per-CPU statistics file.
 pub const STATS_PATH: &str = "stats";
 
+/// The file listing the argument filters that are set ([`crate::filter`]).
+pub const FILTERS_PATH: &str = "filters";
+
 /// The file naming the clock record timestamps come from ([`crate::clock`]).
 pub const CLOCK_PATH: &str = "clock";
 
@@ -71,6 +94,49 @@ pub const CRASH_TEST_COMMAND: &str = "panic";
 /// The longest command, in bytes, one write to [`EVENTS_PATH`] may carry; the kernel refuses
 /// longer writes.
 pub const MAX_COMMAND_BYTES: usize = 4096;
+
+/// The directory of capabilities, `cap/<access>` ([`Access`]).
+pub const CAP_DIR: &str = "cap";
+
+/// What a capability lets its holder do; see [Capabilities](self#capabilities).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// Read every file, and drain, map and commit the CPU rings: `cap/read`.
+    Read,
+    /// [`Access::Read`], and write control commands: `cap/control`.
+    Control,
+}
+
+impl Access {
+    /// The access's name in `cap/<name>`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Control => "control",
+        }
+    }
+
+    /// The access named `name`, or `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Access::Read, Access::Control]
+            .into_iter()
+            .find(|access| access.name() == name)
+    }
+
+    /// Whether this access includes everything `other` allows.
+    pub const fn includes(self, other: Access) -> bool {
+        matches!(
+            (self, other),
+            (Access::Control, _) | (Access::Read, Access::Read)
+        )
+    }
+}
+
+impl fmt::Display for Access {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{CAP_DIR}/{}", self.name())
+    }
+}
 
 /// The directory of per-CPU record files, `cpu/<n>`.
 ///
@@ -100,12 +166,16 @@ pub enum Path {
     Events,
     /// [`STATS_PATH`].
     Stats,
+    /// [`FILTERS_PATH`].
+    Filters,
     /// [`CLOCK_PATH`].
     Clock,
     /// `cpu/<n>`: the records of CPU `n`.
     Cpu(u32),
     /// [`CRASH_PATH`].
     Crash,
+    /// `cap/<access>`: a capability ([`Access`]).
+    Cap(Access),
 }
 
 impl Path {
@@ -115,9 +185,16 @@ impl Path {
             "" => Some(Path::Root),
             EVENTS_PATH => Some(Path::Events),
             STATS_PATH => Some(Path::Stats),
+            FILTERS_PATH => Some(Path::Filters),
             CLOCK_PATH => Some(Path::Clock),
             CRASH_PATH => Some(Path::Crash),
             other => {
+                if let Some(name) = other
+                    .strip_prefix(CAP_DIR)
+                    .and_then(|p| p.strip_prefix('/'))
+                {
+                    return Access::from_name(name).map(Path::Cap);
+                }
                 let n = other.strip_prefix(CPU_DIR)?.strip_prefix('/')?;
                 // `u32::from_str` takes a leading `+`; a path does not.
                 if !n.bytes().all(|b| b.is_ascii_digit()) {
@@ -136,6 +213,15 @@ pub enum Command<'a> {
     Enable(&'a str),
     /// Turn off the events of a selection.
     Disable(&'a str),
+    /// Set the argument filter of one event, or remove it with
+    /// [`filter::NONE`](crate::filter::NONE): `filter <event> <filter>`. The filter text is
+    /// parsed against the event's arguments with [`Filter::parse`](crate::filter::Filter::parse).
+    Filter {
+        /// The event's name.
+        event: &'a str,
+        /// The filter text.
+        filter: &'a str,
+    },
 }
 
 /// A write to [`EVENTS_PATH`] that is not a command.
@@ -148,6 +234,8 @@ pub enum CommandError {
     UnknownVerb,
     /// The position of a `commit` is missing or not a decimal number.
     Position,
+    /// A `filter` without both an event name and a filter.
+    FilterEvent,
 }
 
 impl fmt::Display for CommandError {
@@ -155,8 +243,9 @@ impl fmt::Display for CommandError {
         f.write_str(match self {
             CommandError::NotUtf8 => "trace command is not UTF-8",
             CommandError::UnknownVerb => {
-                "trace command must start with enable or disable (events) or commit (cpu/<n>)"
+                "trace command must start with enable, disable or filter (events) or commit (cpu/<n>)"
             }
+            CommandError::FilterEvent => "trace filter needs an event name and a filter",
             CommandError::Position => "trace commit needs a decimal position",
         })
     }
@@ -179,12 +268,22 @@ impl<'a> Command<'a> {
     ///
     /// # Errors
     ///
-    /// [`CommandError::NotUtf8`] or [`CommandError::UnknownVerb`].
+    /// [`CommandError::NotUtf8`], [`CommandError::UnknownVerb`], or
+    /// [`CommandError::FilterEvent`] for a `filter` without an event and a filter.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, CommandError> {
         let (verb, rest) = verb(bytes)?;
         match verb {
             "enable" => Ok(Command::Enable(rest)),
             "disable" => Ok(Command::Disable(rest)),
+            "filter" => {
+                let (event, filter) = rest
+                    .split_once(|c: char| c.is_ascii_whitespace())
+                    .ok_or(CommandError::FilterEvent)?;
+                Ok(Command::Filter {
+                    event,
+                    filter: filter.trim(),
+                })
+            }
             _ => Err(CommandError::UnknownVerb),
         }
     }
@@ -231,6 +330,7 @@ impl fmt::Display for Command<'_> {
         match self {
             Command::Enable(spec) => write!(f, "enable {spec}"),
             Command::Disable(spec) => write!(f, "disable {spec}"),
+            Command::Filter { event, filter } => write!(f, "filter {event} {filter}"),
         }
     }
 }
@@ -346,6 +446,46 @@ impl fmt::Display for EventLine<'_> {
     }
 }
 
+/// One line of the [`FILTERS_PATH`] file: the command that sets the filter,
+/// `filter <event> <filter>`, which [`Command::parse`] reads back.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterLine<'a> {
+    /// The filtered event.
+    pub event: &'a Event,
+    /// Its filter.
+    pub filter: &'a crate::filter::Filter,
+}
+
+impl fmt::Display for FilterLine<'_> {
+    /// The line, with its `\n`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "filter {} {}",
+            self.event.name(),
+            self.filter.display(self.event)
+        )
+    }
+}
+
+/// The line of the [`FILTERS_PATH`] file for an event whose filter is set but could not be
+/// read because a replacement kept overlapping the read
+/// ([`Loaded::Busy`](crate::filter::Loaded::Busy)): `# filter <event> is being replaced`.
+/// It starts with `#` so it is not read back as a command. The kernel reads the filters with
+/// their writer excluded, so it does not write this line in practice.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterBusyLine<'a> {
+    /// The filtered event.
+    pub event: &'a Event,
+}
+
+impl fmt::Display for FilterBusyLine<'_> {
+    /// The line, with its `\n`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "# filter {} is being replaced", self.event.name())
+    }
+}
+
 /// One line of the [`STATS_PATH`] file: `cpu <n> pending <words> lost <records>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatsLine {
@@ -399,6 +539,7 @@ mod tests {
         assert_eq!(Path::parse("/"), Some(Path::Root));
         assert_eq!(Path::parse("events"), Some(Path::Events));
         assert_eq!(Path::parse("/stats/"), Some(Path::Stats));
+        assert_eq!(Path::parse("filters"), Some(Path::Filters));
         assert_eq!(Path::parse("clock"), Some(Path::Clock));
         assert_eq!(Path::parse("crash"), Some(Path::Crash));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));
@@ -409,6 +550,63 @@ mod tests {
         assert_eq!(Path::parse("cpu/x"), None);
         assert_eq!(Path::parse("cpus/1"), None);
         assert_eq!(Path::parse("other"), None);
+    }
+
+    #[test]
+    fn capability_paths() {
+        assert_eq!(Path::parse("cap/read"), Some(Path::Cap(Access::Read)));
+        assert_eq!(
+            Path::parse("/cap/control"),
+            Some(Path::Cap(Access::Control))
+        );
+        assert_eq!(Path::parse("cap"), None);
+        assert_eq!(Path::parse("cap/"), None);
+        assert_eq!(Path::parse("cap/write"), None);
+        assert_eq!(Path::parse("capread"), None);
+        for access in [Access::Read, Access::Control] {
+            assert_eq!(Path::parse(&access.to_string()), Some(Path::Cap(access)));
+        }
+    }
+
+    #[test]
+    fn control_includes_read_but_not_the_reverse() {
+        assert!(Access::Control.includes(Access::Read));
+        assert!(Access::Control.includes(Access::Control));
+        assert!(Access::Read.includes(Access::Read));
+        assert!(!Access::Read.includes(Access::Control));
+    }
+
+    #[test]
+    fn a_busy_filter_line_is_not_a_command() {
+        let line = FilterBusyLine {
+            event: &SCHED_SWITCH,
+        }
+        .to_string();
+        assert_eq!(line, "# filter sched.switch is being replaced\n");
+        assert!(Command::parse(line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn filter_lines_read_back_as_commands() {
+        use crate::filter::Filter;
+        let filter = Filter::parse(&SCHED_SWITCH, "next_pid == 7")
+            .expect("parses")
+            .expect("set");
+        let line = FilterLine {
+            event: &SCHED_SWITCH,
+            filter: &filter,
+        }
+        .to_string();
+        assert_eq!(line, "filter sched.switch next_pid == 0x7\n");
+        let Ok(Command::Filter {
+            event,
+            filter: text,
+        }) = Command::parse(line.as_bytes())
+        else {
+            panic!("{line:?} is not a filter command");
+        };
+        assert_eq!(event, "sched.switch");
+        assert_eq!(Filter::parse(&SCHED_SWITCH, text), Ok(Some(filter)));
     }
 
     #[test]
@@ -427,6 +625,22 @@ mod tests {
             Err(CommandError::UnknownVerb)
         );
         assert_eq!(Command::parse(b"\xff"), Err(CommandError::NotUtf8));
+        assert_eq!(
+            Command::parse(b"filter syscall.enter  nr == 3 && a < 4\n"),
+            Ok(Command::Filter {
+                event: "syscall.enter",
+                filter: "nr == 3 && a < 4"
+            })
+        );
+        assert_eq!(
+            Command::parse(b"filter syscall.enter"),
+            Err(CommandError::FilterEvent)
+        );
+        let line = Command::Filter {
+            event: "sched.switch",
+            filter: "none",
+        };
+        assert_eq!(Command::parse(line.to_string().as_bytes()), Ok(line));
         assert_eq!(Command::Enable("all").to_string(), "enable all");
     }
 

@@ -3,6 +3,20 @@
 use std::{env, path::Path, process::Command};
 use toml::Table;
 
+/// Ferric Oxide: a page-aligned physical address from the kernel config, as an integer or a
+/// "0x..." string; `None` if it is neither or not page aligned.
+fn page_aligned(value: &toml::Value) -> Option<u64> {
+    let base = match value {
+        toml::Value::Integer(n) => u64::try_from(*n).ok(),
+        toml::Value::String(s) => match s.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => s.parse().ok(),
+        },
+        _ => None,
+    };
+    base.filter(|base| base % 4096 == 0)
+}
+
 fn parse_kconfig(arch: &str) -> Option<()> {
     println!("cargo:rerun-if-changed=config.toml");
 
@@ -34,18 +48,18 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         .get("trace")
         .and_then(|t| t.as_table().unwrap().get("crash_base"))
     {
-        let base = match base {
-            toml::Value::Integer(n) => u64::try_from(*n).ok(),
-            toml::Value::String(s) => match s.strip_prefix("0x") {
-                Some(hex) => u64::from_str_radix(hex, 16).ok(),
-                None => s.parse().ok(),
-            },
-            _ => None,
-        };
-        let base = base
-            .filter(|base| base % 4096 == 0)
-            .expect("trace.crash_base must be a page-aligned address");
+        let base = page_aligned(base).expect("trace.crash_base must be a page-aligned address");
         println!("cargo:rustc-env=FERRIC_TRACE_CRASH_BASE={base}");
+    }
+
+    // Ferric Oxide: the physical address of the persistent log's region (`log_persist`,
+    // src/log_persist.rs), from `log.persist_base`, in the same forms as `trace.crash_base`.
+    if let Some(base) = root
+        .get("log")
+        .and_then(|t| t.as_table().unwrap().get("persist_base"))
+    {
+        let base = page_aligned(base).expect("log.persist_base must be a page-aligned address");
+        println!("cargo:rustc-env=FERRIC_LOG_PERSIST_BASE={base}");
     }
 
     let arch_table = root.get("arch")?.as_table().unwrap().get(arch)?.as_table().unwrap();

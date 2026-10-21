@@ -122,6 +122,10 @@ name = "ferric-pcache"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-procinfo"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
 
@@ -205,6 +209,7 @@ dependencies = [
  "ferric-irq",
  "ferric-nospec",
  "ferric-pcache",
+ "ferric-procinfo",
  "ferric-regbuf",
  "ferric-ring",
  "ferric-trace",

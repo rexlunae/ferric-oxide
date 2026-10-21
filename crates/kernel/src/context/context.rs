@@ -277,6 +277,27 @@ impl Context {
         self.preempt_locks == 0
     }
 
+    /// Marks a not-yet-started context runnable and records its start before the caller
+    /// releases the context lock. Returns true for that transition, or false without
+    /// changing the context if it was not in `NotYetStarted`.
+    pub(crate) fn start(&mut self) -> bool {
+        if !matches!(
+            self.status,
+            Status::HardBlocked {
+                reason: HardBlockedReason::NotYetStarted
+            }
+        ) {
+            return false;
+        }
+        self.status = Status::Runnable;
+        trace_event!(
+            ferric_trace::kernel::SCHED_CONTEXT_START,
+            self.pid,
+            self.debug_id
+        );
+        true
+    }
+
     /// Block the context, and return true if it was runnable before being blocked
     pub fn block(&mut self, reason: &'static str) -> bool {
         if self.status.is_runnable() {

@@ -660,11 +660,11 @@ pub unsafe fn init(
     register_memory_from_kernel_args(args);
 
     unsafe {
-        // Ferric Oxide: keep the trace crash region out of the free memory, if it lies inside
-        // one free area of the boot memory map (which only this CPU writes, now) and overlaps
-        // no other area.
-        #[cfg(feature = "trace_crash")]
-        crate::trace::crash::reserve(|start, end| {
+        // Ferric Oxide: keep the trace crash region and the persistent log's region out of the
+        // free memory, each if it lies inside one free area of the boot memory map (which only
+        // this CPU writes, now) and overlaps no other area, the other region included.
+        #[cfg(any(feature = "trace_crash", feature = "log_persist"))]
+        let is_free = |start, end| {
             let map = (*MEMORY_MAP.get())
                 .iter()
                 .map(|entry| ferric_trace::crash::MapArea {
@@ -677,7 +677,11 @@ pub unsafe fn init(
                     },
                 });
             ferric_trace::crash::region_is_free(start, end, map)
-        });
+        };
+        #[cfg(feature = "trace_crash")]
+        crate::trace::crash::reserve(is_free);
+        #[cfg(feature = "log_persist")]
+        crate::log_persist::reserve(is_free);
 
         let physmem_limit = MemoryEntry {
             start: align_up(low_limit.unwrap_or(0)),

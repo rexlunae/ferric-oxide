@@ -9,11 +9,13 @@
 //! | [`Request::Bind`] | plain | `[verb]` | a [`Bind`] record, [`Bind::BYTES`] bytes |
 //! | [`Request::AddFilter`] | plain | `[verb]` | a [`Filter`](crate::filter::Filter), [`Filter::BYTES`](crate::filter::Filter::BYTES) bytes; the reply is the [`FilterId`] |
 //! | [`Request::RemoveFilter`] | plain | `[verb, filter ID]` | none |
+//! | [`Request::Own`] | `CallFlags::WRITE \| CallFlags::FD` | `[verb]` | the descriptor number of a netstack `udp` or `tcp` socket bound on the port (it moves to the driver, which keeps it open, so netstack keeps the port reserved) |
 //! | [`Request::Kick`] | plain | `[verb]` | none |
 //! | [`Request::Stats`] | plain | `[verb]` | the reply is a [`Stats`] record, [`Stats::BYTES`] bytes |
 //!
 //! `Attach` comes before `Bind`, which starts the queue on the attached grants; attaching
-//! again before `Bind` replaces them.
+//! again before `Bind` replaces them. `Own` comes after `Bind`: a filter on a TCP or UDP
+//! destination port needs the port owned first ([`crate::own`]).
 //!
 //! The kernel gives a scheme at most [`Request::CALL_WORDS`] metadata words of a plain call,
 //! padded with zeros to that many (the caller's word count does not reach the scheme), and only
@@ -26,6 +28,7 @@
 //! is, and [`Stats::to_bytes`] and [`Stats::from_bytes`] the one place the statistics
 //! layout is. Closing the socket stops its queue, removes its filters and unmaps its grants.
 
+use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::umem::FrameSize;
@@ -39,6 +42,7 @@ const VERB_REMOVE_FILTER: u64 = 3;
 const VERB_KICK: u64 = 4;
 const VERB_STATS: u64 = 5;
 const VERB_ATTACH: u64 = 6;
+const VERB_OWN: u64 = 7;
 
 /// The number of entries of a ring: a power of two from [`RingSize::MIN`] to
 /// [`RingSize::MAX`], so free-running indices wrap onto slots with a mask.
@@ -115,12 +119,27 @@ pub struct Bind {
     pub mode: Mode,
     /// The logical CPU whose queue interrupt and driver worker serve the socket.
     pub cpu: u32,
+    /// Options.
+    pub flags: BindFlags,
+}
+
+bitflags! {
+    /// The options of [`Bind`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct BindFlags: u32 {
+        /// Send TX frames unchecked. Without it the driver validates each TX frame
+        /// ([`crate::own::Ownership::check_tx`]): the NIC's source MAC, and TCP or UDP from an
+        /// owned port. Queue sockets are root's, so any socket may ask for it; unprivileged
+        /// sockets will not.
+        const RAW_TX = 1;
+    }
 }
 
 impl Bind {
     /// The size of the record: eight little-endian `u32`s, the frame size in bytes, the Fill,
     /// RX, TX and Completion ring sizes in entries, the mode (1 auto, 2 copy, 3 zero-copy),
-    /// the CPU, and a reserved zero.
+    /// the CPU, and the [`BindFlags`] (zero before flags existed, so older records still
+    /// decode).
     pub const BYTES: usize = 32;
 
     /// The record.
@@ -133,7 +152,7 @@ impl Bind {
             self.completion.get(),
             self.mode.to_word() as u32,
             self.cpu,
-            0,
+            self.flags.bits(),
         ];
         let mut out = [0; Self::BYTES];
         for (chunk, word) in out.chunks_exact_mut(4).zip(words) {
@@ -147,8 +166,8 @@ impl Bind {
     /// # Errors
     ///
     /// [`DecodeError::Length`] when `bytes` is not [`Bind::BYTES`] long, and
-    /// [`DecodeError::Value`] for a frame size, ring size or mode out of range, or a reserved
-    /// word that is not zero.
+    /// [`DecodeError::Value`] for a frame size, ring size or mode out of range, or an unknown
+    /// flag.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() != Self::BYTES {
             return Err(DecodeError::Length);
@@ -159,10 +178,8 @@ impl Bind {
             le.copy_from_slice(chunk);
             *word = u32::from_le_bytes(le);
         }
-        let [frame_size, fill, rx, tx, completion, mode, cpu, reserved] = words;
-        if reserved != 0 {
-            return Err(DecodeError::Value);
-        }
+        let [frame_size, fill, rx, tx, completion, mode, cpu, flags] = words;
+        let flags = BindFlags::from_bits(flags).ok_or(DecodeError::Value)?;
         let ring = |entries| RingSize::new(entries).ok_or(DecodeError::Value);
         Ok(Self {
             frame_size: FrameSize::from_bytes(u64::from(frame_size)).ok_or(DecodeError::Value)?,
@@ -172,6 +189,7 @@ impl Bind {
             completion: ring(completion)?,
             mode: Mode::from_word(u64::from(mode)).ok_or(DecodeError::Value)?,
             cpu,
+            flags,
         })
     }
 }
@@ -208,6 +226,8 @@ pub enum Request {
     Kick,
     /// Report the socket's [`Stats`].
     Stats,
+    /// Own a TCP or UDP port: pass a netstack socket bound on it (a descriptor-passing call).
+    Own,
 }
 
 impl Request {
@@ -222,7 +242,7 @@ impl Request {
     /// Whether the request is a descriptor-passing call (`CallFlags::FD`) rather than a plain
     /// one. A driver refuses a request that arrives on the other kind of call.
     pub const fn passes_descriptors(self) -> bool {
-        matches!(self, Self::Attach)
+        matches!(self, Self::Attach | Self::Own)
     }
 
     /// The metadata words, and how many of them are used.
@@ -254,6 +274,10 @@ impl Request {
                 words[0] = VERB_STATS;
                 1
             }
+            Self::Own => {
+                words[0] = VERB_OWN;
+                1
+            }
         };
         (words, len)
     }
@@ -269,7 +293,7 @@ impl Request {
         let (&verb, args) = words.split_first().ok_or(DecodeError::Verb)?;
         let used = match verb {
             VERB_REMOVE_FILTER => 1,
-            VERB_ATTACH | VERB_BIND | VERB_ADD_FILTER | VERB_KICK | VERB_STATS => 0,
+            VERB_ATTACH | VERB_BIND | VERB_ADD_FILTER | VERB_KICK | VERB_STATS | VERB_OWN => 0,
             _ => return Err(DecodeError::Verb),
         };
         if args.len() < used
@@ -284,6 +308,7 @@ impl Request {
             VERB_ADD_FILTER => Self::AddFilter,
             VERB_REMOVE_FILTER => Self::RemoveFilter(FilterId(args[0])),
             VERB_KICK => Self::Kick,
+            VERB_OWN => Self::Own,
             _ => Self::Stats,
         })
     }
@@ -330,12 +355,14 @@ pub struct Stats {
     pub overflow_drops: u64,
     /// Fill and TX entries dropped because they failed the UMEM checks.
     pub invalid_descriptors: u64,
+    /// TX frames dropped by TX validation ([`crate::own::Ownership::check_tx`]).
+    pub tx_rejected: u64,
 }
 
 impl Stats {
-    /// The size of the record: six little-endian `u64`s, the mode first (1 copy, 2
-    /// zero-copy).
-    pub const BYTES: usize = 48;
+    /// The size of the record: seven little-endian `u64`s, the mode first (1 copy, 2
+    /// zero-copy), then the counters in field order.
+    pub const BYTES: usize = 56;
 
     /// The record.
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
@@ -350,6 +377,7 @@ impl Stats {
             self.fill_empty_drops,
             self.overflow_drops,
             self.invalid_descriptors,
+            self.tx_rejected,
         ];
         let mut out = [0; Self::BYTES];
         for (chunk, word) in out.chunks_exact_mut(8).zip(words) {
@@ -368,7 +396,7 @@ impl Stats {
         if bytes.len() != Self::BYTES {
             return Err(StatsError::Length);
         }
-        let mut words = [0u64; 6];
+        let mut words = [0u64; 7];
         for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
             let mut le = [0; 8];
             le.copy_from_slice(chunk);
@@ -381,6 +409,7 @@ impl Stats {
             fill_empty_drops,
             overflow_drops,
             invalid_descriptors,
+            tx_rejected,
         ] = words;
         let mode = match mode {
             1 => ActiveMode::Copy,
@@ -394,6 +423,7 @@ impl Stats {
             fill_empty_drops,
             overflow_drops,
             invalid_descriptors,
+            tx_rejected,
         })
     }
 }
@@ -430,6 +460,7 @@ mod tests {
             completion: ring(4096),
             mode: Mode::Auto,
             cpu: 3,
+            flags: BindFlags::empty(),
         }
     }
 
@@ -467,6 +498,7 @@ mod tests {
             Request::RemoveFilter(FilterId::new(u64::MAX)),
             Request::Kick,
             Request::Stats,
+            Request::Own,
         ] {
             let (words, len) = request.encode();
             let sent = &words[..len];
@@ -494,6 +526,7 @@ mod tests {
                 mode: Mode::Copy,
                 fill: ring(RingSize::MIN),
                 completion: ring(RingSize::MAX),
+                flags: BindFlags::RAW_TX,
                 ..bind()
             },
         ] {
@@ -537,7 +570,8 @@ mod tests {
             (4, u32::MAX),
             (5, 0),
             (5, 4),
-            (7, 1),
+            (7, 2),
+            (7, u32::MAX),
         ] {
             let mut bad = good;
             bad[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -571,10 +605,11 @@ mod tests {
             fill_empty_drops: 3,
             overflow_drops: 4,
             invalid_descriptors: u64::MAX,
+            tx_rejected: 5,
         };
         let bytes = stats.to_bytes();
         assert_eq!(Stats::from_bytes(&bytes), Ok(stats));
-        assert_eq!(Stats::from_bytes(&bytes[..47]), Err(StatsError::Length));
+        assert_eq!(Stats::from_bytes(&bytes[..55]), Err(StatsError::Length));
         let mut bad = bytes;
         bad[0] = 0;
         assert_eq!(Stats::from_bytes(&bad), Err(StatsError::Mode));

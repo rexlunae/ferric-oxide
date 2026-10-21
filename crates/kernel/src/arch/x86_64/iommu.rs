@@ -635,7 +635,16 @@ fn log_faults(regs: &Regs) {
     let status = FaultStatus(regs.read(regs::FSTS));
     if status.pending() {
         for rec in fault::records(regs.cap, status) {
-            if let Some(record) = FaultRecord::decode(regs.read(rec.low), regs.read(rec.high)) {
+            let (lo, hi) = (regs.read(rec.low), regs.read(rec.high));
+            if let Some(record) = FaultRecord::decode(lo, hi) {
+                trace_event!(
+                    ferric_trace::kernel::IOMMU_FAULT,
+                    regs.base,
+                    ferric_trace::kernel::IommuFormat::VtdFaultRecord.raw(),
+                    lo,
+                    hi,
+                    1
+                );
                 let what = if record.reason.is_interrupt_remapping() {
                     "interrupt remapping"
                 } else {

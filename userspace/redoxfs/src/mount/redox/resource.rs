@@ -459,6 +459,45 @@ impl FileMmapInfo {
         }
     }
 
+    /// Ferric Oxide: marks every cached range out of date, so the next `fmap` of it reads the
+    /// file again and reads stop using the cache. Called when an idle node is opened: its id
+    /// may now name a different file, as RedoxFS reuses the blocks of deleted nodes.
+    pub fn invalidate(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Ferric Oxide: copies `bytes`, just written to the file at `offset`, into the ranges
+    /// still mapped, which are the pages processes see, so a live shared mapping and the
+    /// file stay the same. Bytes outside the write are left alone, stores through the
+    /// mapping included. Unmapped ranges are not updated: the write made them out of date,
+    /// and the next `fmap` reads them again.
+    fn write_through(&mut self, offset: u64, bytes: &[u8]) {
+        let Some(end) = offset.checked_add(bytes.len() as u64) else {
+            return;
+        };
+        for (range, fmap) in self.ranges.conflicts(offset..end) {
+            if fmap.rc == 0 {
+                continue;
+            }
+            let start = range.start.max(offset);
+            let stop = range.end.min(end);
+            if start >= stop {
+                continue;
+            }
+            let from = &bytes[(start - offset) as usize..(stop - offset) as usize];
+            // SAFETY: every range lies inside the buffer at `base`, which `fmap` sized to
+            // cover it, and `from` is `stop - start` bytes inside that range; `bytes` is the
+            // caller's buffer, not the mapping, so the two do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    from.as_ptr(),
+                    self.base.add(start as usize),
+                    from.len(),
+                );
+            }
+        }
+    }
+
     pub fn in_use(&self) -> bool {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
     }
@@ -601,13 +640,19 @@ impl<D: Disk> Resource<D> for FileResource {
             fmap_info.version += 1;
         }
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        tx.write_node(
+        let count = tx.write_node(
             self.node_ptr,
             effective_offset,
             buf,
             mtime.as_secs(),
             mtime.subsec_nanos(),
-        )
+        )?;
+        // Ferric Oxide: live mappings see the write, so a range reused while mapped holds the
+        // file's bytes when `fmap` marks it current.
+        if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
+            fmap_info.write_through(effective_offset, &buf[..count.min(buf.len())]);
+        }
+        Ok(count)
     }
 
     fn fsize(&mut self, tx: &mut Transaction<D>) -> Result<u64> {
@@ -687,6 +732,10 @@ impl<D: Disk> Resource<D> for FileResource {
         for (range, v_opt) in affected_fmaps {
             //dbg!(&range);
             let range_size = range.end - range.start;
+            // Ferric Oxide: an unmapped range kept from an older version of the file (written
+            // since, or a deleted file whose node id was reused) is read again, not handed out
+            // with the old contents.
+            let v_opt = v_opt.filter(|fmap| fmap.rc > 0 || fmap.version == fmap_info.version);
             if let Some(mut fmap) = v_opt {
                 fmap.rc += 1;
                 fmap.writable += usize::from(writes_back(flags));
@@ -695,7 +744,7 @@ impl<D: Disk> Resource<D> for FileResource {
                 //FIXME: Use result?
                 let _ = fmap_info.ranges.insert(range.start, range_size, fmap);
             } else {
-                let map = unsafe {
+                let mut map = unsafe {
                     Fmap::new(
                         self.node_ptr,
                         flags,
@@ -705,6 +754,10 @@ impl<D: Disk> Resource<D> for FileResource {
                         tx,
                     )?
                 };
+                // Ferric Oxide: just read, so current. Reads of the file come from the mapped
+                // buffer only while its ranges are current, and must, or a store through a
+                // shared mapping would not be seen by read() until the funmap writes it back.
+                map.version = fmap_info.version;
                 //FIXME: Use result?
                 //TODO: Save aligned size for unmap
                 let _ = fmap_info.ranges.insert(range.start, range_size, map);
@@ -821,12 +874,10 @@ impl<D: Disk> Resource<D> for FileResource {
 
     fn sync(&mut self, fmaps: &mut Fmaps, tx: &mut Transaction<D>) -> Result<()> {
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
-            for (range, fmap) in fmap_info.ranges.iter_mut() {
-                // Ferric Oxide: a range nothing maps any more was written back when it was
-                // unmapped, and its retained buffer may be older than later writes.
-                if fmap.rc == 0 {
-                    continue;
-                }
+            // Ferric Oxide: only ranges still mapped. An unmapped one was written back by its
+            // funmap, and the file may have been written since; writing its old bytes again
+            // would undo that write.
+            for (range, fmap) in fmap_info.ranges.iter_mut().filter(|(_, fmap)| fmap.rc > 0) {
                 unsafe {
                     fmap.sync(
                         self.node_ptr,
@@ -910,10 +961,12 @@ impl Drop for FileResource {
 impl range_tree::Value for Fmap {
     type K = u64;
 
+    // Ferric Oxide: ranges of different versions are not merged, or a range read before a
+    // write would take the newer version of its neighbour and be served as current.
     fn try_merge_forward(self, other: &Self) -> core::result::Result<Self, Self> {
         if self.rc == other.rc
-            && self.writable == other.writable
             && self.flags == other.flags
+            && self.version == other.version
             && self.last_page_tail == 0
         {
             Ok(self)
@@ -923,8 +976,8 @@ impl range_tree::Value for Fmap {
     }
     fn try_merge_backwards(self, other: &Self) -> core::result::Result<Self, Self> {
         if self.rc == other.rc
-            && self.writable == other.writable
             && self.flags == other.flags
+            && self.version == other.version
             && other.last_page_tail == 0
         {
             Ok(self)

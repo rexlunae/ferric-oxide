@@ -44,6 +44,31 @@ fn ferric_trace() -> Command {
 }
 
 #[test]
+fn exports_otlp_json() {
+    let dir = capture();
+    let output = ferric_trace()
+        .args(["otlp", "--start-unix-ns", "1000000000"])
+        .arg(dir.path())
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    // The first resource is pid 0, whose context the first switch put out (an instant); the
+    // second is pid 3's.
+    let spans = doc["resourceSpans"][1]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans");
+    // The system call, and the scheme request it made as its child.
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0]["name"], "syscall 0x21000004");
+    assert_eq!(spans[0]["startTimeUnixNano"], "1000001000");
+    assert_eq!(spans[0]["endTimeUnixNano"], "1000005000");
+    assert_eq!(spans[1]["name"], "scheme 2 Write");
+    assert_eq!(spans[1]["parentSpanId"], spans[0]["spanId"]);
+    assert_eq!(spans[1]["endTimeUnixNano"], "1000003000");
+}
+
+#[test]
 fn exports_perfetto_json() {
     let dir = capture();
     let out = dir.path().join("trace.json");
@@ -148,7 +173,9 @@ fn captures_a_scheme_directory() {
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).expect("utf-8");
     assert!(
-        text.starts_with("cpu 0: 32 bytes, 0 records lost before the capture, 0 during it\n"),
+        text.starts_with(
+            "cpu 0: 32 bytes, 0 records lost before the capture, 0 during it (read)\n"
+        ),
         "{text}"
     );
     let printed = ferric_trace().arg("text").arg(&out).output().expect("runs");
@@ -204,4 +231,110 @@ fn captures_a_scheme_directory() {
         .output()
         .expect("runs");
     assert!(json.status.success(), "{json:?}");
+}
+
+#[test]
+fn profiles_for_some_seconds() {
+    let scheme = tempfile::tempdir().expect("temp dir");
+    fs::write(scheme.path().join("ctl-profiling"), "kernel_text 0x1000\n").expect("write");
+    fs::write(scheme.path().join("profiling-0"), []).expect("write");
+    fs::write(scheme.path().join("profiling-1"), []).expect("write");
+    let out = scheme.path().join("profile");
+    let output = ferric_trace()
+        .arg("profile")
+        .arg(&out)
+        .args(["--seconds", "0.2", "--scheme"])
+        .arg(scheme.path())
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(stdout.contains("cpu 1: 0 bytes of samples"), "{stdout}");
+    assert!(out.join("kernel_text").exists());
+    assert!(!out.join("INCOMPLETE").exists());
+
+    let without_profiler = tempfile::tempdir().expect("temp dir");
+    let output = ferric_trace()
+        .arg("profile")
+        .arg(without_profiler.path().join("p"))
+        .args(["--scheme"])
+        .arg(without_profiler.path())
+        .args(["--", "true"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("ctl-profiling"), "{stderr}");
+}
+
+#[test]
+fn draws_a_flamegraph() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let profile = dir.path().join("profile");
+    fs::create_dir(&profile).expect("mkdir");
+    fs::write(
+        profile.join("kernel_text"),
+        "kernel_text 0xffffffff80000000\n",
+    )
+    .expect("write");
+    let magic = ferric_trace::profile::SAMPLE_MAGIC;
+    let words = [
+        magic | 5,
+        0x40_1000,
+        1,
+        3,
+        0x40_2000,
+        magic | 4,
+        0x40_1000,
+        2,
+        3,
+    ];
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    fs::write(profile.join("samples0"), bytes).expect("write");
+    fs::write(profile.join("names"), "3 /usr/bin/ion\n").expect("write");
+    let svg = dir.path().join("out.svg");
+    let folded = dir.path().join("out.folded");
+    let output = ferric_trace()
+        .arg("flamegraph")
+        .arg(&profile)
+        .arg("-o")
+        .arg(&svg)
+        .arg("--folded")
+        .arg(&folded)
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&folded).expect("folded"),
+        "/usr/bin/ion;[unknown] 1\n/usr/bin/ion;[unknown];[unknown] 1\n"
+    );
+    let svg = fs::read_to_string(&svg).expect("svg");
+    assert!(
+        svg.contains("<title>/usr/bin/ion (2 samples, 100.00%)</title>"),
+        "{svg}"
+    );
+}
+
+#[test]
+fn capture_via_the_mapping_needs_a_ring_that_maps() {
+    let scheme = tempfile::tempdir().expect("temp dir");
+    fs::write(scheme.path().join("stats"), "cpu 0 pending 0 lost 0\n").expect("write");
+    fs::create_dir(scheme.path().join("cpu")).expect("mkdir");
+    fs::write(scheme.path().join("cpu/0"), b"").expect("write");
+    let saved = tempfile::tempdir().expect("temp dir");
+    let output = ferric_trace()
+        .args(["capture", "--via", "map", "--scheme"])
+        .arg(scheme.path())
+        .arg(saved.path().join("capture"))
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    // A stand-in file is not a ring: the mapping is refused, and the error says so.
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("cannot map the ring"), "{err}");
+    let refused = ferric_trace()
+        .args(["capture", "--via", "mmap", "x"])
+        .output()
+        .expect("runs");
+    assert!(!refused.status.success());
 }

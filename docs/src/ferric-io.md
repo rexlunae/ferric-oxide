@@ -63,6 +63,23 @@ descendants are gone, including work started by another thread. CPU teardown
 includes TLB shootdowns; DMA teardown includes completed IOTLB invalidation.
 New mappings of revoked grants fail with `ECANCELED`.
 
+A revoke, or the region's close, takes the registered frames away from a
+holder at a moment the holder did not choose. So a holder's CPU mapping is
+not unmapped but replaced in place, under one hold of the holder's address
+space lock, with zeroed private anonymous memory of the same protection (the
+`PROT_READ`, `PROT_WRITE` and `PROT_EXEC` bits the holder mapped it with, so a
+`PROT_NONE` mapping stays inaccessible). The frames are unpinned and the TLBs shot down as before, so the holder can no
+longer see or change the owner's memory. But the range stays mapped: the
+holder reads zeros there, its writes go to its own private pages, and it never
+faults on memory it was granted. A driver that keeps a grant mapped (such as
+a kernel-bypass queue socket's UMEM in `driver-network`) can therefore check
+`GrantInfo::revoked` once per tick and stop serving the grant, without a
+revoke between the check and an access crashing it. The replacement memory
+is the holder's to `munmap` like any other. When the holder itself lets go,
+with `Request::Unmap` or by closing its grant, the mapping is unmapped as
+before. `crates/regbuf/src/table.rs` records why each mapping is taken down
+(`Teardown`), and its host tests cover which operations keep the range.
+
 If teardown fails, the request reports an error such as `EIO`; it does not
 promise revocation completed. The mapping stays recorded for retry, and its
 frames remain pinned. Closed regions with outstanding mappings are retained
@@ -311,6 +328,106 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+## Disk benchmark (ferric-iobench)
+
+Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
+fio itself is GPL-2.0, so the project does not ship or port it
+(`recipes/wip/bench/io/fio` is an upstream recipe and stays unused). The
+benchmark is its own MIT code, in two parts:
+
+- `crates/iobench` (`ferric-iobench`, `no_std`, host-tested) holds the logic.
+  It parses fio's options (`--rw`, `--bs`, `--iodepth`, `--numjobs`,
+  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct=1`) and
+  refuses by name what the runner does not do: writes, engines other than
+  `psync`, and buffered I/O (`--direct=0`). Before a job runs, its block size
+  is checked against the partition's logical block size (`st_blksize`), since
+  the disk scheme refuses reads that are not whole blocks. A job with fewer
+  blocks than reads in flight is refused too: some threads would have nothing
+  to read, and the fio command fewer jobs. It has the block order, a
+  latency histogram with fio's bucket layout, the IOPS, bandwidth and
+  percentile report, and the fio command line for running the same job on
+  Linux.
+- `recipes/tests/ferric-iobench` is the on-target runner. It reads the
+  largest partition of the NVMe disk scheme. Without arguments it runs three
+  jobs: `randread-4k-qd1` (latency), `randread-4k-qd32` (IOPS) and
+  `read-128k-qd1` (bandwidth). With arguments it runs the one job they
+  describe, for example `ferric-iobench --rw=randread --bs=4k --iodepth=8`.
+
+When nvmed has per-CPU queue pairs, every round runs the job once with each
+queue policy: `MainQueue` (the one-queue path), `Adaptive` (the default) and
+`Workers`. Odd rounds run the policies in reverse order.
+`ferric_blkqueue::ab` compares `Adaptive` against `MainQueue` round by round,
+with the same paired rule and confirmation rounds as `nvme-read-4k-t<N>`
+above. The runner prints one line per policy and one for the comparison:
+
+```text
+FERRIC_BENCH iobench-randread-4k-qd32 policy=main rounds=3 ios=6144 iops=… mib_s=… lat_min_ns=… lat_mean_ns=… lat_p50_ns=… lat_p99_ns=… lat_p999_ns=… lat_max_ns=…
+FERRIC_BENCH iobench-randread-4k-qd32 ab_baseline_iops=… ab_candidate_iops=… ab_ratio=… ab_tolerance=… ab_rounds=3 ab=pass
+```
+
+A policy's line covers all of its rounds: total reads over total time, and
+every read in the histogram. The A/B line gives the per-round medians. Without
+per-CPU queues there is one path, `policy=single`, and `ab=none`.
+`scripts/ferric-ci/check-iobench-log.sh` requires every line on each of the
+five CI boots, fails on `ab=fail`, and puts the numbers in a notice and in a
+table in the job summary. CI runs on emulated NVMe under KVM on shared
+runners, so its numbers are only good for the same-boot comparison, not as
+absolute figures.
+
+### Comparing with fio on Linux
+
+`Job::fio_command` prints the fio command line that runs the same job on
+Linux. Run it in a guest with the same shape (the same QEMU `-cpu`, CPU count,
+memory and `-device nvme` options as `boot-smoke.sh`, or the same reference
+machine), against the partition block device that matches the one the runner
+read. There are two engines, and they answer different questions:
+
+- `FioEngine::Psync` is the like-for-like run. It uses
+  `--ioengine=psync --numjobs=N`, so there are N threads each doing one
+  synchronous `pread`, which is exactly what the runner does. The runner
+  shares a single block order between its threads. fio gives each job its own
+  region, so the command cuts the region into one range of whole blocks per
+  job (`Job::ranges`, one `--name=… --offset=… --size=…` section each; when
+  the blocks do not divide evenly, the first jobs get one block more), and
+  `--group_reporting` adds the jobs together. In both, every block is read
+  once, and every offset and size is a multiple of `bs`, as direct I/O needs. The difference between the two
+  numbers is the system's per-read cost: Ferric Oxide's system call, scheme
+  IPC and nvmed against Linux's block layer and NVMe driver.
+- `FioEngine::IoUring` is the exit baseline. It uses
+  `--ioengine=io_uring --iodepth=N`: one thread with N reads in flight, which
+  is Linux's fastest path. The disk sees the same queue depth. Ferric Oxide
+  has no asynchronous disk path in the runner yet (kernel rings can carry disk
+  reads later), so this gap includes the cost of using threads instead of a
+  ring.
+
+For the default jobs, with `DEV` as the partition device:
+
+```sh
+fio --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=randread-4k-qd1-0 --offset=0 --size=4194304
+# 32 sections of 262144 bytes, from --offset=0 to --offset=8126464:
+fio --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=randread-4k-qd32-0 --offset=0 --size=262144 --name=randread-4k-qd32-1 --offset=262144 --size=262144 … --name=randread-4k-qd32-31 --offset=8126464 --size=262144
+fio --name=randread-4k-qd32 --filename=DEV --rw=randread --bs=4096 --direct=1 --randseed=9223372040899026669 --ioengine=io_uring --iodepth=32 --numjobs=1 --size=8388608
+fio --filename=DEV --rw=read --bs=131072 --direct=1 --randseed=9223372040899026669 --ioengine=psync --group_reporting --name=read-128k-qd1-0 --offset=0 --size=33554432
+```
+
+The figures map onto fio's output like this:
+
+| `ferric-iobench` | fio | Notes |
+| --- | --- | --- |
+| `iops` | `read: IOPS=` | Reads over the wall-clock time from the first submission to the last completion. Like fio, the runner starts its threads before its clock: they wait at a barrier, and the clock starts when they are all there. |
+| `mib_s` | `BW=… MiB/s` | Both use `kb_base=1024`. |
+| `lat_*_ns` | `clat` (and `lat`) | Measured per read, from just before the `pread` to just after it returns. With a synchronous engine, fio's `slat` is close to zero, so `lat` and `clat` agree. fio prints microseconds by default. |
+| `lat_p50_ns`, `lat_p99_ns`, `lat_p999_ns` | `clat percentiles` 50.00th, 99.00th, 99.90th | The bucket layout is the same: exact below 128 ns, then 64 linear buckets per power of two, so each bucket is within 1/64 (1.6%). Like fio, the value reported is the middle of the bucket that holds the read of that rank, with the rank rounded up. |
+| `lat_min_ns`, `lat_max_ns`, `lat_mean_ns` | `clat min`, `max`, `avg` | Exact, not from the buckets. |
+
+The random order is a seeded permutation (a bijective mix over the next power
+of two, with cycle-walking), not fio's LFSR. The same `--randseed` therefore
+gives a different sequence on each system. Both read every block exactly once,
+with no locality. A flash drive's random-read figure does not depend on the
+exact sequence, so the numbers compare. The disk scheme has no page cache, so
+every read reaches the device, as `--direct=1` does on Linux. Neither side has
+a ramp-up period (`ramp_time` is 0 by default).
+
 ## From PCI discovery to a driver's DMA address
 
 1. Bootstrap exposes `/scheme/kernel.iommu`. `pcid` opens its root as root
@@ -534,7 +651,10 @@ aside room in the CQ for its completions, looks up the files it names
 (refusing rings with `EINVAL`, since a chain holding its ring would keep the
 ring from closing), and returns without waiting; the worker runs asynchronous chains in order, with
 the submitter's address space and credentials, and posts each chain's CQEs
-together, then triggers `EVENT_READ`. `Request::Enter { to_submit,
+together, then triggers `EVENT_READ`. After each chain and address-space cleanup,
+the worker restores its original PID and credentials before becoming idle
+or exiting; its lifecycle start and exit therefore both identify a kernel
+worker (PID 0). `Request::Enter { to_submit,
 min_complete }` waits after submitting until the CQ holds `min_complete`
 completions or nothing submitted is still running, on the worker or in
 another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
@@ -708,15 +828,16 @@ ran the serving thread, and no other CPU stole it, because work stealing does
 not take a lone context. The caller now direct-switches only when the handler
 context is a different context.
 
-## Kernel-bypass network queues (ABI only)
+## Kernel-bypass network queues
 
-`ferric-netq` (`crates/netq`) is the ABI of the planned kernel-bypass network
-queues (roadmap Phase 2.5, design in `io/netbypass-design.md` in the project
-files). It is `no_std` with no `unsafe` code and is host-tested. **No driver
-uses it yet:** there is no `queue` path on any network scheme and no
-`drivers.net_bypass` option, so nothing in the image changes. Copy mode in
-`driver-network` (with an e1000 test), then `igbd` and zero-copy come in later
-changes.
+`ferric-netq` (`crates/netq`) is the ABI of the kernel-bypass network queues
+(roadmap Phase 2.5, design in `io/netbypass-design.md` in the project files),
+and the driver's side of copy mode. It is `no_std` with no `unsafe` code and
+is host-tested. `drivers.net_bypass = true` (Drivers menu, default `false`,
+needs `kernel.regbuf`) builds `driver-network` with its `bypass` feature
+(through `e1000d/bypass`), which adds the `queue` path in copy mode. Without
+the option the network schemes have no `queue` path, as upstream.
+Zero-copy mode, `igbd` and unprivileged sockets come in later changes.
 
 An application opens `queue` beneath a network scheme
 (`/scheme/network.<nic>/queue`), registers a UMEM (a regbuf region split into
@@ -740,15 +861,81 @@ netstack.
   `Attach` passes the UMEM grant and the ring grant as `CallFlags::FD`
   descriptors (the kernel gives a scheme only the first metadata word of such
   a call), then `Bind` starts the queue with its parameters (frame size, ring
-  sizes, mode, CPU) in a 32-byte payload. `AddFilter`, `RemoveFilter`, `Kick`
-  and `Stats` follow. Every request fits the three metadata words the kernel
-  passes on a plain call.
+  sizes, mode, CPU, and `BindFlags`) in a 32-byte payload. `Own`,
+  `AddFilter`, `RemoveFilter`, `Kick` and `Stats` follow. Every request fits
+  the three metadata words the kernel passes on a plain call.
+- `own`: port ownership and TX validation. `Own` passes a netstack `udp` or
+  `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
+  reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
+  keeps the socket open, so netstack keeps the port reserved; an `Own` of a
+  port the socket already owns keeps no second descriptor. A filter on a
+  TCP or UDP destination port needs that port owned (on the filter's address,
+  when the netstack socket is bound to one). TX validation drops a frame
+  unless it has the NIC's source MAC, no VLAN header (a priority tag counts),
+  and is TCP or UDP from an owned port (and address). Validated TX sends no IP
+  fragments, the first one included, since a fragment's ports cannot be
+  checked without reassembly; `BindFlags::RAW_TX` skips validation and is the
+  supported path for fragments and anything else it does not cover. Dropped frames still
+  come back on Completion and are counted in `Stats::tx_rejected`. The path
+  check guards against mistakes, not a hostile root, since queue sockets are
+  root's and root can serve any scheme. Unprivileged sockets will need the
+  kernel to vouch for the scheme that answered.
 - `ring`: the four rings on `ferric-ring`'s index protocol. `RingLayout`
   places them in the ring grant (one header page of indices and flags, then
   each ring's slots on pages of their own, Fill, RX, TX, Completion), and
   hands each side its producers and consumers. A peer's out-of-range index is
   `ferric-ring`'s `RingError::Corrupt`, and the driver sets `NEED_WAKEUP` before it sleeps on
   an empty Fill or TX ring, so the application only `Kick`s when asked.
+  `CopyQueue::transmit` also leaves `NEED_WAKEUP` set on TX when it stops with
+  entries still there, because its budget ran out or Completion was full: the
+  driver sends only when kicked, so the application must kick again (after
+  reaping Completion) for the rest. Each `transmit` clears the flag first.
+
+- `copy`: one socket in copy mode (`CopyQueue`): up to 16 filters, the copy
+  of a matched received frame into the next Fill frame and onto RX, and the
+  copy of TX frames out of the UMEM for the NIC, handed back on Completion
+  only when it has room, so no frame is lost. Frames that cannot be delivered
+  are dropped and counted in `Stats`. UMEM and ring memory are seen as atomic
+  words, so the application writing them at any time cannot cause undefined
+  behaviour. `write_frame` and `read_frame` are those copies; applications
+  use them for their side too.
+
+In `driver-network` (`src/bypass.rs`), `Attach` maps both grants read-write
+and shared; each must be a read-write grant of whole pages. `Bind` starts the
+socket in copy mode (`Mode::ZeroCopy` fails with `ENOSPC`). While any socket
+is bound, every tick drains the adapter, gives each frame to the first socket
+with a matching filter (`ferric_netq::copy::offer`; `EVENT_READ` is posted
+only when a frame reached the socket's RX ring), and keeps the rest, in
+order, for netstack's reads (up to 256 frames; the oldest is dropped beyond
+that). `Kick` sends up to 256 TX packets through the adapter, after TX
+validation unless the socket was bound with `RAW_TX`. A filter on a port the
+socket does not own fails with `EACCES`, and an `Own` with anything but a
+bound netstack TCP or UDP socket with `EINVAL`. A socket whose rings turn
+out corrupt, or whose grant its owner revokes (checked on every tick and
+call), is stopped, and its calls fail with `EIO`; a socket stopped during a
+pass gets none of that pass's later frames. Closing a socket unmaps its
+grants and closes its netstack sockets. Every queue socket is root's, since
+the scheme root is root-only, so any socket may ask for raw TX.
+
+`ferric-netq-test` (`recipes/tests/ferric-netq-test`, in the CI smoke image)
+is the on-target test. It checks netstack answers an ICMP echo to the
+gateway, attaches a UMEM and a ring region to a queue socket on e1000d, and
+checks the refusals (calls before `Bind`, a zero-copy `Bind`, a second
+`Bind`, an unknown filter, a short `Stats` payload) and that `Mode::Auto`
+runs in copy mode. With an ARP filter it sends an ARP request for the
+gateway through its TX ring and receives the reply on RX, while netstack's
+echo still works beside it; with an ICMP filter it sends its own echo
+request and receives the reply; this socket is bound with `RAW_TX`. A second
+socket, bound without it, owns a UDP port through a netstack socket. Filters
+on unowned ports and an `Own` with a file are refused. It exchanges a DNS
+query with the configured server from that port, and has three spoofed
+frames dropped and counted: a foreign source MAC, an unowned source port,
+and ICMP. A TX benchmark then sends 20,000 60-byte UDP frames through the
+socket and the same number through netstack's UDP socket, and prints both
+rates (`FERRIC_BENCH netq-tx-udp60`; QEMU numbers, for trend only). Last, it
+checks the counters, closes both sockets with requests in flight, and checks
+netstack answers again. It skips when the driver has no queue sockets or
+there is no `kernel.regbuf` scheme.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.

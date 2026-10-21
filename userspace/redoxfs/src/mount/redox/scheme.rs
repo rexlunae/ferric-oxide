@@ -451,6 +451,8 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                 .entry(node_ptr.id())
                 .or_insert_with(FileMmapInfo::new);
             if !fmap_info.in_use() {
+                // Ferric Oxide: see `FileMmapInfo::invalidate`.
+                fmap_info.invalidate();
                 // Notify filesystem of open
                 self.fs.tx(|tx| tx.on_open_node(node_ptr))?;
             }
@@ -1148,6 +1150,8 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
                 .entry(node_ptr.id())
                 .or_insert_with(FileMmapInfo::new);
             if !fmap_info.in_use() {
+                // Ferric Oxide: see `FileMmapInfo::invalidate`.
+                fmap_info.invalidate();
                 // Notify filesystem of open
                 self.fs.tx(|tx| tx.on_open_node(node_ptr))?;
             }

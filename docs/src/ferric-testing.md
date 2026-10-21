@@ -16,6 +16,7 @@ cargo test --locked -p ferric-regbuf --all-features
 cargo test --locked -p ferric-blkgrant --all-features
 cargo test --locked -p ferric-trace --all-features
 cargo test --locked -p ferric-iommu --all-features
+cargo test --locked -p ferric-wasm-abi --all-features
 ```
 
 The workspace command includes members such as `ferric-hwrand`, installer
@@ -165,7 +166,7 @@ the desired kernel configuration for each, run the matching command from
 # With kernel.iommu = "never" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -173,7 +174,7 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
 # With kernel.iommu = "auto" generated and copied:
 RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   cargo doc --locked --no-deps \
-  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_level_info \
+  --features regbuf,rings,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info \
   --target targets/x86_64-unknown-kernel.json \
   -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   -Z json-target-spec
@@ -192,14 +193,18 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-aslr-test` | Address variation between program executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
+| `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
+| `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, disable, and read-only mapping of the rings with `commit` checks |
-| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings |
+| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, a DNS round trip from an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
+| `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
+| `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), disable, and read-only mapping of the rings with `commit` checks |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
-| `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation |
+| `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
 `ferric-tlb-test` also covers a relibc join race: an exiting thread stores its
@@ -227,7 +232,9 @@ KASLR/KPTI logs, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
-posts the benchmark as a notice. Read that script for the exact required marker set.
+posts the benchmark as a notice, and `check-iobench-log.sh` checks the disk
+benchmark's lines and A/B and writes its figures to the job summary. Read those
+scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
 (see [Kernel tracing](ferric-tracing.md#overhead-budget)).
@@ -287,6 +294,12 @@ output. It uses KVM with `host` when available and otherwise TCG with `max`.
 `BOOT_TIMEOUT` changes the default 300-second limit. `BOOT_IOMMU=vtd` requests
 interrupt remapping and a split irqchip. AMD DMA remapping requires QEMU 10 or
 later; the workflow uses a newer-QEMU container for that variant.
+`OVMF_FIRMWARE` selects a firmware file instead of searching the usual paths.
+
+`scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
+QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
+failure, a crash after the marker, a missing test result and a missing marker.
+The host-tools workflow runs it before the Rust checks.
 
 ### CET image and Kleya rerun
 

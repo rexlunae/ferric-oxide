@@ -1296,6 +1296,7 @@ type Step = fn() -> Result<(), Failure>;
 
 /// Runs the test.
 pub fn main() -> ExitCode {
+    let async_only = std::env::args().nth(1).as_deref() == Some("--async-only");
     match open_ring() {
         Ok(_) => {}
         Err(err) if matches!(err.errno(), ENODEV | ENOENT) => {
@@ -1332,6 +1333,9 @@ pub fn main() -> ExitCode {
         ("ring-bench", bench),
     ];
     for (name, step) in steps {
+        if async_only && !matches!(name, "ring-async" | "ring-async-close") {
+            continue;
+        }
         match step() {
             Ok(()) => println!("FERRIC_TEST_PASS {name}"),
             Err(why) => {
