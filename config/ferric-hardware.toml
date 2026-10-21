@@ -3,10 +3,10 @@
 # Boots on physical hardware (or QEMU) and prints a CPU, scheme and audio
 # inventory on the console before starting the login consoles. Build it with
 #
-#   make CONFIG_NAME=ferric-hardware REPO_BINARY=1 all
+#   make CONFIG_NAME=ferric-hardware all
 #
-# so every package except the kernel, bootloader, relibc, redoxfs and base
-# comes prebuilt, while those five are compiled from this checkout. The audio
+# from source so the image contains the kernel, drivers and services in this
+# checkout rather than packages from an upstream binary repository. The audio
 # section waits for pcid to spawn the HDA drivers and reports whether an
 # `audiohw` scheme exists, which is what the multi-controller change in
 # ihdad/audiod is meant to guarantee.
