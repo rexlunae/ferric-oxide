@@ -193,6 +193,9 @@ mod tests {
                 crate::kernel::SCHED_FUTEX_WAIT.id(),
                 crate::kernel::SCHED_FUTEX_RESUME.id(),
                 crate::kernel::SCHED_FUTEX_WAKE.id(),
+                crate::kernel::SCHED_CONTEXT_CREATE.id(),
+                crate::kernel::SCHED_CONTEXT_START.id(),
+                crate::kernel::SCHED_CONTEXT_EXIT.id(),
             ]
         );
     }

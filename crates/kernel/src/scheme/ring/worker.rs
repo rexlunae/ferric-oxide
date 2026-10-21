@@ -39,9 +39,7 @@ use super::{
     errno_result, refuse_rings, release_files, resolve_files, run_chain, ChainFiles, Ring,
 };
 use crate::{
-    context::{
-        self, cancel_context, memory::AddrSpaceWrapper, wakeup_context, ContextLock, Status,
-    },
+    context::{self, cancel_context, memory::AddrSpaceWrapper, wakeup_context, ContextLock},
     scheme::CallerCtx,
     sync::{CleanLockToken, L1},
     syscall::process::exit_this_context,
@@ -189,7 +187,7 @@ fn spawn(ring: &Arc<Ring>, token: &mut CleanLockToken) -> Result<()> {
         // marked too, though the worker never enters user mode: `context::spawn` gave it no
         // return to user mode, and it ends in `exit_this_context`.
         context.userspace = true;
-        context.status = Status::Runnable;
+        assert!(context.start(), "new ring worker is not yet started");
         context.cpu_id
     };
     wakeup_context(&context_lock, cpu_id, &mut token.downgrade());

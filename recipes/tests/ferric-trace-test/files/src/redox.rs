@@ -24,6 +24,7 @@ use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRI
 mod cap;
 mod crash;
 mod futex;
+mod lifecycle;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -888,6 +889,7 @@ fn run() -> Result<(), Failure> {
 
     check_fault(&cpus)?;
     futex::check_futex(&cpus)?;
+    lifecycle::check_lifecycle(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
     cap::check_cap()
@@ -1082,6 +1084,9 @@ fn check_filter(cpus: &[u32]) -> Result<(), Failure> {
 
 /// Runs the test.
 pub fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(lifecycle::CHILD_ARG) {
+        return ExitCode::from(lifecycle::CHILD_STATUS);
+    }
     // A child of `trace-cap`, run as another user with a capability on its stdin.
     if let Some(access) = std::env::args()
         .nth(1)

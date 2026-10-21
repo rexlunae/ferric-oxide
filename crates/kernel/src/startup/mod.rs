@@ -7,7 +7,7 @@ use core::{
 
 use crate::{
     arch::interrupt,
-    context::{self, context::Kstack, switch::SwitchResult, wakeup_context, Status},
+    context::{self, context::Kstack, switch::SwitchResult, wakeup_context},
     memory::{PhysicalAddress, RmmA, RmmArch},
     profiling, scheme,
     sync::CleanLockToken,
@@ -192,7 +192,6 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     match context::spawn(true, owner, userspace_init, &mut token) {
         Ok(context_lock) => {
             let mut context = context_lock.write(token.token());
-            context.status = Status::Runnable;
             context.name.clear();
             context.name.push_str("[bootstrap]");
 
@@ -200,6 +199,7 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
             context.euid = 0;
             context.egid = 0;
 
+            assert!(context.start(), "new bootstrap context is not yet started");
             let cpu_id = context.cpu_id;
             drop(context);
 

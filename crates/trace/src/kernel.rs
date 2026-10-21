@@ -176,6 +176,44 @@ crate::events! {
         level: Info,
         args: ["key", "addr", "requested", "woken"],
     }
+
+    /// A context was successfully spawned and registered, before its caller can start it:
+    /// the new context's debug id and whether it may enter user mode (0 or 1).
+    ///
+    /// No PID has been assigned yet. This covers `context::spawn`, including ring workers,
+    /// but not the per-CPU idle contexts. Dropping an unstarted context need not emit an exit.
+    pub const SCHED_CONTEXT_CREATE = 13 {
+        name: "sched.context_create",
+        subsystem: Sched,
+        level: Info,
+        args: ["context", "user_mode"],
+    }
+
+    /// An accepted transition from not-yet-started to runnable, under the context lock:
+    /// the assigned PID and debug id. The context cannot run before this record is written.
+    ///
+    /// Covers the proc scheme's `start`, bootstrap and ring workers. This is not an exec
+    /// or a process birth: multiple contexts may belong to one PID, and PID 0 is used by
+    /// kernel contexts. The emitter may be a manager running on another context.
+    pub const SCHED_CONTEXT_START = 14 {
+        name: "sched.context_start",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "context"],
+    }
+
+    /// A running context completed resource cleanup and is marked dead, before its owner
+    /// is notified: PID, debug id, whether it has an unhandled exception (0 or 1), and the
+    /// exception's raw `redox_syscall::Exception` kind, code and address (zero when absent).
+    ///
+    /// This is a context exit, not a process exit status or signal number. Exceptions
+    /// delivered to a user-space handler do not end the context here.
+    pub const SCHED_CONTEXT_EXIT = 15 {
+        name: "sched.context_exit",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "context", "exception", "kind", "code", "addr"],
+    }
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -418,6 +456,9 @@ mod tests {
         assert_eq!(SCHED_FUTEX_WAIT.id().get(), 10);
         assert_eq!(SCHED_FUTEX_RESUME.id().get(), 11);
         assert_eq!(SCHED_FUTEX_WAKE.id().get(), 12);
+        assert_eq!(SCHED_CONTEXT_CREATE.id().get(), 13);
+        assert_eq!(SCHED_CONTEXT_START.id().get(), 14);
+        assert_eq!(SCHED_CONTEXT_EXIT.id().get(), 15);
     }
 
     #[test]
@@ -441,6 +482,9 @@ mod tests {
             &SCHED_FUTEX_WAIT,
             &SCHED_FUTEX_RESUME,
             &SCHED_FUTEX_WAKE,
+            &SCHED_CONTEXT_CREATE,
+            &SCHED_CONTEXT_START,
+            &SCHED_CONTEXT_EXIT,
         ] {
             assert_eq!(event.level(), crate::Level::Info, "{}", event.name());
         }
@@ -448,10 +492,17 @@ mod tests {
     }
 
     #[test]
-    fn futex_events_use_the_existing_scheduler_controls() {
+    fn lifecycle_events_use_the_existing_scheduler_controls() {
         let selected = crate::select(&CATALOG, "sched").unwrap();
         let compiled = CATALOG.compiled_for(|f| f == "trace_sched" || f == "trace_level_info");
-        for event in [&SCHED_FUTEX_WAIT, &SCHED_FUTEX_RESUME, &SCHED_FUTEX_WAKE] {
+        for event in [
+            &SCHED_FUTEX_WAIT,
+            &SCHED_FUTEX_RESUME,
+            &SCHED_FUTEX_WAKE,
+            &SCHED_CONTEXT_CREATE,
+            &SCHED_CONTEXT_START,
+            &SCHED_CONTEXT_EXIT,
+        ] {
             assert_eq!(event.subsystem(), Subsystem::Sched);
             assert!(selected.contains(event.id()));
             assert!(compiled.contains(event.id()));
