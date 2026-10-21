@@ -382,6 +382,10 @@ pub struct DSO {
 
     /// Is this DSO for ld.so?
     is_me: bool,
+
+    /// Ferric Oxide: the load bias and path recorded with the kernel (sys_proc), so that
+    /// unloading the library takes its record away again.
+    recorded_image: Option<(usize, String)>,
 }
 
 impl DSO {
@@ -428,6 +432,7 @@ impl DSO {
                 pie: true,
                 is_ready: AtomicBool::new(false),
                 is_me: true,
+                recorded_image: None,
             },
             tcb_master,
         )
@@ -460,6 +465,21 @@ impl DSO {
         } else {
             elf.entry() as usize
         };
+        // Ferric Oxide: tell the kernel where this library went (sys_proc), for profilers.
+        #[cfg(target_os = "redox")]
+        let recorded_image = if base_addr.is_none() {
+            let bias = if is_pie_enabled(&elf) {
+                mmap.as_ptr() as usize
+            } else {
+                0
+            };
+            redox_rt::proc::record_own_image(bias, path.as_bytes());
+            Some((bias, path.to_string()))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "redox"))]
+        let recorded_image = None;
 
         let dso = DSO {
             name,
@@ -482,6 +502,7 @@ impl DSO {
             scope: spin::Once::new(),
             is_ready: AtomicBool::new(false),
             is_me: false,
+            recorded_image,
         };
 
         Ok((dso, tcb_master, elf.elf_program_headers().to_vec()))
@@ -1381,6 +1402,13 @@ impl Drop for DSO {
             unsafe {
                 self.run_fini();
             }
+        }
+        // Ferric Oxide: the library's pages go when `mmap` drops, after this body, so its
+        // image record goes now, on every path that drops it (a failed load too), or a
+        // library later mapped at the same address is profiled under this one's name.
+        #[cfg(target_os = "redox")]
+        if let Some((bias, path)) = &self.recorded_image {
+            redox_rt::proc::unrecord_own_image(*bias, path.as_bytes());
         }
     }
 }

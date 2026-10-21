@@ -7,6 +7,8 @@
 //! - `proc-self`: this process's own block: its name, `runnable` and running, some CPU time,
 //!   the `sys` file it holds open, and a grant of at least the [`ALLOC_BYTES`] it allocated,
 //!   counted in its private memory.
+//! - `proc-images`: the block lists this program's own image, as exec recorded it, at a load
+//!   bias no higher than the address of its own code.
 //! - `proc-slice`: two reads in a row show this running context's CPU time growing, so the
 //!   current timeslice is counted and not only the ones that ended.
 //! - `proc-guard`: with a thread parked, the grant right below the one holding its stack is
@@ -122,6 +124,7 @@ fn check_self(text: &str, held: &[u8]) -> Result<(), Failure> {
     }
     // Keep the allocation alive until here.
     std::hint::black_box(held);
+    check_images(me)?;
     println!(
         "FERRIC_TEST_PASS proc-self (context {}, {} fds, {} grants, {} pages at {:#x}, {} ns)",
         context.id,
@@ -130,6 +133,31 @@ fn check_self(text: &str, held: &[u8]) -> Result<(), Failure> {
         grant.pages,
         grant.base,
         context.active_ns
+    );
+    Ok(())
+}
+
+/// `proc-images`.
+fn check_images(me: &Process<'_>) -> Result<(), Failure> {
+    let code = check_images as fn(&Process<'_>) -> Result<(), Failure> as usize as u64;
+    let Some(image) = me
+        .images
+        .iter()
+        .find(|i| i.path.0.ends_with("ferric-proc-test"))
+    else {
+        return Err(check(format!("own image not among {:?}", me.images)));
+    };
+    if image.base > code {
+        return Err(check(format!(
+            "own image at {:#x}, above its code at {code:#x}",
+            image.base
+        )));
+    }
+    println!(
+        "FERRIC_TEST_PASS proc-images ({} images, own at {:#x} from {})",
+        me.images.len(),
+        image.base,
+        image.path.0
     );
     Ok(())
 }

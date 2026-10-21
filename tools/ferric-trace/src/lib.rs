@@ -13,6 +13,8 @@
 //!   (`/scheme/kernel.trace/crash`, the `ferric-trace crash` command) as a capture.
 //! - [`profile`] records a profile from the kernel's sampling profiler (`kernel.profiling`) on
 //!   the target (the `ferric-trace profile` command) and loads it back on the host.
+//! - [`flamegraph`] symbolizes a profile's stacks and folds them; [`svg`] draws the result
+//!   (the `ferric-trace flamegraph` command).
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
 //! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
 //!   sources, IOMMU fault reports) into words, for both views.
@@ -49,8 +51,10 @@ pub mod capture;
 pub mod crash;
 pub mod describe;
 pub mod drain;
+pub mod flamegraph;
 pub mod otlp;
 pub mod perfetto;
 pub mod profile;
 pub mod spans;
+pub mod svg;
 pub mod text;

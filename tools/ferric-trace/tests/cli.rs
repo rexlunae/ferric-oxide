@@ -268,6 +268,54 @@ fn profiles_for_some_seconds() {
 }
 
 #[test]
+fn draws_a_flamegraph() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let profile = dir.path().join("profile");
+    fs::create_dir(&profile).expect("mkdir");
+    fs::write(
+        profile.join("kernel_text"),
+        "kernel_text 0xffffffff80000000\n",
+    )
+    .expect("write");
+    let magic = ferric_trace::profile::SAMPLE_MAGIC;
+    let words = [
+        magic | 5,
+        0x40_1000,
+        1,
+        3,
+        0x40_2000,
+        magic | 4,
+        0x40_1000,
+        2,
+        3,
+    ];
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    fs::write(profile.join("samples0"), bytes).expect("write");
+    fs::write(profile.join("names"), "3 /usr/bin/ion\n").expect("write");
+    let svg = dir.path().join("out.svg");
+    let folded = dir.path().join("out.folded");
+    let output = ferric_trace()
+        .arg("flamegraph")
+        .arg(&profile)
+        .arg("-o")
+        .arg(&svg)
+        .arg("--folded")
+        .arg(&folded)
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&folded).expect("folded"),
+        "/usr/bin/ion;[unknown] 1\n/usr/bin/ion;[unknown];[unknown] 1\n"
+    );
+    let svg = fs::read_to_string(&svg).expect("svg");
+    assert!(
+        svg.contains("<title>/usr/bin/ion (2 samples, 100.00%)</title>"),
+        "{svg}"
+    );
+}
+
+#[test]
 fn capture_via_the_mapping_needs_a_ring_that_maps() {
     let scheme = tempfile::tempdir().expect("temp dir");
     fs::write(scheme.path().join("stats"), "cpu 0 pending 0 lost 0\n").expect("write");

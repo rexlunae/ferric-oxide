@@ -19,6 +19,10 @@ ferric-trace-map = { path = "../../crates/trace-map" }
 # To decode the hardware reports in `iommu.fault` records, as the kernel does.
 ferric-amdvi = { path = "../../crates/amdvi" }
 ferric-vtd = { path = "../../crates/vtd", default-features = false }
+ferric-procinfo = { path = "../../crates/procinfo", features = ["alloc"] }
+# ELF symbol tables for `flamegraph`.
+object = { version = "0.38", default-features = false, features = ["read_core", "elf", "std"] }
+rustc-demangle = "0.1.28"
 serde.workspace = true
 # For the scheme opcode names (`schemev2::Opcode`); no system calls are made.
 redox_syscall = { version = "0.9.4", default-features = false }

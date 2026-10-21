@@ -593,6 +593,52 @@ kernel without the whole-sample writes) as one error and carries on after
 them.
 User stacks are only walked through frame pointers, so build the image with
 `cpu.frame_pointers` ([#149](https://github.com/rexlunae/ferric-oxide/pull/149)) for useful user frames.
+With `kernel.sys_proc` it also reads `/scheme/sys/proc` as it drains and saves
+an `images` file: the `image` lines of every sampled context.
+
+Those lines come from the loaders. Exec (`redox-rt`) records the program and
+its interpreter, and `ld.so` each library it maps: the load bias and path
+(`ferric_procinfo::ImageRecord`, written to the address space's `images`
+handle in the proc scheme). The kernel keeps up to 64 per address space,
+copies them on fork and starts empty on exec, so user addresses can be
+symbolized with ASLR on. A program that lives less than one drain interval may
+be missed, and its frames then show as `[unknown]`. `ld.so` takes a library's
+record back when a library is unloaded (in the library's drop, so a failed
+`dlopen` cleans up too; the address space's `images-unload` handle), but the
+recorder keeps every image it saw, so samples taken before the unload still
+resolve. Each snapshot is an epoch, and each sighting of an image an occurrence
+with the epochs it was seen in (`image-spans`); an image that comes back after
+missing from a snapshot is a new occurrence. The `batches` file gives the
+sample files' lengths after each drain, which dates every sample with the epoch
+of the snapshot that followed it. The symbolizer resolves a sample against the
+occurrence live at its epoch, so old samples keep their library when another
+(or the same one again) is later mapped at the same address, and falls back to
+the newest image that holds the address.
+The recorder reads the file before sampling, after the first drain, after
+every fifth (about every 500 ms) and after the last: one read took about
+1.6 ms on the CI image, 1.6% of the time when it was read at every drain, so
+an image that lives less than half a second may be missed. `ferric-trace
+profile` prints what the reads cost (`image snapshots: … ppm of the … from the
+first to the last`).
+
+```sh
+ferric-trace flamegraph prof/ --kernel kernel.all --root build/x86_64/ferric-smoke/sysroot \
+    --folded prof.folded -o prof.svg
+```
+
+`ferric-trace flamegraph` (on the host or the target) symbolizes each stack
+from ELF symbol tables. Kernel addresses use the kernel ELF, with the KASLR
+slide taken from `kernel_text`. User addresses use the image that holds them,
+read from `--root` (unstripped binaries, such as the cookbook's build trees,
+give names; stripped ones show `[<file>]`). The paths come from the target and
+are not trusted: a path with `..`, or one that leaves `--root` through a
+symbolic link, is not read, and its frames show `[<file>]`. It writes the folded stacks
+(`root;frame;frame count`, the format other flame graph tools read) and its own
+self-contained SVG (`tools/ferric-trace/src/svg.rs`): root at the bottom,
+frames sorted by name, the name, count and share in each frame's tooltip.
+`profile-image.yml` builds an image with `kernel.profiling`, `kernel.sys_proc`
+and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
+
 ## Validation
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
@@ -811,6 +857,7 @@ fd 0 scheme pipe number 3
 fd 3 scheme sys number 7
 fd 4 scheme user:7 number 1
 grant 0x400000 pages 12 provider allocated prot r-x
+image 0x0 path /usr/bin/ferric-proc-test
 ```
 
 - `context`: the context's debug id (the id `sched.switch` records carry, so
@@ -835,6 +882,9 @@ grant 0x400000 pages 12 provider allocated prot r-x
   `phys`, `external`, `fmap`) and its protection, as user space may use it:
   a `PROT_NONE` guard page (`kernel.prot_none`) is `---`, not readable.
   Threads of one process share an address space and list the same grants.
+- `image`: each ELF image its loaders recorded (see "Sampling profiles"): the
+  load bias (0 for an executable that is not position-independent) and the
+  path, which runs to the end of the line.
 
 The kernel builds the file in two passes, so it takes no lock out of order.
 First it copies each context, and its descriptors' scheme ids, under that

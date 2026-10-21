@@ -1,7 +1,7 @@
 //! Ferric Oxide: `/scheme/sys/proc`, per-process introspection (`sys_proc`).
 //!
 //! One block per context, in the line format of `ferric_procinfo`: the context, its memory,
-//! its open file descriptors and its grants. Only root may open it (it lists addresses).
+//! its open file descriptors, its grants and the images its loaders recorded. Only root may open it (it lists addresses).
 //!
 //! The data are gathered in two passes, so no lock is held out of order: the first walks
 //! the contexts, copying what each one shows and the scheme id of every descriptor; the
@@ -11,8 +11,8 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 
 use ferric_procinfo::{
-    cpu_time_ns, ContextLine, FdLine, GrantLine, MemoryLine, Name, Prot, Provider, SchemeRef,
-    Status,
+    cpu_time_ns, ContextLine, FdLine, GrantLine, Image, MemoryLine, Name, Prot, Provider,
+    SchemeRef, Status,
 };
 use hashbrown::HashMap;
 use syscall::flag::MapFlags;
@@ -108,12 +108,12 @@ fn snapshots(token: &mut CleanLockToken) -> Vec<Snapshot> {
     out
 }
 
-/// The memory line and the grants of `addr_space`.
+/// The memory line, the grants and the images of `addr_space`.
 fn memory(
     addr_space: &AddrSpaceWrapper,
     kernel_bytes: u64,
     token: &mut CleanLockToken,
-) -> (MemoryLine, Vec<GrantLine>) {
+) -> (MemoryLine, Vec<GrantLine>, Vec<Image>) {
     let guard = addr_space.acquire_read(token.downgrade());
     let (mut private, mut shared) = (0u64, 0u64);
     let mut grants = Vec::new();
@@ -144,7 +144,7 @@ fn memory(
         shared,
         kernel: kernel_bytes,
     };
-    (line, grants)
+    (line, grants, guard.images.clone())
 }
 
 /// The name of the scheme a descriptor with handle `number` on scheme `id` is open on, as
@@ -195,7 +195,7 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
                 name: Name(&snapshot.name),
             }
         );
-        let (memory, grants) = match &snapshot.addr_space {
+        let (memory, grants, images) = match &snapshot.addr_space {
             Some(addr_space) => memory(addr_space, snapshot.kernel_bytes, token),
             None => (
                 MemoryLine {
@@ -203,6 +203,7 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
                     shared: 0,
                     kernel: snapshot.kernel_bytes,
                 },
+                Vec::new(),
                 Vec::new(),
             ),
         };
@@ -226,6 +227,9 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         drop(schemes);
         for grant in grants {
             let _ = write!(report, "{grant}");
+        }
+        for image in &images {
+            let _ = write!(report, "{}", image.line());
         }
     }
     Ok(report.into_bytes())
