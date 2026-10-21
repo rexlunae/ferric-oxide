@@ -85,10 +85,10 @@ ferric-iobench || echo FERRIC_TEST_FAIL iobench exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
 ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
-# Saves a capture and reads it back, on a kernel with kernel.trace. The /scheme listing says
+# Saves a capture through the ring mappings and reads it back, on a kernel with kernel.trace. The /scheme listing says
 # whether it has one, as in ferric-trace-test; the trace-overhead baseline image has none.
 if contains "$(ls /scheme)" kernel.trace
-    ferric-trace capture /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
+    ferric-trace capture --via map /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
 else
     echo FERRIC_TEST_SKIP trace-capture: no kernel.trace scheme
 end

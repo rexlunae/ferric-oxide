@@ -29,6 +29,11 @@ enum Cmd {
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
         scheme: PathBuf,
+        /// How to take the records out of the rings: `map` copies them out of the read-only
+        /// mapping and commits each copy once it is saved, `read` reads them, and `auto` maps
+        /// where the kernel allows it and reads otherwise
+        #[arg(long, default_value_t = drain::Via::Auto)]
+        via: drain::Via,
     },
     /// Print every record, one line each, in timestamp order
     Text {
@@ -108,12 +113,16 @@ enum CliError {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Cmd::Capture { out, scheme } => {
-            let drained = drain::drain_scheme(&scheme, &out)?;
+        Cmd::Capture { out, scheme, via } => {
+            let drained = drain::drain_scheme(&scheme, &out, via)?;
             for cpu in &drained {
                 println!(
-                    "cpu {}: {} bytes, {} records lost before the capture, {} during it",
-                    cpu.cpu, cpu.bytes, cpu.lost_before, cpu.lost_during
+                    "cpu {}: {} bytes, {} records lost before the capture, {} during it ({})",
+                    cpu.cpu,
+                    cpu.bytes,
+                    cpu.lost_before,
+                    cpu.lost_during,
+                    if cpu.mapped { "mapped" } else { "read" }
                 );
             }
             println!("saved {} CPUs to {}", drained.len(), out.display());

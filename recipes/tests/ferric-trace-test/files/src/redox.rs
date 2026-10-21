@@ -5,7 +5,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicU64;
 
 use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
@@ -15,9 +14,10 @@ use ferric_trace::kernel::{
     CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH,
     SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
 };
-use ferric_trace::record::{Records, WORD_BYTES};
+use ferric_trace::record::Records;
 use ferric_trace::ring::View;
 use ferric_trace::{Event, EventId};
+use ferric_trace_map::Mapping;
 use syscall::schemev2::Opcode;
 use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
@@ -439,45 +439,6 @@ fn check_initfs() -> Result<(), Failure> {
     Ok(())
 }
 
-/// A CPU's ring mapped into this process, until dropped.
-struct Mapped {
-    addr: usize,
-}
-
-impl Mapped {
-    /// Maps [`CPU_MAP_BYTES`] of `fd` from offset 0 with `flags`, or returns the error.
-    fn new(fd: usize, size: usize, flags: MapFlags) -> syscall::Result<Self> {
-        let map = syscall::Map {
-            offset: 0,
-            size,
-            flags,
-            address: 0,
-        };
-        // SAFETY: a fresh mapping at an address the kernel picks; nothing in this process
-        // refers to that memory yet.
-        let addr = unsafe { syscall::fmap(fd, &map) }?;
-        Ok(Self { addr })
-    }
-
-    /// The ring's words.
-    fn words(&self) -> &[AtomicU64] {
-        // SAFETY: the mapping is CPU_MAP_BYTES of page-aligned shared memory, mapped until
-        // `drop`, which needs `&mut self`, so it outlives this borrow. `AtomicU64` has the size
-        // and alignment of a `u64` and any bit pattern is valid, and the kernel writes the
-        // same memory only atomically.
-        unsafe {
-            core::slice::from_raw_parts(self.addr as *const AtomicU64, CPU_MAP_BYTES / WORD_BYTES)
-        }
-    }
-}
-
-impl Drop for Mapped {
-    fn drop(&mut self) {
-        // SAFETY: the mapping made by `new`; no borrow of it outlives `&mut self`.
-        let _ = unsafe { syscall::funmap(self.addr, CPU_MAP_BYTES) };
-    }
-}
-
 /// Checks that `result` failed with `errno`.
 fn expect_errno(
     step: &'static str,
@@ -504,7 +465,7 @@ fn commit(fd: usize, end: u64) -> syscall::Result<usize> {
 struct CpuMap {
     cpu: u32,
     file: File,
-    map: Mapped,
+    map: Mapping,
 }
 
 impl CpuMap {
@@ -527,7 +488,7 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
                 .open(&path)
                 .map_err(io_failure(step, &path))?;
             let fd = file.as_raw_fd() as usize;
-            let refused = |flags, size| Mapped::new(fd, size, flags).map(|map| map.addr);
+            let refused = |flags, size| Mapping::probe(fd, size, flags).map(|()| 0);
             expect_errno(
                 step,
                 "writable mmap of a ring",
@@ -552,7 +513,7 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
                 refused(MapFlags::PROT_READ | MapFlags::MAP_PRIVATE, CPU_MAP_BYTES),
                 EINVAL,
             )?;
-            let map = Mapped::new(fd, CPU_MAP_BYTES, read_shared).map_err(|err| Failure {
+            let map = Mapping::ring(fd).map_err(|err| Failure {
                 step,
                 why: Why::Call {
                     call: "mmap of a ring",
@@ -563,7 +524,7 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
             // writes through; the kernel must refuse it anyway.
             let result = unsafe {
                 syscall::mprotect(
-                    map.addr,
+                    map.addr(),
                     CPU_MAP_BYTES,
                     MapFlags::PROT_READ | MapFlags::PROT_WRITE,
                 )
