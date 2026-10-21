@@ -1,0 +1,20 @@
+[package]
+name = "rtl8125d"
+description = "Realtek RTL8125B 2.5GbE ethernet driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libredox.workspace = true
+log.workspace = true
+redox_event.workspace = true
+redox_syscall.workspace = true
+
+common = { path = "../../common" }
+daemon = { path = "../../../daemon" }
+driver-network = { path = "../driver-network" }
+ferric-rtl8125.workspace = true
+pcid = { path = "../../pcid" }
+
+[lints]
+workspace = true

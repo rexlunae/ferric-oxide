@@ -57,14 +57,38 @@ since there is no PS/2 port to fall back to.
 
 | Device | ID | Driver and match | Status | Notes |
 | --- | --- | --- | --- | --- |
-| Realtek RTL8125 2.5GbE | `10ec:8125` rev 05 | none | missing | The existing `rtl8168d` matches only `0x8168` and `0x8169`. RTL8125 is not a PCI-ID-only addition: its driver needs the new descriptor/interrupt path and the MAC/PHY firmware patch tables. |
+| Realtek RTL8125 2.5GbE | `10ec:8125` rev 05 | `rtl8125d`, ID `10ec:8125` | binds | New driver for the RTL8125B. It compiles for `x86_64-unknown-redox` but has not been booted on the machine; QEMU does not emulate this controller. |
 | Realtek RTL8922AE Wi-Fi 7 | `10ec:8922` | none | missing | Also supplies Bluetooth on this board. This is a Phase 5 effort and needs a firmware strategy and a native-versus-compatibility-layer decision. |
 
 Ethernet is the highest-impact gap for a usable machine: without it the test
-image cannot reach the network or fetch packages. The work is a driver port,
-not a configuration change. The permissively licensed FreeBSD `if_re` driver
-is the practical reference for RTL8125; the Linux and macOS drivers are GPL
-and cannot be ported into the MIT tree.
+image cannot reach the network or fetch packages. `rtl8125d` is no longer a
+missing driver, but it is not yet a proven one. It initialises the MAC and PHY
+through the same OCP access paths as the permissively licensed FreeBSD `if_re`
+driver, loads the RTL8125B MAC and PHY patch tables, applies the RTL8125B EPHY
+register sequence, and uses the legacy 16-byte descriptor format with the new
+interrupt map. The Linux and macOS drivers are GPL and were not used as
+references.
+
+The driver deliberately claims only the RTL8125B. It supports one RX queue, one
+TX queue, 1500-byte frames, and the single interrupt vector that `pcid`
+allocates (MSI-X, MSI or INTx). It does not implement jumbo frames, checksum or
+segmentation offload, VLAN stripping, multiple queues, per-queue MSI-X vectors,
+or wake-on-LAN. The firmware tables and the part of the initialisation that can
+be checked without MMIO live in the host-tested `crates/rtl8125` crate.
+
+The receive descriptor length includes the Ethernet CRC, so the driver strips
+it before handing a frame to the network scheme. The scheme hands the frame to
+`netstack`, whose Ethernet link buffer was enlarged from 1500 to 1514 bytes so
+that a maximum-size frame is not truncated; the old size dropped the tail of
+every full-MTU packet.
+
+QEMU has no RTL8125 device model, so the driver cannot be exercised in the
+smoke VM. Validation requires booting the hardware image on the machine and
+checking the boot log for the detected MAC version, both patch versions, a
+valid MAC address, and link-up after the PHY completes auto-negotiation. The
+first bare-metal boot is also the first test of the DMA mapping and interrupt
+path; until that log exists, the device-map entry means "the configuration
+matches", not "the driver works".
 
 ### Audio
 
@@ -115,15 +139,16 @@ desktop, but they do not block a first boot.
 inventory on the console and then starts the login consoles:
 
 ```sh
-make CONFIG_NAME=ferric-hardware REPO_BINARY=1 all
+make CONFIG_NAME=ferric-hardware all
 ```
 
 It compiles the kernel, bootloader, relibc, RedoxFS and `base` from this
-checkout and downloads the other packages prebuilt. The report sits between
-`FERRIC_HARDWARE_BEGIN` and `FERRIC_HARDWARE_END`. `FERRIC_HARDWARE_FAIL
-audio-scheme` means that no `audiohw` scheme appeared within 30 seconds; the
-script does not shut the machine down, so the console stays available for the
-next check.
+checkout. Build the rest from source as well: the validation image must contain
+the drivers and services from this tree, not packages fetched from an upstream
+binary repository. The report sits between `FERRIC_HARDWARE_BEGIN` and
+`FERRIC_HARDWARE_END`. `FERRIC_HARDWARE_FAIL audio-scheme` means that no
+`audiohw` scheme appeared within 30 seconds; the script does not shut the
+machine down, so the console stays available for the next check.
 
 QEMU can exercise the multi-controller audio path without the physical
 machine by adding three HDA controllers: three `ich9-intel-hda` devices, each
@@ -140,11 +165,12 @@ the physical codecs.
    device, boot it through UEFI, and capture the serial or screen log. Confirm
    the CPU feature check, the GOP framebuffer, NVMe enumeration, xHCI, USB
    input and the audio controller before changing more drivers.
-2. **RTL8125 Ethernet.** Port the RTL8125 initialisation, descriptor rings,
-   interrupt path and firmware tables from the permissively licensed FreeBSD
-   driver, or implement them from the register documentation if it is
-   available. Keep the driver in a new crate rather than growing the
-   RTL8168 register layout into a chip-specific tangle.
+2. **Validate RTL8125 Ethernet.** `rtl8125d` is in the tree but has only
+   compiled, not run. Boot the hardware image and confirm that the driver finds
+   the RTL8125B, reads a valid MAC address, accepts both firmware patch
+   versions, and brings the link up. If initialisation stalls, use the MAC and
+   PHY OCP timeouts and the recorded patch versions to narrow the failure
+   before changing the register sequence.
 3. **ACPI and platform devices.** Exercise the AML interpreter on this board,
    then add thermal and fan reporting and CPU frequency/C-state support.
 4. **Wi-Fi and Bluetooth.** Choose native Rust or a LinuxKPI-style driver

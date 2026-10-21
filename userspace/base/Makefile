@@ -17,7 +17,7 @@ INITFS_BINS = ipcd init logd ramfs randd zerod \
 	pcid pcid-spawner rtcd vesad
 INITFS_DRIVERS_BINS = nvmed virtio-blkd  virtio-gpud
 BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
-DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8139d rtl8168d \
+DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8125d rtl8139d rtl8168d \
 	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid
 
 ifneq (,$(filter i586-unknown-redox i686-unknown-redox x86_64-unknown-redox,$(TARGET)))

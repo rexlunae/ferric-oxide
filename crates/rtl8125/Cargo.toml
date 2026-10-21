@@ -1,0 +1,8 @@
+[package]
+name = "ferric-rtl8125"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Register, descriptor and firmware-patch facts for the Realtek RTL8125 Ethernet controller"
+
+[dependencies]
