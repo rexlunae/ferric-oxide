@@ -214,6 +214,43 @@ crate::events! {
         level: Info,
         args: ["pid", "context", "exception", "kind", "code", "addr"],
     }
+
+    /// An `AddrSpace::mmap` attempt completed under the address-space lock: the user
+    /// page-table root's physical address, requested address (0 without a hint), page
+    /// count, raw `redox_syscall::MapFlags`, and returned address or negated errno.
+    ///
+    /// `space` identifies an address space while it exists; its frame may be reused after
+    /// destruction. The producer may be a manager operating on another address space.
+    /// This is an operation result, not a full journal: fixed replacement can unmap old
+    /// pages before a failed allocation, and clone/move/drop paths are not covered.
+    pub const MM_MAP = 16 {
+        name: "mm.map",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "addr", "pages", "flags", "ret"],
+    }
+
+    /// An `AddrSpaceWrapper::mprotect` attempt completed under the address-space lock:
+    /// page-table root, requested address/page count, raw `MapFlags`, and 0 or negated
+    /// errno. Permissions can have changed on earlier grants even when a later one fails.
+    /// The flags express the request, not necessarily hardware-enforced read protection.
+    pub const MM_PROTECT = 17 {
+        name: "mm.protect",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "addr", "pages", "flags", "ret"],
+    }
+
+    /// An `AddrSpaceWrapper::munmap` attempt completed under the address-space lock:
+    /// page-table root, requested address/page count, whether to unpin (0 or 1), and 0
+    /// or negated errno. Holes are allowed; a failure can follow partial unmapping.
+    /// This precedes scheme notifications and excludes internal replacement/move/drop.
+    pub const MM_UNMAP = 18 {
+        name: "mm.unmap",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "addr", "pages", "unpin", "ret"],
+    }
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -459,6 +496,9 @@ mod tests {
         assert_eq!(SCHED_CONTEXT_CREATE.id().get(), 13);
         assert_eq!(SCHED_CONTEXT_START.id().get(), 14);
         assert_eq!(SCHED_CONTEXT_EXIT.id().get(), 15);
+        assert_eq!(MM_MAP.id().get(), 16);
+        assert_eq!(MM_PROTECT.id().get(), 17);
+        assert_eq!(MM_UNMAP.id().get(), 18);
     }
 
     #[test]
@@ -477,6 +517,9 @@ mod tests {
         // IOMMU fault is something going wrong.
         for event in [
             &MM_PAGE_FAULT,
+            &MM_MAP,
+            &MM_PROTECT,
+            &MM_UNMAP,
             &IRQ_DELIVER,
             &IRQ_ACK,
             &SCHED_FUTEX_WAIT,
@@ -506,6 +549,19 @@ mod tests {
             assert_eq!(event.subsystem(), Subsystem::Sched);
             assert!(selected.contains(event.id()));
             assert!(compiled.contains(event.id()));
+        }
+    }
+
+    #[test]
+    fn mapping_events_use_the_existing_memory_controls() {
+        let selected = crate::select(&CATALOG, "mm").unwrap();
+        let compiled = CATALOG.compiled_for(|f| f == "trace_mm" || f == "trace_level_info");
+        let absent = CATALOG.compiled_for(|f| f == "trace_level_info");
+        for event in [&MM_PAGE_FAULT, &MM_MAP, &MM_PROTECT, &MM_UNMAP] {
+            assert_eq!(event.subsystem(), Subsystem::Mm);
+            assert!(selected.contains(event.id()));
+            assert!(compiled.contains(event.id()));
+            assert!(!absent.contains(event.id()));
         }
     }
 

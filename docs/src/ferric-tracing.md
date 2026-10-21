@@ -19,7 +19,7 @@ what is on at run time.
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, and `sched.context_create`/`context_start`/`context_exit` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
-| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault` |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
 | `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (an `error`-level event, so every `kernel.trace_max_level` keeps it) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
@@ -132,6 +132,40 @@ The events are:
 | `sched.context_create` | `context`, `user_mode` |
 | `sched.context_start` | `pid`, `context` |
 | `sched.context_exit` | `pid`, `context`, `exception`, `kind`, `code`, `addr` |
+
+### Mapping-operation results
+
+`mm.map`, `mm.protect` and `mm.unmap` are info-level events under
+`kernel.trace_mm`. They record attempts through `AddrSpace::mmap`,
+`AddrSpaceWrapper::mprotect` and `AddrSpaceWrapper::munmap`, respectively,
+after their result is known and local TLB flushers have completed, while the
+address-space write lock is still held. Operations on that space therefore
+cannot interleave their results. Scheme notifications of an unmap occur later.
+
+Each carries `space` (the physical address of the user page-table root),
+`addr` and `pages`. The root identifies the target while it exists, including
+when a manager operates on a different process's space; it is not a PID and
+its physical frame may be reused after destruction. Exporters still attribute
+the record to its producer's track. `pages` counts kernel pages (4096 bytes on
+x86-64), not bytes. Map/protect carry the requested raw
+`redox_syscall::MapFlags`; unmap carries `unpin` (0 or 1). `ret` uses
+`Error::mux`: the selected virtual address for a successful map, 0 for a
+successful protect/unmap, or a negated errno. Map's `addr` is the requested
+hint, or 0 without one; flags distinguish a fixed request at address 0.
+
+These are operation results, not a complete mapping journal. Refusals before
+these APIs (for example, an unaligned system-call range or a scheme's earlier
+refusal) produce no such record. A failed operation can still have changed
+earlier grants: fixed replacement unmaps before allocation, and protection
+and unmap process overlapping grants in turn. Unmap can succeed over holes.
+Flags describe the request, not necessarily hardware-enforced read access.
+Clone, move, address-space destruction and internal replacement paths are
+not comprehensively recorded. An mmap return does not imply physical pages
+have been populated; anonymous pages can fault in later.
+
+```text
+enable mm.map mm.protect mm.unmap
+```
 
 ### Kernel context lifecycle
 
@@ -853,6 +887,13 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       checks the same lifecycle for kernel workers after normal requests and
       cancellation, with PID 0 at both start and exit (`trace-lifecycle`).
 
+  15. checks mapping-operation results for an anonymous allocation, refused
+      overlapping fixed allocation, protection changes from the current context
+      and a peer thread, refused widening of a read-only ring, and unmap. All
+      records must retain the same target page-table root and operation order.
+      Unaligned requests refused before these APIs produce no result; disabling
+      the three events suppresses a second allocation/unmap (`trace-mapping`).
+
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
   trace-fault` on a kernel without `mm.page_fault`).
@@ -1090,8 +1131,9 @@ is refused the file.
 
 ## Not implemented yet
 
-- Tracepoints for other subsystems (memory mappings, IOMMU map and unmap,
-  user-space process creation/exec/wait), and for the interrupts the kernel handles
+- A complete mapping journal (clone, move, replacement and destruction),
+  IOMMU map/unmap and user-space process creation/exec/wait tracepoints, and
+  tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.

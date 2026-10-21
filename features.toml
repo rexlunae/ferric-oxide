@@ -744,12 +744,14 @@ driver)."""
 id = "kernel.trace_mm"
 menu = "kernel.tracing"
 type = "bool"
-title = "Page fault tracepoints"
+title = "Memory tracepoints"
 default = true
 depends = "kernel.trace"
 kernel_feature = "trace_mm"
 rebuild = ["kernel"]
-help = """Compile in mm.page_fault, one record per page fault the kernel handles: the
+help = """Compile in mm.map, mm.protect and mm.unmap results for address-space
+operations (target page-table root, requested range/flags and return value),
+and mm.page_fault, one record per page fault the kernel handles: the
 faulting address, the instruction pointer, the kind of access (read, write or
 fetch; user or kernel; page present or not) and the outcome (mapped, a failed
 copy to or from user memory, or unhandled). Faults the kernel takes on purpose
