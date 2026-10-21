@@ -1299,6 +1299,14 @@ name = "ferric-cet"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-codecache"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-config"
 version = "0.1.0"
 dependencies = [
@@ -1320,6 +1328,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ferric-hwrand"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-iobench"
 version = "0.1.0"
 
 [[package]]
@@ -1376,6 +1388,13 @@ name = "ferric-pcache"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-procinfo"
+version = "0.1.0"
+dependencies = [
+ "ferric-procinfo",
+]
+
+[[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
 
@@ -1398,13 +1417,28 @@ dependencies = [
 name = "ferric-trace-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
+ "ferric-amdvi",
+ "ferric-procinfo",
  "ferric-trace",
+ "ferric-trace-map",
+ "ferric-vtd",
+ "object",
  "redox_syscall 0.9.4",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ferric-trace-map"
+version = "0.1.0"
+dependencies = [
+ "ferric-trace",
+ "redox_syscall 0.9.4",
 ]
 
 [[package]]
@@ -1413,6 +1447,10 @@ version = "0.1.0"
 dependencies = [
  "ferric-iommu",
 ]
+
+[[package]]
+name = "ferric-wasm-abi"
+version = "0.1.0"
 
 [[package]]
 name = "ff"
@@ -4561,6 +4599,12 @@ dependencies = [
  "constant_time_eq",
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc_version"

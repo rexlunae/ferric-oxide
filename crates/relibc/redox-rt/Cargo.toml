@@ -22,6 +22,8 @@ redox_protocols.workspace = true
 generic-rt = { path = "../generic-rt" }
 # Ferric Oxide: shared crate beside relibc in the monorepo's crates/ (see recipes/core/relibc).
 ferric-hwrand = { path = "../../hwrand", optional = true }
+# Ferric Oxide: the image records exec and ld.so give the kernel for /scheme/sys/proc.
+ferric-procinfo = { path = "../../procinfo" }
 
 [features]
 proc = []

@@ -20,8 +20,9 @@ log="${2:-serial.log}"
 cpu="${3:-}"
 timeout_secs="${BOOT_TIMEOUT:-300}"
 
-firmware=""
+firmware="${OVMF_FIRMWARE:-}"
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/qemu/OVMF.fd; do
+    if [ -n "$firmware" ]; then break; fi
     if [ -f "$f" ]; then firmware="$f"; break; fi
 done
 if [ -z "$firmware" ]; then

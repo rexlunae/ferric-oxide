@@ -1,0 +1,174 @@
+name: profile-image
+
+# Builds and boots one x86_64 image with the sampling profiler on (kernel.profiling, which
+# sets a CPU aside, so kernel.trace stays off), /scheme/sys/proc for the loaded images
+# (kernel.sys_proc) and user frame pointers (cpu.frame_pointers). The smoke script then
+# records a profile of a short fuzz run with `ferric-trace profile` and draws it with
+# `ferric-trace flamegraph` (docs/src/ferric-tracing.md, "Sampling profiles"). One boot; it
+# runs only when the profiler, the loader, the tools or this workflow change.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/kernel/src/profiling.rs"
+      - "crates/kernel/src/scheme/debug.rs"
+      - "crates/kernel/src/scheme/proc.rs"
+      - "crates/kernel/src/scheme/sys/**"
+      - "crates/kernel/src/context/memory.rs"
+      - "crates/procinfo/**"
+      - "crates/trace/src/profile.rs"
+      - "crates/relibc/redox-rt/src/proc.rs"
+      - "crates/relibc/src/ld_so/**"
+      - "tools/ferric-trace/**"
+      - "config/ferric-smoke.toml"
+      - "features.toml"
+      - "scripts/ferric-ci/boot-smoke.sh"
+      - ".github/workflows/profile-image.yml"
+
+concurrency:
+  group: profile-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONFIG_NAME: ferric-smoke
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: docker.io/redoxos/redox-base-x86_64:latest
+    env:
+      PODMAN_BUILD: "0"
+      SKIP_CHECK_TOOLS: "1"
+      REPO_BINARY: "1"
+      FSTOOLS_NO_MOUNT: "1"
+      COOKBOOK_VERBOSE: "false"
+      CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/prepare-submodules
+
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cbindgen
+        run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            prefix
+            build/fstools
+            target
+          key: redox-host-${{ hashFiles('Cargo.lock', 'tools/installer/**', 'mk/prefix.mk', 'mk/fstools.mk', 'rust-toolchain.toml') }}
+          restore-keys: redox-host-
+
+      # Everything else stays at the catalog defaults, including kpti = "auto",
+      # which is off on CPUs that are not Meltdown-affected (Tiger Lake and later,
+      # Zen 3 and later), so shadow stacks turn on there.
+      - name: Features with the profiler on
+        run: |
+          out="$RUNNER_TEMP/ferric-profile"
+          mkdir -p "$out"
+          printf '[cpu]\nframe_pointers = true\n[kernel]\nprofiling = true\nsys_proc = true\n' > "$out/ferric.toml"
+          "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
+            --config "$out/ferric.toml" --out "$out" generate
+          # The recipe-facing settings, as image.yml passes them (signed fox manifests
+          # included, or the smoke image's fox verify fails), and the user-space flags that
+          # carry the frame pointers.
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_FOX_MANIFEST FERRIC_TARGET_RUSTFLAGS FERRIC_TARGET_CPPFLAGS FERRIC_TARGET_FLAGS_EXCLUDE; do
+            value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
+            echo "$var=$value" | tee -a "$GITHUB_ENV"
+          done
+          grep -q "^export FERRIC_KERNEL_FEATURES:=.*profiling" "$out/config.mk"
+          grep -q "^export FERRIC_FOX_MANIFEST:=1" "$out/config.mk"
+          if [ -f "$out/kernel-config.toml" ]; then
+            echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build image
+        run: make all CONFIG_NAME="$CONFIG_NAME"
+
+      - name: Compress image
+        run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferric-profile-image
+          path: harddrive.img.zst
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: profile-build-logs
+          path: |
+            recipes/**/target/*/build/*.log
+            recipes/**/target/*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  boot:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LOG: serial-profile.log
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf zstd
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferric-profile-image
+
+      - name: Boot smoke test
+        run: |
+          zstd -d harddrive.img.zst -o harddrive.img
+          scripts/ferric-ci/boot-smoke.sh harddrive.img "$LOG" host
+
+      # The profile and flame graph were made, the kernel served its text address, and the
+      # images of the profiled programs were recorded through exec and ld.so.
+      # The packages were adopted with signed manifests and verified, as in image.yml.
+      - name: Check fox
+        run: |
+          grep -aE "adopted ([0-9]+) of \1 packages" "$LOG"
+          grep -aE "fox 0\.1\.0 \([0-9]+ files, signed by cookbook\)" "$LOG"
+          if grep -aF "unsigned name" "$LOG"; then
+            echo "::error::packages were adopted without a signed manifest"
+            exit 1
+          fi
+          grep -aF "FERRIC_TEST_PASS fox-verify" "$LOG"
+
+      - name: Check the profile
+        run: |
+          grep -aF "FERRIC_TEST_PASS profile" "$LOG"
+          grep -m1 -aE "kernel_text 0xffff" "$LOG"
+          grep -m1 -aE "image 0x[0-9a-f]+ path .*ferric-syscall-fuzz" "$LOG"
+          grep -aF "FERRIC_TEST_PASS proc-images" "$LOG"
+          echo "::notice::$(grep -aF 'ferric-trace: ' "$LOG" | grep samples | tr -d '\r' | tail -n 1)"
+          # What reading /scheme/sys/proc every drain cost (review 4320670273).
+          grep -aF "image snapshots: " "$LOG"
+          echo "::notice::$(grep -aF 'image snapshots: ' "$LOG" | tr -d '\r' | tail -n 1)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-log-profile
+          path: ${{ env.LOG }}
+          retention-days: 14

@@ -106,10 +106,12 @@ jobs:
           # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
           # ferric-iommu-test's iommu-msi-percpu runs, and nvmed's per-CPU queue pairs
           # (also off by default) are on so the boot disk runs through them. The crash dump
-          # region (off by default) is on, so every boot reserves and arms it; the crash image
-          # below also tests a dump. Kernel-bypass network queues (off by default) are built
+          # region (off by default) and the persistent kernel log (also off by default) are on,
+          # so every boot reserves and arms them; the crash image below also tests a dump and the
+          # log the panicking boot left. /scheme/sys/proc (off by default) is on so
+          # ferric-proc-test runs, and kernel-bypass network queues (off by default) are built
           # into e1000d, so the boot's network checks run with copy mode compiled in.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nirq_percpu = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\n' > "$out/ferric.toml"
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -367,11 +369,25 @@ jobs:
       - name: Check futex wakeups
         run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
 
+      # The image has kernel.sys_proc on, so ferric-proc-test must run every step, not skip.
+      - name: Check per-process introspection
+        run: |
+          for step in parse self images slice guard cap root-only; do
+            grep -aF "FERRIC_TEST_PASS proc-$step" "$LOG"
+          done
+          grep -aE "FERRIC_TEST_PASS proc-(self|images)" "$LOG" | tr -d '\r' | sed 's/^.*FERRIC_TEST_PASS //' | while read -r line; do
+            echo "::notice::$line"
+          done
+      # A process opens a scheme it created on the same thread and serves from another: the
+      # kernel must block the caller rather than direct-switch it to itself.
+      - name: Check a scheme opened by its creating thread
+        run: grep -aF "FERRIC_TEST_PASS scheme-self-open" "$LOG"
+
       # The image has kernel.regbuf on, so ferric-regbuf-test must run every step, not skip.
       - name: Check registered buffers
         run: |
           steps="register file-backed grant-rw grant-ro pinned reshare-mmap reshare-register reshare-borrow
-            forward-borrow revoke unmap close shared bytes bounce-newer"
+            forward-borrow revoke unmap close shared bytes bounce-newer revoke-prot"
           for step in $steps; do
             grep -aF "FERRIC_TEST_PASS regbuf-$step" "$LOG"
           done
@@ -382,16 +398,31 @@ jobs:
       # read benchmark, which the step repeats as a notice.
       - name: Check storage DMA into registered buffers
         run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
+      # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
+      # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
+      # in the same boot. The figures go to a notice and the job summary; the per-CPU default
+      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab).
+      - name: Check the disk benchmark
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
       # The image has kernel.trace on, so ferric-trace-test must run every step, not skip.
       - name: Check kernel tracing
         run: |
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
           # Bootstrap applied the initfs trace.toml; the kernel logs the command.
           grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
-          for step in initfs boot enable decode order write read yield sched scheme disable mmap clock; do
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault futex lifecycle irq filter clock cap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
-          echo "::notice::ferric-trace-test passed all 13 steps"
+          # The page fault and interrupt steps' details: record counts, and the interrupt
+          # seen delivered and acknowledged.
+          grep -aE "FERRIC_TEST_PASS trace-(fault|irq)[: ]" "$LOG" | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+          # trace-irq comes from ferric-iommu-test, which acknowledges an interrupt itself.
+          echo "::notice::ferric-trace-test passed all 18 steps, ferric-iommu-test trace-irq"
+          # The kernel logged the argument filter trace-filter set (T3c).
+          grep -aF "trace: filter syscall.enter nr == " "$LOG"
           # The kernel logged the timestamp clock it picked (T3d); trace-clock checked its
           # rate against the wall clock. Both go up as notices.
           grep -qaE "trace: clock (tsc|kvmclock|hpet) \(" "$LOG"
@@ -409,6 +440,13 @@ jobs:
             grep -aF "FERRIC_TEST_SKIP trace-crash" "$LOG"
           fi
           grep -aF "trace: crash region at 0x4000000 (64 KiB)" "$LOG"
+          # kernel.log_persist reserved and armed its region right after it; a cold boot is
+          # boot 0 and has no previous log.
+          grep -aF "log: persistent log at 0x4010000 (64 KiB), boot 0" "$LOG"
+          if grep -aF "log: the previous boot's log (" "$LOG"; then
+            echo "::error::a cold boot found a previous boot's log"
+            exit 1
+          fi
 
       # The image has kernel.rings on, so ferric-ring-test must run every step, not skip.
       - name: Check rings
@@ -447,6 +485,16 @@ jobs:
           grep -aE "$tx" "$LOG"
           grep -aE "$rtt" "$LOG"
           echo "::notice::ferric-netq-test passed all $(wc -w <<< "$steps") steps on ${{ matrix.nic }}"
+      # ferric-borrow-test times page writes to an unmapped file and to one with live shared
+      # mappings, which RedoxFS writes through to (QEMU numbers, for trend only). Only the
+      # smoke image runs it; the fuzz image's console script runs the fuzzer alone.
+      - name: Show the mapped-write benchmark
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          grep -aE "FERRIC_BENCH borrow-pwrite .*unmapped_ns=[0-9]+ mapped_ns=[0-9]+" "$LOG" \
+            | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and
@@ -535,6 +583,14 @@ jobs:
             echo "::notice::$line"
           done
           grep -aF "FERRIC_TEST_PASS trace-crash-read" "$LOG"
+          # The persistent log: the second boot is boot 1 and found the first boot's log,
+          # whose panic the test read back from /scheme/sys/log_previous.
+          grep -aF "log: persistent log at 0x4010000 (64 KiB), boot 1" "$LOG"
+          grep -aF "log: the previous boot's log (" "$LOG"
+          grep -aF "FERRIC_TEST_PASS log-previous" "$LOG" | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+          grep -aF "FERRIC_TEST_PASS log-previous" "$LOG"
           # Exactly two boots.
           test "$(grep -acF "FERRIC_SMOKE_BEGIN" "$LOG")" = 2
 

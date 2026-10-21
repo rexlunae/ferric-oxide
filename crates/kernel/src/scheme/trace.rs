@@ -5,6 +5,9 @@
 //!   `enable <selection>` or `disable <selection>` turns events on or off, patching their
 //!   tracepoints live (`arch::static_key`).
 //! - `stats`: one line per CPU with the words waiting in its ring and the records it lost.
+//!   Writing `filter <event> <filter>` to `events` sets that event's argument filter
+//!   (`ferric_trace::filter`), and `filter <event> none` removes it.
+//! - `filters`: one line per filtered event, written as the command that sets its filter.
 //! - `clock`: the clock record timestamps come from and its tick length
 //!   (`ferric_trace::clock::ClockLine`), chosen once at boot (`trace::clock`).
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
@@ -30,9 +33,15 @@
 //! those words, so `View::peek` checks `tail` after each copy and retries one it overtook.
 //! The mapping needs `PROT_READ`: a mapping without it would still be readable.
 //!
-//! `events`, `stats` and `clock` are read from a snapshot taken at the first read of each open, as in
-//! the `sys` scheme. Only root may open the scheme for now: traces leak timing and kernel
-//! addresses, and a Phase 4 capability will replace the uid check.
+//! - `cap/read`, `cap/control`: a capability (`ferric_trace::abi::Access`). `dup(cap, path)`
+//!   opens `path` with the capability's access whatever the caller's user, so root can hand an
+//!   unprivileged collector exactly the access it needs. Read access reads and drains;
+//!   writing `events` or `crash` needs control access. A capability can be narrowed by
+//!   `dup(cap, "cap/read")`, never widened.
+//!
+//! `events`, `stats`, `clock`, `filters` and `crash` are read from a snapshot taken at the first read of each open, as in
+//! the `sys` scheme. Opening by path is for root only (with control access): traces leak
+//! timing and kernel addresses.
 
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
@@ -40,7 +49,13 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ferric_trace::abi::{Command, CpuCommand, EventLine, Path, StatsLine, CPU_MAP_BYTES};
+use ferric_trace::{
+    abi::{
+        Access, Command, CpuCommand, EventLine, FilterBusyLine, FilterLine, Path, StatsLine,
+        CPU_MAP_BYTES,
+    },
+    filter::Loaded,
+};
 use spin::{Mutex, MutexGuard};
 use syscall::{
     error::{Error, Result, EACCES, EAGAIN, EBADF, EINVAL, ENOENT, EOPNOTSUPP},
@@ -56,7 +71,7 @@ use crate::{
         data::Map,
         usercopy::{UserSliceRo, UserSliceWo},
     },
-    trace::{self, ControlError, Mode},
+    trace::{self, ControlError, FilterControlError, Mode},
 };
 
 /// The number of the scheme root.
@@ -76,6 +91,7 @@ pub struct TraceScheme;
 enum Text {
     Events,
     Stats,
+    Filters,
     Clock,
     Crash,
 }
@@ -83,13 +99,17 @@ enum Text {
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events`, `stats` or `clock`, with the snapshot its reads come from once taken.
+    /// `events`, `stats`, `clock`, `filters` or `crash`, with the snapshot its reads come
+    /// from once taken, and the access it was opened with.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
+        access: Access,
     },
-    /// `cpu/<n>`.
+    /// `cpu/<n>`. Every access may drain, map and commit it.
     Cpu(LogicalCpuId),
+    /// `cap/<access>`: opens other paths through `dup`.
+    Cap(Access),
 }
 
 /// Every open handle but the root, by number.
@@ -119,6 +139,22 @@ fn render(text: Text) -> Arc<[u8]> {
                 let (pending, lost) = trace::ring(LogicalCpuId::new(cpu))
                     .map_or((0, 0), |ring| (ring.pending() as u64, ring.lost()));
                 let _ = write!(out, "{}", StatsLine { cpu, pending, lost });
+            }
+        }
+        Text::Filters => {
+            for (event, loaded) in trace::filters() {
+                let _ = match loaded {
+                    Loaded::Set(filter) => write!(
+                        out,
+                        "{}",
+                        FilterLine {
+                            event,
+                            filter: &filter
+                        }
+                    ),
+                    Loaded::Busy => write!(out, "{}", FilterBusyLine { event }),
+                    Loaded::Empty => Ok(()),
+                };
             }
         }
         Text::Clock => {
@@ -175,6 +211,54 @@ fn command_bytes(buf: UserSliceRo) -> Result<(Vec<u8>, usize)> {
     Ok((bytes, len))
 }
 
+/// Opens `path` with `access`: from a path open by root (`Access::Control`) or through a
+/// capability's `dup`.
+fn open(path: &str, access: Access) -> Result<OpenResult> {
+    let (handle, flags) = match Path::parse(path).ok_or(Error::new(ENOENT))? {
+        Path::Root => return Err(Error::new(ENOENT)),
+        Path::Events => (Text::Events, InternalFlags::POSITIONED),
+        Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
+        Path::Filters => (Text::Filters, InternalFlags::POSITIONED),
+        Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
+        Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
+        Path::Crash => return Err(Error::new(ENOENT)),
+        Path::Cpu(cpu) if cpu < crate::cpu_count() => {
+            return Ok(insert(
+                Handle::Cpu(LogicalCpuId::new(cpu)),
+                InternalFlags::empty(),
+            ));
+        }
+        Path::Cpu(_) => return Err(Error::new(ENOENT)),
+        // Narrowing only: a capability never yields more access than it has.
+        Path::Cap(wanted) if access.includes(wanted) => {
+            return Ok(insert(Handle::Cap(wanted), InternalFlags::empty()));
+        }
+        Path::Cap(_) => return Err(Error::new(EACCES)),
+    };
+    let handle = Handle::Text {
+        text: handle,
+        snapshot: None,
+        access,
+    };
+    Ok(insert(handle, flags))
+}
+
+/// Stores `handle` under a new number.
+fn insert(handle: Handle, flags: InternalFlags) -> OpenResult {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    HANDLES.lock().insert(id, handle);
+    OpenResult::SchemeLocal(id, flags)
+}
+
+/// `EACCES` unless `access` allows control: writing commands to `events` or `crash`.
+fn require_control(access: Access) -> Result<()> {
+    if access.includes(Access::Control) {
+        Ok(())
+    } else {
+        Err(Error::new(EACCES))
+    }
+}
+
 /// Runs a command written to `events`.
 fn events_command(buf: UserSliceRo) -> Result<usize> {
     let (bytes, len) = command_bytes(buf)?;
@@ -182,6 +266,7 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
     let (spec, on) = match command {
         Command::Enable(spec) => (spec, true),
         Command::Disable(spec) => (spec, false),
+        Command::Filter { event, filter } => return filter_command(event, filter, len),
     };
     match trace::control(spec, on, Mode::Live) {
         Ok(changed) => {
@@ -191,6 +276,28 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
         Err(err) => {
             warn!("trace: {command}: {err}");
             Err(control_errno(&err))
+        }
+    }
+}
+
+/// Runs `filter <event> <filter>`: sets or removes the event's argument filter.
+fn filter_command(event: &str, filter: &str, len: usize) -> Result<usize> {
+    match trace::set_filter(event, filter) {
+        Ok((event, Some(set))) => {
+            info!("trace: filter {} {}", event.name(), set.display(event));
+            Ok(len)
+        }
+        Ok((event, None)) => {
+            info!("trace: filter {} none", event.name());
+            Ok(len)
+        }
+        Err(err) => {
+            warn!("trace: filter {event} {filter}: {err}");
+            Err(Error::new(match err {
+                FilterControlError::UnknownEvent(_) => ENOENT,
+                FilterControlError::NotCompiled(_) => EOPNOTSUPP,
+                FilterControlError::Filter(_) => EINVAL,
+            }))
         }
     }
 }
@@ -233,36 +340,29 @@ impl KernelScheme for TraceScheme {
         if file != ROOT {
             return Err(Error::new(EACCES));
         }
-        // Phase 4 replaces this with a capability.
+        // By path for root only; anyone else opens through a capability (`kdup`).
         if caller.uid != 0 {
             return Err(Error::new(EACCES));
         }
         let path = path.as_str().map_err(|_| Error::new(ENOENT))?;
-        let (handle, flags) = match Path::parse(path).ok_or(Error::new(ENOENT))? {
-            Path::Root => return Err(Error::new(ENOENT)),
-            Path::Events => (Text::Events, InternalFlags::POSITIONED),
-            Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
-            Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
-            Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
-            Path::Crash => return Err(Error::new(ENOENT)),
-            Path::Cpu(cpu) if cpu < crate::cpu_count() => {
-                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                HANDLES
-                    .lock()
-                    .insert(id, Handle::Cpu(LogicalCpuId::new(cpu)));
-                return Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()));
-            }
-            Path::Cpu(_) => return Err(Error::new(ENOENT)),
+        open(path, Access::Control)
+    }
+
+    fn kdup(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        _caller: CallerCtx,
+        _token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        // Only a capability opens other paths, and with its own access: this is what lets a
+        // process that is not root use the scheme.
+        let Some(Handle::Cap(access)) = HANDLES.lock().get(&id).cloned() else {
+            return Err(Error::new(EOPNOTSUPP));
         };
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        HANDLES.lock().insert(
-            id,
-            Handle::Text {
-                text: handle,
-                snapshot: None,
-            },
-        );
-        Ok(OpenResult::SchemeLocal(id, flags))
+        let (bytes, _len) = command_bytes(buf)?;
+        let path = core::str::from_utf8(&bytes).map_err(|_| Error::new(ENOENT))?;
+        open(path, access)
     }
 
     fn close(&self, id: usize, _token: &mut CleanLockToken) -> Result<()> {
@@ -284,7 +384,8 @@ impl KernelScheme for TraceScheme {
     ) -> Result<usize> {
         let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
         match handle {
-            Handle::Text { text, snapshot } => {
+            Handle::Cap(_) => Err(Error::new(EBADF)),
+            Handle::Text { text, snapshot, .. } => {
                 let data = match snapshot {
                     Some(data) => data,
                     None => {
@@ -326,16 +427,21 @@ impl KernelScheme for TraceScheme {
         let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
         match handle {
             Handle::Text {
-                text: Text::Events, ..
-            } => events_command(buf),
+                text: Text::Events,
+                access,
+                ..
+            } => require_control(access).and_then(|()| events_command(buf)),
             Handle::Cpu(cpu) => cpu_command(cpu, buf),
             Handle::Text {
-                text: Text::Crash, ..
-            } => crash_command(buf),
-            Handle::Text {
-                text: Text::Stats | Text::Clock,
+                text: Text::Crash,
+                access,
                 ..
-            } => Err(Error::new(EBADF)),
+            } => require_control(access).and_then(|()| crash_command(buf)),
+            Handle::Text {
+                text: Text::Stats | Text::Clock | Text::Filters,
+                ..
+            }
+            | Handle::Cap(_) => Err(Error::new(EBADF)),
         }
     }
 
@@ -404,6 +510,10 @@ impl KernelScheme for TraceScheme {
                 text: Text::Stats, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::STATS_PATH),
             Handle::Text {
+                text: Text::Filters,
+                ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::FILTERS_PATH),
+            Handle::Text {
                 text: Text::Clock, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CLOCK_PATH),
             Handle::Text {
@@ -414,6 +524,7 @@ impl KernelScheme for TraceScheme {
                 ferric_trace::abi::CPU_DIR,
                 cpu.get()
             ),
+            Handle::Cap(access) => alloc::format!("/scheme/kernel.trace/{access}"),
         };
         buf.copy_common_bytes_from_slice(path.as_bytes())
     }

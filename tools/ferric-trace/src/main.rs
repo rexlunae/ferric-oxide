@@ -1,8 +1,10 @@
 //! `ferric-trace`: saves kernel trace captures on the target (the `cpu<n>` files drained from
-//! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto, and reads the
-//! crash dump a kernel panic left for the next boot.
+//! `/scheme/kernel.trace`), prints them as text or exports them for Perfetto or OpenTelemetry,
+//! reads the crash dump a kernel panic left for the next boot, and records profiles from the
+//! kernel's sampling profiler.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -11,7 +13,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::crash::CrashReport;
-use ferric_trace_cli::{drain, perfetto, text};
+use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
+use ferric_trace_cli::profile::{self, Run};
+use ferric_trace_cli::{drain, otlp, perfetto, svg, text};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -29,6 +33,53 @@ enum Cmd {
         /// The trace scheme
         #[arg(long, default_value = "/scheme/kernel.trace")]
         scheme: PathBuf,
+        /// How to take the records out of the rings: `map` copies them out of the read-only
+        /// mapping and commits each copy once it is saved, `read` reads them, and `auto` maps
+        /// where the kernel allows it and reads otherwise
+        #[arg(long, default_value_t = drain::Via::Auto)]
+        via: drain::Via,
+    },
+    /// On the target, as root, with kernel.profiling: sample every CPU while a command runs
+    /// (or for --seconds) and save the samples into a profile directory
+    Profile {
+        /// The directory to save the profile in; it must not exist yet
+        out: PathBuf,
+        /// Sample for this many seconds instead of running a command
+        #[arg(long, conflicts_with = "command", required_unless_present = "command")]
+        seconds: Option<f64>,
+        /// The debug scheme
+        #[arg(long, default_value = "/scheme/debug")]
+        scheme: PathBuf,
+        /// The per-process file listing loaded images (skipped if missing)
+        #[arg(long, default_value = "/scheme/sys/proc")]
+        proc: PathBuf,
+        /// The command to profile, after `--`
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
+    /// Draw a profile as a flame graph SVG, and optionally save its folded stacks
+    Flamegraph {
+        /// The profile directory `ferric-trace profile` saved
+        profile: PathBuf,
+        /// The kernel ELF the profile ran (to symbolize kernel frames)
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        /// The target's root directory on this machine, such as the cookbook sysroot or a
+        /// mounted image (to symbolize user frames)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Where to write the SVG (default: standard output)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// Also write the folded stacks here
+        #[arg(long)]
+        folded: Option<PathBuf>,
+        /// The graph's heading
+        #[arg(long, default_value = "Ferric Oxide profile")]
+        title: String,
+        /// Read a profile marked INCOMPLETE anyway
+        #[arg(long)]
+        partial: bool,
     },
     /// Print every record, one line each, in timestamp order
     Text {
@@ -67,6 +118,26 @@ enum Cmd {
         #[arg(long, default_value = "1000")]
         tsc_mhz: perfetto::TscMhz,
     },
+    /// Write OpenTelemetry traces as OTLP/JSON, for an OTLP/HTTP collector's /v1/traces or the
+    /// Collector's otlpjsonfile receiver
+    Otlp {
+        /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
+        #[arg(long)]
+        partial: bool,
+        /// Where to write the JSON (default: standard output)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// The TSC frequency of the traced machine in MHz, as for `perfetto`
+        #[arg(long, default_value = "1000")]
+        tsc_mhz: perfetto::TscMhz,
+        /// The Unix time of the first record in nanoseconds (default: 0, so times count from
+        /// the first record)
+        #[arg(long, default_value = "0")]
+        start_unix_ns: u64,
+    },
 }
 
 /// Why the command failed.
@@ -76,6 +147,12 @@ enum CliError {
     Capture(#[from] ferric_trace_cli::capture::CaptureError),
     #[error("capture failed")]
     Drain(#[from] ferric_trace_cli::drain::DrainError),
+    #[error("profile failed")]
+    Profile(#[from] ferric_trace_cli::profile::ProfileError),
+    #[error("cannot symbolize")]
+    Flamegraph(#[from] ferric_trace_cli::flamegraph::FlamegraphError),
+    #[error("--seconds must be a non-negative number, not {0}")]
+    Seconds(f64),
     #[error(transparent)]
     Crash(#[from] ferric_trace_cli::crash::CrashDumpError),
     #[error("cannot write {}", path.display())]
@@ -88,12 +165,16 @@ enum CliError {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Cmd::Capture { out, scheme } => {
-            let drained = drain::drain_scheme(&scheme, &out)?;
+        Cmd::Capture { out, scheme, via } => {
+            let drained = drain::drain_scheme(&scheme, &out, via)?;
             for cpu in &drained {
                 println!(
-                    "cpu {}: {} bytes, {} records lost before the capture, {} during it",
-                    cpu.cpu, cpu.bytes, cpu.lost_before, cpu.lost_during
+                    "cpu {}: {} bytes, {} records lost before the capture, {} during it ({})",
+                    cpu.cpu,
+                    cpu.bytes,
+                    cpu.lost_before,
+                    cpu.lost_during,
+                    if cpu.mapped { "mapped" } else { "read" }
                 );
             }
             println!("saved {} CPUs to {}", drained.len(), out.display());
@@ -104,6 +185,48 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 );
             }
             Ok(())
+        }
+        Cmd::Profile {
+            out,
+            seconds,
+            scheme,
+            proc,
+            command,
+        } => record_profile(&scheme, &proc, &out, seconds, command),
+        Cmd::Flamegraph {
+            profile,
+            kernel,
+            root,
+            output,
+            folded,
+            title,
+            partial,
+        } => {
+            let profile = profile::Profile::load(&profile, partial)?;
+            let mut symbolizer = Symbolizer::new(&profile, kernel.as_deref(), root.as_deref())?;
+            let stacks = Folded::new(&profile, &mut symbolizer);
+            if let Some(path) = folded {
+                fs::write(&path, stacks.text())
+                    .map_err(|source| CliError::Write { path, source })?;
+            }
+            eprintln!(
+                "ferric-trace: {} samples, {} distinct stacks, {} unreadable",
+                stacks.total(),
+                stacks.stacks.len(),
+                stacks.bad
+            );
+            let svg = svg::render(&stacks.stacks, &title);
+            match output {
+                Some(path) => {
+                    fs::write(&path, svg).map_err(|source| CliError::Write { path, source })
+                }
+                None => io::stdout()
+                    .write_all(svg.as_bytes())
+                    .map_err(|source| CliError::Write {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    }),
+            }
         }
         Cmd::Crash { dump, out } => crash(&dump, out.as_deref()),
         Cmd::Text { inputs, partial } => {
@@ -125,20 +248,84 @@ fn run(cli: Cli) -> Result<(), CliError> {
         } => {
             let capture = loader(partial)(&inputs)?;
             let rate = perfetto::TickRate::for_clock(capture.clock(), tsc_mhz);
-            let json = perfetto::to_json(&capture, rate);
-            match output {
-                Some(path) => {
-                    fs::write(&path, json).map_err(|source| CliError::Write { path, source })
-                }
-                None => io::stdout()
-                    .write_all(json.as_bytes())
-                    .map_err(|source| CliError::Write {
-                        path: PathBuf::from("<stdout>"),
-                        source,
-                    }),
-            }
+            write_output(output, &perfetto::to_json(&capture, rate))
+        }
+        Cmd::Otlp {
+            inputs,
+            partial,
+            output,
+            tsc_mhz,
+            start_unix_ns,
+        } => {
+            let capture = loader(partial)(&inputs)?;
+            let options = otlp::Options {
+                rate: perfetto::TickRate::for_clock(capture.clock(), tsc_mhz),
+                start_unix_ns,
+            };
+            write_output(output, &otlp::to_json(&capture, options))
         }
     }
+}
+
+/// Writes `text` to `output`, or to standard output.
+fn write_output(output: Option<PathBuf>, text: &str) -> Result<(), CliError> {
+    match output {
+        Some(path) => fs::write(&path, text).map_err(|source| CliError::Write { path, source }),
+        None => io::stdout()
+            .write_all(text.as_bytes())
+            .map_err(|source| CliError::Write {
+                path: PathBuf::from("<stdout>"),
+                source,
+            }),
+    }
+}
+
+/// `ferric-trace profile`.
+fn record_profile(
+    scheme: &std::path::Path,
+    proc: &std::path::Path,
+    out: &std::path::Path,
+    seconds: Option<f64>,
+    command: Vec<OsString>,
+) -> Result<(), CliError> {
+    let run = match seconds {
+        Some(s) => {
+            Run::For(std::time::Duration::try_from_secs_f64(s).map_err(|_| CliError::Seconds(s))?)
+        }
+        None => Run::Command(command),
+    };
+    let recorded = profile::record(scheme, proc, out, &run)?;
+    for (cpu, bytes) in recorded.cpu_bytes.iter().enumerate() {
+        println!("cpu {cpu}: {bytes} bytes of samples");
+    }
+    println!(
+        "named {} contexts, images of {}; saved to {}",
+        recorded.names,
+        recorded.images,
+        out.display()
+    );
+    let snapshots = recorded.snapshots;
+    println!(
+        "image snapshots: {} in {:?} (longest {:?}), {} ppm of the {:?} from the first to the last",
+        snapshots.count,
+        snapshots.total,
+        snapshots.longest,
+        snapshots.duty_ppm(),
+        snapshots.span
+    );
+    if recorded.images == 0 {
+        eprintln!(
+            "ferric-trace: warning: no images recorded ({} missing or empty); user frames will \
+             not be symbolized",
+            proc.display()
+        );
+    }
+    if let Some(status) = recorded.status
+        && !status.success()
+    {
+        eprintln!("ferric-trace: warning: the profiled command exited with {status}");
+    }
+    Ok(())
 }
 
 /// `ferric-trace crash`.

@@ -271,7 +271,7 @@ impl Driver<'_> {
             .and_then(|off| iova.checked_add(off))
             .ok_or(Error::new(EINVAL))?;
         if grant_info(fd).map_err(sys)?.revoked {
-            println!("FERRIC_IOMMU_EXPECT_FAULT write {target:#x}");
+            crate::trace::expect_dma_fault(true, target as u64);
         }
         self.edu
             .dma(target as u64, true)

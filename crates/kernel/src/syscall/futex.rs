@@ -199,58 +199,29 @@ pub fn futex(
                     .push(FutexEntry {
                         context_lock: Arc::downgrade(&context_lock),
                     });
+                trace_event!(
+                    ferric_trace::kernel::SCHED_FUTEX_WAIT,
+                    target_physaddr.data(),
+                    addr,
+                    context.debug_id,
+                    if op == FUTEX_WAIT { 32 } else { 64 },
+                    expected,
+                    context.wake.is_some(),
+                );
                 target_physaddr
             };
 
             context::switch(token);
 
-            // The scheduler clears `wake` on timeout. Hence if a timeout was
-            // set and `wake` is now `None`, we timed out.
-            let wake = context::current().write(token.token()).wake.take();
-            let resume_result = if timeout_opt.is_some() && wake.is_none() {
-                Err(Error::new(ETIMEDOUT))
-            } else {
-                Ok(0)
-            };
-
-            // TODO: this doing a second search is not efficient. It probably best to have another
-            // hashtable mapping context and whether it was woken up AND where to remove index from FUTEXES
-            let mut futexes_map = FUTEXES.lock(token.token());
-            let (futexes_map, _) = futexes_map.token_split();
-
-            let Some(futexes) = futexes_map.get_mut(&target_physaddr) else {
-                return resume_result;
-            };
-            let current_lock = context::current();
-            let mut found = false;
-
-            let mut i = 0;
-            while i < futexes.len() {
-                if let Some(ctx) = futexes[i].context_lock.upgrade() {
-                    if Arc::ptr_eq(&ctx, &current_lock) {
-                        // Not woken up by FUTEX_WAKE, remove our entry
-                        futexes.swap_remove(i);
-                        found = true;
-                        break;
-                    }
-                    i += 1;
-                } else {
-                    futexes.swap_remove(i);
-                }
-            }
-
-            if futexes.is_empty() {
-                futexes_map.remove(&target_physaddr);
-            }
-
-            // Timeouts must remove their waiter too, otherwise a later wake can be
-            // consumed by a context that is no longer waiting on this word.
-            if !found || resume_result.is_err() {
-                return resume_result;
-            }
-
-            // Not woken up by FUTEX_WAKE, likely by signal
-            Err(Error::new(EINTR))
+            let result = finish_wait(target_physaddr, timeout_opt.is_some(), token);
+            trace_event!(
+                ferric_trace::kernel::SCHED_FUTEX_RESUME,
+                target_physaddr.data(),
+                addr,
+                context::current().read(token.token()).debug_id,
+                Error::mux(result),
+            );
+            result
         }
         FUTEX_WAKE => {
             let mut woken = 0;
@@ -280,10 +251,74 @@ pub fn futex(
                 if is_empty {
                     futexes_map.remove(&target_physaddr);
                 }
-            }
 
+                // A resumed waiter must take this lock in finish_wait before recording
+                // completion, so publish the wake before it can publish its resume.
+                trace_event!(
+                    ferric_trace::kernel::SCHED_FUTEX_WAKE,
+                    target_physaddr.data(),
+                    addr,
+                    val,
+                    woken,
+                );
+            }
             Ok(woken)
         }
         _ => Err(Error::new(EINVAL)),
     }
+}
+
+/// Removes a resumed caller's queued entry and determines its syscall result before tracing it.
+fn finish_wait(
+    target_physaddr: PhysicalAddress,
+    timed: bool,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    // The scheduler clears `wake` on timeout. Hence if a timeout was
+    // set and `wake` is now `None`, we timed out.
+    let wake = context::current().write(token.token()).wake.take();
+    let resume_result = if timed && wake.is_none() {
+        Err(Error::new(ETIMEDOUT))
+    } else {
+        Ok(0)
+    };
+
+    // TODO: this doing a second search is not efficient. It probably best to have another
+    // hashtable mapping context and whether it was woken up AND where to remove index from FUTEXES
+    let mut futexes_map = FUTEXES.lock(token.token());
+    let (futexes_map, _) = futexes_map.token_split();
+
+    let Some(futexes) = futexes_map.get_mut(&target_physaddr) else {
+        return resume_result;
+    };
+    let current_lock = context::current();
+    let mut found = false;
+
+    let mut i = 0;
+    while i < futexes.len() {
+        if let Some(ctx) = futexes[i].context_lock.upgrade() {
+            if Arc::ptr_eq(&ctx, &current_lock) {
+                // Not woken up by FUTEX_WAKE, remove our entry
+                futexes.swap_remove(i);
+                found = true;
+                break;
+            }
+            i += 1;
+        } else {
+            futexes.swap_remove(i);
+        }
+    }
+
+    if futexes.is_empty() {
+        futexes_map.remove(&target_physaddr);
+    }
+
+    // Timeouts must remove their waiter too, otherwise a later wake can be
+    // consumed by a context that is no longer waiting on this word.
+    if !found || resume_result.is_err() {
+        return resume_result;
+    }
+
+    // Not woken up by FUTEX_WAKE, likely by signal
+    Err(Error::new(EINTR))
 }
