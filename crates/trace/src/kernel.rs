@@ -193,8 +193,8 @@ crate::events! {
     /// the assigned PID and debug id. The context cannot run before this record is written.
     ///
     /// Covers the proc scheme's `start`, bootstrap and ring workers. This is not an exec
-    /// or a process birth: multiple contexts may belong to one PID, and PID 0 is used by
-    /// kernel contexts. The emitter may be a manager running on another context.
+    /// or a process birth: multiple contexts may belong to one PID, and PID 0 can mean
+    /// an unassigned PID or a kernel context. The emitter may be a manager on another context.
     pub const SCHED_CONTEXT_START = 14 {
         name: "sched.context_start",
         subsystem: Sched,

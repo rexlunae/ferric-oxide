@@ -278,7 +278,8 @@ impl Context {
     }
 
     /// Marks a not-yet-started context runnable and records its start before the caller
-    /// releases the context lock. Returns false without changing any other state.
+    /// releases the context lock. Returns true for that transition, or false without
+    /// changing the context if it was not in `NotYetStarted`.
     pub(crate) fn start(&mut self) -> bool {
         if !matches!(
             self.status,

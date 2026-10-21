@@ -148,8 +148,8 @@ process-level operations.
 - `sched.context_start` records an accepted transition from `NotYetStarted`
   to runnable, under the context lock, before the context can run. It covers
   the proc scheme's `start` operation, bootstrap and ring workers. `pid` is
-  the current assigned PID; kernel workers use 0. Rejected starts do not
-  record anything. This is a start transition, not a guarantee of one unique
+  the current assigned PID; 0 means unassigned or a kernel worker. Rejected
+  starts do not record anything. This is a start transition, not a guarantee of one unique
   process birth or an exec event.
 - `sched.context_exit` records completed context resource cleanup while
   marking it dead, before notifying its owner. `exception` is 1 only when an

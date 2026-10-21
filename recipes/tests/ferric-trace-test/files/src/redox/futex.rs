@@ -174,6 +174,12 @@ fn pairs(entries: &[&Entry], expected_results: &[u64]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Checks queued waits, ordered wakes, collection under polling pressure and live disable.
+///
+/// # Errors
+///
+/// Reports failed trace I/O or futex operations, failed peer startup/completion, missing
+/// or incorrectly ordered records, wrong counts, or records emitted after disable.
 pub(super) fn check_futex(cpus: &[u32]) -> Result<(), Failure> {
     let step = "trace-futex";
     let list = listing(step)?;

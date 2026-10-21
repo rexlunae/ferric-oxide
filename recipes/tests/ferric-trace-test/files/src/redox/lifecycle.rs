@@ -8,7 +8,9 @@ use ferric_trace::kernel::{SCHED_CONTEXT_CREATE, SCHED_CONTEXT_EXIT, SCHED_CONTE
 
 use super::{Entry, Failure, check, command, drain, io_failure, listing};
 
+/// Selects the child that exits immediately without running the tracing suite.
 pub(super) const CHILD_ARG: &str = "lifecycle-child";
+/// Its process exit status, checked with wait rather than inferred from kernel records.
 pub(super) const CHILD_STATUS: u8 = 23;
 const EVENTS: &str = "sched.context_create sched.context_start sched.context_exit";
 
@@ -80,6 +82,12 @@ fn verify(trace: &[Vec<Entry>], pid: u32) -> Result<usize, Failure> {
     Ok(count)
 }
 
+/// Checks child and thread lifecycle records and their suppression after live disable.
+///
+/// # Errors
+///
+/// Reports failed trace I/O, child/thread creation or cleanup, missing or incorrectly
+/// ordered records, wrong metadata, or records emitted after disable.
 pub(super) fn check_lifecycle(cpus: &[u32]) -> Result<(), Failure> {
     let step = "trace-lifecycle";
     let list = listing(step)?;
