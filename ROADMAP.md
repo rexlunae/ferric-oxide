@@ -26,7 +26,7 @@ Last updated 21 October 2026.
 | **V Virtualization and enclaves** | In progress | Prepared host-tested VMX/SVM formats and `kernel.vm` ABI [#111](https://github.com/rexlunae/ferric-oxide/pull/111) | No kernel backend, scheme, VMM or image integration yet; see [Virtualization](docs/src/ferric-virt.md). Needs 2.2–2.3 and Phase T |
 | **3 Storage and filesystems** | In progress | Linux volumes, read-only: LUKS1/LUKS2 headers and volume-key recovery (`ferric-luks`) [#115](https://github.com/rexlunae/ferric-oxide/pull/115), LVM2 labels, metadata and LV mapping (`ferric-lvm`) [#116](https://github.com/rexlunae/ferric-oxide/pull/116) | Read-only ext4 scheme (`fs.ext4`) [#159](https://github.com/rexlunae/ferric-oxide/pull/159). Remaining: the stackable block layer, LUKS and LVM as block layers, writable ext4, XFS, FAT/exFAT, RedoxFS on rings, TRIM |
 | **4 Capability model** | Not started | | |
-| **5 Real hardware** | Not started | | |
+| **5 Real hardware** | Started | | Realtek 2.5G Ethernet: the RTL8125B driver `rtl8125d` (in progress, compiles for the target but has not run on the machine; QEMU does not emulate the controller), with the MAC and PHY firmware data in the host-tested `crates/rtl8125`. Not started: ACPI, USB, Wi-Fi and Bluetooth, multi-queue NVMe and virtio-net, Intel `ice`/`ixgbe` |
 | **6 Graphics and desktop** | Not started | | |
 | **7 Server** | Not started | | |
 | **8 Releases** (M1, M2) | Not started | | |
