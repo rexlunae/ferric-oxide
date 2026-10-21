@@ -80,4 +80,32 @@ mod tests {
             "[000]            0: mm.page_fault addr=0x1000 ip=0x40 flags=0x6 outcome=0x0 | write user, mapped"
         );
     }
+
+    #[test]
+    fn futex_records_keep_the_shared_key_context_and_result() {
+        use ferric_trace::kernel::{SCHED_FUTEX_RESUME, SCHED_FUTEX_WAIT, SCHED_FUTEX_WAKE};
+
+        // The waker uses another virtual address for the same physical word. The waiter
+        // resumes on another CPU; neither the key nor the context may change in decoding.
+        let waiter = bytes(&[(
+            &SCHED_FUTEX_WAIT,
+            100,
+            &[0x8000, 0x4000, 27, 64, u64::MAX, 1],
+        )]);
+        let waker = bytes(&[(&SCHED_FUTEX_WAKE, 120, &[0x8000, 0x9000, 1, 1])]);
+        let resumed = bytes(&[(&SCHED_FUTEX_RESUME, 140, &[0x8000, 0x4000, 27, 0])]);
+        let capture = Capture::from_cpus(vec![
+            CpuCapture::decode(0, &waiter).unwrap(),
+            CpuCapture::decode(1, &waker).unwrap(),
+            CpuCapture::decode(2, &resumed).unwrap(),
+        ]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "[000]            0: sched.futex_wait key=0x8000 addr=0x4000 context=0x1b bits=0x40 expected=0xffffffffffffffff timed=0x1\n\
+             [001]           20: sched.futex_wake key=0x8000 addr=0x9000 requested=0x1 woken=0x1\n\
+             [002]           40: sched.futex_resume key=0x8000 addr=0x4000 context=0x1b ret=0x0\n"
+        );
+    }
 }

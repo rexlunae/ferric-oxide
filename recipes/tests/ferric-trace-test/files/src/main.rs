@@ -43,6 +43,10 @@
 //!   which fails with `EFAULT`. Each page must have an `mm.page_fault` from user mode, a
 //!   write, ending `mapped`, and the read one from the kernel at the buffer ending `copy
 //!   failed`.
+//! - `trace-futex`: 32/64-bit waits produce a queued wait and matching resume with the
+//!   timeout or wake result; mismatched waits produce neither. Empty, zero-count and
+//!   successful peer wakes record their returned counts, and disabling the events stops
+//!   recording them. The check uses the shared physical key and context id across CPUs.
 //! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
 //!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
 //!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on

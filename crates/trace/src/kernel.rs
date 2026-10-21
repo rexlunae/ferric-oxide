@@ -134,6 +134,46 @@ crate::events! {
         level: Error,
         args: ["unit", "format", "lo", "hi", "count"],
     }
+
+    /// A futex comparison succeeded and the caller joined the wait queue, before the
+    /// queue lock is released: the physical word key, the caller's virtual address,
+    /// context debug id, word width (32 or 64 bits), compared value, and whether a
+    /// timeout was supplied (0 or 1). Refused waits do not produce this event.
+    ///
+    /// Match the next `sched.futex_resume` with the same key and context, even across
+    /// CPUs. A key is a physical byte address and may be reused after memory is freed.
+    pub const SCHED_FUTEX_WAIT = 10 {
+        name: "sched.futex_wait",
+        subsystem: Sched,
+        level: Info,
+        args: ["key", "addr", "context", "bits", "expected", "timed"],
+    }
+
+    /// A queued futex wait finished, after removing any remaining waiter: the physical
+    /// word key, virtual address, context debug id and the result in `Error::mux`
+    /// encoding (0 for a wake, negated errno for timeout or interruption).
+    ///
+    /// This ends the wait, not the waking call: the caller may only run much later.
+    pub const SCHED_FUTEX_RESUME = 11 {
+        name: "sched.futex_resume",
+        subsystem: Sched,
+        level: Info,
+        args: ["key", "addr", "context", "ret"],
+    }
+
+    /// A valid futex wake finished: the physical word key, the waker's virtual address,
+    /// requested wake count and returned count. Calls that find no waiters, including
+    /// requests to wake zero, are recorded too.
+    ///
+    /// The returned count is the number of live queue entries processed by the syscall;
+    /// a timeout or signal can already have made an entry runnable before its cleanup.
+    /// It does not count contexts that necessarily changed from blocked to runnable.
+    pub const SCHED_FUTEX_WAKE = 12 {
+        name: "sched.futex_wake",
+        subsystem: Sched,
+        level: Info,
+        args: ["key", "addr", "requested", "woken"],
+    }
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -373,6 +413,9 @@ mod tests {
         assert_eq!(IRQ_ACK.subsystem(), Subsystem::Irq);
         assert_eq!(IOMMU_FAULT.id().get(), 9);
         assert_eq!(IOMMU_FAULT.subsystem(), Subsystem::Iommu);
+        assert_eq!(SCHED_FUTEX_WAIT.id().get(), 10);
+        assert_eq!(SCHED_FUTEX_RESUME.id().get(), 11);
+        assert_eq!(SCHED_FUTEX_WAKE.id().get(), 12);
     }
 
     #[test]
@@ -389,10 +432,28 @@ mod tests {
     fn levels_follow_the_rules() {
         // Ordinary events are info, so the default `kernel.trace_max_level` has them; an
         // IOMMU fault is something going wrong.
-        for event in [&MM_PAGE_FAULT, &IRQ_DELIVER, &IRQ_ACK] {
+        for event in [
+            &MM_PAGE_FAULT,
+            &IRQ_DELIVER,
+            &IRQ_ACK,
+            &SCHED_FUTEX_WAIT,
+            &SCHED_FUTEX_RESUME,
+            &SCHED_FUTEX_WAKE,
+        ] {
             assert_eq!(event.level(), crate::Level::Info, "{}", event.name());
         }
         assert_eq!(IOMMU_FAULT.level(), crate::Level::Error);
+    }
+
+    #[test]
+    fn futex_events_use_the_existing_scheduler_controls() {
+        let selected = crate::select(&CATALOG, "sched").unwrap();
+        let compiled = CATALOG.compiled_for(|f| f == "trace_sched" || f == "trace_level_info");
+        for event in [&SCHED_FUTEX_WAIT, &SCHED_FUTEX_RESUME, &SCHED_FUTEX_WAKE] {
+            assert_eq!(event.subsystem(), Subsystem::Sched);
+            assert!(selected.contains(event.id()));
+            assert!(compiled.contains(event.id()));
+        }
     }
 
     #[test]
