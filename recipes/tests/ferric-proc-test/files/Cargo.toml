@@ -1,0 +1,15 @@
+[package]
+name = "ferric-proc-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Per-process introspection (/scheme/sys/proc) test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+ferric-procinfo = { path = "../../../../crates/procinfo", features = ["alloc"] }
+
+[profile.release]
+debug = false

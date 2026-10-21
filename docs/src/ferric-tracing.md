@@ -759,6 +759,62 @@ traced boot lacks its `lost records` line. It warns when records were dropped,
 since a dropped record costs less than a written one, and prints every result
 as a notice on the run.
 
+## Per-process introspection
+
+With `kernel.sys_proc` (Kernel menu, off by default; kernel feature
+`sys_proc`), the `sys` scheme serves `/scheme/sys/proc`: a snapshot of every
+context, read in one go. Only root may open it (`EPERM` otherwise), because it
+shows the address-space layout of every process. A capability will replace
+the uid check with Phase 4.
+
+Each context is a block of lines, in the format of the `ferric-procinfo`
+crate (`crates/procinfo`), which the kernel writes with and tools parse with:
+
+```text
+context 12 pid 9 euid 0 egid 0 status runnable cpu 1 running yes active_ns 5210000 sched_ns 61000 name /usr/bin/ferric-proc-test
+memory private 9670656 shared 65536 kernel 81920
+fd 0 scheme pipe number 3
+fd 3 scheme sys number 7
+fd 4 scheme user:7 number 1
+grant 0x400000 pages 12 provider allocated prot r-x
+```
+
+- `context`: the context's debug id (the id `sched.switch` records carry, so
+  a trace and this file name the same context), process id, effective user
+  and group, state (`runnable`, `sleeping`, `blocked`, `dead`), the CPU it is
+  on and whether it is running there, and its CPU time in nanoseconds
+  (`active_ns` running, `sched_ns` scheduled). A running context's times
+  include its current timeslice, so two reads in a row show them growing.
+  Each CPU's idle context (`[kmain]`) is never charged. The name comes last and runs to the end of the line; control characters in it
+  are printed as `?`, so a name cannot forge a line.
+- `memory`: bytes of grants the address space owns (`private`) and shares
+  with other address spaces or schemes (`shared`), and the kernel memory the
+  context uses itself (kernel stack and FPU state). Borrowed device memory is
+  in neither count.
+- `fd`: each open descriptor with the scheme it is open on and the scheme's
+  handle number. Kernel schemes are named. A user-space scheme has no name in
+  the kernel, so it shows as `user:<scheme id>`; descriptors open on the same
+  user scheme share the id. The scheme manager's descriptors show as `mgr`,
+  except the scheme creation capability, which is `cap`.
+- `grant`: each mapping of the address space, with its base address, size in
+  pages, where the memory comes from (`allocated`, `allocated_shared`,
+  `phys`, `external`, `fmap`) and its protection, as user space may use it:
+  a `PROT_NONE` guard page (`kernel.prot_none`) is `---`, not readable.
+  Threads of one process share an address space and list the same grants.
+
+The kernel builds the file in two passes, so it takes no lock out of order.
+First it copies each context, and its descriptors' scheme ids, under that
+context's lock. Then it reads each address space and the scheme table with
+the context locks released. A process that changes between the two passes is
+shown partly before and partly after the change.
+
+`ferric_procinfo::processes` groups the file into one record per context.
+`ferric-proc-test` (in the smoke image, with `sys_proc` on in CI) checks its
+own block (name, CPU time, a file it holds open, an 8 MiB allocation), that
+its CPU time grows between two reads, that a thread stack's guard page shows
+as `---`, that no `mgr` descriptor names the capability, and that user 1000
+is refused the file.
+
 ## Not implemented yet
 
 - Tracepoints for other subsystems (memory mappings, IOMMU map and unmap,
@@ -766,3 +822,6 @@ as a notice on the run.
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.
+- Per-descriptor detail in `/scheme/sys/proc` from the fork's own schemes
+  (ring sizes, IOMMU domain mappings), and flamegraphs from the profiler with
+  user frame pointers.

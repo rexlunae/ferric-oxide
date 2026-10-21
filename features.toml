@@ -884,6 +884,21 @@ rebuild = ["kernel"]
 help = "Expose per-process file descriptor statistics through the sys: scheme."
 
 [[option]]
+id = "kernel.sys_proc"
+menu = "kernel"
+type = "bool"
+title = "Per-process introspection in sys:"
+default = false
+kernel_feature = "sys_proc"
+rebuild = ["kernel"]
+help = """
+Serve /scheme/sys/proc: for every context, its process and user ids, state,
+CPU and CPU time, its memory, each open file descriptor (the scheme it is open
+on and the handle) and each grant of its address space (address, size, where
+the memory comes from, protection). Only root may read it, since it shows
+addresses. The format is the ferric-procinfo crate's."""
+
+[[option]]
 id = "kernel.busy_panic"
 menu = "kernel"
 type = "bool"
