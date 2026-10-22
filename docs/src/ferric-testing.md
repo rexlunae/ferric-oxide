@@ -348,6 +348,13 @@ The smoke configuration runs a short fixed-seed syscall fuzz test.
 eight-process random-seed run, scheduled by the image workflow. The seed is
 printed so a failing run can be replayed with the same fuzzer arguments.
 
+Each child also makes the calls that crashed the kernel before, independent of
+its random stream, so a reintroduced bug fails every run instead of only the
+seed that first found it: `mremap` and `fmap` with `MAP_FIXED` at the top of the
+kernel half, `funmap` with a length that has no aligned value, a negative
+`FUTEX_WAIT` timeout and a negative timer write. The child exits with a
+regression status if one of them is accepted instead of refused.
+
 Preserve the serial log, image configuration, feature choices, kernel symbols
 and test seed. `scripts/backtrace.sh` helps symbolize kernel addresses;
 kernel-image KASLR traces use link addresses. Image CI retains build logs on

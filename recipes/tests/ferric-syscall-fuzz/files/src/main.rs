@@ -92,6 +92,7 @@ mod sys {
     pub const PROT_WRITE: usize = 0x0002_0000;
     pub const PROT_READ: usize = 0x0004_0000;
     pub const MAP_PRIVATE: usize = 0x0002;
+    pub const MAP_FIXED: usize = 0x0004;
 
     /// `redox_syscall::UPPER_FDTBL_TAG`: descriptors with this bit live in the
     /// upper table, where relibc keeps its process and thread handles. The
@@ -726,6 +727,69 @@ impl Fuzzer {
         // SAFETY: the kernel must refuse this; if it does not, only this
         // process's mapping is affected.
         let _ = unsafe { sys::call(sys::MREMAP, args) };
+
+        // fmap of a file with MAP_FIXED and a mapping whose end wraps past the
+        // top of user space corrupted the free-space accounting of the address
+        // space, and a later mapping then landed on memory a grant already
+        // owned, which panicked the kernel with an overlap assertion (fixed by
+        // validating the span). A file on the root file system reaches the
+        // grant path through its scheme's mapping request, and anonymous memory
+        // through the memory scheme, so both are tried.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open("fmap-fixed")
+            .ok()
+            .map(|file| file.into_raw_fd() as usize);
+        let zeroed = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/scheme/memory/zeroed")
+            .ok()
+            .map(|file| file.into_raw_fd() as usize);
+        let opened = [file, zeroed];
+        for fd in opened.into_iter().flatten() {
+            for len in [0x1000usize, 0x10_0000] {
+                let map = [
+                    0xFFFF_FFFF_FFFF_F000,
+                    len,
+                    sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
+                    0,
+                ];
+                if self.verbose {
+                    eprintln!("regression {:#x} fd {fd} {map:x?}", sys::FMAP);
+                }
+                // SAFETY: the descriptor is this process's and the mapping asks
+                // for an address the kernel must refuse.
+                let ret = unsafe {
+                    sys::call(
+                        sys::FMAP,
+                        [fd, map.as_ptr() as usize, size_of_val(&map), 0, 0, 0],
+                    )
+                };
+                if !sys::is_err(ret) {
+                    eprintln!("fuzz: fmap MAP_FIXED in the kernel half returned {ret:#x}");
+                    std::process::exit(REGRESSED_EXIT);
+                }
+            }
+            // SAFETY: closing a descriptor this process opened and owns.
+            unsafe { sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]) };
+        }
+
+        // funmap with a length that has no aligned value rounded into a
+        // different range; it now fails with EINVAL.
+        let args = [self.victim, usize::MAX, 0, 0, 0, 0];
+        if self.verbose {
+            eprintln!("regression {:#x} {args:x?}", sys::FUNMAP);
+        }
+        // SAFETY: the range names this process's own mapping and a length the
+        // kernel must refuse.
+        let ret = unsafe { sys::call(sys::FUNMAP, args) };
+        if ret != sys::EINVAL.wrapping_neg() {
+            eprintln!("fuzz: funmap with a huge length returned {ret:#x}, not EINVAL");
+            std::process::exit(REGRESSED_EXIT);
+        }
 
         // FUTEX_WAIT on a matching word with a negative timeout slept forever,
         // because the deadline wrapped to a huge value (fixed by rejecting it

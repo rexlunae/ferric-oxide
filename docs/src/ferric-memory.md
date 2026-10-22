@@ -50,6 +50,35 @@ also reserves a main-stack guard. With `kernel.prot_none`, user access to a
 guard faults instead of reading ordinary mapped memory. The guard and ASLR
 image tests exercise these behaviors.
 
+## Mapping ranges stay inside user space
+
+User space ends at `USER_END_OFFSET` (2^47, `0x0000_8000_0000_0000`, on
+x86-64 with four-level paging). The grant table of an address space keeps
+its grants and free holes only below that limit, so a span that leaves the
+range is not accounted for, and one whose end wraps past the top can make a
+later selection hand out pages that a grant already owns. The address space
+then panics on the overlap assertion in `UserGrants::insert`; the syscall
+fuzzer found this through `fmap` and `mremap` with addresses in the kernel
+half.
+
+Every entry point rejects such a span before it reaches the grant table:
+
+| Entry point | Validation |
+| --- | --- |
+| Anonymous `fmap` (memory scheme) and `proc` mappings | `PageSpan::validate_nonempty` on the requested range |
+| `fmap` of a scheme file descriptor (`fmap_inner`) | the page count must fit in `USER_END_OFFSET`, and a `MAP_FIXED` address plus that size must end below it |
+| `funmap` | the aligned length must be representable and the range must validate |
+| `mremap` | both the old and the new range must validate |
+| `AddrSpace::mmap` | last check for every caller: the span size and, for a fixed base, base plus size are compared with `USER_END_OFFSET` before any hole or grant is touched |
+
+The hole bookkeeping also saturates and checks its arithmetic, so an
+unvalidated span cannot wrap a hole end into a smaller address and pass the
+fit test in `find_free`, and a hole can never replace an existing one in only
+one of the two indexes. The `ferric-syscall-fuzz` regression calls repeat the
+requests that found these bugs on every run: `mremap` to the top of the kernel
+half, `fmap` with `MAP_FIXED` there, and a `funmap` length with no aligned
+value.
+
 ## KPTI and PCID
 
 `kernel.cpu.kpti` defaults to `auto`. It enables kernel page-table isolation

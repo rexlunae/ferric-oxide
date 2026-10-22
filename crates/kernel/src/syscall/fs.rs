@@ -662,7 +662,12 @@ pub fn funmap(virtual_address: usize, length: usize, token: &mut CleanLockToken)
     // Thus, while (temporarily) allowing unaligned lengths for compatibility, aligning the length
     // should be done by libc.
 
-    let length_aligned = length.next_multiple_of(PAGE_SIZE);
+    // Ferric Oxide: a length near the top of the address space has no aligned value to round to;
+    // it is outside user space regardless, so fail like any other invalid range instead of
+    // wrapping or panicking on the rounding.
+    let Some(length_aligned) = length.checked_next_multiple_of(PAGE_SIZE) else {
+        return Err(Error::new(EINVAL));
+    };
     if length != length_aligned {
         warn!(
             "funmap passed length {:#x} instead of {:#x}",
