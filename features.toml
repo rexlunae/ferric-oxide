@@ -777,7 +777,7 @@ bound how long a driver took to handle the interrupt."""
 id = "kernel.trace_iommu"
 menu = "kernel.tracing"
 type = "bool"
-title = "IOMMU fault tracepoints"
+title = "IOMMU fault and DMA mapping tracepoints"
 default = true
 depends = "kernel.trace"
 kernel_feature = "trace_iommu"
@@ -786,7 +786,10 @@ help = """Compile in iommu.fault, recorded for each fault an IOMMU reports (a DM
 interrupt request it blocked, or an error of its own) along with the kernel's
 log line. The record keeps the hardware's report as it is (a VT-d fault record
 or an AMD-Vi event log entry), and ferric-trace decodes it. These are
-error-level events, so any kernel.trace_max_level compiles them in."""
+error-level events, so any kernel.trace_max_level compiles them in. Also compile
+in the info-level iommu.map, iommu.protect and iommu.unmap events for completed
+DMA domain operations, after required IOTLB invalidation. Failed/partial changes
+and whole-domain destruction are not a complete mapping journal."""
 
 [[option]]
 id = "kernel.trace_max_level"

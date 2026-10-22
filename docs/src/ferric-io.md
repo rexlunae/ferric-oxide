@@ -514,6 +514,12 @@ those installation and rollback failures, grant and region closure, and IOVA
 retention and release. Hardware boot tests exercise the normal mapping path;
 they do not inject invalidation failures into a real IOMMU.
 
+With `kernel.trace_iommu` and an info-or-more-verbose maximum, `iommu.map`,
+`iommu.protect` and `iommu.unmap` record completed domain operations after
+required invalidations, including translation and grant paths. Failed/partial
+operations and whole-domain destruction are absent; see [DMA tracing](ferric-tracing.md#completed-dma-domain-operations)
+for the domain identity, fields and scope.
+
 ## Storage DMA into registered buffers
 
 `drivers.grant_dma = true` (Drivers menu, default `false`) lets an application

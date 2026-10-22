@@ -251,6 +251,42 @@ crate::events! {
         level: Info,
         args: ["space", "addr", "pages", "unpin", "ret"],
     }
+
+    /// A DMA domain successfully mapped a physical run and completed required IOTLB
+    /// invalidations: domain ID, physical root table, IOVA, physical address, byte length,
+    /// and read/write permission bits (each 0 or 1).
+    ///
+    /// The ID/root pair identifies a live domain, not its producer; both may be reused
+    /// after destruction. Cached translations and identity tables bypass this operation.
+    /// Failed attempts are absent, even if they changed tables before failing.
+    pub const IOMMU_MAP = 19 {
+        name: "iommu.map",
+        subsystem: Iommu,
+        level: Info,
+        args: ["domain", "root", "iova", "phys", "bytes", "read", "write"],
+    }
+
+    /// A DMA domain successfully changed permissions and completed IOTLB invalidation:
+    /// domain ID, physical root table, IOVA, byte length and read/write bits (0 or 1).
+    /// Failed or partially completed changes are absent.
+    pub const IOMMU_PROTECT = 20 {
+        name: "iommu.protect",
+        subsystem: Iommu,
+        level: Info,
+        args: ["domain", "root", "iova", "bytes", "read", "write"],
+    }
+
+    /// A DMA domain successfully unmapped a range and completed IOTLB invalidation:
+    /// domain ID, physical root table, IOVA and byte length.
+    ///
+    /// This can be rollback of a failed map. Failed/partial unmaps and whole-domain
+    /// destruction are absent, so these events do not form a complete mapping journal.
+    pub const IOMMU_UNMAP = 21 {
+        name: "iommu.unmap",
+        subsystem: Iommu,
+        level: Info,
+        args: ["domain", "root", "iova", "bytes"],
+    }
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -499,6 +535,9 @@ mod tests {
         assert_eq!(MM_MAP.id().get(), 16);
         assert_eq!(MM_PROTECT.id().get(), 17);
         assert_eq!(MM_UNMAP.id().get(), 18);
+        assert_eq!(IOMMU_MAP.id().get(), 19);
+        assert_eq!(IOMMU_PROTECT.id().get(), 20);
+        assert_eq!(IOMMU_UNMAP.id().get(), 21);
     }
 
     #[test]
@@ -520,6 +559,9 @@ mod tests {
             &MM_MAP,
             &MM_PROTECT,
             &MM_UNMAP,
+            &IOMMU_MAP,
+            &IOMMU_PROTECT,
+            &IOMMU_UNMAP,
             &IRQ_DELIVER,
             &IRQ_ACK,
             &SCHED_FUTEX_WAIT,
@@ -563,6 +605,22 @@ mod tests {
             assert!(compiled.contains(event.id()));
             assert!(!absent.contains(event.id()));
         }
+    }
+
+    #[test]
+    fn dma_mapping_events_use_the_existing_iommu_controls() {
+        let selected = crate::select(&CATALOG, "iommu").unwrap();
+        let compiled = CATALOG.compiled_for(|f| f == "trace_iommu" || f == "trace_level_info");
+        let absent = CATALOG.compiled_for(|f| f == "trace_level_info");
+        let errors = CATALOG.compiled_for(|f| f == "trace_iommu" || f == "trace_level_error");
+        for event in [&IOMMU_MAP, &IOMMU_PROTECT, &IOMMU_UNMAP] {
+            assert_eq!(event.subsystem(), Subsystem::Iommu);
+            assert!(selected.contains(event.id()));
+            assert!(compiled.contains(event.id()));
+            assert!(!absent.contains(event.id()));
+            assert!(!errors.contains(event.id()));
+        }
+        assert!(errors.contains(IOMMU_FAULT.id()));
     }
 
     #[test]

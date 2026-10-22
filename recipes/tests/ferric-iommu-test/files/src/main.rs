@@ -68,7 +68,8 @@
 //! and for the interrupt fault `FERRIC_IOMMU_EXPECT_IRQ_FAULT <index>`; the vtd boot CI job
 //! checks the kernel logged exactly those faults, from this device. With kernel tracing
 //! (`kernel.trace_iommu`) it also turns the `iommu.fault` event on and checks the kernel
-//! recorded those faults ([`trace`], `iommu-trace`). With `kernel.trace_irq` it turns the
+//! recorded those faults ([`trace`], `iommu-trace`). The isolated `iommu-mapping-trace`
+//! check also verifies completed map/protect/unmap operations, cache hits and live disable. With `kernel.trace_irq` it turns the
 //! `irq` events on around `iommu-msi`'s interrupt, which it acknowledges itself, and checks
 //! the kernel recorded its delivery and the acknowledgement (`trace-irq`). When the program
 //! exits the domain closes and the kernel blocks the device, and pcid frees its interrupt
@@ -197,6 +198,7 @@ const IRQ_BLOCKED_WAIT: Duration = Duration::from_millis(500);
 const CANARY: u8 = 0xa5;
 
 /// Why a test failed.
+#[derive(Debug)]
 enum Failure {
     /// An environment variable is missing or not a descriptor number.
     Env(&'static str),
@@ -1434,6 +1436,7 @@ fn run(mut setup: Setup) -> (Option<Outcome>, MsiOutcome) {
         Ok(false) => return (None, msi),
         Err(err) => return (Some(Outcome::all_failed(err)), msi),
     }
+    trace::check_mappings(&setup.translator);
     let iova = match translate_in_domain(&setup) {
         Ok(iova) => iova,
         Err(err) => {
@@ -1566,17 +1569,21 @@ fn main() -> ExitCode {
         trace::Start::Skip(why) => Ok(trace::Report {
             iommu: trace::Step::Skip(why),
             irq: trace::Step::Skip(why),
+            mappings: trace::Step::Skip(why),
         }),
     });
     // pcid-spawner waits for this before it starts the next driver.
     let _ = notify.write_all(&[0]);
     let trace_ok = match traced {
         Ok(report) => {
-            report_trace("iommu-trace", report.iommu) & report_trace("trace-irq", report.irq)
+            report_trace("iommu-trace", report.iommu)
+                & report_trace("trace-irq", report.irq)
+                & report_trace("iommu-mapping-trace", report.mappings)
         }
         Err(err) => {
             println!("FERRIC_TEST_FAIL iommu-trace: {err}");
             println!("FERRIC_TEST_FAIL trace-irq: {err}");
+            println!("FERRIC_TEST_FAIL iommu-mapping-trace: {err}");
             false
         }
     };

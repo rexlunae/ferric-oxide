@@ -21,7 +21,7 @@ what is on at run time.
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
-| `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (an `error`-level event, so every `kernel.trace_max_level` keeps it) |
+| `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
 | `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
@@ -166,6 +166,46 @@ have been populated; anonymous pages can fault in later.
 ```text
 enable mm.map mm.protect mm.unmap
 ```
+
+### Completed DMA domain operations
+
+`iommu.map`, `iommu.protect` and `iommu.unmap` are info-level events under
+`kernel.trace_iommu`. They record successful `Domain::map`, `protect` and
+`unmap` calls, after table updates and every required IOTLB invalidation has
+completed. Both VT-d and AMD-Vi use these hooks. The caller still owns exclusive
+access to the domain when the event is emitted.
+
+| Event | Arguments |
+| --- | --- |
+| `iommu.map` | `domain`, `root`, `iova`, `phys`, `bytes`, `read`, `write` |
+| `iommu.protect` | `domain`, `root`, `iova`, `bytes`, `read`, `write` |
+| `iommu.unmap` | `domain`, `root`, `iova`, `bytes` |
+
+`domain` is the hardware domain ID and `root` its physical page-table root.
+The pair identifies the target while it exists; both values can be reused
+after domain destruction. They identify neither the emitting process nor a
+single device: a domain can have multiple devices, and revocation can be
+emitted by another process. `iova`, `phys` and `bytes` are byte addresses and
+lengths, even when large pages implement a run. `read` and `write` are each
+0 or 1 and describe device access.
+
+These events cover translation installations, permission narrowing/widening,
+grant runs, revocation and reserved-memory mappings that call these APIs.
+A repeated translation that reuses an unchanged mapping emits no new map.
+A successful rollback can emit an unmap without a corresponding successful
+map. Failed calls emit no completion event, even if some table entries changed
+or an invalidation left reachability uncertain. Whole-domain blocking and
+destruction, identity tables, device attachment and IOVA allocation/retirement
+are not comprehensively recorded. This is not a complete mapping journal or
+proof of DMA isolation; consult the operation's error and retained-resource
+state when cleanup fails.
+
+`ferric-iommu-test` checks an exact one-page map, a repeated translation with
+no duplicate map, read-only protection, ordered unmap with the same domain
+identity, and no records after live disable (`iommu-mapping-trace`). It runs
+only with a bound domain and these events compiled in; image CI requires it
+in all four IOMMU boots. Hardware invalidation failures are not injected by
+this test.
 
 ### Kernel context lifecycle
 
@@ -1132,7 +1172,7 @@ is refused the file.
 ## Not implemented yet
 
 - A complete mapping journal (clone, move, replacement and destruction),
-  IOMMU map/unmap and user-space process creation/exec/wait tracepoints, and
+  user-space process creation/exec/wait tracepoints, and
   tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
