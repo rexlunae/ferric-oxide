@@ -271,7 +271,8 @@ impl Domain {
     }
 
     /// Maps `len` bytes at `iova` to `phys` with `access`, using large pages where the
-    /// addresses allow and every unit supports them.
+    /// addresses allow and every unit supports them. Optional `iommu.map` records success
+    /// after required invalidations; failed/partial operations produce no completion.
     ///
     /// # Errors
     ///
@@ -319,11 +320,23 @@ impl Domain {
         // VT-d units in caching mode may cache not-present entries, so making entries present
         // needs an invalidation there (CAP.CM, section 6.1). AMD-Vi gives no such guarantee
         // either way, so its pages are always invalidated.
-        self.flush_iotlb(iova, len, false, |unit| unit.regs.cap.caching_mode())
+        self.flush_iotlb(iova, len, false, |unit| unit.regs.cap.caching_mode())?;
+        trace_event!(
+            ferric_trace::kernel::IOMMU_MAP,
+            self.did,
+            self.root,
+            iova,
+            phys,
+            len,
+            access.read(),
+            access.write(),
+        );
+        Ok(())
     }
 
     /// Unmaps `len` bytes at `iova`, invalidates the IOTLB of every unit the domain is
-    /// attached to, waits for that, and then frees the table pages left empty.
+    /// attached to, waits for that, and then frees the table pages left empty. Optional
+    /// `iommu.unmap` records only complete success, including successful rollback calls.
     ///
     /// # Errors
     ///
@@ -358,12 +371,21 @@ impl Domain {
         for page in emptied {
             self.tables.free(page);
         }
-        result.map_err(DomainError::Unmap)
+        result.map_err(DomainError::Unmap)?;
+        trace_event!(
+            ferric_trace::kernel::IOMMU_UNMAP,
+            self.did,
+            self.root,
+            iova,
+            len
+        );
+        Ok(())
     }
 
     /// Changes the device's access to the `len` bytes mapped at `iova` to `access`, then
     /// invalidates the IOTLB of every unit the domain is attached to and waits for that, so
-    /// when it returns no device can use the old access any more.
+    /// when it returns no device can use the old access any more. Optional `iommu.protect`
+    /// records only complete success; failed/partial changes produce no completion.
     ///
     /// # Errors
     ///
@@ -392,7 +414,17 @@ impl Domain {
         if done > 0 {
             self.flush_iotlb(iova, done, false, |_| true)?;
         }
-        result.map_err(DomainError::Protect)
+        result.map_err(DomainError::Protect)?;
+        trace_event!(
+            ferric_trace::kernel::IOMMU_PROTECT,
+            self.did,
+            self.root,
+            iova,
+            len,
+            access.read(),
+            access.write(),
+        );
+        Ok(())
     }
 
     /// The attached devices.

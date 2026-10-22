@@ -52,6 +52,8 @@ use ferric_trace::kernel::{IOMMU_FAULT, IRQ_ACK, IRQ_DELIVER, IommuFormat, IrqSo
 use ferric_trace::record::Records;
 use ferric_vtd::fault::{FaultRecord, RequestKind};
 
+mod mappings;
+
 /// How long [`finish`] waits for the records of announced faults.
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -184,6 +186,13 @@ impl Interrupts {
 /// Why `iommu-trace` or `trace-irq` failed.
 #[derive(Debug)]
 pub enum Error {
+    /// A DMA mapping operation used by the tracing regression failed.
+    MappingOperation(super::Failure),
+    /// A mapping capture did not describe the operations performed.
+    MappingMismatch {
+        /// The expectation violated by the capture.
+        what: &'static str,
+    },
     /// A file of the trace scheme could not be used.
     Io { path: String, source: io::Error },
     /// A listing line or record did not parse.
@@ -197,6 +206,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MappingOperation(source) => write!(f, "mapping operation: {source}"),
+            Self::MappingMismatch { what } => write!(f, "DMA mapping trace: {what}"),
             Self::Io { path, source } => write!(f, "{path}: {source}"),
             Self::Parse { path, what } => write!(f, "{path}: {what}"),
             Self::Missing { expected, records } => write!(
@@ -222,6 +233,10 @@ struct Tracer {
     faults: Vec<Fault>,
     /// The `irq` events, when the kernel has both.
     interrupts: Option<Interrupts>,
+    /// Completed domain operations collected alongside faults and interrupts.
+    mappings: Vec<mappings::Entry>,
+    /// The isolated mapping/permission/unmap regression, when a domain was bound.
+    mapping_step: Option<Step>,
 }
 
 /// The tracer, once [`start`] found the event.
@@ -252,6 +267,8 @@ pub struct Report {
     pub iommu: Step,
     /// `trace-irq`.
     pub irq: Step,
+    /// `iommu-mapping-trace`.
+    pub mappings: Step,
 }
 
 /// The path of `file` in the trace scheme.
@@ -343,6 +360,8 @@ pub fn start() -> Result<Start, Error> {
         expected: Vec::new(),
         faults: Vec::new(),
         interrupts,
+        mappings: Vec::new(),
+        mapping_step: None,
     };
     tracer.drain()?;
     *lock() = Some(tracer);
@@ -376,6 +395,14 @@ impl Tracer {
                     let args: Vec<u64> = record.args().collect();
                     let timestamp = record.timestamp();
                     let event = record.event();
+                    if mappings::is_event(event) {
+                        self.mappings.push(mappings::Entry {
+                            event,
+                            args,
+                            timestamp,
+                        });
+                        continue;
+                    }
                     match (&args[..], self.interrupts.as_mut()) {
                         (&[_, format, lo, hi, _], _) if event == IOMMU_FAULT.id() => {
                             self.faults.push(Fault { format, lo, hi });
@@ -546,6 +573,7 @@ pub fn finish() -> Result<Report, Error> {
         return Ok(Report {
             iommu: Step::Skip("tracing did not start"),
             irq: Step::Skip("tracing did not start"),
+            mappings: Step::Skip("tracing did not start"),
         });
     };
     let deadline = Instant::now() + WAIT;
@@ -566,10 +594,23 @@ pub fn finish() -> Result<Report, Error> {
         }
     }
     result?;
+    let mappings = tracer
+        .mapping_step
+        .take()
+        .unwrap_or(Step::Skip("no bound DMA domain"));
     Ok(Report {
         iommu: iommu_step(&tracer),
         irq: irq_step(tracer.interrupts.as_ref()),
+        mappings,
     })
+}
+
+/// Checks completed DMA mapping records on a bound domain, including cached translations
+/// and live disable. The result is reported by [`finish`] alongside the fault/IRQ checks.
+pub fn check_mappings(translator: &super::Translator) {
+    if let Some(tracer) = lock().as_mut() {
+        tracer.mapping_step = Some(mappings::check(tracer, translator));
+    }
 }
 
 /// `iommu-trace`'s result from the collected records.
