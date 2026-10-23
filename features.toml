@@ -569,14 +569,15 @@ grants (ferric-netq). This is copy mode: the driver matches each received frame
 against the sockets' steering filters before netstack sees it, copies a match
 into the application's frame and publishes it on the RX ring, and sends the
 application's TX frames by copying them out of the UMEM. Frames no filter
-matches go to netstack as before. Zero-copy mode, port ownership for
-unprivileged sockets and TX validation come later. Builds e1000d with its
-bypass Cargo feature. Needs Kernel > Registered buffers. Off by default;
+matches go to netstack as before; a socket without raw TX sends only from the
+addresses and ports it owns. Zero-copy mode and unprivileged sockets come
+later. Builds e1000d and virtio-netd with their
+bypass Cargo features. Needs Kernel > Registered buffers. Off by default;
 without it the network schemes have no queue path, as upstream."""
 
 [[option.effect]]
 when = "value"
-make_append = { FERRIC_BASE_FEATURES = "e1000d/bypass" }
+make_append = { FERRIC_BASE_FEATURES = "e1000d/bypass virtio-netd/bypass" }
 
 [[option]]
 id = "kernel.self_modifying"

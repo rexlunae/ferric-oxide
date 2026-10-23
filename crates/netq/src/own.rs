@@ -1,17 +1,24 @@
 //! Port ownership and TX validation (design section 4, "Port ownership" and "TX validation").
 //!
 //! A filter on a TCP or UDP destination port must not take a port a netstack socket is
-//! using. To own a port, the application binds an ordinary netstack socket on it
-//! (`udp:0.0.0.0:5353`, say) and passes that socket's descriptor with
+//! using. To own a port, the application binds an ordinary netstack socket on it, at one of
+//! the interface's addresses (`udp:10.0.2.15:5353`, say), and passes that socket's descriptor
+//! with
 //! [`Request::Own`](crate::call::Request::Own). The driver keeps the descriptor open, so
 //! netstack keeps the port reserved for as long as the queue socket lives, and reads which port
 //! it is from the descriptor's path ([`OwnedPort::from_fpath`]): netstack's `udp` and `tcp`
 //! schemes write `/scheme/<udp|tcp>/<remote>/<local>`, with the local endpoint last.
 //!
+//! An owned port is always an address and a port. A netstack socket bound to every address
+//! (`0.0.0.0` or `::`) is refused ([`OwnError::UnspecifiedAddress`]): owning it would let the
+//! queue socket send from any source address, and the driver does not know which addresses
+//! are the interface's. Binding to one address names the source the socket may use.
+//!
 //! [`Ownership`] is one socket's owned ports. [`Ownership::check_filter`] refuses a filter on a
-//! destination port the socket does not own, and [`Ownership::check_tx`] is TX validation: a
-//! frame the socket sends must carry the NIC's source MAC, no VLAN tag, and be TCP or UDP
-//! from an owned port (and from the owned address, when the netstack socket is bound to one).
+//! destination port the socket does not own at the filter's destination address (a filter
+//! with a port must name the address), and [`Ownership::check_tx`] is TX validation: a frame
+//! the socket sends must carry the NIC's source MAC, no VLAN tag, and be TCP or UDP from an
+//! owned address and port.
 //! A socket bound with [`BindFlags::RAW_TX`](crate::call::BindFlags::RAW_TX) skips TX
 //! validation.
 //!
@@ -69,8 +76,8 @@ impl Transport {
 pub struct OwnedPort {
     /// The protocol.
     pub transport: Transport,
-    /// The address the netstack socket is bound to, or `None` for every address.
-    pub addr: Option<IpAddr>,
+    /// The address the netstack socket is bound to, never unspecified.
+    pub addr: IpAddr,
     /// The port, never zero.
     pub port: u16,
 }
@@ -81,17 +88,25 @@ impl OwnedPort {
     /// # Errors
     ///
     /// [`OwnError::NotASocket`] when `path` is not a path of netstack's `udp` or `tcp`
-    /// scheme with a remote and a local endpoint, and [`OwnError::Unbound`] when the local
-    /// endpoint has port 0.
+    /// scheme with a remote and a local endpoint, [`OwnError::Unbound`] when the local
+    /// endpoint has port 0, and [`OwnError::UnspecifiedAddress`] when it is bound to every
+    /// address.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ferric_netq::own::{OwnedPort, Transport};
+    /// use core::net::{IpAddr, Ipv4Addr};
+    /// use ferric_netq::own::{OwnError, OwnedPort, Transport};
     ///
-    /// let owned = OwnedPort::from_fpath("/scheme/udp/0.0.0.0:0/0.0.0.0:5353").expect("a socket");
+    /// let owned = OwnedPort::from_fpath("/scheme/udp/0.0.0.0:0/10.0.2.15:5353").expect("a socket");
     /// assert_eq!(owned.transport, Transport::Udp);
-    /// assert_eq!((owned.addr, owned.port), (None, 5353));
+    /// assert_eq!(owned.addr, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)));
+    /// assert_eq!(owned.port, 5353);
+    /// // Every address is not one the socket can own.
+    /// assert_eq!(
+    ///     OwnedPort::from_fpath("/scheme/udp/0.0.0.0:0/0.0.0.0:5353"),
+    ///     Err(OwnError::UnspecifiedAddress)
+    /// );
     /// ```
     pub fn from_fpath(path: &str) -> Result<Self, OwnError> {
         let rest = path.strip_prefix("/scheme/").ok_or(OwnError::NotASocket)?;
@@ -107,20 +122,19 @@ impl OwnedPort {
         if local.port() == 0 {
             return Err(OwnError::Unbound);
         }
-        let addr = Some(local.ip()).filter(|ip| !ip.is_unspecified());
+        if local.ip().is_unspecified() {
+            return Err(OwnError::UnspecifiedAddress);
+        }
         Ok(Self {
             transport,
-            addr,
+            addr: local.ip(),
             port: local.port(),
         })
     }
 
-    /// Whether this ownership covers `transport` port `port` at `addr` (`None`: every
-    /// address).
-    fn covers(&self, transport: Transport, port: u16, addr: Option<IpAddr>) -> bool {
-        self.transport == transport
-            && self.port == port
-            && (self.addr.is_none() || self.addr == addr)
+    /// Whether this ownership covers `transport` port `port` at `addr`.
+    fn covers(&self, transport: Transport, port: u16, addr: IpAddr) -> bool {
+        self.transport == transport && self.port == port && self.addr == addr
     }
 }
 
@@ -134,6 +148,10 @@ pub enum OwnError {
     /// The socket is not bound to a port.
     #[error("the netstack socket is not bound to a port")]
     Unbound,
+    /// The socket is bound to every address (`0.0.0.0` or `::`), which would let the queue
+    /// socket send from any source address. Bind it to one of the interface's addresses.
+    #[error("the netstack socket is bound to every address, not to one")]
+    UnspecifiedAddress,
     /// The socket already owns [`Ownership::MAX_PORTS`] ports.
     #[error("the queue socket owns as many ports as it may")]
     Full,
@@ -143,8 +161,8 @@ pub enum OwnError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum FilterOwnError {
-    /// The filter names a destination port the socket does not own (on the filter's
-    /// destination address, when the owned port is bound to one).
+    /// The filter names a destination port the socket does not own at the filter's
+    /// destination address, or names a port without an address.
     #[error("the queue socket does not own the filter's destination port")]
     NotOwned,
 }
@@ -168,8 +186,8 @@ pub enum TxReject {
     /// `BindFlags::RAW_TX`, the supported path for anything validation does not cover.
     #[error("the frame is not TCP or UDP with its ports (fragments are not sent)")]
     NotTransport,
-    /// The source port (or address) is not one the socket owns.
-    #[error("the source port is not one the socket owns")]
+    /// The source address and port are not ones the socket owns.
+    #[error("the source address and port are not ones the socket owns")]
     NotOwned,
 }
 
@@ -211,7 +229,7 @@ impl Ownership {
     }
 
     /// Whether the socket owns `transport` port `port` at `addr`.
-    pub fn owns(&self, transport: Transport, port: u16, addr: Option<IpAddr>) -> bool {
+    pub fn owns(&self, transport: Transport, port: u16, addr: IpAddr) -> bool {
         self.ports
             .iter()
             .flatten()
@@ -219,12 +237,13 @@ impl Ownership {
     }
 
     /// Whether the socket may add `filter`: a match on a destination port needs that port
-    /// owned. Other filters (ARP, ICMP, whole protocols, a secondary MAC) are allowed, as
+    /// owned at the filter's destination address, which it must name. Other filters (ARP, ICMP, whole protocols, a secondary MAC) are allowed, as
     /// queue sockets are root's.
     ///
     /// # Errors
     ///
-    /// [`FilterOwnError::NotOwned`] for a destination port the socket does not own.
+    /// [`FilterOwnError::NotOwned`] for a destination port the socket does not own at the
+    /// filter's destination address, or one without an address.
     pub fn check_filter(&self, filter: &Filter) -> Result<(), FilterOwnError> {
         let FilterSpec::Match(fields) = filter.spec() else {
             return Ok(());
@@ -232,12 +251,14 @@ impl Ownership {
         let Some(port) = fields.dst_port else {
             return Ok(());
         };
-        // A valid filter with a port names TCP or UDP.
+        // A valid filter with a port names TCP or UDP. Without an address it would take the
+        // port on every address, and an owned port is owned at one.
         let transport = fields
             .ip_protocol
             .and_then(Transport::from_protocol)
             .ok_or(FilterOwnError::NotOwned)?;
-        if self.owns(transport, port, fields.dst_addr) {
+        let addr = fields.dst_addr.ok_or(FilterOwnError::NotOwned)?;
+        if self.owns(transport, port, addr) {
             Ok(())
         } else {
             Err(FilterOwnError::NotOwned)
@@ -245,7 +266,8 @@ impl Ownership {
     }
 
     /// TX validation of a frame with `headers` on a NIC with MAC address `nic`: the NIC's
-    /// source MAC, no VLAN header (not even a priority tag), and TCP or UDP from an owned port.
+    /// source MAC, no VLAN header (not even a priority tag), and TCP or UDP from an owned
+    /// address and port.
     /// IP fragments, the first one included, are refused ([`TxReject::NotTransport`]); raw TX
     /// (`BindFlags::RAW_TX`) is the path for them.
     ///
@@ -263,7 +285,7 @@ impl Ownership {
         let ip = headers.ip.as_ref().ok_or(TxReject::NotTransport)?;
         let transport = Transport::from_protocol(ip.protocol).ok_or(TxReject::NotTransport)?;
         let ports = ip.ports.ok_or(TxReject::NotTransport)?;
-        if self.owns(transport, ports.src, Some(ip.src)) {
+        if self.owns(transport, ports.src, ip.src) {
             Ok(())
         } else {
             Err(TxReject::NotOwned)
@@ -286,10 +308,13 @@ mod tests {
 
     const ICMP: u8 = 1;
 
+    /// The address the tests' sockets are bound to.
+    const HOST: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15));
+
     fn udp_port(port: u16) -> OwnedPort {
         OwnedPort {
             transport: Transport::Udp,
-            addr: None,
+            addr: HOST,
             port,
         }
     }
@@ -317,23 +342,32 @@ mod tests {
     #[test]
     fn netstack_paths_name_the_owned_port() {
         assert_eq!(
-            OwnedPort::from_fpath("/scheme/udp/0.0.0.0:0/0.0.0.0:5353"),
+            OwnedPort::from_fpath("/scheme/udp/0.0.0.0:0/10.0.2.15:5353"),
             Ok(udp_port(5353))
         );
         assert_eq!(
             OwnedPort::from_fpath("/scheme/tcp/10.0.2.2:80/10.0.2.15:40000"),
             Ok(OwnedPort {
                 transport: Transport::Tcp,
-                addr: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15))),
+                addr: HOST,
                 port: 40000,
             })
         );
         let v6 = OwnedPort::from_fpath("/scheme/udp/[::]:0/[fe80::1]:7").expect("a socket");
-        assert_eq!((v6.port, v6.addr.map(|a| a.is_ipv6())), (7, Some(true)));
-        assert_eq!(
-            OwnedPort::from_fpath("/scheme/udp/[::]:0/[::]:9").map(|o| o.addr),
-            Ok(None)
-        );
+        assert_eq!((v6.port, v6.addr.is_ipv6()), (7, true));
+        // Every address is refused, IPv4 or IPv6: the owner would send from any source.
+        for every in [
+            "/scheme/udp/0.0.0.0:0/0.0.0.0:5353",
+            "/scheme/tcp/10.0.2.2:80/0.0.0.0:40000",
+            "/scheme/udp/[::]:0/[::]:9",
+        ] {
+            assert_eq!(
+                OwnedPort::from_fpath(every),
+                Err(OwnError::UnspecifiedAddress),
+                "{every}"
+            );
+        }
+        assert!(!OwnError::UnspecifiedAddress.to_string().is_empty());
         for bad in [
             "",
             "udp/0.0.0.0:0/0.0.0.0:5353",
@@ -360,7 +394,7 @@ mod tests {
     #[test]
     fn the_table_holds_a_bounded_set_of_ports() {
         let mut owned = Ownership::new();
-        assert!(!owned.owns(Transport::Udp, 1, None));
+        assert!(!owned.owns(Transport::Udp, 1, HOST));
         assert_eq!(owned.own(udp_port(1)), Ok(true));
         // Owning twice is fine, reports nothing new, and takes no second slot.
         assert_eq!(owned.own(udp_port(1)), Ok(false));
@@ -369,48 +403,36 @@ mod tests {
         }
         assert_eq!(owned.own(udp_port(1)), Ok(false));
         assert_eq!(owned.own(udp_port(999)), Err(OwnError::Full));
-        assert!(owned.owns(Transport::Udp, 16, None));
+        assert!(owned.owns(Transport::Udp, 16, HOST));
         assert!(
-            !owned.owns(Transport::Tcp, 16, None),
+            !owned.owns(Transport::Tcp, 16, HOST),
             "TCP and UDP ports differ"
+        );
+        assert!(
+            !owned.owns(Transport::Udp, 16, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 16))),
+            "a port is owned at one address"
         );
     }
 
     #[test]
     fn filters_on_ports_need_ownership() {
-        let host = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15));
         let other = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 16));
         let mut owned = Ownership::new();
-        let udp_5353 = port_filter(IP_PROTOCOL_UDP, 5353, None);
+        let udp_5353 = port_filter(IP_PROTOCOL_UDP, 5353, Some(HOST));
         assert_eq!(owned.check_filter(&udp_5353), Err(FilterOwnError::NotOwned));
         owned.own(udp_port(5353)).expect("room");
         assert_eq!(owned.check_filter(&udp_5353), Ok(()));
-        assert_eq!(
-            owned.check_filter(&port_filter(IP_PROTOCOL_UDP, 5353, Some(host))),
-            Ok(())
-        );
-        assert_eq!(
-            owned.check_filter(&port_filter(IP_PROTOCOL_TCP, 5353, None)),
-            Err(FilterOwnError::NotOwned)
-        );
-        // A port owned on one address covers filters for that address only.
-        owned
-            .own(OwnedPort {
-                transport: Transport::Tcp,
-                addr: Some(host),
-                port: 80,
-            })
-            .expect("room");
-        assert_eq!(
-            owned.check_filter(&port_filter(IP_PROTOCOL_TCP, 80, Some(host))),
-            Ok(())
-        );
+        // A port is owned at one address: a filter must name it, and only it.
         for unowned in [None, Some(other)] {
             assert_eq!(
-                owned.check_filter(&port_filter(IP_PROTOCOL_TCP, 80, unowned)),
+                owned.check_filter(&port_filter(IP_PROTOCOL_UDP, 5353, unowned)),
                 Err(FilterOwnError::NotOwned)
             );
         }
+        assert_eq!(
+            owned.check_filter(&port_filter(IP_PROTOCOL_TCP, 5353, Some(HOST))),
+            Err(FilterOwnError::NotOwned)
+        );
         // Filters without a destination port stay allowed for root's sockets.
         let icmp = Filter::new(FilterSpec::Match(MatchSpec {
             ip_protocol: Some(ICMP),
@@ -483,18 +505,13 @@ mod tests {
             owned.check_tx(&headers(&arp), nic),
             Err(TxReject::NotTransport)
         );
-        // An address-bound port also checks the source address.
-        let mut bound = Ownership::new();
-        bound
-            .own(OwnedPort {
-                transport: Transport::Udp,
-                addr: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15))),
-                port: 5353,
-            })
-            .expect("room");
-        assert_eq!(bound.check_tx(&headers(&good), nic), Ok(()));
+        // The source address is checked too: an owned port from another address is spoofed.
         assert_eq!(
-            bound.check_tx(&headers(&udp_from([10, 0, 2, 99], 5353, &[])), nic),
+            owned.check_tx(&headers(&udp_from([10, 0, 2, 99], 5353, &[])), nic),
+            Err(TxReject::NotOwned)
+        );
+        assert_eq!(
+            owned.check_tx(&headers(&udp_from([0, 0, 0, 0], 5353, &[])), nic),
             Err(TxReject::NotOwned)
         );
         assert!(!TxReject::Tagged.to_string().is_empty());

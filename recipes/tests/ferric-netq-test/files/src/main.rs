@@ -19,6 +19,19 @@
 //!   request the test builds and sends itself is answered on its RX ring.
 //! - `netq-stats`: the driver's counters agree with what the test sent and received, no
 //!   descriptor was invalid, and no frame was dropped (Fill empty or RX overflow).
+//! - `netq-own`: a second socket, bound without raw TX, owns a UDP port through a netstack
+//!   socket bound to the interface's address; filters on unowned ports or on the owned port at
+//!   another address, an `Own` with a file and an `Own` with a socket bound to `0.0.0.0` are
+//!   refused.
+//! - `netq-udp`: a DNS query and its answer through the owned port.
+//! - `netq-spoof`: frames from a foreign source MAC, an unowned port, the owned port at another
+//!   source address, and ICMP are dropped and counted.
+//! - `netq-tx-bounds`: TX descriptors outside the UMEM (past its end, not at a frame's start,
+//!   longer than a frame, with a reserved flag) are counted as invalid and never sent.
+//! - `netq-bench`: 60-byte UDP frames through the socket and through netstack
+//!   (`FERRIC_BENCH netq-tx-udp60`).
+//! - `netq-latency`: ICMP echo round trips to the gateway through the socket and through
+//!   netstack's `icmp` scheme, p50 and p99 of each (`FERRIC_BENCH netq-echo-rtt`).
 //! - `netq-close`: closing the socket with requests still in flight leaves the driver serving
 //!   netstack, which answers an echo again; a second socket then opened on fresh grants of the
 //!   same memory binds, and an echo the test sends through it is answered on its RX ring.

@@ -469,6 +469,7 @@ fn word_index(frame: Frame) -> usize {
 mod tests {
     extern crate std;
 
+    use core::net::IpAddr;
     use std::vec::Vec;
 
     use super::*;
@@ -506,10 +507,16 @@ mod tests {
     /// The source port of [`udp_frame`]s.
     const SRC_PORT: u16 = 5000;
 
-    fn udp_port(port: u16) -> OwnedPort {
+    /// The address [`udp_frame`]s come from: the socket's own address.
+    const LOCAL: [u8; 4] = [10, 0, 0, 9];
+
+    /// The address [`udp_frame`]s go to, which receive filters name.
+    const DEST: [u8; 4] = [10, 0, 0, 1];
+
+    fn udp_port(addr: [u8; 4], port: u16) -> OwnedPort {
         OwnedPort {
             transport: Transport::Udp,
-            addr: None,
+            addr: IpAddr::from(addr),
             port,
         }
     }
@@ -525,8 +532,9 @@ mod tests {
         /// A socket owning the UDP ports the tests send from and filter on.
         fn new() -> Self {
             let mut t = Self::unowned(bind());
-            for port in [SRC_PORT, 7, 8, 9] {
-                t.queue.own(udp_port(port)).expect("room");
+            t.queue.own(udp_port(LOCAL, SRC_PORT)).expect("room");
+            for port in [7, 8, 9] {
+                t.queue.own(udp_port(DEST, port)).expect("room");
             }
             t
         }
@@ -565,13 +573,7 @@ mod tests {
     }
 
     fn udp_frame(port: u16) -> Vec<u8> {
-        let ip = ipv4(
-            IP_PROTOCOL_UDP,
-            [10, 0, 0, 9],
-            [10, 0, 0, 1],
-            0,
-            &udp(5000, port),
-        );
+        let ip = ipv4(IP_PROTOCOL_UDP, LOCAL, DEST, 0, &udp(SRC_PORT, port));
         ethernet(&[], ETHERTYPE_IPV4, &ip)
     }
 
@@ -579,6 +581,7 @@ mod tests {
         Filter::new(FilterSpec::Match(MatchSpec {
             ip_protocol: Some(IP_PROTOCOL_UDP),
             dst_port: Some(port),
+            dst_addr: Some(IpAddr::from(DEST)),
             ..MatchSpec::default()
         }))
         .expect("valid")
@@ -739,7 +742,7 @@ mod tests {
             t.queue.add_filter(port_filter(7)),
             Err(FilterTableError::NotOwned(FilterOwnError::NotOwned))
         );
-        t.queue.own(udp_port(7)).expect("room");
+        t.queue.own(udp_port(DEST, 7)).expect("room");
         assert!(t.queue.add_filter(port_filter(7)).is_ok());
     }
 
@@ -777,24 +780,28 @@ mod tests {
         let good = udp_frame(7);
         let mut spoofed_mac = good.clone();
         spoofed_mac[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 0x66]);
-        let ip = ipv4(
-            IP_PROTOCOL_UDP,
-            [10, 0, 0, 9],
-            [10, 0, 0, 1],
-            0,
-            &udp(6000, 7),
-        );
+        let ip = ipv4(IP_PROTOCOL_UDP, LOCAL, DEST, 0, &udp(6000, 7));
         let unowned_port = ethernet(&[], ETHERTYPE_IPV4, &ip);
+        // The right port from an address the socket does not own.
+        let ip = ipv4(IP_PROTOCOL_UDP, [10, 0, 0, 99], DEST, 0, &udp(SRC_PORT, 7));
+        let spoofed_ip = ethernet(&[], ETHERTYPE_IPV4, &ip);
         let arp = ethernet(&[], 0x0806, &[0; 28]);
         let runt = [0u8; 10].to_vec();
-        let frames = [good.clone(), spoofed_mac, unowned_port, arp, runt];
+        let frames = [
+            good.clone(),
+            spoofed_mac,
+            unowned_port,
+            spoofed_ip,
+            arp,
+            runt,
+        ];
 
         let mut t = App::new();
         let (wire, back) = send_all(&mut t, &frames);
         assert_eq!(wire, [good]);
         assert_eq!(back, frames.len(), "rejected frames still come back");
         assert_eq!(t.queue.stats().tx_packets, 1);
-        assert_eq!(t.queue.stats().tx_rejected, 4);
+        assert_eq!(t.queue.stats().tx_rejected, 5);
 
         let mut raw = App::unowned(Bind {
             flags: BindFlags::RAW_TX,

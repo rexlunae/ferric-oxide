@@ -283,8 +283,15 @@ jobs:
         # domains. "amdvi" and "amdvi-enforce" do the same with an emulated AMD IOMMU
         # (DMA remapping only), under QEMU 10 in a container (see the boot step).
         iommu: [none, vtd, enforce, amdvi, amdvi-enforce]
+        nic: [e1000]
+        # The same image with a virtio-net card: ferric-netq-test runs on virtio-netd, and its
+        # benchmarks give virtio-net numbers next to e1000's.
+        include:
+          - cpu: host
+            iommu: none
+            nic: virtio
     env:
-      LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}.log
+      LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}.log
     steps:
       - uses: actions/checkout@v4
 
@@ -309,6 +316,7 @@ jobs:
           # The fuzzing image runs for 20 minutes before it shuts down.
           BOOT_TIMEOUT: ${{ env.CONFIG_NAME == 'ferric-fuzz' && '1800' || '300' }}
           BOOT_IOMMU: ${{ matrix.iommu == 'enforce' && 'vtd' || startsWith(matrix.iommu, 'amdvi') && 'amdvi' || matrix.iommu }}
+          BOOT_NIC: ${{ matrix.nic }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
           if [ -f kernel.elf.zst ]; then
@@ -319,7 +327,7 @@ jobs:
             # Ubuntu 24.04's QEMU 8.2 does not translate DMA through amd-iommu (dma-remap
             # came in QEMU 10), so the AMD-Vi boots run Ubuntu 26.04's QEMU in a container,
             # with the runner's KVM and OVMF.
-            docker run --rm --device /dev/kvm -e BOOT_IOMMU -e BOOT_TIMEOUT \
+            docker run --rm --device /dev/kvm -e BOOT_IOMMU -e BOOT_NIC -e BOOT_TIMEOUT \
               -v "$PWD:/work" -w /work -v /usr/share/ovmf:/usr/share/ovmf:ro ubuntu:26.04 \
               bash -c 'set -e
                 apt-get update -q
@@ -477,20 +485,31 @@ jobs:
           done
           echo "::notice::ferric-pcache-test passed all 14 steps"
       # The image has drivers.net_bypass and kernel.regbuf on, so ferric-netq-test must run
-      # every step, not skip: a queue socket on e1000d in copy mode, beside netstack.
+      # every step, not skip: a queue socket on e1000d (or virtio-netd) in copy mode, beside
+      # netstack.
       - name: Check kernel-bypass queue sockets
         run: |
-          steps="netstack attach checks arp steer ping stats own udp spoof bench close"
+          steps="netstack attach checks arp steer ping stats own udp spoof tx-bounds bench latency close"
           for step in $steps; do
             grep -aF "FERRIC_TEST_PASS netq-$step" "$LOG"
           done
-          # The counters, and the TX benchmark against netstack (QEMU numbers, for trend only).
-          grep -aE "netq: rx_packets=[0-9]+ tx_packets=[0-9]+|FERRIC_BENCH netq-tx-udp60 .*bypass_fps=[0-9]+ netstack_fps=[0-9]+" "$LOG" \
+          # The test ran on the NIC this boot has (virtio-netd names its scheme *_virtio_net).
+          if [ "${{ matrix.nic }}" = virtio ]; then
+            grep -aE "netq: network\.[^,]+_virtio_net, " "$LOG"
+          else
+            grep -aE "netq: network\.[^,]+, " "$LOG"
+            if grep -aE "netq: network\.[^,]+_virtio_net, " "$LOG"; then exit 1; fi
+          fi
+          # The counters, and the benchmarks against netstack (QEMU numbers, for trend only).
+          tx='FERRIC_BENCH netq-tx-udp60 .*bypass_fps=[0-9]+ netstack_fps=[0-9]+'
+          rtt='FERRIC_BENCH netq-echo-rtt .*bypass_p50_us=[0-9]+ bypass_p99_us=[0-9]+ .*netstack_p50_us=[0-9]+ netstack_p99_us=[0-9]+'
+          grep -aE "netq: network\.|netq: rx_packets=[0-9]+ tx_packets=[0-9]+|$tx|$rtt" "$LOG" \
             | tr -d '\r' | while read -r line; do
-            echo "::notice::$line"
+            echo "::notice title=netq (${{ matrix.nic }})::$line"
           done
-          grep -aE "FERRIC_BENCH netq-tx-udp60 .*bypass_fps=[0-9]+ netstack_fps=[0-9]+" "$LOG"
-          echo "::notice::ferric-netq-test passed all $(wc -w <<< "$steps") steps"
+          grep -aE "$tx" "$LOG"
+          grep -aE "$rtt" "$LOG"
+          echo "::notice::ferric-netq-test passed all $(wc -w <<< "$steps") steps on ${{ matrix.nic }}"
       # ferric-borrow-test times page writes to an unmapped file and to one with live shared
       # mappings, which RedoxFS writes through to (QEMU numbers, for trend only). Only the
       # smoke image runs it; the fuzz image's console script runs the fuzzer alone.
@@ -534,7 +553,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}
+          name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}
           path: ${{ env.LOG }}
           retention-days: 14
 

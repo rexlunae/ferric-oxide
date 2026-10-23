@@ -18,5 +18,9 @@ driver-network = { path = "../driver-network" }
 redox_syscall.workspace = true
 libredox.workspace = true
 
+[features]
+# Ferric Oxide: kernel-bypass queue sockets in copy mode (drivers.net_bypass).
+bypass = ["driver-network/bypass"]
+
 [lints]
 workspace = true

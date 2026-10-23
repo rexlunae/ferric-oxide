@@ -8,6 +8,8 @@
 #   remapping), for kernels built with kernel.iommu = "auto" or "enforce".
 #   BOOT_IOMMU=amdvi adds an emulated AMD IOMMU (DMA remapping only) instead. Its
 #   DMA translation and I/O page fault events need QEMU 10 or later (dma-remap).
+#   BOOT_NIC=virtio gives the guest a virtio-net card (virtio-netd) in place of the
+#   default e1000 (BOOT_NIC=e1000, e1000d), at the same slot.
 #   BOOT_REBOOT=1 lets the guest reset and boot again (no -no-reboot), and does not
 #   treat a kernel panic as a failure: for the crash-dump image, whose first boot
 #   panics on purpose and resets (see image.yml's crash job, which checks the log).
@@ -71,7 +73,14 @@ edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
 # The disk and network controllers sit at fixed slots too, so check-iommu-log.sh can
 # find the DMA domains of their drivers by requester ID.
 disk_dev=(-device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0)
-net_dev=(-device e1000,netdev=net0,addr=5.0)
+case "${BOOT_NIC:-e1000}" in
+    e1000) net_dev=(-device e1000,netdev=net0,addr=5.0) ;;
+    virtio) net_dev=(-device virtio-net-pci,netdev=net0,addr=5.0) ;;
+    *)
+        echo "boot-smoke: unknown BOOT_NIC=$BOOT_NIC (expected e1000 or virtio)" >&2
+        exit 2
+        ;;
+esac
 
 reboot=(-no-reboot)
 crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
@@ -244,7 +253,7 @@ if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$markers"; then
     exit 1
 fi
 if grep -q '^FERRIC_SMOKE_OK' <<< "$markers"; then
-    echo "boot-smoke: PASS (cpu=$cpu, iommu=${BOOT_IOMMU:-none}, qemu exit $status)"
+    echo "boot-smoke: PASS (cpu=$cpu, iommu=${BOOT_IOMMU:-none}, nic=${BOOT_NIC:-e1000}, qemu exit $status)"
     exit 0
 fi
 if [ "$status" = 124 ]; then

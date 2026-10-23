@@ -422,8 +422,9 @@ impl<T: NetworkAdapter> Queue<T> {
     /// # Errors
     ///
     /// `ENOTCONN` before `Bind`, `EIO` on a stopped socket, `EINVAL` for a descriptor that is
-    /// not a bound netstack TCP or UDP socket, and `ENOSPC` when the socket owns as many ports
-    /// as it may.
+    /// not a netstack TCP or UDP socket bound to one address (a socket bound to `0.0.0.0` is
+    /// refused, so every owned port names the source address TX checks), and `ENOSPC` when the
+    /// socket owns as many ports as it may.
     fn own(&mut self, data: &mut NetworkSchemeData<T>, request: &SendFdRequest) -> Result<usize> {
         let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
         if !bound.check_grants() {
