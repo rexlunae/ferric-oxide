@@ -172,6 +172,7 @@ desktop, but they do not block a first boot.
 inventory on the console and then starts the login consoles:
 
 ```sh
+# Enable drivers.rtl8125 in ferric.toml through make menuconfig first.
 make CONFIG_NAME=ferric-hardware all
 ```
 
@@ -266,3 +267,20 @@ free packet slots alone do not imply that enough contiguous payload bytes remain
 When an enqueue fails, the router drops that frame and stops that device's polling
 pass, then continues serving queued traffic. A host regression fills the byte
 ring before its metadata slots and checks that subsequent traffic still works.
+
+### RTL8125 table provenance
+
+The firmware tables match the BSD-4-Clause Realtek vendor driver maintained by
+Alex Dupre, pinned and identified in `ferric-rtl8125::firmware`. They are not in
+FreeBSD's base `sys/dev/re/if_re.c`. Their original license is retained in
+`crates/rtl8125/LICENSE-BSD-4-Clause` and referenced by `NOTICE.md`; images or
+other binary distributions containing the driver must include that notice.
+A word comparison validates the imported bytes, not execution on hardware.
+
+`drivers.rtl8125` (Drivers menu, default off) selects the experimental driver.
+Without it, `base` builds no RTL8125 daemon and installs no PCI match for it.
+With it, the driver and match are installed together with `LICENSE-BSD-4-Clause`
+and `NOTICE` under `/usr/share/doc/rtl8125d/`. Image CI enables it to compile the
+driver; QEMU has no RTL8125 controller, so that is not physical-device validation.
+The host-tools driver job also runs the RTL8125 controller-model and netstack
+queue regression tests.

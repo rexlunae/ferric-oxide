@@ -5,7 +5,8 @@
 #
 #   make CONFIG_NAME=ferric-hardware all
 #
-# from source so the image contains the kernel, drivers and services in this
+# Enable drivers.rtl8125 through ferric-config for the experimental network
+# driver. Build from source so the image contains the kernel, drivers and services in this
 # checkout rather than packages from an upstream binary repository. The audio
 # section waits for pcid to spawn the HDA drivers and reports whether an
 # `audiohw` scheme exists, which is what the multi-controller change in

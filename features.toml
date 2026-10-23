@@ -505,6 +505,24 @@ read until the file system closes it. Off by default; without it the kernel
 has no such scheme and every read goes to the file system, as upstream."""
 
 [[option]]
+id = "drivers.rtl8125"
+menu = "drivers"
+type = "bool"
+title = "Experimental Realtek RTL8125B Ethernet driver"
+default = false
+rebuild = ["base"]
+help = """
+Build and install rtl8125d and its PCI match for the RTL8125B controller.
+The controller model is host-tested, but physical hardware validation is
+pending. This driver uses BSD-4-Clause vendor firmware tables; their notice
+is installed with the driver. Off by default, preserving the upstream driver
+set when no ferric.toml is present. Other RTL8125 revisions are refused."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BASE_DRIVERS = "rtl8125d" }
+
+[[option]]
 id = "drivers.grant_dma"
 menu = "drivers"
 type = "bool"

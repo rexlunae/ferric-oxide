@@ -10,8 +10,8 @@
 //! different interrupt map, a 32-bit interrupt status register, a different
 //! transmit doorbell and a MAC MCU that must be patched through OCP before the
 //! controller behaves reliably. The register facts here come from the
-//! permissively licensed FreeBSD `if_re` driver; the tables in [`firmware`] are
-//! hardware data rather than copied code. Linux and macOS drivers are GPL and
+//! BSD-licensed Realtek vendor driver for FreeBSD; [`firmware`] identifies its
+//! pinned source and the retained BSD-4-Clause notice. Linux and macOS drivers are GPL and
 //! are not used as a source.
 //!
 //! [`version::detect`] reads the MAC version from the transmit configuration

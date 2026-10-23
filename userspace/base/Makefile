@@ -17,8 +17,13 @@ INITFS_BINS = ipcd init logd ramfs randd zerod \
 	pcid pcid-spawner rtcd vesad
 INITFS_DRIVERS_BINS = nvmed virtio-blkd  virtio-gpud
 BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
-DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8125d rtl8139d rtl8168d \
+DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8139d rtl8168d \
 	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid
+
+# Ferric-only drivers are selected by features.toml; absent configuration,
+# build and install the upstream driver set.
+FERRIC_BASE_DRIVERS ?=
+DRIVERS_BINS += $(FERRIC_BASE_DRIVERS)
 
 ifneq (,$(filter i586-unknown-redox i686-unknown-redox x86_64-unknown-redox,$(TARGET)))
     INITFS_BINS += ps2d
@@ -109,6 +114,9 @@ install-base: base $(SYSROOT)/bin/redoxfs
 	@cp -v "$(SRC_DIR)/init.d"/* "$(DESTDIR)/usr/lib/init.d/"
 	@find "$(SRC_DIR)/drivers" -maxdepth 3 -type f -name 'config.toml' | while read -r conf; do \
 		driver=$$(basename "$$(dirname "$$conf")"); \
+		if [ "$$driver" = rtl8125d ]; then \
+			case " $(DRIVERS_BINS) " in *" rtl8125d "*) ;; *) continue ;; esac; \
+		fi; \
 		cp -v "$$conf" "$(DESTDIR)/usr/lib/pcid.d/$$driver.toml"; \
 	done
 	@cp -v "$(SRC_DIR)/drivers/usb/xhcid/drivers.toml" "$(DESTDIR)/usr/lib/xhcid.d/"
@@ -123,6 +131,12 @@ install-base: base $(SYSROOT)/bin/redoxfs
 		cp -v "$(TARGET_DIR)/$$bin" "$(BUILD_DIR)/initfs/lib/drivers"; \
 	done
 	cp "$(SYSROOT)/bin/redoxfs" "$(BUILD_DIR)/initfs/bin"
+ifneq (,$(filter rtl8125d,$(DRIVERS_BINS)))
+# Retain the vendor firmware's license in binary distributions.
+	@mkdir -p "$(DESTDIR)/usr/share/doc/rtl8125d"
+	cp "$(SRC_DIR)/../../crates/rtl8125/LICENSE-BSD-4-Clause" "$(DESTDIR)/usr/share/doc/rtl8125d/"
+	cp "$(SRC_DIR)/../../crates/rtl8125/NOTICE" "$(DESTDIR)/usr/share/doc/rtl8125d/"
+endif
 # Copy initfs config files
 	@mkdir -p "$(BUILD_DIR)/initfs/lib/init.d" "$(BUILD_DIR)/initfs/lib/pcid.d"
 	cp "$(SRC_DIR)/init.initfs.d"/* "$(BUILD_DIR)/initfs/lib/init.d/"

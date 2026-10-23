@@ -1,15 +1,19 @@
 //! Firmware patch data for the RTL8125B MAC and PHY microcontrollers.
 //!
-//! The arrays below are the register-value tables that the permissively
-//! licensed FreeBSD `if_re` driver programs into the RTL8125B. They are
-//! factual hardware data: the controller's MAC MCU and PHY MCU patch RAM
-//! expect these exact words, in this order. The surrounding code, paging and
-//! patch-version protocol are implemented in the driver; this module only
-//! carries the data and its metadata.
+//! These tables are distributed under BSD-4-Clause; the original copyright,
+//! conditions and disclaimer are retained in `../LICENSE-BSD-4-Clause` and the
+//! repository's `NOTICE.md`. This product includes software developed by Bill Paul.
 //!
-//! Source: FreeBSD `sys/dev/re/if_re.c`, functions
-//! `re_set_mac_mcu_8125b_2` and `phy_mcu_ram_code_8125b_2`
-//! (BSD-4-Clause), consulted 2026-10-19.
+//! Source: Realtek's FreeBSD driver maintained by Alex Dupre,
+//! `if_re.c` at commit `cea3599aa88ba5893bb4af28974000d58326b095`:
+//! <https://github.com/alexdupre/rtl_bsd_drv/blob/cea3599aa88ba5893bb4af28974000d58326b095/if_re.c>.
+//! The MAC table in `re_set_mac_mcu_8125b_2` (368 words) and
+//! `phy_mcu_ram_code_8125b_2` (2,896 words) were compared word for word on
+//! 2026-10-23. This is the vendor driver used by FreeBSD's `realtek-re-kmod`
+//! port, not the `sys/dev/re/if_re.c` driver in FreeBSD's base source tree.
+//!
+//! The surrounding code implements the patch paging and version protocol;
+//! this module holds the controller programs and their metadata.
 
 /// MAC MCU patch RAM words programmed at `0xF800 + offset * 2`,
 /// 256 words per page.
