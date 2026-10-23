@@ -520,7 +520,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}
+          name: serial-log-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}
           path: ${{ env.LOG }}
           retention-days: 14
 
