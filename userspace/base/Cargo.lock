@@ -2274,6 +2274,7 @@ dependencies = [
  "pcid",
  "redox_event",
  "redox_syscall 0.9.4",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

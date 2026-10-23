@@ -925,6 +925,10 @@ impl NetworkAdapter for Rtl8125 {
 impl Rtl8125 {
     /// Initialise the controller and its DMA rings.
     ///
+    /// # Errors
+    /// Returns `ENODEV` for an unsupported MAC revision or invalid station address,
+    /// allocation errors for DMA memory, or `EIO` when controller/PHY handshakes time out.
+    ///
     /// # Safety
     ///
     /// `base` must point to the uncacheable memory BAR of an RTL8125 function

@@ -3,7 +3,8 @@
 # Boots on physical hardware (or QEMU) and prints a CPU, scheme and audio
 # inventory on the console before starting the login consoles. Build it with
 #
-#   make CONFIG_NAME=ferric-hardware all
+#   cargo run -p ferric-config -- set image.config=ferric-hardware drivers.rtl8125=true
+#   make all
 #
 # Enable drivers.rtl8125 through ferric-config for the experimental network
 # driver. Build from source so the image contains the kernel, drivers and services in this

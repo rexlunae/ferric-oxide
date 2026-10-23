@@ -172,8 +172,8 @@ desktop, but they do not block a first boot.
 inventory on the console and then starts the login consoles:
 
 ```sh
-# Enable drivers.rtl8125 in ferric.toml through make menuconfig first.
-make CONFIG_NAME=ferric-hardware all
+cargo run -p ferric-config -- set image.config=ferric-hardware drivers.rtl8125=true
+make all
 ```
 
 It compiles the kernel, bootloader, relibc, RedoxFS and `base` from this
@@ -284,3 +284,13 @@ and `NOTICE` under `/usr/share/doc/rtl8125d/`. Image CI enables it to compile th
 driver; QEMU has no RTL8125 controller, so that is not physical-device validation.
 The host-tools driver job also runs the RTL8125 controller-model and netstack
 queue regression tests.
+
+Select the `ferric-hardware` image in ferric-config as shown above, so generated
+CPU, kernel and driver options apply to that image. A mismatching command-line
+`CONFIG_NAME` override disables generated target options. RTL8125 devices with
+no legacy interrupt line are refused with `ENODEV`: message-interrupt queue
+routing is not implemented.
+
+The RTL8125 daemon keeps setup and event-loop failures typed, prints their source
+chains at its outer boundary and exits on failure. Unsupported interrupt routing
+is rejected before allocating or starting the controller's DMA rings.

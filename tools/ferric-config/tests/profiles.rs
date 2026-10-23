@@ -14,7 +14,14 @@ impl Fixture {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         std::fs::copy(repo.join("features.toml"), dir.path().join("features.toml")).unwrap();
         std::fs::create_dir(dir.path().join("config")).unwrap();
-        for name in ["desktop", "base", "minimal", "ferric-smoke", "ferric-fuzz"] {
+        for name in [
+            "desktop",
+            "base",
+            "minimal",
+            "ferric-smoke",
+            "ferric-fuzz",
+            "ferric-hardware",
+        ] {
             std::fs::copy(
                 repo.join("config").join(format!("{name}.toml")),
                 dir.path().join("config").join(format!("{name}.toml")),
@@ -277,4 +284,20 @@ fn absent_user_config_keeps_upstream_make_path_and_desktop_default() {
     assert!(values[6].is_empty());
     assert!(!fixture.dir.path().join("ferric.toml").exists());
     assert!(!fixture.generated("config.mk").exists());
+}
+
+#[test]
+fn hardware_profile_keeps_the_experimental_driver_on_its_selected_target() {
+    let fixture = Fixture::new();
+    fixture.run(&[
+        "set",
+        "image.config=ferric-hardware",
+        "drivers.rtl8125=true",
+    ]);
+    fixture.run(&["generate"]);
+    let mk = std::fs::read_to_string(fixture.generated("config.mk")).unwrap();
+    assert!(mk.contains("CONFIG_NAME?=ferric-hardware"));
+    assert!(mk.contains("export FERRIC_BASE_DRIVERS:=rtl8125d"));
+    let fs = std::fs::read_to_string(fixture.generated("filesystem.toml")).unwrap();
+    assert!(fs.contains("ferric-hardware.toml"));
 }
