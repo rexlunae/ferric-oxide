@@ -39,6 +39,14 @@ use std::time::{Duration, Instant};
 
 /// System call numbers and flags, copied from `redox_syscall` so the fuzzer
 /// has no dependencies.
+///
+/// The copy is deliberate even though the kernel and user space share one ABI
+/// crate: the fuzzer has to send the numbers and bits it was built against
+/// without reading them back from the ABI it is meant to test. A drifted
+/// constant then shows up as a call that no longer reaches the code under test,
+/// which the checks below catch, instead of as a call that silently follows the
+/// new value. The entries carry the same names as their `redox_syscall`
+/// counterparts, so a change there is easy to trace.
 mod sys {
     const CLASS_PATH: usize = 0x1000_0000;
     const CLASS_FILE: usize = 0x2000_0000;
@@ -726,56 +734,96 @@ impl Fuzzer {
         }
         // SAFETY: the kernel must refuse this; if it does not, only this
         // process's mapping is affected.
-        let _ = unsafe { sys::call(sys::MREMAP, args) };
+        let ret = unsafe { sys::call(sys::MREMAP, args) };
+        if !sys::is_err(ret) {
+            eprintln!("fuzz: mremap into the kernel half returned {ret:#x}");
+            std::process::exit(REGRESSED_EXIT);
+        }
 
-        // fmap of a file with MAP_FIXED and a mapping whose end wraps past the
-        // top of user space corrupted the free-space accounting of the address
-        // space, and a later mapping then landed on memory a grant already
-        // owned, which panicked the kernel with an overlap assertion (fixed by
-        // validating the span). A file on the root file system reaches the
-        // grant path through its scheme's mapping request, and anonymous memory
-        // through the memory scheme, so both are tried.
-        let file = OpenOptions::new()
+        // fmap with MAP_FIXED at 0xffff_ffff_ffff_f000 and a length above one
+        // page corrupted the free-space accounting of the address space, and a
+        // later mapping then landed on memory a grant already owned, which
+        // panicked the kernel with an overlap assertion (fixed by validating
+        // the span). Anonymous memory is asked for with no descriptor at all,
+        // so this half of the check cannot be skipped, and a file on the root
+        // file system is asked for as well because that path reaches its
+        // scheme's mapping request before the address space is touched.
+        let kernel_half = [
+            0xFFFF_FFFF_FFFF_F000,
+            0x10_0000,
+            sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
+            0,
+        ];
+        if self.verbose {
+            eprintln!("regression {:#x} {kernel_half:x?}", sys::FMAP);
+        }
+        // SAFETY: `!0` selects anonymous memory, and the mapping asks for an
+        // address the kernel must refuse.
+        let ret = unsafe {
+            sys::call(
+                sys::FMAP,
+                [
+                    usize::MAX,
+                    kernel_half.as_ptr() as usize,
+                    size_of_val(&kernel_half),
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if !sys::is_err(ret) {
+            eprintln!("fuzz: anonymous fmap MAP_FIXED in the kernel half returned {ret:#x}");
+            std::process::exit(REGRESSED_EXIT);
+        }
+
+        // The same rule for a descriptor: a fixed span whose end leaves user
+        // space has to be refused before the scheme is asked to map anything.
+        // These addresses are below the kernel half, so even a kernel that
+        // accepted one could not hand out pages there.
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open("fmap-fixed")
-            .ok()
-            .map(|file| file.into_raw_fd() as usize);
-        let zeroed = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/scheme/memory/zeroed")
-            .ok()
-            .map(|file| file.into_raw_fd() as usize);
-        let opened = [file, zeroed];
-        for fd in opened.into_iter().flatten() {
-            for len in [0x1000usize, 0x10_0000] {
-                let map = [
-                    0xFFFF_FFFF_FFFF_F000,
-                    len,
-                    sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
-                    0,
-                ];
-                if self.verbose {
-                    eprintln!("regression {:#x} fd {fd} {map:x?}", sys::FMAP);
-                }
-                // SAFETY: the descriptor is this process's and the mapping asks
-                // for an address the kernel must refuse.
-                let ret = unsafe {
-                    sys::call(
-                        sys::FMAP,
-                        [fd, map.as_ptr() as usize, size_of_val(&map), 0, 0, 0],
-                    )
-                };
-                if !sys::is_err(ret) {
-                    eprintln!("fuzz: fmap MAP_FIXED in the kernel half returned {ret:#x}");
-                    std::process::exit(REGRESSED_EXIT);
-                }
+        {
+            Ok(file) => file.into_raw_fd() as usize,
+            Err(e) => {
+                // The parent gives every child a writable scratch directory, so
+                // a file that cannot be created there would silently skip the
+                // check.
+                eprintln!("fuzz: no scratch file for the fmap regression: {e}");
+                std::process::exit(REGRESSED_EXIT);
             }
-            // SAFETY: closing a descriptor this process opened and owns.
-            unsafe { sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]) };
+        };
+        for (address, len) in [
+            (0x7FFF_FFFF_F000usize, 0x10_0000usize),
+            (0x8000_0000_0000, 0x1000),
+        ] {
+            let map = [
+                address,
+                len,
+                sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
+                0,
+            ];
+            if self.verbose {
+                eprintln!("regression {:#x} fd {file} {map:x?}", sys::FMAP);
+            }
+            // SAFETY: the descriptor is this process's and the mapping asks for
+            // a span the kernel must refuse.
+            let ret = unsafe {
+                sys::call(
+                    sys::FMAP,
+                    [file, map.as_ptr() as usize, size_of_val(&map), 0, 0, 0],
+                )
+            };
+            if !sys::is_err(ret) {
+                eprintln!("fuzz: fmap MAP_FIXED past user space returned {ret:#x}");
+                std::process::exit(REGRESSED_EXIT);
+            }
         }
+        // SAFETY: closing a descriptor this process opened and owns.
+        unsafe { sys::call(sys::CLOSE, [file, 0, 0, 0, 0, 0]) };
 
         // funmap with a length that has no aligned value rounded into a
         // different range; it now fails with EINVAL.
