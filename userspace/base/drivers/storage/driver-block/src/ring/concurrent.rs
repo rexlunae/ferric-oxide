@@ -1,18 +1,22 @@
-//! Ferric Oxide: reads and writes on a disk descriptor served as concurrent tasks.
+//! Ferric Oxide: reads and writes on a disk descriptor served concurrently.
 //!
 //! The scheme serves calls one at a time, which keeps a disk with several hardware queues
 //! (nvmed with per-CPU queue pairs) from ever having two requests in flight. When the disk
 //! says its clones may serve requests at the same time ([`Disk::concurrent`]), a plain read
-//! or write on a disk or partition descriptor is checked and located here, at once, and then
-//! runs as a task of its own on a clone of the disk, which writes its response itself. Every
-//! other call, and every call on other disks, is still served in turn by `tick`.
+//! or write on a disk or partition descriptor is checked and located here, at once, and
+//! becomes a [`PendingIo`]: the request together with what it needs to answer itself.
+//!
+//! The disk can take the request with [`Disk::submit`] and serve it on another thread (nvmed
+//! hands it to a worker, which writes the response itself, so the reply skips the scheme's
+//! thread). Otherwise it runs as a task of its own on the scheme's thread, on a clone of the
+//! disk. Every other call, and every call on other disks, is still served in turn by `tick`.
 //!
 //! The call's buffer is mapped into the driver until its response is written, which only the
-//! task does. A descriptor closed while its requests run is held open until the last one ends
-//! ([`SharedGate`], over `ferric_blkqueue::order::CloseGate`). `tick` runs a close that has
-//! become ready before it serves the next request, and the request that makes it ready wakes
-//! the scheme's loop ([`SharedGate::ready`]), so the close also runs on a disk that gets no
-//! further requests.
+//! [`PendingIo`] does, exactly once (dropping it unanswered answers `EIO`). A descriptor
+//! closed while its requests run is held open until the last one ends ([`SharedGate`], over
+//! `ferric_blkqueue::order::CloseGate`). `tick` runs a close that has become ready before it
+//! serves the next request, and the request that makes it ready wakes the scheme's loop
+//! ([`SharedGate::ready`]), so the close also runs on a disk that gets no further requests.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -20,13 +24,14 @@ use std::task::{Context, Poll, Waker};
 
 use ferric_blkqueue::order::CloseGate;
 use redox_scheme::scheme::{Op, OpRead, OpWrite};
-use redox_scheme::{Response, SignalBehavior};
+use redox_scheme::{Response, SignalBehavior, Socket};
+use syscall::{Error, EIO};
 
 use super::{Disk, Handle, Hardware, RingDiskSchemeInner};
 
 impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
-    /// Starts `op` as a task when it is a read or write the disk can serve concurrently, or
-    /// gives it back to be served in turn.
+    /// Starts `op` when it is a read or write the disk can serve concurrently, or gives it
+    /// back to be served in turn.
     pub(super) fn spawn_io(&mut self, op: Op) -> Result<(), Op> {
         let mut io = match op {
             Op::Read(read) => Io::Read(read),
@@ -40,7 +45,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
         let Ok(&Handle::Disk { num, pt }) = self.handles.get(id) else {
             return Err(io.into_op());
         };
-        let Some(wrapper) = self.disks.get(&num) else {
+        let Some(wrapper) = self.disks.get_mut(&num) else {
             return Err(io.into_op());
         };
         if !wrapper.disk.concurrent() {
@@ -50,45 +55,112 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskSchemeInner<T, Hw> {
         let block = match wrapper.locate(pt, offset / block_size, len) {
             Ok(block) => block,
             Err(err) => {
-                self.respond(io.respond(Err(err)));
+                respond(&self.socket, io.respond(Err(err)));
                 return Ok(());
             }
         };
+        self.gate.begin(id);
+        let pending = PendingIo {
+            io: Some(io),
+            block,
+            fd: id,
+            socket: Arc::clone(&self.socket),
+            gate: self.gate.clone(),
+        };
+        let Err(mut pending) = wrapper.disk.submit(pending) else {
+            return Ok(());
+        };
         let mut disk = wrapper.disk.clone();
-        let socket = std::rc::Rc::clone(&self.socket);
-        let work = async move {
-            match io {
-                Io::Read(mut read) => {
-                    let result = disk.read(block, read.buf()).await;
-                    Response::new(result, read)
-                }
-                Io::Write(write) => {
-                    let result = disk.write(block, write.buf()).await;
-                    Response::new(result, write)
-                }
-            }
-        };
-        let answer = move |response| {
-            if let Err(err) = socket.write_response(response, SignalBehavior::Restart) {
-                log::error!("disk scheme: cannot answer a concurrent request: {err}");
-            }
-        };
         // The task is detached: it ends by itself once its response is written.
-        let _task = self.executor.spawn(track(&self.gate, id, work, answer));
+        let _task = self.executor.spawn(async move {
+            let block = pending.block();
+            let result = match pending.transfer() {
+                Transfer::Read(buf) => disk.read(block, buf).await,
+                Transfer::Write(buf) => disk.write(block, buf).await,
+            };
+            pending.finish(result);
+        });
         Ok(())
-    }
-
-    fn respond(&self, response: Response) {
-        if let Err(err) = self
-            .socket
-            .write_response(response, SignalBehavior::Restart)
-        {
-            log::error!("disk scheme: cannot answer a request: {err}");
-        }
     }
 }
 
-/// A call that [`RingDiskSchemeInner::spawn_io`] may run as a task.
+/// Writes `response`, logging a failure (the caller then gets no answer, as with any
+/// response the scheme cannot write).
+fn respond(socket: &Socket, response: Response) {
+    if let Err(err) = socket.write_response(response, SignalBehavior::Restart) {
+        log::error!("disk scheme: cannot answer a request: {err}");
+    }
+}
+
+/// A read or write on a disk, located and checked, that answers itself: [`finish`] it with
+/// the result, from any thread. Dropping it unfinished answers `EIO`, so a request is never
+/// left without a response.
+///
+/// [`finish`]: Self::finish
+pub struct PendingIo {
+    /// `Some` until answered.
+    io: Option<Io>,
+    block: u64,
+    /// The descriptor, for the close gate.
+    fd: usize,
+    socket: Arc<Socket>,
+    gate: SharedGate,
+}
+
+// SAFETY: the call's buffer (the raw pointer in `OpRead`/`OpWrite`) is mapped into the
+// driver for this request until its response is written, and nothing else refers to it: the
+// scheme moved the call in here and keeps no copy. Only the thread holding the `PendingIo`
+// touches the buffer, and the response that releases it is written once, by that thread. The
+// socket and the gate are `Send + Sync`.
+unsafe impl Send for PendingIo {}
+
+/// The buffer of a [`PendingIo`].
+pub enum Transfer<'a> {
+    /// Read into this buffer.
+    Read(&'a mut [u8]),
+    /// Write from this buffer.
+    Write(&'a [u8]),
+}
+
+impl PendingIo {
+    /// The disk block the transfer starts at (partition offset applied).
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    /// The transfer's buffer: a whole number of blocks.
+    pub fn transfer(&mut self) -> Transfer<'_> {
+        match &mut self.io {
+            Some(Io::Read(read)) => Transfer::Read(read.buf()),
+            Some(Io::Write(write)) => Transfer::Write(write.buf()),
+            // Only `answer` empties it, and nothing uses the request after that.
+            None => Transfer::Write(&[]),
+        }
+    }
+
+    /// Answers the request with `result` (bytes transferred, or the error).
+    pub fn finish(mut self, result: syscall::Result<usize>) {
+        self.answer(result);
+    }
+
+    fn answer(&mut self, result: syscall::Result<usize>) {
+        let Some(io) = self.io.take() else {
+            return;
+        };
+        // The transfer is over: a close waiting for it may run from now on, and the
+        // response below only needs the request's tag.
+        self.gate.end(self.fd);
+        respond(&self.socket, io.respond(result));
+    }
+}
+
+impl Drop for PendingIo {
+    fn drop(&mut self) {
+        self.answer(Err(Error::new(EIO)));
+    }
+}
+
+/// A call that [`RingDiskSchemeInner::spawn_io`] may serve concurrently.
 enum Io {
     Read(OpRead),
     Write(OpWrite),
@@ -115,6 +187,10 @@ impl Io {
 /// Starts counting a request on descriptor `fd` in `gate` at once, and returns the task that
 /// runs `work`, hands its result to `answer` (which writes the response), and then counts the
 /// request done, waking the scheme's loop if that makes a waiting close ready.
+///
+/// The tests below build requests with this; `spawn_io` counts what it starts in [`PendingIo`]
+/// instead, because that one may finish on another thread.
+#[cfg(test)]
 fn track<W: Future>(
     gate: &SharedGate,
     fd: usize,
