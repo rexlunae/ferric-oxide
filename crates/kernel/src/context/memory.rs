@@ -471,6 +471,28 @@ impl AddrSpaceWrapper {
         };
         let mut dst_flusher = Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack);
 
+        // Ferric Oxide: `r#move` inserts a grant without going through `mmap`, so it repeats that
+        // function's user-space range rule. A destination outside the user half would either be
+        // dropped from the hole bookkeeping or enter it with a wrapped end, and a later selection
+        // then hands out pages a grant already owns.
+        let Some(dst_span_size) = new_page_count.checked_mul(PAGE_SIZE) else {
+            return Err(Error::new(ENOMEM));
+        };
+        if dst_span_size > crate::USER_END_OFFSET {
+            return Err(Error::new(ENOMEM));
+        }
+        if let Some(base) = requested_dst_base
+            && (new_flags.contains(MapFlags::MAP_FIXED)
+                || new_flags.contains(MapFlags::MAP_FIXED_NOREPLACE))
+            && base
+                .start_address()
+                .data()
+                .checked_add(dst_span_size)
+                .is_none_or(|end| end > crate::USER_END_OFFSET)
+        {
+            return Err(Error::new(EINVAL));
+        }
+
         let dst_base = match requested_dst_base {
             Some(base) if new_flags.contains(MapFlags::MAP_FIXED_NOREPLACE) => {
                 if dst
@@ -901,26 +923,28 @@ impl AddrSpace {
         // with a wrapped end, and a later selection then hands out pages that a grant already
         // occupies, which trips the overlap assertion in `UserGrants::insert`. The syscall fuzzer
         // reached that through `fmap` of a file descriptor with `MAP_FIXED` at
-        // 0xffff_ffff_ffff_f000, so check here for all callers as well as in the syscalls.
-        let Some(span_size) = page_count.get().checked_mul(PAGE_SIZE) else {
-            return Err(Error::new(ENOMEM));
-        };
-        if span_size > crate::USER_END_OFFSET {
-            return Err(Error::new(ENOMEM));
-        }
-        if let Some(requested_base) = requested_base_opt
-            && (flags.contains(MapFlags::MAP_FIXED)
-                || flags.contains(MapFlags::MAP_FIXED_NOREPLACE))
-            && requested_base
-                .start_address()
-                .data()
-                .checked_add(span_size)
-                .is_none_or(|end| end > crate::USER_END_OFFSET)
-        {
-            return Err(Error::new(EINVAL));
-        }
-
+        // 0xffff_ffff_ffff_f000, so check here for all callers as well as in the syscalls. The
+        // check runs inside the traced region so `mm.map` records a rejected span like any other
+        // failed mapping.
         let result = (|| {
+            let Some(span_size) = page_count.get().checked_mul(PAGE_SIZE) else {
+                return Err(Error::new(ENOMEM));
+            };
+            if span_size > crate::USER_END_OFFSET {
+                return Err(Error::new(ENOMEM));
+            }
+            if let Some(requested_base) = requested_base_opt
+                && (flags.contains(MapFlags::MAP_FIXED)
+                    || flags.contains(MapFlags::MAP_FIXED_NOREPLACE))
+                && requested_base
+                    .start_address()
+                    .data()
+                    .checked_add(span_size)
+                    .is_none_or(|end| end > crate::USER_END_OFFSET)
+            {
+                return Err(Error::new(EINVAL));
+            }
+
             let selected_span = match requested_base_opt {
                 // TODO: Rename MAP_FIXED+MAP_FIXED_NOREPLACE to MAP_FIXED and
                 // MAP_FIXED_REPLACE/MAP_REPLACE?

@@ -69,14 +69,18 @@ Every entry point rejects such a span before it reaches the grant table:
 | `fmap` of a scheme file descriptor (`fmap_inner`) | the page count must fit in `USER_END_OFFSET`, and a `MAP_FIXED` address plus that size must end below it |
 | `funmap` | the aligned length must be representable and the range must validate |
 | `mremap` | both the old and the new range must validate |
+| `AddrSpace::r#move` (proc transfer, `mremap`) | the destination size and, for a fixed base, base plus size must stay below `USER_END_OFFSET`, because it inserts a grant without calling `mmap` |
 | `AddrSpace::mmap` | last check for every caller: the span size and, for a fixed base, base plus size are compared with `USER_END_OFFSET` before any hole or grant is touched |
 
-The hole bookkeeping also saturates and checks its arithmetic, so an
-unvalidated span cannot wrap a hole end into a smaller address and pass the
-fit test in `find_free`, and a hole can never replace an existing one in only
-one of the two indexes. The `ferric-syscall-fuzz` regression calls repeat the
-requests that found these bugs on every run: `mremap` to the top of the kernel
-half, `fmap` with `MAP_FIXED` there, and a `funmap` length with no aligned
+The `AddrSpace::mmap` check runs inside the region that emits `mm.map`, so a
+rejected span is recorded in kernel traces like any other failed mapping. The
+hole bookkeeping also saturates and checks its arithmetic, so an unvalidated
+span cannot wrap a hole end into a smaller address and pass the fit test in
+`find_free`, and a hole can never replace an existing one in only one of the
+two indexes. The `ferric-syscall-fuzz` regression calls repeat the requests
+that found these bugs on every run: `mremap` and an anonymous `fmap` with
+`MAP_FIXED` at the top of the kernel half, a file-backed `fmap` with
+`MAP_FIXED` whose end leaves user space, and a `funmap` length with no aligned
 value.
 
 ## KPTI and PCID
