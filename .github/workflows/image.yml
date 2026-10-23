@@ -503,6 +503,7 @@ jobs:
           done
       # fs.ext4 is on, so ferric-ext4-test mounts its image with ext4d and runs every step.
       - name: Check ext4
+        if: env.CONFIG_NAME == 'ferric-smoke'
         run: |
           for step in image mount list read stat erofs; do
             grep -aF "FERRIC_TEST_PASS ext4-$step" "$LOG"

@@ -36,7 +36,7 @@
 //! let image = std::fs::File::open("disk.ext4")?;
 //! let mut fs = Fs::new(Window::whole(image)?)?;
 //! let root = fs.root()?;
-//! let file = fs.open(Some(root), "hello.txt", OpenMode::read())?;
+//! let file = fs.open_as(Some(root), "hello.txt", OpenMode::read(), 1000, 100)?;
 //! let mut buf = [0; 64];
 //! let n = fs.read(file, 0, &mut buf)?;
 //! assert_eq!(&buf[..n], b"hello from ext4\n");

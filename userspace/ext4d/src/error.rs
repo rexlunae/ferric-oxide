@@ -3,8 +3,8 @@
 
 use ext4_view::Ext4Error;
 use syscall::error::{
-    EBADF, EFBIG, EILSEQ, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, EOPNOTSUPP,
-    EROFS,
+    EACCES, EBADF, EFBIG, EILSEQ, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR,
+    EOPNOTSUPP, EROFS,
 };
 use thiserror::Error;
 
@@ -30,9 +30,15 @@ pub enum Error {
     /// A file call (a read) on a directory.
     #[error("is a directory")]
     IsADirectory,
-    /// `O_NOFOLLOW` without `O_SYMLINK` named a symbolic link.
+    /// `O_NOFOLLOW` without `O_SYMLINK` or `O_STAT` named a symbolic link.
     #[error("the path names a symbolic link and O_NOFOLLOW is set")]
     SymlinkNotFollowed,
+    /// The caller cannot search a directory or read the final inode.
+    #[error("permission denied")]
+    PermissionDenied,
+    /// `O_SYMLINK` named an object that is not a symbolic link.
+    #[error("not a symbolic link")]
+    NotASymlink,
     /// The superblock could not be read.
     #[error("cannot read the superblock")]
     Device(#[source] WindowError),
@@ -49,6 +55,8 @@ impl Error {
     pub fn errno(&self) -> i32 {
         match self {
             Self::ReadOnly => EROFS,
+            Self::PermissionDenied => EACCES,
+            Self::NotASymlink => EINVAL,
             Self::BadHandle { .. } => EBADF,
             Self::NotADirectory => ENOTDIR,
             Self::IsADirectory => EISDIR,

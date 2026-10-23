@@ -4,7 +4,7 @@
 //! and `fpath` are served. Everything that would change the volume (opens for writing or
 //! creating, `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename`, `flink`) fails
 //! with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through
-//! [`Error::errno`].
+//! [`Error::errno`]. Opens enforce the caller's UID/GID through [`Fs::open_as`].
 
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
@@ -134,11 +134,17 @@ impl SchemeSync for Ext4Scheme {
         path: &str,
         flags: usize,
         _fcntl_flags: u32,
-        _ctx: &CallerCtx,
+        ctx: &CallerCtx,
     ) -> syscall::Result<OpenResult> {
         let number = self
             .fs
-            .open(Some(dirfd), path, OpenMode::from_flags(flags))
+            .open_as(
+                Some(dirfd),
+                path,
+                OpenMode::from_flags(flags),
+                ctx.uid,
+                ctx.gid,
+            )
             .map_err(|e| errno(&e))?;
         Ok(OpenResult::ThisScheme {
             number,

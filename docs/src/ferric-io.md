@@ -856,6 +856,14 @@ device) and serves in the foreground until it is stopped.
 - **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
   `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
   `EROFS`.
+- **Access:** the scheme uses the caller's UID and primary GID. It checks
+  directory search permissions at each path component, including expanded
+  symlink targets, and read permission on the final inode. UID zero bypasses
+  these checks. Supplementary groups and ACLs are unsupported; permissions
+  use the inode's owner/group/other mode bits. `O_STAT` handles expose metadata
+  without permitting data reads, and `O_STAT | O_NOFOLLOW` stats the link itself.
+  `O_SYMLINK` on a regular file fails with `EINVAL`; relative opens require a
+  directory handle, including paths containing `..`.
 - **Layers:** the daemon reads through `ext4d::device::ReadAt`, which a LUKS
   (`ferric-luks`) or LVM (`ferric-lvm`) volume can implement to put ext4 on top
   of it; no such layer is wired up yet.
@@ -866,7 +874,12 @@ device) and serves in the foreground until it is stopped.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`; `ferric-ext4-test` mounts the same image on
-the target.
+the target, including `symlink_metadata` and refusal of `read_link` on a regular
+file. A UID/GID 2000 child must read a public file and receive `EACCES` for
+protected files, directories and symlink targets. Host fixtures additionally
+cover owner and primary-group access.
+The image workflow checks the ext4 markers only for smoke boots, since the
+nightly fuzz script runs only the fuzzer and package verification.
 
 ## Kernel-bypass network queues
 

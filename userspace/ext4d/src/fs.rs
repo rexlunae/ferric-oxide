@@ -3,8 +3,9 @@
 //!
 //! Handles are numbers the scheme gives its clients. Each names an open file or directory
 //! with its path from the volume's root, so relative opens and `fpath` work. Paths are
-//! normalized lexically (`.` and `..` resolved as text), as RedoxFS does. Symbolic links are
-//! followed by the reader, except where `O_SYMLINK` asks for the link itself.
+//! resolved component by component, checking directory search permissions before descending
+//! or processing `..`. Symbolic links are expanded with the same checks, except where
+//! `O_SYMLINK` or `O_STAT | O_NOFOLLOW` asks for the final link itself.
 //!
 //! Nothing here changes the volume. [`OpenMode::wants_write`] opens and every changing call
 //! fail with [`Error::ReadOnly`].
@@ -12,7 +13,7 @@
 //! Limitation: `ext4-view` does not expose inode numbers. [`Attributes::ino`] is a stable
 //! number made from the path instead, so hard links to one inode get different numbers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ext4_view::{Ext4, Ext4Read, File, FileType, Metadata};
 
@@ -32,6 +33,8 @@ pub struct OpenMode {
     pub symlink: bool,
     /// Do not follow a final symbolic link (`O_NOFOLLOW`).
     pub no_follow: bool,
+    /// Open metadata only (`O_STAT`), without permitting file reads.
+    pub stat: bool,
 }
 
 impl OpenMode {
@@ -43,13 +46,14 @@ impl OpenMode {
             directory: false,
             symlink: false,
             no_follow: false,
+            stat: false,
         }
     }
 
     /// Reads the mode from Redox `openat` flags.
     pub const fn from_flags(flags: usize) -> Self {
         use syscall::flag::{
-            O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_SYMLINK, O_TRUNC,
+            O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK, O_TRUNC,
         };
         let access = flags & O_ACCMODE;
         Self {
@@ -58,6 +62,7 @@ impl OpenMode {
             directory: flags & O_DIRECTORY != 0,
             symlink: flags & O_SYMLINK != 0,
             no_follow: flags & O_NOFOLLOW != 0,
+            stat: flags & O_STAT != 0,
         }
     }
 
@@ -197,6 +202,7 @@ pub struct Entry {
 }
 
 enum Open {
+    Metadata,
     File(Box<File>),
     Directory { entries: Option<Vec<Entry>> },
     Symlink { target: Vec<u8> },
@@ -269,52 +275,72 @@ impl Fs {
     /// [`Error::ReadOnly`] for any open that could change the volume, [`Error::BadHandle`]
     /// for an unknown `base`, [`Error::NotADirectory`] when `mode.directory` is set and the
     /// path is not one, [`Error::SymlinkNotFollowed`] for `O_NOFOLLOW` on a link, and
-    /// [`Error::Ext4`] when the path cannot be resolved or read.
+    /// [`Error::Ext4`] when the path cannot be resolved or read. This convenience
+    /// entry point opens as UID/GID zero; schemes must use [`Self::open_as`].
     pub fn open(
         &mut self,
         base: Option<usize>,
         path: &str,
         mode: OpenMode,
     ) -> Result<usize, Error> {
+        self.open_as(base, path, mode, 0, 0)
+    }
+
+    /// Opens a path using the caller's user and primary group IDs.
+    ///
+    /// Checks search permission on every traversed directory, including symlink targets,
+    /// and read permission on the final object unless `mode.stat` requests metadata only.
+    /// UID zero bypasses permission checks. Supplementary groups and ACLs are not supported;
+    /// access is restricted to the inode's owner/group/other mode bits.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::open`], [`Error::PermissionDenied`] for denied access,
+    /// and [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file.
+    pub fn open_as(
+        &mut self,
+        base: Option<usize>,
+        path: &str,
+        mode: OpenMode,
+        uid: u32,
+        gid: u32,
+    ) -> Result<usize, Error> {
         if mode.wants_write() {
             return Err(Error::ReadOnly);
         }
         let start = match base {
-            Some(base) if !path.starts_with('/') => self.handle(base)?.path.as_str(),
+            Some(base) if !path.starts_with('/') => {
+                let handle = self.handle(base)?;
+                if !handle.metadata.is_dir() {
+                    return Err(Error::NotADirectory);
+                }
+                handle.path.as_str()
+            }
             _ => "/",
         };
-        let path = normalize(start, path);
-        let link = self.ext4.symlink_metadata(path.as_str())?;
-        let handle = if link.is_symlink() && (mode.symlink || mode.no_follow) {
-            if !mode.symlink {
-                return Err(Error::SymlinkNotFollowed);
-            }
-            let target = self.ext4.read_link(path.as_str())?;
-            let target = target.as_ref().to_vec();
-            Handle {
-                path,
-                metadata: link,
-                open: Open::Symlink { target },
-            }
+        let (path, metadata) = self.resolve(start, path, mode, uid, gid)?;
+        if mode.directory && !metadata.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        if mode.symlink && !metadata.is_symlink() {
+            return Err(Error::NotASymlink);
+        }
+        let open = if mode.stat {
+            Open::Metadata
+        } else if metadata.is_symlink() {
+            let target = self.ext4.read_link(path.as_str())?.as_ref().to_vec();
+            Open::Symlink { target }
         } else {
-            let metadata = if link.is_symlink() {
-                self.ext4.metadata(path.as_str())?
-            } else {
-                link
-            };
-            if mode.directory && !metadata.is_dir() {
-                return Err(Error::NotADirectory);
-            }
-            let open = if metadata.is_dir() {
+            require_access(&metadata, uid, gid, 0o4)?;
+            if metadata.is_dir() {
                 Open::Directory { entries: None }
             } else {
                 Open::File(Box::new(self.ext4.open(path.as_str())?))
-            };
-            Handle {
-                path,
-                metadata,
-                open,
             }
+        };
+        let handle = Handle {
+            path,
+            metadata,
+            open,
         };
         let id = self.next;
         self.next += 1;
@@ -337,6 +363,7 @@ impl Fs {
     /// when the reader fails.
     pub fn read(&mut self, id: usize, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         match &mut self.handle_mut(id)?.open {
+            Open::Metadata => Err(Error::BadHandle { handle: id }),
             Open::Directory { .. } => Err(Error::IsADirectory),
             Open::Symlink { target } => {
                 let start = usize::try_from(offset).map_or(target.len(), |o| o.min(target.len()));
@@ -427,6 +454,71 @@ impl Fs {
         Err(Error::ReadOnly)
     }
 
+    fn resolve(
+        &self,
+        start: &str,
+        path: &str,
+        mode: OpenMode,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(String, Metadata), Error> {
+        if path.len() > 4096 {
+            return Err(ext4_view::Ext4Error::PathTooLong.into());
+        }
+        let mut current = start.to_owned();
+        let mut pending: VecDeque<String> = path.split('/').map(str::to_owned).collect();
+        let mut links = 0;
+        while let Some(component) = pending.pop_front() {
+            let directory = self.ext4.symlink_metadata(current.as_str())?;
+            if !directory.is_dir() {
+                return Err(Error::NotADirectory);
+            }
+            require_access(&directory, uid, gid, 0o1)?;
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    current = normalize(&current, "..");
+                    continue;
+                }
+                _ => {}
+            }
+            let next = normalize(&current, &component);
+            let metadata = self.ext4.symlink_metadata(next.as_str())?;
+            if metadata.is_symlink() {
+                let final_link = pending.is_empty();
+                if final_link && (mode.symlink || mode.no_follow) {
+                    if mode.symlink || mode.stat {
+                        return Ok((next, metadata));
+                    }
+                    return Err(Error::SymlinkNotFollowed);
+                }
+                links += 1;
+                if links > 40 {
+                    return Err(ext4_view::Ext4Error::TooManySymlinks.into());
+                }
+                let target = self.ext4.read_link(next.as_str())?;
+                let target = std::str::from_utf8(target.as_ref())
+                    .map_err(|_| ext4_view::Ext4Error::NotUtf8)?;
+                if target.is_empty() {
+                    return Err(ext4_view::Ext4Error::NotFound.into());
+                }
+                if target.starts_with('/') {
+                    current = "/".to_owned();
+                }
+                for part in target.split('/').rev() {
+                    pending.push_front(part.to_owned());
+                }
+            } else {
+                current = next;
+            }
+            if current.len() + pending.iter().map(|s| s.len() + 1).sum::<usize>() > 4096 {
+                return Err(ext4_view::Ext4Error::PathTooLong.into());
+            }
+        }
+        let metadata = self.ext4.symlink_metadata(current.as_str())?;
+        Ok((current, metadata))
+    }
+
     fn handle(&self, id: usize) -> Result<&Handle, Error> {
         self.handles.get(&id).ok_or(Error::BadHandle { handle: id })
     }
@@ -435,6 +527,22 @@ impl Fs {
         self.handles
             .get_mut(&id)
             .ok_or(Error::BadHandle { handle: id })
+    }
+}
+
+/// Apply one inode's owner, primary group or other permission class.
+fn require_access(metadata: &Metadata, uid: u32, gid: u32, operation: u16) -> Result<(), Error> {
+    let shift = if metadata.uid() == uid {
+        6
+    } else if metadata.gid() == gid {
+        3
+    } else {
+        0
+    };
+    if uid == 0 || (metadata.mode() >> shift) & operation == operation {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied)
     }
 }
 

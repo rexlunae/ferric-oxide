@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -177,7 +178,58 @@ fn stat() -> Result<(), Failure> {
     same("big.bin's size", big.len(), 200 * 1024)?;
     same("big.bin is a file", big.is_file(), true)?;
     same("dir is a directory", meta("dir")?.is_dir(), true)?;
-    same("hello.txt's size", meta("hello.txt")?.len(), 16)
+    same("hello.txt's size", meta("hello.txt")?.len(), 16)?;
+    let link = io("lstat the link", fs::symlink_metadata(at("link")))?;
+    same("link is a symlink", link.file_type().is_symlink(), true)?;
+    same("link target length", link.len(), 9)?;
+    match fs::read_link(at("hello.txt")) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => access(),
+        _ => Err(Failure::Changed {
+            what: "read_link on a regular file",
+        }),
+    }
+}
+
+/// Exercise CallerCtx propagation using a process with neither file ownership nor group access.
+fn access() -> Result<(), Failure> {
+    let status = io(
+        "run unprivileged access checks",
+        Command::new("/usr/bin/ferric-ext4-test")
+            .arg("--access-check")
+            .uid(2000)
+            .gid(2000)
+            .status(),
+    )?;
+    same("unprivileged access checks", status.success(), true)
+}
+
+fn access_child() -> Result<(), Failure> {
+    same(
+        "public file is readable",
+        io("read public file", fs::read(at("hello.txt")))?,
+        b"hello from ext4\n".to_vec(),
+    )?;
+    for path in [
+        "dir/private.txt",
+        "dir/private-link",
+        "dir/private-dir/secret",
+        "dir/secret-link",
+        "dir/private-dir/../nested.txt",
+    ] {
+        match File::open(at(path)) {
+            Err(e) => same("protected open errno", e.raw_os_error(), Some(libc::EACCES))?,
+            Ok(_) => same("protected open is denied", true, false)?,
+        }
+    }
+    let meta = io(
+        "lstat a protected target's link",
+        fs::symlink_metadata(at("dir/private-link")),
+    )?;
+    same(
+        "protected target's link is statted",
+        meta.file_type().is_symlink(),
+        true,
+    )
 }
 
 /// `result` must have failed with `EROFS`.
@@ -232,6 +284,13 @@ fn report(step: &str, result: Result<(), Failure>) -> bool {
 }
 
 pub fn main() -> ExitCode {
+    if std::env::args().any(|arg| arg == "--access-check") {
+        return if report("access", access_child()) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if !Path::new(EXT4D).exists() {
         println!("FERRIC_TEST_SKIP ext4: no {EXT4D} (fs.ext4 is off)");
         return ExitCode::SUCCESS;

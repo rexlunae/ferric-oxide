@@ -11,6 +11,9 @@
 # metadata_csum, dir_index, a journal and so on), with:
 #   hello.txt          "hello from ext4\n"
 #   dir/nested.txt     "nested\n"
+#   dir/private.txt    mode 0640, uid 1000, gid 100
+#   dir/private-dir/   mode 0700, uid 1000, gid 100, contains secret
+#   dir/*-link         links to private.txt, private-dir/secret and /
 #   empty/             an empty directory
 #   link               a symbolic link to hello.txt
 #   big.bin            200 KiB, byte i is (i * 7 + i / 4096) mod 251, over several blocks
@@ -20,10 +23,17 @@ out=${1:-$(dirname "$0")}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 root=$work/root
-mkdir -p "$root/dir" "$root/empty" "$root/many"
+mkdir -p "$root/dir/private-dir" "$root/empty" "$root/many"
 printf 'hello from ext4\n' > "$root/hello.txt"
 printf 'nested\n' > "$root/dir/nested.txt"
 ln -s hello.txt "$root/link"
+printf 'private\n' > "$root/dir/private.txt"
+printf 'secret\n' > "$root/dir/private-dir/secret"
+chmod 640 "$root/dir/private.txt"
+chmod 700 "$root/dir/private-dir"
+ln -s private.txt "$root/dir/private-link"
+ln -s private-dir/secret "$root/dir/secret-link"
+ln -s / "$root/dir/root-link"
 python3 -c '
 import sys
 n = 200 * 1024
@@ -41,3 +51,9 @@ E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
     -L ferric-basic -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a10 \
     -E hash_seed=0a1b2c3d-4e5f-4607-8819-2a3b4c5d6e7f,root_owner=0:0 \
     -d "$root" "$out/basic.ext4" 4M
+
+# Fixed credentials allow owner/group/other checks on every host.
+for name in /dir/private.txt /dir/private-dir; do
+    debugfs -w -R "set_inode_field $name uid 1000" "$out/basic.ext4" >/dev/null 2>&1
+    debugfs -w -R "set_inode_field $name gid 100" "$out/basic.ext4" >/dev/null 2>&1
+done

@@ -295,3 +295,109 @@ fn a_partition_is_read_through_its_window() {
         .expect("a file");
     assert_eq!(read_all(&mut fs, hello), b"hello from ext4\n");
 }
+
+#[test]
+fn metadata_links_and_relative_file_bases_obey_open_flags() {
+    let mut fs = mount();
+    let stat = OpenMode::from_flags(syscall::O_STAT | syscall::O_NOFOLLOW);
+    let link = fs.open(None, "link", stat).expect("lstat the link");
+    assert_eq!(fs.attributes(link).unwrap().kind, Kind::Symlink);
+    assert_eq!(fs.attributes(link).unwrap().size, 9);
+    assert_eq!(
+        fs.read(link, 0, &mut [0; 16]).unwrap_err().errno(),
+        syscall::EBADF
+    );
+    let mode = OpenMode {
+        symlink: true,
+        ..OpenMode::read()
+    };
+    assert_eq!(
+        fs.open(None, "hello.txt", mode).unwrap_err().errno(),
+        syscall::EINVAL
+    );
+    let file = fs.open(None, "dir/nested.txt", OpenMode::read()).unwrap();
+    for path in ["../nested.txt", ".", ""] {
+        assert_eq!(
+            fs.open(Some(file), path, OpenMode::read())
+                .unwrap_err()
+                .errno(),
+            syscall::ENOTDIR
+        );
+    }
+    assert!(fs.open(Some(file), "/hello.txt", OpenMode::read()).is_ok());
+    assert_eq!(
+        fs.open(None, "hello.txt/../hello.txt", OpenMode::read())
+            .unwrap_err()
+            .errno(),
+        syscall::ENOTDIR
+    );
+}
+
+#[test]
+fn unprivileged_opens_check_directory_search_and_final_read_permissions() {
+    let mut fs = mount();
+    assert!(
+        fs.open_as(None, "hello.txt", OpenMode::read(), 2000, 2000)
+            .is_ok()
+    );
+    for path in ["lost+found", "lost+found/../hello.txt", "lost+found/."] {
+        assert_eq!(
+            fs.open_as(None, path, OpenMode::read(), 2000, 2000)
+                .unwrap_err()
+                .errno(),
+            syscall::EACCES
+        );
+    }
+    // Metadata-only opens require search on parents, but no read on the final inode.
+    let stat = OpenMode::from_flags(syscall::O_STAT);
+    assert!(fs.open_as(None, "lost+found", stat, 2000, 2000).is_ok());
+    assert_eq!(
+        fs.open_as(None, "lost+found/../hello.txt", stat, 2000, 2000)
+            .unwrap_err()
+            .errno(),
+        syscall::EACCES
+    );
+    assert!(
+        fs.open_as(None, "dir/private.txt", OpenMode::read(), 1000, 2000)
+            .is_ok()
+    );
+    assert!(
+        fs.open_as(None, "dir/private.txt", OpenMode::read(), 2000, 100)
+            .is_ok()
+    );
+    for path in [
+        "dir/private.txt",
+        "dir/private-link",
+        "dir/private-dir/secret",
+        "dir/secret-link",
+        "dir/private-dir/../nested.txt",
+    ] {
+        assert_eq!(
+            fs.open_as(None, path, OpenMode::read(), 2000, 2000)
+                .unwrap_err()
+                .errno(),
+            syscall::EACCES,
+            "{path}"
+        );
+        assert!(
+            fs.open_as(None, path, OpenMode::read(), 0, 0).is_ok(),
+            "root: {path}"
+        );
+    }
+    // A symlink followed by .. must resolve relative to the target directory.
+    let through = fs
+        .open_as(
+            None,
+            "dir/root-link/hello.txt",
+            OpenMode::read(),
+            2000,
+            2000,
+        )
+        .unwrap();
+    assert_eq!(fs.path(through).unwrap(), "/hello.txt");
+    let link_stat = OpenMode::from_flags(syscall::O_STAT | syscall::O_NOFOLLOW);
+    assert!(
+        fs.open_as(None, "dir/private-link", link_stat, 2000, 2000)
+            .is_ok()
+    );
+}
