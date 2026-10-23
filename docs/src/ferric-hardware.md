@@ -257,3 +257,12 @@ result.
 The hardware matrix is deliberately separate from the implementation status
 table in [Implemented System](ferric-oxide.md): a driver that binds is not a
 driver that has passed a hardware test.
+
+### Receive queue saturation
+
+The Ethernet link accepts a full 1500-byte IP packet plus its Ethernet header.
+The router's bounded receive queue checks allocation for each incoming packet:
+free packet slots alone do not imply that enough contiguous payload bytes remain.
+When an enqueue fails, the router drops that frame and stops that device's polling
+pass, then continues serving queued traffic. A host regression fills the byte
+ring before its metadata slots and checks that subsequent traffic still works.

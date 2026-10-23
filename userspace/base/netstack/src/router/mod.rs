@@ -64,10 +64,15 @@ impl Router {
                     break;
                 };
 
-                self.rx_buffer
-                    .enqueue(buf.len(), ())
-                    .expect("We checked if it was full")
-                    .copy_from_slice(buf);
+                // Free metadata slots do not guarantee enough payload bytes for
+                // this frame (or room to wrap the byte ring).
+                match self.rx_buffer.enqueue(buf.len(), ()) {
+                    Ok(packet) => packet.copy_from_slice(buf),
+                    Err(_) => {
+                        warn!("router dropped packet because receive buffer lacks space");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -186,5 +191,43 @@ impl<'a> smoltcp::phy::RxToken for RxToken<'a> {
             .expect("This was checked before creating the RxToken");
 
         f(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::loopback::LoopbackDevice;
+    use crate::link::LinkDevice;
+
+    #[test]
+    fn receive_drops_a_packet_when_byte_space_runs_out_before_slots() {
+        let now = Instant::from_millis(0);
+        let mut loopback = LoopbackDevice::default();
+        let next_hop = "127.0.0.1".parse().unwrap();
+        loopback.send(next_hop, &[1; 1500], now);
+        loopback.send(next_hop, &[2; 1500], now);
+        let mut devices = DeviceList::default();
+        devices.push(loopback);
+        let mut router = Router::new(
+            Rc::new(RefCell::new(devices)),
+            Rc::new(RefCell::new(RouteTable::default())),
+        );
+        // Both packets have a metadata slot, but only one fits in the byte ring.
+        router.rx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0; 2000]);
+        router.poll(now);
+        assert!(!router.rx_buffer.is_full());
+        assert_eq!(router.rx_buffer.dequeue().unwrap().1, &[1; 1500]);
+        assert!(router.rx_buffer.is_empty());
+        // Dropping a frame leaves the queue usable for later traffic.
+        router
+            .devices
+            .borrow_mut()
+            .iter_mut()
+            .next()
+            .unwrap()
+            .send(next_hop, &[3; 1500], now);
+        router.poll(now);
+        assert_eq!(router.rx_buffer.dequeue().unwrap().1, &[3; 1500]);
     }
 }
