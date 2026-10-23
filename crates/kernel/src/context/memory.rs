@@ -108,6 +108,39 @@ impl UnmapResult {
     }
 }
 
+/// Ferric Oxide: the size in bytes of a grant of `page_count` pages, after checking that the
+/// grant would stay in user space.
+///
+/// Every grant lies in `[0, USER_END_OFFSET)`, and the grant table only tracks free holes
+/// there. A span outside it is either dropped from the hole bookkeeping or enters it with a
+/// wrapped end, and a later selection then hands out pages that a grant already occupies,
+/// which trips the overlap assertion in `UserGrants::insert`. The syscall fuzzer reached that
+/// through `fmap` of a descriptor with `MAP_FIXED` at 0xffff_ffff_ffff_f000 and through
+/// `mremap` to the same address. `mmap` and `r#move` both insert grants, so the rule lives
+/// here rather than in each of them.
+///
+/// # Errors
+///
+/// `ENOMEM` if the size overflows or does not fit in user space at all, `EINVAL` if a fixed
+/// `base` would put the end past `USER_END_OFFSET`.
+fn grant_span_size(page_count: usize, base: Option<Page>, flags: MapFlags) -> Result<usize> {
+    let Some(size) = page_count.checked_mul(PAGE_SIZE) else {
+        return Err(Error::new(ENOMEM));
+    };
+    if size > crate::USER_END_OFFSET {
+        return Err(Error::new(ENOMEM));
+    }
+    let fixed =
+        flags.contains(MapFlags::MAP_FIXED) || flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
+    if let Some(base) = base
+        && fixed
+        && PageSpan::validate(base.start_address(), size).is_none()
+    {
+        return Err(Error::new(EINVAL));
+    }
+    Ok(size)
+}
+
 #[derive(Debug)]
 pub struct AddrSpaceWrapper {
     pub inner: RwLock<L5, AddrSpace>,
@@ -471,27 +504,9 @@ impl AddrSpaceWrapper {
         };
         let mut dst_flusher = Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack);
 
-        // Ferric Oxide: `r#move` inserts a grant without going through `mmap`, so it repeats that
-        // function's user-space range rule. A destination outside the user half would either be
-        // dropped from the hole bookkeeping or enter it with a wrapped end, and a later selection
-        // then hands out pages a grant already owns.
-        let Some(dst_span_size) = new_page_count.checked_mul(PAGE_SIZE) else {
-            return Err(Error::new(ENOMEM));
-        };
-        if dst_span_size > crate::USER_END_OFFSET {
-            return Err(Error::new(ENOMEM));
-        }
-        if let Some(base) = requested_dst_base
-            && (new_flags.contains(MapFlags::MAP_FIXED)
-                || new_flags.contains(MapFlags::MAP_FIXED_NOREPLACE))
-            && base
-                .start_address()
-                .data()
-                .checked_add(dst_span_size)
-                .is_none_or(|end| end > crate::USER_END_OFFSET)
-        {
-            return Err(Error::new(EINVAL));
-        }
+        // Ferric Oxide: `r#move` inserts a grant without going through `mmap`, so it needs the
+        // same user-space range rule (`grant_span_size`).
+        grant_span_size(new_page_count, requested_dst_base, new_flags)?;
 
         let dst_base = match requested_dst_base {
             Some(base) if new_flags.contains(MapFlags::MAP_FIXED_NOREPLACE) => {
@@ -918,32 +933,11 @@ impl AddrSpace {
     ) -> Result<Page> {
         assert_eq!(dst_lock.inner.as_mut_ptr(), self as *mut Self);
 
-        // Ferric Oxide: every grant lies in the user half, and the grant table only tracks free
-        // holes there. A span outside it is either dropped from the hole bookkeeping or enters it
-        // with a wrapped end, and a later selection then hands out pages that a grant already
-        // occupies, which trips the overlap assertion in `UserGrants::insert`. The syscall fuzzer
-        // reached that through `fmap` of a file descriptor with `MAP_FIXED` at
-        // 0xffff_ffff_ffff_f000, so check here for all callers as well as in the syscalls. The
-        // check runs inside the traced region so `mm.map` records a rejected span like any other
-        // failed mapping.
+        // Ferric Oxide: refuse a span that leaves user space before touching the grant table
+        // (`grant_span_size`, which `r#move` also uses). It runs inside the traced region so
+        // `mm.map` records a rejected span like any other failed mapping.
         let result = (|| {
-            let Some(span_size) = page_count.get().checked_mul(PAGE_SIZE) else {
-                return Err(Error::new(ENOMEM));
-            };
-            if span_size > crate::USER_END_OFFSET {
-                return Err(Error::new(ENOMEM));
-            }
-            if let Some(requested_base) = requested_base_opt
-                && (flags.contains(MapFlags::MAP_FIXED)
-                    || flags.contains(MapFlags::MAP_FIXED_NOREPLACE))
-                && requested_base
-                    .start_address()
-                    .data()
-                    .checked_add(span_size)
-                    .is_none_or(|end| end > crate::USER_END_OFFSET)
-            {
-                return Err(Error::new(EINVAL));
-            }
+            grant_span_size(page_count.get(), requested_base_opt, flags)?;
 
             let selected_span = match requested_base_opt {
                 // TODO: Rename MAP_FIXED+MAP_FIXED_NOREPLACE to MAP_FIXED and
