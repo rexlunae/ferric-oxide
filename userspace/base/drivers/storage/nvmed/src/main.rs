@@ -72,6 +72,16 @@ impl Disk for NvmeDisk {
             .is_some_and(|workers| workers.policy().serves_concurrently())
     }
 
+    /// With per-CPU workers, a concurrent read or write goes to a worker, which writes the
+    /// scheme's response itself (see `percore::Dispatcher::submit`).
+    #[cfg(feature = "percore")]
+    fn submit(&mut self, io: driver_block::PendingIo) -> Result<(), driver_block::PendingIo> {
+        match &self.workers {
+            Some(workers) => workers.submit(self.ns, io),
+            None => Err(io),
+        }
+    }
+
     fn block_size(&self) -> u32 {
         self.ns.block_size.try_into().unwrap()
     }
