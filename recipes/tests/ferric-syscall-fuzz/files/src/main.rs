@@ -37,6 +37,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use syscall::{Map, MapFlags};
+
 /// System call numbers and flags, copied from `redox_syscall` so the fuzzer
 /// has no dependencies.
 ///
@@ -100,7 +102,6 @@ mod sys {
     pub const PROT_WRITE: usize = 0x0002_0000;
     pub const PROT_READ: usize = 0x0004_0000;
     pub const MAP_PRIVATE: usize = 0x0002;
-    pub const MAP_FIXED: usize = 0x0004;
 
     /// `redox_syscall::UPPER_FDTBL_TAG`: descriptors with this bit live in the
     /// upper table, where relibc keeps its process and thread handles. The
@@ -662,19 +663,19 @@ impl Fuzzer {
 
     /// Maps the anonymous region the memory-management calls target.
     fn map_victim(&mut self) {
-        let map = [
-            0,
-            VICTIM_LEN,
-            sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE,
-            0,
-        ];
+        let map = Map {
+            offset: 0,
+            size: VICTIM_LEN,
+            flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_PRIVATE,
+            address: 0,
+        };
         // SAFETY: fmap of anonymous memory at an address the kernel picks.
         let ret = unsafe {
             sys::call(
                 sys::FMAP,
                 [
                     usize::MAX,
-                    map.as_ptr() as usize,
+                    &map as *const Map as usize,
                     size_of_val(&map),
                     0,
                     0,
@@ -682,9 +683,10 @@ impl Fuzzer {
                 ],
             )
         };
-        if !sys::is_err(ret) {
-            self.victim = ret;
+        if sys::is_err(ret) {
+            regressed(&format!("cannot map the regression source: {ret:#x}"));
         }
+        self.victim = ret;
     }
 
     fn run(&mut self, calls: usize) {
@@ -750,18 +752,19 @@ impl Fuzzer {
         // page corrupted the free-space accounting of the address space, and a
         // later mapping then landed on memory a grant already owned, which
         // panicked the kernel with an overlap assertion (fixed by validating
-        // the span). Anonymous memory is asked for with no descriptor at all,
-        // so this half of the check cannot be skipped, and a file on the root
-        // file system is asked for as well because that path reaches its
-        // scheme's mapping request before the address space is touched.
-        let kernel_half = [
-            0xFFFF_FFFF_FFFF_F000,
-            0x10_0000,
-            sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
-            0,
-        ];
+        // the span). Both checks below exercise rejection before a scheme is
+        // asked to map anything; a valid file-backed mapping is tested separately.
+        let kernel_half = Map {
+            offset: 0,
+            size: 0x10_0000,
+            flags: MapFlags::PROT_READ
+                | MapFlags::PROT_WRITE
+                | MapFlags::MAP_PRIVATE
+                | MapFlags::MAP_FIXED,
+            address: 0xFFFF_FFFF_FFFF_F000,
+        };
         if self.verbose {
-            eprintln!("regression {:#x} {kernel_half:x?}", sys::FMAP);
+            eprintln!("regression {:#x} {kernel_half:?}", sys::FMAP);
         }
         // SAFETY: `!0` selects anonymous memory, and the mapping asks for an
         // address the kernel must refuse.
@@ -770,7 +773,7 @@ impl Fuzzer {
                 sys::FMAP,
                 [
                     usize::MAX,
-                    kernel_half.as_ptr() as usize,
+                    &kernel_half as *const Map as usize,
                     size_of_val(&kernel_half),
                     0,
                     0,
@@ -799,7 +802,12 @@ impl Fuzzer {
             .truncate(true)
             .open("fmap-fixed")
         {
-            Ok(file) => file.into_raw_fd() as usize,
+            Ok(file) => {
+                if let Err(e) = file.set_len(PAGE_SIZE as u64) {
+                    regressed(&format!("cannot size the fmap regression file: {e}"));
+                }
+                file.into_raw_fd() as usize
+            }
             Err(e) => {
                 // The parent gives every child a writable scratch directory, so
                 // a file that cannot be created there would silently skip the
@@ -811,21 +819,31 @@ impl Fuzzer {
             (0x7FFF_FFFF_F000usize, 0x20_0000usize),
             (0x8000_0000_0000, 0x1000),
         ] {
-            let map = [
+            let map = Map {
+                offset: 0,
+                size: len,
+                flags: MapFlags::PROT_READ
+                    | MapFlags::PROT_WRITE
+                    | MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_FIXED,
                 address,
-                len,
-                sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE | sys::MAP_FIXED,
-                0,
-            ];
+            };
             if self.verbose {
-                eprintln!("regression {:#x} fd {file} {map:x?}", sys::FMAP);
+                eprintln!("regression {:#x} fd {file} {map:?}", sys::FMAP);
             }
             // SAFETY: the descriptor is this process's and the mapping asks for
             // a span the kernel must refuse.
             let ret = unsafe {
                 sys::call(
                     sys::FMAP,
-                    [file, map.as_ptr() as usize, size_of_val(&map), 0, 0, 0],
+                    [
+                        file,
+                        &map as *const Map as usize,
+                        size_of_val(&map),
+                        0,
+                        0,
+                        0,
+                    ],
                 )
             };
             if !sys::is_err(ret) {
@@ -833,6 +851,36 @@ impl Fuzzer {
                     "fmap MAP_FIXED at {address:#x} for {len:#x} past user space returned {ret:#x}"
                 ));
             }
+        }
+        // A legal mapping must reach the filesystem and succeed as well, so a
+        // broken request layout or blanket refusal cannot pass these checks.
+        let map = Map {
+            offset: 0,
+            size: PAGE_SIZE,
+            flags: MapFlags::PROT_READ | MapFlags::MAP_PRIVATE,
+            address: 0,
+        };
+        // SAFETY: the descriptor is ours, and the kernel chooses an unused address.
+        let mapped = unsafe {
+            sys::call(
+                sys::FMAP,
+                [
+                    file,
+                    &map as *const Map as usize,
+                    size_of_val(&map),
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if sys::is_err(mapped) {
+            regressed(&format!("valid file-backed fmap failed: {mapped:#x}"));
+        }
+        // SAFETY: this is exactly the mapping returned by the preceding call.
+        let unmapped = unsafe { sys::call(sys::FUNMAP, [mapped, PAGE_SIZE, 0, 0, 0, 0]) };
+        if sys::is_err(unmapped) {
+            regressed(&format!("valid file-backed funmap failed: {unmapped:#x}"));
         }
         // SAFETY: closing a descriptor this process opened and owns.
         unsafe { sys::call(sys::CLOSE, [file, 0, 0, 0, 0, 0]) };

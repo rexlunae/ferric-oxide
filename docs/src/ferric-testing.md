@@ -360,6 +360,10 @@ if its scratch file cannot be created, so neither check can be skipped
 silently. A failing check writes its reason to the child's scratch directory,
 which the parent prints once per distinct reason, so the boot log names the
 check a seed trips without replaying the child.
+Mapping requests use `redox_syscall::Map`, including its distinct offset and
+address fields. Source mapping setup must succeed before testing `mremap`.
+The invalid file-backed requests test rejection at kernel preflight; a legal
+file-backed map and unmap also have to succeed to exercise filesystem mapping.
 
 Preserve the serial log, image configuration, feature choices, kernel symbols
 and test seed. `scripts/backtrace.sh` helps symbolize kernel addresses;
