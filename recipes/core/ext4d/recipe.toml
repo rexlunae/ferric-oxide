@@ -1,0 +1,11 @@
+# Ferric Oxide: ext4d, the read-only ext4 file system daemon (features.toml fs.ext4, off by
+# default). It lives in this repository at userspace/ext4d/; as a path source (relative to
+# the repository root), edits there rebuild it.
+[source]
+path = "userspace/ext4d"
+
+[build]
+template = "custom"
+script = """
+cookbook_cargo
+"""

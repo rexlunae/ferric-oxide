@@ -840,6 +840,53 @@ ran the serving thread, and no other CPU stole it, because work stealing does
 not take a lone context. The caller now direct-switches only when the handler
 context is a different context.
 
+## ext4, read-only
+
+`ext4d` (`userspace/ext4d/`, features.toml `fs.ext4`, off by default) serves an
+ext4 volume read-only as a scheme, the way RedoxFS serves its own:
+
+```text
+ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME
+```
+
+`DEVICE` is a disk, a partition or an image file; `--offset` and `--length` pick
+the volume's bytes out of a whole disk. The volume appears at `/scheme/SCHEME`.
+The daemon registers the scheme, enters the null namespace (it already holds the
+device) and serves in the foreground until it is stopped.
+
+- **Reading** is done by the `ext4-view` crate (MIT or Apache-2.0): extents,
+  hashed (htree) directories, metadata checksums, 64-bit block numbers and the
+  journal. ext4d reads the superblock's block counts itself for `statvfs`,
+  written from "The Super Block" in "Ext4 Disk Layout" on the ext4 wiki at
+  kernel.org. No code comes from Linux.
+- **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
+  `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
+  `EROFS`.
+- **Access:** the scheme uses the caller's UID and primary GID. It checks
+  directory search permissions at each path component, including expanded
+  symlink targets, and read permission on the final inode. UID zero bypasses
+  these checks. Supplementary groups and ACLs are unsupported; permissions
+  use the inode's owner/group/other mode bits. `O_STAT` handles expose metadata
+  without permitting data reads, and `O_STAT | O_NOFOLLOW` stats the link itself.
+  `O_SYMLINK` on a regular file fails with `EINVAL`; relative opens require a
+  directory handle, including paths containing `..`.
+- **Layers:** the daemon reads through `ext4d::device::ReadAt`, which a LUKS
+  (`ferric-luks`) or LVM (`ferric-lvm`) volume can implement to put ext4 on top
+  of it; no such layer is wired up yet.
+- **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
+  hash of the path (hard links get different numbers) and `st_ctime` is the
+  modification time; `mmap` is not served; encrypted files and devices are
+  refused (`EOPNOTSUPP`).
+
+Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
+`tests/fixtures/make-fixtures.sh`; `ferric-ext4-test` mounts the same image on
+the target, including `symlink_metadata` and refusal of `read_link` on a regular
+file. A UID/GID 2000 child must read a public file and receive `EACCES` for
+protected files, directories and symlink targets. Host fixtures additionally
+cover owner and primary-group access.
+The image workflow checks the ext4 markers only for smoke boots, since the
+nightly fuzz script runs only the fuzzer and package verification.
+
 ## Kernel-bypass network queues
 
 `ferric-netq` (`crates/netq`) is the ABI of the kernel-bypass network queues

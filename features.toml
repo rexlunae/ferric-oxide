@@ -77,6 +77,11 @@ title = "Drivers"
 help = "Build-time options of the user-space drivers in the base package."
 
 [[menu]]
+id = "fs"
+title = "File systems"
+help = "File systems besides RedoxFS that the image can mount."
+
+[[menu]]
 id = "image"
 title = "Image contents"
 help = "Which filesystem configuration the image starts from, and changes on top of it."
@@ -1227,6 +1232,27 @@ help = "Pass --encrypt to redoxfs-mkfs. The image build asks for a password."
 
 [[option.effect]]
 make = { REDOXFS_MKFS_FLAGS = "--encrypt" }
+
+# ---------------------------------------------------------------- file systems
+
+[[option]]
+id = "fs.ext4"
+menu = "fs"
+type = "bool"
+title = "Read-only ext4 (ext4d)"
+default = false
+help = """
+Add ext4d to the image: a daemon that serves an ext4 volume read-only as a
+scheme, the way RedoxFS serves its own. Run it as
+`ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME`, with a disk, a
+partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
+Every change (writing, creating, removing, renaming) fails with EROFS.
+Reading is done by the ext4-view crate, and handles extents, hashed
+directories, checksums and the journal. Source: userspace/ext4d."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["ext4d"]
 
 # ---------------------------------------------------------------- packages
 
