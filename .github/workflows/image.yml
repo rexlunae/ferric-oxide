@@ -121,7 +121,7 @@ jobs:
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
           # kernel link arguments, bootloader features, signed fox manifests)
           # on to the build.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_FOX_MANIFEST; do
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_BASE_DRIVERS FERRIC_FOX_MANIFEST; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
@@ -141,6 +141,18 @@ jobs:
           # Log downloads are not always available to reviewers, so a failed build also
           # reports the end of its log as one annotation.
           set -o pipefail
+          # The image above enables [drivers] rtl8125, which ferric-config reports as
+          # FERRIC_BASE_DRIVERS. base builds the daemon and installs its PCI match only
+          # when that list reaches it, and an empty list still produces a bootable
+          # image, so check the selection arrived instead of leaving it to a silent
+          # omission.
+          case " ${FERRIC_BASE_DRIVERS:-} " in
+            *" rtl8125d "*) ;;
+            *)
+              echo "::error title=rtl8125d not selected::[drivers] rtl8125 = true did not reach the build (FERRIC_BASE_DRIVERS='${FERRIC_BASE_DRIVERS:-}')"
+              exit 1
+              ;;
+          esac
           if ! make all CONFIG_NAME="$CONFIG_NAME" 2>&1 | tee "$RUNNER_TEMP/build.log"; then
             tail -n 80 "$RUNNER_TEMP/build.log" \
               | sed -e 's/%/%25/g' -e 's/\r//g' \

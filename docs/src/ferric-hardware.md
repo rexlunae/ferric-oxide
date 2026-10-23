@@ -91,7 +91,10 @@ The receive descriptor length includes the Ethernet CRC, so the driver strips
 it before handing a frame to the network scheme. The scheme hands the frame to
 `netstack`, whose Ethernet link buffer was enlarged from 1500 to 1514 bytes so
 that a maximum-size frame is not truncated; the old size dropped the tail of
-every full-MTU packet.
+every full-MTU packet. The router's own MTU is that same 1500-byte IP payload,
+taken from the link's constant; it was 1486 (one Ethernet header short), which
+made smoltcp fragment egress that a frame carries whole and left the last slot
+of a full receive ring without room for a maximum-size packet.
 
 QEMU has no RTL8125 device model, so the driver cannot be exercised in the
 smoke VM. Validation requires booting the hardware image on the machine and
@@ -262,8 +265,11 @@ driver that has passed a hardware test.
 ### Receive queue saturation
 
 The Ethernet link accepts a full 1500-byte IP packet plus its Ethernet header.
-The router's bounded receive queue checks allocation for each incoming packet:
-free packet slots alone do not imply that enough contiguous payload bytes remain.
+The router's receive and transmit rings each hold one 1500-byte packet per
+metadata slot, so the byte ring is exactly its slot count times the MTU; a host
+regression fills every slot with a maximum-size packet. The router's bounded
+receive queue still checks allocation for each incoming packet, because free
+packet slots alone do not imply that enough contiguous payload bytes remain.
 When an enqueue fails, the router drops that frame and stops that device's polling
 pass, then continues serving queued traffic. A host regression fills the byte
 ring before its metadata slots and checks that subsequent traffic still works.

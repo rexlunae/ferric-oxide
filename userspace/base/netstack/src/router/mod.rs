@@ -7,6 +7,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::IpAddress;
 
 use self::route_table::RouteTable;
+use crate::link::ethernet::EthernetLink;
 use crate::link::DeviceList;
 use crate::scheme::Smolnetd;
 
@@ -39,7 +40,16 @@ impl Router {
         }
     }
 
-    pub const MTU: usize = 1486;
+    /// Largest IP packet the stack sends to, or accepts from, a link.
+    ///
+    /// The router speaks [`Medium::Ip`], so this is the link's IP payload with
+    /// no framing subtracted: smoltcp sizes outgoing packets, the IPv4 MSS and
+    /// the advertised window from it, and each link adds its own header in
+    /// front of the packet. The receive and transmit rings hold one packet of
+    /// this size per slot, so a full-sized packet always has room and a
+    /// 1486-byte limit would both fragment egress and drop the last packet of
+    /// a full ring even when a metadata slot was free.
+    pub const MTU: usize = EthernetLink::MTU;
 
     pub fn can_recv(&self) -> bool {
         let mut can_recv = false;
@@ -199,6 +209,26 @@ mod tests {
     use super::*;
     use crate::link::loopback::LoopbackDevice;
     use crate::link::LinkDevice;
+
+    #[test]
+    fn every_ring_slot_holds_a_full_sized_packet() {
+        // A link hands the router an Ethernet frame's whole IP payload, so
+        // every ring slot has to fit one: with a smaller MTU the last slot
+        // keeps unusable space and a full-sized packet is dropped even though
+        // a metadata slot is free.
+        let packet = vec![0xAB; EthernetLink::MTU];
+        let mut buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; Smolnetd::SOCKET_BUFFER_SIZE],
+            vec![0u8; Router::MTU * Smolnetd::SOCKET_BUFFER_SIZE],
+        );
+        for slot in 0..Smolnetd::SOCKET_BUFFER_SIZE {
+            buffer
+                .enqueue(packet.len(), ())
+                .unwrap_or_else(|_| panic!("ring slot {slot} cannot hold a full-sized packet"))
+                .copy_from_slice(&packet);
+        }
+        assert!(buffer.is_full());
+    }
 
     #[test]
     fn receive_drops_a_packet_when_byte_space_runs_out_before_slots() {

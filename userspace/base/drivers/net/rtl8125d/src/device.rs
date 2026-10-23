@@ -681,17 +681,29 @@ impl<R: Regs> Controller<R> {
         Ok(())
     }
 
+    /// Lock or unlock the ASPM and clock-request controls (`RL_CFG2_ASPM_LOCK`
+    /// and `RL_CFG5_ASPM_LOCK` in the reference `if_re` driver).
+    ///
+    /// Unlocking has to clear the bits: a card whose configuration space
+    /// already has them set (the reference board does before the driver runs)
+    /// would otherwise keep the MAC MCU from honouring the clock-request
+    /// programming the driver makes while it patches the MAC and powers up the
+    /// PHY. The lock bit is therefore the clear mask on both paths and is set
+    /// again only when locking.
     fn aspm_clkreq_lock(&self, enable: bool) {
+        let set = |bit: u8| if enable { bit } else { 0 };
         self.regs
-            .update8(regs::CFG5, 0, if enable { regs::CFG5_ASPM_LOCK } else { 0 });
+            .update8(regs::CFG5, regs::CFG5_ASPM_LOCK, set(regs::CFG5_ASPM_LOCK));
         self.regs
-            .update8(regs::CFG2, 0, if enable { regs::CFG2_ASPM_LOCK } else { 0 });
+            .update8(regs::CFG2, regs::CFG2_ASPM_LOCK, set(regs::CFG2_ASPM_LOCK));
     }
 
+    /// Force or release the clock request (the reference driver's
+    /// `RL_CLKREQ_FORCE`), clearing the bit before setting it when forcing.
     fn force_clkreq(&self, enable: bool) {
         self.regs.update8(
             regs::CLOCK_REQUEST_F1,
-            0,
+            regs::CLOCK_REQUEST_FORCE,
             if enable { regs::CLOCK_REQUEST_FORCE } else { 0 },
         );
     }
@@ -1312,6 +1324,51 @@ mod tests {
         let device = FakeDevice::new();
         device.state.borrow_mut().put32(regs::TXCFG, 0x0000_0000);
         assert!(check_mac_version(&device).is_err());
+    }
+
+    #[test]
+    fn clock_locks_clear_before_they_are_set() {
+        let device = FakeDevice::new();
+        // The reference board has both ASPM locks set before the driver runs,
+        // and CFG5 carries wake-on-LAN configuration beside its lock bit.
+        device
+            .state
+            .borrow_mut()
+            .put8(regs::CFG2, regs::CFG2_ASPM_LOCK | regs::CFG2_RTL8125_BIT5);
+        device
+            .state
+            .borrow_mut()
+            .put8(regs::CFG5, regs::CFG5_ASPM_LOCK | regs::CFG5_WOL_MASK);
+        device
+            .state
+            .borrow_mut()
+            .put8(regs::CLOCK_REQUEST_F1, regs::CLOCK_REQUEST_FORCE | (1 << 4));
+        let controller = Controller::new(device.clone());
+
+        controller.aspm_clkreq_lock(false);
+        controller.force_clkreq(false);
+
+        // Unlocking clears the lock bits and leaves the other bits alone.
+        assert_eq!(device.read8(regs::CFG2), regs::CFG2_RTL8125_BIT5);
+        assert_eq!(device.read8(regs::CFG5), regs::CFG5_WOL_MASK);
+        assert_eq!(device.read8(regs::CLOCK_REQUEST_F1), 1 << 4);
+
+        controller.aspm_clkreq_lock(true);
+        controller.force_clkreq(true);
+
+        // Locking sets them again, still preserving the other bits.
+        assert_eq!(
+            device.read8(regs::CFG2),
+            regs::CFG2_ASPM_LOCK | regs::CFG2_RTL8125_BIT5
+        );
+        assert_eq!(
+            device.read8(regs::CFG5),
+            regs::CFG5_ASPM_LOCK | regs::CFG5_WOL_MASK
+        );
+        assert_eq!(
+            device.read8(regs::CLOCK_REQUEST_F1),
+            regs::CLOCK_REQUEST_FORCE | (1 << 4)
+        );
     }
 
     #[test]
