@@ -23,6 +23,11 @@
 //! belongs to the scheme's future until the job is settled, so a future dropped early waits
 //! for the worker first.
 //!
+//! Under [`QueuePolicy::Workers`] the disk scheme serves reads and writes concurrently and
+//! hands each one over whole, as a [`PendingIo`], through [`Dispatcher::submit`]. The worker
+//! then runs it and writes the scheme's response itself, so the reply does not go back
+//! through the main thread (no pipe report, no main-thread wake-up).
+//!
 //! A worker holds each job through a [`Claim`], which settles the job's [`JobSlot`] once:
 //! done, or abandoned if the worker drops the job unfinished. When a worker thread ends
 //! (returns or unwinds), its [`WorkerEnd`] marks it dead, drops the jobs still queued for it
@@ -43,6 +48,7 @@ use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use driver_block::{PendingIo, Transfer};
 use ferric_blkqueue::ids::{self, IdStream, WORKER_GONE};
 use ferric_blkqueue::slot::{Claim, JobSlot, Outcome};
 use ferric_blkqueue::{QueuePolicy, Route};
@@ -91,7 +97,7 @@ unsafe impl Send for Job {}
 
 /// The main thread's handle on one worker.
 struct Worker {
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::Sender<Work>,
     /// The write end of the pipe the worker's executor waits on.
     wake: File,
     cpu: CpuId,
@@ -232,7 +238,7 @@ impl Dispatcher {
             op,
             claim,
         };
-        if worker.jobs.send(job).is_err() {
+        if worker.jobs.send(Work::Job(job)).is_err() {
             log::error!("nvmed: the worker on CPU {} is gone", worker.cpu.get());
             worker.alive.store(false, Ordering::Release);
             // The job came back undelivered and is dropped: nothing touches the buffer.
@@ -257,6 +263,43 @@ impl Dispatcher {
         .await;
         self.started.borrow_mut().remove(&id);
         result
+    }
+
+    /// Hands `io` to the next live worker, which runs it on its queue pair and writes the
+    /// scheme's response itself.
+    ///
+    /// # Errors
+    ///
+    /// Gives `io` back, untouched, when every worker has ended; the scheme then serves it on
+    /// its own thread.
+    pub fn submit(&self, namespace: NvmeNamespace, io: PendingIo) -> Result<(), PendingIo> {
+        let mut work = Work::Answer { namespace, io };
+        while let Some(index) = self.next_live_worker() {
+            let worker = &self.workers[index];
+            match worker.jobs.send(work) {
+                Ok(()) => {
+                    if let Err(err) = (&worker.wake).write_all(&[1]) {
+                        // Queued all the same: the next wake-up finds it, and the worker's
+                        // end answers it if none comes.
+                        log::error!(
+                            "nvmed: cannot wake the worker on CPU {}: {err}",
+                            worker.cpu.get()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::SendError(back)) => {
+                    log::error!("nvmed: the worker on CPU {} is gone", worker.cpu.get());
+                    worker.alive.store(false, Ordering::Release);
+                    work = back;
+                }
+            }
+        }
+        match work {
+            Work::Answer { io, .. } => Err(io),
+            // Only answers are sent from here.
+            Work::Job(_) => Ok(()),
+        }
     }
 
     /// Wakes the futures of the jobs the workers settled, and returns how many it woke.
@@ -487,8 +530,14 @@ async fn watch_worker(
             } else {
                 "is empty"
             };
+            // A request the worker answers itself has no job id (see `Work::Answer`).
+            let what = if id == WORKER_GONE {
+                "a direct request".to_owned()
+            } else {
+                format!("job {id}")
+            };
             log::warn!(
-                "nvmed: watchdog: queue pair {qid} job {id} has waited {} ms; its completion queue {entry}",
+                "nvmed: watchdog: queue pair {qid} {what} has waited {} ms; its completion queue {entry}",
                 waited.as_millis()
             );
         }
@@ -711,7 +760,7 @@ fn spawn_worker(
 /// What a worker finds in its queue.
 enum Next {
     /// A job to run.
-    Job(Job),
+    Job(Work),
     /// Nothing queued: wait for a wake-up.
     Idle,
     /// The dispatcher is gone: end the thread.
@@ -725,7 +774,7 @@ enum Next {
 struct WorkerEnd {
     qid: u16,
     /// `Some` until the drop.
-    jobs: Option<mpsc::Receiver<Job>>,
+    jobs: Option<mpsc::Receiver<Work>>,
     done_tx: File,
     alive: Arc<AtomicBool>,
 }
@@ -804,12 +853,17 @@ fn serve(
             while matches!((&wake_rx).read(&mut bytes), Ok(n) if n > 0) {}
             loop {
                 match end.next_job() {
-                    Next::Job(job) => {
+                    Next::Job(Work::Job(job)) => {
                         let id = job.id;
                         in_flight.set(Some((id, Instant::now())));
                         run(&nvme, job).await;
                         in_flight.set(None);
                         end.report(id);
+                    }
+                    Next::Job(Work::Answer { namespace, io }) => {
+                        in_flight.set(Some((WORKER_GONE, Instant::now())));
+                        answer(&nvme, namespace, io).await;
+                        in_flight.set(None);
                     }
                     Next::Idle => break,
                     Next::Closed => return,
@@ -818,6 +872,27 @@ fn serve(
             let _ = wake.as_mut().next().await;
         }
     });
+}
+
+/// What a worker is sent.
+enum Work {
+    /// A job whose result goes back to the main thread's future.
+    Job(Job),
+    /// A scheme request the worker answers itself.
+    Answer {
+        namespace: NvmeNamespace,
+        io: PendingIo,
+    },
+}
+
+/// Runs `io` on this thread's queue pair and writes the scheme's response.
+async fn answer(nvme: &Nvme, namespace: NvmeNamespace, mut io: PendingIo) {
+    let lba = io.block();
+    let result = match io.transfer() {
+        Transfer::Read(buf) => nvme.namespace_read(&namespace, lba, buf).await,
+        Transfer::Write(buf) => nvme.namespace_write(&namespace, lba, buf).await,
+    };
+    io.finish(result);
 }
 
 /// Runs one job on this thread's queue pair and stores its result.

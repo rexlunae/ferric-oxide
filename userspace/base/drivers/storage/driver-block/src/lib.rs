@@ -132,6 +132,18 @@ pub trait Disk {
     fn concurrent(&self) -> bool {
         false
     }
+
+    /// Ferric Oxide: takes a concurrent read or write (see [`Disk::concurrent`]) to serve off
+    /// the scheme's thread; the disk answers it with [`PendingIo::finish`]. The default gives
+    /// it back, and the scheme runs it as a task on its own thread through
+    /// [`read`](Self::read) or [`write`](Self::write).
+    ///
+    /// # Errors
+    ///
+    /// Gives `io` back when the disk does not take it.
+    fn submit(&mut self, io: PendingIo) -> Result<(), PendingIo> {
+        Err(io)
+    }
 }
 
 impl<T: Disk + ?Sized> Disk for Box<T> {
@@ -157,6 +169,10 @@ impl<T: Disk + ?Sized> Disk for Box<T> {
 
     fn concurrent(&self) -> bool {
         (**self).concurrent()
+    }
+
+    fn submit(&mut self, io: PendingIo) -> Result<(), PendingIo> {
+        (**self).submit(io)
     }
 }
 

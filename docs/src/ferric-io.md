@@ -274,8 +274,14 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   writes as concurrent tasks when the disk says its clones may run at once
   (`Disk::concurrent`). nvmed says so
   only with per-CPU workers under the `Workers` policy
-  (`QueuePolicy::serves_concurrently`). Each request is checked and located at once, and then
-  runs on a clone of the disk, which writes the response itself. Every other
+  (`QueuePolicy::serves_concurrently`). Each request is checked and located
+  at once, and becomes a `driver_block::PendingIo`: the request together with
+  what it needs to answer itself, from any thread. The disk can take it with
+  `Disk::submit`. nvmed hands it to a worker (#134), which runs it on its own queue
+  pair and writes the scheme's response itself, so the reply skips the main
+  thread (no completion pipe, no main-thread wake-up). Otherwise it runs as a
+  task on the scheme's thread, on a clone of the disk. A `PendingIo` dropped
+  unanswered (a worker that ends) answers `EIO`. Every other
   call, and every call on other disks, is still served one at a time, as
   upstream. A descriptor closed while its requests run stays open until the
   last one ends (`driver_block::SharedGate`, over
@@ -289,7 +295,7 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   async lock.
 - On QEMU, spilling overlapping requests to per-CPU workers cannot beat one
   queue. The emulated controller serves all its queues from one thread, and
-  each hand-off costs two cross-CPU wake-ups. With `Adaptive` served
+  each hand-off costs cross-CPU wake-ups. With `Adaptive` served
   concurrently, two-thread reads reached 0.78 of the single queue and
   four-thread reads 0.67. So `Adaptive` and `MainQueue` are served one call at
   a time, as before, and the benchmark's `workers_iops` rows (true overlap)

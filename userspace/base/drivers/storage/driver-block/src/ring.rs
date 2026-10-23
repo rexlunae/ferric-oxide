@@ -34,9 +34,9 @@ use zerocopy::TryFromBytes;
 
 use super::Disk;
 
-// Ferric Oxide: reads and writes served as concurrent tasks.
+// Ferric Oxide: reads and writes served concurrently.
 mod concurrent;
-pub use concurrent::{CloseReady, SharedGate};
+pub use concurrent::{CloseReady, PendingIo, SharedGate, Transfer};
 
 use crate::{EventSource, PhysAddr};
 
@@ -306,7 +306,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
         executor: Rc<LocalExecutor<Hw>>,
     ) -> Self {
         assert!(scheme_name.starts_with("disk"));
-        let socket = Rc::new(Socket::nonblock().expect("failed to create disk scheme"));
+        let socket = std::sync::Arc::new(Socket::nonblock().expect("failed to create disk scheme"));
         let shm_dir_name = format!("/scheme/shm/{scheme_name}");
 
         let mut inner = RingDiskSchemeInner {
@@ -439,7 +439,7 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> RingDiskScheme<T, Hw> {
 
 struct RingDiskSchemeInner<T: Disk, Hw: Hardware> {
     scheme_name: String,
-    socket: Rc<Socket>,
+    socket: std::sync::Arc<Socket>,
     /// Ferric Oxide: in-flight concurrent requests per descriptor, and the closes they hold.
     gate: concurrent::SharedGate,
     disks: BTreeMap<u32, RingDiskWrapper<T>>,
