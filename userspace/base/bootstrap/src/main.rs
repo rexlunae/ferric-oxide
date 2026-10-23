@@ -162,6 +162,9 @@ impl KernelSchemeMap {
             } else if info.scheme_id == ferric_ring::abi::SCHEME_ID {
                 // Ferric Oxide: the kernel's ring scheme (kernel.rings = true).
                 ferric.push((ferric_ring::abi::SCHEME_NAME, FdGuard::new(info.fd)));
+            } else if info.scheme_id == ferric_pcache::abi::SCHEME_ID {
+                // Ferric Oxide: the kernel's page cache scheme (kernel.page_cache = true).
+                ferric.push((ferric_pcache::abi::SCHEME_NAME, FdGuard::new(info.fd)));
             }
         }
         Self(map, ferric)

@@ -1386,6 +1386,10 @@ version = "0.1.0"
 [[package]]
 name = "ferric-pcache"
 version = "0.1.0"
+dependencies = [
+ "libredox",
+ "redox_syscall 0.9.4",
+]
 
 [[package]]
 name = "ferric-procinfo"
@@ -1403,6 +1407,13 @@ name = "ferric-ring"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "ferric-svm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -1439,6 +1450,20 @@ version = "0.1.0"
 dependencies = [
  "ferric-trace",
  "redox_syscall 0.9.4",
+]
+
+[[package]]
+name = "ferric-vm"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ferric-vmx"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.17",
 ]
 
 [[package]]

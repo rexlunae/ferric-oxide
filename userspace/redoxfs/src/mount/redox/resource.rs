@@ -9,8 +9,8 @@ use syscall::data::{Stat, TimeSpec};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{Error, Result, EBADF, EINVAL, EISDIR, ENOTDIR, EPERM};
 use syscall::flag::{
-    MapFlags, F_GETFL, F_SETFL, MODE_PERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_WRONLY,
-    PROT_READ, PROT_WRITE,
+    MapFlags, F_GETFL, F_SETFL, MAP_SHARED, MODE_PERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR,
+    O_WRONLY, PROT_READ, PROT_WRITE,
 };
 use syscall::{EBADFD, ENOENT, PAGE_SIZE};
 
@@ -54,11 +54,14 @@ pub trait Resource<D: Disk> {
         tx: &mut Transaction<D>,
     ) -> Result<usize>;
 
+    /// Ferric Oxide: `writes_back` says the mapping going away was shared and writable
+    /// (the kernel's `MunmapFlags::NEEDS_SYNC`).
     fn funmap(
         &mut self,
         fmaps: &mut Fmaps,
         offset: u64,
         size: usize,
+        writes_back: bool,
         tx: &mut Transaction<D>,
     ) -> Result<()>;
 
@@ -249,6 +252,7 @@ impl<D: Disk> Resource<D> for DirResource {
         _fmaps: &mut Fmaps,
         _offset: u64,
         _size: usize,
+        _writes_back: bool,
         _tx: &mut Transaction<D>,
     ) -> Result<()> {
         Err(Error::new(EBADF))
@@ -350,6 +354,16 @@ pub struct Fmap {
     flags: MapFlags,
     last_page_tail: u16,
     version: u64,
+    /// Ferric Oxide: how many of the `rc` mappings are shared and writable. Only those can
+    /// change the buffer (the kernel maps private ones copy-on-write), so only while there
+    /// are any is the range written back to the file, and the page cache leaves it alone.
+    writable: usize,
+}
+
+/// Ferric Oxide: whether a mapping with `flags` writes into RedoxFS's buffer. A private
+/// mapping does not: the kernel copies a page on its first store.
+fn writes_back(flags: MapFlags) -> bool {
+    flags.contains(PROT_WRITE) && flags.contains(MAP_SHARED)
 }
 
 impl Fmap {
@@ -389,6 +403,7 @@ impl Fmap {
             flags,
             last_page_tail: (unaligned_size % PAGE_SIZE) as u16,
             version: 0,
+            writable: usize::from(writes_back(flags)),
         })
     }
 
@@ -400,7 +415,9 @@ impl Fmap {
         size: usize,
         tx: &mut Transaction<D>,
     ) -> Result<()> {
-        if self.flags & PROT_WRITE == PROT_WRITE {
+        // Ferric Oxide: only shared writable mappings change the buffer; writing it back for
+        // a private one could only put back bytes older than later writes.
+        if self.writable > 0 {
             let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             tx.write_node(
                 node_ptr,
@@ -483,6 +500,13 @@ impl FileMmapInfo {
 
     pub fn in_use(&self) -> bool {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
+    }
+
+    /// Ferric Oxide: the references to mapped ranges that `Fmap::sync` writes back to the
+    /// file, those of shared writable mappings; the page cache leaves the file alone while
+    /// there are any.
+    pub fn writable_mappings(&self) -> usize {
+        self.ranges.iter().map(|(_, fmap)| fmap.writable).sum()
     }
 
     pub fn stale(&self) -> bool {
@@ -714,6 +738,7 @@ impl<D: Disk> Resource<D> for FileResource {
             let v_opt = v_opt.filter(|fmap| fmap.rc > 0 || fmap.version == fmap_info.version);
             if let Some(mut fmap) = v_opt {
                 fmap.rc += 1;
+                fmap.writable += usize::from(writes_back(flags));
                 fmap.flags |= flags;
                 fmap.version = fmap_info.version;
                 //FIXME: Use result?
@@ -748,6 +773,7 @@ impl<D: Disk> Resource<D> for FileResource {
         fmaps: &mut Fmaps,
         offset: u64,
         size: usize,
+        writes_back: bool,
         tx: &mut Transaction<D>,
     ) -> Result<()> {
         let fmap_info = fmaps
@@ -791,6 +817,11 @@ impl<D: Disk> Resource<D> for FileResource {
                     (range.end - range.start) as usize,
                     tx,
                 )?;
+            }
+            // Ferric Oxide: after the sync, which writes back the stores of the mapping
+            // going away.
+            if writes_back {
+                fmap.writable = fmap.writable.saturating_sub(1);
             }
 
             //FIXME: Use result?
@@ -967,6 +998,7 @@ impl range_tree::Value for Fmap {
                 flags: self.flags,
                 last_page_tail: 0,
                 version: self.version,
+                writable: self.writable,
             }),
             Fmap {
                 rc: self.rc,
@@ -977,12 +1009,14 @@ impl range_tree::Value for Fmap {
                     0
                 },
                 version: self.version,
+                writable: self.writable,
             },
             next_range.map(|_range| Fmap {
                 rc: self.rc,
                 flags: self.flags,
                 last_page_tail: self.last_page_tail,
                 version: self.version,
+                writable: self.writable,
             }),
         )
     }

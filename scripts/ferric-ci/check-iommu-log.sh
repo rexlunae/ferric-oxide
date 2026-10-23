@@ -134,6 +134,7 @@ case "$mode" in
         fi
         # Nothing faults, so there is nothing for iommu.fault to record.
         need "FERRIC_TEST_SKIP iommu-trace"
+        need "FERRIC_TEST_SKIP iommu-mapping-trace"
         if grep -aF "FERRIC_TEST_FAIL iommu-trace" <<< "$clean"; then
             fail "iommu-trace failed without an IOMMU"
         fi
@@ -180,6 +181,7 @@ need "IOMMU: domain self-test passed \(attach/map/unmap/detach\)"
 # Every CI image has kernel.trace (and so kernel.trace_iommu): the kernel's iommu.fault
 # records must cover every fault ferric-iommu-test announced.
 need "FERRIC_TEST_PASS iommu-trace: [0-9]+ announced fault\(s\) have iommu.fault records"
+need "FERRIC_TEST_PASS iommu-mapping-trace: exact domain/range/permissions"
 
 if [ "$vendor" = amdvi ]; then
     # QEMU's amd-iommu has IASup and an MSI capability, so the unit invalidates with

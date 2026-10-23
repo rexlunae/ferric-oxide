@@ -93,7 +93,9 @@ fi
 # Work on a copy so the artifact stays pristine.
 disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
-trap 'rm -f "$disk"' EXIT
+# A QEMU monitor of its own, so a run that times out can dump where each CPU is.
+monitor="$(mktemp -u --suffix=.mon)"
+trap 'rm -f "$disk" "$monitor"' EXIT
 
 # Run QEMU in the background and watch the log, so a crash or the shutdown
 # ends the run at once instead of waiting for the timeout.
@@ -106,7 +108,8 @@ qemu-system-x86_64 \
     -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
     -nographic -vga none "${reboot[@]}" \
-    -serial mon:stdio < /dev/null > "$log" 2>&1 &
+    -monitor unix:"$monitor",server,nowait \
+    -serial stdio < /dev/null > "$log" 2>&1 &
 qemu_pid=$!
 tail -n +1 -f "$log" --pid="$qemu_pid" &
 tail_pid=$!
@@ -127,9 +130,104 @@ for ((i = 0; i < timeout_secs; i++)); do
     sleep 1
 done
 if [ -z "$status" ]; then
+    # Where every CPU is when the run times out: a guest stuck in the kernel shows kernel
+    # addresses (and IF clear when it spins with interrupts off).
+    echo "boot-smoke: CPU state at the timeout" >&2
+    # Before anything disturbs the guest: every CPU's registers, sampled a few times, and for
+    # each CPU spinning in the kernel (CPL 0, not halted) its frame-pointer chain, read through
+    # the monitor. Only then an NMI, whose dump on the serial log gives the kernel image's
+    # KASLR slide (its RIP against the link address it prints), so the raw addresses can be
+    # named below.
+    probe_log="$(mktemp)"
+    python3 - "$monitor" <<'PY' | tee "$probe_log" >&2 || true
+import re, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.settimeout(2)
+
+def cmd(line):
+    s.sendall(line.encode() + b"\n")
+    out = b""
+    deadline = time.time() + 5
+    while not out.endswith(b"(qemu) ") and time.time() < deadline:
+        try:
+            chunk = s.recv(65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace"))
+
+cmd("")
+def cpus(text):
+    found = {}
+    for block in re.split(r"(?m)^CPU#", text)[1:]:
+        n = int(block.split("\n", 1)[0])
+        regs = dict(re.findall(r"([A-Z0-9]+)=([0-9a-f]+)", block))
+        found[n] = regs
+    return found
+
+last = {}
+for sample in range(5):
+    last = cpus(cmd("info registers -a"))
+    for n, r in sorted(last.items()):
+        print(f"boot-smoke-cpu: sample {sample} cpu {n} rip=0x{r.get('RIP', '0')} "
+              f"rbp=0x{r.get('RBP', '0')} rfl={r.get('RFL', '?')} cpl={r.get('CPL', '?')} "
+              f"hlt={r.get('HLT', '?')}")
+    time.sleep(0.2)
+for n, r in sorted(last.items()):
+    if r.get("CPL") != "0" or r.get("HLT") != "0":
+        continue
+    cmd(f"cpu {n}")
+    rbp = int(r.get("RBP", "0"), 16)
+    for depth in range(24):
+        if rbp < 0xffff800000000000 or rbp % 8:
+            break
+        m = re.search(r":\s*0x([0-9a-f]+)\s+0x([0-9a-f]+)", cmd(f"x /2gx {rbp:#x}"))
+        if not m:
+            break
+        rbp, ret = int(m.group(1), 16), int(m.group(2), 16)
+        print(f"boot-smoke-cpu: cpu {n} frame {depth} ret=0x{ret:x}")
+cmd("cpu 0")
+cmd("nmi")
+time.sleep(3)
+PY
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
     status=124
+    # KERNEL_ELF (the image's kernel, with its symbol table) names the functions: the NMI's
+    # own link addresses, and the sampled addresses less the slide the first NMI dump shows.
+    if [ -n "${KERNEL_ELF:-}" ] && [ -f "$KERNEL_ELF" ]; then
+        tr -d '\r' < "$log" | python3 -c '
+import bisect, re, subprocess, sys
+syms = []
+for line in subprocess.run(["nm", "-n", "-C", "--defined-only", sys.argv[1]],
+                           capture_output=True, text=True).stdout.splitlines():
+    parts = line.split(" ", 2)
+    if len(parts) == 3 and parts[1] in "tTwW":
+        syms.append((int(parts[0], 16), parts[2]))
+keys = [a for a, _ in syms]
+def name(a):
+    i = bisect.bisect_right(keys, a) - 1
+    return f"{syms[i][1]}+{a - syms[i][0]:#x}" if i >= 0 else "?"
+log = sys.stdin.read()
+slide = None
+m = re.search(r"NMI: interrupted at 0x([0-9a-f]+)\s+RFLAG:[^\n]*\n(?:[^\n]*\n)*?RIP:\s+([0-9a-f]+)", log)
+if m:
+    slide = int(m.group(2), 16) - int(m.group(1), 16)
+    print(f"boot-smoke-cpu: kernel image slide {slide:#x}")
+for link in re.findall(r"NMI: interrupted at 0x([0-9a-f]+)", log):
+    print(f"boot-smoke-cpu: NMI at 0x{link} is in {name(int(link, 16))}")
+if slide is not None:
+    with open(sys.argv[2]) as probe:
+        for line in probe:
+            m = re.search(r"(sample \d+ cpu \d+ rip|cpu \d+ frame \d+ ret)=0x([0-9a-f]+)", line)
+            if m and int(m.group(2), 16) >= 0xffffffff80000000:
+                a = int(m.group(2), 16) - slide
+                print(f"boot-smoke-cpu: {m.group(1)} {a:#x} is in {name(a)}")
+' "$KERNEL_ELF" "$probe_log" >&2 || true
+    fi
 fi
 kill "$tail_pid" 2>/dev/null || true
 

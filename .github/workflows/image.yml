@@ -102,7 +102,8 @@ jobs:
           # Registered buffers, kernel tracing and rings are off by default; turn them on so
           # ferric-regbuf-test, ferric-trace-test (with sched.switch on from boot, and
           # scheme.cancel on from the initfs trace.toml bootstrap applies) and
-          # ferric-ring-test run, and nvmed's grant DMA (also off by default) so
+          # ferric-ring-test run, the page cache (off by default) so ferric-pcache-test
+          # does, and nvmed's grant DMA (also off by default) so
           # ferric-blkgrant-test does. Per-CPU interrupt delivery (off by default) is on so
           # ferric-iommu-test's iommu-msi-percpu runs, and nvmed's per-CPU queue pairs
           # (also off by default) are on so the boot disk runs through them. The crash dump
@@ -111,7 +112,7 @@ jobs:
           # log the panicking boot left. /scheme/sys/proc (off by default) is on so
           # ferric-proc-test runs, and kernel-bypass network queues (off by default) are built
           # into e1000d, so the boot's network checks run with copy mode compiled in.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\n' > "$out/ferric.toml"
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc and initfs features,
@@ -145,12 +146,20 @@ jobs:
           fi
 
       - name: Compress image
-        run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+        run: |
+          zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
+          # The image's kernel with its symbol table, so a boot that times out can name the
+          # functions its CPUs are stuck in (boot-smoke.sh, KERNEL_ELF).
+          kernel="$(ls recipes/core/kernel/target/*/stage/usr/lib/boot/kernel 2>/dev/null | head -n 1)"
+          if [ -n "$kernel" ]; then zstd -q -T0 "$kernel" -o kernel.elf.zst; fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ferric-smoke-image
-          path: harddrive.img.zst
+          path: |
+            harddrive.img.zst
+            kernel.elf.zst
+          if-no-files-found: warn
           retention-days: 7
 
       # The same image with a kernel built with kernel.iommu = "enforce": only the kernel is
@@ -309,6 +318,10 @@ jobs:
           BOOT_NIC: ${{ matrix.nic }}
         run: |
           zstd -d harddrive.img.zst -o harddrive.img
+          if [ -f kernel.elf.zst ]; then
+            zstd -q -d kernel.elf.zst -o kernel.elf
+            export KERNEL_ELF="$PWD/kernel.elf"
+          fi
           if [ "$BOOT_IOMMU" = amdvi ]; then
             # Ubuntu 24.04's QEMU 8.2 does not translate DMA through amd-iommu (dma-remap
             # came in QEMU 10), so the AMD-Vi boots run Ubuntu 26.04's QEMU in a container,
@@ -411,7 +424,7 @@ jobs:
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
           # Bootstrap applied the initfs trace.toml; the kernel logs the command.
           grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
-          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault futex lifecycle irq filter clock cap; do
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault mapping futex lifecycle irq filter clock cap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
           # The page fault and interrupt steps' details: record counts, and the interrupt
@@ -420,7 +433,7 @@ jobs:
             echo "::notice::$line"
           done
           # trace-irq comes from ferric-iommu-test, which acknowledges an interrupt itself.
-          echo "::notice::ferric-trace-test passed all 18 steps, ferric-iommu-test trace-irq"
+          echo "::notice::ferric-trace-test passed all 19 steps, ferric-iommu-test trace-irq"
           # The kernel logged the argument filter trace-filter set (T3c).
           grep -aF "trace: filter syscall.enter nr == " "$LOG"
           # The kernel logged the timestamp clock it picked (T3d); trace-clock checked its
@@ -459,6 +472,17 @@ jobs:
           done
           echo "::notice::ferric-ring-test passed all 19 steps"
 
+      # The image has kernel.page_cache on, so ferric-pcache-test must run every step, not
+      # skip, including the ones on RedoxFS, which then serves read-only files from the cache.
+      - name: Check the page cache
+        run: |
+          for step in miss hit readahead eio bad-answer restore owner exec invalidate generation close redoxfs redoxfs-mmap redoxfs-bench; do
+            grep -aF "FERRIC_TEST_PASS pcache-$step" "$LOG"
+          done
+          grep -aF "FERRIC_BENCH pcache" "$LOG" | tr -d '\r' | while read -r line; do
+            echo "::notice::$line"
+          done
+          echo "::notice::ferric-pcache-test passed all 14 steps"
       # The image has drivers.net_bypass and kernel.regbuf on, so ferric-netq-test must run
       # every step, not skip: a queue socket on e1000d (or virtio-netd) in copy mode, beside
       # netstack.
@@ -508,7 +532,7 @@ jobs:
         run: |
           # Test results and IOMMU, pcid and interrupt lines first, then the tail.
           tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$RUNNER_TEMP/clean.log" || true
-          { grep -aE 'FERRIC_TEST_(FAIL|SKIP)|FERRIC_IOMMU|IOMMU|pcid|iommu|interrupt|panic|PANIC|EXCEPTION' "$RUNNER_TEMP/clean.log" \
+          { grep -aE 'FERRIC_TEST_(FAIL|SKIP)|FERRIC_IOMMU|IOMMU|pcid|iommu|interrupt|panic|PANIC|EXCEPTION|pcache|Page fault' "$RUNNER_TEMP/clean.log" \
               | grep -av 'funmap passed' | tail -n 120
             grep -av 'funmap passed' "$RUNNER_TEMP/clean.log" | tail -n 40; } > "$RUNNER_TEMP/tail.log" || true
           split -l 40 "$RUNNER_TEMP/tail.log" "$RUNNER_TEMP/tail."

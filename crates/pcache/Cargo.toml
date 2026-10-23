@@ -7,7 +7,14 @@ description = "The kernel page cache's interface and policies: cache objects, fi
 
 [dependencies]
 
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = { version = "0.1.20", optional = true }
+redox_syscall = { version = "0.9", optional = true, default-features = false }
+
 [features]
 default = []
 ## The reclaim lists and the reverse map (`clock`, `rmap`), which need a heap.
 alloc = []
+## The file system's side on Redox (`client`): the queue, objects and the fill pump. Needs
+## `std`; on other targets it adds nothing.
+client = ["alloc", "dep:libredox", "dep:redox_syscall"]

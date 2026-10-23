@@ -1,3 +1,9 @@
+//! User address spaces, virtual grants and their page-table/ownership lifetimes.
+//!
+//! Optional `trace_mm` records map, protection and unmap API results while holding the
+//! target space's write lock. They describe requests and results, including partial errors,
+//! rather than a complete journal of every grant mutation.
+
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -260,6 +266,13 @@ impl AddrSpaceWrapper {
         new.inner.get_mut().images.clone_from(&guard.images);
         Ok(new_arc)
     }
+    /// Changes permissions on the grants overlapping `requested_span`.
+    ///
+    /// Earlier grants can have changed when a later grant refuses the request. Optional
+    /// `mm.protect` tracing records that result before releasing the address-space lock.
+    ///
+    /// # Errors
+    /// Returns `EBUSY` for a pinned grant or `EACCES` for permissions a grant cannot have.
     pub fn mprotect(
         &self,
         requested_span: PageSpan,
@@ -270,76 +283,93 @@ impl AddrSpaceWrapper {
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
-        // Ferric Oxide: a device loses write access along with the process, before the call
-        // returns and while the address space is locked (scheme/iommu.rs). Done first, so it
-        // also holds when a later grant fails.
-        #[cfg(iommu_enabled)]
-        if !flags.contains(MapFlags::PROT_WRITE) {
-            crate::scheme::iommu::narrow(self, requested_span);
-        }
+        let result = (|| {
+            // Ferric Oxide: a device loses write access along with the process, before the call
+            // returns and while the address space is locked (scheme/iommu.rs). Done first, so it
+            // also holds when a later grant fails.
+            #[cfg(iommu_enabled)]
+            if !flags.contains(MapFlags::PROT_WRITE) {
+                crate::scheme::iommu::narrow(self, requested_span);
+            }
 
-        let mapper = &mut guard.table.utable;
-        let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+            let mapper = &mut guard.table.utable;
+            let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
 
-        // TODO: Remove allocation (might require BTreeMap::set_key or interior mutability).
-        let regions = guard
-            .grants
-            .conflicts(requested_span)
-            .map(|(base, info)| {
-                if info.is_pinned() {
-                    Err(Error::new(EBUSY))
-                } else {
-                    Ok(PageSpan::new(base, info.page_count))
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for grant_span_res in regions {
-            let grant_span = grant_span_res?;
-
-            let grant = guard
+            // TODO: Remove allocation (might require BTreeMap::set_key or interior mutability).
+            let regions = guard
                 .grants
-                .remove_containing(grant_span.base)
-                .expect("grant cannot magically disappear while we hold the lock!");
-            //info!("Mprotecting {:#?} to {:#?} in {:#?}", grant, flags, grant_span);
-            let intersection = grant_span.intersection(requested_span);
+                .conflicts(requested_span)
+                .map(|(base, info)| {
+                    if info.is_pinned() {
+                        Err(Error::new(EBUSY))
+                    } else {
+                        Ok(PageSpan::new(base, info.page_count))
+                    }
+                })
+                .collect::<Vec<_>>();
 
-            let (before, mut grant, after) = grant
-                .extract(intersection)
-                .expect("failed to extract grant");
-            //info!("Sliced into\n\n{:#?}\n\n{:#?}\n\n{:#?}", before, grant, after);
+            for grant_span_res in regions {
+                let grant_span = grant_span_res?;
 
-            if let Some(before) = before {
-                guard.grants.insert(before);
-            }
-            // FIXME: andypython: should this be done at the end?
-            if let Some(after) = after {
-                guard.grants.insert(after);
-            }
+                let grant = guard
+                    .grants
+                    .remove_containing(grant_span.base)
+                    .expect("grant cannot magically disappear while we hold the lock!");
+                //info!("Mprotecting {:#?} to {:#?} in {:#?}", grant, flags, grant_span);
+                let intersection = grant_span.intersection(requested_span);
 
-            if !grant.info.can_have_flags(flags) {
+                let (before, mut grant, after) = grant
+                    .extract(intersection)
+                    .expect("failed to extract grant");
+                //info!("Sliced into\n\n{:#?}\n\n{:#?}\n\n{:#?}", before, grant, after);
+
+                if let Some(before) = before {
+                    guard.grants.insert(before);
+                }
+                // FIXME: andypython: should this be done at the end?
+                if let Some(after) = after {
+                    guard.grants.insert(after);
+                }
+
+                if !grant.info.can_have_flags(flags) {
+                    guard.grants.insert(grant);
+                    return Err(Error::new(EACCES));
+                }
+
+                let new_flags = grant
+                    .info
+                    .flags()
+                    // TODO: Require a capability in order to map executable memory?
+                    .user(user_accessible(flags))
+                    .execute(flags.contains(MapFlags::PROT_EXEC))
+                    .write(flags.contains(MapFlags::PROT_WRITE));
+
+                // TODO: Allow enabling/disabling read access on architectures which allow it. On
+                // x86_64 with protection keys (although only enforced by userspace), and AArch64 (I
+                // think), execute-only memory is also supported.
+
+                grant.remap(mapper, &mut flusher, new_flags);
+                //info!("Mprotect grant became {:#?}", grant);
                 guard.grants.insert(grant);
-                return Err(Error::new(EACCES));
             }
-
-            let new_flags = grant
-                .info
-                .flags()
-                // TODO: Require a capability in order to map executable memory?
-                .user(user_accessible(flags))
-                .execute(flags.contains(MapFlags::PROT_EXEC))
-                .write(flags.contains(MapFlags::PROT_WRITE));
-
-            // TODO: Allow enabling/disabling read access on architectures which allow it. On
-            // x86_64 with protection keys (although only enforced by userspace), and AArch64 (I
-            // think), execute-only memory is also supported.
-
-            grant.remap(mapper, &mut flusher, new_flags);
-            //info!("Mprotect grant became {:#?}", grant);
-            guard.grants.insert(grant);
-        }
-        Ok(())
+            Ok(())
+        })();
+        trace_event!(
+            ferric_trace::kernel::MM_PROTECT,
+            guard.table.utable.table().phys().data(),
+            requested_span.base.start_address().data(),
+            requested_span.count,
+            flags.bits(),
+            Error::mux(result.map(|_| 0)),
+        );
+        result
     }
+    /// Unmaps overlapping grants and returns deferred scheme notifications; holes are allowed.
+    /// Optional `mm.unmap` tracing precedes those notifications and the lock release.
+    ///
+    /// # Errors
+    /// Returns `EBUSY` for a pinned grant unless `unpin`, or `EINVAL` when a grant cannot
+    /// be extracted. Earlier grants may already have been unmapped on failure.
     #[must_use = "needs to notify files"]
     pub fn munmap(
         &self,
@@ -361,6 +391,15 @@ impl AddrSpaceWrapper {
         // Ferric Oxide: take down DMA mappings of the unmapped memory (scheme/iommu.rs).
         #[cfg(iommu_enabled)]
         crate::scheme::iommu::release(self, requested_span);
+        drop(flusher);
+        trace_event!(
+            ferric_trace::kernel::MM_UNMAP,
+            guard.table.utable.table().phys().data(),
+            requested_span.base.start_address().data(),
+            requested_span.count,
+            unpin,
+            Error::mux(result.as_ref().map(|_| 0).map_err(|err| *err)),
+        );
         result
     }
     /// Ferric Oxide: replaces `span` with zeroed private anonymous memory mapped with `flags`,
@@ -834,6 +873,16 @@ impl AddrSpace {
     ) -> Result<Page> {
         self.mmap(dst_lock, None, page_count, flags, None, map)
     }
+    /// Selects a span, builds its grant with `map`, and inserts it into this address space.
+    /// Optional `mm.map` tracing records the request and result under the write lock.
+    ///
+    /// # Errors
+    /// Returns `EEXIST` for a conflicting `MAP_FIXED_NOREPLACE`, `ENOMEM` when no free
+    /// span is found, or an error from unmapping/rebuilding a fixed span or from `map`.
+    /// Fixed replacement may already have removed old grants when `map` fails.
+    ///
+    /// # Panics
+    /// Panics if `dst_lock` is not the wrapper owning this address space.
     pub fn mmap(
         &mut self,
         dst_lock: &AddrSpaceWrapper,
@@ -845,60 +894,71 @@ impl AddrSpace {
     ) -> Result<Page> {
         assert_eq!(dst_lock.inner.as_mut_ptr(), self as *mut Self);
 
-        let selected_span = match requested_base_opt {
-            // TODO: Rename MAP_FIXED+MAP_FIXED_NOREPLACE to MAP_FIXED and
-            // MAP_FIXED_REPLACE/MAP_REPLACE?
-            Some(requested_base) => {
-                let requested_span = PageSpan::new(requested_base, page_count.get());
+        let result = (|| {
+            let selected_span = match requested_base_opt {
+                // TODO: Rename MAP_FIXED+MAP_FIXED_NOREPLACE to MAP_FIXED and
+                // MAP_FIXED_REPLACE/MAP_REPLACE?
+                Some(requested_base) => {
+                    let requested_span = PageSpan::new(requested_base, page_count.get());
 
-                if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-                    if self.grants.conflicts(requested_span).next().is_some() {
-                        return Err(Error::new(EEXIST));
-                    }
-                    requested_span
-                } else if flags.contains(MapFlags::MAP_FIXED) {
-                    let unpin = false;
-                    let mut notify_files = Self::munmap_inner(
-                        &mut self.grants,
-                        &mut self.table.utable,
-                        &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
-                        requested_span,
-                        unpin,
-                    )?;
-                    // Ferric Oxide: see `AddrSpaceWrapper::munmap`.
-                    #[cfg(iommu_enabled)]
-                    crate::scheme::iommu::release(dst_lock, requested_span);
-                    if let Some(notify_files_out) = notify_files_out {
-                        notify_files_out.append(&mut notify_files);
-                    }
+                    if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+                        if self.grants.conflicts(requested_span).next().is_some() {
+                            return Err(Error::new(EEXIST));
+                        }
+                        requested_span
+                    } else if flags.contains(MapFlags::MAP_FIXED) {
+                        let unpin = false;
+                        let mut notify_files = Self::munmap_inner(
+                            &mut self.grants,
+                            &mut self.table.utable,
+                            &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
+                            requested_span,
+                            unpin,
+                        )?;
+                        // Ferric Oxide: see `AddrSpaceWrapper::munmap`.
+                        #[cfg(iommu_enabled)]
+                        crate::scheme::iommu::release(dst_lock, requested_span);
+                        if let Some(notify_files_out) = notify_files_out {
+                            notify_files_out.append(&mut notify_files);
+                        }
 
-                    requested_span
-                } else {
-                    self.grants
-                        .find_free_near(self.mmap_min, page_count.get(), Some(requested_base))
-                        .ok_or(Error::new(ENOMEM))?
+                        requested_span
+                    } else {
+                        self.grants
+                            .find_free_near(self.mmap_min, page_count.get(), Some(requested_base))
+                            .ok_or(Error::new(ENOMEM))?
+                    }
                 }
-            }
-            None => self
-                .grants
-                .find_free(self.mmap_min, page_count.get())
-                .ok_or(Error::new(ENOMEM))?,
-        };
+                None => self
+                    .grants
+                    .find_free(self.mmap_min, page_count.get())
+                    .ok_or(Error::new(ENOMEM))?,
+            };
 
-        // TODO: Threads share address spaces, so not only the inactive flusher should be sending
-        // out IPIs. IPIs will only be sent when downgrading mappings (i.e. when a stale TLB entry
-        // will not be corrected by a page fault), and will furthermore require proper
-        // synchronization.
+            // TODO: Threads share address spaces, so not only the inactive flusher should be sending
+            // out IPIs. IPIs will only be sent when downgrading mappings (i.e. when a stale TLB entry
+            // will not be corrected by a page fault), and will furthermore require proper
+            // synchronization.
 
-        let grant = map(
-            selected_span.base,
-            page_flags(flags),
-            &mut self.table.utable,
-            &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
-        )?;
-        self.grants.insert(grant);
+            let grant = map(
+                selected_span.base,
+                page_flags(flags),
+                &mut self.table.utable,
+                &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
+            )?;
+            self.grants.insert(grant);
 
-        Ok(selected_span.base)
+            Ok(selected_span.base)
+        })();
+        trace_event!(
+            ferric_trace::kernel::MM_MAP,
+            self.table.utable.table().phys().data(),
+            requested_base_opt.map_or(0, |page| page.start_address().data()),
+            page_count.get(),
+            flags.bits(),
+            Error::mux(result.map(|page| page.start_address().data())),
+        );
+        result
     }
 
     pub fn into_drop(self, token: &mut CleanLockToken) {

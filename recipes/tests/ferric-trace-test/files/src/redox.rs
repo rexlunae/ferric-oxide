@@ -25,6 +25,7 @@ mod cap;
 mod crash;
 mod futex;
 mod lifecycle;
+mod mapping;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -897,6 +898,7 @@ fn run() -> Result<(), Failure> {
     println!("FERRIC_TEST_PASS trace-mmap");
 
     check_fault(&cpus)?;
+    mapping::check_mapping(&cpus)?;
     futex::check_futex(&cpus)?;
     lifecycle::check_lifecycle(&cpus)?;
     check_filter(&cpus)?;

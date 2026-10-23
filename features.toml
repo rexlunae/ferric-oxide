@@ -480,6 +480,26 @@ unchanged. Off by default; without it the kernel has no such scheme, as
 upstream."""
 
 [[option]]
+id = "kernel.page_cache"
+menu = "kernel"
+type = "bool"
+title = "Shared page cache (read path)"
+default = false
+kernel_feature = "page_cache"
+rebuild = ["kernel"]
+help = """
+Provide the kernel.pcache scheme (Phase 2.6). A file system keeps the contents
+of the files it chooses to cache in kernel objects, and the kernel serves read
+and pread of those files from them, copying from memory with no round trip to
+the file system once the pages are there. A miss becomes a fill request on the
+file system's queue, with readahead past it; a failed fill fails its readers
+with EIO and the next read tries again. RedoxFS caches the files its clients
+open read-only; writes still go to RedoxFS, which drops the pages they change.
+Mappings, cached writes and reclaim come later, so an object keeps every page
+read until the file system closes it. Off by default; without it the kernel
+has no such scheme and every read goes to the file system, as upstream."""
+
+[[option]]
 id = "drivers.grant_dma"
 menu = "drivers"
 type = "bool"
@@ -725,12 +745,14 @@ driver)."""
 id = "kernel.trace_mm"
 menu = "kernel.tracing"
 type = "bool"
-title = "Page fault tracepoints"
+title = "Memory tracepoints"
 default = true
 depends = "kernel.trace"
 kernel_feature = "trace_mm"
 rebuild = ["kernel"]
-help = """Compile in mm.page_fault, one record per page fault the kernel handles: the
+help = """Compile in mm.map, mm.protect and mm.unmap results for address-space
+operations (target page-table root, requested range/flags and return value),
+and mm.page_fault, one record per page fault the kernel handles: the
 faulting address, the instruction pointer, the kind of access (read, write or
 fetch; user or kernel; page present or not) and the outcome (mapped, a failed
 copy to or from user memory, or unhandled). Faults the kernel takes on purpose
@@ -756,7 +778,7 @@ bound how long a driver took to handle the interrupt."""
 id = "kernel.trace_iommu"
 menu = "kernel.tracing"
 type = "bool"
-title = "IOMMU fault tracepoints"
+title = "IOMMU fault and DMA mapping tracepoints"
 default = true
 depends = "kernel.trace"
 kernel_feature = "trace_iommu"
@@ -765,7 +787,10 @@ help = """Compile in iommu.fault, recorded for each fault an IOMMU reports (a DM
 interrupt request it blocked, or an error of its own) along with the kernel's
 log line. The record keeps the hardware's report as it is (a VT-d fault record
 or an AMD-Vi event log entry), and ferric-trace decodes it. These are
-error-level events, so any kernel.trace_max_level compiles them in."""
+error-level events, so any kernel.trace_max_level compiles them in. Also compile
+in the info-level iommu.map, iommu.protect and iommu.unmap events for completed
+DMA domain operations, after required IOTLB invalidation. Failed/partial changes
+and whole-domain destruction are not a complete mapping journal."""
 
 [[option]]
 id = "kernel.trace_max_level"

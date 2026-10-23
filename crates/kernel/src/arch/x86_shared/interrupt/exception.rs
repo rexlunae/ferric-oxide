@@ -57,7 +57,13 @@ interrupt_stack!(non_maskable, @paranoid, |stack| {
     {
         // TODO: This will likely deadlock
         println!("Non-maskable interrupt");
-        stack.dump();
+        // Ferric Oxide: the interrupted instruction at its link address (as kernel.sym has it)
+        // and the frames above it, so an NMI locates a CPU stuck in the kernel.
+        println!(
+            "NMI: interrupted at {:#x}",
+            stack.instr_pointer().wrapping_sub(crate::kernel_image_slide())
+        );
+        stack.trace();
     }
 });
 
