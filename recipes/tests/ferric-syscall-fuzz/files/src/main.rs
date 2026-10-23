@@ -169,6 +169,13 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Exit code of a child whose fixed-bug check at start-up failed, so the
 /// parent can fail the run even though children's stderr is discarded.
 const REGRESSED_EXIT: i32 = 3;
+/// File, in the child's own scratch directory, that a child writes the failing
+/// check to. Children's stderr is discarded, so this is the only way the parent
+/// can name the check a seed trips without replaying it.
+const REGRESSION_FILE: &str = "regression.txt";
+/// Distinct regression reasons the parent prints before it stops reading them.
+/// Every child runs the same checks, so the others would repeat the first few.
+const MAX_REASONS: usize = 3;
 
 /// xorshift64*: small, fast and good enough to pick arguments.
 struct Rng(u64);
@@ -736,8 +743,7 @@ impl Fuzzer {
         // process's mapping is affected.
         let ret = unsafe { sys::call(sys::MREMAP, args) };
         if !sys::is_err(ret) {
-            eprintln!("fuzz: mremap into the kernel half returned {ret:#x}");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!("mremap into the kernel half returned {ret:#x}"));
         }
 
         // fmap with MAP_FIXED at 0xffff_ffff_ffff_f000 and a length above one
@@ -773,18 +779,24 @@ impl Fuzzer {
             )
         };
         if !sys::is_err(ret) {
-            eprintln!("fuzz: anonymous fmap MAP_FIXED in the kernel half returned {ret:#x}");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "anonymous fmap MAP_FIXED in the kernel half returned {ret:#x}"
+            ));
         }
 
         // The same rule for a descriptor: a fixed span whose end leaves user
         // space has to be refused before the scheme is asked to map anything.
-        // These addresses are below the kernel half, so even a kernel that
-        // accepted one could not hand out pages there.
+        // The first span starts on the last page below the boundary and so ends
+        // `0x10_0000` bytes above it; the second starts exactly on the boundary.
+        // Both are still below the kernel half, so a kernel that accepted one
+        // could not hand out kernel pages there, and a span that only *reached*
+        // the boundary is not asked for: that one is legal and the scheme is
+        // free to serve it.
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open("fmap-fixed")
         {
             Ok(file) => file.into_raw_fd() as usize,
@@ -792,12 +804,11 @@ impl Fuzzer {
                 // The parent gives every child a writable scratch directory, so
                 // a file that cannot be created there would silently skip the
                 // check.
-                eprintln!("fuzz: no scratch file for the fmap regression: {e}");
-                std::process::exit(REGRESSED_EXIT);
+                regressed(&format!("no scratch file for the fmap regression: {e}"));
             }
         };
         for (address, len) in [
-            (0x7FFF_FFFF_F000usize, 0x10_0000usize),
+            (0x7FFF_FFFF_F000usize, 0x20_0000usize),
             (0x8000_0000_0000, 0x1000),
         ] {
             let map = [
@@ -818,8 +829,9 @@ impl Fuzzer {
                 )
             };
             if !sys::is_err(ret) {
-                eprintln!("fuzz: fmap MAP_FIXED past user space returned {ret:#x}");
-                std::process::exit(REGRESSED_EXIT);
+                regressed(&format!(
+                    "fmap MAP_FIXED at {address:#x} for {len:#x} past user space returned {ret:#x}"
+                ));
             }
         }
         // SAFETY: closing a descriptor this process opened and owns.
@@ -835,8 +847,9 @@ impl Fuzzer {
         // kernel must refuse.
         let ret = unsafe { sys::call(sys::FUNMAP, args) };
         if ret != sys::EINVAL.wrapping_neg() {
-            eprintln!("fuzz: funmap with a huge length returned {ret:#x}, not EINVAL");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "funmap with a huge length returned {ret:#x}, not EINVAL"
+            ));
         }
 
         // FUTEX_WAIT on a matching word with a negative timeout slept forever,
@@ -854,8 +867,9 @@ impl Fuzzer {
         // only reads.
         let ret = unsafe { sys::call(sys::FUTEX, args) };
         if ret != sys::EINVAL.wrapping_neg() {
-            eprintln!("fuzz: negative futex timeout returned {ret:#x}, not EINVAL");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "negative futex timeout returned {ret:#x}, not EINVAL"
+            ));
         }
 
         // A timer write with a negative time registered a deadline that never
@@ -868,8 +882,9 @@ impl Fuzzer {
             .and_then(|mut timer| timer.write(&time));
         if result.as_ref().err().and_then(std::io::Error::raw_os_error) != Some(sys::EINVAL as i32)
         {
-            eprintln!("fuzz: negative timer write returned {result:?}, not EINVAL");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "negative timer write returned {result:?}, not EINVAL"
+            ));
         }
     }
 
@@ -921,6 +936,8 @@ struct Tally {
     timed_out: usize,
     /// Seeds of the children that timed out, replayed with tracing at the end.
     hung: Vec<u64>,
+    /// Reasons already printed for children that failed a regression check.
+    reasons: Vec<String>,
 }
 
 /// A child that has not been reaped yet.
@@ -1058,6 +1075,36 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
     let _ = std::fs::remove_dir_all(&child_dir);
 }
 
+/// Records why a child's start-up checks failed, then exits with
+/// [`REGRESSED_EXIT`].
+///
+/// Children's standard streams go to `/dev/null`, so a message printed here
+/// would never reach the boot log. The reason is written to
+/// [`REGRESSION_FILE`] in the child's scratch directory instead, where
+/// [`reap`] reads it and prints it once per distinct reason.
+fn regressed(reason: &str) -> ! {
+    // The run has failed either way, so a scratch directory that cannot be
+    // written must not change how the child exits.
+    let _ = std::fs::write(REGRESSION_FILE, reason.as_bytes());
+    std::process::exit(REGRESSED_EXIT);
+}
+
+/// Prints why the child in `done` failed a regression check, unless the same
+/// reason was already printed or [`MAX_REASONS`] reasons have been.
+fn report_regression(tally: &mut Tally, done: &Running) {
+    let Ok(reason) = std::fs::read_to_string(format!("{}/{}", done.dir, REGRESSION_FILE)) else {
+        return;
+    };
+    let reason = reason.trim();
+    if reason.is_empty() || tally.reasons.iter().any(|seen| seen == reason) {
+        return;
+    }
+    if tally.reasons.len() < MAX_REASONS {
+        println!("fuzz: child seed {} failed: {reason}", done.seed);
+    }
+    tally.reasons.push(reason.to_string());
+}
+
 /// Reaps finished children and kills ones past the timeout.
 ///
 /// # Errors
@@ -1086,14 +1133,15 @@ fn reap(running: &mut Vec<Running>, tally: &mut Tally) -> Result<(), String> {
                 continue;
             }
         };
+        let done = running.swap_remove(i);
         if status.signal().is_some() {
             tally.signaled += 1;
         } else if status.code() == Some(REGRESSED_EXIT) {
             tally.regressed += 1;
+            report_regression(tally, &done);
         } else {
             tally.exited += 1;
         }
-        let done = running.swap_remove(i);
         // Children can leave files behind; a long nightly run starts tens of
         // thousands, which would fill the image if the directories stayed.
         let _ = std::fs::remove_dir_all(&done.dir);

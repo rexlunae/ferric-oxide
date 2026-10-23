@@ -357,7 +357,9 @@ leaves user space, `funmap` with a length that has no aligned value, a negative
 the child exits with a regression status if one is accepted instead of refused.
 The anonymous `fmap` needs no descriptor, and the file-backed one fails the run
 if its scratch file cannot be created, so neither check can be skipped
-silently.
+silently. A failing check writes its reason to the child's scratch directory,
+which the parent prints once per distinct reason, so the boot log names the
+check a seed trips without replaying the child.
 
 Preserve the serial log, image configuration, feature choices, kernel symbols
 and test seed. `scripts/backtrace.sh` helps symbolize kernel addresses;
