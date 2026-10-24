@@ -15,11 +15,16 @@ chmod +x "$work/bin/qemu-system-x86_64"
 export PATH="$work/bin:$PATH" OVMF_FIRMWARE="$work/firmware" BOOT_TIMEOUT=5
 export FAKE_QEMU_LOG="$work/fixture" FAKE_QEMU_ARGS="$work/qemu-args"
 check() {
-    local name="$1" expected="$2" contents="$3" status=0
+    local name="$1" expected="$2" contents="$3" text="${4:-}" status=0
     printf '%s\n' "$contents" > "$FAKE_QEMU_LOG"
     bash "$runner" "$work/image" "$work/serial" host > "$work/output" 2>&1 || status=$?
     if [ "$status" -ne "$expected" ]; then
         echo "$name: expected $expected, got $status" >&2
+        cat "$work/output" >&2
+        exit 1
+    fi
+    if [ -n "$text" ] && ! grep -qF -- "$text" "$work/output"; then
+        echo "$name: expected the output to contain: $text" >&2
         cat "$work/output" >&2
         exit 1
     fi
@@ -31,6 +36,14 @@ check missing-result 1 'FERRIC_SMOKE_OK'
 check failure 1 $'FERRIC_TEST_FAIL xstate\nFERRIC_SMOKE_OK'
 check panic-after-marker 1 $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\nKERNEL PANIC'
 check missing-marker 1 'FERRIC_TEST_PASS xstate'
+# The boot in #155: the linker could not load the shell that runs the smoke
+# script, so the marker could never appear. The run says so instead of timing out.
+check smoke-shell-unlinked 1 \
+    $'FERRIC_TEST_PASS iommu-dma\r\n[ld.so]: failed to link /usr/bin/ion: NotFound\r\ninit: cd "/" && env -i "ion" "/usr/lib/ferric-smoke.ion" failed with exit status: 1' \
+    'the smoke shell could not start'
+# The same message after the smoke test passed says nothing about the run.
+check link-failure-after-marker 0 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link /usr/bin/false: NotFound'
 
 # The smoke image's audio check needs both controllers on the QEMU command line.
 grep -q -- '-device ich9-intel-hda,id=hda0' "$FAKE_QEMU_ARGS" \
