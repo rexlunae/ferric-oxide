@@ -92,7 +92,10 @@ crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
 # A boot that cannot start the smoke shell never prints the marker. ld.so names a
 # file it could not link, and init reports the smoke command's exit status, so the
 # run can stop there and say why instead of waiting out the timeout (#155).
-smoke_dead_pattern='\[ld\.so\]: failed to link|init: .*ferric-smoke\.ion.* failed with exit status'
+# The linker line is fatal only for the shell itself: every program reports the
+# same prefix, and a program the script starts that fails to link is one of its
+# test results, not a reason to kill the guest.
+smoke_dead_pattern='\[ld\.so\]: failed to link .*/bin/ion:|init: .*ferric-smoke\.ion.* failed with exit status'
 if [ "${BOOT_REBOOT:-0}" = 1 ]; then
     reboot=()
     # The intended panic is checked by the caller; only an exception still ends the run.
@@ -139,8 +142,14 @@ for ((i = 0; i < timeout_secs; i++)); do
         break
     fi
     if grep -qaE "$smoke_dead_pattern" "$log"; then
-        deadend=1
         sleep 1 # let the rest of the shell's error output reach the log
+        # A guest that is already shutting down can print a link failure for a
+        # program it stops, and it may print the marker in the same second. Wait
+        # for QEMU again instead of failing a boot that finished its tests.
+        if grep -qa 'FERRIC_SMOKE_OK' "$log"; then
+            continue
+        fi
+        deadend=1
         break
     fi
     sleep 1
