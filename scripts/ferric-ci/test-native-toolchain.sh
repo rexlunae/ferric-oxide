@@ -151,7 +151,7 @@ for arch in aarch64 x86_64; do
     mkdir -p "$image_dir"
     touch "$image_dir/harddrive.img" "$image_dir/redox-live.iso" "$image_dir/extra.img" "$image_dir/firmware.fd"
     make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH="$arch" \
-        HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no \
+        HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no PREFIX_TOOLCHAIN=llvm \
         FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
     image=harddrive.img
     [ "$arch" = aarch64 ] && image=redox-live.iso
@@ -165,16 +165,37 @@ for arch in aarch64 x86_64; do
     grep -x max "$FAKE_QEMU_ARGS" >/dev/null
     if [ "$arch" = aarch64 ]; then
         make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH="$arch" \
-            HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no kvm=yes \
+            HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no kvm=yes PREFIX_TOOLCHAIN=llvm \
             FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
         grep -x hvf "$FAKE_QEMU_ARGS" >/dev/null
         grep -x host "$FAKE_QEMU_ARGS" >/dev/null
         make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH="$arch" \
-            HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no FERRIC_QEMU_LIVE=no \
+            HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no FERRIC_QEMU_LIVE=no PREFIX_TOOLCHAIN=llvm \
             FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
         grep -F "$image_dir/harddrive.img" "$FAKE_QEMU_ARGS" >/dev/null
     fi
 done
+# No native toolchain or generated configuration: retain upstream CPU defaults.
+image_dir="$temp/qemu-x86_64"
+make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH=x86_64 \
+    HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no PREFIX_TOOLCHAIN=recipe \
+    FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
+grep -x core2duo "$FAKE_QEMU_ARGS" >/dev/null
+image_dir="$temp/qemu-aarch64"
+make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH=aarch64 \
+    HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no PREFIX_TOOLCHAIN=recipe \
+    FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
+grep -x hvf "$FAKE_QEMU_ARGS" >/dev/null
+grep -x max "$FAKE_QEMU_ARGS" >/dev/null
+# An explicit CPU model still overrides the native LLVM default.
+image_dir="$temp/qemu-x86_64"
+make --no-print-directory -f "$root/mk/qemu.mk" qemu-run ARCH=x86_64 \
+    HOST_ARCH=arm64 UNAME=Darwin BUILD="$image_dir" gpu=no PREFIX_TOOLCHAIN=llvm \
+    QEMU_CPU=custom-model FIRMWARE= PFLASH0="$image_dir/firmware.fd" QEMU="$mock/qemu" >/dev/null
+grep -x custom-model "$FAKE_QEMU_ARGS" >/dev/null
+# A board ROM replaces generic UEFI firmware; no download is needed for check.
+make --no-print-directory -f "$root/mk/qemu.mk" qemu-check ARCH=aarch64 \
+    BOARD=raspi3bp QEMU="$mock/qemu" FIRMWARE= PFLASH0= >/dev/null
 if make --no-print-directory -f "$root/mk/qemu.mk" qemu-check ARCH=aarch64 \
     QEMU="$mock/qemu" FIRMWARE= PFLASH0= >/dev/null 2>&1; then
     echo 'Missing ARM64 firmware was accepted' >&2; exit 1

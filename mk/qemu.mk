@@ -31,7 +31,12 @@ else ifeq ($(ARCH),x86_64)
 	VGA_SUPPORTED=yes
 	QEMU_ARCH=x86_64
 	QEMU_MACHINE?=q35
+	# Native cross-builds can omit the saved target's CPU settings. They still
+	# need a v3-capable emulated CPU; configured and explicit models take priority.
+	ifeq ($(PREFIX_TOOLCHAIN),llvm)
 	QEMU_CPU?=max
+	endif
+	QEMU_CPU?=core2duo
 	QEMU_SMP?=4
 	QEMU_MEM?=2048
 	ifeq ($(uefi),yes)
@@ -97,9 +102,13 @@ else ifeq ($(ARCH),aarch64)
 		endif
 	endif
 
-	# ARM64 currently needs software emulation; HVF traps in early user space.
-	# Keep hardware acceleration available explicitly for bring-up work.
+	# Keep native ARM64 on the validated software path. Unconfigured recipe
+	# builds retain their inherited host defaults.
+	ifeq ($(PREFIX_TOOLCHAIN),llvm)
 	kvm?=no
+	else ifeq ($(HOST_ARCH),arm64)
+	kvm?=yes
+	endif
 else ifeq ($(ARCH),riscv64gc)
 	live=no
 	audio=no
@@ -326,7 +335,11 @@ endif
 
 ifeq ($(UNAME),Darwin)
     ifneq ($(kvm),no)
+    ifeq ($(PREFIX_TOOLCHAIN),llvm)
         QEMUFLAGS+=-accel hvf -cpu host
+    else
+        QEMUFLAGS+=-accel hvf -cpu max
+    endif
     else
         QEMUFLAGS+=-cpu $(QEMU_CPU)
     endif
@@ -392,7 +405,7 @@ ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0),x86_64|yes||)
 	@echo "UEFI firmware not found; set PFLASH0=/path/to/edk2-x86_64-code.fd or FIRMWARE=/path/to/OVMF.fd" >&2
 	@exit 1
 endif
-ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0),aarch64|yes||)
+ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0)|$(QEMU_KERNEL),aarch64|yes|||)
 	@echo "UEFI firmware not found; set PFLASH0=/path/to/edk2-aarch64-code.fd or FIRMWARE=/path/to/AAVMF_CODE.fd" >&2
 	@exit 1
 endif

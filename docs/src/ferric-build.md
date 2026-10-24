@@ -86,6 +86,13 @@ discovered in the usual Linux, Homebrew and MacPorts locations. If necessary,
 pass `PFLASH0=/path/to/edk2-aarch64-code.fd` for ARM64, or
 `PFLASH0=/path/to/edk2-x86_64-code.fd` for x86-64.
 Missing firmware produces an error rather than silently attempting BIOS boot.
+Boards that supply a boot ROM through `QEMU_KERNEL`, such as `raspi3bp`, use
+that ROM instead of requiring generic ARM64 UEFI firmware.
+
+Native LLVM x86-64 builds default to QEMU's `max` CPU when no model is selected,
+including cross-builds whose saved CPU settings do not apply. Configured or
+explicit CPU models take priority. The inherited unconfigured recipe workflow
+retains its `core2duo` software CPU and original acceleration defaults.
 
 ```sh
 cargo xtask run -- QEMU_MEM=4096 kvm=no

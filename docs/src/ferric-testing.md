@@ -403,7 +403,9 @@ argument quoting, explicit LLD/Redox settings and rejection of unsupported
 targets. Both x86-64 and ARM64 adapters are checked, including ARM64's Cargo
 build-std settings. Mock QEMU checks cover ARM64 live/software defaults, explicit
 HVF selection, x86-64 emulation on Apple Silicon, image selection and missing
-ARM64 firmware. CLI tests cover host defaults, explicit architecture selection, aliases and legacy `ARCH=` overrides.
+ARM64 firmware. They also check the Raspberry Pi ROM exception, native versus
+unconfigured CPU defaults, and explicit CPU model precedence. CLI tests cover
+host defaults, explicit architecture selection, aliases and legacy `ARCH=` overrides.
 The script also uses Make's actual native-prefix prerequisite list to check
 invalidation after header, manifest, configuration, shared-crate, submodule and
 directory changes, while ignoring generated caches. The installer tests
