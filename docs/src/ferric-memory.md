@@ -25,6 +25,29 @@ SMAP and FSGSBASE retain the same policy model. SMAP limits supervisor access
 to user mappings; FSGSBASE provides the selected fast FS/GS-base operations.
 CPU baseline validation is in `arch/x86_64/cpu_level.rs`.
 
+### ARM64 signal arguments
+
+In relibc, `redox-rt/src/arch/aarch64.rs` saves an interrupted program's
+integer registers in the order defined by `ArchIntRegs` and restores them
+after the signal handler. In particular, the saved x2 slot precedes x1.
+Reversing that pair swaps arguments when execution resumes: a signal arriving
+during the dynamic loader's `memcpy` can replace its byte count with its source
+address and make an otherwise ordinary `ls` launch fault. The signal frame
+now saves that pair in the same order as its restore sequence.
+
+ARM64 also defers signal delivery while a system call is executing. The SVC
+exit first publishes the result in x0, then selects a pending handler, so its
+saved x0 is the result rather than the call's original argument. In particular,
+an interrupted startup `yield` must return zero; restoring its sentinel `-1`
+argument instead made relibc's host check abort a valid executable.
+
+The `ferric-signal-test` recipe exercises asynchronous delivery with a source
+pointer in x1 and a length in x2, then checks repeated dynamic command
+launches; see [validation](ferric-testing.md#arm64-signal-return-regression).
+It also verifies SIMD registers and FPCR/FPSR across a handler that deliberately
+clobbers them. The trampoline preserves SIMD state privately below the public
+integer frame; the opaque ARM64 `ucontext_t` layout remains unchanged.
+
 ## Address randomization and guards
 
 | Option | Integration | Limits |

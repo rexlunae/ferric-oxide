@@ -22,6 +22,8 @@ use self::{
 
 mod acpi;
 mod arch;
+#[cfg(target_arch = "aarch64")]
+mod clock;
 mod device;
 mod disk;
 mod display;
@@ -152,6 +154,11 @@ impl OsEfi {
 impl Os for OsEfi {
     type D = DiskOrFileEfi;
     type V = VideoModeIter;
+
+    #[cfg(target_arch = "aarch64")]
+    fn boot_time(&self) -> Option<ferric_boot_time::BootTime> {
+        clock::sample(self.st)
+    }
 
     #[cfg(target_arch = "aarch64")]
     fn name(&self) -> &str {

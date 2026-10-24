@@ -79,6 +79,23 @@ also fail at runtime; reaching login is not validation of every application.
 `qemu.live` chooses live/persistent images; persistent ARM64 boots are not yet
 validated. Live guest filesystem changes are lost on exit.
 
+ARM64 UEFI boots initialize wall time from firmware `GetTime`, including
+ACPI boots where the kernel cannot discover the PL031 RTC through a device
+tree. The bootloader validates the Gregorian date, nanoseconds, timezone and
+daylight flags using `ferric-boot-time`, then passes `BOOT_TIME_OFFSET_NS` as
+a hexadecimal Unix-minus-physical-counter offset in the boot environment.
+The counter continues across kernel entry, so time spent loading the kernel
+or editing boot variables is counted once. `CLOCK_MONOTONIC` is unchanged.
+
+UEFI timezone metadata is applied using its specified sign; an unspecified
+timezone means the RTC is assumed to store UTC. Firmware with an incorrect
+RTC still supplies an incorrect date. Failed or invalid firmware samples are
+logged and omitted; the kernel retains its device-tree PL031 fallback where
+available. Without either source, wall time remains the Unix epoch plus the
+physical counter. This initializes time at boot; it does not provide network
+time synchronization or write changes back to the RTC. See the
+[clock regression checks](ferric-testing.md#arm64-firmware-clock-regression).
+
 After building, `cargo xtask run --no-build --headless` reuses the selected
 image. Only persistent disk images retain guest changes between boots.
 QEMU's UEFI firmware is

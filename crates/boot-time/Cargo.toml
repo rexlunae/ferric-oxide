@@ -1,0 +1,10 @@
+[package]
+name = "ferric-boot-time"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Validated firmware wall-clock handoff from the bootloader to the kernel"
+
+[dependencies]
+# Also consumed through recipe symlinks outside the host workspace.
+time = { version = "0.3.44", default-features = false }

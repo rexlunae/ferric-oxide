@@ -59,7 +59,7 @@ pub struct SigStack {
 
     // x86_64: 864 bytes
     // i686: 512 bytes
-    // aarch64: 272 bytes (SIMD TODO)
+    // aarch64: 272 bytes (SIMD is saved privately below this frame)
     // riscv64: 520 bytes (vector extensions TODO)
     pub regs: ArchIntRegs,
 }

@@ -1295,6 +1295,13 @@ name = "ferric-blkqueue"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-boot-time"
+version = "0.1.0"
+dependencies = [
+ "time",
+]
+
+[[package]]
 name = "ferric-build"
 version = "0.1.0"
 dependencies = [

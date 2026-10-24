@@ -197,6 +197,8 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
                     scratch.x5, &mut token,
                 );
                 stack.scratch.x0 = ret;
+                // Save the completed syscall's x0 if a signal redirects this return.
+                crate::context::signal::signal_handler(&mut token);
             }
 
             ty => {

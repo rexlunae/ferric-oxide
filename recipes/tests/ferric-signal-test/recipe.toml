@@ -1,0 +1,16 @@
+# Run relibc's asynchronous ARM64 signal-register regression on an image.
+[source]
+path = "crates/relibc/tests"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+mkdir -p "${COOKBOOK_STAGE}/usr/bin"
+mkdir -p "${COOKBOOK_STAGE}/usr/lib"
+${CC} ${CPPFLAGS} ${CFLAGS} -static -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -pthread \
+    "${COOKBOOK_SOURCE}/signals/registers.c" \
+    -o "${COOKBOOK_STAGE}/usr/bin/ferric-signal-test" ${LDFLAGS}
+cp "${COOKBOOK_SOURCE}/signals/launch.ion" \
+    "${COOKBOOK_STAGE}/usr/lib/ferric-signal-launch.ion"
+"""

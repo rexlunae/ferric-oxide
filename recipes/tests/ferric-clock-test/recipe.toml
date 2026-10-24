@@ -1,0 +1,13 @@
+# Verify an image's RTC initialization against an externally chosen epoch range.
+[source]
+path = "recipes/tests/ferric-clock-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+mkdir -p "${COOKBOOK_STAGE}/usr/bin"
+${CC} ${CPPFLAGS} ${CFLAGS} -static -std=c11 -O2 -Wall -Wextra -Werror \
+    "${COOKBOOK_SOURCE}/clock.c" \
+    -o "${COOKBOOK_STAGE}/usr/bin/ferric-clock-test" ${LDFLAGS}
+"""

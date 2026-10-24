@@ -41,6 +41,7 @@ redox_uefi_std = { git = "https://github.com/rexlunae/uefi.git" }
 
 [target."aarch64-unknown-uefi".dependencies]
 dmidecode = "0.8.0"
+ferric-boot-time = { path = "../boot-time" }
 
 [target."x86_64-unknown-uefi".dependencies]
 x86 = "0.52.0"
