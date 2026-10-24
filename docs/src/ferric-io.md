@@ -449,7 +449,12 @@ a ramp-up period (`ramp_time` is 0 by default).
    mapping. Contiguous allocations receive contiguous IOVA ranges.
 5. Removing write access with `mprotect` narrows device permissions too.
    Unmapping memory, process exit and domain closure retire translations
-   with the required invalidations before frames can be released.
+   with the required invalidations before frames can be released. A
+   translation whose installation could not confirm its invalidation may
+   still be reachable by the device, so the kernel keeps its IOVA block and
+   frame pins owned, by IOVA, without recording a mapping; only a domain
+   closure that blocks every device releases them, and exactly once. A
+   closure that cannot block them keeps them pinned.
 
 The entry points are `userspace/base/drivers/pcid/src/iommu.rs`,
 `src/driver_interface/mod.rs`, `crates/kernel/src/scheme/iommu.rs`, and

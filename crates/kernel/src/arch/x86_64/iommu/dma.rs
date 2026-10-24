@@ -29,6 +29,12 @@
 //! translated, so the tables are freed whole before the frames are unpinned. Whenever the
 //! hardware does not confirm an invalidation, the frames stay pinned for good.
 //!
+//! An installation that fails without confirming its invalidation is the same case, one step
+//! earlier: the driver gets no IOVA and no mapping record names the entries, but a device may
+//! still reach them ([`DmaSpace::translate`]). Those blocks and pins are kept in the domain too,
+//! by IOVA, and released exactly once when the domain's close blocks every device; a close that
+//! could not block them keeps them pinned for good, like the mappings above.
+//!
 //! The bookkeeping (which frames have which IOVA, and who still reaches them) is the
 //! host-tested `ferric_iommu::dma` module.
 //!
@@ -56,7 +62,7 @@ use ferric_iommu::dma::{
     grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
     UnmapFailure, UnmapState,
 };
-use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Span};
+use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Retained, Span};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
 use super::domain::{Domain, DomainError};
@@ -314,6 +320,10 @@ fn runs(frames: &[Frame]) -> Vec<(u64, u64)> {
 pub struct DmaSpace {
     domain: Domain,
     mappings: DmaMappings<Held>,
+    /// Translations whose installation failed without confirming an invalidation, by IOVA: a
+    /// device may still reach them, so their blocks and pins stay owned until the domain closes
+    /// with its devices blocked (#73).
+    uncertain: Retained<(IovaRange, Pins)>,
     /// Grant mappings by IOVA.
     #[cfg(feature = "regbuf")]
     grants: alloc::collections::BTreeMap<u64, GrantHeld>,
@@ -328,6 +338,7 @@ impl DmaSpace {
         Self {
             domain,
             mappings: DmaMappings::new(),
+            uncertain: Retained::new(),
             #[cfg(feature = "regbuf")]
             grants: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "regbuf")]
@@ -401,9 +412,18 @@ impl DmaSpace {
         {
             // A table error leaves nothing mapped (`map` undoes its part, with the
             // invalidation that needs). A failed invalidation may leave entries a unit uses,
-            // so then the block and the frames stay taken.
+            // so then the block and the frames stay owned: the driver gets no IOVA, no mapping
+            // record names them, and only the domain's close can tell that blocking its
+            // devices made them unreachable (#73).
             if matches!(err, DomainError::Map(_)) {
                 self.give_back(block, pins);
+            } else {
+                warn!(
+                    "IOMMU: domain {}: mapping IOVA {:#x}+{len:#x} failed with {err} and its invalidation did not complete; the block and its frames stay owned until the domain closes",
+                    self.domain.id(),
+                    block.start
+                );
+                self.uncertain.insert((block, pins));
             }
             return Err(err.into());
         }
@@ -687,6 +707,9 @@ impl Drop for DmaSpace {
                 mapping.data.pins.release();
             }
         }
+        // A close that blocked every device made the uncertain installations unreachable too,
+        // even though no mapping record names them.
+        self.uncertain.release(clean, |(_, pins)| pins.release());
         #[cfg(feature = "regbuf")]
         for (_, held) in core::mem::take(&mut self.grants) {
             if clean {

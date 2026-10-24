@@ -16,7 +16,10 @@
 //! - when the process takes write access away from memory (`mprotect`), the writable
 //!   mappings that memory reaches are found ([`DmaMappings::writable_reached_by`]) for the
 //!   kernel to make read-only for the device too;
-//! - closing the domain hands back everything ([`DmaMappings::drain`]).
+//! - closing the domain hands back everything ([`DmaMappings::drain`]);
+//! - an installation that failed without confirming its invalidation may still be reachable by
+//!   a device, and no mapping record names it, so [`Retained`] keeps its resources owned until a
+//!   teardown has blocked the domain's devices.
 //!
 //! The type only does the bookkeeping. The kernel owns the IOVA allocator, the translation
 //! tables, the invalidation and the frame pinning, and keeps what it needs to undo them in the
@@ -173,6 +176,72 @@ pub fn complete_unmap<T, E>(
     };
     unmap(mapping)?;
     Ok(mappings.remove(&iova))
+}
+
+/// Installations the hardware did not confirm, kept owned until the domain is torn down.
+///
+/// A mapping whose installation failed without completing its invalidation may still be
+/// reachable by a device, so its IOVA block and its frame pins have to stay owned. No mapping
+/// record names it, so no unmap or close request can find it: only a teardown that blocked the
+/// domain's devices can retire it.
+///
+/// [`Retained::release`] hands every entry back exactly once, and only when that teardown
+/// succeeded. Without the confirmation the entries stay owned and are dropped at the end,
+/// which leaks what they hold by design, the safe outcome while a device may still reach it.
+#[derive(Debug, Default)]
+pub struct Retained<T> {
+    entries: Vec<T>,
+}
+
+impl<T> Retained<T> {
+    /// Nothing retained.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Keeps `value` owned until a teardown releases it.
+    pub fn insert(&mut self, value: T) {
+        self.entries.push(value);
+    }
+
+    /// How many installations are retained.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is retained.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Hands every retained entry to `release`, in the order they were inserted, when `clean`
+    /// says the teardown blocked the devices; otherwise keeps them all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_iommu::dma::Retained;
+    ///
+    /// let mut retained = Retained::new();
+    /// retained.insert("block at 0x4000");
+    /// // A teardown that could not block the devices keeps it owned.
+    /// retained.release(false, |_| unreachable!("nothing may be released"));
+    /// assert_eq!(retained.len(), 1);
+    /// // One that blocked them releases it, once.
+    /// retained.release(true, |entry| assert_eq!(entry, "block at 0x4000"));
+    /// assert!(retained.is_empty());
+    /// retained.release(true, |_| unreachable!("released once already"));
+    /// ```
+    pub fn release(&mut self, clean: bool, mut release: impl FnMut(T)) {
+        if !clean {
+            return;
+        }
+        for entry in core::mem::take(&mut self.entries) {
+            release(entry);
+        }
+    }
 }
 
 /// A range of addresses: `len` bytes from `start`.
@@ -739,5 +808,24 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].data, 7);
         assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn retained_installations_wait_for_a_clean_teardown() {
+        let mut retained = Retained::new();
+        assert!(retained.is_empty());
+        retained.insert(0x4000);
+        retained.insert(0x8000);
+        let mut released = Vec::new();
+        // A teardown that could not block the devices releases nothing.
+        retained.release(false, |block| released.push(block));
+        assert!(released.is_empty());
+        assert_eq!(retained.len(), 2);
+        // One that blocked them releases every installation once, in order.
+        retained.release(true, |block| released.push(block));
+        assert_eq!(released, [0x4000, 0x8000]);
+        assert!(retained.is_empty());
+        retained.release(true, |block| released.push(block));
+        assert_eq!(released.len(), 2);
     }
 }
