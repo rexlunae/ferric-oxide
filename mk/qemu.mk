@@ -40,7 +40,9 @@ else ifeq ($(ARCH),x86_64)
 			PFLASH0=$(firstword \
 				$(wildcard /usr/share/qemu/edk2-x86_64-code.fd) \
 				$(wildcard /run/libvirt/nix-ovmf/edk2-x86_64-code.fd) \
-				$(wildcard /opt/homebrew/opt/qemu/share/qemu/edk2s-x86_64-code.fd) \
+				$(wildcard /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd) \
+				$(wildcard /usr/local/share/qemu/edk2-x86_64-code.fd) \
+				$(wildcard /opt/local/share/qemu/edk2-x86_64-code.fd) \
 			)
 		endif
 	endif
@@ -334,26 +336,26 @@ ifneq ($(PFLASH1),)
 	QEMUFLAGS+=-drive if=pflash,format=raw,unit=1,file=$(BUILD)/fw_vars.bin
 endif
 
-.PHONY: qemu-deps
+.PHONY: qemu-deps qemu-runtime-deps
 
-qemu-deps: $(DISK)
+qemu-deps: $(DISK) qemu-runtime-deps
 
 ifeq ($(disk),usb)
 else ifeq ($(disk),sdcard)
 else ifeq ($(disk),windows)
-qemu-deps: $(WINDOWS_DISK)
+qemu-runtime-deps: $(WINDOWS_DISK)
 else
-qemu-deps: $(EXTRA_DISK)
+qemu-runtime-deps: $(EXTRA_DISK)
 endif
 
-qemu-deps:$(FIRMWARE)
+qemu-runtime-deps:$(FIRMWARE)
 
-qemu-deps:$(QEMU_KERNEL)
+qemu-runtime-deps:$(QEMU_KERNEL)
 
-qemu-deps: $(PFLASH0)
+qemu-runtime-deps: $(PFLASH0)
 
 ifneq ($(PFLASH1),)
-qemu-deps: $(BUILD)/fw_vars.bin
+qemu-runtime-deps: $(BUILD)/fw_vars.bin
 
 .PRECIOUS: $(BUILD)/fw_vars.bin
 $(BUILD)/fw_vars.bin: $(PFLASH1)
@@ -361,7 +363,7 @@ $(BUILD)/fw_vars.bin: $(PFLASH1)
 endif
 
 $(EXTRA_DISK):
-	truncate -s 1g $@
+	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@" --mib 1024
 
 $(WINDOWS_DISK): $(BUILD)/harddrive.img
 	rm -f $@
@@ -374,7 +376,22 @@ $(BUILD)/raspi3bp_uboot.rom:
 $(BUILD)/qemu_uboot.rom:
 	wget -O $@ https://gitlab.redox-os.org/Ivan/redox_firmware/-/raw/main/platform/qemu/qemu_arm64/u-boot-qemu-arm64.bin
 
-qemu: qemu-deps
+# Fail with a useful error instead of silently falling back to legacy BIOS.
+.PHONY: qemu-check
+qemu-check:
+	@command -v "$(QEMU)" >/dev/null || { echo "QEMU not found: $(QEMU)" >&2; exit 1; }
+ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0),x86_64|yes||)
+	@echo "UEFI firmware not found; set PFLASH0=/path/to/edk2-x86_64-code.fd or FIRMWARE=/path/to/OVMF.fd" >&2
+	@exit 1
+endif
+
+qemu: qemu-check qemu-deps
+
+.PHONY: qemu-run
+qemu-run: qemu-check qemu-runtime-deps
+
+qemu qemu-run:
+	@test -f "$(DISK)" || { echo "Image missing: $(DISK); run cargo xtask build first" >&2; exit 1; }
 ifeq ($(wildcard $(MOUNT_DIR)),)
 	$(QEMU) $(QEMUFLAGS)
 else

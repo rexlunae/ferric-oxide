@@ -28,6 +28,20 @@ Unsuplied configuration will use the default. You can use the `general.prompt`
 setting to prompt when configuration is not set. Multiple configurations can
 be specified, they will be built in order.
 
+## Images without FUSE or root privileges
+
+`--no-mount` builds a staging tree and writes it through the Rust RedoxFS API.
+Guest ownership is recorded during installation and applied inside the image;
+it does not require changing host file ownership. Package files default to
+guest root, while explicit file declarations and account homes retain their
+configured IDs. Permissions, including private user homes and `/etc/shadow`,
+are preserved. This path needs neither sudo nor macFUSE on macOS.
+
+Library callers can use `install_dir_unprivileged` and the returned
+`ImageOwnership::archive`. Ordinary directory installation keeps its existing
+host ownership behavior. `with_redoxfs_ar` also retains its existing behavior
+of archiving host metadata.
+
 ## Finishing an image with fox (Ferric Oxide)
 
 `--fox=<host fox binary>` runs `fox` against the finished image root, after

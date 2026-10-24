@@ -38,16 +38,31 @@ However you feel about AI, engaging with it in the current threat environment is
 
 ## Getting started
 
-Ferric Oxide currently builds the same way as upstream Redox. The bootstrap script sets up a Podman-based build environment:
+The recommended development path uses rustup, Cargo and native Clang:
 
 ```sh
 git clone https://github.com/rexlunae/ferric-oxide
 cd ferric-oxide
-./podman_bootstrap.sh
-make all
+cargo xtask setup
+cargo xtask build
+cargo xtask run --headless
 ```
 
-If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot the result in a virtual machine, run `make qemu`.
+Install Rust with rustup, a native C/C++ compiler and SDK (Xcode Command Line
+Tools on macOS), and NASM first. QEMU is needed to run the image. Setup installs
+Rust components and required Cargo utilities; it never installs Homebrew or
+system packages. `./native_bootstrap.sh` is an alias for the setup command.
+
+The initial x86-64 `native` profile builds the local OS components and uses
+prebuilt application packages. Images are written with Rust tools without
+sudo, FUSE or macFUSE. On Apple Silicon, x86-64 runs under QEMU emulation.
+Omit `--headless` for a display window. See the
+[build guide](docs/src/ferric-build.md) for dependencies, configuration,
+the retained target ABI runtime libraries and current limits.
+
+Podman remains available explicitly with `cargo xtask --podman build`, and for
+specialized container workflows such as the kernel debugger. It is optional
+for the native build. Existing Make targets remain available.
 
 ### Choosing features
 

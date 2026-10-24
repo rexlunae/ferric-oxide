@@ -1295,6 +1295,16 @@ name = "ferric-blkqueue"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-build"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "semver",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-cet"
 version = "0.1.0"
 

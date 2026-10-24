@@ -1,0 +1,28 @@
+# Native development image: rebuild the fork's OS components with Cargo,
+# while reusing binary application packages from the existing package server.
+include = ["minimal.toml"]
+
+[general]
+filesystem_size = 512
+
+[packages]
+kernel = "source"
+bootloader = "source"
+relibc = "source"
+base = "source"
+redoxfs = "source"
+
+[[files]]
+path = "/etc/hostname"
+data = "ferric-oxide"
+postinstall = true
+
+[[files]]
+path = "/usr/lib/os-release"
+postinstall = true
+data = """
+PRETTY_NAME="Ferric Oxide"
+NAME="Ferric Oxide"
+ID="ferric-oxide"
+HOME_URL="https://github.com/rexlunae/ferric-oxide"
+"""

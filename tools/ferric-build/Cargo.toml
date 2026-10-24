@@ -1,0 +1,15 @@
+[package]
+name = "ferric-build"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Native Cargo entry point for Ferric Oxide images and QEMU"
+
+[dependencies]
+clap.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

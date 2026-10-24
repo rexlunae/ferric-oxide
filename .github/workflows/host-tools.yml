@@ -12,6 +12,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "mk/fstools.mk"
+      - "mk/llvm.mk"
+      - "scripts/native-toolchain.sh"
+      - "scripts/native/**"
+      - ".cargo/config.toml"
       - "tools/**"
       - "crates/**"
       - "scripts/ferric-ci/**"
@@ -41,12 +45,14 @@ jobs:
           restore-keys: host-
       - name: Smoke runner regression tests
         run: bash scripts/ferric-ci/test-boot-smoke.sh
+      - name: Native toolchain regression tests
+        run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
         run: cargo test --locked --workspace
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-build -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -54,7 +60,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)

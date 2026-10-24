@@ -26,7 +26,7 @@ export CFLAGS=-I$(TARGET_HEADERS)
 
 PROFILE?=release
 
-HEADERS_UNPARSED=$(shell find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" $(EXCEPT_MATH) -printf "%f\n")
+HEADERS_UNPARSED=$(filter-out _% $(if $(USE_RUST_LIBM),,math),$(notdir $(patsubst %/,%,$(wildcard src/header/*/))))
 HEADERS_DEPS=$(shell find src/header -type f \( -name "cbindgen.toml" -o -name "*.rs" \))
 #HEADERS=$(patsubst %,%.h,$(subst _,/,$(HEADERS_UNPARSED)))
 

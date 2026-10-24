@@ -1192,6 +1192,7 @@ ferric-smoke and ferric-fuzz select the existing CI test images on x86_64.
 They retain your configured CPU and kernel options; CI's forced test settings
 are separate from these image-content choices."""
 choices = [
+  { value = "native", title = "native: local OS components and prebuilt applications" },
   { value = "minimal", title = "minimal: console only" },
   { value = "server", title = "server: console and network services" },
   { value = "desktop-minimal", title = "desktop-minimal: Orbital and a terminal" },
@@ -1364,9 +1365,37 @@ id = "build.podman"
 menu = "build"
 type = "bool"
 title = "Build inside Podman"
-default = true
+default = false
 make_var = "PODMAN_BUILD"
-help = "Run the build in the Podman container (recommended). Sets PODMAN_BUILD."
+help = "Opt into the Linux container for recipes that need it. Native builds are the default for configured Ferric builds. Sets PODMAN_BUILD."
+
+[[option]]
+id = "build.toolchain"
+menu = "build"
+type = "choice"
+title = "Cross toolchain"
+default = "llvm"
+defaults = [{ when = "build.podman || target.arch != 'x86_64'", value = "recipe" }]
+choices = ["llvm", "recipe"]
+make_var = "PREFIX_TOOLCHAIN"
+rebuild = ["*"]
+help = """
+llvm uses host Clang, rustup's pinned Rust compiler and bundled LLVM tools.
+It downloads target runtime data without installing or building GCC/LLVM.
+Currently supports x86_64-unknown-redox. Existing Rust/C++ packages still
+need GCC ABI runtime libraries; these are target libraries, not compilers.
+recipe uses the inherited prebuilt or source-built cross toolchain."""
+
+[[option]]
+id = "build.fuse"
+menu = "build"
+type = "bool"
+title = "Mount images through FUSE"
+default = false
+make_var = "FSTOOLS_NO_MOUNT"
+make_true = "0"
+make_false = "1"
+help = "Use host filesystem mounts for image creation. Off uses the Rust RedoxFS writer and records guest ownership without sudo or macFUSE."
 
 [[option]]
 id = "build.prefix_binary"
@@ -1540,3 +1569,8 @@ message = "Ferric smoke and fuzz configurations require x86_64; their test packa
 level = "error"
 when = "image.config == 'ferric-hardware' && target.arch != 'x86_64'"
 message = "The Ferric hardware bring-up configuration requires x86_64."
+
+[[rule]]
+level = "error"
+when = "build.toolchain == 'llvm' && target.arch != 'x86_64'"
+message = "The native LLVM toolchain currently supports x86_64 only; select build.toolchain = 'recipe' for other targets."

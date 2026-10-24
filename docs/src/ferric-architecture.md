@@ -12,6 +12,7 @@ developed through libraries and ports; it does not make this a Linux kernel.
 | --- | --- |
 | Root `Cargo.toml` | Host workspace for `tools/` and host-testable shared crates; root `Cargo.lock` controls these builds |
 | `tools/cookbook/` | Recipe fetching, dependency builds, staging, packaging and the `repo` command |
+| `tools/ferric-build/` | Native rustup/Clang setup, image build and QEMU orchestration (`cargo xtask`) |
 | `tools/ferric-config/` | Feature selection and build configuration generation |
 | `tools/installer/` | Image configuration parsing and installation; shared by host tooling and the target installer recipe |
 | `tools/redoxer/` | Component execution/build support in a Redox environment; its example is standalone |

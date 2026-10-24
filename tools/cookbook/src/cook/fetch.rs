@@ -154,7 +154,18 @@ fn refresh_path_source(original: &Path, snapshot: &Path, rule: &str) -> Result<b
         return Ok(true);
     }
     let mut entries = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(original) {
+    for entry in walkdir::WalkDir::new(original)
+        .into_iter()
+        .filter_entry(|entry| {
+            path_source_entry(
+                original,
+                entry
+                    .path()
+                    .strip_prefix(original)
+                    .expect("WalkDir entries are descendants of its root"),
+            )
+        })
+    {
         let entry = entry?;
         let metadata = entry.metadata()?;
         let relative = entry
@@ -927,6 +938,29 @@ pub fn fetch_get_source_info(recipe: &CookRecipe) -> Result<SourceIdentifier> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_snapshots_skip_build_outputs_and_ignore_their_updates() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let snapshot = temporary.path().join("source");
+        for name in ["target", "build", "sysroot", ".git", "src/build"] {
+            fs::create_dir_all(original.join(name)).unwrap();
+            fs::write(original.join(name).join("file"), "data").unwrap();
+        }
+        fs::create_dir_all(original.join("bootstrap/target")).unwrap();
+        fs::write(original.join("bootstrap/target/CACHEDIR.TAG"), "cache").unwrap();
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
+        assert!(!snapshot.join("bootstrap/target").exists());
+        for name in ["target", "build", "sysroot", ".git"] {
+            assert!(!snapshot.join(name).exists());
+            fs::write(original.join(name).join("file"), "new artifact").unwrap();
+        }
+        assert!(snapshot.join("src/build/file").is_file());
+        assert!(refresh_path_source(&original, &snapshot, "source").unwrap());
+        fs::write(original.join("src/build/file"), "new source").unwrap();
+        assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
+    }
 
     #[test]
     fn deleted_nested_source_files_invalidate_fetch_without_overwriting_local_edits() {

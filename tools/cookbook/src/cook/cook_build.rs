@@ -217,6 +217,8 @@ pub fn build(
         .iter()
         .map(|p| p.with_added_extension("pkgar"))
         .collect();
+    let native_sysroot_time = native_sysroot_modified(recipe_dir);
+    let native_sysroot_changed = native_sysroot_is_newer(native_sysroot_time, &stage_pkgars);
     let cli_jobs = cook_config.jobs;
     if recipe.build.kind == BuildKind::None {
         // metapackages don't need to do anything here
@@ -256,7 +258,7 @@ pub fn build(
         };
     }
 
-    if !check_source {
+    if !check_source && !native_sysroot_changed {
         // TODO: when stage_dirs does not exist due to clean_target was true, extract from stage.pkgar?
         let stage_present = stage_pkgars.iter().all(|file| file.is_file());
         if stage_present && auto_deps_file.is_file() {
@@ -293,6 +295,7 @@ pub fn build(
             source_dir,
             &auto_deps_file,
             stage_pkgars,
+            native_sysroot_time,
         )
     } {
         if auto_deps_file.is_file() {
@@ -330,7 +333,8 @@ pub fn build(
         fs::create_dir_clean(&stage_dir_tmp)?;
 
         // Create build dir, if it does not exist
-        if cook_config.clean_build || !build_dir.is_dir() {
+        // Cargo does not fingerprint native libraries supplied through a sysroot.
+        if cook_config.clean_build || native_sysroot_changed || !build_dir.is_dir() {
             fs::create_dir_clean(&build_dir)?;
         }
 
@@ -544,12 +548,32 @@ pub fn build(
     Ok(BuildResult::new(stage_dirs, auto_deps))
 }
 
+fn native_sysroot_is_newer(stamp: Option<std::time::SystemTime>, packages: &[PathBuf]) -> bool {
+    stamp.is_some_and(|stamp| {
+        fs::modified_all(packages, fs::modified).map_or(true, |stage| stamp > stage)
+    })
+}
+
+// A native sysroot contains static relibc objects outside normal recipe deps.
+// Kernel/UEFI do not link them, and relibc itself creates the sysroot stamp.
+fn native_sysroot_modified(recipe_dir: &Path) -> Option<std::time::SystemTime> {
+    if matches!(
+        recipe_dir.file_name()?.to_str()?,
+        "relibc" | "kernel" | "bootloader"
+    ) {
+        return None;
+    }
+    let stamp = std::env::var_os("FERRIC_NATIVE_SYSROOT_STAMP")?;
+    fs::modified(Path::new(&stamp)).ok()
+}
+
 fn build_is_source_newer(
     logger: &PtyOut,
     recipe_dir: &Path,
     source_dir: &Path,
     auto_deps_file: &Path,
     stage_pkgars: Vec<PathBuf>,
+    native_sysroot_modified: Option<std::time::SystemTime>,
 ) -> bool {
     if !auto_deps_file.is_file() {
         return true;
@@ -560,6 +584,9 @@ fn build_is_source_newer(
     let Ok(mut source_modified) = fs::modified_dir_ignore_git(source_dir) else {
         return false;
     };
+    if let Some(modified) = native_sysroot_modified {
+        source_modified = source_modified.max(modified);
+    }
     let mut recipe_is_newest = false;
     if let Ok(recipe_modified) = fs::modified(&recipe_dir.join("recipe.toml"))
         && recipe_modified > source_modified
@@ -842,6 +869,50 @@ fn hint_incorrect_pkey(logger: &PtyOut, source_pubkey: &Path, source_pkgar: &Pat
 #[cfg(test)]
 mod tests {
     use std::os::unix;
+
+    #[test]
+    fn refreshed_native_sysroot_invalidates_statically_linked_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let auto_deps = temp.path().join("auto-deps.toml");
+        std::fs::write(&auto_deps, "").unwrap();
+        let package = temp.path().join("stage.pkgar");
+        std::fs::write(&package, "package").unwrap();
+        let stage_time = super::fs::modified(&package).unwrap();
+        assert!(!super::native_sysroot_is_newer(None, &[package.clone()]));
+        assert!(!super::native_sysroot_is_newer(
+            Some(stage_time),
+            &[package.clone()]
+        ));
+        assert!(super::native_sysroot_is_newer(
+            Some(stage_time + std::time::Duration::from_secs(2)),
+            &[package.clone()]
+        ));
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(stage_time - std::time::Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(!super::build_is_source_newer(
+            &None,
+            temp.path(),
+            &source,
+            &auto_deps,
+            vec![package.clone()],
+            None
+        ));
+        assert!(super::build_is_source_newer(
+            &None,
+            temp.path(),
+            &source,
+            &auto_deps,
+            vec![package],
+            Some(stage_time + std::time::Duration::from_secs(2))
+        ));
+    }
 
     #[test]
     fn file_system_loop_no_infinite_loop() {
