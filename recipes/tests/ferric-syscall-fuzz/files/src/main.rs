@@ -37,8 +37,18 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use syscall::{Map, MapFlags};
+
 /// System call numbers and flags, copied from `redox_syscall` so the fuzzer
 /// has no dependencies.
+///
+/// The copy is deliberate even though the kernel and user space share one ABI
+/// crate: the fuzzer has to send the numbers and bits it was built against
+/// without reading them back from the ABI it is meant to test. A drifted
+/// constant then shows up as a call that no longer reaches the code under test,
+/// which the checks below catch, instead of as a call that silently follows the
+/// new value. The entries carry the same names as their `redox_syscall`
+/// counterparts, so a change there is easy to trace.
 mod sys {
     const CLASS_PATH: usize = 0x1000_0000;
     const CLASS_FILE: usize = 0x2000_0000;
@@ -160,6 +170,13 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Exit code of a child whose fixed-bug check at start-up failed, so the
 /// parent can fail the run even though children's stderr is discarded.
 const REGRESSED_EXIT: i32 = 3;
+/// File, in the child's own scratch directory, that a child writes the failing
+/// check to. Children's stderr is discarded, so this is the only way the parent
+/// can name the check a seed trips without replaying it.
+const REGRESSION_FILE: &str = "regression.txt";
+/// Distinct regression reasons the parent prints before it stops reading them.
+/// Every child runs the same checks, so the others would repeat the first few.
+const MAX_REASONS: usize = 3;
 
 /// xorshift64*: small, fast and good enough to pick arguments.
 struct Rng(u64);
@@ -646,19 +663,19 @@ impl Fuzzer {
 
     /// Maps the anonymous region the memory-management calls target.
     fn map_victim(&mut self) {
-        let map = [
-            0,
-            VICTIM_LEN,
-            sys::PROT_READ | sys::PROT_WRITE | sys::MAP_PRIVATE,
-            0,
-        ];
+        let map = Map {
+            offset: 0,
+            size: VICTIM_LEN,
+            flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_PRIVATE,
+            address: 0,
+        };
         // SAFETY: fmap of anonymous memory at an address the kernel picks.
         let ret = unsafe {
             sys::call(
                 sys::FMAP,
                 [
                     usize::MAX,
-                    map.as_ptr() as usize,
+                    &map as *const Map as usize,
                     size_of_val(&map),
                     0,
                     0,
@@ -666,9 +683,10 @@ impl Fuzzer {
                 ],
             )
         };
-        if !sys::is_err(ret) {
-            self.victim = ret;
+        if sys::is_err(ret) {
+            regressed(&format!("cannot map the regression source: {ret:#x}"));
         }
+        self.victim = ret;
     }
 
     fn run(&mut self, calls: usize) {
@@ -725,7 +743,162 @@ impl Fuzzer {
         }
         // SAFETY: the kernel must refuse this; if it does not, only this
         // process's mapping is affected.
-        let _ = unsafe { sys::call(sys::MREMAP, args) };
+        let ret = unsafe { sys::call(sys::MREMAP, args) };
+        if !sys::is_err(ret) {
+            regressed(&format!("mremap into the kernel half returned {ret:#x}"));
+        }
+
+        // fmap with MAP_FIXED at 0xffff_ffff_ffff_f000 and a length above one
+        // page corrupted the free-space accounting of the address space, and a
+        // later mapping then landed on memory a grant already owned, which
+        // panicked the kernel with an overlap assertion (fixed by validating
+        // the span). Both checks below exercise rejection before a scheme is
+        // asked to map anything; a valid file-backed mapping is tested separately.
+        let kernel_half = Map {
+            offset: 0,
+            size: 0x10_0000,
+            flags: MapFlags::PROT_READ
+                | MapFlags::PROT_WRITE
+                | MapFlags::MAP_PRIVATE
+                | MapFlags::MAP_FIXED,
+            address: 0xFFFF_FFFF_FFFF_F000,
+        };
+        if self.verbose {
+            eprintln!("regression {:#x} {kernel_half:?}", sys::FMAP);
+        }
+        // SAFETY: `!0` selects anonymous memory, and the mapping asks for an
+        // address the kernel must refuse.
+        let ret = unsafe {
+            sys::call(
+                sys::FMAP,
+                [
+                    usize::MAX,
+                    &kernel_half as *const Map as usize,
+                    size_of_val(&kernel_half),
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if !sys::is_err(ret) {
+            regressed(&format!(
+                "anonymous fmap MAP_FIXED in the kernel half returned {ret:#x}"
+            ));
+        }
+
+        // The same rule for a descriptor: a fixed span whose end leaves user
+        // space has to be refused before the scheme is asked to map anything.
+        // The first span starts on the last page below the boundary and so ends
+        // `0x10_0000` bytes above it; the second starts exactly on the boundary.
+        // Both are still below the kernel half, so a kernel that accepted one
+        // could not hand out kernel pages there, and a span that only *reached*
+        // the boundary is not asked for: that one is legal and the scheme is
+        // free to serve it.
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("fmap-fixed")
+        {
+            Ok(file) => {
+                if let Err(e) = file.set_len(PAGE_SIZE as u64) {
+                    regressed(&format!("cannot size the fmap regression file: {e}"));
+                }
+                file.into_raw_fd() as usize
+            }
+            Err(e) => {
+                // The parent gives every child a writable scratch directory, so
+                // a file that cannot be created there would silently skip the
+                // check.
+                regressed(&format!("no scratch file for the fmap regression: {e}"));
+            }
+        };
+        for (address, len) in [
+            (0x7FFF_FFFF_F000usize, 0x20_0000usize),
+            (0x8000_0000_0000, 0x1000),
+        ] {
+            let map = Map {
+                offset: 0,
+                size: len,
+                flags: MapFlags::PROT_READ
+                    | MapFlags::PROT_WRITE
+                    | MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_FIXED,
+                address,
+            };
+            if self.verbose {
+                eprintln!("regression {:#x} fd {file} {map:?}", sys::FMAP);
+            }
+            // SAFETY: the descriptor is this process's and the mapping asks for
+            // a span the kernel must refuse.
+            let ret = unsafe {
+                sys::call(
+                    sys::FMAP,
+                    [
+                        file,
+                        &map as *const Map as usize,
+                        size_of_val(&map),
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            if !sys::is_err(ret) {
+                regressed(&format!(
+                    "fmap MAP_FIXED at {address:#x} for {len:#x} past user space returned {ret:#x}"
+                ));
+            }
+        }
+        // A legal mapping must reach the filesystem and succeed as well, so a
+        // broken request layout or blanket refusal cannot pass these checks.
+        let map = Map {
+            offset: 0,
+            size: PAGE_SIZE,
+            flags: MapFlags::PROT_READ | MapFlags::MAP_PRIVATE,
+            address: 0,
+        };
+        // SAFETY: the descriptor is ours, and the kernel chooses an unused address.
+        let mapped = unsafe {
+            sys::call(
+                sys::FMAP,
+                [
+                    file,
+                    &map as *const Map as usize,
+                    size_of_val(&map),
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if sys::is_err(mapped) {
+            regressed(&format!("valid file-backed fmap failed: {mapped:#x}"));
+        }
+        // SAFETY: this is exactly the mapping returned by the preceding call.
+        let unmapped = unsafe { sys::call(sys::FUNMAP, [mapped, PAGE_SIZE, 0, 0, 0, 0]) };
+        if sys::is_err(unmapped) {
+            regressed(&format!("valid file-backed funmap failed: {unmapped:#x}"));
+        }
+        // SAFETY: closing a descriptor this process opened and owns.
+        unsafe { sys::call(sys::CLOSE, [file, 0, 0, 0, 0, 0]) };
+
+        // funmap with a length that has no aligned value rounded into a
+        // different range; it now fails with EINVAL.
+        let args = [self.victim, usize::MAX, 0, 0, 0, 0];
+        if self.verbose {
+            eprintln!("regression {:#x} {args:x?}", sys::FUNMAP);
+        }
+        // SAFETY: the range names this process's own mapping and a length the
+        // kernel must refuse.
+        let ret = unsafe { sys::call(sys::FUNMAP, args) };
+        if ret != sys::EINVAL.wrapping_neg() {
+            regressed(&format!(
+                "funmap with a huge length returned {ret:#x}, not EINVAL"
+            ));
+        }
 
         // FUTEX_WAIT on a matching word with a negative timeout slept forever,
         // because the deadline wrapped to a huge value (fixed by rejecting it
@@ -742,8 +915,9 @@ impl Fuzzer {
         // only reads.
         let ret = unsafe { sys::call(sys::FUTEX, args) };
         if ret != sys::EINVAL.wrapping_neg() {
-            eprintln!("fuzz: negative futex timeout returned {ret:#x}, not EINVAL");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "negative futex timeout returned {ret:#x}, not EINVAL"
+            ));
         }
 
         // A timer write with a negative time registered a deadline that never
@@ -756,8 +930,9 @@ impl Fuzzer {
             .and_then(|mut timer| timer.write(&time));
         if result.as_ref().err().and_then(std::io::Error::raw_os_error) != Some(sys::EINVAL as i32)
         {
-            eprintln!("fuzz: negative timer write returned {result:?}, not EINVAL");
-            std::process::exit(REGRESSED_EXIT);
+            regressed(&format!(
+                "negative timer write returned {result:?}, not EINVAL"
+            ));
         }
     }
 
@@ -809,6 +984,8 @@ struct Tally {
     timed_out: usize,
     /// Seeds of the children that timed out, replayed with tracing at the end.
     hung: Vec<u64>,
+    /// Reasons already printed for children that failed a regression check.
+    reasons: Vec<String>,
 }
 
 /// A child that has not been reaped yet.
@@ -946,6 +1123,36 @@ fn replay(exe: &str, dir: &str, seed: u64, calls: usize) {
     let _ = std::fs::remove_dir_all(&child_dir);
 }
 
+/// Records why a child's start-up checks failed, then exits with
+/// [`REGRESSED_EXIT`].
+///
+/// Children's standard streams go to `/dev/null`, so a message printed here
+/// would never reach the boot log. The reason is written to
+/// [`REGRESSION_FILE`] in the child's scratch directory instead, where
+/// [`reap`] reads it and prints it once per distinct reason.
+fn regressed(reason: &str) -> ! {
+    // The run has failed either way, so a scratch directory that cannot be
+    // written must not change how the child exits.
+    let _ = std::fs::write(REGRESSION_FILE, reason.as_bytes());
+    std::process::exit(REGRESSED_EXIT);
+}
+
+/// Prints why the child in `done` failed a regression check, unless the same
+/// reason was already printed or [`MAX_REASONS`] reasons have been.
+fn report_regression(tally: &mut Tally, done: &Running) {
+    let Ok(reason) = std::fs::read_to_string(format!("{}/{}", done.dir, REGRESSION_FILE)) else {
+        return;
+    };
+    let reason = reason.trim();
+    if reason.is_empty() || tally.reasons.iter().any(|seen| seen == reason) {
+        return;
+    }
+    if tally.reasons.len() < MAX_REASONS {
+        println!("fuzz: child seed {} failed: {reason}", done.seed);
+    }
+    tally.reasons.push(reason.to_string());
+}
+
 /// Reaps finished children and kills ones past the timeout.
 ///
 /// # Errors
@@ -974,14 +1181,15 @@ fn reap(running: &mut Vec<Running>, tally: &mut Tally) -> Result<(), String> {
                 continue;
             }
         };
+        let done = running.swap_remove(i);
         if status.signal().is_some() {
             tally.signaled += 1;
         } else if status.code() == Some(REGRESSED_EXIT) {
             tally.regressed += 1;
+            report_regression(tally, &done);
         } else {
             tally.exited += 1;
         }
-        let done = running.swap_remove(i);
         // Children can leave files behind; a long nightly run starts tens of
         // thousands, which would fill the image if the directories stayed.
         let _ = std::fs::remove_dir_all(&done.dir);

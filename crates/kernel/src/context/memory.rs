@@ -108,6 +108,39 @@ impl UnmapResult {
     }
 }
 
+/// Ferric Oxide: the size in bytes of a grant of `page_count` pages, after checking that the
+/// grant would stay in user space.
+///
+/// Every grant lies in `[0, USER_END_OFFSET)`, and the grant table only tracks free holes
+/// there. A span outside it is either dropped from the hole bookkeeping or enters it with a
+/// wrapped end, and a later selection then hands out pages that a grant already occupies,
+/// which trips the overlap assertion in `UserGrants::insert`. The syscall fuzzer reached that
+/// through `fmap` of a descriptor with `MAP_FIXED` at 0xffff_ffff_ffff_f000 and through
+/// `mremap` to the same address. `mmap` and `r#move` both insert grants, so the rule lives
+/// here rather than in each of them.
+///
+/// # Errors
+///
+/// `ENOMEM` if the size overflows or does not fit in user space at all, `EINVAL` if a fixed
+/// `base` would put the end past `USER_END_OFFSET`.
+fn grant_span_size(page_count: usize, base: Option<Page>, flags: MapFlags) -> Result<usize> {
+    let Some(size) = page_count.checked_mul(PAGE_SIZE) else {
+        return Err(Error::new(ENOMEM));
+    };
+    if size > crate::USER_END_OFFSET {
+        return Err(Error::new(ENOMEM));
+    }
+    let fixed =
+        flags.contains(MapFlags::MAP_FIXED) || flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
+    if let Some(base) = base
+        && fixed
+        && PageSpan::validate(base.start_address(), size).is_none()
+    {
+        return Err(Error::new(EINVAL));
+    }
+    Ok(size)
+}
+
 #[derive(Debug)]
 pub struct AddrSpaceWrapper {
     pub inner: RwLock<L5, AddrSpace>,
@@ -470,6 +503,10 @@ impl AddrSpaceWrapper {
             None => None,
         };
         let mut dst_flusher = Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack);
+
+        // Ferric Oxide: `r#move` inserts a grant without going through `mmap`, so it needs the
+        // same user-space range rule (`grant_span_size`).
+        grant_span_size(new_page_count, requested_dst_base, new_flags)?;
 
         let dst_base = match requested_dst_base {
             Some(base) if new_flags.contains(MapFlags::MAP_FIXED_NOREPLACE) => {
@@ -877,8 +914,10 @@ impl AddrSpace {
     /// Optional `mm.map` tracing records the request and result under the write lock.
     ///
     /// # Errors
-    /// Returns `EEXIST` for a conflicting `MAP_FIXED_NOREPLACE`, `ENOMEM` when no free
-    /// span is found, or an error from unmapping/rebuilding a fixed span or from `map`.
+    /// Returns `EINVAL` when the span is outside user space (in `[0, USER_END_OFFSET)`) or a
+    /// fixed base would put its end there, `EEXIST` for a conflicting `MAP_FIXED_NOREPLACE`,
+    /// `ENOMEM` when the span does not fit in user space or no free span is found, or an error
+    /// from unmapping/rebuilding a fixed span or from `map`.
     /// Fixed replacement may already have removed old grants when `map` fails.
     ///
     /// # Panics
@@ -894,7 +933,12 @@ impl AddrSpace {
     ) -> Result<Page> {
         assert_eq!(dst_lock.inner.as_mut_ptr(), self as *mut Self);
 
+        // Ferric Oxide: refuse a span that leaves user space before touching the grant table
+        // (`grant_span_size`, which `r#move` also uses). It runs inside the traced region so
+        // `mm.map` records a rejected span like any other failed mapping.
         let result = (|| {
+            grant_span_size(page_count.get(), requested_base_opt, flags)?;
+
             let selected_span = match requested_base_opt {
                 // TODO: Rename MAP_FIXED+MAP_FIXED_NOREPLACE to MAP_FIXED and
                 // MAP_FIXED_REPLACE/MAP_REPLACE?
@@ -1163,7 +1207,12 @@ impl UserGrants {
     }
     /// Internal helper to keep the two hole maps in sync
     fn insert_hole(&mut self, offset: VirtualAddress, size: usize) {
-        self.holes_by_addr.insert(offset, size);
+        // The same offset can be re-inserted with a different size when adjacent holes are merged,
+        // and leaving the old `(size, offset)` behind in the size index would let `find_free` pick
+        // a hole that no longer reaches that far.
+        if let Some(previous_size) = self.holes_by_addr.insert(offset, size) {
+            self.holes_by_size.remove(&(previous_size, offset));
+        }
         self.holes_by_size.insert((size, offset));
     }
     /// Internal helper to keep the two hole maps in sync
@@ -1243,7 +1292,9 @@ impl UserGrants {
         // TODO: Allow explicitly allocating guard pages? Perhaps using mprotect or mmap with
         // PROT_NONE?
 
-        let req_size = page_count * PAGE_SIZE;
+        // `mmap` rejects spans that do not fit in user space, and the saturating arithmetic keeps
+        // an oversized `min` or hole from wrapping into a bogus fit.
+        let req_size = page_count.checked_mul(PAGE_SIZE)?;
         let (_, hole_start) = self
             .holes_by_size
             .range((req_size, VirtualAddress::new(0))..)
@@ -1251,8 +1302,8 @@ impl UserGrants {
                 // A hole might be large enough, but the usable
                 // portion above `min` address might be too small.
                 let usable_start = cmp::max(hole_offset.data(), min);
-                let hole_end = hole_offset.data() + hole_size;
-                usable_start + req_size <= hole_end
+                let hole_end = hole_offset.data().saturating_add(hole_size);
+                usable_start.saturating_add(req_size) <= hole_end
             })?;
         // Create new region
         Some(PageSpan::new(
@@ -1272,8 +1323,11 @@ impl UserGrants {
     }
     fn reserve(&mut self, base: Page, page_count: usize) {
         let start_address = base.start_address();
-        let size = page_count * PAGE_SIZE;
-        let end_address = base.start_address().add(size);
+        // `mmap` keeps every span inside user space, so none of this can overflow. It saturates
+        // anyway: a wrapped end would split the free space in the wrong place, and a wrapped
+        // remainder would insert a hole over grants that are already there.
+        let size = page_count.saturating_mul(PAGE_SIZE);
+        let end_address = VirtualAddress::new(start_address.data().saturating_add(size));
 
         let previous_hole = self
             .holes_by_addr
@@ -1282,7 +1336,7 @@ impl UserGrants {
             .map(|(&k, &v)| (k, v));
 
         if let Some((hole_offset, hole_size)) = previous_hole {
-            let prev_hole_end = hole_offset.data() + hole_size;
+            let prev_hole_end = hole_offset.data().saturating_add(hole_size);
 
             // Note that prev_hole_end cannot exactly equal start_address, since that would imply
             // there is another grant at that position already, as it would otherwise have been
@@ -1301,18 +1355,19 @@ impl UserGrants {
         }
 
         // Next hole
-        if let Some(hole_size) = self.remove_hole(&start_address) {
-            let remainder = hole_size - size;
-            if remainder > 0 {
-                self.insert_hole(end_address, remainder);
-            }
+        if let Some(hole_size) = self.remove_hole(&start_address)
+            && let Some(remainder) = hole_size.checked_sub(size)
+            && remainder > 0
+        {
+            self.insert_hole(end_address, remainder);
         }
     }
 
     fn unreserve(&mut self, base: Page, page_count: usize) {
         let start_address = base.start_address();
-        let size = page_count * PAGE_SIZE;
-        let end_address = base.start_address().add(size);
+        // See `reserve`; a wrapped end would drop or corrupt the hole that covers user space.
+        let size = page_count.saturating_mul(PAGE_SIZE);
+        let end_address = VirtualAddress::new(start_address.data().saturating_add(size));
 
         // The size of any possible hole directly after the to-be-freed region.
         let exactly_after_size = self.remove_hole(&end_address);
@@ -1323,18 +1378,24 @@ impl UserGrants {
             .holes_by_addr
             .range(..start_address)
             .next_back()
-            .filter(|(offset, size)| offset.data() + **size == start_address.data())
+            .filter(|(offset, size)| offset.data().saturating_add(**size) == start_address.data())
             .map(|(&offset, &size)| (offset, size))
         {
             self.resize_hole(
                 &hole_offset,
-                end_address.data() - hole_offset.data() + exactly_after_size.unwrap_or(0),
+                end_address
+                    .data()
+                    .saturating_sub(hole_offset.data())
+                    .saturating_add(exactly_after_size.unwrap_or(0)),
             );
         } else {
             // There was no free region directly before the to-be-freed region, however will
             // now unconditionally insert a new free region where the grant was, and add that extra
             // size if there was something after it.
-            self.insert_hole(start_address, size + exactly_after_size.unwrap_or(0));
+            self.insert_hole(
+                start_address,
+                size.saturating_add(exactly_after_size.unwrap_or(0)),
+            );
         }
     }
     pub fn insert(&mut self, mut grant: Grant) {

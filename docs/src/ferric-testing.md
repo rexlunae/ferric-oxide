@@ -348,6 +348,23 @@ The smoke configuration runs a short fixed-seed syscall fuzz test.
 eight-process random-seed run, scheduled by the image workflow. The seed is
 printed so a failing run can be replayed with the same fuzzer arguments.
 
+Each child also makes the calls that crashed the kernel before, independent of
+its random stream, so a reintroduced bug fails every run instead of only the
+seed that first found it: `mremap` and an anonymous `fmap` with `MAP_FIXED` at
+the top of the kernel half, a file-backed `fmap` with `MAP_FIXED` whose end
+leaves user space, `funmap` with a length that has no aligned value, a negative
+`FUTEX_WAIT` timeout and a negative timer write. Every result is checked, and
+the child exits with a regression status if one is accepted instead of refused.
+The anonymous `fmap` needs no descriptor, and the file-backed one fails the run
+if its scratch file cannot be created, so neither check can be skipped
+silently. A failing check writes its reason to the child's scratch directory,
+which the parent prints once per distinct reason, so the boot log names the
+check a seed trips without replaying the child.
+Mapping requests use `redox_syscall::Map`, including its distinct offset and
+address fields. Source mapping setup must succeed before testing `mremap`.
+The invalid file-backed requests test rejection at kernel preflight; a legal
+file-backed map and unmap also have to succeed to exercise filesystem mapping.
+
 Preserve the serial log, image configuration, feature choices, kernel symbols
 and test seed. `scripts/backtrace.sh` helps symbolize kernel addresses;
 kernel-image KASLR traces use link addresses. Image CI retains build logs on

@@ -1177,6 +1177,21 @@ impl UserInner {
 
         let fixed = map.flags.contains(MapFlags::MAP_FIXED)
             || map.flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
+
+        // Ferric Oxide: the mapping has to stay in user space. `AddrSpace::mmap` refuses such
+        // spans, but the size and, with `MAP_FIXED`, the address come straight from user space,
+        // and the syscall fuzzer reached this path with an address of 0xffff_ffff_ffff_f000.
+        // Reject it here as well, before the scheme is asked to prepare anything.
+        let Some(mapped_size) = page_count.checked_mul(PAGE_SIZE) else {
+            return Err(Error::new(EINVAL));
+        };
+        if mapped_size > crate::USER_END_OFFSET {
+            return Err(Error::new(EINVAL));
+        }
+        if fixed && PageSpan::validate(VirtualAddress::new(map.address), mapped_size).is_none() {
+            return Err(Error::new(EINVAL));
+        }
+
         let dst_base = (map.address != 0 || fixed)
             .then_some(Page::containing_address(VirtualAddress::new(map.address)));
 
