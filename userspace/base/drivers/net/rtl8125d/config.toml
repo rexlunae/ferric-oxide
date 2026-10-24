@@ -1,0 +1,5 @@
+[[drivers]]
+name = "RTL8125 NIC"
+class = 0x02
+ids = { 0x10ec = [0x8125] }
+command = ["rtl8125d"]

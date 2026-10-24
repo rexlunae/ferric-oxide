@@ -1,0 +1,8 @@
+RTL8125 firmware tables
+
+This product includes software developed by Bill Paul.
+
+Source: https://github.com/alexdupre/rtl_bsd_drv/blob/cea3599aa88ba5893bb4af28974000d58326b095/if_re.c
+
+The controller programs in firmware.rs retain the BSD-4-Clause terms in
+LICENSE-BSD-4-Clause. The surrounding Ferric code is MIT licensed.

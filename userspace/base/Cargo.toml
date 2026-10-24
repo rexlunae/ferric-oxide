@@ -50,6 +50,7 @@ members = [
     "drivers/net/driver-network",
     "drivers/net/e1000d",
     "drivers/net/ixgbed",
+    "drivers/net/rtl8125d",
     "drivers/net/rtl8139d",
     "drivers/net/rtl8168d",
     "drivers/net/virtio-netd",
@@ -106,6 +107,7 @@ redox_syscall = { version = "0.9.4",  features = ["std"] }
 # next to its copy of this tree).
 ferric-iommu = { path = "../../crates/iommu" }
 ferric-irq = { path = "../../crates/irq" }
+ferric-rtl8125 = { path = "../../crates/rtl8125" }
 ferric-vtd = { path = "../../crates/vtd", default-features = false }
 redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
 redox_termios = "0.1.4"

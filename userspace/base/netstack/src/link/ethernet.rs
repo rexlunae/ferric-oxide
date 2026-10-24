@@ -48,7 +48,11 @@ pub struct EthernetLink {
 impl EthernetLink {
     // TODO: Review these constants
     const MAX_WAITING_PACKET_COUNT: usize = 10;
-    const MTU: usize = 1500;
+    /// Largest IP packet a standard Ethernet frame carries: its 1500-byte
+    /// payload, without the 14-byte header the link adds in front of it.
+    pub(crate) const MTU: usize = 1500;
+    /// Length of the Ethernet header in front of an MTU-sized IP packet.
+    const ETHERNET_HEADER_LEN: usize = 14;
     const WAITING_PACKET_BUFFER_SIZE: usize = Self::MTU * Self::MAX_WAITING_PACKET_COUNT;
 
     const NEIGHBOR_LIVE_TIME: Duration = Duration::from_secs(60);
@@ -66,8 +70,8 @@ impl EthernetLink {
             waiting_packets,
             hardware_address: None,
             ip_address: None,
-            input_buffer: vec![0u8; Self::MTU],
-            output_buffer: Vec::with_capacity(Self::MTU),
+            input_buffer: vec![0u8; Self::MTU + Self::ETHERNET_HEADER_LEN],
+            output_buffer: Vec::with_capacity(Self::MTU + Self::ETHERNET_HEADER_LEN),
             arp_state: Default::default(),
             neighbor_cache: Default::default(),
         }

@@ -684,6 +684,22 @@ mod tests {
     }
 
     #[test]
+    fn experimental_rtl8125_is_opt_in() {
+        let schema = real_schema();
+        for enabled in [false, true] {
+            let user = BTreeMap::from([("drivers.rtl8125".to_owned(), Value::Bool(enabled))]);
+            let resolved = resolve(&schema, &user);
+            let output = plan(&schema, &resolved, &root(), Path::new("build/ferric")).unwrap();
+            let mk = file(&output, "config.mk");
+            assert_eq!(
+                mk.contains("export FERRIC_BASE_DRIVERS:=rtl8125d\n"),
+                enabled,
+                "{mk}"
+            );
+        }
+    }
+
+    #[test]
     fn default_plan() {
         let s = real_schema();
         let r = resolve(&s, &BTreeMap::new());

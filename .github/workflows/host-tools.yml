@@ -226,4 +226,4 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p driver-block
+        run: cargo test --locked -p driver-block -p netstack -p rtl8125d

@@ -505,6 +505,25 @@ read until the file system closes it. Off by default; without it the kernel
 has no such scheme and every read goes to the file system, as upstream."""
 
 [[option]]
+id = "drivers.rtl8125"
+menu = "drivers"
+type = "bool"
+title = "Experimental Realtek RTL8125B Ethernet driver"
+default = false
+depends = "target.arch == 'x86_64'"
+rebuild = ["base"]
+help = """
+Build and install rtl8125d and its PCI match for the RTL8125B controller.
+The controller model is host-tested, but physical hardware validation is
+pending. This driver uses BSD-4-Clause vendor firmware tables; their notice
+is installed with the driver. Off by default, preserving the upstream driver
+set when no ferric.toml is present. Other RTL8125 revisions are refused."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BASE_DRIVERS = "rtl8125d" }
+
+[[option]]
 id = "drivers.grant_dma"
 menu = "drivers"
 type = "bool"
@@ -1185,6 +1204,7 @@ choices = [
   { value = "tests", title = "tests: test suites" },
   { value = "ferric-smoke", title = "ferric-smoke: Ferric CI smoke tests (x86-64)" },
   { value = "ferric-fuzz", title = "ferric-fuzz: extended syscall fuzzing (x86-64)" },
+  { value = "ferric-hardware", title = "ferric-hardware: hardware bring-up inventory (x86-64)" },
 ]
 
 [[option]]
@@ -1515,3 +1535,8 @@ message = "The full configuration only exists for x86_64."
 level = "error"
 when = "image.config in ['ferric-smoke', 'ferric-fuzz'] && target.arch != 'x86_64'"
 message = "Ferric smoke and fuzz configurations require x86_64; their test packages include x86-64 register-state checks."
+
+[[rule]]
+level = "error"
+when = "image.config == 'ferric-hardware' && target.arch != 'x86_64'"
+message = "The Ferric hardware bring-up configuration requires x86_64."

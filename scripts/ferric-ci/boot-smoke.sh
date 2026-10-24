@@ -82,6 +82,11 @@ case "${BOOT_NIC:-e1000}" in
         ;;
 esac
 
+# Two HDA controllers for the audio check in config/ferric-smoke.toml: the
+# first driver registers audiohw, the second must use audiohw.<pci-address>.
+hda_dev=(-device ich9-intel-hda,id=hda0 -device hda-output,bus=hda0.0
+         -device ich9-intel-hda,id=hda1 -device hda-output,bus=hda1.0)
+
 reboot=(-no-reboot)
 crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
 if [ "${BOOT_REBOOT:-0}" = 1 ]; then
@@ -107,6 +112,7 @@ qemu-system-x86_64 \
     -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
     -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
+    "${hda_dev[@]}" \
     -nographic -vga none "${reboot[@]}" \
     -monitor unix:"$monitor",server,nowait \
     -serial stdio < /dev/null > "$log" 2>&1 &

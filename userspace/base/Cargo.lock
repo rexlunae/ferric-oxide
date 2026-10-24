@@ -929,6 +929,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-rtl8125"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-vtd"
 version = "0.1.0"
 dependencies = [
@@ -2255,6 +2259,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "common",
+]
+
+[[package]]
+name = "rtl8125d"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "daemon",
+ "driver-network",
+ "ferric-rtl8125",
+ "libredox",
+ "log",
+ "pcid",
+ "redox_event",
+ "redox_syscall 0.9.4",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

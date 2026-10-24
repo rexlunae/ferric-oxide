@@ -7,6 +7,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::IpAddress;
 
 use self::route_table::RouteTable;
+use crate::link::ethernet::EthernetLink;
 use crate::link::DeviceList;
 use crate::scheme::Smolnetd;
 
@@ -39,7 +40,16 @@ impl Router {
         }
     }
 
-    pub const MTU: usize = 1486;
+    /// Largest IP packet the stack sends to, or accepts from, a link.
+    ///
+    /// The router speaks [`Medium::Ip`], so this is the link's IP payload with
+    /// no framing subtracted: smoltcp sizes outgoing packets, the IPv4 MSS and
+    /// the advertised window from it, and each link adds its own header in
+    /// front of the packet. The receive and transmit rings hold one packet of
+    /// this size per slot, so a full-sized packet always has room and a
+    /// 1486-byte limit would both fragment egress and drop the last packet of
+    /// a full ring even when a metadata slot was free.
+    pub const MTU: usize = EthernetLink::MTU;
 
     pub fn can_recv(&self) -> bool {
         let mut can_recv = false;
@@ -64,10 +74,15 @@ impl Router {
                     break;
                 };
 
-                self.rx_buffer
-                    .enqueue(buf.len(), ())
-                    .expect("We checked if it was full")
-                    .copy_from_slice(buf);
+                // Free metadata slots do not guarantee enough payload bytes for
+                // this frame (or room to wrap the byte ring).
+                match self.rx_buffer.enqueue(buf.len(), ()) {
+                    Ok(packet) => packet.copy_from_slice(buf),
+                    Err(_) => {
+                        warn!("router dropped packet because receive buffer lacks space");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -186,5 +201,63 @@ impl<'a> smoltcp::phy::RxToken for RxToken<'a> {
             .expect("This was checked before creating the RxToken");
 
         f(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::loopback::LoopbackDevice;
+    use crate::link::LinkDevice;
+
+    #[test]
+    fn every_ring_slot_holds_a_full_sized_packet() {
+        // A link hands the router an Ethernet frame's whole IP payload, so
+        // every ring slot has to fit one: with a smaller MTU the last slot
+        // keeps unusable space and a full-sized packet is dropped even though
+        // a metadata slot is free.
+        let packet = vec![0xAB; EthernetLink::MTU];
+        let mut buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; Smolnetd::SOCKET_BUFFER_SIZE],
+            vec![0u8; Router::MTU * Smolnetd::SOCKET_BUFFER_SIZE],
+        );
+        for slot in 0..Smolnetd::SOCKET_BUFFER_SIZE {
+            buffer
+                .enqueue(packet.len(), ())
+                .unwrap_or_else(|_| panic!("ring slot {slot} cannot hold a full-sized packet"))
+                .copy_from_slice(&packet);
+        }
+        assert!(buffer.is_full());
+    }
+
+    #[test]
+    fn receive_drops_a_packet_when_byte_space_runs_out_before_slots() {
+        let now = Instant::from_millis(0);
+        let mut loopback = LoopbackDevice::default();
+        let next_hop = "127.0.0.1".parse().unwrap();
+        loopback.send(next_hop, &[1; 1500], now);
+        loopback.send(next_hop, &[2; 1500], now);
+        let mut devices = DeviceList::default();
+        devices.push(loopback);
+        let mut router = Router::new(
+            Rc::new(RefCell::new(devices)),
+            Rc::new(RefCell::new(RouteTable::default())),
+        );
+        // Both packets have a metadata slot, but only one fits in the byte ring.
+        router.rx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0; 2000]);
+        router.poll(now);
+        assert!(!router.rx_buffer.is_full());
+        assert_eq!(router.rx_buffer.dequeue().unwrap().1, &[1; 1500]);
+        assert!(router.rx_buffer.is_empty());
+        // Dropping a frame leaves the queue usable for later traffic.
+        router
+            .devices
+            .borrow_mut()
+            .iter_mut()
+            .next()
+            .unwrap()
+            .send(next_hop, &[3; 1500], now);
+        router.poll(now);
+        assert_eq!(router.rx_buffer.dequeue().unwrap().1, &[3; 1500]);
     }
 }

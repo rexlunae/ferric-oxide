@@ -69,8 +69,28 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         };
         let mut readiness_based = ReadinessBased::new(Box::new(socket), 16);
 
-        register_sync_scheme(readiness_based.socket(), "audiohw", &mut device)
-            .expect("ihdad: failed to register audiohw scheme to namespace");
+        // Machines with a chipset codec and one or more HDMI/DisplayPort
+        // codecs have several HDA controllers. Give the analog codec the
+        // well-known name and every other codec a unique one, so the
+        // controllers do not race to register the same scheme.
+        let scheme_name = match device.output_kind() {
+            hda::device::OutputKind::Analog => "audiohw".to_owned(),
+            _ => format!("audiohw.{}", pci_config.func.name()),
+        };
+
+        let scheme_name =
+            match register_sync_scheme(readiness_based.socket(), &scheme_name, &mut device) {
+                Ok(()) => scheme_name,
+                Err(err) if scheme_name == "audiohw" => {
+                    let fallback = format!("audiohw.{}", pci_config.func.name());
+                    log::warn!("audiohw is already registered ({err}); using {fallback}");
+                    register_sync_scheme(readiness_based.socket(), &fallback, &mut device)
+                        .expect("ihdad: failed to register fallback audio scheme");
+                    fallback
+                }
+                Err(err) => panic!("ihdad: failed to register {scheme_name} scheme: {err}"),
+            };
+        log::info!("registered {scheme_name}");
         daemon.ready();
 
         event_queue

@@ -80,6 +80,22 @@ uname -a
 cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
+# Two HDA controllers (boot-smoke.sh adds them): the first driver that registers
+# takes audiohw and the next must use audiohw.<pci-address> instead of failing.
+# Wait for the second scheme so a slow probe does not race the check.
+let audio_tries = 0
+while test $audio_tries -lt 30
+    if contains "$(ls /scheme)" "audiohw.pci-"
+        break
+    end
+    sleep 1
+    let audio_tries += 1
+end
+if contains "$(ls /scheme)" "audiohw.pci-"
+    echo FERRIC_TEST_PASS audio-second-controller
+else
+    echo FERRIC_TEST_FAIL audio-second-controller: no second HDA scheme
+end
 # The crash dump (kernel.trace_crash): skips unless there is one, or, on the crash image's
 # first boot, panics the kernel on purpose; the next boot checks the dump it left.
 ferric-trace-test crash || echo FERRIC_TEST_FAIL trace-crash exited with an error

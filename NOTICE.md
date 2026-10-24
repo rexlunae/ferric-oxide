@@ -15,3 +15,13 @@ Components that this fork consumes as Cargo dependencies or git submodules are m
 "Redox OS" and the Redox OS logo are trademarks of the Redox OS nonprofit. Ferric Oxide does not use them as its own name or logo, and nothing in this project implies endorsement by, or affiliation with, the Redox OS nonprofit. References to Redox OS in this repository describe where the code came from, or name upstream components (such as RedoxFS, relibc and the `redox` target triple) whose names are kept for technical compatibility.
 
 The upstream trademark policy is published at [gitlab.redox-os.org/redox-os/redox/-/blob/master/TRADEMARK.md](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/TRADEMARK.md).
+
+## RTL8125 firmware tables
+
+`crates/rtl8125/src/firmware.rs` contains MAC and PHY controller programs from
+[Realtek's FreeBSD driver](https://github.com/alexdupre/rtl_bsd_drv/blob/cea3599aa88ba5893bb4af28974000d58326b095/if_re.c),
+maintained by Alex Dupre, at commit `cea3599aa88ba5893bb4af28974000d58326b095`.
+These tables retain their BSD-4-Clause terms in
+[`crates/rtl8125/LICENSE-BSD-4-Clause`](crates/rtl8125/LICENSE-BSD-4-Clause).
+Binary distributions containing them must reproduce that notice and disclaimer.
+This product includes software developed by Bill Paul.

@@ -107,6 +107,8 @@ On x86-64, select `image.config=ferric-smoke` for the smoke-test image or
 menuconfig. Both profiles preserve saved CPU/kernel settings and generated
 image overrides. They do not force CI's optional kernel test features. Other
 architectures are rejected because the included tests use x86-64 instructions.
+The `ferric-hardware` choice selects the x86-64 hardware inventory image;
+`drivers.rtl8125=true` adds the experimental RTL8125B driver to that image.
 Use these catalog choices instead of a mismatching command-line `CONFIG_NAME`;
 see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reproducing-a-boot).
 
