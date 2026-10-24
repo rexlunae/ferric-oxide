@@ -104,6 +104,10 @@ pub trait Os {
 
     fn hwdesc(&self) -> OsHwDesc;
 
+    /// Samples firmware wall time against the ARM physical counter, if present.
+    #[cfg(target_arch = "aarch64")]
+    fn boot_time(&self) -> Option<ferric_boot_time::BootTime>;
+
     fn video_outputs(&self) -> usize;
     fn video_modes(&self, output_i: usize) -> Self::V;
     fn set_video_mode(&self, output_i: usize, mode: &mut OsVideoMode);

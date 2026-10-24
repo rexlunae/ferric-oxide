@@ -575,6 +575,11 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         }
     }
 
+    // Sample before the final UEFI memory-map snapshot; the counter-based
+    // offset stays valid even if the environment editor delays kernel entry.
+    #[cfg(target_arch = "aarch64")]
+    let boot_time = os.boot_time();
+
     let page_phys = unsafe { paging_create(os, kernel.as_ptr() as u64, kernel.len() as u64) }
         .expect("Failed to set up paging");
 
@@ -583,6 +588,12 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
             slice: unsafe { slice::from_raw_parts_mut(env_base, max_env_size) },
             i: 0,
         };
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(clock) = boot_time {
+            writeln!(w, "{}={clock}", ferric_boot_time::ENV_KEY)
+                .expect("clock handoff fits the freshly allocated 64 KiB environment");
+        }
 
         match hwdesc {
             OsHwDesc::Acpi(addr, size) => {

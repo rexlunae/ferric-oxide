@@ -1,0 +1,16 @@
+#!/usr/bin/env ion
+# Check actual dynamic executable startup as well as the register-level test.
+let round = 0
+while test $round -lt 128
+    if test "$(ls -d /usr/bin)" != /usr/bin
+        echo FERRIC_TEST_FAIL signal-launch: ls output changed at round $round
+        exit 1
+    end
+    if ion -c true
+        let round += 1
+    else
+        echo FERRIC_TEST_FAIL signal-launch: ion failed at round $round
+        exit 1
+    end
+end
+echo FERRIC_TEST_PASS signal-launch
