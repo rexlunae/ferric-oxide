@@ -191,7 +191,48 @@ pub fn install_dir(
     output_dir: impl AsRef<Path>,
     cookbook: Option<&str>,
 ) -> Result<()> {
-    let output_dir = output_dir.as_ref();
+    install_dir_inner(config, output_dir.as_ref(), cookbook, &mut None)
+}
+
+/// Install an image root without changing host ownership.
+///
+/// Guest IDs are recorded for [`crate::ImageOwnership::archive`]. Files from
+/// packages default to root ownership; file declarations and user homes retain
+/// their configured guest IDs. This does not make a host directory suitable for
+/// executing as the guest root: it is staging data for an image.
+///
+/// # Errors
+/// Returns package, configuration, filesystem or account errors.
+///
+/// # Examples
+/// ```no_run
+/// # fn main() -> anyhow::Result<()> {
+/// let config = redox_installer::Config::default();
+/// let owners = redox_installer::install_dir_unprivileged(config, "build/staging", None)?;
+/// // Pass `owners` and the staging directory to ImageOwnership::archive.
+/// # let _ = owners;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Panics
+/// May panic when the random source fails during password salt generation.
+pub fn install_dir_unprivileged(
+    config: Config,
+    output_dir: impl AsRef<Path>,
+    cookbook: Option<&str>,
+) -> Result<crate::ImageOwnership> {
+    let mut ownership = Some(crate::ImageOwnership::default());
+    install_dir_inner(config, output_dir.as_ref(), cookbook, &mut ownership)?;
+    Ok(ownership.unwrap_or_default())
+}
+
+fn install_dir_inner(
+    config: Config,
+    output_dir: &Path,
+    cookbook: Option<&str>,
+    ownership: &mut Option<crate::ImageOwnership>,
+) -> Result<()> {
     // Check the root before creating it: create_dir_all follows existing links.
     match fs::symlink_metadata(output_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -207,7 +248,7 @@ pub fn install_dir(
 
     for file in &config.files {
         if !file.postinstall {
-            file.create(&output_dir)?;
+            file.create_with_ownership(&output_dir, ownership)?;
         }
     }
 
@@ -215,7 +256,7 @@ pub fn install_dir(
 
     for file in &config.files {
         if file.postinstall {
-            file.create(&output_dir)?;
+            file.create_with_ownership(&output_dir, ownership)?;
         }
     }
 
@@ -270,10 +311,10 @@ pub fn install_dir(
 
         FileConfig::new_directory(home.clone())
             .with_recursive_mod(0o700, uid, gid)
-            .create(&output_dir)?;
+            .create_with_ownership(&output_dir, ownership)?;
 
         if uid >= 1000 {
-            prepare_user_home(&output_dir, uid, gid, &home)?;
+            prepare_user_home(&output_dir, uid, gid, &home, ownership)?;
         }
 
         let password = hash_password(&password)?;
@@ -296,13 +337,14 @@ pub fn install_dir(
     }
 
     if !passwd.is_empty() {
-        FileConfig::new_file("/etc/passwd".to_string(), passwd).create(&output_dir)?;
+        FileConfig::new_file("/etc/passwd".to_string(), passwd)
+            .create_with_ownership(&output_dir, ownership)?;
     }
 
     if !shadow.is_empty() {
         FileConfig::new_file("/etc/shadow".to_string(), shadow)
             .with_mod(0o0600, 0, 0)
-            .create(&output_dir)?;
+            .create_with_ownership(&output_dir, ownership)?;
     }
 
     if !groups.is_empty() {
@@ -317,7 +359,8 @@ pub fn install_dir(
             println!("\tMembers: {}", members.join(", "));
         }
 
-        FileConfig::new_file("/etc/group".to_string(), groups_data).create(&output_dir)?;
+        FileConfig::new_file("/etc/group".to_string(), groups_data)
+            .create_with_ownership(&output_dir, ownership)?;
     }
 
     // Ferric Oxide: fox adopts, syncs and describes the finished root, so
@@ -334,6 +377,7 @@ fn prepare_user_home(
     uid: u32,
     gid: u32,
     home: &String,
+    ownership: &mut Option<crate::ImageOwnership>,
 ) -> Result<(), anyhow::Error> {
     for xdg_folder in &[
         "Desktop",
@@ -352,7 +396,7 @@ fn prepare_user_home(
     ] {
         FileConfig::new_directory(format!("{}/{}", home, xdg_folder))
             .with_mod(0o0700, uid, gid)
-            .create(output_dir)?;
+            .create_with_ownership(output_dir, ownership)?;
     }
     FileConfig::new_file(
         format!("{}/.config/user-dirs.dirs", home),
@@ -369,11 +413,11 @@ XDG_VIDEOS_DIR="$HOME/Videos"
         .to_string(),
     )
     .with_mod(0o0600, uid, gid)
-    .create(output_dir)?;
+    .create_with_ownership(output_dir, ownership)?;
 
     let skel_dir = output_dir.join("etc/skel");
     if skel_dir.is_dir() {
-        copy_dir_all(&skel_dir, home.clone(), output_dir, uid, gid)?;
+        copy_dir_all(&skel_dir, home.clone(), output_dir, uid, gid, ownership)?;
     }
     Ok(())
 }
@@ -384,18 +428,19 @@ fn copy_dir_all(
     output_dir: &Path,
     uid: u32,
     gid: u32,
+    ownership: &mut Option<crate::ImageOwnership>,
 ) -> anyhow::Result<()> {
     if !Path::new(dst.as_str()).is_dir() {
         FileConfig::new_directory(dst.clone())
             .with_mod(0o0700, uid, gid)
-            .create(&output_dir)?;
+            .create_with_ownership(&output_dir, ownership)?;
     }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let dst_path = format!("{}/{}", dst, entry.file_name().display());
         if file_type.is_dir() {
-            copy_dir_all(entry.path(), dst_path, output_dir, uid, gid)?;
+            copy_dir_all(entry.path(), dst_path, output_dir, uid, gid, ownership)?;
         } else if file_type.is_file() {
             FileConfig::new_file(
                 dst_path,
@@ -403,7 +448,7 @@ fn copy_dir_all(
                     .with_context(|| format!("Reading {}", entry.path().display()))?,
             )
             .with_mod(0o0600, uid, gid)
-            .create(&output_dir)?;
+            .create_with_ownership(&output_dir, ownership)?;
         } else if file_type.is_symlink() {
             // TODO
         }
@@ -563,6 +608,26 @@ where
     fs::remove_dir_all(&mount_path)?;
 
     res
+}
+
+fn with_redoxfs_ar_owned<D, F>(
+    mut fs: FileSystem<D>,
+    mount_path: Option<&Path>,
+    callback: F,
+) -> Result<()>
+where
+    D: Disk + Send + 'static,
+    F: FnOnce(&Path) -> Result<crate::ImageOwnership>,
+{
+    let mount_path = decide_mount_path(mount_path);
+
+    let res = callback(Path::new(&mount_path));
+
+    if let Ok(ownership) = &res {
+        ownership.archive(&mut fs, &mount_path)?;
+    }
+    fs::remove_dir_all(&mount_path)?;
+    res.map(|_| ())
 }
 
 /// Fetch BIOS and UEFI bootloader bytes using the selected package configuration.
@@ -1001,8 +1066,8 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
         };
         with_whole_disk(output, &disk_option, move |fs| {
             if config.general.no_mount.unwrap_or(false) {
-                with_redoxfs_ar(fs, None, move |mount_path| {
-                    install_dir(config, mount_path, cookbook)
+                with_redoxfs_ar_owned(fs, None, move |mount_path| {
+                    install_dir_unprivileged(config, mount_path, cookbook)
                 })
             } else {
                 with_redoxfs_mount(fs, None, move |mount_path| {

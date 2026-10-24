@@ -35,6 +35,7 @@ passed, or that a feature is enabled in every image.
 | Area | Implemented behavior | Boundary or remaining work |
 | --- | --- | --- |
 | Monorepo | Local kernel, bootloader, relibc, base services, RedoxFS, installer and Redoxer sources; shared host workspace | Other applications still come from recipes; target builds remain separate |
+| Native build | `cargo xtask` setup, image build and QEMU; rustup, host Clang/LLD and rootless image writing | x86-64 UEFI; target GCC ABI runtime data remains; some application recipes need additional tools |
 | Feature configuration | TOML catalog, interactive editor, CLI, validation and generation of Make, image and kernel settings | Catalog defaults apply through `ferric.toml`; no file preserves the upstream-style build path |
 | CPU state | x86-64-v3 baseline for configured user-space builds; optional v4, AVX and AVX-512 state saving, boot checks | Prebuilt packages and toolchain libraries do not acquire local CPU flags |
 | Memory protection | Physical-map and kernel-image KASLR, user ASLR, `PROT_NONE` guards, KPTI and PCID support | Address randomization uses RDRAND with a fixed-layout fallback; fixed user mappings are not relocated |

@@ -4,7 +4,7 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/blkgrant", "crates/blkqueue", "crates/cet", "crates/codecache", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iobench", "crates/iommu", "crates/irq", "crates/luks", "crates/lvm", "crates/netq", "crates/nospec", "crates/pcache", "crates/procinfo", "crates/regbuf", "crates/ring", "crates/rtl8125", "crates/svm", "crates/trace", "crates/trace-map", "crates/vm", "crates/vmx", "crates/vtd", "crates/wasm-abi", "tools/cargo-fox", "tools/cookbook", "tools/ferric-config", "tools/ferric-trace", "tools/fox", "tools/fox-registry"]
+default-members = ["crates/amdvi", "crates/blkgrant", "crates/blkqueue", "crates/cet", "crates/codecache", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iobench", "crates/iommu", "crates/irq", "crates/luks", "crates/lvm", "crates/netq", "crates/nospec", "crates/pcache", "crates/procinfo", "crates/regbuf", "crates/ring", "crates/rtl8125", "crates/svm", "crates/trace", "crates/trace-map", "crates/vm", "crates/vmx", "crates/vtd", "crates/wasm-abi", "tools/cargo-fox", "tools/cookbook", "tools/ferric-build", "tools/ferric-config", "tools/ferric-trace", "tools/fox", "tools/fox-registry"]
 members = [
     "crates/amdvi",
     "crates/blkgrant",
@@ -40,6 +40,7 @@ members = [
     "crates/wasm-abi",
     "tools/cargo-fox",
     "tools/cookbook",
+    "tools/ferric-build",
     "tools/ferric-config",
     "tools/ferric-trace",
     "tools/fox",
@@ -62,6 +63,7 @@ exclude = [
 
 # Versions shared by more than one host tool.
 [workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.20"

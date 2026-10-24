@@ -18,7 +18,7 @@ else
 	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
 	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
 	fi && \
-	truncate -s "$$FILESYSTEM_SIZE"m $@.partial
+	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
 	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) $@.partial
 	mv $@.partial $@
 	touch $@
@@ -35,7 +35,7 @@ else
 	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
 	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
 	fi && \
-	truncate -s "$$FILESYSTEM_SIZE"m $@.partial
+	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
 	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
 	mv $@.partial $@
 	touch $@
@@ -54,7 +54,7 @@ else
 	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
 	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
 	fi && \
-	truncate -s "$$FILESYSTEM_SIZE"m $@.partial
+	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
 	$(REDOXFS_MKFS) $(REDOXFS_MKFS_FLAGS) $@.partial
 	mkdir -p $(MOUNT_DIR)
 	$(REDOXFS) $@.partial $(MOUNT_DIR)

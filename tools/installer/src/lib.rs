@@ -19,7 +19,11 @@ mod disk_wrapper;
 #[cfg(feature = "installer")]
 mod installer;
 #[cfg(feature = "installer")]
+mod ownership;
+#[cfg(feature = "installer")]
 pub use crate::installer::*;
+#[cfg(feature = "installer")]
+pub use ownership::ImageOwnership;
 
 pub use crate::config::Config;
 pub use crate::config::file::FileConfig;

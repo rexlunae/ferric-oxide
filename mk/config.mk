@@ -21,6 +21,8 @@ ARCH?=$(HOST_ARCH)
 BOARD?=
 ## Enable to use binary prefix (much faster)
 PREFIX_BINARY?=1
+## llvm uses host Clang and rustup; recipe preserves the inherited toolchain.
+PREFIX_TOOLCHAIN?=recipe
 ## Enable to use up-to-date rust compiler (experimental, only available to Tier 2 targets)
 ## Even more experimental, add -Zbuild-std to cookbook.toml to allow compilation to Tier 3 targets
 PREFIX_USE_UPSTREAM_RUST_COMPILER?=0
@@ -78,6 +80,7 @@ FSTOOLS_IN_PODMAN=0
 HOST_TARGET := $(shell env -u RUSTUP_TOOLCHAIN rustc -vV | grep host | cut -d: -f2 | tr -d " ")
 # x86_64 linux hosts have all toolchains
 ifeq ($(PREFIX_BINARY),1)
+ifneq ($(PREFIX_TOOLCHAIN),llvm)
 ifeq ($(HOST_TARGET),aarch64-unknown-linux-gnu)
 	ifneq ($(ARCH),aarch64)
 	ifneq ($(ARCH),x86_64)
@@ -89,6 +92,7 @@ else ifeq ($(HOST_TARGET),x86_64-unknown-linux-gnu)
 else
     $(info The $(ARCH) binary prefix is only built for Linux hosts)
 	PREFIX_BINARY=0
+endif
 endif
 endif
 endif
@@ -123,6 +127,10 @@ ifeq ($(UNAME),Darwin)
 	NPROC=sysctl -n hw.ncpu
 	SED=gsed
 	FIND=gfind
+	ifeq ($(PREFIX_TOOLCHAIN),llvm)
+		SED=sed
+		FIND=find
+	endif
 	VB_AUDIO=coreaudio
 	VBM=/Applications/VirtualBox.app/Contents/MacOS/VBoxManage
 else ifeq ($(UNAME),FreeBSD)

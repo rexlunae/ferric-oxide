@@ -31,12 +31,21 @@ fn chown<P: AsRef<Path>>(path: P, uid: uid_t, gid: gid_t, recursive: bool) -> Re
 
 // TODO: Rewrite impls
 impl crate::FileConfig {
+    #[cfg(test)]
     pub(crate) fn create<P: AsRef<Path>>(&self, prefix: P) -> Result<()> {
+        self.create_with_ownership(prefix, &mut None)
+    }
+
+    pub(crate) fn create_with_ownership<P: AsRef<Path>>(
+        &self,
+        prefix: P,
+        ownership: &mut Option<crate::ImageOwnership>,
+    ) -> Result<()> {
+        let prefix = prefix.as_ref();
         let relative = crate::image_relative_path(Path::new(&self.path))?;
         let target_file = if self.symlink {
             // Replacing the link itself is safe; only its parent is traversed.
-            let parent =
-                crate::image_path(prefix.as_ref(), relative.parent().unwrap_or(Path::new("")))?;
+            let parent = crate::image_path(prefix, relative.parent().unwrap_or(Path::new("")))?;
             parent.join(relative.file_name().ok_or_else(|| {
                 Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -44,14 +53,14 @@ impl crate::FileConfig {
                 )
             })?)
         } else {
-            crate::image_path(prefix.as_ref(), &relative)?
+            crate::image_path(prefix, &relative)?
         };
 
         if self.directory {
             println!("Create directory {}", target_file.display());
             fs::create_dir_all(&target_file)
                 .with_context(|| format!("failed to create directory {}", target_file.display()))?;
-            self.apply_perms(&target_file)?;
+            self.apply_perms(prefix, &target_file, ownership)?;
             return Ok(());
         } else if let Some(parent) = target_file.parent() {
             println!("Create file parent {}", parent.display());
@@ -90,11 +99,16 @@ impl crate::FileConfig {
             };
             file.write_all(self.data.as_bytes())?;
 
-            self.apply_perms(target_file)
+            self.apply_perms(prefix, target_file, ownership)
         }
     }
 
-    fn apply_perms<P: AsRef<Path>>(&self, target: P) -> Result<()> {
+    fn apply_perms<P: AsRef<Path>>(
+        &self,
+        root: &Path,
+        target: P,
+        ownership: &mut Option<crate::ImageOwnership>,
+    ) -> Result<()> {
         let path = target.as_ref();
         let mode = self
             .mode
@@ -106,6 +120,10 @@ impl crate::FileConfig {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
 
+        if let Some(ownership) = ownership {
+            ownership.record(root, path, self.uid, self.gid, self.recursive_chown)?;
+            return Ok(());
+        }
         // chown
         chown(path, uid, gid, self.recursive_chown)
             .with_context(|| format!("failed to chown {}", path.display()))
@@ -121,13 +139,8 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("installer-test-{}-{nonce}", std::process::id()));
-            fs::create_dir(&path).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.keep().canonicalize().unwrap();
             Self(path)
         }
         fn path(&self) -> &Path {

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Offline regression tests: never install tools or download runtime archives.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+temp=$(mktemp -d)
+trap 'rm -rf "$temp"' EXIT
+mock="$temp/mock"
+rust_root="$temp/rust"
+prefix="$temp/prefix with a 'quote"
+target=x86_64-unknown-redox
+mkdir -p "$mock" "$rust_root/bin" "$rust_root/lib/rustlib/mock-host/bin" "$prefix"
+cat > "$mock/rustup" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+    which) printf '%s/bin/rustc\n' "$FAKE_RUST_ROOT" ;;
+    component|target) ;;
+    *) exit 90 ;;
+esac
+STUB
+cat > "$rust_root/bin/rustc" <<'STUB'
+#!/usr/bin/env bash
+printf 'host: mock-host\n'
+STUB
+for tool in cargo rustdoc; do cp "$rust_root/bin/rustc" "$rust_root/bin/$tool"; done
+for tool in ar nm objcopy objdump strip; do touch "$rust_root/lib/rustlib/mock-host/bin/llvm-$tool"; done
+touch "$rust_root/lib/rustlib/mock-host/bin/rust-lld"
+cat > "$mock/clang" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE_CLANG_ARGS"
+STUB
+cp "$mock/clang" "$mock/clang++"
+cat > "$mock/gcc" <<'STUB'
+#!/usr/bin/env bash
+exit 91
+STUB
+chmod +x "$mock/"* "$rust_root/bin/"*
+fixture="$temp/fixture"
+mkdir -p "$fixture/$target/include" "$fixture/$target/lib" "$fixture/lib/gcc/$target/13.2.0" "$fixture/bin"
+touch "$fixture/$target/include/stdio.h" "$fixture/$target/lib/libc.a" "$fixture/lib/gcc/$target/13.2.0/crtbegin.o" "$fixture/bin/gcc"
+tar -cf "$prefix/target-runtime.tar.gz" -C "$fixture" .
+export FAKE_RUST_ROOT="$rust_root" FAKE_CLANG_ARGS="$temp/clang-args"
+PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" "$target"
+test ! -e "$prefix/sysroot/bin/gcc"
+test -f "$prefix/sysroot/$target/include/stdio.h"
+test -L "$prefix/sysroot/bin/rustc"
+test -L "$prefix/sysroot/lib/gcc/$target/13.2.0/crtbeginT.o"
+case "$(cat "$prefix/sysroot/bin/$target.cfg")" in
+    *--target=x86_64-unknown-linux-gnu*--sysroot=*) ;;
+    *) echo 'Missing ELF driver or target sysroot' >&2; exit 1 ;;
+esac
+"$prefix/sysroot/bin/$target-clang" --target="$target" -c 'file with spaces.c'
+case "$(cat "$FAKE_CLANG_ARGS")" in
+    *--target=x86_64-unknown-redox*|*dynamic-linker*) exit 1 ;;
+esac
+test "$(tail -n 1 "$FAKE_CLANG_ARGS")" = 'file with spaces.c'
+"$prefix/sysroot/bin/$target-clang" source.c -o app
+case "$(cat "$FAKE_CLANG_ARGS")" in
+    *--dynamic-linker=/usr/lib/ld64.so.1*) ;;
+    *) exit 1 ;;
+esac
+"$prefix/sysroot/bin/$target-clang" -static source.c -o app
+case "$(cat "$FAKE_CLANG_ARGS")" in *dynamic-linker*) exit 1 ;; esac
+if PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" aarch64-unknown-redox; then
+    echo 'Unsupported target was accepted' >&2; exit 1
+fi
+
+# Exercise the actual Make prerequisite list without building or installing.
+inputs="$temp/inputs"
+ready="prefix/llvm/$target/ready"
+mkdir -p "$inputs/$(dirname "$ready")"
+input_files=(
+    crates/relibc/src/lib.rs crates/relibc/src/debug.rs
+    crates/relibc/include/stdio.h crates/relibc/Cargo.toml
+    crates/relibc/Cargo.lock crates/relibc/Makefile crates/relibc/config.mk
+    crates/relibc/build.rs crates/relibc/cbindgen.globdefs.toml
+    crates/relibc/.cargo/config.toml crates/relibc/redox-rt/Cargo.toml
+    crates/relibc/redox-rt/src/lib.rs
+    crates/relibc/ld_so/src/lib.rs crates/relibc/redox-ioctl/src/lib.rs
+    crates/relibc/generic-rt/src/lib.rs crates/relibc/openlibm/src/math.c
+    crates/relibc/dlmalloc-rs/src/lib.rs crates/hwrand/src/lib.rs
+    crates/procinfo/src/lib.rs crates/kernel/syscall/src/lib.rs
+    scripts/native-toolchain.sh scripts/native/runtime.ld rust-toolchain.toml
+    recipes/core/relibc/recipe.toml
+)
+for input in "${input_files[@]}"; do
+    mkdir -p "$inputs/$(dirname "$input")"
+    touch "$inputs/$input"
+done
+touch "$inputs/host-ready"
+for cache in target build sysroot prefix .git; do
+    mkdir -p "$inputs/crates/relibc/$cache"
+    touch "$inputs/crates/relibc/$cache/generated"
+done
+mkdir -p "$inputs/crates/relibc/openlibm/.git" "$inputs/crates/relibc/dlmalloc-rs/target"
+touch "$inputs/crates/relibc/openlibm/.git/index" "$inputs/crates/relibc/dlmalloc-rs/target/cache"
+find "$inputs" -exec touch -t 202001010000 {} +
+touch -t 202001020000 "$inputs/$ready"
+check_ready() {
+    local status=0
+    (cd "$inputs" && make --no-print-directory -f "$root/mk/llvm.mk" \
+        -q "$ready" TARGET="$target" FSTOOLS_TAG=host-ready) || status=$?
+    if [ "$status" -ne "$1" ]; then
+        echo "Unexpected native sysroot freshness ($status, expected $1): $2" >&2
+        exit 1
+    fi
+}
+check_ready 0 'unchanged inputs'
+for input in "${input_files[@]}"; do
+    touch -t 202001030000 "$inputs/$input"
+    check_ready 1 "$input changed"
+    touch -t 202001010000 "$inputs/$input"
+done
+# Parent directory timestamps detect additions/removals, even of old files.
+rm "$inputs/crates/relibc/include/stdio.h"
+touch -t 202001030000 "$inputs/crates/relibc/include"
+check_ready 1 'header removed'
+touch -t 202001010000 "$inputs/crates/relibc/include"
+find "$inputs/crates/relibc" -name generated -o -name cache -o -name index | while IFS= read -r output; do
+    touch -t 202001030000 "$output"
+done
+check_ready 0 'generated caches changed'
+printf 'Native toolchain regression tests passed\n'

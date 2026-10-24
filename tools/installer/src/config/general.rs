@@ -20,7 +20,7 @@ pub struct GeneralConfig {
     /// If set, write bootloader disk into this path
     pub write_bootloader: Option<String>,
     /// Use AR to write files instead of FUSE-based mount
-    /// (bypasses FUSE, but slower and requires namespaced context such as "podman unshare")
+    /// Guest ownership is recorded and applied inside the image, without host chown.
     pub no_mount: Option<bool>,
 }
 

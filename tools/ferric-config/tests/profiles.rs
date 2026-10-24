@@ -18,6 +18,7 @@ impl Fixture {
             "desktop",
             "base",
             "minimal",
+            "native",
             "ferric-smoke",
             "ferric-fuzz",
             "ferric-hardware",
@@ -300,4 +301,31 @@ fn hardware_profile_keeps_the_experimental_driver_on_its_selected_target() {
     assert!(mk.contains("export FERRIC_BASE_DRIVERS:=rtl8125d"));
     let fs = std::fs::read_to_string(fixture.generated("filesystem.toml")).unwrap();
     assert!(fs.contains("ferric-hardware.toml"));
+}
+
+#[test]
+fn native_profile_rebuilds_fork_components_and_selects_native_tools() {
+    let fixture = Fixture::new();
+    fixture.run(&["set", "image.config=native", "build.repo_binary=true"]);
+    fixture.run(&["generate", "--no-touch"]);
+    let mk = std::fs::read_to_string(fixture.generated("config.mk")).unwrap();
+    for setting in [
+        "PREFIX_TOOLCHAIN?=llvm",
+        "PODMAN_BUILD?=0",
+        "FSTOOLS_NO_MOUNT?=1",
+    ] {
+        assert!(mk.contains(setting), "{mk}");
+    }
+    let config = redox_installer::Config::from_file(&fixture.generated("filesystem.toml")).unwrap();
+    for package in ["kernel", "bootloader", "relibc", "base", "redoxfs", "fox"] {
+        assert!(
+            matches!(config.packages.get(package), Some(redox_installer::PackageConfig::Build(rule)) if rule == "source"),
+            "{package}"
+        );
+    }
+    fixture.run(&["set", "build.podman=true"]);
+    fixture.run(&["generate", "--no-touch"]);
+    let mk = std::fs::read_to_string(fixture.generated("config.mk")).unwrap();
+    assert!(mk.contains("PREFIX_TOOLCHAIN?=recipe"), "{mk}");
+    assert!(mk.contains("PODMAN_BUILD?=1"), "{mk}");
 }

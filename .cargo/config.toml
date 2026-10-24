@@ -20,3 +20,6 @@ rustflags = []
 
 [env]
 CFLAGS_riscv64gc_unknown_redox="-march=rv64gc -mabi=lp64d"
+
+[alias]
+xtask = "run --package ferric-build --"

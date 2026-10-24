@@ -6,7 +6,7 @@ path = "crates/relibc"
 
 [build]
 template = "custom"
-compiler = "gcc-no-lto"
+compiler = "no-lto"
 script = """
 # rustup workaround https://github.com/rust-lang/rustup/issues/988
 if [ "${COOKBOOK_HOST_SYSROOT}" = "/usr" ]; then
@@ -32,6 +32,12 @@ done
 # math_libm only with USE_RUST_LIBM (otherwise openlibm provides libm), so
 # keep that choice when overriding it.
 RELIBC_MAKE_ARGS=()
+if [ "${FERRIC_LLVM_TOOLCHAIN}" = 1 ]
+then
+    # Command-line Make assignments override the inherited GCC defaults.
+    RELIBC_MAKE_ARGS+=("CC=${GNU_TARGET}-clang" "LD=ld.lld" "AR=llvm-ar"
+        "NM=llvm-nm" "OBJCOPY=llvm-objcopy")
+fi
 if [ -n "${FERRIC_RELIBC_FEATURES}" ]
 then
     relibc_features="${FERRIC_RELIBC_FEATURES// /,}"

@@ -28,16 +28,23 @@ impl DiskWrapper {
     /// # Errors
     /// Returns open, metadata or size-detection I/O errors.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut disk = OpenOptions::new().read(true).write(true).open(path)?;
+        let disk = OpenOptions::new().read(true).write(true).open(path)?;
         let metadata = disk.metadata()?;
-        let mut size = metadata.len();
+        let size = metadata.len();
 
         // size doesn't work here, must seek to figure out
         #[cfg(target_os = "linux")]
-        if size == 0 {
-            size = disk.seek(SeekFrom::End(0))?;
-            disk.seek(SeekFrom::Start(0))?;
-        }
+        let (disk, size) = {
+            let mut disk = disk;
+            let size = if size == 0 {
+                let size = disk.seek(SeekFrom::End(0))?;
+                disk.seek(SeekFrom::Start(0))?;
+                size
+            } else {
+                size
+            };
+            (disk, size)
+        };
         // TODO: get real block size: disk_metadata.blksize() works on disks but not image files
         let block_size = 512;
         let block = vec![0u8; block_size].into_boxed_slice();

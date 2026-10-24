@@ -1,3 +1,8 @@
+//! x86-64 TLS, fork and signal register transitions.
+//!
+//! Fork copies its cloned stack handoff above the child's Rust call stack before
+//! invoking helpers, and keeps FPU control words separate from saved registers.
+
 use core::{
     cell::SyncUnsafeCell,
     mem::offset_of,
@@ -138,7 +143,7 @@ asmfunction!(__relibc_internal_fork_wrapper (usize) -> usize: ["
 
     sub rsp, 16
 
-    stmxcsr [rsp+16]
+    stmxcsr [rsp]
     fnstcw [rsp+8]
 
     // rdi: &ForkArgs
@@ -153,13 +158,24 @@ asmfunction!(__relibc_internal_fork_wrapper (usize) -> usize: ["
 
 "] <= [fork_impl = sym fork_impl]);
 asmfunction!(__relibc_internal_fork_ret: ["
-    # scratchpad is in rsi, move to rdi for child_hook
-    mov rdi, rsi
+    # Read the parent frame before reusing its stack for child_hook. Its calls
+    # can overwrite fork_inner's scratchpad below the restored initial rsp.
+    mov rax, [rsi + {cur_filetable}]
+    mov rdx, [rsi + {new_filetable}]
+    mov rcx, [rsi + {new_proc}]
+    mov r8, [rsi + {new_thr}]
+    sub rsp, {scratchpad_size}
+    mov [rsp + {cur_filetable}], rax
+    mov [rsp + {new_filetable}], rdx
+    mov [rsp + {new_proc}], rcx
+    mov [rsp + {new_thr}], r8
+    mov rdi, rsp
 
     call {child_hook}
+    add rsp, {scratchpad_size}
 
-    ldmxcsr [rsp + 16]
-    mov rcx, [rsp + 8]
+    ldmxcsr [rsp]
+    fldcw [rsp + 8]
 
     xor rax, rax
 
@@ -173,7 +189,14 @@ asmfunction!(__relibc_internal_fork_ret: ["
 
     pop rbp
     ret
-"] <= [child_hook = sym child_hook]);
+"] <= [
+    child_hook = sym child_hook,
+    scratchpad_size = const size_of::<ForkScratchpad>(),
+    cur_filetable = const offset_of!(ForkScratchpad, cur_filetable_fd),
+    new_filetable = const offset_of!(ForkScratchpad, new_filetable_fd),
+    new_proc = const offset_of!(ForkScratchpad, new_proc_fd),
+    new_thr = const offset_of!(ForkScratchpad, new_thr_fd),
+]);
 asmfunction!(__relibc_internal_rlct_clone_ret: ["
     # Load registers
     pop rax

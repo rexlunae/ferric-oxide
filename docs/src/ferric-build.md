@@ -1,33 +1,119 @@
 # Build and configuration
 
-The top-level Make build orchestrates the cross toolchain, host tools,
-cookbook packages and disk image. Running Cargo at the repository root builds
-host tools and shared libraries; it does not produce a bootable OS image.
+The Cargo entry point (`tools/ferric-build`, aliased as `cargo xtask`) runs the
+existing Make/recipe engine for package ordering and image creation. Host,
+kernel, bootloader and userspace retain their independent Cargo workspaces.
+Plain `cargo build` at the root builds host tools and shared libraries;
+`cargo xtask build` produces an OS image.
 
-## Building an image
-
-From the repository root, the usual Podman workflow is:
+## Native build and QEMU
 
 ```sh
-git submodule update --init --recursive
-./podman_bootstrap.sh
-make menuconfig
-make config-check
-make all
-make qemu
+cargo xtask doctor
+cargo xtask setup
+cargo xtask build
+cargo xtask run --headless
 ```
 
-`make menuconfig` is the step that opts into the Ferric feature catalog. Save
-the configuration before building. Without a `ferric.toml`, the Make build
-keeps its upstream-style configuration path and does not apply Ferric catalog
-defaults. The local fork sources are still the recipe inputs in either case.
-On hosts without SELinux, use `make all USE_SELINUX=0`.
+Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK,
+and NASM. On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
+still needed for the kernel's assembly trampoline. QEMU is needed only to boot.
+Use existing installations or install missing tools using your preferred
+method: setup never invokes Homebrew, a system package manager or sudo.
 
-See the inherited [Podman build](podman-build.md),
-[build-system reference](build-system-reference.md) and
-[troubleshooting](troubleshooting.md) for environment setup and general Make
-targets. Prefer the in-tree component paths in
-[Architecture](ferric-architecture.md) over historical checkout paths there.
+Setup installs missing or outdated `cbindgen` and `just` with Cargo, adds `rust-src`,
+`llvm-tools-preview` and `x86_64-unknown-redox` to the pinned toolchain, initializes
+submodules and creates `ferric.toml` only if absent. It selects `image.config =
+"native"` and binary application packages. `config/native.toml` rebuilds the
+local kernel, UEFI bootloader, relibc, base services/drivers and RedoxFS, even
+with `build.repo_binary = true`. The selected package manager is added by the
+catalog. Existing configurations are preserved, so their image choice and
+package policy still apply. The first build downloads Rust components, target
+runtime data, Cargo dependencies and application packages.
+
+The native toolchain (`build.toolchain = "llvm"`, `mk/llvm.mk`) uses host Clang
+and rustup's compiler, LLD and LLVM binary utilities. It extracts target headers,
+libraries and startup objects from the existing upstream GCC toolchain archive
+without installing or executing its Linux compiler binaries. Rust's current
+Redox target still links `libgcc`; existing C++ packages require `libstdc++` and
+its headers. Replacing these ABI runtimes with compiler-rt/libc++ is separate
+work. Native builds do not compile GCC, LLVM or Rust itself.
+
+Stock Clang has no complete Redox linker driver. The generated adapter uses
+Clang's x86-64 ELF/Linux driver for linker/startup handling, removes Linux
+predefines, defines `__redox__`, and selects the Redox sysroot, LLD and
+`/usr/lib/ld64.so.1`. Rust's target remains `x86_64-unknown-redox`. A small linker
+script exports the constructor-array symbols relibc needs in dynamic executables.
+Static links and shared libraries keep their normal layouts. Clang must support
+`--gcc-install-dir`; no separate Homebrew LLVM installation is needed when the
+host's Clang supports it. Native artifacts live under
+`prefix/llvm/x86_64-unknown-redox/`, apart from the inherited toolchain.
+
+Configured builds default to native LLVM on x86-64, `build.podman = false`, and
+`build.fuse = false`. Image creation records guest ownership and applies it
+inside RedoxFS rather than calling host `chown`. Later file declarations retain
+previous guest IDs when those fields are omitted. Archiving currently makes a
+second pass over the image tree to set guest owners, including default root IDs;
+sparse image allocation uses
+Rust's filesystem API. This avoids FUSE, macFUSE, sudo and GNU coreutils for the
+normal image path. Explicit `make mount` still requires FUSE.
+
+`cargo xtask run` builds and boots `build/x86_64/<config>/harddrive.img` using the
+existing QEMU configuration. `--headless` selects the serial console without a
+display window. On Apple Silicon, the x86-64 guest uses software emulation;
+hardware acceleration requires matching architectures. After building, use
+`cargo xtask run --no-build --headless` to reuse the existing disk and preserve
+guest changes. QEMU's UEFI firmware is
+discovered in the usual Linux, Homebrew and MacPorts locations. If necessary,
+pass `PFLASH0=/path/to/edk2-x86_64-code.fd` or `FIRMWARE=/path/to/OVMF.fd`.
+Missing firmware produces an error rather than silently attempting BIOS boot.
+
+```sh
+cargo xtask run -- QEMU_MEM=4096 kvm=no
+cargo xtask --dry-run build
+cargo xtask build -- REPO_BINARY=0
+make menuconfig
+make config-check
+make r.kernel
+```
+
+Make assignments after `--` override the Cargo command's native x86-64,
+container and FUSE settings. Without a terminal, Cargo commands disable the
+cookbook TUI so builds can be logged. The native path currently supports
+x86-64 UEFI. Some third-party recipes still require GNU build utilities or
+explicit GCC compilers; dependencies for those recipes are installed only when
+needed. A full application rebuild has broader requirements than the initial
+native profile. Local recipe snapshots skip root `target/`, `build/`, `sysroot/`
+and Git metadata, as well as nested Cargo target directories marked as caches,
+so existing component build caches are not copied into each recipe or used to
+invalidate source fingerprints. The native prefix tracks relibc's headers,
+manifests, Make/build configuration, source submodules and shared path
+dependencies, including directory changes for added or deleted inputs. Build
+outputs and Git metadata are excluded. These inputs refresh the sysroot before
+recipe/image cache decisions. Its stamp invalidates a source recipe when any
+required package archive is missing or older than the sysroot; a newer archive
+variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot.
+The x86-64 relibc fork transition keeps the handoff buffer live
+through address-space cloning and copies it above the child's Rust call stack,
+so ordinary compiler stack layouts cannot overwrite its file-table handles.
+Its floating-point control slots are separate from saved integer registers.
+
+## Optional container and inherited toolchain
+
+Use `cargo xtask --podman build` with an existing Podman installation to select
+the Linux recipe toolchain. `./podman_bootstrap.sh` remains the explicit legacy
+container setup, which can install host packages. On hosts without SELinux, the
+Cargo wrapper disables SELinux volume labels. Container debugging and other
+specialized workflows remain available independently.
+
+`build.toolchain = "recipe"` retains the inherited prebuilt/source cross
+compiler path. It is the default when selecting Podman or a non-x86-64 target.
+Without `ferric.toml`, plain Make preserves the upstream-style configuration
+and defaults. Saving `make menuconfig` opts into the Ferric catalog. Source
+recipe inputs remain local fork sources in either mode. See the inherited
+[Podman build](podman-build.md), [build-system reference](build-system-reference.md)
+and [troubleshooting](troubleshooting.md) for additional Make workflows; verify
+historical source paths against [Architecture](ferric-architecture.md).
 
 ## Configuration inputs and precedence
 

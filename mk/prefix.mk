@@ -2,6 +2,12 @@
 
 PREFIX=prefix/$(TARGET)
 
+# Native LLVM uses rustup and host Clang; keep the inherited toolchain available
+# for recipes which still require GCC and for upstream-style builds.
+ifeq ($(PREFIX_TOOLCHAIN),llvm)
+include mk/llvm.mk
+else
+
 # Ferric Oxide: downloads retry. static.redox-os.org has sometimes resolved to
 # IPv6 addresses only, which hosts without IPv6 (GitHub's runners) cannot
 # reach, so prefer IPv4 and resolve again on each try.
@@ -468,3 +474,5 @@ else
 endif
 
 endif
+
+endif # PREFIX_TOOLCHAIN

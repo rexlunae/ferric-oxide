@@ -385,6 +385,50 @@ For behavior changes affecting an image, build with `make all` and boot with
 Actual machine reports belong in root `HARDWARE.md`; its inherited reports
 include old Redox versions and are not validation of current Ferric features.
 
+## Native build checks
+
+The native entry point and image writer have host tests:
+
+```sh
+cargo test --locked -p ferric-build -p ferric-config
+cargo test --locked -p redox_cookbook --lib
+cargo test --locked -p redox_installer --no-default-features --features installer
+bash scripts/ferric-ci/test-native-toolchain.sh
+cargo xtask --dry-run build
+```
+
+The shell regression uses a small synthetic runtime archive and mock Rust/Clang
+tools, with no network or package installation. It checks compiler exclusion,
+argument quoting, explicit LLD/Redox settings and rejection of unsupported
+targets. It also uses Make's actual native-prefix prerequisite list to check
+invalidation after header, manifest, configuration, shared-crate, submodule and
+directory changes, while ignoring generated caches. The installer tests
+round-trip guest owners and modes through RedoxFS without host `chown`, including
+repeated declarations with omitted or partial IDs. Cookbook tests cover
+source-cache exclusion and native sysroot invalidation with mixed-age or missing
+package variants. These host checks do not prove a complete OS boot: also run
+`cargo xtask build` and `cargo xtask run --headless` for image changes, and
+report the build and boot results separately.
+
+For the native fork regression, log in at the serial console with the accounts
+from `config/base.toml`, then run:
+
+```sh
+ion -c 'for n in 1 2 3 4 5 6 7 8; ion -c true; end'
+fox verify --installed
+```
+
+Booting through init, mounting the root filesystem, reaching a shell and
+launching nested shells exercises the relibc fork handoff under release
+optimization. The x86-64 child trampoline must preserve its descriptor buffer
+and saved registers while calling Rust. Package verification additionally
+checks that the rootless image's installed payloads remain intact.
+
+A full `cargo test --locked --workspace` also enables the imported Redoxer
+execution/FUSE feature. On macOS that optional tool requires a libfuse setup;
+the native build and the targeted commands above require neither FUSE nor
+macFUSE.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
