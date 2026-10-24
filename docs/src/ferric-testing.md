@@ -400,7 +400,13 @@ cargo xtask --dry-run build
 The shell regression uses a small synthetic runtime archive and mock Rust/Clang
 tools, with no network or package installation. It checks compiler exclusion,
 argument quoting, explicit LLD/Redox settings and rejection of unsupported
-targets. It also uses Make's actual native-prefix prerequisite list to check
+targets. Both x86-64 and ARM64 adapters are checked, including ARM64's Cargo
+build-std settings. Mock QEMU checks cover ARM64 live/software defaults, explicit
+HVF selection, x86-64 emulation on Apple Silicon, image selection and missing
+ARM64 firmware. They also check the Raspberry Pi ROM exception, native versus
+unconfigured CPU defaults, and explicit CPU model precedence. CLI tests cover
+host defaults, explicit architecture selection, aliases and legacy `ARCH=` overrides.
+The script also uses Make's actual native-prefix prerequisite list to check
 invalidation after header, manifest, configuration, shared-crate, submodule and
 directory changes, while ignoring generated caches. The installer tests
 round-trip guest owners and modes through RedoxFS without host `chown`, including
@@ -409,6 +415,12 @@ source-cache exclusion and native sysroot invalidation with mixed-age or missing
 package variants. These host checks do not prove a complete OS boot: also run
 `cargo xtask build` and `cargo xtask run --headless` for image changes, and
 report the build and boot results separately.
+
+On Apple Silicon the default build/run pair exercises ARM64 live/software
+emulation. Also use
+`cargo xtask --arch x86_64 build` and `cargo xtask --arch x86_64 run --headless`
+to check cross-compilation and software emulation. A build for one architecture
+does not validate the other's boot path.
 
 For the native fork regression, log in at the serial console with the accounts
 from `config/base.toml`, then run:
