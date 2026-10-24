@@ -40,7 +40,9 @@ cargo xtask build
 cargo xtask run --headless
 ```
 
-Setup requires rustup, a native compiler/SDK and NASM, and installs only Rust
+Commands use the host architecture by default; add `--arch x86_64` or
+`--arch aarch64` to setup, build and run for a different guest architecture.
+Setup requires rustup and a native compiler/SDK (plus NASM for x86-64), and installs only Rust
 components and Cargo utilities. QEMU is needed for `run`. Existing
 `ferric.toml` files are preserved. Podman is an explicit option via
 `cargo xtask --podman build`; the inherited recipe toolchain remains available

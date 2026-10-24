@@ -10,18 +10,33 @@ cargo xtask build
 cargo xtask run --headless
 ```
 
-Setup adds `rust-src`, `llvm-tools-preview` and the Redox standard library to the
-repository's pinned rustup toolchain, installs missing or outdated `cbindgen` and `just` with
-Cargo, initializes the source submodules and creates `ferric.toml` if absent.
+The default guest matches the host: ARM64 on Apple Silicon and x86-64 on
+Intel/AMD. Select another architecture explicitly for cross-compilation:
+
+```sh
+cargo xtask --arch x86_64 setup
+cargo xtask --arch x86_64 build
+cargo xtask --arch x86_64 run --headless
+# On an Intel/AMD host, use --arch aarch64 for an ARM64 guest.
+```
+
+Setup adds `rust-src`, `llvm-tools-preview` and (for x86-64) the Redox standard
+library to the repository's pinned rustup toolchain, installs missing or outdated
+`cbindgen` and `just` with Cargo, initializes the source submodules and creates `ferric.toml` if absent.
 It never invokes Homebrew, another system package manager, or sudo. Install a
-native C/C++ compiler and SDK (Xcode Command Line Tools on macOS), NASM and QEMU
-using your preferred method. QEMU is required only for `run`.
+native C/C++ compiler and SDK (Xcode Command Line Tools on macOS) and QEMU
+(plus NASM for x86-64) using your preferred method. QEMU is required only for `run`.
 
 The initial `native` image builds the local kernel, UEFI bootloader, relibc,
 base services/drivers and RedoxFS; applications use existing binary packages.
-The feature catalog also adds the selected package manager. A first build needs
-network access. Existing `ferric.toml` files are preserved. Cargo commands
-explicitly select x86-64, native LLVM and image writing without FUSE; Make
+The feature catalog also adds the selected package manager. ARM64 defaults to
+a RAM-backed live image under software emulation; its changes are lost on exit.
+Persistent ARM64 storage and HVF boots remain incomplete; some prebuilt ARM64
+applications also fail at runtime. x86-64 defaults to a persistent disk image.
+A first build needs network access. Existing `ferric.toml` files are preserved. Cargo commands
+select the host architecture unless `--arch` is supplied, native LLVM and image
+writing without FUSE. ARM64 builds std from rust-src using Cargo because its
+Redox target has no prebuilt standard library. Make
 assignments supplied after `--` can override them:
 
 ```sh
@@ -35,8 +50,8 @@ cargo xtask --podman build
 `--podman` opts into the inherited Linux recipe toolchain and requires a working
 Podman installation. Existing Make targets remain available for component work,
 including `make r.kernel` and `make menuconfig`. Native LLVM is currently for
-`x86_64-unknown-redox`; see the [build chapter](../../docs/src/ferric-build.md)
-for its sysroot, driver adapter, ABI runtime requirements and limitations.
+`x86_64-unknown-redox` and `aarch64-unknown-redox`; see the
+[build chapter](../../docs/src/ferric-build.md) for its sysroot, driver adapter, ABI runtime requirements and limitations.
 
 Native assembly uses Clang already on `PATH` and LLVM tools from rustup. It does
 not build GCC, LLVM or Rust compilers. Existing target GCC runtime libraries and

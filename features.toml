@@ -1375,14 +1375,15 @@ menu = "build"
 type = "choice"
 title = "Cross toolchain"
 default = "llvm"
-defaults = [{ when = "build.podman || target.arch != 'x86_64'", value = "recipe" }]
+defaults = [{ when = "build.podman || target.arch == 'riscv64gc'", value = "recipe" }]
 choices = ["llvm", "recipe"]
 make_var = "PREFIX_TOOLCHAIN"
 rebuild = ["*"]
 help = """
 llvm uses host Clang, rustup's pinned Rust compiler and bundled LLVM tools.
 It downloads target runtime data without installing or building GCC/LLVM.
-Currently supports x86_64-unknown-redox. Existing Rust/C++ packages still
+Supports x86_64-unknown-redox and aarch64-unknown-redox. ARM64 builds std from
+rust-src with Cargo. Existing Rust/C++ packages still
 need GCC ABI runtime libraries; these are target libraries, not compilers.
 recipe uses the inherited prebuilt or source-built cross toolchain."""
 
@@ -1450,12 +1451,24 @@ help = "Try to build every package even when some fail. Sets REPO_NONSTOP."
 # ---------------------------------------------------------------- qemu
 
 [[option]]
+id = "qemu.live"
+menu = "qemu"
+type = "choice"
+title = "Boot a RAM-backed live image"
+default = "no"
+defaults = [{ when = "target.arch == 'aarch64'", value = "yes" }]
+choices = ["yes", "no"]
+make_var = "FERRIC_QEMU_LIVE"
+help = "ARM64 defaults to a live image while persistent storage bring-up is incomplete. Guest changes to a live image are lost on exit. Sets the default for live; command-line live=yes/no overrides it."
+
+[[option]]
 id = "qemu.kvm"
 menu = "qemu"
 type = "choice"
 title = "Hardware virtualization"
 default = "auto"
-help = "auto uses KVM when host and target architectures match."
+defaults = [{ when = "target.arch == 'aarch64'", value = "no" }]
+help = "auto uses hardware acceleration for matching host/guest architectures where supported. ARM64 defaults to software emulation; HVF currently traps during early user-space startup. yes explicitly requests KVM on Linux or HVF on macOS."
 choices = ["auto", "yes", "no"]
 
 [[option.effect]]
@@ -1572,5 +1585,5 @@ message = "The Ferric hardware bring-up configuration requires x86_64."
 
 [[rule]]
 level = "error"
-when = "build.toolchain == 'llvm' && target.arch != 'x86_64'"
-message = "The native LLVM toolchain currently supports x86_64 only; select build.toolchain = 'recipe' for other targets."
+when = "build.toolchain == 'llvm' && target.arch == 'riscv64gc'"
+message = "The native LLVM toolchain supports x86_64 and aarch64; select build.toolchain = 'recipe' for RISC-V."

@@ -12,12 +12,15 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
 #[derive(Parser)]
 #[command(about, version)]
 struct Cli {
+    /// Guest architecture (defaults to this host's architecture).
+    #[arg(long, global = true, value_enum)]
+    arch: Option<Architecture>,
     /// Use the Linux recipe toolchain inside an existing Podman installation.
     #[arg(long, global = true)]
     podman: bool,
@@ -26,6 +29,56 @@ struct Cli {
     dry_run: bool,
     #[command(subcommand)]
     task: Task,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Architecture {
+    #[value(name = "x86_64", alias = "amd64")]
+    X86_64,
+    #[value(name = "aarch64", alias = "arm64")]
+    Aarch64,
+}
+
+impl Architecture {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "x86_64" | "amd64" => Ok(Self::X86_64),
+            "aarch64" | "arm64" => Ok(Self::Aarch64),
+            _ => Err(BuildError::Architecture(name.to_owned())),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    fn qemu(self) -> &'static str {
+        match self {
+            Self::X86_64 => "qemu-system-x86_64",
+            Self::Aarch64 => "qemu-system-aarch64",
+        }
+    }
+
+    fn needs_prebuilt_std(self) -> bool {
+        self == Self::X86_64
+    }
+}
+
+fn selected_architecture(
+    requested: Option<Architecture>,
+    args: &[OsString],
+) -> Result<Architecture> {
+    if let Some(name) = args
+        .iter()
+        .rev()
+        .find_map(|arg| arg.to_str()?.strip_prefix("ARCH="))
+    {
+        return Architecture::parse(name);
+    }
+    requested.map_or_else(|| Architecture::parse(env::consts::ARCH), Ok)
 }
 
 #[derive(Subcommand)]
@@ -61,6 +114,8 @@ enum Task {
 
 #[derive(Debug, Error)]
 enum BuildError {
+    #[error("unsupported architecture {0}; use --arch aarch64 or --arch x86_64")]
+    Architecture(String),
     #[error("{program:?} could not be started")]
     Start {
         program: OsString,
@@ -88,11 +143,16 @@ type Result<T> = std::result::Result<T, BuildError>;
 
 const CARGO_UTILITIES: [(&str, &str); 2] = [("cbindgen", "0.29.0"), ("just", "1.50.0")];
 
-const INITIAL_CONFIG: &str = "\
+fn initial_config(arch: Architecture) -> String {
+    format!(
+        "\
 # Native development profile; edit this file or run make menuconfig.\n\
-[target]\narch = \"x86_64\"\n\n\
+[target]\narch = \"{}\"\n\n\
 [image]\nconfig = \"native\"\n\n\
-[build]\npodman = false\ntoolchain = \"llvm\"\nrepo_binary = true\n";
+[build]\npodman = false\ntoolchain = \"llvm\"\nrepo_binary = true\n",
+        arch.name()
+    )
+}
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -141,16 +201,20 @@ fn cargo(root: &Path) -> Command {
     command
 }
 
-fn doctor() -> Result<()> {
+fn doctor(arch: Architecture) -> Result<()> {
+    eprintln!("Guest architecture: {}", arch.name());
     for tool in [
-        "rustup", "cargo", "clang", "clang++", "git", "curl", "tar", "make", "nasm",
+        "rustup", "cargo", "clang", "clang++", "git", "curl", "tar", "make",
     ] {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
             None => return Err(BuildError::Missing(tool)),
         }
     }
-    for tool in ["cbindgen", "just", "qemu-system-x86_64"] {
+    if arch == Architecture::X86_64 && find_tool("nasm").is_none() {
+        return Err(BuildError::Missing("nasm"));
+    }
+    for tool in ["cbindgen", "just", arch.qemu()] {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
             None => eprintln!(
@@ -166,7 +230,7 @@ fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn initialize(root: &Path) -> Result<()> {
+fn initialize(root: &Path, arch: Architecture) -> Result<()> {
     let path = root.join("ferric.toml");
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
@@ -176,7 +240,7 @@ fn initialize(root: &Path) -> Result<()> {
         }
         Err(source) => return Err(BuildError::Io { path, source }),
     };
-    file.write_all(INITIAL_CONFIG.as_bytes())
+    file.write_all(initial_config(arch).as_bytes())
         .map_err(|source| BuildError::Io { path, source })
 }
 
@@ -204,20 +268,22 @@ fn utility_ready(tool: &str, minimum: &str) -> Result<bool> {
     Ok(output.status.success() && version_satisfies(&output.stdout, minimum))
 }
 
-fn setup(root: &Path, dry_run: bool) -> Result<()> {
-    doctor()?;
+fn setup(root: &Path, arch: Architecture, dry_run: bool) -> Result<()> {
+    doctor(arch)?;
     let mut rustup = Command::new("rustup");
     rustup
         .current_dir(root)
         .env_remove("RUSTUP_TOOLCHAIN")
         .args(["component", "add", "rust-src", "llvm-tools-preview"]);
     execute(&mut rustup, dry_run)?;
-    let mut rustup = Command::new("rustup");
-    rustup
-        .current_dir(root)
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .args(["target", "add", "x86_64-unknown-redox"]);
-    execute(&mut rustup, dry_run)?;
+    if arch.needs_prebuilt_std() {
+        let mut rustup = Command::new("rustup");
+        rustup
+            .current_dir(root)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .args(["target", "add", "x86_64-unknown-redox"]);
+        execute(&mut rustup, dry_run)?;
+    }
     for (tool, version) in CARGO_UTILITIES {
         if !utility_ready(tool, version)? {
             execute(
@@ -236,21 +302,23 @@ fn setup(root: &Path, dry_run: bool) -> Result<()> {
         dry_run,
     )?;
     if !dry_run {
-        initialize(root)?;
+        initialize(root, arch)?;
     }
     Ok(())
 }
 
-fn make_command(root: &Path, target: &str, podman: bool, args: &[OsString]) -> Command {
+fn make_command(
+    root: &Path,
+    target: &str,
+    arch: Architecture,
+    podman: bool,
+    args: &[OsString],
+) -> Command {
     let mut command = Command::new(env::var_os("MAKE").unwrap_or_else(|| "make".into()));
     command.current_dir(root).env_remove("RUSTUP_TOOLCHAIN");
     // These select execution tools, while OS features still come from ferric.toml.
-    command.args([
-        target,
-        "ARCH=x86_64",
-        "FSTOOLS_NO_MOUNT=1",
-        "FSTOOLS_IN_PODMAN=0",
-    ]);
+    command.args([target, "FSTOOLS_NO_MOUNT=1", "FSTOOLS_IN_PODMAN=0"]);
+    command.arg(format!("ARCH={}", arch.name()));
     if podman {
         command.args(["PODMAN_BUILD=1", "PREFIX_TOOLCHAIN=recipe"]);
         if !Path::new("/sys/fs/selinux").exists() {
@@ -262,7 +330,12 @@ fn make_command(root: &Path, target: &str, podman: bool, args: &[OsString]) -> C
     if !io::stdout().is_terminal() {
         command.env("CI", "1");
     }
-    command.args(args);
+    // Architecture was resolved before selecting Make and QEMU tools. Keep a
+    // legacy ARCH=arm64 alias from overriding the normalized ARCH=aarch64.
+    command.args(
+        args.iter()
+            .filter(|arg| !arg.to_str().is_some_and(|arg| arg.starts_with("ARCH="))),
+    );
     command
 }
 
@@ -286,10 +359,16 @@ fn run(cli: Cli) -> Result<()> {
             file.set_len(u64::from(mib) * 1024 * 1024)
                 .map_err(|source| BuildError::Io { path, source })
         }
-        Task::Doctor => doctor(),
-        Task::Setup => setup(&root, cli.dry_run),
+        Task::Doctor => doctor(selected_architecture(cli.arch, &[])?),
+        Task::Setup => setup(&root, selected_architecture(cli.arch, &[])?, cli.dry_run),
         Task::Build { args } => execute(
-            &mut make_command(&root, "all", cli.podman, &args),
+            &mut make_command(
+                &root,
+                "qemu-image",
+                selected_architecture(cli.arch, &args)?,
+                cli.podman,
+                &args,
+            ),
             cli.dry_run,
         ),
         Task::Run {
@@ -297,8 +376,9 @@ fn run(cli: Cli) -> Result<()> {
             no_build,
             mut args,
         } => {
-            if !cli.dry_run && find_tool("qemu-system-x86_64").is_none() {
-                return Err(BuildError::Missing("qemu-system-x86_64"));
+            let arch = selected_architecture(cli.arch, &args)?;
+            if !cli.dry_run && find_tool(arch.qemu()).is_none() {
+                return Err(BuildError::Missing(arch.qemu()));
             }
             if headless {
                 args.push("gpu=no".into());
@@ -307,6 +387,7 @@ fn run(cli: Cli) -> Result<()> {
                 &mut make_command(
                     &root,
                     if no_build { "qemu-run" } else { "qemu" },
+                    arch,
                     cli.podman,
                     &args,
                 ),
@@ -336,10 +417,43 @@ mod tests {
     use super::*;
     use std::{ffi::OsStr, fs};
     #[test]
+    fn architecture_defaults_to_host_and_explicit_selection_overrides_it() {
+        assert_eq!(
+            selected_architecture(None, &[]).unwrap(),
+            Architecture::parse(env::consts::ARCH).unwrap()
+        );
+        assert_eq!(Architecture::parse("arm64").unwrap(), Architecture::Aarch64);
+        for (name, arch) in [
+            ("aarch64", Architecture::Aarch64),
+            ("x86_64", Architecture::X86_64),
+        ] {
+            let cli = Cli::try_parse_from(["xtask", "run", "--arch", name]).unwrap();
+            assert_eq!(selected_architecture(cli.arch, &[]).unwrap(), arch);
+            let command = make_command(Path::new("/example"), "qemu", arch, false, &[]);
+            assert!(
+                command
+                    .get_args()
+                    .any(|arg| arg == OsStr::new(&format!("ARCH={name}")))
+            );
+            assert_eq!(arch.qemu(), format!("qemu-system-{name}"));
+        }
+        assert_eq!(
+            selected_architecture(Some(Architecture::Aarch64), &["ARCH=x86_64".into()]).unwrap(),
+            Architecture::X86_64
+        );
+        assert!(selected_architecture(None, &["ARCH=unknown".into()]).is_err());
+        assert!(!Architecture::Aarch64.needs_prebuilt_std());
+        let args = ["ARCH=arm64".into()];
+        let arch = selected_architecture(None, &args).unwrap();
+        let command = make_command(Path::new("/example"), "qemu", arch, false, &args);
+        assert!(command.get_args().any(|arg| arg == "ARCH=aarch64"));
+        assert!(!command.get_args().any(|arg| arg == "ARCH=arm64"));
+    }
+    #[test]
     fn setup_preserves_existing_configuration() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("ferric.toml"), "# user choices\n").unwrap();
-        initialize(dir.path()).unwrap();
+        initialize(dir.path(), Architecture::Aarch64).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("ferric.toml")).unwrap(),
             "# user choices\n"
@@ -347,21 +461,22 @@ mod tests {
     }
     #[test]
     fn setup_creates_native_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        initialize(dir.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("ferric.toml")).unwrap(),
-            INITIAL_CONFIG
-        );
+        for arch in [Architecture::Aarch64, Architecture::X86_64] {
+            let dir = tempfile::tempdir().unwrap();
+            initialize(dir.path(), arch).unwrap();
+            let config = fs::read_to_string(dir.path().join("ferric.toml")).unwrap();
+            assert_eq!(config, initial_config(arch));
+            assert!(config.contains(&format!("arch = \"{}\"", arch.name())));
+        }
     }
     #[test]
     fn native_and_container_builds_are_explicit() {
         let root = Path::new("/example");
-        let native = make_command(root, "all", false, &[]);
+        let native = make_command(root, "all", Architecture::Aarch64, false, &[]);
         let args: Vec<_> = native.get_args().collect();
         assert!(args.contains(&OsStr::new("PODMAN_BUILD=0")));
         assert!(args.contains(&OsStr::new("PREFIX_TOOLCHAIN=llvm")));
-        let container = make_command(root, "all", true, &[]);
+        let container = make_command(root, "all", Architecture::X86_64, true, &[]);
         let args: Vec<_> = container.get_args().collect();
         assert!(args.contains(&OsStr::new("PODMAN_BUILD=1")));
         assert!(args.contains(&OsStr::new("PREFIX_TOOLCHAIN=recipe")));
@@ -371,6 +486,7 @@ mod tests {
         let command = make_command(
             Path::new("/example"),
             "qemu",
+            Architecture::X86_64,
             false,
             &["QEMU=/path with spaces/qemu".into(), "QEMU_MEM=4096".into()],
         );

@@ -5,6 +5,9 @@ QEMUFLAGS?=-d guest_errors -name "Redox OS $(ARCH)"
 netboot?=no
 redoxer?=no
 VGA_SUPPORTED=no
+ifneq ($(FERRIC_QEMU_LIVE),)
+live?=$(FERRIC_QEMU_LIVE)
+endif
 
 ifeq ($(ARCH),i586)
 	audio?=ac97
@@ -28,7 +31,7 @@ else ifeq ($(ARCH),x86_64)
 	VGA_SUPPORTED=yes
 	QEMU_ARCH=x86_64
 	QEMU_MACHINE?=q35
-	QEMU_CPU?=core2duo
+	QEMU_CPU?=max
 	QEMU_SMP?=4
 	QEMU_MEM?=2048
 	ifeq ($(uefi),yes)
@@ -82,6 +85,8 @@ else ifeq ($(ARCH),aarch64)
 					$(wildcard /usr/share/qemu/edk2-aarch64-code.fd) \
 					$(wildcard /run/libvirt/nix-ovmf/edk2-aarch64-code.fd) \
 					$(wildcard /opt/homebrew/opt/qemu/share/qemu/edk2-aarch64-code.fd) \
+					$(wildcard /usr/local/share/qemu/edk2-aarch64-code.fd) \
+					$(wildcard /opt/local/share/qemu/edk2-aarch64-code.fd) \
 				)
 			endif
 		else
@@ -92,10 +97,9 @@ else ifeq ($(ARCH),aarch64)
 		endif
 	endif
 
-	# Default to using HVF when host is MacOS Silicon
-	ifeq ($(HOST_ARCH),arm64)
-		kvm?=yes
-	endif
+	# ARM64 currently needs software emulation; HVF traps in early user space.
+	# Keep hardware acceleration available explicitly for bring-up work.
+	kvm?=no
 else ifeq ($(ARCH),riscv64gc)
 	live=no
 	audio=no
@@ -322,7 +326,7 @@ endif
 
 ifeq ($(UNAME),Darwin)
     ifneq ($(kvm),no)
-        QEMUFLAGS+=-accel hvf -cpu max
+        QEMUFLAGS+=-accel hvf -cpu host
     else
         QEMUFLAGS+=-cpu $(QEMU_CPU)
     endif
@@ -337,6 +341,10 @@ ifneq ($(PFLASH1),)
 endif
 
 .PHONY: qemu-deps qemu-runtime-deps
+
+# Build the same artifact that qemu/qemu-run will select (live or persistent).
+.PHONY: qemu-image
+qemu-image: $(DISK)
 
 qemu-deps: $(DISK) qemu-runtime-deps
 
@@ -382,6 +390,10 @@ qemu-check:
 	@command -v "$(QEMU)" >/dev/null || { echo "QEMU not found: $(QEMU)" >&2; exit 1; }
 ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0),x86_64|yes||)
 	@echo "UEFI firmware not found; set PFLASH0=/path/to/edk2-x86_64-code.fd or FIRMWARE=/path/to/OVMF.fd" >&2
+	@exit 1
+endif
+ifeq ($(ARCH)|$(uefi)|$(FIRMWARE)|$(PFLASH0),aarch64|yes||)
+	@echo "UEFI firmware not found; set PFLASH0=/path/to/edk2-aarch64-code.fd or FIRMWARE=/path/to/AAVMF_CODE.fd" >&2
 	@exit 1
 endif
 

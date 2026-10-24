@@ -5,14 +5,18 @@ set -euo pipefail
 prefix=${1:?absolute prefix directory required}
 target=${2:?target triple required}
 case "$target" in
-    x86_64-unknown-redox) ;;
-    *) echo "Native LLVM currently supports x86_64-unknown-redox; use the recipe toolchain for $target" >&2; exit 1 ;;
+    x86_64-unknown-redox) driver=x86_64-unknown-linux-gnu; interpreter=ld64.so.1 ;;
+    aarch64-unknown-redox) driver=aarch64-unknown-linux-gnu; interpreter=ld.so.1 ;;
+    *) echo "Native LLVM supports x86_64-unknown-redox and aarch64-unknown-redox; use the recipe toolchain for $target" >&2; exit 1 ;;
 esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$root/rust-toolchain.toml")
 rustup_cmd=(env -u RUSTUP_TOOLCHAIN rustup)
 "${rustup_cmd[@]}" component add --toolchain "$channel" rust-src llvm-tools-preview
-"${rustup_cmd[@]}" target add --toolchain "$channel" "$target"
+# ARM64 Redox is a tier-3 target: Cargo builds std from rust-src below.
+if [ "$target" = x86_64-unknown-redox ]; then
+    "${rustup_cmd[@]}" target add --toolchain "$channel" "$target"
+fi
 rustc_path=$("${rustup_cmd[@]}" which --toolchain "$channel" rustc)
 rust_root=$(cd "$(dirname "$rustc_path")/.." && pwd)
 host=$("$rustc_path" -vV | sed -n 's/^host: //p')
@@ -45,9 +49,20 @@ cp -R "$staging/$target" "$sysroot/$target"
 cp -R "$staging/lib/gcc" "$sysroot/lib/gcc"
 rm -rf "$staging"
 ln -s "$rust_root/lib/rustlib" "$sysroot/lib/rustlib"
-for tool in rustc cargo rustdoc; do
+for tool in rustc rustdoc; do
     ln -s "$rust_root/bin/$tool" "$sysroot/bin/$tool"
 done
+quote_sh() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+if [ "$target" = aarch64-unknown-redox ]; then
+    {
+        printf '#!/usr/bin/env bash\nexec '
+        quote_sh "$rust_root/bin/cargo"
+        printf ' --config '\''unstable.build-std=["std","panic_abort"]'\'' "$@"\n'
+    } > "$sysroot/bin/cargo"
+    chmod +x "$sysroot/bin/cargo"
+else
+    ln -s "$rust_root/bin/cargo" "$sysroot/bin/cargo"
+fi
 for tool in ar nm objcopy objdump strip; do
     ln -s "$llvm_bin/llvm-$tool" "$sysroot/bin/llvm-$tool"
     ln -s "llvm-$tool" "$sysroot/bin/$target-$tool"
@@ -60,7 +75,7 @@ quote_cfg() { printf '"%s"\n' "${1//\"/\\\"}"; }
 {
     # Stock Clang has no Redox driver. Select its ELF/Linux driver for startup
     # and linker handling, then expose the Redox predefines to C/C++ sources.
-    quote_cfg "--target=x86_64-unknown-linux-gnu"
+    quote_cfg "--target=$driver"
     for macro in linux __linux __linux__ __gnu_linux__; do quote_cfg "-U$macro"; done
     quote_cfg "-D__redox__=1"
     quote_cfg "-Qunused-arguments"
@@ -69,25 +84,28 @@ quote_cfg() { printf '"%s"\n' "${1//\"/\\\"}"; }
     quote_cfg "--gcc-install-dir=$sysroot/lib/gcc/$target/$version"
 } > "$sysroot/bin/$target.cfg"
 # Shell quoting is separate from Clang config-file quoting.
-quote_sh() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 for tool in clang clang++; do
     compiler="$clang_path"
     [ "$tool" = clang ] || compiler=$(command -v clang++)
     {
         printf '#!/usr/bin/env bash\n'
+        printf 'redox_target='
+        quote_sh "$target"
+        printf '\n'
         cat <<'WRAPPER'
 # redoxer supplies the Redox target too; keep it from overriding our ELF driver.
 args=()
 link_executable=yes
 for arg in "$@"; do
     case "$arg" in
-        --target=x86_64-unknown-redox) ;;
+        --target="$redox_target") ;;
+        --target=*-unknown-redox) echo "Compiler target mismatch: $arg (expected $redox_target)" >&2; exit 1 ;;
         -c|-S|-E|-shared|-static|-static-pie) link_executable=no; args+=("$arg") ;;
         *) args+=("$arg") ;;
     esac
 done
 WRAPPER
-        printf 'if [ "$link_executable" = yes ]; then args+=(-Wl,--dynamic-linker=/usr/lib/ld64.so.1 -Wl,-T,'
+        printf 'if [ "$link_executable" = yes ]; then args+=(-Wl,--dynamic-linker=/usr/lib/%s -Wl,-T,' "$interpreter"
         quote_sh "$root/scripts/native/runtime.ld"
         printf '); fi\nexec '
         quote_sh "$compiler"
