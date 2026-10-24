@@ -115,6 +115,23 @@ mod tests {
             uid = 12
             gid = 34
             mode = 384
+            [[files]]
+            path = "/etc/special"
+            data = "updated without IDs"
+            mode = 384
+            [[files]]
+            path = "/etc/partial"
+            data = "initial"
+            uid = 12
+            gid = 34
+            [[files]]
+            path = "/etc/partial"
+            data = "UID update"
+            uid = 56
+            [[files]]
+            path = "/etc/partial"
+            data = "GID update"
+            gid = 78
         "#,
         )
         .unwrap();
@@ -146,6 +163,8 @@ mod tests {
                     let special = tx.find_node(etc.ptr(), "special")?;
                     assert_eq!((special.data().uid(), special.data().gid()), (12, 34));
                     assert_eq!(special.data().mode() & 0o777, 0o600);
+                    let partial = tx.find_node(etc.ptr(), "partial")?;
+                    assert_eq!((partial.data().uid(), partial.data().gid()), (56, 78));
                     let shadow = tx.find_node(etc.ptr(), "shadow")?;
                     assert_eq!((shadow.data().uid(), shadow.data().gid()), (0, 0));
                     assert_eq!(shadow.data().mode() & 0o777, 0o600);

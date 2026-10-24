@@ -550,7 +550,9 @@ pub fn build(
 
 fn native_sysroot_is_newer(stamp: Option<std::time::SystemTime>, packages: &[PathBuf]) -> bool {
     stamp.is_some_and(|stamp| {
-        fs::modified_all(packages, fs::modified).map_or(true, |stage| stamp > stage)
+        packages
+            .iter()
+            .any(|package| fs::modified(package).map_or(true, |stage| stamp > stage))
     })
 }
 
@@ -575,7 +577,8 @@ fn build_is_source_newer(
     stage_pkgars: Vec<PathBuf>,
     native_sysroot_modified: Option<std::time::SystemTime>,
 ) -> bool {
-    if !auto_deps_file.is_file() {
+    if !auto_deps_file.is_file() || native_sysroot_is_newer(native_sysroot_modified, &stage_pkgars)
+    {
         return true;
     }
     let Ok(stage_modified) = fs::modified_all(&stage_pkgars, fs::modified) else {
@@ -584,9 +587,6 @@ fn build_is_source_newer(
     let Ok(mut source_modified) = fs::modified_dir_ignore_git(source_dir) else {
         return false;
     };
-    if let Some(modified) = native_sysroot_modified {
-        source_modified = source_modified.max(modified);
-    }
     let mut recipe_is_newest = false;
     if let Ok(recipe_modified) = fs::modified(&recipe_dir.join("recipe.toml"))
         && recipe_modified > source_modified
@@ -869,6 +869,50 @@ fn hint_incorrect_pkey(logger: &PtyOut, source_pubkey: &Path, source_pkgar: &Pat
 #[cfg(test)]
 mod tests {
     use std::os::unix;
+
+    #[test]
+    fn native_sysroot_checks_every_required_package_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let auto_deps = temp.path().join("auto-deps.toml");
+        std::fs::write(&auto_deps, "").unwrap();
+        let stamp = std::time::SystemTime::now();
+        let old = stamp - std::time::Duration::from_secs(60);
+        let new = stamp + std::time::Duration::from_secs(60);
+        let package = temp.path().join("stage.pkgar");
+        let dev = temp.path().join("stage.dev.pkgar");
+        for (path, modified) in [(&source, old), (&package, old), (&dev, new)] {
+            if path != &source {
+                std::fs::write(path, "package").unwrap();
+            }
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        let variants = vec![package.clone(), dev.clone()];
+        assert!(super::native_sysroot_is_newer(Some(stamp), &variants));
+        assert!(super::build_is_source_newer(
+            &None,
+            temp.path(),
+            &source,
+            &auto_deps,
+            variants.clone(),
+            Some(stamp)
+        ));
+        std::fs::remove_file(&package).unwrap();
+        assert!(super::native_sysroot_is_newer(Some(stamp), &variants));
+        assert!(super::build_is_source_newer(
+            &None,
+            temp.path(),
+            &source,
+            &auto_deps,
+            variants,
+            Some(stamp)
+        ));
+        assert!(!super::native_sysroot_is_newer(Some(stamp), &[dev]));
+    }
 
     #[test]
     fn refreshed_native_sysroot_invalidates_statically_linked_packages() {

@@ -63,4 +63,60 @@ case "$(cat "$FAKE_CLANG_ARGS")" in *dynamic-linker*) exit 1 ;; esac
 if PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" aarch64-unknown-redox; then
     echo 'Unsupported target was accepted' >&2; exit 1
 fi
+
+# Exercise the actual Make prerequisite list without building or installing.
+inputs="$temp/inputs"
+ready="prefix/llvm/$target/ready"
+mkdir -p "$inputs/$(dirname "$ready")"
+input_files=(
+    crates/relibc/src/lib.rs crates/relibc/src/debug.rs
+    crates/relibc/include/stdio.h crates/relibc/Cargo.toml
+    crates/relibc/Cargo.lock crates/relibc/Makefile crates/relibc/config.mk
+    crates/relibc/build.rs crates/relibc/cbindgen.globdefs.toml
+    crates/relibc/.cargo/config.toml crates/relibc/redox-rt/Cargo.toml
+    crates/relibc/redox-rt/src/lib.rs
+    crates/relibc/ld_so/src/lib.rs crates/relibc/redox-ioctl/src/lib.rs
+    crates/relibc/generic-rt/src/lib.rs crates/relibc/openlibm/src/math.c
+    crates/relibc/dlmalloc-rs/src/lib.rs crates/hwrand/src/lib.rs
+    crates/procinfo/src/lib.rs crates/kernel/syscall/src/lib.rs
+    scripts/native-toolchain.sh scripts/native/runtime.ld rust-toolchain.toml
+    recipes/core/relibc/recipe.toml
+)
+for input in "${input_files[@]}"; do
+    mkdir -p "$inputs/$(dirname "$input")"
+    touch "$inputs/$input"
+done
+touch "$inputs/host-ready"
+for cache in target build sysroot prefix .git; do
+    mkdir -p "$inputs/crates/relibc/$cache"
+    touch "$inputs/crates/relibc/$cache/generated"
+done
+mkdir -p "$inputs/crates/relibc/openlibm/.git" "$inputs/crates/relibc/dlmalloc-rs/target"
+touch "$inputs/crates/relibc/openlibm/.git/index" "$inputs/crates/relibc/dlmalloc-rs/target/cache"
+find "$inputs" -exec touch -t 202001010000 {} +
+touch -t 202001020000 "$inputs/$ready"
+check_ready() {
+    local status=0
+    (cd "$inputs" && make --no-print-directory -f "$root/mk/llvm.mk" \
+        -q "$ready" TARGET="$target" FSTOOLS_TAG=host-ready) || status=$?
+    if [ "$status" -ne "$1" ]; then
+        echo "Unexpected native sysroot freshness ($status, expected $1): $2" >&2
+        exit 1
+    fi
+}
+check_ready 0 'unchanged inputs'
+for input in "${input_files[@]}"; do
+    touch -t 202001030000 "$inputs/$input"
+    check_ready 1 "$input changed"
+    touch -t 202001010000 "$inputs/$input"
+done
+# Parent directory timestamps detect additions/removals, even of old files.
+rm "$inputs/crates/relibc/include/stdio.h"
+touch -t 202001030000 "$inputs/crates/relibc/include"
+check_ready 1 'header removed'
+touch -t 202001010000 "$inputs/crates/relibc/include"
+find "$inputs/crates/relibc" -name generated -o -name cache -o -name index | while IFS= read -r output; do
+    touch -t 202001030000 "$output"
+done
+check_ready 0 'generated caches changed'
 printf 'Native toolchain regression tests passed\n'

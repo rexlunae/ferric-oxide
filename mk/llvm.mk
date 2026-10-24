@@ -19,7 +19,13 @@ prefix_clean:
 
 $(PREFIX)/sysroot: $(PREFIX)/ready
 
-RELIBC_SOURCE_INPUTS:=$(shell find crates/relibc/src crates/relibc/redox-rt/src crates/relibc/ld_so/src -type f -o -type d)
+# Track the complete installation inputs, including headers, Cargo/build config,
+# submodules and relibc's shared path dependencies. Directory mtimes also catch
+# removals. Keep generated outputs and Git internals outside the dependency set.
+RELIBC_SOURCE_INPUTS:=$(shell find crates/relibc crates/hwrand crates/procinfo crates/kernel/syscall \
+	\( -name .git -o -name target -o -path crates/relibc/build \
+	-o -path crates/relibc/sysroot -o -path crates/relibc/prefix \) -prune \
+	-o \( -type f -o -type d -o -type l \) -print)
 # Recipe shortcuts such as debug.% must not be applied to source prerequisites.
 $(RELIBC_SOURCE_INPUTS): ;
 $(PREFIX)/ready: $(RELIBC_SOURCE_INPUTS)

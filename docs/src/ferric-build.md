@@ -51,7 +51,10 @@ host's Clang supports it. Native artifacts live under
 
 Configured builds default to native LLVM on x86-64, `build.podman = false`, and
 `build.fuse = false`. Image creation records guest ownership and applies it
-inside RedoxFS rather than calling host `chown`; sparse image allocation uses
+inside RedoxFS rather than calling host `chown`. Later file declarations retain
+previous guest IDs when those fields are omitted. Archiving currently makes a
+second pass over the image tree to set guest owners, including default root IDs;
+sparse image allocation uses
 Rust's filesystem API. This avoids FUSE, macFUSE, sudo and GNU coreutils for the
 normal image path. Explicit `make mount` still requires FUSE.
 
@@ -83,9 +86,14 @@ needed. A full application rebuild has broader requirements than the initial
 native profile. Local recipe snapshots skip root `target/`, `build/`, `sysroot/`
 and Git metadata, as well as nested Cargo target directories marked as caches,
 so existing component build caches are not copied into each recipe or used to
-invalidate source fingerprints. A native sysroot stamp invalidates statically
-linked source packages after relibc changes; kernel and UEFI builds do not link
-that sysroot. The x86-64 relibc fork transition keeps the handoff buffer live
+invalidate source fingerprints. The native prefix tracks relibc's headers,
+manifests, Make/build configuration, source submodules and shared path
+dependencies, including directory changes for added or deleted inputs. Build
+outputs and Git metadata are excluded. These inputs refresh the sysroot before
+recipe/image cache decisions. Its stamp invalidates a source recipe when any
+required package archive is missing or older than the sysroot; a newer archive
+variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot.
+The x86-64 relibc fork transition keeps the handoff buffer live
 through address-space cloning and copies it above the child's Rust call stack,
 so ordinary compiler stack layouts cannot overwrite its file-table handles.
 Its floating-point control slots are separate from saved integer registers.

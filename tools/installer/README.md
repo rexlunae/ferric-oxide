@@ -34,7 +34,9 @@ be specified, they will be built in order.
 Guest ownership is recorded during installation and applied inside the image;
 it does not require changing host file ownership. Package files default to
 guest root, while explicit file declarations and account homes retain their
-configured IDs. Permissions, including private user homes and `/etc/shadow`,
+configured IDs. Repeated declarations update only explicitly supplied UID/GID
+fields; omitted fields retain the recorded owner. Permissions, including private
+user homes and `/etc/shadow`,
 are preserved. This path needs neither sudo nor macFUSE on macOS.
 
 Library callers can use `install_dir_unprivileged` and the returned

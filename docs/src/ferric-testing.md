@@ -400,9 +400,13 @@ cargo xtask --dry-run build
 The shell regression uses a small synthetic runtime archive and mock Rust/Clang
 tools, with no network or package installation. It checks compiler exclusion,
 argument quoting, explicit LLD/Redox settings and rejection of unsupported
-targets. The installer tests round-trip guest owners and modes through RedoxFS
-without host `chown`. Cookbook tests cover source-cache exclusion and native
-sysroot invalidation. These host checks do not prove a complete OS boot: also run
+targets. It also uses Make's actual native-prefix prerequisite list to check
+invalidation after header, manifest, configuration, shared-crate, submodule and
+directory changes, while ignoring generated caches. The installer tests
+round-trip guest owners and modes through RedoxFS without host `chown`, including
+repeated declarations with omitted or partial IDs. Cookbook tests cover
+source-cache exclusion and native sysroot invalidation with mixed-age or missing
+package variants. These host checks do not prove a complete OS boot: also run
 `cargo xtask build` and `cargo xtask run --headless` for image changes, and
 report the build and boot results separately.
 
