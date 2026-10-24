@@ -70,7 +70,6 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - **Clean-room Linux compatibility.** Linux file systems (ext4, XFS, LVM, LUKS) and other Linux-compatible features are written from published format specifications and documentation, never ported or translated from GPL source. Do not read Linux kernel source while implementing them, and say which specification you used in the module docs.
 - **Keep internal Redox names.** The `redox` target triple, `relibc`, `RedoxFS`, `redox_syscall`, scheme names and existing paths stay as they are so upstream changes keep merging. The rebrand is user-facing only. Do not use the Redox name or logo for the fork itself (see [TRADEMARK.md](TRADEMARK.md)).
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
-- **Respect upstream subtrees.** `crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/` are synced from upstream with `git subtree`. Do not move or rename files inside them, and keep changes there small and local. Put fork-only functionality in new crates under `crates/` or `userspace/` and call into it from the upstream tree.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
 
@@ -84,6 +83,9 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - Shared crates should be `no_std` (with an optional `std` or `alloc` feature) whenever the code does not need the operating system, so the kernel, drivers and host tools can all use them.
 - Prefer generic code over copy-pasted variants. Use traits for real abstraction points, not one-implementation interfaces.
 - Use one definition for each ABI type, constant or table. Kernel/user-space interfaces live in `redox_syscall` or `ferric-abi`, never duplicated in each consumer.
+- We can use non-MIT dependencies by reference. What makes our project subject to a different license is if we distribute it with non-MIT code integrated.
+- Follow modern best practices for Rust as aggressively as you can. Refactor code using old styles, avoid comments that are redundant with the code.
+- Write tests aggressively, especially around critical code paths. We want to eliminate bugs as quickly as we can. Notify me if you find a bug that might also apply to Redox, as we may still want to manually submit a report.
 
 ### Use existing crates
 
@@ -115,6 +117,7 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - Turning errors into text is the job of the outermost layer of a binary: `main`, a TUI status line, a log statement. Even there, print the full source chain.
 - Do not use `unwrap()` or `expect()` on fallible operations in library, kernel or daemon code. They are fine in tests, and `expect("reason")` is acceptable for invariants that cannot fail, with the reason saying why.
 - Existing code that returns string errors (for example `tools/ferric-config`) predates this rule. Convert it to typed errors when you touch it.
+- If possible, fix all warnings before shipping code. We want our builds clean.
 
 ### Unsafe code
 
