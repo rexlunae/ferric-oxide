@@ -454,7 +454,10 @@ a ramp-up period (`ramp_time` is 0 by default).
    still be reachable by the device, so the kernel keeps its IOVA block and
    frame pins owned, by IOVA, without recording a mapping; only a domain
    closure that blocks every device releases them, and exactly once. A
-   closure that cannot block them keeps them pinned.
+   closure that cannot block them keeps them pinned. No test injects a failed
+   installation: the shared crate's unit test covers the retained entries and
+   the ordering of their release, and the kernel path is compiled for the
+   target but only runs when hardware fails an invalidation.
 
 The entry points are `userspace/base/drivers/pcid/src/iommu.rs`,
 `src/driver_interface/mod.rs`, `crates/kernel/src/scheme/iommu.rs`, and
