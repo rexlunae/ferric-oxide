@@ -62,7 +62,7 @@ use ferric_iommu::dma::{
     grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
     UnmapFailure, UnmapState,
 };
-use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Retained, Span};
+use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Retained, Span, Teardown};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
 use super::domain::{Domain, DomainError};
@@ -701,18 +701,22 @@ impl Drop for DmaSpace {
     fn drop(&mut self) {
         // Blocking the devices invalidates everything the domain translated, so the frames
         // can be unpinned without unmapping them one by one.
-        let clean = self.domain.close();
+        let teardown = if self.domain.close() {
+            Teardown::Blocked
+        } else {
+            Teardown::Unblocked
+        };
         for mapping in self.mappings.drain() {
-            if clean {
+            if teardown == Teardown::Blocked {
                 mapping.data.pins.release();
             }
         }
         // A close that blocked every device made the uncertain installations unreachable too,
         // even though no mapping record names them.
-        self.uncertain.release(clean, |(_, pins)| pins.release());
+        self.uncertain.release(teardown, |(_, pins)| pins.release());
         #[cfg(feature = "regbuf")]
         for (_, held) in core::mem::take(&mut self.grants) {
-            if clean {
+            if teardown == Teardown::Blocked {
                 held.pins.release();
             }
         }

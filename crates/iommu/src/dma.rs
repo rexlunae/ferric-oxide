@@ -178,6 +178,16 @@ pub fn complete_unmap<T, E>(
     Ok(mappings.remove(&iova))
 }
 
+/// What a teardown did to the devices that could reach a domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Teardown {
+    /// Every device was blocked, so nothing the domain translated is reachable any more.
+    Blocked,
+    /// At least one device could not be blocked, so what the domain translated may still be
+    /// reachable.
+    Unblocked,
+}
+
 /// Installations the hardware did not confirm, kept owned until the domain is torn down.
 ///
 /// A mapping whose installation failed without completing its invalidation may still be
@@ -186,8 +196,8 @@ pub fn complete_unmap<T, E>(
 /// domain's devices can retire it.
 ///
 /// [`Retained::release`] hands every entry back exactly once, and only when that teardown
-/// succeeded. Without the confirmation the entries stay owned and are dropped at the end,
-/// which leaks what they hold by design, the safe outcome while a device may still reach it.
+/// blocked the devices. Otherwise the entries stay owned and are dropped at the end, which
+/// leaks what they hold by design, the safe outcome while a device may still reach it.
 #[derive(Debug, Default)]
 pub struct Retained<T> {
     entries: Vec<T>,
@@ -216,26 +226,34 @@ impl<T> Retained<T> {
         self.entries.is_empty()
     }
 
-    /// Hands every retained entry to `release`, in the order they were inserted, when `clean`
-    /// says the teardown blocked the devices; otherwise keeps them all.
+    /// Hands every retained entry to `release`, in the order they were inserted, when
+    /// `teardown` blocked the devices; otherwise keeps them all.
+    ///
+    /// Releasing drains the entries, so a second call after a blocking teardown hands nothing
+    /// over.
+    ///
+    /// # Panics
+    ///
+    /// A panic in `release` propagates, and the entries after the one being released are not
+    /// processed: they were already taken out of the list and are dropped instead.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ferric_iommu::dma::Retained;
+    /// use ferric_iommu::dma::{Retained, Teardown};
     ///
     /// let mut retained = Retained::new();
     /// retained.insert("block at 0x4000");
     /// // A teardown that could not block the devices keeps it owned.
-    /// retained.release(false, |_| unreachable!("nothing may be released"));
+    /// retained.release(Teardown::Unblocked, |_| unreachable!("nothing may be released"));
     /// assert_eq!(retained.len(), 1);
     /// // One that blocked them releases it, once.
-    /// retained.release(true, |entry| assert_eq!(entry, "block at 0x4000"));
+    /// retained.release(Teardown::Blocked, |entry| assert_eq!(entry, "block at 0x4000"));
     /// assert!(retained.is_empty());
-    /// retained.release(true, |_| unreachable!("released once already"));
+    /// retained.release(Teardown::Blocked, |_| unreachable!("released once already"));
     /// ```
-    pub fn release(&mut self, clean: bool, mut release: impl FnMut(T)) {
-        if !clean {
+    pub fn release(&mut self, teardown: Teardown, mut release: impl FnMut(T)) {
+        if teardown != Teardown::Blocked {
             return;
         }
         for entry in core::mem::take(&mut self.entries) {
@@ -818,14 +836,14 @@ mod tests {
         retained.insert(0x8000);
         let mut released = Vec::new();
         // A teardown that could not block the devices releases nothing.
-        retained.release(false, |block| released.push(block));
+        retained.release(Teardown::Unblocked, |block| released.push(block));
         assert!(released.is_empty());
         assert_eq!(retained.len(), 2);
         // One that blocked them releases every installation once, in order.
-        retained.release(true, |block| released.push(block));
+        retained.release(Teardown::Blocked, |block| released.push(block));
         assert_eq!(released, [0x4000, 0x8000]);
         assert!(retained.is_empty());
-        retained.release(true, |block| released.push(block));
+        retained.release(Teardown::Blocked, |block| released.push(block));
         assert_eq!(released.len(), 2);
     }
 }
