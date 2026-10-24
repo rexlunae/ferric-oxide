@@ -167,3 +167,83 @@ You can use the value from "shrinking by ..." to accurately tell how many bytes 
 ```sh
 truncate -s -1559135232 redox.img
 ```
+
+### Working with Linux Partition
+
+> ⚠️ **Warning:** Experimental and dangerous; always double-check your command before executing it.
+
+On Linux, RedoxFS supports formatting and mounting directly from `/dev` partition. [Redox OS GUI installer](./installing.md) also supports formatting and installing into a whole disk or specific partition. This guide only covers the manual process using `redoxfs` CLI tools.
+
+### Creating an empty partition for RedoxFS
+
+First thing you need to do is that you need to create an empty space for RedoxFS partition to fit in. Use [GParted](https://gparted.org/), [GNOME Disks](https://apps.gnome.org/DiskUtility/) or [KDE Partition Manager](https://apps.kde.org/partitionmanager/) to create an empty partition, then identify the partition using `lsblk`
+
+```sh
+lsblk
+```
+
+```
+NAME          MAJ:MIN RM  SIZE RO TYPE  MOUNTPOINTS
+zram0         251:0    0  7.7G  0 disk  [SWAP]
+vda           253:0    0  2.7G  0 disk
+vdb           253:16   0  200G  0 disk
+├─vdb1        253:17   0 1022M  0 part  /boot/efi
+├─vdb2        253:18   0  3.9G  0 part
+└─vdb3        253:19   0  191G  0 part  /
+```
+
+For example, we want to format a partition with RedoxFS in `/dev/vdb2`. Format it using redoxfs-mkfs:
+
+```sh
+sudo $(which redoxfs-mkfs) /dev/vdb2
+```
+
+After the format is complete, the partition managers should detect the new partition type as `Unknown`.
+
+### Mounting RedoxFS partition
+
+Before mounting, you can create an empty directory:
+
+```sh
+mkdir myredoxfs
+```
+
+There are two ways to mount the RedoxFS partition to the directory based on your preference:
+
+#### Rootless mount
+
+A rootless mount grants full access to a partition to a specific user. It can be configured using `setfacl`:
+
+```sh
+sudo setfacl -m u:$USER:rw /dev/vdb2
+```
+
+Then mount the disk without sudo:
+
+```sh
+redoxfs /dev/vdb2 ./myredoxfs
+```
+
+This way you can gain full access to the files partition, ignoring standard file permissions (i.e., allow writing files as a root user), but the mounted device is not shared with other users in your operating system.
+
+To unmount from the partition, use `fusermount3`:
+
+```sh
+fusermount3 ./myredoxfs
+```
+
+#### Rootful mount
+
+A rootful mount allows sharing the mounted device with other users, and standard file permissions apply. It can be mounted using `sudo`:
+
+```sh
+sudo REDOXFS_FUSE_SHARE=1 $(which redoxfs) /dev/vdb2 ./myredoxfs
+```
+
+The environment variable `REDOXFS_FUSE_SHARE=1` is used to share a FUSE mount from root with other non-root users. The FUSE options applied are `default_permission` and `allow_other`. See [FUSE man page](https://man.archlinux.org/man/mount.fuse.8.en#default_permissions) for details.
+
+To unmount from the shared partition, use a similar command with sudo.
+
+```sh
+sudo fusermount3 ./myredoxfs
+```
