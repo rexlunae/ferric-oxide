@@ -13,7 +13,7 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Task | Documents and implementation references |
 | --- | --- |
 | Understand the system, boot sequence, services or workspace boundaries | [Architecture](docs/src/ferric-architecture.md), then [schemes](docs/src/schemes-resources.md) and [scheme operation](docs/src/scheme-operation.md) |
-| Build an image, change feature options or add a recipe | [Build and configuration](docs/src/ferric-build.md), [ferric-config usage](tools/ferric-config/README.md), [feature catalog](features.toml), [build-system reference](docs/src/build-system-reference.md) and [application porting](docs/src/porting-applications.md) |
+| Build an image, change feature options or add a recipe | [Native Cargo entry point](tools/ferric-build/README.md), [Build and configuration](docs/src/ferric-build.md), [ferric-config usage](tools/ferric-config/README.md), [feature catalog](features.toml), [build-system reference](docs/src/build-system-reference.md) and [application porting](docs/src/porting-applications.md) |
 | Change address spaces, CPU state or kernel hardening | [Memory and CPU protection](docs/src/ferric-memory.md), relevant Rustdoc in `crates/kernel/` and the shared crates under `crates/` |
 | Work on PCI drivers, DMA, IOMMU domains or registered buffers | [Registered buffers and IOMMUs](docs/src/ferric-io.md), ABI/module docs in `crates/{regbuf,iommu,vtd,amdvi}/src/`, and `userspace/base/drivers/pcid/` |
 | Add tracepoints or read kernel traces | [Kernel tracing](docs/src/ferric-tracing.md), ABI and format docs in `crates/trace/src/`, `crates/kernel/src/trace/` and `tools/ferric-trace/` |
@@ -46,6 +46,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | --- | --- | --- |
 | `Cargo.toml` (root) | Host workspace: build tools that run on the developer machine | host |
 | `tools/cookbook/` | The recipe engine and `repo` binary | host |
+| `tools/ferric-build/` | Native Cargo setup, image build and QEMU entry point (`cargo xtask`) | host |
 | `tools/ferric-config/` | `make menuconfig` / TOML feature tool | host |
 | `tools/installer/`, `tools/redoxer/` | Image installer and component build/execution tools | host; installer also has a target recipe |
 | `tools/fox/` | Package verification, installation (from archives, signed git sources or registries), trust store, adoption, audit, SBOM and sync CLI; also built for the target by `recipes/core/fox` | host, and `x86_64-unknown-redox` through the recipe |
@@ -69,7 +70,6 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - **Clean-room Linux compatibility.** Linux file systems (ext4, XFS, LVM, LUKS) and other Linux-compatible features are written from published format specifications and documentation, never ported or translated from GPL source. Do not read Linux kernel source while implementing them, and say which specification you used in the module docs.
 - **Keep internal Redox names.** The `redox` target triple, `relibc`, `RedoxFS`, `redox_syscall`, scheme names and existing paths stay as they are so upstream changes keep merging. The rebrand is user-facing only. Do not use the Redox name or logo for the fork itself (see [TRADEMARK.md](TRADEMARK.md)).
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
-- **Respect upstream subtrees.** `crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/` are synced from upstream with `git subtree`. Do not move or rename files inside them, and keep changes there small and local. Put fork-only functionality in new crates under `crates/` or `userspace/` and call into it from the upstream tree.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
 
@@ -83,6 +83,9 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - Shared crates should be `no_std` (with an optional `std` or `alloc` feature) whenever the code does not need the operating system, so the kernel, drivers and host tools can all use them.
 - Prefer generic code over copy-pasted variants. Use traits for real abstraction points, not one-implementation interfaces.
 - Use one definition for each ABI type, constant or table. Kernel/user-space interfaces live in `redox_syscall` or `ferric-abi`, never duplicated in each consumer.
+- We can use non-MIT dependencies by reference. What makes our project subject to a different license is if we distribute it with non-MIT code integrated.
+- Follow modern best practices for Rust as aggressively as you can. Refactor code using old styles, avoid comments that are redundant with the code.
+- Write tests aggressively, especially around critical code paths. We want to eliminate bugs as quickly as we can. Notify me if you find a bug that might also apply to Redox, as we may still want to manually submit a report.
 
 ### Use existing crates
 
@@ -114,6 +117,7 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - Turning errors into text is the job of the outermost layer of a binary: `main`, a TUI status line, a log statement. Even there, print the full source chain.
 - Do not use `unwrap()` or `expect()` on fallible operations in library, kernel or daemon code. They are fine in tests, and `expect("reason")` is acceptable for invariants that cannot fail, with the reason saying why.
 - Existing code that returns string errors (for example `tools/ferric-config`) predates this rule. Convert it to typed errors when you touch it.
+- If possible, fix all warnings before shipping code. We want our builds clean.
 
 ### Unsafe code
 

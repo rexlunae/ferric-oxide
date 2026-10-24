@@ -55,7 +55,15 @@ pub fn create_target_dir(recipe_dir: &Path, target: &'static str) -> Result<Path
 /// # Errors
 /// Returns an I/O error for an existing destination file or link, or failed I/O.
 pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
-    let dst = dst.as_ref();
+    copy_dir_filtered(src.as_ref(), dst.as_ref(), Path::new(""), &|_| true)
+}
+
+fn copy_dir_filtered(
+    src: &Path,
+    dst: &Path,
+    relative: &Path,
+    include: &dyn Fn(&Path) -> bool,
+) -> io::Result<()> {
     if fs::symlink_metadata(dst).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -65,12 +73,16 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let relative = relative.join(entry.file_name());
+        if !include(&relative) {
+            continue;
+        }
         let ty = entry.file_type()?;
         let target = dst.join(entry.file_name());
         if ty.is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(entry.path())?, target)?;
         } else if ty.is_dir() {
-            copy_dir_all(entry.path(), target)?;
+            copy_dir_filtered(&entry.path(), &target, &relative, include)?;
         } else {
             // create_new refuses links and existing files instead of opening
             // their targets. Use the returned descriptor for data and modes.
@@ -86,6 +98,31 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<
     Ok(())
 }
 
+/// Whether a relative path belongs in a local source snapshot.
+///
+/// Excludes root build outputs and Git internals, including submodule metadata.
+/// Nested source directories named `build` or `target` remain source inputs.
+pub(crate) fn path_source_entry(original: &Path, relative: &Path) -> bool {
+    // Standalone crates (for example base/bootstrap) can have their own cache.
+    if relative.file_name().is_some_and(|name| name == "target")
+        && ["CACHEDIR.TAG", ".rustc_info.json"]
+            .iter()
+            .any(|marker| original.join(relative).join(marker).is_file())
+    {
+        return false;
+    }
+    let mut components = relative.components();
+    if components.clone().any(|part| part.as_os_str() == ".git") {
+        return false;
+    }
+    !components.next().is_some_and(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("target" | "build" | "sysroot")
+        )
+    })
+}
+
 /// Replace a path-source snapshot, propagating deleted files and directories.
 ///
 /// # Errors
@@ -93,7 +130,10 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<
 pub(crate) fn replace_dir_all(src: &Path, dst: &Path) -> Result<()> {
     let temporary = dst.with_extension("tmp");
     create_dir_clean(&temporary)?;
-    copy_dir_all(src, &temporary).map_err(wrap_io_err!(src, temporary, "Copying source"))?;
+    copy_dir_filtered(src, &temporary, Path::new(""), &|relative| {
+        path_source_entry(src, relative)
+    })
+    .map_err(wrap_io_err!(src, temporary, "Copying source"))?;
     if fs::symlink_metadata(dst).is_ok() {
         remove_all(dst)?;
     }
@@ -166,7 +206,7 @@ pub fn modified(path: &Path) -> Result<SystemTime> {
 }
 
 pub fn modified_all(
-    path: &Vec<PathBuf>,
+    path: &[PathBuf],
     func: fn(path: &Path) -> Result<SystemTime>,
 ) -> Result<SystemTime> {
     let mut newest = SystemTime::UNIX_EPOCH;

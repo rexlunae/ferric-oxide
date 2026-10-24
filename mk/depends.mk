@@ -8,8 +8,10 @@ endif
 ifeq ($(shell which cbindgen),)
 $(error cbindgen not found, install from crates.io or from your package manager)
 endif
+ifneq ($(filter x86_64 i586,$(ARCH)),)
 ifeq ($(shell which nasm),)
 $(error nasm not found, install from your package manager)
+endif
 endif
 ifeq ($(shell which just),)
 $(error 'just' not found, install from crates.io or from your package manager)

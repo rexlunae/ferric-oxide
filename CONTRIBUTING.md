@@ -29,16 +29,24 @@ Ferric Oxide is developed on GitHub.
 
 ## Getting a build working
 
-Ferric Oxide currently builds exactly like upstream Redox:
+Use the native Cargo workflow described in the
+[build guide](docs/src/ferric-build.md):
 
 ```sh
 git clone https://github.com/rexlunae/ferric-oxide
 cd ferric-oxide
-./podman_bootstrap.sh
-make all
+cargo xtask setup
+cargo xtask build
+cargo xtask run --headless
 ```
 
-If your system does not use SELinux, run `make all USE_SELINUX=0`. Boot the image with `make qemu`.
+Commands use the host architecture by default; add `--arch x86_64` or
+`--arch aarch64` to setup, build and run for a different guest architecture.
+Setup requires rustup and a native compiler/SDK (plus NASM for x86-64), and installs only Rust
+components and Cargo utilities. QEMU is needed for `run`. Existing
+`ferric.toml` files are preserved. Podman is an explicit option via
+`cargo xtask --podman build`; the inherited recipe toolchain remains available
+for recipes that need GCC-specific tools.
 
 The upstream [Redox Book](https://doc.redox-os.org/book/) is still the reference for the build system. These pages are the most useful:
 

@@ -707,7 +707,9 @@ mod tests {
         let mk = file(&plan, "config.mk");
         assert!(mk.contains("ARCH?=x86_64\n"), "{mk}");
         assert!(mk.contains("CONFIG_NAME?=desktop\n"), "{mk}");
-        assert!(mk.contains("PODMAN_BUILD?=1\n"), "{mk}");
+        assert!(mk.contains("PODMAN_BUILD?=0\n"), "{mk}");
+        assert!(mk.contains("PREFIX_TOOLCHAIN?=llvm\n"), "{mk}");
+        assert!(mk.contains("FSTOOLS_NO_MOUNT?=1\n"), "{mk}");
         assert!(mk.contains("REPO_BINARY?=\n"), "{mk}");
         assert!(
             mk.contains("export FERRIC_TARGET_RUSTFLAGS:=-C target-cpu=x86-64-v3\n"),

@@ -1,3 +1,8 @@
+//! Process handles, address-space setup and fork/exec handoffs.
+//!
+//! Fork materializes and retains its stack handoff through the address-space
+//! snapshot; architecture trampolines consume that snapshot in the child.
+
 use core::{cell::SyncUnsafeCell, cmp, fmt::Debug, ops::Range};
 
 use crate::{
@@ -1107,7 +1112,10 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
             target_arch = "riscv64"
         ))]
         let arg1 = {
-            let scratchpad_ptr: *const ForkScratchpad = &raw const scratchpad;
+            // The child reads this stack slot from the cloned address space.
+            // Make the pointer escape before cloning so its fields are stored.
+            let scratchpad_ptr: *const ForkScratchpad =
+                core::hint::black_box(&raw const scratchpad);
             scratchpad_ptr as usize
         };
         #[cfg(target_arch = "x86")]
@@ -1200,6 +1208,13 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
                 initial_rsp as usize,
             );
             new_addr_space_sel_fd.write(&buf)?;
+            // Keep the stack slot live until the child address space owns it.
+            #[cfg(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            ))]
+            core::hint::black_box(&scratchpad);
         }
         {
             // Reuse the same sigaltstack and signal entry (all memory will be re-mapped CoW later).

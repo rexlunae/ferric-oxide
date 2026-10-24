@@ -7,6 +7,13 @@ agents can all edit it.
 For the system-level build flow and component integration, see the book's
 [Build and configuration](../../docs/src/ferric-build.md) chapter.
 
+Configured x86-64 builds now default to native Clang/rustup (`build.toolchain =
+"llvm"`), with `build.podman = false` and image writing without FUSE
+(`build.fuse = false`). `cargo xtask setup` creates an initial `native` image
+profile. Choose `build.toolchain = "recipe"` for the inherited compiler path;
+Podman and other architectures select it by default. See the build chapter
+for the target ABI libraries and current native limitations.
+
 There are three files:
 
 | File | Tracked | What it is |

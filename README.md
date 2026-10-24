@@ -38,16 +38,45 @@ However you feel about AI, engaging with it in the current threat environment is
 
 ## Getting started
 
-Ferric Oxide currently builds the same way as upstream Redox. The bootstrap script sets up a Podman-based build environment:
+The recommended development path uses rustup, Cargo and native Clang:
 
 ```sh
 git clone https://github.com/rexlunae/ferric-oxide
 cd ferric-oxide
-./podman_bootstrap.sh
-make all
+cargo xtask setup
+cargo xtask build
+cargo xtask run --headless
 ```
 
-If your system does not use SELinux, pass `USE_SELINUX=0` to `make all`. To boot the result in a virtual machine, run `make qemu`.
+Install Rust with rustup, a native C/C++ compiler and SDK (Xcode Command Line
+Tools on macOS). NASM is needed for x86-64 builds. QEMU is needed to run the image.
+Setup installs Rust components and required Cargo utilities; it never installs Homebrew or
+system packages. `./native_bootstrap.sh` is an alias for the setup command.
+
+Commands default to the host architecture: ARM64 (`aarch64`) on Apple Silicon,
+and x86-64 on Intel/AMD hosts. To cross-compile and emulate x86-64 on Apple Silicon:
+
+```sh
+cargo xtask --arch x86_64 setup
+cargo xtask --arch x86_64 build
+cargo xtask --arch x86_64 run --headless
+```
+
+Use `--arch aarch64` for an ARM64 guest on an Intel/AMD host. Pass the same
+architecture to setup, build and run.
+
+The initial `native` profile builds the local OS components and uses
+prebuilt application packages. Images are written with Rust tools without
+sudo, FUSE or macFUSE. ARM64 currently boots a RAM-backed live image under
+software emulation; guest changes are lost on exit. Persistent storage and HVF
+bring-up remain incomplete. Cross-architecture guests also use software emulation.
+Omit `--headless` for a display window. See the
+[build guide](docs/src/ferric-build.md) for dependencies, configuration,
+the retained target ABI runtime libraries and current limits.
+
+Podman remains available explicitly with `cargo xtask --podman build`, and for
+specialized container workflows such as the kernel debugger. It is optional
+for the native build. Existing Make targets remain available.
 
 ### Choosing features
 

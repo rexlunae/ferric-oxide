@@ -44,11 +44,12 @@ ifeq ($(REPO_OFFLINE),1)
 CARGO_OFFLINE_FLAG=--offline
 endif
 
-$(FSTOOLS_TAG): $(CONTAINER_TAG)
+$(FSTOOLS_TAG): $(CONTAINER_TAG) Cargo.toml Cargo.lock $(wildcard tools/*/Cargo.toml crates/fox-*/Cargo.toml)
+$(FSTOOLS_TAG): $(shell find tools/cookbook/src tools/redoxer/src tools/installer/src tools/fox/src crates/fox-* -type f)
 ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@
 else
-	$(HOST_CARGO) build --manifest-path Cargo.toml --release --locked $(CARGO_OFFLINE_FLAG)
+	$(HOST_CARGO) build --manifest-path Cargo.toml --release --locked -p redox_cookbook --bins -p fox $(CARGO_OFFLINE_FLAG)
 	mkdir -p $(@D)
 	touch $@
 endif
