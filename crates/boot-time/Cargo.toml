@@ -6,5 +6,8 @@ license = "MIT"
 description = "Validated firmware wall-clock handoff from the bootloader to the kernel"
 
 [dependencies]
-# Also consumed through recipe symlinks outside the host workspace.
-time = { version = "0.3.44", default-features = false }
+# The workspace's no_std baseline, so this crate and the host tools that need
+# the clock share one version. The kernel and bootloader workspaces build it as
+# a path dependency, and it stays a member of the host workspace, so the
+# inherited entry resolves where the version is declared.
+time = { workspace = true }

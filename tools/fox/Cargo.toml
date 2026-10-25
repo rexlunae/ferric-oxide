@@ -19,7 +19,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["std", "formatting"] }
 toml = { workspace = true, features = ["parse", "display", "serde", "std"] }
 
 [dev-dependencies]

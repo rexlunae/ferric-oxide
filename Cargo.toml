@@ -84,8 +84,10 @@ toml = { version = "1", default-features = false }
 # Release-tag signatures for fox: OpenSSH Ed25519 keys and SSHSIG.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 semver = "1.0.27"
-# RFC 3339 times in build records and registry metadata.
-time = { version = "0.3.44", default-features = false, features = ["std"] }
+# RFC 3339 times in build records and registry metadata. The baseline is no_std
+# for ferric-boot-time (which the kernel and bootloader also build); host crates
+# that need the clock or formatting add the feature themselves.
+time = { version = "0.3.44", default-features = false }
 
 [profile.release.package.ferric-config]
 opt-level = 2

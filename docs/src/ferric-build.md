@@ -91,9 +91,11 @@ UEFI timezone metadata is applied using its specified sign; an unspecified
 timezone means the RTC is assumed to store UTC. Firmware with an incorrect
 RTC still supplies an incorrect date. Failed or invalid firmware samples are
 logged and omitted; the kernel retains its device-tree PL031 fallback where
-available. Without either source, wall time remains the Unix epoch plus the
-physical counter. This initializes time at boot; it does not provide network
-time synchronization or write changes back to the RTC. See the
+available, anchoring the RTC it reads to the physical counter beside it so the
+uptime before that read is not counted twice. Without either source, wall time
+remains the Unix epoch plus the physical counter. This initializes time at
+boot; it does not provide network time synchronization or write changes back to
+the RTC. See the
 [clock regression checks](ferric-testing.md#arm64-firmware-clock-regression).
 
 After building, `cargo xtask run --no-build --headless` reuses the selected

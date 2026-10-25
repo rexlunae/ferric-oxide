@@ -12,9 +12,15 @@ pub unsafe fn init(fdt: &fdt::Fdt) {
         {
             Some(phys) => {
                 let mut rtc = Pl031rtc { phys };
-                info!("PL031 RTC at {:#x}", rtc.phys);
                 let mut token = unsafe { CleanLockToken::new() };
-                *time::START.lock(token.token()) = (rtc.time() as u128) * time::NANOS_PER_SEC;
+                // `realtime` adds the counter to START, so the anchor is the
+                // RTC minus the counter read beside it. Storing the RTC epoch
+                // alone would count the counter's uptime a second time.
+                let counter = crate::arch::time::monotonic_absolute(&mut token);
+                let seconds = rtc.time();
+                let rtc_ns = (seconds as u128) * time::NANOS_PER_SEC;
+                info!("PL031 RTC at {:#x}, wall clock {seconds} s", rtc.phys);
+                *time::START.lock(token.token()) = rtc_ns.saturating_sub(counter);
             }
             None => {
                 warn!("No PL031 RTC registers");
