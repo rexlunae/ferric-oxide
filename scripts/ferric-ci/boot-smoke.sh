@@ -245,6 +245,11 @@ PY
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
     status=124
+    # The NMI's list of contexts, whole, on stderr: the failure annotation keeps only the last
+    # lines of the console, and some callers discard stdout, so this is the copy that names the
+    # context a hang with every CPU idle is stuck on.
+    echo "boot-smoke: contexts at the timeout" >&2
+    tr -d '\r' < "$log" | grep -aE '^(NMI: |  pid |  0x[0-9a-f]+: busy$)' >&2 || true
     # KERNEL_ELF (the image's kernel, with its symbol table) names the functions: the NMI's
     # own link addresses, and the sampled addresses less the slide the first NMI dump shows.
     if [ -n "${KERNEL_ELF:-}" ] && [ -f "$KERNEL_ELF" ]; then

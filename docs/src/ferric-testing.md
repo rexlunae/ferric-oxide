@@ -255,6 +255,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
+| `ferric-exit-test` | Process exit while a second thread is busy reading a pipe or parking on a futex: the force-killed thread must not block in its next wait, so every child exits ([#200](https://github.com/rexlunae/ferric-oxide/issues/200)) |
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
@@ -373,6 +374,31 @@ This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
 
+When the marker does not arrive within the timeout, the script first samples
+every CPU's registers through the QEMU monitor (several times, with the
+frame-pointer chain of each CPU spinning in the kernel), then sends an NMI to
+CPU 0. The NMI handler prints its stack trace and then one line per context:
+
+```text
+NMI: 41 contexts
+  pid 21 "/scheme/initfs/bin/redoxfs" Blocked "pcache::records" running=false queued=false cpu=Some(1) syscall=Some([22000003, ...])
+  0xffffff7f8013bb60: busy
+```
+
+Each row gives the process, the context's name, its status and block reason,
+whether it is running or queued to run, the CPU it last ran on and the system
+call it is in. With every CPU idle (a lost wake-up, as in
+[#200](https://github.com/rexlunae/ferric-oxide/issues/200)), the stuck
+context is the one blocked on something that will never come. The handler takes
+only `try_` locks, so it cannot deadlock on a lock the interrupted code holds:
+a context whose lock is held prints as `<address>: busy`, and `NMI: context
+list busy` means the context list itself was locked and no rows follow. Writing
+to the console still takes the console lock, so an NMI that interrupts a
+console writer stalls there, as its stack trace always has. After QEMU is
+stopped the script copies the context rows to stderr, so they reach the job log
+even where a workflow discards the script's stdout or keeps only the console's
+tail (trace-overhead does both).
+
 The two HDA controllers exercise the audio scheme naming in `ihdad` and
 `audiod`. The smoke script waits up to 30 seconds for the second controller's
 `audiohw.<pci-address>` scheme and reports `audio-second-controller`: the
@@ -385,8 +411,9 @@ failure, a crash after the marker, a missing test result, a missing marker, a
 smoke shell that could not be linked (which must fail with that message rather
 than a generic timeout), a link failure after the marker and a marker that
 arrives while the runner waits after that line (both of which must still pass), a
-program the script starts that fails to link (which must not fail the run), and
-that the runner adds both HDA controllers. Its fake QEMU stays alive for a
+program the script starts that fails to link (which must not fail the run), a
+timeout whose NMI context rows (and only those) must reach stderr, and that
+the runner adds both HDA controllers. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.

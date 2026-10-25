@@ -73,6 +73,32 @@ check marker-during-wait 0 \
 check child-link-failure 0 \
     $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK'
 
+# A boot that never prints the marker times out. The NMI the runner sends then makes the
+# kernel list every context. The runner copies those rows, and only those, to stderr,
+# because trace-overhead discards its stdout and the failure annotation keeps only the
+# console's tail. A row the NMI could not lock reads "busy", and "context list busy"
+# means it got none.
+printf '%s\n' $'FERRIC_TEST_PASS xstate\r' 'NMI: 3 contexts' \
+    '  pid 1 "/scheme/initfs/bin/init" Blocked "UserInner::read (v2)" running=false queued=false cpu=Some(0) syscall=None' \
+    '  0xffffff7f8013bb60: busy' \
+    $'  pid 40 "/usr/bin/ferric-ext4-test" Runnable "" running=false queued=false cpu=Some(2) syscall=None\r' \
+    'not a context row' > "$FAKE_QEMU_LOG"
+status=0
+BOOT_TIMEOUT=2 FAKE_QEMU_SLEEP=6 bash "$runner" "$work/image" "$work/serial" host \
+    > "$work/stdout" 2> "$work/stderr" || status=$?
+[ "$status" -eq 1 ] || { echo "timeout-contexts: expected 1, got $status" >&2; cat "$work/stderr" >&2; exit 1; }
+grep -qF 'timed out after 2s' "$work/stderr" \
+    || { echo "timeout-contexts: no timeout message" >&2; cat "$work/stderr" >&2; exit 1; }
+sed -n '/^boot-smoke: contexts at the timeout$/,/^boot-smoke: FAIL/p' "$work/stderr" \
+    | grep -v '^boot-smoke: ' > "$work/rows"
+expected_rows=$(tr -d '\r' < "$FAKE_QEMU_LOG" | grep -v -e '^FERRIC_' -e '^not a context row$')
+[ "$(cat "$work/rows")" = "$expected_rows" ] || {
+    echo "timeout-contexts: the context rows on stderr were:" >&2
+    cat "$work/rows" >&2
+    exit 1
+}
+echo "PASS: timeout-contexts"
+
 # The smoke image's audio check needs both controllers on the QEMU command line.
 grep -q -- '-device ich9-intel-hda,id=hda0' "$FAKE_QEMU_ARGS" \
     && grep -q -- '-device ich9-intel-hda,id=hda1' "$FAKE_QEMU_ARGS" \

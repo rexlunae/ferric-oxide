@@ -22,6 +22,8 @@ ferric-guard-test = "source"
 ferric-tlb-test = "source"
 ferric-borrow-test = "source"
 ferric-futex-test = "source"
+# Process exit with a thread still busy (#200).
+ferric-exit-test = "source"
 # Reads /scheme/sys/proc (kernel.sys_proc, which CI turns on); skips otherwise.
 ferric-proc-test = "source"
 ferric-syscall-fuzz = "source"
@@ -109,6 +111,7 @@ ferric-blkgrant-test || echo FERRIC_TEST_FAIL nvme-grant exited with an error
 ferric-netq-test || echo FERRIC_TEST_FAIL netq exited with an error
 ferric-iobench || echo FERRIC_TEST_FAIL iobench exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
+ferric-exit-test || echo FERRIC_TEST_FAIL exit-busy-thread exited with an error
 ferric-proc-test || echo FERRIC_TEST_FAIL proc exited with an error
 ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error

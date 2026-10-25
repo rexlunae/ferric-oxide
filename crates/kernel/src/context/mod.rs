@@ -421,3 +421,36 @@ pub fn get_contexts_stats(token: &mut CleanLockToken) -> [usize; 6] {
         idling_cpu,
     ]
 }
+
+/// Ferric Oxide: prints one line per context (its process, name, status, what it is blocked
+/// on, whether it is running or queued to run, and the system call it is in) from the NMI
+/// handler. A hang with every CPU idle is a context that waits for a wakeup that never
+/// comes, and this names it and the call it waits in.
+///
+/// Only `try_` locks are taken, so an NMI that interrupted a holder of the context list or of
+/// a context skips it (and says so) instead of deadlocking; nothing is allocated.
+pub fn dump_for_nmi(mut token: LockToken<'_, L1>) {
+    let Some(mut contexts) = CONTEXTS.try_read(token.token()) else {
+        crate::println!("NMI: context list busy");
+        return;
+    };
+    let (contexts, mut token) = contexts.token_split();
+    crate::println!("NMI: {} contexts", contexts.len());
+    for context_ref in contexts.iter() {
+        let Some(context) = context_ref.try_read(token.token()) else {
+            crate::println!("  {:p}: busy", Arc::as_ptr(context_ref));
+            continue;
+        };
+        crate::println!(
+            "  pid {} {:?} {:?} {:?} running={} queued={} cpu={:?} syscall={:x?}",
+            context.pid,
+            context.name.as_str(),
+            context.status,
+            context.status_reason,
+            context.running,
+            context.queue_key.is_some(),
+            context.cpu_id.map(LogicalCpuId::get),
+            context.current_syscall(),
+        );
+    }
+}
