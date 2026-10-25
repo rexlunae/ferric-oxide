@@ -1,0 +1,108 @@
+# Ferric Oxide scheduler and timer baseline image
+#
+# Runs the reproducible baseline protocol for issue #179 (and the tickless sections of
+# #185): with kernel.trace and the trace_sched events on, it captures windows of (1) a
+# quiet idle system, (2) one CPU-bound best-effort context, (3) 1/16/64/256 rings with a
+# genuinely pending read (the legacy per-ring workers), and reports the periodic PIT and
+# broadcast counts, switch rates and wakeup counts from the captures, plus the wake
+# latency of the waiting rings and the usual bench lines with tracing on. The host runs
+# it with scripts/ferric-ci/boot-smoke.sh and checks the log with
+# scripts/ferric-ci/check-sched-bench-log.sh; BOOT_SMP=1 gives the single-CPU runs.
+#
+# Build with the CI ferric.toml (kernel.trace, rings, nvmed's per-CPU queues, grant DMA
+# and the rest, as image.yml writes it), e.g.:
+#   make all CONFIG_NAME=ferric-sched-bench
+# A 1-vCPU and a 4-vCPU boot on KVM are the protocol's two configurations.
+
+include = ["minimal.toml"]
+
+[general]
+filesystem_size = 256
+
+[packages]
+kernel = "source"
+relibc = "source"
+bootloader = "source"
+redoxfs = "source"
+base = "source"
+# The trace tool: captures the phase windows and prints the counts lines.
+ferric-trace = "source"
+# Times file I/O and system calls with tracing off and on (trace-loss reporting).
+ferric-trace-bench = "source"
+# The waiting-ring scale workload (ferric-ring-test --scale) and the ring bench lines.
+ferric-ring-test = "source"
+# The Phase 2 disk benchmark lines (iobench-*), as in the smoke image.
+ferric-iobench = "source"
+# The busy best-effort workload of the baseline (ferric-sched-burn).
+ferric-sched-bench = "source"
+# As in the smoke image: the installed package manager sign-check.
+fox = "source"
+pkgutils = "ignore"
+
+[[files]]
+path = "/usr/lib/init.d/30_console"
+data = """
+requires_weak 10_net.target
+requires_weak 05_fox-adopt.service
+ion /usr/lib/ferric-sched-bench.ion
+"""
+
+[[files]]
+path = "/usr/lib/ferric-sched-bench.ion"
+data = """
+#!/usr/bin/env ion
+echo FERRIC_SCHED_BENCH_BEGIN
+uname -a
+cat /scheme/sys/uname
+cat /scheme/sys/cpu
+ls /scheme
+# The protocol needs kernel.trace with the sched events compiled in (the CI ferric.toml
+# turns both on: kernel.trace and kernel.trace_boot = "sched"). Without it the image
+# skips, as the smoke image's trace steps do.
+if contains "$(ls /scheme)" kernel.trace
+    echo enable sched > /scheme/kernel.trace/events
+    # Let the boot services settle before the windows.
+    sleep 10
+
+    # Window 1: a quiet idle system. There are no runnable user contexts to wake; the
+    # periodic PIT interrupt and its broadcast are the only scheduler activity. The
+    # discard capture before the window fixes the window's start.
+    rm -rf /tmp/sched-idle.d
+    ferric-trace capture /tmp/sched-idle.d
+    sleep 10
+    ferric-trace capture /tmp/sched-idle-window.d
+    ferric-trace counts /tmp/sched-idle-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.switch
+
+    # Window 2: one CPU-bound best-effort context (a syscall-free spin); the tick is the
+    # only thing that preempts it, so the window shows the periodic preemption of a
+    # greedy context.
+    rm -rf /tmp/sched-burn.d
+    ferric-trace capture /tmp/sched-burn.d
+    ferric-sched-burn --seconds 10
+    ferric-trace capture /tmp/sched-burn-window.d
+    ferric-trace counts /tmp/sched-burn-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.switch
+
+    # Windows 3: waiting rings. Each run's window covers the setup of the rings (their
+    # worker contexts start there), the quiet hold of the blocked reads, and the wake of
+    # every ring; the wake latency itself comes from the run's FERRIC_BENCH line.
+    for rings in 1 16 64 256
+        rm -rf /tmp/sched-scale-$rings.d
+        ferric-trace capture /tmp/sched-scale-$rings.d
+        ferric-ring-test --scale $rings --quiet-seconds 8 > /tmp/scale-$rings.log
+        cat /tmp/scale-$rings.log
+        ferric-trace capture /tmp/sched-scale-$rings-window.d
+        ferric-trace counts /tmp/sched-scale-$rings-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.ipi_wake --gap sched.switch --gap sched.context_create
+    end
+
+    # Windows 4: the benchmark lines with tracing on (the trace-bench workload also
+    # reports its own off/on overhead and trace loss).
+    ferric-ring-test || echo FERRIC_TEST_FAIL ring exited with an error
+    ferric-trace-bench || echo FERRIC_TEST_FAIL trace-bench exited with an error
+    ferric-iobench || echo FERRIC_TEST_FAIL iobench exited with an error
+else
+    echo FERRIC_TEST_SKIP sched-bench: no kernel.trace scheme
+end
+echo FERRIC_SCHED_BENCH_DONE
+echo FERRIC_SMOKE_OK
+shutdown
+"""

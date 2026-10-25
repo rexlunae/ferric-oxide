@@ -866,6 +866,81 @@ and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), 
 captures sent to one backend keep separate traces. The mapping is described in
 `tools/ferric-trace/src/otlp.rs`.
 
+## Scheduler and timer baseline
+
+The tickless scheduler work ([#177] and its issue track) needs a measured
+picture of today's periodic behavior before it changes anything: how many
+timer interrupts the periodic PIT path produces per second, when the `Pit`
+broadcast IPI reaches the other CPUs, how often the scheduler switches, what a
+cross-CPU wakeup costs, and what a waiting ring's per-ring worker costs. The
+reproducible protocol for that picture is the scheduler and timer baseline
+(issue [#179], extended by the tickless sections of [#185]). It is a
+measurement protocol, not a benchmark of a candidate: it pins a commit and a
+configuration, collects raw captures and machine-readable lines, and states
+the machine and boot it measured. Success thresholds for later work are frozen
+from these numbers before candidate tuning.
+
+The baseline image is `config/ferric-sched-bench.toml` (`make all
+CONFIG_NAME=ferric-sched-bench`), built with the CI `ferric.toml` (image.yml
+writes it), which turns `kernel.trace` and the `trace_sched` events on. The
+image's console script, `/usr/lib/ferric-sched-bench.ion`, runs four windows:
+
+1. **Idle.** Ten seconds with no runnable user workload. The capture counts
+   the periodic `sched.tick` records on the PIT owner and `sched.ipi_pit`
+   records on every other CPU: the timer interrupt rate the tickless work
+   must stop, and its jitter.
+2. **One busy context.** `ferric-sched-burn --seconds 10` runs a syscall-free
+   spin. The periodic tick is the only thing that can preempt it, so the
+   window shows the periodic preemption of a greedy best-effort context.
+3. **Waiting rings.** `ferric-ring-test --scale N --quiet-seconds 8` for
+   `N` in 1, 16, 64, 256: each ring submits one asynchronous 1-byte read of an
+   empty pipe, so its worker blocks in the read (the legacy one-context-per-
+   ring model). The window covers the setup (each ring's `sched.context_create`
+   and `sched.context_start`), the quiet hold, and the wake of every ring; the
+   run prints the wake latency (write to completion, per ring, with
+   fio-style percentiles) as a `FERRIC_BENCH ring-scale` line.
+4. **Benchmarks with tracing on.** `ferric-ring-test`, `ferric-trace-bench`
+   and `ferric-iobench` run and print their usual `FERRIC_BENCH` lines; the
+   trace-bench lines also report the tracing overhead and lost records.
+
+Between and after the windows, the script captures the rings with
+`ferric-trace capture` and prints one `counts` line per event (per CPU and
+merged) with `ferric-trace counts`, the `counts` view:
+
+```text
+counts sched.tick cpu=0 count=2440 rate_per_s=243
+counts sched.tick cpu=all count=2440 rate_per_s=243 gap_ns_min=4050000 gap_ns_mean=4053000
+        gap_ns_p50=4052000 gap_ns_p99=4073000 gap_ns_p999=4100000 gap_ns_max=12340000
+```
+
+A `counts` line has the event, the CPU (`cpu=all` for the merged line), the
+record count, the rate over the capture (first to last record), and, with
+`--gap <event>`, the gaps between a CPU's consecutive records of that event as
+fio-style percentiles in nanoseconds. A capture directory's `stats.start` and
+`stats.end` snapshots add `lost_before` and `lost_during` to the CPU lines, so
+a window that overflowed its ring reports the loss instead of silently
+undercounting. The tool takes the same inputs as `text`:
+
+```sh
+cargo run -p ferric-trace-cli -- counts capture/ --gap sched.tick --gap sched.switch
+```
+
+The host runs the image with `scripts/ferric-ci/boot-smoke.sh` on KVM
+(`host,migratable=off`; software QEMU's PIT and LAPIC timing is not
+representative), `BOOT_SMP=1` and the default 4 vCPUs, once each, and checks
+the serial log with `scripts/ferric-ci/check-sched-bench-log.sh`. The
+protocol's report records the exact commit and image configuration, the
+machine and QEMU version, the raw serial log and captures, and the `counts`
+and `FERRIC_BENCH` lines; QEMU/KVM's 5–15% noise is not evidence of a
+speedup, only baseline evidence. The same windows and counts are the
+before/after harness for the tickless work: a tickless kernel's idle window
+must show no `sched.tick` or `sched.ipi_pit` records at all, while `sched.switch`
+rates, wake counts and the ring-scale lines keep their meaning.
+
+[#177]: https://github.com/rexlunae/ferric-oxide/issues/177
+[#179]: https://github.com/rexlunae/ferric-oxide/issues/179
+[#185]: https://github.com/rexlunae/ferric-oxide/issues/185
+
 ## Sampling profiles
 
 `kernel.profiling` is upstream's sampling profiler, separate from the
