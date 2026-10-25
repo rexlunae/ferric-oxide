@@ -6,8 +6,9 @@ license = "MIT"
 description = "Validated firmware wall-clock handoff from the bootloader to the kernel"
 
 [dependencies]
-# The workspace's no_std baseline, so this crate and the host tools that need
-# the clock share one version. The kernel and bootloader workspaces build it as
-# a path dependency, and it stays a member of the host workspace, so the
-# inherited entry resolves where the version is declared.
-time = { workspace = true }
+# The same no_std baseline as the host workspace's `time` entry, declared with
+# its version rather than inherited from it. The bootloader recipe builds this
+# crate as a sibling symlink of a copied bootloader source tree, where Cargo has
+# no workspace root to inherit from, so `workspace = true` fails there. Keep the
+# version in step with `workspace.dependencies.time`.
+time = { version = "0.3.44", default-features = false }
