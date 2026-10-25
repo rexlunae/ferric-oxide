@@ -1,6 +1,6 @@
 use core::fmt::{Result, Write};
 
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use sbi_rt::{get_marchid, get_mimpid, get_mvendorid};
 
 use crate::dtb::DTB_BINARY;

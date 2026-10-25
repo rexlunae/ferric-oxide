@@ -2,10 +2,7 @@ use crate::{
     arch::{device::irqchip::hlic, time},
     dtb::DTB_BINARY,
 };
-use fdt::{
-    node::{FdtNode, NodeProperty},
-    Fdt,
-};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 
 pub mod cpu;
 pub(crate) mod irqchip;

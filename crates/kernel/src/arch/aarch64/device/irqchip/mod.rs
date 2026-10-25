@@ -1,6 +1,6 @@
 use crate::dtb::irqchip::{InterruptController, IRQ_CHIP};
 use alloc::boxed::Box;
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 
 pub(crate) mod gic;
 pub(crate) mod gicv3;

@@ -1,13 +1,13 @@
 use crate::{
     arch::{device::irqchip::hlic, start::BOOT_HART_ID},
     dtb::{
-        get_mmio_address,
+        translate_mmio_address,
         irqchip::{InterruptController, InterruptHandler, IrqCell, IrqDesc, IRQ_CHIP},
     },
     sync::CleanLockToken,
 };
 use core::{mem, num::NonZero, sync::atomic::Ordering};
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use syscall::{Error, Io, Mmio, EINVAL};
 
 #[repr(packed(4))]
@@ -123,7 +123,7 @@ impl InterruptController for Plic {
 
         // MMIO region
         let reg = my_node.reg().unwrap().next().unwrap();
-        let addr = get_mmio_address(&fdt, &my_node, &reg).unwrap();
+        let addr = translate_mmio_address(&fdt, &my_node, &reg).unwrap();
         // Specifies how many external interrupts are supported by this controller.
         let ndev = my_node
             .property("riscv,ndev")

@@ -2,7 +2,7 @@ use super::InterruptController;
 use crate::{
     arch::device::{ROOT_IC_IDX, ROOT_IC_IDX_IS_SET},
     dtb::{
-        get_mmio_address,
+        translate_mmio_address,
         irqchip::{InterruptHandler, IrqCell, IrqDesc},
     },
     sync::CleanLockToken,
@@ -12,7 +12,7 @@ use core::{
     ptr::{read_volatile, write_volatile},
     sync::atomic::Ordering,
 };
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 use syscall::{
     error::{Error, EINVAL},
     Result,
@@ -83,7 +83,7 @@ impl Bcm2836ArmInterruptController {
     fn parse_inner(fdt: &Fdt, node: &FdtNode) -> Result<(usize, usize)> {
         //assert address_cells == 0x1, size_cells == 0x1
         let reg = node.reg().unwrap().nth(0).unwrap();
-        let addr = get_mmio_address(fdt, node, &reg).unwrap();
+        let addr = translate_mmio_address(fdt, node, &reg).unwrap();
 
         Ok((addr, reg.size.unwrap()))
     }

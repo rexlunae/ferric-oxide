@@ -147,7 +147,7 @@ fn delivers_to(handle_cpu: LogicalCpuId, cpu: LogicalCpuId) -> bool {
 ///
 /// Ferric Oxide: for interrupts from the PIC or I/O APIC (and the interrupt controllers of other
 /// architectures), which belong to the BSP's `irq:N` handles wherever they are taken. A vector
-/// reserved on a CPU goes through [`vector_trigger`].
+/// reserved on a CPU goes through `vector_trigger`.
 pub fn irq_trigger(irq: u8, token: &mut CleanLockToken) {
     deliver(irq, LogicalCpuId::BSP, Source::Line, token);
 }

@@ -48,6 +48,14 @@ trace macros use explicit paths rather than `macro_use` scope propagation.
 Boot messages identify Ferric Oxide; the `Redox` uname system identifier,
 system-call ABI and target names remain for compatibility with existing tools.
 
+`crates/devicetree/` provides allocation-free, borrowed hardware-description
+access for both the kernel and bootloader through the published `fdt` parser.
+It checks header block extents and tree structure before traversal, preserves
+console aliases/parameters and phandles, and bounds address/size cell decoding.
+Its MMIO translation follows every ancestor bus and rejects range crossings and
+overflow. The kernel retains its independent reservation-map and reserved-memory
+policy checks. This does not replace drivers or validate every device binding.
+
 The six imported subtrees are `crates/kernel/`, `crates/bootloader/`,
 `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/`.
 `.github/workflows/subtree-sync.yml` pulls their upstream changes into this

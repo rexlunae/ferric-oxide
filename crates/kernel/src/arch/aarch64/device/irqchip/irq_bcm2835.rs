@@ -1,10 +1,10 @@
 use core::ptr::{read_volatile, write_volatile};
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 
 use super::InterruptController;
 use crate::{
     dtb::{
-        get_interrupt, get_mmio_address,
+        get_interrupt, translate_mmio_address,
         irqchip::{InterruptHandler, IrqCell, IrqDesc, IRQ_CHIP},
     },
     sync::CleanLockToken,
@@ -77,7 +77,7 @@ impl Bcm2835ArmInterruptController {
         unsafe {
             //assert address_cells == 0x1, size_cells == 0x1
             let mem = node.reg().unwrap().nth(0).unwrap();
-            let base = get_mmio_address(fdt, node, &mem).unwrap();
+            let base = translate_mmio_address(fdt, node, &mem).unwrap();
             let size = mem.size.unwrap() as u32;
             let mut ret_virq = None;
 

@@ -116,7 +116,7 @@ impl KernelArgs {
         }
     }
 
-    pub(crate) fn dtb(&self) -> Option<fdt::Fdt<'static>> {
+    pub(crate) fn dtb(&self) -> Option<ferric_devicetree::Tree<'static>> {
         if self.hwdesc_base != 0 {
             let data = unsafe {
                 slice::from_raw_parts(
@@ -125,7 +125,7 @@ impl KernelArgs {
                     self.hwdesc_size as usize,
                 )
             };
-            fdt::Fdt::new(data).ok()
+            ferric_devicetree::Tree::new(data).ok()
         } else {
             None
         }

@@ -133,15 +133,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmidecode"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5a070ca68f8ba202b05487d52b9ac56eaebb5b66cdd68d1a17e63174bb11e3b"
-dependencies = [
- "bitflags 1.3.2",
-]
-
-[[package]]
 name = "endian-num"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,14 +140,22 @@ checksum = "f8f59926911ef34d1efb9ea1ee8ca78385df62ce700ccf2bcb149011bd226888"
 
 [[package]]
 name = "fdt"
-version = "0.2.0-alpha1"
-source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
+version = "0.2.0-alpha3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
 
 [[package]]
 name = "ferric-boot-time"
 version = "0.1.0"
 dependencies = [
  "time",
+]
+
+[[package]]
+name = "ferric-devicetree"
+version = "0.1.0"
+dependencies = [
+ "fdt",
 ]
 
 [[package]]
@@ -256,9 +255,8 @@ version = "1.0.0"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
- "dmidecode",
- "fdt",
  "ferric-boot-time",
+ "ferric-devicetree",
  "ferric-elfreloc",
  "ferric-hwrand",
  "linked_list_allocator",

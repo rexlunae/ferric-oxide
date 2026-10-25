@@ -40,7 +40,6 @@ redox_uefi = { git = "https://github.com/rexlunae/uefi.git" }
 redox_uefi_std = { git = "https://github.com/rexlunae/uefi.git" }
 
 [target."aarch64-unknown-uefi".dependencies]
-dmidecode = "0.8.0"
 ferric-boot-time = { path = "../boot-time" }
 
 [target."x86_64-unknown-uefi".dependencies]
@@ -48,7 +47,7 @@ x86 = "0.52.0"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 byteorder = { version = "1", default-features = false }
-fdt = { git = "https://github.com/repnop/fdt.git", rev = "2fb1409edd1877c714a0aa36b6a7c5351004be54" }
+ferric-devicetree = { path = "../devicetree" }
 
 [features]
 default = []

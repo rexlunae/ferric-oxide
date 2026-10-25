@@ -1,14 +1,14 @@
-use crate::{dtb::get_mmio_address, sync::CleanLockToken, time};
+use crate::{dtb::translate_mmio_address, sync::CleanLockToken, time};
 use core::ptr::read_volatile;
 
 static RTC_DR: usize = 0x000;
 
-pub unsafe fn init(fdt: &fdt::Fdt) {
+pub unsafe fn init(fdt: &ferric_devicetree::Tree) {
     if let Some(node) = fdt.find_compatible(&["arm,pl031"]) {
         match node
             .reg()
             .and_then(|mut iter| iter.next())
-            .and_then(|region| get_mmio_address(fdt, &node, &region))
+            .and_then(|region| translate_mmio_address(fdt, &node, &region))
         {
             Some(phys) => {
                 let mut rtc = Pl031rtc { phys };

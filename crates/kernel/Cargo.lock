@@ -96,8 +96,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "fdt"
-version = "0.2.0-alpha1"
-source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
+version = "0.2.0-alpha3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
 
 [[package]]
 name = "ferric-aligned-buffer"
@@ -120,6 +121,13 @@ dependencies = [
 [[package]]
 name = "ferric-cet"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-devicetree"
+version = "0.1.0"
+dependencies = [
+ "fdt",
+]
 
 [[package]]
 name = "ferric-hwrand"
@@ -229,11 +237,11 @@ dependencies = [
  "bitfield",
  "bitflags 2.9.1",
  "cc",
- "fdt",
  "ferric-aligned-buffer",
  "ferric-amdvi",
  "ferric-boot-time",
  "ferric-cet",
+ "ferric-devicetree",
  "ferric-hwrand",
  "ferric-iommu",
  "ferric-irq",

@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 
 pub use crate::dtb::serial::COM1;
 use crate::{

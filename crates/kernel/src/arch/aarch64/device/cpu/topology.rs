@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 use spin::Once;
 
 use crate::cpu_set::MAX_CPU_COUNT;
@@ -115,7 +115,7 @@ impl fmt::Display for TopologyError<'_> {
     }
 }
 
-fn property_u32(node: FdtNode<'_, '_>, name: &str) -> Option<u32> {
+fn property_u32(node: FdtNode<'_>, name: &str) -> Option<u32> {
     let bytes: [u8; 4] = node.property(name)?.value.try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
 }
@@ -128,14 +128,14 @@ fn parse_mpidr(reg: &[u8], address_cells: usize) -> Option<u64> {
     }
 }
 
-fn enabled(node: FdtNode<'_, '_>) -> bool {
+fn enabled(node: FdtNode<'_>) -> bool {
     match node.property("status") {
         None => true,
         Some(status) => matches!(status.as_str(), Some("ok" | "okay")),
     }
 }
 
-fn enable_method(node: FdtNode<'_, '_>) -> EnableMethod {
+fn enable_method(node: FdtNode<'_>) -> EnableMethod {
     match node.property("enable-method") {
         None => EnableMethod::None,
         Some(method) => match method.as_str() {

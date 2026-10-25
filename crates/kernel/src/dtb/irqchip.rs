@@ -4,7 +4,7 @@ use crate::{
     sync::CleanLockToken,
 };
 use alloc::{boxed::Box, vec::Vec};
-use fdt::{node::NodeProperty, Fdt};
+use ferric_devicetree::{Property as NodeProperty, Tree as Fdt};
 use syscall::{Error, Result, EINVAL};
 
 pub trait InterruptHandler {

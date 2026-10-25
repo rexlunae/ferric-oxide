@@ -110,7 +110,7 @@ impl CpuStats {
 
     /// Add an IRQ event to both the global count and the CPU that handled it.
     ///
-    /// This should be called in all [`crate::arch::interrupt::irq::eoi`],
+    /// This should be called in all `crate::arch::interrupt::irq::eoi`,
     /// for all architectures.
     #[inline]
     pub fn add_irq(&self, irq: u8) {

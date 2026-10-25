@@ -6,10 +6,8 @@ pub mod serial;
 use crate::dtb::irqchip::IrqCell;
 use crate::startup::memory::{register_memory_region, BootloaderMemoryKind};
 use core::slice;
-use fdt::{
-    node::{CellSizes, FdtNode, NodeProperty},
-    standard_nodes::MemoryRegion,
-    Fdt,
+use ferric_devicetree::{
+    CellSizes, MemoryRegion, Node as FdtNode, Property as NodeProperty, Tree as Fdt,
 };
 use rmm::PhysicalAddress;
 use spin::once::Once;
@@ -101,7 +99,7 @@ fn cells_to_usize(bytes: &[u8], cells: usize) -> Option<usize> {
     usize::try_from(value).ok()
 }
 
-fn explicit_cell_sizes(node: FdtNode<'_, '_>) -> Option<CellSizes> {
+fn explicit_cell_sizes(node: FdtNode<'_>) -> Option<CellSizes> {
     fn cell_count(property: NodeProperty<'_>) -> Option<usize> {
         let bytes: [u8; 4] = property.value.try_into().ok()?;
         usize::try_from(u32::from_be_bytes(bytes)).ok()
@@ -184,9 +182,8 @@ fn visit_fdt_memory_reservations(dt: &Fdt, visit: &mut impl FnMut(usize, usize))
         return;
     };
 
-    // Parse this directly instead of using `Fdt::memory_reservations()`: the
-    // pinned fdt implementation slices at `off_mem_rsvmap` without first
-    // checking that the offset is within the DTB buffer.
+    // Reservation entries need validation independently of the structure and
+    // strings blocks, including a terminator before the structure block.
     if offset < FDT_HEADER_SIZE
         || offset % size_of::<u64>() != 0
         || structure_offset > data.len()
@@ -236,7 +233,7 @@ fn visit_fdt_memory_reservations(dt: &Fdt, visit: &mut impl FnMut(usize, usize))
     }
 }
 
-fn reserved_memory_node_is_available(node: FdtNode<'_, '_>) -> bool {
+fn reserved_memory_node_is_available(node: FdtNode<'_>) -> bool {
     match node.property("status") {
         None => true,
         Some(status) => matches!(status.as_str(), Some("ok" | "okay")),
@@ -252,7 +249,7 @@ fn reserved_memory_node_is_available(node: FdtNode<'_, '_>) -> bool {
 /// only one possible allocation, making it a fixed firmware carve-out in
 /// practice. This is used by Amlogic's `linux,secmon` DT nodes.
 fn visit_exact_dynamic_reserved_memory_range(
-    node: FdtNode<'_, '_>,
+    node: FdtNode<'_>,
     cell_sizes: CellSizes,
     visit: &mut impl FnMut(usize, usize),
 ) -> bool {
@@ -445,7 +442,7 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
                 for entry in reg {
                     if let Some(size) = entry.size {
                         let addr = entry.starting_address as usize;
-                        if let Some(mapped_addr) = get_mmio_address(dt, &device, &entry) {
+                        if let Some(mapped_addr) = translate_mmio_address(dt, &device, &entry) {
                             crate::debug!(
                                 "soc device {} 0x{:08x} -> 0x{:08x} size 0x{:08x}",
                                 device.name,
@@ -505,111 +502,19 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
     }
 }
 
-fn same_node(left: FdtNode<'_, '_>, right: FdtNode<'_, '_>) -> bool {
-    if left.name != right.name {
-        return false;
-    }
-    // FdtNode is reconstructed while walking the tree and has no identity
-    // operation. A property's value is a slice into the original DTB, so equal
-    // `reg` slice pointers identify the same node occurrence without relying
-    // on names that may repeat below different buses.
-    match (left.property("reg"), right.property("reg")) {
-        (Some(left_reg), Some(right_reg)) => core::ptr::eq(left_reg.value, right_reg.value),
-        _ => false,
-    }
-}
-
-fn translate_bus_address(bus: FdtNode<'_, '_>, address: usize, size: usize) -> Option<usize> {
-    let ranges_property = bus.property("ranges")?;
-    if ranges_property.value.is_empty() {
-        return Some(address);
-    }
-
-    let last_offset = size.saturating_sub(1);
-    let ranges = bus.ranges()?;
-    for range in ranges {
-        let Some(offset) = address.checked_sub(range.child_bus_address) else {
-            continue;
-        };
-        if offset < range.size && last_offset < range.size - offset {
-            return range.parent_bus_address.checked_add(offset);
-        }
-    }
-    None
-}
-
-fn translate_from_subtree(
-    bus_or_device: FdtNode<'_, '_>,
-    target: FdtNode<'_, '_>,
-    address: usize,
-    size: usize,
-) -> Option<usize> {
-    if same_node(bus_or_device, target) {
-        return Some(address);
-    }
-
-    for child in bus_or_device.children() {
-        if let Some(child_address) = translate_from_subtree(child, target, address, size) {
-            // `bus_or_device` is the bus parent of the subtree that matched.
-            return translate_bus_address(bus_or_device, child_address, size);
-        }
-    }
-    None
-}
-
-/// Translate a device's bus-relative `reg` address through every ancestor's
-/// `ranges` property until it reaches the CPU physical address space.
+/// Translate a device's bus-relative register region into CPU physical memory.
+/// Missing mappings, malformed ranges, crossings and overflow return `None`.
 pub fn translate_mmio_address(fdt: &Fdt, device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
-    /* DT spec 2.3.8 "ranges":
-     * The ranges property provides a means of defining a mapping or translation between
-     * the address space of the bus (the child address space) and the address space of the bus
-     * node’s parent (the parent address space).
-     * If the property is defined with an <empty> value, it specifies that the parent and child
-     * address space is identical, and no address translation is required.
-     * If the property is not present in a bus node, it is assumed that no mapping exists between
-     * children of the node and the parent address space.
-     */
-
-    let address = region.starting_address as usize;
-    let size = region.size.unwrap_or(1);
-    let root = fdt.find_node("/")?;
-
-    // The root is already the CPU address space, so only its children perform
-    // translations. This also supports devices that are not under `/soc`.
-    for child in root.children() {
-        if let Some(translated) = translate_from_subtree(child, *device, address, size) {
-            translated.checked_add(size.saturating_sub(1))?;
-            return Some(translated);
-        }
-    }
-    None
-}
-
-// FIXME return PhysicalAddress
-pub fn get_mmio_address(fdt: &Fdt, _device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
-    let mut mapped_addr = region.starting_address as usize;
-    let size = region.size.unwrap_or(0).saturating_sub(1);
-    let last_address = mapped_addr.saturating_add(size);
-    if let Some(parent) = fdt.find_node("/soc") {
-        let mut ranges = parent.ranges().map(|ranges| ranges.peekable())?;
-        if ranges.peek().is_some() {
-            let parent_range = ranges.find(|range| {
-                range.child_bus_address <= mapped_addr
-                    && last_address - range.child_bus_address <= range.size
-            })?;
-            mapped_addr = parent_range
-                .parent_bus_address
-                .checked_add(mapped_addr - parent_range.child_bus_address)?;
-            let _ = mapped_addr.checked_add(size)?;
-        }
-    }
-    Some(mapped_addr)
+    fdt.translate_mmio_address(*device, region)
 }
 
 #[cfg_attr(not(dtb), expect(dead_code))]
-pub fn interrupt_parent<'a>(fdt: &'a Fdt, node: &'a FdtNode) -> Option<FdtNode<'a, 'a>> {
+pub fn interrupt_parent<'a>(fdt: &Fdt<'a>, node: &FdtNode) -> Option<FdtNode<'a>> {
     // FIXME traverse device tree up
-    node.interrupt_parent()
+    node.property("interrupt-parent")
+        .and_then(NodeProperty::as_usize)
+        .and_then(|phandle| u32::try_from(phandle).ok())
+        .and_then(|phandle| fdt.find_phandle(phandle))
         .or_else(|| fdt.find_node("/soc").and_then(|soc| soc.interrupt_parent()))
         .or_else(|| fdt.find_node("/").and_then(|node| node.interrupt_parent()))
 }
@@ -633,11 +538,11 @@ pub fn get_interrupt(fdt: &Fdt, node: &FdtNode, idx: usize) -> Option<IrqCell> {
     }
 }
 
-pub fn diag_uart_node<'a>(dtb: &'a Fdt) -> Option<FdtNode<'a, 'a>> {
+pub fn diag_uart_node<'a>(dtb: &Fdt<'a>) -> Option<FdtNode<'a>> {
     Some(dtb.chosen().stdout()?.node())
 }
 
-pub fn diag_uart_params<'a>(dtb: &'a Fdt<'a>) -> Option<&'a str> {
+pub fn diag_uart_params<'a>(dtb: &Fdt<'a>) -> Option<&'a str> {
     dtb.chosen().stdout()?.params()
 }
 
@@ -683,10 +588,7 @@ mod tests {
         explicit_cell_sizes, translate_mmio_address, visit_address_size_pairs,
         visit_fdt_memory_reservations, visit_fixed_reserved_memory_ranges,
     };
-    use fdt::{
-        node::{CellSizes, NodeProperty},
-        Fdt,
-    };
+    use ferric_devicetree::{CellSizes, Property as NodeProperty, Tree as Fdt};
 
     static MMIO_DTB: &[u8] = include_bytes!("testdata/mmio.dtb");
     static INVALID_RESERVED_MEMORY_DTB: &[u8] =
@@ -767,12 +669,21 @@ mod tests {
             data[RESERVATION_MAP_OFFSET_FIELD..RESERVATION_MAP_OFFSET_FIELD + 4]
                 .try_into()
                 .unwrap(),
-        );
-        // Point off_dt_struct one entry past off_mem_rsvmap, cutting the
-        // reservation map off before its terminating {0, 0} entry.
-        let truncated_structure_offset = off_mem_rsvmap + 16;
-        data[STRUCTURE_BLOCK_OFFSET_FIELD..STRUCTURE_BLOCK_OFFSET_FIELD + 4]
-            .copy_from_slice(&truncated_structure_offset.to_be_bytes());
+        ) as usize;
+        let off_dt_struct = u32::from_be_bytes(
+            data[STRUCTURE_BLOCK_OFFSET_FIELD..STRUCTURE_BLOCK_OFFSET_FIELD + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        // Keep the structure valid: move the map to its final 16-byte slot and
+        // replace the terminator with the real entry, leaving no room for zero.
+        let entry: [u8; 16] = data[off_mem_rsvmap..off_mem_rsvmap + 16]
+            .try_into()
+            .unwrap();
+        let truncated_map_offset = off_dt_struct - 16;
+        data[truncated_map_offset..off_dt_struct].copy_from_slice(&entry);
+        data[RESERVATION_MAP_OFFSET_FIELD..RESERVATION_MAP_OFFSET_FIELD + 4]
+            .copy_from_slice(&(truncated_map_offset as u32).to_be_bytes());
         let fdt = Fdt::new(&data).unwrap();
         let mut ranges = Vec::new();
 
