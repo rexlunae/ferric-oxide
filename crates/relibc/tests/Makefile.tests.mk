@@ -241,6 +241,7 @@ VARIED_NAMES=\
 	psignal \
 	pwd \
 	sa_restart \
+	signals/registers \
 	signals/kill-self \
 	signals/kill0-self \
 	signals/kill-invalid \

@@ -18,7 +18,7 @@ semver.workspace = true
 serde.workspace = true
 ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-time = { workspace = true, features = ["formatting", "parsing"] }
+time = { workspace = true, features = ["std", "formatting", "parsing"] }
 toml = { workspace = true, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]

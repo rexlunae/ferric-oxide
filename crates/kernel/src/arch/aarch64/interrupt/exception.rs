@@ -197,6 +197,14 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
                     scratch.x5, &mut token,
                 );
                 stack.scratch.x0 = ret;
+                // The frame now holds the result, so signal entry may save it as
+                // x0. `syscall` leaves the flag set on this architecture for
+                // exactly this reason; clear it before any delivery below.
+                crate::percpu::PercpuBlock::current()
+                    .inside_syscall
+                    .set(false);
+                // Save the completed syscall's x0 if a signal redirects this return.
+                crate::context::signal::signal_handler(&mut token);
             }
 
             ty => {

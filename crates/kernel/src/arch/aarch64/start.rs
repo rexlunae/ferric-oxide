@@ -135,6 +135,10 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
                 }
             }
 
+            // SAFETY: the bootstrap CPU has no locks held and scheduling has
+            // not started, so it can create a fresh lock token.
+            crate::arch::time::init_boot_time(args.env(), &mut crate::sync::CleanLockToken::new());
+
             args.bootstrap()
         };
 

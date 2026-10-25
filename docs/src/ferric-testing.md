@@ -443,6 +443,91 @@ emulation. Also use
 to check cross-compilation and software emulation. A build for one architecture
 does not validate the other's boot path.
 
+### ARM64 firmware clock regression
+
+`cargo test --locked -p ferric-boot-time` checks firmware calendar validation,
+Gregorian leap years (including century rules), fractional seconds, both UEFI
+timezone signs, unspecified timezone and daylight metadata, malformed handoffs,
+and the counter offset across delayed kernel entry. The crate is `no_std` and
+shared by the ARM64 bootloader and kernel.
+
+For a target check, add `ferric-clock-test = "source"` to the packages in a
+native image overlay, then build and boot it as in the signal test below.
+Pass an externally known Unix epoch range to `ferric-clock-test MIN MAX`;
+using the guest's own date as the expected value cannot detect this bug.
+The test checks realtime against that range, verifies monotonic remains
+independent, sleeps for 200 ms, and compares both clocks' elapsed time.
+Require `FERRIC_TEST_PASS clock` and a zero exit status.
+
+To make the check reproducible, use a QEMU wrapper with a fixed UTC RTC and
+the virtual clock (substitute the installed QEMU executable if necessary):
+
+```sh
+cat > build/qemu-clock <<'EOF'
+#!/bin/sh
+exec qemu-system-aarch64 -rtc base=2024-02-29T12:34:56,clock=vm "$@"
+EOF
+chmod +x build/qemu-clock
+cargo xtask --arch aarch64 run --no-build --headless -- QEMU="$PWD/build/qemu-clock"
+```
+
+After login, run `ferric-clock-test --offset 1709210095 1709210096`.
+This checks realtime minus monotonic against the seeded Unix epoch
+1709210096, allowing the RTC's one-second resolution. It detects both an
+uninitialized epoch and adding firmware uptime twice. `date -u` and service
+logs should show February 29, 2024 plus elapsed virtual time. Also boot with
+the normal QEMU executable and check realtime against the host's current UTC
+epoch (allowing a few seconds for RTC resolution and command delivery).
+These checks exercise the UEFI/ACPI handoff; they do not validate a physical
+board's RTC, network time synchronization, or the device-tree fallback.
+
+### ARM64 signal-return regression
+
+`crates/relibc/tests/signals/registers.c` holds a source pointer in x1 and a
+small byte count in x2 while another thread sends 64 process-directed
+`SIGUSR1` signals. A release/acquire handshake forces every delivery into
+that assembly region, where no C call could legitimately clobber the
+registers. The handler deliberately clobbers q0/q1 and FPCR/FPSR. The receiver
+checks both integer registers, the vector data and the floating-point control
+and status after each handler returns, then copies and verifies the data.
+An alarm bounds a stalled test.
+Other architectures print a skip, which does not count as ARM64 coverage.
+The test is registered in relibc's static and dynamic C test suites.
+
+On Redox, a second 64-round handshake sends signals while the receiver calls
+`sched_yield` with x0 seeded to `-1`. Every call must return zero. This catches
+the kernel saving a signal's x0 before the completed syscall result has been
+published, which otherwise made relibc's startup host check abort.
+
+To include it in a native ARM64 development image without changing the saved
+configuration, create an overlay under the ignored build directory:
+
+```sh
+mkdir -p build/signal-test
+cat > build/signal-test/filesystem.toml <<'EOF'
+include = ["../../config/native.toml"]
+[packages]
+ferric-signal-test = "source"
+EOF
+cargo xtask --arch aarch64 build -- FILESYSTEM_CONFIG=build/signal-test/filesystem.toml
+cargo xtask --arch aarch64 run --no-build --headless
+```
+
+Log in, then run:
+
+```sh
+ferric-signal-test
+ion /usr/lib/ferric-signal-launch.ion
+```
+
+Require `FERRIC_TEST_PASS signal-registers`,
+`FERRIC_TEST_PASS signal-syscall-result` and
+`FERRIC_TEST_PASS signal-launch`, with no exception from the tested commands.
+The launch script checks the output of `ls -d /usr/bin` and a nested
+`ion -c true` in each of 128 rounds, failing on the first changed output or
+failed launch. This covers actual dynamic startup alongside the deterministic
+register test. The native ARM64 live-image/storage limitations still apply.
+
 For the native fork regression, log in at the serial console with the accounts
 from `config/base.toml`, then run:
 

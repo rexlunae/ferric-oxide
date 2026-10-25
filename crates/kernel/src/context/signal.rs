@@ -20,6 +20,15 @@ pub fn signal_handler(token: &mut CleanLockToken) {
         crate::syscall::process::exit_this_context(None, token);
     }
 
+    // ARM64 uses x0 both for the syscall result and for the value saved by
+    // signal entry. Selecting a handler before the result is published would
+    // save the syscall's argument instead. The EL0 SVC exit delivers it after
+    // storing the result. Signal-based wakeups still interrupt blocked calls.
+    #[cfg(target_arch = "aarch64")]
+    if crate::percpu::PercpuBlock::current().inside_syscall.get() {
+        return;
+    }
+
     /*let thumbs_down = ptrace::breakpoint_callback(
         PTRACE_STOP_SIGNAL,
         Some(ptrace_event!(PTRACE_STOP_SIGNAL)),

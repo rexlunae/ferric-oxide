@@ -284,6 +284,11 @@ pub fn syscall(
     debug_end([a, b, c, d, e, f, g], result, token);
 
     let percpu = PercpuBlock::current();
+    // ARM64 keeps the flag set until the EL0 SVC exit has stored the result in
+    // the exception frame: x0 carries both the result and the value a signal
+    // entry saves, and a timer in this gap would otherwise let signal delivery
+    // save the argument. `synchronous_exception_at_el0` clears it there.
+    #[cfg(not(target_arch = "aarch64"))]
     percpu.inside_syscall.set(false);
 
     if percpu.switch_internals.being_sigkilled.get() {

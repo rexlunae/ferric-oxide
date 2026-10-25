@@ -4,11 +4,12 @@
 [workspace]
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
-default-members = ["crates/amdvi", "crates/blkgrant", "crates/blkqueue", "crates/cet", "crates/codecache", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iobench", "crates/iommu", "crates/irq", "crates/luks", "crates/lvm", "crates/netq", "crates/nospec", "crates/pcache", "crates/procinfo", "crates/regbuf", "crates/ring", "crates/rtl8125", "crates/svm", "crates/trace", "crates/trace-map", "crates/vm", "crates/vmx", "crates/vtd", "crates/wasm-abi", "tools/cargo-fox", "tools/cookbook", "tools/ferric-build", "tools/ferric-config", "tools/ferric-trace", "tools/fox", "tools/fox-registry"]
+default-members = ["crates/amdvi", "crates/blkgrant", "crates/blkqueue", "crates/boot-time", "crates/cet", "crates/codecache", "crates/elfreloc", "crates/fox-build", "crates/fox-core", "crates/fox-git", "crates/fox-index", "crates/fox-sbom", "crates/fox-store", "crates/iobench", "crates/iommu", "crates/irq", "crates/luks", "crates/lvm", "crates/netq", "crates/nospec", "crates/pcache", "crates/procinfo", "crates/regbuf", "crates/ring", "crates/rtl8125", "crates/svm", "crates/trace", "crates/trace-map", "crates/vm", "crates/vmx", "crates/vtd", "crates/wasm-abi", "tools/cargo-fox", "tools/cookbook", "tools/ferric-build", "tools/ferric-config", "tools/ferric-trace", "tools/fox", "tools/fox-registry"]
 members = [
     "crates/amdvi",
     "crates/blkgrant",
     "crates/blkqueue",
+    "crates/boot-time",
     "crates/cet",
     "crates/codecache",
     "crates/elfreloc",
@@ -83,8 +84,10 @@ toml = { version = "1", default-features = false }
 # Release-tag signatures for fox: OpenSSH Ed25519 keys and SSHSIG.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 semver = "1.0.27"
-# RFC 3339 times in build records and registry metadata.
-time = { version = "0.3.44", default-features = false, features = ["std"] }
+# RFC 3339 times in build records and registry metadata. The baseline is no_std
+# for ferric-boot-time (which the kernel and bootloader also build); host crates
+# that need the clock or formatting add the feature themselves.
+time = { version = "0.3.44", default-features = false }
 
 [profile.release.package.ferric-config]
 opt-level = 2
