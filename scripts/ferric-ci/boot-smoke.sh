@@ -89,6 +89,15 @@ hda_dev=(-device ich9-intel-hda,id=hda0 -device hda-output,bus=hda0.0
 
 reboot=(-no-reboot)
 crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
+# A boot that cannot start the smoke shell never prints the marker. ld.so names a
+# file it could not link, and init reports the smoke command's exit status, so the
+# run can stop there and say why instead of waiting out the timeout (#155).
+# The linker line is fatal only for the shell itself: every program reports the
+# same prefix, and a program the script starts that fails to link is one of its
+# test results, not a reason to kill the guest.
+# ld.so quotes the path it could not link, as in `failed to link '/usr/bin/ion':`,
+# so the quotes are part of the pattern; the path may or may not have a directory.
+smoke_dead_pattern="\[ld\.so\]: failed to link '([^']*/)?bin/ion':|init: .*ferric-smoke\.ion.* failed with exit status"
 if [ "${BOOT_REBOOT:-0}" = 1 ]; then
     reboot=()
     # The intended panic is checked by the caller; only an exception still ends the run.
@@ -122,6 +131,7 @@ tail_pid=$!
 
 status=""
 crash=""
+deadend=""
 for ((i = 0; i < timeout_secs; i++)); do
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
         status=0
@@ -133,8 +143,41 @@ for ((i = 0; i < timeout_secs; i++)); do
         sleep 2 # let the rest of the backtrace reach the log
         break
     fi
+    if grep -qaE "$smoke_dead_pattern" "$log"; then
+        # A guest that is already shutting down can print a link failure for a
+        # program it stops, and it may print the marker in the same second. Watch
+        # the marker for a second, then give the line its own meaning, so the
+        # answer does not depend on when this pass happened to read the log.
+        marker=""
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if grep -qa 'FERRIC_SMOKE_OK' "$log"; then
+                marker=1
+                break
+            fi
+            sleep 0.1
+        done
+        if [ -n "$marker" ]; then
+            continue
+        fi
+        deadend=1
+        break
+    fi
     sleep 1
 done
+# The same check after the loop covers a guest that exited before the watch saw it,
+# and only applies while no marker has been printed: a link failure after the smoke
+# test finished is not a reason to fail a boot that passed.
+if [ -z "$deadend" ] && ! grep -qa 'FERRIC_SMOKE_OK' "$log" \
+    && grep -qaE "$smoke_dead_pattern" "$log"; then
+    deadend=1
+fi
+if [ -n "$deadend" ]; then
+    kill "$qemu_pid" 2>/dev/null || true
+    wait "$qemu_pid" 2>/dev/null || true
+    tr -d '\r' < "$log" | grep -aE "$smoke_dead_pattern" | tail -n 5 >&2 || true
+    echo "boot-smoke: FAIL, the smoke shell could not start (see the console lines above)" >&2
+    exit 1
+fi
 if [ -z "$status" ]; then
     # Where every CPU is when the run times out: a guest stuck in the kernel shows kernel
     # addresses (and IF clear when it spins with interrupts off).

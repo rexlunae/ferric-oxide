@@ -302,6 +302,21 @@ remapping requires QEMU 10 or later; the workflow uses a newer-QEMU container
 for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
 the usual paths.
 
+The script stops early instead of waiting out the timeout when the smoke shell
+cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
+quoted path it prints), or init reporting that `ion /usr/lib/ferric-smoke.ion`
+failed, ends the run with that console error and `boot-smoke: FAIL, the smoke
+shell could not start`. The linker line counts only for the shell: every program
+reports the same prefix, so a program the script starts that fails to link stays
+that program's test result instead of killing the guest. A boot that prints the
+marker first still passes, including one that prints it while the runner watches
+for the marker in the second after it saw such a line, so a link failure during
+shutdown does not fail a green run. `scripts/ferric-ci/test-boot-smoke.sh`
+exercises these cases against a fake QEMU, without firmware or virtualization.
+This turns the intermittent boot in
+[#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
+labelled failure; the underlying `NotFound` during early boot is still open.
+
 The two HDA controllers exercise the audio scheme naming in `ihdad` and
 `audiod`. The smoke script waits up to 30 seconds for the second controller's
 `audiohw.<pci-address>` scheme and reports `audio-second-controller`: the
@@ -310,9 +325,15 @@ audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
 QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a missing test result, a missing marker,
-and that the runner adds both HDA controllers. The host-tools workflow runs
-it before the Rust checks.
+failure, a crash after the marker, a missing test result, a missing marker, a
+smoke shell that could not be linked (which must fail with that message rather
+than a generic timeout), a link failure after the marker and a marker that
+arrives while the runner waits after that line (both of which must still pass), a
+program the script starts that fails to link (which must not fail the run), and
+that the runner adds both HDA controllers. Its fake QEMU stays alive for a
+moment after printing, like a guest still shutting down, so the watch loop
+reads the log instead of finding QEMU already gone. The host-tools workflow
+runs it before the Rust checks.
 
 ### CET image and Kleya rerun
 
