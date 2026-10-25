@@ -299,7 +299,7 @@ fn install(
         .filter(|cpu| !cpu.boot_cpu && cpu.enable_method == EnableMethod::Psci)
         .count();
 
-    info!(
+    crate::info!(
         "{} CPU topology: {} enabled, {} disabled, BSP MPIDR={:#x}, {} PSCI secondaries",
         topology.source.name(),
         topology.cpus.len(),
@@ -308,7 +308,7 @@ fn install(
         psci_secondaries
     );
     for (logical_id, cpu) in topology.cpus.iter().enumerate() {
-        debug!(
+        crate::debug!(
             "CPU topology logical #{}: MPIDR={:#x} boot={} enable-method={}",
             logical_id,
             cpu.mpidr,
@@ -325,7 +325,7 @@ pub(super) fn init(fdt: &Fdt<'_>) -> Option<&'static [CpuDescription]> {
     let discovered = match discover(fdt, boot_mpidr) {
         Ok(topology) => topology,
         Err(error) => {
-            warn!("CPU topology unavailable: {}", error);
+            crate::warn!("CPU topology unavailable: {}", error);
             return None;
         }
     };
@@ -341,7 +341,7 @@ pub(super) fn init_acpi(
     let discovered = match discover_acpi(madt, boot_mpidr, psci_available) {
         Ok(topology) => topology,
         Err(error) => {
-            warn!("CPU topology unavailable: {}", error);
+            crate::warn!("CPU topology unavailable: {}", error);
             return None;
         }
     };

@@ -17,7 +17,7 @@ use x86::{bits64::rflags::RFlags, msr, segmentation::SegmentSelector};
 #[cfg(shstk_compiled)]
 macro_rules! shstk_syscall_entry {
     () => {
-        alternative!(feature: "shstk", then: ["setssbsy"], default: [""])
+        $crate::arch::macros::alternative!(feature: "shstk", then: ["setssbsy"], default: [""])
     };
 }
 #[cfg(not(shstk_compiled))]
@@ -42,7 +42,7 @@ macro_rules! shstk_syscall_exit {
     // leave SSP at 0, and IRETQ would then try to free a token at address 0. The jump stays inside
     // the alternative, so it is position-independent when copied over the NOP slot.
     () => {
-        alternative!(feature: "shstk", then: ["
+        $crate::arch::macros::alternative!(feature: "shstk", then: ["
             test BYTE PTR [rsp + 137], 1
             jnz 1f
             rdsspq rax
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
             // `syscall::syscall`, so that large function compiles as it does without tracing.
             // Here the arguments are read from the saved registers, and only while the event is
             // on; keeping `nr` for the exit event costs a register this function saves anyway.
-            trace_event!(
+            crate::trace::trace_event!(
                 ferric_trace::kernel::SYSCALL_ENTER,
                 nr,
                 scratch.rdi,
@@ -157,7 +157,7 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
                 scratch.r9,
                 &mut token,
             );
-            trace_event!(ferric_trace::kernel::SYSCALL_EXIT, nr, ret);
+            crate::trace::trace_event!(ferric_trace::kernel::SYSCALL_EXIT, nr, ret);
             (*stack).scratch.rax = ret;
         }
 
@@ -169,13 +169,13 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
 pub unsafe extern "C" fn syscall_instruction() {
     core::arch::naked_asm!(
     // Ferric Oxide (IBT): SYSCALL enters through IA32_LSTAR like an indirect branch.
-    ibt_endbr!(),
+    crate::arch::macros::ibt_endbr!(),
     // Yes, this is magic. No, you don't need to understand
     "swapgs;",                    // Swap KGSBASE with GSBASE, allowing fast TSS access.
     "mov gs:[{sp}], rsp;",        // Save userspace stack pointer
     // Ferric Oxide (KPTI): load the kernel page table, using RSP as the scratch register. This
     // clears the shadow and user PCID bits and adds the no-flush bit with PCID (see handler.rs).
-    kpti_alternative!("
+    crate::arch::interrupt::handler::kpti_alternative!("
         mov rsp, cr3
         and rsp, -0x1801
         or rsp, gs:[{KPTI_CR3_NOFLUSH}]
@@ -192,8 +192,8 @@ pub unsafe extern "C" fn syscall_instruction() {
 
     // Push context registers
     "push rax;",
-    push_scratch!(),
-    push_preserved!(),
+    crate::push_scratch!(),
+    crate::push_preserved!(),
 
     // Call inner funtion
     "mov rdi, rsp;",
@@ -212,11 +212,11 @@ pub unsafe extern "C" fn syscall_instruction() {
     shstk_syscall_exit!(),
 
     // Pop context registers
-    pop_preserved!(),
-    pop_scratch!(),
+    crate::pop_preserved!(),
+    crate::pop_scratch!(),
 
     // Ferric Oxide (KPTI): move the return frame to the entry stack and load the shadow table.
-    kpti_exit!("0"),
+    crate::arch::interrupt::handler::kpti_exit!("0"),
 
     // Restore user GSBASE by swapping GSBASE and KGSBASE.
     "swapgs;",

@@ -11,7 +11,7 @@ pub static FRAMEBUFFER: Mutex<(usize, usize, usize)> = Mutex::new((0, 0, 0));
 
 #[allow(unused)]
 pub fn init(env: &[u8]) {
-    println!("Starting graphical debug");
+    crate::println!("Starting graphical debug");
 
     let mut phys = 0;
     let mut virt = 0;
@@ -49,13 +49,17 @@ pub fn init(env: &[u8]) {
     *FRAMEBUFFER.lock() = (phys, virt, stride * height * 4);
 
     if phys == 0 || virt == 0 || width == 0 || height == 0 || stride == 0 {
-        println!("Framebuffer not found");
+        crate::println!("Framebuffer not found");
         return;
     }
 
-    println!(
+    crate::println!(
         "Framebuffer {}x{} stride {} at {:X} mapped to {:X}",
-        width, height, stride, phys, virt
+        width,
+        height,
+        stride,
+        phys,
+        virt
     );
 
     let debug_display = DebugDisplay::new(width, height, stride, virt as *mut u32);
@@ -66,5 +70,5 @@ pub fn init(env: &[u8]) {
 pub fn fini() {
     DEBUG_DISPLAY.lock().take();
 
-    println!("Finished graphical debug");
+    crate::println!("Finished graphical debug");
 }

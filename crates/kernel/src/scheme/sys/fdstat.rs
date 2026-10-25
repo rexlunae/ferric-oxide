@@ -80,10 +80,10 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
                 Some(scheme::Handle::SchemeCreationCapability) => "SchemeCreationCapability".into(),
                 Some(scheme::Handle::Scheme(KernelSchemes::Global(g))) => g.as_str().into(),
                 Some(scheme::Handle::Scheme(KernelSchemes::User(scheme))) => {
-                    format!("[user {:p}]", Arc::as_ptr(&scheme.inner)).into()
+                    alloc::format!("[user {:p}]", Arc::as_ptr(&scheme.inner)).into()
                 }
                 Some(scheme::Handle::Scheme(KernelSchemes::SchemeMgr)) => "SchemeMgr".into(),
-                _ => format!("[unknown {}]", scheme_id.0).into(),
+                _ => alloc::format!("[unknown {}]", scheme_id.0).into(),
             };
             descr.number = file.description.read(token.token()).number;
         });

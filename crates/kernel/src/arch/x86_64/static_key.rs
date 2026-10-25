@@ -288,7 +288,7 @@ fn poll() {
     }
 }
 
-interrupt!(sync_ipi, || {
+crate::interrupt!(sync_ipi, || {
     ack();
     crate::arch::device::local_apic::eoi();
 });

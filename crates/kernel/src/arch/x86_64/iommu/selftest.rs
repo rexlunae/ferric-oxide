@@ -59,13 +59,13 @@ fn expect(ok: bool, what: &'static str) -> Result<(), TestError> {
 pub(super) fn run() {
     match test() {
         Ok(None) => {
-            info!("IOMMU: domain self-test passed (attach/map/unmap/detach)");
+            crate::info!("IOMMU: domain self-test passed (attach/map/unmap/detach)");
         }
         Ok(Some(why)) => {
-            info!("IOMMU: domain self-test passed (map/unmap; attach skipped: {why})");
+            crate::info!("IOMMU: domain self-test passed (map/unmap; attach skipped: {why})");
         }
         Err(err) => {
-            error!("IOMMU: domain self-test failed: {err}");
+            crate::error!("IOMMU: domain self-test failed: {err}");
         }
     }
 }

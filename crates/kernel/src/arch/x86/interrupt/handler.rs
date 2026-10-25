@@ -10,9 +10,9 @@ pub struct ScratchRegisters {
 
 impl ScratchRegisters {
     pub fn dump(&self) {
-        println!("EAX:   {:08x}", { self.eax });
-        println!("ECX:   {:08x}", { self.ecx });
-        println!("EDX:   {:08x}", { self.edx });
+        crate::println!("EAX:   {:08x}", { self.eax });
+        crate::println!("ECX:   {:08x}", { self.ecx });
+        crate::println!("EDX:   {:08x}", { self.edx });
     }
 }
 
@@ -27,10 +27,10 @@ pub struct PreservedRegisters {
 
 impl PreservedRegisters {
     pub fn dump(&self) {
-        println!("EBX:   {:08x}", { self.ebx });
-        println!("EDI:   {:08x}", { self.edi });
-        println!("ESI:   {:08x}", { self.esi });
-        println!("EBP:   {:08x}", { self.ebp });
+        crate::println!("EBX:   {:08x}", { self.ebx });
+        crate::println!("EDI:   {:08x}", { self.edi });
+        crate::println!("ESI:   {:08x}", { self.esi });
+        crate::println!("EBP:   {:08x}", { self.ebp });
     }
 }
 
@@ -51,13 +51,13 @@ pub struct IretRegisters {
 
 impl IretRegisters {
     pub fn dump(&self) {
-        println!("EFLAG: {:08x}", { self.eflags });
-        println!("CS:    {:08x}", { self.cs });
-        println!("EIP:   {:08x}", { self.eip });
+        crate::println!("EFLAG: {:08x}", { self.eflags });
+        crate::println!("CS:    {:08x}", { self.cs });
+        crate::println!("EIP:   {:08x}", { self.eip });
 
         if self.cs & 0b11 != 0b00 {
-            println!("ESP:   {:08x}", { self.esp });
-            println!("SS:    {:08x}", { self.ss });
+            crate::println!("ESP:   {:08x}", { self.esp });
+            crate::println!("SS:    {:08x}", { self.ss });
         }
     }
 }
@@ -194,7 +194,7 @@ pub struct InterruptErrorStack {
 
 impl InterruptErrorStack {
     pub fn dump(&self) {
-        println!("CODE:  {:08x}", { self.code });
+        crate::println!("CODE:  {:08x}", { self.code });
         self.inner.dump();
     }
     pub fn trace(&self) {
@@ -295,8 +295,8 @@ macro_rules! interrupt_stack {
             core::arch::naked_asm!(
                 // Backup all userspace registers to stack
                 "push eax",
-                push_scratch!(),
-                push_preserved!(),
+                $crate::push_scratch!(),
+                $crate::push_preserved!(),
 
                 // Enter kernel TLS segment
                 enter_gs!(),
@@ -311,8 +311,8 @@ macro_rules! interrupt_stack {
                 exit_gs!(),
 
                 // Restore all userspace registers
-                pop_preserved!(),
-                pop_scratch!(),
+                $crate::pop_preserved!(),
+                $crate::pop_scratch!(),
 
                 "iretd",
 
@@ -320,8 +320,8 @@ macro_rules! interrupt_stack {
             );
         }
     };
-    ($name:ident, |$stack:ident| $code:block) => { interrupt_stack!($name, |$stack| $code); };
-    ($name:ident, @paranoid, |$stack:ident| $code:block) => { interrupt_stack!($name, |$stack| $code); }
+    ($name:ident, |$stack:ident| $code:block) => { $crate::interrupt_stack!($name, |$stack| $code); };
+    ($name:ident, @paranoid, |$stack:ident| $code:block) => { $crate::interrupt_stack!($name, |$stack| $code); }
 }
 
 #[macro_export]
@@ -336,7 +336,7 @@ macro_rules! interrupt {
             core::arch::naked_asm!(
                 // Backup all userspace registers to stack
                 "push eax",
-                push_scratch!(),
+                $crate::push_scratch!(),
 
                 // Enter kernel TLS segment
                 enter_gs!(),
@@ -348,7 +348,7 @@ macro_rules! interrupt {
                 exit_gs!(),
 
                 // Restore all userspace registers
-                pop_scratch!(),
+                $crate::pop_scratch!(),
 
                 "iretd",
 
@@ -374,8 +374,8 @@ macro_rules! interrupt_error {
                 "xchg [esp], eax",
 
                 // Push all userspace registers
-                push_scratch!(),
-                push_preserved!(),
+                $crate::push_scratch!(),
+                $crate::push_preserved!(),
 
                 // Enter kernel TLS segment
                 enter_gs!(),
@@ -397,8 +397,8 @@ macro_rules! interrupt_error {
                 exit_gs!(),
 
                 // Restore all userspace registers
-                pop_preserved!(),
-                pop_scratch!(),
+                $crate::pop_preserved!(),
+                $crate::pop_scratch!(),
 
                 // The error code has already been popped, so use the regular macro.
                 "iretd",
@@ -443,8 +443,8 @@ pub unsafe extern "C" fn enter_usermode() {
         // Exit kernel TLS segment
         exit_gs!(),
         // Restore all userspace registers
-        pop_preserved!(),
-        pop_scratch!(),
+        $crate::pop_preserved!(),
+        $crate::pop_scratch!(),
         "iretd",
     )
 }

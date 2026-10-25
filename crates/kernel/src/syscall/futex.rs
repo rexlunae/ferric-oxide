@@ -199,7 +199,7 @@ pub fn futex(
                     .push(FutexEntry {
                         context_lock: Arc::downgrade(&context_lock),
                     });
-                trace_event!(
+                crate::trace::trace_event!(
                     ferric_trace::kernel::SCHED_FUTEX_WAIT,
                     target_physaddr.data(),
                     addr,
@@ -214,7 +214,7 @@ pub fn futex(
             context::switch(token);
 
             let result = finish_wait(target_physaddr, timeout_opt.is_some(), token);
-            trace_event!(
+            crate::trace::trace_event!(
                 ferric_trace::kernel::SCHED_FUTEX_RESUME,
                 target_physaddr.data(),
                 addr,
@@ -254,7 +254,7 @@ pub fn futex(
 
                 // A resumed waiter must take this lock in finish_wait before recording
                 // completion, so publish the wake before it can publish its resume.
-                trace_event!(
+                crate::trace::trace_event!(
                     ferric_trace::kernel::SCHED_FUTEX_WAKE,
                     target_physaddr.data(),
                     addr,

@@ -241,7 +241,7 @@ pub(super) fn enable(
             } else {
                 "xAPIC (8-bit)"
             };
-            info!(
+            crate::info!(
                 "IOMMU: interrupt remapping enabled at unit {:#x}: {} entries, {width} destinations, compatibility-format interrupts blocked",
                 regs.base,
                 table.size.entries()
@@ -250,12 +250,12 @@ pub(super) fn enable(
         }
         Err(err) => {
             if cfg!(iommu = "enforce") {
-                warn!(
+                crate::warn!(
                     "IOMMU: enforce mode: unit {:#x} cannot remap interrupts ({err}); its devices can still send any interrupt",
                     regs.base
                 );
             } else {
-                info!(
+                crate::info!(
                     "IOMMU: interrupt remapping not enabled at unit {:#x}: {err}",
                     regs.base
                 );
@@ -400,7 +400,7 @@ pub fn alloc_msi(
     })?;
     let entry = alloc_entry(index, source, apic_id, vector)?;
     let in_use = in_use();
-    info!(
+    crate::info!(
         "IOMMU: interrupt remapping entry {} for {:04x}:{}: vector {vector:#x} on CPU {cpu} (APIC {apic_id}); {in_use} IRTE(s) allocated",
         entry.id & 0xffff,
         device.segment,
@@ -528,7 +528,7 @@ pub fn move_vector(
     drop(states);
     result?;
     if moved != 0 {
-        info!(
+        crate::info!(
             "IOMMU: {moved} interrupt remapping entr{} moved from vector {from_vector:#x} on CPU {from_cpu} to vector {to_vector:#x} on CPU {to_cpu} (APIC {to_apic})",
             if moved == 1 { "y" } else { "ies" }
         );
@@ -621,7 +621,7 @@ pub(super) fn on_fault_vector() {
         return;
     }
     check.ioapic.write_entry(check.pin, check.rte | RTE_MASKED);
-    info!(
+    crate::info!(
         "IOMMU: I/O APIC {} pin {} delivered {} timer interrupt(s) through interrupt remapping entry {} (its source-id check names {}); pin masked again",
         check.apic_id, check.pin, check.ticks, check.entry, check.source
     );
@@ -679,9 +679,10 @@ pub(super) fn setup_ioapics() {
                 MadtEntry::IoApic(io) if io.id == source.id => Some(io),
                 _ => None,
             }) else {
-                warn!(
+                crate::warn!(
                     "IOMMU: DMAR names I/O APIC {} at {}, which the MADT does not list",
-                    source.id, source.source
+                    source.id,
+                    source.source
                 );
                 continue;
             };
@@ -691,7 +692,7 @@ pub(super) fn setup_ioapics() {
                 ioapic.gsi_base,
             );
             let masked = mask_compatibility_entries(&regs);
-            info!(
+            crate::info!(
                 "IOMMU: I/O APIC {} (source-id {}) remapped by unit {:#x}; {masked} compatibility-format entries masked",
                 source.id, source.source, unit.regs.base
             );
@@ -705,7 +706,7 @@ pub(super) fn setup_ioapics() {
                     arm_pin_check(index, regs, source.id, source.source, pin, active_low)
                 }
                 Some(_) => {
-                    info!("IOMMU: ISA IRQ 0 is level-triggered; I/O APIC check skipped");
+                    crate::info!("IOMMU: ISA IRQ 0 is level-triggered; I/O APIC check skipped");
                 }
                 None => {}
             }
@@ -731,13 +732,13 @@ fn arm_pin_check(
     let entry = match entry {
         Ok(entry) => (entry.id & 0xffff) as u16,
         Err(err) => {
-            warn!("IOMMU: cannot check I/O APIC {apic_id} pin {pin}: {err}");
+            crate::warn!("IOMMU: cannot check I/O APIC {apic_id} pin {pin}: {err}");
             return;
         }
     };
     let rte = ioapic_rte(entry, FAULT_VECTOR, TriggerMode::Edge, active_low, false);
     ioapic.write_entry(pin, rte);
-    info!(
+    crate::info!(
         "IOMMU: I/O APIC {apic_id} pin {pin} (ISA IRQ 0) routed through interrupt remapping entry {entry} for a check"
     );
     *PIN_CHECK.lock() = Some(PinCheck {

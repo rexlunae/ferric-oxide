@@ -89,7 +89,7 @@ impl LocalApic {
                 .is_some_and(|feature_info| feature_info.has_x2apic());
 
             if !self.x2 {
-                debug!("Detected xAPIC at {:#x}", physaddr.data());
+                crate::debug!("Detected xAPIC at {:#x}", physaddr.data());
                 if let Some((_entry, lvl, _, flush)) = mapper.unmap_phys(virtaddr) {
                     assert_eq!(lvl, 0, "huge page overlapping with lAPIC mapping");
 
@@ -102,7 +102,7 @@ impl LocalApic {
                     .expect("failed to map local APIC memory")
                     .flush();
             } else {
-                debug!("Detected x2APIC");
+                crate::debug!("Detected x2APIC");
             }
 
             self.init_ap();

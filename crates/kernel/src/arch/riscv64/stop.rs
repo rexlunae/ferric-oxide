@@ -1,7 +1,7 @@
 use crate::sync::CleanLockToken;
 
 pub unsafe fn kreset() -> ! {
-    println!("kreset");
+    crate::println!("kreset");
     unimplemented!()
 }
 
@@ -10,6 +10,6 @@ pub unsafe fn emergency_reset() -> ! {
 }
 
 pub unsafe fn kstop(_token: &mut CleanLockToken) -> ! {
-    println!("kstop");
+    crate::println!("kstop");
     unimplemented!()
 }

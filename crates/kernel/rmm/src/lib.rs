@@ -1,3 +1,9 @@
+//! Architecture-generic physical frame allocation and page-table management.
+//!
+//! Architecture implementations define page layouts and access to mapped memory;
+//! allocators and mappers build on those contracts. The optional `std` feature
+//! supplies a software-emulated architecture for host validation.
+
 #![no_std]
 #![allow(clippy::new_without_default)]
 

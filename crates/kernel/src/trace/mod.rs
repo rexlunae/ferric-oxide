@@ -1,6 +1,6 @@
 //! Ferric Oxide: kernel tracepoints (roadmap Phase T, `kernel.trace`).
 //!
-//! `trace_event!(EVENT, args...)` marks a tracepoint. The events, their ids and the record format
+//! `crate::trace::trace_event!(EVENT, args...)` marks a tracepoint. The events, their ids and the record format
 //! are the `ferric-trace` crate's (`crates/trace`); this module decides at build time which
 //! tracepoints exist, turns them on and off, and writes their records:
 //!
@@ -26,10 +26,10 @@
 //! while a record is written, and the CPU's ring has a single producer. A record that would
 //! be written with interrupts on is counted as lost instead.
 
-#[cfg(feature = "trace_crash")]
-pub mod crash;
 #[cfg(feature = "trace")]
 pub mod clock;
+#[cfg(feature = "trace_crash")]
+pub mod crash;
 #[cfg(feature = "trace")]
 mod imp;
 
@@ -54,3 +54,5 @@ macro_rules! trace_event {
         }
     }};
 }
+
+pub(crate) use trace_event;

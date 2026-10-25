@@ -50,27 +50,27 @@ pub(crate) struct KernelArgs {
 
 impl KernelArgs {
     pub(crate) fn print(&self) {
-        debug!(
+        crate::debug!(
             "Kernel: {:X}:{:X}",
             { self.kernel_base },
             self.kernel_base + self.kernel_size
         );
-        debug!(
+        crate::debug!(
             "Env: {:X}:{:X}",
             { self.env_base },
             self.env_base + self.env_size
         );
-        debug!(
+        crate::debug!(
             "HWDESC: {:X}:{:X}",
             { self.hwdesc_base },
             self.hwdesc_base + self.hwdesc_size
         );
-        debug!(
+        crate::debug!(
             "Areas: {:X}:{:X}",
             { self.areas_base },
             self.areas_base + self.areas_size
         );
-        debug!(
+        crate::debug!(
             "Bootstrap: {:X}:{:X}",
             { self.bootstrap_base },
             self.bootstrap_base + self.bootstrap_size
@@ -164,14 +164,14 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
 
     #[cfg(target_arch = "aarch64")]
     {
-        info!("SECONDARY CPU INIT");
+        crate::info!("SECONDARY CPU INIT");
         crate::arch::device::cpu::start_secondaries();
     }
 
     //Initialize global schemes, such as `acpi:`.
     scheme::init_globals();
 
-    debug!("BSP: {} CPUs", crate::cpu_count());
+    crate::debug!("BSP: {} CPUs", crate::cpu_count());
 
     // Ferric Oxide: a trace ring for each CPU, now that they are counted.
     #[cfg(feature = "trace")]
@@ -182,7 +182,7 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     // Ferric Oxide: save the previous boot's log and keep this one's in the same memory.
     #[cfg(feature = "log_persist")]
     crate::log_persist::init();
-    debug!("Env: {:?}", ::core::str::from_utf8(bootstrap.env));
+    crate::debug!("Env: {:?}", ::core::str::from_utf8(bootstrap.env));
 
     BOOTSTRAP.call_once(|| bootstrap);
 
@@ -228,7 +228,7 @@ pub(crate) fn kmain_ap(cpu_id: crate::cpu_set::LogicalCpuId, kmain_kstack: Kstac
     profiling::maybe_run_profiling_helper_forever(cpu_id);
 
     if !cfg!(feature = "multi_core") {
-        debug!("AP {}: Disabled", cpu_id);
+        crate::debug!("AP {}: Disabled", cpu_id);
 
         loop {
             unsafe {
@@ -240,7 +240,7 @@ pub(crate) fn kmain_ap(cpu_id: crate::cpu_set::LogicalCpuId, kmain_kstack: Kstac
 
     context::init(&mut token, kmain_kstack);
 
-    debug!("AP {}", cpu_id);
+    crate::debug!("AP {}", cpu_id);
 
     profiling::ready_for_profiling();
 

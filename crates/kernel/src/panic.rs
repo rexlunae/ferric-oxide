@@ -38,7 +38,7 @@ fn panic_handler_inner(info: &PanicInfo) -> ! {
     #[cfg(feature = "trace_crash")]
     crate::trace::crash::dump(info);
 
-    println!("KERNEL PANIC: {}", info);
+    crate::println!("KERNEL PANIC: {}", info);
 
     unsafe {
         stack_trace();
@@ -46,21 +46,21 @@ fn panic_handler_inner(info: &PanicInfo) -> ! {
 
     let current_ref = context::try_current();
     let Some(context_lock) = &*current_ref else {
-        println!("CPU {}, CID <none>", cpu_id());
+        crate::println!("CPU {}, CID <none>", cpu_id());
 
         halt()
     };
 
-    println!("CPU {}, CID {:p}", cpu_id(), context_lock);
+    crate::println!("CPU {}, CID {:p}", cpu_id(), context_lock);
 
     {
         // This could deadlock, but at this point we are going to halt anyways
         let mut token = unsafe { CleanLockToken::new() };
         let context = context_lock.read(token.token());
-        println!("NAME: {}, DEBUG ID: {}", context.name, context.debug_id);
+        crate::println!("NAME: {}, DEBUG ID: {}", context.name, context.debug_id);
 
         if let Some([a, b, c, d, e, f, g]) = context.current_syscall() {
-            println!(
+            crate::println!(
                 "SYSCALL: {}",
                 syscall::debug::format_call(a, b, c, d, e, f, g)
             );
@@ -77,9 +77,9 @@ fn halt() -> ! {
     #[cfg(not(feature = "trace_crash"))]
     let reset = false;
     if reset {
-        println!("RESET");
+        crate::println!("RESET");
     } else {
-        println!("HALT");
+        crate::println!("HALT");
     }
     // SAFETY: the kernel is going down: halting this CPU forever, or resetting the machine when
     // the crash test asked for it, is all that is left to do.
@@ -139,18 +139,18 @@ pub unsafe fn stack_trace() {
                 && mapper.translate(fp_virt).is_some()
                 && mapper.translate(pc_virt).is_some())
             {
-                println!("  {:>016x}: GUARD PAGE", frame_.fp);
+                crate::println!("  {:>016x}: GUARD PAGE", frame_.fp);
                 break;
             }
 
             let pc = *frame_.pc_ptr;
             if pc == 0 {
-                println!(" {:>016x}: EMPTY RETURN", frame_.fp);
+                crate::println!(" {:>016x}: EMPTY RETURN", frame_.fp);
                 break;
             }
 
             let pc = pc.wrapping_sub(slide);
-            println!("  FP {:>016x}: PC {:>016x}", frame_.fp, pc);
+            crate::println!("  FP {:>016x}: PC {:>016x}", frame_.fp, pc);
 
             for sym in symbols.iter() {
                 if sym.st_type() != elf::STT_FUNC {
@@ -161,14 +161,14 @@ pub unsafe fn stack_trace() {
                     continue;
                 }
 
-                println!("    {:>016X}+{:>04X}", sym_addr, pc - sym_addr);
+                crate::println!("    {:>016X}+{:>04X}", sym_addr, pc - sym_addr);
 
                 if let Some(sym_name) = sym
                     .name(NativeEndian, symbols.strings())
                     .ok()
                     .and_then(|name| core::str::from_utf8(name).ok())
                 {
-                    println!("    {:#}", demangle(sym_name));
+                    crate::println!("    {:#}", demangle(sym_name));
                 }
             }
             frame = frame_.next();
@@ -183,7 +183,7 @@ pub unsafe fn user_stack_trace(stack: &InterruptStack) {
     let sp = stack.stack_pointer();
 
     if fp < sp {
-        println!("  <Unable to generate stack while frame pointers omitted>");
+        crate::println!("  <Unable to generate stack while frame pointers omitted>");
         return;
     }
     if fp >= crate::USER_END_OFFSET {
@@ -199,11 +199,11 @@ pub unsafe fn user_stack_trace(stack: &InterruptStack) {
         {
             Ok(val) => val,
             Err(err) => {
-                println!("  <Failed to read RIP 0x{:>016x}>: {}", fp, err);
+                crate::println!("  <Failed to read RIP 0x{:>016x}>: {}", fp, err);
                 break;
             }
         };
-        println!("  FP {:>016x}: PC {:>016x}", fp, rip);
+        crate::println!("  FP {:>016x}: PC {:>016x}", fp, rip);
         if rip == 0 {
             break;
         }
@@ -213,7 +213,7 @@ pub unsafe fn user_stack_trace(stack: &InterruptStack) {
             Err(_err) => break,
         };
         if next_fp <= fp {
-            println!(
+            crate::println!(
                 "  <Invalid next frame pointer 0x{:>016x}; stack walk ended>",
                 next_fp
             );

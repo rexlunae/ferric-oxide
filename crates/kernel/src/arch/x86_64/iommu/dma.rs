@@ -53,6 +53,7 @@
 //! and can never reach memory that a later mapping put there (io/registered-buffers-design.md,
 //! PR 4 decisions).
 
+use crate::{error, info, warn};
 use alloc::vec::Vec;
 use core::fmt;
 

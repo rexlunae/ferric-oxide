@@ -278,7 +278,7 @@ impl UserInner {
                 };
             }
             // Ferric Oxide: the scheme.request tracepoint (`kernel.trace`).
-            trace_event!(
+            crate::trace::trace_event!(
                 ferric_trace::kernel::SCHEME_REQUEST,
                 self.scheme_id.get(),
                 sqe.tag,
@@ -391,7 +391,7 @@ impl UserInner {
                             let token = preempt.token();
 
                             // Ferric Oxide: the scheme.cancel tracepoint (`kernel.trace`).
-                            trace_event!(
+                            crate::trace::trace_event!(
                                 ferric_trace::kernel::SCHEME_CANCEL,
                                 self.scheme_id.get(),
                                 sqe.tag,
@@ -874,7 +874,7 @@ impl UserInner {
         flags: MapFlags,
         token: &mut CleanLockToken,
     ) -> Result<()> {
-        info!("REQUEST FMAP");
+        crate::info!("REQUEST FMAP");
 
         let tag = self.next_id(token)?;
         {
@@ -967,9 +967,12 @@ impl UserInner {
                 base_addr,
                 page_count,
             } => {
-                info!(
+                crate::info!(
                     "PROVIDE_MAP {:x} {:x} {:?} {:x}",
-                    tag, offset, base_addr, page_count
+                    tag,
+                    offset,
+                    base_addr,
+                    page_count
                 );
 
                 if offset % PAGE_SIZE as u64 != 0 {
@@ -1093,7 +1096,7 @@ impl UserInner {
                         // Ferric Oxide: the scheme.response tracepoint (`kernel.trace`), only
                         // for a CQE answering a waiting request, with the result as normalized
                         // above.
-                        trace_event!(
+                        crate::trace::trace_event!(
                             ferric_trace::kernel::SCHEME_RESPONSE,
                             self.scheme_id.get(),
                             tag,
@@ -1367,7 +1370,7 @@ impl UserInner {
         if metadata.is_empty() {
             return Err(Error::new(EINVAL));
         }
-        debug!(
+        crate::debug!(
             "call_fdread: payload: {} metadata: {}",
             payload.len(),
             metadata.len()
@@ -2016,7 +2019,7 @@ impl KernelScheme for UserScheme {
     ) -> Result<usize> {
         // SYS_FSTATVFS has been removed, so this should be unreachable for UserScheme which
         // overrides translate_stdfscall
-        error!("getdents should be unreachable for UserScheme");
+        crate::error!("getdents should be unreachable for UserScheme");
         Err(Error::new(EBADFD))
     }
     fn kfstat(&self, file: usize, stat: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
@@ -2051,7 +2054,7 @@ impl KernelScheme for UserScheme {
     ) -> Result<()> {
         // SYS_FSTATVFS has been removed, so this should be unreachable for UserScheme which
         // overrides translate_stdfscall
-        error!("kfstatvfs should be unreachable for UserScheme");
+        crate::error!("kfstatvfs should be unreachable for UserScheme");
         Err(Error::new(EBADFD))
     }
     fn kfmap(

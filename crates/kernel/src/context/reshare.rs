@@ -88,7 +88,7 @@ pub fn is_pinned_borrow(info: &GrantInfo) -> bool {
 /// [`ReshareError::PinnedBorrow`] when it is a pinned borrow.
 pub fn check_grant(base: Page, info: &GrantInfo) -> Result<(), ReshareError> {
     if is_pinned_borrow(info) {
-        warn!(
+        crate::warn!(
             "refusing to share borrowed pages at {:#x}",
             base.start_address().data()
         );

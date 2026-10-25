@@ -16,15 +16,15 @@ pub struct ScratchRegisters {
 
 impl ScratchRegisters {
     pub fn dump(&self) {
-        println!("RAX:   {:016x}", { self.rax });
-        println!("RCX:   {:016x}", { self.rcx });
-        println!("RDX:   {:016x}", { self.rdx });
-        println!("RDI:   {:016x}", { self.rdi });
-        println!("RSI:   {:016x}", { self.rsi });
-        println!("R8:    {:016x}", { self.r8 });
-        println!("R9:    {:016x}", { self.r9 });
-        println!("R10:   {:016x}", { self.r10 });
-        println!("R11:   {:016x}", { self.r11 });
+        crate::println!("RAX:   {:016x}", { self.rax });
+        crate::println!("RCX:   {:016x}", { self.rcx });
+        crate::println!("RDX:   {:016x}", { self.rdx });
+        crate::println!("RDI:   {:016x}", { self.rdi });
+        crate::println!("RSI:   {:016x}", { self.rsi });
+        crate::println!("R8:    {:016x}", { self.r8 });
+        crate::println!("R9:    {:016x}", { self.r9 });
+        crate::println!("R10:   {:016x}", { self.r10 });
+        crate::println!("R11:   {:016x}", { self.r11 });
     }
 }
 
@@ -41,12 +41,12 @@ pub struct PreservedRegisters {
 
 impl PreservedRegisters {
     pub fn dump(&self) {
-        println!("RBX:   {:016x}", { self.rbx });
-        println!("RBP:   {:016x}", { self.rbp });
-        println!("R12:   {:016x}", { self.r12 });
-        println!("R13:   {:016x}", { self.r13 });
-        println!("R14:   {:016x}", { self.r14 });
-        println!("R15:   {:016x}", { self.r15 });
+        crate::println!("RBX:   {:016x}", { self.rbx });
+        crate::println!("RBP:   {:016x}", { self.rbp });
+        crate::println!("R12:   {:016x}", { self.r12 });
+        crate::println!("R13:   {:016x}", { self.r13 });
+        crate::println!("R14:   {:016x}", { self.r14 });
+        crate::println!("R15:   {:016x}", { self.r15 });
     }
 }
 
@@ -66,20 +66,22 @@ pub struct IretRegisters {
 
 impl IretRegisters {
     pub fn dump(&self) {
-        println!("RFLAG: {:016x}", { self.rflags });
-        println!("CS:    {:016x}", { self.cs });
-        println!("RIP:   {:016x}", { self.rip });
+        crate::println!("RFLAG: {:016x}", { self.rflags });
+        crate::println!("CS:    {:016x}", { self.cs });
+        crate::println!("RIP:   {:016x}", { self.rip });
 
-        println!("RSP:   {:016x}", { self.rsp });
-        println!("SS:    {:016x}", { self.ss });
+        crate::println!("RSP:   {:016x}", { self.rsp });
+        crate::println!("SS:    {:016x}", { self.ss });
 
         unsafe {
             let fsbase = x86::msr::rdmsr(x86::msr::IA32_FS_BASE);
             let gsbase = x86::msr::rdmsr(x86::msr::IA32_KERNEL_GSBASE);
             let kgsbase = x86::msr::rdmsr(x86::msr::IA32_GS_BASE);
-            println!(
+            crate::println!(
                 "FSBASE  {:016x}\nGSBASE  {:016x}\nKGSBASE {:016x}",
-                fsbase, gsbase, kgsbase
+                fsbase,
+                gsbase,
+                kgsbase
             );
         }
     }
@@ -288,7 +290,7 @@ pub const KPTI_CR3_USER: usize =
 macro_rules! kpti_alternative {
     ($code:expr_2021) => {
         concat!(
-            alternative!(feature: "kpti", then: [$code], default: ["jmp 69f"]),
+            $crate::arch::macros::alternative!(feature: "kpti", then: [$code], default: ["jmp 69f"]),
             "\n69:\n"
         )
     };
@@ -306,7 +308,7 @@ macro_rules! kpti_alternative {
 // flush the kernel PCID instead, which is always correct.
 macro_rules! kpti_enter {
     ($err:literal, $fix:literal) => {
-        kpti_alternative!(concat!(
+        $crate::arch::interrupt::handler::kpti_alternative!(concat!(
             "
         test QWORD PTR [rsp + 8 + ",
             $err,
@@ -374,7 +376,7 @@ macro_rules! kpti_enter {
 // is 1 when SWAPGS has already restored the user GS, 0 when GS is still the kernel's.
 macro_rules! kpti_exit {
     ($gs_user:literal) => {
-        kpti_alternative!(concat!(
+        $crate::arch::interrupt::handler::kpti_alternative!(concat!(
             "
         test QWORD PTR [rsp + 8], 3
         jz 77f
@@ -412,7 +414,7 @@ macro_rules! kpti_exit {
 // PCID is on: TLB invalidations never wait for a flush on a later switch (see kpti.rs).
 macro_rules! kpti_paranoid_save {
     () => {
-        kpti_alternative!(
+        $crate::arch::interrupt::handler::kpti_alternative!(
             "
         mov r12, cr3
         bt r12, 12
@@ -428,7 +430,7 @@ macro_rules! kpti_paranoid_save {
 }
 macro_rules! kpti_paranoid_restore {
     () => {
-        kpti_alternative!(
+        $crate::arch::interrupt::handler::kpti_alternative!(
             "
         bt r12, 12
         jnc 79f
@@ -505,7 +507,7 @@ macro_rules! conditional_swapgs_paranoid {
         "sub rdi, {PCR_GDT_OFFSET};",
 
         // Read the current IA32_GS_BASE value into RDX.
-        alternative!(
+        $crate::arch::macros::alternative!(
             feature: "fsgsbase",
             then: ["rdgsbase rdx"],
             default: ["
@@ -527,13 +529,13 @@ macro_rules! conditional_swapgs_paranoid {
         swapgs
         2:
         ",
-        kpti_paranoid_save!(),
+        $crate::arch::interrupt::handler::kpti_paranoid_save!(),
     ) }
 }
 macro_rules! conditional_swapgs_back_paranoid {
     () => {
         concat!(
-            kpti_paranoid_restore!(),
+            $crate::arch::interrupt::handler::kpti_paranoid_restore!(),
             "
         test bl, bl
         jnz 2f
@@ -563,20 +565,20 @@ macro_rules! interrupt_stack {
             }
             core::arch::naked_asm!(
                 // Ferric Oxide (IBT): the IDT is an indirect branch target.
-                ibt_endbr!(),
+                $crate::arch::macros::ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 
                 // Ferric Oxide (KPTI)
-                kpti_enter!("0", $kpti_fix),
+                $crate::arch::interrupt::handler::kpti_enter!("0", $kpti_fix),
 
                 // Backup all userspace registers to stack
-                $save1!(),
+                $crate::arch::interrupt::handler::$save1!(),
                 "push rax",
-                push_scratch!(),
-                push_preserved!(),
+                $crate::push_scratch!(),
+                $crate::push_preserved!(),
 
-                $save2!(),
+                $crate::arch::interrupt::handler::$save2!(),
 
                 // Call inner function with pointer to stack
                 "
@@ -584,14 +586,14 @@ macro_rules! interrupt_stack {
                 call {inner}
                 ",
 
-                $rstor2!(),
+                $crate::arch::interrupt::handler::$rstor2!(),
 
                 // Restore all userspace registers
-                pop_preserved!(),
-                pop_scratch!(),
+                $crate::pop_preserved!(),
+                $crate::pop_scratch!(),
 
-                $rstor1!(),
-                kpti_exit!("1"),
+                $crate::arch::interrupt::handler::$rstor1!(),
+                $crate::arch::interrupt::handler::kpti_exit!("1"),
                 "iretq",
 
                 inner = sym inner,
@@ -606,8 +608,8 @@ macro_rules! interrupt_stack {
             );
         }
     };
-    ($name:ident, |$stack:ident| $code:block) => { interrupt_stack!($name, swapgs_iff_ring3_fast!, nop!, nop!, swapgs_iff_ring3_fast!, is_paranoid: false, kpti_fix: "1", |$stack| $code); };
-    ($name:ident, @paranoid, |$stack:ident| $code:block) => { interrupt_stack!($name, nop!, conditional_swapgs_paranoid!, conditional_swapgs_back_paranoid!, nop!, is_paranoid: true, kpti_fix: "0", |$stack| $code); }
+    ($name:ident, |$stack:ident| $code:block) => { $crate::interrupt_stack!($name, swapgs_iff_ring3_fast!, nop!, nop!, swapgs_iff_ring3_fast!, is_paranoid: false, kpti_fix: "1", |$stack| $code); };
+    ($name:ident, @paranoid, |$stack:ident| $code:block) => { $crate::interrupt_stack!($name, nop!, conditional_swapgs_paranoid!, conditional_swapgs_back_paranoid!, nop!, is_paranoid: true, kpti_fix: "0", |$stack| $code); }
 }
 
 #[macro_export]
@@ -621,26 +623,26 @@ macro_rules! interrupt {
 
             core::arch::naked_asm!(
                 // Ferric Oxide (IBT): the IDT is an indirect branch target.
-                ibt_endbr!(),
+                $crate::arch::macros::ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 
                 // Ferric Oxide (KPTI)
-                kpti_enter!("0", "1"),
+                $crate::arch::interrupt::handler::kpti_enter!("0", "1"),
 
                 // Backup all userspace registers to stack
-                swapgs_iff_ring3_fast!(),
+                $crate::arch::interrupt::handler::swapgs_iff_ring3_fast!(),
                 "push rax",
-                push_scratch!(),
+                $crate::push_scratch!(),
 
                 // Call inner function with pointer to stack
                 "call {inner}",
 
                 // Restore all userspace registers
-                pop_scratch!(),
+                $crate::pop_scratch!(),
 
-                swapgs_iff_ring3_fast!(),
-                kpti_exit!("1"),
+                $crate::arch::interrupt::handler::swapgs_iff_ring3_fast!(),
+                $crate::arch::interrupt::handler::kpti_exit!("1"),
                 "iretq",
 
                 inner = sym inner,
@@ -665,20 +667,20 @@ macro_rules! interrupt_error {
 
             core::arch::naked_asm!(
                 // Ferric Oxide (IBT): the IDT is an indirect branch target.
-                ibt_endbr!(),
+                $crate::arch::macros::ibt_endbr!(),
                 // Clear direction flag, required by ABI when running any Rust code in the kernel.
                 "cld;",
 
                 // Ferric Oxide (KPTI)
-                kpti_enter!("8", "1"),
+                $crate::arch::interrupt::handler::kpti_enter!("8", "1"),
 
-                swapgs_iff_ring3_fast_errorcode!(),
+                $crate::arch::interrupt::handler::swapgs_iff_ring3_fast_errorcode!(),
 
                 // Don't push RAX yet, as the error code is already stored in RAX's position.
 
                 // Push all userspace registers
-                push_scratch!(),
-                push_preserved!(),
+                $crate::push_scratch!(),
+                $crate::push_preserved!(),
 
                 // Now that we have a couple of usable registers, put the error code in the second
                 // argument register for the inner function, and save RAX where it would normally
@@ -691,12 +693,12 @@ macro_rules! interrupt_error {
                 "call {inner};",
 
                 // Restore all userspace registers
-                pop_preserved!(),
-                pop_scratch!(),
+                $crate::pop_preserved!(),
+                $crate::pop_scratch!(),
 
                 // The error code has already been popped, so use the regular macro.
-                swapgs_iff_ring3_fast!(),
-                kpti_exit!("1"),
+                $crate::arch::interrupt::handler::swapgs_iff_ring3_fast!(),
+                $crate::arch::interrupt::handler::kpti_exit!("1"),
                 "iretq;",
 
                 inner = sym inner,
@@ -744,3 +746,11 @@ impl ArchIntCtx for InterruptStack {
         self.iret.rflags &= !(1 << 18);
     }
 }
+
+// Assembly helpers used by the exported interrupt macros.
+#[allow(unused_imports)]
+pub(crate) use {
+    conditional_swapgs_back_paranoid, conditional_swapgs_paranoid, kpti_alternative, kpti_enter,
+    kpti_exit, kpti_paranoid_restore, kpti_paranoid_save, nop, swapgs_iff_ring3_fast,
+    swapgs_iff_ring3_fast_errorcode,
+};

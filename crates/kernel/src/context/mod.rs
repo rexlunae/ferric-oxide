@@ -349,7 +349,7 @@ pub fn spawn(
     let context_ref = ContextRef(Arc::clone(&context_lock));
     contexts_mut(token.downgrade()).insert(context_ref);
 
-    trace_event!(
+    crate::trace::trace_event!(
         ferric_trace::kernel::SCHED_CONTEXT_CREATE,
         context_lock.read(token.token()).debug_id,
         userspace_allowed,

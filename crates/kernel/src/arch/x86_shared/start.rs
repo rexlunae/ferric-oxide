@@ -97,7 +97,7 @@ extern "C" fn kstart() {
 
         // Ferric Oxide (IBT): the bootloader jumps here indirectly.
         #[cfg(target_arch = "x86_64")]
-        ibt_endbr!(),
+        crate::arch::macros::ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // BSS should already be zero
@@ -136,7 +136,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
         // Set up graphical debug
         graphical_debug::init(args.env());
 
-        info!("Redox OS starting...");
+        crate::info!("Ferric Oxide starting...");
         args.print();
 
         // Stop early with a clear message on CPUs below the configured baseline.
@@ -228,7 +228,7 @@ fn continue_after_kmain_stack(
     kstack_slot: &mut Option<Kstack>,
     numa_region_mask: &Option<numa::RegionMask>,
 ) -> ! {
-    info!("Now on kmain stack");
+    crate::info!("Now on kmain stack");
     unsafe {
         let bootstrap = {
             #[cfg(target_arch = "x86_64")]
@@ -317,7 +317,7 @@ pub extern "C" fn kstart_ap() {
 
         // Ferric Oxide (IBT): the AP trampoline jumps here indirectly (`jmp rax`).
         #[cfg(target_arch = "x86_64")]
-        ibt_endbr!(),
+        crate::arch::macros::ibt_endbr!(),
         #[cfg(target_arch = "x86_64")]
         "
         // Note: The System V ABI requires the stack to be aligned to 16 bytes

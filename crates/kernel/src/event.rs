@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-int_like!(EventQueueId, AtomicEventQueueId, usize, AtomicUsize);
+crate::int_like!(EventQueueId, AtomicEventQueueId, usize, AtomicUsize);
 
 pub struct EventQueue {
     id: EventQueueId,

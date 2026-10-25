@@ -90,15 +90,15 @@ impl Bcm2836ArmInterruptController {
 
     unsafe fn init(&mut self) {
         unsafe {
-            debug!("IRQ BCM2836 INIT");
+            crate::debug!("IRQ BCM2836 INIT");
             //init local timer freq
             self.write(LOCAL_CONTROL, 0x0);
             self.write(LOCAL_PRESCALER, 0x8000_0000);
 
             //routing all irq to core
             self.write(LOCAL_GPU_ROUTING, self.active_cpu);
-            debug!("routing all irq to core {}", self.active_cpu);
-            debug!("IRQ BCM2836 END");
+            crate::debug!("routing all irq to core {}", self.active_cpu);
+            crate::debug!("IRQ BCM2836 END");
         }
     }
 
@@ -151,7 +151,7 @@ impl InterruptController for Bcm2836ArmInterruptController {
                 i += 1;
             }
 
-            info!("bcm2836 irq_range = ({}, {})", idx, idx + cnt);
+            crate::info!("bcm2836 irq_range = ({}, {})", idx, idx + cnt);
             self.irq_range = (idx, idx + cnt);
             *irq_idx = idx + cnt;
         }
@@ -177,7 +177,7 @@ impl InterruptController for Bcm2836ArmInterruptController {
     fn irq_eoi(&mut self, _irq_num: u32) {}
 
     fn irq_enable(&mut self, irq_num: u32) {
-        debug!("bcm2836 enable {}", irq_num);
+        crate::debug!("bcm2836 enable {}", irq_num);
         match irq_num {
             LOCAL_IRQ_CNTPNSIRQ => unsafe {
                 let cpuid: usize;

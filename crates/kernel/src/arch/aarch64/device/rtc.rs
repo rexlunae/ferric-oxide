@@ -19,15 +19,15 @@ pub unsafe fn init(fdt: &fdt::Fdt) {
                 let counter = crate::arch::time::monotonic_absolute(&mut token);
                 let seconds = rtc.time();
                 let rtc_ns = (seconds as u128) * time::NANOS_PER_SEC;
-                info!("PL031 RTC at {:#x}, wall clock {seconds} s", rtc.phys);
+                crate::info!("PL031 RTC at {:#x}, wall clock {seconds} s", rtc.phys);
                 *time::START.lock(token.token()) = rtc_ns.saturating_sub(counter);
             }
             None => {
-                warn!("No PL031 RTC registers");
+                crate::warn!("No PL031 RTC registers");
             }
         }
     } else {
-        warn!("No PL031 RTC found");
+        crate::warn!("No PL031 RTC found");
     }
 }
 

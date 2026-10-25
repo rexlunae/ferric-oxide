@@ -23,7 +23,7 @@ mod control {
     pub const TX_INT_EN: u32 = 1 << 28;
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// AML_UART_STATUS (0x0c), read-only.
     #[derive(Clone, Copy, Debug)]
     struct UartStatusFlags: u32 {
@@ -39,7 +39,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// AML_UART_REG5 (0x14).
     #[derive(Clone, Copy, Debug)]
     struct UartBaudFlags: u32 {

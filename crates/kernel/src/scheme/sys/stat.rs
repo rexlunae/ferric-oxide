@@ -21,7 +21,7 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
     let (futex_keys, futex_subs) = get_futex_stat(token);
     let pipe_subs = crate::scheme::pipe::get_pipe_stat(token);
     let timeout_subs = crate::context::timeout::get_timeout_stat(token);
-    let res = format!(
+    let res = alloc::format!(
         "{}{}\n\
         boot_time: {start_time_sec}\n\
         context_switches: {context_switches}\n\
@@ -63,7 +63,7 @@ fn get_cpu_stats() -> String {
         total_irq += stat.irq;
         let _ = writeln!(&mut cpu_data, "cpu{} {}", id.get(), stat);
     }
-    format!(
+    alloc::format!(
         "cpu  {total_user} {total_nice} {total_kernel} {total_idle} {total_irq}\n\
         {cpu_data}"
     )

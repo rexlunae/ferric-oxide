@@ -26,7 +26,7 @@ use super::{CallerCtx, KernelScheme, OpenResult};
 /// A scheme used to access the RSDT or XSDT, and listen for shutdown, which is needed for e.g. `acpid` to function.
 pub struct AcpiScheme;
 
-bitflags! {
+bitflags::bitflags! {
     #[derive(PartialEq)]
     struct HandleBits: usize {
         const CAN_READ_RXSDT = 1;
@@ -53,7 +53,9 @@ pub fn register_kstop(token: &mut CleanLockToken) -> bool {
     *KSTOP_FLAG.lock(token.token()) = true;
 
     if !EXISTS_KSTOP_HANDLE.load(Ordering::Relaxed) {
-        error!("No userspace ACPI handler was notified when trying to shutdown. This is bad.");
+        crate::error!(
+            "No userspace ACPI handler was notified when trying to shutdown. This is bad."
+        );
         // Let the kernel shutdown without ACPI.
         return false;
     }
@@ -83,7 +85,7 @@ impl AcpiScheme {
                 Some(RxsdtEnum::Rsdt(rsdt)) => rsdt.as_slice(),
                 Some(RxsdtEnum::Xsdt(xsdt)) => xsdt.as_slice(),
                 None => {
-                    warn!("expected RXSDT_ENUM to be initialized before AcpiScheme, is ACPI available?");
+                    crate::warn!("expected RXSDT_ENUM to be initialized before AcpiScheme, is ACPI available?");
                     &[]
                 }
             };
@@ -92,7 +94,7 @@ impl AcpiScheme {
         });
 
         if !data_init {
-            error!("AcpiScheme::init called multiple times");
+            crate::error!("AcpiScheme::init called multiple times");
         }
     }
 }
@@ -187,11 +189,11 @@ impl KernelScheme for AcpiScheme {
                         let value = crate::arch::misc::rdmsr_safe(register)
                             .map_err(|MsrFault| Error::new(EIO))?;
 
-                        debug!("MSR READ {register:x} => {value:x}");
+                        crate::debug!("MSR READ {register:x} => {value:x}");
                         payload.write_usize(value as usize)?;
                     }
                     if let Some(write_data) = write_data {
-                        debug!("MSR WRITE {register:x} <= {write_data:x}");
+                        crate::debug!("MSR WRITE {register:x} <= {write_data:x}");
 
                         crate::arch::misc::wrmsr_safe(register, write_data)
                             .map_err(|MsrFault| Error::new(EIO))?;

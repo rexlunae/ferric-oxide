@@ -3,9 +3,9 @@
 //! was. The crash dump (`kernel.trace_crash`) and the persistent log (`kernel.log_persist`)
 //! each keep one.
 //!
-//! [`Region::reserve`], during memory setup, takes the region out of the free memory, provided
+//! [`crate::reserved::Region::reserve`], during memory setup, takes the region out of the free memory, provided
 //! it is wholly free RAM in the boot memory map, and has it mapped like the boot-time
-//! identity-mapped areas. Once the physical map exists, [`Region::words`] gives its memory.
+//! identity-mapped areas. Once the physical map exists, [`crate::reserved::Region::words`] gives its memory.
 
 use core::{fmt, sync::atomic::AtomicU64};
 
@@ -16,7 +16,7 @@ use crate::{
     startup::memory::{register_memory_region, BootloaderMemoryKind},
 };
 
-/// A reserved region; only [`Region::reserve`] makes one.
+/// A reserved region; only [`crate::reserved::Region::reserve`] makes one.
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     base: usize,

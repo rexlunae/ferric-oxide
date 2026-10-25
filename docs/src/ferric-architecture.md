@@ -35,6 +35,19 @@ UEFI and Redox user-space builds keep their own targets, profiles and dependency
 resolution. There is no `tools/redoxfs-host/` crate in the current tree: host
 RedoxFS tools come from `userspace/redoxfs/` through the recipe/fstools path.
 
+`crates/aligned-buffer/` is a shared `no_std` library using `alloc` for owned,
+zeroed byte buffers with explicit alignment. The kernel uses it for saved CPU
+state. It contains no kernel mappings or scheduling policy. The imported `rmm`
+and `redox_syscall` packages remain under `crates/kernel/`: their existing paths
+and workspace boundary are retained for upstream integration.
+
+Inside the kernel, `cpu_set` owns logical CPU publication and affinity masks;
+`sync/records` owns the initialized record representations and whole-record
+copy/dequeue protocol used by `WaitQueue`. Interrupt, logging, allocation and
+trace macros use explicit paths rather than `macro_use` scope propagation.
+Boot messages identify Ferric Oxide; the `Redox` uname system identifier,
+system-call ABI and target names remain for compatibility with existing tools.
+
 The six imported subtrees are `crates/kernel/`, `crates/bootloader/`,
 `crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/`.
 `.github/workflows/subtree-sync.yml` pulls their upstream changes into this

@@ -4,7 +4,6 @@ pub use crate::arch::x86_shared::*;
 pub mod consts;
 
 /// Interrupt instructions
-#[macro_use]
 pub mod interrupt;
 
 #[unsafe(naked)]

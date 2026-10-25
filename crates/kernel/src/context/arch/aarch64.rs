@@ -106,25 +106,25 @@ impl Context {
 
     #[allow(unused)]
     pub fn dump(&self) {
-        println!("elr_el1: 0x{:016x}", self.elr_el1);
-        println!("sp_el0: 0x{:016x}", self.sp_el0);
-        println!("tpidr_el0: 0x{:016x}", self.tpidr_el0);
-        println!("tpidrro_el0: 0x{:016x}", self.tpidrro_el0);
-        println!("spsr_el1: 0x{:016x}", self.spsr_el1);
-        println!("esr_el1: 0x{:016x}", self.esr_el1);
-        println!("sp: 0x{:016x}", self.sp);
-        println!("lr: 0x{:016x}", self.lr);
-        println!("fp: 0x{:016x}", self.fp);
-        println!("x28: 0x{:016x}", self.x28);
-        println!("x27: 0x{:016x}", self.x27);
-        println!("x26: 0x{:016x}", self.x26);
-        println!("x25: 0x{:016x}", self.x25);
-        println!("x24: 0x{:016x}", self.x24);
-        println!("x23: 0x{:016x}", self.x23);
-        println!("x22: 0x{:016x}", self.x22);
-        println!("x21: 0x{:016x}", self.x21);
-        println!("x20: 0x{:016x}", self.x20);
-        println!("x19: 0x{:016x}", self.x19);
+        crate::println!("elr_el1: 0x{:016x}", self.elr_el1);
+        crate::println!("sp_el0: 0x{:016x}", self.sp_el0);
+        crate::println!("tpidr_el0: 0x{:016x}", self.tpidr_el0);
+        crate::println!("tpidrro_el0: 0x{:016x}", self.tpidrro_el0);
+        crate::println!("spsr_el1: 0x{:016x}", self.spsr_el1);
+        crate::println!("esr_el1: 0x{:016x}", self.esr_el1);
+        crate::println!("sp: 0x{:016x}", self.sp);
+        crate::println!("lr: 0x{:016x}", self.lr);
+        crate::println!("fp: 0x{:016x}", self.fp);
+        crate::println!("x28: 0x{:016x}", self.x28);
+        crate::println!("x27: 0x{:016x}", self.x27);
+        crate::println!("x26: 0x{:016x}", self.x26);
+        crate::println!("x25: 0x{:016x}", self.x25);
+        crate::println!("x24: 0x{:016x}", self.x24);
+        crate::println!("x23: 0x{:016x}", self.x23);
+        crate::println!("x22: 0x{:016x}", self.x22);
+        crate::println!("x21: 0x{:016x}", self.x21);
+        crate::println!("x20: 0x{:016x}", self.x20);
+        crate::println!("x19: 0x{:016x}", self.x19);
     }
 }
 

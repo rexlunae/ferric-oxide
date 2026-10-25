@@ -144,11 +144,11 @@ pub fn init_boot(env: &[u8]) {
         match control(spec, true, Mode::Boot) {
             Ok(_) => {
                 for event in CATALOG.events().iter().filter(|event| is_on(event.id())) {
-                    info!("trace: {} on from boot ({source})", event.name());
+                    crate::info!("trace: {} on from boot ({source})", event.name());
                 }
             }
             Err(err) => {
-                warn!("trace: {source}={spec:?} ignored: {err}");
+                crate::warn!("trace: {source}={spec:?} ignored: {err}");
             }
         }
     }
@@ -243,14 +243,13 @@ pub fn init_rings() {
     // The clock is picked before the first ring exists, so every record has its timestamps.
     super::clock::choice();
     for (cpu, ring) in RINGS.iter().enumerate().take(crate::cpu_count() as usize) {
-        let made = ring
-            .try_call_once(|| {
-                Ring::shared(FramePages::allocate()?)
-                    .map(|ring| ring.when_full(WHEN_FULL))
-                    .map_err(RingInitError::Layout)
-            });
+        let made = ring.try_call_once(|| {
+            Ring::shared(FramePages::allocate()?)
+                .map(|ring| ring.when_full(WHEN_FULL))
+                .map_err(RingInitError::Layout)
+        });
         if let Err(err) = made {
-            warn!("trace: no ring for CPU {cpu}: {err}");
+            crate::warn!("trace: no ring for CPU {cpu}: {err}");
         }
     }
 }

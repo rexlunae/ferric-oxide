@@ -1,0 +1,6 @@
+[package]
+name = "ferric-aligned-buffer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fallible, aligned byte buffers for no_std consumers"

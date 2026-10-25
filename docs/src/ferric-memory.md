@@ -25,6 +25,21 @@ SMAP and FSGSBASE retain the same policy model. SMAP limits supervisor access
 to user mappings; FSGSBASE provides the selected fast FS/GS-base operations.
 CPU baseline validation is in `arch/x86_64/cpu_level.rs`.
 
+Saved CPU-state buffers use `ferric-aligned-buffer` (`crates/aligned-buffer/`).
+It retains each allocation's exact layout for deallocation and uses the same
+implementation in host tests and the kernel. Empty buffers require no allocation;
+invalid alignments and oversized layouts return typed errors. Kernel context
+creation maps allocation failures to `ENOMEM`. The buffer holds initialized bytes
+rather than arbitrary zeroed Rust types, so it needs no unsafe zero-validity trait.
+
+The boot-time `rmm::BumpAllocator` requires an unsafe constructor: its caller
+must transfer exclusive ownership of disjoint, aligned, writable mapped areas.
+It rejects zero or overflowing frame requests
+before advancing its cursor. An initial offset beyond every memory area produces
+an exhausted allocator with zero remaining capacity. Its host tests cover these
+boundaries and zeroing/disjointness of allocations in the software memory model.
+These checks do not validate real page-table or TLB operations.
+
 ### ARM64 signal arguments
 
 In relibc, `redox-rt/src/arch/aarch64.rs` saves an interrupted program's
