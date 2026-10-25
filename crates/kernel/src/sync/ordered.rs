@@ -208,6 +208,27 @@ impl<L: Level, T: Default> Default for Mutex<L, T> {
 #[cfg(feature = "busy_panic")]
 pub const DEADLOCK_SPIN_CAP: usize = 5000;
 
+/// Ferric Oxide: what a CPU does between tries of a contended lock in `spin_wait`: it
+/// acknowledges any pending TLB shootdown and, with `busy_panic`, panics naming `what` after
+/// [`DEADLOCK_SPIN_CAP`] failed tries, like the other lock loops here.
+fn serve_shootdowns(what: &'static str) -> impl FnMut() {
+    #[cfg(not(feature = "busy_panic"))]
+    let _ = what;
+    let my_percpu = PercpuBlock::current();
+    #[cfg(feature = "busy_panic")]
+    let mut tries = DEADLOCK_SPIN_CAP;
+    move || {
+        my_percpu.maybe_handle_tlb_shootdown();
+        #[cfg(feature = "busy_panic")]
+        {
+            tries = tries.saturating_sub(1);
+            if tries == 0 {
+                panic!("Deadlock at {what} may have triggered")
+            }
+        }
+    }
+}
+
 impl<L: Level, T> Mutex<L, T> {
     /// Creates a new mutex in an unlocked state ready for use
     pub const fn new(val: T) -> Self {
@@ -558,22 +579,8 @@ impl<L: Level, T> RwLock<L, T> {
         // Ferric Oxide: answer TLB shootdowns while spinning, as the other lock paths do. The
         // context switch spins here with interrupts off; a holder of this context's lock can be
         // waiting on a CPU that waits for this one's acknowledgement (spin_wait.rs).
-        let my_percpu = PercpuBlock::current();
-        #[cfg(feature = "busy_panic")]
-        let mut i = DEADLOCK_SPIN_CAP;
-        let guard = super::spin_wait::until(
-            || self.inner.try_write(),
-            || {
-                my_percpu.maybe_handle_tlb_shootdown();
-                #[cfg(feature = "busy_panic")]
-                {
-                    i = i.saturating_sub(1);
-                    if i == 0 {
-                        panic!("Deadlock at write_arc may have triggered")
-                    }
-                }
-            },
-        );
+        let guard =
+            super::spin_wait::until(|| self.inner.try_write(), serve_shootdowns("write_arc"));
         core::mem::forget(guard);
         ArcRwLockWriteGuard {
             rwlock: self.clone(),
@@ -669,8 +676,14 @@ impl<'a, L: Level, T> RwLockUpgradableGuard<'a, L, T> {
 
     /// Upgrade to RW lock
     pub fn upgrade(self) -> RwLockWriteGuard<'a, L, T> {
+        // Ferric Oxide: wait for the readers to leave while answering TLB shootdowns, as the
+        // other lock paths do (spin_wait.rs).
         RwLockWriteGuard {
-            inner: spin::RwLockUpgradableGuard::upgrade(self.inner),
+            inner: super::spin_wait::upgrade(
+                self.inner,
+                spin::RwLockUpgradableGuard::try_upgrade,
+                serve_shootdowns("upgrade"),
+            ),
             lock_token: self.lock_token,
         }
     }

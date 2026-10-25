@@ -142,8 +142,8 @@ they share the pair. This is not a cache of a separate PCID pair per process.
 
 A CPU that waits for a contended lock keeps answering TLB shootdowns. Every
 ordered lock path, including the context switch's `write_arc` on a context
-lock, retries the lock and acknowledges any pending shootdown between tries
-(`sync/spin_wait.rs`). The context switch runs with interrupts off, so without
+lock and the upgrade of an upgradeable read guard, retries the lock and
+acknowledges any pending shootdown between tries (`sync/spin_wait.rs`). The context switch runs with interrupts off, so without
 this a CPU waiting for a context lock cannot acknowledge a flush. If the
 flushing CPU holds a lock that the context lock's holder waits for, none of
 them can continue; that was the boot-smoke hang in
