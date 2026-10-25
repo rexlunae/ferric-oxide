@@ -64,6 +64,13 @@ crate::interrupt_stack!(non_maskable, @paranoid, |stack| {
             stack.instr_pointer().wrapping_sub(crate::kernel_image_slide())
         );
         stack.trace();
+        // Ferric Oxide: and what every context is waiting for, so an NMI also names the
+        // context a hang with every CPU idle is stuck on (boot-smoke.sh sends one at its
+        // timeout).
+        // SAFETY: the dump takes only `try_` locks, so the token cannot deadlock on a lock
+        // the interrupted code holds, and it is dropped before the handler returns.
+        let mut token = unsafe { crate::sync::CleanLockToken::new() };
+        crate::context::dump_for_nmi(token.downgrade());
     }
 });
 
