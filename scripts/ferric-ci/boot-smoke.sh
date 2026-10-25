@@ -95,7 +95,9 @@ crash_pattern='UNHANDLED EXCEPTION|KERNEL PANIC|kernel panicked|panicked at'
 # The linker line is fatal only for the shell itself: every program reports the
 # same prefix, and a program the script starts that fails to link is one of its
 # test results, not a reason to kill the guest.
-smoke_dead_pattern='\[ld\.so\]: failed to link .*/bin/ion:|init: .*ferric-smoke\.ion.* failed with exit status'
+# ld.so quotes the path it could not link, as in `failed to link '/usr/bin/ion':`,
+# so the quotes are part of the pattern; the path may or may not have a directory.
+smoke_dead_pattern="\[ld\.so\]: failed to link '([^']*/)?bin/ion':|init: .*ferric-smoke\.ion.* failed with exit status"
 if [ "${BOOT_REBOOT:-0}" = 1 ]; then
     reboot=()
     # The intended panic is checked by the caller; only an exception still ends the run.
@@ -142,11 +144,19 @@ for ((i = 0; i < timeout_secs; i++)); do
         break
     fi
     if grep -qaE "$smoke_dead_pattern" "$log"; then
-        sleep 1 # let the rest of the shell's error output reach the log
         # A guest that is already shutting down can print a link failure for a
-        # program it stops, and it may print the marker in the same second. Wait
-        # for QEMU again instead of failing a boot that finished its tests.
-        if grep -qa 'FERRIC_SMOKE_OK' "$log"; then
+        # program it stops, and it may print the marker in the same second. Watch
+        # the marker for a second, then give the line its own meaning, so the
+        # answer does not depend on when this pass happened to read the log.
+        marker=""
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if grep -qa 'FERRIC_SMOKE_OK' "$log"; then
+                marker=1
+                break
+            fi
+            sleep 0.1
+        done
+        if [ -n "$marker" ]; then
             continue
         fi
         deadend=1

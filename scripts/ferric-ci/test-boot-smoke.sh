@@ -9,11 +9,14 @@ touch "$work/image" "$work/firmware"
 cat > "$work/bin/qemu-system-x86_64" <<'QEMU'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_QEMU_ARGS"
-# FAKE_QEMU_SPLIT prints that many lines, pauses, and prints the rest, so a test
-# can put a line after the runner has already read an earlier one.
+# FAKE_QEMU_SPLIT prints that many lines, pauses FAKE_QEMU_SPLIT_DELAY seconds,
+# and prints the rest, so a test can put a line after the runner has already read
+# an earlier one. The delay stays under the runner's one-second marker watch,
+# which reads the log every 0.1 seconds, so the marker lands inside that window
+# whatever the runner's first pass saw.
 if [ -n "${FAKE_QEMU_SPLIT:-}" ]; then
     head -n "$FAKE_QEMU_SPLIT" "$FAKE_QEMU_LOG"
-    sleep 0.5
+    sleep "${FAKE_QEMU_SPLIT_DELAY:-0.5}"
     tail -n +"$((FAKE_QEMU_SPLIT + 1))" "$FAKE_QEMU_LOG"
 else
     cat "$FAKE_QEMU_LOG"
@@ -50,20 +53,25 @@ check panic-after-marker 1 $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\nKERNEL PA
 check missing-marker 1 'FERRIC_TEST_PASS xstate'
 # The boot in #155: the linker could not load the shell that runs the smoke
 # script, so the marker could never appear. The run says so instead of timing out.
+# ld.so quotes the path, as crates/relibc/src/ld_so/start.rs prints it.
 check smoke-shell-unlinked 1 \
-    $'FERRIC_TEST_PASS iommu-dma\r\n[ld.so]: failed to link /usr/bin/ion: NotFound\r\ninit: cd "/" && env -i "ion" "/usr/lib/ferric-smoke.ion" failed with exit status: 1' \
+    $'FERRIC_TEST_PASS iommu-dma\r\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound\r\ninit: cd "/" && env -i "ion" "/usr/lib/ferric-smoke.ion" failed with exit status: 1' \
+    'the smoke shell could not start'
+# The shell's path may also be reported without a directory part.
+check smoke-shell-unlinked-bare-path 1 \
+    $'FERRIC_TEST_PASS iommu-dma\n[ld.so]: failed to link \'/bin/ion\': NotFound' \
     'the smoke shell could not start'
 # The same message after the smoke test passed says nothing about the run.
 check link-failure-after-marker 0 \
-    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link /usr/bin/ion: NotFound'
-# Nor does one that reaches the log while the runner is waiting out the second
-# after it saw the line: the guest printed the marker in that second.
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound'
+# Nor does one that reaches the log while the runner is watching for the marker
+# after it saw the line: the guest printed the marker during that watch.
 check marker-during-wait 0 \
-    $'[ld.so]: failed to link /usr/bin/ion: NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' '' 1
+    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' '' 1
 # A program the smoke script starts can fail to link too; that is the script's
 # test result, and the run must not be killed for it.
 check child-link-failure 0 \
-    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link /usr/bin/cat: NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK'
+    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK'
 
 # The smoke image's audio check needs both controllers on the QEMU command line.
 grep -q -- '-device ich9-intel-hda,id=hda0' "$FAKE_QEMU_ARGS" \

@@ -303,15 +303,17 @@ for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
 the usual paths.
 
 The script stops early instead of waiting out the timeout when the smoke shell
-cannot start: ld.so reporting that it could not link `/usr/bin/ion`, or init
-reporting that `ion /usr/lib/ferric-smoke.ion` failed, ends the run with that
-console error and `boot-smoke: FAIL, the smoke shell could not start`. The
-linker line counts only for the shell: every program reports the same prefix, so
-a program the script starts that fails to link stays that program's test result
-instead of killing the guest. A boot that prints the marker first still passes,
-including one that prints it in the second the runner waits after seeing such a
-line, so a link failure during shutdown does not fail a green run. This turns
-the intermittent boot in
+cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
+quoted path it prints), or init reporting that `ion /usr/lib/ferric-smoke.ion`
+failed, ends the run with that console error and `boot-smoke: FAIL, the smoke
+shell could not start`. The linker line counts only for the shell: every program
+reports the same prefix, so a program the script starts that fails to link stays
+that program's test result instead of killing the guest. A boot that prints the
+marker first still passes, including one that prints it while the runner watches
+for the marker in the second after it saw such a line, so a link failure during
+shutdown does not fail a green run. `scripts/ferric-ci/test-boot-smoke.sh`
+exercises these cases against a fake QEMU, without firmware or virtualization.
+This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
 
