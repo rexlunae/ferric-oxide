@@ -334,6 +334,37 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+### Where a request's time goes (drivers.nvmed_perf)
+
+`drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
+each I/O request's phases with the CPU cycle counter and logs a summary about
+every five seconds:
+
+```text
+nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+```
+
+- `read.service`/`write.service` run from `namespace_read`/`namespace_write`
+  entry to return, on whichever thread serves the request: the scheme's main
+  thread, or a per-CPU worker answering a job or a direct request.
+- `read.device`/`write.device` sum, over the request's commands, the time from
+  just before the submission queue's doorbell to the observed completion,
+  including the controller's service time and the interrupt-to-worker wake-up
+  latency.
+- The difference (service minus device) is the driver's own work: queue-pair
+  and lock waits, bounce-buffer copies and executor wake-up latency not
+  charged to the device.
+
+The counter reads add no system calls, so an instrumented driver still shows
+the syscall counts of the unmodified one, and the ticks are calibrated once
+against the monotonic clock at driver start. Which thread served what, and
+the queueing and response legs, come from the kernel trace
+(`scheme.request`/`scheme.response`, `sched.switch`, `irq.deliver`/`irq.ack`,
+and the debug-level `scheme.sqe_deliver`/`scheme.cqe_receive`, which need
+`kernel.trace_max_level = "debug"`). The phase figures are for comparing one
+boot, not a documented time source.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.

@@ -573,6 +573,27 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
+id = "drivers.nvmed_perf"
+menu = "drivers"
+type = "bool"
+title = "nvmed request-phase timing"
+default = false
+rebuild = ["base"]
+help = """
+Build nvmed with its perf Cargo feature: it times each I/O request's phases
+with the CPU cycle counter (request entry to first submission, submission to
+completion, completion to return) and logs a per-second summary of counts,
+means and maxima. The counter reads add no system calls, so an instrumented
+driver still shows the syscall counts of an unmodified one; the summary lines
+are the ones to compare with the scheme.request/scheme.response and
+irq.deliver/irq.ack trace records. Off by default; without it nvmed is built
+as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/perf" }
+
+[[option]]
 id = "drivers.net_bypass"
 menu = "drivers"
 type = "bool"
