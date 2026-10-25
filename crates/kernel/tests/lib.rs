@@ -14,3 +14,29 @@ mod cpu_set;
 mod records;
 #[path = "../src/sync/spin_wait.rs"]
 mod spin_wait;
+
+#[cfg(test)]
+mod wait_support;
+#[cfg(test)]
+use wait_support::{context, percpu};
+#[cfg(test)]
+#[path = "../src/sync/ordered.rs"]
+mod ordered;
+#[cfg(test)]
+#[path = "../src/sync/wait_condition.rs"]
+pub(crate) mod wait_condition;
+#[cfg(test)]
+mod sync {
+    pub(crate) use crate::ordered::*;
+}
+
+#[test]
+fn empty_wait_condition_destruction_does_not_acquire_a_lock_or_recreate_a_token() {
+    // SAFETY: This test starts without locks and keeps only this clean token.
+    let mut token = unsafe { sync::CleanLockToken::new() };
+    let outer = sync::Mutex::<sync::L2, _>::new(());
+    let _guard = outer.lock(token.token());
+    let accesses = percpu::accesses();
+    drop(wait_condition::WaitCondition::new());
+    assert_eq!(percpu::accesses(), accesses);
+}
