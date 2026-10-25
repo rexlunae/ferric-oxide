@@ -161,7 +161,7 @@ impl KernelScheme for SerioScheme {
         let handle = *HANDLES.read(token.token()).get(id)?;
 
         let path = match handle.kind {
-            HandleKind::Device(index) => format!("serio:{}", index).into_bytes(),
+            HandleKind::Device(index) => alloc::format!("serio:{}", index).into_bytes(),
             HandleKind::SchemeRoot => return Err(Error::new(EBADF)),
         };
 

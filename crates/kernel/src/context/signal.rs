@@ -38,7 +38,7 @@ pub fn signal_handler(token: &mut CleanLockToken) {
     // TODO: thumbs_down
     let Some((thread_ctl, proc_ctl, st)) = context.sigcontrol() else {
         // Discard signal if sigcontrol is unset.
-        trace!("no sigcontrol, returning");
+        crate::trace!("no sigcontrol, returning");
         return;
     };
     if thread_ctl.currently_pending_unblocked(proc_ctl) == 0 {
@@ -56,7 +56,7 @@ pub fn signal_handler(token: &mut CleanLockToken) {
     if control_flags.contains(SigcontrolFlags::INHIBIT_DELIVERY) {
         // Signals are inhibited to protect critical sections inside libc, but this code will run
         // every time the context is switched to.
-        trace!("Inhibiting delivery, returning");
+        crate::trace!("Inhibiting delivery, returning");
         return;
     }
 
@@ -65,7 +65,7 @@ pub fn signal_handler(token: &mut CleanLockToken) {
     let mut context = context.upgrade();
     let Some(regs) = context.regs_mut() else {
         // TODO: is this even reachable?
-        trace!("No registers, returning");
+        crate::trace!("No registers, returning");
         return;
     };
 
@@ -98,7 +98,7 @@ pub fn excp_handler(excp: syscall::Exception) {
 
     if !excp_handler_inner(excp, &mut context) {
         // TODO: Let procmgr print this?
-        info!(
+        crate::info!(
             "UNHANDLED EXCEPTION, CPU {}, PID {}, NAME {}, CONTEXT {:p}",
             crate::cpu_id(),
             context.pid,
@@ -133,7 +133,7 @@ fn excp_handler_inner(excp: syscall::Exception, context: &mut Context) -> bool {
 
     let Some(regs) = context.regs_mut() else {
         // probably a kernel exception
-        trace!("No registers upon exception, returning");
+        crate::trace!("No registers upon exception, returning");
         return false;
     };
 

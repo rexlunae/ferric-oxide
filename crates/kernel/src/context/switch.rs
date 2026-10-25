@@ -482,7 +482,7 @@ fn schedule(
     let all_contexts = context::contexts(token.downgrade())
         .len()
         .saturating_sub(cpu_count); // ignore kmain
-    print!(
+    crate::print!(
         "\r TIME {}.{} IDLE {} WAKEUPS {} ALL {} ",
         schedule_time / 1000_000_000,
         (schedule_time / 100_000_000) % 10,
@@ -1318,7 +1318,6 @@ unsafe fn switch_to(
             && prev_context_guard.queue_key.is_none()
             && matches!(prev_context_guard.status, context::Status::Runnable)
         {
-            //info!("Switching `{}` => `{}`, prev was not in any runqueue despite being runnable", prev_context_guard.name, next_context_guard.name);
             percpu
                 .switch_internals
                 .local_wakeup_list
@@ -1334,7 +1333,7 @@ unsafe fn switch_to(
     let next_context = &mut *next_context_guard;
 
     // Ferric Oxide: the sched.switch tracepoint (`kernel.trace`).
-    trace_event!(
+    crate::trace::trace_event!(
         ferric_trace::kernel::SCHED_SWITCH,
         prev_context.pid,
         next_context.pid,

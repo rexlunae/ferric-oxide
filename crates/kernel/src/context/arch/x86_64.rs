@@ -265,7 +265,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
         // in which case the slower full path is needed.
         if !prev.inside_syscall {
             core::arch::asm!(
-                alternative2!(
+                crate::arch::macros::alternative2!(
                     feature1: "xsaveopt",
                     then1: ["
                     xsaveopt64 [{prev_fx}]
@@ -302,7 +302,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
         // Fog's instruction tables).
         if next.inside_syscall {
             core::arch::asm!(concat!(
-                alternative!(
+                crate::arch::macros::alternative!(
                     feature: "xsave",
                     // AVX is available. On AVX-512 CPUs this also zeroes the upper bits of
                     // zmm0-zmm15; zmm16-zmm31 and k0-k7 are handled below.
@@ -342,7 +342,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
             // whatever the last context to run on this CPU left there. Zero them so nothing
             // leaks across contexts. VEX-encoded kxorw zero-extends into the full 64-bit k
             // register, so this needs only AVX512F.
-            core::arch::asm!(alternative!(
+            core::arch::asm!(crate::arch::macros::alternative!(
                 feature: "avx512",
                 then: ["
                     vpxord zmm16, zmm16, zmm16
@@ -374,7 +374,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
             ));
         } else {
             core::arch::asm!(
-                alternative!(
+                crate::arch::macros::alternative!(
                     feature: "xsave",
                     then: ["
                     xrstor64 [{next_fx}]
@@ -391,7 +391,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
 
         {
             core::arch::asm!(
-                alternative!(
+                crate::arch::macros::alternative!(
                     feature: "fsgsbase",
                     then: ["
                     mov rax, [{next}+{fsbase_off}]
@@ -454,7 +454,7 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
 #[cfg(shstk_compiled)]
 macro_rules! shstk_switch {
     () => {
-        alternative!(
+        $crate::arch::macros::alternative!(
             feature: "shstk",
             then: ["
             rdsspq rax

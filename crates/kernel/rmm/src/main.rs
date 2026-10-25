@@ -180,6 +180,8 @@ unsafe fn new_tables<A: Arch>(areas: &'static [MemoryArea]) {
         println!("Memory: {}", format_size(size));
 
         // Create a basic allocator for the first pages
+        // SAFETY: The emulated machine owns these disjoint, mapped memory areas
+        // and this is its only frame allocator.
         let mut bump_allocator = BumpAllocator::<A>::new(areas, 0);
 
         {
@@ -190,7 +192,7 @@ unsafe fn new_tables<A: Arch>(areas: &'static [MemoryArea]) {
                 for i in 0..area.size / A::PAGE_SIZE {
                     let phys = area.base.add(i * A::PAGE_SIZE);
                     let (_, flush) = mapper
-                        .map_linearly(phys, PageFlags::<A>::new().write(true))
+                        .map_linearly(phys, PageFlags::<A>::new().write(true), 0)
                         .expect("failed to map page to frame");
                     flush.ignore(); // Not the active table
                 }
@@ -239,7 +241,7 @@ unsafe fn new_tables<A: Arch>(areas: &'static [MemoryArea]) {
                 .allocate_one()
                 .expect("failed to map page");
             let flush = mapper
-                .map_phys(virt, phys, PageFlags::<A>::new().user(true).write(true))
+                .map_phys(virt, phys, PageFlags::<A>::new().user(true).write(true), 0)
                 .expect("failed to map page");
             flush_all.consume(flush);
         }
@@ -248,7 +250,7 @@ unsafe fn new_tables<A: Arch>(areas: &'static [MemoryArea]) {
         let mut flush_all = PageFlushAll::new();
         for i in 0..16 {
             let virt = VirtualAddress::new(MEGABYTE + i * A::PAGE_SIZE);
-            let (old, _, flush) = mapper.unmap_phys(virt).expect("failed to unmap page");
+            let (old, _, _, flush) = mapper.unmap_phys(virt).expect("failed to unmap page");
             mapper.allocator_mut().free_one(old);
             flush_all.consume(flush);
         }

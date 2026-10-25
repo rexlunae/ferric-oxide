@@ -348,13 +348,13 @@ impl AddrSpaceWrapper {
                     .grants
                     .remove_containing(grant_span.base)
                     .expect("grant cannot magically disappear while we hold the lock!");
-                //info!("Mprotecting {:#?} to {:#?} in {:#?}", grant, flags, grant_span);
+                //crate::info!("Mprotecting {:#?} to {:#?} in {:#?}", grant, flags, grant_span);
                 let intersection = grant_span.intersection(requested_span);
 
                 let (before, mut grant, after) = grant
                     .extract(intersection)
                     .expect("failed to extract grant");
-                //info!("Sliced into\n\n{:#?}\n\n{:#?}\n\n{:#?}", before, grant, after);
+                //crate::info!("Sliced into\n\n{:#?}\n\n{:#?}\n\n{:#?}", before, grant, after);
 
                 if let Some(before) = before {
                     guard.grants.insert(before);
@@ -382,12 +382,12 @@ impl AddrSpaceWrapper {
                 // think), execute-only memory is also supported.
 
                 grant.remap(mapper, &mut flusher, new_flags);
-                //info!("Mprotect grant became {:#?}", grant);
+                //crate::info!("Mprotect grant became {:#?}", grant);
                 guard.grants.insert(grant);
             }
             Ok(())
         })();
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::MM_PROTECT,
             guard.table.utable.table().phys().data(),
             requested_span.base.start_address().data(),
@@ -425,7 +425,7 @@ impl AddrSpaceWrapper {
         #[cfg(iommu_enabled)]
         crate::scheme::iommu::release(self, requested_span);
         drop(flusher);
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::MM_UNMAP,
             guard.table.utable.table().phys().data(),
             requested_span.base.start_address().data(),
@@ -994,7 +994,7 @@ impl AddrSpace {
 
             Ok(selected_span.base)
         })();
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::MM_MAP,
             self.table.utable.table().phys().data(),
             requested_base_opt.map_or(0, |page| page.start_address().data()),
@@ -1653,7 +1653,9 @@ impl Grant {
 
         for i in 0..span.count {
             if let Some(info) = get_page_info(phys.next_by(i)) {
-                warn!("Driver tried to physmap the allocator-frame {phys:?} (info {info:?})!");
+                crate::warn!(
+                    "Driver tried to physmap the allocator-frame {phys:?} (info {info:?})!"
+                );
                 return Err(Error::new(EPERM));
             }
         }
@@ -2015,17 +2017,23 @@ impl Grant {
             let prev_span = prev_span.replace(grant_span);
 
             if prev_span.is_none() && src_grant_base > src_base {
-                warn!(
+                crate::warn!(
                     "Grant too far away, prev_span {:?} src_base {:?} grant base {:?} grant {:#?}",
-                    prev_span, src_base, src_grant_base, src_grant
+                    prev_span,
+                    src_base,
+                    src_grant_base,
+                    src_grant
                 );
                 return Err(Error::new(EINVAL));
             } else if let Some(prev) = prev_span
                 && prev.end() != src_grant_base
             {
-                warn!(
+                crate::warn!(
                     "Hole between grants, prev_span {:?} src_base {:?} grant base {:?} grant {:#?}",
-                    prev_span, src_base, src_grant_base, src_grant
+                    prev_span,
+                    src_base,
+                    src_grant_base,
+                    src_grant
                 );
                 return Err(Error::new(EINVAL));
             }
@@ -2036,12 +2044,12 @@ impl Grant {
         }
 
         let Some(last_span) = prev_span else {
-            warn!("Called Grant::borrow, but no grants were there!");
+            crate::warn!("Called Grant::borrow, but no grants were there!");
             return Err(Error::new(EINVAL));
         };
 
         if last_span.end() < src_span.end() {
-            warn!("Requested end page too far away from last grant");
+            crate::warn!("Requested end page too far away from last grant");
             return Err(Error::new(EINVAL));
         }
         if eager {
@@ -2352,7 +2360,7 @@ impl Grant {
                     continue;
                 };
                 flush.ignore();
-                //info!("Remapped page {:?} (frame {:?})", page, Frame::containing(mapper.translate(page.start_address()).unwrap().0));
+                //crate::info!("Remapped page {:?} (frame {:?})", page, Frame::containing(mapper.translate(page.start_address()).unwrap().0));
                 flusher.queue(
                     Frame::containing(phys),
                     None,
@@ -2920,7 +2928,7 @@ pub fn try_correcting_page_tables(
     token: &mut CleanLockToken,
 ) -> Result<(), PfError> {
     let Ok(addr_space) = AddrSpace::current() else {
-        debug!("User page fault without address space being set.");
+        crate::debug!("User page fault without address space being set.");
         return Err(PfError::Segv);
     };
 
@@ -2949,7 +2957,7 @@ fn correct_inner<'l>(
     let mut flusher = Flusher::with_cpu_set(&addr_space_lock.used_by, &addr_space_lock.tlb_ack);
 
     let Some((grant_base, grant_info)) = addr_space.grants.contains(faulting_page) else {
-        debug!("Lacks grant");
+        crate::debug!("Lacks grant");
         return Err(PfError::Segv);
     };
 
@@ -2965,11 +2973,11 @@ fn correct_inner<'l>(
         AccessMode::Read => (),
 
         AccessMode::Write if !grant_flags.has_write() => {
-            debug!("Write, but grant was not PROT_WRITE.");
+            crate::debug!("Write, but grant was not PROT_WRITE.");
             return Err(PfError::Segv);
         }
         AccessMode::InstrFetch if !grant_flags.has_execute() => {
-            debug!("Instuction fetch, but grant was not PROT_EXEC.");
+            crate::debug!("Instuction fetch, but grant was not PROT_EXEC.");
             return Err(PfError::Segv);
         }
 
@@ -3155,7 +3163,7 @@ fn correct_inner<'l>(
                     let mut guard = RwLockUpgradableGuard::upgrade(guard);
 
                     // TODO: Should this be called?
-                    warn!("Mapped zero page since grant didn't exist");
+                    crate::warn!("Mapped zero page since grant didn't exist");
                     map_zeroed(
                         &mut guard.table.utable,
                         src_page,
@@ -3214,7 +3222,7 @@ fn correct_inner<'l>(
             addr_space = unsafe { addr_space_lock.acquire_rewrite(addr_space_guard_token) };
             flusher = Flusher::with_cpu_set(&addr_space_lock.used_by, &addr_space_lock.tlb_ack);
 
-            info!("Got frame {:?} from external fmap", frame);
+            crate::info!("Got frame {:?} from external fmap", frame);
 
             frame
         }
@@ -3412,7 +3420,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             PercpuBlock::current().maybe_handle_tlb_shootdown();
             #[cfg(target_arch = "aarch64")]
             if stall_watch.stalled() {
-                error!(
+                crate::error!(
                     "TLB shootdown stalled on CPU {}: acknowledgements {}/{}",
                     current_cpu_id,
                     self.state.ackword.load(Ordering::SeqCst),

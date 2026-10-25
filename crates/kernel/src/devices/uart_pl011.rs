@@ -7,7 +7,7 @@ use crate::{
     sync::CleanLockToken,
 };
 
-bitflags! {
+bitflags::bitflags! {
     /// UARTFR
     #[derive(Clone, Copy, Debug)]
     struct UartFrFlags: u32 {
@@ -19,7 +19,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// UARTCR
     #[derive(Clone, Copy, Debug)]
     struct UartCrFlags: u32 {
@@ -29,7 +29,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     // UARTIMSC
     #[derive(Clone, Copy, Debug)]
     struct UartImscFlags: u32 {
@@ -39,7 +39,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     // UARTICR
     #[derive(Clone, Copy, Debug)]
     struct UartIcrFlags: u32 {
@@ -49,7 +49,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     // UARTRIS
     #[derive(Clone, Copy, Debug)]
     struct UartRisFlags: u32 {
@@ -59,7 +59,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     //UARTMIS
     #[derive(Clone, Copy, Debug)]
     struct UartMisFlags: u32 {
@@ -68,7 +68,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     //UARTLCR_H
     #[derive(Clone, Copy, Debug)]
     struct UartLcrhFlags: u32 {
@@ -76,7 +76,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     //UARTIFLS
     #[derive(Clone, Copy, Debug)]
     struct UartIflsFlags: u32 {

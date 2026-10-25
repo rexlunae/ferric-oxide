@@ -27,6 +27,28 @@ on:
       - ".github/actions/prepare-cargo-git/**"
 
 jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-cargo-git
+      - name: Install the kernel toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/kernel/rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src --component clippy --component rustfmt --component miri
+      - name: Kernel helper format
+        run: cargo fmt --manifest-path crates/kernel/tests/Cargo.toml -p ferric-kernel-tests --check
+      - name: Kernel helper tests and lints
+        run: |
+          cargo test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-features
+          cargo clippy --locked --manifest-path crates/kernel/tests/Cargo.toml --all-targets --all-features --no-deps -- -D warnings
+      - name: Frame allocator host tests
+        run: cargo test --locked --manifest-path crates/kernel/Cargo.toml -p rmm --features std --lib
+      - name: Allocation and record memory safety
+        run: |
+          cargo miri test --locked -p ferric-aligned-buffer
+          cargo miri test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-features
+
   docs:
     runs-on: ubuntu-24.04
     strategy:

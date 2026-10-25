@@ -10,8 +10,8 @@ use hashbrown::{HashMap, HashSet};
 
 /// Super unsafe due to page table switching and raw pointers!
 pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanLockToken) {
-    println!("DEBUGGER START");
-    println!();
+    crate::println!("DEBUGGER START");
+    crate::println!();
 
     let mut tree = HashMap::new();
     let mut spaces = HashSet::new();
@@ -28,7 +28,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                 continue;
             }
             let context = context_arc.read(token.token());
-            println!("{:p}: {}", Arc::as_ptr(context_arc), context.name);
+            crate::println!("{:p}: {}", Arc::as_ptr(context_arc), context.name);
 
             let mut mark_frame_use = |frame| {
                 tree.entry(frame).or_insert((0, false)).0 += 1;
@@ -83,16 +83,17 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                 }
             }
 
-            println!("status: {:?}", context.status);
+            crate::println!("status: {:?}", context.status);
             if !context.status_reason.is_empty() {
-                println!("reason: {}", context.status_reason);
+                crate::println!("reason: {}", context.status_reason);
             }
-            println!(
+            crate::println!(
                 "running {} scheduled {}",
-                context.running, context.currently_scheduled
+                context.running,
+                context.currently_scheduled
             );
             if let Some([a, b, c, d, e, f, g]) = context.current_syscall() {
-                println!(
+                crate::println!(
                     "syscall: {}",
                     crate::syscall::debug::format_call(a, b, c, d, e, f, g)
                 );
@@ -100,7 +101,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
             if let Some(ref addr_space) = context.addr_space {
                 let addr_space = addr_space.acquire_read(token.downgrade());
                 if !addr_space.grants.is_empty() {
-                    println!("grants:");
+                    crate::println!("grants:");
                     for (base, info) in addr_space.grants.iter() {
                         let size = info.page_count() * PAGE_SIZE;
 
@@ -113,7 +114,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                         );
 
                         #[cfg(target_arch = "aarch64")]
-                        println!(
+                        crate::println!(
                             "    virt 0x{:016x}:0x{:016x} {} size 0x{:08x} {:?}",
                             base.start_address().data(),
                             base.next_by(info.page_count() - 1).start_address().data() + 0xFFF,
@@ -125,7 +126,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                         // FIXME riscv64 implementation
 
                         #[cfg(target_arch = "x86")]
-                        println!(
+                        crate::println!(
                             "    virt 0x{:08x}:0x{:08x} {} size 0x{:08x} {:?}",
                             base.start_address().data(),
                             base.next_by(info.page_count()).start_address().data() + 0xFFF,
@@ -135,7 +136,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                         );
 
                         #[cfg(target_arch = "x86_64")]
-                        println!(
+                        crate::println!(
                             "    virt 0x{:016x}:0x{:016x} {} size 0x{:08x} {:?}",
                             base.start_address().data(),
                             base.start_address().data() + size - 1,
@@ -147,7 +148,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
                 }
             }
             if let Some(regs) = context.regs() {
-                println!("regs:");
+                crate::println!("regs:");
                 regs.dump();
 
                 #[cfg(target_arch = "aarch64")]
@@ -173,7 +174,7 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
             // Switch to original page table
             unsafe { RmmA::set_table(TableKind::User, old_table) };
 
-            println!();
+            crate::println!();
         }
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -207,20 +208,23 @@ pub unsafe fn debugger(target_id: Option<*const ContextLock>, token: &mut CleanL
             Some(RefCount::Shared(s)) => (s.get(), " shared"),
         };
         if c != count {
-            println!(
+            crate::println!(
                 "frame refcount mismatch for {:?} ({} != {}{})",
-                frame, c, count, s
+                frame,
+                c,
+                count,
+                s
             );
         }
     }
 
-    println!("DEBUGGER END");
+    crate::println!("DEBUGGER END");
 }
 
 fn dump_stack(context: &Context, mut sp: usize) {
     let width = size_of::<usize>();
 
-    println!("stack: {:>0width$x}", sp, width = width);
+    crate::println!("stack: {:>0width$x}", sp, width = width);
     let mut token = unsafe { CleanLockToken::new() };
     //Maximum 64 usizes
     for _ in 0..64 {
@@ -233,15 +237,15 @@ fn dump_stack(context: &Context, mut sp: usize) {
                 .is_some()
         }) {
             let value = unsafe { *(sp as *const usize) };
-            println!("    {:>0width$x}: {:>0width$x}", sp, value, width = width);
+            crate::println!("    {:>0width$x}: {:>0width$x}", sp, value, width = width);
             if let Some(next_sp) = sp.checked_add(size_of::<usize>()) {
                 sp = next_sp;
             } else {
-                println!("    {:>0width$x}: OVERFLOW", sp, width = width);
+                crate::println!("    {:>0width$x}: OVERFLOW", sp, width = width);
                 break;
             }
         } else {
-            println!("    {:>0width$x}: GUARD PAGE", sp, width = width);
+            crate::println!("    {:>0width$x}: GUARD PAGE", sp, width = width);
             break;
         }
     }
@@ -301,7 +305,7 @@ unsafe fn check_page_table_consistency(
                     {
                         Some(g) => g,
                         None => {
-                            error!(
+                            crate::error!(
                                 "ADDRESS {:p} LACKING GRANT BUT MAPPED TO {:#0x} FLAGS {:?}!",
                                 address.data() as *const u8,
                                 physaddr.data(),
@@ -315,7 +319,7 @@ unsafe fn check_page_table_consistency(
                     if grant.flags().write(false).data() & !EXCLUDE
                         != flags.write(false).data() & !EXCLUDE
                     {
-                        error!(
+                        crate::error!(
                             "FLAG MISMATCH: {:?} != {:?}, address {:p} in grant at {:?}",
                             grant.flags(),
                             flags,
@@ -347,7 +351,7 @@ unsafe fn check_page_table_consistency(
                             }
                         }
                     } else {
-                        //println!("!OWNED {:?}", frame);
+                        //crate::println!("!OWNED {:?}", frame);
                     }
                 }
             }
@@ -360,11 +364,11 @@ unsafe fn check_page_table_consistency(
             let _entry = match addr_space.table.utable.translate(page.start_address()) {
                 Some(e) => e,
                 None => {
-                    error!("GRANT AT {:?} LACKING MAPPING AT PAGE {:p}", span, page.start_address().data() as *const u8);
+                    crate::error!("GRANT AT {:?} LACKING MAPPING AT PAGE {:p}", span, page.start_address().data() as *const u8);
                     continue;
                 }
             };
         }
     }*/
-    println!("Consistency appears correct");
+    crate::println!("Consistency appears correct");
 }

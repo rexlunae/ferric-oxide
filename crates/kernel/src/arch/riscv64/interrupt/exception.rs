@@ -37,7 +37,7 @@ pub unsafe extern "C" fn exception_handler() {
         "sd      sp, 0(tp)",
         "ld      sp, 8(tp)",
 
-        push_registers!(),
+        crate::push_registers!(),
         "ld      t0, 0(tp)",
         "sd      t0, (1 * 8)(sp)", // save original SP
         "csrrw   t0, sscratch, tp",
@@ -58,7 +58,7 @@ pub unsafe extern "C" fn exception_handler() {
 
         "addi    sp, sp, -2 * 8", // fake stack frame for the stack tracer
 
-        push_registers!(),
+        crate::push_registers!(),
 
         "addi    t1, sp, 34 * 8",
         "sd      t1, (1 * 8)(sp)", // save original SP
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn exception_handler() {
         "csrc   sstatus, t0",
 
     "4:",
-        pop_registers!(),
+        crate::pop_registers!(),
         "sret",
         sym exception_handler_inner
     );
@@ -97,7 +97,7 @@ unsafe fn exception_handler_inner(regs: &mut InterruptStack) {
             options(nostack)
         );
 
-        //info!("Exception handler incoming: sepc={:x} scause={:x} sstatus={:x}", regs.iret.sepc, scause, sstatus);
+        //crate::info!("Exception handler incoming: sepc={:x} scause={:x} sstatus={:x}", regs.iret.sepc, scause, sstatus);
 
         let user_mode = sstatus & (1 << 8) == 0;
 
@@ -109,7 +109,7 @@ unsafe fn exception_handler_inner(regs: &mut InterruptStack) {
         } else {
             handle_system_exception(scause, regs);
         }
-        //info!("Exception handler outgoing");
+        //crate::info!("Exception handler outgoing");
     }
 }
 
@@ -125,9 +125,10 @@ unsafe fn handle_system_exception(scause: usize, regs: &InterruptStack) {
             options(nostack)
         );
 
-        error!(
+        crate::error!(
             "S-mode exception! scause={:#016x}, stval={:#016x}",
-            scause, stval
+            scause,
+            stval
         );
 
         if tp == 0 {
@@ -176,9 +177,10 @@ unsafe fn handle_user_exception(scause: usize, regs: &mut InterruptStack) {
         options(nostack)
         );
 
-        info!(
+        crate::info!(
             "U-mode exception! scause={:#016x}, stval={:#016x}",
-            scause, stval
+            scause,
+            stval
         );
         regs.dump();
 

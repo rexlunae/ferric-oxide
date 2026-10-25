@@ -240,35 +240,51 @@ impl core::error::Error for FrameError {}
 ///
 /// # Panics
 ///
-/// If the compiled shadow-stack pool fails its allocation, mapping or write-protection self-test.
+/// When the `always` policy cannot be met by the CPU or the KPTI configuration.
 pub fn report() {
-    #[cfg(shstk_compiled)]
-    stacks::check_pool();
     if POLICY == Policy::Never {
         return;
     }
     let supported = cpu_has_shstk();
     let on = decision();
     if supported && !on && !window_covers_ram() {
-        warn!("CET: RAM extends beyond the shadow-stack window (1 TiB); shadow stacks stay off");
+        crate::warn!(
+            "CET: RAM extends beyond the shadow-stack window (1 TiB); shadow stacks stay off"
+        );
     }
     let decision = if on { "on" } else { "off" };
-    info!("CET: shadow stacks supported={supported} policy={POLICY} decision={decision}");
+    crate::info!("CET: shadow stacks supported={supported} policy={POLICY} decision={decision}");
     if !on {
         // The skip case, including CI on CPUs without CET_SS: nothing is enabled, behaviour
         // matches a build without shadow stacks.
-        info!("CET: shadow stacks not enabled on this boot");
+        crate::info!("CET: shadow stacks not enabled on this boot");
         return;
     }
     // `enabled_for_cpu` panics here for `always` + KPTI; `auto` + KPTI falls through to the log.
     if !enabled_for_cpu() {
-        info!(
+        crate::info!(
             "CET: supervisor shadow stacks allocated but left off (KPTI is on; enabling shadow \
              stacks alongside KPTI is not yet supported)"
         );
     } else {
-        info!("CET: supervisor shadow stacks allocated for every kernel stack; enabling CET");
+        crate::info!(
+            "CET: supervisor shadow stacks allocated for every kernel stack; enabling CET"
+        );
     }
+}
+
+/// Checks shadow-stack allocation, isolation and reuse after secondary CPUs start.
+///
+/// Runs before CET is enabled, including on machines without CET. Retiring two
+/// probe mappings while the secondary CPUs wait for the BSP also checks that
+/// those CPUs service TLB shootdowns before interrupts are enabled.
+///
+/// # Panics
+///
+/// If the pool fails its allocation, mapping or write-protection self-test.
+#[cfg(shstk_compiled)]
+pub fn check_boot_pool() {
+    stacks::check_pool();
 }
 
 #[cfg(shstk_compiled)]
@@ -583,7 +599,9 @@ mod stacks {
             // RAM can exceed the supported window while the auto policy leaves CET off. The
             // boot mapping checks still cover the reservation; a window probe must not abort
             // that fallback boot when no reserved key fits.
-            info!("CET: pool isolation window probe skipped (no reserved key fits the window)");
+            crate::info!(
+                "CET: pool isolation window probe skipped (no reserved key fits the window)"
+            );
             return;
         };
         for _ in 0..2 {
@@ -628,7 +646,7 @@ mod stacks {
                 .expect("one self-test return fits a shadow stack");
             // Drop tests retirement and pool reuse; the next allocation must be cleared.
         }
-        info!("CET: shadow-stack pool isolation self-test passed");
+        crate::info!("CET: shadow-stack pool isolation self-test passed");
     }
 
     /// The SSP MSRs the kernel writes.
@@ -880,9 +898,9 @@ mod stacks {
             // Exercise the same isolation and reuse checks with real WRSS and CET-safe #PF
             // recovery now that this CPU's shadow stack is live.
             check_pool();
-            info!("CET: shadow stacks enabled, self-test passed");
+            crate::info!("CET: shadow stacks enabled, self-test passed");
         } else {
-            debug!("CET: shadow stacks enabled on this CPU, self-test passed");
+            crate::debug!("CET: shadow stacks enabled on this CPU, self-test passed");
         }
     }
 

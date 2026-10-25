@@ -14,7 +14,7 @@ pub fn cpu_info<W: Write>(w: &mut W) -> Result {
         match Fdt::new(dtb) {
             Ok(fdt) => dtb_info(w, &fdt)?,
             Err(e) => {
-                error!("cpu_info: could not read fdt: {}", e);
+                crate::error!("cpu_info: could not read fdt: {}", e);
             }
         }
     }

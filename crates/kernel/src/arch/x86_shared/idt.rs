@@ -409,7 +409,7 @@ fn install_one_ist(pcr: &mut ProcessorControlRegion, ist: u8, stack: &Kstack) {
     crate::arch::shstk::set_ist_ssp(&mut pcr.shstk_ist_ssp, ist, stack.shadow_stack());
 }
 
-bitflags! {
+bitflags::bitflags! {
     pub struct IdtFlags: u8 {
         const PRESENT = 1 << 7;
         const RING_0 = 0 << 5;

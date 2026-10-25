@@ -321,7 +321,7 @@ impl Domain {
         // needs an invalidation there (CAP.CM, section 6.1). AMD-Vi gives no such guarantee
         // either way, so its pages are always invalidated.
         self.flush_iotlb(iova, len, false, |unit| unit.regs.cap.caching_mode())?;
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::IOMMU_MAP,
             self.did,
             self.root,
@@ -372,7 +372,7 @@ impl Domain {
             self.tables.free(page);
         }
         result.map_err(DomainError::Unmap)?;
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::IOMMU_UNMAP,
             self.did,
             self.root,
@@ -415,7 +415,7 @@ impl Domain {
             self.flush_iotlb(iova, done, false, |_| true)?;
         }
         result.map_err(DomainError::Protect)?;
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::IOMMU_PROTECT,
             self.did,
             self.root,
@@ -510,9 +510,11 @@ impl Domain {
             self.reserved.retain(|r| *r != range);
             let len = range.end.saturating_sub(range.start);
             if let Err(err) = self.unmap(range.start, len) {
-                warn!(
+                crate::warn!(
                     "IOMMU: cannot unmap reserved memory {:#x}-{:#x} from domain {}: {err}",
-                    range.start, range.end, self.did
+                    range.start,
+                    range.end,
+                    self.did
                 );
             }
         }
@@ -598,9 +600,11 @@ impl Domain {
         let mut clean = true;
         for (device, index) in core::mem::take(&mut self.attached) {
             if let Err(err) = block(self.vendor, index, device) {
-                error!(
+                crate::error!(
                     "IOMMU: cannot detach {:04x}:{} from domain {}: {err}; leaking its tables",
-                    device.segment, device.bdf, self.did
+                    device.segment,
+                    device.bdf,
+                    self.did
                 );
                 clean = false;
                 break;

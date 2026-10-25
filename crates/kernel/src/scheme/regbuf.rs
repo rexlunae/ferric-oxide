@@ -378,7 +378,7 @@ fn unmap_one(mapping: &Mapping, teardown: Teardown, token: &mut CleanLockToken) 
         space.munmap(mapping.span, true, token)
     }
     .inspect_err(|err| {
-        warn!(
+        crate::warn!(
             "regbuf: cannot unmap {:#x} ({} pages): {err:?}",
             mapping.span.base.start_address().data(),
             mapping.span.count
@@ -591,7 +591,7 @@ impl KernelScheme for RegBufScheme {
             // The pages mapped before the failure could not be unmapped again either: record
             // them on the grant, so revoking or closing it still takes them down.
             if span.count != 0 && region.grants.add_mapping(id, mapping).is_err() {
-                warn!("regbuf: {id} lost a partial mapping it could not undo");
+                crate::warn!("regbuf: {id} lost a partial mapping it could not undo");
             }
             return Err(err);
         }
@@ -611,7 +611,7 @@ fn retry_stuck(token: &mut CleanLockToken) {
     for region in stuck {
         let gone = region.lock().grants.close();
         if take_down(&region, gone, token).is_err() {
-            warn!("regbuf: a closed region still cannot unmap a grant mapping");
+            crate::warn!("regbuf: a closed region still cannot unmap a grant mapping");
         }
     }
 }
@@ -645,7 +645,7 @@ fn revoke(region: &Arc<Mutex<Region>>, id: GrantId, token: &mut CleanLockToken) 
             (gone, grants)
         };
         if !gone.is_empty() {
-            info!(
+            crate::info!(
                 "regbuf: {id} revoked with {} grant(s) under it, unmapping {} mapping(s)",
                 grants.saturating_sub(1),
                 gone.len()
@@ -712,7 +712,7 @@ fn register(
     };
     let pages = span.count as u64;
     BUDGET.lock().charge(uid, pages, limits()).map_err(|err| {
-        warn!("regbuf: cannot pin {pages} pages: {err}");
+        crate::warn!("regbuf: cannot pin {pages} pages: {err}");
         Error::new(EDQUOT)
     })?;
     // The commit is serialized with close_region by the region lock: a registration that
@@ -945,7 +945,7 @@ impl DmaGrant {
                 // Not reached: the region stayed locked since check_dma.
                 drop(region);
                 if super::iommu::revoke_grant_mapping(record).is_err() {
-                    warn!(
+                    crate::warn!(
                         "regbuf: {} lost an IOMMU mapping it could not undo",
                         self.id
                     );

@@ -8,7 +8,7 @@ use core::fmt::Write;
 use crate::{context, context::contexts, sync::CleanLockToken, syscall::error::Result};
 
 pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
-    let mut string = format!(
+    let mut string = alloc::format!(
         "{:<6}{:<6}{:<6}{:<6}{:<6}{:<11}{:<12}{:<12}{:<8}{:<8}{}\n",
         "PID",
         "EUID",
@@ -102,18 +102,18 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
 
             let cpu_string = match cpuid {
                 Some(cpu_id) => {
-                    format!("{cpu_id}")
+                    alloc::format!("{cpu_id}")
                 }
                 _ => "?".to_owned(),
             };
-            let cpu_time_string = format!(
+            let cpu_time_string = alloc::format!(
                 "{:02}:{:02}:{:02}.{:02}",
                 cpu_time_s / 3600,
                 (cpu_time_s / 60) % 60,
                 cpu_time_s % 60,
                 cpu_time_ns / 10_000_000
             );
-            let sch_time_string = format!(
+            let sch_time_string = alloc::format!(
                 "{:02}:{:02}:{:02}.{:02}",
                 sch_time_s / 3600,
                 (sch_time_s / 60) % 60,
@@ -190,12 +190,12 @@ fn format_bytes(memory: usize) -> String {
     } else if memory > KB {
         format_bytes_inner(memory, KB, "KB")
     } else {
-        format!("{memory} B")
+        alloc::format!("{memory} B")
     }
 }
 
 fn format_bytes_inner(memory: usize, divisor: usize, suffix: &'static str) -> String {
-    let mut s = format!("{}", memory / divisor);
+    let mut s = alloc::format!("{}", memory / divisor);
     if s.len() == 1 {
         let _ = write!(s, ".{:02}", (memory % divisor) / (divisor / 100));
     } else if s.len() == 2 {

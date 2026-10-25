@@ -264,7 +264,7 @@ fn prepare_trampoline() -> Option<(RaiiFrame, PhysicalAddress)> {
     let trampoline = RaiiFrame::allocate().ok()?;
     let trampoline_phys = trampoline.get().base();
     if trampoline_phys.data() >= crate::arch::consts::USER_END_OFFSET {
-        warn!("CPU trampoline lies outside the TTBR0 address range");
+        crate::warn!("CPU trampoline lies outside the TTBR0 address range");
         return None;
     }
 
@@ -272,7 +272,7 @@ fn prepare_trampoline() -> Option<(RaiiFrame, PhysicalAddress)> {
     let source_end = ptr::addr_of!(__aarch64_ap_trampoline_end) as usize;
     let source_len = source_end.checked_sub(source_start)?;
     if source_len == 0 || source_len > PAGE_SIZE {
-        warn!("CPU trampoline has invalid size {}", source_len);
+        crate::warn!("CPU trampoline has invalid size {}", source_len);
         return None;
     }
 
@@ -310,18 +310,18 @@ fn prepare_trampoline() -> Option<(RaiiFrame, PhysicalAddress)> {
 pub(super) fn prepare(topology: &[CpuDescription]) {
     let secondary_count = topology.iter().filter(|cpu| !cpu.boot_cpu).count();
     if secondary_count == 0 {
-        info!("CPU boot resources: no secondary CPUs");
+        crate::info!("CPU boot resources: no secondary CPUs");
         return;
     }
     if !cfg!(feature = "multi_core") {
-        info!("CPU boot resource preparation disabled by kernel configuration");
+        crate::info!("CPU boot resource preparation disabled by kernel configuration");
         return;
     }
     if let Some(cpu) = topology
         .iter()
         .find(|cpu| !cpu.boot_cpu && cpu.enable_method != EnableMethod::Psci)
     {
-        warn!(
+        crate::warn!(
             "CPU boot resources unavailable: secondary MPIDR={:#x} is not PSCI-enabled",
             cpu.mpidr
         );
@@ -335,25 +335,25 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
     // TTBR0 and TTBR1 walks are explicitly Inner Shareable.
     let tcr = unsafe { control_regs::tcr_el1() };
     if !tcr_walks_are_inner_shareable(tcr) {
-        error!(
+        crate::error!(
             "CPU boot resources unavailable: TCR_EL1 does not make TTBR0/TTBR1 walks inner-shareable ({:#x})",
             tcr
         );
         return;
     }
-    info!(
+    crate::info!(
         "BSP translation-table walks are inner-shareable: TCR_EL1={:#x}",
         tcr
     );
 
     let Some((trampoline, idmap_root)) = prepare_trampoline() else {
-        warn!("CPU boot resources unavailable: cannot prepare physical trampoline");
+        crate::warn!("CPU boot resources unavailable: cannot prepare physical trampoline");
         return;
     };
 
     let mut slots = Vec::new();
     if slots.try_reserve_exact(secondary_count).is_err() {
-        warn!(
+        crate::warn!(
             "CPU boot resources unavailable: cannot reserve {} slots",
             secondary_count
         );
@@ -377,9 +377,11 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
         let stack = match Kstack::new() {
             Ok(stack) => stack,
             Err(error) => {
-                warn!(
+                crate::warn!(
                     "CPU boot resources unavailable for logical {} MPIDR={:#x}: stack: {:?}",
-                    logical_id, cpu.mpidr, error
+                    logical_id,
+                    cpu.mpidr,
+                    error
                 );
                 return;
             }
@@ -387,9 +389,11 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
         let percpu = match crate::arch::misc::prepare(logical_id) {
             Ok(percpu) => percpu,
             Err(error) => {
-                warn!(
+                crate::warn!(
                     "CPU boot resources unavailable for logical {} MPIDR={:#x}: percpu: {:?}",
-                    logical_id, cpu.mpidr, error
+                    logical_id,
+                    cpu.mpidr,
+                    error
                 );
                 return;
             }
@@ -397,9 +401,11 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
         let args = match RaiiFrame::allocate() {
             Ok(args) => args,
             Err(error) => {
-                warn!(
+                crate::warn!(
                     "CPU boot resources unavailable for logical {} MPIDR={:#x}: args: {:?}",
-                    logical_id, cpu.mpidr, error
+                    logical_id,
+                    cpu.mpidr,
+                    error
                 );
                 return;
             }
@@ -445,7 +451,7 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
         trampoline,
         idmap_root,
     });
-    info!(
+    crate::info!(
         "CPU boot resources: {} PSCI slots ready, trampoline={:#x}, idmap={:#x}",
         resources.slots.len(),
         resources.trampoline.get().base().data(),
@@ -453,7 +459,7 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
     );
     for slot in &resources.slots {
         let stack_top = slot.stack.initial_top_phys();
-        debug!(
+        crate::debug!(
             "CPU boot slot logical {}: MPIDR={:#x} stack_phys={:#x}..{:#x} percpu_phys={:#x} args_phys={:#x}",
             slot.logical_id,
             slot.mpidr,
@@ -467,18 +473,18 @@ pub(super) fn prepare(topology: &[CpuDescription]) {
 
 pub(super) fn start_secondaries() {
     if !cfg!(feature = "multi_core") {
-        info!("CPU activation disabled by kernel configuration");
+        crate::info!("CPU activation disabled by kernel configuration");
         return;
     }
     let Some(resources) = BOOT_RESOURCES.get() else {
         return;
     };
     let Some(gic_capacity) = crate::arch::device::irqchip::cpu_capacity() else {
-        error!("CPU activation unavailable: PSCI secondary boot currently requires GICv2");
+        crate::error!("CPU activation unavailable: PSCI secondary boot currently requires GICv2");
         return;
     };
     if resources.slots.len() + 1 > gic_capacity {
-        error!(
+        crate::error!(
             "CPU activation unavailable: topology requires {} CPUs but GICv2 exposes {} interfaces",
             resources.slots.len() + 1,
             gic_capacity
@@ -486,18 +492,18 @@ pub(super) fn start_secondaries() {
         return;
     }
     if crate::arch::device::irqchip::current_cpu_target_mask().is_none() {
-        error!("CPU activation unavailable: BSP has no directed-SGI target mask");
+        crate::error!("CPU activation unavailable: BSP has no directed-SGI target mask");
         return;
     }
     if !crate::arch::device::generic_timer::ready() {
-        error!("CPU activation unavailable: architected timer is not initialized");
+        crate::error!("CPU activation unavailable: architected timer is not initialized");
         return;
     }
 
     let entry_phys = resources.trampoline.get().base().data();
     let frequency = u64::from(unsafe { control_regs::cntfrq_el0() });
     if frequency == 0 {
-        error!("CPU activation unavailable: architected timer frequency is zero");
+        crate::error!("CPU activation unavailable: architected timer frequency is zero");
         return;
     }
     let timeout_ticks = frequency.saturating_mul(BOOT_TIMEOUT_SECONDS);
@@ -508,17 +514,19 @@ pub(super) fn start_secondaries() {
         args.state.store(STATE_STARTING, Ordering::Release);
         clean_data_to_poc(args as *const BootArgs as usize, size_of::<BootArgs>());
 
-        info!(
+        crate::info!(
             "CPU logical {}: PSCI CPU_ON MPIDR={:#x}",
-            slot.logical_id, slot.mpidr
+            slot.logical_id,
+            slot.mpidr
         );
         if let Err(error) =
             crate::arch::device::psci::cpu_on(slot.mpidr, entry_phys, slot.args.get().base().data())
         {
             args.state.store(STATE_FAILED, Ordering::Release);
-            error!(
+            crate::error!(
                 "CPU logical {}: PSCI CPU_ON failed: {:?}",
-                slot.logical_id, error
+                slot.logical_id,
+                error
             );
             break;
         }
@@ -536,37 +544,38 @@ pub(super) fn start_secondaries() {
                     ) {
                         args.state.store(STATE_ABORTED, Ordering::Release);
                         unsafe { asm!("sev", options(nostack)) };
-                        error!(
+                        crate::error!(
                             "CPU logical {}: local SGI self-test could not start: {:?}",
-                            slot.logical_id, error
+                            slot.logical_id,
+                            error
                         );
                         return;
                     }
                     self_test_sgi_sent = true;
                 }
                 STATE_FAILED | STATE_ABORTED => {
-                    error!(
+                    crate::error!(
                         "CPU logical {}: secondary initialization failed",
                         slot.logical_id
                     );
                     return;
                 }
                 STATE_BAD_ENTRY_EL => {
-                    error!(
+                    crate::error!(
                         "CPU logical {}: unsupported exception level",
                         slot.logical_id
                     );
                     return;
                 }
                 STATE_ARGS_INVALID => {
-                    error!(
+                    crate::error!(
                         "CPU logical {}: boot arguments invalid after trampoline",
                         slot.logical_id
                     );
                     return;
                 }
                 STATE_PERCPU_INVALID => {
-                    error!(
+                    crate::error!(
                         "CPU logical {}: per-CPU pointer invalid after trampoline",
                         slot.logical_id
                     );
@@ -589,7 +598,7 @@ pub(super) fn start_secondaries() {
                     break;
                 }
                 unsafe { asm!("sev", options(nostack)) };
-                error!("CPU logical {}: boot handshake timed out", slot.logical_id);
+                crate::error!("CPU logical {}: boot handshake timed out", slot.logical_id);
                 return;
             }
             core::hint::spin_loop();
@@ -598,7 +607,7 @@ pub(super) fn start_secondaries() {
         if !crate::publish_cpu(slot.logical_id) {
             args.state.store(STATE_ABORTED, Ordering::Release);
             unsafe { asm!("sev", options(nostack)) };
-            error!(
+            crate::error!(
                 "CPU logical {}: refused non-contiguous online publication",
                 slot.logical_id
             );
@@ -607,10 +616,10 @@ pub(super) fn start_secondaries() {
         args.state.store(STATE_ONLINE, Ordering::Release);
         unsafe { asm!("sev", options(nostack)) };
         online += 1;
-        info!("CPU logical {}: online", slot.logical_id);
+        crate::info!("CPU logical {}: online", slot.logical_id);
     }
 
-    info!("CPU activation complete: {} CPUs online", online);
+    crate::info!("CPU activation complete: {} CPUs online", online);
 }
 
 unsafe extern "C" fn secondary_start(args_ptr: *const BootArgs) -> ! {
@@ -643,18 +652,20 @@ unsafe extern "C" fn secondary_start(args_ptr: *const BootArgs) -> ! {
         );
     }
     if let Err(error) = crate::arch::device::irqchip::init_ap() {
-        error!(
+        crate::error!(
             "CPU logical {}: local GIC init failed: {:?}",
-            logical_id, error
+            logical_id,
+            error
         );
         args.state.store(STATE_FAILED, Ordering::Release);
         unsafe { asm!("sev", options(nostack)) };
         park();
     }
     if let Err(error) = crate::arch::device::generic_timer::init_ap() {
-        error!(
+        crate::error!(
             "CPU logical {}: local timer init failed: {:?}",
-            logical_id, error
+            logical_id,
+            error
         );
         args.state.store(STATE_FAILED, Ordering::Release);
         unsafe { asm!("sev", options(nostack)) };
@@ -695,9 +706,10 @@ unsafe extern "C" fn secondary_start(args_ptr: *const BootArgs) -> ! {
                 saw_timer = true;
             } else {
                 crate::arch::device::irqchip::end_root(raw_iar);
-                error!(
+                crate::error!(
                     "CPU logical {}: unexpected local IRQ {} during boot self-test",
-                    logical_id, hwirq
+                    logical_id,
+                    hwirq
                 );
                 args.state.store(STATE_FAILED, Ordering::Release);
                 unsafe { asm!("sev", options(nostack)) };
@@ -706,9 +718,11 @@ unsafe extern "C" fn secondary_start(args_ptr: *const BootArgs) -> ! {
         }
 
         if unsafe { control_regs::cntvct_el0() }.wrapping_sub(started) >= timeout_ticks {
-            error!(
+            crate::error!(
                 "CPU logical {}: local interrupt self-test timed out (sgi={}, timer={})",
-                logical_id, saw_sgi, saw_timer
+                logical_id,
+                saw_sgi,
+                saw_timer
             );
             args.state.store(STATE_FAILED, Ordering::Release);
             unsafe { asm!("sev", options(nostack)) };
@@ -729,7 +743,7 @@ unsafe extern "C" fn secondary_start(args_ptr: *const BootArgs) -> ! {
     {
         park();
     }
-    info!(
+    crate::info!(
         "CPU logical {}: local SGI/timer self-test passed",
         logical_id
     );

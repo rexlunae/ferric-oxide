@@ -98,11 +98,11 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
                 init_early(dtb);
             }
 
-            info!("Redox OS starting...");
+            crate::info!("Ferric Oxide starting...");
             args.print();
 
             if let Some(dtb) = &dtb {
-                debug!("device tree: {:?}", dtb);
+                crate::debug!("device tree: {:?}", dtb);
             }
 
             // Initialize RMM
@@ -110,7 +110,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
 
             let boot_hart_id =
                 get_boot_hart_id(args.env()).expect("Didn't get boot HART id from bootloader");
-            info!("Booting on HART {}", boot_hart_id);
+            crate::info!("Booting on HART {}", boot_hart_id);
             BOOT_HART_ID.store(boot_hart_id, Ordering::Relaxed);
 
             paging::init();

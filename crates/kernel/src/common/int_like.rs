@@ -7,7 +7,7 @@
 //! /// Define an opaque type `Pid` backed by a `usize`.
 //! int_like!(Pid, usize);
 //!
-//! const ZERO: Pid = Pid::from(0);
+//! const ZERO: Pid = Pid::new(0);
 //! ```
 //!
 //! # Example
@@ -18,10 +18,11 @@
 //!
 //! int_like!(Pid, AtomicPid, usize, AtomicUsize);
 //!
-//! const ZERO: Pid = Pid::from(0);
+//! const ZERO: Pid = Pid::new(0);
 //! let ATOMIC_PID: AtomicPid = AtomicPid::default();
 //! ```
 
+/// Defines an integer newtype and, optionally, its typed atomic wrapper.
 #[macro_export]
 macro_rules! int_like {
     ($new_type_name:ident, $backing_type: ident) => {
@@ -56,7 +57,7 @@ macro_rules! int_like {
     };
 
     ($new_type_name:ident, $new_atomic_type_name: ident, $backing_type:ident, $backing_atomic_type:ident) => {
-        int_like!($new_type_name, $backing_type);
+        $crate::int_like!($new_type_name, $backing_type);
 
         /// A mutable holder for T that can safely be shared among threads.
         /// Runtime equivalent to using `AtomicUsize`, just type-safer.
@@ -151,11 +152,11 @@ fn test() {
     use ::core::sync::atomic::AtomicUsize;
 
     // Generate type `usize_like`.
-    int_like!(UsizeLike, usize);
+    crate::int_like!(UsizeLike, usize);
     assert_eq!(size_of::<UsizeLike>(), size_of::<usize>());
 
     // Generate types `usize_like` and `AtomicUsize`.
-    int_like!(UsizeLike2, AtomicUsizeLike, usize, AtomicUsize);
+    crate::int_like!(UsizeLike2, AtomicUsizeLike, usize, AtomicUsize);
     assert_eq!(size_of::<UsizeLike2>(), size_of::<usize>());
     assert_eq!(size_of::<AtomicUsizeLike>(), size_of::<AtomicUsize>());
 }

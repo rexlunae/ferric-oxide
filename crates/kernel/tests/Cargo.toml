@@ -1,0 +1,17 @@
+# Host tests of actual kernel modules, sharing the kernel's dependency lockfile.
+[package]
+name = "ferric-kernel-tests"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+redox_syscall = { path = "../syscall", default-features = false }
+ferric-irq = { path = "../../irq", optional = true }
+
+[features]
+irq-percpu = ["dep:ferric-irq"]

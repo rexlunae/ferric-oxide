@@ -200,7 +200,7 @@ fn register_memory_from_kernel_args(args: &KernelArgs) {
 
 pub fn register_memory_region(base: usize, size: usize, kind: BootloaderMemoryKind) {
     if kind != Null && size != 0 {
-        debug!("Registering {:?} memory {:X} size {:X}", kind, base, size);
+        crate::debug!("Registering {:?} memory {:X} size {:X}", kind, base, size);
         unsafe { (*MEMORY_MAP.get()).register(base, size, kind) }
     }
 }
@@ -225,9 +225,12 @@ unsafe fn add_memory(areas: &mut [MemoryArea], area_i: &mut usize, mut area: Mem
     unsafe {
         for reservation in (*MEMORY_MAP.get()).non_free() {
             if area.end > reservation.start && area.end <= reservation.end {
-                info!(
+                crate::info!(
                     "Memory {:X}:{:X} overlaps with reservation {:X}:{:X}",
-                    area.start, area.end, reservation.start, reservation.end
+                    area.start,
+                    area.end,
+                    reservation.start,
+                    reservation.end
                 );
                 area.end = reservation.start;
             }
@@ -236,9 +239,12 @@ unsafe fn add_memory(areas: &mut [MemoryArea], area_i: &mut usize, mut area: Mem
             }
 
             if area.start >= reservation.start && area.start < reservation.end {
-                info!(
+                crate::info!(
                     "Memory {:X}:{:X} overlaps with reservation {:X}:{:X}",
-                    area.start, area.end, reservation.start, reservation.end
+                    area.start,
+                    area.end,
+                    reservation.start,
+                    reservation.end
                 );
                 area.start = reservation.end;
             }
@@ -247,9 +253,12 @@ unsafe fn add_memory(areas: &mut [MemoryArea], area_i: &mut usize, mut area: Mem
             }
 
             if area.start <= reservation.start && area.end > reservation.start {
-                info!(
+                crate::info!(
                     "Memory {:X}:{:X} contains reservation {:X}:{:X}",
-                    area.start, area.end, reservation.start, reservation.end
+                    area.start,
+                    area.end,
+                    reservation.start,
+                    reservation.end
                 );
                 debug_assert!(area.start < reservation.start && reservation.end < area.end,
                     "Should've contained reservation entirely: memory block {:X}:{:X} reservation {:X}:{:X}",
@@ -296,9 +305,14 @@ unsafe fn add_memory(areas: &mut [MemoryArea], area_i: &mut usize, mut area: Mem
                 kind: BootloaderMemoryKind::Free,
             };
             if let Some(union) = area.combine(&other) {
-                debug!(
+                crate::debug!(
                     "{:X}:{:X} overlaps with area {:X}:{:X}, combining into {:X}:{:X}",
-                    area.start, area.end, other.start, other.end, union.start, union.end
+                    area.start,
+                    area.end,
+                    other.start,
+                    other.end,
+                    union.start,
+                    union.end
                 );
                 area = union;
                 *area_i -= 1; // delete the original memory chunk
@@ -355,7 +369,7 @@ unsafe fn map_phys_contiguous_inactive<A: Arch>(
         .try_into()
         .expect("unrealistic page table depth");
 
-    debug!(
+    crate::debug!(
         "Contiguously mapping {:#0x} => {:#0x}, {page_count} pages, level {highest_map_level}",
         phys_base.data(),
         virt_base.data()
@@ -366,7 +380,7 @@ unsafe fn map_phys_contiguous_inactive<A: Arch>(
         let next_level = (level + 1).min(highest_map_level);
         let pages_this_level = 1 << (A::PAGE_ENTRY_SHIFT * usize::from(level));
         let pages_next_level = 1 << (A::PAGE_ENTRY_SHIFT * usize::from(next_level));
-        debug!(
+        crate::debug!(
             "head+middle lvl {level} next {next_level} pages_per_iter {pages_this_level} base {:#0x} remaining {page_count}",
             phys_base.data()
         );
@@ -380,7 +394,7 @@ unsafe fn map_phys_contiguous_inactive<A: Arch>(
                 // Always use highest possible level.
                 break;
             }
-            trace!(
+            crate::trace!(
                 "level {level} mapping {:#0x} => {:#0x}, bump alloc off {:#0x}",
                 phys_base.data(),
                 virt_base.data(),
@@ -402,7 +416,7 @@ unsafe fn map_phys_contiguous_inactive<A: Arch>(
     // tail
     for level in (0..highest_map_level).rev() {
         let pages_this_level = 1 << (A::PAGE_ENTRY_SHIFT * usize::from(level));
-        debug!(
+        crate::debug!(
             "tail lvl {level} pages {pages_this_level} base {:#0x} remaining {page_count}",
             phys_base.data()
         );
@@ -454,7 +468,7 @@ unsafe fn map_memory<A: Arch>(
         let highest_huge_level = (NonZeroU8::new(1).unwrap()..NonZeroU8::MAX)
             .position(|lvl| A::entry_flag_large(lvl).is_none())
             .map_or(0, |i| u8::try_from(i).unwrap());
-        info!("Highest huge page level: {highest_huge_level}");
+        crate::info!("Highest huge page level: {highest_huge_level}");
 
         // Map all physical areas at PHYS_OFFSET
         let physmap_flags = PageFlags::new()
@@ -462,7 +476,7 @@ unsafe fn map_memory<A: Arch>(
             .global(cfg!(target_arch = "x86_64"));
         for area in areas.iter() {
             if area.size % PAGE_SIZE != 0 || area.base.data() % PAGE_SIZE != 0 {
-                error!("Unaligned area: {area:?}");
+                crate::error!("Unaligned area: {area:?}");
             }
             let end = area
                 .base
@@ -494,9 +508,10 @@ unsafe fn map_memory<A: Arch>(
             assert_eq!(args.stack_size % PAGE_SIZE as u64, 0);
             assert_ne!(args.stack_size, 0);
 
-            debug!(
+            crate::debug!(
                 "MAPPING STACK, BASE {:x} SIZE {:x}",
-                args.stack_base, args.stack_size
+                args.stack_base,
+                args.stack_size
             );
             map_phys_contiguous_inactive(
                 &mut mapper,
@@ -572,8 +587,8 @@ unsafe fn map_memory<A: Arch>(
             }
         }
 
-        debug!("Table: {:X}", mapper.table().phys().data());
-        mapper.table().debug_entries(|args| debug!("{args}"));
+        crate::debug!("Table: {:X}", mapper.table().phys().data());
+        mapper.table().debug_entries(|args| crate::debug!("{args}"));
 
         #[cfg(all(target_arch = "x86_64", shstk_compiled))]
         for phys in crate::arch::shstk::pool_region().range().step_by(PAGE_SIZE) {
@@ -638,14 +653,16 @@ fn choose_phys_offset() -> usize {
         let phys_end = map_end(|kind| kind != Null);
         match crate::arch::kaslr::choose_phys_offset(phys_end) {
             Some(offset) => {
-                info!(
+                crate::info!(
                     "KASLR: physical memory map randomized ({} bits)",
                     crate::arch::kaslr::entropy_bits(phys_end)
                 );
                 return offset;
             }
             None => {
-                warn!("KASLR: no hardware randomness or room; physical memory map not moved");
+                crate::warn!(
+                    "KASLR: no hardware randomness or room; physical memory map not moved"
+                );
             }
         }
     }
@@ -694,7 +711,7 @@ pub unsafe fn init(
 
         // Copy initial memory map, and page align it
         for area in (*MEMORY_MAP.get()).free() {
-            debug!("{:X}:{:X}", area.start, area.end);
+            crate::debug!("{:X}:{:X}", area.start, area.end);
 
             if let Some(area) = area.intersect(&physmem_limit) {
                 add_memory(areas, &mut area_i, area);
@@ -711,14 +728,17 @@ pub unsafe fn init(
         let mut size = 0_usize;
         for area in areas.iter() {
             if area.size > 0 {
-                debug!("{:X?}", area);
+                crate::debug!("{:X?}", area);
                 size = size.saturating_add(area.size);
             }
         }
 
-        info!("Memory: {} MB", size.div_ceil(MEGABYTE));
+        crate::info!("Memory: {} MB", size.div_ceil(MEGABYTE));
 
         // Create a basic allocator for the first pages
+        // SAFETY: The boot memory map has excluded reserved ranges and produced
+        // disjoint, page-aligned usable areas mapped by CurrentRmmArch. Startup
+        // transfers their ownership to this single allocator.
         let mut bump_allocator = BumpAllocator::<CurrentRmmArch>::new(areas, 0);
 
         #[cfg(all(target_arch = "x86_64", shstk_compiled))]
@@ -728,7 +748,7 @@ pub unsafe fn init(
         // Ferric Oxide: the bootloader may have moved the kernel image (kernel image KASLR); say
         // so beside the physical-map KASLR line.
         if crate::kernel_image_slide() != 0 {
-            info!("KASLR: kernel image randomized");
+            crate::info!("KASLR: kernel image randomized");
         }
         map_memory(args, areas, &mut bump_allocator, phys_offset);
         // The new table is active, so phys_to_virt can follow it now.
@@ -737,7 +757,7 @@ pub unsafe fn init(
 
         // Create the physical memory map
         let offset = bump_allocator.offset();
-        info!("Permanently used: {} KB", offset.div_ceil(KILOBYTE));
+        crate::info!("Permanently used: {} KB", offset.div_ceil(KILOBYTE));
         bump_allocator
     }
 }

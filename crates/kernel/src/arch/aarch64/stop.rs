@@ -1,7 +1,7 @@
 use crate::{arch::device::psci, sync::CleanLockToken};
 
 fn halt_after_failed_psci(operation: &str, error: psci::CallError) -> ! {
-    error!("PSCI {} failed: {:?}", operation, error);
+    crate::error!("PSCI {} failed: {:?}", operation, error);
     loop {
         unsafe {
             crate::arch::interrupt::disable();
@@ -11,7 +11,7 @@ fn halt_after_failed_psci(operation: &str, error: psci::CallError) -> ! {
 }
 
 pub unsafe fn kreset() -> ! {
-    println!("kreset");
+    crate::println!("kreset");
     match psci::system_reset() {
         Ok(()) => unreachable!(),
         Err(error) => halt_after_failed_psci("SYSTEM_RESET", error),
@@ -26,7 +26,7 @@ pub unsafe fn emergency_reset() -> ! {
 }
 
 pub unsafe fn kstop(_token: &mut CleanLockToken) -> ! {
-    println!("kstop");
+    crate::println!("kstop");
     match psci::system_off() {
         Ok(()) => unreachable!(),
         Err(error) => halt_after_failed_psci("SYSTEM_OFF", error),

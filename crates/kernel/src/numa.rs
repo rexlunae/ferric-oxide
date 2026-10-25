@@ -35,7 +35,10 @@ pub struct NumaNodeID(u32);
 impl NumaNodeID {
     pub fn new(node_id: u32) -> Result<Self, String> {
         if node_id as usize >= MAX_DOMAINS {
-            return Err(format!("Number of nodes supported is {}", MAX_DOMAINS));
+            return Err(alloc::format!(
+                "Number of nodes supported is {}",
+                MAX_DOMAINS
+            ));
         }
         Ok(NumaNodeID(node_id))
     }
@@ -192,18 +195,18 @@ pub fn dump_info() {
         && let Some(memories) = NUMA_MEMORY.get()
         && let Some(nodes) = NUMA_NODES.get()
     {
-        println!(
+        crate::println!(
             "Number of NUMA nodes: {}",
             nodes.iter().filter(|e| e.is_some()).count()
         );
         for i in 0..cpus.len() {
             if let Some(cpu) = cpus[i] {
-                println!("CPU {} : Node {}", i, cpu.get());
+                crate::println!("CPU {} : Node {}", i, cpu.get());
             }
         }
         for i in 0..memories.len() {
             if let Some(ref memory) = memories[i] {
-                println!(
+                crate::println!(
                     "Memory Block starting at address {:#x} of size {:#x} bytes : Node {}",
                     memory.start,
                     memory.length,
@@ -212,7 +215,7 @@ pub fn dump_info() {
             }
         }
     } else {
-        println!("Unable to determine NUMA topology");
+        crate::println!("Unable to determine NUMA topology");
     }
 }
 

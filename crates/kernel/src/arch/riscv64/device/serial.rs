@@ -37,7 +37,7 @@ pub unsafe fn init(fdt: &Fdt) -> Option<()> {
                 .ic
                 .irq_xlate(intr)
                 .unwrap();
-            info!("serial_port virq = {}", virq);
+            crate::info!("serial_port virq = {}", virq);
             register_irq(virq as u32, Box::new(Com1Irq {}));
             IRQ_CHIP.irq_enable(virq as u32);
         }

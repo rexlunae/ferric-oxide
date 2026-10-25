@@ -167,7 +167,7 @@ pub fn syscall(
             // TODO: This can't be removed yet, since the pre-libredox softbuffer crate is a blocker.
             SYS_FSYNC => {
                 //let ctxt_name = crate::context::current().read(token.token()).name;
-                //warn!("Context `{ctxt_name}` is using deprecated SYS_FSYNC");
+                //crate::warn!("Context `{ctxt_name}` is using deprecated SYS_FSYNC");
 
                 file_op_generic(fd, token, |scheme, number, token| {
                     scheme.fsync(number, token).map(|()| 0)
@@ -180,7 +180,7 @@ pub fn syscall(
                 if e & (1 << 17) != 0 {
                     let flags =
                         CallFlags::from_bits(e & !0xff & !(1 << 17)).ok_or(Error::new(EINVAL))?;
-                    warn!("Using old SYS_CALL flags, please update relibc/base and rebuild");
+                    crate::warn!("Using old SYS_CALL flags, please update relibc/base and rebuild");
                     if g / core::mem::size_of::<usize>() > 16 {
                         return Err(Error::new(EINVAL));
                     };
@@ -236,7 +236,7 @@ pub fn syscall(
             }
             // TODO: remove soon
             SYS_OPENAT_INTO => {
-                warn!("Using old SYS_OPENAT_INTO, please update relibc/base and rebuild");
+                crate::warn!("Using old SYS_OPENAT_INTO, please update relibc/base and rebuild");
                 openat_into(
                     fd,
                     UserSlice::ro(c, d)?,

@@ -38,8 +38,17 @@ expect_endbr kernel::arch::x86_64::interrupt::syscall::syscall_instruction
 expect_endbr kstart
 expect_endbr kernel::arch::x86_shared::start::kstart_ap
 
-# Every interrupt and exception stub the IDT points at (the naked functions, not their `inner`).
-handlers="$(nm -C "$kernel" | sed -n 's/^[0-9a-f]* [tT] \(kernel::arch::x86_shared::interrupt::\(exception\|irq\|ipi\)::[a-z0-9_]*\)$/\1/p')"
+# Select linked interrupt declarations, excluding ordinary direct-call helpers
+# such as irq::acknowledge. LLVM need not emit endbr64 for those helpers.
+declarations="$(
+    for family in exception irq ipi; do
+        sed -nE "s/^(crate::)?interrupt(_stack|_error)?!\(([a-z0-9_]+),.*/kernel::arch::x86_shared::interrupt::$family::\3/p" \
+            "crates/kernel/src/arch/x86_shared/interrupt/$family.rs"
+    done
+)"
+handlers="$(nm -C "$kernel" \
+    | sed -nE 's/^[0-9a-f]+ [tT] (kernel::arch::x86_shared::interrupt::(exception|irq|ipi)::[a-z0-9_]+)$/\1/p' \
+    | grep -Fx "$declarations" || true)"
 count="$(grep -c . <<< "$handlers" || true)"
 if [ "$count" -lt 30 ]; then
     echo "Found only $count interrupt handlers; did their names change?"

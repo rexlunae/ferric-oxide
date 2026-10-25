@@ -39,7 +39,10 @@ fn missing_features(level: u8, missing: &mut impl FnMut(&'static str)) {
         need("ssse3", b.is_some_and(|f| f.has_ssse3()));
         need("sse4.1", b.is_some_and(|f| f.has_sse41()));
         need("sse4.2", b.is_some_and(|f| f.has_sse42()));
-        need("lahf_lm", ext_proc.as_ref().is_some_and(|f| f.has_lahf_sahf()));
+        need(
+            "lahf_lm",
+            ext_proc.as_ref().is_some_and(|f| f.has_lahf_sahf()),
+        );
     }
     if level >= 3 {
         let b = basic.as_ref();
@@ -76,17 +79,20 @@ pub fn check() {
     let mut count = 0usize;
     missing_features(level, &mut |name| {
         if count == 0 {
-            error!("This CPU does not meet x86-64-v{} required by this build.", level);
+            crate::error!(
+                "This CPU does not meet x86-64-v{} required by this build.",
+                level
+            );
         }
-        error!("  missing CPU feature: {}", name);
+        crate::error!("  missing CPU feature: {}", name);
         count = count.saturating_add(1);
     });
 
     if count == 0 {
-        info!("CPU meets x86-64-v{}", level);
+        crate::info!("CPU meets x86-64-v{}", level);
         return;
     }
-    error!(
+    crate::error!(
         "Rebuild with a lower cpu.x86_64_level in ferric.toml, or boot on a newer CPU. Halting."
     );
     loop {

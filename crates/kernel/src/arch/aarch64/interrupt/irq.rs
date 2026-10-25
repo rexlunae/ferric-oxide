@@ -25,7 +25,7 @@ unsafe fn dispatch() {
     {
         unsafe { IRQ_CHIP.trigger_virq(virq as u32, &mut token) };
     } else {
-        println!("unexpected irq num {}", hwirq);
+        crate::println!("unexpected irq num {}", hwirq);
         // IDs 1020..1023 are special/spurious GIC values and must not be
         // written to EOIR because no interrupt was acknowledged.
         if hwirq < 1020 {
@@ -34,9 +34,9 @@ unsafe fn dispatch() {
     }
 }
 
-exception_stack!(irq_at_el0, |_stack| { unsafe { dispatch() } });
+crate::exception_stack!(irq_at_el0, |_stack| { unsafe { dispatch() } });
 
-exception_stack!(irq_at_el1, |_stack| { unsafe { dispatch() } });
+crate::exception_stack!(irq_at_el1, |_stack| { unsafe { dispatch() } });
 
 /*
 pub unsafe fn irq_handler_gentimer(irq: u32) {

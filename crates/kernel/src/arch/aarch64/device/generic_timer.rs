@@ -11,7 +11,7 @@ use crate::{
 use fdt::Fdt;
 use syscall::{Error, Result, EINVAL, ENODEV};
 
-bitflags! {
+bitflags::bitflags! {
     struct TimerCtrlFlags: u32 {
         const ENABLE = 1 << 0;
         const IMASK = 1 << 1;
@@ -36,35 +36,35 @@ pub(crate) fn ready() -> bool {
 
 pub unsafe fn init(fdt: &Fdt<'_>) {
     let use_virtual = unsafe { !control_regs::vhe_present() };
-    debug!("generic_timer use_virtual_timer = {:?}", use_virtual);
+    crate::debug!("generic_timer use_virtual_timer = {:?}", use_virtual);
 
     let clk_freq = unsafe { control_regs::cntfrq_el0() };
     if clk_freq == 0 {
-        error!("architected timer reports zero frequency");
+        crate::error!("architected timer reports zero frequency");
         return;
     }
 
     let Some(node) = fdt.find_compatible(&["arm,armv8-timer", "arm,armv7-timer"]) else {
-        error!("architected timer not found in devicetree");
+        crate::error!("architected timer not found in devicetree");
         return;
     };
     let irq_index = if use_virtual { 2 } else { 1 };
     let Some(irq) = get_interrupt(fdt, &node, irq_index) else {
-        error!("architected timer is missing interrupt index {}", irq_index);
+        crate::error!("architected timer is missing interrupt index {}", irq_index);
         return;
     };
-    debug!("architected timer irq = {:?}", irq);
+    crate::debug!("architected timer irq = {:?}", irq);
 
     let Some(ic_idx) = ic_for_chip(fdt, &node) else {
-        error!("failed to find interrupt parent for architected timer");
+        crate::error!("failed to find interrupt parent for architected timer");
         return;
     };
     let Ok(virq) = (unsafe { IRQ_CHIP.irq_chip_list.chips[ic_idx].ic.irq_xlate(irq) }) else {
-        error!("failed to translate architected timer interrupt");
+        crate::error!("failed to translate architected timer interrupt");
         return;
     };
     let Some(desc) = (unsafe { IRQ_CHIP.irq_desc.get(virq) }) else {
-        error!(
+        crate::error!(
             "architected timer virq {} is outside the descriptor table",
             virq
         );
@@ -79,11 +79,11 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
         virq: virq as u32,
     };
     if config.reload_count == 0 {
-        error!("architected timer frequency is too low");
+        crate::error!("architected timer frequency is too low");
         return;
     }
 
-    info!(
+    crate::info!(
         "architected timer virq = {} ({})",
         virq,
         if use_virtual {
@@ -101,7 +101,7 @@ pub unsafe fn init_acpi(non_secure_physical_gsiv: u32, virtual_gsiv: u32) {
     let use_virtual = unsafe { !control_regs::vhe_present() };
     let clk_freq = unsafe { control_regs::cntfrq_el0() };
     if clk_freq == 0 {
-        error!("architected timer reports zero frequency");
+        crate::error!("architected timer reports zero frequency");
         return;
     }
     let hwirq = if use_virtual {
@@ -111,7 +111,7 @@ pub unsafe fn init_acpi(non_secure_physical_gsiv: u32, virtual_gsiv: u32) {
     };
     let reload_count = clk_freq / 100;
     if reload_count == 0 {
-        error!("architected timer frequency is too low");
+        crate::error!("architected timer frequency is too low");
         return;
     }
     let config = TIMER.call_once(|| TimerConfig {
@@ -121,7 +121,7 @@ pub unsafe fn init_acpi(non_secure_physical_gsiv: u32, virtual_gsiv: u32) {
         hwirq,
         virq: hwirq,
     });
-    info!(
+    crate::info!(
         "architected timer virq = {} ({})",
         config.virq,
         if config.use_virtual {

@@ -25,6 +25,21 @@ SMAP and FSGSBASE retain the same policy model. SMAP limits supervisor access
 to user mappings; FSGSBASE provides the selected fast FS/GS-base operations.
 CPU baseline validation is in `arch/x86_64/cpu_level.rs`.
 
+Saved CPU-state buffers use `ferric-aligned-buffer` (`crates/aligned-buffer/`).
+It retains each allocation's exact layout for deallocation and uses the same
+implementation in host tests and the kernel. Empty buffers require no allocation;
+invalid alignments and oversized layouts return typed errors. Kernel context
+creation maps allocation failures to `ENOMEM`. The buffer holds initialized bytes
+rather than arbitrary zeroed Rust types, so it needs no unsafe zero-validity trait.
+
+The boot-time `rmm::BumpAllocator` requires an unsafe constructor: its caller
+must transfer exclusive ownership of disjoint, aligned, writable mapped areas.
+It rejects zero or overflowing frame requests
+before advancing its cursor. An initial offset beyond every memory area produces
+an exhausted allocator with zero remaining capacity. Its host tests cover these
+boundaries and zeroing/disjointness of allocations in the software memory model.
+These checks do not validate real page-table or TLB operations.
+
 ### ARM64 signal arguments
 
 In relibc, `redox-rt/src/arch/aarch64.rs` saves an interrupted program's
@@ -167,8 +182,11 @@ The boot self-test also checks PTEs, attempts ordinary writes to the shadow
 mapping and both physical-map addresses, and requires page faults without
 changing the entries. Its narrowly scoped fault recovery restarts the same
 `rep stosq` with zero count, preserving the return RIP and CET shadow frame.
-It checks clearing and reuse before enable, and repeats with real `WRSS` after
-the BSP enables CET. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
+It checks clearing and reuse after the secondary CPUs start but before CET is
+enabled, and repeats with real `WRSS` after the BSP enables CET. Secondary CPUs
+service TLB shootdowns while waiting for BSP context initialization, because
+interrupts are still masked and mapping retirement can otherwise deadlock the
+BSP's second probe. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
 If no complete reserved key fits the supported window, it retains the boot
 mapping checks and explicitly skips the window-dependent probe. This preserves
 the CET-disabled `auto` boot when the pool is above the 1 TiB window limit.

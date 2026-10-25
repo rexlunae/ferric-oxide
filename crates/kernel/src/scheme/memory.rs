@@ -39,7 +39,7 @@ pub enum MemoryType {
     DeviceMemory = 3,
 }
 
-bitflags! {
+bitflags::bitflags! {
     struct HandleFlags: u16 {
         // TODO: below 32 bits?
         const PHYS_CONTIGUOUS = 1;
@@ -148,9 +148,10 @@ impl MemoryScheme {
         }
 
         if !size.is_multiple_of(PAGE_SIZE) {
-            warn!(
+            crate::warn!(
                 "physmap size {} is not multiple of PAGE_SIZE {}",
-                size, PAGE_SIZE
+                size,
+                PAGE_SIZE
             );
             return Err(Error::new(EINVAL));
         }

@@ -15,7 +15,7 @@ pub struct KvmSupport {
     max_leaf: u32,
     supp_feats: KvmFeatureBits,
 }
-bitflags! {
+bitflags::bitflags! {
     // https://www.kernel.org/doc/html/latest/virt/kvm/x86/cpuid.html
     #[derive(Debug)]
     struct KvmFeatureBits: u32 {
@@ -61,7 +61,7 @@ pub fn monotonic_absolute() -> Option<u128> {
     let prev = inf.prev.replace(time);
     if prev > time {
         // TODO
-        error!("TSC wraparound ({prev} > {time})");
+        crate::error!("TSC wraparound ({prev} > {time})");
         return None;
     }
     assert!(prev <= time);
@@ -125,7 +125,7 @@ pub fn get_kvm_support() -> &'static Option<KvmSupport> {
 
         let supp_feats = KvmFeatureBits::from_bits_retain(res.eax);
 
-        debug!("Detected KVM paravirtualization support, features {supp_feats:?}");
+        crate::debug!("Detected KVM paravirtualization support, features {supp_feats:?}");
 
         Some(KvmSupport {
             max_leaf,

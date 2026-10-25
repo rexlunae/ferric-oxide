@@ -30,7 +30,9 @@ pub unsafe fn init() {
 
         crate::dtb::irqchip::init(&fdt);
 
-        let cpu = fdt.find_node(format!("/cpus/cpu@{}", 0).as_str()).unwrap();
+        let cpu = fdt
+            .find_node(alloc::format!("/cpus/cpu@{}", 0).as_str())
+            .unwrap();
         init_intc(&cpu);
         init_time(&fdt);
     }

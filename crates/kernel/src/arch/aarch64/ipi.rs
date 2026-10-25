@@ -26,7 +26,7 @@ pub fn ipi(kind: IpiKind, target: IpiTarget) {
     match target {
         IpiTarget::Other => {
             if let Err(error) = crate::arch::device::irqchip::send_sgi(kind as u8, None) {
-                warn!("failed to send {:?} IPI: {:?}", kind, error);
+                crate::warn!("failed to send {:?} IPI: {:?}", kind, error);
             }
         }
     }
@@ -43,9 +43,11 @@ pub fn ipi_single(kind: IpiKind, target: &PercpuBlock) {
         .gic_target_mask
         .load(Ordering::Acquire);
     if let Err(error) = crate::arch::device::irqchip::send_sgi(kind as u8, Some(target_mask)) {
-        warn!(
+        crate::warn!(
             "failed to send {:?} IPI to logical {}: {:?}",
-            kind, target.cpu_id, error
+            kind,
+            target.cpu_id,
+            error
         );
     }
 }

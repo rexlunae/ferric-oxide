@@ -100,6 +100,10 @@ version = "0.2.0-alpha1"
 source = "git+https://github.com/repnop/fdt.git?rev=2fb1409edd1877c714a0aa36b6a7c5351004be54#2fb1409edd1877c714a0aa36b6a7c5351004be54"
 
 [[package]]
+name = "ferric-aligned-buffer"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-amdvi"
 version = "0.1.0"
 dependencies = [
@@ -128,6 +132,14 @@ version = "0.1.0"
 [[package]]
 name = "ferric-irq"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-kernel-tests"
+version = "0.1.0"
+dependencies = [
+ "ferric-irq",
+ "redox_syscall",
+]
 
 [[package]]
 name = "ferric-nospec"
@@ -218,6 +230,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cc",
  "fdt",
+ "ferric-aligned-buffer",
  "ferric-amdvi",
  "ferric-boot-time",
  "ferric-cet",

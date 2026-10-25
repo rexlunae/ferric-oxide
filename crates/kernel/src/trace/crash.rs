@@ -66,7 +66,7 @@ pub fn reserve(is_free: impl Fn(usize, usize) -> bool) {
         }
         Err(err) => {
             let end = base.saturating_add(REGION_BYTES);
-            warn!("trace: crash region {base:#x}..{end:#x} is {err}; no crash dumps");
+            crate::warn!("trace: crash region {base:#x}..{end:#x} is {err}; no crash dumps");
         }
     }
 }
@@ -80,14 +80,14 @@ pub fn init() {
     let words = region.words();
     match Dump::len_in(words) {
         Ok(len) => save(words, len),
-        Err(err) => debug!("trace: no crash dump from the previous boot: {err}"),
+        Err(err) => crate::debug!("trace: no crash dump from the previous boot: {err}"),
     }
     if let Err(err) = Writer::arm(words) {
-        warn!("trace: crash region not armed: {err}");
+        crate::warn!("trace: crash region not armed: {err}");
         return;
     }
     REGION.call_once(|| words);
-    info!(
+    crate::info!(
         "trace: crash region at {:#x} ({} KiB)",
         region.base(),
         region.bytes() / 1024
@@ -103,14 +103,14 @@ fn save(words: &[AtomicU64], len: usize) {
         .collect();
     let Ok(dump) = Dump::parse(&bytes) else {
         // The region changed under the copy, which nothing at this point of boot does.
-        warn!("trace: the crash dump from the previous boot changed while it was read");
+        crate::warn!("trace: the crash dump from the previous boot changed while it was read");
         return;
     };
     if let Some((cpu, message)) = dump.message() {
         let message = core::str::from_utf8(message).unwrap_or("(not UTF-8)");
-        warn!("trace: the previous boot panicked on CPU {cpu}: {message}");
+        crate::warn!("trace: the previous boot panicked on CPU {cpu}: {message}");
     }
-    info!("trace: its crash dump ({len} bytes) is in /scheme/kernel.trace/crash");
+    crate::info!("trace: its crash dump ({len} bytes) is in /scheme/kernel.trace/crash");
     SAVED.call_once(|| Arc::from(bytes));
 }
 
@@ -149,7 +149,7 @@ pub fn dump(info: &PanicInfo) {
         writer.cpu(cpu, ring, share);
     }
     writer.finish();
-    println!("trace: crash dump written");
+    crate::println!("trace: crash dump written");
 }
 
 /// Whether the panic handler should reset the machine after the dump, as it does after

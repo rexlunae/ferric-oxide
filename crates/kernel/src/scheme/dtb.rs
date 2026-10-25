@@ -41,7 +41,7 @@ impl DtbScheme {
         });
 
         if !data_init {
-            error!("DtbScheme::new called multiple times");
+            crate::error!("DtbScheme::new called multiple times");
         }
     }
 }

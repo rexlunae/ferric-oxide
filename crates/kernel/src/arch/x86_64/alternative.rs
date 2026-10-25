@@ -104,7 +104,7 @@ pub unsafe fn early_init(bsp: bool) {
             let ymm_upper_offset = feature_info().has_avx().then(|| {
                 xcr0 |= Xcr0::XCR0_AVX_STATE;
                 x86::controlregs::xcr0_write(xcr0);
-                info!("Enabling AVX");
+                crate::info!("Enabling AVX");
 
                 let state = ext_state_info
                     .iter()
@@ -117,7 +117,7 @@ pub unsafe fn early_init(bsp: bool) {
                 // 16 * size_of::<u128>() is well below usize::MAX
                 #[expect(clippy::arithmetic_side_effects)]
                 if state.size() as usize != 16 * size_of::<u128>() {
-                    warn!("Unusual AVX state size {}", state.size());
+                    crate::warn!("Unusual AVX state size {}", state.size());
                 }
 
                 state.offset()
@@ -143,7 +143,7 @@ pub unsafe fn early_init(bsp: bool) {
                     | Xcr0::XCR0_HI16_ZMM_STATE;
                 x86::controlregs::xcr0_write(xcr0);
                 if bsp {
-                    info!("Enabling AVX-512");
+                    crate::info!("Enabling AVX-512");
                 }
 
                 enable |= KcpuFeatures::AVX512;
@@ -160,7 +160,7 @@ pub unsafe fn early_init(bsp: bool) {
                 ymm_upper_offset,
                 xsave_size: ext_state_info.xsave_area_size_enabled_features(),
             };
-            debug!("XSAVE: {:?}", info);
+            crate::debug!("XSAVE: {:?}", info);
 
             xsave::XSAVE_INFO.call_once(|| info);
         } else {
@@ -210,7 +210,7 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
             return;
         }
 
-        debug!("self-modifying features: {:?}", enable);
+        crate::debug!("self-modifying features: {:?}", enable);
 
         for reloc in relocs.iter().copied() {
             let name = core::str::from_utf8(core::slice::from_raw_parts(
@@ -238,7 +238,7 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
             // only outputs the (slower) single-byte 0x90 NOP.
 
             patch_text(reloc.code_start, reloc.padded_len, |code| {
-                trace!(
+                crate::trace!(
                     "feature {} current {:x?} altcode {:x?}",
                     name,
                     code,
@@ -246,21 +246,21 @@ unsafe fn overwrite(relocs: &[AltReloc], enable: KcpuFeatures) {
                 );
 
                 if feature_is_enabled {
-                    trace!("feature {} origcode {:x?}", name, code);
+                    crate::trace!("feature {} origcode {:x?}", name, code);
                     let (dst, dst_nops) = code.split_at_mut(altcode.len());
                     dst.copy_from_slice(altcode);
 
                     fill_nops(dst_nops);
-                    trace!("feature {} new {:x?} altcode {:x?}", name, code, altcode);
+                    crate::trace!("feature {} new {:x?} altcode {:x?}", name, code, altcode);
                 } else {
-                    trace!("feature !{} origcode {:x?}", name, code);
+                    crate::trace!("feature !{} origcode {:x?}", name, code);
                     let (_, padded) = code.split_at_mut(reloc.origcode_len);
 
                     // Not strictly necessary, but reduces the number of instructions using longer nop
                     // instructions.
                     fill_nops(padded);
 
-                    trace!("feature !{} new {:x?}", name, code);
+                    crate::trace!("feature !{} new {:x?}", name, code);
                 }
             });
         }
@@ -343,7 +343,7 @@ pub(crate) unsafe fn patch_text(code_start: *mut u8, len: usize, write: impl FnO
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     #[derive(Clone, Copy, Debug)]
     pub struct KcpuFeatures: usize {
         const SMAP = 1;

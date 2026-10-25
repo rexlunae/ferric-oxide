@@ -55,7 +55,7 @@ fn profiler_control(id: usize, byte: u8) -> Result<()> {
     // Under the lock, so no other write or close comes between the decision and the switch.
     crate::profiling::IS_PROFILING.store(on, Ordering::SeqCst);
     drop(owner);
-    info!("Wrote {on} to IS_PROFILING");
+    crate::info!("Wrote {on} to IS_PROFILING");
     Ok(())
 }
 

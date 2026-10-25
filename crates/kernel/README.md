@@ -1,9 +1,9 @@
-# Kernel
+# Ferric Oxide kernel
 
-Redox OS Microkernel
+The Ferric Oxide microkernel, derived from Redox OS. Internal ABI, package and
+target names retain their Redox identity for compatibility.
 
 [![docs](https://img.shields.io/badge/docs-master-blue.svg)](https://docs.rs/redox_syscall/latest/syscall/)
-[![SLOCs counter](https://tokei.rs/b1/github/redox-os/kernel?category=code)](https://github.com/XAMPPRocky/tokei)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 ## Requirements
@@ -12,17 +12,20 @@ Redox OS Microkernel
 
 ## Building The Documentation
 
-Use this command:
+From this directory, using the declared nightly toolchain:
 
 ```sh
-cargo doc --open --target x86_64-unknown-none
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps \
+  --target targets/x86_64-unknown-kernel.json \
+  -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
 ```
 
 ## Debugging
 
 ### QEMU
 
-Running [QEMU](https://www.qemu.org) with the `-s` flag will set up QEMU to listen on port `1234` for a GDB client to connect to it. To debug the redox kernel run.
+Running [QEMU](https://www.qemu.org) with the `-s` flag will set up QEMU to listen on port `1234` for a GDB client to connect to it. To debug the Ferric Oxide kernel run.
 
 ```sh
 make qemu gdb=yes
@@ -61,17 +64,25 @@ the process. See your debuggers man page for more information on useful commands
 
 To learn how to contribute to this system component you need to read the following document:
 
-- [CONTRIBUTING.md](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/CONTRIBUTING.md)
+- [Contributing to Ferric Oxide](../../CONTRIBUTING.md)
+- [AI contribution policy](../../AI_POLICY.md)
 
 ## Development
 
-To learn how to do development with this system component inside the Redox build system you need to read the [Build System](https://doc.redox-os.org/book/build-system-reference.html) and [Coding and Building](https://doc.redox-os.org/book/coding-and-building.html) pages.
+The kernel is part of the Ferric Oxide monorepo and keeps a separate workspace
+and lockfile. Start with [build and configuration](../../docs/src/ferric-build.md)
+and [validation and debugging](../../docs/src/ferric-testing.md). From the
+repository root, `make all` builds an image and `make qemu` boots it. A direct
+kernel build uses `make -C crates/kernel ARCH=x86_64` and the custom target.
 
-### How To Build
+Host tests of CPU masks, CPU publication and queue records run with:
 
-To build this system component you need to download the Redox build system, you can learn how to do it on the [Building Redox](https://doc.redox-os.org/book/podman-build.html) page.
+```sh
+cargo test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-features
+cargo test --locked --manifest-path crates/kernel/Cargo.toml -p rmm --features std --lib
+```
 
-This is necessary because they only work with cross-compilation to a Redox virtual machine, but you can do some testing from Linux.
+These tests do not boot the kernel or execute interrupt/context-switch assembly.
 
 ## Funding - _Unix-style Signals and Process Management_
 

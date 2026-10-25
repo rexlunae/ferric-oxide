@@ -1,5 +1,5 @@
-pub mod aligned_box;
-#[macro_use]
+//! Integer newtypes and kernel debugging helpers.
+
 pub mod int_like;
 
 /// Debug macro, lifted from the std

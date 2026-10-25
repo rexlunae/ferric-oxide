@@ -24,10 +24,10 @@ const PER_INT_CAP: u64 = 0x10;
 
 pub unsafe fn init(hpet: &mut Hpet) -> bool {
     unsafe {
-        debug!("HPET @ {:#x}", { hpet.base_address.address });
+        crate::debug!("HPET @ {:#x}", { hpet.base_address.address });
         debug_caps(hpet);
 
-        trace!("HPET Before Init");
+        crate::trace!("HPET Before Init");
         debug_config(hpet);
 
         // Disable HPET
@@ -39,7 +39,7 @@ pub unsafe fn init(hpet: &mut Hpet) -> bool {
 
         let capability = hpet.read_u64(CAPABILITY_OFFSET);
         if capability & LEG_RT_CAP == 0 {
-            warn!("HPET missing capability LEG_RT_CAP");
+            crate::warn!("HPET missing capability LEG_RT_CAP");
             return false;
         }
 
@@ -48,7 +48,7 @@ pub unsafe fn init(hpet: &mut Hpet) -> bool {
 
         let t0_capabilities = hpet.read_u64(T0_CONFIG_CAPABILITY_OFFSET);
         if t0_capabilities & PER_INT_CAP == 0 {
-            warn!("HPET T0 missing capability PER_INT_CAP");
+            crate::warn!("HPET T0 missing capability PER_INT_CAP");
             return false;
         }
 
@@ -68,7 +68,7 @@ pub unsafe fn init(hpet: &mut Hpet) -> bool {
             hpet.write_u64(GENERAL_CONFIG_OFFSET, config_word);
         }
 
-        trace!("HPET After Init");
+        crate::trace!("HPET After Init");
         debug_config(hpet);
 
         true
@@ -78,27 +78,27 @@ pub unsafe fn init(hpet: &mut Hpet) -> bool {
 unsafe fn debug_caps(hpet: &mut Hpet) {
     unsafe {
         let capability = hpet.read_u64(CAPABILITY_OFFSET);
-        trace!("  caps: {:#x}", capability);
-        trace!(
+        crate::trace!("  caps: {:#x}", capability);
+        crate::trace!(
             "    clock period: {:?}",
             Duration::from_nanos((capability >> 32) / 1_000_000)
         );
-        trace!(
+        crate::trace!(
             "    ID: {:#x} revision: {}",
             (capability >> 16) as u16,
             capability as u8
         );
-        trace!(
+        crate::trace!(
             "    LEG_RT_CAP: {} COUNT_SIZE_CAP: {}",
             capability & (1 << 15) == (1 << 15),
             capability & (1 << 13) == (1 << 13)
         );
         // The NUM_TIM_CAP field contains the index of the last timer.
         // Add 1 to get the amount of timers.
-        trace!("    timers: {}", ((capability >> 8) as u8 & 0x1F) + 1);
+        crate::trace!("    timers: {}", ((capability >> 8) as u8 & 0x1F) + 1);
 
         let t0_capabilities = hpet.read_u64(T0_CONFIG_CAPABILITY_OFFSET);
-        trace!(
+        crate::trace!(
             "  T0 interrupt routing: {:#x}",
             (t0_capabilities >> 32) as u32
         );
@@ -108,19 +108,19 @@ unsafe fn debug_caps(hpet: &mut Hpet) {
 unsafe fn debug_config(hpet: &mut Hpet) {
     unsafe {
         let config_word = hpet.read_u64(GENERAL_CONFIG_OFFSET);
-        trace!("  config: {:#x}", config_word);
+        crate::trace!("  config: {:#x}", config_word);
 
         let interrupt_status = hpet.read_u64(GENERAL_INTERRUPT_OFFSET);
-        trace!("  interrupt status: {:#x}", interrupt_status);
+        crate::trace!("  interrupt status: {:#x}", interrupt_status);
 
         let counter = hpet.read_u64(MAIN_COUNTER_OFFSET);
-        trace!("  counter: {:#x}", counter);
+        crate::trace!("  counter: {:#x}", counter);
 
         let t0_capabilities = hpet.read_u64(T0_CONFIG_CAPABILITY_OFFSET);
-        trace!("  T0 flags: {:#x}", t0_capabilities as u32);
+        crate::trace!("  T0 flags: {:#x}", t0_capabilities as u32);
 
         let t0_comparator = hpet.read_u64(T0_COMPARATOR_OFFSET);
-        trace!("  T0 comparator: {:#x}", t0_comparator);
+        crate::trace!("  T0 comparator: {:#x}", t0_comparator);
     }
 }
 
@@ -136,8 +136,12 @@ const COUNT_SIZE_CAP: u64 = 1 << 13;
 pub(crate) fn trace_counter(hpet: &Hpet) -> Option<(*const u64, u64)> {
     // SAFETY: the ACPI code mapped the HPET's registers when it found the table; reading the
     // capabilities and configuration registers has no side effects.
-    let (capability, config) =
-        unsafe { (hpet.read_u64(CAPABILITY_OFFSET), hpet.read_u64(GENERAL_CONFIG_OFFSET)) };
+    let (capability, config) = unsafe {
+        (
+            hpet.read_u64(CAPABILITY_OFFSET),
+            hpet.read_u64(GENERAL_CONFIG_OFFSET),
+        )
+    };
     let period_fs = capability >> 32;
     let usable = capability & COUNT_SIZE_CAP != 0 && config & ENABLE_CNF != 0 && period_fs != 0;
     let address = hpet.base_address.address as usize + MAIN_COUNTER_OFFSET;

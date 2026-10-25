@@ -2,7 +2,6 @@
 
 use core::arch::asm;
 
-#[macro_use]
 pub mod handler;
 
 pub mod exception;

@@ -130,11 +130,11 @@ pub fn serio_command(index: usize, data: u8) {
     if PROFILE_TOGGLEABLE {
         if index == 0 && data == 30 {
             // "a" key in QEMU
-            info!("Enabling profiling");
+            crate::info!("Enabling profiling");
             IS_PROFILING.store(true, Ordering::SeqCst);
         } else if index == 0 && data == 48 {
             // "b" key
-            info!("Disabling profiling");
+            crate::info!("Disabling profiling");
             IS_PROFILING.store(false, Ordering::SeqCst);
         }
     }
@@ -339,7 +339,7 @@ pub unsafe fn allocate(total_cpu_count: u32) {
         return;
     }
 
-    info!("Preliminary number of CPUs: {total_cpu_count}");
+    crate::info!("Preliminary number of CPUs: {total_cpu_count}");
 
     let ordinary_cpu_count = total_cpu_count.checked_sub(1).unwrap();
     NUM_ORDINARY_CPUS.store(ordinary_cpu_count, Ordering::SeqCst);

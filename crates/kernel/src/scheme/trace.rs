@@ -205,7 +205,7 @@ fn command_bytes(buf: UserSliceRo) -> Result<(Vec<u8>, usize)> {
     if buf.len() > MAX_COMMAND {
         return Err(Error::new(EINVAL));
     }
-    let mut bytes: Vec<u8> = vec![0; buf.len()];
+    let mut bytes: Vec<u8> = alloc::vec![0; buf.len()];
     let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
     bytes.truncate(len);
     Ok((bytes, len))
@@ -270,11 +270,11 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
     };
     match trace::control(spec, on, Mode::Live) {
         Ok(changed) => {
-            info!("trace: {command} ({changed} event(s) changed)");
+            crate::info!("trace: {command} ({changed} event(s) changed)");
             Ok(len)
         }
         Err(err) => {
-            warn!("trace: {command}: {err}");
+            crate::warn!("trace: {command}: {err}");
             Err(control_errno(&err))
         }
     }
@@ -284,15 +284,15 @@ fn events_command(buf: UserSliceRo) -> Result<usize> {
 fn filter_command(event: &str, filter: &str, len: usize) -> Result<usize> {
     match trace::set_filter(event, filter) {
         Ok((event, Some(set))) => {
-            info!("trace: filter {} {}", event.name(), set.display(event));
+            crate::info!("trace: filter {} {}", event.name(), set.display(event));
             Ok(len)
         }
         Ok((event, None)) => {
-            info!("trace: filter {} none", event.name());
+            crate::info!("trace: filter {} none", event.name());
             Ok(len)
         }
         Err(err) => {
-            warn!("trace: filter {event} {filter}: {err}");
+            crate::warn!("trace: filter {event} {filter}: {err}");
             Err(Error::new(match err {
                 FilterControlError::UnknownEvent(_) => ENOENT,
                 FilterControlError::NotCompiled(_) => EOPNOTSUPP,
@@ -403,7 +403,7 @@ impl KernelScheme for TraceScheme {
                 let Some(ring) = trace::ring(cpu) else {
                     return Ok(0);
                 };
-                let mut records = vec![0u8; buf.len().min(MAX_READ)];
+                let mut records = alloc::vec![0u8; buf.len().min(MAX_READ)];
                 // One reader at a time, from the copy to the commit. The records are consumed
                 // only once they reached the caller, so a failed copy loses none.
                 let _consumer = consumer(cpu)?;
