@@ -190,6 +190,10 @@ pub fn futex(
                 {
                     return Err(Error::new(EINTR));
                 }
+                // Ferric Oxide: a thread killed on its way here does not wait (#200).
+                if context.killed_before_wait() {
+                    return Err(Error::new(EINTR));
+                }
                 context.wake = timeout_opt.map(|time| time.to_nanos());
                 context.block("futex");
 

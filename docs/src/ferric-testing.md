@@ -255,6 +255,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
+| `ferric-exit-test` | Process exit while a second thread is busy reading a pipe or parking on a futex: the force-killed thread must not block in its next wait, so every child exits ([#200](https://github.com/rexlunae/ferric-oxide/issues/200)) |
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |

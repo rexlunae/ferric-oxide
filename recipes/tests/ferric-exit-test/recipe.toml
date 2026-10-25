@@ -1,0 +1,14 @@
+# Ferric Oxide: the on-target test for process exit with a busy thread (#200). It runs
+# itself many times as a child whose second thread is still working when the main thread
+# exits, and checks every child ends: a thread killed by the exit on its way into a wait
+# must not block there for good. Only for test images. Source lives in files/.
+[source]
+path = "recipes/tests/ferric-exit-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""
