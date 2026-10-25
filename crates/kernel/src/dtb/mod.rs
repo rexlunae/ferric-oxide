@@ -677,12 +677,21 @@ mod tests {
             data[RESERVATION_MAP_OFFSET_FIELD..RESERVATION_MAP_OFFSET_FIELD + 4]
                 .try_into()
                 .unwrap(),
-        );
-        // Point off_dt_struct one entry past off_mem_rsvmap, cutting the
-        // reservation map off before its terminating {0, 0} entry.
-        let truncated_structure_offset = off_mem_rsvmap + 16;
-        data[STRUCTURE_BLOCK_OFFSET_FIELD..STRUCTURE_BLOCK_OFFSET_FIELD + 4]
-            .copy_from_slice(&truncated_structure_offset.to_be_bytes());
+        ) as usize;
+        let off_dt_struct = u32::from_be_bytes(
+            data[STRUCTURE_BLOCK_OFFSET_FIELD..STRUCTURE_BLOCK_OFFSET_FIELD + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        // Keep the structure valid: move the map to its final 16-byte slot and
+        // replace the terminator with the real entry, leaving no room for zero.
+        let entry: [u8; 16] = data[off_mem_rsvmap..off_mem_rsvmap + 16]
+            .try_into()
+            .unwrap();
+        let truncated_map_offset = off_dt_struct - 16;
+        data[truncated_map_offset..off_dt_struct].copy_from_slice(&entry);
+        data[RESERVATION_MAP_OFFSET_FIELD..RESERVATION_MAP_OFFSET_FIELD + 4]
+            .copy_from_slice(&(truncated_map_offset as u32).to_be_bytes());
         let fdt = Fdt::new(&data).unwrap();
         let mut ranges = Vec::new();
 

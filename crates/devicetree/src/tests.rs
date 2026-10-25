@@ -234,3 +234,19 @@ fn root_identity_survives_lookup_and_parent_views() {
     let copied = FIRMWARE.to_vec();
     assert!(!root.same_node(Tree::new(&copied).unwrap().root()));
 }
+
+#[test]
+fn leaves_reservation_map_policy_to_the_consumer() {
+    let mut data = MMIO.to_vec();
+    let original_map = word(&data, 16).unwrap() as usize;
+    let structure = word(&data, 8).unwrap() as usize;
+    let entry: [u8; 16] = data[original_map..original_map + 16].try_into().unwrap();
+    let new_map = structure - 16;
+    data[new_map..structure].copy_from_slice(&entry);
+    data[16..20].copy_from_slice(&(new_map as u32).to_be_bytes());
+    // An unterminated reservation map does not invalidate the tree structure.
+    // The kernel's independently bounded scanner handles this format error.
+    let tree = Tree::new(&data).unwrap();
+    assert_eq!(tree.chosen().stdout().unwrap().node().name, "serial@200");
+    assert_eq!(&tree.raw_data()[new_map..structure], &entry);
+}
