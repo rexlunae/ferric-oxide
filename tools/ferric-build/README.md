@@ -35,7 +35,9 @@ Persistent ARM64 storage and HVF boots remain incomplete; some prebuilt ARM64
 applications also fail at runtime. x86-64 defaults to a persistent disk image.
 A first build needs network access. Existing `ferric.toml` files are preserved. Cargo commands
 select the host architecture unless `--arch` is supplied, native LLVM and image
-writing without FUSE. ARM64 builds std from rust-src using Cargo because its
+writing without FUSE. The selected architecture is applied before validating
+saved feature choices; x86-only settings are inactive for an ARM64 run, and
+`ferric.toml` is not rewritten. ARM64 builds std from rust-src using Cargo because its
 Redox target has no prebuilt standard library. Make
 assignments supplied after `--` can override them:
 
@@ -46,6 +48,27 @@ cargo xtask run --no-build --headless
 cargo xtask --dry-run build
 cargo xtask --podman build
 ```
+
+In `make menuconfig`, **Processor baseline → x86-64 CPU support** and
+**ARM64 CPU support** each have a minimum baseline and independent variant
+checkboxes. Both CPU types can be configured regardless of the active target.
+Normal builds use that target's baseline. To build the checked variants:
+
+```sh
+cargo run -p ferric-config -- variants --json
+cargo xtask build --all-variants
+cargo xtask --arch x86_64 build --all-variants
+cargo xtask --arch x86_64 build --cpu-variant v4
+cargo xtask --arch aarch64 run --cpu-variant armv8.0-a --no-build --headless
+```
+
+Variants below their architecture's minimum are inactive. The all-variants
+command builds both CPU types unless `--arch` (or `ARCH=`) filters it; prepare
+each toolchain with `cargo xtask --arch ... setup` first. Outputs are separate,
+under `build/<arch>/<image>/variants/<level>/`. Combining architectures in one
+image is future work. Prebuilt application packages retain their published
+CPU baseline; only locally built components acquire the selected flags.
+Variant dry runs print the configuration query without executing it.
 
 `--podman` opts into the inherited Linux recipe toolchain and requires a working
 Podman installation. Existing Make targets remain available for component work,

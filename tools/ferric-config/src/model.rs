@@ -39,6 +39,29 @@ pub struct UserConfig {
     pub values: BTreeMap<String, Value>,
 }
 
+/// A failure to read or parse the saved configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    /// Reading an existing configuration failed.
+    #[error("cannot read {}", path.display())]
+    Read {
+        /// Configuration path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The configuration is not valid TOML.
+    #[error("cannot parse {}", path.display())]
+    Parse {
+        /// Configuration path.
+        path: PathBuf,
+        /// Underlying TOML error, including its source location.
+        #[source]
+        source: toml_edit::TomlError,
+    },
+}
+
 fn flatten(table: &dyn toml_edit::TableLike, prefix: &str, out: &mut Vec<(String, Item)>) {
     for (k, item) in table.iter() {
         let key = if prefix.is_empty() {
@@ -56,15 +79,26 @@ fn flatten(table: &dyn toml_edit::TableLike, prefix: &str, out: &mut Vec<(String
 impl UserConfig {
     /// Loads ferric.toml. A missing file is an empty configuration. Entries
     /// that do not match the schema are reported and ignored.
-    pub fn load(path: &Path, schema: &Schema) -> Result<(UserConfig, Vec<Diag>), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::Read`] for filesystem failures other than a missing
+    /// file, or [`LoadError::Parse`] for invalid TOML, retaining the source error.
+    pub fn load(path: &Path, schema: &Schema) -> Result<(UserConfig, Vec<Diag>), LoadError> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+            Err(source) => {
+                return Err(LoadError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
         };
-        let doc: DocumentMut = text
-            .parse()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let doc: DocumentMut = text.parse().map_err(|source| LoadError::Parse {
+            path: path.to_owned(),
+            source,
+        })?;
         let mut entries = Vec::new();
         flatten(doc.as_table(), "", &mut entries);
         let mut values = BTreeMap::new();
@@ -446,10 +480,10 @@ mod tests {
     }
 
     #[test]
-    fn arch_hides_x86_options() {
+    fn arch_hides_x86_execution_options_but_keeps_both_baselines_editable() {
         let s = real_schema();
         let r = resolve(&s, &user(&[("target.arch", Value::Str("aarch64".into()))]));
-        assert!(!r.active[s.position("cpu.x86_64_level").unwrap()]);
+        assert!(r.active[s.position("cpu.x86_64_level").unwrap()]);
         assert!(!r.active[s.position("kernel.cpu.smap").unwrap()]);
         assert!(r.active[s.position("cpu.aarch64_level").unwrap()]);
     }
@@ -521,5 +555,37 @@ mod tests {
         assert!(u.values.is_empty());
         assert_eq!(diags.len(), 2, "{diags:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_errors_preserve_paths_and_sources() {
+        use std::error::Error;
+        let schema = real_schema();
+        let directory = tempfile::tempdir().unwrap();
+        let Err(error) = UserConfig::load(directory.path(), &schema) else {
+            panic!("a directory cannot be read as a configuration file");
+        };
+        assert!(matches!(&error, LoadError::Read { path, .. } if path == directory.path()));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+
+        let path = directory.path().join("ferric.toml");
+        std::fs::write(&path, "[target\n").unwrap();
+        let Err(error) = UserConfig::load(&path, &schema) else {
+            panic!("invalid TOML cannot be loaded");
+        };
+        assert!(matches!(&error, LoadError::Parse { path: got, .. } if got == &path));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<toml_edit::TomlError>()
+                .is_some()
+        );
     }
 }
