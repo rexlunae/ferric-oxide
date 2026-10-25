@@ -9,7 +9,10 @@ publish = false
 [dependencies]
 ferric-luks = { path = "../luks", optional = true }
 ferric-lvm = { path = "../lvm", optional = true }
-thiserror.workspace = true
+# Not inherited from the host workspace: recipes (ferric-blockd) build this crate through a
+# symlink outside that workspace, where `workspace = true` cannot be resolved. Keep the
+# version in step with the root Cargo.toml's [workspace.dependencies].
+thiserror = { version = "2", default-features = false }
 
 [features]
 # Everything, for the host tests; the kernel, bootloader and daemon pick what they need with

@@ -7,4 +7,7 @@ description = "Read-only LVM2 physical-volume labels, metadata and logical-volum
 publish = false
 
 [dependencies]
-thiserror.workspace = true
+# Not inherited from the host workspace: recipes (ferric-blockd) build this crate through a
+# symlink outside that workspace, where `workspace = true` cannot be resolved. Keep the
+# version in step with the root Cargo.toml's [workspace.dependencies].
+thiserror = { version = "2", default-features = false }
