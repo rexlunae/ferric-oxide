@@ -23,6 +23,11 @@
 //!   damage to the log. It stops the replay if that copy is the one to write; a copy that a
 //!   newer one replaces, or that is revoked, is never written, so its damage does not
 //!   matter.
+//!
+//! Before [`Recovery::scan`] returns, every copy in the plan has been read successfully,
+//! whatever the checksum type, so a replay never stops part-way on a read error from the
+//! journal. A copy that cannot be read is an error only if it would be written (or, with
+//! async commits, at once, since it decides whether its transaction counts).
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -44,8 +49,20 @@ pub struct Write {
     pub sequence: u32,
     escaped: bool,
     checksum: u32,
-    /// Whether the data block matched its checksum when the log was scanned.
-    intact: bool,
+    /// What the scan learned of the data block.
+    data: Data,
+}
+
+/// What a scan knows about a logged data block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Data {
+    /// Not read yet: a journal without data checksums, or a read that failed and is
+    /// retried once the copy is known to be written.
+    Unread,
+    /// Read and matching its checksum (or read, in a journal without checksums).
+    Intact,
+    /// Read and failing its checksum.
+    Damaged,
 }
 
 /// Why a scan or a read for replay failed.
@@ -109,7 +126,7 @@ pub struct Recovery {
 /// matched its checksum, and its revoke records.
 #[derive(Default)]
 struct Transaction {
-    tags: Vec<(log::Tag, u32, bool)>,
+    tags: Vec<(log::Tag, u32, Data)>,
     revokes: Vec<u64>,
 }
 
@@ -146,8 +163,11 @@ impl Recovery {
     /// Scans the log of the journal `sb` describes and plans the replay. A clean journal
     /// ([`Superblock::needs_recovery`] false) gives an empty plan.
     ///
-    /// Every data block in the log is read and checked here (see the module docs for what
-    /// a damaged one means), so a plan that comes back can be applied in full.
+    /// Every block the plan writes is read and checked here, and in a journal with data
+    /// checksums so is every other data block in the log (see the module docs for what a
+    /// damaged one means), so a plan that comes back can be applied in full. A read error
+    /// on a copy the plan drops anyway (replaced by a newer copy, or revoked) is ignored,
+    /// except under async commits, where it is returned.
     ///
     /// # Errors
     ///
@@ -173,13 +193,7 @@ impl Recovery {
         recovery.next_sequence = end_sequence.wrapping_add(1);
         recovery.transactions = u32::try_from(committed.len()).unwrap_or(u32::MAX);
         recovery.writes = plan(sb, committed);
-        if let Some(bad) = recovery.writes.iter().find(|write| !write.intact) {
-            return Err(RecoveryError::DataChecksum {
-                source_block: bad.source,
-                target: bad.target,
-                sequence: bad.sequence,
-            });
-        }
+        preflight(journal, sb, &mut recovery.writes)?;
         Ok(recovery)
     }
 
@@ -291,7 +305,7 @@ fn read_log<J: JournalRead>(
                 let tags = log::tags(&buf, sb);
                 let count = u32::try_from(tags.len()).unwrap_or(u32::MAX);
                 for (i, tag) in (1..).zip(tags) {
-                    open.tags.push((tag, cursor.ahead(i), true));
+                    open.tags.push((tag, cursor.ahead(i), Data::Unread));
                 }
                 cursor.advance(1 + count)?;
             }
@@ -322,7 +336,11 @@ fn read_log<J: JournalRead>(
 }
 
 /// Reads and checks every data block of transaction `seq`, marking each tag; returns whether
-/// all of them matched.
+/// none of them is damaged.
+///
+/// A block that cannot be read is left [`Data::Unread`] for [`preflight`] to read again if
+/// it turns out to be written, except under async commits, where whether the transaction
+/// counts at all depends on that block, so the read error is returned at once.
 fn check_data<J: JournalRead>(
     journal: &J,
     sb: &Superblock,
@@ -334,12 +352,50 @@ fn check_data<J: JournalRead>(
         return Ok(true);
     }
     let mut whole = true;
-    for (tag, source, intact) in &mut transaction.tags {
-        read_block(journal, *source, buf)?;
-        *intact = checksum_ok(sb, seq, tag.escaped, tag.checksum, buf);
-        whole &= *intact;
+    for (tag, source, data) in &mut transaction.tags {
+        match read_block(journal, *source, buf) {
+            Ok(()) => {}
+            Err(error) if sb.is_async_commit() => return Err(error),
+            Err(_) => continue,
+        }
+        *data = if checksum_ok(sb, seq, tag.escaped, tag.checksum, buf) {
+            Data::Intact
+        } else {
+            whole = false;
+            Data::Damaged
+        };
     }
     Ok(whole)
+}
+
+/// Makes sure every planned write can be carried out before the caller writes anything:
+/// reads each copy the log scan did not (all of them in a journal without data checksums,
+/// and any whose first read failed) and refuses a damaged copy.
+fn preflight<J: JournalRead>(
+    journal: &J,
+    sb: &Superblock,
+    writes: &mut [Write],
+) -> Result<(), RecoveryError<J::Error>> {
+    let mut buf = vec![0; sb.block_size() as usize];
+    for write in writes {
+        if write.data == Data::Unread {
+            read_block(journal, write.source, &mut buf)?;
+            write.data = if checksum_ok(sb, write.sequence, write.escaped, write.checksum, &mut buf)
+            {
+                Data::Intact
+            } else {
+                Data::Damaged
+            };
+        }
+        if write.data == Data::Damaged {
+            return Err(RecoveryError::DataChecksum {
+                source_block: write.source,
+                target: write.target,
+                sequence: write.sequence,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether transaction `a` is the same as or older than `b`, with sequence numbers that
@@ -367,7 +423,7 @@ fn plan(sb: &Superblock, committed: Vec<(u32, Transaction)>) -> Vec<Write> {
     }
     let mut writes: BTreeMap<u64, Write> = BTreeMap::new();
     for (seq, transaction) in committed {
-        for (tag, source, intact) in transaction.tags {
+        for (tag, source, data) in transaction.tags {
             let cancelled = revoked
                 .get(&tag.target)
                 .is_some_and(|&revoked_in| not_after(seq, revoked_in));
@@ -380,7 +436,7 @@ fn plan(sb: &Superblock, committed: Vec<(u32, Transaction)>) -> Vec<Write> {
                         sequence: seq,
                         escaped: tag.escaped,
                         checksum: tag.checksum,
-                        intact,
+                        data,
                     },
                 );
             }

@@ -112,12 +112,19 @@ impl Builder {
             if i == blocks.len() - 1 {
                 flags |= 0x8;
             }
-            let at = 12 + i * 16 + if i == 0 { 0 } else { 16 };
+            // Version 3 tags are 16 bytes; without checksums a 64-bit tag is 12 bytes, with
+            // its 16-bit flags after a 16-bit checksum field that stays zero.
+            let v3 = self.sb.checksum().is_crc32c();
+            let size = if v3 { 16 } else { 12 };
+            let at = 12 + i * size + if i == 0 { 0 } else { 16 };
             let block = self.block();
             put(block, at, target as u32);
+            // As a big-endian u32 the flags land in the low half, where both layouts keep them.
             put(block, at + 4, flags);
+            if v3 {
+                put(block, at + 12, checksum);
+            }
             put(block, at + 8, (target >> 32) as u32);
-            put(block, at + 12, checksum);
             contents.push(stored);
         }
         self.seal_tail();
@@ -420,4 +427,108 @@ fn a_damaged_copy_that_is_never_written_does_not_stop_the_replay() {
     damage(&mut j, 3);
     let recovery = j.scan().expect("only intact copies are written");
     assert_eq!(replayed(&j, &recovery), [(100, 2)]);
+}
+
+/// `INCOMPAT_REVOKE | INCOMPAT_64BIT`: a journal without checksums.
+const NO_CHECKSUMS: u32 = 0x1 | 0x2;
+
+/// A device error from [`Failing`].
+#[derive(Debug, PartialEq, Eq)]
+struct Unreadable(u32);
+
+impl core::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "journal block {} is unreadable", self.0)
+    }
+}
+
+impl core::error::Error for Unreadable {}
+
+/// A journal in which some blocks cannot be read.
+struct Failing<'a> {
+    journal: &'a Builder,
+    bad: &'a [u32],
+}
+
+impl JournalRead for Failing<'_> {
+    type Error = Unreadable;
+
+    fn read_block(&self, block: u32, buf: &mut [u8]) -> Result<(), Unreadable> {
+        if self.bad.contains(&block) {
+            return Err(Unreadable(block));
+        }
+        let Ok(()) = self.journal.read_block(block, buf);
+        Ok(())
+    }
+}
+
+fn scan_failing(j: &Builder, bad: &[u32]) -> Result<Recovery, RecoveryError<Unreadable>> {
+    Recovery::scan(&Failing { journal: j, bad }, &j.sb)
+}
+
+#[test]
+fn without_checksums_every_planned_copy_is_read_before_the_plan_returns() {
+    let mut j = Builder::with_features(1, 1, NO_CHECKSUMS);
+    j.data(&[(100, 1), (101, 1)]);
+    j.commit();
+    assert_eq!(
+        replayed(&j, &j.scan().expect("readable")),
+        [(100, 1), (101, 1)]
+    );
+    // Block 3 holds the copy of 101: the scan itself must fail, not a later read.
+    assert!(matches!(
+        scan_failing(&j, &[3]),
+        Err(RecoveryError::Read {
+            block: 3,
+            source: Unreadable(3)
+        })
+    ));
+}
+
+#[test]
+fn an_unreadable_copy_that_is_never_written_does_not_stop_the_replay() {
+    for features in [REVOKE_V3_64, NO_CHECKSUMS] {
+        let mut j = Builder::with_features(1, 1, features);
+        // Blocks 2 and 3 hold transaction 1's copies of 100 and 101.
+        j.data(&[(100, 1), (101, 1)]);
+        j.commit();
+        j.data(&[(100, 2)]);
+        j.revoke(&[101]);
+        j.commit();
+        let recovery = scan_failing(&j, &[2, 3]).expect("the unreadable copies are dropped");
+        let writes: Vec<_> = recovery
+            .writes()
+            .iter()
+            .map(|w| (w.target, w.sequence))
+            .collect();
+        assert_eq!(writes, [(100, 2)]);
+    }
+}
+
+#[test]
+fn an_unreadable_copy_that_would_be_written_is_an_error() {
+    let mut j = Builder::new(1, 1);
+    j.data(&[(100, 1)]);
+    j.commit();
+    j.data(&[(200, 2)]);
+    j.commit();
+    assert!(matches!(
+        scan_failing(&j, &[5]),
+        Err(RecoveryError::Read { block: 5, .. })
+    ));
+}
+
+#[test]
+fn with_async_commits_an_unreadable_data_block_is_an_error_at_once() {
+    let mut j = Builder::with_features(1, 1, ASYNC);
+    j.data(&[(100, 1)]);
+    j.commit();
+    j.data(&[(100, 2)]);
+    j.commit();
+    // Block 2 (the old copy of 100) is replaced, but whether transaction 1 counts at all
+    // depends on reading it, so the scan cannot go on.
+    assert!(matches!(
+        scan_failing(&j, &[2]),
+        Err(RecoveryError::Read { block: 2, .. })
+    ));
 }
