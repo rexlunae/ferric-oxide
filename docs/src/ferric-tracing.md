@@ -922,7 +922,37 @@ a window that overflowed its ring reports the loss instead of silently
 undercounting. The tool takes the same inputs as `text`:
 
 ```sh
-cargo run -p ferric-trace-cli -- counts capture/ --gap sched.tick --gap sched.switch
+cargo run -p ferric-trace-cli -- counts capture/ --tsc-mhz 4292 --gap sched.tick --gap sched.switch
+```
+
+The kernel's trace clock is the invariant TSC and does not know its own
+frequency, so a TSC capture's `counts` lines are in real nanoseconds only
+with the traced machine's TSC rate in `--tsc-mhz` (perfetto's `--tsc-mhz`
+is the same value). Under KVM with `host,migratable=off` the guest TSC runs
+at the host's rate; measure it on the host and record it with the results:
+
+```sh
+gcc -O2 -x c -o /tmp/tscrate - <<'C'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+#include <x86intrin.h>
+int main(void) {
+    struct timespec a, b;
+    uint64_t t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    t0 = __rdtsc();
+    struct timespec s = { .tv_sec = 0, .tv_nsec = 500000000 };
+    nanosleep(&s, 0);
+    t1 = __rdtsc();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double ns = (double)((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec));
+    printf("tsc_rate=%.2f MHz\n", (double)(t1 - t0) / ns * 1000.0);
+    return 0;
+}
+C
+/tmp/tscrate
 ```
 
 The host runs the image with `scripts/ferric-ci/boot-smoke.sh` on KVM

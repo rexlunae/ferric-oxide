@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Check a ferric-sched-bench image boot log (config/ferric-sched-bench.toml) for the
-# scheduler/timer baseline protocol: the marker lines, the per-phase trace counts of the
+# scheduler/timer baseline protocol: the markers, the per-phase trace counts of the
 # periodic tick, Pit broadcast and wakeup IPIs, the waiting-ring scale runs, and the
-# benchmark lines. The measurements themselves are printed as a notice; this script only
-# checks that every phase ran and reported.
+# benchmark lines. The measurements themselves are printed as a notice; this script
+# only checks that every phase ran and reported.
 #
-# Usage: check-sched-bench-log.sh LOG
+# Usage: check-sched-bench-log.sh LOG [CPUS]
+#   CPUS (default 4) names the boot's vCPU count; a 1-vCPU boot has no Pit broadcast
+#   or cross-CPU wakeup IPIs, so those lines are not expected there.
 set -euo pipefail
 
 log="$1"
+cpus="${2:-4}"
 clean="$(tr -d '\r\000' < "$log")"
 
 fail() {
@@ -27,15 +30,24 @@ if grep -aE "FERRIC_TEST_FAIL" <<< "$clean"; then
     fail "a FERRIC_TEST_FAIL line is present"
 fi
 
-# The periodic tick is the baseline the tickless work must stop: every phase window must
-# have counted it (on the PIT owner) and its broadcast (on the other CPUs), and the count
-# lines must come out of the guest's ferric-trace counts.
-need "counts sched.tick cpu=all count=[1-9][0-9]*"
-need "counts sched.ipi_pit cpu=all count=[1-9][0-9]*"
-need "counts sched.switch cpu=all count=[0-9]* gap_ns_p99=[0-9]+"
+# The six windows (idle, burn, four ring counts) each report the periodic tick and
+# its inter-tick gaps (the tick period and jitter the tickless work must stop).
+ticks="$(grep -acE '^counts sched\.tick cpu=all count=[0-9]+ rate_per_s=[0-9]+ gap_ns_p99=[0-9]+' <<< "$clean")"
+if [ "$ticks" -lt 6 ]; then
+    fail "expected six per-window sched.tick count lines, saw $ticks"
+fi
+if [ "$cpus" -gt 1 ]; then
+    need '^counts sched\.ipi_pit cpu=all count=[1-9][0-9]* rate_per_s=[0-9]+ gap_ns_p99=[0-9]+'
+fi
 
-# The scale runs: setup and wake markers, the wake-latency line, and the pass, for each
-# ring count.
+# The burn window shows the periodic preemption of a greedy context: switches.
+need '^counts sched\.switch cpu=all count=[1-9][0-9]* .*gap_ns_p99=[0-9]+'
+# The waiting-ring windows show the wake bursts and the ring worker churn.
+need '^counts sched\.ipi_wake cpu=all count=[1-9][0-9]* .*gap_ns_p99=[0-9]+'
+need '^counts sched\.context_create cpu=all count=[1-9][0-9]*'
+
+# The scale runs: setup and wake markers, the wake-latency line, and the pass, for
+# each ring count.
 for rings in 1 16 64 256; do
     need "FERRIC_SCALE_SETUP rings=$rings"
     need "FERRIC_SCALE_WAKE rings=$rings"
