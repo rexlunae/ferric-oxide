@@ -16,7 +16,7 @@ use ferric_trace::abi::{EMIT_PATH, UserRecord};
 use libredox::protocol::O_CLOEXEC;
 use redox_rt::proc::FdGuard;
 use syscall::flag::O_WRONLY;
-use syscall::{ENOENT, EOPNOTSUPP, Error};
+use syscall::{EOPNOTSUPP, Error};
 
 /// Where procmgr writes its trace records, while the kernel takes them.
 pub struct ProcTrace {
@@ -30,8 +30,6 @@ impl ProcTrace {
         let emit = root.and_then(
             |root| match root.openat(EMIT_PATH, O_WRONLY | O_CLOEXEC, 0) {
                 Ok(emit) => Some(emit),
-                // A kernel older than the user events.
-                Err(Error { errno: ENOENT }) => None,
                 Err(err) => {
                     log::warn!("procmgr: trace: cannot open {EMIT_PATH}: {err}");
                     None

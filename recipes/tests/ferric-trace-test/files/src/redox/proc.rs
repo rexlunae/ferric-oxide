@@ -87,6 +87,41 @@ fn refused(what: &str, bytes: &[u8]) -> Result<(), Failure> {
     }
 }
 
+/// A pid no process has: the probe record's.
+const PROBE_PID: u64 = u64::MAX;
+
+/// Writes a `sched.proc_exec` record for [`PROBE_PID`] to `emit` itself, so a failure says
+/// whether the kernel path or `procmgr` lost the records.
+fn probe(cpus: &[u32]) -> Result<(), Failure> {
+    let mut bytes = [0; UserRecord::MAX_BYTES];
+    let record = UserRecord::new(&SCHED_PROC_EXEC, &[PROBE_PID])
+        .map_err(|err| check(STEP, format!("record: {err}")))?;
+    let len = record.encode(&mut bytes);
+    let path = path(abi::EMIT_PATH);
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|mut f| f.write(&bytes[..len]))
+        .map_err(io_failure(STEP, "emit"))?;
+    let trace = drain(STEP, cpus)?;
+    if find(&trace, &SCHED_PROC_EXEC, &[PROBE_PID]).is_none() {
+        return Err(check(STEP, "a record written to emit was not stored"));
+    }
+    Ok(())
+}
+
+/// What `trace` holds of the process events, for a failure message.
+fn summary(trace: &[Vec<Entry>]) -> String {
+    let seen: Vec<_> = trace
+        .iter()
+        .flatten()
+        .filter(|e| USER_EVENTS.iter().any(|event| e.is(event)))
+        .take(16)
+        .map(|e| format!("{}{:?}", e.event.get(), e.args))
+        .collect();
+    format!("process records seen: {seen:?}")
+}
+
 /// User space may write only the process events: a kernel event's record, a record with
 /// reserved header bits and a partial word are all refused.
 fn check_refusals() -> Result<(), Failure> {
@@ -123,6 +158,7 @@ pub(super) fn check_proc(cpus: &[u32]) -> Result<(), Failure> {
     command(STEP, &format!("disable {EVENTS}"))?;
     drain(STEP, cpus)?;
     command(STEP, &format!("enable {EVENTS}"))?;
+    probe(cpus)?;
     let parent = u64::from(std::process::id());
     let child = u64::from(spawn_child()?);
     let mut trace = Vec::new();
@@ -135,7 +171,10 @@ pub(super) fn check_proc(cpus: &[u32]) -> Result<(), Failure> {
         if Instant::now() >= limit {
             return Err(check(
                 STEP,
-                format!("no complete fork/exec/exit/wait for pid {child}"),
+                format!(
+                    "no complete fork/exec/exit/wait for pid {child} of {parent}; {}",
+                    summary(&trace)
+                ),
             ));
         }
         std::thread::sleep(Duration::from_millis(1));
