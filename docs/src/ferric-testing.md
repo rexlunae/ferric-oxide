@@ -142,6 +142,28 @@ corruption. Because the bootloader is a soft-float UEFI target, CI also builds
 it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
 `x86_64-unknown-uefi`; check that build when changing its dependencies.
 
+## Device-tree parser checks
+
+The kernel and ARM64/RISC-V bootloader share `ferric-devicetree`, which consumes
+the published `fdt` prerelease. Run its host fixtures and memory checks with:
+
+```sh
+cargo test --locked -p ferric-devicetree
+cargo clippy --locked --no-deps --all-targets -p ferric-devicetree -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-devicetree
+cargo miri test --locked -p ferric-devicetree
+```
+
+Tests cover console aliases and parameters, compatible lists, phandles, CPU
+registers with zero size cells, independent default cell widths, PCI ranges,
+nested MMIO translation and range boundaries, malformed headers/structures and
+invalid cell widths. CI runs these with the host workspace, strict docs/Clippy
+and Miri. Regenerate the local DTS fixture with the command in the crate README.
+These tests do not execute firmware or initialize hardware. Dependency updates
+also require ARM64 bootloader/kernel builds and a software QEMU image boot;
+check console, CPU topology, interrupt/timer progress and the signal/clock
+regressions. Record image/configuration details and every skipped check.
+
 ## Kernel lint and binary checks
 
 | Check | Purpose |

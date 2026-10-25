@@ -314,6 +314,14 @@ fetches from upstream Redox at build time.
   requests and never writes there. Recipes that fetch their own component
   trees from upstream Redox are outside this list and remain to be migrated.
 
+Device-tree parsing for the kernel and ARM64/RISC-V bootloader goes through
+`crates/devicetree/` (`ferric-devicetree`), which uses crates.io's
+`fdt = "=0.2.0-alpha3"` with default features disabled. This replaces the old git
+revision. The exact prerelease is intentional: 0.1.5 lacks required interfaces,
+and the 0.2 parser API is still evolving. Each consumer's lockfile records the
+registry version and checksum. The MPL-2.0 parser remains an external dependency;
+the MIT adapter does not vendor or copy its implementation.
+
 The prebuilt toolchain, the package key and the Rust nightly components in
 `mk/prefix.mk` are downloaded with `wget` through its `WGET` variable. It
 prefers IPv4, because hosts without IPv6, such as GitHub's runners, cannot reach

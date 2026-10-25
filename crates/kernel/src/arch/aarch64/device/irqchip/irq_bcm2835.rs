@@ -1,5 +1,5 @@
 use core::ptr::{read_volatile, write_volatile};
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 
 use super::InterruptController;
 use crate::{

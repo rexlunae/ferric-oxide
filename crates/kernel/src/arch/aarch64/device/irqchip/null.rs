@@ -1,4 +1,4 @@
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use syscall::{
     error::{Error, EINVAL},
     Result,

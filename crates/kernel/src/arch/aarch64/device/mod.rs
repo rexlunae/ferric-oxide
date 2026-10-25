@@ -1,6 +1,6 @@
 use crate::info;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 
 pub mod cpu;
 pub mod generic_timer;

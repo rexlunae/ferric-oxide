@@ -6,6 +6,13 @@ Redox OS Microkernel
 [![SLOCs counter](https://tokei.rs/b1/github/redox-os/kernel?category=code)](https://github.com/XAMPPRocky/tokei)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
+## Device trees
+
+The kernel uses `ferric-devicetree` (`../devicetree`) for borrowed device-tree
+access and MMIO translation. It shares the published crates.io parser with the
+bootloader. See its README for host tests and `../../docs/src/ferric-testing.md`
+for required image checks.
+
 ## Requirements
 
 * [`nasm`](https://nasm.us/) needs to be available on the PATH at build time.

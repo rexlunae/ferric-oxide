@@ -3,7 +3,7 @@ use core::ptr::read_volatile;
 
 static RTC_DR: usize = 0x000;
 
-pub unsafe fn init(fdt: &fdt::Fdt) {
+pub unsafe fn init(fdt: &ferric_devicetree::Tree) {
     if let Some(node) = fdt.find_compatible(&["arm,pl031"]) {
         match node
             .reg()

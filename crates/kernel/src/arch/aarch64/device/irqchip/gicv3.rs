@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::arch::asm;
-use fdt::{node::NodeProperty, Fdt};
+use ferric_devicetree::{Property as NodeProperty, Tree as Fdt};
 
 use super::{gic::GicDistIf, InterruptController};
 use crate::{

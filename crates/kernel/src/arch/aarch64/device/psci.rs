@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 
 const PSCI_VERSION: u32 = 0x8400_0000;
 const PSCI_CPU_ON_64: u32 = 0xc400_0003;

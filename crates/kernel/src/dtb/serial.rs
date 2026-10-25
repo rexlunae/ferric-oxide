@@ -1,4 +1,4 @@
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use spin::Mutex;
 use syscall::MmioPtr;
 
@@ -23,7 +23,7 @@ fn stdout_baud(dtb: &Fdt) -> Option<u32> {
     params.get(..digits)?.parse().ok()
 }
 
-fn named_clock_rate(dtb: &Fdt, node: fdt::node::FdtNode<'_, '_>, name: &str) -> Option<u32> {
+fn named_clock_rate(dtb: &Fdt, node: ferric_devicetree::Node<'_>, name: &str) -> Option<u32> {
     // Initial Meson support only handles clocks whose provider exposes a
     // fixed rate directly through clock-frequency. It does not evaluate
     // outputs from programmable clock controllers.

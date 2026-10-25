@@ -4,7 +4,7 @@
 //! defined in other files inside of the `arch` module
 use core::{arch::naked_asm, cell::SyncUnsafeCell, slice};
 
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 
 use crate::{
     allocator,
@@ -84,7 +84,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
             };
 
             let dtb_res = hwdesc_data
-                .ok_or(fdt::FdtError::BadPtr)
+                .ok_or(ferric_devicetree::Error::Bounds)
                 .and_then(|data| Fdt::new(data));
 
             // Try to find serial port prior to logging

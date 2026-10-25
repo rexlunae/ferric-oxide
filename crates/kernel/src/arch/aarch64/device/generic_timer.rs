@@ -8,7 +8,7 @@ use crate::{
     sync::CleanLockToken,
     time,
 };
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use syscall::{Error, Result, EINVAL, ENODEV};
 
 bitflags! {

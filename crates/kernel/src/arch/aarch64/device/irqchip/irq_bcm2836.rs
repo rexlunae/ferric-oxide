@@ -12,7 +12,7 @@ use core::{
     ptr::{read_volatile, write_volatile},
     sync::atomic::Ordering,
 };
-use fdt::{node::FdtNode, Fdt};
+use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 use syscall::{
     error::{Error, EINVAL},
     Result,

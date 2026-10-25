@@ -7,7 +7,7 @@ use crate::{
     sync::CleanLockToken,
 };
 use core::{mem, num::NonZero, sync::atomic::Ordering};
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 use syscall::{Error, Io, Mmio, EINVAL};
 
 #[repr(packed(4))]

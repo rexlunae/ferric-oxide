@@ -6,7 +6,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use core::{arch::asm, cmp::max};
-use fdt::node::FdtNode;
+use ferric_devicetree::Node as FdtNode;
 use spin::Mutex;
 // This is a Core-Local Interruptor (CLINT). A single device directly routed into each HLIC
 // It is responsible for local timer and IPI interrupts

@@ -278,7 +278,7 @@ pub fn cpu_info<W: Write>(w: &mut W) -> Result {
     Ok(())
 }
 
-pub fn init_topology(fdt: &fdt::Fdt<'_>) {
+pub fn init_topology(fdt: &ferric_devicetree::Tree<'_>) {
     let Some(topology) = topology::init(fdt) else {
         return;
     };

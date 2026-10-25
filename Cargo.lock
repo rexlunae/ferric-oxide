@@ -1280,6 +1280,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdt"
+version = "0.2.0-alpha3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
+
+[[package]]
 name = "ferric-amdvi"
 version = "0.1.0"
 dependencies = [
@@ -1337,6 +1343,13 @@ dependencies = [
  "thiserror 2.0.17",
  "toml 1.1.8+spec-1.1.0",
  "toml_edit 0.25.17+spec-1.1.0",
+]
+
+[[package]]
+name = "ferric-devicetree"
+version = "0.1.0"
+dependencies = [
+ "fdt",
 ]
 
 [[package]]

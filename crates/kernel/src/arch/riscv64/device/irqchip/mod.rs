@@ -1,7 +1,7 @@
 use self::clint::Clint;
 use crate::dtb::irqchip::InterruptController;
 use alloc::boxed::Box;
-use fdt::Fdt;
+use ferric_devicetree::Tree as Fdt;
 
 pub(crate) mod hlic;
 mod plic;
