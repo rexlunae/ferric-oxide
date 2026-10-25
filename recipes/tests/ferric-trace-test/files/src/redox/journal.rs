@@ -1,18 +1,32 @@
-//! The mapping journal: fixed replacement, `mremap` moves, a fork's clone and its teardown.
+//! The mapping journal: fixed replacement, `mremap` moves, a fork's clone with the grant it
+//! leaves out, and the copy's teardown.
 
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use ferric_trace::Event;
-use ferric_trace::kernel::{MM_CLONE, MM_DESTROY, MM_MAP, MM_MOVE, MM_REPLACE};
+use ferric_trace::kernel::{MM_CLONE, MM_CLONE_SKIP, MM_DESTROY, MM_MAP, MM_MOVE, MM_REPLACE};
 use syscall::{Map, MapFlags, MremapFlags, SYS_MREMAP};
 
 use super::lifecycle::spawn_child;
 use super::mapping::{anonymous, ordered, succeeded};
-use super::{Entry, Failure, PAGE, check, command, drain, has_event};
+use super::{Entry, Failure, PAGE, check, command, drain, has_event, io_failure};
 
 const STEP: &str = "trace-journal";
-const EVENTS: &str = "mm.map mm.replace mm.move mm.clone mm.destroy";
-const JOURNAL: [&Event; 5] = [&MM_MAP, &MM_REPLACE, &MM_MOVE, &MM_CLONE, &MM_DESTROY];
+const EVENTS: &str = "mm.map mm.replace mm.move mm.clone mm.clone_skip mm.destroy";
+const JOURNAL: [&Event; 6] = [
+    &MM_MAP,
+    &MM_REPLACE,
+    &MM_MOVE,
+    &MM_CLONE,
+    &MM_CLONE_SKIP,
+    &MM_DESTROY,
+];
+
+/// Physically contiguous memory, which a fork does not copy (`mm.clone_skip`); the test runs
+/// as root, which the memory scheme requires.
+const CONTIGUOUS: &str = "/scheme/memory/zeroed@wb?phys_contiguous";
 
 /// The size of each mapping, in pages: a count the allocator's own mappings are unlikely to
 /// share, so an exact record cannot match one of them.
@@ -29,6 +43,8 @@ struct Addresses {
     moved: usize,
     /// The second anonymous mapping, which the final fixed move replaced.
     target: usize,
+    /// The page of contiguous memory mapped across the fork.
+    contiguous: usize,
     /// The forked child's process id.
     child: u32,
 }
@@ -73,13 +89,40 @@ fn operations() -> Result<Addresses, Failure> {
     succeeded(STEP, "munmap", unsafe {
         syscall::funmap(target, PAGES * PAGE)
     })?;
-    let child = spawn_child(STEP)?;
+    let (contiguous, child) = fork_with_contiguous()?;
     Ok(Addresses {
         first,
         moved,
         target,
+        contiguous,
         child,
     })
+}
+
+/// Forks a child while a page of contiguous memory is mapped, then unmaps that page; returns
+/// its address and the child's process id.
+fn fork_with_contiguous() -> Result<(usize, u32), Failure> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(CONTIGUOUS)
+        .map_err(io_failure(STEP, CONTIGUOUS))?;
+    let map = Map {
+        offset: 0,
+        size: PAGE,
+        flags: rw() | MapFlags::MAP_PRIVATE,
+        address: 0,
+    };
+    let fd = usize::try_from(file.as_raw_fd()).map_err(|_| check(STEP, "negative descriptor"))?;
+    // SAFETY: the kernel picks unused memory for this mapping, and no Rust reference points
+    // into it.
+    let contiguous = succeeded(STEP, "contiguous mmap", unsafe { syscall::fmap(fd, &map) })?;
+    let child = spawn_child(STEP);
+    // SAFETY: drops the contiguous page mapped above, which nothing refers to.
+    let unmapped = unsafe { syscall::funmap(contiguous, PAGE) };
+    let child = child?;
+    succeeded(STEP, "contiguous munmap", unmapped)?;
+    Ok((contiguous, child))
 }
 
 /// The new address space of this process's one successful `mm.clone`, from `space`.
@@ -189,6 +232,12 @@ fn verify(trace: &[Vec<Entry>], at: &Addresses) -> Result<(), Failure> {
     let clone = cloned(trace, space)?;
     if clone.timestamp < after || !destroyed(trace, clone) {
         return Err(check(STEP, "mm.clone out of order or not destroyed"));
+    }
+    let new = clone.arg(1).unwrap_or(0);
+    let left_out = [space, new, at.contiguous as u64, 1];
+    let skip = ordered(STEP, trace, &MM_CLONE_SKIP, left_out, after)?;
+    if skip.timestamp > clone.timestamp {
+        return Err(check(STEP, "mm.clone_skip after its mm.clone"));
     }
     Ok(())
 }

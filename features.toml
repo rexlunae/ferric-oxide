@@ -778,7 +778,8 @@ help = """Compile in mm.map, mm.protect and mm.unmap results for address-space
 operations (target page-table root, requested range/flags and return value),
 and the rest of the mapping journal: mm.replace (a fixed mapping removed what
 was in its span), mm.move (mremap and grant moves between address spaces),
-mm.clone (a fork's copy of an address space) and mm.destroy (an address space
+mm.clone (a fork's copy of an address space), mm.clone_skip (a grant the
+copy left out) and mm.destroy (an address space
 torn down). Also compile in mm.page_fault, one record per page fault the kernel handles: the
 faulting address, the instruction pointer, the kind of access (read, write or
 fetch; user or kernel; page present or not) and the outcome (mapped, a failed

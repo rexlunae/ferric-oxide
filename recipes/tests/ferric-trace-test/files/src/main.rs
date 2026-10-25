@@ -50,8 +50,9 @@
 //!   `mm.replace` before its `mm.map`; `mremap` to an address the kernel picks, and with
 //!   `FIXED_REPLACE` onto another live mapping (an `mm.replace` first), each has an exact
 //!   `mm.move` within this address space; forking a child has one successful `mm.clone` of
-//!   this address space with grants and pages copied, and the copy has an `mm.destroy` once
-//!   the child execs and exits. Disabling the events stops all of them.
+//!   this address space with grants and pages copied, an `mm.clone_skip` before it for a page
+//!   of physically contiguous memory (which a fork does not copy), and the copy has an
+//!   `mm.destroy` once the child execs and exits. Disabling the events stops all of them.
 //! - `trace-futex`: 32/64-bit waits produce a queued wait and matching resume with the
 //!   timeout or wake result; mismatched waits produce neither. Empty, zero-count and
 //!   successful peer wakes record their returned counts, and disabling the events stops

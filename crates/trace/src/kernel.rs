@@ -222,8 +222,10 @@ crate::events! {
     /// `space` identifies an address space while it exists; its frame may be reused after
     /// destruction. The producer may be a manager operating on another address space.
     /// A fixed request first removes what was mapped in its span: an `mm.replace` record
-    /// precedes this one. With `mm.replace`, `mm.move`, `mm.clone` and `mm.destroy` the `mm`
-    /// events journal every change to a user address space's grants.
+    /// precedes this one. A registered-buffer revoke records its zeroed replacement as a
+    /// fixed private map too, after its `mm.replace`. With `mm.replace`, `mm.move`,
+    /// `mm.clone`, `mm.clone_skip` and `mm.destroy` the `mm` events journal every change to
+    /// a user address space's grants.
     pub const MM_MAP = 16 {
         name: "mm.map",
         subsystem: Mm,
@@ -332,8 +334,8 @@ crate::events! {
     /// source and new page-table roots, the grants and pages copied, and 0 or negated
     /// errno. On failure `new_space`, `grants` and `pages` are 0; a partly built copy has
     /// already been torn down with its own `mm.destroy` record. Grants a clone does not keep
-    /// (pinned scheme borrows, contiguous driver memory, file-mapping borrows) are not
-    /// counted.
+    /// are not counted; each has an `mm.clone_skip` record before this one, so the copy holds
+    /// the source's grants minus those.
     pub const MM_CLONE = 24 {
         name: "mm.clone",
         subsystem: Mm,
@@ -349,6 +351,17 @@ crate::events! {
         subsystem: Mm,
         level: Info,
         args: ["space", "grants", "pages"],
+    }
+
+    /// A grant `AddrSpaceWrapper::try_clone` did not copy into the new address space, under
+    /// the source's lock and before the `mm.clone` record: the source and new page-table
+    /// roots, and the grant's address and page count. Pinned scheme borrows, physically
+    /// contiguous driver memory and file-mapping borrows are not kept across a fork.
+    pub const MM_CLONE_SKIP = 26 {
+        name: "mm.clone_skip",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "new_space", "addr", "pages"],
     }
 }
 
@@ -605,6 +618,7 @@ mod tests {
         assert_eq!(MM_MOVE.id().get(), 23);
         assert_eq!(MM_CLONE.id().get(), 24);
         assert_eq!(MM_DESTROY.id().get(), 25);
+        assert_eq!(MM_CLONE_SKIP.id().get(), 26);
     }
 
     #[test]
@@ -630,6 +644,7 @@ mod tests {
             &MM_MOVE,
             &MM_CLONE,
             &MM_DESTROY,
+            &MM_CLONE_SKIP,
             &IOMMU_MAP,
             &IOMMU_PROTECT,
             &IOMMU_UNMAP,
@@ -679,6 +694,7 @@ mod tests {
             &MM_MOVE,
             &MM_CLONE,
             &MM_DESTROY,
+            &MM_CLONE_SKIP,
         ] {
             assert_eq!(event.subsystem(), Subsystem::Mm);
             assert!(selected.contains(event.id()));

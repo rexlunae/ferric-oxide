@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn mapping_journal_preserves_replacements_moves_clones_and_teardown() {
-        use ferric_trace::kernel::{MM_CLONE, MM_DESTROY, MM_MOVE, MM_REPLACE};
+        use ferric_trace::kernel::{MM_CLONE, MM_CLONE_SKIP, MM_DESTROY, MM_MOVE, MM_REPLACE};
         let b = bytes(&[
             (&MM_REPLACE, 10, &[0x1000, 0x8000, 2, 0]),
             (
@@ -165,6 +165,7 @@ mod tests {
                 20,
                 &[0x1000, 0x1000, 0x8000, 2, 0x20000, 4, 0x10_0003, 0x20000],
             ),
+            (&MM_CLONE_SKIP, 25, &[0x1000, 0x5000, 0x30000, 1]),
             (&MM_CLONE, 30, &[0x1000, 0x5000, 7, 40, 0]),
             (&MM_CLONE, 40, &[0x1000, 0, 0, 0, u64::MAX - 11]),
             (&MM_DESTROY, 50, &[0x5000, 7, 40]),
@@ -184,6 +185,9 @@ mod tests {
         assert!(text.contains(
             "mm.clone space=0x1000 new_space=0x0 grants=0x0 pages=0x0 ret=0xfffffffffffffff4"
         ));
+        assert!(
+            text.contains("mm.clone_skip space=0x1000 new_space=0x5000 addr=0x30000 pages=0x1")
+        );
         assert!(text.contains("mm.destroy space=0x5000 grants=0x7 pages=0x28"));
     }
 

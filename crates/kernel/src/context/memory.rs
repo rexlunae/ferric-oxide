@@ -155,6 +155,20 @@ fn trace_replace(mapper: &PageMapper, span: PageSpan, result: &Result<UnmapVec>)
     );
 }
 
+/// Ferric Oxide: records an `mm.clone_skip`: a clone into the space `new` translates did not
+/// keep the grant of `pages` at `base` from the space `src` translates.
+fn trace_clone_skip(src: &PageMapper, new: &PageMapper, base: Page, pages: usize) {
+    #[cfg(not(feature = "trace"))]
+    let _ = (src, new, base, pages);
+    crate::trace::trace_event!(
+        ferric_trace::kernel::MM_CLONE_SKIP,
+        src.table().phys().data(),
+        new.table().phys().data(),
+        base.start_address().data(),
+        pages,
+    );
+}
+
 /// Ferric Oxide: how many grants `grants` holds and how many pages they span, for the
 /// `mm.clone` and `mm.destroy` records.
 #[cfg(feature = "trace")]
@@ -285,25 +299,25 @@ impl AddrSpaceWrapper {
                 | Provider::AllocatedShared {
                     is_pinned_userscheme_borrow: true,
                     ..
-                } => continue,
+                } => None,
 
                 // No, physically contiguous driver memory won't either.
                 Provider::Allocated {
                     phys_contiguous: true,
                     ..
-                } => continue,
+                } => None,
 
-                Provider::PhysBorrowed { base } => Grant::physmap(
+                Provider::PhysBorrowed { base } => Some(Grant::physmap(
                     base,
                     PageSpan::new(grant_base, grant_info.page_count),
                     grant_info.flags,
                     &mut new.inner.get_mut().table.utable,
                     &mut NopFlusher,
-                )?,
+                )?),
                 Provider::Allocated {
                     ref cow_file_ref,
                     phys_contiguous: false,
-                } => Grant::copy_mappings(
+                } => Some(Grant::copy_mappings(
                     grant_base,
                     grant_base,
                     grant_info.page_count,
@@ -315,11 +329,11 @@ impl AddrSpaceWrapper {
                     CopyMappingsMode::Owned {
                         cow_file_ref: cow_file_ref.clone(),
                     },
-                )?,
+                )?),
                 // TODO: Merge Allocated and AllocatedShared, and make CopyMappingsMode a field?
                 Provider::AllocatedShared {
                     is_pinned_userscheme_borrow: false,
-                } => Grant::copy_mappings(
+                } => Some(Grant::copy_mappings(
                     grant_base,
                     grant_base,
                     grant_info.page_count,
@@ -329,7 +343,7 @@ impl AddrSpaceWrapper {
                     &mut this_flusher,
                     &mut NopFlusher,
                     CopyMappingsMode::Borrowed,
-                )?,
+                )?),
 
                 // MAP_SHARED grants are retained by reference, across address space clones (the
                 // "fork" analogue from monolithic kernels).
@@ -337,7 +351,7 @@ impl AddrSpaceWrapper {
                     ref address_space,
                     src_base,
                     ..
-                } => Grant::borrow_grant(
+                } => Some(Grant::borrow_grant(
                     Arc::clone(address_space),
                     src_base,
                     grant_base,
@@ -345,8 +359,18 @@ impl AddrSpaceWrapper {
                     &mut new.inner.get_mut().table.utable,
                     &mut NopFlusher,
                     false,
-                )?,
-                Provider::FmapBorrowed { .. } => continue,
+                )?),
+                Provider::FmapBorrowed { .. } => None,
+            };
+            // Ferric Oxide: the journal names each grant the copy leaves out (`mm.clone_skip`).
+            let Some(new_grant) = new_grant else {
+                trace_clone_skip(
+                    this_mapper,
+                    &new.inner.get_mut().table.utable,
+                    grant_base,
+                    grant_info.page_count,
+                );
+                continue;
             };
 
             new.inner.get_mut().grants.insert(new_grant);
@@ -529,8 +553,22 @@ impl AddrSpaceWrapper {
             &mut guard.table.utable,
             &mut flusher,
             false,
-        )?;
-        guard.grants.insert(zeroed);
+        );
+        // Ferric Oxide: the journal records the zeroed grant as the fixed private map it is.
+        crate::trace::trace_event!(
+            ferric_trace::kernel::MM_MAP,
+            guard.table.utable.table().phys().data(),
+            span.base.start_address().data(),
+            span.count,
+            (flags | MapFlags::MAP_FIXED | MapFlags::MAP_PRIVATE).bits(),
+            Error::mux(
+                zeroed
+                    .as_ref()
+                    .map(|_| span.base.start_address().data())
+                    .map_err(|_| Error::from(Enomem))
+            ),
+        );
+        guard.grants.insert(zeroed?);
         Ok(notify)
     }
     /// Moves the grants of `src_span` (in `src_opt`'s address space, or this one) to this
