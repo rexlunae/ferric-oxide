@@ -559,9 +559,20 @@ impl<L: Level, T> RwLock<L, T> {
         // context switch spins here with interrupts off; a holder of this context's lock can be
         // waiting on a CPU that waits for this one's acknowledgement (spin_wait.rs).
         let my_percpu = PercpuBlock::current();
+        #[cfg(feature = "busy_panic")]
+        let mut i = DEADLOCK_SPIN_CAP;
         let guard = super::spin_wait::until(
             || self.inner.try_write(),
-            || my_percpu.maybe_handle_tlb_shootdown(),
+            || {
+                my_percpu.maybe_handle_tlb_shootdown();
+                #[cfg(feature = "busy_panic")]
+                {
+                    i = i.saturating_sub(1);
+                    if i == 0 {
+                        panic!("Deadlock at write_arc may have triggered")
+                    }
+                }
+            },
         );
         core::mem::forget(guard);
         ArcRwLockWriteGuard {

@@ -140,6 +140,17 @@ entries across entry and return. Page invalidations and shootdowns invalidate
 the user PCID as well; switches between address spaces still flush because
 they share the pair. This is not a cache of a separate PCID pair per process.
 
+A CPU that waits for a contended lock keeps answering TLB shootdowns. Every
+ordered lock path, including the context switch's `write_arc` on a context
+lock, retries the lock and acknowledges any pending shootdown between tries
+(`sync/spin_wait.rs`). The context switch runs with interrupts off, so without
+this a CPU waiting for a context lock cannot acknowledge a flush. If the
+flushing CPU holds a lock that the context lock's holder waits for, none of
+them can continue; that was the boot-smoke hang in
+[#198](https://github.com/rexlunae/ferric-oxide/issues/198). The host tests
+in `crates/kernel/tests` model the wait with threads and an acknowledgement
+flag; only the image boots exercise the real context-switch path.
+
 The old catalog option `kernel.pti` is separate from `kernel.cpu.kpti`. It
 describes an experimental inherited path and currently names a Cargo feature
 absent from the kernel manifest. Use `kernel.cpu.kpti` for the implemented
