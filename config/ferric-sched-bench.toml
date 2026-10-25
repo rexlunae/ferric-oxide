@@ -13,6 +13,13 @@
 # and the rest, as image.yml writes it), e.g.:
 #   make all CONFIG_NAME=ferric-sched-bench
 # A 1-vCPU and a 4-vCPU boot on KVM are the protocol's two configurations.
+#
+# The trace timestamps are TSC cycles (the kernel's trace clock picks the
+# invariant TSC, whose period it does not know), so the counts runs must tell
+# ferric-trace the traced machine's TSC frequency. Set TSC_MHZ below to the
+# KVM guest's TSC rate (the host's, measured as documented in
+# docs/src/ferric-tracing.md). kleya's is 4292. The counts lines are in real
+# nanoseconds only with the right value.
 
 include = ["minimal.toml"]
 
@@ -60,6 +67,7 @@ ls /scheme
 # turns both on: kernel.trace and kernel.trace_boot = "sched"). Without it the image
 # skips, as the smoke image's trace steps do.
 if contains "$(ls /scheme)" kernel.trace
+    let tsc_mhz = 4292
     echo enable sched > /scheme/kernel.trace/events
     # Let the boot services settle before the windows.
     sleep 10
@@ -71,7 +79,7 @@ if contains "$(ls /scheme)" kernel.trace
     ferric-trace capture /tmp/sched-idle.d
     sleep 10
     ferric-trace capture /tmp/sched-idle-window.d
-    ferric-trace counts /tmp/sched-idle-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.switch
+    ferric-trace counts /tmp/sched-idle-window.d --tsc-mhz $tsc_mhz --gap sched.tick --gap sched.ipi_pit --gap sched.switch
 
     # Window 2: one CPU-bound best-effort context (a syscall-free spin); the tick is the
     # only thing that preempts it, so the window shows the periodic preemption of a
@@ -80,7 +88,7 @@ if contains "$(ls /scheme)" kernel.trace
     ferric-trace capture /tmp/sched-burn.d
     ferric-sched-burn --seconds 10
     ferric-trace capture /tmp/sched-burn-window.d
-    ferric-trace counts /tmp/sched-burn-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.switch
+    ferric-trace counts /tmp/sched-burn-window.d --tsc-mhz $tsc_mhz --gap sched.tick --gap sched.ipi_pit --gap sched.switch
 
     # Windows 3: waiting rings. Each run's window covers the setup of the rings (their
     # worker contexts start there), the quiet hold of the blocked reads, and the wake of
@@ -91,7 +99,7 @@ if contains "$(ls /scheme)" kernel.trace
         ferric-ring-test --scale $rings --quiet-seconds 8 > /tmp/scale-$rings.log
         cat /tmp/scale-$rings.log
         ferric-trace capture /tmp/sched-scale-$rings-window.d
-        ferric-trace counts /tmp/sched-scale-$rings-window.d --gap sched.tick --gap sched.ipi_pit --gap sched.ipi_wake --gap sched.switch --gap sched.context_create
+        ferric-trace counts /tmp/sched-scale-$rings-window.d --tsc-mhz $tsc_mhz --gap sched.tick --gap sched.ipi_pit --gap sched.ipi_wake --gap sched.switch --gap sched.context_create
     end
 
     # Windows 4: the benchmark lines with tracing on (the trace-bench workload also
