@@ -9,10 +9,15 @@
 //!   link reads as its target;
 //! - `ext4-stat`: sizes and kinds come back from `stat`;
 //! - `ext4-erofs`: writing, creating, removing, renaming and making a directory fail with
-//!   `EROFS`, and the file is unchanged afterwards.
+//!   `EROFS`, and the file is unchanged afterwards;
+//! - `ext4-journal`: `ext4d` replays the journal of `journal-v3`, a volume that needs
+//!   recovery, serves hello.txt as the journal left it, and the image no longer needs
+//!   recovery. Without the replay (fs.ext4_journal_replay off) `ext4d` refuses that volume
+//!   and the step prints `FERRIC_TEST_SKIP ext4-journal`.
 //!
-//! Without `/usr/bin/ext4d` (fs.ext4 off) it prints `FERRIC_TEST_SKIP ext4`. The image is
-//! `basic.ext4` from `userspace/ext4d/tests/fixtures/`, whose script lists its contents.
+//! Without `/usr/bin/ext4d` (fs.ext4 off) it prints `FERRIC_TEST_SKIP ext4`. The images are
+//! `basic.ext4` and `journal-v3.ext4.gz` from `userspace/ext4d/tests/fixtures/`, whose
+//! script lists their contents.
 
 #![forbid(unsafe_code)]
 

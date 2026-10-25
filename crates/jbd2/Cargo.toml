@@ -1,0 +1,18 @@
+[package]
+name = "ferric-jbd2"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "JBD2 journal recovery planning for ext4 (superblock, descriptor, revoke and commit blocks, CRC32C checksums), no_std, written from the published ext4 disk layout"
+publish = false
+
+[dependencies]
+# CRC32C (Castagnoli), as ext4-view already uses for ext4's own checksums.
+crc = { version = "3.3", default-features = false }
+# Not inherited from the host workspace: ext4d's recipe builds this crate through a symlink
+# outside that workspace, where `workspace = true` cannot be resolved. Keep the version in
+# step with the root Cargo.toml's [workspace.dependencies].
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+flate2 = "1"

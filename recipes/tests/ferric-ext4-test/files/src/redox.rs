@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -20,6 +21,18 @@ const SCHEME: &str = "ferric-ext4";
 const ROOT: &str = "/scheme/ferric-ext4";
 /// How long the daemon may take to mount.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A volume that needs journal recovery (gzipped), built into the test: make-fixtures.sh
+/// lists its transactions.
+const JOURNAL_IMAGE: &[u8] =
+    include_bytes!("../../../../../userspace/ext4d/tests/fixtures/journal-v3.ext4.gz");
+/// Where it is written for `ext4d` to replay and read.
+const JOURNAL_IMAGE_PATH: &str = "/tmp/ferric-ext4-journal.ext4";
+/// Its scheme.
+const JOURNAL_SCHEME: &str = "ferric-ext4-journal";
+const JOURNAL_ROOT: &str = "/scheme/ferric-ext4-journal";
+/// `s_feature_incompat` in the volume superblock, and its `INCOMPAT_RECOVER` bit.
+const INCOMPAT_AT: u64 = 1024 + 0x60;
+const INCOMPAT_RECOVER: u32 = 0x4;
 
 /// Why a step failed.
 #[derive(Debug, Error)]
@@ -48,6 +61,15 @@ enum Failure {
     Exited { status: std::process::ExitStatus },
     #[error("ext4d did not mount within {MOUNT_TIMEOUT:?}")]
     Timeout,
+    #[error("the volume still needs recovery after ext4d mounted it")]
+    NotRecovered,
+}
+
+/// How the journal step went.
+enum Journal {
+    Ran(Result<(), Failure>),
+    /// `ext4d` refused the volume without replaying it: built without fs.ext4_journal_replay.
+    NoReplay,
 }
 
 fn io<T>(what: impl Into<String>, result: io::Result<T>) -> Result<T, Failure> {
@@ -77,11 +99,11 @@ fn at(path: &str) -> String {
     format!("{ROOT}/{path}")
 }
 
-/// Waits for `/scheme/ferric-ext4` to answer, or for the daemon to give up.
-fn mount(child: &mut Child) -> Result<(), Failure> {
+/// Waits for `root` to answer, or for the daemon to give up.
+fn mount(child: &mut Child, root: &str) -> Result<(), Failure> {
     let start = Instant::now();
     loop {
-        if fs::metadata(ROOT).is_ok() {
+        if fs::metadata(root).is_ok() {
             return Ok(());
         }
         if let Some(status) = io("wait for ext4d", child.try_wait())? {
@@ -264,6 +286,65 @@ fn read_only() -> Result<(), Failure> {
     same("new.txt exists", fs::metadata(at("new.txt")).is_ok(), false)
 }
 
+/// Replays and mounts a volume that needs recovery: hello.txt must read as the journal left
+/// it, and the image on disk must no longer need recovery.
+fn journal() -> Journal {
+    let mut image = Vec::new();
+    if let Err(source) = flate2::read::GzDecoder::new(JOURNAL_IMAGE).read_to_end(&mut image) {
+        return Journal::Ran(Err(Failure::Io {
+            what: "unpack the journal image".into(),
+            source,
+        }));
+    }
+    if let Err(err) = io(
+        "write the journal image",
+        fs::write(JOURNAL_IMAGE_PATH, image),
+    ) {
+        return Journal::Ran(Err(err));
+    }
+    let mut child = match io(
+        "start ext4d",
+        Command::new(EXT4D)
+            .args([JOURNAL_IMAGE_PATH, JOURNAL_SCHEME])
+            .stdin(Stdio::null())
+            .spawn(),
+    ) {
+        Ok(child) => child,
+        Err(err) => return Journal::Ran(Err(err)),
+    };
+    let result = match mount(&mut child, JOURNAL_ROOT) {
+        // ext4-view refuses this volume's journal (it has an escaped block), so an ext4d
+        // without the replay exits.
+        Err(Failure::Exited { .. }) => return Journal::NoReplay,
+        Err(err) => Err(err),
+        Ok(()) => replayed(),
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    Journal::Ran(result)
+}
+
+fn replayed() -> Result<(), Failure> {
+    same(
+        "hello.txt after the replay",
+        io(
+            "read hello.txt",
+            fs::read(format!("{JOURNAL_ROOT}/hello.txt")),
+        )?,
+        b"journaled hello\n".to_vec(),
+    )?;
+    let image = io("open the journal image", File::open(JOURNAL_IMAGE_PATH))?;
+    let mut incompat = [0; 4];
+    io(
+        "read the superblock",
+        image.read_exact_at(&mut incompat, INCOMPAT_AT),
+    )?;
+    if u32::from_le_bytes(incompat) & INCOMPAT_RECOVER != 0 {
+        return Err(Failure::NotRecovered);
+    }
+    Ok(())
+}
+
 fn report(step: &str, result: Result<(), Failure>) -> bool {
     match result {
         Ok(()) => {
@@ -315,7 +396,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut ok = report("mount", mount(&mut child));
+    let mut ok = report("mount", mount(&mut child, ROOT));
     if ok {
         ok &= report("list", list());
         ok &= report("read", read());
@@ -326,6 +407,15 @@ pub fn main() -> ExitCode {
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(IMAGE_PATH);
+    match journal() {
+        Journal::Ran(result) => ok &= report("journal", result),
+        Journal::NoReplay => {
+            println!(
+                "FERRIC_TEST_SKIP ext4-journal: ext4d has no journal replay (fs.ext4_journal_replay is off)"
+            );
+        }
+    }
+    let _ = fs::remove_file(JOURNAL_IMAGE_PATH);
     if ok {
         ExitCode::SUCCESS
     } else {
