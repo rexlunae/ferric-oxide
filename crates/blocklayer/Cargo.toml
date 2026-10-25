@@ -1,0 +1,23 @@
+[package]
+name = "ferric-blocklayer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Stackable read-only block layers (slices, LUKS decryption, LVM logical volumes), no_std"
+publish = false
+
+[dependencies]
+ferric-luks = { path = "../luks", optional = true }
+ferric-lvm = { path = "../lvm", optional = true }
+thiserror.workspace = true
+
+[features]
+# Everything, for the host tests; the kernel, bootloader and daemon pick what they need with
+# default-features = false.
+default = ["luks", "lvm"]
+## Heap-backed layers: the runtime [`Stack`] and the `Box`/`Arc` device impls.
+alloc = []
+## The LUKS1/LUKS2 decryption layer (features.toml `fs.luks`).
+luks = ["alloc", "dep:ferric-luks"]
+## The LVM2 logical-volume layer (features.toml `fs.lvm`).
+lvm = ["alloc", "dep:ferric-lvm"]

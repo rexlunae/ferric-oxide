@@ -878,9 +878,9 @@ device) and serves in the foreground until it is stopped.
   without permitting data reads, and `O_STAT | O_NOFOLLOW` stats the link itself.
   `O_SYMLINK` on a regular file fails with `EINVAL`; relative opens require a
   directory handle, including paths containing `..`.
-- **Layers:** the daemon reads through `ext4d::device::ReadAt`, which a LUKS
-  (`ferric-luks`) or LVM (`ferric-lvm`) volume can implement to put ext4 on top
-  of it; no such layer is wired up yet.
+- **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
+  serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
+  [Block layers](#block-layers-luks-and-lvm-read-only)).
 - **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
   hash of the path (hard links get different numbers) and `st_ctime` is the
   modification time; `mmap` is not served; encrypted files and devices are
@@ -894,6 +894,84 @@ protected files, directories and symlink targets. Host fixtures additionally
 cover owner and primary-group access.
 The image workflow checks the ext4 markers only for smoke boots, since the
 nightly fuzz script runs only the fuzzer and package verification.
+
+## Block layers: LUKS and LVM, read-only
+
+`ferric-blocklayer` (`crates/blocklayer/`) is a stack of read-only block
+layers, each a `BlockDevice` (a size and a positioned read) built on the
+devices below it, so they nest in whatever order the disk was set up in:
+
+- **`Slice`**: a byte window of a device, such as a partition.
+- **`Crypt`** (feature `luks`): opens a LUKS1 or LUKS2 volume through
+  `ferric-luks` (header, passphrase, volume key, data segment) and decrypts
+  AES-XTS sectors of 512 to 4096 bytes with `plain64` IVs. Whole sectors are
+  decrypted in the caller's buffer; a partial sector at either end goes through
+  one sector of scratch space. Segments that are flagged (reencryption),
+  integrity-protected, or more than one are refused.
+- **`Lvm`** (feature `lvm`): reads every PV's label and metadata through
+  `ferric-lvm`, takes the newest metadata (highest `seqno`), matches each PV of
+  the group to a device by its label's UUID, and splits reads wherever the
+  logical volume moves to another extent run, stripe chunk or PV. Every PV of the
+  group must be given; mirror, RAID, thin, cache and snapshot segments are
+  refused.
+- **`Stack`**: one type for a stack chosen at run time, whose error
+  (`StackError`) keeps each layer's error in its source chain.
+
+The crate is `no_std` (`alloc` for the LUKS, LVM and `Stack` layers) and has
+no `unsafe` code. It builds for bare-metal targets, with
+`RUSTFLAGS="--cfg aes_force_soft"` and `ferric-luks/force-soft` where SIMD is
+not available, as for the bootloader.
+
+**IVs of large sectors.** The LUKS2 specification (1.1.4, section 3.3) gives a
+crypt segment's `sector_size` and its `iv_tweak` ("the starting offset for the
+Initialization Vector") but not the unit the IV counts in when sectors are
+larger than 512 bytes. This was settled by experiment, without reading any
+implementation's source: cryptsetup 2.7 encrypted a volume with 4096-byte
+sectors (`crates/blocklayer/tests/fixtures/make-fixtures.sh`), and its data
+decrypts only when the IV of the sector at byte `b` of the segment is
+`iv_tweak + b / 512`; counting in 4096-byte units gives noise from the second
+sector on. So the IV always counts 512-byte units (`ferric_luks::data::IV_UNIT`),
+and the fixture test `lvm_on_luks_with_4k_sectors_decrypts` reads sectors whose
+IVs differ under the two readings.
+
+`ferric-blockd` (`userspace/blockd/`, features.toml `fs.luks` and `fs.lvm`, off
+by default; each builds in its layer) serves the top of a stack as a read-only
+scheme:
+
+```text
+ferric-blockd SCHEME STEP...
+  dev:PATH              push a disk, partition or image file
+  slice:OFFSET:LENGTH   the top volume's bytes OFFSET..OFFSET+LENGTH (LENGTH "-": to the end)
+  luks:KEYFILE          the LUKS volume on the top volume
+  lvm:NAME              logical volume NAME of the group whose PVs are all the volumes so far
+```
+
+For example, LVM on LUKS on a partition, with ext4 on the logical volume:
+
+```text
+ferric-blockd root dev:/scheme/disk.nvme/0p2 luks:/etc/keys/root lvm:root
+ext4d /scheme/root rootfs
+```
+
+- **Passphrase:** the whole content of `KEYFILE`, byte for byte (a trailing
+  newline is part of it), as cryptsetup reads `--key-file`; never from the
+  command line. The daemon reads key files and opens devices before it enters
+  the null namespace.
+- **Access:** the scheme holds one file, the volume, at its root. Only UID 0
+  may open it (it is decrypted data); opens for writing, creating or
+  truncating, and writes, `ftruncate`, `fchmod`, `fchown` and `futimens`, fail
+  with `EROFS`. Reads stop at the end of the volume.
+- **Limits:** read-only; no keyslot management, tokens, detached headers or
+  reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
+  started by hand, not by init, the installer or the bootloader.
+
+The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
+as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
+hold a known byte pattern in every volume: LUKS2 (512-byte sectors) on an LV
+split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
+data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
+Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
+serves the same images through `ferric-blockd` on the target.
 
 ## Kernel-bypass network queues
 

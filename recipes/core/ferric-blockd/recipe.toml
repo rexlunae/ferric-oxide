@@ -1,0 +1,18 @@
+# Ferric Oxide: ferric-blockd, the read-only block-layer daemon that serves LUKS volumes and
+# LVM logical volumes as a scheme (features.toml fs.luks and fs.lvm, off by default). It
+# lives in this repository at userspace/blockd/; as a path source (relative to the
+# repository root), edits there rebuild it.
+[source]
+path = "userspace/blockd"
+
+[build]
+template = "custom"
+script = """
+# The layers are path dependencies at ../../crates from userspace/blockd/. The cookbook builds
+# a copy of userspace/blockd/ in this recipe's source/, so give that copy the same relative
+# path to them, as the base recipe does.
+ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
+# fs.luks and fs.lvm each add their layer to FERRIC_BLOCKD_FEATURES; built by name without a
+# ferric.toml (as the smoke image is), the daemon has both.
+cookbook_cargo --no-default-features --features "${FERRIC_BLOCKD_FEATURES:-luks lvm}"
+"""

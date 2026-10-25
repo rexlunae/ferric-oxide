@@ -2,8 +2,9 @@
 //! passphrase.
 //!
 //! This is the header half of Ferric Oxide's dm-crypt compatibility (roadmap Phase 3): the
-//! bootloader and the block-layer daemon use it to find and check a LUKS header and to unlock
-//! the volume key. Decrypting data segments is left to the block layer.
+//! bootloader and the block-layer daemon use it to find and check a LUKS header, to unlock the
+//! volume key and to decrypt data sectors. Reading those sectors from a device, and stacking
+//! volumes, is left to the block layer (`ferric-blocklayer`).
 //!
 //! # Specifications
 //!
@@ -24,6 +25,8 @@
 //! - `unlock` on either header derives keys with PBKDF2 or Argon2, decrypts key material
 //!   ([`cipher`]), merges it ([`af`]) and checks the digest, within [`Limits`] that bound the
 //!   work a hostile header can ask for.
+//! - [`Header::data_segment`] says where the encrypted data is and how it is encrypted, and
+//!   [`data`] decrypts its sectors with the volume key.
 //!
 //! The crate does no I/O of its own: every read goes through a
 //! `FnMut(offset, &mut buf) -> Result<(), E>` that fills the whole buffer, so it runs over a
@@ -57,6 +60,7 @@ extern crate alloc;
 pub mod af;
 mod bytes;
 pub mod cipher;
+pub mod data;
 pub mod hash;
 pub mod luks1;
 pub mod luks2;
