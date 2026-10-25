@@ -66,6 +66,7 @@ impl<'a, T> Out<'a, T> {
         // writes.
         unsafe { Self::nonnull(r.as_mut_ptr()) }
     }
+    /// Write value into the pointer
     #[inline]
     pub fn write(&mut self, t: T) {
         unsafe {

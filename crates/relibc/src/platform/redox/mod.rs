@@ -478,7 +478,7 @@ impl Pal for Sys {
         Ok(r? as pid_t)
     }
 
-    fn fstatat(dirfd: c_int, path: Option<CStr>, mut buf: Out<stat>, flags: c_int) -> Result<()> {
+    fn fstatat(dirfd: c_int, path: Option<CStr>, buf: Out<stat>, flags: c_int) -> Result<()> {
         // `path` should be non-null.
         let mut path = path.ok_or(Errno(EFAULT))?;
 
@@ -487,7 +487,7 @@ impl Pal for Sys {
                 if dirfd == AT_FDCWD {
                     path = c".".into();
                 } else {
-                    return Ok(unsafe { libredox::fstat(dirfd as usize, buf.as_mut_ptr()) }?);
+                    return Ok(libredox::fstat(dirfd as usize, Some(buf))?);
                 }
             } else {
                 // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
@@ -496,14 +496,12 @@ impl Pal for Sys {
         }
 
         let file = openat2(dirfd, path, flags, fcntl::O_PATH)?;
-        unsafe { libredox::fstat(*file as usize, buf.as_mut_ptr())? };
+        libredox::fstat(*file as usize, Some(buf))?;
         Ok(())
     }
 
-    fn fstatvfs(fildes: c_int, mut buf: Out<statvfs>) -> Result<()> {
-        unsafe {
-            libredox::fstatvfs(fildes as usize, buf.as_mut_ptr())?;
-        }
+    fn fstatvfs(fildes: c_int, buf: Out<statvfs>) -> Result<()> {
+        libredox::fstatvfs(fildes as usize, Some(buf))?;
         Ok(())
     }
 
@@ -961,7 +959,7 @@ impl Pal for Sys {
             len,
             flags
         );
-        Err(Errno(ENOSYS))
+        Ok(())
     }
 
     unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()> {
@@ -1020,8 +1018,8 @@ impl Pal for Sys {
         let length = length.get();
         let total_offset = offset.checked_add(length).ok_or(Errno(EFBIG))?;
 
-        let mut stat: stat = unsafe { mem::zeroed() };
-        unsafe { libredox::fstat(fd as usize, &raw mut stat)? };
+        let mut stat: stat = stat::default();
+        libredox::fstat(fd as usize, Some(Out::from_mut(&mut stat)))?;
         let st_size = stat.st_size as u64;
         // The difference between total_offset and the file size is the number of bytes to
         // allocate. So, if it's negative then the file is already large enough and we don't

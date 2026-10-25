@@ -13,7 +13,7 @@ use syscall::{
 
 use crate::{
     header::{
-        errno::EINVAL, fcntl::AT_FDCWD, signal::sigaction, sys_stat::UTIME_NOW, sys_uio::iovec,
+        errno::EINVAL, fcntl::AT_FDCWD, signal::sigaction, sys_stat, sys_statvfs, sys_uio::iovec,
         time::timespec,
     },
     out::Out,
@@ -115,45 +115,47 @@ pub fn getdents(fd: usize, buf: &mut [u8], opaque: u64) -> Result<usize> {
 
     Ok(record_len.into())
 }
-pub unsafe fn fstat(fd: usize, buf: *mut crate::header::sys_stat::stat) -> Result<()> {
+pub fn fstat(fd: usize, buf: Option<Out<sys_stat::stat>>) -> Result<()> {
     let mut redox_buf: syscall::Stat = Default::default();
     redox_rt::sys::fstat(fd, &mut redox_buf)?;
 
-    if let Some(buf) = unsafe { buf.as_mut() } {
-        buf.st_dev = redox_buf.st_dev as dev_t;
-        buf.st_ino = redox_buf.st_ino as ino_t;
-        buf.st_nlink = nlink_t::from(redox_buf.st_nlink);
-        buf.st_mode = redox_buf.st_mode as mode_t;
-        buf.st_uid = redox_buf.st_uid as uid_t;
-        buf.st_gid = redox_buf.st_gid as gid_t;
+    let Some(mut out) = buf else {
+        return Ok(());
+    };
+    let buf = sys_stat::stat {
+        st_dev: redox_buf.st_dev as dev_t,
+        st_ino: redox_buf.st_ino as ino_t,
+        st_nlink: nlink_t::from(redox_buf.st_nlink),
+        st_mode: redox_buf.st_mode as mode_t,
+        st_uid: redox_buf.st_uid as uid_t,
+        st_gid: redox_buf.st_gid as gid_t,
         // TODO st_rdev
-        buf.st_rdev = 0;
-        buf.st_size = redox_buf.st_size as off_t;
+        st_rdev: 0,
+        st_size: redox_buf.st_size as off_t,
         #[cfg(target_pointer_width = "32")]
-        {
-            buf.st_blksize = redox_buf.st_blksize as blksize_t;
-        }
+        st_blksize: redox_buf.st_blksize as blksize_t,
         #[cfg(target_pointer_width = "64")]
-        {
-            buf.st_blksize = blksize_t::from(redox_buf.st_blksize);
-        }
-        buf.st_blocks = redox_buf.st_blocks as blkcnt_t;
-        buf.st_atim = timespec {
+        st_blksize: blksize_t::from(redox_buf.st_blksize),
+        st_blocks: redox_buf.st_blocks as blkcnt_t,
+        st_atim: timespec {
             tv_sec: redox_buf.st_atime as time_t,
             tv_nsec: redox_buf.st_atime_nsec as c_long,
-        };
-        buf.st_mtim = timespec {
+        },
+        st_mtim: timespec {
             tv_sec: redox_buf.st_mtime as time_t,
             tv_nsec: redox_buf.st_mtime_nsec as c_long,
-        };
-        buf.st_ctim = timespec {
+        },
+        st_ctim: timespec {
             tv_sec: redox_buf.st_ctime as time_t,
             tv_nsec: redox_buf.st_ctime_nsec as c_long,
-        };
-    }
+        },
+        ..Default::default()
+    };
+
+    out.write(buf);
     Ok(())
 }
-pub unsafe fn fstatvfs(fd: usize, buf: *mut crate::header::sys_statvfs::statvfs) -> Result<()> {
+pub fn fstatvfs(fd: usize, buf: Option<Out<sys_statvfs::statvfs>>) -> Result<()> {
     let mut kbuf: syscall::StatVfs = Default::default();
     std_fs_call_ro(
         fd,
@@ -161,22 +163,24 @@ pub unsafe fn fstatvfs(fd: usize, buf: *mut crate::header::sys_statvfs::statvfs)
         &StdFsCallMeta::new(StdFsCallKind::Fstatvfs, 0, 0),
     )?;
 
-    if !buf.is_null() {
-        unsafe {
-            (*buf).f_bsize = kbuf.f_bsize as c_ulong;
-            (*buf).f_frsize = kbuf.f_bsize as c_ulong;
-            (*buf).f_blocks = kbuf.f_blocks as c_ulong;
-            (*buf).f_bfree = kbuf.f_bfree as c_ulong;
-            (*buf).f_bavail = kbuf.f_bavail as c_ulong;
-            //TODO
-            (*buf).f_files = 0;
-            (*buf).f_ffree = 0;
-            (*buf).f_favail = 0;
-            (*buf).f_fsid = 0;
-            (*buf).f_flag = 0;
-            (*buf).f_namemax = 0;
-        }
-    }
+    let Some(mut out) = buf else {
+        return Ok(());
+    };
+    let buf = sys_statvfs::statvfs {
+        f_bsize: kbuf.f_bsize as c_ulong,
+        f_frsize: kbuf.f_bsize as c_ulong,
+        f_blocks: kbuf.f_blocks as c_ulong,
+        f_bfree: kbuf.f_bfree as c_ulong,
+        f_bavail: kbuf.f_bavail as c_ulong,
+        //TODO
+        f_files: 0,
+        f_ffree: 0,
+        f_favail: 0,
+        f_fsid: 0,
+        f_flag: 0,
+        f_namemax: 0,
+    };
+    out.write(buf);
     Ok(())
 }
 pub fn fsync(fd: usize) -> Result<()> {
@@ -197,11 +201,11 @@ pub unsafe fn futimens(fd: usize, times: *const timespec) -> Result<()> {
         [
             syscall::TimeSpec {
                 tv_sec: 0,
-                tv_nsec: UTIME_NOW as c_int,
+                tv_nsec: sys_stat::UTIME_NOW as c_int,
             },
             syscall::TimeSpec {
                 tv_sec: 0,
-                tv_nsec: UTIME_NOW as c_int,
+                tv_nsec: sys_stat::UTIME_NOW as c_int,
             },
         ]
     } else {
@@ -286,6 +290,7 @@ pub unsafe extern "C" fn redox_dup_v1(fd: usize, buf: *const u8, len: usize) -> 
         core::slice::from_raw_parts(buf, len)
     }))
 }
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn redox_dup2_v1(
     old_fd: usize,
@@ -297,6 +302,11 @@ pub unsafe extern "C" fn redox_dup2_v1(
         core::slice::from_raw_parts(buf, len)
     }))
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn redox_dup2_v2(old_fd: usize, new_fd: usize) -> RawResult {
+    Error::mux(redox_rt::sys::dup2(old_fd, new_fd, &[]))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn redox_read_v1(fd: usize, dst_base: *mut u8, dst_len: usize) -> RawResult {
     Error::mux(posix_read(fd, unsafe {
@@ -338,18 +348,17 @@ pub unsafe extern "C" fn redox_getdents_v0(
     )
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn redox_fstat_v1(
-    fd: usize,
-    stat: *mut crate::header::sys_stat::stat,
-) -> RawResult {
-    Error::mux(unsafe { fstat(fd, stat) }.map(|()| 0))
+pub unsafe extern "C" fn redox_fstat_v1(fd: usize, stat: *mut sys_stat::stat) -> RawResult {
+    let stat = unsafe { Out::nullable(stat) };
+    Error::mux(fstat(fd, stat).map(|()| 0))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn redox_fstatvfs_v1(
     fd: usize,
-    stat: *mut crate::header::sys_statvfs::statvfs,
+    stat: *mut sys_statvfs::statvfs,
 ) -> RawResult {
-    Error::mux(unsafe { fstatvfs(fd, stat) }.map(|()| 0))
+    let stat = unsafe { Out::nullable(stat) };
+    Error::mux(fstatvfs(fd, stat).map(|()| 0))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn redox_fsync_v1(fd: usize) -> RawResult {
