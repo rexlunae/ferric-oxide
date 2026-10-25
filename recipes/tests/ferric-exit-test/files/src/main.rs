@@ -6,7 +6,8 @@
 //! there for good, or the process never finishes exiting and its parent waits forever.
 //!
 //! The test runs itself as a child many times, in two kinds. In both, the main thread starts
-//! its work only once the second thread has said it is running, so the two overlap:
+//! its work only once the second thread has made one pass through its wait, so the two
+//! overlap:
 //!
 //! - `pipe`: a second thread reads a pipe one byte at a time while the main thread fills it,
 //!   then the main thread exits. The reader is still draining the pipe when the kill comes,
@@ -24,7 +25,8 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitCode};
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
@@ -109,92 +111,75 @@ impl std::error::Error for Failure {
     }
 }
 
-/// Why a child could not set up its busy thread.
-#[derive(Debug)]
-enum ChildError {
-    /// Making or writing the pipe failed.
-    Pipe(io::Error),
-    /// The second thread ended before it said it had started.
-    WorkerGone,
+/// Reads or wake-ups the second thread has finished: each is a pass through its wait.
+type Progress = Arc<AtomicUsize>;
+
+/// Spawns `work` on a second thread, giving it a [`Progress`] to count each pass.
+fn start_worker(work: impl FnOnce(&AtomicUsize) + Send + 'static) -> (Thread, Progress) {
+    let progress = Progress::default();
+    let counted = Arc::clone(&progress);
+    let worker = thread::spawn(move || work(&counted));
+    (worker.thread().clone(), progress)
 }
 
-impl fmt::Display for ChildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pipe(_) => f.write_str("pipe failed"),
-            Self::WorkerGone => f.write_str("the second thread ended before it started"),
-        }
+/// Calls `poke` until the second thread has made one pass through its wait, so the main thread's
+/// work (and its exit) overlaps with a worker that is going in and out of waits rather than
+/// one that has not started yet. A worker that never gets there leaves the child hanging,
+/// which the parent reports.
+fn await_first_wait(progress: &AtomicUsize, mut poke: impl FnMut()) {
+    while progress.load(Ordering::Acquire) == 0 {
+        poke();
+        thread::yield_now();
     }
-}
-
-impl std::error::Error for ChildError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Pipe(source) => Some(source),
-            Self::WorkerGone => None,
-        }
-    }
-}
-
-/// Spawns `work` on a second thread and returns once it is running, so the main thread's
-/// work (and its exit) overlaps with it rather than finishing before it starts.
-fn start_worker(work: impl FnOnce() + Send + 'static) -> Result<Thread, ChildError> {
-    let (started, ready) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        // The receiver lives until this is received; a send cannot fail first.
-        let _ = started.send(());
-        work();
-    });
-    ready.recv().map_err(|_| ChildError::WorkerGone)?;
-    Ok(worker.thread().clone())
 }
 
 /// A `pipe` child: fills a pipe its second thread drains, then exits with that thread busy.
-fn pipe_child() -> Result<(), ChildError> {
-    let (mut reader, mut writer) = io::pipe().map_err(ChildError::Pipe)?;
-    start_worker(move || {
+fn pipe_child() -> io::Result<()> {
+    let (mut reader, mut writer) = io::pipe()?;
+    let (_, progress) = start_worker(move |progress| {
         let mut byte = [0; 1];
         // Reads until the exit kills this thread. End of file or an error cannot happen while
         // the main thread holds the write end, but if one did, park rather than spin.
-        while matches!(reader.read(&mut byte), Ok(1)) {}
+        while matches!(reader.read(&mut byte), Ok(1)) {
+            progress.fetch_add(1, Ordering::Release);
+        }
         loop {
             thread::park();
         }
-    })?;
+    });
+    // One byte, then wait for the reader to take it: it is now reading for real.
+    writer.write_all(&[1])?;
+    await_first_wait(&progress, || {});
     for _ in 0..WORK {
-        writer.write_all(&[1]).map_err(ChildError::Pipe)?;
+        writer.write_all(&[1])?;
     }
     Ok(())
 }
 
 /// A `futex` child: unparks its second thread again and again, then exits with it busy.
-fn futex_child() -> Result<(), ChildError> {
-    let parker = start_worker(|| {
+fn futex_child() {
+    let (parker, progress) = start_worker(|progress| {
         loop {
             thread::park();
+            progress.fetch_add(1, Ordering::Release);
         }
-    })?;
+    });
+    await_first_wait(&progress, || parker.unpark());
     for _ in 0..WORK {
         parker.unpark();
     }
-    Ok(())
 }
 
 /// Runs this program as a child of `kind`. Its exit is the test.
 fn child(kind: Kind) -> ExitCode {
-    let result = match kind {
-        Kind::Pipe => pipe_child(),
-        Kind::Futex => futex_child(),
-    };
-    if let Err(err) = result {
-        let mut line = format!("ferric-exit-test {} child: {err}", kind.arg());
-        let mut source = std::error::Error::source(&err);
-        while let Some(cause) = source {
-            line.push_str(&format!(": {cause}"));
-            source = cause.source();
+    match kind {
+        Kind::Pipe => {
+            if let Err(err) = pipe_child() {
+                eprintln!("ferric-exit-test pipe child: {err}");
+                return ExitCode::FAILURE;
+            }
         }
-        eprintln!("{line}");
-        return ExitCode::FAILURE;
+        Kind::Futex => futex_child(),
     }
     // The second thread is still busy here: this exit is what the parent waits on.
     std::process::exit(0)
