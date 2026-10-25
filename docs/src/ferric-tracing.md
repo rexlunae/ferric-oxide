@@ -263,11 +263,18 @@ without them the first write fails with `EOPNOTSUPP` and `procmgr` stops
 writing; on a kernel without `kernel.trace` it opens nothing. While an event
 is off, each report costs `procmgr` one system call and stores nothing.
 
-- `sched.proc_fork` records a successful `fork`: `parent` and the new
-  `child` PID, before the parent's call returns.
-- `sched.proc_exec` records that `pid` has replaced its image: `redox-rt`
-  tells `procmgr` once `execve` has loaded the new program. A failed `execve`
-  reports nothing.
+- `sched.proc_fork` records that `procmgr` created the `child` process for
+  a `fork` by `parent`. The parent then copies its address space and file
+  table into the child and starts it. If that fails, `fork` returns an error
+  and the child never runs, so a fork record without a `sched.context_start`
+  for the child is a failed fork.
+- `sched.proc_exec` records that `pid` committed to an `execve`. `redox-rt`
+  tells `procmgr` once it has loaded the new program, and then switches to
+  it. An `execve` that fails while loading reports nothing. If one of the
+  few descriptor operations of the switch itself fails, the record stays
+  but the process keeps its old image. `procmgr` already treats the process
+  as exec'd at that point; for example, its parent can no longer
+  `setpgid` it.
 - `sched.proc_exit` records that the last thread of `pid` has gone and the
   process is a zombie: `status` is the exit status, `signal` the signal that
   killed it, or 0.

@@ -1021,7 +1021,8 @@ impl<'a> ProcScheme<'a> {
                 b"fork" => {
                     log::trace!("Forking {pid:?}");
                     let child_pid = self.fork(pid)?;
-                    // Ferric Oxide
+                    // Ferric Oxide: the child exists; the parent's redox-rt now sets it up and
+                    // starts it, and a failure there leaves the child unstarted.
                     self.trace.record(
                         &ferric_trace::kernel::SCHED_PROC_FORK,
                         &[pid.0 as u64, child_pid.0 as u64],
@@ -1251,7 +1252,8 @@ impl<'a> ProcScheme<'a> {
                     ProcCall::DisableSetpgid => {
                         if let Some(proc) = self.processes.get(&fd_pid) {
                             proc.borrow_mut().disabled_setpgid = true;
-                            // Ferric Oxide: redox-rt sends this once execve has replaced the image.
+                            // Ferric Oxide: redox-rt sends this once execve has loaded the new
+                            // image, just before it switches to it.
                             self.trace
                                 .record(&ferric_trace::kernel::SCHED_PROC_EXEC, &[fd_pid.0 as u64]);
                             Response::ready_ok(0, op)

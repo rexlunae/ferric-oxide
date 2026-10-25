@@ -290,7 +290,8 @@ crate::events! {
 
     /// The process manager (`procmgr`) created a process for a `fork`: the parent's and the
     /// new child's process IDs. The child's first context has not started yet; its
-    /// `sched.context_start` follows with the child's PID.
+    /// `sched.context_start` follows with the child's PID once the parent has set the child
+    /// up. A fork that fails during that setup has this record and no such start.
     ///
     /// This and the other `sched.proc_*` events are [`USER_EVENTS`]: user space writes them
     /// through the scheme's `emit` file ([`crate::abi::EMIT_PATH`]), and the kernel only
@@ -302,9 +303,11 @@ crate::events! {
         args: ["parent", "child"],
     }
 
-    /// A process finished an `exec`: its process ID. The process manager records it when the
-    /// process's runtime reports the new image (after the new program is loaded and before
-    /// it runs), so a process can also report it for itself without an exec.
+    /// A process committed to an `exec`: its process ID. The process manager records it when
+    /// the process's runtime reports the new image, after the new program is loaded and
+    /// before the runtime switches to it. A failure in that switch leaves this record while
+    /// the process keeps its old image. A process can also report it for itself without an
+    /// exec.
     pub const SCHED_PROC_EXEC = 23 {
         name: "sched.proc_exec",
         subsystem: Sched,
