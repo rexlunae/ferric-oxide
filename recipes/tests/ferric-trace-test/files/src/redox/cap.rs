@@ -9,6 +9,9 @@
 //! - writes a harmless command (`disable scheme.cancel`, which the earlier steps left off) to
 //!   `events` opened through the capability: refused with `EACCES` for read access, done for
 //!   control access;
+//! - fails to open `emit` by path (`EACCES`), and opens it through the capability only with
+//!   control access (`EACCES` for read), so only root or a `cap/control` holder can write
+//!   user-space records;
 //! - narrows the capability to `cap/read`, and with read access fails to widen it to
 //!   `cap/control` (`EACCES`).
 //!
@@ -97,6 +100,23 @@ fn through_cap(file: &str) -> io::Result<File> {
     Ok(unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
 }
 
+/// Only root or a `cap/control` holder may write user-space records: `emit` by path is
+/// refused (`EACCES`), and through the capability it opens only with control access.
+fn check_emit(access: Access) -> Result<(), String> {
+    let emit = path(abi::EMIT_PATH);
+    match std::fs::OpenOptions::new().write(true).open(&emit) {
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
+        other => {
+            return Err(format!("opening {emit} by path gave {other:?}, not EACCES"));
+        }
+    }
+    match (access, through_cap(abi::EMIT_PATH).map(drop)) {
+        (Access::Control, Ok(())) => Ok(()),
+        (Access::Read, Err(err)) if err.raw_os_error() == Some(EACCES) => Ok(()),
+        (_, other) => Err(format!("dup emit gave {other:?}")),
+    }
+}
+
 fn child_checks(access: Access) -> Result<(), String> {
     let stats = path(abi::STATS_PATH);
     match File::open(&stats) {
@@ -128,6 +148,7 @@ fn child_checks(access: Access) -> Result<(), String> {
         (Access::Read, Err(err)) if err.raw_os_error() == Some(EACCES) => {}
         (_, other) => return Err(format!("writing {HARMLESS:?} gave {other:?}")),
     }
+    check_emit(access)?;
     through_cap(&Access::Read.to_string()).map_err(|e| format!("narrowing to read: {e}"))?;
     let widened = through_cap(&Access::Control.to_string()).map(drop);
     match (access, widened) {

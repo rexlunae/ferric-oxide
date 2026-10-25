@@ -74,7 +74,7 @@
 //!   frequency they imply is printed.
 //! - `trace-cap`: a process that is not root cannot open the scheme by path, but can through
 //!   a capability (`cap/read`, `cap/control`) root handed it, with that capability's access
-//!   and no more; see `redox::cap`.
+//!   and no more, and cannot open `emit` by path or through `cap/read`; see `redox::cap`.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. `trace-fault` prints `FERRIC_TEST_SKIP trace-fault` on a

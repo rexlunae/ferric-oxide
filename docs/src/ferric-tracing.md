@@ -481,6 +481,12 @@ other event, a wrong argument count, reserved bits or a partial word with
 an event that is off is accepted and dropped; one that is on goes through the
 event's argument filter like a kernel record.
 
+Only root, or a process root gave a `cap/control` capability, can open
+`emit`. A record from user space cannot pass for a kernel record. The kernel
+accepts only the process lifecycle event ids, and no kernel tracepoint emits
+those ids. So the event id alone says a record came from `emit`, and no
+kernel event can be forged. In a stock image only `procmgr` opens `emit`.
+
 ### Capabilities
 
 A capability is a descriptor of `cap/read` or `cap/control`. Only root can
@@ -965,7 +971,8 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
      capability. Writing `disable scheme.cancel` (a no-op by then) to `events`
      through the capability is refused with `read` access and done with
      `control`. Narrowing to `cap/read` works, and widening `read` to
-     `cap/control` is refused (`trace-cap`).
+     `cap/control` is refused. The child cannot open `emit` by path, and opens
+     it through the capability only with `control` (`trace-cap`).
   13. checks 32/64-bit queued futex waits with timeout and peer wake, mismatched
       comparisons, zero-count and empty wakes, and disable. A successful wake
       must precede its matching resume. It drains all CPU rings while polling
