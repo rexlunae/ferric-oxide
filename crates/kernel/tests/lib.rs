@@ -12,3 +12,5 @@ extern crate alloc;
 mod cpu_set;
 #[path = "../src/sync/records.rs"]
 mod records;
+#[path = "../src/sync/spin_wait.rs"]
+mod spin_wait;
