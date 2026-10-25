@@ -39,7 +39,12 @@ fn put(block: &mut [u8], at: usize, value: u32) {
 impl Builder {
     /// A journal whose log starts at `start` with sequence `sequence`.
     fn new(start: u32, sequence: u32) -> Self {
-        let mut sb_raw = raw(REVOKE_V3_64, start);
+        Self::with_features(start, sequence, REVOKE_V3_64)
+    }
+
+    /// As [`Builder::new`], with `incompat` as the journal's incompatible features.
+    fn with_features(start: u32, sequence: u32, incompat: u32) -> Self {
+        let mut sb_raw = raw(incompat, start);
         put(&mut sb_raw, 0x10, LEN);
         put(&mut sb_raw, 0x18, sequence);
         let crc = crc32c_without(&[], &sb_raw, 0xFC);
@@ -355,4 +360,64 @@ fn reads_need_a_whole_block() {
             found: 10
         }
     ));
+}
+
+/// `INCOMPAT_ASYNC_COMMIT` on top of the usual features.
+const ASYNC: u32 = REVOKE_V3_64 | 0x4;
+
+/// Flips a bit in the data block at journal block `block`.
+fn damage(j: &mut Builder, block: u32) {
+    j.bytes[block as usize * BS + 300] ^= 1;
+}
+
+#[test]
+fn an_async_commit_over_damaged_data_ends_the_log() {
+    let mut j = Builder::with_features(1, 10, ASYNC);
+    j.data(&[(100, 1)]);
+    j.commit();
+    // Transaction 11's commit reached the disk, but its data (block 5) did not.
+    j.data(&[(200, 2), (201, 2)]);
+    j.commit();
+    j.data(&[(300, 3)]);
+    j.commit();
+    damage(&mut j, 5);
+    let recovery = j.scan().expect("transaction 10 is replayed");
+    assert_eq!(replayed(&j, &recovery), [(100, 1)]);
+    assert_eq!(recovery.transactions(), 1);
+    // Sequence 11 had no (whole) commit.
+    assert_eq!(recovery.next_sequence(), 12);
+}
+
+#[test]
+fn without_async_commits_damaged_data_under_a_commit_is_an_error() {
+    let mut j = Builder::new(1, 10);
+    j.data(&[(100, 1)]);
+    j.commit();
+    j.data(&[(200, 2)]);
+    j.commit();
+    damage(&mut j, 5);
+    assert!(matches!(
+        j.scan(),
+        Err(RecoveryError::DataChecksum {
+            source_block: 5,
+            target: 200,
+            sequence: 11
+        })
+    ));
+}
+
+#[test]
+fn a_damaged_copy_that_is_never_written_does_not_stop_the_replay() {
+    let mut j = Builder::new(1, 1);
+    // Blocks 2 and 3 hold transaction 1's copies of 100 and 101.
+    j.data(&[(100, 1), (101, 1)]);
+    j.commit();
+    // 100 gets a newer copy and 101 is revoked: the damaged old copies are not written.
+    j.data(&[(100, 2)]);
+    j.revoke(&[101]);
+    j.commit();
+    damage(&mut j, 2);
+    damage(&mut j, 3);
+    let recovery = j.scan().expect("only intact copies are written");
+    assert_eq!(replayed(&j, &recovery), [(100, 2)]);
 }

@@ -68,7 +68,7 @@ enum Failure {
 /// How the journal step went.
 enum Journal {
     Ran(Result<(), Failure>),
-    /// `ext4d` refused the volume without replaying it: built without fs.ext4_journal_replay.
+    /// `ext4d --features` does not list `journal-replay`: fs.ext4_journal_replay is off.
     NoReplay,
 }
 
@@ -286,9 +286,32 @@ fn read_only() -> Result<(), Failure> {
     same("new.txt exists", fs::metadata(at("new.txt")).is_ok(), false)
 }
 
+/// Whether `ext4d --features` lists `journal-replay`.
+fn has_replay() -> Result<bool, Failure> {
+    let output = io(
+        "run ext4d --features",
+        Command::new(EXT4D).arg("--features").output(),
+    )?;
+    same(
+        "ext4d --features exits cleanly",
+        output.status.success(),
+        true,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == "journal-replay"))
+}
+
 /// Replays and mounts a volume that needs recovery: hello.txt must read as the journal left
-/// it, and the image on disk must no longer need recovery.
+/// it, and the image on disk must no longer need recovery. Any failure to do so, including
+/// ext4d exiting before it mounts, fails the step; it is skipped only when ext4d says it has
+/// no journal replay.
 fn journal() -> Journal {
+    match has_replay() {
+        Ok(true) => {}
+        Ok(false) => return Journal::NoReplay,
+        Err(err) => return Journal::Ran(Err(err)),
+    }
     let mut image = Vec::new();
     if let Err(source) = flate2::read::GzDecoder::new(JOURNAL_IMAGE).read_to_end(&mut image) {
         return Journal::Ran(Err(Failure::Io {
@@ -312,13 +335,7 @@ fn journal() -> Journal {
         Ok(child) => child,
         Err(err) => return Journal::Ran(Err(err)),
     };
-    let result = match mount(&mut child, JOURNAL_ROOT) {
-        // ext4-view refuses this volume's journal (it has an escaped block), so an ext4d
-        // without the replay exits.
-        Err(Failure::Exited { .. }) => return Journal::NoReplay,
-        Err(err) => Err(err),
-        Ok(()) => replayed(),
-    };
+    let result = mount(&mut child, JOURNAL_ROOT).and_then(|()| replayed());
     let _ = child.kill();
     let _ = child.wait();
     Journal::Ran(result)

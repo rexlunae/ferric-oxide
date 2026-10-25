@@ -12,8 +12,9 @@
 //!   `EROFS`, and the file is unchanged afterwards;
 //! - `ext4-journal`: `ext4d` replays the journal of `journal-v3`, a volume that needs
 //!   recovery, serves hello.txt as the journal left it, and the image no longer needs
-//!   recovery. Without the replay (fs.ext4_journal_replay off) `ext4d` refuses that volume
-//!   and the step prints `FERRIC_TEST_SKIP ext4-journal`.
+//!   recovery. When `ext4d --features` does not list `journal-replay`
+//!   (fs.ext4_journal_replay off) the step prints `FERRIC_TEST_SKIP ext4-journal`; with it,
+//!   ext4d exiting before it mounts (a failed replay) fails the step.
 //!
 //! Without `/usr/bin/ext4d` (fs.ext4 off) it prints `FERRIC_TEST_SKIP ext4`. The images are
 //! `basic.ext4` and `journal-v3.ext4.gz` from `userspace/ext4d/tests/fixtures/`, whose

@@ -5,7 +5,20 @@
 //! an Inode", "Inode Table", "The Contents of inode.i_block" ("Direct/Indirect Block
 //! Addressing" and "Extent Tree"). All fields are little-endian.
 //!
-//! The checksums of the group descriptor, the inode and extent blocks are not checked here.
+//! The replay writes to the blocks this map names (the journal superblock, when it empties
+//! the log), so a map read from a damaged or forged volume must not be able to point those
+//! writes at anything else. Before the map is used:
+//!
+//! - the superblock's own checksum is checked (with `metadata_csum`), and the journal
+//!   inode's `i_block` and size must match the copy the superblock keeps in `s_jnl_blocks`
+//!   (when `s_jnl_backup_type` says it keeps one);
+//! - the map must cover the journal from block 0 without holes, lie inside the volume and
+//!   not overlap itself;
+//! - it must not overlap the volume's fixed metadata: the boot block, every superblock and
+//!   group descriptor table copy (with the reserved GDT blocks), and each group's block and
+//!   inode bitmaps and inode table.
+//!
+//! The checksums of group descriptors, the inode and extent blocks are not checked here.
 //! What the journal yields is checked anyway: the journal superblock has its magic number
 //! (and its own checksum on version 2 and 3 journals), and every block that is replayed
 //! must sit under a valid commit.
@@ -20,6 +33,17 @@ const INCOMPAT_JOURNAL_DEV: u32 = 0x8;
 const INCOMPAT_META_BG: u32 = 0x10;
 /// `s_feature_ro_compat`: metadata checksums, including the superblock's.
 pub(super) const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
+/// `s_feature_ro_compat`: superblock backups only in groups 0, 1 and powers of 3, 5 and 7.
+const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
+/// `s_feature_compat`: superblock backups only in the two groups `s_backup_bgs` names.
+const COMPAT_SPARSE_SUPER2: u32 = 0x200;
+/// `s_jnl_backup_type`: `s_jnl_blocks` holds a copy of the journal inode's block map.
+const JNL_BACKUP_BLOCKS: u8 = 1;
+/// Where the superblock keeps `s_jnl_blocks`: `i_block` (60 bytes), `i_size_high`,
+/// `i_size`.
+const JNL_BLOCKS_AT: usize = 0x10C;
+/// Where the superblock keeps `s_checksum`.
+pub(super) const CHECKSUM_AT: usize = 0x3FC;
 /// `i_flags`: `i_block` holds an extent tree.
 const EXTENTS_FL: u32 = 0x8_0000;
 /// The extent header's magic number.
@@ -35,10 +59,17 @@ pub(super) struct Volume {
     needs_recovery: bool,
     incompat: u32,
     first_data_block: u32,
+    blocks_per_group: u32,
     inodes_per_group: u32,
     inode_size: u32,
     desc_size: u32,
     first_meta_bg: u32,
+    reserved_gdt_blocks: u32,
+    compat: u32,
+    ro_compat: u32,
+    backup_groups: [u32; 2],
+    /// The superblock's copy of the journal inode's `i_block`, `i_size_high` and `i_size`.
+    journal_backup: Option<[u8; 68]>,
     pub(super) journal_inode: u32,
 }
 
@@ -55,19 +86,39 @@ impl Volume {
             u32::from(le16(sb, 0x58))
         };
         let desc_size = if wide { u32::from(le16(sb, 0xFE)) } else { 32 };
+        let ro_compat = le32(sb, 0x64);
+        if ro_compat & RO_COMPAT_METADATA_CSUM != 0 {
+            let stored = le32(sb, CHECKSUM_AT);
+            let computed = ferric_jbd2::crc32c(&[&sb[..CHECKSUM_AT]]);
+            if stored != computed {
+                return Err(JournalError::SuperblockChecksum { stored, computed });
+            }
+        }
+        let journal_backup = (sb[0xFD] == JNL_BACKUP_BLOCKS).then(|| {
+            let mut copy = [0; 68];
+            copy.copy_from_slice(&sb[JNL_BLOCKS_AT..JNL_BLOCKS_AT + 68]);
+            copy
+        });
         let volume = Self {
             block_size: geometry.block_size,
             blocks: geometry.blocks,
             needs_recovery: superblock::needs_recovery(sb),
             incompat,
             first_data_block: le32(sb, 0x14),
+            blocks_per_group: le32(sb, 0x20),
             inodes_per_group: le32(sb, 0x28),
             inode_size,
             desc_size,
             first_meta_bg: le32(sb, 0x104),
+            reserved_gdt_blocks: u32::from(le16(sb, 0xCE)),
+            compat: le32(sb, 0x5C),
+            ro_compat,
+            backup_groups: [le32(sb, 0x24C), le32(sb, 0x250)],
+            journal_backup,
             journal_inode: le32(sb, 0xE0),
         };
         let sane = volume.inodes_per_group != 0
+            && volume.blocks_per_group != 0
             && (128..=volume.block_size).contains(&inode_size)
             && (32..=volume.block_size).contains(&desc_size);
         if !sane {
@@ -86,6 +137,76 @@ impl Volume {
             return Err(JournalError::ExternalJournal);
         }
         Ok(true)
+    }
+
+    /// The number of block groups.
+    fn groups(&self) -> u64 {
+        let data = self.blocks.saturating_sub(u64::from(self.first_data_block));
+        data.div_ceil(u64::from(self.blocks_per_group))
+    }
+
+    /// Whether group `group` starts with a copy of the superblock and descriptor table.
+    fn has_backup(&self, group: u64) -> bool {
+        if group == 0 {
+            return true;
+        }
+        if self.compat & COMPAT_SPARSE_SUPER2 != 0 {
+            return self
+                .backup_groups
+                .iter()
+                .any(|&g| g != 0 && u64::from(g) == group);
+        }
+        if self.ro_compat & RO_COMPAT_SPARSE_SUPER == 0 {
+            return true;
+        }
+        group == 1 || [3, 5, 7].into_iter().any(|base| is_power_of(group, base))
+    }
+
+    /// The volume's fixed metadata as block ranges (`start..end`): the boot block and every
+    /// superblock and descriptor table copy with the reserved GDT blocks, then each group's
+    /// bitmaps and inode table, read from its descriptor.
+    fn metadata<R: ReadAt>(&self, window: &Window<R>) -> Result<Vec<(u64, u64)>, JournalError> {
+        if self.incompat & INCOMPAT_META_BG != 0 {
+            return Err(JournalError::Unsupported {
+                what: "replaying the journal of a meta_bg volume",
+            });
+        }
+        let groups = self.groups();
+        let block_size = u64::from(self.block_size);
+        let gdt_blocks = (groups * u64::from(self.desc_size)).div_ceil(block_size);
+        let header = 1 + gdt_blocks + u64::from(self.reserved_gdt_blocks);
+        let table_blocks =
+            (u64::from(self.inodes_per_group) * u64::from(self.inode_size)).div_ceil(block_size);
+        // Block 0 holds the boot sector (and, with 1 KiB blocks, nothing else).
+        let mut ranges = vec![(0, u64::from(self.first_data_block) + header)];
+        let mut gdt = vec![0; self.block_size as usize];
+        let per_block = block_size / u64::from(self.desc_size);
+        for group in 0..groups {
+            let start = u64::from(self.first_data_block) + group * u64::from(self.blocks_per_group);
+            if group != 0 && self.has_backup(group) {
+                ranges.push((start, start + header));
+            }
+            if group % per_block == 0 {
+                let block = u64::from(self.first_data_block) + 1 + group / per_block;
+                self.read_block(window, block, &mut gdt)?;
+            }
+            let at = ((group % per_block) * u64::from(self.desc_size)) as usize;
+            let desc = &gdt[at..at + self.desc_size as usize];
+            let field = |lo: usize, hi: usize| {
+                let high = if self.desc_size >= 64 {
+                    le32(desc, hi)
+                } else {
+                    0
+                };
+                u64::from(high) << 32 | u64::from(le32(desc, lo))
+            };
+            let (block_bitmap, inode_bitmap, table) =
+                (field(0x0, 0x20), field(0x4, 0x24), field(0x8, 0x28));
+            ranges.push((block_bitmap, block_bitmap + 1));
+            ranges.push((inode_bitmap, inode_bitmap + 1));
+            ranges.push((table, table.saturating_add(table_blocks)));
+        }
+        Ok(ranges)
     }
 
     fn block_offset(&self, block: u64) -> Result<u64, JournalError> {
@@ -170,6 +291,14 @@ impl BlockMap {
         let len = u32::try_from(size / u64::from(volume.block_size))
             .map_err(|_| JournalError::BadInode { number })?;
         let i_block = &inode[0x28..0x64];
+        if let Some(backup) = &volume.journal_backup {
+            let same = backup[..60] == *i_block
+                && backup[60..64] == inode[0x6C..0x70]
+                && backup[64..68] == inode[0x4..0x8];
+            if !same {
+                return Err(JournalError::JournalBackupMismatch);
+            }
+        }
         let mut map = Self {
             runs: Vec::new(),
             len,
@@ -180,7 +309,55 @@ impl BlockMap {
             map.indirect(volume, window, i_block)?;
         }
         map.runs.sort_by_key(|run| run.logical);
+        map.validate(volume, window)?;
         Ok(map)
+    }
+
+    /// Whether volume block `block` belongs to the journal.
+    pub(super) fn contains(&self, block: u64) -> bool {
+        self.runs
+            .iter()
+            .any(|run| (run.physical..run.physical + u64::from(run.len)).contains(&block))
+    }
+
+    /// Checks that the map covers the journal from block 0 without holes, lies inside the
+    /// volume and does not overlap itself or the volume's fixed metadata.
+    fn validate<R: ReadAt>(&self, volume: &Volume, window: &Window<R>) -> Result<(), JournalError> {
+        let number = volume.journal_inode;
+        let mut next = 0u32;
+        let mut spans = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            if run.logical != next {
+                return Err(JournalError::BadInode { number });
+            }
+            next = run
+                .logical
+                .checked_add(run.len)
+                .ok_or(JournalError::BadInode { number })?;
+            let end = run
+                .physical
+                .checked_add(u64::from(run.len))
+                .filter(|&end| run.physical != 0 && end <= volume.blocks)
+                .ok_or(JournalError::JournalOutsideVolume {
+                    block: run.physical,
+                })?;
+            spans.push((run.physical, end));
+        }
+        if next < self.len {
+            return Err(JournalError::BadInode { number });
+        }
+        spans.sort_unstable();
+        if let Some(pair) = spans.windows(2).find(|pair| pair[0].1 > pair[1].0) {
+            return Err(JournalError::JournalOverlap { block: pair[1].0 });
+        }
+        for (start, end) in volume.metadata(window)? {
+            if let Some(&(run, _)) = spans.iter().find(|&&(s, e)| s < end && start < e) {
+                return Err(JournalError::JournalOverlap {
+                    block: run.max(start),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The volume block that holds journal block `block`.
@@ -312,6 +489,17 @@ impl BlockMap {
     }
 }
 
+/// Whether `n` is a power (the first or higher) of `base`.
+fn is_power_of(mut n: u64, base: u64) -> bool {
+    if n < base {
+        return false;
+    }
+    while n.is_multiple_of(base) {
+        n /= base;
+    }
+    n == 1
+}
+
 /// The little-endian `u16` at `at`; every caller's buffer is long enough.
 fn le16(raw: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([raw[at], raw[at + 1]])
@@ -325,6 +513,15 @@ pub(super) fn le32(raw: &[u8], at: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_superblock_backups_are_in_groups_0_1_and_powers_of_3_5_7() {
+        let with: Vec<u64> = (0..60)
+            .filter(|&g| g == 0 || g == 1 || [3, 5, 7].into_iter().any(|b| is_power_of(g, b)))
+            .collect();
+        assert_eq!(with, [0, 1, 3, 5, 7, 9, 25, 27, 49]);
+        assert!(!is_power_of(1, 3) && !is_power_of(15, 3) && is_power_of(343, 7));
+    }
 
     #[test]
     fn runs_map_blocks_and_merge() {

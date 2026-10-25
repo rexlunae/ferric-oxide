@@ -220,11 +220,124 @@ fn a_corrupt_journal_block_stops_the_replay_before_any_write() {
     assert_eq!(after, corrupt, "nothing was written");
 }
 
+/// Recomputes the volume superblock's checksum after a test changed it (`metadata_csum`).
+fn reseal(image: &mut [u8]) {
+    let crc = ferric_jbd2::crc32c(&[&image[1024..1024 + 0x3FC]]);
+    image[1024 + 0x3FC..2048].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn le32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+/// Where the journal inode's `i_block` is: the copy of the superblock's `s_jnl_blocks`
+/// found after the superblock (in the inode table).
+fn journal_i_block(image: &[u8]) -> usize {
+    let backup = &image[1024 + 0x10C..1024 + 0x10C + 60];
+    2048 + image[2048..]
+        .windows(60)
+        .position(|w| w == backup)
+        .expect("the journal inode")
+}
+
+/// The first leaf entry of the journal's extent tree, 12 bytes into `i_block`: `ee_block`,
+/// `ee_len`, `ee_start_hi`, `ee_start_lo`. In the fixture it maps journal blocks 0 and 1.
+const EE_START_LO: usize = 12 + 8;
+
+/// Moves the journal's first extent to volume block `start`, in the inode and, when
+/// `backup` is set, in the superblock's copy too.
+fn move_journal(image: &mut [u8], start: u32, backup: bool) {
+    let at = journal_i_block(image) + EE_START_LO;
+    image[at..at + 4].copy_from_slice(&start.to_le_bytes());
+    if backup {
+        let at = 1024 + 0x10C + EE_START_LO;
+        image[at..at + 4].copy_from_slice(&start.to_le_bytes());
+        reseal(image);
+    }
+}
+
+fn refused(image: Vec<u8>) -> JournalError {
+    let (outcome, after) = replay(image.clone());
+    assert_eq!(after, image, "nothing was written");
+    outcome.expect_err("refused")
+}
+
+#[test]
+fn a_superblock_that_fails_its_checksum_is_refused() {
+    let mut image = load("journal-v3.ext4.gz");
+    image[1024 + 0x200] ^= 1;
+    assert!(matches!(
+        refused(image),
+        JournalError::SuperblockChecksum { .. }
+    ));
+}
+
+#[test]
+fn a_journal_inode_unlike_the_superblock_copy_is_refused() {
+    let mut image = load("journal-v3.ext4.gz");
+    move_journal(&mut image, 2, false);
+    assert!(matches!(
+        refused(image),
+        JournalError::JournalBackupMismatch
+    ));
+}
+
+#[test]
+fn a_journal_mapped_onto_metadata_is_refused() {
+    // Block 2 is the group descriptor table; 300 is past it, inside the inode tables or
+    // bitmaps of the 1 KiB-block fixture's flex group.
+    for start in [2, 300] {
+        let mut image = load("journal-v3.ext4.gz");
+        move_journal(&mut image, start, true);
+        let err = refused(image);
+        assert!(
+            matches!(err, JournalError::JournalOverlap { .. }),
+            "{start}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_journal_mapped_past_the_volume_is_refused() {
+    let mut image = load("journal-v3.ext4.gz");
+    let blocks = le32(&image, 1024 + 0x4);
+    // The first extent is two blocks long, so it now ends past the last block.
+    move_journal(&mut image, blocks - 1, true);
+    let err = refused(image);
+    assert!(
+        matches!(err, JournalError::JournalOutsideVolume { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_replay_into_the_journal_itself_is_refused() {
+    let mut image = load("journal-v3.ext4.gz");
+    let at = journal_i_block(&image) + EE_START_LO;
+    let journal = le32(&image, at) as usize;
+    // Point the first tag of the first descriptor (journal block 1, in the first extent)
+    // at the journal superblock's own block, and reseal the descriptor's tail checksum
+    // (over the journal UUID and the block).
+    let descriptor = (journal + 1) * 1024;
+    let target = u32::try_from(journal).expect("small");
+    image[descriptor + 12..descriptor + 16].copy_from_slice(&target.to_be_bytes());
+    let uuid = image[journal * 1024 + 0x30..journal * 1024 + 0x40].to_vec();
+    image[descriptor + 1020..descriptor + 1024].fill(0);
+    let crc = ferric_jbd2::crc32c(&[&uuid, &image[descriptor..descriptor + 1024]]);
+    image[descriptor + 1020..descriptor + 1024].copy_from_slice(&crc.to_be_bytes());
+    let err = refused(image);
+    assert!(
+        matches!(err, JournalError::TargetInJournal { block } if block == u64::from(target)),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn an_external_journal_is_refused() {
     let mut image = load("journal-v3.ext4.gz");
     // Clear s_journal_inum: the journal would then be the device s_journal_dev names.
     image[1024 + 0xE0..1024 + 0xE4].fill(0);
+    reseal(&mut image);
     let (outcome, after) = replay(image.clone());
     assert!(matches!(outcome, Err(JournalError::ExternalJournal)));
     assert_eq!(after, image);

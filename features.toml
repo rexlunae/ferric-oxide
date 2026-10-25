@@ -1337,7 +1337,10 @@ the disk before serving it, as `e2fsck -E journal_only` does: every committed
 transaction is written home, then the journal is emptied and the volume's
 needs_recovery flag cleared. Only then is the device opened for writing, and
 only for the replay; the volume is still served read-only. Every journal
-checksum is checked before the first write, and an interrupted replay can be
+checksum, including that of every logged block, is checked before the first
+write; a damaged block that would be written stops the replay (with async
+commits it ends the log at its transaction instead). The journal's location is
+checked against the volume and its metadata, and an interrupted replay can be
 run again.
 
 Off, ext4d never writes, and reads such a volume through ext4-view's view of

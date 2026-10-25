@@ -36,14 +36,12 @@ use thiserror::Error;
 
 use crate::device::{ReadAt, Window, WindowError, WriteAt};
 use crate::superblock::{self, INCOMPAT_RECOVER, SuperblockError as VolumeSuperblockError};
-use map::{BlockMap, RO_COMPAT_METADATA_CSUM, Volume};
+use map::{BlockMap, CHECKSUM_AT, RO_COMPAT_METADATA_CSUM, Volume};
 
 /// Where the volume superblock keeps `s_feature_incompat`.
 const INCOMPAT_AT: usize = 0x60;
 /// Where the volume superblock keeps `s_feature_ro_compat`.
 const RO_COMPAT_AT: usize = 0x64;
-/// Where the volume superblock keeps `s_checksum`.
-const CHECKSUM_AT: usize = 0x3FC;
 
 /// Why the journal could not be replayed.
 #[derive(Debug, Error)]
@@ -52,6 +50,35 @@ pub enum JournalError {
     /// The volume superblock was refused.
     #[error("bad superblock")]
     Superblock(#[from] VolumeSuperblockError),
+    /// The volume superblock fails its checksum (with `metadata_csum`).
+    #[error("superblock checksum {stored:#010x}, expected {computed:#010x}")]
+    SuperblockChecksum {
+        /// The value stored.
+        stored: u32,
+        /// The value computed.
+        computed: u32,
+    },
+    /// The journal inode's block map or size is not the copy the superblock keeps.
+    #[error("the journal inode does not match the superblock's copy of its block map")]
+    JournalBackupMismatch,
+    /// The journal inode maps a block outside the volume.
+    #[error("the journal inode maps block {block}, outside the volume")]
+    JournalOutsideVolume {
+        /// The first block of the run.
+        block: u64,
+    },
+    /// The journal inode maps a block twice, or onto the volume's fixed metadata.
+    #[error("the journal inode maps block {block}, which is already in use")]
+    JournalOverlap {
+        /// The first block that overlaps.
+        block: u64,
+    },
+    /// The journal asks to replay a block that belongs to the journal itself.
+    #[error("the journal would overwrite its own block {block}")]
+    TargetInJournal {
+        /// The block.
+        block: u64,
+    },
     /// The volume superblock's inode or group-descriptor fields are out of range.
     #[error("the superblock's inode or group descriptor sizes are out of range")]
     BadSuperblock,
@@ -217,10 +244,17 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
         });
     }
     let recovery = Recovery::scan(&journal, &jsb)?;
-    if let Some(write) = recovery.writes().iter().find(|w| w.target >= volume.blocks) {
-        return Err(JournalError::BlockOutOfRange {
-            block: write.target,
-        });
+    for write in recovery.writes() {
+        if write.target >= volume.blocks {
+            return Err(JournalError::BlockOutOfRange {
+                block: write.target,
+            });
+        }
+        if map.contains(write.target) {
+            return Err(JournalError::TargetInJournal {
+                block: write.target,
+            });
+        }
     }
     write_blocks(window, &volume, &map, &jsb, &recovery)?;
     jsb.mark_recovered(&mut raw, recovery.next_sequence())?;

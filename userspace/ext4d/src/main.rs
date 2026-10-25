@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME
+//! ext4d --features
 //! ```
 //!
 //! `DEVICE` is a disk, a partition or an image file. `--offset` and `--length` pick the
@@ -11,13 +12,26 @@
 //!
 //! Built with `journal-replay` (features.toml `fs.ext4_journal_replay`), it first replays the
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
-//! for that. Without it the device is only ever opened for reading.
+//! for that. Without it the device is only ever opened for reading. `ext4d --features`
+//! prints the optional features it was built with, one per line, so tests can tell.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
+/// The optional Cargo features this build has, as `--features` prints them.
+const FEATURES: &[&str] = &[
+    #[cfg(feature = "journal-replay")]
+    "journal-replay",
+];
+
 fn main() -> ExitCode {
+    if std::env::args().skip(1).eq(["--features"]) {
+        for feature in FEATURES {
+            println!("{feature}");
+        }
+        return ExitCode::SUCCESS;
+    }
     #[cfg(target_os = "redox")]
     {
         daemon::main()

@@ -262,6 +262,12 @@ impl Superblock {
         self.incompat & INCOMPAT_REVOKE != 0
     }
 
+    /// Whether commit blocks may reach the disk before the blocks they commit
+    /// (`INCOMPAT_ASYNC_COMMIT`), so a valid commit does not prove its data is whole.
+    pub const fn is_async_commit(&self) -> bool {
+        self.incompat & INCOMPAT_ASYNC_COMMIT != 0
+    }
+
     /// Whether block numbers are 64 bits wide.
     pub const fn is_64bit(&self) -> bool {
         self.incompat & INCOMPAT_64BIT != 0

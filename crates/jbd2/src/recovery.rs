@@ -11,6 +11,18 @@
 //! transactions up to and including `r`: they are stale (the block was freed, then maybe
 //! reused for data that bypasses the journal). Copies in later transactions still count.
 //! Of the copies left, the newest wins, so each block is written once.
+//!
+//! With version 2 or 3 checksums, the data block of every tag is read and checked when its
+//! transaction's commit block is reached, before anything is planned:
+//!
+//! - With `INCOMPAT_ASYNC_COMMIT` the commit block may be written before the data it
+//!   commits, so a transaction with a damaged data block is one that was still being
+//!   written: it counts as uncommitted and ends the log, and the transactions before it
+//!   are replayed.
+//! - Otherwise the commit block is written last, so a damaged block under a valid commit is
+//!   damage to the log. It stops the replay if that copy is the one to write; a copy that a
+//!   newer one replaces, or that is revoked, is never written, so its damage does not
+//!   matter.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -32,6 +44,8 @@ pub struct Write {
     pub sequence: u32,
     escaped: bool,
     checksum: u32,
+    /// Whether the data block matched its checksum when the log was scanned.
+    intact: bool,
 }
 
 /// Why a scan or a read for replay failed.
@@ -91,10 +105,11 @@ pub struct Recovery {
     block_size: usize,
 }
 
-/// A transaction being read: its tags (with their data blocks) and revoke records.
+/// A transaction being read: its tags, each with its data block and whether that block
+/// matched its checksum, and its revoke records.
 #[derive(Default)]
 struct Transaction {
-    tags: Vec<(log::Tag, u32)>,
+    tags: Vec<(log::Tag, u32, bool)>,
     revokes: Vec<u64>,
 }
 
@@ -131,8 +146,8 @@ impl Recovery {
     /// Scans the log of the journal `sb` describes and plans the replay. A clean journal
     /// ([`Superblock::needs_recovery`] false) gives an empty plan.
     ///
-    /// The data blocks of every planned write are read and checked here, so a plan that
-    /// comes back can be applied in full.
+    /// Every data block in the log is read and checked here (see the module docs for what
+    /// a damaged one means), so a plan that comes back can be applied in full.
     ///
     /// # Errors
     ///
@@ -158,9 +173,12 @@ impl Recovery {
         recovery.next_sequence = end_sequence.wrapping_add(1);
         recovery.transactions = u32::try_from(committed.len()).unwrap_or(u32::MAX);
         recovery.writes = plan(sb, committed);
-        let mut buf = vec![0; block_size];
-        for write in &recovery.writes {
-            recovery.read(journal, sb, write, &mut buf)?;
+        if let Some(bad) = recovery.writes.iter().find(|write| !write.intact) {
+            return Err(RecoveryError::DataChecksum {
+                source_block: bad.source,
+                target: bad.target,
+                sequence: bad.sequence,
+            });
         }
         Ok(recovery)
     }
@@ -204,7 +222,7 @@ impl Recovery {
             });
         }
         read_block(journal, write.source, buf)?;
-        if sb.checksum().is_crc32c() && !checksum_ok(sb, write, buf) {
+        if !checksum_ok(sb, write.sequence, write.escaped, write.checksum, buf) {
             return Err(RecoveryError::DataChecksum {
                 source_block: write.source,
                 target: write.target,
@@ -218,18 +236,25 @@ impl Recovery {
     }
 }
 
-/// Whether `data`, as read from the log, matches the tag's checksum. For an escaped block
-/// either form is accepted (see the crate docs).
-fn checksum_ok(sb: &Superblock, write: &Write, data: &mut [u8]) -> bool {
-    if log::data_checksum(sb, write.sequence, data) == write.checksum {
+/// Whether `data`, as read from the log for a tag of transaction `sequence`, matches the
+/// tag's checksum; always true for a journal without version 2 or 3 checksums. For an
+/// escaped block either form is accepted (see the crate docs).
+fn checksum_ok(
+    sb: &Superblock,
+    sequence: u32,
+    escaped: bool,
+    checksum: u32,
+    data: &mut [u8],
+) -> bool {
+    if !sb.checksum().is_crc32c() || log::data_checksum(sb, sequence, data) == checksum {
         return true;
     }
-    if !write.escaped {
+    if !escaped {
         return false;
     }
     let stored = [data[0], data[1], data[2], data[3]];
     data[..4].copy_from_slice(&MAGIC.to_be_bytes());
-    let ok = log::data_checksum(sb, write.sequence, data) == write.checksum;
+    let ok = log::data_checksum(sb, sequence, data) == checksum;
     data[..4].copy_from_slice(&stored);
     ok
 }
@@ -266,7 +291,7 @@ fn read_log<J: JournalRead>(
                 let tags = log::tags(&buf, sb);
                 let count = u32::try_from(tags.len()).unwrap_or(u32::MAX);
                 for (i, tag) in (1..).zip(tags) {
-                    open.tags.push((tag, cursor.ahead(i)));
+                    open.tags.push((tag, cursor.ahead(i), true));
                 }
                 cursor.advance(1 + count)?;
             }
@@ -280,6 +305,12 @@ fn read_log<J: JournalRead>(
                 cursor.advance(1)?;
             }
             Some((COMMIT, seq)) if seq == *sequence && log::commit_ok(&buf, sb) => {
+                let whole = check_data(journal, sb, seq, &mut open, &mut buf)?;
+                if !whole && sb.is_async_commit() {
+                    // The commit reached the disk before all of its data: the transaction
+                    // was still being written, so the log ends before it.
+                    return Ok(committed);
+                }
                 committed.push((seq, core::mem::take(&mut open)));
                 *sequence = sequence.wrapping_add(1);
                 cursor.advance(1)?;
@@ -288,6 +319,27 @@ fn read_log<J: JournalRead>(
             _ => return Ok(committed),
         }
     }
+}
+
+/// Reads and checks every data block of transaction `seq`, marking each tag; returns whether
+/// all of them matched.
+fn check_data<J: JournalRead>(
+    journal: &J,
+    sb: &Superblock,
+    seq: u32,
+    transaction: &mut Transaction,
+    buf: &mut [u8],
+) -> Result<bool, RecoveryError<J::Error>> {
+    if !sb.checksum().is_crc32c() {
+        return Ok(true);
+    }
+    let mut whole = true;
+    for (tag, source, intact) in &mut transaction.tags {
+        read_block(journal, *source, buf)?;
+        *intact = checksum_ok(sb, seq, tag.escaped, tag.checksum, buf);
+        whole &= *intact;
+    }
+    Ok(whole)
 }
 
 /// Whether transaction `a` is the same as or older than `b`, with sequence numbers that
@@ -315,7 +367,7 @@ fn plan(sb: &Superblock, committed: Vec<(u32, Transaction)>) -> Vec<Write> {
     }
     let mut writes: BTreeMap<u64, Write> = BTreeMap::new();
     for (seq, transaction) in committed {
-        for (tag, source) in transaction.tags {
+        for (tag, source, intact) in transaction.tags {
             let cancelled = revoked
                 .get(&tag.target)
                 .is_some_and(|&revoked_in| not_after(seq, revoked_in));
@@ -328,6 +380,7 @@ fn plan(sb: &Superblock, committed: Vec<(u32, Transaction)>) -> Vec<Write> {
                         sequence: seq,
                         escaped: tag.escaped,
                         checksum: tag.checksum,
+                        intact,
                     },
                 );
             }

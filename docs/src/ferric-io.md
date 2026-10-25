@@ -909,12 +909,24 @@ has to start from a replayed journal.
   and commit blocks, with version 2 and 3 CRC32C checksums. It keeps the
   transactions that have a valid commit block, applies the revoke records (a
   revoke in transaction *r* cancels copies of the block logged in transactions
-  up to *r*) and yields the newest surviving copy of each block. A block that
-  fails its checksum stops the replay before anything is written. Fast commits
+  up to *r*) and yields the newest surviving copy of each block. Every logged
+  block is checked against its tag checksum when its transaction's commit
+  block is reached, before anything is written. Under a journal with
+  `INCOMPAT_ASYNC_COMMIT` (where the commit block need not be written last) a
+  damaged block marks its transaction as torn: the log ends there and the
+  transactions before it are replayed. Otherwise a damaged block stops the
+  replay if it is the copy that would be written; a copy that a newer one
+  replaces or that is revoked is never written, so it does not. Fast commits
   and external journal devices are refused; version 1 commit checksums are not
   verified.
 - **ext4d** (`userspace/ext4d/src/journal/`) finds the journal inode through
-  its group descriptor and extent tree (or ext3 block map), writes the planned
+  its group descriptor and extent tree (or ext3 block map). It checks the map
+  before trusting it: the inode's block map and size must match the backup in
+  the superblock (`s_jnl_blocks`), the superblock checksum must hold, and the
+  journal must lie inside the volume, without holes, and clear of the
+  superblocks, group descriptors, reserved GDT blocks, bitmaps and inode
+  tables (volumes with `meta_bg` are refused for now). No replayed block may
+  land inside the journal. It then writes the planned
   blocks and flushes, then empties the journal (`s_start` 0) and flushes, then
   clears `needs_recovery`, updates the superblock checksum and flushes. A replay
   interrupted at any point can be run again and gives the same volume; the
