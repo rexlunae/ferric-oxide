@@ -222,6 +222,9 @@ pub(crate) fn kmain_ap(cpu_id: crate::cpu_set::LogicalCpuId, kmain_kstack: Kstac
 
     AP_READY.store(true, Ordering::SeqCst);
     while !BSP_READY.load(Ordering::Acquire) {
+        // Interrupts are still masked. The BSP can retire shared mappings while
+        // these CPUs wait, so pending shootdowns must not depend on an IPI.
+        crate::percpu::PercpuBlock::current().maybe_handle_tlb_shootdown();
         hint::spin_loop();
     }
 

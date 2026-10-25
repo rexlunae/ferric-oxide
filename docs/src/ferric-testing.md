@@ -395,7 +395,11 @@ skip or KPTI preventing enablement does not count as a successful rerun.
 Preserve `build-info.txt`, `SHA256SUMS`, `kernel.all`, the serial log and QEMU
 version with the result for [#78](https://github.com/rexlunae/ferric-oxide/issues/78).
 The image workflow's ordinary CET-disabled CI boot validates the pool and
-fallback boot, not this hardware result.
+fallback boot, not this hardware result. The pool test runs after the secondary
+CPUs reach their BSP wait, retires two successive probe mappings, and requires
+those CPUs to service shootdowns with interrupts still masked. This covers the
+startup deadlock seen in the PR #174 Kleya rerun even on CI CPUs without CET;
+the post-enable WRSS and control-protection paths still need the hardware rerun.
 
 The harness rejects crashes and `FERRIC_TEST_FAIL` markers and requires the
 smoke completion marker. A completion marker alone is insufficient because

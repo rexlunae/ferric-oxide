@@ -182,8 +182,11 @@ The boot self-test also checks PTEs, attempts ordinary writes to the shadow
 mapping and both physical-map addresses, and requires page faults without
 changing the entries. Its narrowly scoped fault recovery restarts the same
 `rep stosq` with zero count, preserving the return RIP and CET shadow frame.
-It checks clearing and reuse before enable, and repeats with real `WRSS` after
-the BSP enables CET. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
+It checks clearing and reuse after the secondary CPUs start but before CET is
+enabled, and repeats with real `WRSS` after the BSP enables CET. Secondary CPUs
+service TLB shootdowns while waiting for BSP context initialization, because
+interrupts are still masked and mapping retirement can otherwise deadlock the
+BSP's second probe. See `arch/x86_64/shstk.rs` and `crates/cet/src/shstk/`.
 If no complete reserved key fits the supported window, it retains the boot
 mapping checks and explicitly skips the window-dependent probe. This preserves
 the CET-disabled `auto` boot when the pool is above the 1 TiB window limit.

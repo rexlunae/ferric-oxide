@@ -277,6 +277,9 @@ fn continue_after_kmain_stack(
 
         let kstack = kstack_slot.take().expect("kstack_slot must be Some");
 
+        #[cfg(all(target_arch = "x86_64", shstk_compiled))]
+        crate::arch::shstk::check_boot_pool();
+
         // Ferric Oxide (shadow stacks): last, after every CR4 write, with no return between
         // SETSSBSY and the diverging `kmain` below.
         #[cfg(all(target_arch = "x86_64", shstk_compiled))]

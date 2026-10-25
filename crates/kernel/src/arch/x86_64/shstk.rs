@@ -240,10 +240,8 @@ impl core::error::Error for FrameError {}
 ///
 /// # Panics
 ///
-/// If the compiled shadow-stack pool fails its allocation, mapping or write-protection self-test.
+/// When the `always` policy cannot be met by the CPU or the KPTI configuration.
 pub fn report() {
-    #[cfg(shstk_compiled)]
-    stacks::check_pool();
     if POLICY == Policy::Never {
         return;
     }
@@ -273,6 +271,20 @@ pub fn report() {
             "CET: supervisor shadow stacks allocated for every kernel stack; enabling CET"
         );
     }
+}
+
+/// Checks shadow-stack allocation, isolation and reuse after secondary CPUs start.
+///
+/// Runs before CET is enabled, including on machines without CET. Retiring two
+/// probe mappings while the secondary CPUs wait for the BSP also checks that
+/// those CPUs service TLB shootdowns before interrupts are enabled.
+///
+/// # Panics
+///
+/// If the pool fails its allocation, mapping or write-protection self-test.
+#[cfg(shstk_compiled)]
+pub fn check_boot_pool() {
+    stacks::check_pool();
 }
 
 #[cfg(shstk_compiled)]
