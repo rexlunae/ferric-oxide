@@ -5,7 +5,8 @@
 //! to be woken from; the kernel must stop it at its next wait instead of letting it block
 //! there for good, or the process never finishes exiting and its parent waits forever.
 //!
-//! The test runs itself as a child many times, in two kinds:
+//! The test runs itself as a child many times, in two kinds. In both, the main thread starts
+//! its work only once the second thread has said it is running, so the two overlap:
 //!
 //! - `pipe`: a second thread reads a pipe one byte at a time while the main thread fills it,
 //!   then the main thread exits. The reader is still draining the pipe when the kill comes,
@@ -23,7 +24,8 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitCode};
-use std::thread;
+use std::sync::mpsc;
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 /// Children of each kind.
@@ -107,10 +109,50 @@ impl std::error::Error for Failure {
     }
 }
 
+/// Why a child could not set up its busy thread.
+#[derive(Debug)]
+enum ChildError {
+    /// Making or writing the pipe failed.
+    Pipe(io::Error),
+    /// The second thread ended before it said it had started.
+    WorkerGone,
+}
+
+impl fmt::Display for ChildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pipe(_) => f.write_str("pipe failed"),
+            Self::WorkerGone => f.write_str("the second thread ended before it started"),
+        }
+    }
+}
+
+impl std::error::Error for ChildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pipe(source) => Some(source),
+            Self::WorkerGone => None,
+        }
+    }
+}
+
+/// Spawns `work` on a second thread and returns once it is running, so the main thread's
+/// work (and its exit) overlaps with it rather than finishing before it starts.
+fn start_worker(work: impl FnOnce() + Send + 'static) -> Result<Thread, ChildError> {
+    let (started, ready) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        // The receiver lives until this is received; a send cannot fail first.
+        let _ = started.send(());
+        work();
+    });
+    ready.recv().map_err(|_| ChildError::WorkerGone)?;
+    Ok(worker.thread().clone())
+}
+
 /// A `pipe` child: fills a pipe its second thread drains, then exits with that thread busy.
-fn pipe_child() -> io::Result<()> {
-    let (mut reader, mut writer) = io::pipe()?;
-    thread::spawn(move || {
+fn pipe_child() -> Result<(), ChildError> {
+    let (mut reader, mut writer) = io::pipe().map_err(ChildError::Pipe)?;
+    start_worker(move || {
         let mut byte = [0; 1];
         // Reads until the exit kills this thread. End of file or an error cannot happen while
         // the main thread holds the write end, but if one did, park rather than spin.
@@ -118,35 +160,41 @@ fn pipe_child() -> io::Result<()> {
         loop {
             thread::park();
         }
-    });
+    })?;
     for _ in 0..WORK {
-        writer.write_all(&[1])?;
+        writer.write_all(&[1]).map_err(ChildError::Pipe)?;
     }
     Ok(())
 }
 
 /// A `futex` child: unparks its second thread again and again, then exits with it busy.
-fn futex_child() {
-    let parker = thread::spawn(|| {
+fn futex_child() -> Result<(), ChildError> {
+    let parker = start_worker(|| {
         loop {
             thread::park();
         }
-    });
+    })?;
     for _ in 0..WORK {
-        parker.thread().unpark();
+        parker.unpark();
     }
+    Ok(())
 }
 
 /// Runs this program as a child of `kind`. Its exit is the test.
 fn child(kind: Kind) -> ExitCode {
-    match kind {
-        Kind::Pipe => {
-            if let Err(err) = pipe_child() {
-                eprintln!("ferric-exit-test pipe child: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
+    let result = match kind {
+        Kind::Pipe => pipe_child(),
         Kind::Futex => futex_child(),
+    };
+    if let Err(err) = result {
+        let mut line = format!("ferric-exit-test {} child: {err}", kind.arg());
+        let mut source = std::error::Error::source(&err);
+        while let Some(cause) = source {
+            line.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        eprintln!("{line}");
+        return ExitCode::FAILURE;
     }
     // The second thread is still busy here: this exit is what the parent waits on.
     std::process::exit(0)
