@@ -555,7 +555,15 @@ impl<L: Level, T> RwLock<L, T> {
 
     // Unsafe due to not using token, currently required by context::switch
     pub unsafe fn write_arc(self: &Arc<Self>) -> ArcRwLockWriteGuard<L, T> {
-        core::mem::forget(self.inner.write());
+        // Ferric Oxide: answer TLB shootdowns while spinning, as the other lock paths do. The
+        // context switch spins here with interrupts off; a holder of this context's lock can be
+        // waiting on a CPU that waits for this one's acknowledgement (spin_wait.rs).
+        let my_percpu = PercpuBlock::current();
+        let guard = super::spin_wait::until(
+            || self.inner.try_write(),
+            || my_percpu.maybe_handle_tlb_shootdown(),
+        );
+        core::mem::forget(guard);
         ArcRwLockWriteGuard {
             rwlock: self.clone(),
         }
