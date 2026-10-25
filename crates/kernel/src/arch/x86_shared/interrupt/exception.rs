@@ -166,12 +166,7 @@ crate::interrupt_stack!(device_not_available, |stack| {
 crate::interrupt_error!(double_fault, |stack, _code| {
     crate::println!("Double fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_error!(invalid_tss, |stack, code| {
@@ -322,12 +317,7 @@ crate::interrupt_error!(alignment_check, |stack, code| {
 crate::interrupt_stack!(machine_check, @paranoid, |stack| {
     crate::println!("Machine check fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_stack!(simd, |stack| {
@@ -345,23 +335,13 @@ crate::interrupt_stack!(simd, |stack| {
 crate::interrupt_stack!(virtualization, |stack| {
     crate::println!("Virtualization fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_error!(security, |stack, _code| {
     crate::println!("Security exception");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 // Ferric Oxide (CET, see arch/x86_64/ibt.rs and shstk.rs): with kernel indirect branch tracking
