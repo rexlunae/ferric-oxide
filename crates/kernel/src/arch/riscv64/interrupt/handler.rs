@@ -38,37 +38,37 @@ pub struct Registers {
 
 impl Registers {
     pub fn dump(&self) {
-        println!("X1:    {:>016X}", { self.x1 });
-        println!("X2:    {:>016X}", { self.x2 });
-        println!("X3:    {:>016X}", { self.x3 });
-        println!("X4:    {:>016X}", { self.x4 });
-        println!("X5:    {:>016X}", { self.x5 });
-        println!("X6:    {:>016X}", { self.x6 });
-        println!("X7:    {:>016X}", { self.x7 });
-        println!("X8:    {:>016X}", { self.x8 });
-        println!("X9:    {:>016X}", { self.x9 });
-        println!("X10:   {:>016X}", { self.x10 });
-        println!("X11:   {:>016X}", { self.x11 });
-        println!("X12:   {:>016X}", { self.x12 });
-        println!("X13:   {:>016X}", { self.x13 });
-        println!("X14:   {:>016X}", { self.x14 });
-        println!("X15:   {:>016X}", { self.x15 });
-        println!("X16:   {:>016X}", { self.x16 });
-        println!("X17:   {:>016X}", { self.x17 });
-        println!("X18:   {:>016X}", { self.x18 });
-        println!("X19:   {:>016X}", { self.x19 });
-        println!("X20:   {:>016X}", { self.x20 });
-        println!("X21:   {:>016X}", { self.x21 });
-        println!("X22:   {:>016X}", { self.x22 });
-        println!("X23:   {:>016X}", { self.x23 });
-        println!("X24:   {:>016X}", { self.x24 });
-        println!("X25:   {:>016X}", { self.x25 });
-        println!("X26:   {:>016X}", { self.x26 });
-        println!("X27:   {:>016X}", { self.x27 });
-        println!("X28:   {:>016X}", { self.x28 });
-        println!("X29:   {:>016X}", { self.x29 });
-        println!("X30:   {:>016X}", { self.x30 });
-        println!("X31:   {:>016X}", { self.x31 });
+        crate::println!("X1:    {:>016X}", { self.x1 });
+        crate::println!("X2:    {:>016X}", { self.x2 });
+        crate::println!("X3:    {:>016X}", { self.x3 });
+        crate::println!("X4:    {:>016X}", { self.x4 });
+        crate::println!("X5:    {:>016X}", { self.x5 });
+        crate::println!("X6:    {:>016X}", { self.x6 });
+        crate::println!("X7:    {:>016X}", { self.x7 });
+        crate::println!("X8:    {:>016X}", { self.x8 });
+        crate::println!("X9:    {:>016X}", { self.x9 });
+        crate::println!("X10:   {:>016X}", { self.x10 });
+        crate::println!("X11:   {:>016X}", { self.x11 });
+        crate::println!("X12:   {:>016X}", { self.x12 });
+        crate::println!("X13:   {:>016X}", { self.x13 });
+        crate::println!("X14:   {:>016X}", { self.x14 });
+        crate::println!("X15:   {:>016X}", { self.x15 });
+        crate::println!("X16:   {:>016X}", { self.x16 });
+        crate::println!("X17:   {:>016X}", { self.x17 });
+        crate::println!("X18:   {:>016X}", { self.x18 });
+        crate::println!("X19:   {:>016X}", { self.x19 });
+        crate::println!("X20:   {:>016X}", { self.x20 });
+        crate::println!("X21:   {:>016X}", { self.x21 });
+        crate::println!("X22:   {:>016X}", { self.x22 });
+        crate::println!("X23:   {:>016X}", { self.x23 });
+        crate::println!("X24:   {:>016X}", { self.x24 });
+        crate::println!("X25:   {:>016X}", { self.x25 });
+        crate::println!("X26:   {:>016X}", { self.x26 });
+        crate::println!("X27:   {:>016X}", { self.x27 });
+        crate::println!("X28:   {:>016X}", { self.x28 });
+        crate::println!("X29:   {:>016X}", { self.x29 });
+        crate::println!("X30:   {:>016X}", { self.x30 });
+        crate::println!("X31:   {:>016X}", { self.x31 });
     }
 }
 
@@ -80,7 +80,7 @@ pub struct IretRegisters {
 
 impl IretRegisters {
     pub fn dump(&self) {
-        println!("SEPC: {:>016X}", { self.sepc });
+        crate::println!("SEPC: {:>016X}", { self.sepc });
     }
 }
 
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn enter_usermode() -> ! {
         "csrs    sstatus, t0",
         "addi    t0, sp, 32 * 8", // save S mode stack to percpu
         "sd      t0, 8(tp)",
-        pop_registers!(),
+        crate::pop_registers!(),
         "sret",
     )
 }

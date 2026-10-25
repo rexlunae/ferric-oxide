@@ -20,7 +20,7 @@ unsafe fn init_root_ic(fdt: &Fdt) {
         let is_set = ROOT_IC_IDX_IS_SET.load(Ordering::Relaxed);
         if is_set != 0 {
             let ic_idx = ROOT_IC_IDX.load(Ordering::Relaxed);
-            info!("Already selected {} as root ic", ic_idx);
+            crate::info!("Already selected {} as root ic", ic_idx);
             return;
         }
 
@@ -33,7 +33,7 @@ unsafe fn init_root_ic(fdt: &Fdt) {
         let ic_idx = IRQ_CHIP
             .phandle_to_ic_idx(root_irqc_phandle as u32)
             .unwrap();
-        info!("select {} as root ic", ic_idx);
+        crate::info!("select {} as root ic", ic_idx);
         ROOT_IC_IDX.store(ic_idx, Ordering::Release);
         ROOT_IC_IDX_IS_SET.store(1, Ordering::Release);
     }
@@ -41,18 +41,18 @@ unsafe fn init_root_ic(fdt: &Fdt) {
 
 pub unsafe fn init_devicetree(fdt: &Fdt) {
     unsafe {
-        info!("PSCI INIT");
+        crate::info!("PSCI INIT");
         psci::init(fdt);
-        info!("CPU TOPOLOGY INIT");
+        crate::info!("CPU TOPOLOGY INIT");
         cpu::init_topology(fdt);
-        info!("IRQCHIP INIT");
+        crate::info!("IRQCHIP INIT");
         crate::dtb::irqchip::init(&fdt);
         init_root_ic(&fdt);
-        info!("GIT INIT");
+        crate::info!("GIT INIT");
         generic_timer::init(fdt);
-        info!("SERIAL INIT");
+        crate::info!("SERIAL INIT");
         serial::init(fdt);
-        info!("RTC INIT");
+        crate::info!("RTC INIT");
         rtc::init(fdt);
     }
 }

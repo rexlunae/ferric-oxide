@@ -14,14 +14,14 @@ pub(super) fn init(madt: Madt) {
     let mut gicd_opt = None;
     let mut giccs = Vec::new();
     for madt_entry in madt.iter() {
-        debug!("      {:#x?}", madt_entry);
+        crate::debug!("      {:#x?}", madt_entry);
         match madt_entry {
             MadtEntry::Gicc(gicc) => {
                 giccs.push(gicc);
             }
             MadtEntry::Gicd(gicd) => {
                 if gicd_opt.is_some() {
-                    warn!("Only one GICD should be present on a system, ignoring this one");
+                    crate::warn!("Only one GICD should be present on a system, ignoring this one");
                 } else {
                     gicd_opt = Some(gicd);
                 }
@@ -30,7 +30,7 @@ pub(super) fn init(madt: Madt) {
         }
     }
     let Some(gicd) = gicd_opt else {
-        warn!("No GICD found");
+        crate::warn!("No GICD found");
         return;
     };
     let mut gic_dist_if = GicDistIf::default();
@@ -39,7 +39,7 @@ pub(super) fn init(madt: Madt) {
         let virt = map_device_memory(phys, PAGE_SIZE);
         gic_dist_if.init(virt.data());
     };
-    info!("{:#x?}", gic_dist_if);
+    crate::info!("{:#x?}", gic_dist_if);
     match gicd.gic_version {
         1 | 2 => {
             #[allow(clippy::never_loop)]
@@ -50,7 +50,7 @@ pub(super) fn init(madt: Madt) {
                     let virt = map_device_memory(phys, PAGE_SIZE);
                     gic_cpu_if.init(virt.data())
                 };
-                info!("{:#x?}", gic_cpu_if);
+                crate::info!("{:#x?}", gic_cpu_if);
                 let gic = GenericInterruptController {
                     gic_dist_if,
                     gic_cpu_if,
@@ -72,7 +72,7 @@ pub(super) fn init(madt: Madt) {
             for gicc in giccs {
                 let mut gic_cpu_if = GicV3CpuIf;
                 unsafe { gic_cpu_if.init() };
-                info!("{:#x?}", gic_cpu_if);
+                crate::info!("{:#x?}", gic_cpu_if);
                 let gic = GicV3 {
                     gic_dist_if,
                     gic_cpu_if,
@@ -92,7 +92,7 @@ pub(super) fn init(madt: Madt) {
             }
         }
         _ => {
-            warn!("unsupported GIC version {}", gicd.gic_version);
+            crate::warn!("unsupported GIC version {}", gicd.gic_version);
         }
     }
     unsafe { IRQ_CHIP.init(None) };

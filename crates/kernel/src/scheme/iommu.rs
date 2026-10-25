@@ -214,7 +214,7 @@ impl KernelScheme for IommuScheme {
                 return Err(Error::new(ENOENT));
             }
             let domain = Domain::new().map_err(|err| {
-                warn!("IOMMU: cannot create a domain: {err}");
+                crate::warn!("IOMMU: cannot create a domain: {err}");
                 errno(&err)
             })?;
             Handle::Domain {
@@ -247,12 +247,12 @@ impl KernelScheme for IommuScheme {
                     BOUND.fetch_sub(1, Ordering::Relaxed);
                 }
                 if clean {
-                    info!(
+                    crate::info!(
                         "IOMMU: domain {} closed, {devices} device(s) blocked, {mappings} DMA mapping(s) unpinned",
                         space.id()
                     );
                 } else {
-                    warn!(
+                    crate::warn!(
                         "IOMMU: domain {} close failed; its frames stay pinned",
                         space.id()
                     );
@@ -343,9 +343,10 @@ fn alloc_irte(route: MsiRoute, payload: UserSliceRw) -> Result<usize> {
     };
     let entry = interrupt::alloc_msi(dev, source, route.cpu, route.vector).map_err(|err| {
         if !matches!(err, IrqError::NotEnabled | IrqError::Skip(_)) {
-            warn!(
+            crate::warn!(
                 "IOMMU: cannot make an interrupt remapping entry for {:04x}:{}: {err}",
-                dev.segment, dev.bdf
+                dev.segment,
+                dev.bdf
             );
         }
         irq_errno(&err)
@@ -389,7 +390,7 @@ fn attach(cap: usize, id: usize, device: Device) -> Result<()> {
     with_domain(&mut HANDLES.lock(), id, |space, _| {
         let domain = space.domain();
         domain.attach(device).map_err(|err| {
-            warn!(
+            crate::warn!(
                 "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
                 device.segment,
                 device.bdf,
@@ -397,7 +398,7 @@ fn attach(cap: usize, id: usize, device: Device) -> Result<()> {
             );
             errno(&err)
         })?;
-        info!(
+        crate::info!(
             "IOMMU: {:04x}:{} attached to domain {}",
             device.segment,
             device.bdf,
@@ -433,7 +434,7 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
             return Err(Error::new(EBUSY));
         }
         if cfg!(iommu = "enforce") && domain.device_count() == 0 {
-            warn!(
+            crate::warn!(
                 "IOMMU: {name} tried to bind domain {} with no device attached",
                 domain.id()
             );
@@ -443,7 +444,7 @@ fn bind(id: usize, token: &mut CleanLockToken) -> Result<()> {
             BOUND.fetch_add(1, Ordering::Relaxed);
         }
         *bound = Some(alloc::sync::Arc::downgrade(&addr_space));
-        info!(
+        crate::info!(
             "IOMMU: domain {} ({} device(s)) bound by {name}",
             domain.id(),
             domain.device_count()
@@ -487,9 +488,10 @@ fn join(id: usize, token: &mut CleanLockToken) -> Result<usize> {
     })?;
     let (from, into) = move_devices(&mut handles, &devices, id, target)?;
     for device in &devices {
-        info!(
+        crate::info!(
             "IOMMU: {:04x}:{} moved from domain {from} into domain {into} (bound by {name})",
-            device.segment, device.bdf
+            device.segment,
+            device.bdf
         );
     }
     Ok(devices.len())
@@ -523,7 +525,7 @@ fn move_devices(
         let domain = space.domain();
         for &device in devices {
             domain.attach(device).map_err(|err| {
-                warn!(
+                crate::warn!(
                     "IOMMU: cannot attach {:04x}:{} to domain {}: {err}",
                     device.segment,
                     device.bdf,
@@ -545,7 +547,7 @@ fn move_devices(
         let mut stuck = Vec::new();
         for &device in moved {
             if let Err(e) = space.domain().detach(device) {
-                warn!(
+                crate::warn!(
                     "IOMMU: {:04x}:{} cannot leave domain {}: {e}",
                     device.segment,
                     device.bdf,
@@ -567,7 +569,7 @@ fn move_devices(
         Ok(())
     });
     if !stuck.is_empty() {
-        warn!(
+        crate::warn!(
             "IOMMU: join into domain handle {into} failed and was not fully undone: {} device(s) stay in it",
             stuck.len()
         );
@@ -580,7 +582,7 @@ fn move_devices(
 fn reattach(domain: &mut Domain, devices: &[Device]) {
     for &device in devices {
         if let Err(err) = domain.attach(device) {
-            warn!(
+            crate::warn!(
                 "IOMMU: {:04x}:{} stays blocked: it cannot go back into domain {}: {err}",
                 device.segment,
                 device.bdf,
@@ -639,7 +641,7 @@ pub fn translate(virt: VirtualAddress, token: &mut CleanLockToken) -> Result<Opt
     };
     let iova = space.translate(&guard, virt).map_err(|err| {
         if !matches!(err, DmaError::NotMapped { .. }) {
-            warn!(
+            crate::warn!(
                 "IOMMU: cannot map {:#x} in domain {}: {err}",
                 virt.data(),
                 space.id()
@@ -737,14 +739,14 @@ fn map_grant(id: usize, grant_fd: u64, token: &mut CleanLockToken) -> Result<usi
         let space = bound_domain(&mut handles, id, owner)?;
         let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
         let attempt = space.map_grant(frames, writable, ticket).map_err(|err| {
-            warn!(
+            crate::warn!(
                 "IOMMU: cannot map {grant_id} in domain {}: {err}",
                 space.id()
             );
             dma_errno(&err)
         })?;
         if let MapAttempt::Mapped(iova) = &attempt {
-            info!(
+            crate::info!(
                 "IOMMU: domain {}: {grant_id} mapped at IOVA {iova:#x} ({} page(s), {})",
                 space.id(),
                 frames.len(),
@@ -752,7 +754,7 @@ fn map_grant(id: usize, grant_fd: u64, token: &mut CleanLockToken) -> Result<usi
             );
         }
         let attempt = attempt.map_error(|err| {
-            warn!(
+            crate::warn!(
                 "IOMMU: retained failed mapping of {grant_id} in domain {}: {err}",
                 space.id()
             );
@@ -793,7 +795,7 @@ fn unmap_grant(id: usize, iova: u64) -> Result<()> {
         let mut handles = HANDLES.lock();
         let space = bound_domain(&mut handles, id, alloc::sync::Arc::as_ptr(&addr_space))?;
         if space.release_retired(iova) {
-            info!(
+            crate::info!(
                 "IOMMU: domain {}: IOVA {iova:#x} of a revoked grant released by the driver",
                 space.id()
             );
@@ -802,7 +804,7 @@ fn unmap_grant(id: usize, iova: u64) -> Result<()> {
         let ticket = space
             .unmap_grant(iova, None)
             .map_err(|err| dma_errno(&err))?;
-        info!(
+        crate::info!(
             "IOMMU: domain {}: grant mapping at IOVA {iova:#x} unmapped by the driver",
             space.id()
         );
@@ -862,7 +864,7 @@ fn unmap_grant_record(record: super::regbuf::DmaRecord) -> Result<()> {
     };
     match space.unmap_grant(record.iova, Some(record.ticket)) {
         Ok(_) => {
-            info!(
+            crate::info!(
                 "IOMMU: domain {}: grant mapping at IOVA {:#x} taken down with its grant, IOTLB invalidated",
                 space.id(),
                 record.iova

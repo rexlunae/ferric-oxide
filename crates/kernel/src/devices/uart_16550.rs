@@ -6,7 +6,7 @@ use core::convert::TryInto;
 use crate::syscall::io::Pio;
 use crate::syscall::io::{Io, MmioPtr, ReadOnly};
 
-bitflags! {
+bitflags::bitflags! {
     /// Interrupt enable flags
     struct IntEnFlags: u8 {
         const RECEIVED = 1;
@@ -17,7 +17,7 @@ bitflags! {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// Line status flags
     struct LineStsFlags: u8 {
         const INPUT_FULL = 1;

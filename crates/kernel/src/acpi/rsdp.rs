@@ -23,7 +23,7 @@ impl Rsdp {
             let rsdp: Rsdp = unsafe { rsdp_ptr.cast().read() };
 
             if rsdp.signature != *b"RSD PTR " {
-                error!("RSDP signature check failed");
+                crate::error!("RSDP signature check failed");
                 return None;
             }
 
@@ -32,7 +32,7 @@ impl Rsdp {
                 sum = sum.wrapping_add(unsafe { rsdp_ptr.add(i).read() });
             }
             if sum != 0 {
-                error!("RSDP checksum failed");
+                crate::error!("RSDP checksum failed");
                 return None;
             }
 
@@ -42,7 +42,7 @@ impl Rsdp {
                     sum = sum.wrapping_add(unsafe { rsdp_ptr.add(i).read() });
                 }
                 if sum != 0 {
-                    error!("XSDP checksum failed");
+                    crate::error!("XSDP checksum failed");
                     return None;
                 }
             }

@@ -8,13 +8,13 @@ pub(crate) fn init_boot_time(env: &[u8], token: &mut CleanLockToken) {
     match ferric_boot_time::BootTime::from_env(env) {
         Ok(Some(clock)) => {
             *crate::time::START.lock(token.token()) = clock.offset_ns();
-            info!("Wall clock initialized from UEFI RTC");
+            crate::info!("Wall clock initialized from UEFI RTC");
         }
         Ok(None) => {
-            warn!("No UEFI clock handoff; relying on device-tree RTC if present");
+            crate::warn!("No UEFI clock handoff; relying on device-tree RTC if present");
         }
         Err(err) => {
-            warn!("Ignoring invalid UEFI clock handoff: {err}");
+            crate::warn!("Ignoring invalid UEFI clock handoff: {err}");
         }
     }
 }

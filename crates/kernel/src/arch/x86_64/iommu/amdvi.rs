@@ -374,7 +374,7 @@ impl Unit {
     /// After an overflow: logs it, and restarts the event log if it stopped (EventLogRun
     /// clear) by turning EventLogEn off, emptying the log and turning it on again.
     fn restart_event_log(&self, st: u64) {
-        warn!(
+        crate::warn!(
             "IOMMU: unit {:#x}: event log overflowed; some events were lost",
             self.regs.base
         );
@@ -429,7 +429,7 @@ impl Unit {
 /// Logs one run of identical events.
 fn report(base: u64, run: Run) {
     // Ferric Oxide (`kernel.trace_iommu`): the entry as the IOMMU wrote it.
-    trace_event!(
+    crate::trace::trace_event!(
         ferric_trace::kernel::IOMMU_FAULT,
         base,
         ferric_trace::kernel::IommuFormat::AmdViEvent.raw(),
@@ -440,9 +440,9 @@ fn report(base: u64, run: Run) {
     let kind = run.event.decode();
     let times = Times(run.count);
     if run.event.is_dma_fault() {
-        error!("IOMMU: DMA fault at unit {base:#x}: {kind}{times}");
+        crate::error!("IOMMU: DMA fault at unit {base:#x}: {kind}{times}");
     } else {
-        error!("IOMMU: unit {base:#x}: {kind}{times}");
+        crate::error!("IOMMU: unit {base:#x}: {kind}{times}");
     }
 }
 
@@ -705,16 +705,16 @@ fn find_capability(bdf: Bdf, id: u8) -> Option<u8> {
 fn route_event_interrupt(ivhd: &Ivhd<'_>) -> bool {
     let base = ivhd.base;
     if ivhd.segment != 0 {
-        warn!("IOMMU: AMD-Vi unit at {base:#x} is in segment {}; its events are read after commands only", ivhd.segment);
+        crate::warn!("IOMMU: AMD-Vi unit at {base:#x} is in segment {}; its events are read after commands only", ivhd.segment);
         return false;
     }
     let Some(apic_id) = super::bsp_apic_id().and_then(|id| u8::try_from(id).ok()) else {
-        warn!("IOMMU: BSP APIC ID unknown or above 255; events at unit {base:#x} are read after commands only");
+        crate::warn!("IOMMU: BSP APIC ID unknown or above 255; events at unit {base:#x} are read after commands only");
         return false;
     };
     let bdf = Bdf::from_source_id(ivhd.device_id.0);
     let Some(cap) = find_capability(bdf, MSI_CAPABILITY) else {
-        warn!("IOMMU: AMD-Vi unit at {base:#x} ({}) has no MSI capability; its events are read after commands only", ivhd.device_id);
+        crate::warn!("IOMMU: AMD-Vi unit at {base:#x} ({}) has no MSI capability; its events are read after commands only", ivhd.device_id);
         return false;
     };
     let header = pci_config_read(bdf, cap);
@@ -751,7 +751,7 @@ fn fill_device_table(ivhd: &Ivhd<'_>, state: &mut UnitState) {
         let coverage = match coverage {
             Ok(coverage) => coverage,
             Err(err) => {
-                warn!(
+                crate::warn!(
                     "IOMMU: AMD-Vi unit at {:#x}: stopped reading its device entries: {err}",
                     ivhd.base
                 );
@@ -842,12 +842,13 @@ fn init_unit(ivhd: Ivhd<'static>) -> Result<Unit, Error> {
     } else {
         "identity domain"
     };
-    info!(
+    crate::info!(
         "IOMMU: AMD-Vi unit at {:#x} ({}) enabled ({unattached})",
-        ivhd.base, ivhd.device_id
+        ivhd.base,
+        ivhd.device_id
     );
     let how = if interrupt { "MSI" } else { "polled" };
-    info!(
+    crate::info!(
         "IOMMU: unit {:#x}: {EVENT_LOG_ENTRIES}-entry event log ({how}), {} invalidation",
         ivhd.base,
         if unit.plan.invalidate_all {
@@ -864,13 +865,13 @@ pub(super) fn init(bytes: &'static [u8]) {
     let ivrs = match Ivrs::parse(bytes) {
         Ok(ivrs) => IVRS.call_once(|| ivrs),
         Err(err) => {
-            warn!("IOMMU: IVRS table is invalid ({err}), AMD-Vi not enabled");
+            crate::warn!("IOMMU: IVRS table is invalid ({err}), AMD-Vi not enabled");
             return;
         }
     };
     for ivmd in ivrs.memory() {
         if let Some(pages) = ivmd.pages() {
-            info!(
+            crate::info!(
                 "IOMMU: IVMD {:#x}-{:#x} kept out of DMA domains{}",
                 pages.start,
                 pages.end,
@@ -887,7 +888,7 @@ pub(super) fn init(bytes: &'static [u8]) {
             EMPTY_ROOT.call_once(|| block);
         }
         Err(err) => {
-            warn!("IOMMU: AMD-Vi not enabled: {err}");
+            crate::warn!("IOMMU: AMD-Vi not enabled: {err}");
             return;
         }
     }
@@ -896,7 +897,7 @@ pub(super) fn init(bytes: &'static [u8]) {
         match init_unit(ivhd) {
             Ok(unit) => enabled.push(unit),
             Err(err) => {
-                warn!("IOMMU: AMD-Vi unit at {:#x} skipped: {err}", ivhd.base);
+                crate::warn!("IOMMU: AMD-Vi unit at {:#x} skipped: {err}", ivhd.base);
             }
         }
     }
@@ -909,7 +910,7 @@ pub(super) fn init(bytes: &'static [u8]) {
         super::selftest::run();
         super::announce_enforce();
         if cfg!(iommu = "enforce") {
-            warn!(
+            crate::warn!(
                 "IOMMU: AMD-Vi interrupt remapping is not implemented yet; device interrupts are not checked"
             );
         }

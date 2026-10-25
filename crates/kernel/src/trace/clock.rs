@@ -66,9 +66,9 @@ fn select() -> Choice {
     }
     CLOCK.store(choice.clock.raw(), Ordering::Release);
     if choice.reliable {
-        info!("trace: clock {} ({})", choice.clock, choice.reason());
+        crate::info!("trace: clock {} ({})", choice.clock, choice.reason());
     } else {
-        warn!("trace: clock {} ({})", choice.clock, choice.reason());
+        crate::warn!("trace: clock {} ({})", choice.clock, choice.reason());
     }
     choice
 }

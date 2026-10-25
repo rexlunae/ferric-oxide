@@ -597,7 +597,7 @@ fn acpi_table(signature: &str) -> Option<&'static [u8]> {
 /// Logs what `kernel.iommu = "enforce"` means, once DMA domains are available.
 fn announce_enforce() {
     if cfg!(iommu = "enforce") {
-        info!(
+        crate::info!(
             "IOMMU: enforce mode: only drivers with a bound domain get DMA addresses, and only devices attached to a domain can DMA"
         );
     }
@@ -607,7 +607,7 @@ fn announce_enforce() {
 fn enable_fault_interrupt(regs: &Regs) {
     log_faults(regs);
     let Some(apic_id) = bsp_apic_id() else {
-        warn!(
+        crate::warn!(
             "IOMMU: BSP APIC ID unknown; faults at unit {:#x} are not reported",
             regs.base
         );
@@ -622,7 +622,7 @@ fn enable_fault_interrupt(regs: &Regs) {
             regs.write(regs::FECTL, 0u32);
         }
         Err(_) => {
-            warn!(
+            crate::warn!(
                 "IOMMU: BSP APIC ID {apic_id} needs interrupt remapping; faults at unit {:#x} are not reported",
                 regs.base
             );
@@ -637,7 +637,7 @@ fn log_faults(regs: &Regs) {
         for rec in fault::records(regs.cap, status) {
             let (lo, hi) = (regs.read(rec.low), regs.read(rec.high));
             if let Some(record) = FaultRecord::decode(lo, hi) {
-                trace_event!(
+                crate::trace::trace_event!(
                     ferric_trace::kernel::IOMMU_FAULT,
                     regs.base,
                     ferric_trace::kernel::IommuFormat::VtdFaultRecord.raw(),
@@ -650,27 +650,27 @@ fn log_faults(regs: &Regs) {
                 } else {
                     "DMA"
                 };
-                error!("IOMMU: {what} fault at unit {:#x}: {record}", regs.base);
+                crate::error!("IOMMU: {what} fault at unit {:#x}: {record}", regs.base);
                 // Writing F back as 1 frees the record; the other bits are read-only.
                 regs.write(rec.f_dword, fault::RECORD_F_DWORD);
             }
         }
     }
     if status.overflow() {
-        error!(
+        crate::error!(
             "IOMMU: unit {:#x} lost faults (fault records full)",
             regs.base
         );
     }
     if let Some(err) = QueueError::from_fault_status(status.0) {
-        error!("IOMMU: unit {:#x}: {err}", regs.base);
+        crate::error!("IOMMU: unit {:#x}: {err}", regs.base);
     }
     if status.clear_value() != 0 {
         regs.write(regs::FSTS, status.clear_value());
     }
 }
 
-interrupt!(fault_interrupt, || {
+crate::interrupt!(fault_interrupt, || {
     for unit in UNITS.get().into_iter().flatten() {
         log_faults(&unit.regs);
     }
@@ -694,14 +694,15 @@ fn identity_top(dmar: &Dmar<'_>) -> u64 {
     for rmrr in rmrrs(dmar) {
         match rmrr.end() {
             Some(end) => {
-                info!(
+                crate::info!(
                     "IOMMU: RMRR {:#x}-{:#x} identity-mapped",
-                    rmrr.base, rmrr.limit
+                    rmrr.base,
+                    rmrr.limit
                 );
                 top = top.max(end);
             }
             None => {
-                warn!("IOMMU: ignoring empty RMRR at {:#x}", rmrr.base);
+                crate::warn!("IOMMU: ignoring empty RMRR at {:#x}", rmrr.base);
             }
         }
     }
@@ -751,11 +752,11 @@ fn init_unit(
     } else {
         "identity domain"
     };
-    info!(
+    crate::info!(
         "IOMMU: VT-d unit at {:#x} enabled ({unattached})",
         drhd.register_base
     );
-    info!(
+    crate::info!(
         "IOMMU: unit {:#x} uses {how} invalidation",
         drhd.register_base
     );
@@ -782,7 +783,7 @@ pub fn init() {
     } else if let Some(bytes) = acpi_table("IVRS") {
         amdvi::init(bytes);
     } else {
-        info!("IOMMU: no DMAR or IVRS table, IOMMU not enabled");
+        crate::info!("IOMMU: no DMAR or IVRS table, IOMMU not enabled");
     }
 }
 
@@ -791,7 +792,7 @@ fn init_vtd(bytes: &'static [u8]) {
     let dmar = match Dmar::parse(bytes) {
         Ok(dmar) => DMAR.call_once(|| dmar),
         Err(err) => {
-            warn!("IOMMU: DMAR table is invalid ({err}), VT-d not enabled");
+            crate::warn!("IOMMU: DMAR table is invalid ({err}), VT-d not enabled");
             return;
         }
     };
@@ -805,7 +806,7 @@ fn init_vtd(bytes: &'static [u8]) {
                 match init_unit(&drhd, dmar.flags(), top, &mut identities, &mut tables) {
                     Ok(unit) => units.push(unit),
                     Err(err) => {
-                        warn!(
+                        crate::warn!(
                             "IOMMU: VT-d unit at {:#x} skipped: {err}",
                             drhd.register_base
                         );
@@ -814,7 +815,7 @@ fn init_vtd(bytes: &'static [u8]) {
             }
             Ok(_) => {}
             Err(err) => {
-                warn!("IOMMU: stopped reading the DMAR table: {err}");
+                crate::warn!("IOMMU: stopped reading the DMAR table: {err}");
                 break;
             }
         }
@@ -831,6 +832,6 @@ fn init_vtd(bytes: &'static [u8]) {
         selftest::run();
         announce_enforce();
     } else if !units.is_empty() {
-        warn!("IOMMU: the units share no table layout; DMA domains are unavailable");
+        crate::warn!("IOMMU: the units share no table layout; DMA domains are unavailable");
     }
 }

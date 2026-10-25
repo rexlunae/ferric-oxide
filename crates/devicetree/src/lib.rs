@@ -48,7 +48,18 @@ impl fmt::Display for Error {
     }
 }
 
-impl core::error::Error for Error {}
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            // The published `fdt` prerelease's `FdtError` implements only
+            // `Debug` and `Display`, not `core::error::Error`, so it cannot be
+            // returned as a source. The `Parse` variant still retains the inner
+            // `fdt::FdtError` by value for typed diagnostics.
+            Self::Bounds => None,
+            Self::Parse(_) => None,
+        }
+    }
+}
 
 impl From<fdt::FdtError> for Error {
     fn from(value: fdt::FdtError) -> Self {

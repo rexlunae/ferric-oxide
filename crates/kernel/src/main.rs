@@ -1,7 +1,7 @@
-//! # The Redox OS Kernel, version 2
+//! Ferric Oxide microkernel.
 //!
-//! The Redox OS Kernel is a microkernel that supports `x86_64` systems and
-//! provides Unix-like syscalls for primarily Rust applications
+//! Architecture startup initializes memory, CPU state and scheduling before
+//! handing control to user-space services through the Redox system-call ABI.
 
 #![feature(int_roundings)]
 #![cfg_attr(dtb, feature(iter_next_chunk))]
@@ -11,27 +11,17 @@
 #![cfg_attr(not(test), no_main)]
 #![allow(clippy::new_without_default)]
 
-#[macro_use]
 extern crate alloc;
 
-#[macro_use]
-extern crate bitflags;
-
-use core::sync::atomic::{AtomicU32, Ordering};
-
-#[macro_use]
 /// Shared data structures
 mod common;
 
-#[macro_use]
 mod macros;
 
 /// Ferric Oxide: tracepoints (`trace_event!`) and their per-CPU rings (`kernel.trace`)
-#[macro_use]
 mod trace;
 
 /// Architecture-dependent stuff
-#[macro_use]
 #[allow(dead_code)] // TODO
 mod arch;
 use crate::arch::{consts::*, ipi, stop, CurrentRmmArch};
@@ -49,6 +39,9 @@ mod dtb;
 
 /// Logical CPU ID and bitset types
 mod cpu_set;
+use cpu_set::cpu_count;
+#[cfg(any(target_arch = "aarch64", test))]
+use cpu_set::publish_cpu;
 
 /// Stats for the CPUs
 mod cpu_stats;
@@ -118,54 +111,28 @@ fn cpu_id() -> crate::cpu_set::LogicalCpuId {
     crate::percpu::PercpuBlock::current().cpu_id
 }
 
-/// The count of all CPUs that can have work scheduled
-static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
-
-/// Get the number of CPUs currently active
-#[inline(always)]
-fn cpu_count() -> u32 {
-    CPU_COUNT.load(Ordering::Acquire)
-}
-
-/// Publishes the next contiguous logical CPU after its architecture-specific
-/// initialization and handshake have completed.
-fn publish_cpu(cpu_id: crate::cpu_set::LogicalCpuId) -> bool {
-    let expected = cpu_id.get();
-    CPU_COUNT
-        .compare_exchange(expected, expected + 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-#[cfg(not(test))]
 macro_rules! linker_offsets(
     ($($name:ident),*) => {
         $(
+        #[doc = concat!("Returns the address of the linker symbol `", stringify!($name), "`.")]
         #[inline(always)]
         #[allow(non_snake_case)]
         pub fn $name() -> usize {
-            unsafe extern "C" {
-                // TODO: UnsafeCell?
-                static $name: u8;
+            #[cfg(not(test))]
+            {
+                unsafe extern "C" {
+                    static $name: u8;
+                }
+                (&raw const $name) as usize
             }
-            (&raw const $name) as usize
+            #[cfg(test)]
+            unreachable!("linker symbols are unavailable in host tests")
         }
         )*
     }
 );
 
-#[cfg(test)]
-macro_rules! linker_offsets(
-    ($($name:ident),*) => {
-        $(
-        #[inline(always)]
-        #[allow(non_snake_case)]
-        pub fn $name() -> usize {
-            unreachable!()
-        }
-        )*
-    }
-);
-
+/// Addresses supplied by the architecture's kernel linker script.
 mod kernel_executable_offsets {
     linker_offsets!(
         KERNEL_OFFSET,

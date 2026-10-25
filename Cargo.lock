@@ -1280,6 +1280,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-aligned-buffer"
+version = "0.1.0"
+
+[[package]]
 name = "fdt"
 version = "0.2.0-alpha3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

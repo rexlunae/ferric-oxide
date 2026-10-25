@@ -99,7 +99,7 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
         assert_ne!(target, my_percpublock.cpu_id);
 
         let Some(percpublock) = get_percpu_block(target) else {
-            warn!("Trying to TLB shootdown a CPU that doesn't exist or isn't initialized.");
+            crate::warn!("Trying to TLB shootdown a CPU that doesn't exist or isn't initialized.");
             return;
         };
         #[expect(clippy::bool_comparison)]

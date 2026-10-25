@@ -142,6 +142,40 @@ corruption. Because the bootloader is a soft-float UEFI target, CI also builds
 it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
 `x86_64-unknown-uefi`; check that build when changing its dependencies.
 
+## Kernel helper tests
+
+Kernel algorithms that do not touch hardware have a host test package at
+`crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
+It includes the actual `cpu_set` and `sync/records`
+modules, rather than duplicating their implementations. Run from the root:
+
+```sh
+cargo test --locked -p ferric-aligned-buffer
+cargo test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-features
+cargo clippy --locked --manifest-path crates/kernel/tests/Cargo.toml \
+  --all-targets --all-features --no-deps -- -D warnings
+cargo test --locked --manifest-path crates/kernel/Cargo.toml -p rmm --features std --lib
+cargo miri test --locked -p ferric-aligned-buffer
+cargo miri test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-features
+```
+
+Miri requires the `miri` component for the declared nightly toolchain. The
+kernel-lints workflow runs these tests, including Miri; the shared buffer also
+receives the host workspace's strict Clippy and Rustdoc checks.
+
+Coverage includes alignment, zero-length buffers, layout overflow and exact
+deallocation layouts, independent buffer clones, every CPU-mask word boundary,
+out-of-range CPU IDs, duplicate/gapped/concurrent CPU publication, initialized
+event/SQE ABI bytes, wrapped queues, whole-record reads and copy-failure rollback.
+Wait queues return zero immediately for an empty destination, reject nonempty
+destinations smaller than one record with `EINVAL`, and leave queued records
+untouched if either user-copy segment fails. Larger buffers receive only whole
+records. Record tests simulate copy failures; they do not execute the user-copy
+assembly or the scheduler's block/wake protocol. Full kernel host `cargo test`
+is separate and still has older scheduler fixtures that do not compile against
+the current `Context::new` interface. Use image tests for actual context switching
+and fault handling.
+
 ## Device-tree parser checks
 
 The kernel and ARM64/RISC-V bootloader share `ferric-devicetree`, which consumes
@@ -170,7 +204,7 @@ regressions. Record image/configuration details and every skipped check.
 | --- | --- |
 | `scripts/ferric-ci/kernel-lint-ratchet.sh` | Holds per-lint Clippy counts and `unsafe` uses at or below `ci/kernel-lints.json` |
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
-| `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at selected entry points in an IBT-built kernel |
+| `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
 
@@ -383,7 +417,11 @@ skip or KPTI preventing enablement does not count as a successful rerun.
 Preserve `build-info.txt`, `SHA256SUMS`, `kernel.all`, the serial log and QEMU
 version with the result for [#78](https://github.com/rexlunae/ferric-oxide/issues/78).
 The image workflow's ordinary CET-disabled CI boot validates the pool and
-fallback boot, not this hardware result.
+fallback boot, not this hardware result. The pool test runs after the secondary
+CPUs reach their BSP wait, retires two successive probe mappings, and requires
+those CPUs to service shootdowns with interrupts still masked. This covers the
+startup deadlock seen in the PR #174 Kleya rerun even on CI CPUs without CET;
+the post-enable WRSS and control-protection paths still need the hardware rerun.
 
 The harness rejects crashes and `FERRIC_TEST_FAIL` markers and requires the
 smoke completion marker. A completion marker alone is insufficient because

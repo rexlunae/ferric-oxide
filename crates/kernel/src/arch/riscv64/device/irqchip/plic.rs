@@ -1,7 +1,7 @@
 use crate::{
     arch::{device::irqchip::hlic, start::BOOT_HART_ID},
     dtb::{
-        get_mmio_address,
+        translate_mmio_address,
         irqchip::{InterruptController, InterruptHandler, IrqCell, IrqDesc, IRQ_CHIP},
     },
     sync::CleanLockToken,
@@ -97,15 +97,15 @@ impl InterruptHandler for Plic {
     fn irq_handler(&mut self, _irq: u32, token: &mut CleanLockToken) {
         unsafe {
             let irq = self.irq_ack();
-            //println!("PLIC interrupt {}", irq);
+            //crate::println!("PLIC interrupt {}", irq);
             if let Some(virq) = self.irq_to_virq(irq) {
                 IRQ_CHIP.trigger_virq(virq as u32, token);
             } else {
-                error!("unexpected irq num {}", irq);
+                crate::error!("unexpected irq num {}", irq);
                 self.irq_eoi(irq);
             }
         }
-        //println!("PLIC interrupt done");
+        //crate::println!("PLIC interrupt done");
     }
 }
 
@@ -123,7 +123,7 @@ impl InterruptController for Plic {
 
         // MMIO region
         let reg = my_node.reg().unwrap().next().unwrap();
-        let addr = get_mmio_address(&fdt, &my_node, &reg).unwrap();
+        let addr = translate_mmio_address(&fdt, &my_node, &reg).unwrap();
         // Specifies how many external interrupts are supported by this controller.
         let ndev = my_node
             .property("riscv,ndev")
@@ -149,7 +149,7 @@ impl InterruptController for Plic {
             .iter()
             .position(|x| x.parent_interrupt.is_some() && x.parent == hlic_ic_idx)
             .unwrap();
-        info!("PLIC: using context {}", self.context);
+        crate::info!("PLIC: using context {}", self.context);
 
         let regs = unsafe { self.regs.as_mut().unwrap() };
         regs.set_priority_threshold(self.context, 0);

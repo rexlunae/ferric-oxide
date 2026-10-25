@@ -66,7 +66,7 @@ pub fn trigger(token: &mut CleanLockToken) {
                     real >= time
                 }
                 clock => {
-                    println!("timeout::trigger: unknown clock {}", clock);
+                    crate::println!("timeout::trigger: unknown clock {}", clock);
                     true
                 }
             };

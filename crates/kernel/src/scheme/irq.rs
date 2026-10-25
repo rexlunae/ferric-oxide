@@ -95,13 +95,10 @@ fn count_interrupt(irq: u8, owner: LogicalCpuId) -> (LogicalCpuId, usize) {
         return (owner, count);
     }
     let _ = owner;
-    let count = COUNTS
-        .lock()
-        .get_mut(usize::from(irq))
-        .map_or(0, |count| {
-            *count = count.wrapping_add(1);
-            *count
-        });
+    let count = COUNTS.lock().get_mut(usize::from(irq)).map_or(0, |count| {
+        *count = count.wrapping_add(1);
+        *count
+    });
     (LogicalCpuId::BSP, count)
 }
 
@@ -171,7 +168,10 @@ enum Source {
     /// [`irq_trigger`]: a PIC or I/O APIC line.
     Line,
     /// `vector_trigger`: a vector reserved on the running CPU (MSI, MSI-X).
-    #[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     Vector,
 }
 
@@ -196,7 +196,7 @@ fn deliver(irq: u8, owner: LogicalCpuId, source: Source, token: &mut CleanLockTo
 
     // Ferric Oxide (`kernel.trace_irq`): recorded before the handles wake, so a driver's
     // acknowledgement always comes after it.
-    trace_event!(
+    crate::trace::trace_event!(
         ferric_trace::kernel::IRQ_DELIVER,
         irq,
         cpu.get(),
@@ -272,12 +272,12 @@ impl IrqScheme {
                     })
                     .collect::<Vec<_>>(),
                 None => {
-                    warn!("no MADT found, defaulting to 1 CPU");
-                    vec![0]
+                    crate::warn!("no MADT found, defaulting to 1 CPU");
+                    alloc::vec![0]
                 }
             }
         } else {
-            vec![0]
+            alloc::vec![0]
         };
 
         CPUS.call_once(|| cpus);
@@ -368,7 +368,7 @@ impl IrqScheme {
                 if irq_number >= TOTAL_IRQ_COUNT {
                     return Err(Error::new(ENOENT));
                 }
-                debug!("open_phandle_irq  virq={}", irq_number);
+                crate::debug!("open_phandle_irq  virq={}", irq_number);
                 let reservation = if flags & O_STAT == 0 {
                     let cpu_id = LogicalCpuId::BSP;
                     if is_reserved(cpu_id, irq_number) {
@@ -440,7 +440,7 @@ fn cpus_file() -> Vec<u8> {
 ///
 /// 1. A free vector is reserved on `to`, so the move cannot fail for want of one later.
 /// 2. Every interrupt remapping entry that delivered the old vector to the old CPU is rewritten
-///    to deliver the new one ([`crate::arch::iommu::interrupt::move_vector`]); the device's
+///    to deliver the new one (`crate::arch::iommu::interrupt::move_vector`); the device's
 ///    message stays as it is. The old vector stays reserved meanwhile, so what the unit had
 ///    already sent the old way is still counted on the old CPU's row.
 /// 3. Every handle of the old (CPU, vector) is re-keyed to the new one, with an interrupt
@@ -558,7 +558,7 @@ fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -
     {
         use crate::arch::iommu::interrupt::{move_vector, IrqError};
         move_vector(from.get(), from_vector, to.get(), to_vector).map_err(|err| {
-            warn!(
+            crate::warn!(
                 "irq: cannot move vector {from_vector:#x} from CPU {} to CPU {}: {err}",
                 from.get(),
                 to.get()
@@ -909,7 +909,7 @@ impl crate::scheme::KernelScheme for IrqScheme {
                     return Ok(0);
                 }
                 handle_ack.store(ack, Ordering::SeqCst);
-                trace_event!(
+                crate::trace::trace_event!(
                     ferric_trace::kernel::IRQ_ACK,
                     handle_irq,
                     handle_cpu.get(),
@@ -993,10 +993,10 @@ impl crate::scheme::KernelScheme for IrqScheme {
         let handle = handles_guard.get(id)?;
 
         let scheme_path = match handle {
-            Handle::Irq { irq, .. } => format!("irq:{}", irq),
+            Handle::Irq { irq, .. } => alloc::format!("irq:{}", irq),
             Handle::Bsp => "irq:bsp".to_owned(),
-            Handle::Avail(cpu_id) => format!("irq:cpu-{:2x}", cpu_id.get()),
-            Handle::Phandle(phandle, _) => format!("irq:phandle-{}", phandle),
+            Handle::Avail(cpu_id) => alloc::format!("irq:cpu-{:2x}", cpu_id.get()),
+            Handle::Phandle(phandle, _) => alloc::format!("irq:phandle-{}", phandle),
             Handle::TopLevel => "irq:".to_owned(),
             #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
             Handle::Cpus(_) => "irq:cpus".to_owned(),

@@ -101,6 +101,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
 
 [[package]]
+name = "ferric-aligned-buffer"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-amdvi"
 version = "0.1.0"
 dependencies = [
@@ -136,6 +140,14 @@ version = "0.1.0"
 [[package]]
 name = "ferric-irq"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-kernel-tests"
+version = "0.1.0"
+dependencies = [
+ "ferric-irq",
+ "redox_syscall",
+]
 
 [[package]]
 name = "ferric-nospec"
@@ -225,6 +237,7 @@ dependencies = [
  "bitfield",
  "bitflags 2.9.1",
  "cc",
+ "ferric-aligned-buffer",
  "ferric-amdvi",
  "ferric-boot-time",
  "ferric-cet",

@@ -1,8 +1,8 @@
 use core::ptr::{self, read_volatile, write_volatile};
 
+use crate::memory::PhysicalAddress;
 #[cfg(not(target_arch = "x86"))]
 use crate::memory::{RmmA, RmmArch};
-use crate::{find_one_sdt, memory::PhysicalAddress};
 
 use super::{sdt::Sdt, GenericAddressStructure, ACPI_TABLE};
 
@@ -24,10 +24,10 @@ pub struct Hpet {
 
 impl Hpet {
     pub fn init() {
-        let hpet = Hpet::new(find_one_sdt!("HPET"));
+        let hpet = Hpet::new(crate::find_one_sdt!("HPET"));
 
         if let Some(hpet) = hpet {
-            debug!("  HPET: {:X}", hpet.hpet_number);
+            crate::debug!("  HPET: {:X}", hpet.hpet_number);
 
             let mut hpet_t = ACPI_TABLE.hpet.write();
             *hpet_t = Some(hpet);
@@ -41,7 +41,7 @@ impl Hpet {
                 unsafe { s.map() };
                 Some(s)
             } else {
-                warn!(
+                crate::warn!(
                     "HPET has unsupported address space {}",
                     s.base_address.address_space
                 );

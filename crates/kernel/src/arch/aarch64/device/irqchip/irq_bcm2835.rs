@@ -4,7 +4,7 @@ use ferric_devicetree::{Node as FdtNode, Tree as Fdt};
 use super::InterruptController;
 use crate::{
     dtb::{
-        get_interrupt, get_mmio_address,
+        get_interrupt, translate_mmio_address,
         irqchip::{InterruptHandler, IrqCell, IrqDesc, IRQ_CHIP},
     },
     sync::CleanLockToken,
@@ -77,7 +77,7 @@ impl Bcm2835ArmInterruptController {
         unsafe {
             //assert address_cells == 0x1, size_cells == 0x1
             let mem = node.reg().unwrap().nth(0).unwrap();
-            let base = get_mmio_address(fdt, node, &mem).unwrap();
+            let base = translate_mmio_address(fdt, node, &mem).unwrap();
             let size = mem.size.unwrap() as u32;
             let mut ret_virq = None;
 
@@ -90,9 +90,10 @@ impl Bcm2835ArmInterruptController {
                     .ic
                     .irq_xlate(irq)
                     .unwrap();
-                info!(
+                crate::info!(
                     "register bcm2835arm_ctrl as ic_idx {}'s child  virq = {}",
-                    ic_idx, virq
+                    ic_idx,
+                    virq
                 );
                 ret_virq = Some(virq);
             }
@@ -102,13 +103,13 @@ impl Bcm2835ArmInterruptController {
 
     unsafe fn init(&mut self) {
         unsafe {
-            debug!("IRQ BCM2835 INIT");
+            crate::debug!("IRQ BCM2835 INIT");
             //disable all interrupt
             self.write(DISABLE_0, 0xffff_ffff);
             self.write(DISABLE_1, 0xffff_ffff);
             self.write(DISABLE_2, 0xffff_ffff);
 
-            debug!("IRQ BCM2835 END");
+            crate::debug!("IRQ BCM2835 END");
         }
     }
 
@@ -154,7 +155,7 @@ impl InterruptController for Bcm2835ArmInterruptController {
                 i += 1;
             }
 
-            info!("bcm2835 irq_range = ({}, {})", idx, idx + cnt);
+            crate::info!("bcm2835 irq_range = ({}, {})", idx, idx + cnt);
             self.irq_range = (idx, idx + cnt);
             *irq_idx = idx + cnt;
         }
@@ -199,9 +200,10 @@ impl InterruptController for Bcm2835ArmInterruptController {
                 return irq_32_63 + 64;
             }
             num => {
-                error!(
+                crate::error!(
                     "unexpected irq pending in BASIC PENDING: 0x{}, sources = 0x{:08x}",
-                    num, sources
+                    num,
+                    sources
                 );
                 return num;
             }
@@ -211,7 +213,7 @@ impl InterruptController for Bcm2835ArmInterruptController {
     fn irq_eoi(&mut self, _irq_num: u32) {}
 
     fn irq_enable(&mut self, irq_num: u32) {
-        debug!("bcm2835 enable {} {}", irq_num, irq_num & 0x1f);
+        crate::debug!("bcm2835 enable {} {}", irq_num, irq_num & 0x1f);
         match irq_num {
             num @ 0..=31 => {
                 let val = 1 << num;
@@ -291,7 +293,7 @@ impl InterruptHandler for Bcm2835ArmInterruptController {
                     handler.irq_handler(virq as u32, token);
                 }
             } else {
-                error!("unexpected irq num {}", irq);
+                crate::error!("unexpected irq num {}", irq);
             }
             self.irq_eoi(irq);
         }

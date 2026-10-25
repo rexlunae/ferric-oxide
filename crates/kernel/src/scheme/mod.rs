@@ -113,10 +113,10 @@ pub mod user;
 pub const SCHEME_MAX_SCHEMES: usize = 65_536;
 
 // Unique identifier for a scheme.
-int_like!(SchemeId, usize);
+crate::int_like!(SchemeId, usize);
 
 // Unique identifier for a file descriptor.
-int_like!(FileHandle, AtomicFileHandle, usize, AtomicUsize);
+crate::int_like!(FileHandle, AtomicFileHandle, usize, AtomicUsize);
 
 #[allow(dead_code)]
 pub enum StrOrBytes<'a> {

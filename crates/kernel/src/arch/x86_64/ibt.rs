@@ -102,7 +102,7 @@ pub fn check() {
 pub fn init_cpu(bsp: bool) {
     if !decide() {
         if bsp && COMPILED {
-            info!("IBT: kernel indirect branch tracking unavailable on this CPU");
+            crate::info!("IBT: kernel indirect branch tracking unavailable on this CPU");
         }
         return;
     }
@@ -141,9 +141,9 @@ pub fn init_cpu(bsp: bool) {
     }
 
     if bsp {
-        info!("IBT: kernel indirect branch tracking enabled");
+        crate::info!("IBT: kernel indirect branch tracking enabled");
     } else {
-        debug!("IBT: enabled on this CPU");
+        crate::debug!("IBT: enabled on this CPU");
     }
 }
 
@@ -152,5 +152,5 @@ fn failed(why: &str) {
     if POLICY == Policy::Always {
         panic!("IBT: could not enable kernel indirect branch tracking: {why}");
     }
-    warn!("IBT: kernel indirect branch tracking left off: {why}");
+    crate::warn!("IBT: kernel indirect branch tracking left off: {why}");
 }

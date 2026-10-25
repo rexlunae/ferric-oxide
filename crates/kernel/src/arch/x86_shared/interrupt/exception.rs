@@ -10,8 +10,8 @@ use crate::{
     syscall::flag::*,
 };
 
-interrupt_stack!(divide_by_zero, |stack| {
-    println!("Divide by zero");
+crate::interrupt_stack!(divide_by_zero, |stack| {
+    crate::println!("Divide by zero");
     stack.trace();
     excp_handler(Exception {
         kind: 0,
@@ -19,7 +19,7 @@ interrupt_stack!(divide_by_zero, |stack| {
     });
 });
 
-interrupt_stack!(debug, @paranoid, |stack| {
+crate::interrupt_stack!(debug, @paranoid, |stack| {
     let mut handled = false;
 
     // Disable singlestep before there is a breakpoint, since the breakpoint
@@ -40,7 +40,7 @@ interrupt_stack!(debug, @paranoid, |stack| {
     }
 
     if !handled {
-        println!("Debug trap");
+        crate::println!("Debug trap");
         stack.dump();
         excp_handler(Exception {
             kind: 1,
@@ -49,17 +49,17 @@ interrupt_stack!(debug, @paranoid, |stack| {
     }
 });
 
-interrupt_stack!(non_maskable, @paranoid, |stack| {
+crate::interrupt_stack!(non_maskable, @paranoid, |stack| {
     #[cfg(target_arch = "x86_64")]
     unsafe { crate::profiling::nmi_handler(stack) };
 
     #[cfg(not(all(target_arch = "x86_64", feature = "profiling")))]
     {
         // TODO: This will likely deadlock
-        println!("Non-maskable interrupt");
+        crate::println!("Non-maskable interrupt");
         // Ferric Oxide: the interrupted instruction at its link address (as kernel.sym has it)
         // and the frames above it, so an NMI locates a CPU stuck in the kernel.
-        println!(
+        crate::println!(
             "NMI: interrupted at {:#x}",
             stack.instr_pointer().wrapping_sub(crate::kernel_image_slide())
         );
@@ -67,7 +67,7 @@ interrupt_stack!(non_maskable, @paranoid, |stack| {
     }
 });
 
-interrupt_stack!(breakpoint, |stack| {
+crate::interrupt_stack!(breakpoint, |stack| {
     // Ferric Oxide: an int3 a tracepoint site holds while it is patched live resumes after the
     // site (arch/x86_64/static_key.rs).
     #[cfg(all(feature = "trace", target_arch = "x86_64"))]
@@ -111,7 +111,7 @@ interrupt_stack!(breakpoint, |stack| {
 
     let mut token = unsafe { CleanLockToken::new() };
     if ptrace::breakpoint_callback(PTRACE_STOP_BREAKPOINT, None, &mut token).is_none() {
-        println!("Breakpoint trap");
+        crate::println!("Breakpoint trap");
         stack.dump();
         excp_handler(Exception {
             kind: 3,
@@ -120,8 +120,8 @@ interrupt_stack!(breakpoint, |stack| {
     }
 });
 
-interrupt_stack!(overflow, |stack| {
-    println!("Overflow trap");
+crate::interrupt_stack!(overflow, |stack| {
+    crate::println!("Overflow trap");
     stack.trace();
     excp_handler(Exception {
         kind: 4,
@@ -129,8 +129,8 @@ interrupt_stack!(overflow, |stack| {
     });
 });
 
-interrupt_stack!(bound_range, |stack| {
-    println!("Bound range exceeded fault");
+crate::interrupt_stack!(bound_range, |stack| {
+    crate::println!("Bound range exceeded fault");
     stack.trace();
     excp_handler(Exception {
         kind: 5,
@@ -138,8 +138,8 @@ interrupt_stack!(bound_range, |stack| {
     });
 });
 
-interrupt_stack!(invalid_opcode, |stack| {
-    println!("Invalid opcode fault");
+crate::interrupt_stack!(invalid_opcode, |stack| {
+    crate::println!("Invalid opcode fault");
     stack.trace();
     excp_handler(Exception {
         kind: 6,
@@ -147,8 +147,8 @@ interrupt_stack!(invalid_opcode, |stack| {
     });
 });
 
-interrupt_stack!(device_not_available, |stack| {
-    println!("Device not available fault");
+crate::interrupt_stack!(device_not_available, |stack| {
+    crate::println!("Device not available fault");
     stack.trace();
     excp_handler(Exception {
         kind: 7,
@@ -156,8 +156,8 @@ interrupt_stack!(device_not_available, |stack| {
     });
 });
 
-interrupt_error!(double_fault, |stack, _code| {
-    println!("Double fault");
+crate::interrupt_error!(double_fault, |stack, _code| {
+    crate::println!("Double fault");
     stack.trace();
     unsafe {
         loop {
@@ -167,8 +167,8 @@ interrupt_error!(double_fault, |stack, _code| {
     }
 });
 
-interrupt_error!(invalid_tss, |stack, code| {
-    println!("Invalid TSS fault");
+crate::interrupt_error!(invalid_tss, |stack, code| {
+    crate::println!("Invalid TSS fault");
     stack.trace();
     excp_handler(Exception {
         kind: 10,
@@ -177,8 +177,8 @@ interrupt_error!(invalid_tss, |stack, code| {
     });
 });
 
-interrupt_error!(segment_not_present, |stack, code| {
-    println!("Segment not present fault");
+crate::interrupt_error!(segment_not_present, |stack, code| {
+    crate::println!("Segment not present fault");
     stack.trace();
     excp_handler(Exception {
         kind: 11,
@@ -187,8 +187,8 @@ interrupt_error!(segment_not_present, |stack, code| {
     });
 });
 
-interrupt_error!(stack_segment, |stack, code| {
-    println!("Stack segment fault");
+crate::interrupt_error!(stack_segment, |stack, code| {
+    crate::println!("Stack segment fault");
     stack.trace();
     excp_handler(Exception {
         kind: 12,
@@ -197,7 +197,7 @@ interrupt_error!(stack_segment, |stack, code| {
     });
 });
 
-interrupt_error!(protection, |stack, code| {
+crate::interrupt_error!(protection, |stack, code| {
     let was_failing_msr;
 
     // TODO: maybe consider just forcing userspace to handle this, but our exception handling is
@@ -230,7 +230,7 @@ interrupt_error!(protection, |stack, code| {
     }
 
     if !was_failing_msr {
-        println!("Protection fault code={:#0x}", code);
+        crate::println!("Protection fault code={:#0x}", code);
         stack.trace();
         excp_handler(Exception {
             kind: 13,
@@ -240,7 +240,7 @@ interrupt_error!(protection, |stack, code| {
     }
 });
 
-interrupt_error!(page, |stack, code| {
+crate::interrupt_error!(page, |stack, code| {
     let cr2 = VirtualAddress::new(unsafe { x86::controlregs::cr2() });
     #[cfg(all(target_arch = "x86_64", shstk_compiled))]
     if crate::arch::shstk::recover_pool_probe(stack, code, cr2.data()) {
@@ -272,7 +272,7 @@ interrupt_error!(page, |stack, code| {
 
     #[cfg(target_arch = "x86")]
     if crate::memory::page_fault_handler(&mut stack.inner, generic_flags, cr2).is_err() {
-        println!("Page fault: {:>08X} {:#?}", cr2.data(), arch_flags);
+        crate::println!("Page fault: {:>08X} {:#?}", cr2.data(), arch_flags);
         stack.trace();
         excp_handler(Exception {
             kind: 14,
@@ -283,7 +283,7 @@ interrupt_error!(page, |stack, code| {
 
     #[cfg(target_arch = "x86_64")]
     if crate::memory::page_fault_handler(stack, generic_flags, cr2).is_err() {
-        println!("Page fault: {:>016X} {:#?}", cr2.data(), arch_flags);
+        crate::println!("Page fault: {:>016X} {:#?}", cr2.data(), arch_flags);
         stack.trace();
         excp_handler(Exception {
             kind: 14,
@@ -293,8 +293,8 @@ interrupt_error!(page, |stack, code| {
     }
 });
 
-interrupt_stack!(fpu_fault, |stack| {
-    println!("FPU floating point fault");
+crate::interrupt_stack!(fpu_fault, |stack| {
+    crate::println!("FPU floating point fault");
     stack.trace();
     excp_handler(Exception {
         kind: 16,
@@ -302,8 +302,8 @@ interrupt_stack!(fpu_fault, |stack| {
     });
 });
 
-interrupt_error!(alignment_check, |stack, code| {
-    println!("Alignment check fault");
+crate::interrupt_error!(alignment_check, |stack, code| {
+    crate::println!("Alignment check fault");
     stack.trace();
     excp_handler(Exception {
         kind: 17,
@@ -312,8 +312,8 @@ interrupt_error!(alignment_check, |stack, code| {
     });
 });
 
-interrupt_stack!(machine_check, @paranoid, |stack| {
-    println!("Machine check fault");
+crate::interrupt_stack!(machine_check, @paranoid, |stack| {
+    crate::println!("Machine check fault");
     stack.trace();
     unsafe {
         loop {
@@ -323,11 +323,11 @@ interrupt_stack!(machine_check, @paranoid, |stack| {
     }
 });
 
-interrupt_stack!(simd, |stack| {
-    println!("SIMD floating point fault");
+crate::interrupt_stack!(simd, |stack| {
+    crate::println!("SIMD floating point fault");
     let mut mxcsr = 0_usize;
     unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) core::ptr::addr_of_mut!(mxcsr)) };
-    println!("MXCSR {:#0x}", mxcsr);
+    crate::println!("MXCSR {:#0x}", mxcsr);
     stack.trace();
     excp_handler(Exception {
         kind: 19,
@@ -335,8 +335,8 @@ interrupt_stack!(simd, |stack| {
     });
 });
 
-interrupt_stack!(virtualization, |stack| {
-    println!("Virtualization fault");
+crate::interrupt_stack!(virtualization, |stack| {
+    crate::println!("Virtualization fault");
     stack.trace();
     unsafe {
         loop {
@@ -346,8 +346,8 @@ interrupt_stack!(virtualization, |stack| {
     }
 });
 
-interrupt_error!(security, |stack, _code| {
-    println!("Security exception");
+crate::interrupt_error!(security, |stack, _code| {
+    crate::println!("Security exception");
     stack.trace();
     unsafe {
         loop {
@@ -363,10 +363,10 @@ interrupt_error!(security, |stack, _code| {
 // User-mode CET is never enabled, so a #CP from user space is unexpected; it is handled like other
 // faults there.
 #[cfg(target_arch = "x86_64")]
-interrupt_error!(control_protection, |stack, code| {
+crate::interrupt_error!(control_protection, |stack, code| {
     let fault = ferric_cet::ControlProtectionError::from_error_code(code as u64);
     if stack.iret.cs & 3 == 3 {
-        println!("Control protection fault in user space: {}", fault);
+        crate::println!("Control protection fault in user space: {}", fault);
         stack.trace();
         excp_handler(Exception {
             kind: 21,
@@ -375,7 +375,7 @@ interrupt_error!(control_protection, |stack, code| {
         });
         return;
     }
-    println!("Control protection fault code={:#x}", code);
+    crate::println!("Control protection fault code={:#x}", code);
     stack.trace();
     // For an IBT fault RIP is the branch target that lacks `endbr64`; for a shadow-stack fault it
     // is the `ret`/`iretq` or token instruction. The trace above shows how execution got there.

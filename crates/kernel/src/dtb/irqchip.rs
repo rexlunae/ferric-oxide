@@ -88,9 +88,12 @@ impl IrqChipList {
                     continue;
                 };
 
-                debug!(
+                crate::debug!(
                     "{}, compatible = {}, #interrupt-cells = 0x{:08x}, phandle = 0x{:08x}",
-                    node.name, compatible, intr_cells, phandle
+                    node.name,
+                    compatible,
+                    intr_cells,
+                    phandle
                 );
                 let mut item = IrqChipItem {
                     phandle,
@@ -135,19 +138,19 @@ impl IrqChipList {
                         .and_then(NodeProperty::as_usize)
                         .unwrap() as u32;
                     let parent_interrupt_cells = parent.interrupt_cells().unwrap();
-                    debug!("interrupt-parent = 0x{:08x}", parent_phandle);
-                    debug!("interrupts begin:");
+                    crate::debug!("interrupt-parent = 0x{:08x}", parent_phandle);
+                    crate::debug!("interrupts begin:");
                     while let Some(parent_interrupt) =
                         interrupt_address(&mut intr_data, parent_interrupt_cells)
                     {
-                        debug!("{:?}, ", parent_interrupt);
+                        crate::debug!("{:?}, ", parent_interrupt);
                         item.parents.push(IrqConnection {
                             parent_phandle,
                             parent: 0,
                             parent_interrupt: gate_interrupt_address(parent_interrupt),
                         });
                     }
-                    debug!("interrupts end");
+                    crate::debug!("interrupts end");
                 } else if let Some(intr_data) = node.property("interrupts-extended") {
                     // FIXME use the helper when fixed (see gh#37)
                     // Shouldn't matter much since ARM seems to not use extended interrupt and
@@ -164,7 +167,7 @@ impl IrqChipList {
                         && let Some(parent_interrupt) =
                             interrupt_address(&mut intr_data, parent_interrupt_cells)
                     {
-                        debug!("{:?}, ", parent_interrupt);
+                        crate::debug!("{:?}, ", parent_interrupt);
                         item.parents.push(IrqConnection {
                             parent_phandle,
                             parent: 0,
@@ -251,9 +254,11 @@ impl IrqChipList {
                             irq_desc[virq].basic.child_ic_idx = Some(cur_idx);
                         }
                         _ => {
-                            error!(
+                            crate::error!(
                                 "Cannot connect irq chip {} to parent irq {} : {:?}",
-                                cur_chip.phandle, parent.phandle, parent_interrupt
+                                cur_chip.phandle,
+                                parent.phandle,
+                                parent_interrupt
                             );
                         }
                     }
@@ -391,13 +396,13 @@ pub fn init(fdt: &Fdt) {
 
 pub fn register_irq(virq: u32, handler: Box<dyn InterruptHandler>) {
     if virq >= 1024 {
-        error!("irq {} exceed 1024!!!", virq);
+        crate::error!("irq {} exceed 1024!!!", virq);
         return;
     }
 
     unsafe {
         if IRQ_CHIP.irq_desc[virq as usize].handler.is_some() {
-            error!("irq {} has already been registered!", virq);
+            crate::error!("irq {} has already been registered!", virq);
             return;
         }
 
@@ -423,6 +428,6 @@ pub fn set_reserved(_cpu_id: LogicalCpuId, index: u8, reserved: bool) {
 }
 
 pub fn available_irqs_iter(_cpu_id: LogicalCpuId) -> impl Iterator<Item = u8> + 'static {
-    error!("available_irqs_iter has been called");
+    crate::error!("available_irqs_iter has been called");
     0..0
 }

@@ -32,12 +32,12 @@ impl Gtdt {
             match Gtdt::new(gtdt_sdt[0]) {
                 Some(gtdt) => gtdt,
                 None => {
-                    warn!("Failed to parse GTDT");
+                    crate::warn!("Failed to parse GTDT");
                     return;
                 }
             }
         } else {
-            warn!("Unable to find GTDT");
+            crate::warn!("Unable to find GTDT");
             return;
         };
 

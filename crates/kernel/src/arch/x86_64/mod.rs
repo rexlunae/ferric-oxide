@@ -5,7 +5,6 @@ pub mod alternative;
 /// Boot-time check for the configured x86-64 microarchitecture level
 pub mod cpu_level;
 
-#[macro_use]
 pub mod macros;
 
 /// Constants like memory locations
@@ -16,7 +15,6 @@ pub mod consts;
 pub mod kaslr;
 
 /// Interrupt instructions
-#[macro_use]
 pub mod interrupt;
 
 /// Ferric Oxide: static keys for tracepoints (`kernel.trace`)
@@ -32,7 +30,7 @@ pub mod kpti;
 /// Ferric Oxide: kernel indirect branch tracking (CET IBT)
 pub mod ibt;
 
-/// Ferric Oxide: kernel shadow stacks (CET SS), allocated and kept consistent but not yet enabled
+/// Ferric Oxide: supervisor shadow-stack allocation and enforcement (CET SS)
 pub mod shstk;
 
 /// Ferric Oxide: Intel VT-d DMA remapping
@@ -48,7 +46,7 @@ pub unsafe extern "C" fn arch_copy_to_user(dst: usize, src: usize, len: usize) -
     core::arch::naked_asm!(
         ".global __usercopy_start
         __usercopy_start:",
-        alternative!(
+        crate::arch::macros::alternative!(
             feature: "smap",
             then: ["
             xor eax, eax

@@ -11,8 +11,8 @@ use crate::{
 
 use super::InterruptStack;
 
-exception_stack!(synchronous_exception_at_el1_with_sp0, |stack| {
-    println!("Synchronous exception at EL1 with SP0");
+crate::exception_stack!(synchronous_exception_at_el1_with_sp0, |stack| {
+    crate::println!("Synchronous exception at EL1 with SP0");
     stack.trace();
     loop {}
 });
@@ -41,7 +41,7 @@ unsafe fn instr_data_abort_inner(
     unsafe {
         let iss = iss(stack.iret.esr_el1);
         let fsc = iss & 0x3F;
-        //dbg!(fsc);
+        //crate::dbg!(fsc);
 
         let was_translation_fault = fsc >= 0b000100 && fsc <= 0b000111;
         //let was_permission_fault = fsc >= 0b001101 && fsc <= 0b001111;
@@ -60,7 +60,7 @@ unsafe fn instr_data_abort_inner(
         flags.set(GenericPfFlags::USER_NOT_SUPERVISOR, from_user);
 
         let faulting_addr = VirtualAddress::new(far_el1());
-        //dbg!(faulting_addr, flags, from);
+        //crate::dbg!(faulting_addr, flags, from);
 
         crate::memory::page_fault_handler(stack, flags, faulting_addr).is_ok()
     }
@@ -108,7 +108,7 @@ unsafe fn instr_trapped_msr_mrs_inner(
         let dir = iss & 0x000_0001;
 
         /*
-        print!("iss=0x{:x}, res0=0b{:03b}, op0=0b{:02b}\n
+        crate::print!("iss=0x{:x}, res0=0b{:03b}, op0=0b{:02b}\n
                 op2=0b{:03b}, op1=0b{:03b}, crn=0b{:04b}\n
                 rt=0b{:05b}, crm=0b{:04b}, dir=0b{:b}\n",
                 iss, res0, op0, op2, op1, crn, rt, crm, dir);
@@ -146,20 +146,20 @@ unsafe fn instr_trapped_msr_mrs_inner(
     }
 }
 
-exception_stack!(synchronous_exception_at_el1_with_spx, |stack| {
+crate::exception_stack!(synchronous_exception_at_el1_with_spx, |stack| {
     unsafe {
         if !pf_inner(
             stack,
             exception_code(stack.iret.esr_el1),
             "sync_exc_el1_spx",
         ) {
-            println!("Synchronous exception at EL1 with SPx");
+            crate::println!("Synchronous exception at EL1 with SPx");
             if exception_code(stack.iret.esr_el1) == 0b100101 {
                 let far_el1 = far_el1();
-                println!("FAR_EL1 = 0x{:08x}", far_el1);
+                crate::println!("FAR_EL1 = 0x{:08x}", far_el1);
             } else if exception_code(stack.iret.esr_el1) == 0b100100 {
                 let far_el1 = far_el1();
-                println!("USER FAR_EL1 = 0x{:08x}", far_el1);
+                crate::println!("USER FAR_EL1 = 0x{:08x}", far_el1);
             }
             stack.trace();
             loop {}
@@ -185,7 +185,7 @@ unsafe fn pf_inner(stack: &mut InterruptStack, ty: u8, from: &str) -> bool {
     }
 }
 
-exception_stack!(synchronous_exception_at_el0, |stack| {
+crate::exception_stack!(synchronous_exception_at_el0, |stack| {
     unsafe {
         let code = exception_code(stack.iret.esr_el1);
         match code {
@@ -209,12 +209,12 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
 
             ty => {
                 if !pf_inner(stack, ty as u8, "sync_exc_el0") {
-                    error!(
+                    crate::error!(
                         "FATAL: Not an SVC induced synchronous exception (ty={:b})",
                         ty
                     );
                     let far_el1 = far_el1();
-                    println!("FAR_EL1: {:#0x}", far_el1);
+                    crate::println!("FAR_EL1: {:#0x}", far_el1);
                     //crate::debugger::debugger(None);
                     stack.trace();
                     excp_handler(Exception {
@@ -227,8 +227,8 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
     }
 });
 
-exception_stack!(unhandled_exception, |stack| {
-    println!("Unhandled exception");
+crate::exception_stack!(unhandled_exception, |stack| {
+    crate::println!("Unhandled exception");
     stack.trace();
     loop {}
 });

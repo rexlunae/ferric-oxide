@@ -51,12 +51,12 @@ impl Spcr {
             match Spcr::new(spcr_sdt[0]) {
                 Some(spcr) => spcr,
                 None => {
-                    warn!("Failed to parse SPCR");
+                    crate::warn!("Failed to parse SPCR");
                     return;
                 }
             }
         } else {
-            warn!("Unable to find SPCR");
+            crate::warn!("Unable to find SPCR");
             return;
         };
 
@@ -91,7 +91,7 @@ impl Spcr {
                             }
                         }
                     } else {
-                        warn!(
+                        crate::warn!(
                             "SPCR unsuppoted address for PL011 {:#x?}",
                             spcr.base_address
                         );
@@ -99,9 +99,10 @@ impl Spcr {
                 }
                 //TODO: support more types!
                 unsupported => {
-                    warn!(
+                    crate::warn!(
                         "SPCR revision {} unsupported interface type {}",
-                        spcr.header.revision, unsupported
+                        spcr.header.revision,
+                        unsupported
                     );
                 }
             }
@@ -109,11 +110,11 @@ impl Spcr {
             match spcr.interface_type {
                 //TODO: support more types!
                 unsupported => {
-                    warn!("SPCR revision 1 unsupported interface type {}", unsupported);
+                    crate::warn!("SPCR revision 1 unsupported interface type {}", unsupported);
                 }
             }
         } else {
-            warn!("SPCR unsupported revision {}", spcr.header.revision);
+            crate::warn!("SPCR unsupported revision {}", spcr.header.revision);
         }
         let mut serial_port = COM1.lock();
         if serial_was_empty && !matches!(*serial_port, SerialKind::NotPresent) {

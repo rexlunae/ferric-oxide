@@ -96,7 +96,7 @@ pub fn description_op<T>(
     result
 }
 pub fn copy_path_to_buf(raw_path: UserSliceRo, max_len: usize) -> Result<String> {
-    let mut path_buf = vec![0_u8; max_len];
+    let mut path_buf = alloc::vec![0_u8; max_len];
     if raw_path.len() > path_buf.len() {
         return Err(Error::new(ENAMETOOLONG));
     }
@@ -669,9 +669,10 @@ pub fn funmap(virtual_address: usize, length: usize, token: &mut CleanLockToken)
         return Err(Error::new(EINVAL));
     };
     if length != length_aligned {
-        warn!(
+        crate::warn!(
             "funmap passed length {:#x} instead of {:#x}",
-            length, length_aligned
+            length,
+            length_aligned
         );
     }
 

@@ -38,7 +38,7 @@ use super::{BAD_FD, Entry, Failure, Why, check, command, io_failure, path, read_
 const CRASH_MARK_LEN: usize = 1931;
 
 /// A line the kernel logs before its heap and in-memory log exist.
-const EARLY_LINE: &str = "Redox OS starting";
+const EARLY_LINE: &str = "Ferric Oxide starting";
 
 /// This boot's in-memory kernel log.
 const LOG_PATH: &str = "/scheme/sys/log";

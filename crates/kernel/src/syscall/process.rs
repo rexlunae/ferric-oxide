@@ -58,7 +58,7 @@ pub fn exit_this_context(excp: Option<syscall::Exception>, token: &mut CleanLock
         let mut guard = context_lock.write(token.token());
         guard.status = context::Status::Dead { excp };
 
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::SCHED_CONTEXT_EXIT,
             guard.pid,
             guard.debug_id,
@@ -98,7 +98,7 @@ pub fn mprotect(
     flags: MapFlags,
     token: &mut CleanLockToken,
 ) -> Result<()> {
-    // println!("mprotect {:#X}, {}, {:#X}", address, size, flags);
+    // crate::println!("mprotect {:#X}, {}, {:#X}", address, size, flags);
 
     let span = PageSpan::validate_nonempty(VirtualAddress::new(address), size)
         .ok_or(Error::new(EINVAL))?;
@@ -248,7 +248,7 @@ pub unsafe fn usermode_bootstrap(bootstrap: &Bootstrap, token: &mut CleanLockTok
         .expect("failed to copy memory to bootstrap");
 
     let bootstrap_entry = u64::from_le_bytes(bootstrap_slice[0x1a..0x22].try_into().unwrap());
-    debug!("Bootstrap entry point: {:X}", bootstrap_entry);
+    crate::debug!("Bootstrap entry point: {:X}", bootstrap_entry);
     assert_ne!(bootstrap_entry, 0);
 
     // Start in a minimal environment without any stack.

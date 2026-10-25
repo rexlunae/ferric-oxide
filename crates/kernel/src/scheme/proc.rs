@@ -1080,7 +1080,7 @@ impl ContextHandle {
 
                     try_stop_context(context, token, |context, _| match context.regs_mut() {
                         None => {
-                            println!(
+                            crate::println!(
                                 "{}:{}: Couldn't read registers from stopped process",
                                 file!(),
                                 line!()
@@ -1351,7 +1351,7 @@ impl ContextHandle {
                     }
                     ContextVerb::ForceKill => {
                         if context::is_current(&context) {
-                            //trace!("FORCEKILL SELF {} {}", context.read().debug_id, context.read().pid);
+                            //crate::trace!("FORCEKILL SELF {} {}", context.read().debug_id, context.read().pid);
                             // The following functionality simplifies the cleanup step when detached threads
                             // terminate.
                             if let Some(post_unmap) = args.next() {
@@ -1377,7 +1377,7 @@ impl ContextHandle {
                         } else {
                             let cpu_id = {
                                 let mut ctxt = context.write(token.token());
-                                //trace!("FORCEKILL NONSELF={} {}, SELF={}", ctxt.debug_id, ctxt.pid, context::current().read().debug_id);
+                                //crate::trace!("FORCEKILL NONSELF={} {}, SELF={}", ctxt.debug_id, ctxt.pid, context::current().read().debug_id);
                                 if ctxt.status.is_dead() {
                                     return Ok(size_of::<usize>());
                                 }
@@ -1434,7 +1434,7 @@ impl ContextHandle {
                 match context_verb {
                     ContextVerb::ForceKill => {
                         if context::is_current(&context) {
-                            //trace!("FORCEKILL SELF {} {}", context.read().debug_id, context.read().pid);
+                            //crate::trace!("FORCEKILL SELF {} {}", context.read().debug_id, context.read().pid);
                             // The following functionality simplifies the cleanup step when detached threads
                             // terminate.
                             if let Some(post_unmap) = args.next() {
@@ -1499,7 +1499,7 @@ impl ContextHandle {
                         try_stop_context(context, token, |context, _| match context.regs() {
                             None => {
                                 assert!(!context.running, "try_stop_context is broken, clearly");
-                                println!(
+                                crate::println!(
                                     "{}:{}: Couldn't read registers from stopped process",
                                     file!(),
                                     line!()

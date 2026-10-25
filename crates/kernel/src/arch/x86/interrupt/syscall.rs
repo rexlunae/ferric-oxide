@@ -27,7 +27,7 @@ macro_rules! with_interrupt_stack {
     }};
 }
 
-interrupt_stack!(syscall, |stack| {
+crate::interrupt_stack!(syscall, |stack| {
     with_interrupt_stack!(|stack, token| {
         let scratch = &stack.scratch;
         let preserved = &stack.preserved;

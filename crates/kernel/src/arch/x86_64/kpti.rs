@@ -234,9 +234,9 @@ pub unsafe fn init_bsp() {
             RmmA::set_user_pcid(true);
         }
     }
-    info!("KPTI: user page tables isolated from the kernel");
+    crate::info!("KPTI: user page tables isolated from the kernel");
     if pcid {
-        info!("KPTI: PCID enabled, no-flush CR3 switches");
+        crate::info!("KPTI: PCID enabled, no-flush CR3 switches");
     }
 }
 

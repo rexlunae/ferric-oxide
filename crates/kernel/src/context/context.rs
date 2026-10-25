@@ -5,11 +5,11 @@ use core::{
     num::NonZeroUsize,
     sync::atomic::{AtomicU32, Ordering},
 };
+use ferric_aligned_buffer::AlignedBuffer;
 use syscall::{SigProcControl, Sigcontrol, UPPER_FDTBL_TAG};
 
 use crate::{
     arch::interrupt::InterruptStack,
-    common::aligned_box::AlignedBox,
     context::{
         self, arch,
         file::{FileDescriptor, LockedFileDescription},
@@ -148,7 +148,7 @@ pub struct Context {
     /// The architecture specific context
     pub arch: arch::Context,
     /// Kernel FX - used to store SIMD and FPU registers on context switch
-    pub kfx: AlignedBox<[u8], { arch::KFX_ALIGN }>,
+    pub kfx: AlignedBuffer<{ arch::KFX_ALIGN }>,
     /// Kernel stack, if located on the heap.
     pub kstack: Kstack,
     /// Address space containing a page table lock, and grants. Normally this will have a value,
@@ -243,7 +243,7 @@ impl Context {
             syscall_tail: SyscallFrame::Free(RaiiFrame::allocate()?),
             wake: None,
             arch: arch::Context::new(),
-            kfx: AlignedBox::<[u8], { arch::KFX_ALIGN }>::try_zeroed_slice(crate::arch::kfx_size())?,
+            kfx: AlignedBuffer::try_zeroed(crate::arch::kfx_size()).map_err(|_| Enomem)?,
             kstack,
             addr_space: None,
             name: ArrayString::new(),
@@ -290,7 +290,7 @@ impl Context {
             return false;
         }
         self.status = Status::Runnable;
-        trace_event!(
+        crate::trace::trace_event!(
             ferric_trace::kernel::SCHED_CONTEXT_START,
             self.pid,
             self.debug_id
@@ -639,7 +639,7 @@ impl Kstack {
         {
             this.shadow = crate::arch::shstk::ShadowStack::for_kstack(this.base.base())
                 .inspect_err(|err| {
-                    warn!("CET: no shadow stack for a kernel stack: {err}");
+                    crate::warn!("CET: no shadow stack for a kernel stack: {err}");
                 })?;
         }
         Ok(this)

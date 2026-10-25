@@ -115,7 +115,7 @@ impl Clint {
     pub(crate) fn irq_handler(self: &mut Self, hart_id: usize, irq: usize) {
         match irq {
             IRQ_IPI => {
-                println!("IPI interrupt at {}", hart_id);
+                crate::println!("IPI interrupt at {}", hart_id);
             }
             IRQ_TIMER => {
                 let mtime: usize;

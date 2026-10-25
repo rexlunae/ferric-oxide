@@ -6,14 +6,14 @@
 //! ([`crate::reserved`]), and copies everything it logs there as well as to its in-memory log,
 //! so after a warm reboot the next boot finds the end of the previous boot's log:
 //!
-//! - [`early`], from `Writer::write` before the heap and the in-memory log exist, keeps the
-//!   newest [`EARLY_BYTES`] logged in a static buffer, and [`take_early`], from `log::init`,
+//! - [`crate::log_persist::early`], from `Writer::write` before the heap and the in-memory log exist, keeps the
+//!   newest `EARLY_BYTES` logged in a static buffer, and [`crate::log_persist::take_early`], from `log::init`,
 //!   moves them into the new in-memory log, so the lines of early boot reach the region too.
-//! - [`reserve`], during memory setup, takes the region out of the free memory.
-//! - [`init`], in `kmain`, copies the log the previous boot left to the heap (the `sys`
+//! - [`crate::log_persist::reserve`], during memory setup, takes the region out of the free memory.
+//! - [`crate::log_persist::init`], in `kmain`, copies the log the previous boot left to the heap (the `sys`
 //!   scheme's `log_previous` file serves it), arms the region for this boot, and copies the
 //!   in-memory log so far into it.
-//! - [`append`], from `Log::write` under the in-memory log's lock, appends every logged byte,
+//! - [`crate::log_persist::append`], from `Log::write` under the in-memory log's lock, appends every logged byte,
 //!   the panic handler's message included.
 
 use alloc::{sync::Arc, vec};
@@ -27,10 +27,10 @@ use crate::reserved::Region;
 /// default (64 MiB, 64 KiB long).
 const DEFAULT_BASE: usize = (64 << 20) + (64 << 10);
 
-/// The region, once [`reserve`] took it out of the free memory.
+/// The region, once [`crate::log_persist::reserve`] took it out of the free memory.
 static RESERVED: Once<Region> = Once::new();
 
-/// This boot's log in the region, once [`init`] armed it.
+/// This boot's log in the region, once [`crate::log_persist::init`] armed it.
 static LOG: Once<Log<'static>> = Once::new();
 
 /// The log the previous boot left, if any.
@@ -48,7 +48,7 @@ pub fn early(bytes: &[u8]) {
     EARLY.lock().push(bytes);
 }
 
-/// Moves what [`early`] kept into `log`, the new in-memory log, oldest first. Called by
+/// Moves what [`crate::log_persist::early`] kept into `log`, the new in-memory log, oldest first. Called by
 /// `log::init` with the in-memory log's lock held, so no line comes between.
 pub fn take_early(log: &mut crate::log::Log) {
     let mut early = EARLY.lock();
@@ -78,7 +78,9 @@ pub fn reserve(is_free: impl Fn(usize, usize) -> bool) {
         }
         Err(err) => {
             let end = base.saturating_add(REGION_BYTES);
-            warn!("log: persistent log region {base:#x}..{end:#x} is {err}; no persistent log");
+            crate::warn!(
+                "log: persistent log region {base:#x}..{end:#x} is {err}; no persistent log"
+            );
         }
     }
 }
@@ -92,13 +94,13 @@ pub fn init() {
     let words = region.words();
     let boot = match Previous::find(words) {
         Ok(previous) => {
-            let mut text = vec![0; previous.kept()];
+            let mut text = alloc::vec![0; previous.kept()];
             previous.copy(words, &mut text);
             PREVIOUS.call_once(|| Arc::from(text));
             previous.boot().wrapping_add(1)
         }
         Err(err) => {
-            debug!("log: no persistent log from the previous boot: {err}");
+            crate::debug!("log: no persistent log from the previous boot: {err}");
             0
         }
     };
@@ -118,19 +120,19 @@ pub fn init() {
         LOG.call_once(|| persistent);
     }
     if let Some(previous) = PREVIOUS.get() {
-        info!(
+        crate::info!(
             "log: the previous boot's log ({} bytes) is in /scheme/sys/log_previous",
             previous.len()
         );
     }
-    info!(
+    crate::info!(
         "log: persistent log at {:#x} ({} KiB), boot {boot}",
         region.base(),
         region.bytes() / 1024
     );
 }
 
-/// Appends `bytes` to this boot's persistent log, once [`init`] armed it. Called by
+/// Appends `bytes` to this boot's persistent log, once [`crate::log_persist::init`] armed it. Called by
 /// `Log::write` with the in-memory log's lock held, which keeps to one writer at a time.
 pub fn append(bytes: &[u8]) {
     if let Some(log) = LOG.get() {

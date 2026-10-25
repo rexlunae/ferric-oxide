@@ -33,7 +33,9 @@ pub(crate) fn reserve_pool(allocator: &mut BumpAllocator<RmmA>) {
     let pool = StackPool::new(physical.data() as u64)
         .expect("boot allocator returns a page-aligned addressable reservation");
     POOL.call_once(|| Mutex::new(pool));
-    info!("CET: reserved {POOL_BYTES} bytes outside the physical memory map for shadow stacks");
+    crate::info!(
+        "CET: reserved {POOL_BYTES} bytes outside the physical memory map for shadow stacks"
+    );
 }
 
 fn pool() -> &'static Mutex<StackPool> {

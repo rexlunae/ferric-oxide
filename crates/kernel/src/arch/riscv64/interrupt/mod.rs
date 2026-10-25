@@ -1,6 +1,5 @@
 use core::arch::asm;
 
-#[macro_use]
 mod handler;
 
 mod exception;

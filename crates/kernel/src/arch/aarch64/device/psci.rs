@@ -63,7 +63,7 @@ fn initialize_conduit(conduit: Conduit, source: &str) {
     // cannot accidentally use a half-initialized interface.
     let version = unsafe { invoke_with(conduit, PSCI_VERSION, 0, 0, 0) };
     if version < 0 {
-        warn!(
+        crate::warn!(
             "PSCI_VERSION failed through {} from {} with {}",
             conduit.name(),
             source,
@@ -75,15 +75,17 @@ fn initialize_conduit(conduit: Conduit, source: &str) {
     let major = version >> 16;
     let minor = version & 0xffff;
     if major == 0 && minor < 2 {
-        warn!(
+        crate::warn!(
             "{} claims PSCI v0.2+ but firmware reported {}.{}",
-            source, major, minor
+            source,
+            major,
+            minor
         );
         return;
     }
 
     CONDUIT.store(conduit.encoded(), Ordering::Release);
-    info!(
+    crate::info!(
         "PSCI {}.{} using {} conduit from {}",
         major,
         minor,
@@ -99,7 +101,7 @@ fn initialize_conduit(conduit: Conduit, source: &str) {
 /// trees expose `arm,psci-0.2` or newer and use the standardized IDs.
 pub fn init(fdt: &Fdt<'_>) {
     let Some(node) = fdt.find_compatible(&["arm,psci-1.0", "arm,psci-0.2"]) else {
-        warn!("PSCI v0.2+ node not found; reset and power-off are unavailable");
+        crate::warn!("PSCI v0.2+ node not found; reset and power-off are unavailable");
         return;
     };
 
@@ -108,7 +110,7 @@ pub fn init(fdt: &Fdt<'_>) {
         .and_then(|property| property.as_str())
         .is_some_and(|status| status != "ok" && status != "okay")
     {
-        warn!("PSCI node is disabled; reset and power-off are unavailable");
+        crate::warn!("PSCI node is disabled; reset and power-off are unavailable");
         return;
     }
 
@@ -116,11 +118,11 @@ pub fn init(fdt: &Fdt<'_>) {
         .property("method")
         .and_then(|property| property.as_str())
     else {
-        warn!("PSCI node has no valid method property");
+        crate::warn!("PSCI node has no valid method property");
         return;
     };
     let Some(conduit) = Conduit::from_method(method) else {
-        warn!("PSCI node has unsupported method {:?}", method);
+        crate::warn!("PSCI node has unsupported method {:?}", method);
         return;
     };
 
@@ -139,12 +141,12 @@ pub(crate) fn init_acpi() {
     let fadts = crate::acpi::find_sdt("FACP");
     let fadt = match fadts.as_slice() {
         [] => {
-            warn!("ACPI FADT not found; PSCI is unavailable");
+            crate::warn!("ACPI FADT not found; PSCI is unavailable");
             return;
         }
         [fadt] => *fadt,
         _ => {
-            warn!(
+            crate::warn!(
                 "ACPI supplies {} FADTs; PSCI conduit is ambiguous",
                 fadts.len()
             );
@@ -153,7 +155,7 @@ pub(crate) fn init_acpi() {
     };
     let length = fadt.length as usize;
     if length < FADT_ARM_BOOT_ARCH_END {
-        warn!(
+        crate::warn!(
             "ACPI FADT is too short for ARM boot architecture flags ({})",
             length
         );
@@ -166,7 +168,7 @@ pub(crate) fn init_acpi() {
             .read_unaligned()
     });
     if arm_boot_arch & PSCI_COMPLIANT == 0 {
-        warn!("ACPI FADT does not advertise PSCI compliance");
+        crate::warn!("ACPI FADT does not advertise PSCI compliance");
         return;
     }
 

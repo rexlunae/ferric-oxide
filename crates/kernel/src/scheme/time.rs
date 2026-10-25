@@ -211,7 +211,8 @@ impl KernelScheme for TimeScheme {
             Handle::SchemeRoot => return Err(Error::new(EBADF)),
         };
 
-        let scheme_path = format!("/scheme/time/{}/{}", handle.clock, handle.kind).into_bytes();
+        let scheme_path =
+            alloc::format!("/scheme/time/{}/{}", handle.clock, handle.kind).into_bytes();
         buf.copy_common_bytes_from_slice(&scheme_path)
     }
 }

@@ -1,4 +1,4 @@
-use crate::{dtb::get_mmio_address, sync::CleanLockToken, time};
+use crate::{dtb::translate_mmio_address, sync::CleanLockToken, time};
 use core::ptr::read_volatile;
 
 static RTC_DR: usize = 0x000;
@@ -8,7 +8,7 @@ pub unsafe fn init(fdt: &ferric_devicetree::Tree) {
         match node
             .reg()
             .and_then(|mut iter| iter.next())
-            .and_then(|region| get_mmio_address(fdt, &node, &region))
+            .and_then(|region| translate_mmio_address(fdt, &node, &region))
         {
             Some(phys) => {
                 let mut rtc = Pl031rtc { phys };
@@ -19,15 +19,15 @@ pub unsafe fn init(fdt: &ferric_devicetree::Tree) {
                 let counter = crate::arch::time::monotonic_absolute(&mut token);
                 let seconds = rtc.time();
                 let rtc_ns = (seconds as u128) * time::NANOS_PER_SEC;
-                info!("PL031 RTC at {:#x}, wall clock {seconds} s", rtc.phys);
+                crate::info!("PL031 RTC at {:#x}, wall clock {seconds} s", rtc.phys);
                 *time::START.lock(token.token()) = rtc_ns.saturating_sub(counter);
             }
             None => {
-                warn!("No PL031 RTC registers");
+                crate::warn!("No PL031 RTC registers");
             }
         }
     } else {
-        warn!("No PL031 RTC found");
+        crate::warn!("No PL031 RTC found");
     }
 }
 

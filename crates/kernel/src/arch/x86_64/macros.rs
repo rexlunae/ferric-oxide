@@ -1,3 +1,5 @@
+//! Assembly alternatives and CET entry markers, accessed through explicit paths.
+
 macro_rules! expand_bool(
     ($value:expr_2021) => {
         concat!($value)
@@ -6,7 +8,7 @@ macro_rules! expand_bool(
 
 macro_rules! alternative(
     (feature: $feature:literal, then: [$($then:expr_2021),*], default: [$($default:expr_2021),*]) => {
-        alternative2!(feature1: $feature, then1: [$($then),*], feature2: "", then2: [""], default: [$($default),*])
+        $crate::arch::macros::alternative2!(feature1: $feature, then1: [$($then),*], feature2: "", then2: [""], default: [$($default),*])
     }
 );
 macro_rules! saturating_sub(
@@ -27,19 +29,19 @@ macro_rules! alternative2(
             .set true, 1
             .set false, 0
             40:
-            .if ", expand_bool!(cfg!(cpu_feature_always = $feature1)), "
+            .if ", $crate::arch::macros::expand_bool!(cfg!(cpu_feature_always = $feature1)), "
             ", $($then1,)* "
-            .elseif ", expand_bool!(cfg!(cpu_feature_always = $feature2)), "
+            .elseif ", $crate::arch::macros::expand_bool!(cfg!(cpu_feature_always = $feature2)), "
             ", $($then2,)* "
             .else
             ", $($default,)* "
             .endif
             42:
-            .if ", expand_bool!(cfg!(cpu_feature_auto = $feature1)), "
-            .skip -", saturating_sub!("51f - 50f", "42b - 40b"), ", 0x90
+            .if ", $crate::arch::macros::expand_bool!(cfg!(cpu_feature_auto = $feature1)), "
+            .skip -", $crate::arch::macros::saturating_sub!("51f - 50f", "42b - 40b"), ", 0x90
             .endif
-            .if ", expand_bool!(cfg!(cpu_feature_auto = $feature2)), "
-            .skip -", saturating_sub!("61f - 60f", "42b - 40b"), ", 0x90
+            .if ", $crate::arch::macros::expand_bool!(cfg!(cpu_feature_auto = $feature2)), "
+            .skip -", $crate::arch::macros::saturating_sub!("61f - 60f", "42b - 40b"), ", 0x90
             .endif
             41:
             ",
@@ -47,14 +49,14 @@ macro_rules! alternative2(
             // quite obvious what saturating_sub does.
 
             // Declare them in reverse order. Last relocation wins!
-            alternative_auto!("6", $feature2, [$($then2),*]),
-            alternative_auto!("5", $feature1, [$($then1),*]),
+            $crate::arch::macros::alternative_auto!("6", $feature2, [$($then2),*]),
+            $crate::arch::macros::alternative_auto!("5", $feature1, [$($then1),*]),
         )
     };
 );
 macro_rules! alternative_auto(
     ($first_digit:literal, $feature:literal, [$($then:expr_2021),*]) => { concat!(
-        ".if ", expand_bool!(cfg!(cpu_feature_auto = $feature)), "
+        ".if ", $crate::arch::macros::expand_bool!(cfg!(cpu_feature_auto = $feature)), "
         .pushsection .altcode.", $feature, ",\"a\"
         ", $first_digit, "0:
         ", $($then,)* "
@@ -94,3 +96,11 @@ macro_rules! ibt_endbr {
         ""
     };
 }
+
+// Path-based scope for assembly alternatives and their expansion helpers.
+pub(crate) use alternative;
+pub(crate) use alternative2;
+pub(crate) use alternative_auto;
+pub(crate) use expand_bool;
+pub(crate) use ibt_endbr;
+pub(crate) use saturating_sub;

@@ -92,7 +92,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
                 dtb::serial::init_early(dtb);
             }
 
-            info!("Redox OS starting...");
+            crate::info!("Ferric Oxide starting...");
             args.print();
 
             // Initialize RMM
@@ -126,7 +126,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs) -> ! {
                 }
                 Err(err) => {
                     dtb::init(None);
-                    warn!("failed to parse DTB: {}", err);
+                    crate::warn!("failed to parse DTB: {}", err);
 
                     #[cfg(feature = "acpi")]
                     {

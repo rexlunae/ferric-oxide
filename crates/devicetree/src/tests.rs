@@ -193,6 +193,27 @@ fn rejects_malformed_structure_and_property_names() {
 }
 
 #[test]
+fn rejects_node_names_containing_a_slash() {
+    // `Tree::new` rejects a non-root node whose parsed name contains a slash;
+    // corrupt the name in the structure block without changing its length or the
+    // following null terminator, so only the name validation can reject it.
+    let mut data = FIRMWARE.to_vec();
+    let tree = Tree::new(&data).unwrap();
+    let name = tree.find_node("/soc/bus@1000").unwrap().name;
+    assert!(!name.contains('/'));
+    assert!(!name.is_empty());
+    let offset = name.as_ptr() as usize - data.as_ptr() as usize;
+    assert!(offset + name.len() < data.len());
+    // Replace the first byte of the name with a slash byte; `bus@1000` is ASCII,
+    // so the replacement keeps the name's byte length unchanged.
+    data[offset] = b'/';
+    match Tree::new(&data) {
+        Err(Error::Parse(_)) => {}
+        other => panic!("a node name containing '/' must be rejected, got {other:?}"),
+    }
+}
+
+#[test]
 fn validates_strings_and_borrows_only_the_declared_blob() {
     assert!(
         Property {

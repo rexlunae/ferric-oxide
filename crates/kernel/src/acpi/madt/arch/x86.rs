@@ -27,9 +27,9 @@ pub(super) fn init(madt: Madt) {
     let me = local_apic.id();
 
     if local_apic.x2 {
-        debug!("    X2APIC {}", me.get());
+        crate::debug!("    X2APIC {}", me.get());
     } else {
-        debug!("    XAPIC {}: {:>08X}", me.get(), local_apic.address);
+        crate::debug!("    XAPIC {}: {:>08X}", me.get(), local_apic.address);
     }
 
     if cfg!(not(feature = "multi_core")) {
@@ -68,10 +68,10 @@ pub(super) fn init(madt: Madt) {
         crate::profiling::allocate(preliminary_cpu_count as u32);
     }
     for madt_entry in madt.iter() {
-        debug!("      {:x?}", madt_entry);
+        crate::debug!("      {:x?}", madt_entry);
         if let MadtEntry::LocalApic(ap_local_apic) = madt_entry {
             if u32::from(ap_local_apic.id) == me.get() {
-                debug!("        This is my local APIC");
+                crate::debug!("        This is my local APIC");
             } else if ap_local_apic.flags & 1 == 1 {
                 let cpu_id = LogicalCpuId::next();
 

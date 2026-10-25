@@ -38,7 +38,7 @@ pub unsafe fn init(dtb: Option<(usize, usize)>) {
         }
     });
     if !initialized {
-        println!("DTB_BINARY INIT TWICE!");
+        crate::println!("DTB_BINARY INIT TWICE!");
     }
 }
 
@@ -49,7 +49,7 @@ pub fn travel_interrupt_ctrl(fdt: &Fdt) {
         .property("interrupt-parent")
         .and_then(NodeProperty::as_usize)
     {
-        debug!("root parent = 0x{:08x}", root_intr_parent);
+        crate::debug!("root parent = 0x{:08x}", root_intr_parent);
     }
     for node in fdt.all_nodes() {
         if node.property("interrupt-controller").is_some() {
@@ -67,19 +67,22 @@ pub fn travel_interrupt_ctrl(fdt: &Fdt) {
                     .and_then(NodeProperty::as_usize);
                 let _intr_data = node.property("interrupts");
 
-                debug!(
+                crate::debug!(
                     "{}, compatible = {}, #interrupt-cells = 0x{:08x}, phandle = 0x{:08x}",
-                    node.name, compatible, intr_cells, phandle
+                    node.name,
+                    compatible,
+                    intr_cells,
+                    phandle
                 );
                 if let Some(intr) = _intr {
                     if let Some(intr_data) = _intr_data {
-                        debug!("interrupt-parent = 0x{:08x}", intr);
-                        debug!("interrupts begin:");
+                        crate::debug!("interrupt-parent = 0x{:08x}", intr);
+                        crate::debug!("interrupts begin:");
                         for &chunk in intr_data.value.as_chunks::<4>().0 {
-                            debug!("0x{:08x}, ", u32::from_be_bytes(chunk));
+                            crate::debug!("0x{:08x}, ", u32::from_be_bytes(chunk));
                         }
                     }
-                    debug!("interrupts end");
+                    crate::debug!("interrupts end");
                 }
             }
         }
@@ -115,39 +118,41 @@ fn visit_address_size_pairs(
     visit: &mut impl FnMut(usize, usize),
 ) {
     let Some(stride_cells) = cell_sizes.address_cells.checked_add(cell_sizes.size_cells) else {
-        warn!("invalid reserved-memory reg property for {node_name}");
+        crate::warn!("invalid reserved-memory reg property for {node_name}");
         return;
     };
     let Some(stride) = stride_cells.checked_mul(size_of::<u32>()) else {
-        warn!("invalid reserved-memory reg property for {node_name}");
+        crate::warn!("invalid reserved-memory reg property for {node_name}");
         return;
     };
     let Some(address_bytes) = cell_sizes.address_cells.checked_mul(size_of::<u32>()) else {
-        warn!("invalid reserved-memory reg property for {node_name}");
+        crate::warn!("invalid reserved-memory reg property for {node_name}");
         return;
     };
 
     if stride == 0 || property.value.is_empty() || !property.value.len().is_multiple_of(stride) {
-        warn!("invalid reserved-memory reg property for {node_name}");
+        crate::warn!("invalid reserved-memory reg property for {node_name}");
         return;
     }
 
     for pair in property.value.chunks_exact(stride) {
         let Some(address) = cells_to_usize(pair, cell_sizes.address_cells) else {
-            warn!("unsupported reserved-memory address for {node_name}");
+            crate::warn!("unsupported reserved-memory address for {node_name}");
             continue;
         };
         let Some(size) = cells_to_usize(&pair[address_bytes..], cell_sizes.size_cells) else {
-            warn!("unsupported reserved-memory size for {node_name}");
+            crate::warn!("unsupported reserved-memory size for {node_name}");
             continue;
         };
 
         if address.checked_add(size).is_none() {
-            warn!("reserved-memory range overflows for {node_name}");
+            crate::warn!("reserved-memory range overflows for {node_name}");
         } else if size != 0 {
-            debug!(
+            crate::debug!(
                 "reserved-memory {} 0x{:08x} size 0x{:08x}",
-                node_name, address, size
+                node_name,
+                address,
+                size
             );
             visit(address, size);
         }
@@ -169,11 +174,11 @@ fn visit_fdt_memory_reservations(dt: &Fdt, visit: &mut impl FnMut(usize, usize))
         usize::try_from(u32::from_be_bytes(bytes)).ok()
     };
     let Some(mut offset) = read_offset(RESERVATION_MAP_OFFSET_FIELD) else {
-        warn!("invalid FDT memory reservation map offset");
+        crate::warn!("invalid FDT memory reservation map offset");
         return;
     };
     let Some(structure_offset) = read_offset(STRUCTURE_BLOCK_OFFSET_FIELD) else {
-        warn!("invalid FDT structure block offset");
+        crate::warn!("invalid FDT structure block offset");
         return;
     };
 
@@ -184,22 +189,22 @@ fn visit_fdt_memory_reservations(dt: &Fdt, visit: &mut impl FnMut(usize, usize))
         || structure_offset > data.len()
         || offset > structure_offset
     {
-        warn!("invalid FDT memory reservation map bounds");
+        crate::warn!("invalid FDT memory reservation map bounds");
         return;
     }
     let Some(reservations) = data.get(offset..structure_offset) else {
-        warn!("invalid FDT memory reservation map bounds");
+        crate::warn!("invalid FDT memory reservation map bounds");
         return;
     };
     offset = 0;
 
     loop {
         let Some(end) = offset.checked_add(RESERVATION_ENTRY_SIZE) else {
-            warn!("invalid FDT memory reservation map");
+            crate::warn!("invalid FDT memory reservation map");
             return;
         };
         let Some(entry) = reservations.get(offset..end) else {
-            warn!("unterminated FDT memory reservation map");
+            crate::warn!("unterminated FDT memory reservation map");
             return;
         };
         let address = u64::from_be_bytes(entry[..8].try_into().unwrap());
@@ -216,9 +221,10 @@ fn visit_fdt_memory_reservations(dt: &Fdt, visit: &mut impl FnMut(usize, usize))
                 }
             }
             _ => {
-                warn!(
+                crate::warn!(
                     "unsupported FDT memory reservation 0x{:016x} size 0x{:016x}",
-                    address, size
+                    address,
+                    size
                 );
             }
         }
@@ -251,15 +257,15 @@ fn visit_exact_dynamic_reserved_memory_range(
         return false;
     };
     let Some(size_bytes) = cell_sizes.size_cells.checked_mul(size_of::<u32>()) else {
-        warn!("invalid reserved-memory size property for {}", node.name);
+        crate::warn!("invalid reserved-memory size property for {}", node.name);
         return false;
     };
     if size_property.value.len() != size_bytes {
-        warn!("invalid reserved-memory size property for {}", node.name);
+        crate::warn!("invalid reserved-memory size property for {}", node.name);
         return false;
     }
     let Some(size) = cells_to_usize(size_property.value, cell_sizes.size_cells) else {
-        warn!("unsupported reserved-memory size for {}", node.name);
+        crate::warn!("unsupported reserved-memory size for {}", node.name);
         return false;
     };
 
@@ -267,21 +273,21 @@ fn visit_exact_dynamic_reserved_memory_range(
         return false;
     };
     let Some(stride_cells) = cell_sizes.address_cells.checked_add(cell_sizes.size_cells) else {
-        warn!(
+        crate::warn!(
             "invalid reserved-memory alloc-ranges property for {}",
             node.name
         );
         return false;
     };
     let Some(stride) = stride_cells.checked_mul(size_of::<u32>()) else {
-        warn!(
+        crate::warn!(
             "invalid reserved-memory alloc-ranges property for {}",
             node.name
         );
         return false;
     };
     let Some(address_bytes) = cell_sizes.address_cells.checked_mul(size_of::<u32>()) else {
-        warn!(
+        crate::warn!(
             "invalid reserved-memory alloc-ranges property for {}",
             node.name
         );
@@ -297,7 +303,7 @@ fn visit_exact_dynamic_reserved_memory_range(
         &alloc_ranges.value[..address_bytes],
         cell_sizes.address_cells,
     ) else {
-        warn!(
+        crate::warn!(
             "unsupported reserved-memory allocation address for {}",
             node.name
         );
@@ -306,7 +312,7 @@ fn visit_exact_dynamic_reserved_memory_range(
     let Some(range_size) =
         cells_to_usize(&alloc_ranges.value[address_bytes..], cell_sizes.size_cells)
     else {
-        warn!(
+        crate::warn!(
             "unsupported reserved-memory allocation size for {}",
             node.name
         );
@@ -317,9 +323,11 @@ fn visit_exact_dynamic_reserved_memory_range(
         return false;
     }
 
-    debug!(
+    crate::debug!(
         "reserving exact dynamic memory {} 0x{:08x} size 0x{:08x}",
-        node.name, address, size
+        node.name,
+        address,
+        size
     );
     visit(address, size);
     true
@@ -338,15 +346,15 @@ fn visit_fixed_reserved_memory_ranges(dt: &Fdt, mut visit: impl FnMut(usize, usi
         return;
     };
     let Some(cell_sizes) = explicit_cell_sizes(reserved_memory) else {
-        warn!("invalid /reserved-memory cell sizes; ignoring its children");
+        crate::warn!("invalid /reserved-memory cell sizes; ignoring its children");
         return;
     };
     let Some(root) = dt.find_node("/") else {
-        warn!("missing root node; ignoring /reserved-memory children");
+        crate::warn!("missing root node; ignoring /reserved-memory children");
         return;
     };
     let Some(root_cell_sizes) = explicit_cell_sizes(root) else {
-        warn!("invalid root cell sizes; ignoring /reserved-memory children");
+        crate::warn!("invalid root cell sizes; ignoring /reserved-memory children");
         return;
     };
     let valid_cell_sizes = cell_sizes.address_cells == root_cell_sizes.address_cells
@@ -356,7 +364,7 @@ fn visit_fixed_reserved_memory_ranges(dt: &Fdt, mut visit: impl FnMut(usize, usi
         .is_some_and(|ranges| ranges.value.is_empty());
 
     if !valid_cell_sizes || !valid_ranges {
-        warn!("invalid /reserved-memory node format; ignoring its children");
+        crate::warn!("invalid /reserved-memory node format; ignoring its children");
         return;
     }
 
@@ -370,13 +378,13 @@ fn visit_fixed_reserved_memory_ranges(dt: &Fdt, mut visit: impl FnMut(usize, usi
         } else if child.property("size").is_some() {
             if !visit_exact_dynamic_reserved_memory_range(child, cell_sizes, &mut visit) {
                 // TODO: register dynamic reserved-memory pools once a CMA allocator exists.
-                debug!(
+                crate::debug!(
                     "dynamic reserved-memory node {}; ignoring it until allocation is supported",
                     child.name
                 );
             }
         } else {
-            warn!(
+            crate::warn!(
                 "reserved-memory node {} has neither reg nor size; ignoring it",
                 child.name
             );
@@ -408,7 +416,7 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
     if let Some(soc_node) = dt.find_node("/soc") {
         if let Some(reg) = soc_node.ranges() {
             for chunk in reg {
-                debug!(
+                crate::debug!(
                     "dev mem 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}",
                     chunk.child_bus_address_hi,
                     chunk.child_bus_address,
@@ -424,7 +432,7 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
                 );*/
             }
         } else {
-            warn!("devicetree /soc has no ranges");
+            crate::warn!("devicetree /soc has no ranges");
         }
 
         // also add direct /soc children because they might not be shown in
@@ -434,10 +442,13 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
                 for entry in reg {
                     if let Some(size) = entry.size {
                         let addr = entry.starting_address as usize;
-                        if let Some(mapped_addr) = get_mmio_address(dt, &device, &entry) {
-                            debug!(
+                        if let Some(mapped_addr) = translate_mmio_address(dt, &device, &entry) {
+                            crate::debug!(
                                 "soc device {} 0x{:08x} -> 0x{:08x} size 0x{:08x}",
-                                device.name, addr, mapped_addr, size
+                                device.name,
+                                addr,
+                                mapped_addr,
+                                size
                             );
                             register_memory_region(mapped_addr, size, BootloaderMemoryKind::Device);
                         }
@@ -446,14 +457,14 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
             }
         }
     } else {
-        warn!("failed to find /soc in devicetree");
+        crate::warn!("failed to find /soc in devicetree");
     }
 
     // The selected console may be below a nested bus whose own `reg` range
     // does not cover all children. Register the exact translated range so it
     // remains mapped after the boot-time identity map is replaced.
     if let Some((address, size, _, _, _)) = diag_uart_range(dt) {
-        debug!(
+        crate::debug!(
             "diagnostic UART 0x{:08x} size 0x{:08x}",
             address.data(),
             size
@@ -479,9 +490,11 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
                 let Some(address) = translate_mmio_address(dt, &controller, &region) else {
                     continue;
                 };
-                debug!(
+                crate::debug!(
                     "root interrupt controller {} 0x{:08x} size 0x{:08x}",
-                    controller.name, address, size
+                    controller.name,
+                    address,
+                    size
                 );
                 register_memory_region(address, size, BootloaderMemoryKind::Device);
             }
@@ -493,27 +506,6 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
 /// Missing mappings, malformed ranges, crossings and overflow return `None`.
 pub fn translate_mmio_address(fdt: &Fdt, device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
     fdt.translate_mmio_address(*device, region)
-}
-
-// FIXME return PhysicalAddress
-pub fn get_mmio_address(fdt: &Fdt, _device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
-    let mut mapped_addr = region.starting_address as usize;
-    let size = region.size.unwrap_or(0).saturating_sub(1);
-    let last_address = mapped_addr.saturating_add(size);
-    if let Some(parent) = fdt.find_node("/soc") {
-        let mut ranges = parent.ranges().map(|ranges| ranges.peekable())?;
-        if ranges.peek().is_some() {
-            let parent_range = ranges.find(|range| {
-                range.child_bus_address <= mapped_addr
-                    && last_address - range.child_bus_address <= range.size
-            })?;
-            mapped_addr = parent_range
-                .parent_bus_address
-                .checked_add(mapped_addr - parent_range.child_bus_address)?;
-            let _ = mapped_addr.checked_add(size)?;
-        }
-    }
-    Some(mapped_addr)
 }
 
 #[cfg_attr(not(dtb), expect(dead_code))]
@@ -638,7 +630,7 @@ mod tests {
 
         assert_eq!(
             ranges,
-            vec![
+            alloc::vec![
                 (0x1000, 0x100),
                 (0x2000, 0x100),
                 (0x3000, 0x80),
@@ -699,7 +691,7 @@ mod tests {
 
         // The one real entry that fit before the truncation is still
         // reported; parsing stops instead of reading past the map.
-        assert_eq!(ranges, vec![(0x1000, 0x100)]);
+        assert_eq!(ranges, alloc::vec![(0x1000, 0x100)]);
     }
 
     #[test]
@@ -732,7 +724,7 @@ mod tests {
             ranges.push((address, size));
         });
 
-        assert_eq!(ranges, vec![(0x2000, 0x100), (0x3000, 0x200)]);
+        assert_eq!(ranges, alloc::vec![(0x2000, 0x100), (0x3000, 0x200)]);
     }
 
     #[test]
@@ -804,6 +796,6 @@ mod tests {
 
         visit_fixed_reserved_memory_ranges(&fdt, |address, size| ranges.push((address, size)));
 
-        assert_eq!(ranges, vec![(0x1000, 0x100)]);
+        assert_eq!(ranges, alloc::vec![(0x1000, 0x100)]);
     }
 }

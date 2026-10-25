@@ -251,7 +251,7 @@ impl InterruptController for GenericInterruptController {
             i += 1;
         }
 
-        info!("gic irq_range = ({}, {})", idx, idx + cnt);
+        crate::info!("gic irq_range = ({}, {})", idx, idx + cnt);
         self.irq_range = (idx, idx + cnt);
         GIC_IRQ_BASE.store(idx, Ordering::Release);
         *irq_idx = idx + cnt;
@@ -316,13 +316,16 @@ impl GicDistIf {
             self.ncpus = ((typer & (0x7 << 5)) >> 5) + 1;
             GIC_CPU_CAPACITY.store(self.ncpus as usize, Ordering::Release);
             self.nirqs = ((typer & 0x1f) + 1) * 32;
-            info!(
+            crate::info!(
                 "gic: Distributor supports {:?} CPUs and {:?} IRQs",
-                self.ncpus, self.nirqs
+                self.ncpus,
+                self.nirqs
             );
             let target_mask = read_current_cpu_target_mask(addr);
             if target_mask == 0 && self.ncpus > 1 {
-                warn!("GICv2 did not expose the boot CPU target mask; SMP will remain disabled");
+                crate::warn!(
+                    "GICv2 did not expose the boot CPU target mask; SMP will remain disabled"
+                );
             }
 
             // Set all SPIs to level triggered

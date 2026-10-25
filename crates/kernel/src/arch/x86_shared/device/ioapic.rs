@@ -323,7 +323,7 @@ pub unsafe fn init() {
                 }
             }
         }
-        println!(
+        crate::println!(
             "I/O APICs: {:?}, overrides: {:?}",
             ioapics(),
             src_overrides()
@@ -355,7 +355,7 @@ pub unsafe fn init() {
             let apic = match find_ioapic(gsi) {
                 Some(ioapic) => ioapic,
                 None => {
-                    println!("Unable to find a suitable APIC for legacy IRQ {} (GSI {}). It will not be mapped.", legacy_irq, gsi);
+                    crate::println!("Unable to find a suitable APIC for legacy IRQ {} (GSI {}). It will not be mapped.", legacy_irq, gsi);
                     continue;
                 }
             };
@@ -381,7 +381,7 @@ pub unsafe fn init() {
             };
             apic.map(redir_tbl_index, map_info);
         }
-        println!(
+        crate::println!(
             "I/O APICs: {:?}, overrides: {:?}",
             ioapics(),
             src_overrides()
@@ -405,7 +405,7 @@ pub unsafe fn init() {
                 }
             };
             if let Some(m) = method {
-                m.execute("\\_PIC".into(), vec!(crate::acpi::aml::AmlValue::Integer(1)));
+                m.execute("\\_PIC".into(), alloc::vec!(crate::acpi::aml::AmlValue::Integer(1)));
             }
         }*/
     }

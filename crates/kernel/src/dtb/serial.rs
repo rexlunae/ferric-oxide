@@ -98,15 +98,16 @@ pub unsafe fn init_early(dtb: &Fdt) {
                 Some(SerialKind::Ns16550u32(serial_port))
             } else if uart_meson::is_compatible(compatible) {
                 if size < MESON_UART_REGISTER_SIZE || !virt.is_multiple_of(size_of::<u32>()) {
-                    warn!(
+                    crate::warn!(
                         "invalid Meson UART MMIO range at {:#X}, size {:#X}",
-                        virt, size
+                        virt,
+                        size
                     );
                     return;
                 }
 
                 let Some(node) = crate::dtb::diag_uart_node(dtb) else {
-                    warn!("diagnostic UART disappeared while parsing DTB");
+                    crate::warn!("diagnostic UART disappeared while parsing DTB");
                     return;
                 };
                 let fifo_size = node
@@ -120,7 +121,7 @@ pub unsafe fn init_early(dtb: &Fdt) {
                     .filter(|&value| value != 0)
                     .unwrap_or(115_200);
                 let Some(variant) = uart_meson::ClockVariant::from_compatible(compatible) else {
-                    warn!("unsupported Meson UART compatible {:?}", compatible);
+                    crate::warn!("unsupported Meson UART compatible {:?}", compatible);
                     return;
                 };
                 let clock_name = if uart_meson::uses_vendor_clock_binding(compatible) {
@@ -129,16 +130,19 @@ pub unsafe fn init_early(dtb: &Fdt) {
                     "baud"
                 };
                 let Some(clock_rate) = named_clock_rate(dtb, node, clock_name) else {
-                    warn!(
+                    crate::warn!(
                         "Meson UART {:?} requires a {:?} clock",
-                        compatible, clock_name
+                        compatible,
+                        clock_name
                     );
                     return;
                 };
                 if clock_rate != MESON_XTAL_HZ {
-                    warn!(
+                    crate::warn!(
                         "Meson UART {:?} clock is {} Hz, expected {} Hz",
-                        compatible, clock_rate, MESON_XTAL_HZ
+                        compatible,
+                        clock_rate,
+                        MESON_XTAL_HZ
                     );
                     return;
                 }
@@ -156,12 +160,14 @@ pub unsafe fn init_early(dtb: &Fdt) {
             match serial_opt {
                 Some(serial) => {
                     *COM1.lock() = serial;
-                    info!("UART {:?} at {:#X} size {:#X}", compatible, virt, size);
+                    crate::info!("UART {:?} at {:#X} size {:#X}", compatible, virt, size);
                 }
                 None => {
-                    warn!(
+                    crate::warn!(
                         "UART {:?} at {:#X} size {:#X}: no driver found",
-                        compatible, virt, size
+                        compatible,
+                        virt,
+                        size
                     );
                 }
             }

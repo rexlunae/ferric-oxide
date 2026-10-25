@@ -113,7 +113,7 @@ pub unsafe fn init_before_mem(
         let rsdp_opt = Rsdp::get_rsdp(already_supplied_rsdp);
 
         if let Some(rsdp) = rsdp_opt {
-            debug!("SDT address: {:#x}", rsdp.sdt_address().data());
+            crate::debug!("SDT address: {:#x}", rsdp.sdt_address().data());
             let rxsdt = get_sdt(rsdp.sdt_address(), mapper);
 
             let rxsdt = if let Some(rsdt) = Rsdt::new(rxsdt) {
@@ -126,7 +126,7 @@ pub unsafe fn init_before_mem(
                 });
 
                 if !initialized {
-                    error!("RXSDT_ENUM already initialized");
+                    crate::error!("RXSDT_ENUM already initialized");
                 }
 
                 rsdt
@@ -139,12 +139,12 @@ pub unsafe fn init_before_mem(
                     RxsdtEnum::Xsdt(xsdt)
                 });
                 if !initialized {
-                    error!("RXSDT_ENUM already initialized");
+                    crate::error!("RXSDT_ENUM already initialized");
                 }
 
                 xsdt
             } else {
-                warn!("UNKNOWN RSDT OR XSDT SIGNATURE");
+                crate::warn!("UNKNOWN RSDT OR XSDT SIGNATURE");
                 return;
             };
 
@@ -154,7 +154,7 @@ pub unsafe fn init_before_mem(
                 get_sdt(sdt, mapper);
             }
         } else {
-            error!("NO RSDP FOUND");
+            crate::error!("NO RSDP FOUND");
         }
     }
 }
@@ -204,7 +204,7 @@ pub type SdtSignature = (String, [u8; 6], [u8; 8]);
 pub static SDT_POINTERS: RwLock<Option<HashMap<SdtSignature, &'static Sdt>>> = RwLock::new(None);
 
 pub fn find_sdt(name: &str) -> Vec<&'static Sdt> {
-    let mut sdts: Vec<&'static Sdt> = vec![];
+    let mut sdts: Vec<&'static Sdt> = alloc::vec![];
 
     if let Some(ref ptrs) = *(SDT_POINTERS.read()) {
         for (signature, sdt) in ptrs {
@@ -223,12 +223,12 @@ macro_rules! find_one_sdt {
         use $crate::acpi::find_sdt;
         match find_sdt($name).as_slice() {
             [] => {
-                println!("Unable to find {}", $name);
+                $crate::println!("Unable to find {}", $name);
                 return;
             }
             [x] => *x,
             x => {
-                println!("{} {} found, expected 1", x.len(), $name);
+                $crate::println!("{} {} found, expected 1", x.len(), $name);
                 return;
             }
         }

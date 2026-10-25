@@ -69,7 +69,7 @@ pub struct FileDescription {
     pub flags: u32,
     pub internal_flags: InternalFlags,
 }
-bitflags! {
+bitflags::bitflags! {
     #[derive(Clone, Copy, Debug)]
     pub struct InternalFlags: u32 {
         const POSITIONED = 1 << 0;

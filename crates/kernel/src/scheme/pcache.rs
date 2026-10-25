@@ -503,7 +503,7 @@ fn end_object(object: &Arc<Object>, token: &mut CleanLockToken) {
         state.index.fail_all()
     };
     if failed != 0 {
-        info!(
+        crate::info!(
             "pcache: object {} went with {failed} page(s) being filled",
             object.id.get()
         );
