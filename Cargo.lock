@@ -1371,6 +1371,10 @@ name = "ferric-elfreloc"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-exec-core"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-hwrand"
 version = "0.1.0"
 
@@ -1488,6 +1492,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ferric-amdvi",
+ "ferric-iobench",
  "ferric-procinfo",
  "ferric-trace",
  "ferric-trace-map",
