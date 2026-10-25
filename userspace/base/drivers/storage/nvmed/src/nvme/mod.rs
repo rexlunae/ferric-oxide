@@ -534,6 +534,10 @@ impl Nvme {
         };
 
         let mut cmd = NvmeCmd::default();
+        // Ferric Oxide: with the perf feature, the command's device time runs from just
+        // before the submission to the observed completion.
+        #[cfg(feature = "perf")]
+        let perf_device_start = crate::perf::ticks();
         let comp = self
             .submit_and_complete_command(ctxt.io_queue, |cid| {
                 cmd = if write {
@@ -544,6 +548,15 @@ impl Nvme {
                 cmd.clone()
             })
             .await;
+        #[cfg(feature = "perf")]
+        crate::perf::record_device(
+            if write {
+                crate::perf::Phase::WriteDevice
+            } else {
+                crate::perf::Phase::ReadDevice
+            },
+            crate::perf::ticks().saturating_sub(perf_device_start),
+        );
 
         let status = comp.status >> 1;
         if status == 0 {
@@ -560,6 +573,25 @@ impl Nvme {
         mut lba: u64,
         buf: &mut [u8],
     ) -> Result<usize> {
+        // Ferric Oxide: with the perf feature, time the whole request on this thread.
+        #[cfg(feature = "perf")]
+        crate::perf::start_request();
+
+        let result = Self::namespace_read_inner(self, namespace, &mut lba, buf).await;
+
+        #[cfg(feature = "perf")]
+        crate::perf::end_request(crate::perf::Phase::ReadService);
+
+        result
+    }
+
+    /// [`Self::namespace_read`] without the perf timing wrappers.
+    async fn namespace_read_inner(
+        &self,
+        namespace: &NvmeNamespace,
+        lba: &mut u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
         let ctxt = self.cur_thread_ctxt();
         let ctxt = ctxt.lock();
 
@@ -571,12 +603,12 @@ impl Nvme {
             assert!(blocks > 0);
             assert!(blocks <= 0x1_0000);
 
-            self.namespace_rw(&*ctxt, namespace, lba, (blocks - 1) as u16, false)
+            self.namespace_rw(&*ctxt, namespace, *lba, (blocks - 1) as u16, false)
                 .await?;
 
             chunk.copy_from_slice(&ctxt.buffer.borrow()[..chunk.len()]);
 
-            lba += blocks as u64;
+            *lba += blocks as u64;
         }
 
         Ok(buf.len())
@@ -586,6 +618,25 @@ impl Nvme {
         &self,
         namespace: &NvmeNamespace,
         mut lba: u64,
+        buf: &[u8],
+    ) -> Result<usize> {
+        // Ferric Oxide: with the perf feature, time the whole request on this thread.
+        #[cfg(feature = "perf")]
+        crate::perf::start_request();
+
+        let result = Self::namespace_write_inner(self, namespace, &mut lba, buf).await;
+
+        #[cfg(feature = "perf")]
+        crate::perf::end_request(crate::perf::Phase::WriteService);
+
+        result
+    }
+
+    /// [`Self::namespace_write`] without the perf timing wrappers.
+    async fn namespace_write_inner(
+        &self,
+        namespace: &NvmeNamespace,
+        lba: &mut u64,
         buf: &[u8],
     ) -> Result<usize> {
         let ctxt = self.cur_thread_ctxt();
@@ -601,10 +652,10 @@ impl Nvme {
 
             ctxt.buffer.borrow_mut()[..chunk.len()].copy_from_slice(chunk);
 
-            self.namespace_rw(&*ctxt, namespace, lba, (blocks - 1) as u16, true)
+            self.namespace_rw(&*ctxt, namespace, *lba, (blocks - 1) as u16, true)
                 .await?;
 
-            lba += blocks as u64;
+            *lba += blocks as u64;
         }
 
         Ok(buf.len())
