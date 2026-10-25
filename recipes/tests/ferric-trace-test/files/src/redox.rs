@@ -24,6 +24,7 @@ use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRI
 mod cap;
 mod crash;
 mod futex;
+mod journal;
 mod lifecycle;
 mod mapping;
 
@@ -899,6 +900,7 @@ fn run() -> Result<(), Failure> {
 
     check_fault(&cpus)?;
     mapping::check_mapping(&cpus)?;
+    journal::check_journal(&cpus)?;
     futex::check_futex(&cpus)?;
     lifecycle::check_lifecycle(&cpus)?;
     check_filter(&cpus)?;
