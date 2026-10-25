@@ -107,7 +107,9 @@ impl<'a> Tree<'a> {
         }
         for entry in raw.all_nodes()? {
             let (_, node) = entry?;
-            node.name()?;
+            if node.name()?.name.contains('/') {
+                return Err(fdt::FdtError::InvalidNodeName.into());
+            }
             for property in node.properties()? {
                 property?;
             }
@@ -127,10 +129,16 @@ impl<'a> Tree<'a> {
                 .checked_add(parsed.unit_address.map_or(0, |unit| 1 + unit.len()))?;
             str::from_utf8(self.data.get(start..start.checked_add(len)?)?).ok()?
         };
+        let identity = if name == "/" {
+            0
+        } else {
+            (name.as_ptr() as usize).checked_sub(self.data.as_ptr() as usize)?
+        };
         Some(Node {
             raw,
             tree: self,
             name,
+            identity,
         })
     }
 
@@ -140,6 +148,7 @@ impl<'a> Tree<'a> {
             raw: self.root.as_node(),
             tree: *self,
             name: "/",
+            identity: 0,
         }
     }
     /// The original blob, bounded to the header's declared total size.
@@ -233,6 +242,7 @@ pub struct Node<'a> {
     tree: Tree<'a>,
     /// Full node name, including its unit address when present.
     pub name: &'a str,
+    identity: usize,
 }
 
 impl<'a> Node<'a> {
@@ -279,7 +289,9 @@ impl<'a> Node<'a> {
     }
     /// Compares node identity within the same blob, independent of its name.
     pub fn same_node(self, other: Node<'_>) -> bool {
-        core::ptr::eq(self.tree.data, other.tree.data) && core::ptr::eq(self.name, other.name)
+        // Root names are synthesized literals; their addresses need not be
+        // pooled across codegen units. Other names occupy unique blob offsets.
+        core::ptr::eq(self.tree.data, other.tree.data) && self.identity == other.identity
     }
     /// Returns each cell count independently, defaulting to two address cells
     /// and one size cell when its property is absent; malformed encodings return `None`.

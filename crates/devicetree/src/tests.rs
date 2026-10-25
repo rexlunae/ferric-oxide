@@ -224,3 +224,13 @@ fn validates_strings_and_borrows_only_the_declared_blob() {
     assert_eq!(tree.total_size(), FIRMWARE.len());
     assert_eq!(tree.raw_data(), FIRMWARE);
 }
+
+#[test]
+fn root_identity_survives_lookup_and_parent_views() {
+    let tree = Tree::new(FIRMWARE).unwrap();
+    let root = tree.root();
+    assert!(root.same_node(tree.find_node("/").unwrap()));
+    assert!(root.same_node(tree.find_node("/soc").unwrap().parent().unwrap()));
+    let copied = FIRMWARE.to_vec();
+    assert!(!root.same_node(Tree::new(&copied).unwrap().root()));
+}
