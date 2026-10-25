@@ -43,7 +43,13 @@ enum VirtualId {
     InternalId(u64),
 }
 
-pub fn run(write_fd: FdGuard, socket: Socket, auth: FdGuard, event: FdGuard) -> ! {
+pub fn run(
+    write_fd: FdGuard,
+    socket: Socket,
+    auth: FdGuard,
+    event: FdGuard,
+    trace: crate::proc_trace::ProcTrace, // Ferric Oxide
+) -> ! {
     // TODO?
     let socket_ident = socket.inner().raw();
 
@@ -54,7 +60,7 @@ pub fn run(write_fd: FdGuard, socket: Socket, auth: FdGuard, event: FdGuard) -> 
         .subscribe(socket.inner().raw(), socket_ident, EventFlags::EVENT_READ)
         .expect("failed to listen to scheme socket events");
 
-    let mut scheme = ProcScheme::new(auth, &queue);
+    let mut scheme = ProcScheme::new(auth, &queue, trace);
 
     // send open-capability to bootstrap
     let new_id = scheme.handles.insert(Handle::SchemeRoot);
@@ -500,6 +506,8 @@ struct ProcScheme<'a> {
 
     queue: &'a RawEventQueue,
     auth: FdGuard,
+    /// Ferric Oxide: the process lifecycle tracepoints.
+    trace: crate::proc_trace::ProcTrace,
 }
 #[derive(Debug, Default)]
 struct Pgrp {
@@ -591,7 +599,11 @@ impl RawEventQueue {
 }
 
 impl<'a> ProcScheme<'a> {
-    pub fn new(auth: FdGuard, queue: &'a RawEventQueue) -> ProcScheme<'a> {
+    pub fn new(
+        auth: FdGuard,
+        queue: &'a RawEventQueue,
+        trace: crate::proc_trace::ProcTrace,
+    ) -> ProcScheme<'a> {
         ProcScheme {
             processes: HashMap::new(),
             groups: HashMap::new(),
@@ -603,6 +615,7 @@ impl<'a> ProcScheme<'a> {
             next_internal_id: 1,
             queue,
             auth,
+            trace,
         }
     }
     fn new_id(&mut self) -> ProcessId {
@@ -1008,6 +1021,11 @@ impl<'a> ProcScheme<'a> {
                 b"fork" => {
                     log::trace!("Forking {pid:?}");
                     let child_pid = self.fork(pid)?;
+                    // Ferric Oxide
+                    self.trace.record(
+                        &ferric_trace::kernel::SCHED_PROC_FORK,
+                        &[pid.0 as u64, child_pid.0 as u64],
+                    );
                     Ok(OpenResult::ThisScheme {
                         number: self.handles.insert(Handle::Proc(child_pid)),
                         flags: NewFdFlags::empty(),
@@ -1233,6 +1251,9 @@ impl<'a> ProcScheme<'a> {
                     ProcCall::DisableSetpgid => {
                         if let Some(proc) = self.processes.get(&fd_pid) {
                             proc.borrow_mut().disabled_setpgid = true;
+                            // Ferric Oxide: redox-rt sends this once execve has replaced the image.
+                            self.trace
+                                .record(&ferric_trace::kernel::SCHED_PROC_EXEC, &[fd_pid.0 as u64]);
                             Response::ready_ok(0, op)
                         } else {
                             Response::ready_err(ESRCH, op)
@@ -2003,6 +2024,15 @@ impl<'a> ProcScheme<'a> {
                     state_entry.remove();
 
                     proc.status = ProcessStatus::Exited { signal, status };
+                    // Ferric Oxide
+                    self.trace.record(
+                        &ferric_trace::kernel::SCHED_PROC_EXIT,
+                        &[
+                            proc.pid.0 as u64,
+                            u64::from(status),
+                            signal.map_or(0, |signal| u64::from(signal.get())),
+                        ],
+                    );
 
                     let mut remove_session = false;
                     if let Some(session) = self.sessions.get_mut(&proc.sid) {
@@ -2165,6 +2195,13 @@ impl<'a> ProcScheme<'a> {
 
                 match res {
                     Ready(Ok((pid, status))) => {
+                        // Ferric Oxide: pid 0 is a WNOHANG wait that found nothing.
+                        if pid != 0 {
+                            self.trace.record(
+                                &ferric_trace::kernel::SCHED_PROC_WAIT,
+                                &[waiter.0 as u64, pid as u64, status as u32 as u64],
+                            );
+                        }
                         if let Ok(status_out) = plain::from_mut_bytes::<i32>(op.payload()) {
                             *status_out = status;
                         }

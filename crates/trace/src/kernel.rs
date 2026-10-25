@@ -287,6 +287,66 @@ crate::events! {
         level: Info,
         args: ["domain", "root", "iova", "bytes"],
     }
+
+    /// The process manager (`procmgr`) created a process for a `fork`: the parent's and the
+    /// new child's process IDs. The child's first context has not started yet; its
+    /// `sched.context_start` follows with the child's PID.
+    ///
+    /// This and the other `sched.proc_*` events are [`USER_EVENTS`]: user space writes them
+    /// through the scheme's `emit` file ([`crate::abi::EMIT_PATH`]), and the kernel only
+    /// stamps and stores them. They report what the process manager did, not a kernel action.
+    pub const SCHED_PROC_FORK = 22 {
+        name: "sched.proc_fork",
+        subsystem: Sched,
+        level: Info,
+        args: ["parent", "child"],
+    }
+
+    /// A process finished an `exec`: its process ID. The process manager records it when the
+    /// process's runtime reports the new image (after the new program is loaded and before
+    /// it runs), so a process can also report it for itself without an exec.
+    pub const SCHED_PROC_EXEC = 23 {
+        name: "sched.proc_exec",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid"],
+    }
+
+    /// A process exited and its threads are gone, so it is now waitable: its process ID, its
+    /// exit status (0–255, 0 when a signal ended it) and the signal that ended it (0 for a
+    /// normal exit).
+    pub const SCHED_PROC_EXIT = 24 {
+        name: "sched.proc_exit",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "status", "signal"],
+    }
+
+    /// A `waitpid` returned a child's status change: the waiting process's ID, the child's
+    /// process ID, and the raw wait status the caller got (`WIFEXITED`, `WIFSIGNALED`,
+    /// `WIFSTOPPED` or `WIFCONTINUED` encoding). A `WNOHANG` call that found nothing, and
+    /// a failed call, record nothing.
+    pub const SCHED_PROC_WAIT = 25 {
+        name: "sched.proc_wait",
+        subsystem: Sched,
+        level: Info,
+        args: ["waiter", "pid", "status"],
+    }
+}
+
+/// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
+/// manager's process lifecycle. Every other event is the kernel's own, and the kernel
+/// refuses to take it from user space.
+pub const USER_EVENTS: [&crate::Event; 4] = [
+    &SCHED_PROC_FORK,
+    &SCHED_PROC_EXEC,
+    &SCHED_PROC_EXIT,
+    &SCHED_PROC_WAIT,
+];
+
+/// The user-space event with id `id`, or `None` for a kernel event or an unknown id.
+pub fn user_event(id: crate::EventId) -> Option<&'static crate::Event> {
+    USER_EVENTS.into_iter().find(|event| event.id() == id)
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -538,6 +598,10 @@ mod tests {
         assert_eq!(IOMMU_MAP.id().get(), 19);
         assert_eq!(IOMMU_PROTECT.id().get(), 20);
         assert_eq!(IOMMU_UNMAP.id().get(), 21);
+        assert_eq!(SCHED_PROC_FORK.id().get(), 22);
+        assert_eq!(SCHED_PROC_EXEC.id().get(), 23);
+        assert_eq!(SCHED_PROC_EXIT.id().get(), 24);
+        assert_eq!(SCHED_PROC_WAIT.id().get(), 25);
     }
 
     #[test]
@@ -570,6 +634,10 @@ mod tests {
             &SCHED_CONTEXT_CREATE,
             &SCHED_CONTEXT_START,
             &SCHED_CONTEXT_EXIT,
+            &SCHED_PROC_FORK,
+            &SCHED_PROC_EXEC,
+            &SCHED_PROC_EXIT,
+            &SCHED_PROC_WAIT,
         ] {
             assert_eq!(event.level(), crate::Level::Info, "{}", event.name());
         }
@@ -587,11 +655,39 @@ mod tests {
             &SCHED_CONTEXT_CREATE,
             &SCHED_CONTEXT_START,
             &SCHED_CONTEXT_EXIT,
+            &SCHED_PROC_FORK,
+            &SCHED_PROC_EXEC,
+            &SCHED_PROC_EXIT,
+            &SCHED_PROC_WAIT,
         ] {
             assert_eq!(event.subsystem(), Subsystem::Sched);
             assert!(selected.contains(event.id()));
             assert!(compiled.contains(event.id()));
         }
+    }
+
+    #[test]
+    fn only_process_lifecycle_events_come_from_user_space() {
+        for event in USER_EVENTS {
+            assert_eq!(
+                user_event(event.id()).map(crate::Event::name),
+                Some(event.name())
+            );
+            assert!(event.name().starts_with("sched.proc_"), "{}", event.name());
+            assert_eq!(
+                CATALOG.get(event.id()).map(crate::Event::name),
+                Some(event.name())
+            );
+        }
+        let kernel_events = CATALOG
+            .events()
+            .iter()
+            .filter(|event| user_event(event.id()).is_none())
+            .count();
+        assert_eq!(kernel_events, CATALOG.len() - USER_EVENTS.len());
+        assert!(user_event(SCHED_CONTEXT_START.id()).is_none());
+        assert!(user_event(SYSCALL_ENTER.id()).is_none());
+        assert!(user_event(crate::EventId::new(200)).is_none());
     }
 
     #[test]

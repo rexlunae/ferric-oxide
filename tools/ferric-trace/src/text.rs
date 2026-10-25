@@ -135,6 +135,29 @@ mod tests {
     }
 
     #[test]
+    fn process_lifecycle_records_name_every_process() {
+        use ferric_trace::kernel::{
+            SCHED_PROC_EXEC, SCHED_PROC_EXIT, SCHED_PROC_FORK, SCHED_PROC_WAIT,
+        };
+        let b = bytes(&[
+            (&SCHED_PROC_FORK, 10, &[7, 42]),
+            (&SCHED_PROC_EXEC, 20, &[42]),
+            (&SCHED_PROC_EXIT, 30, &[42, 23, 0]),
+            (&SCHED_PROC_EXIT, 35, &[43, 0, 9]),
+            (&SCHED_PROC_WAIT, 40, &[7, 42, 23 << 8]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(1, &b).unwrap()]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("sched.proc_fork parent=0x7 child=0x2a"));
+        assert!(text.contains("sched.proc_exec pid=0x2a"));
+        assert!(text.contains("sched.proc_exit pid=0x2a status=0x17 signal=0x0"));
+        assert!(text.contains("sched.proc_exit pid=0x2b status=0x0 signal=0x9"));
+        assert!(text.contains("sched.proc_wait waiter=0x7 pid=0x2a status=0x1700"));
+    }
+
+    #[test]
     fn mapping_operations_preserve_space_requests_and_failures() {
         use ferric_trace::kernel::{MM_MAP, MM_PROTECT, MM_UNMAP};
         let b = bytes(&[

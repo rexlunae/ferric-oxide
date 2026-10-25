@@ -17,7 +17,7 @@ what is on at run time.
 | --- | --- | --- |
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
-| `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, and `sched.context_create`/`context_start`/`context_exit` |
+| `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, `sched.context_create`/`context_start`/`context_exit`, and `procmgr`'s `sched.proc_fork`/`proc_exec`/`proc_exit`/`proc_wait` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
 | `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
@@ -132,6 +132,10 @@ The events are:
 | `sched.context_create` | `context`, `user_mode` |
 | `sched.context_start` | `pid`, `context` |
 | `sched.context_exit` | `pid`, `context`, `exception`, `kind`, `code`, `addr` |
+| `sched.proc_fork` | `parent`, `child` (from `procmgr`) |
+| `sched.proc_exec` | `pid` (from `procmgr`) |
+| `sched.proc_exit` | `pid`, `status`, `signal` (from `procmgr`) |
+| `sched.proc_wait` | `waiter`, `pid`, `status` (from `procmgr`) |
 
 ### Mapping-operation results
 
@@ -246,6 +250,38 @@ incomplete lifecycles. Enable all three with:
 
 ```text
 enable sched.context_create sched.context_start sched.context_exit
+```
+
+### Process lifecycle
+
+The kernel does not know when a process forks, execs, exits or is reaped:
+user-space `procmgr` does. So `procmgr` reports these four events itself, by
+writing a record to `kernel.trace/emit` ([User-space records](#user-space-records)),
+and the kernel stamps and stores it in the writing CPU's ring like its own.
+They are `sched` events, compiled in with `kernel.trace_sched`. On a kernel
+without them the first write fails with `EOPNOTSUPP` and `procmgr` stops
+writing; on a kernel without `kernel.trace` it opens nothing. While an event
+is off, each report costs `procmgr` one system call and stores nothing.
+
+- `sched.proc_fork` records a successful `fork`: `parent` and the new
+  `child` PID, before the parent's call returns.
+- `sched.proc_exec` records that `pid` has replaced its image: `redox-rt`
+  tells `procmgr` once `execve` has loaded the new program. A failed `execve`
+  reports nothing.
+- `sched.proc_exit` records that the last thread of `pid` has gone and the
+  process is a zombie: `status` is the exit status, `signal` the signal that
+  killed it, or 0.
+- `sched.proc_wait` records a `waitpid` that returned `pid` to `waiter`, with
+  `status` as `waitpid` reports it (`exit status << 8 | signal`, or a stop or
+  continue status). A `WNOHANG` wait that found nothing reports nothing.
+
+These records are the process-level view; join them to the context
+lifecycle records by `pid`. The kernel vouches for their time and CPU, and
+for their event, but not for their arguments, which are what `procmgr` wrote.
+Enable all four with:
+
+```text
+enable sched.proc_fork sched.proc_exec sched.proc_exit sched.proc_wait
 ```
 
 ### Futex waits and wakes
@@ -431,6 +467,19 @@ over ([Capabilities](#capabilities)). The paths are defined in
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 | `cap/read`, `cap/control` | — (a capability, see below) | — |
+| `emit` | — | One user-space record ([User-space records](#user-space-records)); opening it needs control access |
+
+### User-space records
+
+A few events are reported by user space: the process lifecycle events
+(`ferric_trace::kernel::USER_EVENTS`). A holder of control access opens `emit`
+and writes one `ferric_trace::abi::UserRecord` per write: little-endian 64-bit
+words, the first holding the event id in bits 15:0 and the argument count in
+bits 23:16 (the rest zero), then one word per argument. The kernel refuses any
+other event, a wrong argument count, reserved bits or a partial word with
+`EINVAL`, and an event it does not compile in with `EOPNOTSUPP`. A record for
+an event that is off is accepted and dropped; one that is on goes through the
+event's argument filter like a kernel record.
 
 ### Capabilities
 
@@ -926,8 +975,14 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       When rings are available, it runs `ferric-ring-test --async-only` and
       checks the same lifecycle for kernel workers after normal requests and
       cancellation, with PID 0 at both start and exit (`trace-lifecycle`).
+  15. runs a child that exits with status 23 and waits for it, and checks that
+      `procmgr` reported its fork (naming the test as its parent), exec, exit
+      (status 23, no signal) and the test's wait (`23 << 8`), in that order.
+      It checks that `emit` refuses a kernel event's record, reserved header
+      bits and a partial word, and that disabling the four events suppresses a
+      second child's records (`trace-proc`).
 
-  15. checks mapping-operation results for an anonymous allocation, refused
+  16. checks mapping-operation results for an anonymous allocation, refused
       overlapping fixed allocation, protection changes from the current context
       and a peer thread, refused widening of a read-only ring, and unmap. All
       records must retain the same target page-table root and operation order.
@@ -1171,8 +1226,7 @@ is refused the file.
 
 ## Not implemented yet
 
-- A complete mapping journal (clone, move, replacement and destruction),
-  user-space process creation/exec/wait tracepoints, and
+- A complete mapping journal (clone, move, replacement and destruction), and
   tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
