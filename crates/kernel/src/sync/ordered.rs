@@ -210,7 +210,7 @@ pub const DEADLOCK_SPIN_CAP: usize = 5000;
 
 /// Ferric Oxide: what a CPU does between tries of a contended lock in `spin_wait`: it
 /// acknowledges any pending TLB shootdown and, with `busy_panic`, panics naming `what` after
-/// [`DEADLOCK_SPIN_CAP`] failed tries, like the other lock loops here.
+/// `DEADLOCK_SPIN_CAP` failed tries, like the other lock loops here.
 fn serve_shootdowns(what: &'static str) -> impl FnMut() {
     #[cfg(not(feature = "busy_panic"))]
     let _ = what;
