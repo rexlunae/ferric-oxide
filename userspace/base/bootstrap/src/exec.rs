@@ -172,12 +172,16 @@ pub fn main() -> ! {
                 .remove(&GlobalSchemes::Event)
                 .expect("failed to get event fd");
             // Ferric Oxide: procmgr reports process lifecycle events to kernel.trace.
+            // The in-tree redox_syscall numbers it (GlobalSchemes::Trace); an older one lists
+            // it by name.
             let trace = crate::proc_trace::ProcTrace::open(
-                kernel_schemes
-                    .1
-                    .iter()
-                    .find(|(name, _)| *name == ferric_trace::abi::SCHEME_NAME)
-                    .map(|(_, fd)| fd),
+                kernel_schemes.get(GlobalSchemes::Trace).or_else(|| {
+                    kernel_schemes
+                        .1
+                        .iter()
+                        .find(|(name, _)| *name == ferric_trace::abi::SCHEME_NAME)
+                        .map(|(_, fd)| fd)
+                }),
             );
             drop(kernel_schemes);
             crate::procmgr::run(write_fd, socket, auth, event, trace)
