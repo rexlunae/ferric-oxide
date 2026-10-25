@@ -1,7 +1,8 @@
 //! The `ferric-blockd` scheme: Redox scheme calls on top of [`Volume`].
 //!
-//! The scheme root is the volume. Reads, `fsize`, `fstat`, `fpath`, `fsync` and `fcntl` are
-//! served; writes, `ftruncate`, `fchmod`, `fchown` and `futimens` fail with `EROFS`. Errors
+//! The volume is opened from the scheme root, which itself serves nothing (see
+//! [`crate::volume`]), so every read passes the caller check in `openat`. Reads, `fsize`,
+//! `fstat`, `fpath`, `fsync` and `fcntl` are served on volume handles; writes, `ftruncate`, `fchmod`, `fchown` and `futimens` fail with `EROFS`. Errors
 //! become errnos only through [`Error::errno`](crate::volume::Error::errno).
 
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
@@ -132,7 +133,7 @@ impl<D: BlockDevice> SchemeSync for BlockScheme<D> {
         _fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> syscall::Result<OpenResult> {
-        self.volume.check(dirfd).map_err(|e| errno(&e))?;
+        self.volume.check_root(dirfd).map_err(|e| errno(&e))?;
         let number = self
             .volume
             .open(path, flags, ctx.uid)

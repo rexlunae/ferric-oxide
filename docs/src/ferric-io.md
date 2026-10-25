@@ -904,7 +904,8 @@ devices below it, so they nest in whatever order the disk was set up in:
 - **`Slice`**: a byte window of a device, such as a partition.
 - **`Crypt`** (feature `luks`): opens a LUKS1 or LUKS2 volume through
   `ferric-luks` (header, passphrase, volume key, data segment) and decrypts
-  AES-XTS sectors of 512 to 4096 bytes with `plain64` IVs. Whole sectors are
+  AES-XTS sectors of 512 to 4096 bytes with `plain64` IVs, or `plain` ones,
+  which wrap to 0 at sector 2^32 (2 TiB in). Whole sectors are
   decrypted in the caller's buffer; a partial sector at either end goes through
   one sector of scratch space. Segments that are flagged (reencryption),
   integrity-protected, or more than one are refused.
@@ -953,13 +954,18 @@ ferric-blockd root dev:/scheme/disk.nvme/0p2 luks:/etc/keys/root lvm:root
 ext4d /scheme/root rootfs
 ```
 
+- **Disks:** a Redox disk scheme serves only whole, aligned blocks, so every
+  read is widened to the device's blocks (`st_blksize`): the aligned middle goes
+  straight into the caller's buffer and a partial first or last block through a
+  one-block bounce buffer.
 - **Passphrase:** the whole content of `KEYFILE`, byte for byte (a trailing
   newline is part of it), as cryptsetup reads `--key-file`; never from the
   command line. The daemon reads key files and opens devices before it enters
   the null namespace.
 - **Access:** the scheme holds one file, the volume, at its root. Only UID 0
-  may open it (it is decrypted data); opens for writing, creating or
-  truncating, and writes, `ftruncate`, `fchmod`, `fchown` and `futimens`, fail
+  may open it (it is decrypted data), and the scheme root handle itself serves
+  no data or metadata (`EBADF`), so every read goes through a checked open.
+  Opens for writing, creating or truncating, and writes, `ftruncate`, `fchmod`, `fchown` and `futimens`, fail
   with `EROFS`. Reads stop at the end of the volume.
 - **Limits:** read-only; no keyslot management, tokens, detached headers or
   reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;

@@ -13,7 +13,7 @@ use thiserror::Error;
 /// LUKS2 (4096-byte sectors) holding PV innervg, LV "inner", pattern seed 6.
 const LVM_ON_LUKS: &[u8] =
     include_bytes!("../../../../../crates/blocklayer/tests/fixtures/lvm-on-luks.img");
-/// PV blkvg: LV "sealed" holds LUKS2 (512-byte sectors), pattern seed 5.
+/// PV blkvg: LV "sealed", over two extent runs, holds LUKS2 (512-byte sectors), pattern seed 5.
 const LVM: &[u8] = include_bytes!("../../../../../crates/blocklayer/tests/fixtures/lvm.img");
 /// A LUKS1 header whose payload starts at sector 4096, and the first 8 KiB of that payload
 /// (pattern seed 3).
@@ -195,7 +195,19 @@ fn luks_on_lvm() -> Result<Served, Failure> {
             &format!("luks:{KEY}"),
         ]),
     )?;
-    check(&served, 64 * 1024, 5)?;
+    check(&served, 128 * 1024, 5)?;
+    // The LV jumps from PE 6 to PE 9 at 64 KiB into the decrypted data.
+    let file = io("open /scheme/ferric-blk-lul", File::open(&served.root))?;
+    let mut run = vec![0; 8192];
+    io(
+        "read across the extent jump",
+        file.read_exact_at(&mut run, 60 * 1024),
+    )?;
+    same(
+        "the bytes across the extent jump",
+        run,
+        pattern(5, 60 * 1024, 8192),
+    )?;
     Ok(served)
 }
 

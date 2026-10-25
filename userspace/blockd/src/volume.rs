@@ -4,6 +4,10 @@
 //! since it is decrypted data, and only for reading: opens for writing, creating or
 //! truncating, and every call that would change it, fail with `EROFS`. Errors become errnos
 //! only in [`Error::errno`].
+//!
+//! The scheme root handle ([`ROOT`]) is only a directory to open the volume from: it serves
+//! no data and no metadata (`EBADF`), so every read goes through a handle [`Volume::open`]
+//! made after checking the caller.
 
 use std::collections::BTreeSet;
 
@@ -13,7 +17,7 @@ use syscall::error::{EACCES, EBADF, EIO, ENOENT, ENOTDIR, EROFS};
 use syscall::flag::{MODE_FILE, O_ACCMODE, O_CREAT, O_DIRECTORY, O_RDONLY, O_TRUNC};
 use thiserror::Error;
 
-/// The handle number of the scheme root, which is the volume.
+/// The handle number of the scheme root, which the volume is opened from.
 pub const ROOT: usize = 0;
 
 /// The block size `fstat` reports.
@@ -73,7 +77,7 @@ impl<D: BlockDevice> Volume<D> {
     pub fn new(device: D) -> Self {
         Self {
             device,
-            handles: BTreeSet::from([ROOT]),
+            handles: BTreeSet::new(),
             next: ROOT + 1,
         }
     }
@@ -111,7 +115,23 @@ impl<D: BlockDevice> Volume<D> {
         Ok(handle)
     }
 
-    /// Checks that `handle` is open.
+    /// Checks that `dirfd` is the scheme root, the only handle the volume is opened from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotADirectory`] for a volume handle and [`Error::BadHandle`] for any other.
+    pub fn check_root(&self, dirfd: usize) -> Result<(), Error<D::Error>> {
+        if dirfd == ROOT {
+            Ok(())
+        } else if self.handles.contains(&dirfd) {
+            Err(Error::NotADirectory)
+        } else {
+            Err(Error::BadHandle { handle: dirfd })
+        }
+    }
+
+    /// Checks that `handle` is an open volume handle: one [`Volume::open`] made. The scheme
+    /// root is not one.
     ///
     /// # Errors
     ///
@@ -175,11 +195,9 @@ impl<D: BlockDevice> Volume<D> {
         })
     }
 
-    /// Closes `handle`; the root handle stays open.
+    /// Closes `handle`.
     pub fn close(&mut self, handle: usize) {
-        if handle != ROOT {
-            self.handles.remove(&handle);
-        }
+        self.handles.remove(&handle);
     }
 }
 
@@ -209,8 +227,26 @@ mod tests {
         assert_eq!((stat.st_size, stat.st_mode), (100, MODE_FILE | 0o400));
         v.close(h);
         assert_eq!(v.read(h, 0, &mut buf).unwrap_err().errno(), EBADF);
-        v.close(ROOT);
-        assert!(v.stat(ROOT).is_ok());
+        assert_eq!(v.check_root(ROOT).map_err(|e| e.errno()), Ok(()));
+        let h = v.open("", O_RDONLY, 0).unwrap();
+        assert_eq!(v.check_root(h).unwrap_err().errno(), ENOTDIR);
+        assert_eq!(v.check_root(99).unwrap_err().errno(), EBADF);
+    }
+
+    /// The scheme root serves nothing, so a process that is not root cannot read the volume
+    /// through it, whatever handle it holds; it must open the volume, which refuses it.
+    #[test]
+    fn the_root_handle_serves_no_data() {
+        let mut v = volume();
+        let mut buf = [0; 8];
+        assert_eq!(v.read(ROOT, 0, &mut buf).unwrap_err().errno(), EBADF);
+        assert_eq!(v.stat(ROOT).unwrap_err().errno(), EBADF);
+        assert_eq!(v.refuse_change(ROOT).unwrap_err().errno(), EBADF);
+        assert_eq!(v.open("", O_RDONLY, 1000).unwrap_err().errno(), EACCES);
+        assert_eq!(buf, [0; 8]);
+        let h = v.open("", O_RDONLY, 0).unwrap();
+        v.close(h);
+        assert_eq!(v.read(h, 0, &mut buf).unwrap_err().errno(), EBADF);
     }
 
     #[test]
@@ -224,7 +260,8 @@ mod tests {
         assert_eq!(errno(v.open("", O_RDONLY | O_DIRECTORY, 0)), ENOTDIR);
         assert_eq!(errno(v.open("other", O_RDONLY, 0)), ENOENT);
         assert_eq!(errno(v.open("", O_RDONLY, 1000)), EACCES);
-        assert_eq!(v.refuse_change(ROOT).unwrap_err().errno(), EROFS);
+        let h = v.open("", O_RDONLY, 0).unwrap();
+        assert_eq!(v.refuse_change(h).unwrap_err().errno(), EROFS);
         assert_eq!(v.refuse_change(9).unwrap_err().errno(), EBADF);
     }
 

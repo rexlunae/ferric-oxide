@@ -8,12 +8,12 @@ so tests check decrypted and mapped bytes against data no Ferric Oxide code wrot
 passphrase is "correct horse".
 
 lvm.img          LV "data" over two extent runs (seed 4); LUKS2, 512-byte sectors, in LV
-                 "sealed" (seed 5)
+                 "sealed" (seed 5), also over two runs, with data kept across the jump
 lvm-on-luks.img  LV "inner" (seed 6) in LUKS2 with 4096-byte sectors
 luks1-data.bin   the first 8 KiB of LUKS1 data (seed 3) for ../../../luks/tests/fixtures/luks1.img,
                  whose payload starts at sector 4096
 
-Bytes no test reads (unused keyslot space, encrypted data past the first 8 KiB) are zeroed,
+Bytes no test reads (unused keyslot space, encrypted data no test reads) are zeroed,
 so the images compress well. To check against the tools as they are now:
 
     sudo tests/fixtures/make-fixtures.sh /some/empty/dir

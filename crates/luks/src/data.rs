@@ -6,7 +6,8 @@
 //!
 //! # IVs
 //!
-//! Every sector is encrypted with the `plain64` IV. LUKS1 data has 512-byte sectors, the first
+//! Every sector is encrypted with the `plain64` IV, or `plain`, its 32-bit form, which wraps
+//! to 0 at sector 2^32 (see [`crate::cipher`]). LUKS1 data has 512-byte sectors, the first
 //! at IV 0 (LUKS1 specification, appendix B). A LUKS2 crypt segment names its `sector_size`
 //! (512, 1024, 2048 or 4096 bytes) and an `iv_tweak`, "the starting offset for the
 //! Initialization Vector" (LUKS2 specification 1.1.4, section 3.3), but the specification does
@@ -200,12 +201,20 @@ mod tests {
     use super::*;
 
     fn decryptor(sector_size: u32, iv_tweak: u64) -> (Decryptor, Xts128<Aes128>) {
+        decryptor_for(Cipher::AesXtsPlain64, sector_size, iv_tweak)
+    }
+
+    fn decryptor_for(
+        cipher: Cipher,
+        sector_size: u32,
+        iv_tweak: u64,
+    ) -> (Decryptor, Xts128<Aes128>) {
         let key: Vec<u8> = (100..132).collect();
         let xts = Xts128::new(
             Aes128::new_from_slice(&key[..16]).unwrap(),
             Aes128::new_from_slice(&key[16..]).unwrap(),
         );
-        let cipher = DataCipher::new(Cipher::AesXtsPlain64, &key).unwrap();
+        let cipher = DataCipher::new(cipher, &key).unwrap();
         (
             Decryptor {
                 cipher,
@@ -241,6 +250,38 @@ mod tests {
         xts.encrypt_sector(b, 0u128.to_le_bytes());
         d.decrypt(&mut data, 0).unwrap();
         assert_eq!(data, plain);
+    }
+
+    /// At sector 2^32 (2 TiB in), `plain` wraps to IV 0 and `plain64` does not.
+    #[test]
+    fn plain_wraps_at_32_bits_and_plain64_does_not() {
+        let boundary = 1u64 << 32;
+        let offset = boundary * IV_UNIT;
+        let plain = [9u8; 1024];
+        for (cipher, first, second) in [
+            (Cipher::AesXtsPlain, 0u64, 1u64),
+            (Cipher::AesXtsPlain64, boundary, boundary + 1),
+        ] {
+            let (d, xts) = decryptor_for(cipher, 512, 0);
+            let mut data = plain;
+            let (a, b) = data.split_at_mut(512);
+            xts.encrypt_sector(a, u128::from(first).to_le_bytes());
+            xts.encrypt_sector(b, u128::from(second).to_le_bytes());
+            d.decrypt(&mut data, offset).unwrap();
+            assert_eq!(data, plain, "{cipher:?}");
+        }
+        // The sector just below the boundary is the same for both.
+        for cipher in [Cipher::AesXtsPlain, Cipher::AesXtsPlain64] {
+            let (d, xts) = decryptor_for(cipher, 512, 0);
+            let mut data = [3u8; 512];
+            xts.encrypt_sector(&mut data, u128::from(boundary - 1).to_le_bytes());
+            d.decrypt(&mut data, offset - 512).unwrap();
+            assert_eq!(data, [3u8; 512], "{cipher:?}");
+        }
+        assert_eq!(
+            Cipher::from_dm_crypt("aes-xts-plain"),
+            Ok(Cipher::AesXtsPlain)
+        );
     }
 
     #[test]

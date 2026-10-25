@@ -66,20 +66,30 @@ fn a_logical_volume_reads_across_its_segments() {
     let at = 128 * KIB - 100;
     assert_eq!(read(&lv, at, 300), pattern(4, at, 300));
     assert!(lv.read_at(256 * KIB - 1, &mut [0; 2]).is_err());
+    let sealed = Lvm::open(vec![Memory::new(fixture("lvm.img"))], "sealed").expect("opens");
+    assert_eq!(sealed.volume().segments.len(), 2);
 }
 
-/// LUKS2 with 512-byte sectors, inside a logical volume.
+/// LUKS2 with 512-byte sectors, inside a logical volume split over two extent runs: the
+/// decrypted read across 64 KiB crosses the jump from PE 6 to PE 9.
 #[test]
 fn luks_on_lvm_decrypts() {
     let lv = Stack::lvm(vec![image("lvm.img")], "sealed").expect("lv");
-    assert_eq!(lv.size(), 5 * 64 * KIB);
+    assert_eq!(lv.size(), 6 * 64 * KIB);
     let volume = lv.crypt(PASSPHRASE, &Limits::default()).expect("unlocks");
-    // The LUKS2 data starts 256 KiB into the 320 KiB volume.
-    assert_eq!(volume.size(), 64 * KIB);
+    // The LUKS2 data starts 256 KiB into the 384 KiB volume.
+    assert_eq!(volume.size(), 128 * KIB);
     assert_eq!(read(&volume, 0, KEPT), pattern(5, 0, KEPT));
     // Partial sectors at both ends.
     assert_eq!(read(&volume, 100, 1000), pattern(5, 100, 1000));
     assert_eq!(read(&volume, 511, 2), pattern(5, 511, 2));
+    // Across the extent jump, whole and unaligned.
+    let jump = 64 * KIB;
+    assert_eq!(
+        read(&volume, jump - 4096, KEPT),
+        pattern(5, jump - 4096, KEPT)
+    );
+    assert_eq!(read(&volume, jump - 300, 700), pattern(5, jump - 300, 700));
 }
 
 /// LVM inside LUKS2 with 4096-byte sectors: the IVs of large sectors count 512-byte units.

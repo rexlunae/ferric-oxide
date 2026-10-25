@@ -37,11 +37,12 @@ fn serve(args: &[String]) -> Volume<Stack<FileDevice>> {
     Volume::new(assemble(&spec.steps, &mut Files).expect("assembles"))
 }
 
-fn read_all(volume: &Volume<impl BlockDevice>, offset: u64, len: usize) -> Vec<u8> {
+/// Reads through a handle opened as root, as the scheme's `openat` makes one.
+fn read_all(volume: &mut Volume<impl BlockDevice>, offset: u64, len: usize) -> Vec<u8> {
+    let handle = volume.open("", syscall::flag::O_RDONLY, 0).expect("opens");
     let mut buf = vec![0; len];
-    let n = volume
-        .read(ferric_blockd::volume::ROOT, offset, &mut buf)
-        .expect("reads");
+    let n = volume.read(handle, offset, &mut buf).expect("reads");
+    volume.close(handle);
     buf.truncate(n);
     buf
 }
@@ -49,22 +50,22 @@ fn read_all(volume: &Volume<impl BlockDevice>, offset: u64, len: usize) -> Vec<u
 #[test]
 fn lvm_on_luks() {
     let key = key_file("lvm_on_luks", b"correct horse");
-    let volume = serve(&[
+    let mut volume = serve(&[
         "inner".into(),
         format!("dev:{}", fixture("lvm-on-luks.img")),
         format!("luks:{}", key.display()),
         "lvm:inner".into(),
     ]);
     assert_eq!(volume.size(), 64 * 1024);
-    assert_eq!(read_all(&volume, 0, 8192), pattern(6, 0, 8192));
+    assert_eq!(read_all(&mut volume, 0, 8192), pattern(6, 0, 8192));
     // Reads stop at the end of the volume.
-    assert_eq!(read_all(&volume, 64 * 1024 - 10, 100).len(), 10);
+    assert_eq!(read_all(&mut volume, 64 * 1024 - 10, 100).len(), 10);
 }
 
 #[test]
 fn luks_on_lvm_through_a_slice() {
     let key = key_file("luks_on_lvm", b"correct horse");
-    let volume = serve(&[
+    let mut volume = serve(&[
         "sealed".into(),
         format!("dev:{}", fixture("lvm.img")),
         "slice:0:-".into(),
@@ -73,7 +74,7 @@ fn luks_on_lvm_through_a_slice() {
         "slice:4096:4096".into(),
     ]);
     assert_eq!(volume.size(), 4096);
-    assert_eq!(read_all(&volume, 0, 4096), pattern(5, 4096, 4096));
+    assert_eq!(read_all(&mut volume, 0, 4096), pattern(5, 4096, 4096));
 }
 
 #[test]
@@ -101,4 +102,32 @@ fn a_trailing_newline_is_part_of_the_passphrase() {
             "the passphrase does not open any LUKS keyslot",
         ]
     );
+}
+
+/// A caller that is not root gets no decrypted data: not by opening the volume, and not
+/// through the scheme root handle.
+#[test]
+fn unprivileged_callers_read_nothing() {
+    let key = key_file("unprivileged", b"correct horse");
+    let mut volume = serve(&[
+        "inner".into(),
+        format!("dev:{}", fixture("lvm-on-luks.img")),
+        format!("luks:{}", key.display()),
+        "lvm:inner".into(),
+    ]);
+    let errno = |e: ferric_blockd::volume::Error<_>| e.errno();
+    assert_eq!(
+        volume
+            .open("", syscall::flag::O_RDONLY, 1000)
+            .map_err(errno),
+        Err(syscall::error::EACCES)
+    );
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        volume
+            .read(ferric_blockd::volume::ROOT, 0, &mut buf)
+            .map_err(errno),
+        Err(syscall::error::EBADF)
+    );
+    assert_eq!(buf, [0; 64]);
 }
