@@ -24,6 +24,8 @@ pub mod initfs;
 pub mod initfs_trace;
 pub mod initnsmgr;
 pub mod procmgr;
+// Ferric Oxide: procmgr's process lifecycle tracepoints.
+pub mod proc_trace;
 pub mod start;
 
 extern crate alloc;

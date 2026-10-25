@@ -443,7 +443,7 @@ jobs:
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
           # Bootstrap applied the initfs trace.toml; the kernel logs the command.
           grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
-          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault mapping futex lifecycle irq filter clock cap; do
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault mapping futex lifecycle proc irq filter clock cap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
           # The page fault and interrupt steps' details: record counts, and the interrupt
@@ -452,7 +452,7 @@ jobs:
             echo "::notice::$line"
           done
           # trace-irq comes from ferric-iommu-test, which acknowledges an interrupt itself.
-          echo "::notice::ferric-trace-test passed all 19 steps, ferric-iommu-test trace-irq"
+          echo "::notice::ferric-trace-test passed all 20 steps, ferric-iommu-test trace-irq"
           # The kernel logged the argument filter trace-filter set (T3c).
           grep -aF "trace: filter syscall.enter nr == " "$LOG"
           # The kernel logged the timestamp clock it picked (T3d); trace-clock checked its
