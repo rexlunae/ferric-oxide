@@ -15,6 +15,8 @@ use std::process::{Command, ExitCode, ExitStatus};
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
+mod variants;
+
 #[derive(Parser)]
 #[command(about, version)]
 struct Cli {
@@ -96,11 +98,20 @@ enum Task {
     Setup,
     /// Build an image; pass extra Make assignments/targets after --.
     Build {
+        /// Build every enabled CPU variant into a separate image directory.
+        #[arg(long, conflicts_with = "cpu_variant")]
+        all_variants: bool,
+        /// Build one enabled CPU variant instead of the architecture's baseline.
+        #[arg(long)]
+        cpu_variant: Option<String>,
         #[arg(last = true)]
         args: Vec<OsString>,
     },
     /// Build and boot in QEMU; pass extra Make assignments after --.
     Run {
+        /// Boot one enabled CPU variant's separate image.
+        #[arg(long)]
+        cpu_variant: Option<String>,
         /// Boot the existing disk without rebuilding it or resetting guest changes.
         #[arg(long)]
         no_build: bool,
@@ -137,6 +148,19 @@ enum BuildError {
         "missing required tool {0}; install it using your preferred method, then rerun cargo xtask setup"
     )]
     Missing(&'static str),
+    #[error("cannot decode ferric-config's CPU variant plan")]
+    VariantPlan {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("CPU variant {level} is not enabled for {arch}; select it in make menuconfig")]
+    DisabledVariant { arch: &'static str, level: String },
+    #[error("no enabled CPU variants match the requested architecture")]
+    NoVariants,
+    #[error(
+        "BUILD and FERRIC_CPU_VARIANT are assigned by the CPU variant command; remove the conflicting Make assignment"
+    )]
+    VariantAssignment,
 }
 
 type Result<T> = std::result::Result<T, BuildError>;
@@ -361,20 +385,50 @@ fn run(cli: Cli) -> Result<()> {
         }
         Task::Doctor => doctor(selected_architecture(cli.arch, &[])?),
         Task::Setup => setup(&root, selected_architecture(cli.arch, &[])?, cli.dry_run),
-        Task::Build { args } => execute(
-            &mut make_command(
-                &root,
-                "qemu-image",
-                selected_architecture(cli.arch, &args)?,
-                cli.podman,
-                &args,
-            ),
-            cli.dry_run,
-        ),
+        Task::Build {
+            args,
+            all_variants,
+            cpu_variant,
+        } => {
+            if all_variants {
+                let filter = if cli.arch.is_some()
+                    || args
+                        .iter()
+                        .any(|arg| arg.to_str().is_some_and(|arg| arg.starts_with("ARCH=")))
+                {
+                    Some(selected_architecture(cli.arch, &args)?)
+                } else {
+                    None
+                };
+                variants::build_all(&root, filter, cli.podman, &args, cli.dry_run)
+            } else if let Some(level) = cpu_variant {
+                variants::run_one(
+                    &root,
+                    "qemu-image",
+                    selected_architecture(cli.arch, &args)?,
+                    &level,
+                    cli.podman,
+                    &args,
+                    cli.dry_run,
+                )
+            } else {
+                execute(
+                    &mut make_command(
+                        &root,
+                        "qemu-image",
+                        selected_architecture(cli.arch, &args)?,
+                        cli.podman,
+                        &args,
+                    ),
+                    cli.dry_run,
+                )
+            }
+        }
         Task::Run {
             headless,
             no_build,
             mut args,
+            cpu_variant,
         } => {
             let arch = selected_architecture(cli.arch, &args)?;
             if !cli.dry_run && find_tool(arch.qemu()).is_none() {
@@ -382,6 +436,17 @@ fn run(cli: Cli) -> Result<()> {
             }
             if headless {
                 args.push("gpu=no".into());
+            }
+            if let Some(level) = cpu_variant {
+                return variants::run_one(
+                    &root,
+                    if no_build { "qemu-run" } else { "qemu" },
+                    arch,
+                    &level,
+                    cli.podman,
+                    &args,
+                    cli.dry_run,
+                );
             }
             execute(
                 &mut make_command(
@@ -416,6 +481,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::{ffi::OsStr, fs};
+
     #[test]
     fn architecture_defaults_to_host_and_explicit_selection_overrides_it() {
         assert_eq!(

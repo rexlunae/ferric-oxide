@@ -600,12 +600,6 @@ pub fn apply(root: &Path, out_dir: &Path, plan: &Plan, touch: bool) -> Result<Ap
     for p in &plan.remove {
         let _ = std::fs::remove_file(root.join(p));
     }
-    // make compares config.mk against ferric.toml; keep it newer even when
-    // nothing changed so make does not regenerate on every run.
-    let mk = root.join(out_dir).join("config.mk");
-    if let Ok(f) = std::fs::File::options().write(true).open(&mk) {
-        let _ = f.set_modified(SystemTime::now());
-    }
 
     let state_path = abs_out.join("state.toml");
     let old = read_state(&state_path).unwrap_or_default();

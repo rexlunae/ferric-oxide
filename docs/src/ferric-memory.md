@@ -40,6 +40,14 @@ an exhausted allocator with zero remaining capacity. Its host tests cover these
 boundaries and zeroing/disjointness of allocations in the software memory model.
 These checks do not validate real page-table or TLB operations.
 
+An empty kernel wait condition can be destroyed without acquiring a lock or
+creating another clean lock token. This covers drained page-cache objects and
+queues closed during RedoxFS startup, including with `kernel.drop_panic` enabled.
+The diagnostic still catches implicit destruction of a nonempty wait list;
+callers that hold a token use explicit notification/destruction paths. Host
+tests compile the actual ordered-lock and wait-condition modules and verify
+empty destruction while another lock is held. They do not emulate scheduling.
+
 ### ARM64 signal arguments
 
 In relibc, `redox-rt/src/arch/aarch64.rs` saves an interrupted program's

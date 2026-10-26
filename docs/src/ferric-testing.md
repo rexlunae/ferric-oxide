@@ -179,6 +179,13 @@ Miri requires the `miri` component for the declared nightly toolchain. The
 kernel-lints workflow runs these tests, including Miri; the shared buffer also
 receives the host workspace's strict Clippy and Rustdoc checks.
 
+The helper package also compiles the actual ordered-lock and wait-condition
+code for empty-list destruction tests, including `drop_panic`. Its host-only
+context/shootdown stubs fail if those hardware paths are reached. The regression
+holds another lock while destroying an empty condition and verifies no further
+lock acquisition occurs. This covers the page-cache cleanup panic found during
+an ARM64 native boot; it does not simulate blocked waiters or context switches.
+
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
 out-of-range CPU IDs, nonzero xAPIC and x2APIC IDs, duplicate/gapped/concurrent CPU publication, initialized
