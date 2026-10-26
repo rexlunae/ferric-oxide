@@ -916,7 +916,7 @@ impl PackageSource for RegistrySource<'_> {
         };
         match from_registry(self.root, &spec, self.args, self.policy) {
             Ok((pending, origin)) => Ok(Some(Found::Archive(
-                open_pending(pending, self.keys)?,
+                Box::new(open_pending(pending, self.keys)?),
                 Some(origin),
             ))),
             Err(CliError::Registry(error))
@@ -1003,7 +1003,12 @@ fn install(
     let keys = trusted_keys_in(cli, &root)?;
     let mut requested = pending
         .into_iter()
-        .map(|(pending, origin)| Ok(Request::Archive(open_pending(pending, &keys)?, origin)))
+        .map(|(pending, origin)| {
+            Ok(Request::Archive(
+                Box::new(open_pending(pending, &keys)?),
+                origin,
+            ))
+        })
         .collect::<Result<Vec<_>, CliError>>()?;
     let mut repositories = dependencies.repositories(keys.clone());
     let plan = if dependencies.skip {

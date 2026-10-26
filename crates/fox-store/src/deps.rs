@@ -60,7 +60,7 @@ use crate::{InstallOptions, InstallReport, Origin, Store, StoreError};
 pub enum Found {
     /// A verified archive, with the registry it came from if it came from
     /// one.
-    Archive(Archive, Option<Origin>),
+    Archive(Box<Archive>, Option<Origin>),
     /// A meta-package: it installs nothing itself, only these packages.
     Meta(Vec<PackageName>),
 }
@@ -257,7 +257,7 @@ impl PackageSource for LocalRepository {
                 found: found.clone(),
             });
         }
-        Ok(Some(Found::Archive(archive, None)))
+        Ok(Some(Found::Archive(Box::new(archive), None)))
     }
 }
 
@@ -265,7 +265,7 @@ impl PackageSource for LocalRepository {
 #[derive(Debug)]
 pub enum Request {
     /// A verified archive, with the registry it came from, if any.
-    Archive(Archive, Option<Origin>),
+    Archive(Box<Archive>, Option<Origin>),
     /// A package to look up in the source.
     Name(PackageName),
 }
@@ -318,7 +318,7 @@ pub enum PlanError<E> {
 
 /// What [`plan`] has collected under a name.
 enum Node {
-    Archive(Archive, Option<Origin>),
+    Archive(Box<Archive>, Option<Origin>),
     Meta(Vec<PackageName>),
 }
 
@@ -436,7 +436,7 @@ pub fn plan<S: PackageSource>(
     let mut meta = Vec::new();
     for name in order {
         match found.remove(&name) {
-            Some(Node::Archive(archive, origin)) => install.push((archive, origin)),
+            Some(Node::Archive(archive, origin)) => install.push((*archive, origin)),
             Some(Node::Meta(_)) => meta.push(name),
             None => {}
         }
@@ -529,7 +529,10 @@ mod tests {
 
         fn open(&self, name: &str) -> Request {
             let path = self.dir.path().join(format!("{name}.pkgar"));
-            Request::Archive(Archive::open(&path, &self.key.trusted()).unwrap(), None)
+            Request::Archive(
+                Box::new(Archive::open(&path, &self.key.trusted()).unwrap()),
+                None,
+            )
         }
 
         fn source(&self) -> LocalRepository {
