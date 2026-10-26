@@ -392,7 +392,16 @@ from the guest, the kernel drives its local APICs in xAPIC mode, so the decoding
 of the xAPIC ID register (its ID sits in bits 31:24) and the targeted IPIs, such
 as per-CPU TLB shootdowns, that are sent to those IDs get a real boot. The other
 boots use `host`, which runs in x2APIC mode. The decoding itself is also
-host-tested (`apic_id` in the kernel helper tests).
+host-tested (`apic_id` in the kernel helper tests). That boot checks
+correctness, so its performance A/B gates, the NVMe queue-policy A/B
+(`check-blkgrant-log.sh`) and the disk benchmark's adaptive-against-main A/B
+(`check-iobench-log.sh`), only warn when they fail (`PERF_AB=report`, set for
+the whole boot job; see `scripts/ferric-ci/perf-ab.sh`): every EOI and IPI is
+then an xAPIC MMIO access that exits to the host under nested KVM, so nvmed's
+per-CPU policies, which take more of them, measure the APIC emulation more
+than nvmed. The figures are still reported.
+`scripts/ferric-ci/test-perf-ab.sh` (host-tools CI) runs both checks on
+fixture logs with and without `PERF_AB=report`.
 
 The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
@@ -693,6 +702,16 @@ the first dirty time, and another dirty file keeps its timer. ABI tests cover
 the `DirtyPages` request and reject extra metadata/packed flags. CI compiles
 the RedoxFS client and kernel query together; the writeback-enabled image's
 fsync, age, mapping and truncation smoke checks cover target integration.
+
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
 
 ### Profiler CPU wakeup acknowledgements
 
