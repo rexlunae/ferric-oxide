@@ -154,8 +154,17 @@ impl LocalApic {
         }
     }
 
+    /// This CPU's APIC ID, as the MADT, the ICR destination field and interrupt messages name it.
+    ///
+    /// Ferric Oxide (#214): the raw register is decoded by [`super::apic_id::decode`], since the
+    /// xAPIC register keeps the ID in its top byte. Every user of `apic_id_opt` (targeted IPIs,
+    /// the MADT's own-APIC check, NUMA, `irq:`, IOMMU interrupt destinations) expects the ID
+    /// itself.
     pub fn id(&self) -> ApicId {
-        ApicId::new(self.identification(IdentificationRegister::Id))
+        ApicId::new(super::apic_id::decode(
+            self.identification(IdentificationRegister::Id),
+            self.x2,
+        ))
     }
 
     pub fn version(&self) -> u32 {

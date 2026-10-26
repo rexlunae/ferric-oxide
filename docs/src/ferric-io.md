@@ -334,6 +334,37 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+A wake-up drained into an idling CPU must not be left behind either (#200).
+The wake-up IPI handler moves the wake-ups into the CPU's local list, which
+only the next `switch` processes, so on a CPU that runs its idle context the
+handler switches at once. Before it halts, the idle loop re-checks the local
+list with interrupts disabled. That check is for wake-ups that have no
+interrupt behind them: a contended switch's re-push, or a direct switch back.
+A wake-up IPI cannot strand anything at the halt. `sti; hlt` holds interrupts
+until the `hlt` has executed, and an interrupt that ends a halt returns past
+the `hlt` (Intel SDM, STI and HLT), so the loop always runs again. A
+`Contended` result from the handler's switch is therefore not retried inside
+the handler, where spinning with interrupts off could wait on a CPU that is
+waiting for this one. The loop it returns to retries with interrupts on. The handler asks
+whether the CPU is idling through `try_idle_context` (#214). The reason is
+`kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
+this handler and never sets up contexts. Asking that CPU for its idle context
+panicked; it then stopped answering TLB shootdowns, and the profile image hung
+with the other CPUs waiting for it. Because the TLB shootdown vector is among
+those routed vectors, the handler now answers a pending shootdown on such a
+CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
+set, and the next broadcast shootdown (sent when a kernel shadow stack is
+freed) spins on it forever.
+
+The context-free acknowledgement branch is shared with host/Miri regression
+tests: it returns no idle context, services a pending TLB shootdown before EOI
+and never reads current-context state. This is control-flow coverage; actual
+interrupt entry/TLB hardware remain covered by target boots and hardware tests.
+Device IRQ targeting now excludes the profiler CPU from `irq:` listings,
+steering and IOMMU destinations. The xAPIC ID register is decoded from bits
+31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
+modes, and smoke CI also boots with x2APIC disabled.
+
 ### Overlapping requests with per-CPU workers (drivers.nvme_overlap)
 
 `drivers.nvme_overlap` enables nvmed's `overlap` feature (including `percore`).
