@@ -78,7 +78,7 @@
 # Contributing
 
 - [Contributing](./contributing.md)
-  - [Chat](./chat.md)
+  - [Getting in Touch](./chat.md)
 
 - [Best practices and guidelines](./best-practices.md)
   - [Literate programming](./literate-programming.md)
@@ -88,11 +88,10 @@
   - [Avoiding Panics](./avoiding-panics.md)
   - [Testing](./testing-practices.md)
 
-- [Using Redox GitLab](./using-redox-gitlab.md)
-  - [Signing in to GitLab](./signing-in-to-gitlab.md)
+- [Working on GitHub](./using-redox-gitlab.md)
   - [Repository Structure](./repository-structure.md)
   - [Creating Proper Bug Reports](./creating-proper-bug-reports.md)
-  - [Creating Proper Merge Requests](./creating-proper-pull-requests.md)
+  - [Creating Proper Pull Requests](./creating-proper-pull-requests.md)
   - [Filing Issues](./filing-issues.md)
 
 # Developing with and for Redox
