@@ -32,7 +32,7 @@ const INCOMPAT_JOURNAL_DEV: u32 = 0x8;
 /// `s_feature_incompat`: group descriptors are spread over the volume.
 const INCOMPAT_META_BG: u32 = 0x10;
 /// `s_feature_ro_compat`: metadata checksums, including the superblock's.
-pub(super) const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
+pub(crate) const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 /// `s_feature_ro_compat`: superblock backups only in groups 0, 1 and powers of 3, 5 and 7.
 const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
 /// `s_feature_compat`: superblock backups only in the two groups `s_backup_bgs` names.
@@ -43,7 +43,7 @@ const JNL_BACKUP_BLOCKS: u8 = 1;
 /// `i_size`.
 const JNL_BLOCKS_AT: usize = 0x10C;
 /// Where the superblock keeps `s_checksum`.
-pub(super) const CHECKSUM_AT: usize = 0x3FC;
+pub(crate) const CHECKSUM_AT: usize = 0x3FC;
 /// `i_flags`: `i_block` holds an extent tree.
 const EXTENTS_FL: u32 = 0x8_0000;
 /// The extent header's magic number.
@@ -53,29 +53,32 @@ const MAX_DEPTH: u16 = 5;
 
 /// The superblock fields journal recovery needs.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Volume {
-    pub(super) block_size: u32,
-    pub(super) blocks: u64,
+pub(crate) struct Volume {
+    pub(crate) block_size: u32,
+    pub(crate) blocks: u64,
     needs_recovery: bool,
-    incompat: u32,
+    pub(crate) incompat: u32,
     first_data_block: u32,
     blocks_per_group: u32,
     inodes_per_group: u32,
-    inode_size: u32,
+    /// `s_inodes_count`.
+    pub(crate) inodes: u32,
+    /// The size of an on-disk inode in bytes.
+    pub(crate) inode_size: u32,
     desc_size: u32,
     first_meta_bg: u32,
     reserved_gdt_blocks: u32,
-    compat: u32,
-    ro_compat: u32,
+    pub(crate) compat: u32,
+    pub(crate) ro_compat: u32,
     backup_groups: [u32; 2],
     /// The superblock's copy of the journal inode's `i_block`, `i_size_high` and `i_size`.
     journal_backup: Option<[u8; 68]>,
-    pub(super) journal_inode: u32,
+    pub(crate) journal_inode: u32,
 }
 
 impl Volume {
     /// Reads the fields from the superblock's bytes.
-    pub(super) fn parse(sb: &[u8; superblock::SIZE]) -> Result<Self, JournalError> {
+    pub(crate) fn parse(sb: &[u8; superblock::SIZE]) -> Result<Self, JournalError> {
         let geometry = superblock::Geometry::parse(sb)?;
         let incompat = le32(sb, 0x60);
         let wide = incompat & INCOMPAT_64BIT != 0;
@@ -107,6 +110,7 @@ impl Volume {
             first_data_block: le32(sb, 0x14),
             blocks_per_group: le32(sb, 0x20),
             inodes_per_group: le32(sb, 0x28),
+            inodes: le32(sb, 0x0),
             inode_size,
             desc_size,
             first_meta_bg: le32(sb, 0x104),
@@ -129,7 +133,7 @@ impl Volume {
 
     /// Whether the volume has an internal journal that needs replaying; an error for a
     /// journal kept on another device.
-    pub(super) fn needs_replay(&self) -> Result<bool, JournalError> {
+    pub(crate) fn needs_replay(&self) -> Result<bool, JournalError> {
         if !self.needs_recovery {
             return Ok(false);
         }
@@ -232,8 +236,20 @@ impl Volume {
         window: &Window<R>,
         number: u32,
     ) -> Result<Vec<u8>, JournalError> {
+        let mut inode = vec![0; self.inode_size as usize];
+        window.read_exact_at(&mut inode, self.inode_offset(window, number)?)?;
+        Ok(inode)
+    }
+
+    /// The byte offset of inode `number` on the volume, from its group descriptor.
+    pub(crate) fn inode_offset<R: ReadAt>(
+        &self,
+        window: &Window<R>,
+        number: u32,
+    ) -> Result<u64, JournalError> {
         let index = number
             .checked_sub(1)
+            .filter(|_| number <= self.inodes)
             .ok_or(JournalError::BadInode { number })?;
         let group = u64::from(index / self.inodes_per_group);
         let desc_offset = group * u64::from(self.desc_size);
@@ -241,7 +257,7 @@ impl Volume {
         // With meta_bg, only the descriptors before s_first_meta_bg are in the usual place.
         if self.incompat & INCOMPAT_META_BG != 0 && desc_block >= u64::from(self.first_meta_bg) {
             return Err(JournalError::Unsupported {
-                what: "a journal inode in a meta_bg group",
+                what: "an inode in a meta_bg group",
             });
         }
         // The descriptor table starts in the block after the superblock's.
@@ -256,9 +272,7 @@ impl Volume {
         };
         let inode_table = u64::from(high) << 32 | u64::from(le32(&desc, 0x8));
         let slot = u64::from(index % self.inodes_per_group) * u64::from(self.inode_size);
-        let mut inode = vec![0; self.inode_size as usize];
-        window.read_exact_at(&mut inode, self.block_offset(inode_table)? + slot)?;
-        Ok(inode)
+        Ok(self.block_offset(inode_table)? + slot)
     }
 }
 
@@ -273,15 +287,15 @@ struct Run {
 
 /// Where each block of the journal inode is on the volume.
 #[derive(Debug)]
-pub(super) struct BlockMap {
+pub(crate) struct BlockMap {
     runs: Vec<Run>,
     /// The journal's length in blocks, from the inode's size.
-    pub(super) len: u32,
+    pub(crate) len: u32,
 }
 
 impl BlockMap {
     /// Maps the journal inode of `volume`.
-    pub(super) fn load<R: ReadAt>(
+    pub(crate) fn load<R: ReadAt>(
         volume: &Volume,
         window: &Window<R>,
     ) -> Result<Self, JournalError> {
@@ -314,7 +328,7 @@ impl BlockMap {
     }
 
     /// Whether volume block `block` belongs to the journal.
-    pub(super) fn contains(&self, block: u64) -> bool {
+    pub(crate) fn contains(&self, block: u64) -> bool {
         self.runs
             .iter()
             .any(|run| (run.physical..run.physical + u64::from(run.len)).contains(&block))
@@ -361,7 +375,7 @@ impl BlockMap {
     }
 
     /// The volume block that holds journal block `block`.
-    pub(super) fn physical(&self, block: u32) -> Option<u64> {
+    pub(crate) fn physical(&self, block: u32) -> Option<u64> {
         let at = self.runs.partition_point(|run| run.logical <= block);
         let run = self.runs.get(at.checked_sub(1)?)?;
         let into = block - run.logical;
@@ -506,7 +520,7 @@ fn le16(raw: &[u8], at: usize) -> u16 {
 }
 
 /// The little-endian `u32` at `at`; every caller's buffer is long enough.
-pub(super) fn le32(raw: &[u8], at: usize) -> u32 {
+pub(crate) fn le32(raw: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
 }
 

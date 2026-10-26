@@ -10,6 +10,8 @@ description = "Native Cargo entry point for Ferric Oxide images and QEMU"
 clap.workspace = true
 semver.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

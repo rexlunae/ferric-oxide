@@ -8,8 +8,22 @@
 ## Without ferric.toml nothing changes. See tools/ferric-config/README.md.
 FERRIC_CONFIG?=ferric.toml
 FERRIC_OUT=build/ferric
+FERRIC_CONFIG_TOOL?=env -u RUSTUP_TOOLCHAIN -u CC -u TARGET -u RUSTFLAGS cargo run --quiet --release \
+	--manifest-path tools/ferric-config/Cargo.toml -- --config $(FERRIC_CONFIG) --out $(FERRIC_OUT)
+# Capture explicit target assignments before generated/default values are loaded.
+FERRIC_TARGET_OVERRIDES:=$(if $(filter undefined,$(origin ARCH)),,--override target.arch=$(ARCH)) $(if $(filter undefined,$(origin BOARD)),,--override target.board=$(BOARD)) $(if $(filter undefined,$(origin CONFIG_NAME)),,--override image.config=$(CONFIG_NAME)) $(if $(FERRIC_CPU_VARIANT),--override cpu.$(ARCH)_level=$(FERRIC_CPU_VARIANT))
+FERRIC_CONFIG_GOALS:=menuconfig config-check config-list config-generate
+FERRIC_CONFIG_ONLY:=$(if $(strip $(MAKECMDGOALS)),$(if $(filter-out $(FERRIC_CONFIG_GOALS),$(MAKECMDGOALS)),,1))
+ifneq ($(FERRIC_CONFIG_ONLY),1)
 ifneq ($(wildcard $(FERRIC_CONFIG)),)
+# Resolve before reading the include. Target overrides need not change any
+# file's timestamp, and Make 3.81 cannot reliably detect same-second rewrites.
+FERRIC_CONFIG_STATUS:=$(shell $(FERRIC_CONFIG_TOOL) generate $(FERRIC_TARGET_OVERRIDES) >&2; echo $$?)
+ifneq ($(FERRIC_CONFIG_STATUS),0)
+$(error ferric-config generation failed)
+endif
 include $(FERRIC_OUT)/config.mk
+endif
 endif
 
 HOST_ARCH?=$(shell uname -m)
