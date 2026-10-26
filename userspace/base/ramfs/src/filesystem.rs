@@ -29,6 +29,12 @@ pub struct File {
 }
 
 impl File {
+    /// Ferric Oxide: sets the owner and group `fchown` asks for, keeping either one that is
+    /// `ferric_abi::id::UNCHANGED` (-1, as POSIX `chown` defines it).
+    pub fn set_owner(&mut self, uid: u32, gid: u32) {
+        (self.uid, self.gid) = ferric_abi::id::owner_after((self.uid, self.gid), uid, gid);
+    }
+
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         match self.data {
             FileData::File(ref bytes) => {
