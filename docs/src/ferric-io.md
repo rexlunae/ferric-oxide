@@ -342,11 +342,15 @@ interrupts disabled, before it halts. A `Contended` result from the handler's
 switch is not retried inside the handler: spinning there with interrupts off
 could wait on a CPU that is waiting for this one. Instead, the handler returns
 to the idle loop past its `hlt`, and the loop switches again. The handler asks
-whether the CPU is idling through `try_idle_context` (#214), because
-`kernel.profiling`'s profiler CPU routes every vector from 33 up to this
-handler and never sets up contexts. Asking that CPU for its idle context
+whether the CPU is idling through `try_idle_context` (#214). The reason is
+`kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
+this handler and never sets up contexts. Asking that CPU for its idle context
 panicked; it then stopped answering TLB shootdowns, and the profile image hung
-with the other CPUs waiting for it.
+with the other CPUs waiting for it. Because the TLB shootdown vector is among
+those routed vectors, the handler now answers a pending shootdown on such a
+CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
+set, and the next broadcast shootdown (sent when a kernel shadow stack is
+freed) spins on it forever.
 
 ## Disk benchmark (ferric-iobench)
 
