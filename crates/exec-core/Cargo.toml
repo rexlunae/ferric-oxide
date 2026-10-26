@@ -1,0 +1,19 @@
+[package]
+name = "ferric-exec-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host-testable no_std executor core for kernel async work"
+
+[dependencies]
+
+[features]
+default = ["alloc"]
+# Dynamic task storage and container support. The wake path and the core state machine
+# need neither allocations nor locks. Turning this off leaves the clock, task ids
+# and task-step types; constructing an executor requires alloc.
+alloc = []
+
+[[example]]
+name = "microbench"
+required-features = ["alloc"]
