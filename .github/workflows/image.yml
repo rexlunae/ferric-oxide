@@ -448,7 +448,8 @@ jobs:
         run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
       - name: Check Adaptive requests actually overlap in dispatch
         if: env.CONFIG_NAME == 'ferric-smoke'
-        run: grep -aF "nvmed: Adaptive overlap dispatched" "$LOG"
+        run: |
+          grep -aF "nvmed: Adaptive overlap dispatched" "$LOG"
       # The image has kernel.trace on, so ferric-trace-test must run every step, not skip.
       - name: Check kernel tracing
         run: |
