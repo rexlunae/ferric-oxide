@@ -46,6 +46,13 @@ of archiving host metadata.
 
 ## Finishing an image with fox (Ferric Oxide)
 
+The installer places packages with fox's store (`crates/fox-store`): each
+configured package and its dependencies come from the cookbook's
+`repo/<target>/`, verified against `build/id_ed25519.pub.toml`, and are
+recorded in fox's database in the image. That key is installed as
+`/etc/fox/keys/cookbook.toml`. Without `--cookbook` no packages can be
+installed.
+
 `--fox=<host fox binary>` runs `fox` against the finished image root, after
 the packages, files and accounts are in place:
 
@@ -55,8 +62,7 @@ redox_installer image.img -c config/desktop.toml --cookbook=. \
     --fox-packages=config/packages.toml --fox-locked
 ```
 
-It runs `fox adopt-pkg --allow-unsigned-metadata`, then, with
-`--fox-packages`, `fox sync --config <set> --target <image target>`
+With `--fox-packages` it runs `fox sync --config <set> --target <image target>`
 (`--fox-locked` adds `--locked`), then, with `--fox-sbom`,
 `fox sbom --system`. A failing step fails the installation. The make
 build passes these options from `ferric.toml`; see the package tooling
