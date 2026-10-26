@@ -3842,6 +3842,7 @@ bitflags::bitflags! {
         /// Add a new mapping where no present PTE was. `Flusher` skips the shootdown for it on
         /// x86, which never caches not-present entries; other architectures still flush.
         const NEW_MAPPING = 1 << 31;
+        const NEW_MAPPING = 1 << 31;
     }
 }
 impl TlbShootdownActions {
