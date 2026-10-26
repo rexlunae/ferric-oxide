@@ -216,12 +216,46 @@ The goal is for Ferric Oxide to share disks with Linux and run on servers that w
 
 ## Phase 6: Graphics and desktop
 
-- **VMs first:** virtio-gpu with Venus (Vulkan) and virgl, so the desktop is accelerated under KVM.
-- **Bare metal:** a DRM/KMS-compatible user-space interface, so Mesa's `radv`/`radeonsi` (AMD) and `anv`/`iris` (Intel) drivers run largely unmodified. This is the same build-vs-port decision as Wi-Fi.
-- **Wayland compositor:** finish the COSMIC port (cosmic-comp on Smithay) as the main desktop, with Orbital kept as the fallback.
-- Use the GPU drivers' fds as capabilities, with buffers shared through the Phase 2 grant mechanism (a dma-buf equivalent).
+**Direction adopted 26 October 2026:** use Wayland, Smithay, Mesa and Xwayland.
+Graphics implementation is deferred until the current PR backlog has been
+merged; the prerequisites in Phases 2 and 5 still apply. Existing experimental
+recipes are groundwork, not evidence of a working accelerated desktop.
 
-**Exit:** a COSMIC session with hardware Vulkan on both reference machines, and a 4K desktop running at the display's refresh rate.
+- **Display and compositor:** use [Wayland](https://wayland.freedesktop.org/)
+  and standard desktop protocols, with [Smithay](https://github.com/Smithay/smithay)
+  as the Rust compositor foundation. Keep Ferric-specific integration in the
+  platform backend and window-management policy. Smithay is a library, so a
+  complete desktop shell remains future work; COSMIC is no longer the selected
+  desktop.
+- **Rendering:** use [Mesa](https://docs.mesa3d.org/) for EGL, OpenGL/OpenGL ES
+  and Vulkan. Software rendering remains useful for bring-up and diagnostics,
+  but does not satisfy the hardware-acceleration milestones.
+- **VMs first:** bring up virtio-gpu with VirGL for OpenGL, then Venus for
+  Vulkan, on a supported QEMU/KVM host. Verify that rendering uses the host GPU.
+- **Bare metal:** provide a DRM/KMS-compatible user-space interface and the
+  native GPU driver support Mesa needs, starting with one supported GPU at a
+  time. Modesetting, GPU memory management, command submission, buffer sharing
+  and synchronization are part of this work; porting the compositor alone does
+  not enable acceleration. Keep drivers isolated and license-compatible.
+- **Shared buffers:** use GPU driver fds as capabilities, with cross-process
+  buffer sharing built on the Phase 2 grant mechanisms. Add the graphics-specific
+  buffer formats, ownership and synchronization fences needed by Mesa and the
+  compositor; the existing grants are not a complete dma-buf implementation.
+- **Application compatibility:** support native Wayland toolkit applications
+  and [Xwayland](https://wayland.freedesktop.org/docs/book/Xwayland.html) for
+  legacy X11 clients. Applications and toolkits still need target ports or a
+  separate execution environment; display-protocol support is not Linux binary
+  compatibility.
+
+**Orbital is deprecated.** Retain it only as an optional legacy bring-up and
+compatibility path, with limited maintenance needed to keep existing use
+working. New graphics investment goes into the stack above. Removing Orbital
+or changing image defaults is a separate future change.
+
+**Exit:** a Smithay-based Wayland session with hardware-accelerated composition
+and Vulkan on both reference machines, native Wayland toolkit applications and
+X11 clients through Xwayland, and a 4K desktop running at the display's refresh
+rate. Verify GPU use separately from software fallback.
 
 ## Phase 7: Server
 
