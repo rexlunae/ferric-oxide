@@ -30,6 +30,7 @@ journal-replay = []
 write = ["journal-replay"]
 
 [dependencies]
+ferric-fspath = { path = "../../crates/fspath" }
 ext4-view = { version = "1.0.0", features = ["std"] }
 # The futimens sentinels (UTIME_NOW, UTIME_OMIT), shared with relibc.
 ferric-abi = { path = "../../crates/abi" }

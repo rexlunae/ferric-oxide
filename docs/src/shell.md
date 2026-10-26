@@ -1,12 +1,12 @@
 # Ion
 
-Ion is a terminal shell and library for shells/command execution in Redox, and it's used by default. Ion has it's own manual, which you can find on the [Ion Manual](https://doc.redox-os.org/ion-manual/).
+Ion is a terminal shell and library for shells/command execution from the Redox project, and it's the default shell here. Ion has it's own manual, which you can find on the [Ion Manual](https://doc.redox-os.org/ion-manual/).
 
-## 1. The default shell in Redox
+## 1. The default shell
 
 ### What is a terminal shell?
 
-A terminal shell is a layer around the operating system kernel and libraries, that allows users to interact with the operating system. That means a shell can be used on any operating system (Ion runs on both Linux and Redox) or implementation of a standard library as long as the provided API is the same. Shells can either be graphical (GUI) or command-line (CLI).
+A terminal shell is a layer around the operating system kernel and libraries, that allows users to interact with the operating system. That means a shell can be used on any operating system (Ion runs on both Linux and Ferric Oxide) or implementation of a standard library as long as the provided API is the same. Shells can either be graphical (GUI) or command-line (CLI).
 
 ### Text shells
 
@@ -37,7 +37,7 @@ Early [terminals](https://en.wikipedia.org/wiki/Computer_terminal) were devices 
 
 Terminals are used to read input from a keyboard and display textual output of the shell and other programs running inside it. This means that a terminal converts key strokes into control codes that are further used by the shell. The shell provides the user with a command line prompt (for instance: user name and working directory), line editing capabilities (Ctrl + a,e,u,k...), history, and the ability to run other programs (ls, uname, vim, etc.) according to user's input.
 
-TODO: In Linux we have device files like `/dev/tty`, how is this concept handled in Redox?
+TODO: In Linux we have device files like `/dev/tty`, how is this concept handled here?
 
 # Shell
 

@@ -49,6 +49,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use driver_block::{PendingIo, Transfer};
+use ferric_blkqueue::activity::{Activity, Claim as InFlightGuard};
 use ferric_blkqueue::ids::{self, IdStream, WORKER_GONE};
 use ferric_blkqueue::slot::{Claim, JobSlot, Outcome};
 use ferric_blkqueue::{QueuePolicy, Route};
@@ -133,8 +134,8 @@ pub struct Dispatcher {
     started: RefCell<HashMap<u64, Started>>,
     /// How requests are placed.
     policy: Cell<QueuePolicy>,
-    /// Requests in flight on any queue pair, the main thread's included.
-    in_flight: Rc<Cell<usize>>,
+    /// Requests in flight on any queue pair, including direct-response worker jobs.
+    in_flight: Activity,
     /// Held by the request running on the main thread's queue pair: its thread context (and
     /// bounce buffer) serves one request at a time, and its lock is reentrant, so concurrent
     /// requests on the scheme's thread must queue here instead.
@@ -146,22 +147,6 @@ pub struct Dispatcher {
 pub struct InlineGuard<'a> {
     _counted: InFlightGuard,
     _main: futures::lock::MutexGuard<'a, ()>,
-}
-
-/// One request counted in [`Dispatcher`]'s in-flight total until it is dropped.
-pub struct InFlightGuard(Rc<Cell<usize>>);
-
-impl InFlightGuard {
-    fn new(count: &Rc<Cell<usize>>) -> Self {
-        count.set(count.get() + 1);
-        Self(Rc::clone(count))
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
-    }
 }
 
 impl Dispatcher {
@@ -181,14 +166,14 @@ impl Dispatcher {
     /// the caller runs it inline while holding the guard. `None` means it goes to a worker
     /// through [`run`](Self::run).
     pub async fn claim_inline(&self) -> Option<InlineGuard<'_>> {
-        let route = match self.policy.get().route(self.in_flight.get()) {
+        let route = match self.policy.get().route(self.in_flight.count()) {
             Route::Worker if !self.workers.iter().any(Worker::is_alive) => Route::Main,
             route => route,
         };
         match route {
             Route::Main => {
                 // Counted before waiting, so that requests arriving meanwhile see this one.
-                let counted = InFlightGuard::new(&self.in_flight);
+                let counted = self.in_flight.claim();
                 let main = self.main_queue.lock().await;
                 Some(InlineGuard {
                     _counted: counted,
@@ -222,7 +207,7 @@ impl Dispatcher {
         lba: u64,
         op: Op,
     ) -> syscall::Result<usize> {
-        let _counted = InFlightGuard::new(&self.in_flight);
+        let _counted = self.in_flight.claim();
         let id = self.next_id.get();
         self.next_id.set(ids::next_id(id));
         let Some(index) = self.next_live_worker() else {
@@ -273,7 +258,11 @@ impl Dispatcher {
     /// Gives `io` back, untouched, when every worker has ended; the scheme then serves it on
     /// its own thread.
     pub fn submit(&self, namespace: NvmeNamespace, io: PendingIo) -> Result<(), PendingIo> {
-        let mut work = Work::Answer { namespace, io };
+        let mut work = Work::Answer {
+            namespace,
+            io,
+            _counted: self.in_flight.claim(),
+        };
         while let Some(index) = self.next_live_worker() {
             let worker = &self.workers[index];
             match worker.jobs.send(work) {
@@ -654,7 +643,7 @@ pub fn start(
         workers,
         next_worker: Cell::new(0),
         policy: Cell::new(QueuePolicy::default()),
-        in_flight: Rc::new(Cell::new(0)),
+        in_flight: Activity::default(),
         main_queue: futures::lock::Mutex::new(()),
         next_id: Cell::new(0),
         done,
@@ -860,7 +849,11 @@ fn serve(
                         in_flight.set(None);
                         end.report(id);
                     }
-                    Next::Job(Work::Answer { namespace, io }) => {
+                    Next::Job(Work::Answer {
+                        namespace,
+                        io,
+                        _counted,
+                    }) => {
                         in_flight.set(Some((WORKER_GONE, Instant::now())));
                         answer(&nvme, namespace, io).await;
                         in_flight.set(None);
@@ -882,6 +875,8 @@ enum Work {
     Answer {
         namespace: NvmeNamespace,
         io: PendingIo,
+        /// Retained through enqueue, response, failure and worker-exit cleanup.
+        _counted: InFlightGuard,
     },
 }
 

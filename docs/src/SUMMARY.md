@@ -37,7 +37,7 @@
 - [System Design](./system-design.md)
   - [Microkernels](./microkernels.md)
   - [Boot Process](./boot-process.md)
-  - [Redox kernel](./kernel.md)
+  - [The Kernel](./kernel.md)
   - [System Services in User Space](./user-space.md)
   - [Communication](./communication.md)
   - [Memory Management](./memory.md)

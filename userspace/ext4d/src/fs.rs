@@ -21,6 +21,10 @@
 //! Limitation: [`Attributes::ino`] is a stable number made from the path, so hard links to
 //! one inode get different numbers.
 
+/// Text path normalization shared with the other filesystem daemons.
+pub use ferric_fspath::normalize;
+use ferric_fspath::path_ino;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -1135,42 +1139,6 @@ fn read_entries(ext4: &Ext4, path: &str) -> Result<Vec<Entry>, Error> {
         });
     }
     Ok(entries)
-}
-
-/// `path` resolved against the directory `start` (both from the root), with `.` and `..`
-/// resolved as text and no empty components. The result starts with `/`; `..` at the root
-/// stays at the root.
-pub fn normalize(start: &str, path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    let full = if path.starts_with('/') {
-        [path, ""]
-    } else {
-        [start, path]
-    };
-    for component in full.iter().flat_map(|p| p.split('/')) {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            name => parts.push(name),
-        }
-    }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
-    out
-}
-
-/// A stable number for the file at `path`: 2 for the root, as in ext4, and a 64-bit FNV-1a
-/// hash of the path, kept clear of the small numbers ext4 reserves, for the rest.
-fn path_ino(path: &str) -> u64 {
-    if path == "/" {
-        return 2;
-    }
-    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    hash | 1 << 63
 }
 
 #[cfg(test)]

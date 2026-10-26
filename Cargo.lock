@@ -1381,6 +1381,10 @@ name = "ferric-exec-core"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-fspath"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-hwrand"
 version = "0.1.0"
 
