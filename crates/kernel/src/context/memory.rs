@@ -2065,6 +2065,12 @@ impl Grant {
                 let frame = if let Some(page_info) = get_page_info(frame) {
                     match page_info.add_ref(RefKind::Shared) {
                         Ok(()) => frame,
+                        // SAFETY: `guard` holds the source address space's lock, so no other
+                        // thread can change its tables. Remapping the page to the private copy
+                        // leaves the old translation cached; `flush.ignore()` is sound because
+                        // the remap and the old frame are queued on the source flusher, which
+                        // is flushed after the loop, so the old frame is freed only after every
+                        // CPU using the source address space has dropped the old translation.
                         Err(AddRefError::CowToShared) => unsafe {
                             let CowResult {
                                 new_frame: new_cow_frame,
