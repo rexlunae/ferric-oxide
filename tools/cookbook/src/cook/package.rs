@@ -314,13 +314,13 @@ pub fn package_handle_push(
     keys.insert(key.label, key.key);
     let archive = fox_core::archive::Archive::open(archive_path, &keys)?;
     let name = &archive.manifest().name;
-    match store.get(name)? {
-        Some(p) if p.state == fox_store::PackageState::Removing => {
-            // An interrupted removal: finish it, then install afresh.
-            store.remove(name, false)?;
-        }
-        Some(p) if p.archive_blake3 == Some(archive.blake3()) => return Ok(true),
-        _ => {}
+    // A record left Removing by an interrupted removal is not cached: the
+    // install replaces it, and as it still owns its files, restores any
+    // that are gone or changed.
+    if store.get(name)?.is_some_and(|p| {
+        p.state == fox_store::PackageState::Installed && p.archive_blake3 == Some(archive.blake3())
+    }) {
+        return Ok(true);
     }
     // Without features.toml packages.signed_manifests, cookbook archives
     // carry only the unsigned metadata file beside them.
@@ -409,18 +409,22 @@ mod tests {
     }
 
     #[test]
-    fn push_finishes_an_interrupted_removal() {
+    fn push_recovers_an_interrupted_removal() {
         let dir = tempfile::tempdir().unwrap();
         let key = FixtureKey::generate(dir.path(), "id_ed25519").unwrap();
         let manifest = Manifest::new(PackageName::new("app").unwrap(), "1.0");
-        let file = [FixtureEntry::file("usr/bin/app", b"app", 0o755)];
+        let file = [
+            FixtureEntry::file("usr/bin/app", b"app", 0o755),
+            FixtureEntry::file("usr/bin/tool", b"tool", 0o755),
+        ];
         let archive = build_package(dir.path(), &key, Some(&manifest), &file, false).unwrap();
         let sysroot = dir.path().join("sysroot");
         std::fs::create_dir(&sysroot).unwrap();
         let store = fox_store::Store::open(&sysroot).unwrap();
         package_handle_push(Some(&store), &key.public_path, &archive, &sysroot).unwrap();
 
-        // A removal cut off after it marked the package and took one file.
+        // A removal cut off after it marked the package and took one file,
+        // with another changed locally.
         let db = sysroot.join(fox_store::STATE_DIR).join("installed.toml");
         let text = std::fs::read_to_string(&db).unwrap();
         let removing = text.replacen(
@@ -435,9 +439,18 @@ mod tests {
             fox_store::PackageState::Removing
         );
         std::fs::remove_file(sysroot.join("usr/bin/app")).unwrap();
+        std::fs::write(sysroot.join("usr/bin/tool"), b"changed").unwrap();
 
         assert!(!package_handle_push(Some(&store), &key.public_path, &archive, &sysroot).unwrap());
-        assert!(sysroot.join("usr/bin/app").is_file(), "the file is back");
+        assert!(
+            sysroot.join("usr/bin/app").is_file(),
+            "the removed file is back"
+        );
+        assert_eq!(
+            std::fs::read(sysroot.join("usr/bin/tool")).unwrap(),
+            b"tool",
+            "the changed file is restored"
+        );
         let installed = store.get(&manifest.name).unwrap().unwrap();
         assert_eq!(installed.state, fox_store::PackageState::Installed);
     }
