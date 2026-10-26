@@ -33,6 +33,12 @@ on:
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
+concurrency:
+  # A new push to a pull request supersedes its older run; runs on main and
+  # ci/** branches are kept.
+  group: host-tools-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-24.04
