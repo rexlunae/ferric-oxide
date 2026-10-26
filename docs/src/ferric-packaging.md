@@ -176,7 +176,9 @@ database supplies management state, not a replacement trust root.
 ## Adopting pkg's packages
 
 `fox adopt-pkg` (`Store::adopt_pkg`) takes over a root that upstream `pkg`
-populated: the installer writes such roots, and older systems used `pkg`.
+populated, such as an older system or an image built by upstream's
+installer. Ferric's installer records packages with fox directly, so its
+images need no adoption.
 `pkg` lists its packages in `etc/pkg/packages.toml` and keeps each one's
 signed head in `var/lib/packages/<name>.pkgar_head`. For every listed
 package, adoption:
@@ -297,8 +299,8 @@ over HTTPS yet, which `pkg` does. Choose `packages.manager = "pkgutils"` for
 that.
 
 The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
-requires every package to have been installed with a signed manifest, then
-runs `fox verify --installed`.
+lists the packages the installer recorded and runs `fox verify --installed`,
+which checks each one against its signed head.
 
 ## Hermetic builds and attestations
 

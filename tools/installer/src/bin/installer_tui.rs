@@ -172,6 +172,16 @@ fn package_files(
     for dir in [fox_store::STATE_DIR, fox_core::keys::TRUSTED_KEYS_DIR] {
         state_files(root_path, &root_path.join(dir), files)?;
     }
+    // fox's configuration is reserved rather than owned by a package.
+    for file in [
+        fox_core::registries::REGISTRIES_FILE,
+        fox_core::policy::POLICY_FILE,
+        fox_core::trust::TRUST_FILE,
+    ] {
+        if root_path.join(file).is_file() {
+            files.push(file.to_string());
+        }
+    }
     Ok(())
 }
 
@@ -382,5 +392,43 @@ fn main() {
             eprintln!("redox_installer_tui: failed to install: {:?}", err);
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_files_keep_fox_state_and_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path();
+        let kept = [
+            fox_core::registries::REGISTRIES_FILE,
+            fox_core::policy::POLICY_FILE,
+            fox_core::trust::TRUST_FILE,
+            "etc/fox/keys/cookbook.pub.toml",
+        ];
+        for file in kept
+            .into_iter()
+            .chain(["var/lib/fox/registries/main/index.toml"])
+        {
+            let path = root_path.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        fox_store::Store::open(root_path).unwrap();
+
+        let mut files = Vec::new();
+        package_files(root_path, &mut Config::default(), &mut files).unwrap();
+        for file in kept {
+            assert!(files.iter().any(|f| f == file), "{file} is copied");
+        }
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.starts_with("var/lib/fox/registries")),
+            "registry checkouts are rebuilt, not copied"
+        );
     }
 }

@@ -1,5 +1,7 @@
+# Host and target installer share the in-tree source. The path source makes
+# the cookbook rebuild the installer when tools/installer changes; changes
+# only under crates/fox-* need `make cr.installer`, as for recipes/core/fox.
 [source]
-# Host and target installer share the in-tree source.
 path = "tools/installer"
 
 [build]
