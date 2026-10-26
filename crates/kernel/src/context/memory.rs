@@ -18,7 +18,7 @@ use core::{
     ops::{Bound, Deref},
     sync::atomic::{AtomicU32, Ordering},
 };
-use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush};
+use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush, PhysicalAddress};
 use smallvec::SmallVec;
 use syscall::{error::*, flag::MapFlags, GrantFlags, MunmapFlags, NumaMemoryPolicy};
 
@@ -2477,14 +2477,21 @@ impl Grant {
             let dst_page = dst_base.next_by(src_page.offset_from(self.base));
 
             // TODO: Validate flags?
-            let Some((phys, lvl, _flags, flush)) =
-                (unsafe { src_mapper.unmap_phys(src_page.start_address()) })
-            else {
+            // SAFETY: the grant owns these pages, and `src_flusher` shoots down the old
+            // translations (and the emptied page tables) before anything they held is freed.
+            let Some((phys, lvl)) = (unsafe {
+                src_mapper
+                    .unmap_phys_deferring_tables(
+                        src_page.start_address(),
+                        &mut queue_table_free(src_flusher),
+                    )
+                    .map(|(phys, lvl, _flags, flush)| {
+                        flush.ignore();
+                        (phys, lvl)
+                    })
+            }) else {
                 continue;
             };
-            unsafe {
-                flush.ignore();
-            }
             // TODO: huge pages
             debug_assert_eq!(lvl, 0, "no userspace pages have huge mappings");
 
@@ -2609,7 +2616,10 @@ impl Grant {
             for i in 0..self.info.page_count {
                 unsafe {
                     let (phys, lvl, _, flush) = mapper
-                        .unmap_phys(self.base.next_by(i).start_address())
+                        .unmap_phys_deferring_tables(
+                            self.base.next_by(i).start_address(),
+                            &mut queue_table_free(flusher),
+                        )
                         .expect("all physborrowed grants must be fully Present in the page tables");
                     flush.ignore();
                     // TODO: huge pages
@@ -2627,9 +2637,12 @@ impl Grant {
         } else {
             for page in self.span().pages() {
                 // Lazy mappings do not need to be unmapped.
-                let Some((phys, lvl, _, flush)) =
-                    (unsafe { mapper.unmap_phys(page.start_address()) })
-                else {
+                let Some((phys, lvl, _, flush)) = (unsafe {
+                    mapper.unmap_phys_deferring_tables(
+                        page.start_address(),
+                        &mut queue_table_free(flusher),
+                    )
+                }) else {
                     continue;
                 };
 
@@ -3471,6 +3484,19 @@ pub trait GenericFlusher {
         actions: TlbShootdownActions,
     );
 }
+/// Returns a callback for [`rmm::PageMapper::unmap_phys_deferring_tables`] that queues each
+/// emptied page-table frame on `flusher`, so it is freed only after the shootdown.
+fn queue_table_free(flusher: &mut impl GenericFlusher) -> impl FnMut(PhysicalAddress) + '_ {
+    move |table| {
+        flusher.queue(
+            Frame::containing(table),
+            None,
+            TlbShootdownActions::FREE_TABLE,
+        )
+    }
+}
+/// Applies actions immediately, for address spaces that no CPU has loaded (such as one being
+/// dropped), where there is nothing to shoot down.
 pub struct NopFlusher;
 impl GenericFlusher for NopFlusher {
     fn queue(
@@ -3479,10 +3505,21 @@ impl GenericFlusher for NopFlusher {
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
     ) {
-        if actions.contains(TlbShootdownActions::FREE) {
+        if actions.contains(TlbShootdownActions::FREE_TABLE) {
+            // No CPU has this address space loaded, so none can still walk through the table.
+            free_table_frame(frame);
+        } else if actions.contains(TlbShootdownActions::FREE) {
             handle_free_action(frame, phys_contiguous_count);
         }
     }
+}
+/// Returns a page-table frame that [`rmm::PageMapper::unmap_phys_deferring_tables`] unlinked to
+/// the frame allocator. Callers must only do so once no CPU can still walk through it.
+fn free_table_frame(frame: Frame) {
+    // SAFETY: the frame came from `TheFrameAllocator` as a page table and holds no `PageInfo`
+    // reference; the unmap unlinked it, and the callers free it only after the shootdown that
+    // drops every cached walk through it (or when no CPU has the address space loaded).
+    unsafe { deallocate_frame(frame) };
 }
 fn handle_free_action(base: Frame, phys_contiguous_count: Option<NonZeroUsize>) {
     if let Some(count) = phys_contiguous_count {
@@ -3535,6 +3572,10 @@ enum PageQueueEntry {
         base: Frame,
         phys_contiguous_count: Option<NonZeroUsize>,
     },
+    /// A page-table frame emptied by an unmap. Other CPUs' paging-structure caches may still
+    /// point at it, so the shootdown before it is freed must invalidate those caches too, not
+    /// only the TLB entries for the unmapped pages.
+    FreeTable(Frame),
     Other {
         actions: TlbShootdownActions,
         //page: Page,
@@ -3634,6 +3675,11 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 } => {
                     handle_free_action(base, phys_contiguous_count);
                 }
+                PageQueueEntry::FreeTable(frame) => {
+                    // Every CPU that had this address space loaded has now invalidated its TLB
+                    // and paging-structure caches.
+                    free_table_frame(frame);
+                }
                 PageQueueEntry::Other { actions } => {
                     // We currently invalidate everything on each flush
                     let _ = actions;
@@ -3651,7 +3697,9 @@ impl GenericFlusher for Flusher<'_, '_> {
     ) {
         let actions = actions & !TlbShootdownActions::NEW_MAPPING;
 
-        let entry = if actions.contains(TlbShootdownActions::FREE) {
+        let entry = if actions.contains(TlbShootdownActions::FREE_TABLE) {
+            PageQueueEntry::FreeTable(frame)
+        } else if actions.contains(TlbShootdownActions::FREE) {
             PageQueueEntry::Free {
                 base: frame,
                 phys_contiguous_count,
@@ -3685,6 +3733,11 @@ bitflags::bitflags! {
 
         // Unmap a page from one address space without deallocating it.
         const MOVE = 1 << 4;
+
+        // Delay the deallocation of a page-table frame that an unmap emptied. Unlike FREE, the
+        // frame has no PageInfo reference count; it goes straight back to the allocator. Always
+        // forces a shootdown round, which must also invalidate paging-structure caches.
+        const FREE_TABLE = 1 << 5;
 
         // Add a new mapping to an address space.
         // Not really a TLB shootdown action on most architectures, so almost always a no-op.

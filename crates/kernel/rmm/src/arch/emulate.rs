@@ -150,6 +150,18 @@ static MEMORY_AREAS: [MemoryArea; 2] = [
 
 static MACHINE: Mutex<Option<Machine<EmulateArch>>> = Mutex::new(None);
 
+/// Resets the global emulated machine and keeps other tests off it while the guard lives.
+#[cfg(test)]
+pub(crate) fn fresh_machine() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    let guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the guard serializes every test that uses the global emulated machine.
+    unsafe { EmulateArch::init() };
+    guard
+}
+
 struct Machine<A> {
     memory: Box<[u8]>,
     map: BTreeMap<VirtualAddress, PageEntry<A>>,
