@@ -60,8 +60,8 @@ fn mremap(old: usize, new: usize, flags: MremapFlags) -> syscall::Result<usize> 
     unsafe { syscall::syscall5(SYS_MREMAP, old, size, new, size, flags.bits() | rw().bits()) }
 }
 
-/// Replaces a mapping in place, moves it twice and forks a child that execs and exits.
-fn operations() -> Result<Addresses, Failure> {
+/// Replaces a mapping in place and moves it twice, the mapping operations before the fork.
+fn mapping_operations() -> Result<(usize, usize, usize), Failure> {
     let first = anonymous(STEP, PAGES)?;
     let fixed = Map {
         offset: 0,
@@ -89,14 +89,7 @@ fn operations() -> Result<Addresses, Failure> {
     succeeded(STEP, "munmap", unsafe {
         syscall::funmap(target, PAGES * PAGE)
     })?;
-    let (contiguous, child) = fork_with_contiguous()?;
-    Ok(Addresses {
-        first,
-        moved,
-        target,
-        contiguous,
-        child,
-    })
+    Ok((first, moved, target))
 }
 
 /// Forks a child while a page of contiguous memory is mapped, then unmaps that page; returns
@@ -125,12 +118,21 @@ fn fork_with_contiguous() -> Result<(usize, u32), Failure> {
     Ok((contiguous, child))
 }
 
-/// The new address space of this process's one successful `mm.clone`, from `space`.
-fn cloned(trace: &[Vec<Entry>], space: u64) -> Result<&Entry, Failure> {
-    let mut clones = trace
+/// The `mm.clone` records of this process's space, from `space`.
+fn clones<'a>(trace: &'a [Vec<Entry>], space: u64) -> impl Iterator<Item = &'a Entry> + 'a {
+    trace
         .iter()
         .flatten()
-        .filter(|e| e.is(&MM_CLONE) && e.arg(0) == Some(space));
+        .filter(move |e| e.is(&MM_CLONE) && e.arg(0) == Some(space))
+}
+
+/// The new address space of this process's one successful `mm.clone`, from `space`.
+///
+/// # Errors
+/// `no mm.clone of this address space` when the trace has none, `more than one mm.clone
+/// for one fork` when it has several.
+fn cloned(trace: &[Vec<Entry>], space: u64) -> Result<&Entry, Failure> {
+    let mut clones = clones(trace, space);
     let clone = clones
         .next()
         .ok_or_else(|| check(STEP, "no mm.clone of this address space"))?;
@@ -154,17 +156,50 @@ fn destroyed(trace: &[Vec<Entry>], clone: &Entry) -> bool {
 }
 
 /// Drains until the fork's copy has been torn down: the child's exec replaces it, and the
-/// kernel can finish that after `wait` returns.
-fn collect(cpus: &[u32], first: usize) -> Result<Vec<Vec<Entry>>, Failure> {
+/// kernel can finish that after `wait` returns. The fork's records may also arrive in a
+/// later drain than the first: they are written into whatever CPU ring the fork ran on, and
+/// a drain walks the rings one by one, so a record can land behind a drain that already
+/// passed its ring (a full ring can drop it too; the step's earlier drain before the fork
+/// makes that unlikely, and a rerun shows a drop). So absence of the clone alone is not a
+/// failure yet; only the limit ending without the pair is. A record that appears twice
+/// still fails at once; `verify` checks the arguments once the records are all in.
+fn collect(
+    cpus: &[u32],
+    space: u64,
+    mut trace: Vec<Vec<Entry>>,
+) -> Result<Vec<Vec<Entry>>, Failure> {
     let limit = Instant::now() + TEARDOWN;
-    let mut trace = drain(STEP, cpus)?;
-    let space = space(&trace, first)?;
     loop {
-        if destroyed(&trace, cloned(&trace, space)?) {
-            return Ok(trace);
+        // The clone's facts, copied out: nothing may borrow `trace` past the drain below.
+        let (mut new_space, mut clone_at, mut duplicates, mut torn) = (None, None, false, false);
+        for clone in clones(&trace, space) {
+            if new_space.is_none() {
+                new_space = clone.arg(1);
+                clone_at = Some(clone.timestamp);
+            } else {
+                duplicates = true;
+            }
+        }
+        if duplicates {
+            return Err(check(STEP, "more than one mm.clone for one fork"));
+        }
+        if let (Some(new), Some(at)) = (new_space, clone_at) {
+            torn = trace.iter().flatten().any(|e| {
+                e.is(&MM_DESTROY) && e.arg(0) == Some(new) && e.timestamp >= at
+            });
+            if torn {
+                return Ok(trace);
+            }
         }
         if Instant::now() >= limit {
-            return Err(check(STEP, "the forked address space was not destroyed"));
+            return Err(check(
+                STEP,
+                if new_space.is_some() {
+                    "the forked address space was not destroyed"
+                } else {
+                    "no mm.clone of this address space"
+                },
+            ));
         }
         std::thread::sleep(Duration::from_millis(1));
         trace.extend(drain(STEP, cpus)?);
@@ -245,7 +280,7 @@ fn verify(trace: &[Vec<Entry>], at: &Addresses) -> Result<(), Failure> {
 /// No journal record may appear once the events are off, for the same operations.
 fn disabled(cpus: &[u32]) -> Result<(), Failure> {
     drain(STEP, cpus)?;
-    operations()?;
+    mapping_operations()?;
     if drain(STEP, cpus)?
         .iter()
         .flatten()
@@ -270,7 +305,25 @@ pub(super) fn check_journal(cpus: &[u32]) -> Result<(), Failure> {
     command(STEP, &format!("disable {EVENTS}"))?;
     drain(STEP, cpus)?;
     command(STEP, &format!("enable {EVENTS}"))?;
-    let result = operations().and_then(|at| Ok((collect(cpus, at.first)?, at)));
+    let result = (|| {
+        let (first, moved, target) = mapping_operations()?;
+        // While the journal events are on, every mapping operation of every process is
+        // recorded, and on a busy boot the rings drop records from the moment they fill
+        // (`stats` counts the drops). Drain before the fork, keeping the mapping records,
+        // so the `mm.clone` and `mm.clone_skip` the fork is about to write land in rings
+        // with a whole ring of room until the next drain.
+        let mut trace = drain(STEP, cpus)?;
+        let (contiguous, child) = fork_with_contiguous()?;
+        let at = Addresses {
+            first,
+            moved,
+            target,
+            contiguous,
+            child,
+        };
+        let space = space(&trace, at.first)?;
+        collect(cpus, space, trace).map(|trace| (trace, at))
+    })();
     // Off again even when a step failed, so later steps are not traced.
     command(STEP, &format!("disable {EVENTS}"))?;
     let (mut trace, at) = result?;

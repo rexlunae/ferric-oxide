@@ -23,6 +23,7 @@ on:
       - "config/**"
       - "userspace/redoxfs/**"
       - "userspace/ext4d/**"
+      - "recipes/core/ext4d/**"
       - "recipes/tests/ferric-ext4-test/**"
       - "userspace/blockd/**"
       - "recipes/tests/ferric-blocklayer-test/**"
@@ -107,6 +108,15 @@ jobs:
           cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
           cargo test --locked -p ferric-blkqueue --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
+      # ferric-jbd2: JBD2 journal recovery planning, which ext4d's journal replay
+      # (fs.ext4_journal_replay) uses; no_std, so also built for a bare-metal target.
+      - name: ferric-jbd2
+        run: |
+          cargo clippy --locked --all-targets -p ferric-jbd2 -- -D warnings
+          cargo test --locked -p ferric-jbd2
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-jbd2
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-jbd2 --target x86_64-unknown-none
       # ferric-iobench: the disk benchmark's fio-style jobs, block order, latency histogram and
       # report (recipes/tests/ferric-iobench runs them on the target).
       - name: ferric-iobench
@@ -193,8 +203,9 @@ jobs:
       - name: Test
         run: cargo test --locked --lib
 
-  # ext4d (fs.ext4): its tests on the committed ext4 image and on one mke2fs makes now, its
-  # lints and docs for the host and for Redox, and the on-target test's lints.
+  # ext4d (fs.ext4): its tests on the committed ext4 images and on ones e2fsprogs makes now
+  # (the journal replay, fs.ext4_journal_replay, against e2fsck's), its lints and docs for
+  # the host and for Redox with and without the replay, and the on-target test's lints.
   ext4d:
     runs-on: ubuntu-24.04
     defaults:
@@ -213,21 +224,26 @@ jobs:
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml
-      - name: Test (committed image)
-        run: cargo test --locked
-      - name: Test (fresh image from mke2fs)
+      - name: Test (committed images)
+        run: |
+          cargo test --locked
+          cargo test --locked --features journal-replay
+      - name: Test (fresh images from e2fsprogs)
         run: |
           mke2fs -V
           mkdir -p "$RUNNER_TEMP/ext4"
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --target x86_64-unknown-redox -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
+          for features in "" "--features journal-replay"; do
+            cargo clippy --locked --all-targets $features -- -D warnings
+            cargo clippy --locked --all-targets --target x86_64-unknown-redox $features -- -D warnings
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps $features
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox $features
+          done
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
 

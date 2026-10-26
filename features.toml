@@ -49,6 +49,18 @@ soft-float without SSE/AVX, and its use of CPU features is controlled
 under Kernel > CPU feature use instead."""
 
 [[menu]]
+id = "cpu.x86_64"
+parent = "cpu"
+title = "x86-64 CPU support"
+help = "Minimum CPU baseline and independently selected x86-64 build variants."
+
+[[menu]]
+id = "cpu.aarch64"
+parent = "cpu"
+title = "ARM64 CPU support"
+help = "Minimum CPU baseline and independently selected ARM64 build variants."
+
+[[menu]]
 id = "kernel"
 title = "Kernel"
 help = "Cargo features and build-time policy for the kernel."
@@ -132,11 +144,10 @@ help = "Sub-device for AArch64 images, for example raspi3bp. Empty means generic
 
 [[option]]
 id = "cpu.x86_64_level"
-menu = "cpu"
+menu = "cpu.x86_64"
 type = "choice"
-title = "x86-64 microarchitecture level"
+title = "Minimum x86-64 baseline"
 default = "v3"
-depends = "target.arch == 'x86_64'"
 rebuild = ["*"]
 help = """
 psABI microarchitecture level for all userspace code.
@@ -155,7 +166,9 @@ v4 needs a kernel with AVX-512 state support (kernel.cpu.avx512), which
 v4 turns on by default.
 
 With packages.manager = "fox", v3 and v4 also pick the level of the
-prebuilt and source-built fox packages synced into the image."""
+prebuilt and source-built fox packages synced into the image.
+This baseline is independent of the variant checkboxes below. Normal builds use
+the baseline; cargo xtask build --all-variants builds the checked variants."""
 choices = [
   { value = "v1", title = "v1 (baseline)" },
   { value = "v2", title = "v2" },
@@ -164,37 +177,36 @@ choices = [
 ]
 
 [[option.effect]]
-when = "value == 'v1'"
+when = "target.arch == 'x86_64' && value == 'v1'"
 make = { QEMU_CPU = "core2duo" }
 
 # The kernel checks the CPU against the level at boot and halts with a list of
 # missing features, instead of user space dying later with an invalid opcode.
 [[option.effect]]
-when = "value != 'v1'"
+when = "target.arch == 'x86_64' && value != 'v1'"
 kernel_config = { "arch.x86_64.level" = "{value}" }
 
 [[option.effect]]
-when = "value == 'v2'"
+when = "target.arch == 'x86_64' && value == 'v2'"
 make = { QEMU_CPU = "Nehalem" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v2", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v2" }
 
 [[option.effect]]
-when = "value == 'v3'"
+when = "target.arch == 'x86_64' && value == 'v3'"
 make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v3" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v3", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v3" }
 
 [[option.effect]]
-when = "value == 'v4'"
+when = "target.arch == 'x86_64' && value == 'v4'"
 make = { QEMU_CPU = "max", FERRIC_FOX_LEVEL = "v4" }
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-cpu=x86-64-v4", FERRIC_TARGET_CPPFLAGS = "-march=x86-64-v4" }
 
 [[option]]
 id = "cpu.aarch64_level"
-menu = "cpu"
+menu = "cpu.aarch64"
 type = "choice"
-title = "AArch64 architecture version"
+title = "Minimum ARM64 baseline"
 default = "armv8.0-a"
-depends = "target.arch == 'aarch64'"
 rebuild = ["*"]
 help = """
 Minimum Arm architecture version for userspace code.
@@ -209,12 +221,58 @@ choices = [
 ]
 
 [[option.effect]]
-when = "value == 'armv8.2-a'"
+when = "target.arch == 'aarch64' && value == 'armv8.2-a'"
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-feature=+v8.2a", FERRIC_TARGET_CPPFLAGS = "-march=armv8.2-a" }
 
 [[option.effect]]
-when = "value == 'armv9-a'"
+when = "target.arch == 'aarch64' && value == 'armv9-a'"
 make_append = { FERRIC_TARGET_RUSTFLAGS = "-C target-feature=+v9a", FERRIC_TARGET_CPPFLAGS = "-march=armv9-a" }
+
+[[option]]
+id = "cpu.x86_64_v3"
+menu = "cpu.x86_64"
+type = "bool"
+title = "Build x86-64-v3 (AVX2) variant"
+default = true
+depends = "cpu.x86_64_level != 'v4'"
+help = "Include x86-64-v3 in cargo xtask build --all-variants. Independent of the v4 checkbox. Variants below the minimum baseline are inactive."
+
+[[option]]
+id = "cpu.x86_64_v4"
+menu = "cpu.x86_64"
+type = "bool"
+title = "Build x86-64-v4 (AVX-512) variant"
+default = false
+defaults = [{ when = "cpu.x86_64_level == 'v4'", value = true }]
+help = "Include x86-64-v4 in cargo xtask build --all-variants. This variant enables the matching kernel CPU-state policy; it does not change the saved minimum baseline."
+
+[[option]]
+id = "cpu.aarch64_v8_0"
+menu = "cpu.aarch64"
+type = "bool"
+title = "Build ARMv8.0-A variant"
+default = true
+depends = "cpu.aarch64_level == 'armv8.0-a'"
+help = "Include ARMv8.0-A in cargo xtask build --all-variants. Each ARM variant has an independent checkbox; variants below the minimum baseline are inactive."
+
+[[option]]
+id = "cpu.aarch64_v8_2"
+menu = "cpu.aarch64"
+type = "bool"
+title = "Build ARMv8.2-A variant"
+default = false
+defaults = [{ when = "cpu.aarch64_level == 'armv8.2-a'", value = true }]
+depends = "cpu.aarch64_level != 'armv9-a'"
+help = "Include ARMv8.2-A in cargo xtask build --all-variants, independently of ARMv8.0-A and ARMv9-A."
+
+[[option]]
+id = "cpu.aarch64_v9"
+menu = "cpu.aarch64"
+type = "bool"
+title = "Build ARMv9-A variant"
+default = false
+defaults = [{ when = "cpu.aarch64_level == 'armv9-a'", value = true }]
+help = "Include ARMv9-A in cargo xtask build --all-variants. These builds currently produce separate images; combining architectures in one image is future work."
 
 [[option]]
 id = "cpu.extra_rustflags"
@@ -646,6 +704,7 @@ menu = "kernel"
 type = "bool"
 title = "Page table isolation (KPTI)"
 default = false
+depends = "target.arch == 'x86_64'"
 experimental = true
 kernel_feature = "pti"
 rebuild = ["kernel"]
@@ -723,6 +782,7 @@ menu = "kernel"
 type = "bool"
 title = "Kernel profiling"
 default = false
+depends = "target.arch == 'x86_64'"
 kernel_feature = "profiling"
 rebuild = ["kernel"]
 help = "Sample kernel execution for the profiling tools."
@@ -1047,7 +1107,7 @@ title = "Panic on unexpected drops"
 default = false
 kernel_feature = "drop_panic"
 rebuild = ["kernel"]
-help = "Panic when certain kernel objects are dropped unexpectedly. For debugging leaks and use-after-free."
+help = "Panic when certain kernel objects are dropped unexpectedly. Empty wait conditions can be destroyed normally; nonempty lists still require explicit cleanup. For debugging leaks and use-after-free."
 
 [[option]]
 id = "kernel.cpu.smap"
@@ -1345,6 +1405,36 @@ crates/blocklayer. Source: userspace/blockd."""
 when = "value"
 source_packages = ["ferric-blockd"]
 make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
+
+[[option]]
+id = "fs.ext4_journal_replay"
+menu = "fs"
+type = "bool"
+title = "Replay ext4 journals onto the disk"
+default = false
+depends = "fs.ext4"
+rebuild = ["ext4d"]
+help = """
+When a volume was not cleanly unmounted, have ext4d replay its journal onto
+the disk before serving it, as `e2fsck -E journal_only` does: every committed
+transaction is written home, then the journal is emptied and the volume's
+needs_recovery flag cleared. Only then is the device opened for writing, and
+only for the replay; the volume is still served read-only. Every journal
+checksum, including that of every logged block, is checked before the first
+write; a damaged block that would be written stops the replay (with async
+commits it ends the log at its transaction instead). The journal's location is
+checked against the volume and its metadata, and an interrupted replay can be
+run again.
+
+Off, ext4d never writes, and reads such a volume through ext4-view's view of
+the journal in memory, which refuses journals with escaped blocks and does
+not follow a log that wraps round. This is the first step towards writable
+ext4. Source: crates/jbd2 and userspace/ext4d/src/journal."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_EXT4D_FEATURES = "journal-replay" }
+
 
 # ---------------------------------------------------------------- packages
 
