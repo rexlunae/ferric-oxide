@@ -56,11 +56,11 @@ Its MMIO translation follows every ancestor bus and rejects range crossings and
 overflow. The kernel retains its independent reservation-map and reserved-memory
 policy checks. This does not replace drivers or validate every device binding.
 
-The six imported subtrees are `crates/kernel/`, `crates/bootloader/`,
-`crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/`.
-`.github/workflows/subtree-sync.yml` pulls their upstream changes into this
-fork and proposes local pull requests. Installer and Redoxer are local snapshots
-and are not in that workflow's sync matrix. relibc's `openlibm` and
+`crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`,
+`userspace/redoxfs/` and `docs/` were imported from Redox OS as git subtrees,
+so their history is preserved, and Installer and Redoxer as snapshots. None of
+them is synced from Redox: they are maintained here, and a Redox change is
+ported by hand when it is wanted. relibc's `openlibm` and
 `dlmalloc-rs` remain nested submodules, registered in the root `.gitmodules`.
 
 ## From firmware to user programs
