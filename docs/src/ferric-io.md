@@ -917,7 +917,11 @@ device) and serves in the foreground until it is stopped.
   below) and `fstat` reads `st_ctime` from it (`i_ctime` with
   `i_ctime_extra`'s epoch bits and nanoseconds). Where the inode cannot be
   found (a path through an inline-data or encrypted directory) it reports the
-  modification time instead.
+  modification time instead. On a volume that needs recovery, `ext4-view`
+  reads through its in-memory view of the journal; the lookup and the change
+  time read the same way, with the committed journal blocks in place of their
+  home blocks (`ext4d::journal::committed_blocks`), so all of `fstat`'s times
+  agree.
 - **Limits:** `st_ino` is a hash of the path (hard links get different
   numbers); `mmap` is not served; encrypted files and devices are refused
   (`EOPNOTSUPP`).

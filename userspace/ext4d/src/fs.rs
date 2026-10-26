@@ -330,17 +330,71 @@ impl<W: crate::device::ReadAt> Ext4Read for Shared<W> {
     }
 }
 
-impl<R: crate::device::ReadAt + 'static> Device for Rc<RefCell<crate::device::Window<R>>> {
+/// The device read as `ext4-view` reads it: on a volume that needs recovery, with the
+/// committed journal blocks in place of their home blocks (`journal::committed_blocks`),
+/// since `ext4-view` overlays them too and its metadata would otherwise disagree with what
+/// is read here.
+struct Raw<R> {
+    device: Rc<RefCell<crate::device::Window<R>>>,
+    /// The committed journal blocks, or `None` when they could not be read; each read then
+    /// tries again, to return the error.
+    overlay: Option<BTreeMap<u64, Vec<u8>>>,
+    block_size: u64,
+}
+
+impl<R: crate::device::ReadAt> Raw<R> {
+    /// The device, with its overlay read now.
+    fn new(device: Rc<RefCell<crate::device::Window<R>>>, block_size: u32) -> Self {
+        let overlay = crate::journal::committed_blocks(&device.borrow())
+            .inspect_err(|err| {
+                log::warn!("cannot read the journal's committed blocks: {err}");
+            })
+            .ok();
+        Self {
+            device,
+            overlay,
+            block_size: u64::from(block_size),
+        }
+    }
+
+    /// Runs `read` on the device as `ext4-view` sees it.
+    fn read<T>(
+        &self,
+        read: impl FnOnce(
+            &crate::device::Window<crate::journal::Overlaid<'_, R>>,
+        ) -> Result<T, crate::lookup::LookupError>,
+    ) -> Result<T, crate::lookup::LookupError> {
+        let device = self.device.borrow();
+        let fresh;
+        let blocks = match &self.overlay {
+            Some(blocks) => blocks,
+            None => {
+                fresh = crate::journal::committed_blocks(&device)?;
+                &fresh
+            }
+        };
+        let overlaid = crate::journal::Overlaid {
+            window: &device,
+            blocks,
+            block_size: self.block_size,
+        };
+        let window =
+            crate::device::Window::whole(overlaid).map_err(crate::journal::JournalError::from)?;
+        read(&window)
+    }
+}
+
+impl<R: crate::device::ReadAt + 'static> Device for Raw<R> {
     fn reader(&self) -> Box<dyn Ext4Read> {
-        Box::new(Shared(Rc::clone(self)))
+        Box::new(Shared(Rc::clone(&self.device)))
     }
 
     fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError> {
-        crate::lookup::inode_of(&self.borrow(), path)
+        self.read(|window| crate::lookup::inode_of(window, path))
     }
 
     fn change_time(&self, number: u32) -> Result<(i64, u32), crate::lookup::LookupError> {
-        crate::lookup::change_time(&self.borrow(), number)
+        self.read(|window| crate::lookup::change_time(window, number))
     }
 }
 
@@ -367,7 +421,9 @@ impl Fs {
         device: crate::device::Window<R>,
     ) -> Result<Self, Error> {
         let sb = read_superblock(&device)?;
-        Self::load(&sb, Box::new(Rc::new(RefCell::new(device))))
+        let block_size = Geometry::parse(&sb)?.block_size;
+        let raw = Raw::new(Rc::new(RefCell::new(device)), block_size);
+        Self::load(&sb, Box::new(raw))
     }
 
     /// The volume whose superblock is `sb`, read through `device`.
@@ -402,7 +458,10 @@ impl Fs {
         crate::write::check_writable(&device)?;
         let sb = read_superblock(&device)?;
         let device = Rc::new(RefCell::new(device));
-        let mut fs = Self::load(&sb, Box::new(Rc::clone(&device)))?;
+        let block_size = Geometry::parse(&sb)?.block_size;
+        // A writable volume never needs recovery (check_writable), so its overlay is empty.
+        let raw = Raw::new(Rc::clone(&device), block_size);
+        let mut fs = Self::load(&sb, Box::new(raw))?;
         fs.writer = Some(Box::new(device));
         Ok(fs)
     }

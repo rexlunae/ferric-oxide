@@ -253,6 +253,40 @@ fn a_crash_at_any_write_leaves_the_change_made_or_not() {
     }
 }
 
+/// On a volume whose journal holds a committed change that is not home yet, a read-only
+/// mount reads the change time as `ext4-view` reads the other times: with the journal's
+/// blocks in place of their home blocks, not from the device as it is.
+#[test]
+fn an_unreplayed_change_time_is_read_through_the_journal() {
+    let before = clean("journal-v3");
+    // After five writes the transaction is committed and the journal points at it, but the
+    // inode table block is not home yet.
+    let mut window = Window::whole(Crashing {
+        bytes: before.clone(),
+        writes_left: 5,
+    })
+    .expect("its length");
+    write::set_times(&mut window, HELLO, &TIMES).expect_err("the device stops");
+    let crashed = window.into_inner().bytes;
+    assert!(
+        journal::needs_replay(&Window::whole(crashed.clone()).expect("its length"))
+            .expect("readable")
+    );
+    // The device still holds the old inode.
+    let at = inode_at(&crashed, HELLO);
+    assert_eq!(crashed[at..at + 256], before[at..at + 256]);
+
+    let mut fs = Fs::new(Window::whole(crashed).expect("its length")).expect("an ext4 volume");
+    assert!(fs.needs_recovery());
+    let root = fs.root().expect("the root");
+    let hello = fs
+        .open_as(Some(root), "hello.txt", OpenMode::read(), 0, 0)
+        .expect("hello.txt");
+    let attributes = fs.attributes(hello).expect("open");
+    assert_eq!((attributes.accessed, attributes.modified), NEW);
+    assert_eq!(attributes.changed, (CHANGED.seconds, CHANGED.nanoseconds));
+}
+
 #[test]
 fn a_volume_that_needs_recovery_is_replayed_first() {
     let image = load("journal-v3.ext4.gz");
