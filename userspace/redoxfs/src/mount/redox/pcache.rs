@@ -730,10 +730,24 @@ impl PageCache {
         let (Some(wb), Ok(node_id)) = (&mut self.writeback, u32::try_from(object.get())) else {
             return;
         };
-        // An object closed since the record was posted was written back as it went.
-        if self.files.contains_key(&node_id) {
-            wb.dirty.dirtied(node_id, Instant::now());
+        // Fsync may have cleaned the object while this record waited in the pump.
+        // The main loop serializes this query with flush completions. A write after
+        // a zero answer posts another record, so it cannot be missed here.
+        let Some(cached) = self.files.get(&node_id) else {
+            return;
+        };
+        let pages = match cached.object.dirty_pages() {
+            Ok(pages) => pages,
+            Err(err) => {
+                log::warn!("page cache: checking node {node_id}: {}", Chain(&err));
+                // Retain the timer on a query failure; dirty data must get another try.
+                1
+            }
+        };
+        if wb.dirty.observe(node_id, pages, Instant::now()) {
             wb.timer.arm();
+        } else {
+            wb.timer.disarm();
         }
     }
 }

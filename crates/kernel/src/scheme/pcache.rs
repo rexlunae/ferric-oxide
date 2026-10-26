@@ -1035,11 +1035,20 @@ impl KernelScheme for PcacheScheme {
             (Request::WrittenBack { pages, outcome }, Handle::Object(object)) => {
                 writeback::written_back(&object, pages, outcome, token)
             }
+            #[cfg(feature = "page_cache_writeback")]
+            (Request::DirtyPages, Handle::Object(object)) => {
+                let state = object.state.lock();
+                if state.gone {
+                    return Err(Error::new(EBADF));
+                }
+                Ok(state.index.dirty_pages())
+            }
             // Cached writes are the `page_cache_writeback` feature.
             #[cfg(not(feature = "page_cache_writeback"))]
             (Request::SetWriteback { .. }, Handle::Queue(_))
             | (
                 Request::HoldWrites { .. }
+                | Request::DirtyPages
                 | Request::TakeDirty { .. }
                 | Request::WrittenBack { .. },
                 Handle::Object(_),

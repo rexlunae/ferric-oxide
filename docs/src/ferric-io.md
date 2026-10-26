@@ -947,6 +947,16 @@ goes on, and the failures are counted. `client` has the calls and
 `spawn_flush_timer`, a thread that wakes the file system once a second while
 some object is dirty.
 
+Before arming the age timer for a writeback record, RedoxFS queries the object's
+current dirty-page count (`Request::DirtyPages`, verb 13, no payload). A record
+can wait in the pump until after fsync has cleaned the object; a zero count
+then removes it from the dirty set and leaves the timer disarmed if nothing
+else is dirty. The main loop serializes this check with its flush completions.
+A write after a zero answer posts another first-dirty record; a write before
+the answer is included in the count. Query errors retain the timer for retry.
+The kernel reads the count under only the object lock, without nesting a queue
+lock or altering the ordering used by writers and writeback.
+
 RedoxFS attaches every regular-file description except `O_FSYNC` ones, as
 opened (read-only, write-only or read-write), and writes back an object:
 
