@@ -95,8 +95,10 @@ To work on a single component without the full build system, use [Redoxer](https
 - Clean up warnings and resolve `TODO`, `FIXME` and `UNOPTIMIZED` markers.
 - Improve automated testing and continuous integration.
 
-## Working with upstream
+## Relationship to Redox OS
 
-Ferric Oxide tracks upstream Redox OS and pulls in its fixes. Internal names such as `redox` in target triples, paths and crate names stay as they are so that merges stay simple; please don't rename them in unrelated pull requests.
+Ferric Oxide was forked from Redox OS and its imported trees keep their history, but the connection is historical: nothing is synced from Redox automatically. If a Redox change is worth having, port it in an ordinary pull request that says where it came from.
+
+Internal names such as `redox` in target triples, paths and crate names stay as they are, because the Rust targets, existing tools and imported code depend on them; please don't rename them in unrelated pull requests.
 
 If you fix something that also affects Redox OS and wrote the fix yourself, consider sending it upstream under their [contribution guidelines](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/CONTRIBUTING.md). Redox OS does not accept LLM-generated contributions, so please do not send AI-generated work there.
