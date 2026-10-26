@@ -201,6 +201,78 @@ fn install_verifies_every_archive_before_installing_any() {
     assert!(!env.root.path().join("usr/bin/hello").exists());
 }
 
+impl Env {
+    /// A cookbook-style repository directory: `<name>.pkgar` per package.
+    fn repo_package(&self, name: &str, depends: &[&str]) -> PathBuf {
+        let dir = self.work.path().join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        let mut manifest = Manifest::new(PackageName::new(name).unwrap(), "1.0.0");
+        manifest.depends = depends
+            .iter()
+            .map(|dep| PackageName::new(*dep).unwrap())
+            .collect();
+        let file = format!("usr/share/{name}");
+        let entries = [FixtureEntry::file(&file, name.as_bytes(), 0o644)];
+        build_package(&dir, &self.key, Some(&manifest), &entries, false).unwrap();
+        dir
+    }
+}
+
+#[test]
+fn install_takes_names_and_dependencies_from_repositories() {
+    let env = Env::new();
+    env.trust_in_root();
+    env.repo_package("libc", &[]);
+    env.repo_package("libgui", &["libc"]);
+    let repo = env.repo_package("app", &["libgui", "libc", "absent"]);
+
+    let output = env.fox(&["--json", "install", "--repo", path_str(&repo), "app"]);
+    let installed = json(&output);
+    let order: Vec<_> = installed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["libc", "libgui", "app"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("app needs absent"), "{stderr}");
+    assert!(env.root.path().join("usr/share/libgui").is_file());
+}
+
+#[test]
+fn install_no_deps_installs_only_what_is_named() {
+    let env = Env::new();
+    env.trust_in_root();
+    env.repo_package("lib", &[]);
+    let repo = env.repo_package("app", &["lib"]);
+
+    let output = env.fox(&["install", "--no-deps", "--repo", path_str(&repo), "app"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(env.root.path().join("usr/share/app").is_file());
+    assert!(!env.root.path().join("usr/share/lib").exists());
+}
+
+#[test]
+fn install_refuses_untrusted_dependencies() {
+    let env = Env::new();
+    env.trust_in_root();
+    let repo = env.repo_package("app", &["lib"]);
+    let other = FixtureKey::generate(env.work.path(), "other").unwrap();
+    let manifest = Manifest::new(PackageName::new("lib").unwrap(), "1");
+    build_package(&repo, &other, Some(&manifest), &[], false).unwrap();
+
+    let output = env.fox(&["install", "--repo", path_str(&repo), "app"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot get lib, needed by app"), "{stderr}");
+    assert!(!env.root.path().join("usr/share/app").exists());
+}
+
 #[test]
 fn remove_rejects_bad_and_unknown_names() {
     let env = Env::new();

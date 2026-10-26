@@ -64,9 +64,10 @@ commit = "3f1c0e5a"
 
 `name` and `version` are required along with the format. Version strings are
 nonempty but need not be semantic versions. Dependency entries are package
-names; they do not express version constraints or implement resolution. Install
-reports missing dependencies but does not fetch them or refuse installation
-solely because they are absent.
+names; they do not express version constraints. `fox install` fetches the
+dependencies a package is missing (see [Dependencies](#dependencies)); one
+that no repository or registry has is reported, and does not stop the
+installation.
 
 The cookbook packs this manifest into every target package when
 `FERRIC_FOX_MANIFEST=1` (`packages.signed_manifests`, on by default with
@@ -116,6 +117,29 @@ a failing exit status. `install --force` permits replacement of otherwise
 conflicting unowned files; `remove --force` bypasses dependent-package refusal.
 Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
 under [Adopting pkg's packages](#adopting-pkgs-packages).
+
+### Dependencies
+
+`install --repo <dir>` (repeatable) names directories of archives called
+`<name>.pkgar`, such as the cookbook's `repo/<target>/`. A package named
+without a registry or version requirement is taken from the first of them
+that has it, before registries are tried:
+
+```sh
+fox --root ./image-root install --repo repo/x86_64-unknown-redox orbital
+```
+
+Once every named package is verified, `install` (`fox_store::deps::plan`)
+looks up each dependency that is neither installed nor already named: in
+the `--repo` directories in order, then in the configured registries (the
+newest release, prebuilt or built as `install <name>` would). It repeats
+for the dependencies of what it found, then installs everything with
+dependencies first. Each archive must verify against the trusted keys like
+a named one, and one that does not stops the command before anything is
+installed. An installed dependency is not upgraded. Dependency cycles are
+allowed. `--no-deps` installs only what was named. `fox sync` does not add
+dependencies: a package set lists every package it installs, so its lock
+pins all of them.
 
 ## Store behavior and persistence
 
@@ -229,9 +253,10 @@ forbid source builds. Registry checkouts and git source caches stay under
 the image's `var/lib/fox/`, where the target's `fox` can use them. The
 image SBOM is not signed yet.
 
-On the target, `fox` installs local `.pkgar` files only. It does not fetch
-from package servers or resolve dependencies, which `pkg` does. Choose
-`packages.manager = "pkgutils"` for that.
+On the target, `fox` installs local `.pkgar` files and their dependencies
+from local repository directories. It does not fetch from package servers
+over HTTPS yet, which `pkg` does. Choose `packages.manager = "pkgutils"` for
+that.
 
 The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
 requires every package to have been adopted with a signed manifest, then
@@ -900,8 +925,8 @@ that comes with images built through fox.
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
-No official registry is published, and `fox` resolves only the requested
-package, not its dependencies. Images are still assembled by the installer
+No official registry is published, and dependencies are found by name
+only, without version constraints. Images are still assembled by the installer
 with `pkg`'s library and then adopted by `fox`; only `packages.set` is
 installed by `fox` itself, and the image SBOM is unsigned. Downloading artifacts over HTTPS is not
 built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,

@@ -14,6 +14,9 @@ use fox_core::policy::{BuildPolicy, Policy};
 use fox_core::trust::TrustStore;
 use fox_core::{NameError, PackageName, TrustedKeys};
 use fox_sbom::{PackageSbom, SbomError};
+use fox_store::deps::{
+    self, ChainError, LocalRepository, LocalRepositoryError, NoSource, PackageSource, PlanError,
+};
 use fox_store::{
     AdoptOptions, InstallOptions, MetadataKind, Origin, PackageState, ProblemKind, Store,
     StoreError,
@@ -86,6 +89,17 @@ pub(crate) enum CliError {
     Sync(#[from] crate::sync::SyncError),
     #[error(transparent)]
     Inventory(#[from] crate::inventory::InventoryError),
+    #[error(transparent)]
+    LocalRepository(#[from] LocalRepositoryError),
+    #[error("{name} is named more than once")]
+    DuplicatePackage { name: PackageName },
+    #[error("cannot get {dependency}, needed by {package}")]
+    Dependency {
+        package: PackageName,
+        dependency: PackageName,
+        #[source]
+        source: Box<CliError>,
+    },
     #[error("invalid author key {key:?}")]
     AuthorKey {
         key: String,
@@ -97,6 +111,21 @@ pub(crate) enum CliError {
 impl From<RegistryError> for CliError {
     fn from(error: RegistryError) -> Self {
         Self::Registry(Box::new(error))
+    }
+}
+
+impl From<std::convert::Infallible> for CliError {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
+impl From<ChainError<LocalRepositoryError, CliError>> for CliError {
+    fn from(error: ChainError<LocalRepositoryError, CliError>) -> Self {
+        match error {
+            ChainError::First(error) => error.into(),
+            ChainError::Second(error) => error,
+        }
     }
 }
 
@@ -147,6 +176,8 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
             force,
             allow_unsigned_metadata,
             prebuilt,
+            repos,
+            no_deps,
             source,
             targets,
         } => install(
@@ -157,6 +188,10 @@ pub(crate) fn run(cli: &Cli) -> Result<ExitCode, CliError> {
             InstallOptions {
                 force: *force,
                 allow_unsigned_metadata: *allow_unsigned_metadata,
+            },
+            Dependencies {
+                repos,
+                skip: *no_deps,
             },
         ),
         Command::Build { out, source, spec } => build(cli, spec, source, out),
@@ -824,12 +859,69 @@ pub(crate) fn install_archive(
     })
 }
 
+/// Where `install` looks for packages named without a registry, and for
+/// the dependencies of what it installs.
+struct Dependencies<'a> {
+    /// Archive directories, tried in order before registries.
+    repos: &'a [PathBuf],
+    /// Install only what was named.
+    skip: bool,
+}
+
+impl Dependencies<'_> {
+    /// The archive of `spec` in the first repository that has one, for a
+    /// package named without a registry or version requirement.
+    fn local_archive(&self, spec: &PackageSpec) -> Option<PathBuf> {
+        if spec.registry.is_some() || spec.req != semver::VersionReq::STAR {
+            return None;
+        }
+        self.repos
+            .iter()
+            .map(|dir| dir.join(format!("{}.pkgar", spec.name)))
+            .find(|path| path.is_file())
+    }
+}
+
+/// The configured registries, as a source of dependencies: the newest
+/// release of each, prebuilt or built as `install <name>` would.
+struct RegistrySource<'a> {
+    root: &'a Path,
+    args: &'a SourceArgs,
+    policy: &'a Policy,
+    keys: &'a TrustedKeys,
+}
+
+impl PackageSource for RegistrySource<'_> {
+    type Error = CliError;
+
+    fn find(&mut self, name: &PackageName) -> Result<Option<(Archive, Option<Origin>)>, CliError> {
+        let spec = PackageSpec {
+            registry: None,
+            name: name.clone(),
+            req: semver::VersionReq::STAR,
+        };
+        match from_registry(self.root, &spec, self.args, self.policy) {
+            Ok((pending, origin)) => Ok(Some((open_pending(pending, self.keys)?, Some(origin)))),
+            Err(CliError::Registry(error))
+                if matches!(
+                    *error,
+                    RegistryError::NoRegistries | RegistryError::NoPackage { .. }
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn install(
     cli: &Cli,
     targets: &[String],
     prebuilt: Option<&Path>,
     source_args: &SourceArgs,
     options: InstallOptions,
+    dependencies: Dependencies<'_>,
 ) -> Result<ExitCode, CliError> {
     let store = Store::open(&cli.root)?;
     let root = store.root().to_path_buf();
@@ -840,7 +932,13 @@ fn install(
     let source_args = &source_args;
     let mut specs = Vec::new();
     for target in targets {
-        specs.push(classify(target)?);
+        specs.push(match classify(target)? {
+            Target::Registry(spec) => match dependencies.local_archive(&spec) {
+                Some(path) => Target::Archive(path),
+                None => Target::Registry(spec),
+            },
+            target => target,
+        });
     }
     let git_sources = specs
         .iter()
@@ -888,8 +986,24 @@ fn install(
         .into_iter()
         .map(|(pending, origin)| Ok((open_pending(pending, &keys)?, origin)))
         .collect::<Result<Vec<_>, CliError>>()?;
+    let plan = if dependencies.skip {
+        deps::plan(&store, archives, &mut NoSource).map_err(plan_error)?
+    } else {
+        let local: Vec<_> = dependencies
+            .repos
+            .iter()
+            .map(|dir| LocalRepository::new(dir, keys.clone()))
+            .collect();
+        let registries = RegistrySource {
+            root: &root,
+            args: source_args,
+            policy: &policy,
+            keys: &keys,
+        };
+        deps::plan(&store, archives, &mut (local, registries)).map_err(plan_error)?
+    };
     let mut results = Vec::new();
-    for (archive, origin) in archives {
+    for (archive, origin) in plan.install {
         results.push(install_archive(cli, &store, &archive, options, origin)?);
     }
     if cli.json {
@@ -1127,6 +1241,22 @@ fn remove(cli: &Cli, names: &[String], force: bool) -> Result<ExitCode, CliError
         print_json(&results)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn plan_error<E: Into<CliError>>(error: PlanError<E>) -> CliError {
+    match error {
+        PlanError::Store(error) => error.into(),
+        PlanError::Duplicate(name) => CliError::DuplicatePackage { name },
+        PlanError::Source {
+            package,
+            dependency,
+            source,
+        } => CliError::Dependency {
+            package,
+            dependency,
+            source: Box::new(source.into()),
+        },
+    }
 }
 
 fn exit_code(ok: bool) -> ExitCode {
