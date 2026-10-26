@@ -54,6 +54,11 @@ pub struct PercpuBlock {
     pub stats: CpuStats,
 
     pub numa_node: Cell<Option<(NumaNodeID, &'static NumaNode)>>,
+
+    /// Ferric Oxide: this CPU's TLB, CR3 and shootdown counters (`tlb_stats`), served as
+    /// `/scheme/sys/tlb`; see `crate::tlb_stats`.
+    #[cfg(feature = "tlb_stats")]
+    pub tlb_stats: ferric_trace::tlb::CpuCounters,
 }
 
 pub static ALL_PERCPU_BLOCKS: [AtomicPtr<PercpuBlock>; MAX_CPU_COUNT as usize] =
@@ -122,6 +127,7 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
         }
 
         crate::ipi::ipi_single(crate::ipi::IpiKind::Tlb, percpublock);
+        crate::tlb_stats::tlb_count!(TlbIpiSent);
     } else {
         let current = crate::cpu_id();
         for id in 0..crate::cpu_count() {
@@ -143,6 +149,7 @@ impl PercpuBlock {
 
         // TODO: Finer-grained flush
         crate::memory::RmmA::invalidate_all();
+        crate::tlb_stats::shootdown_handled();
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {
             addrsp.tlb_ack.fetch_add(1, Ordering::Release);
@@ -183,6 +190,7 @@ pub unsafe fn switch_arch_hook() {
         };
         if retain_pgtbl {
             // If we are not switching to a different address space, we can simply return early.
+            crate::tlb_stats::tlb_count!(Cr3Same);
             return;
         }
         if let Some(prev_addrsp) = &*cur_addrsp {
@@ -213,10 +221,22 @@ pub unsafe fn switch_arch_hook() {
         match next_addrsp_guard {
             Some(next_addrsp) => {
                 next_addrsp.table.utable.make_current();
+                crate::tlb_stats::tlb_count!(Cr3Switch);
+                crate::trace::trace_event!(
+                    ferric_trace::kernel::MM_CR3_SWITCH,
+                    ferric_trace::kernel::Cr3SwitchKind::AddrSpace.raw(),
+                    next_addrsp.table.utable.table().phys().data(),
+                );
                 drop(next_addrsp);
             }
             _ => {
                 crate::memory::RmmA::set_table(rmm::TableKind::User, empty_cr3());
+                crate::tlb_stats::tlb_count!(Cr3Empty);
+                crate::trace::trace_event!(
+                    ferric_trace::kernel::MM_CR3_SWITCH,
+                    ferric_trace::kernel::Cr3SwitchKind::Empty.raw(),
+                    0,
+                );
             }
         }
     }
@@ -242,6 +262,9 @@ impl PercpuBlock {
 
             stats: CpuStats::default(),
             numa_node: Cell::new(None),
+
+            #[cfg(feature = "tlb_stats")]
+            tlb_stats: ferric_trace::tlb::CpuCounters::new(),
         }
     }
 }

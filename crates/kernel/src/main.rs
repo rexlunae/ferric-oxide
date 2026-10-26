@@ -21,6 +21,9 @@ mod macros;
 /// Ferric Oxide: tracepoints (`trace_event!`) and their per-CPU rings (`kernel.trace`)
 mod trace;
 
+/// Ferric Oxide: per-CPU TLB, CR3 and shootdown counters (`tlb_count!`, `kernel.tlb_stats`)
+mod tlb_stats;
+
 /// Architecture-dependent stuff
 #[allow(dead_code)] // TODO
 mod arch;

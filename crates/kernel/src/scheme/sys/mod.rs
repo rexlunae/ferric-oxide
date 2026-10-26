@@ -38,6 +38,9 @@ mod log;
 mod proc;
 mod stat;
 mod syscall;
+// Ferric Oxide: TLB, CR3 and shootdown counters.
+#[cfg(feature = "tlb_stats")]
+mod tlb;
 mod uname;
 
 enum Handle {
@@ -99,6 +102,8 @@ const FILES: &[(&str, Kind)] = &[
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     ("spurious_irq", Rd(interrupt::irq::spurious_irq_resource)),
     ("stat", Rd(stat::resource)),
+    #[cfg(feature = "tlb_stats")]
+    (ferric_trace::tlb::SYS_FILE, Rd(tlb::resource)),
     // Disabled because the debugger is inherently unsafe and probably will break the system.
     /*
     ("trigger_debugger", Rd(|token| unsafe {

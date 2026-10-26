@@ -6,7 +6,8 @@
 //! Some arguments are codes rather than plain numbers. Their one definition is here, next to
 //! the events, so the kernel encodes them and decoders read them the same way:
 //! [`PageFaultFlags`] and [`PageFaultOutcome`] for `mm.page_fault`, [`IrqSource`] for
-//! `irq.deliver` and [`IommuFormat`] for `iommu.fault`.
+//! `irq.deliver`, [`IommuFormat`] for `iommu.fault` and [`Cr3SwitchKind`] for
+//! `mm.cr3_switch`.
 
 use core::fmt;
 
@@ -478,6 +479,55 @@ crate::events! {
         level: Info,
         args: ["drained"],
     }
+
+    /// A `Flusher` batch finished: a change to a user address space's mappings (or 32
+    /// queued pages of one) has been made visible to every CPU. The arguments are the other
+    /// CPUs that had the address space loaded and were made to flush (0 when none was: no
+    /// shootdown), the queued page entries, whether this CPU flushed its own TLB (0 or 1),
+    /// and the TSC ticks it spun waiting for the targets' acknowledgements.
+    ///
+    /// The kernel flushes whole TLBs for a batch, never single pages, so `pages` is the
+    /// batch's size, not the number of `invlpg`s. A debug-level event for TLB cost work; the
+    /// `/scheme/sys/tlb` counters (`kernel.tlb_stats`) count the same without a capture.
+    pub const MM_TLB_FLUSH = 36 {
+        name: "mm.tlb_flush",
+        subsystem: Mm,
+        level: Debug,
+        args: ["targets", "pages", "local", "wait_cycles"],
+    }
+
+    /// This CPU took a TLB shootdown IPI: whether a request was still pending (1, answered
+    /// with a full flush now) or the CPU had already answered it by polling (0), while
+    /// waiting on a shootdown of its own or at a context switch. Debug level.
+    pub const MM_TLB_IPI = 37 {
+        name: "mm.tlb_ipi",
+        subsystem: Mm,
+        level: Debug,
+        args: ["handled"],
+    }
+
+    /// A context switch loaded CR3, flushing this CPU's TLB (the kernel never sets CR3's
+    /// no-flush bit there): a [`Cr3SwitchKind`], and the user page-table root it loaded (the
+    /// `space` of `mm.map` records; 0 for the empty table). Switches that keep the address
+    /// space load nothing and are not recorded: they are the `sched.switch` records without
+    /// one of these. Debug level.
+    pub const MM_CR3_SWITCH = 38 {
+        name: "mm.cr3_switch",
+        subsystem: Mm,
+        level: Debug,
+        args: ["kind", "space"],
+    }
+
+    /// A DMA domain operation (map, unmap or protect) invalidated the IOTLB of its attached
+    /// units and waited for them: domain ID, IOVA, byte length, the number of units
+    /// invalidated, and the TSC ticks the invalidations took. Operations that invalidated
+    /// no unit (VT-d units outside caching mode, on a map) are not recorded. Debug level.
+    pub const IOMMU_IOTLB_FLUSH = 39 {
+        name: "iommu.iotlb_flush",
+        subsystem: Iommu,
+        level: Debug,
+        args: ["domain", "iova", "bytes", "units", "cycles"],
+    }
 }
 
 /// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
@@ -701,6 +751,46 @@ impl fmt::Display for IommuFormat {
     }
 }
 
+/// What a context switch loaded into CR3: the `kind` of an `mm.cr3_switch` record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum Cr3SwitchKind {
+    /// Another address space's table.
+    AddrSpace = 0,
+    /// The empty table, for a context without an address space (a kernel context).
+    Empty = 1,
+}
+
+impl Cr3SwitchKind {
+    /// Every kind.
+    pub const ALL: [Self; 2] = [Self::AddrSpace, Self::Empty];
+
+    /// The raw argument.
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+
+    /// The kind of a raw argument, if it is one.
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.raw() == raw)
+    }
+
+    /// The kind's name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AddrSpace => "address space",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl fmt::Display for Cr3SwitchKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +846,10 @@ mod tests {
         assert_eq!(SCHED_TICK.id().get(), 33);
         assert_eq!(SCHED_IPI_PIT.id().get(), 34);
         assert_eq!(SCHED_IPI_WAKE.id().get(), 35);
+        assert_eq!(MM_TLB_FLUSH.id().get(), 36);
+        assert_eq!(MM_TLB_IPI.id().get(), 37);
+        assert_eq!(MM_CR3_SWITCH.id().get(), 38);
+        assert_eq!(IOMMU_IOTLB_FLUSH.id().get(), 39);
         assert_eq!(SCHEME_SQE_DELIVER.id().get(), 31);
         assert_eq!(SCHEME_SQE_DELIVER.subsystem(), Subsystem::Scheme);
         assert_eq!(SCHEME_CQE_RECEIVE.id().get(), 32);
@@ -809,6 +903,33 @@ mod tests {
         // a measured kernel close to the unmeasured one until a profile asks for them.
         assert_eq!(SCHEME_SQE_DELIVER.level(), crate::Level::Debug);
         assert_eq!(SCHEME_CQE_RECEIVE.level(), crate::Level::Debug);
+        // TLB events fire on every mapping change, switch and IOTLB flush: debug too.
+        for event in [
+            &MM_TLB_FLUSH,
+            &MM_TLB_IPI,
+            &MM_CR3_SWITCH,
+            &IOMMU_IOTLB_FLUSH,
+        ] {
+            assert_eq!(event.level(), crate::Level::Debug, "{}", event.name());
+        }
+    }
+
+    #[test]
+    fn tlb_events_use_the_memory_and_iommu_controls_at_debug() {
+        let info = |f: &str| f == "trace_mm" || f == "trace_iommu" || f == "trace_level_info";
+        let debug = |f: &str| info(f) || f == "trace_level_debug";
+        let at_info = CATALOG.compiled_for(info);
+        let at_debug = CATALOG.compiled_for(debug);
+        let mm = crate::select(&CATALOG, "mm").unwrap();
+        for event in [&MM_TLB_FLUSH, &MM_TLB_IPI, &MM_CR3_SWITCH] {
+            assert_eq!(event.subsystem(), Subsystem::Mm);
+            assert!(mm.contains(event.id()));
+            assert!(!at_info.contains(event.id()));
+            assert!(at_debug.contains(event.id()));
+        }
+        assert_eq!(IOMMU_IOTLB_FLUSH.subsystem(), Subsystem::Iommu);
+        assert!(!at_info.contains(IOMMU_IOTLB_FLUSH.id()));
+        assert!(at_debug.contains(IOMMU_IOTLB_FLUSH.id()));
     }
 
     #[test]
@@ -930,5 +1051,9 @@ mod tests {
             assert_eq!(IommuFormat::from_raw(format.raw()), Some(format));
         }
         assert_eq!(IommuFormat::from_raw(0), None);
+        for kind in Cr3SwitchKind::ALL {
+            assert_eq!(Cr3SwitchKind::from_raw(kind.raw()), Some(kind));
+        }
+        assert_eq!(Cr3SwitchKind::from_raw(2), None);
     }
 }

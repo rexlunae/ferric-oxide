@@ -22,9 +22,14 @@ version = "0.1.0"
 dependencies = [
  "ferric-blkqueue",
  "ferric-iobench",
+ "ferric-trace",
  "libredox",
  "redox_syscall",
 ]
+
+[[package]]
+name = "ferric-trace"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

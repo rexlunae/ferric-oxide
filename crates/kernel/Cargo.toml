@@ -164,6 +164,9 @@ debugger = ["syscall_debug"]
 syscall_debug = []
 
 sys_fdstat = []
+# Ferric Oxide: per-CPU TLB, CR3 and shootdown counters served as /scheme/sys/tlb
+# (kernel.tlb_stats), in ferric-trace's tlb format.
+tlb_stats = ["dep:ferric-trace"]
 # Ferric Oxide: /scheme/sys/proc, per-process introspection (kernel.sys_proc).
 sys_proc = ["dep:ferric-procinfo"]
 

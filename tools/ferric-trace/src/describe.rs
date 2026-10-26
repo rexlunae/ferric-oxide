@@ -7,13 +7,14 @@
 //! - `iommu.fault`: the hardware's report decoded by its own crate, `ferric-vtd` for a VT-d
 //!   fault record and `ferric-amdvi` for an AMD-Vi event log entry, the same decoders the
 //!   kernel's log line uses.
+//! - `mm.cr3_switch`: what the switch loaded ([`Cr3SwitchKind`]).
 //!
 //! Other events need no description: their arguments are plain numbers.
 
 use ferric_amdvi::event::Event as AmdViEvent;
 use ferric_trace::kernel::{
-    IOMMU_FAULT, IRQ_DELIVER, IommuFormat, IrqSource, MM_PAGE_FAULT, PageFaultFlags,
-    PageFaultOutcome,
+    Cr3SwitchKind, IOMMU_FAULT, IRQ_DELIVER, IommuFormat, IrqSource, MM_CR3_SWITCH, MM_PAGE_FAULT,
+    PageFaultFlags, PageFaultOutcome,
 };
 use ferric_vtd::fault::FaultRecord;
 
@@ -28,6 +29,8 @@ pub fn describe(entry: &Entry) -> Option<String> {
         Some(irq_deliver(entry))
     } else if id == IOMMU_FAULT.id() {
         Some(iommu_fault(entry))
+    } else if id == MM_CR3_SWITCH.id() {
+        Some(cr3_switch_kind(entry.arg(0)))
     } else {
         None
     }
@@ -57,6 +60,11 @@ fn irq_deliver(entry: &Entry) -> String {
 /// The name of an interrupt's raw source, or the number when it is not one.
 pub fn source_name(raw: u64) -> String {
     IrqSource::from_raw(raw).map_or_else(|| format!("source {raw}"), |s| s.to_string())
+}
+
+/// `mm.cr3_switch`: the name of what the switch loaded, or the number when it is not a kind.
+pub fn cr3_switch_kind(raw: u64) -> String {
+    Cr3SwitchKind::from_raw(raw).map_or_else(|| format!("kind {raw}"), |k| k.to_string())
 }
 
 /// `iommu.fault`: the decoded report, and how many times it was reported in a row.
@@ -120,6 +128,16 @@ pub(crate) mod tests {
         assert_eq!(describe(&line).as_deref(), Some("line, 0 handles"));
         assert_eq!(describe(&entry(&IRQ_ACK, &[11, 2, 5])), None);
         assert_eq!(describe(&entry(&SYSCALL_EXIT, &[1, 2])), None);
+    }
+
+    #[test]
+    fn cr3_switches_name_what_they_loaded() {
+        let other = entry(&MM_CR3_SWITCH, &[0, 0x1234_0000]);
+        assert_eq!(describe(&other).as_deref(), Some("address space"));
+        let empty = entry(&MM_CR3_SWITCH, &[1, 0]);
+        assert_eq!(describe(&empty).as_deref(), Some("empty"));
+        let odd = entry(&MM_CR3_SWITCH, &[5, 0]);
+        assert_eq!(describe(&odd).as_deref(), Some("kind 5"));
     }
 
     #[test]

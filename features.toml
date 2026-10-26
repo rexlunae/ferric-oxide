@@ -865,7 +865,10 @@ torn down). Also compile in mm.page_fault, one record per page fault the kernel 
 faulting address, the instruction pointer, the kind of access (read, write or
 fetch; user or kernel; page present or not) and the outcome (mapped, a failed
 copy to or from user memory, or unhandled). Faults the kernel takes on purpose
-to probe memory are not recorded."""
+to probe memory are not recorded. With kernel.trace_max_level = "debug", also
+compile in the TLB maintenance events: mm.tlb_flush (each Flusher batch, its
+shootdown targets, pages and acknowledgement wait), mm.tlb_ipi (a TLB
+shootdown IPI taken) and mm.cr3_switch (a context switch that loaded CR3)."""
 
 [[option]]
 id = "kernel.trace_irq"
@@ -899,7 +902,9 @@ or an AMD-Vi event log entry), and ferric-trace decodes it. These are
 error-level events, so any kernel.trace_max_level compiles them in. Also compile
 in the info-level iommu.map, iommu.protect and iommu.unmap events for completed
 DMA domain operations, after required IOTLB invalidation. Failed/partial changes
-and whole-domain destruction are not a complete mapping journal."""
+and whole-domain destruction are not a complete mapping journal. With
+kernel.trace_max_level = "debug", also compile in iommu.iotlb_flush: each
+operation's IOTLB invalidation, its unit count and the TSC ticks it took."""
 
 [[option]]
 id = "kernel.trace_max_level"
@@ -1088,6 +1093,26 @@ CPU and CPU time, its memory, each open file descriptor (the scheme it is open
 on and the handle) and each grant of its address space (address, size, where
 the memory comes from, protection). Only root may read it, since it shows
 addresses. The format is the ferric-procinfo crate's."""
+
+[[option]]
+id = "kernel.tlb_stats"
+menu = "kernel"
+type = "bool"
+title = "TLB, CR3 and shootdown counters in sys:"
+default = false
+kernel_feature = "tlb_stats"
+rebuild = ["kernel"]
+help = """
+Count, per CPU, what TLB maintenance costs: context switches that load CR3 (to
+another address space or the empty table) and those that keep it, single-page
+and full TLB flushes, TLB shootdowns (target CPUs, pages per batch, TSC ticks
+spent waiting for acknowledgements), shootdown IPIs sent, taken and answered,
+IOMMU IOTLB invalidations, and system calls (each a pair of CR3 switches with
+KPTI). Serve them as /scheme/sys/tlb, in the ferric-trace crate's tlb format,
+for benchmarks to read before and after a run; ferric-iobench prints the
+per-operation deltas when the file exists. Each count is a relaxed per-CPU
+add on paths that already flush a TLB or switch address spaces, and one on
+every system call. Off by default; without it nothing is counted."""
 
 [[option]]
 id = "kernel.busy_panic"

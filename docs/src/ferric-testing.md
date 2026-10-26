@@ -712,6 +712,19 @@ nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
 This checks accounting and feature integration; controller timing and idle-burst
 reporting still need an instrumented target boot.
 
+### TLB counters
+
+`cargo test --locked -p ferric-trace` covers the `/scheme/sys/tlb` line format
+(`tlb::tests`: round trip, refused lines, wrapping deltas, the per-read
+figures `ferric-iobench` prints) and the catalog checks that keep the TLB
+events at debug level under `trace_mm` and `trace_iommu`. The iobench runner's
+host tests check that the round's start hook (where the first snapshot is
+taken) runs once, before any work. The kernel side is checked by building it:
+Clippy for the kernel target with `--features tlb_stats` and with the debug
+trace levels, and with `iommu = "auto"` so the IOTLB accounting compiles, plus
+the lint ratchet for the default build. The counts themselves need a boot
+(`kernel.tlb_stats = true`; read `/scheme/sys/tlb`, or run `ferric-iobench`).
+
 ### Profiler CPU wakeup acknowledgements
 
 The host kernel helper suite includes `context/idle.rs`, used by the real

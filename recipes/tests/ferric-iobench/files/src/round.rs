@@ -105,18 +105,39 @@ impl StartGate {
 ///
 /// [`SpawnError`] when a thread cannot be started: the gate then opens to give up, and the
 /// threads already started return without running `work`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_together<T, F>(threads: u32, work: F) -> Result<Timed<T>, SpawnError>
 where
     T: Send,
     F: Fn() -> T + Sync,
 {
-    run_with(threads, work, |_| None)
+    run_with(threads, work, || {}, |_| None)
 }
 
-/// [`run_together`], with `fail` able to refuse to start thread `i` (for the tests).
+/// [`run_together`], calling `at_start` once every thread is ready, just before the clock
+/// starts: the runner snapshots the kernel's TLB counters there, so thread start-up is not
+/// counted either.
+///
+/// # Errors
+///
+/// As [`run_together`]; `at_start` is not called then.
+pub fn run_together_at<T, F>(
+    threads: u32,
+    work: F,
+    at_start: impl FnOnce(),
+) -> Result<Timed<T>, SpawnError>
+where
+    T: Send,
+    F: Fn() -> T + Sync,
+{
+    run_with(threads, work, at_start, |_| None)
+}
+
+/// [`run_together_at`], with `fail` able to refuse to start thread `i` (for the tests).
 fn run_with<T, F>(
     threads: u32,
     work: F,
+    at_start: impl FnOnce(),
     fail: impl Fn(u32) -> Option<io::Error>,
 ) -> Result<Timed<T>, SpawnError>
 where
@@ -148,6 +169,7 @@ where
             }
         }
         gate.wait_ready(threads);
+        at_start();
         let start = Instant::now();
         gate.open(true);
         let mut end = start;
@@ -198,9 +220,13 @@ mod tests {
     #[test]
     fn a_thread_that_cannot_start_releases_the_others() {
         let ran = AtomicU32::new(0);
+        let started = AtomicU32::new(0);
         let err = run_with(
             8,
             || ran.fetch_add(1, Ordering::Relaxed),
+            || {
+                started.fetch_add(1, Ordering::Relaxed);
+            },
             |i| (i == 5).then(|| io::Error::from(io::ErrorKind::OutOfMemory)),
         )
         .err()
@@ -209,6 +235,22 @@ mod tests {
         assert_eq!(err.started, 5);
         assert_eq!(err.source.kind(), io::ErrorKind::OutOfMemory);
         assert_eq!(ran.load(Ordering::Relaxed), 0);
+        assert_eq!(started.load(Ordering::Relaxed), 0);
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn the_start_hook_runs_once_before_any_work() {
+        let marked = AtomicU32::new(0);
+        let timed = run_together_at(
+            4,
+            || marked.load(Ordering::Relaxed),
+            || {
+                marked.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+        // Every thread saw the hook's mark: it ran before the gate opened, exactly once.
+        assert!(timed.results.into_iter().all(|seen| seen == Some(1)));
     }
 }
