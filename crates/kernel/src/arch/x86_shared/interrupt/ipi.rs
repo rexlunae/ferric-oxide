@@ -27,18 +27,18 @@ crate::interrupt!(wakeup, || {
     };
     local_apic::eoi();
     // Ferric Oxide (issue #200): the drain moved the wake-ups into this CPU's local list,
-    // which only the next `context::switch` processes. When this IPI is delivered at the
-    // idle loop's `sti` — after the `switch` that found every context idle already drained
-    // that list — the loop runs `hlt` with the wake-ups still in it, and on an otherwise
-    // idle (tickless) system nothing may interrupt the halt again: the woken contexts stay
-    // `Runnable` in no run queue, requests are never served, and every CPU idles forever
-    // (the boot-smoke hang). If this CPU is idling, do the switch right here instead of
-    // returning into the halt.
+    // which only the next `context::switch` processes. On an idling CPU, switch right here
+    // so they run without waiting for the idle loop's next pass. The loop would get there
+    // too: `sti; hlt` holds interrupts until the `hlt` has executed (Intel SDM, STI), and an
+    // interrupt that ends a halt returns past the `hlt` (SDM, HLT), so this handler's
+    // `iret` always lands on the loop's back-edge, never on the `hlt`. What the idle loop's
+    // own non-empty-list check covers is wake-ups with no interrupt behind them (a
+    // contended switch's re-push, a direct switch back): halting on those would leave them
+    // until an interrupt that, on an idle tickless system, may never come.
     //
     // A `Contended` result needs no retry here (#214): spinning in this handler with
-    // interrupts off could wait on a CPU that is itself waiting for this one. The handler
-    // returns to the idle loop past its `hlt`, and the loop switches again and, with
-    // interrupts disabled, re-checks the local list before it halts.
+    // interrupts off could wait on a CPU that is itself waiting for this one, and the loop
+    // it returns to switches again and retries a contended switch with interrupts on.
     if idling
         && !percpu
             .switch_internals

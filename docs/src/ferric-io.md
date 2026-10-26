@@ -336,12 +336,16 @@ woken, which held two-thread reads to about 400 IOPS.
 
 A wake-up drained into an idling CPU must not be left behind either (#200).
 The wake-up IPI handler moves the wake-ups into the CPU's local list, which
-only the next `switch` processes. So on a CPU that runs its idle context, the
-handler switches at once. The idle loop also re-checks the local list, with
-interrupts disabled, before it halts. A `Contended` result from the handler's
-switch is not retried inside the handler: spinning there with interrupts off
-could wait on a CPU that is waiting for this one. Instead, the handler returns
-to the idle loop past its `hlt`, and the loop switches again. The handler asks
+only the next `switch` processes, so on a CPU that runs its idle context the
+handler switches at once. Before it halts, the idle loop re-checks the local
+list with interrupts disabled. That check is for wake-ups that have no
+interrupt behind them: a contended switch's re-push, or a direct switch back.
+A wake-up IPI cannot strand anything at the halt. `sti; hlt` holds interrupts
+until the `hlt` has executed, and an interrupt that ends a halt returns past
+the `hlt` (Intel SDM, STI and HLT), so the loop always runs again. A
+`Contended` result from the handler's switch is therefore not retried inside
+the handler, where spinning with interrupts off could wait on a CPU that is
+waiting for this one. The loop it returns to retries with interrupts on. The handler asks
 whether the CPU is idling through `try_idle_context` (#214). The reason is
 `kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
 this handler and never sets up contexts. Asking that CPU for its idle context
