@@ -9,9 +9,10 @@
 
 mod common;
 
-use common::load;
+use common::{le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Attributes, Fs, Kind, OpenMode};
+use ext4d::journal;
 
 const NAMES: [&str; 7] = [
     "journal-v3",
@@ -135,5 +136,39 @@ fn a_wrapped_journal_does_not_mix_two_versions_of_an_inode() {
             .expect("hello.txt");
         let a = fs.attributes(file).expect("open");
         assert_eq!((a.accessed, a.modified, a.changed), journaled, "{name}");
+    }
+}
+
+/// An empty journal still needs a clean superblock in the reader's overlay. Otherwise
+/// ext4-view would take its own journal path even though there are no committed writes.
+#[test]
+fn an_empty_journal_overlays_only_the_volume_superblock() {
+    for name in ["journal-v3", "journal-4k"] {
+        let clean = load(&format!("{name}.replayed.ext4.gz"));
+        let mut dirty = clean.clone();
+        // s_feature_incompat's low byte: INCOMPAT_RECOVER, per Ext4 Disk Layout.
+        dirty[1024 + 0x60] |= 0x4;
+        reseal(&mut dirty);
+        let window = Window::whole(dirty.clone()).expect("its length");
+        assert!(
+            journal::committed_blocks(&window)
+                .expect("empty journal")
+                .is_empty()
+        );
+        let blocks = journal::replayed_blocks(&window).expect("readable journal");
+        let block_size = 1024usize << le32(&dirty, 1024 + 0x18);
+        let home = 1024 / block_size;
+        assert_eq!(blocks.len(), 1, "{name}: the clean superblock is required");
+        assert_eq!(
+            blocks[&(home as u64)],
+            clean[home * block_size..(home + 1) * block_size]
+        );
+        assert_eq!(window.into_inner(), dirty, "the device was not changed");
+        let mut ours = mount(dirty);
+        assert!(
+            ours.needs_recovery(),
+            "the underlying volume is still dirty"
+        );
+        assert_eq!(tree(&mut ours), tree(&mut mount(clean)), "{name}");
     }
 }
