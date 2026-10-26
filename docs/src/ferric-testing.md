@@ -437,7 +437,8 @@ number of free frames.
 When the marker does not arrive within the timeout, the script first samples
 every CPU's registers through the QEMU monitor (several times, with the
 frame-pointer chain of each CPU spinning in the kernel, or in user space for a
-CPU at CPL 3, as `user frame` lines), then sends an NMI to CPU 0. The NMI handler prints its stack trace and then one line per context:
+CPU at CPL 3, as `user frame` lines), then sends an NMI to CPU 0. The NMI
+handler prints its stack trace and then one line per context:
 
 ```text
 NMI: 41 contexts
