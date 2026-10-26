@@ -422,9 +422,14 @@ This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
-for the last failed search or open (the path whose `access` or open failed and
+for the failing attempt's search or open (the path whose `access` or open failed and
 its errno, or the search paths a library is in none of), so the next
-occurrence names the file and error without `LD_DEBUG`.
+occurrence names the file and error without `LD_DEBUG`. Context is carried
+by the typed load error, with its original errno, so a later malformed object
+or TLS failure cannot reuse an earlier search diagnostic. The host check
+`bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual loader error
+and errno modules and checks diagnostic isolation and the stable `dlerror`
+messages; platform errno storage and its message table use host adapters.
 
 relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
 failure as `EAGAIN`. It logs the step that failed and the underlying errno at
@@ -474,7 +479,11 @@ than a generic timeout), a link failure after the marker and a marker that
 arrives while the runner waits after that line (both of which must still pass), a
 program the script starts that fails to link (which must not fail the run), a
 timeout whose NMI context rows (and only those) must reach stderr, and that
-the runner adds both HDA controllers. Its fake QEMU stays alive for a
+the runner adds both HDA controllers. A Unix monitor socket fixture supplies
+CPL 3 registers and a user frame; it checks the emitted return address and
+that unaligned, out-of-range and halted-CPU frame pointers are not read.
+The probe consumes the monitor greeting before sending commands, keeping
+register and memory responses aligned with their requests. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.

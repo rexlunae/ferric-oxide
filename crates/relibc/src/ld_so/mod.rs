@@ -24,6 +24,7 @@ mod access;
 pub mod debug;
 pub mod dso;
 pub mod linker;
+mod load_error;
 pub mod start;
 pub mod tcb;
 

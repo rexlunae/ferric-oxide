@@ -194,8 +194,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.settimeout(2)
 
-def cmd(line):
-    s.sendall(line.encode() + b"\n")
+def receive():
     out = b""
     deadline = time.time() + 5
     while not out.endswith(b"(qemu) ") and time.time() < deadline:
@@ -208,7 +207,13 @@ def cmd(line):
         out += chunk
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace"))
 
-cmd("")
+def cmd(line):
+    s.sendall(line.encode() + b"\n")
+    return receive()
+
+# Consume the unsolicited greeting before sending a command; an extra blank
+# command would leave a second prompt and shift every response by one request.
+receive()
 def cpus(text):
     found = {}
     for block in re.split(r"(?m)^CPU#", text)[1:]:

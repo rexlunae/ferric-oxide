@@ -12,7 +12,7 @@ use object::{
     read::elf::{Rela as _, Sym},
 };
 
-use core::{cell::RefCell, ptr};
+use core::ptr;
 
 use crate::{
     c_str::{CStr, CString},
@@ -45,38 +45,7 @@ use super::{
     tcb::{Master, Tcb},
 };
 
-#[derive(Debug, Copy, Clone)]
-pub enum DlError {
-    /// Failed to locate the requested DSO.
-    NotFound,
-    /// The DSO is malformed somehow.
-    Malformed,
-    /// Invalid DSO handle.
-    InvalidHandle,
-    /// Out of memory.
-    Oom,
-}
-
-impl DlError {
-    /// Returns a human-readable, null-terminated C string describing the error.
-    pub const fn repr(&self) -> &'static core::ffi::CStr {
-        match self {
-            DlError::NotFound => {
-                c"Failed to locate the requested DSO. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::Malformed => {
-                c"The DSO is malformed somehow. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::InvalidHandle => {
-                c"Invalid DSO handle. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::Oom => c"Out of memory.",
-        }
-    }
-}
+pub use super::load_error::DlError;
 
 pub type Result<T> = core::result::Result<T, DlError>;
 
@@ -397,10 +366,6 @@ pub struct Linker {
     tls_size: usize,
     objects: BTreeMap<usize, Arc<DSO>>,
     name_to_object_id_map: BTreeMap<String, usize>,
-    /// Ferric Oxide: why the last object search or file open failed, for the fatal "failed to
-    /// link" message. `DlError::NotFound` alone cannot tell a missing library from a file the
-    /// file system refused to open, which made intermittent boot failures (#155) undiagnosable.
-    last_failure: RefCell<Option<String>>,
 }
 
 const ROOT_ID: usize = 1;
@@ -415,17 +380,7 @@ impl Linker {
             tls_size: 0,
             objects: BTreeMap::new(),
             name_to_object_id_map: BTreeMap::new(),
-            last_failure: RefCell::new(None),
         }
-    }
-
-    /// Why the last object search or file open failed, if one has failed.
-    pub fn last_failure(&self) -> Option<String> {
-        self.last_failure.borrow().clone()
-    }
-
-    fn record_failure(&self, reason: String) {
-        *self.last_failure.borrow_mut() = Some(reason);
     }
 
     pub fn load_program(&mut self, path: &str, base_addr: Option<usize>) -> Result<usize> {
@@ -958,7 +913,7 @@ impl Linker {
                     return Ok(name.into());
                 }
                 Err(Errno(errno)) if errno != ENOENT => {
-                    access_error = Some(format!("access '{name}' failed: errno {errno}"));
+                    access_error = Some((name.to_string(), Errno(errno)));
                 }
                 Err(_) => {}
             }
@@ -984,20 +939,20 @@ impl Linker {
                     return Ok(full_path.into());
                 }
                 Err(Errno(errno)) if errno != ENOENT => {
-                    access_error = Some(format!("access '{full_path}' failed: errno {errno}"));
+                    access_error = Some((full_path, Errno(errno)));
                 }
                 Err(_) => {}
             }
         }
-        self.record_failure(
-            access_error.unwrap_or_else(|| format!("'{name}' is in none of {search_paths:?}")),
-        );
-
         if debug {
             eprintln!("[ld.so]: failed to locate '{}'", name);
         }
 
-        Err(DlError::NotFound)
+        Err(DlError::Search {
+            name: name.to_string(),
+            paths: search_paths.into_iter().map(ToString::to_string).collect(),
+            access_error,
+        })
     }
 
     fn read_file(&self, path: &str) -> Result<MmapFile> {
@@ -1017,9 +972,10 @@ impl Linker {
                 if debug {
                     eprintln!("[ld.so]: failed to open '{}': {}", path, err)
                 }
-                self.record_failure(format!("opening '{path}' failed: {err}"));
-
-                DlError::NotFound
+                DlError::Open {
+                    path: path.to_string(),
+                    source: err,
+                }
             })?
         };
 
