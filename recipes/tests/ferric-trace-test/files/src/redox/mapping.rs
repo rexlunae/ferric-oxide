@@ -14,9 +14,14 @@ use super::{
 
 const PAGES: usize = 2;
 
-fn succeeded(call: &'static str, result: syscall::Result<usize>) -> Result<usize, Failure> {
+/// The value of a system call that must succeed, or its failure in `step`.
+pub(super) fn succeeded(
+    step: &'static str,
+    call: &'static str,
+    result: syscall::Result<usize>,
+) -> Result<usize, Failure> {
     result.map_err(|err| Failure {
-        step: "trace-mapping",
+        step,
         why: Why::Call {
             call,
             result: Err(err),
@@ -24,23 +29,26 @@ fn succeeded(call: &'static str, result: syscall::Result<usize>) -> Result<usize
     })
 }
 
-/// Makes fresh anonymous memory; no fixed address or other live mapping is replaced.
-fn anonymous() -> Result<usize, Failure> {
+/// Makes `pages` of fresh anonymous memory for `step`; no fixed address or other live mapping
+/// is replaced.
+pub(super) fn anonymous(step: &'static str, pages: usize) -> Result<usize, Failure> {
     let map = Map {
         offset: 0,
-        size: PAGES * PAGE,
+        size: pages * PAGE,
         flags: MapFlags::MAP_PRIVATE | MapFlags::PROT_READ | MapFlags::PROT_WRITE,
         address: 0,
     };
     // SAFETY: the kernel selects unused memory and this call creates no Rust references.
-    succeeded("anonymous mmap", unsafe { syscall::fmap(!0, &map) })
+    succeeded(step, "anonymous mmap", unsafe { syscall::fmap(!0, &map) })
 }
 
-/// Matches an exact result and preserves the sequence of this test's operations across CPUs.
-fn ordered<'a>(
+/// Finds the one `event` record with exactly `args`, at or after the timestamp `after`, so
+/// `step` checks the sequence of its operations across CPUs.
+pub(super) fn ordered<'a, const N: usize>(
+    step: &'static str,
     trace: &'a [Vec<Entry>],
     event: &ferric_trace::Event,
-    args: [u64; 5],
+    args: [u64; N],
     after: u64,
 ) -> Result<&'a Entry, Failure> {
     let mut matches = trace
@@ -49,10 +57,10 @@ fn ordered<'a>(
         .filter(|e| e.is(event) && e.args == args);
     let entry = matches
         .next()
-        .ok_or_else(|| check("trace-mapping", format!("no {} {args:x?}", event.name())))?;
+        .ok_or_else(|| check(step, format!("no {} {args:x?}", event.name())))?;
     if matches.next().is_some() || entry.timestamp < after {
         return Err(check(
-            "trace-mapping",
+            step,
             format!("duplicate or unordered {} {args:x?}", event.name()),
         ));
     }
@@ -101,14 +109,14 @@ fn operations(addr: usize, ring_addr: usize) -> Result<(), Failure> {
     // SAFETY: drops the private allocation after the peer joined; no references point into it.
     let unmapped = unsafe { syscall::funmap(addr, PAGES * PAGE) };
     expect_errno(step, "overlapping fixed mmap", refused_map, EEXIST)?;
-    succeeded("mprotect", protected)?;
-    succeeded("peer mprotect", peer)?;
-    succeeded("restore mprotect", restored)?;
+    succeeded(step, "mprotect", protected)?;
+    succeeded(step, "peer mprotect", peer)?;
+    succeeded(step, "restore mprotect", restored)?;
     expect_errno(step, "writable ring mprotect", refused_protect, EACCES)?;
     expect_errno(step, "unaligned mmap", invalid_map, EINVAL)?;
     expect_errno(step, "unaligned mprotect", invalid_protect, EINVAL)?;
     expect_errno(step, "unaligned munmap", invalid_unmap, EINVAL)?;
-    succeeded("munmap", unmapped)?;
+    succeeded(step, "munmap", unmapped)?;
     Ok(())
 }
 
@@ -128,6 +136,7 @@ fn verify(trace: &[Vec<Entry>], addr: usize, ring_addr: usize) -> Result<(), Fai
         return Err(check(step, "invalid page-table root"));
     }
     let mut after = ordered(
+        step,
         trace,
         &MM_MAP,
         [
@@ -181,7 +190,7 @@ fn verify(trace: &[Vec<Entry>], addr: usize, ring_addr: usize) -> Result<(), Fai
         ),
         (&MM_UNMAP, [space, addr as u64, PAGES as u64, 0, 0]),
     ] {
-        after = ordered(trace, event, args, after)?.timestamp;
+        after = ordered(step, trace, event, args, after)?.timestamp;
     }
     if trace.iter().flatten().any(|e| {
         [&MM_MAP, &MM_PROTECT, &MM_UNMAP]
@@ -200,9 +209,9 @@ fn verify(trace: &[Vec<Entry>], addr: usize, ring_addr: usize) -> Result<(), Fai
 /// No result event may remain after the three static keys have been disabled.
 fn disabled(cpus: &[u32]) -> Result<(), Failure> {
     let step = "trace-mapping";
-    let disabled = anonymous()?;
+    let disabled = anonymous(step, PAGES)?;
     // SAFETY: the fresh disabled-phase allocation has no references or other users.
-    succeeded("disabled munmap", unsafe {
+    succeeded(step, "disabled munmap", unsafe {
         syscall::funmap(disabled, PAGES * PAGE)
     })?;
     if drain(step, cpus)?.iter().flatten().any(|e| {
@@ -244,7 +253,7 @@ pub(super) fn check_mapping(cpus: &[u32]) -> Result<(), Failure> {
     control
         .write_all(b"enable mm.map mm.protect mm.unmap")
         .map_err(io_failure(step, &control_path))?;
-    let addr = anonymous()?;
+    let addr = anonymous(step, PAGES)?;
     operations(addr, ring_addr)?;
     control
         .write_all(b"disable mm.map mm.protect mm.unmap")

@@ -19,7 +19,7 @@ what is on at run time.
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, `sched.context_create`/`context_start`/`context_exit`, and `procmgr`'s `sched.proc_fork`/`proc_exec`/`proc_exit`/`proc_wait` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
-| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap` |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone` and `mm.destroy` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
 | `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
@@ -157,19 +157,69 @@ x86-64), not bytes. Map/protect carry the requested raw
 successful protect/unmap, or a negated errno. Map's `addr` is the requested
 hint, or 0 without one; flags distinguish a fixed request at address 0.
 
-These are operation results, not a complete mapping journal. Refusals before
-these APIs (for example, an unaligned system-call range or a scheme's earlier
-refusal) produce no such record. A failed operation can still have changed
-earlier grants: fixed replacement unmaps before allocation, and protection
-and unmap process overlapping grants in turn. Unmap can succeed over holes.
-Flags describe the request, not necessarily hardware-enforced read access.
-Clone, move, address-space destruction and internal replacement paths are
-not comprehensively recorded. An mmap return does not imply physical pages
-have been populated; anonymous pages can fault in later.
+Refusals before these APIs (for example, an unaligned system-call range or a
+scheme's earlier refusal) produce no such record. A failed operation can still
+have changed earlier grants: fixed replacement unmaps before allocation (its
+`mm.replace` says so), and protection and unmap process overlapping grants in
+turn. Unmap can succeed over holes. Flags describe the request, not
+necessarily hardware-enforced read access. An mmap return does not imply
+physical pages have been populated; anonymous pages can fault in later.
 
 ```text
 enable mm.map mm.protect mm.unmap
 ```
+
+### Mapping journal
+
+Five more info-level `kernel.trace_mm` events record the changes to a user
+address space's grants that do not go through those three calls. With them,
+the `mm` events record every change: a reader that replays `mm.map`,
+`mm.protect`, `mm.unmap`, `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip`
+and `mm.destroy` in order can follow each space's grants, except that a failed operation's
+record says only that it failed, not how far it got. An empty space appears
+with its first `mm.map`. Page-table entries filled in later by faults are
+not grant changes (`mm.page_fault` records those).
+
+| Event | Arguments |
+| --- | --- |
+| `mm.replace` | `space`, `addr`, `pages`, `ret` |
+| `mm.move` | `src_space`, `dst_space`, `src_addr`, `src_pages`, `dst_addr`, `pages`, `flags`, `ret` |
+| `mm.clone` | `space`, `new_space`, `grants`, `pages`, `ret` |
+| `mm.clone_skip` | `space`, `new_space`, `addr`, `pages` |
+| `mm.destroy` | `space`, `grants`, `pages` |
+
+- `mm.replace`: a fixed request removed what was mapped in its span before
+  installing its own grant, under the same lock. Its causes are a `MAP_FIXED`
+  `mmap` (the `mm.map` follows), a fixed `mremap` or grant-move destination
+  (the `mm.move` follows) and a registered-buffer revoke, which maps zeroed
+  memory in place. A revoke then records that zeroed grant as an `mm.map` with
+  `MAP_FIXED | MAP_PRIVATE` and the grant's protection. The span may have held nothing; `ret` is 0 or a negated
+  errno, after which the operation fails too.
+- `mm.move`: `AddrSpaceWrapper::r#move`, for `mremap` (both spaces the same)
+  and the proc scheme's grant moves between spaces, recorded under the
+  destination's lock. `dst_addr` is the requested destination, or 0 when the
+  kernel picks one; `pages` is the new size, `flags` the raw `MapFlags`, and
+  `ret` the destination address or a negated errno. A move shorter than its
+  source unmaps the source's tail; a longer one maps zeroed pages past it.
+- `mm.clone`: `AddrSpaceWrapper::try_clone`, the copy-on-write copy a `fork`
+  makes, recorded under the source's lock, with the grants and pages the copy
+  holds. On failure
+  `new_space`, `grants` and `pages` are 0, and a partly built copy has already
+  had its own `mm.destroy`.
+- `mm.clone_skip`: a grant the clone did not copy, recorded before the
+  `mm.clone`: pinned scheme borrows, physically contiguous driver memory and
+  file-mapping borrows are not kept across a fork. The copy holds the source's
+  grants minus these.
+- `mm.destroy`: an address space is being torn down because nothing uses it
+  any more (its last context exited or exec'd into another space, or a clone
+  failed), with the grants and pages it still held. After it, `space` can be
+  reused by a new address space.
+
+```text
+enable mm.map mm.protect mm.unmap mm.replace mm.move mm.clone mm.clone_skip mm.destroy
+```
+
+`enable mm` turns on all of them and `mm.page_fault`.
 
 ### Completed DMA domain operations
 
@@ -1003,6 +1053,16 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       Unaligned requests refused before these APIs produce no result; disabling
       the three events suppresses a second allocation/unmap (`trace-mapping`).
 
+  17. checks the mapping journal: a `MAP_FIXED` `mmap` over a live mapping has
+      an `mm.replace` before its `mm.map`; an `mremap` to an address the kernel
+      picks, and one with `FIXED_REPLACE` onto another live mapping (after its
+      `mm.replace`), each have an exact `mm.move` within this space; forking a
+      child has one successful `mm.clone` of this space with grants and pages
+      copied, an `mm.clone_skip` before it for a page of physically contiguous
+      memory, and the copy an `mm.destroy` once the child execs and exits.
+      Disabling the events suppresses the same operations' records
+      (`trace-journal`).
+
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
   trace-fault` on a kernel without `mm.page_fault`).
@@ -1240,8 +1300,7 @@ is refused the file.
 
 ## Not implemented yet
 
-- A complete mapping journal (clone, move, replacement and destruction), and
-  tracepoints for the interrupts the kernel handles
+- Tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.
