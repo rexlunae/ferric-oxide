@@ -1,4 +1,4 @@
-//! Host harness for the loader's actual error types and relibc's actual Errno.
+//! Host harness for the actual loader search, fatal formatter and relibc Errno.
 //! Only platform errno storage, its message table and io::Error are host adapters.
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -12,6 +12,7 @@ mod platform {
 }
 mod header {
     pub mod errno {
+        pub const ENOENT: i32 = 2;
         pub const STR_ERROR: [&str; 1] = ["Success"];
     }
 }
@@ -22,3 +23,6 @@ mod io {
 mod error;
 #[path = "../../crates/relibc/src/ld_so/load_error.rs"]
 mod load_error;
+
+#[path = "../../crates/relibc/src/ld_so/object_search.rs"]
+mod object_search;

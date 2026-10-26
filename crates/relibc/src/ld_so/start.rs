@@ -519,14 +519,7 @@ fn stage2(
     let entry = match linker.load_program(&path, base_addr) {
         Ok(entry) => entry,
         Err(err) => {
-            eprintln!("[ld.so]: failed to link '{path}': {err:?}");
-            if matches!(
-                err,
-                super::linker::DlError::Search { .. } | super::linker::DlError::Open { .. }
-            ) {
-                eprintln!("[ld.so]: {err}");
-            }
-            eprintln!("[ld.so]: enable debug output with `LD_DEBUG=all` for more information");
+            eprintln!("{}", err.fatal(&path));
             unistd::_exit(1);
         }
     };

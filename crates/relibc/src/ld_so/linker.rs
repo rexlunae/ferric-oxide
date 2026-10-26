@@ -19,7 +19,6 @@ use crate::{
     error::Errno,
     header::{
         dl_tls::{__tls_get_addr, dl_tls_index},
-        errno::ENOENT,
         fcntl, sys_mman,
         unistd::F_OK,
     },
@@ -38,7 +37,6 @@ use crate::{ld_so::dso::resolve_sym, platform::types::c_uint};
 #[cfg(not(target_arch = "x86"))]
 use super::dso::Rela;
 use super::{
-    PATH_SEP,
     access::accessible,
     debug::{_dl_debug_state, _r_debug, RTLDState},
     dso::{DSO, ProgramHeader},
@@ -902,57 +900,24 @@ impl Linker {
             eprintln!("[ld.so]: looking for '{}'", name);
         }
 
-        // A missing candidate is normal; any other error is worth reporting.
-        let mut access_error = None;
-        if name.contains('/') {
-            match accessible(name, F_OK) {
-                Ok(()) => {
-                    if debug {
-                        eprintln!("[ld.so]: found at '{}'!", name);
-                    }
-                    return Ok(name.into());
+        let result = super::object_search::find(
+            name,
+            parent_runpath,
+            self.config.library_path.as_deref(),
+            |path| {
+                if debug {
+                    eprintln!("[ld.so]: trying path '{path}'");
                 }
-                Err(Errno(errno)) if errno != ENOENT => {
-                    access_error = Some((name.to_string(), Errno(errno)));
-                }
-                Err(_) => {}
-            }
-        }
-        let mut search_paths = Vec::new();
-        if let Some(runpath) = parent_runpath {
-            search_paths.extend(runpath.split(PATH_SEP));
-        }
-        if let Some(ld_path) = self.config.library_path.as_ref() {
-            search_paths.extend(ld_path.split(PATH_SEP));
-        }
-        search_paths.push("/lib");
-        for part in search_paths.iter() {
-            let full_path = format!("{}/{}", part, name);
-            if debug {
-                eprintln!("[ld.so]: trying path '{}'", full_path);
-            }
-            match accessible(&full_path, F_OK) {
-                Ok(()) => {
-                    if debug {
-                        eprintln!("[ld.so]: found at '{}'!", full_path);
-                    }
-                    return Ok(full_path.into());
-                }
-                Err(Errno(errno)) if errno != ENOENT => {
-                    access_error = Some((full_path, Errno(errno)));
-                }
-                Err(_) => {}
-            }
-        }
+                accessible(path, F_OK)
+            },
+        );
         if debug {
-            eprintln!("[ld.so]: failed to locate '{}'", name);
+            match &result {
+                Ok(path) => eprintln!("[ld.so]: found at '{path}'!"),
+                Err(_) => eprintln!("[ld.so]: failed to locate '{name}'"),
+            }
         }
-
-        Err(DlError::Search {
-            name: name.to_string(),
-            paths: search_paths.into_iter().map(ToString::to_string).collect(),
-            access_error,
-        })
+        result
     }
 
     fn read_file(&self, path: &str) -> Result<MmapFile> {

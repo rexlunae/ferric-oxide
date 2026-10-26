@@ -427,9 +427,12 @@ its errno, or the search paths a library is in none of), so the next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
 or TLS failure cannot reuse an earlier search diagnostic. The host check
-`bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual loader error
-and errno modules and checks diagnostic isolation and the stable `dlerror`
-messages; platform errno storage and its message table use host adapters.
+`bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual object search,
+error, fatal-message formatter and errno modules. It checks candidate order,
+successful fallback, missing and inaccessible libraries reaching the fatal
+output, isolation from a later parse/TLS failure, and stable `dlerror` messages.
+Only platform access checks, errno storage and its message table use host
+adapters; this is not an end-to-end dynamic-link or guest-boot test.
 
 relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
 failure as `EAGAIN`. It logs the step that failed and the underlying errno at

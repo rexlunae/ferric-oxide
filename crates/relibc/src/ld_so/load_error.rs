@@ -38,6 +38,11 @@ pub enum DlError {
 }
 
 impl DlError {
+    /// The complete fatal diagnostic printed by loader startup.
+    pub(super) fn fatal<'a>(&'a self, path: &'a str) -> FatalDiagnostic<'a> {
+        FatalDiagnostic { path, error: self }
+    }
+
     /// Returns the stable, null-terminated message used by `dlerror`.
     pub const fn repr(&self) -> &'static core::ffi::CStr {
         match self {
@@ -50,6 +55,26 @@ impl DlError {
             Self::InvalidHandle => c"Invalid DSO handle. Set `LD_DEBUG=all` for more information.",
             Self::Oom => c"Out of memory.",
         }
+    }
+}
+
+/// Display adapter shared by loader startup and host regression tests.
+pub(super) struct FatalDiagnostic<'a> {
+    path: &'a str,
+    error: &'a DlError,
+}
+
+impl fmt::Display for FatalDiagnostic<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "[ld.so]: failed to link '{}': {:?}",
+            self.path, self.error
+        )?;
+        if matches!(self.error, DlError::Search { .. } | DlError::Open { .. }) {
+            writeln!(f, "[ld.so]: {}", self.error)?;
+        }
+        f.write_str("[ld.so]: enable debug output with `LD_DEBUG=all` for more information")
     }
 }
 
@@ -90,6 +115,10 @@ mod tests {
         let malformed = DlError::Malformed;
         assert_eq!(format!("{malformed}"), malformed.repr().to_str().unwrap());
         assert!(!format!("{malformed}").contains("missing.so"));
+        assert_eq!(
+            format!("{}", malformed.fatal("/bin/ion")),
+            "[ld.so]: failed to link '/bin/ion': Malformed\n[ld.so]: enable debug output with `LD_DEBUG=all` for more information"
+        );
         assert_ne!(missing.repr(), malformed.repr());
     }
 
@@ -108,6 +137,10 @@ mod tests {
         };
         assert!(format!("{opened}").contains("opening '/lib/open.so' failed:"));
         assert!(format!("{opened}").ends_with("(errno 5)"));
+        let fatal = format!("{}", opened.fatal("/bin/ion"));
+        assert!(fatal.starts_with("[ld.so]: failed to link '/bin/ion': Open"));
+        assert!(fatal.contains("\n[ld.so]: opening '/lib/open.so' failed:"));
+        assert!(fatal.contains("(errno 5)\n[ld.so]: enable debug output"));
         assert!(matches!(
             opened,
             DlError::Open {
