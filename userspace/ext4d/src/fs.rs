@@ -219,6 +219,7 @@ struct Handle {
 pub struct Fs {
     ext4: Ext4,
     geometry: Geometry,
+    needs_recovery: bool,
     handles: BTreeMap<usize, Handle>,
     next: usize,
 }
@@ -239,10 +240,12 @@ impl Fs {
             .read_exact_at(&mut sb, superblock::OFFSET)
             .map_err(Error::Device)?;
         let geometry = Geometry::parse(&sb)?;
+        let needs_recovery = superblock::needs_recovery(&sb);
         let ext4 = Ext4::load(Box::new(device) as Box<dyn Ext4Read>)?;
         Ok(Self {
             ext4,
             geometry,
+            needs_recovery,
             handles: BTreeMap::new(),
             next: 1,
         })
@@ -251,6 +254,13 @@ impl Fs {
     /// The volume's size and free space.
     pub const fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    /// Whether the volume's journal still needed replaying when it was mounted: it is then
+    /// read through `ext4-view`'s in-memory view of the journal, which does not handle every
+    /// journal (see `journal`, features.toml `fs.ext4_journal_replay`).
+    pub const fn needs_recovery(&self) -> bool {
+        self.needs_recovery
     }
 
     /// The volume's label.

@@ -1165,8 +1165,13 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       child has one successful `mm.clone` of this space with grants and pages
       copied, an `mm.clone_skip` before it for a page of physically contiguous
       memory, and the copy an `mm.destroy` once the child execs and exits.
-      Disabling the events suppresses the same operations' records
-      (`trace-journal`).
+      The rings drop records once full while the journal events are on (every
+      process's mapping operations are recorded), so the step drains before
+      the fork and keeps draining in a loop until the clone and its teardown
+      are both in: a record a drain missed (dropped from a full ring, or
+      written to a ring a drain already passed) is waited for, and only the
+      5-second limit without the pair fails. Disabling the events suppresses
+      the same operations' records (`trace-journal`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP

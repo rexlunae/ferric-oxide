@@ -886,9 +886,82 @@ device) and serves in the foreground until it is stopped.
   modification time; `mmap` is not served; encrypted files and devices are
   refused (`EOPNOTSUPP`).
 
+### Journal replay
+
+A volume that was not cleanly unmounted has `needs_recovery` set: its journal
+holds committed transactions that may not have reached their home blocks.
+Without help, ext4d reads it through `ext4-view`'s view of the journal in
+memory, which is enough for most volumes but not all: as of `ext4-view` 1.0.0
+it refuses a journal that holds an escaped block (one whose data starts with
+the JBD2 magic number), and on a log that wraps round from the end of the
+journal to its start it ignores the committed transactions and serves the old
+contents. The tests pin both behaviours down.
+
+`fs.ext4_journal_replay` (default off, needs `fs.ext4`; Cargo feature
+`journal-replay`) has ext4d replay the journal onto the disk before it serves
+the volume, as `e2fsck -E journal_only` does. ext4d opens the device for
+writing only when the volume needs recovery, and only for the replay; it still
+serves the volume read-only. This is the groundwork for writable ext4, which
+has to start from a replayed journal.
+
+- **`ferric-jbd2`** (`crates/jbd2`, `no_std`, host-tested) reads the JBD2
+  log: the journal superblock, descriptor blocks and their tags, revoke blocks
+  and commit blocks, with version 2 and 3 CRC32C checksums. It keeps the
+  transactions that have a valid commit block, applies the revoke records (a
+  revoke in transaction *r* cancels copies of the block logged in transactions
+  up to *r*) and yields the newest surviving copy of each block. Every logged
+  block is checked against its tag checksum when its transaction's commit
+  block is reached, before anything is written. Under a journal with
+  `INCOMPAT_ASYNC_COMMIT` (where the commit block need not be written last) a
+  damaged block marks its transaction as torn: the log ends there and the
+  transactions before it are replayed. Otherwise a damaged block stops the
+  replay if it is the copy that would be written; a copy that a newer one
+  replaces or that is revoked is never written, so it does not. Fast commits
+  and external journal devices are refused; version 1 commit checksums are not
+  verified.
+- **ext4d** (`userspace/ext4d/src/journal/`) finds the journal inode through
+  its group descriptor and extent tree (or ext3 block map). It checks the map
+  before trusting it: the inode's block map and size must match the backup in
+  the superblock (`s_jnl_blocks`), the superblock checksum must hold, and the
+  journal must lie inside the volume, without holes, and clear of the
+  superblocks, group descriptors, reserved GDT blocks, bitmaps and inode
+  tables (volumes with `meta_bg` are refused for now). No replayed block may
+  land inside the journal. It then writes the planned
+  blocks and flushes, then empties the journal (`s_start` 0) and flushes, then
+  clears `needs_recovery`, updates the superblock checksum and flushes. A replay
+  interrupted at any point can be run again and gives the same volume; the
+  tests crash a replay before each write to check that.
+
+Both are written from "Journal (jbd2)" and the superblock, group descriptor,
+inode and extent tree sections of "Ext4 Disk Layout" on the ext4 wiki at
+kernel.org. Where that document is silent, the behaviour was settled by
+experiment with e2fsprogs 1.47: `debugfs` (`journal_open -c -v N`,
+`journal_write`) wrote transactions into test volumes, `e2fsck -E
+journal_only` replayed them, and the bytes were compared. That is how these
+were found:
+
+- every checksum is CRC32C started from `0xFFFF_FFFF` and not inverted at the
+  end, run over the journal UUID and then the covered bytes;
+- with version 2 checksums a tag is two bytes longer than its fields (10
+  bytes, or 14 with 64-bit block numbers);
+- the tag checksum of an escaped block covers the block as stored, with its
+  magic number zeroed (ext4d accepts the other form too, since the layout does
+  not say);
+- after a replay, `s_sequence` is one past the first sequence that had no
+  commit.
+
+The fixtures are volumes `make-fixtures.sh` builds this way, gzipped (about
+70 KB in all): version 3 and version 2 checksums with 32- and 64-bit tags, an
+ext3 volume with no checksums and an indirect-mapped journal, 4 KiB blocks, and
+a log that wraps round. Each comes with `e2fsck`'s replay of it, and the tests
+compare ext4d's replay with it block by block (apart from the write time and
+write count e2fsck also updates). CI also builds fresh ones with the runner's
+e2fsprogs and runs the same tests on them.
+
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
-`tests/fixtures/make-fixtures.sh`; `ferric-ext4-test` mounts the same image on
-the target, including `symlink_metadata` and refusal of `read_link` on a regular
+`tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
+`ferric-ext4-test` mounts the same image on the target, and with
+`fs.ext4_journal_replay` replays and mounts `journal-v3` (`ext4-journal`), including `symlink_metadata` and refusal of `read_link` on a regular
 file. A UID/GID 2000 child must read a public file and receive `EACCES` for
 protected files, directories and symlink targets. Host fixtures additionally
 cover owner and primary-group access.

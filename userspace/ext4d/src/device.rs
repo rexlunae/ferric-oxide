@@ -3,6 +3,8 @@
 //! The ext4 reader asks for byte ranges ([`ext4_view::Ext4Read`]). A [`Window`] answers them
 //! from a byte range of a [`ReadAt`] source, so the same daemon reads a whole disk, one
 //! partition of it (`--offset`, `--length`) or an image file, and later a LUKS or LVM volume.
+//! Replaying the journal (features.toml `fs.ext4_journal_replay`) also writes, through
+//! [`WriteAt`].
 
 use std::fs::File;
 use std::io;
@@ -57,6 +59,49 @@ impl ReadAt for Vec<u8> {
     }
 }
 
+/// A [`ReadAt`] source that can also be written, for replaying the journal.
+pub trait WriteAt: ReadAt {
+    /// Writes all of `buf` at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error.
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()>;
+
+    /// Waits until everything written so far is on stable storage.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error from the device.
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+impl WriteAt for File {
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()> {
+        FileExt::write_all_at(self, buf, offset)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sync_data()
+    }
+}
+
+impl WriteAt for Vec<u8> {
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let start = usize::try_from(offset).map_err(|_| io::ErrorKind::UnexpectedEof)?;
+        let dst = start
+            .checked_add(buf.len())
+            .and_then(|end| self.get_mut(start..end))
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
+        dst.copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Why a [`Window`] could not be made or could not serve a read.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -97,6 +142,20 @@ pub enum WindowError {
         #[source]
         source: io::Error,
     },
+    /// The source failed a write.
+    #[error("writing {len} bytes at {start} failed")]
+    Write {
+        /// The write's first byte, from the window's start.
+        start: u64,
+        /// The write's length.
+        len: usize,
+        /// The source's error.
+        #[source]
+        source: io::Error,
+    },
+    /// The source could not flush its writes.
+    #[error("flushing the device failed")]
+    Flush(#[source] io::Error),
 }
 
 /// Bytes `offset..offset + length` of a [`ReadAt`] source, as the ext4 reader sees them.
@@ -166,21 +225,56 @@ impl<R: ReadAt> Window<R> {
     /// [`WindowError::PastEnd`] when the read does not fit in the window, and
     /// [`WindowError::Read`] when the source fails it.
     pub fn read_exact_at(&self, buf: &mut [u8], start: u64) -> Result<(), WindowError> {
-        let past_end = || WindowError::PastEnd {
-            start,
-            len: buf.len(),
-            length: self.length,
-        };
-        let len = u64::try_from(buf.len()).map_err(|_| past_end())?;
-        if start.checked_add(len).is_none_or(|end| end > self.length) {
-            return Err(past_end());
-        }
-        // `start + len` fits in the window, which fits in the source.
-        let at = self.offset + start;
+        let at = self.place(start, buf.len())?;
         let len = buf.len();
         self.source
             .read_exact_at(buf, at)
             .map_err(|source| WindowError::Read { start, len, source })
+    }
+
+    /// Where in the source `len` bytes from byte `start` of the window are.
+    fn place(&self, start: u64, len: usize) -> Result<u64, WindowError> {
+        let past_end = || WindowError::PastEnd {
+            start,
+            len,
+            length: self.length,
+        };
+        let wide = u64::try_from(len).map_err(|_| past_end())?;
+        if start.checked_add(wide).is_none_or(|end| end > self.length) {
+            return Err(past_end());
+        }
+        // `start + len` fits in the window, which fits in the source.
+        Ok(self.offset + start)
+    }
+}
+
+impl<R: WriteAt> Window<R> {
+    /// Writes `buf` at byte `start` of the window.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::PastEnd`] when the write does not fit in the window, and
+    /// [`WindowError::Write`] when the source fails it.
+    pub fn write_all_at(&mut self, buf: &[u8], start: u64) -> Result<(), WindowError> {
+        let at = self.place(start, buf.len())?;
+        let len = buf.len();
+        self.source
+            .write_all_at(buf, at)
+            .map_err(|source| WindowError::Write { start, len, source })
+    }
+
+    /// Waits until every write is on stable storage.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::Flush`] when the source fails to.
+    pub fn flush(&mut self) -> Result<(), WindowError> {
+        self.source.flush().map_err(WindowError::Flush)
+    }
+
+    /// Gives back the source.
+    pub fn into_inner(self) -> R {
+        self.source
     }
 }
 
@@ -250,6 +344,19 @@ mod tests {
         // The last bytes of the window are still readable.
         window.read_exact_at(&mut buf, 28).expect("inside");
         assert_eq!(buf, [44, 45, 46, 47]);
+    }
+
+    #[test]
+    fn writes_stay_inside_the_window() {
+        let mut window = Window::range(bytes(), 16, Some(32)).expect("fits");
+        window.write_all_at(&[9, 9], 30).expect("inside");
+        assert!(matches!(
+            window.write_all_at(&[9, 9], 31),
+            Err(WindowError::PastEnd { start: 31, .. })
+        ));
+        window.flush().expect("a vector flushes");
+        let bytes = window.into_inner();
+        assert_eq!(&bytes[45..49], &[45, 9, 9, 48]);
     }
 
     #[test]
