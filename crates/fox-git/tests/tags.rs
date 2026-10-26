@@ -7,7 +7,7 @@ use fox_git::{GitError, Repository, TagSigner, fetch};
 use semver::Version;
 
 mod common;
-use common::{TAGGER, git, git_stdin, sample_repo, signing_key};
+use common::{TAGGER, git, git_stdin, http_server, sample_repo, signing_key};
 
 fn author(seed: u8) -> AuthorKey {
     AuthorKey::new(signing_key(seed).public_key().clone()).unwrap()
@@ -125,32 +125,89 @@ fn unsigned_tags_and_version_order() {
 #[test]
 fn fetches_into_a_bare_cache_and_updates_it() {
     let upstream = tempfile::tempdir().unwrap();
-    sample_repo(upstream.path());
-    let origin = Repository::open(upstream.path()).unwrap();
+    let url = format!("file://{}", upstream.path().display());
+    fetch_and_update(upstream.path(), &url);
+
+    assert!(matches!(
+        fetch(
+            &format!("file://{}/missing", upstream.path().display()),
+            &tempfile::tempdir().unwrap().path().join("x")
+        ),
+        Err(GitError::Fetch { .. })
+    ));
+}
+
+#[test]
+fn fetches_over_http() {
+    let root = tempfile::tempdir().unwrap();
+    let upstream = root.path().join("hello");
+    std::fs::create_dir(&upstream).unwrap();
+    let base = http_server::serve_git(root.path());
+    fetch_and_update(&upstream, &format!("{base}/hello"));
+
+    let error = fetch(
+        &format!("{base}/missing"),
+        &tempfile::tempdir().unwrap().path().join("x"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, GitError::Fetch { .. }), "{error:?}");
+}
+
+#[test]
+fn git_redirects_are_not_followed() {
+    let target = tempfile::tempdir().unwrap();
+    let moved = http_server::serve(move |_| {
+        let mut response = http_server::Response::new("301 Moved Permanently", "");
+        response
+            .headers
+            .push(("Location".into(), "https://example.com/new.git".into()));
+        response
+    });
+    let error = fetch(&format!("{moved}/old.git"), &target.path().join("x")).unwrap_err();
+    let chain = error_chain(&error);
+    assert!(
+        chain.contains("redirects to Some(\"https://example.com/new.git\")"),
+        "{chain}"
+    );
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        text.push_str(": ");
+        text.push_str(&error.to_string());
+        source = error.source();
+    }
+    text
+}
+
+/// Clones `url`, which serves the repository at `upstream`, then fetches
+/// new commits, tags and a changed default branch.
+fn fetch_and_update(upstream: &std::path::Path, url: &str) {
+    sample_repo(upstream);
+    let origin = Repository::open(upstream).unwrap();
     let first = origin.resolve("HEAD").unwrap();
     origin
         .create_signed_tag("v1.0.0", &first, TAGGER, "one", &signing_key(1))
         .unwrap();
-    let url = format!("file://{}", upstream.path().display());
 
     let caches = tempfile::tempdir().unwrap();
     let cache = caches.path().join("hello");
-    let cached = fetch(&url, &cache).unwrap();
+    let cached = fetch(url, &cache).unwrap();
     assert!(cached.workdir().is_none());
     assert_eq!(cached.resolve("HEAD").unwrap(), first);
+    assert_eq!(cached.origin_url().as_deref(), Some(url));
     cached.tag("v1.0.0").unwrap().verify(&author(1)).unwrap();
     assert!(!caches.path().join("hello.partial").exists());
 
-    git(
-        upstream.path(),
-        &["commit", "-q", "--allow-empty", "-m", "two"],
-    );
-    let origin = Repository::open(upstream.path()).unwrap();
+    git(upstream, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    let origin = Repository::open(upstream).unwrap();
     let second = origin.resolve("HEAD").unwrap();
     origin
         .create_signed_tag("v1.1.0", &second, TAGGER, "two", &signing_key(1))
         .unwrap();
-    let cached = fetch(&url, &cache).unwrap();
+    let cached = fetch(url, &cache).unwrap();
     assert_eq!(cached.resolve("main").unwrap(), second);
     assert_eq!(
         cached.newest_release_tag().unwrap().as_deref(),
@@ -162,23 +219,9 @@ fn fetches_into_a_bare_cache_and_updates_it() {
     );
 
     // The remote switches its default branch; the cache's HEAD follows.
-    git(upstream.path(), &["checkout", "-q", "-b", "trunk"]);
-    git(
-        upstream.path(),
-        &["commit", "-q", "--allow-empty", "-m", "three"],
-    );
-    let third = Repository::open(upstream.path())
-        .unwrap()
-        .resolve("HEAD")
-        .unwrap();
-    let cached = fetch(&url, &cache).unwrap();
+    git(upstream, &["checkout", "-q", "-b", "trunk"]);
+    git(upstream, &["commit", "-q", "--allow-empty", "-m", "three"]);
+    let third = Repository::open(upstream).unwrap().resolve("HEAD").unwrap();
+    let cached = fetch(url, &cache).unwrap();
     assert_eq!(cached.resolve("HEAD").unwrap(), third);
-
-    assert!(matches!(
-        fetch(
-            &format!("file://{}/missing", upstream.path().display()),
-            &caches.path().join("x")
-        ),
-        Err(GitError::Fetch { .. })
-    ));
 }

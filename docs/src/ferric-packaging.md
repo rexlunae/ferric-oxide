@@ -64,10 +64,9 @@ commit = "3f1c0e5a"
 
 `name` and `version` are required along with the format. Version strings are
 nonempty but need not be semantic versions. Dependency entries are package
-names; they do not express version constraints. `fox install` fetches the
-dependencies a package is missing (see [Dependencies](#dependencies)); one
-that no repository or registry has is reported, and does not stop the
-installation.
+names; they do not express version constraints or implement resolution. Install
+reports missing dependencies but does not fetch them or refuse installation
+solely because they are absent.
 
 The cookbook packs this manifest into every target package when
 `FERRIC_FOX_MANIFEST=1` (`packages.signed_manifests`, on by default with
@@ -118,33 +117,6 @@ conflicting unowned files; `remove --force` bypasses dependent-package refusal.
 Neither flag makes an untrusted signature acceptable. `adopt-pkg` is described
 under [Adopting pkg's packages](#adopting-pkgs-packages).
 
-### Dependencies
-
-`install --repo <dir>` (repeatable) names directories of archives called
-`<name>.pkgar`, such as the cookbook's `repo/<target>/`. A package named
-without a registry or version requirement is taken from the first of them
-that has it, before registries are tried:
-
-```sh
-fox --root ./image-root install --repo repo/x86_64-unknown-redox orbital
-```
-
-Once every named package is verified, `install` (`fox_store::deps::plan`)
-looks up each dependency that is neither installed nor already named: in
-the `--repo` directories in order, then in the configured registries (the
-newest release, prebuilt or built as `install <name>` would). It repeats
-for the dependencies of what it found, then installs everything with
-dependencies first. Each archive must verify against the trusted keys like
-a named one, and one that does not stops the command before anything is
-installed. An installed dependency is not upgraded. Dependency cycles are
-allowed. A `<name>.toml` in a repository directory with no `<name>.pkgar`
-beside it is a meta-package, such as a cookbook group (`recipes/groups/`):
-installing it installs the packages its `depends` lists, and it is not
-recorded itself. `--no-deps` installs only what was named, and refuses a
-meta-package. `fox sync` does not add
-dependencies: a package set lists every package it installs, so its lock
-pins all of them.
-
 ## Store behavior and persistence
 
 | Path beneath the install root | Contents |
@@ -176,9 +148,7 @@ database supplies management state, not a replacement trust root.
 ## Adopting pkg's packages
 
 `fox adopt-pkg` (`Store::adopt_pkg`) takes over a root that upstream `pkg`
-populated, such as an older system or an image built by upstream's
-installer. Ferric's installer records packages with fox directly, so its
-images need no adoption.
+populated: the installer writes such roots, and older systems used `pkg`.
 `pkg` lists its packages in `etc/pkg/packages.toml` and keeps each one's
 signed head in `var/lib/packages/<name>.pkgar_head`. For every listed
 package, adoption:
@@ -220,48 +190,10 @@ Remote (`REPO_BINARY`) packages are unpacked and signed again with the
 cookbook's key, so they get manifests too. Packages already packed keep
 what they had until they are repacked.
 
-### Prebuilt packages (`REPO_BINARY`)
-
-Recipes whose rule is `binary` (all of them with `REPO_BINARY=1`) take
-their packages from a remote instead of building them. The cookbook has no
-default remote, and it uses one only when both settings are given, in the
-`[cook]` table of `cookbook.toml` or in the environment:
-
-| `cookbook.toml` | Environment | Meaning |
-| --- | --- | --- |
-| `remote` | `COOKBOOK_REMOTE` | URL of the remote, with `{target}` for the target triple. The cookbook fetches `<url>/repo.toml`, `<url>/<name>.toml` and `<url>/<name>.pkgar` with `curl` |
-| `remote_key` | `COOKBOOK_REMOTE_KEY` | Public key file (`pkgar-keys` format) that must have signed every package from the remote |
-
-Without a remote, or when its index cannot be fetched, `binary` recipes
-are built from source and the cookbook says why once. A remote without a
-key is refused: nothing from a remote is unpacked unless a key pinned on
-this side signed it. The index is cached in `build/remotes/` for eight
-hours (indefinitely with `COOKBOOK_OFFLINE`). `[mirrors]` rewrites apply to
-the remote's URL as to source URLs.
-
-The image workflows still point the cookbook at Redox's package server,
-through `.github/actions/interim-prebuilts`, until Ferric Oxide publishes
-its own fox-signed prebuilt channel. That action is the only place left
-that names it.
-
-`repo push`, which installs built packages into a mounted image's root,
-installs them with fox's store the way the installer does: they are
-recorded in `/var/lib/fox/`, the cookbook's key goes to
-`/etc/fox/keys/cookbook.toml`, and a package whose archive is already
-installed is skipped. With `--no-metadata` it only extracts the files.
-
-The installer places the configuration's packages, and every dependency
-they name, from the cookbook's `repo/<target>/` with fox's store
-(`fox_store::deps`), so they are recorded in `/var/lib/fox/` as they are
-written; a package or dependency missing from the repository fails the
-image build. It copies the cookbook's public key
-(`build/id_ed25519.pub.toml`) to `/etc/fox/keys/cookbook.toml`, so the
-target trusts the key that signed its packages. Archives without a signed
-manifest (`packages.signed_manifests` off) are installed under the names
-the cookbook's metadata gives them. The installer no longer downloads
-packages: without `--cookbook` it installs only the configuration's files
-and accounts. `redox_installer_tui`, which copies the running system to a
-disk, takes the file list from fox's database.
+When an image includes `fox`, the installer copies the cookbook's public
+key (`build/id_ed25519.pub.toml`) to `/etc/fox/keys/cookbook.toml`, so the
+target trusts the key that signed its packages. The installer still places
+packages with `pkg`'s library.
 
 With `packages.manager = "fox"` (`FERRIC_FOX_IMAGE=1`), the image build then
 finishes the root with the host `fox` (`target/release/fox`, built with the
@@ -269,20 +201,24 @@ other host tools; `fox` itself on a self-hosted Redox build). Once the
 packages, files and accounts are in place, the installer runs, against the
 image root:
 
-1. With `packages.set`, `fox sync --config <set> --target <image target>`
+1. `fox adopt-pkg --allow-unsigned-metadata`, so the image boots with its
+   packages already in `fox`'s database. The unsigned names it accepts are
+   the ones the installer took from the image configuration.
+2. With `packages.set`, `fox sync --config <set> --target <image target>`
    (with `--level v3` or `v4` from `cpu.x86_64_level`, and `--locked` with
    `packages.locked`). The set's registries, policy and
    packages are installed into the image, and `fox.lock` is written beside
    the set. Commit it, and turn on `packages.locked` for release builds, so
    an image is built from exactly the pinned archives and commits. Changing
    the set rebuilds the image.
-2. `fox sbom --system --name ferric-oxide-<config>`, writing the image SBOM
+3. `fox sbom --system --name ferric-oxide-<config>`, writing the image SBOM
    to `build/<arch>/<config>/image.cdx.json`.
 
 A failing step fails the image build. `fox`'s
 `/usr/lib/init.d/05_fox-adopt.service` still runs
-`fox adopt-pkg --allow-unsigned-metadata` on first boot. An image built
-this way has no `pkg` state, so it only matters for roots `pkg` populated.
+`fox adopt-pkg --allow-unsigned-metadata` on first boot. On an image built
+this way it finds the packages already adopted, so it only matters for
+images whose root was assembled some other way. After adoption,
 `fox list`, `fox verify --installed`, `fox install` and `fox remove` cover the
 whole system.
 
@@ -293,14 +229,15 @@ forbid source builds. Registry checkouts and git source caches stay under
 the image's `var/lib/fox/`, where the target's `fox` can use them. The
 image SBOM is not signed yet.
 
-On the target, `fox` installs local `.pkgar` files and their dependencies
-from local repository directories. It does not fetch from package servers
-over HTTPS yet, which `pkg` does. Choose `packages.manager = "pkgutils"` for
-that.
+On the target, `fox` reaches registries, git sources and prebuilt
+artifacts over `https://` as the host does (see [HTTP and
+HTTPS](#http-and-https)); the fox recipe depends on `ca-certificates` for
+the certificate store. It does not resolve dependencies, which `pkg` does.
+Choose `packages.manager = "pkgutils"` for that.
 
 The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
-lists the packages the installer recorded and runs `fox verify --installed`,
-which checks each one against its signed head.
+requires every package to have been adopted with a signed manifest, then
+runs `fox verify --installed`.
 
 ## Hermetic builds and attestations
 
@@ -435,9 +372,10 @@ fox --root ./image-root trust list
    scheme and host, no trailing `/` or `.git`), which is also the source's
    identity in the trust store and in attestations. The cache mirrors the
    remote's branches and tags; a tag deleted upstream is deleted from the
-   cache too, so a withdrawn release is not built. HTTPS uses `gix`'s reqwest transport with
-   rustls on ring and is not built for Redox, where `fox` fetches over
-   `file://`, `ssh://` (through `ssh`) and `git://` only.
+   cache too, so a withdrawn release is not built. `file://`, `ssh://`
+   (through `ssh`) and `git://` use `gix`'s transports; `https://` and
+   `http://` use fox's own client (see [HTTP and HTTPS](#http-and-https)),
+   on the target as well as the host.
 2. **Choose.** Without `#`, the newest release tag is built: the highest
    semver-named tag (`1.2.3` or `v1.2.3`) that is not a pre-release. A name
    after `#` is a tag if one exists, otherwise any revision. Without tags,
@@ -499,6 +437,32 @@ the tag itself with that unencrypted OpenSSH Ed25519 key; otherwise it runs
 back, verifies its signature and prints the key's fingerprint, which users
 see when they first install the source. It refuses a dirty work tree or an
 existing tag, and pushes nothing.
+
+### HTTP and HTTPS
+
+`fox-git` has the one HTTP client `fox` uses, on the host and on the
+target alike: [`ureq`](https://crates.io/crates/ureq) over rustls with the
+`ring` provider (aws-lc-rs does not build for Redox). It serves both git's
+smart HTTP protocol, as `gix`'s HTTP backend, and blob downloads. There is
+no reqwest or tokio in the tree.
+
+- **Certificates.** Server certificates are checked against the system
+  store through `rustls-platform-verifier`. On the target that is
+  `/etc/ssl/certs`, from the `ca-certificates` package; `SSL_CERT_FILE`
+  and `SSL_CERT_DIR` override it.
+- **Proxies.** `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY` and `NO_PROXY` are
+  honored.
+- **Redirects.** Git requests do not follow redirects: a moved repository
+  is an error that names the new location, so the URL a package or
+  registry pins is the one fetched. Blob downloads follow up to 10
+  redirects, since their content is checked against its BLAKE3 hash
+  wherever it comes from.
+- **Not supported.** Git's `http.*` settings (extra headers, credential
+  helpers, timeouts) are not read; sources and registries are fetched
+  anonymously.
+
+The tests in `crates/fox-git/tests/` serve a repository with
+`git http-backend` and blobs from a small server on 127.0.0.1.
 
 ## Registries
 
@@ -965,8 +929,10 @@ that comes with images built through fox.
 Git sources are built without a sandbox (see
 [Hermetic builds and attestations](#hermetic-builds-and-attestations)), and
 only release tags are signature-checked, not individual commits.
-No official registry is published, and dependencies are found by name
-only, without version constraints. The image SBOM is unsigned. Downloading artifacts over HTTPS is not
+No official registry is published, and `fox` resolves only the requested
+package, not its dependencies. Images are still assembled by the installer
+with `pkg`'s library and then adopted by `fox`; only `packages.set` is
+installed by `fox` itself, and the image SBOM is unsigned. Downloading artifacts over HTTPS is not
 built for the target, where only `file://` artifact stores work. A dependency solver, hermetic recipe builds,
 content-addressed generations, rollback and boot-time package verification
 are not implemented by these crates. Some source comments refer to packaging

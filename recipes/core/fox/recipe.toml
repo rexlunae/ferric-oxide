@@ -22,3 +22,7 @@ COOKBOOK_SOURCE="${COOKBOOK_ROOT}/tools/fox" cookbook_cargo
 mkdir -pv "${COOKBOOK_STAGE}/usr/lib/init.d"
 cp -v "${COOKBOOK_RECIPE}/05_fox-adopt.service" "${COOKBOOK_STAGE}/usr/lib/init.d/"
 """
+
+[package]
+# fox checks HTTPS servers against the system certificate store.
+dependencies = ["ca-certificates"]
