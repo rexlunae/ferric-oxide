@@ -912,16 +912,18 @@ device) and serves in the foreground until it is stopped.
 - **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
   serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
   [Block layers](#block-layers-luks-and-lvm-read-only)).
-- **Change times:** `ext4-view` exposes neither inode numbers nor change
-  times, so ext4d finds each handle's inode at open itself (`ext4d::lookup`,
-  below) and `fstat` reads `st_ctime` from it (`i_ctime` with
-  `i_ctime_extra`'s epoch bits and nanoseconds). Where the inode cannot be
-  found (a path through an inline-data or encrypted directory) it reports the
-  modification time instead. On a volume that needs recovery, `ext4-view`
-  reads through its in-memory view of the journal; the lookup and the change
-  time read the same way, with the committed journal blocks in place of their
-  home blocks (`ext4d::journal::committed_blocks`), so all of `fstat`'s times
-  agree.
+- **Times:** `ext4-view` exposes neither inode numbers nor change times, so
+  ext4d finds each handle's inode at open itself (`ext4d::lookup`, below) and
+  `fstat` reads `st_atime`, `st_mtime` and `st_ctime` from one read of it
+  (`i_atime`, `i_mtime`, `i_ctime`, each with its `_extra` field's epoch bits
+  and nanoseconds). Where the inode cannot be found (a path through an
+  inline-data or encrypted directory) it reports `ext4-view`'s times, with the
+  modification time as the change time. On a volume that needs recovery the
+  lookup and the inode read go through the committed journal blocks in place
+  of their home blocks (`ext4d::journal::committed_blocks`). `ext4-view` reads
+  through its own in-memory view of the journal, which as of 1.0.0 does not
+  follow a log that wraps round and then serves the older inode; taking all
+  three times from ext4d's read keeps `fstat` from mixing the two versions.
 - **Limits:** `st_ino` is a hash of the path (hard links get different
   numbers); `mmap` is not served; encrypted files and devices are refused
   (`EOPNOTSUPP`).

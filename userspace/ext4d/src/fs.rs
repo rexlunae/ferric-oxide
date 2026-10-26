@@ -300,8 +300,8 @@ trait Device {
     fn reader(&self) -> Box<dyn Ext4Read>;
     /// The inode `path` names.
     fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError>;
-    /// Inode `number`'s change time.
-    fn change_time(&self, number: u32) -> Result<(i64, u32), crate::lookup::LookupError>;
+    /// Inode `number`'s access, modification and change times, from one read of it.
+    fn times(&self, number: u32) -> Result<crate::lookup::InodeTimes, crate::lookup::LookupError>;
 }
 
 /// The device of a volume mounted with [`Fs::new_writable`], for changes.
@@ -393,8 +393,8 @@ impl<R: crate::device::ReadAt + 'static> Device for Raw<R> {
         self.read(|window| crate::lookup::inode_of(window, path))
     }
 
-    fn change_time(&self, number: u32) -> Result<(i64, u32), crate::lookup::LookupError> {
-        self.read(|window| crate::lookup::change_time(window, number))
+    fn times(&self, number: u32) -> Result<crate::lookup::InodeTimes, crate::lookup::LookupError> {
+        self.read(|window| crate::lookup::times(window, number))
     }
 }
 
@@ -699,9 +699,12 @@ impl Fs {
         Ok(entries.as_deref().unwrap_or_default())
     }
 
-    /// The attributes of the file `id` names. Most come from `ext4-view`; the change time is
-    /// read from the inode itself, as `ext4-view` does not expose it, and is the modification
-    /// time instead when the inode could not be found or read (logged).
+    /// The attributes of the file `id` names. Most come from `ext4-view`. The times are read
+    /// from the inode itself, all three from one read, because `ext4-view` does not expose
+    /// the change time and, on a volume whose journal it does not follow (a wrapped log), can
+    /// serve an older copy of the inode than the one the journal holds; taking some times from
+    /// each would mix two versions. When the inode could not be found or read (logged), the
+    /// times are `ext4-view`'s, with the modification time as the change time.
     ///
     /// # Errors
     ///
@@ -711,6 +714,7 @@ impl Fs {
         let m = &handle.metadata;
         let time = |t: ext4_view::Timestamp| (t.seconds(), t.nanoseconds());
         let kind = Kind::from(m.file_type());
+        let times = self.inode_times(handle);
         Ok(Attributes {
             ino: path_ino(&handle.path),
             mode: kind.mode_bits() | m.mode(),
@@ -719,9 +723,9 @@ impl Fs {
             gid: m.gid(),
             size: m.len(),
             block_size: self.geometry.block_size,
-            accessed: time(m.accessed()),
-            modified: time(m.modified()),
-            changed: self.change_time(handle).unwrap_or(time(m.modified())),
+            accessed: times.map_or(time(m.accessed()), |t| t.accessed),
+            modified: times.map_or(time(m.modified()), |t| t.modified),
+            changed: times.map_or(time(m.modified()), |t| t.changed),
         })
     }
 
@@ -910,12 +914,12 @@ impl Fs {
             .ok()
     }
 
-    /// The change time of the inode `handle` names, if it is known and can be read.
-    fn change_time(&self, handle: &Handle) -> Option<(i64, u32)> {
+    /// The times of the inode `handle` names, if it is known and can be read.
+    fn inode_times(&self, handle: &Handle) -> Option<crate::lookup::InodeTimes> {
         let number = handle.inode?;
         self.device
-            .change_time(number)
-            .inspect_err(|err| log::warn!("{}: cannot read the change time: {err}", handle.path))
+            .times(number)
+            .inspect_err(|err| log::warn!("{}: cannot read the inode's times: {err}", handle.path))
             .ok()
     }
 

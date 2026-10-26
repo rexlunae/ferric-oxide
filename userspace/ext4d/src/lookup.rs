@@ -1,6 +1,7 @@
 //! Finding the inode a path names, so the scheme's changing calls (features.toml
-//! `fs.ext4_write`) know which inode to change, and `fstat` can report the inode's change
-//! time ([`change_time`]), which `ext4-view` does not expose. It is in every build.
+//! `fs.ext4_write`) know which inode to change, and reading an inode's times ([`times`]),
+//! so `fstat` can report the change time, which `ext4-view` does not expose, beside access
+//! and modification times read from the same copy of the inode. It is in every build.
 //!
 //! `ext4-view` resolves paths but does not say which inode a path ends at. [`inode_of`]
 //! walks the path itself, from the root directory (inode 2), reading each directory's
@@ -158,17 +159,29 @@ pub fn inode_of<R: ReadAt>(window: &Window<R>, path: &str) -> Result<u32, Lookup
     Ok(current)
 }
 
-/// The change time (`i_ctime`, with `i_ctime_extra` where the inode has it) of inode
-/// `number` on the volume `window` holds, as seconds since the epoch and nanoseconds.
+/// An inode's timestamps, each as seconds since the epoch and nanoseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InodeTimes {
+    /// `i_atime`, with `i_atime_extra` where the inode has it.
+    pub accessed: (i64, u32),
+    /// `i_mtime`, with `i_mtime_extra` where the inode has it.
+    pub modified: (i64, u32),
+    /// `i_ctime`, with `i_ctime_extra` where the inode has it.
+    pub changed: (i64, u32),
+}
+
+/// The access, modification and change times of inode `number` on the volume `window`
+/// holds, all from one read of the inode, so that they always come from the same version
+/// of it.
 ///
 /// # Errors
 ///
 /// [`LookupError::Volume`] when the volume cannot be read or the inode number is out of
 /// range.
-pub fn change_time<R: ReadAt>(window: &Window<R>, number: u32) -> Result<(i64, u32), LookupError> {
+pub fn times<R: ReadAt>(window: &Window<R>, number: u32) -> Result<InodeTimes, LookupError> {
     let volume = Volume::parse(&read_volume_superblock(window)?)?;
     let inode = volume.read_inode(window, number)?;
-    Ok(crate::inode::change_time(&inode))
+    Ok(crate::inode::times(&inode))
 }
 
 /// The inode the entry `name` of directory `directory` names, if it has one.

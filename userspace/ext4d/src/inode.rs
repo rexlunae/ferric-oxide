@@ -8,20 +8,15 @@
 //! offsets and `i_extra_isize`) and "Inode Timestamps" (the epoch bits and nanoseconds in the
 //! `_extra` fields). No code here comes from the Linux kernel or from e2fsprogs.
 
-/// `i_atime`, `i_ctime`, `i_mtime`: the low 32 bits of the seconds, signed. (`ext4-view`
-/// reads the access and modification times; only `crate::write` needs their offsets.)
-#[cfg(feature = "write")]
+/// `i_atime`, `i_ctime`, `i_mtime`: the low 32 bits of the seconds, signed.
 pub(crate) const I_ATIME: usize = 0x8;
 pub(crate) const I_CTIME: usize = 0xC;
-#[cfg(feature = "write")]
 pub(crate) const I_MTIME: usize = 0x10;
 /// `i_extra_isize`: how many bytes past the first 128 the fields below take.
 pub(crate) const I_EXTRA_ISIZE: usize = 0x80;
 /// `i_ctime_extra`, `i_mtime_extra`, `i_atime_extra`: epoch bits and nanoseconds.
 pub(crate) const I_CTIME_EXTRA: usize = 0x84;
-#[cfg(feature = "write")]
 pub(crate) const I_MTIME_EXTRA: usize = 0x88;
-#[cfg(feature = "write")]
 pub(crate) const I_ATIME_EXTRA: usize = 0x8C;
 /// The size of the original (revision 0) inode, before the extra fields.
 pub(crate) const GOOD_OLD_INODE_SIZE: usize = 128;
@@ -49,9 +44,13 @@ pub(crate) fn time(inode: &[u8], field: usize, extra: usize) -> (i64, u32) {
     }
 }
 
-/// The inode's change time (`i_ctime`, `i_ctime_extra`).
-pub(crate) fn change_time(inode: &[u8]) -> (i64, u32) {
-    time(inode, I_CTIME, I_CTIME_EXTRA)
+/// The inode's access, modification and change times, all read from the same copy of it.
+pub(crate) fn times(inode: &[u8]) -> InodeTimes {
+    InodeTimes {
+        accessed: time(inode, I_ATIME, I_ATIME_EXTRA),
+        modified: time(inode, I_MTIME, I_MTIME_EXTRA),
+        changed: time(inode, I_CTIME, I_CTIME_EXTRA),
+    }
 }
 
 /// The little-endian `u16` at `at`; every caller's buffer is long enough.
@@ -64,9 +63,15 @@ fn le32(raw: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
 }
 
+use crate::lookup::InodeTimes;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn change_time(inode: &[u8]) -> (i64, u32) {
+        times(inode).changed
+    }
 
     /// A 256-byte inode with `i_extra_isize` `extra_isize`, change time `ctime` and
     /// `i_ctime_extra` `extra`.

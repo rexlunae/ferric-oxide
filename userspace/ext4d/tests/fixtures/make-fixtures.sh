@@ -111,6 +111,13 @@ gzip -9 -n -c "$img" > "$out/dir-64k.ext4.gz"
 #   journal-wrap   journal-v3 with its log moved to start three blocks before the end of
 #                  the journal, so it wraps round to the first log block
 #
+# journal-wrap-inode: ext4 defaults with a version 3 journal whose one committed
+# transaction logs hello.txt's inode table block with new times (atime 0x70000000, mtime
+# 0x70000001, ctime 0x70000002, over 0x6955B900 for all three in the inode table; the copy
+# is made by debugfs's set_inode_field, which also updates the inode checksum), its log moved to start two blocks before the journal's end
+# so that the commit block wraps round. ext4-view does not follow it, so a read-only mount
+# must read all of the inode's times one way.
+#
 # The jbd2 crate's tests use the journal inodes of journal-v3, journal-v2 and journal-ext3
 # (crates/jbd2/tests/fixtures/*.jbd2.gz, written here too when that directory is given as $2).
 journal_image() {
@@ -168,12 +175,13 @@ journal_image journal-v2-64 1024 2M "jo -c -v 2" -t ext4
 journal_image journal-ext3 1024 2M "jo" -t ext3
 journal_image journal-4k 4096 16M "jo -c -v 3" -t ext4 -J size=4
 
-# journal-wrap: move journal-v3's log so it starts three blocks before the journal's end.
-cp "$work/journal-v3.ext4" "$work/journal-wrap.ext4"
-debugfs -R "blocks <8>" "$work/journal-wrap.ext4" 2>/dev/null > "$work/journal-blocks"
-python3 - "$work/journal-wrap.ext4" "$work/journal-blocks" <<'EOPY'
+# wrap_log IMAGE BACK: move IMAGE's journal log so it starts BACK blocks before the
+# journal's end and wraps round to the first log block.
+wrap_log() {
+    debugfs -R "blocks <8>" "$1" 2>/dev/null > "$work/journal-blocks"
+    python3 - "$1" "$work/journal-blocks" "$2" <<'EOPY'
 import struct, sys
-image, blocks = sys.argv[1], sys.argv[2]
+image, blocks, back = sys.argv[1], sys.argv[2], int(sys.argv[3])
 bs = 1024
 phys = [int(b) for b in open(blocks).read().split()]
 f = open(image, "r+b")
@@ -198,7 +206,7 @@ while any(rd(first + used)):
 log = [rd(first + i) for i in range(used)]
 for i in range(used):
     wr(first + i, bytes(bs))
-new_start = maxlen - 3
+new_start = maxlen - back
 for i, block in enumerate(log):
     wr(first + (new_start - first + i) % (maxlen - first), block)
 sb[0x1C:0x20] = struct.pack(">I", new_start)
@@ -206,8 +214,33 @@ sb[0xFC:0x100] = bytes(4)
 sb[0xFC:0x100] = struct.pack(">I", crc32c(bytes(sb[:1024])))
 wr(0, sb)
 EOPY
+}
 
-for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-wrap; do
+# journal-wrap: journal-v3's log, starting three blocks before the journal's end.
+cp "$work/journal-v3.ext4" "$work/journal-wrap.ext4"
+wrap_log "$work/journal-wrap.ext4" 3
+
+img=$work/journal-wrap-inode.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a40 -E root_owner=0:0 -d "$jroot" "$img" 2M
+# mke2fs -d takes ctime (and atime) from the clock, so pin all three before and after.
+set_times() {
+    for field in "atime @$2" "mtime @$3" "ctime @$4" "atime_extra 0" "mtime_extra 0" \
+        "ctime_extra 0"; do
+        debugfs -w -R "set_inode_field /hello.txt $field" "$1" >/dev/null 2>&1
+    done
+}
+set_times "$img" 1767225600 1767225600 1767225600
+cp "$img" "$work/times.ext4"
+set_times "$work/times.ext4" 1879048192 1879048193 1879048194
+itable=$(debugfs -R "imap /hello.txt" "$img" 2>/dev/null | sed -n 's/.*located at block \([0-9]*\),.*/\1/p')
+dd if="$work/times.ext4" of="$work/itable" bs=1024 skip="$itable" count=1 2>/dev/null
+printf 'jo -c -v 3\njw -b %s %s\njc\n' "$itable" "$work/itable" > "$work/journal.cmd"
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -f "$work/journal.cmd" "$img" >/dev/null 2>&1
+wrap_log "$img" 2
+
+for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-wrap \
+    journal-wrap-inode; do
     replayed "$name"
 done
 

@@ -113,6 +113,23 @@ fn without_the_replay_the_reader_cannot_serve_these_volumes() {
     }
 }
 
+/// journal-wrap-inode's one transaction logs an inode table block, with its commit block
+/// wrapped round to the start of the log.
+#[test]
+fn a_wrapped_inode_table_block_replays_like_e2fsck() {
+    let name = "journal-wrap-inode";
+    let (outcome, ours) = replay(load(&format!("{name}.ext4.gz")));
+    assert_eq!(
+        outcome.expect("replayed"),
+        Outcome::Replayed {
+            transactions: 1,
+            blocks: 1,
+            journal_errno: 0,
+        }
+    );
+    assert_same_blocks(name, &ours, &load(&format!("{name}.replayed.ext4.gz")));
+}
+
 #[test]
 fn a_replayed_volume_is_clean() {
     let (first, once) = replay(load("journal-v3.ext4.gz"));
