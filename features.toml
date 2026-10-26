@@ -697,6 +697,22 @@ rebuild = ["kernel"]
 help = "Log system calls. Very noisy; for debugging only."
 
 [[option]]
+id = "kernel.time.one_shot"
+menu = "kernel"
+type = "bool"
+title = "Per-CPU one-shot scheduler timers"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "time_one_shot"
+rebuild = ["kernel"]
+help = """
+Ferric Oxide (tickless scheduling, #186): build the per-CPU one-shot timer
+machinery — the TSC-deadline LAPIC timer when the CPU supports it, with the
+periodic PIT path kept as the validated fallback — and run the boot-time
+one-shot selftest. Off by default: without it the kernel behaves exactly as
+before, driven by the periodic PIT interrupt."""
+
+[[option]]
 id = "kernel.profiling"
 menu = "kernel"
 type = "bool"

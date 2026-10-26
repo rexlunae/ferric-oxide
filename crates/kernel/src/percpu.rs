@@ -54,6 +54,40 @@ pub struct PercpuBlock {
     pub stats: CpuStats,
 
     pub numa_node: Cell<Option<(NumaNodeID, &'static NumaNode)>>,
+
+    /// The per-CPU one-shot scheduler timer (tickless scheduling, #186,
+    /// `kernel.time.one_shot`).
+    #[cfg(feature = "time_one_shot")]
+    pub one_shot: OneShotPercpu,
+}
+
+/// The per-CPU state of the one-shot scheduler timer (arch/x86_shared/timer.rs).
+///
+/// The armed deadline cell and the fired flag are written by this CPU's timer
+/// path (interrupts off) and read by its switch path; the previous LVT entry
+/// is what a periodic timer (the profiling timer) left behind, restored when
+/// the one-shot is disarmed.
+#[cfg(feature = "time_one_shot")]
+#[derive(Debug)]
+pub struct OneShotPercpu {
+    /// Which deadline (if any) the hardware has, with the rearm logic.
+    pub armed: ferric_timed::ArmedDeadline,
+    /// Whether a fire happened since the last consume.
+    pub fired: core::sync::atomic::AtomicBool,
+    /// The LVT timer entry that was replaced, or `u32::MAX` when none was.
+    pub previous_lvt: Cell<u32>,
+}
+
+#[cfg(feature = "time_one_shot")]
+impl OneShotPercpu {
+    /// A disarmed one-shot: nothing armed, nothing fired, nothing to restore.
+    pub const fn new() -> Self {
+        Self {
+            armed: ferric_timed::ArmedDeadline::new(),
+            fired: core::sync::atomic::AtomicBool::new(false),
+            previous_lvt: Cell::new(u32::MAX),
+        }
+    }
 }
 
 pub static ALL_PERCPU_BLOCKS: [AtomicPtr<PercpuBlock>; MAX_CPU_COUNT as usize] =
@@ -236,6 +270,8 @@ impl PercpuBlock {
 
             stats: CpuStats::default(),
             numa_node: Cell::new(None),
+            #[cfg(feature = "time_one_shot")]
+            one_shot: OneShotPercpu::new(),
         }
     }
 }

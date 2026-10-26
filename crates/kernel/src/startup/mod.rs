@@ -212,6 +212,13 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
 
     #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     numa::dump_info();
+
+    // The one-shot scheduler timer selftest (kernel.time.one_shot): validates
+    // the TSC-deadline timer and reports the measured firing accuracy before
+    // the first userspace run.
+    #[cfg(all(target_arch = "x86_64", feature = "time_one_shot"))]
+    crate::arch::timer::selftest(&mut token);
+
     run_userspace(&mut token)
 }
 

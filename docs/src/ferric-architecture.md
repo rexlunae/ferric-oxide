@@ -127,6 +127,32 @@ and wakeups synchronize through the futex table in `syscall/futex.rs` so a
 wakeup cannot pass between the comparison and waiter registration. Expired
 waiters cannot consume a later wake intended for another waiter.
 
+### Timers and timekeeping
+
+The monotonic clock (`time::monotonic`) comes from a *continuous* source
+selected at boot and validated against the others (`arch/x86_shared/time.rs`,
+tickless scheduling #186): the KVM paravirtual clock when built in and
+available, else the invariant TSC calibrated against the HPET (the
+calibration and a ppm cross-check are logged), else the HPET counter, else
+the previous OFFSET-plus-interpolation path (reported, and the only case
+where the clock depends on the periodic PIT interrupt). The clock keeps
+advancing while the periodic interrupt is masked, and the realtime offset
+contract is unchanged.
+
+The per-CPU one-shot scheduler timer (`arch/x86_shared/timer.rs`,
+`kernel.time.one_shot`) uses the LAPIC timer in TSC-deadline mode (Intel
+SDM) when CPUID reports it: a deadline in TSC ticks is written to
+IA32_TSC_DEADLINE, and one MSR write is the whole reprogram, so the rearm
+protocol is "recheck the clock after programming". The portable deadline
+arithmetic — ordered `Nanos`/`Duration`/`Deadline` types, rate conversions
+and the `ArmedDeadline` rearm cell — lives in the host-tested `ferric-timed`
+crate. With the feature on, a boot selftest arms the timer for a second,
+arms an already-due deadline and checks a disarmed timer stays quiet, and
+reports the measured firing error; the periodic PIT path remains the
+scheduler's event source until the event-driven scheduler (#187) takes
+over, and machines without TSC-deadline support report unsupported and keep
+the periodic path.
+
 Address-space mappings, sharing and copy-on-write live under
 `crates/kernel/src/context/`; physical allocation and page tables are in
 `src/memory/` and the kernel's `rmm/`. Registered buffers and DMA retain frame

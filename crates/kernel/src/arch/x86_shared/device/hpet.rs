@@ -5,14 +5,14 @@ use crate::acpi::hpet::Hpet;
 use core::time::Duration;
 
 const LEG_RT_CNF: u64 = 2;
-const ENABLE_CNF: u64 = 1;
+pub(crate) const ENABLE_CNF: u64 = 1;
 
 const TN_VAL_SET_CNF: u64 = 0x40;
 const TN_TYPE_CNF: u64 = 0x08;
 const TN_INT_ENB_CNF: u64 = 0x04;
 
 pub(crate) const CAPABILITY_OFFSET: usize = 0x00;
-const GENERAL_CONFIG_OFFSET: usize = 0x10;
+pub(crate) const GENERAL_CONFIG_OFFSET: usize = 0x10;
 const GENERAL_INTERRUPT_OFFSET: usize = 0x20;
 pub(crate) const MAIN_COUNTER_OFFSET: usize = 0xF0;
 // const NUM_TIMER_CAP_MASK: u64 = 0x0f00;
@@ -126,13 +126,13 @@ unsafe fn debug_config(hpet: &mut Hpet) {
 
 /// Ferric Oxide: bit 13 of the capabilities register, COUNT_SIZE_CAP: the main counter is 64
 /// bits wide.
-#[cfg(feature = "trace")]
-const COUNT_SIZE_CAP: u64 = 1 << 13;
+pub(crate) const COUNT_SIZE_CAP: u64 = 1 << 13;
 
-/// Ferric Oxide: the HPET's main counter as `kernel.trace`'s fallback clock (`trace::clock`):
-/// its address in the kernel's linear map and its tick length in femtoseconds, when the HPET
-/// is enabled and the counter is 64 bits wide (a 32-bit one wraps within minutes).
-#[cfg(all(feature = "trace", target_arch = "x86_64"))]
+/// Ferric Oxide: the HPET's main counter as a clock source (`trace::clock`'s fallback, and
+/// the tickless work's): its address in the kernel's linear map and its tick length in
+/// femtoseconds, when the HPET is enabled and the counter is 64 bits wide (a 32-bit one
+/// wraps within minutes).
+#[allow(clippy::arithmetic_side_effects)] // address arithmetic on a mapped register
 pub(crate) fn trace_counter(hpet: &Hpet) -> Option<(*const u64, u64)> {
     // SAFETY: the ACPI code mapped the HPET's registers when it found the table; reading the
     // capabilities and configuration registers has no side effects.
