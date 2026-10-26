@@ -31,8 +31,8 @@ Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Its selected-package Clippy check use
 including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
-job tests `userspace/ext4d/` twice, on the committed ext4 image in
-`tests/fixtures/` and on one `make-fixtures.sh` builds with the runner's
+job tests `userspace/ext4d/` twice, on the committed ext4 images in
+`tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
 e2fsprogs (`EXT4D_FIXTURES`), each time with and without the journal replay
 (`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s), and
 lints and documents it for the host and for `x86_64-unknown-redox`, with and
