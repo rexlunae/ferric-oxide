@@ -41,6 +41,8 @@ extern crate alloc;
 
 pub mod ab;
 pub mod abi;
+#[cfg(feature = "std")]
+pub mod activity;
 pub mod ids;
 #[cfg(feature = "alloc")]
 pub mod openers;
@@ -95,7 +97,13 @@ impl QueuePolicy {
     /// thread. So [`Adaptive`](Self::Adaptive) and [`MainQueue`](Self::MainQueue) are served
     /// one call at a time, which keeps every request on the receiving thread's pair.
     pub const fn serves_concurrently(self) -> bool {
-        matches!(self, Self::Workers)
+        self.serves_concurrently_with_overlap(false)
+    }
+
+    /// Whether requests may enter async dispatch, including the first Adaptive
+    /// request when the driver's optional overlap path is enabled.
+    pub const fn serves_concurrently_with_overlap(self, overlap: bool) -> bool {
+        matches!(self, Self::Workers) || (overlap && matches!(self, Self::Adaptive))
     }
 }
 
@@ -117,6 +125,15 @@ mod tests {
         assert!(QueuePolicy::Workers.serves_concurrently());
         assert!(!QueuePolicy::Adaptive.serves_concurrently());
         assert!(!QueuePolicy::MainQueue.serves_concurrently());
+    }
+
+    #[test]
+    fn adaptive_overlap_dispatches_the_first_request_asynchronously() {
+        assert!(QueuePolicy::Adaptive.serves_concurrently_with_overlap(true));
+        assert_eq!(QueuePolicy::Adaptive.route(0), Route::Main);
+        assert_eq!(QueuePolicy::Adaptive.route(1), Route::Worker);
+        assert!(!QueuePolicy::MainQueue.serves_concurrently_with_overlap(true));
+        assert!(QueuePolicy::Workers.serves_concurrently_with_overlap(false));
     }
 
     #[test]

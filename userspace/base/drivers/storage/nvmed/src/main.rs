@@ -64,39 +64,15 @@ impl Disk for NvmeDisk {
         Ok(())
     }
 
-    /// With per-CPU workers, whether a request that arrives while another is in flight is
-    /// handed to a worker that answers it itself ([`PendingIo`], `Work::Answer`), so the
-    /// scheme's thread does not wait for it.
-    ///
-    /// [`Workers`](ferric_blkqueue::QueuePolicy::Workers) always serves concurrently.
-    /// With the `overlap` feature (`drivers.nvme_overlap`, off by default),
-    /// [`Adaptive`](ferric_blkqueue::QueuePolicy::Adaptive) keeps the first request of a
-    /// burst on the main thread's queue pair (its thread context serves one request at a
-    /// time) and overlaps the rest on the workers, so a single thread never pays a
-    /// hand-off. Without the feature, Adaptive serves one call at a time as before:
-    /// measured on QEMU/KVM (Kleya, same-boot A/B), the adaptive overlap loses about
-    /// 1-3% of qd32 IOPS because each hand-off costs more than the emulated controller
-    /// saves, so the default stays serial until real NVMe hardware shows the overlap
-    /// paying.
+    /// Async dispatch is enabled before the first Adaptive request arrives.
+    /// The dispatcher keeps that first request on the scheme thread's queue.
     #[cfg(feature = "percore")]
     fn concurrent(&self) -> bool {
-        self.workers
-            .as_ref()
-            .is_some_and(|workers| match workers.policy() {
-                ferric_blkqueue::QueuePolicy::Workers => true,
-                ferric_blkqueue::QueuePolicy::MainQueue => false,
-                ferric_blkqueue::QueuePolicy::Adaptive => {
-                    #[cfg(feature = "overlap")]
-                    {
-                        workers.busy()
-                    }
-                    #[cfg(not(feature = "overlap"))]
-                    {
-                        false
-                    }
-                }
-                _ => false,
-            })
+        self.workers.as_ref().is_some_and(|workers| {
+            workers
+                .policy()
+                .serves_concurrently_with_overlap(cfg!(feature = "overlap"))
+        })
     }
 
     /// With per-CPU workers, a concurrent read or write goes to a worker, which writes the
@@ -104,7 +80,7 @@ impl Disk for NvmeDisk {
     #[cfg(feature = "percore")]
     fn submit(&mut self, io: driver_block::PendingIo) -> Result<(), driver_block::PendingIo> {
         match &self.workers {
-            Some(workers) => workers.submit(self.ns, io),
+            Some(workers) => workers.submit(&self.nvme, self.ns, io),
             None => Err(io),
         }
     }
