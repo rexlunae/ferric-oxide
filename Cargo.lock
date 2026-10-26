@@ -1688,7 +1688,6 @@ dependencies = [
  "pkgar 0.2.4",
  "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
- "redox-pkg 0.3.3",
  "serde",
  "ssh-key",
  "tempfile",
