@@ -14,10 +14,8 @@
 //! assert_eq!(requests.count(), 0);
 //! ```
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Shared activity count; cloning a counter does not create a request claim.
 #[derive(Clone, Default)]
@@ -50,6 +48,8 @@ impl Drop for Claim {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
