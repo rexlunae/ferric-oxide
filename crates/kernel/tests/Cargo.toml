@@ -12,6 +12,11 @@ path = "lib.rs"
 [dependencies]
 redox_syscall = { path = "../syscall", default-features = false }
 ferric-irq = { path = "../../irq", optional = true }
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
 
 [features]
 irq-percpu = ["dep:ferric-irq"]
+# Exercise wait-list destruction with the kernel's diagnostic enabled.
+drop_panic = []
+# Compile the inherited bounded-spin path when checking all features.
+busy_panic = []
