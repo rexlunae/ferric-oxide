@@ -2,12 +2,14 @@
 //!
 //! The scheme's handles are [`Fs`] handles. Reads, directory listings, `fstat`, `fstatvfs`
 //! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
-//! `fs.ext4_write`), `futimens` sets times through the journal ([`Fs::set_times`]).
-//! Everything else that would change the volume (opens for writing or creating,
-//! `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `frename`, `flink`, and `futimens` on a
-//! read-only mount) fails with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos
-//! only through [`Error::errno`]. Opens and `futimens` enforce the caller's UID/GID.
+//! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
+//! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]). Everything else that would
+//! change the volume (opens for writing or creating, `unlinkat`, `ftruncate`, `frename`,
+//! `flink`, and those three on a read-only mount) fails with `EROFS`, as
+//! [`Error::ReadOnly`] says. Errors become errnos only through [`Error::errno`]. Opens and
+//! every change enforce the caller's UID/GID.
 
+use ferric_abi::id::requested;
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use syscall::data::{Stat, StatVfs, TimeSpec};
@@ -195,12 +197,17 @@ impl SchemeSync for Ext4Scheme {
         Ok(self.fs.attributes(id).map_err(|e| errno(&e))?.size)
     }
 
-    fn fchmod(&mut self, id: usize, _mode: u16, _ctx: &CallerCtx) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn fchmod(&mut self, id: usize, mode: u16, ctx: &CallerCtx) -> syscall::Result<()> {
+        self.fs
+            .set_mode(id, mode, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
-    fn fchown(&mut self, id: usize, _uid: u32, _gid: u32, _ctx: &CallerCtx) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn fchown(&mut self, id: usize, uid: u32, gid: u32, ctx: &CallerCtx) -> syscall::Result<()> {
+        let (uid, gid) = (requested(uid), requested(gid));
+        self.fs
+            .set_owner(id, uid, gid, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
     fn fcntl(

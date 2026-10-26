@@ -244,6 +244,18 @@ for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-
     replayed "$name"
 done
 
+# quota.ext4.gz: ext4 defaults with quota (user and group quota inodes, 3 and 4), 2 MiB,
+# 1 KiB blocks, with hello.txt. Giving hello.txt a new owner or group would move its usage
+# from one quota record to another.
+img=$work/quota.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 -O quota \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a50 -E root_owner=0:0 -d "$jroot" "$img" 2M
+# mke2fs -d leaves the quota files without the usage of what it copies in; e2fsck -fy
+# counts it (and exits 1, having changed the volume).
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fy "$img" >/dev/null || [ $? -eq 1 ]
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
+gzip -9 -n -c "$img" > "$out/quota.ext4.gz"
+
 if [ -n "${2:-}" ]; then
     for name in journal-v3 journal-v2 journal-ext3; do
         debugfs -R "dump <8> $work/$name.jbd2" "$work/$name.ext4" >/dev/null 2>&1
