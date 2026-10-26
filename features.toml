@@ -1334,7 +1334,7 @@ scheme, the way RedoxFS serves its own. Run it as
 partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
 Every change (writing, creating, removing, renaming) fails with EROFS,
 unless fs.ext4_write is on: it adds a journaled writer, which so far sets a
-file's times (futimens). Reading is done by the ext4-view crate, and handles
+file's times, mode and owner (futimens, fchmod, fchown). Reading is done by the ext4-view crate, and handles
 extents, hashed directories, checksums and the journal; fstat's change time
 is read from the inode by ext4d. Source: userspace/ext4d."""
 
@@ -1429,10 +1429,12 @@ Build ext4d with its journaled writer: each change to a volume is one JBD2
 transaction, logged with descriptor and commit blocks and their checksums,
 committed, then written home and the journal emptied (the checkpoint), so a
 crash at any point leaves the change made in full by a replay, or not at all.
-The only change so far sets an existing inode's access, modification and
-change times, which the scheme's futimens does (with POSIX's owner and
-write-permission rules), finding the inode from the path itself; every other
-change still fails with EROFS. Volumes that need recovery are replayed first;
+The changes so far rewrite one existing inode: its access and modification
+times (futimens), its permission bits (fchmod) or its owner and group (fchown),
+each with a new change time, following POSIX's owner, write-permission and
+restricted-chown rules, and finding the inode from the path itself; every other
+change still fails with EROFS. A new owner or group is refused on volumes with
+quota, and IDs above 65535 on volumes not made for Linux or Hurd. Volumes that need recovery are replayed first;
 volumes with a feature the writer does not know (mmp, meta_bg, readonly and
 others), or with no journal, are served read-only, and ext4d says why, as are
 volumes whose device cannot be opened for writing.

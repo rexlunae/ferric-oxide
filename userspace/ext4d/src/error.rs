@@ -48,10 +48,18 @@ pub enum Error {
     /// The ext4 reader failed.
     #[error("ext4")]
     Ext4(#[from] Ext4Error),
-    /// Setting explicit times on a file the caller does not own (POSIX `futimens`: only
-    /// `UTIME_NOW` for both times is allowed with write permission alone).
-    #[error("only the owner can set a file's times")]
+    /// A change only the file's owner (or UID 0) may make: explicit times (POSIX
+    /// `futimens`: `UTIME_NOW` for both times needs only write permission), its mode or its
+    /// owner and group.
+    #[error("only the file's owner can change this")]
     NotOwner,
+    /// `fchown` by a caller other than UID 0 giving the file to another owner, or to a
+    /// group the caller is not in (POSIX `_POSIX_CHOWN_RESTRICTED`).
+    #[error("only UID 0 can give a file away or to a group the caller is not in")]
+    ChownRestricted,
+    /// `fchmod` on a symbolic link opened itself: a link's mode is not used.
+    #[error("a symbolic link's mode cannot be changed")]
+    SymlinkMode,
     /// A `futimens` time whose nanoseconds are out of range and not `UTIME_NOW` or
     /// `UTIME_OMIT`, or a call without exactly two times.
     #[error("invalid time")]
@@ -80,7 +88,8 @@ impl Error {
             Self::Device(_) => EIO,
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
-            Self::NotOwner => EPERM,
+            Self::NotOwner | Self::ChownRestricted => EPERM,
+            Self::SymlinkMode => EOPNOTSUPP,
             Self::InvalidTime => EINVAL,
             #[cfg(feature = "write")]
             Self::Lookup(err) => lookup_errno(err),
@@ -110,7 +119,10 @@ fn write_errno(err: &crate::write::WriteError) -> i32 {
         WriteError::NeedsReplay | WriteError::NoJournal | WriteError::UnsupportedFeature { .. } => {
             EROFS
         }
-        WriteError::TimeOutOfRange { .. } => EINVAL,
+        WriteError::TimeOutOfRange { .. }
+        | WriteError::InvalidPermissions { .. }
+        | WriteError::IdOutOfRange { .. } => EINVAL,
+        WriteError::QuotaTracked { .. } => EOPNOTSUPP,
         // Damaged inodes, journals and devices, and anything added later.
         _ => EIO,
     }
