@@ -1,6 +1,6 @@
 [source]
 # relibc lives in this repository at crates/relibc/, a git subtree of
-# gitlab.redox-os.org/redox-os/relibc (see .github/workflows/subtree-sync.yml).
+# gitlab.redox-os.org/redox-os/relibc (imported with its history; not synced).
 # Its openlibm and dlmalloc-rs submodules are listed in the root .gitmodules.
 path = "crates/relibc"
 

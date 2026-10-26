@@ -411,6 +411,39 @@ crate::events! {
         level: Info,
         args: ["space", "new_space", "addr", "pages"],
     }
+
+    /// The kernel copied whole Sqe records to a user scheme's `read` (the daemon's
+    /// "next request" step, `UserInner::read`): the scheme id, the request count and the
+    /// byte count.
+    ///
+    /// This is a debug-level event for the I/O path: together with `scheme.request` it
+    /// separates the kernel's queueing of a request from the scheme's seeing it, so a
+    /// capture can attribute the gap to scheduling or the socket copy. It fires for every
+    /// user scheme, not only the disk. Only whole records are copied, so `count` is
+    /// `bytes / size_of::<Sqe>()`.
+    pub const SCHEME_SQE_DELIVER = 31 {
+        name: "scheme.sqe_deliver",
+        subsystem: Scheme,
+        level: Debug,
+        args: ["scheme", "count", "bytes"],
+    }
+
+    /// The kernel accepted a user scheme's `write` of Cqe records (the daemon's
+    /// socket receive step, `UserInner::write`): scheme id, accepted record count
+    /// and byte count. Records include control commands (TriggerFevent/ObtainFd)
+    /// as well as responses; this count does not count resumed callers.
+    ///
+    /// This is a debug-level event for the I/O path: together with `scheme.response` it
+    /// separates the scheme's writing an answer from the kernel's accepting it. It fires
+    /// for every user scheme, not only the disk. Only whole Cqe records are accepted, so
+    /// `count` is `bytes / size_of::<Cqe>()`. Commands that produced no Cqe batch
+    /// (a zero-length write) are not recorded.
+    pub const SCHEME_CQE_RECEIVE = 32 {
+        name: "scheme.cqe_receive",
+        subsystem: Scheme,
+        level: Debug,
+        args: ["scheme", "count", "bytes"],
+    }
 }
 
 /// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
@@ -686,6 +719,10 @@ mod tests {
         assert_eq!(MM_CLONE.id().get(), 28);
         assert_eq!(MM_DESTROY.id().get(), 29);
         assert_eq!(MM_CLONE_SKIP.id().get(), 30);
+        assert_eq!(SCHEME_SQE_DELIVER.id().get(), 31);
+        assert_eq!(SCHEME_SQE_DELIVER.subsystem(), Subsystem::Scheme);
+        assert_eq!(SCHEME_CQE_RECEIVE.id().get(), 32);
+        assert_eq!(SCHEME_CQE_RECEIVE.subsystem(), Subsystem::Scheme);
     }
 
     #[test]
@@ -731,6 +768,10 @@ mod tests {
             assert_eq!(event.level(), crate::Level::Info, "{}", event.name());
         }
         assert_eq!(IOMMU_FAULT.level(), crate::Level::Error);
+        // I/O-path events are debug, so the default `kernel.trace_max_level` (info) leaves
+        // a measured kernel close to the unmeasured one until a profile asks for them.
+        assert_eq!(SCHEME_SQE_DELIVER.level(), crate::Level::Debug);
+        assert_eq!(SCHEME_CQE_RECEIVE.level(), crate::Level::Debug);
     }
 
     #[test]

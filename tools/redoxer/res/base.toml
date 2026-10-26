@@ -148,9 +148,9 @@ VERSION_ID="0.9.0"
 VERSION="0.9.0"
 ID="redox-os"
 
-HOME_URL="https://redox-os.org/"
-DOCUMENTATION_URL="https://redox-os.org/docs/"
-SUPPORT_URL="https://redox-os.org/community/"
+HOME_URL="https://github.com/rexlunae/ferric-oxide"
+DOCUMENTATION_URL="https://github.com/rexlunae/ferric-oxide/tree/main/docs"
+SUPPORT_URL="https://github.com/rexlunae/ferric-oxide/issues"
 """
 symlink = false
 directory = false

@@ -5,10 +5,10 @@ architecture, build/configuration flow, memory protection, registered buffers,
 DMA isolation, package tooling and validation. Its chapters are included in
 the mdBook [table of contents](src/SUMMARY.md).
 
-This directory is also the imported Redox book subtree. The inherited chapters
-below provide background and keep their upstream identity; prefer the Ferric
-chapters and current source for fork behavior and paths. Keep additions local
-and update the relevant chapter alongside implementation changes. Contributor
+This directory was imported from the Redox book and is maintained here; it is
+not synced from upstream. Chapters not yet revised for Ferric Oxide still
+describe Redox; prefer the Ferric chapters and current source for behavior and
+paths, and update the relevant chapter alongside implementation changes. Contributor
 rules and a task-based document map are in [AGENTS.md](../AGENTS.md).
 
 ## The inherited Redox Book
