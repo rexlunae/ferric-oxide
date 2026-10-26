@@ -22,7 +22,9 @@
 //! - [`CpuLevel`] and [`feature_set_hash`]: parts of an artifact's
 //!   identity;
 //! - [`GitUrl`]: a repository URL in the normalized form used as a source's
-//!   identity.
+//!   identity;
+//! - [`cookbook`]: the metadata formats the cookbook writes beside its
+//!   archives (`<name>.toml`, `repo.toml`).
 //!
 //! The crate is `no_std` with `alloc`. The `std` feature adds the `archive`
 //! module, which opens `.pkgar` files and hashes every entry's data, the
@@ -57,6 +59,7 @@ pub mod attestation;
 pub mod attested;
 #[cfg(feature = "std")]
 pub mod config;
+pub mod cookbook;
 mod digest;
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;

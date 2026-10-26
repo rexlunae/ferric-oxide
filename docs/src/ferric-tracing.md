@@ -18,8 +18,8 @@ what is on at run time.
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, `sched.context_create`/`context_start`/`context_exit`, and `procmgr`'s `sched.proc_fork`/`proc_exec`/`proc_exit`/`proc_wait` |
-| `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
-| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone` and `mm.destroy` |
+| `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel`, and, with `kernel.trace_max_level = "debug"`, the I/O-path [`scheme.sqe_deliver` and `scheme.cqe_receive`](#scheme-socket-batches) |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip` and `mm.destroy` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
 | `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
@@ -122,6 +122,8 @@ The events are:
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
 | `scheme.cancel` | `scheme`, `tag` |
+| `scheme.sqe_deliver` | `scheme`, `count`, `bytes` (debug level; see [Scheme socket batches](#scheme-socket-batches)) |
+| `scheme.cqe_receive` | `scheme`, `count`, `bytes` (debug level; see [Scheme socket batches](#scheme-socket-batches)) |
 | `mm.page_fault` | `addr`, `ip`, `flags`, `outcome` |
 | `irq.deliver` | `irq`, `cpu`, `source`, `count`, `handles` |
 | `irq.ack` | `irq`, `cpu`, `count` |
@@ -415,6 +417,31 @@ with RedoxFS as `caller`, before it answers as `responder`.
 
 These events do not cover one-way messages (`close`, `detach`) or the kernel's
 own mmap requests.
+
+### Scheme socket batches
+
+`scheme.sqe_deliver` and `scheme.cqe_receive` are debug-level events that see
+the scheme socket itself (`crates/kernel/src/scheme/user.rs`,
+`UserInner::read` and `UserInner::write`), for I/O-path performance work. They
+need `kernel.trace_max_level = "debug"`.
+
+- `scheme.sqe_deliver` is recorded when the kernel copies whole Sqe records to
+  the scheme daemon's `read`: the scheme id, the request count and the byte
+  count. The record's timestamp is the end of the user copy, which is also
+  when the daemon's `read` returns, so together with `scheme.request` it
+  splits the kernel's queueing of a request (and the scheduling of the
+  daemon) from the daemon's seeing it.
+- `scheme.cqe_receive` is recorded when the kernel accepts the daemon's
+  `write` of a batch of Cqe records: the scheme id, accepted record count
+  and byte count. It includes control commands such as `TriggerFevent` and
+  `ObtainFd`, so the count is not the number of responses or resumed callers.
+  Use `scheme.response` and its tag for actual response timing.
+- Both fire for every user scheme, not only the disk scheme, and only when a
+  read or write moved records (a zero-length `write` is not a batch). The
+  counts are whole records: `count * size_of::<Sqe>() == bytes` for a
+  delivery and `count * size_of::<Cqe>() == bytes` for a receive. In a
+  capture, prefer matching `scheme.request`/`scheme.response` by tag for
+  per-request timing; use the batch events for the socket's batching shape.
 
 ### Faults and interrupts
 

@@ -1,7 +1,8 @@
 // Scripts here is executed using "cookbook_redoxer env" where CC, RUSTFLAGS, etc. defined.
 // Look up redoxer env script if you want to see how they work.
 
-pub(crate) static SHARED_PRESCRIPT: &str = r#"
+pub(crate) static SHARED_PRESCRIPT: &str = concat!(
+    r#"
 # Build dynamically
 function DYNAMIC_INIT {
     case "${TARGET}" in
@@ -82,10 +83,16 @@ function DYNAMIC_STATIC_INIT {
     fi
 }
 
+# Writes GNU config.sub (vendored in tools/cookbook/res, upstream GNU config 2022-01-03) to $1.
 function GNU_CONFIG_GET {
-  wget -O "$1" "https://gitlab.redox-os.org/redox-os/gnu-config/-/raw/master/config.sub?inline=false"
+  cat > "$1" <<'FERRIC_CONFIG_SUB_EOF'
+"#,
+    include_str!("../../res/config.sub"),
+    r#"FERRIC_CONFIG_SUB_EOF
+  chmod +x "$1"
 }
-"#;
+"#
+);
 
 pub(crate) static BUILD_PRESCRIPT: &str = r#"
 # Add cookbook bins to path
@@ -505,3 +512,30 @@ fi
 
 killall sccache
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::SHARED_PRESCRIPT;
+    use std::process::Command;
+
+    #[test]
+    fn gnu_config_get_writes_the_vendored_config_sub() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "{SHARED_PRESCRIPT}\nGNU_CONFIG_GET config.sub\n./config.sub x86_64-unknown-redox\n"
+        );
+        let output = Command::new("bash")
+            .arg("-e")
+            .current_dir(dir.path())
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"x86_64-unknown-redox\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("config.sub")).unwrap(),
+            include_bytes!("../../res/config.sub")
+        );
+    }
+}
