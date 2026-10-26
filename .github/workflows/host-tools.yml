@@ -51,6 +51,8 @@ jobs:
         run: bash scripts/ferric-ci/test-boot-smoke.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
+      - name: Perf A/B gate regression tests
+        run: bash scripts/ferric-ci/test-perf-ab.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
@@ -205,8 +207,9 @@ jobs:
         run: cargo test --locked --lib
 
   # ext4d (fs.ext4): its tests on the committed ext4 images and on ones e2fsprogs makes now
-  # (the journal replay, fs.ext4_journal_replay, against e2fsck's), its lints and docs for
-  # the host and for Redox with and without the replay, and the on-target test's lints.
+  # (the journal replay, fs.ext4_journal_replay, against e2fsck's, and the journaled writer,
+  # fs.ext4_write, checked by e2fsck), its lints and docs for the host and for Redox with
+  # each feature set, and the on-target test's lints.
   ext4d:
     runs-on: ubuntu-24.04
     defaults:
@@ -229,6 +232,9 @@ jobs:
         run: |
           cargo test --locked
           cargo test --locked --features journal-replay
+          # The journaled writer (fs.ext4_write), with e2fsck replaying and checking every
+          # volume it leaves.
+          EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" cargo test --locked --features write
       - name: Test (fresh images from e2fsprogs)
         run: |
           mke2fs -V
@@ -236,10 +242,12 @@ jobs:
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
+            cargo test --locked --features write --test write
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
-          for features in "" "--features journal-replay"; do
+          for features in "" "--features journal-replay" "--features write"; do
             cargo clippy --locked --all-targets $features -- -D warnings
             cargo clippy --locked --all-targets --target x86_64-unknown-redox $features -- -D warnings
             RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps $features
