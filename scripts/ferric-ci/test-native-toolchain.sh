@@ -97,7 +97,7 @@ input_files=(
     crates/relibc/ld_so/src/lib.rs crates/relibc/redox-ioctl/src/lib.rs
     crates/relibc/generic-rt/src/lib.rs crates/relibc/openlibm/src/math.c
     crates/relibc/dlmalloc-rs/src/lib.rs crates/hwrand/src/lib.rs
-    crates/procinfo/src/lib.rs crates/kernel/syscall/src/lib.rs
+    crates/procinfo/src/lib.rs crates/abi/src/lib.rs crates/kernel/syscall/src/lib.rs
     scripts/native-toolchain.sh scripts/native/runtime.ld rust-toolchain.toml
     recipes/core/relibc/recipe.toml
 )

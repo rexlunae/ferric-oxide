@@ -59,6 +59,7 @@ name = "ext4d"
 version = "0.1.0"
 dependencies = [
  "ext4-view",
+ "ferric-abi",
  "ferric-jbd2",
  "flate2",
  "libredox",
@@ -67,6 +68,10 @@ dependencies = [
  "redox_syscall",
  "thiserror",
 ]
+
+[[package]]
+name = "ferric-abi"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-jbd2"

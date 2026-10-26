@@ -335,7 +335,6 @@ impl BlockMap {
     /// directory, for a path lookup). Unlike the journal's map, holes are allowed and left
     /// out, and so are unwritten extents, which read as zeros. Nothing is checked beyond
     /// what reading needs: each block is checked to be inside the volume when it is read.
-    #[cfg(feature = "write")]
     pub(crate) fn of_inode<R: ReadAt>(
         volume: &Volume,
         window: &Window<R>,

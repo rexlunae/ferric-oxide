@@ -15,7 +15,8 @@
 //! for that. Without it the device is only ever opened for reading. `write` (features.toml
 //! `fs.ext4_write`) opens the device for writing and serves the volume read-write when the
 //! library can write to it (`ext4d::write::check_writable`), so far for `futimens` only;
-//! otherwise it says why and serves it read-only. `ext4d --features`
+//! when it cannot, or the device does not open for writing, it says why and serves the
+//! volume read-only (`ext4d::fs::Fs::mount_preferring_write`). `ext4d --features`
 //! prints the optional features it was built with, one per line, so tests can tell.
 
 #![forbid(unsafe_code)]
@@ -176,17 +177,16 @@ mod daemon {
         Ok(ext4d::fs::Fs::new(window)?)
     }
 
-    /// Loads the volume: with `write`, for changes when the library can write to it, with
-    /// the device opened again for writing; otherwise read-only, saying why.
+    /// Loads the volume: with `write`, for changes when the library can write to it and the
+    /// device opens for writing; otherwise read-only, saying why.
     #[cfg(feature = "write")]
     fn mount(args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
-        if let Err(err) = ext4d::write::check_writable(&window) {
-            eprint!("ext4d: {}: serving read-only: {err}", args.device);
-            print_sources(&err);
-            return Ok(ext4d::fs::Fs::new(window)?);
+        let (fs, read_only) = ext4d::fs::Fs::mount_preferring_write(window, || open(args, true))?;
+        if let Some(reason) = read_only {
+            eprint!("ext4d: {}: serving read-only: {reason}", args.device);
+            print_sources(&reason);
         }
-        let writable = open(args, true)?;
-        Ok(ext4d::fs::Fs::new_writable(writable)?)
+        Ok(fs)
     }
 
     /// Prints `err`'s sources after it, then ends the line.

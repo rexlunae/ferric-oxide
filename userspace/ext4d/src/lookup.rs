@@ -1,5 +1,6 @@
-//! Finding the inode a path names (features.toml `fs.ext4_write`, Cargo feature `write`), so
-//! the scheme's changing calls know which inode to change.
+//! Finding the inode a path names, so the scheme's changing calls (features.toml
+//! `fs.ext4_write`) know which inode to change, and `fstat` can report the inode's change
+//! time ([`change_time`]), which `ext4-view` does not expose. It is in every build.
 //!
 //! `ext4-view` resolves paths but does not say which inode a path ends at. [`inode_of`]
 //! walks the path itself, from the root directory (inode 2), reading each directory's
@@ -31,6 +32,14 @@
 //! "Hash Tree Directories" on how index blocks read to a linear reader, and the checksum
 //! tail), "Inode Table" (`i_mode`, `i_flags`) and "Special inodes" (the root directory is
 //! inode 2). No code here comes from the Linux kernel or from e2fsprogs.
+//!
+//! One encoding is not in that page: with 64 KiB blocks, an entry that spans a whole block
+//! has a length of 65536, which does not fit `rec_len`'s 16 bits. `mke2fs` (e2fsprogs 1.47)
+//! stores it as `0xFFFF` (an empty `lost+found` block on a volume without
+//! `metadata_csum`), and `e2fsck -fn` accepts both that and 0; both are read as
+//! 65536 in 64 KiB blocks. This was found by looking at the bytes of volumes `mke2fs` made
+//! and at what `e2fsck` accepts, not from either's source. The `dir-64k` fixture
+//! (`tests/fixtures/make-fixtures.sh`) has such an entry naming a file.
 
 use thiserror::Error;
 
@@ -149,6 +158,19 @@ pub fn inode_of<R: ReadAt>(window: &Window<R>, path: &str) -> Result<u32, Lookup
     Ok(current)
 }
 
+/// The change time (`i_ctime`, with `i_ctime_extra` where the inode has it) of inode
+/// `number` on the volume `window` holds, as seconds since the epoch and nanoseconds.
+///
+/// # Errors
+///
+/// [`LookupError::Volume`] when the volume cannot be read or the inode number is out of
+/// range.
+pub fn change_time<R: ReadAt>(window: &Window<R>, number: u32) -> Result<(i64, u32), LookupError> {
+    let volume = Volume::parse(&read_volume_superblock(window)?)?;
+    let inode = volume.read_inode(window, number)?;
+    Ok(crate::inode::change_time(&inode))
+}
+
 /// The inode the entry `name` of directory `directory` names, if it has one.
 fn find<R: ReadAt>(
     volume: &Volume,
@@ -213,14 +235,14 @@ fn find_in_block(block: &[u8], name: &[u8], filetype: bool) -> Result<Option<u32
     while offset < block.len() {
         let entry = block.get(offset..offset + ENTRY_HEADER).ok_or(offset)?;
         let inode = le32(entry, 0);
-        let rec_len = usize::from(u16::from_le_bytes([entry[4], entry[5]]));
+        let rec_len = rec_len(u16::from_le_bytes([entry[4], entry[5]]), block.len());
         let name_len = if filetype {
             usize::from(entry[6])
         } else {
             usize::from(u16::from_le_bytes([entry[6], entry[7]]))
         };
         let fits = rec_len >= ENTRY_HEADER
-            && rec_len % 4 == 0
+            && rec_len.is_multiple_of(4)
             && offset + rec_len <= block.len()
             && ENTRY_HEADER + name_len <= rec_len;
         if !fits {
@@ -233,6 +255,21 @@ fn find_in_block(block: &[u8], name: &[u8], filetype: bool) -> Result<Option<u32
         offset += rec_len;
     }
     Ok(None)
+}
+
+/// The block size whose whole-block entries need [`rec_len`]'s special case.
+const BLOCK_64K: usize = 1 << 16;
+
+/// The length a stored `rec_len` stands for in a directory block of `block_len` bytes: as
+/// stored, except in 64 KiB blocks, where `0xFFFF` and 0 stand for 65536 (an entry over the
+/// whole block), which 16 bits cannot hold. No other length in such a block can be 0xFFFF
+/// (lengths are multiples of 4) or 0 (no entry is empty).
+fn rec_len(stored: u16, block_len: usize) -> usize {
+    if block_len == BLOCK_64K && matches!(stored, 0 | u16::MAX) {
+        BLOCK_64K
+    } else {
+        usize::from(stored)
+    }
 }
 
 /// The little-endian `u32` at `at`; every caller's buffer is long enough.
@@ -331,5 +368,29 @@ mod tests {
         assert_eq!(find_in_block(&short, b"zzz", true), Err(12));
         // A zero rec_len would loop forever if it were accepted.
         assert_eq!(find_in_block(&[0; 16], b"zzz", true), Err(0));
+    }
+
+    #[test]
+    fn a_64k_block_spanned_by_one_entry_stores_its_length_as_0xffff_or_0() {
+        for stored in [u16::MAX, 0] {
+            let mut raw = vec![0; BLOCK_64K];
+            raw[..4].copy_from_slice(&13u32.to_le_bytes());
+            raw[4..6].copy_from_slice(&stored.to_le_bytes());
+            raw[6] = 1;
+            raw[7] = 1;
+            raw[8] = b'b';
+            assert_eq!(find_in_block(&raw, b"b", true), Ok(Some(13)), "{stored:#x}");
+            assert_eq!(find_in_block(&raw, b"c", true), Ok(None), "{stored:#x}");
+            // Only a 64 KiB block has the special case: elsewhere they are malformed.
+            let mut small = raw[..1024].to_vec();
+            small[4..6].copy_from_slice(&stored.to_le_bytes());
+            assert_eq!(find_in_block(&small, b"b", true), Err(0), "{stored:#x}");
+        }
+        // After another entry, 65536 bytes do not fit what is left of the block.
+        let mut raw = vec![0; BLOCK_64K];
+        raw[..12].copy_from_slice(&entry(2, 12, b".", 2));
+        raw[12 + 4..12 + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(find_in_block(&raw, b"zzz", true), Err(12));
+        assert_eq!(rec_len(0xFFF4, BLOCK_64K), 0xFFF4);
     }
 }

@@ -18,6 +18,12 @@
 #   link               a symbolic link to hello.txt
 #   big.bin            200 KiB, byte i is (i * 7 + i / 4096) mod 251, over several blocks
 #   many/f000..f199    200 small files, so the directory is hashed (an htree)
+#
+# dir-64k.ext4.gz: 4 MiB, 64 KiB blocks, no journal, metadata_csum or dir_index, with
+# d/a ("linked from a whole 64 KiB block\n") and d/b, a second link to it whose entry is
+# alone in d's second block. That entry spans the whole block, a length of 65536 that
+# rec_len's 16 bits cannot hold: mke2fs stores it as 0xFFFF in the empty block debugfs's
+# expand_dir adds, and only the entry's inode, name and type are written over it here.
 set -eu
 out=${1:-$(dirname "$0")}
 work=$(mktemp -d)
@@ -57,6 +63,30 @@ for name in /dir/private.txt /dir/private-dir; do
     debugfs -w -R "set_inode_field $name uid 1000" "$out/basic.ext4" >/dev/null 2>&1
     debugfs -w -R "set_inode_field $name gid 100" "$out/basic.ext4" >/dev/null 2>&1
 done
+
+root64=$work/root64
+mkdir -p "$root64/d"
+printf 'linked from a whole 64 KiB block\n' > "$root64/d/a"
+find "$root64" -exec touch -h -d '2026-01-01 00:00:00 UTC' {} +
+img=$work/dir-64k.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 65536 \
+    -O ^has_journal,^metadata_csum,^dir_index \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a30 -E root_owner=0:0 -d "$root64" "$img" 4M 2>/dev/null
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -R "expand_dir /d" "$img" >/dev/null 2>&1
+a=$(debugfs -R "stat /d/a" "$img" 2>/dev/null | sed -n 's/^Inode: *\([0-9]*\).*/\1/p')
+python3 - "$img" "$(debugfs -R "bmap /d 1" "$img" 2>/dev/null)" "$a" <<'EOPY'
+import struct, sys
+image, block, inode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+f = open(image, "r+b")
+f.seek(block * 65536)
+entry = f.read(8)
+assert entry == struct.pack("<IHBB", 0, 0xFFFF, 0, 0), entry
+f.seek(block * 65536)
+f.write(struct.pack("<IHBB", inode, 0xFFFF, 1, 1) + b"b")
+EOPY
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -R "sif /d/a links_count 2" "$img" >/dev/null 2>&1
+e2fsck -fn "$img" >/dev/null 2>&1
+gzip -9 -n -c "$img" > "$out/dir-64k.ext4.gz"
 
 # Journal replay (features.toml fs.ext4_journal_replay). Each NAME.ext4.gz is a volume that
 # needs recovery: debugfs's journal_write logs transactions into its journal without

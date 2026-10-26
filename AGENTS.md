@@ -63,7 +63,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `features.toml` | Catalog of build-time feature options | — |
 | `docs/` | The book: implemented Ferric system chapters and inherited Redox background. Upstream subtree with local additions | — |
 
-Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` and a general `ferric-abi` crate do not exist yet. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
+Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` does not exist yet. `ferric-abi` (`crates/abi`) holds interface constants shared by relibc and daemons, so far the `futimens` sentinels; relibc keeps literal copies for its cbindgen headers and asserts at build time that they match. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
 
 ## Non-negotiable project rules
 

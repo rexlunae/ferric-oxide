@@ -14,16 +14,18 @@
 //! `crate::lookup`. After each change the `ext4-view` reader is loaded again, since it keeps
 //! the blocks it has read, and every handle's metadata is read again from it.
 //!
-//! Limitation: `ext4-view` does not expose inode numbers. [`Attributes::ino`] is a stable
-//! number made from the path instead, so hard links to one inode get different numbers.
+//! `ext4-view` exposes neither inode numbers nor change times. Each handle's inode is found
+//! at open by `crate::lookup`, and [`Fs::attributes`] reads the change time from it.
+//!
+//! Limitation: [`Attributes::ino`] is a stable number made from the path, so hard links to
+//! one inode get different numbers.
 
-#[cfg(feature = "write")]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
-#[cfg(feature = "write")]
 use std::rc::Rc;
 
 use ext4_view::{Ext4, Ext4Read, File, FileType, Metadata};
+use ferric_abi::time::{UTIME_NOW, UTIME_OMIT};
 
 use crate::Error;
 use crate::superblock::{self, Geometry};
@@ -151,6 +153,10 @@ pub struct Attributes {
     pub accessed: (i64, u32),
     /// The last change to the contents.
     pub modified: (i64, u32),
+    /// The last change to the inode (`i_ctime`): its contents, or attributes such as its
+    /// times. The modification time when the inode could not be found (see
+    /// [`Fs::attributes`]).
+    pub changed: (i64, u32),
 }
 
 impl Attributes {
@@ -173,10 +179,8 @@ impl Attributes {
             st_mtime_nsec: self.modified.1,
             st_atime: secs(self.accessed),
             st_atime_nsec: self.accessed.1,
-            // `ext4-view` does not expose the change time; the last change to the contents
-            // is the closest it has.
-            st_ctime: secs(self.modified),
-            st_ctime_nsec: self.modified.1,
+            st_ctime: secs(self.changed),
+            st_ctime_nsec: self.changed.1,
         }
     }
 }
@@ -197,11 +201,6 @@ impl Kind {
         }
     }
 }
-
-/// `tv_nsec` for "the current time" in a `futimens` time (relibc's `sys/stat.h`).
-pub const UTIME_NOW: i64 = (1 << 30) - 1;
-/// `tv_nsec` for "leave this time as it is" in a `futimens` time (relibc's `sys/stat.h`).
-pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 /// What a `futimens` call asks for one of a file's times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,8 +260,24 @@ enum Open {
 struct Handle {
     /// The path from the volume's root, normalized, starting with `/`.
     path: String,
+    /// Its inode number, for what `ext4-view` does not expose (the change time), when
+    /// [`crate::lookup`] could find it.
+    inode: Option<u32>,
     metadata: Metadata,
     open: Open,
+}
+
+/// Why [`Fs::mount_preferring_write`] mounted a volume read-only.
+#[cfg(feature = "write")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReadOnlyReason<E> {
+    /// The volume cannot be written ([`crate::write::check_writable`]).
+    #[error("the volume cannot be written")]
+    Volume(#[source] crate::write::WriteError),
+    /// The device could not be opened for writing (`reopen` failed).
+    #[error("the device cannot be opened for writing")]
+    Device(#[source] E),
 }
 
 /// A mounted ext4 volume and its open handles.
@@ -272,18 +287,26 @@ pub struct Fs {
     needs_recovery: bool,
     handles: BTreeMap<usize, Handle>,
     next: usize,
-    /// The device, for changes, on a volume mounted with [`Fs::new_writable`].
+    /// The device `ext4-view` reads, for reading what it does not expose.
+    device: Box<dyn Device>,
+    /// The same device, for changes, on a volume mounted with [`Fs::new_writable`].
     #[cfg(feature = "write")]
     writer: Option<Box<dyn Writable>>,
 }
 
-/// The writable device of a volume mounted with [`Fs::new_writable`], with its type erased.
-#[cfg(feature = "write")]
-trait Writable {
-    /// A reader of the device for `ext4-view`, which sees every change made through this.
+/// The volume's device, with its type erased, beside `ext4-view`'s reader of it.
+trait Device {
+    /// A reader of the device for `ext4-view`, which sees every change made to it.
     fn reader(&self) -> Box<dyn Ext4Read>;
     /// The inode `path` names.
     fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError>;
+    /// Inode `number`'s change time.
+    fn change_time(&self, number: u32) -> Result<(i64, u32), crate::lookup::LookupError>;
+}
+
+/// The device of a volume mounted with [`Fs::new_writable`], for changes.
+#[cfg(feature = "write")]
+trait Writable {
     /// Sets inode `number`'s times through the journal.
     fn set_times(
         &self,
@@ -292,12 +315,11 @@ trait Writable {
     ) -> Result<(), crate::write::WriteError>;
 }
 
-/// The device, shared by `ext4-view`'s reader and the writer. Fs is single-threaded and
-/// `ext4-view` reads only inside an `Fs` call, so no borrow is held across another.
-#[cfg(feature = "write")]
+/// The device, shared by `ext4-view`'s reader, [`Device`] and the writer. Fs is
+/// single-threaded and `ext4-view` reads only inside an `Fs` call, so no borrow is held
+/// across another.
 struct Shared<W>(Rc<RefCell<crate::device::Window<W>>>);
 
-#[cfg(feature = "write")]
 impl<W: crate::device::ReadAt> Ext4Read for Shared<W> {
     fn read(
         &mut self,
@@ -308,8 +330,7 @@ impl<W: crate::device::ReadAt> Ext4Read for Shared<W> {
     }
 }
 
-#[cfg(feature = "write")]
-impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device::Window<W>>> {
+impl<R: crate::device::ReadAt + 'static> Device for Rc<RefCell<crate::device::Window<R>>> {
     fn reader(&self) -> Box<dyn Ext4Read> {
         Box::new(Shared(Rc::clone(self)))
     }
@@ -318,6 +339,13 @@ impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device:
         crate::lookup::inode_of(&self.borrow(), path)
     }
 
+    fn change_time(&self, number: u32) -> Result<(i64, u32), crate::lookup::LookupError> {
+        crate::lookup::change_time(&self.borrow(), number)
+    }
+}
+
+#[cfg(feature = "write")]
+impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device::Window<W>>> {
     fn set_times(
         &self,
         number: u32,
@@ -339,20 +367,21 @@ impl Fs {
         device: crate::device::Window<R>,
     ) -> Result<Self, Error> {
         let sb = read_superblock(&device)?;
-        Self::load(&sb, Box::new(device))
+        Self::load(&sb, Box::new(Rc::new(RefCell::new(device))))
     }
 
-    /// The volume whose superblock is `sb`, read through `reader`.
-    fn load(sb: &[u8; superblock::SIZE], reader: Box<dyn Ext4Read>) -> Result<Self, Error> {
+    /// The volume whose superblock is `sb`, read through `device`.
+    fn load(sb: &[u8; superblock::SIZE], device: Box<dyn Device>) -> Result<Self, Error> {
         let geometry = Geometry::parse(sb)?;
         let needs_recovery = superblock::needs_recovery(sb);
-        let ext4 = Ext4::load(reader)?;
+        let ext4 = Ext4::load(device.reader())?;
         Ok(Self {
             ext4,
             geometry,
             needs_recovery,
             handles: BTreeMap::new(),
             next: 1,
+            device,
             #[cfg(feature = "write")]
             writer: None,
         })
@@ -373,9 +402,58 @@ impl Fs {
         crate::write::check_writable(&device)?;
         let sb = read_superblock(&device)?;
         let device = Rc::new(RefCell::new(device));
-        let mut fs = Self::load(&sb, device.reader())?;
+        let mut fs = Self::load(&sb, Box::new(Rc::clone(&device)))?;
         fs.writer = Some(Box::new(device));
         Ok(fs)
+    }
+
+    /// Loads the volume `window` holds for changes if it can be, and read-only otherwise:
+    /// what the daemon does at mount. The volume is checked first
+    /// ([`crate::write::check_writable`]); only when it can be written is the device opened
+    /// again for writing, with `reopen`. If either refuses, the volume is served read-only
+    /// from `window`, and the reason comes back with it for the caller to report.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::new`] and [`Self::new_writable`]: neither refusal above is one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ext4d::device::Window;
+    /// use ext4d::fs::{Fs, ReadOnlyReason};
+    ///
+    /// # fn main() -> Result<(), ext4d::Error> {
+    /// # let image = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/basic.ext4"))
+    /// #     .expect("the fixture");
+    /// let window = Window::whole(image.clone()).expect("its length");
+    /// // A device that cannot be opened for writing: the volume is still served.
+    /// let (fs, reason) = Fs::mount_preferring_write(window, || {
+    ///     Err::<Window<Vec<u8>>, _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    /// })?;
+    /// assert!(!fs.is_writable());
+    /// assert!(matches!(reason, Some(ReadOnlyReason::Device(_))));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "write")]
+    pub fn mount_preferring_write<R, W, E>(
+        window: crate::device::Window<R>,
+        reopen: impl FnOnce() -> Result<crate::device::Window<W>, E>,
+    ) -> Result<(Self, Option<ReadOnlyReason<E>>), Error>
+    where
+        R: crate::device::ReadAt + 'static,
+        W: crate::device::WriteAt + 'static,
+        E: core::error::Error + 'static,
+    {
+        let reason = match crate::write::check_writable(&window) {
+            Err(err) => ReadOnlyReason::Volume(err),
+            Ok(()) => match reopen() {
+                Ok(writable) => return Ok((Self::new_writable(writable)?, None)),
+                Err(err) => ReadOnlyReason::Device(err),
+            },
+        };
+        Ok((Self::new(window)?, Some(reason)))
     }
 
     /// Whether the volume was mounted for changes (`Fs::new_writable`, Cargo feature `write`).
@@ -486,8 +564,10 @@ impl Fs {
                 Open::File(Box::new(self.ext4.open(path.as_str())?))
             }
         };
+        let inode = self.inode_of(&path);
         let handle = Handle {
             path,
+            inode,
             metadata,
             open,
         };
@@ -560,7 +640,9 @@ impl Fs {
         Ok(entries.as_deref().unwrap_or_default())
     }
 
-    /// The attributes of the file `id` names.
+    /// The attributes of the file `id` names. Most come from `ext4-view`; the change time is
+    /// read from the inode itself, as `ext4-view` does not expose it, and is the modification
+    /// time instead when the inode could not be found or read (logged).
     ///
     /// # Errors
     ///
@@ -580,6 +662,7 @@ impl Fs {
             block_size: self.geometry.block_size,
             accessed: time(m.accessed()),
             modified: time(m.modified()),
+            changed: self.change_time(handle).unwrap_or(time(m.modified())),
         })
     }
 
@@ -664,7 +747,10 @@ impl Fs {
                 modified: time(modified),
                 changed: now,
             };
-            let number = writer.inode_of(&handle.path)?;
+            let number = match handle.inode {
+                Some(number) => number,
+                None => self.device.inode_of(&handle.path)?,
+            };
             let result = writer.set_times(number, &times);
             // Even a failed change may have written part of the transaction.
             self.reload();
@@ -677,10 +763,7 @@ impl Fs {
     /// old reader is kept, and the change is still on the disk.
     #[cfg(feature = "write")]
     fn reload(&mut self) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
-        match Ext4::load(writer.reader()) {
+        match Ext4::load(self.device.reader()) {
             Ok(ext4) => {
                 for handle in self.handles.values_mut() {
                     if let Ok(metadata) = ext4.symlink_metadata(handle.path.as_str()) {
@@ -756,6 +839,25 @@ impl Fs {
         }
         let metadata = self.ext4.symlink_metadata(current.as_str())?;
         Ok((current, metadata))
+    }
+
+    /// The inode `path` names, for [`Handle::inode`]. When it cannot be found (a path through
+    /// a directory kind `crate::lookup` does not read, such as an inline-data one), the
+    /// handle does without, and reports its modification time as its change time.
+    fn inode_of(&self, path: &str) -> Option<u32> {
+        self.device
+            .inode_of(path)
+            .inspect_err(|err| log::debug!("{path}: no inode number: {err}"))
+            .ok()
+    }
+
+    /// The change time of the inode `handle` names, if it is known and can be read.
+    fn change_time(&self, handle: &Handle) -> Option<(i64, u32)> {
+        let number = handle.inode?;
+        self.device
+            .change_time(number)
+            .inspect_err(|err| log::warn!("{}: cannot read the change time: {err}", handle.path))
+            .ok()
     }
 
     fn handle(&self, id: usize) -> Result<&Handle, Error> {
@@ -913,6 +1015,7 @@ mod tests {
             block_size: 4096,
             accessed: (10, 1),
             modified: (-5, 3),
+            changed: (20, 4),
         };
         let st = a.to_stat();
         assert_eq!(
@@ -922,6 +1025,7 @@ mod tests {
         assert_eq!((st.st_size, st.st_blocks, st.st_blksize), (1025, 3, 4096));
         assert_eq!((st.st_atime, st.st_atime_nsec), (10, 1));
         assert_eq!((st.st_mtime, st.st_mtime_nsec), (0, 3));
+        assert_eq!((st.st_ctime, st.st_ctime_nsec), (20, 4));
     }
 
     #[test]

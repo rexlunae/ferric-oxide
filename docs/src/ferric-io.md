@@ -912,10 +912,15 @@ device) and serves in the foreground until it is stopped.
 - **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
   serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
   [Block layers](#block-layers-luks-and-lvm-read-only)).
-- **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
-  hash of the path (hard links get different numbers) and `st_ctime` is the
-  modification time; `mmap` is not served; encrypted files and devices are
-  refused (`EOPNOTSUPP`).
+- **Change times:** `ext4-view` exposes neither inode numbers nor change
+  times, so ext4d finds each handle's inode at open itself (`ext4d::lookup`,
+  below) and `fstat` reads `st_ctime` from it (`i_ctime` with
+  `i_ctime_extra`'s epoch bits and nanoseconds). Where the inode cannot be
+  found (a path through an inline-data or encrypted directory) it reports the
+  modification time instead.
+- **Limits:** `st_ino` is a hash of the path (hard links get different
+  numbers); `mmap` is not served; encrypted files and devices are refused
+  (`EOPNOTSUPP`).
 
 ### Journal replay
 
@@ -998,7 +1003,9 @@ and change times (`ext4d::write::set_times`), and the scheme's `futimens` makes
 it; every other change still fails with `EROFS`. At mount, ext4d opens the
 device for writing and serves the volume read-write (times only) when
 `ext4d::write::check_writable` accepts it, and otherwise serves it read-only
-and says why.
+and says why; a device that does not open for writing (no write permission, a
+read-only medium) is also served read-only, with the reason logged
+(`Fs::mount_preferring_write`).
 
 - **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
   changed block) into an empty journal from `s_first`: descriptor blocks with
@@ -1026,8 +1033,15 @@ and says why.
   covers hashed ones too: their index blocks read as unused entries, and their
   leaves are linear blocks ("Directory Entries" in "Ext4 Disk Layout").
   Inline-data and encrypted directories are refused (`EOPNOTSUPP`); names match
-  byte for byte, also in case-insensitive directories.
-- **`futimens`** (`Fs::set_times`) follows POSIX: `UTIME_OMIT` for both times
+  byte for byte, also in case-insensitive directories. With 64 KiB blocks, an
+  entry that spans a whole block (length 65536, which `rec_len`'s 16 bits cannot
+  hold) is stored as `0xFFFF`, or 0, which `e2fsck` also accepts; both are read
+  as 65536 (found from `mke2fs`'s output and `e2fsck`'s verdicts, and covered by
+  the `dir-64k` fixture). The lookup is in every build, as `fstat` uses it too.
+- **`futimens`** (`Fs::set_times`) reads `tv_nsec`'s `UTIME_NOW` and
+  `UTIME_OMIT` from `ferric-abi` (`crates/abi`), the one definition relibc's
+  `sys/stat.h` constants are checked against when relibc builds, and follows
+  POSIX: `UTIME_OMIT` for both times
   changes nothing; `UTIME_NOW` for both (or a null pointer, which relibc sends
   as that) needs the caller to own the file or have write permission on it;
   any other times need the caller to own it (`EPERM` otherwise); UID 0 may do

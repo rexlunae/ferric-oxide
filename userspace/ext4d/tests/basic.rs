@@ -190,6 +190,19 @@ fn attributes_come_from_the_inode() {
     assert_eq!(a.block_size, 1024);
     // make-fixtures.sh sets every time to 2026-01-01 00:00:00 UTC.
     assert_eq!(a.modified, (1_767_225_600, 0));
+    // ... except the change time, which `touch` cannot set: mke2fs -d copies the source
+    // file's, the moment make-fixtures.sh wrote it. It is read from the inode itself, as
+    // ext4-view does not expose it, and is what fstat reports.
+    if std::env::var_os("EXT4D_FIXTURES").is_none() {
+        // The committed image: debugfs's `stat /big.bin` gives ctime 0x6adbb8f6.
+        assert_eq!(a.changed, (0x6ADB_B8F6, 0));
+    }
+    assert!(a.changed > a.modified, "{:?}", a.changed);
+    let st = a.to_stat();
+    assert_eq!(
+        (st.st_ctime, st.st_ctime_nsec),
+        (a.changed.0 as u64, a.changed.1)
+    );
     let root = fs.root().expect("the root");
     let r = fs.attributes(root).expect("open");
     assert_eq!((r.kind, r.ino, r.uid, r.gid), (Kind::Directory, 2, 0, 0));

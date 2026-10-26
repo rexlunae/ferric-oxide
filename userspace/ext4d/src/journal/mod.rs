@@ -1,5 +1,10 @@
-//! Replaying the journal onto the volume before it is served (features.toml
-//! `fs.ext4_journal_replay`, Cargo feature `journal-replay`, off by default).
+//! Reading an ext4 volume's journal, and replaying it onto the volume before it is served
+//! (features.toml `fs.ext4_journal_replay`, Cargo feature `journal-replay`, off by default).
+//!
+//! The module is in every build: `crate::lookup` uses its volume superblock and inode block
+//! map (`map`) to find the inodes whose change times `fstat` reports. Only the daemon built
+//! with `journal-replay` calls [`replay`]; without it the device is never opened for
+//! writing.
 //!
 //! A volume that was not cleanly unmounted has `INCOMPAT_RECOVER` set: its journal holds
 //! committed transactions whose blocks may not have reached their home locations. The

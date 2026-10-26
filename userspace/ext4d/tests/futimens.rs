@@ -13,7 +13,7 @@ mod common;
 use common::{SharedImage, e2fsck, load, load_raw};
 use ext4d::Error;
 use ext4d::device::Window;
-use ext4d::fs::{Fs, OpenMode, TimeChange};
+use ext4d::fs::{Fs, OpenMode, ReadOnlyReason, TimeChange};
 use ext4d::lookup::{self, LookupError, ROOT_INODE};
 use ext4d::write::{self, Times, Timestamp, WriteError};
 
@@ -166,6 +166,26 @@ fn lookups_work_on_every_journal_kind_and_block_map() {
 }
 
 #[test]
+fn an_entry_spanning_a_whole_64k_block_is_found() {
+    // dir-64k.ext4.gz: d/b's entry is alone in d's second 64 KiB block, its length stored
+    // as 0xFFFF; it is a second link to d/a.
+    let image = load("dir-64k.ext4.gz");
+    let window = volume(image.clone());
+    let a = lookup::inode_of(&window, "/d/a").expect("d/a");
+    assert_eq!(lookup::inode_of(&window, "/d/b").expect("d/b"), a);
+    assert!(matches!(
+        lookup::inode_of(&window, "/d/c"),
+        Err(LookupError::NotFound { .. })
+    ));
+    // ext4-view reads the same file there.
+    let mut fs = Fs::new(volume(image)).expect("an ext4 volume");
+    let b = open(&mut fs, "d/b", OpenMode::read());
+    let mut buf = [0; 64];
+    let n = fs.read(b, 0, &mut buf).expect("readable");
+    assert_eq!(&buf[..n], b"linked from a whole 64 KiB block\n");
+}
+
+#[test]
 fn paths_that_name_nothing_are_refused() {
     let window = volume(basic());
     assert!(matches!(
@@ -195,6 +215,7 @@ fn paths_that_name_nothing_are_refused() {
 fn futimens_sets_the_times_and_the_change_shows_at_once() {
     let (mut fs, shared) = mount_writable(basic());
     assert!(fs.is_writable());
+    let start = Timestamp::now().seconds;
     let hello = open(&mut fs, "hello.txt", OpenMode::read());
     let again = open(&mut fs, "/hello.txt", OpenMode::read());
     fs.set_times(hello, A_TIME, M_TIME, 0, 0).expect("set");
@@ -209,8 +230,16 @@ fn futimens_sets_the_times_and_the_change_shows_at_once() {
     assert_eq!(&buf[..n], b"hello from ext4\n");
     let fresh = open(&mut fs, "hello.txt", OpenMode::read());
     assert_eq!(fs.read(fresh, 0, &mut buf).expect("readable"), n);
+    // Setting times is itself a change to the inode: its change time is now, not the
+    // modification time it was given.
+    let changed = fs.attributes(hello).expect("open").changed;
+    assert!(changed.0 >= start && changed != new.1, "{changed:?}");
     let image = e2fsck("futimens", shared.bytes());
-    assert_eq!(times_at(image, "/hello.txt"), new);
+    assert_eq!(times_at(image.clone(), "/hello.txt"), new);
+    // A fresh mount reads the same change time from the volume.
+    let mut fresh_fs = Fs::new(volume(image)).expect("an ext4 volume");
+    let id = open(&mut fresh_fs, "hello.txt", OpenMode::read());
+    assert_eq!(fresh_fs.attributes(id).expect("open").changed, changed);
 }
 
 #[test]
@@ -225,6 +254,9 @@ fn utime_now_and_omit() {
     let attributes = fs.attributes(nested).expect("open");
     assert_eq!(attributes.accessed, before.0);
     assert!(attributes.modified.0 >= start, "{:?}", attributes.modified);
+    // The change time is now as well, and fstat reports it.
+    assert!(attributes.changed.0 >= start, "{:?}", attributes.changed);
+    assert_eq!(attributes.to_stat().st_ctime, attributes.changed.0 as u64);
     // Both omitted: nothing is written at all.
     let image = shared.bytes();
     fs.set_times(nested, TimeChange::Omit, TimeChange::Omit, 1234, 1234)
@@ -310,4 +342,48 @@ fn a_volume_that_cannot_be_written_is_not_mounted_for_changes() {
         Err(Error::Write(WriteError::NeedsReplay))
     ));
     write::check_writable(&volume(basic())).expect("basic.ext4 can be written");
+}
+
+#[test]
+fn a_device_that_will_not_open_for_writing_is_served_read_only() {
+    let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    // The volume can be written, but the device does not open for writing.
+    let (mut fs, reason) =
+        Fs::mount_preferring_write(volume(basic()), || Err::<Window<Vec<u8>>, _>(denied()))
+            .expect("mounted");
+    assert!(!fs.is_writable());
+    assert!(
+        matches!(reason, Some(ReadOnlyReason::Device(ref err)) if err.kind() == denied().kind())
+    );
+    let hello = open(&mut fs, "hello.txt", OpenMode::read());
+    let mut buf = [0; 64];
+    let n = fs.read(hello, 0, &mut buf).expect("readable");
+    assert_eq!(&buf[..n], b"hello from ext4\n");
+    assert!(matches!(
+        fs.set_times(hello, A_TIME, M_TIME, 0, 0),
+        Err(Error::ReadOnly)
+    ));
+
+    // A volume that cannot be written (dir-64k has no journal) is not opened for writing at
+    // all.
+    let (fs, reason) = Fs::mount_preferring_write(volume(load("dir-64k.ext4.gz")), || {
+        panic!("the device is not opened for writing");
+        #[allow(unreachable_code)]
+        Err::<Window<Vec<u8>>, std::io::Error>(denied())
+    })
+    .expect("mounted");
+    assert!(!fs.is_writable());
+    assert!(matches!(
+        reason,
+        Some(ReadOnlyReason::Volume(WriteError::NoJournal))
+    ));
+
+    // Both can: the volume is mounted for changes.
+    let shared = SharedImage::new(basic());
+    let (fs, reason) = Fs::mount_preferring_write(volume(basic()), || {
+        Ok::<_, std::io::Error>(Window::whole(shared.clone()).expect("its length"))
+    })
+    .expect("mounted");
+    assert!(fs.is_writable());
+    assert!(reason.is_none());
 }

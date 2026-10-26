@@ -1332,9 +1332,11 @@ Add ext4d to the image: a daemon that serves an ext4 volume read-only as a
 scheme, the way RedoxFS serves its own. Run it as
 `ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME`, with a disk, a
 partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
-Every change (writing, creating, removing, renaming) fails with EROFS.
-Reading is done by the ext4-view crate, and handles extents, hashed
-directories, checksums and the journal. Source: userspace/ext4d."""
+Every change (writing, creating, removing, renaming) fails with EROFS,
+unless fs.ext4_write is on: it adds a journaled writer, which so far sets a
+file's times (futimens). Reading is done by the ext4-view crate, and handles
+extents, hashed directories, checksums and the journal; fstat's change time
+is read from the inode by ext4d. Source: userspace/ext4d."""
 
 [[option.effect]]
 when = "value"
@@ -1432,7 +1434,8 @@ change times, which the scheme's futimens does (with POSIX's owner and
 write-permission rules), finding the inode from the path itself; every other
 change still fails with EROFS. Volumes that need recovery are replayed first;
 volumes with a feature the writer does not know (mmp, meta_bg, readonly and
-others), or with no journal, are served read-only, and ext4d says why.
+others), or with no journal, are served read-only, and ext4d says why, as are
+volumes whose device cannot be opened for writing.
 
 The writer is checked against e2fsprogs: e2fsck replays and checks what it
 leaves, including volumes crashed part-way through a change. Off, ext4d writes

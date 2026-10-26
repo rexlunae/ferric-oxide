@@ -40,6 +40,9 @@ use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
 use thiserror::Error;
 
 use crate::device::{ReadAt, Window, WindowError, WriteAt};
+use crate::inode::{
+    I_ATIME, I_ATIME_EXTRA, I_CTIME, I_CTIME_EXTRA, I_MTIME, I_MTIME_EXTRA, has_extra, le16,
+};
 use crate::journal::map::{BlockMap, RO_COMPAT_METADATA_CSUM, Volume, le32};
 use crate::journal::{
     self, BlockError, Journal, JournalError, open_journal, read_volume_superblock,
@@ -69,24 +72,12 @@ const S_CHECKSUM_SEED: usize = 0x270;
 
 /// Where an inode keeps `i_mode`.
 const I_MODE: usize = 0x0;
-/// `i_atime`, `i_ctime`, `i_mtime`: the low 32 bits of the seconds, signed.
-const I_ATIME: usize = 0x8;
-const I_CTIME: usize = 0xC;
-const I_MTIME: usize = 0x10;
 /// `i_generation`, which the inode checksum covers first.
 const I_GENERATION: usize = 0x64;
 /// `l_i_checksum_lo`: the low 16 bits of the inode checksum.
 const I_CHECKSUM_LO: usize = 0x7C;
-/// `i_extra_isize`: how many bytes past the first 128 the fields below take.
-const I_EXTRA_ISIZE: usize = 0x80;
 /// `i_checksum_hi`: the high 16 bits of the inode checksum.
 const I_CHECKSUM_HI: usize = 0x82;
-/// `i_ctime_extra`, `i_mtime_extra`, `i_atime_extra`: epoch bits and nanoseconds.
-const I_CTIME_EXTRA: usize = 0x84;
-const I_MTIME_EXTRA: usize = 0x88;
-const I_ATIME_EXTRA: usize = 0x8C;
-/// The size of the original (revision 0) inode, before the extra fields.
-const GOOD_OLD_INODE_SIZE: usize = 128;
 
 /// Why the volume could not be changed.
 #[derive(Debug, Error)]
@@ -337,13 +328,6 @@ fn commit_time() -> CommitTime {
     }
 }
 
-/// Whether the inode's extra fields reach past byte `end`.
-fn has_extra(inode: &[u8], end: usize) -> bool {
-    inode.len() > GOOD_OLD_INODE_SIZE
-        && GOOD_OLD_INODE_SIZE + usize::from(le16(inode, I_EXTRA_ISIZE)) >= end
-        && inode.len() >= end
-}
-
 /// Stores `time` in the seconds field at `field` and, if the inode has it, the extra field
 /// at `extra`; `None` when it does not fit.
 ///
@@ -409,14 +393,10 @@ fn put_checksum(inode: &mut [u8], checksum: u32) {
     }
 }
 
-/// The little-endian `u16` at `at`; every caller's buffer is long enough.
-fn le16(raw: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([raw[at], raw[at + 1]])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::{I_EXTRA_ISIZE, time as read_time};
 
     fn inode(extra_isize: u16) -> Vec<u8> {
         let mut inode = vec![0; 256];
@@ -455,6 +435,11 @@ mod tests {
             assert_eq!((extra & 3, extra >> 2), (epoch, 999_999_999), "{seconds}");
             let decoded = i64::from(low) + (i64::from(extra & 3) << 32);
             assert_eq!(decoded, seconds);
+            // What crate::inode reads back, for fstat's change time.
+            assert_eq!(
+                read_time(&inode, I_MTIME, I_MTIME_EXTRA),
+                (seconds, 999_999_999)
+            );
         }
         assert!(put_time(&mut inode, I_MTIME, I_MTIME_EXTRA, time(1 << 34, 0)).is_none());
         assert!(

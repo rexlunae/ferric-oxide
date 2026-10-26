@@ -60,9 +60,8 @@
 pub mod device;
 pub mod error;
 pub mod fs;
-#[cfg(feature = "journal-replay")]
+pub(crate) mod inode;
 pub mod journal;
-#[cfg(feature = "write")]
 pub mod lookup;
 #[cfg(target_os = "redox")]
 pub mod scheme;
