@@ -18,8 +18,17 @@ crate::interrupt!(wakeup, || {
     // `Runnable` in no run queue, requests are never served, and every CPU idles forever
     // (the boot-smoke hang). If this CPU is idling, do the switch right here instead of
     // returning into the halt.
-    let idle = PercpuBlock::current().switch_internals.idle_context();
-    if context::is_current(&idle)
+    //
+    // Issue #214: `kernel.profiling`'s profiler CPU points every vector from 33 up at this
+    // handler and never sets up contexts, so it has no idle context: asking for one there
+    // panicked, that CPU stopped answering TLB shootdowns, and the other CPUs waited for it
+    // forever with interrupts off (the profile-image hang). Such a CPU has nothing to switch to.
+    //
+    // A `Contended` result needs no retry here: spinning in this handler with interrupts off
+    // could wait on a CPU that is itself waiting for this one. The handler returns to the
+    // idle loop past its `hlt`, and the loop switches again and, with interrupts disabled,
+    // re-checks the local list before it halts.
+    if idling(PercpuBlock::current())
         && !PercpuBlock::current()
             .switch_internals
             .local_wakeup_list
@@ -29,6 +38,14 @@ crate::interrupt!(wakeup, || {
         let _ = context::switch(&mut token);
     }
 });
+
+/// Whether this CPU runs its idle context; `false` on a CPU without one (the profiler CPU).
+fn idling(percpu: &PercpuBlock) -> bool {
+    percpu
+        .switch_internals
+        .try_idle_context()
+        .is_some_and(|idle| context::is_current(&idle))
+}
 
 crate::interrupt!(tlb, || {
     PercpuBlock::current().maybe_handle_tlb_shootdown();
