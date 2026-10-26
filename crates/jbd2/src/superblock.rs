@@ -286,12 +286,24 @@ impl Superblock {
         raw: &mut [u8],
         next_sequence: u32,
     ) -> Result<(), SuperblockError> {
+        self.set_log(raw, next_sequence, 0)
+    }
+
+    /// Sets `s_sequence` and `s_start` in `raw`, the bytes of journal block 0, and updates
+    /// the checksum: [`Superblock::mark_recovered`], and the writer pointing the superblock
+    /// at a transaction it logged.
+    pub(crate) fn set_log(
+        &self,
+        raw: &mut [u8],
+        sequence: u32,
+        start: u32,
+    ) -> Result<(), SuperblockError> {
         let len = raw.len();
         let raw = raw
             .get_mut(..SIZE)
             .ok_or(SuperblockError::TooShort { len })?;
-        raw[0x18..0x1C].copy_from_slice(&next_sequence.to_be_bytes());
-        raw[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes());
+        raw[0x18..0x1C].copy_from_slice(&sequence.to_be_bytes());
+        raw[0x1C..0x20].copy_from_slice(&start.to_be_bytes());
         if self.checksum.is_crc32c() {
             let crc = crc32c_without(&[], raw, CHECKSUM_AT);
             raw[CHECKSUM_AT..CHECKSUM_AT + 4].copy_from_slice(&crc.to_be_bytes());
