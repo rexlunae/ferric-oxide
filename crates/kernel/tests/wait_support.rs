@@ -37,6 +37,12 @@ pub(crate) mod context {
         pub(crate) fn sigcontrol(&self) -> Option<(&Control, &(), ())> {
             None
         }
+        /// Host stub for `Context::killed_before_wait`: host tests construct
+        /// contexts directly and never mark one as being sigkilled, so the
+        /// wait-condition path sees "not killed", matching the kernel default.
+        pub(crate) fn killed_before_wait(&self) -> bool {
+            false
+        }
         pub(crate) fn block(&mut self, _: &'static str) {
             panic!("host tests must not block");
         }
