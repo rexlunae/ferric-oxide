@@ -296,10 +296,14 @@ fn notify_dirty(object: &Object, plan: &Write, written: Written, token: &mut Cle
         reason,
     };
     // A queue that closed has failed the object; one out of memory gets the next record,
-    // or the file system's own writeback before it reads or changes the file (whose take
-    // also lets a run be signalled again).
-    if queue.push_records(core::iter::once(record), token).is_err() && urgent {
-        queue.writeback.urgent_sent.store(false, Ordering::Relaxed);
+    // or the file system's own writeback before it reads or changes the file.
+    if queue.push_records(core::iter::once(record), token).is_err() {
+        match reason {
+            WritebackReason::Urgent => queue.writeback.urgent_sent.store(false, Ordering::Relaxed),
+            // Let the stream ask again; a newer signal it made meanwhile stays.
+            WritebackReason::Run => object.state.lock().index.run_not_sent(pages),
+            _ => {}
+        }
     }
 }
 
