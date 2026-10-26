@@ -1084,6 +1084,60 @@ cover owner and primary-group access.
 The image workflow checks the ext4 markers only for smoke boots, since the
 nightly fuzz script runs only the fuzzer and package verification.
 
+## FAT, read-only
+
+FAT and ext4 daemons both use `ferric-fspath` for text path normalization and
+stable path-derived inode numbers. ext4d re-exports its existing `normalize`
+entry point from the shared crate. Each daemon still walks and validates
+components against its own filesystem; the text helper does no lookup or
+symlink resolution.
+
+`fatd` (`userspace/fatd/`, features.toml `fs.fat`, off by default) serves a
+FAT12, FAT16 or FAT32 volume read-only as a scheme: the EFI system partition, a
+USB stick or an SD card. It takes the same arguments as ext4d:
+
+```text
+fatd [--offset BYTES] [--length BYTES] DEVICE SCHEME
+```
+
+The device is only ever opened for reading. The daemon registers the scheme,
+enters the null namespace and serves in the foreground until it is stopped.
+
+- **Reading** is done by the `fatfs` crate (MIT), which the image installer
+  already uses to write the EFI partition: the boot sector, FAT type by
+  cluster count, the allocation tables, cluster chains and long file names.
+  fatd adds the time conversion and the name lookup, written from Microsoft's
+  "FAT: General Overview of On-Disk Format" (the FAT32 File System
+  Specification, version 1.03). No code comes from Linux.
+- **Device:** reads go through `ferric-blocklayer`'s `BlockDevice`, so a
+  partition is a `Slice` and FAT on LUKS or LVM is fatd over a volume
+  `ferric-blockd` serves. `fatfs` reads the allocation table and directories a
+  few bytes at a time; fatd keeps the last 4 KiB it read and serves those
+  reads from it, so they do not each cost a whole-block disk read.
+- **Names:** directories list each entry's long name, or its 8.3 short name
+  when it has none (in lower case when the entry's case flags say so). Lookups
+  ignore case and match the short name too, as the specification asks, so
+  `/efi/boot/bootx64.efi` and `/EFI/BOOT/BOOTX64.EFI` open the same file, and
+  `fpath` gives the names as the directories store them.
+- **Owners:** FAT has none. Every file is root's and mode `0444`, every
+  directory `0555`, and no caller is refused a read.
+- **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
+  `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
+  `EROFS`. The device below refuses writes too, so nothing `fatfs` does can
+  change the volume, and access dates are not updated.
+- **Limits:** FAT has no inode numbers, so `st_ino` is a hash of the stored
+  path (`ferric-fspath`, shared with the other daemons); FAT times have no time
+  zone and are read as UTC; `st_atime` has only a date; `st_ctime` is the
+  modification time; exFAT is not supported yet.
+
+The host tests (`userspace/fatd/tests/`) read FAT12, FAT16 and FAT32 images
+that `tests/fixtures/make-fixtures.sh` builds with `mkfs.fat` and `mtools`:
+long, short and non-ASCII names, a file whose cluster chain is split around
+another, a directory over several clusters, deleted entries and a partition
+inside a larger disk. CI also runs them on images the runner's dosfstools and
+mtools make (`FATD_FIXTURES`). `ferric-fat-test` mounts the FAT32 image on the
+target.
+
 ## Block layers: LUKS and LVM, read-only
 
 `ferric-blocklayer` (`crates/blocklayer/`) is a stack of read-only block

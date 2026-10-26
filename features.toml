@@ -1486,6 +1486,27 @@ userspace/ext4d/src/write.rs."""
 when = "value"
 make_append = { FERRIC_EXT4D_FEATURES = "write" }
 
+[[option]]
+id = "fs.fat"
+menu = "fs"
+type = "bool"
+title = "Read-only FAT12/FAT16/FAT32 (fatd)"
+default = false
+help = """
+Add fatd to the image: a daemon that serves a FAT12, FAT16 or FAT32 volume,
+such as the EFI system partition or a USB stick, read-only as a scheme. Run it
+as `fatd [--offset BYTES] [--length BYTES] DEVICE SCHEME`, with a disk, a
+partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
+Long file names are listed, and names are looked up without regard to case
+and by their 8.3 short names too, as FAT specifies. FAT has no owners: every
+file is shown as root's and readable by everyone. Every change fails with
+EROFS, and the device is only ever opened for reading. Reading is done by the
+fatfs crate; exFAT is not supported yet. Source: userspace/fatd."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["fatd"]
+
 
 # ---------------------------------------------------------------- packages
 

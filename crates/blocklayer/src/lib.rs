@@ -16,6 +16,8 @@
 //!   `ferric-luks`, and decrypts its data sector by sector.
 //! - [`Lvm`] (feature `lvm`) reads the LVM2 metadata of a group's physical volumes, through
 //!   `ferric-lvm`, and maps a logical volume onto them.
+//! - `file` (feature `std`) serves a disk, partition or image file as a device, widening
+//!   reads to the whole blocks a Redox disk scheme requires.
 //! - [`Stack`] (feature `alloc`) is a stack whose shape is chosen at run time, such as from a
 //!   daemon's command line, with one typed error, [`StackError`].
 //!
@@ -50,9 +52,13 @@
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(feature = "luks")]
 mod crypt;
+#[cfg(feature = "std")]
+pub mod file;
 #[cfg(feature = "lvm")]
 mod lvm;
 mod memory;
