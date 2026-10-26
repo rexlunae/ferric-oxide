@@ -402,6 +402,7 @@ fn listed_cpus() -> Vec<u8> {
     #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
     {
         crate::percpu::all_percpu_blocks()
+            .filter(|block| !crate::profiling::is_profiler_cpu(block.cpu_id))
             .filter_map(|block| u8::try_from(block.cpu_id.get()).ok())
             .collect()
     }
@@ -419,6 +420,9 @@ fn cpus_file() -> Vec<u8> {
 
     let mut text = String::new();
     for block in crate::percpu::all_percpu_blocks() {
+        if crate::profiling::is_profiler_cpu(block.cpu_id) {
+            continue;
+        }
         let Some(apic) = block.misc_arch_info.apic_id_opt.get() else {
             continue;
         };
@@ -481,7 +485,7 @@ fn steer(
     if to == from {
         return Err(Error::new(EINVAL));
     }
-    if crate::percpu::get_percpu_block(to).is_none() {
+    if crate::percpu::interrupt_target(to).is_none() {
         return Err(Error::new(ENOENT));
     }
     let from_vector = irq_to_vector(irq);
@@ -673,8 +677,8 @@ impl crate::scheme::KernelScheme for IrqScheme {
                 .or(Err(Error::new(ENOENT)))?;
             let path_str = path_str[2..].trim_end_matches('/');
             // Ferric Oxide: a CPU that is not running has no IDT to reserve vectors in (and
-            // looking for one used to panic).
-            if crate::percpu::get_percpu_block(LogicalCpuId::new(cpu_id.into())).is_none() {
+            // looking for one used to panic), and the profiler CPU would drop them (#214).
+            if crate::percpu::interrupt_target(LogicalCpuId::new(cpu_id.into())).is_none() {
                 return Err(Error::new(ENOENT));
             }
 

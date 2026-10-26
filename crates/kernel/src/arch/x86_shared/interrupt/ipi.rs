@@ -15,7 +15,11 @@ crate::interrupt!(wakeup, || {
     // idle context. Asking it for one panicked; and a shootdown it does not answer leaves its
     // `wants_tlb_shootdown` set, so the next broadcast (`shootdown_tlb_ipi(None)`, used when
     // a shadow stack is freed) spins on it forever. Answer the shootdown, as the `tlb` handler
-    // would, and switch nothing: such a CPU has nothing to switch to.
+    // would, and switch nothing: such a CPU has nothing to switch to. The other vectors need
+    // no answer here: the Wakeup, Switch and Pit broadcasts only ask a CPU with contexts to
+    // reschedule, `irq:` and the IOMMU refuse to aim device interrupts at this CPU
+    // (`percpu::interrupt_target`), and features.toml rejects `kernel.trace` with
+    // `kernel.profiling`, whose tracepoint sync waits for every CPU's answer.
     let Some(idling) = percpu
         .switch_internals
         .try_idle_context()
