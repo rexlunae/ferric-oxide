@@ -388,7 +388,8 @@ runners, so its numbers are only good for the same-boot comparison, not as
 absolute figures.
 
 A file job fills its file before the first round, outside the timed part, so
-its writes overwrite data in place. Each round runs it once through each of two
+its writes overwrite data in place, and runs one untimed round through each
+path before the timed ones. Each round runs it once through each of two
 paths: `path=fs`, a descriptor opened `O_FSYNC`, which RedoxFS always serves
 itself, so every read and write is a request to RedoxFS as without the page
 cache; and `path=cache`, a plain descriptor, which the page cache serves where

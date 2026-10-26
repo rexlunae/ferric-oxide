@@ -9,7 +9,8 @@
 //! two paths are the same path, and the A/B is a same-path control.
 //!
 //! The file is created and filled with `io_size` bytes before the first round, outside the
-//! timed part, so writes overwrite data in place on both paths. Every round ends with an
+//! timed part, so writes overwrite data in place on both paths, and one untimed round runs
+//! through each path before the timed ones. Every round ends with an
 //! `fsync`, so the next round starts with no dirty pages; it is part of the round's time only
 //! with `--end_fsync=1`, as in fio.
 
@@ -46,9 +47,16 @@ const FILL_CHUNK: usize = 1 << 20;
 pub fn bench_job(job: &Job, path: &str) -> Result<(), Failure> {
     fill(path, job.io_size)?;
     let names = PATHS.map(|(_, name)| name);
-    let rounds = run_rounds(job, "path", &names, true, |k| {
-        run_round(path, job, PATHS[k].0)
-    });
+    // One untimed round through each path first: the first round after the fill pays for
+    // RedoxFS settling the new file, which would count against whichever path ran first.
+    let rounds = PATHS
+        .iter()
+        .try_for_each(|&(how, _)| run_round(path, job, how).map(drop))
+        .and_then(|()| {
+            run_rounds(job, "path", &names, true, |k| {
+                run_round(path, job, PATHS[k].0)
+            })
+        });
     // Remove the file whether or not the rounds ran.
     let removed = io("remove the bench file", fs::remove_file(path));
     let rounds = rounds?;
