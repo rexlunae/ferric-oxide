@@ -14,23 +14,36 @@
 //!
 //! - A *task* is one unit of async work with no stack of its own. Its pollable head
 //!   is a `FnMut(&mut TaskCtx) -> Step` closure stored in a fixed pool slot; the
-//!   pool bounds live tasks ([`Executor::spawn`] is fallible) and never panics.
+//!   pool bounds live tasks (`Executor::spawn` is fallible) and never panics.
 //! - A task is `Ready`, `Running`, waiting for a wake (`Waiting`), waiting for a
 //!   deadline (`Sleeping`), `Completed` or `Cancelled`. Task ids carry a
-//!   generation, so a stale [`Waker`] handle (from before a completion, a reap
+//!   generation, so a stale `Waker` handle (from before a completion, a reap
 //!   or a reuse) cannot act on a new occupant.
-//! - [`Executor::poll`] runs at most a configured budget of ready tasks, draining
+//! - `Executor::poll` runs at most a configured budget of ready tasks, draining
 //!   due deadlines and the wake channel between tasks. A budget does not interrupt
 //!   a single unbounded poll, and a cancel that lands during one applies at the
 //!   task's next step boundary.
 //! - Wakes and cancellations from another thread or an interrupt context only set
-//!   an atomic flag on the task's slot and push one entry into the executor's
-//!   bounded wake channel: no allocation, no lock, no destructor runs on the
+//!   an atomic flag on the task's slot and publish a preallocated bitmap hint: no allocation, no lock, no destructor runs on the
 //!   notifying path. The owner (the worker) performs state changes and drops task
 //!   bodies.
-//! - The executor exposes [`Executor::next_deadline`] and [`Executor::schedulable`]:
-//!   the worker has nothing to do when nothing is schedulable and there is no
-//!   deadline, and never has to poll to make progress.
+//! - The executor exposes `Executor::next_deadline` and `Executor::schedulable`:
+//!   blocking workers use `with_notifier` and `prepare_sleep` with an armed,
+//!   latched scheduler wait. `new` is polling-only; kernel bindings are future work.
+//!
+//! # Examples
+//!
+//! ```
+//! # #[cfg(feature = "alloc")] {
+//! use alloc::sync::Arc;
+//! use ferric_exec_core::{Executor, FakeClock, JoinOutcome, Step};
+//! # extern crate alloc;
+//! let mut executor = Executor::new(Arc::new(FakeClock::new()), Default::default());
+//! let task = executor.spawn(|_| Step::Done { result: 42 }).unwrap();
+//! executor.poll();
+//! assert_eq!(executor.join(task), Some(JoinOutcome::Done(42)));
+//! # }
+//! ```
 //!
 //! Work that this core deliberately does not do (see the design): task migration,
 //! work stealing, real-time metadata or reservation authority, and any blocking
@@ -64,4 +77,6 @@ pub use clock::{Clock, FakeClock};
 pub use task::{Step, TaskCtx, TaskId};
 
 #[cfg(feature = "alloc")]
-pub use exec::{Admission, CancelError, Config, Executor, JoinOutcome, PollOutcome, Stats, Waker};
+pub use exec::{
+    Admission, CancelError, Config, Executor, JoinOutcome, Notify, PollOutcome, Stats, Waker,
+};

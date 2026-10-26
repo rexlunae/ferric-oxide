@@ -1,31 +1,34 @@
 //! Task identity, the poll step and the per-task context.
 //!
 //! A [`TaskId`] is the pair of a pool slot and a generation: reusing a slot bumps
-//! the generation, so a stale id (a [`Waker`](crate::Waker) held past completion,
+//! the generation, so a stale id (a `Waker` held past completion,
 //! a late response, a cancelled task's old handle) fails against the new occupant
 //! instead of acting on it.
 
 use core::fmt;
 use core::sync::atomic::AtomicU64;
 
-use crate::exec::WAKE;
+/// The per-task wake bit, also consumed by the allocation-backed executor.
+pub(crate) const WAKE: u64 = 1;
 
 /// A task's identity: its pool slot and the slot's generation.
 ///
 /// The generation makes ids unique across reuses: the pool reuses a slot only
 /// with a new generation, and every handle and queue entry carries the full id,
-/// so a stale handle can never act on a newer task in the same slot.
+/// so a stale handle can never act on a newer task in the same slot. Generations
+/// are 32-bit; exhausted slots retire instead of wrapping. Ids belong to one
+/// executor and must not be used with another executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId {
     /// The pool slot.
     index: u16,
     /// The slot's generation.
-    generation: u16,
+    generation: u32,
 }
 
 impl TaskId {
     /// The id of slot `index` at `generation`.
-    pub const fn new(index: u16, generation: u16) -> Self {
+    pub const fn new(index: u16, generation: u32) -> Self {
         Self { index, generation }
     }
 
@@ -35,7 +38,7 @@ impl TaskId {
     }
 
     /// The slot's generation.
-    pub const fn generation(self) -> u16 {
+    pub const fn generation(self) -> u32 {
         self.generation
     }
 }
@@ -60,7 +63,7 @@ impl fmt::Display for TaskId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     /// The task finished with `result`, which a later
-    /// [`join`](crate::Executor::join) returns.
+    /// `Executor::join` returns.
     Done {
         /// The task's result.
         result: u64,
@@ -102,7 +105,7 @@ impl TaskCtx<'_> {
     /// handshake turns a following `Wait` into a re-enqueue instead of a sleep.
     ///
     /// This is the deterministic, single-threaded form of self-wake; a task can
-    /// also hold its own [`Waker`](crate::Waker) and wake it from any thread.
+    /// also hold its own `Waker` and wake it from any thread.
     pub fn wake(&mut self) {
         self.wake
             .fetch_or(WAKE, core::sync::atomic::Ordering::Release);

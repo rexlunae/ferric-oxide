@@ -56,7 +56,10 @@ a step. It is not a kernel context and has no stack.
 
 - **Identity.** `TaskId = index + generation`. Storage is a fixed pool; an
   index is reused with an incremented generation, so stale ids (a Waker held
-  past completion, a late response) fail harmlessly on the new occupant.
+  past completion, a late response) fail harmlessly on the new occupant. The
+  generation is 32-bit and an exhausted slot retires rather than wrapping.
+  Each occupancy has a distinct flag identity, so a paused stale waker cannot
+  mutate a new task. Out-of-pool public ids are rejected without indexing panics.
 - **States.**
 
 ```text
@@ -92,20 +95,22 @@ Running ──► Completed ──► (reaped: id + generation released)      Wa
     and result until ack-driven cleanup.
 - **Exactly-once results.** A task completes exactly once. `join` returns
   the result when reaped; the completion is stored until the joiner takes
-  it, then the slot is released (generation bump).
+  it, then the slot is released (generation bump). Detached tasks release slots
+  on either completion or cancellation. Cancelling or waking a sleeper removes
+  its heap entry immediately; at most one live deadline per sleeping task remains.
 
 ## Ready queues, admission and polls
 
-- **Per-executor ready queue**, FIFO, owned by the executor. Remote (and
-  IRQ-context) wakeups do not touch the queue: they set a bit on the task's
-  pinned slot and push its index into the executor's bounded wake channel
-  (a fixed preallocated ring, capacity = pool size; an index is pushed only
-  on a 0→1 bit transition, so the ring cannot overflow). The executor drains
-  the channel while polling, clears bits and enqueues the woken tasks. The
-  channel and bits use only atomic operations: an IRQ-safe wake path never
-  allocates, locks the executor or runs user/destructor code ([#180]).
+- **Per-executor ready queue**, FIFO, owned by the executor. Remote and IRQ
+  wakes set per-task atomic flags and a hint in a preallocated slot bitmap.
+  The bitmap cannot overflow or overwrite unread entries, even if a producer
+  pauses. A producer count covers the flag-to-hint publication gap; if nonzero,
+  the owner also scans flags. The wake/cancel path allocates nothing and takes
+  no locks. A paused producer prevents the worker from sleeping until its
+  publication finishes, while the scan lets other tasks keep making progress.
+  Settled tasks invalidate their flags, so held wakers cannot enqueue new work.
 - **Admission.** `spawn` is fallible. Live tasks are bounded by pool
-  capacity; queued work by the pool's free half (documented in the crate).
+  capacity; notification hints and ready entries are also bounded by the pool.
   `Admission` errors are typed; a full pool or full queue never panics and
   never silently drops a wake.
 - **Bounded polls.** `poll(budget)` runs at most `budget` ready tasks and
@@ -118,19 +123,22 @@ Running ──► Completed ──► (reaped: id + generation released)      Wa
 
 ## Sleep and wake handshake
 
-A task that has nothing to do returns `Wait` or `WaitDeadline`. Before it
-goes to sleep the executor re-checks the wake bit once more (the
-*sleep/readiness handshake*): a wake that arrived between the task's check
-and the sleep state change is visible to the sleep transition and the task
-stays queued. The same handshake covers timer expiry: `WaitDeadline` tasks
-are kept in a deadline heap, the executor exposes `next_deadline()` for the
-shared rearm protocol ([#187]), and due tasks move to `Ready` when the
-executor is entered with an advanced clock — the core never polls a clock
-by itself, so there is no periodic polling and no per-executor heartbeat.
-Timer registration/cancellation participates in the shared rearm protocol
-through the bound deadline service in [#181]; the core's `Clock` is a trait
-so host tests use a fake clock and the kernel later passes the validated
-monotonic clock from [#186].
+A task that has nothing to do returns `Wait` or `WaitDeadline`. The core
+rechecks its wake bit at the step boundary, so a concurrent wake requeues it.
+A deadline heap contains only live sleepers; `next_deadline()` exposes the
+current minimum for the shared timer service. The injected clock advances only
+when the caller enters the executor; there is no periodic clock polling.
+
+Worker sleep is a separate protocol. The binding constructs the core with
+`Executor::with_notifier` and an IRQ-safe `Notify`. Before sleeping it arms a
+**latched** scheduler wait and the shared timer for `next_deadline`, then calls
+`prepare_sleep`. The core arms an atomic wake latch and rechecks ready tasks,
+bitmap hints, in-flight producers and due deadlines. False means disarm and
+poll again. True permits blocking on the already-armed registration. A producer
+publishing after that final check consumes the latch and signals `Notify`,
+which must remain visible even if the worker has not actually blocked yet.
+`Executor::new` has no notifier and supports polling only. The kernel binding
+and timer registration remain #181/#187 work; this PR does not install them.
 
 ## Worker model
 
@@ -194,7 +202,8 @@ explicit owner even when a future is dropped.
 
 ## Failure semantics
 
-All allocation, spawn, admission and clock failures are typed errors. There
+Admission failures return typed errors. Allocation uses the configured allocator;
+out-of-memory handling remains that allocator's policy. There
 is no panic on a full queue or on wake loss (wake loss is prevented). A task
 that panics is a kernel bug and is handled by the kernel's panic path, not
 by the executor. Resource accounting: worker stacks, task slots, completion

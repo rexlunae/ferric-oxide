@@ -3,45 +3,37 @@
 //!
 //! # Wake channel
 //!
-//! Cross-thread wakes and cancels never touch the executor's queues: they set an
-//! atomic flag on the task's slot and push one entry into a bounded ring whose
-//! capacity is twice the pool size. A flag transitions 0→1 at most once per
-//! drain, and the drain clears it, so at most one wake entry and one cancel entry
-//! per slot are in flight and a claim can never pass the consumer by more than
-//! the capacity. Entries carry the slot's generation, so a stale waker's entry
-//! is dropped against a reused slot. The drain may wait for a claim whose
-//! producer is between its claim and its store (a producer is an interrupt path
-//! on another CPU); if it cannot make progress it falls back to scanning every
-//! slot's flags, so a request is never lost. A producer that never finishes
-//! (a wedged CPU) keeps the scan in charge of that slot until it returns; the
-//! wake is re-applied, never dropped.
+//! Each task has atomic wake/cancel flags. A preallocated bitmap carries slot
+//! hints, so stalled producers cannot reserve ring cells or overwrite unread
+//! entries. An in-flight producer count covers publication gaps; the owner scans
+//! flags if a producer is paused. Notifications allocate nothing and never lock.
+//! Kernel bindings supply a latched worker notification and arm it before
+//! [`Executor::prepare_sleep`]. No kernel worker is bound by this crate itself.
 
 use alloc::boxed::Box;
 use alloc::collections::{BinaryHeap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Reverse;
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::clock::Clock;
 use crate::task::{Step, TaskCtx, TaskId};
 
 /// The wake flag of a slot's flag word.
-pub(crate) const WAKE: u64 = 1 << 0;
+pub(crate) use crate::task::WAKE;
 /// The cancel flag of a slot's flag word.
 const CANCEL: u64 = 1 << 1;
-/// A channel entry that cancels its task.
-const KIND_CANCEL: u64 = 1 << 63;
 /// Where a slot's flag word keeps its generation.
 const GEN_SHIFT: u32 = 2;
 /// The generation mask of a slot's flag word.
-const GEN_MASK: u64 = (u16::MAX as u64) << GEN_SHIFT;
+const GEN_MASK: u64 = (u32::MAX as u64) << GEN_SHIFT;
 
-/// The generation a slot returns to after wrapping; 0 stays reserved.
-const MAX_GENERATION: u16 = u16::MAX;
+/// Retire a slot at exhaustion rather than reviving an old id.
+const MAX_GENERATION: u32 = u32::MAX;
 
 /// A task slot's flag word: `generation << 2 | cancel | wake`.
-fn flags(generation: u16, wake: bool, cancel: bool) -> u64 {
+fn flags(generation: u32, wake: bool, cancel: bool) -> u64 {
     (u64::from(generation) << GEN_SHIFT) | u64::from(wake) | (u64::from(cancel) << 1)
 }
 
@@ -70,7 +62,7 @@ enum State {
 /// One pool slot.
 struct Slot {
     /// The slot's generation (also the upper bits of the flag word).
-    generation: u16,
+    generation: u32,
     /// The task's state.
     state: State,
     /// The wake and cancel flags, shared with every [`Waker`] of this task.
@@ -86,7 +78,7 @@ struct Slot {
 }
 
 impl Slot {
-    fn free(generation: u16) -> Self {
+    fn free(generation: u32) -> Self {
         Self {
             generation,
             state: State::Free,
@@ -101,107 +93,70 @@ impl Slot {
     }
 }
 
-/// One claimed ring position.
-struct Entry {
-    /// `KIND_CANCEL` set, or a wake.
-    kind: u64,
-    /// The generation the entry was pushed for.
-    generation: u16,
-    /// The pool slot.
-    index: u16,
+/// The scheduler binding's latched notification of an armed worker.
+///
+/// Implementations used from interrupt context must be allocation-free,
+/// nonblocking and must not run task destructors. The binding arms its wait
+/// registration before calling [`Executor::prepare_sleep`]; a notification must
+/// remain observable until the worker consumes it, even before it blocks.
+pub trait Notify: Send + Sync {
+    /// Signals the worker's armed wait registration.
+    fn notify(&self);
 }
 
-/// The ring cell of the wake channel.
-struct Cell {
-    /// `0` empty, `1` claimed but the entry not yet stored, `2` ready.
-    state: AtomicU8,
-    /// The entry, packed as the waker wrote it (kind, generation, index).
-    entry: AtomicU64,
+struct PollOnly;
+impl Notify for PollOnly {
+    fn notify(&self) {}
 }
 
-/// The thread-safe notification channel of an executor.
+/// Preallocated slot hints plus the producer/worker publication handshake.
 struct Channel {
-    /// Cells, `2 × capacity` (two entries per slot, in flight at most once each).
-    cells: Box<[Cell]>,
-    /// The mask for the capacity (a power of two).
-    mask: usize,
-    /// The next position a waker claims (unbounded; the mask wraps it).
-    head: AtomicUsize,
-    /// The next position the executor reads.
-    tail: AtomicUsize,
+    pending: Box<[AtomicU64]>,
+    hints: AtomicUsize,
+    writers: AtomicUsize,
+    armed: AtomicBool,
+    notifier: Arc<dyn Notify>,
 }
 
 impl Channel {
-    fn new(capacity: usize) -> Self {
-        let len = (capacity * 2).next_power_of_two();
-        let cells = (0..len)
-            .map(|_| Cell {
-                state: AtomicU8::new(0),
-                entry: AtomicU64::new(0),
-            })
-            .collect();
+    fn new(capacity: usize, notifier: Arc<dyn Notify>) -> Self {
         Self {
-            cells,
-            mask: len - 1,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            pending: (0..capacity.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            hints: AtomicUsize::new(0),
+            writers: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+            notifier,
         }
     }
 
-    /// Claims a position and writes `entry`; the entry becomes visible in order.
-    ///
-    /// Position claims can overtake stores, so the reader waits for a claimed
-    /// cell to turn ready rather than reading straight through. The capacity is
-    /// twice the pool size and a slot's flags bound its in-flight entries, so a
-    /// claim cannot pass the reader by more than the capacity: this never blocks
-    /// a caller for a position.
-    fn push(&self, kind: u64, generation: u16, index: u16) {
-        let entry = kind | (u64::from(generation) << 16) | u64::from(index);
-        let position = self.head.fetch_add(1, Ordering::AcqRel);
-        let cell = &self.cells[position & self.mask];
-        cell.state.store(1, Ordering::Release);
-        cell.entry.store(entry, Ordering::Release);
-        cell.state.store(2, Ordering::Release);
+    fn push(&self, index: usize) {
+        // Reserve the count first. A consumer may see a reservation before
+        // its bit; `writers` keeps the flag-scan fallback and sleep check active.
+        self.hints.fetch_add(1, Ordering::SeqCst);
+        let mask = 1 << (index % 64);
+        if self.pending[index / 64].fetch_or(mask, Ordering::SeqCst) & mask != 0 {
+            self.hints.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
-    /// The entry at the next unread position, waiting briefly for its writer.
-    ///
-    /// Returns [`Pop::Empty`] when there is nothing to read, and
-    /// [`Pop::Saturated`] when the next writer has not finished within
-    /// `spin_bound` attempts (the caller then scans the pool's flags instead).
-    fn pop(&self, spin_bound: u32) -> Pop {
-        if self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Acquire) {
-            return Pop::Empty;
+    fn signal(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.notifier.notify();
         }
-        let cell = &self.cells[self.tail.load(Ordering::Acquire) & self.mask];
-        let mut spins = 0;
-        while cell.state.load(Ordering::Acquire) != 2 {
-            spins += 1;
-            if spins > spin_bound {
-                return Pop::Saturated;
-            }
-            core::hint::spin_loop();
-        }
-        let word = cell.entry.load(Ordering::Acquire);
-        cell.state.store(0, Ordering::Release);
-        self.tail.fetch_add(1, Ordering::AcqRel);
-        Pop::Entry(Entry {
-            kind: word & KIND_CANCEL,
-            generation: ((word >> 16) & 0xffff) as u16,
-            index: (word & 0xffff) as u16,
-        })
     }
-}
 
-/// What [`Channel::pop`] found.
-enum Pop {
-    /// Nothing unread.
-    Empty,
-    /// A claim has been held too long; scan the flags instead. The request is
-    /// not lost: its flag is still set, and the scan applies it.
-    Saturated,
-    /// A whole entry.
-    Entry(Entry),
+    fn take(&self, index: usize) -> u64 {
+        let bits = self.pending[index].swap(0, Ordering::SeqCst);
+        self.hints
+            .fetch_sub(bits.count_ones() as usize, Ordering::SeqCst);
+        bits
+    }
+
+    fn pending(&self) -> bool {
+        self.writers.load(Ordering::SeqCst) != 0 || self.hints.load(Ordering::SeqCst) != 0
+    }
 }
 
 /// The executor's bounded configuration.
@@ -234,7 +189,7 @@ pub enum Admission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelError {
     /// The id's generation does not match its slot: it was reaped and reused, or
-    /// never existed.
+    /// never existed, or its index lies outside this pool.
     InvalidId,
     /// The task already completed or was cancelled.
     NotLive,
@@ -273,9 +228,9 @@ pub struct Stats {
     pub completed: u64,
     /// Tasks cancelled.
     pub cancelled: u64,
-    /// Channel entries drained (wakes and cancels).
+    /// Slot notification hints drained (coalesced wakes and cancels).
     pub notifications: u64,
-    /// Entries dropped for a stale generation.
+    /// Reserved stale-entry count (bitmap hints always inspect the current slot).
     pub stale: u64,
     /// Polls taken.
     pub polls: u64,
@@ -285,7 +240,7 @@ pub struct Stats {
 /// thread or an interrupt context.
 ///
 /// The handle is `Send + Sync` and its methods allocate nothing, take no locks
-/// and run no destructors: they set the slot's flag and push one channel entry.
+/// and run no task destructors: they set the slot's flag and publish a bitmap hint.
 /// The executor's owner applies the outcome. A handle for a reaped or reused
 /// slot is stale and its calls are dropped ([`is_stale`](Waker::is_stale)).
 #[derive(Clone)]
@@ -309,44 +264,46 @@ impl Waker {
     /// Asks the executor to run the task again, coalescing duplicate wakes. A
     /// wake for a completed or reaped task is dropped.
     pub fn wake(&self) {
-        self.notify(WAKE, 0);
+        self.notify(WAKE, || {});
     }
 
     /// Asks the executor to cancel the task (see
     /// [`Executor::cancel`](Executor::cancel) for the semantics). Cancelling an
     /// already settled task is dropped.
     pub fn cancel(&self) {
-        self.notify(CANCEL, KIND_CANCEL);
+        self.notify(CANCEL, || {});
     }
 
     /// The flag word's current generation (0 for a never-spawned slot).
-    fn generation(&self) -> u16 {
-        ((self.flags.load(Ordering::Acquire) & GEN_MASK) >> GEN_SHIFT) as u16
+    fn generation(&self) -> u32 {
+        ((self.flags.load(Ordering::SeqCst) & GEN_MASK) >> GEN_SHIFT) as u32
     }
 
-    /// Sets `flag` (0→1) and pushes the matching channel entry; the flag
-    /// transition bounds the ring, so the push cannot fail.
-    fn notify(&self, flag: u64, kind: u64) {
-        let mut now = self.flags.load(Ordering::Acquire);
+    // The producer count precedes the flag, covering every publication gap.
+    // `after_flag` is an empty inlined closure except in deterministic tests.
+    fn notify(&self, flag: u64, after_flag: impl FnOnce()) {
+        self.channel.writers.fetch_add(1, Ordering::SeqCst);
+        let mut now = self.flags.load(Ordering::SeqCst);
         loop {
-            if (now & GEN_MASK) >> GEN_SHIFT != u64::from(self.id.generation()) {
-                return; // The slot was reaped and reused, or never held this task.
-            }
-            if now & flag != 0 {
-                return; // Already requested; the request is either pending or spent.
+            if (now & GEN_MASK) >> GEN_SHIFT != u64::from(self.id.generation()) || now & flag != 0 {
+                self.channel.writers.fetch_sub(1, Ordering::SeqCst);
+                self.channel.signal();
+                return;
             }
             match self.flags.compare_exchange_weak(
                 now,
                 now | flag,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => break,
                 Err(actual) => now = actual,
             }
         }
-        self.channel
-            .push(kind, self.id.generation(), self.id.index() as u16);
+        after_flag();
+        self.channel.push(self.id.index());
+        self.channel.writers.fetch_sub(1, Ordering::SeqCst);
+        self.channel.signal();
     }
 }
 
@@ -370,8 +327,22 @@ pub struct Executor {
 impl Executor {
     /// An executor with `config`, reading time from `clock` (nothing here polls
     /// the clock; it is only consulted when the worker enters the executor or
-    /// asks whether it may sleep).
+    /// asks whether it may sleep). This polling-only constructor has no worker
+    /// notification; use [`with_notifier`](Self::with_notifier) for blocking workers.
+    ///
+    /// # Panics
+    /// Panics when capacity or budget is zero.
     pub fn new(clock: Arc<dyn Clock>, config: Config) -> Self {
+        Self::with_notifier(clock, config, Arc::new(PollOnly))
+    }
+
+    /// Creates a core with the binding's latched worker notification.
+    ///
+    /// Arm the scheduler wait before [`prepare_sleep`](Self::prepare_sleep).
+    ///
+    /// # Panics
+    /// Panics when capacity or budget is zero.
+    pub fn with_notifier(clock: Arc<dyn Clock>, config: Config, notifier: Arc<dyn Notify>) -> Self {
         assert!(
             config.capacity > 0,
             "an executor needs at least one task slot"
@@ -382,7 +353,7 @@ impl Executor {
         );
         let capacity = usize::from(config.capacity);
         let slots = (0..capacity)
-            .map(|index| Slot::free(index as u16 + 1))
+            .map(|index| Slot::free(index as u32 + 1))
             .collect();
         let free = (0..capacity).map(|index| index as u16).collect();
         Self {
@@ -391,8 +362,8 @@ impl Executor {
             slots,
             free,
             ready: VecDeque::with_capacity(capacity),
-            sleepers: BinaryHeap::new(),
-            channel: Arc::new(Channel::new(capacity)),
+            sleepers: BinaryHeap::with_capacity(capacity),
+            channel: Arc::new(Channel::new(capacity, notifier)),
             stats: Stats::default(),
         }
     }
@@ -414,8 +385,9 @@ impl Executor {
         debug_assert_eq!(slot.state, State::Free);
         let generation = slot.generation;
         // Clear both flags for the new occupant before the id can escape.
-        slot.flags
-            .store(flags(generation, false, false), Ordering::Release);
+        // A distinct flag identity prevents even a paused old waker's CAS from
+        // affecting this occupancy. Allocation happens at spawn, never at wake.
+        slot.flags = Arc::new(AtomicU64::new(flags(generation, false, false)));
         slot.state = State::Ready;
         slot.join_interest = true;
         slot.deadline = None;
@@ -429,7 +401,7 @@ impl Executor {
 
     /// A [`Waker`] for `id`, or `None` when the id is stale or settled.
     pub fn waker(&self, id: TaskId) -> Option<Waker> {
-        let slot = &self.slots[id.index()];
+        let slot = self.slots.get(id.index())?;
         if slot.generation != id.generation()
             || !matches!(
                 slot.state,
@@ -474,6 +446,7 @@ impl Executor {
                 outcome.cancelled += 1;
                 continue;
             }
+            slot.flags.fetch_and(!WAKE, Ordering::SeqCst);
             let mut body = slot.body.take().expect("a ready task has a body");
             slot.state = State::Running;
             let step = {
@@ -488,8 +461,7 @@ impl Executor {
                     let slot = &mut self.slots[id.index()];
                     slot.state = State::Completed;
                     slot.result = Some(result);
-                    slot.flags
-                        .store(flags(slot.generation, false, false), Ordering::Release);
+                    slot.flags.store(0, Ordering::SeqCst);
                     self.stats.completed += 1;
                     if !slot.join_interest {
                         self.reap(id);
@@ -571,122 +543,82 @@ impl Executor {
         }
     }
 
-    /// Consumes the channel: settles cancels, wakes waiting and sleeping tasks.
+    /// Consumes bitmap hints, with a flag scan for paused producers.
     fn drain(&mut self, outcome: &mut PollOutcome) {
-        let mut saturated = false;
-        loop {
-            match self.channel.pop(10_000) {
-                Pop::Empty => break,
-                Pop::Saturated => {
-                    saturated = true;
-                    break;
-                }
-                Pop::Entry(entry) => {
+        if self.channel.hints.load(Ordering::SeqCst) != 0 {
+            // Snapshot each word once: repeated low-index wakes cannot starve
+            // the other bits, and each drain applies at most capacity hints.
+            for word in 0..self.channel.pending.len() {
+                let mut bits = self.channel.take(word);
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
                     self.stats.notifications += 1;
-                    self.apply(&entry, outcome);
+                    self.apply(word * 64 + bit as usize, outcome);
                 }
             }
         }
-        if saturated {
-            // A producer is wedged between its claim and its store. Never lose
-            // its request: apply every set flag. The flags are left set (the
-            // ring still holds their entries), so a later drain settles them
-            // and the slot cannot receive a duplicate request in between.
+        if self.channel.writers.load(Ordering::SeqCst) != 0 {
             for index in 0..self.slots.len() {
-                let word = self.slots[index].flags.load(Ordering::Acquire);
-                let id = TaskId::new(index as u16, ((word & GEN_MASK) >> GEN_SHIFT) as u16);
-                if word & WAKE != 0 {
-                    let slot = &mut self.slots[index];
-                    if slot.generation == id.generation()
-                        && (slot.state == State::Waiting || slot.state == State::Sleeping)
-                    {
-                        slot.state = State::Ready;
-                        slot.deadline = None;
-                        self.ready.push_back(id);
-                        outcome.woken += 1;
-                    }
-                }
-                if word & CANCEL != 0 {
-                    self.apply(
-                        &Entry {
-                            kind: KIND_CANCEL,
-                            generation: id.generation(),
-                            index: index as u16,
-                        },
-                        outcome,
-                    );
-                }
+                self.apply(index, outcome);
             }
         }
     }
 
-    /// One channel entry: cancel settles the task, wake re-queues a waiting one.
-    fn apply(&mut self, entry: &Entry, outcome: &mut PollOutcome) {
-        let slot = &mut self.slots[entry.index as usize];
-        if slot.generation != entry.generation {
-            // The slot was reaped and reused since; the entry is spent.
-            self.stats.stale += 1;
+    fn apply(&mut self, index: usize, outcome: &mut PollOutcome) {
+        let slot = &mut self.slots[index];
+        let word = slot.flags.fetch_and(GEN_MASK, Ordering::SeqCst);
+        if word & GEN_MASK == 0 {
             return;
         }
-        if entry.kind & KIND_CANCEL != 0 {
-            slot.flags.fetch_and(!CANCEL, Ordering::AcqRel);
-            match slot.state {
-                State::Ready | State::Waiting => {
-                    // A queued task's entry is filtered when it comes up.
-                    slot.state = State::Cancelled;
-                    slot.body.take();
-                    self.stats.cancelled += 1;
-                }
-                State::Sleeping => {
-                    slot.state = State::Cancelled;
-                    slot.deadline = None;
-                    slot.body.take();
-                    self.stats.cancelled += 1;
-                }
-                State::Running => unreachable!(
-                    "a drain never runs while a body does; the step-boundary drain settles cancels"
-                ),
-                State::Completed | State::Cancelled => {
-                    // A cancel of a settled task is dropped.
-                }
-                State::Free => unreachable!("a live entry names a live slot"),
+        let id = TaskId::new(index as u16, slot.generation);
+        if word & CANCEL != 0 {
+            self.settle_cancel(id);
+        } else if word & WAKE != 0 && matches!(slot.state, State::Waiting | State::Sleeping) {
+            let sleeping = slot.deadline.take().is_some();
+            slot.state = State::Ready;
+            if sleeping {
+                self.sleepers.retain(|Reverse((_, task))| *task != id);
             }
-        } else {
-            slot.flags.fetch_and(!WAKE, Ordering::AcqRel);
-            if slot.state == State::Waiting || slot.state == State::Sleeping {
-                slot.state = State::Ready;
-                slot.deadline = None;
-                self.ready
-                    .push_back(TaskId::new(entry.index, entry.generation));
-                outcome.woken += 1;
-            }
+            self.ready.push_back(id);
+            outcome.woken += 1;
         }
     }
 
-    /// Requests the cancellation of `id` from the owner thread: queued, waiting
-    /// and sleeping tasks are settled now (they never run again); a running task
-    /// finishes its current poll and the cancel applies at its step boundary. A
-    /// completed task's cancel is dropped, as is a stale id's.
-    pub fn cancel(&mut self, id: TaskId) -> Result<(), CancelError> {
+    fn settle_cancel(&mut self, id: TaskId) {
         let slot = &mut self.slots[id.index()];
-        if slot.generation != id.generation() {
+        if !matches!(slot.state, State::Ready | State::Waiting | State::Sleeping) {
+            return;
+        }
+        let sleeping = slot.deadline.take().is_some();
+        slot.state = State::Cancelled;
+        slot.flags.store(0, Ordering::SeqCst);
+        slot.body.take();
+        let detached = !slot.join_interest;
+        self.stats.cancelled += 1;
+        if sleeping {
+            self.sleepers.retain(|Reverse((_, task))| *task != id);
+        }
+        if detached {
+            self.reap(id);
+        }
+    }
+
+    /// Cancels a live task at its next step boundary.
+    ///
+    /// # Errors
+    /// Returns [`CancelError::InvalidId`] for stale or out-of-pool ids and
+    /// [`CancelError::NotLive`] when the task has already settled.
+    pub fn cancel(&mut self, id: TaskId) -> Result<(), CancelError> {
+        let slot = self.slots.get(id.index()).ok_or(CancelError::InvalidId)?;
+        if slot.generation != id.generation() || slot.state == State::Free {
             return Err(CancelError::InvalidId);
         }
-        match slot.state {
-            State::Ready | State::Waiting | State::Sleeping => {
-                slot.deadline = None;
-                slot.state = State::Cancelled;
-                slot.body.take();
-                self.stats.cancelled += 1;
-                Ok(())
-            }
-            // A running poll cannot be interrupted from inside the core; the
-            // cross-thread path (a `Waker::cancel`) is drained at the step
-            // boundary, and the owner thread cannot call `cancel` mid-poll.
-            State::Running => Err(CancelError::NotLive),
-            State::Completed | State::Cancelled => Err(CancelError::NotLive),
-            State::Free => Err(CancelError::InvalidId),
+        if !matches!(slot.state, State::Ready | State::Waiting | State::Sleeping) {
+            return Err(CancelError::NotLive);
         }
+        self.settle_cancel(id);
+        Ok(())
     }
 
     /// Returns a completed or cancelled task's outcome and frees its slot, or
@@ -694,7 +626,7 @@ impl Executor {
     /// body is always dropped at completion, whether or not it is joined.
     pub fn join(&mut self, id: TaskId) -> Option<JoinOutcome> {
         let outcome = {
-            let slot = &mut self.slots[id.index()];
+            let slot = self.slots.get_mut(id.index())?;
             if slot.generation != id.generation() {
                 None
             } else {
@@ -716,33 +648,35 @@ impl Executor {
     /// Releases the join interest in `id`: the slot is freed as soon as the task
     /// settles, instead of waiting for a `join`. Stale ids are ignored.
     pub fn drop_interest(&mut self, id: TaskId) {
-        let slot = &mut self.slots[id.index()];
+        let Some(slot) = self.slots.get_mut(id.index()) else {
+            return;
+        };
         if slot.generation != id.generation() {
             return;
         }
         slot.join_interest = false;
-        if slot.state == State::Completed {
+        if matches!(slot.state, State::Completed | State::Cancelled) {
             self.reap(id);
         }
     }
 
-    /// Frees the slot of a settled task: clears every bit, returns the slot to
-    /// the free list and bumps the generation for the next occupant.
+    /// Removes all storage owned by a settled task; exhausted ids never wrap.
     fn reap(&mut self, id: TaskId) {
         let slot = &mut self.slots[id.index()];
+        if slot.state == State::Cancelled {
+            self.ready.retain(|task| *task != id);
+        }
         debug_assert!(matches!(slot.state, State::Completed | State::Cancelled));
-        slot.generation = if slot.generation == MAX_GENERATION {
-            1
-        } else {
-            slot.generation + 1
-        };
         slot.state = State::Free;
         slot.deadline = None;
         slot.join_interest = false;
         slot.result = None;
         slot.body = None;
-        slot.flags.store(0, Ordering::Release);
-        self.free.push_back(id.index() as u16);
+        slot.flags.store(0, Ordering::SeqCst);
+        if slot.generation != MAX_GENERATION {
+            slot.generation += 1;
+            self.free.push_back(id.index() as u16);
+        }
     }
 
     /// The earliest deadline a sleeping task waits for, for the kernel's shared
@@ -755,18 +689,35 @@ impl Executor {
     /// Whether the worker has work: a ready task, a notification pending in the
     /// channel, or a sleeping task that might already be due. When this is false
     /// and [`next_deadline`](Executor::next_deadline) is `None`, the worker may
-    /// sleep until a wake or a rearm.
+    /// use [`prepare_sleep`](Self::prepare_sleep) after arming its binding wait.
     pub fn schedulable(&self) -> bool {
         if !self.ready.is_empty() {
             return true;
         }
-        if self.channel.head.load(Ordering::Acquire) != self.channel.tail.load(Ordering::Acquire) {
+        if self.channel.pending() {
             return true;
         }
         match self.next_deadline() {
             Some(deadline) => self.clock.now() >= deadline,
             None => false,
         }
+    }
+
+    /// Arms the core's wake latch and rechecks pending work before blocking.
+    ///
+    /// The scheduler binding must first arm its latched notification wait and
+    /// timer for [`next_deadline`](Self::next_deadline). If this returns false,
+    /// disarm that wait and poll again. If true, block using that registration:
+    /// a concurrent producer signals it even between this check and blocking.
+    /// [`new`](Self::new) has no notifier and supports polling only; a sleeping
+    /// worker must be constructed with [`with_notifier`](Self::with_notifier).
+    pub fn prepare_sleep(&self) -> bool {
+        self.channel.armed.store(true, Ordering::SeqCst);
+        if self.schedulable() {
+            self.channel.armed.store(false, Ordering::SeqCst);
+            return false;
+        }
+        self.channel.armed.load(Ordering::SeqCst)
     }
 
     /// The counters since construction.
@@ -781,7 +732,225 @@ impl Drop for Executor {
         // drops whatever ran on it. The kernel's cancellation protocol must have
         // settled external request ownership before the executor goes.
         for slot in &mut self.slots {
+            slot.flags.store(0, Ordering::SeqCst);
             slot.body.take();
         }
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    extern crate std;
+    use super::*;
+    use crate::FakeClock;
+    use std::sync::mpsc;
+
+    fn single() -> Executor {
+        Executor::new(
+            Arc::new(FakeClock::new()),
+            Config {
+                capacity: 1,
+                budget: 1,
+            },
+        )
+    }
+
+    struct Signal(mpsc::Sender<()>);
+    impl Notify for Signal {
+        fn notify(&self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn publication_gap_prevents_sleep_and_pending_wake_is_scanned() {
+        let mut exec = single();
+        let id = exec.spawn(|_| Step::Wait).unwrap();
+        exec.poll();
+        let waker = exec.waker(id).unwrap();
+        let (published, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            waker.notify(WAKE, || {
+                published.send(()).unwrap();
+                resumed.recv().unwrap();
+            });
+        });
+        observed.recv().unwrap();
+        assert!(exec.schedulable());
+        assert!(!exec.prepare_sleep());
+        assert_eq!(
+            exec.poll().ran,
+            1,
+            "scan reaches the task before hint publication"
+        );
+        resume.send(()).unwrap();
+        producer.join().unwrap();
+        exec.poll();
+    }
+
+    #[test]
+    fn armed_worker_is_signalled_after_the_final_empty_check() {
+        let (signal, received) = mpsc::channel();
+        let mut exec = Executor::with_notifier(
+            Arc::new(FakeClock::new()),
+            Config {
+                capacity: 1,
+                budget: 1,
+            },
+            Arc::new(Signal(signal)),
+        );
+        let id = exec.spawn(|_| Step::Wait).unwrap();
+        exec.poll();
+        // The receiver models a wait registration armed before prepare_sleep.
+        assert!(exec.prepare_sleep());
+        exec.waker(id).unwrap().wake();
+        received.recv().unwrap();
+        assert_eq!(exec.poll().ran, 1);
+    }
+
+    #[test]
+    fn detached_cancellations_reuse_the_slot_from_either_path() {
+        for remote in [false, true] {
+            let mut exec = single();
+            for _ in 0..100 {
+                let id = exec
+                    .spawn(|_| Step::WaitDeadline { deadline: u64::MAX })
+                    .unwrap();
+                let waker = exec.waker(id).unwrap();
+                exec.poll();
+                exec.drop_interest(id);
+                if remote {
+                    waker.cancel();
+                    exec.poll();
+                } else {
+                    exec.cancel(id).unwrap();
+                }
+                assert!(exec.sleepers.is_empty());
+                assert!(exec.ready.is_empty());
+                assert!(waker.is_stale());
+            }
+        }
+        let mut exec = single();
+        let id = exec.spawn(|_| Step::Wait).unwrap();
+        exec.cancel(id).unwrap();
+        exec.drop_interest(id);
+        assert!(exec.spawn(|_| Step::Wait).is_ok());
+    }
+
+    #[test]
+    fn early_wakes_never_accumulate_stale_deadlines() {
+        let mut exec = single();
+        let id = exec
+            .spawn(|_| Step::WaitDeadline { deadline: u64::MAX })
+            .unwrap();
+        let waker = exec.waker(id).unwrap();
+        exec.poll();
+        for _ in 0..1000 {
+            waker.wake();
+            exec.poll();
+            assert_eq!(exec.sleepers.len(), 1);
+        }
+        exec.cancel(id).unwrap();
+        assert_eq!(exec.next_deadline(), None);
+        assert!(exec.sleepers.is_empty());
+        exec.join(id);
+        assert_eq!(exec.next_deadline(), None);
+    }
+
+    #[test]
+    fn stale_wakers_do_not_revive_after_the_old_16_bit_wrap() {
+        let mut exec = single();
+        let first = exec.spawn(|_| Step::Wait).unwrap();
+        let stale = exec.waker(first).unwrap();
+        exec.cancel(first).unwrap();
+        exec.join(first);
+        for _ in 0..=u16::MAX {
+            let id = exec.spawn(|_| Step::Wait).unwrap();
+            exec.cancel(id).unwrap();
+            exec.join(id);
+        }
+        let current = exec.spawn(|_| Step::Done { result: 7 }).unwrap();
+        assert_ne!(first, current);
+        stale.cancel();
+        exec.poll();
+        assert_eq!(exec.join(current), Some(JoinOutcome::Done(7)));
+    }
+
+    #[test]
+    fn generation_exhaustion_retires_the_slot_instead_of_wrapping() {
+        let mut exec = single();
+        exec.slots[0].generation = MAX_GENERATION;
+        let id = exec.spawn(|_| Step::Wait).unwrap();
+        let old = exec.waker(id).unwrap();
+        exec.cancel(id).unwrap();
+        exec.join(id);
+        assert!(old.is_stale());
+        assert_eq!(exec.spawn(|_| Step::Wait), Err(Admission::PoolFull));
+    }
+
+    #[test]
+    fn stalled_cancel_producer_cannot_overwrite_other_notifications() {
+        let mut exec = Executor::new(
+            Arc::new(FakeClock::new()),
+            Config {
+                capacity: 2,
+                budget: 2,
+            },
+        );
+        let a = exec.spawn(|_| Step::Wait).unwrap();
+        let b = exec.spawn(|_| Step::Wait).unwrap();
+        exec.poll();
+        let cancel = exec.waker(a).unwrap();
+        let repeated = cancel.clone();
+        let wake = exec.waker(b).unwrap();
+        let (published, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            cancel.notify(CANCEL, || {
+                published.send(()).unwrap();
+                resumed.recv().unwrap();
+            });
+        });
+        observed.recv().unwrap();
+        for _ in 0..100 {
+            repeated.cancel();
+            wake.wake();
+            assert_eq!(exec.poll().ran, 1, "other tasks still make progress");
+        }
+        assert_eq!(exec.join(a), Some(JoinOutcome::Cancelled));
+        resume.send(()).unwrap();
+        producer.join().unwrap();
+        exec.poll();
+        assert_eq!(exec.join(b), None);
+        assert!(exec.channel.pending.len() <= usize::from(exec.config.capacity).div_ceil(64));
+    }
+
+    #[test]
+    fn invalid_public_ids_are_rejected_without_panics() {
+        let mut exec = single();
+        for index in [1, u16::MAX] {
+            let id = TaskId::new(index, 1);
+            assert!(exec.waker(id).is_none());
+            assert_eq!(exec.cancel(id), Err(CancelError::InvalidId));
+            assert_eq!(exec.join(id), None);
+            exec.drop_interest(id);
+        }
+    }
+
+    #[test]
+    fn a_single_self_wake_does_not_become_a_permanent_wake_bit() {
+        let mut exec = single();
+        let mut first = true;
+        exec.spawn(move |cx| {
+            if core::mem::take(&mut first) {
+                cx.wake();
+            }
+            Step::Wait
+        })
+        .unwrap();
+        assert_eq!(exec.poll().ran, 1);
+        assert_eq!(exec.poll().ran, 1);
+        assert_eq!(exec.poll().ran, 0);
     }
 }
