@@ -3617,7 +3617,30 @@ impl GenericFlusher for Flusher<'_, '_> {
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
     ) {
+        // A mapping that only fills a previously non-present PTE needs no invalidation on x86:
+        // TLBs and paging-structure caches never hold entries built from a PTE whose P flag is 0
+        // (Intel SDM Vol. 3A 4.10.2.3, 4.10.3.1 and 4.10.4.3; AMD APM Vol. 2 5.5), so no CPU,
+        // local or remote, can hold a stale translation for the page. Skipping it here avoids a
+        // shootdown round per user-scheme capture and per anonymous mmap. Every NEW_MAPPING
+        // caller maps into a span with no present PTE (a fresh span from `AddrSpace::mmap`, after
+        // `MAP_FIXED` has unmapped and flushed the old one, or a page `translate` just found
+        // unmapped), and queues remaps and frees with their own actions.
+        //
+        // This matters because a spurious fault is not harmless everywhere: `correct_inner`
+        // remaps an already-present page idempotently for `Allocated`, `AllocatedShared` and
+        // `PhysBorrowed` grants, but takes an extra page reference for `External` and asks the
+        // scheme again for `FmapBorrowed`. AArch64 does not cache invalid descriptors either, but
+        // without a DSB and a context synchronization on the other PEs a walk can still see the
+        // old invalid entry; RISC-V lets harts cache invalid PTEs until an SFENCE.VMA. Both keep
+        // the shootdown.
+        let new_mapping = actions.contains(TlbShootdownActions::NEW_MAPPING);
         let actions = actions & !TlbShootdownActions::NEW_MAPPING;
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+            && new_mapping
+            && actions.is_empty()
+        {
+            return;
+        }
 
         let entry = if actions.contains(TlbShootdownActions::FREE) {
             PageQueueEntry::Free {
@@ -3654,8 +3677,8 @@ bitflags::bitflags! {
         // Unmap a page from one address space without deallocating it.
         const MOVE = 1 << 4;
 
-        // Add a new mapping to an address space.
-        // Not really a TLB shootdown action on most architectures, so almost always a no-op.
+        // Add a new mapping where no present PTE was. `Flusher` skips the shootdown for it on
+        // x86, which never caches not-present entries; other architectures still flush.
         const NEW_MAPPING = 1 << 31;
     }
 }
