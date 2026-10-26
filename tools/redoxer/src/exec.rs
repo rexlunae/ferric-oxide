@@ -167,11 +167,7 @@ fn bootloader() -> anyhow::Result<PathBuf> {
         fs::create_dir_all(&bootloader_dir)?;
 
         let mut config = redox_installer::Config::default();
-        config.files.push(redox_installer::FileConfig {
-            path: "/etc/pkg.d/50_redox".to_string(),
-            data: "https://static.redox-os.org/pkg".to_string(),
-            ..Default::default()
-        });
+        config.general.cookbook = Some(crate::cookbook_dir()?.display().to_string());
         config
             .packages
             .insert("bootloader".to_string(), Default::default());
@@ -230,6 +226,9 @@ fn base(
         }
 
         config.general.live_disk = Some(qemu_use_live_disk());
+        if config.general.cookbook.is_none() {
+            config.general.cookbook = Some(crate::cookbook_dir()?.display().to_string());
+        }
 
         if fuse {
             run_install_mount(

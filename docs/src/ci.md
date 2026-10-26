@@ -20,6 +20,8 @@ Then download the toolchain, QEMU image and test if installation works with `tru
 redoxer exec true
 ```
 
+Ferric Oxide's Redoxer downloads no packages: set `REDOXER_COOKBOOK` to a checkout of this repository whose `repo/$TARGET/` holds built packages (for example after `make all`), and `redoxer exec` builds its image from those, as `redoxer pkg` does below. The Docker container and the `redoxer` crate on crates.io are upstream's, and still use Redox's package server.
+
 To install and run Redoxer via [the official Docker container](https://hub.docker.com/r/redoxos/redoxer):
 
 ```sh
@@ -84,7 +86,7 @@ Sometimes a project needs native libraries such as OpenSSL or zlib. To have them
 redoxer pkg openssl3 zlib
 ```
 
-It will download and extract the compiled library to `target/$TARGET/sysroot` or configured from `REDOXER_SYSROOT`. After it does, all subsequent Redoxer calls will automatically be linked to them via `RUSTFLAGS`, `LDFLAGS`, etc.
+It will install the built packages, and the packages they depend on, from `$REDOXER_COOKBOOK/repo/$TARGET/` into `target/$TARGET/sysroot` or configured from `REDOXER_SYSROOT`, with fox's store, so `redoxer pkg remove` can take them out again. After it does, all subsequent Redoxer calls will automatically be linked to them via `RUSTFLAGS`, `LDFLAGS`, etc.
 
 To verify how the build works run the `redoxer env` command and examine how environment variables are produced. You can also debug it with a interactive GNU Bash using `redoxer env bash` :
 
