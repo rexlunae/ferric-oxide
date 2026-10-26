@@ -878,22 +878,179 @@ device) and serves in the foreground until it is stopped.
   without permitting data reads, and `O_STAT | O_NOFOLLOW` stats the link itself.
   `O_SYMLINK` on a regular file fails with `EINVAL`; relative opens require a
   directory handle, including paths containing `..`.
-- **Layers:** the daemon reads through `ext4d::device::ReadAt`, which a LUKS
-  (`ferric-luks`) or LVM (`ferric-lvm`) volume can implement to put ext4 on top
-  of it; no such layer is wired up yet.
+- **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
+  serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
+  [Block layers](#block-layers-luks-and-lvm-read-only)).
 - **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
   hash of the path (hard links get different numbers) and `st_ctime` is the
   modification time; `mmap` is not served; encrypted files and devices are
   refused (`EOPNOTSUPP`).
 
+### Journal replay
+
+A volume that was not cleanly unmounted has `needs_recovery` set: its journal
+holds committed transactions that may not have reached their home blocks.
+Without help, ext4d reads it through `ext4-view`'s view of the journal in
+memory, which is enough for most volumes but not all: as of `ext4-view` 1.0.0
+it refuses a journal that holds an escaped block (one whose data starts with
+the JBD2 magic number), and on a log that wraps round from the end of the
+journal to its start it ignores the committed transactions and serves the old
+contents. The tests pin both behaviours down.
+
+`fs.ext4_journal_replay` (default off, needs `fs.ext4`; Cargo feature
+`journal-replay`) has ext4d replay the journal onto the disk before it serves
+the volume, as `e2fsck -E journal_only` does. ext4d opens the device for
+writing only when the volume needs recovery, and only for the replay; it still
+serves the volume read-only. This is the groundwork for writable ext4, which
+has to start from a replayed journal.
+
+- **`ferric-jbd2`** (`crates/jbd2`, `no_std`, host-tested) reads the JBD2
+  log: the journal superblock, descriptor blocks and their tags, revoke blocks
+  and commit blocks, with version 2 and 3 CRC32C checksums. It keeps the
+  transactions that have a valid commit block, applies the revoke records (a
+  revoke in transaction *r* cancels copies of the block logged in transactions
+  up to *r*) and yields the newest surviving copy of each block. Every logged
+  block is checked against its tag checksum when its transaction's commit
+  block is reached, before anything is written. Under a journal with
+  `INCOMPAT_ASYNC_COMMIT` (where the commit block need not be written last) a
+  damaged block marks its transaction as torn: the log ends there and the
+  transactions before it are replayed. Otherwise a damaged block stops the
+  replay if it is the copy that would be written; a copy that a newer one
+  replaces or that is revoked is never written, so it does not. Fast commits
+  and external journal devices are refused; version 1 commit checksums are not
+  verified.
+- **ext4d** (`userspace/ext4d/src/journal/`) finds the journal inode through
+  its group descriptor and extent tree (or ext3 block map). It checks the map
+  before trusting it: the inode's block map and size must match the backup in
+  the superblock (`s_jnl_blocks`), the superblock checksum must hold, and the
+  journal must lie inside the volume, without holes, and clear of the
+  superblocks, group descriptors, reserved GDT blocks, bitmaps and inode
+  tables (volumes with `meta_bg` are refused for now). No replayed block may
+  land inside the journal. It then writes the planned
+  blocks and flushes, then empties the journal (`s_start` 0) and flushes, then
+  clears `needs_recovery`, updates the superblock checksum and flushes. A replay
+  interrupted at any point can be run again and gives the same volume; the
+  tests crash a replay before each write to check that.
+
+Both are written from "Journal (jbd2)" and the superblock, group descriptor,
+inode and extent tree sections of "Ext4 Disk Layout" on the ext4 wiki at
+kernel.org. Where that document is silent, the behaviour was settled by
+experiment with e2fsprogs 1.47: `debugfs` (`journal_open -c -v N`,
+`journal_write`) wrote transactions into test volumes, `e2fsck -E
+journal_only` replayed them, and the bytes were compared. That is how these
+were found:
+
+- every checksum is CRC32C started from `0xFFFF_FFFF` and not inverted at the
+  end, run over the journal UUID and then the covered bytes;
+- with version 2 checksums a tag is two bytes longer than its fields (10
+  bytes, or 14 with 64-bit block numbers);
+- the tag checksum of an escaped block covers the block as stored, with its
+  magic number zeroed (ext4d accepts the other form too, since the layout does
+  not say);
+- after a replay, `s_sequence` is one past the first sequence that had no
+  commit.
+
+The fixtures are volumes `make-fixtures.sh` builds this way, gzipped (about
+70 KB in all): version 3 and version 2 checksums with 32- and 64-bit tags, an
+ext3 volume with no checksums and an indirect-mapped journal, 4 KiB blocks, and
+a log that wraps round. Each comes with `e2fsck`'s replay of it, and the tests
+compare ext4d's replay with it block by block (apart from the write time and
+write count e2fsck also updates). CI also builds fresh ones with the runner's
+e2fsprogs and runs the same tests on them.
+
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
-`tests/fixtures/make-fixtures.sh`; `ferric-ext4-test` mounts the same image on
-the target, including `symlink_metadata` and refusal of `read_link` on a regular
+`tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
+`ferric-ext4-test` mounts the same image on the target, and with
+`fs.ext4_journal_replay` replays and mounts `journal-v3` (`ext4-journal`), including `symlink_metadata` and refusal of `read_link` on a regular
 file. A UID/GID 2000 child must read a public file and receive `EACCES` for
 protected files, directories and symlink targets. Host fixtures additionally
 cover owner and primary-group access.
 The image workflow checks the ext4 markers only for smoke boots, since the
 nightly fuzz script runs only the fuzzer and package verification.
+
+## Block layers: LUKS and LVM, read-only
+
+`ferric-blocklayer` (`crates/blocklayer/`) is a stack of read-only block
+layers, each a `BlockDevice` (a size and a positioned read) built on the
+devices below it, so they nest in whatever order the disk was set up in:
+
+- **`Slice`**: a byte window of a device, such as a partition.
+- **`Crypt`** (feature `luks`): opens a LUKS1 or LUKS2 volume through
+  `ferric-luks` (header, passphrase, volume key, data segment) and decrypts
+  AES-XTS sectors of 512 to 4096 bytes with `plain64` IVs, or `plain` ones,
+  which wrap to 0 at sector 2^32 (2 TiB in). Whole sectors are
+  decrypted in the caller's buffer; a partial sector at either end goes through
+  one sector of scratch space. Segments that are flagged (reencryption),
+  integrity-protected, or more than one are refused.
+- **`Lvm`** (feature `lvm`): reads every PV's label and metadata through
+  `ferric-lvm`, takes the newest metadata (highest `seqno`), matches each PV of
+  the group to a device by its label's UUID, and splits reads wherever the
+  logical volume moves to another extent run, stripe chunk or PV. Every PV of the
+  group must be given; mirror, RAID, thin, cache and snapshot segments are
+  refused.
+- **`Stack`**: one type for a stack chosen at run time, whose error
+  (`StackError`) keeps each layer's error in its source chain.
+
+The crate is `no_std` (`alloc` for the LUKS, LVM and `Stack` layers) and has
+no `unsafe` code. It builds for bare-metal targets, with
+`RUSTFLAGS="--cfg aes_force_soft"` and `ferric-luks/force-soft` where SIMD is
+not available, as for the bootloader.
+
+**IVs of large sectors.** The LUKS2 specification (1.1.4, section 3.3) gives a
+crypt segment's `sector_size` and its `iv_tweak` ("the starting offset for the
+Initialization Vector") but not the unit the IV counts in when sectors are
+larger than 512 bytes. This was settled by experiment, without reading any
+implementation's source: cryptsetup 2.7 encrypted a volume with 4096-byte
+sectors (`crates/blocklayer/tests/fixtures/make-fixtures.sh`), and its data
+decrypts only when the IV of the sector at byte `b` of the segment is
+`iv_tweak + b / 512`; counting in 4096-byte units gives noise from the second
+sector on. So the IV always counts 512-byte units (`ferric_luks::data::IV_UNIT`),
+and the fixture test `lvm_on_luks_with_4k_sectors_decrypts` reads sectors whose
+IVs differ under the two readings.
+
+`ferric-blockd` (`userspace/blockd/`, features.toml `fs.luks` and `fs.lvm`, off
+by default; each builds in its layer) serves the top of a stack as a read-only
+scheme:
+
+```text
+ferric-blockd SCHEME STEP...
+  dev:PATH              push a disk, partition or image file
+  slice:OFFSET:LENGTH   the top volume's bytes OFFSET..OFFSET+LENGTH (LENGTH "-": to the end)
+  luks:KEYFILE          the LUKS volume on the top volume
+  lvm:NAME              logical volume NAME of the group whose PVs are all the volumes so far
+```
+
+For example, LVM on LUKS on a partition, with ext4 on the logical volume:
+
+```text
+ferric-blockd root dev:/scheme/disk.nvme/0p2 luks:/etc/keys/root lvm:root
+ext4d /scheme/root rootfs
+```
+
+- **Disks:** a Redox disk scheme serves only whole, aligned blocks, so every
+  read is widened to the device's blocks (`st_blksize`): the aligned middle goes
+  straight into the caller's buffer and a partial first or last block through a
+  one-block bounce buffer.
+- **Passphrase:** the whole content of `KEYFILE`, byte for byte (a trailing
+  newline is part of it), as cryptsetup reads `--key-file`; never from the
+  command line. The daemon reads key files and opens devices before it enters
+  the null namespace.
+- **Access:** the scheme holds one file, the volume, at its root. Only UID 0
+  may open it (it is decrypted data), and the scheme root handle itself serves
+  no data or metadata (`EBADF`), so every read goes through a checked open.
+  Opens for writing, creating or truncating, and writes, `ftruncate`, `fchmod`, `fchown` and `futimens`, fail
+  with `EROFS`. Reads stop at the end of the volume.
+- **Limits:** read-only; no keyslot management, tokens, detached headers or
+  reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
+  started by hand, not by init, the installer or the bootloader.
+
+The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
+as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
+hold a known byte pattern in every volume: LUKS2 (512-byte sectors) on an LV
+split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
+data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
+Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
+serves the same images through `ferric-blockd` on the target.
 
 ## Kernel-bypass network queues
 

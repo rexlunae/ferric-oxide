@@ -221,8 +221,11 @@ crate::events! {
     ///
     /// `space` identifies an address space while it exists; its frame may be reused after
     /// destruction. The producer may be a manager operating on another address space.
-    /// This is an operation result, not a full journal: fixed replacement can unmap old
-    /// pages before a failed allocation, and clone/move/drop paths are not covered.
+    /// A fixed request first removes what was mapped in its span: an `mm.replace` record
+    /// precedes this one. A registered-buffer revoke records its zeroed replacement as a
+    /// fixed private map too, after its `mm.replace`. With `mm.replace`, `mm.move`,
+    /// `mm.clone`, `mm.clone_skip` and `mm.destroy` the `mm` events journal every change to
+    /// a user address space's grants.
     pub const MM_MAP = 16 {
         name: "mm.map",
         subsystem: Mm,
@@ -244,7 +247,8 @@ crate::events! {
     /// An `AddrSpaceWrapper::munmap` attempt completed under the address-space lock:
     /// page-table root, requested address/page count, whether to unpin (0 or 1), and 0
     /// or negated errno. Holes are allowed; a failure can follow partial unmapping.
-    /// This precedes scheme notifications and excludes internal replacement/move/drop.
+    /// This precedes scheme notifications. Internal removals have their own events:
+    /// `mm.replace`, `mm.move` and `mm.destroy`.
     pub const MM_UNMAP = 18 {
         name: "mm.unmap",
         subsystem: Mm,
@@ -287,6 +291,141 @@ crate::events! {
         level: Info,
         args: ["domain", "root", "iova", "bytes"],
     }
+
+    /// The process manager (`procmgr`) created a process for a `fork`: the parent's and the
+    /// new child's process IDs. The child's first context has not started yet; its
+    /// `sched.context_start` follows with the child's PID once the parent has set the child
+    /// up. A fork that fails during that setup has this record and no such start.
+    ///
+    /// This and the other `sched.proc_*` events are [`USER_EVENTS`]: user space writes them
+    /// through the scheme's `emit` file ([`crate::abi::EMIT_PATH`]), and the kernel only
+    /// stamps and stores them. They report what the process manager did, not a kernel action.
+    pub const SCHED_PROC_FORK = 22 {
+        name: "sched.proc_fork",
+        subsystem: Sched,
+        level: Info,
+        args: ["parent", "child"],
+    }
+
+    /// A process committed to an `exec`: its process ID. The process manager records it when
+    /// the process's runtime reports the new image, after the new program is loaded and
+    /// before the runtime switches to it. A failure in that switch leaves this record while
+    /// the process keeps its old image. A process can also report it for itself without an
+    /// exec.
+    pub const SCHED_PROC_EXEC = 23 {
+        name: "sched.proc_exec",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid"],
+    }
+
+    /// A process exited and its threads are gone, so it is now waitable: its process ID, its
+    /// exit status (0–255, 0 when a signal ended it) and the signal that ended it (0 for a
+    /// normal exit).
+    pub const SCHED_PROC_EXIT = 24 {
+        name: "sched.proc_exit",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "status", "signal"],
+    }
+
+    /// A `waitpid` returned a child's status change: the waiting process's ID, the child's
+    /// process ID, and the raw wait status the caller got (`WIFEXITED`, `WIFSIGNALED`,
+    /// `WIFSTOPPED` or `WIFCONTINUED` encoding). A `WNOHANG` call that found nothing, and
+    /// a failed call, record nothing.
+    pub const SCHED_PROC_WAIT = 25 {
+        name: "sched.proc_wait",
+        subsystem: Sched,
+        level: Info,
+        args: ["waiter", "pid", "status"],
+    }
+
+    /// A fixed mapping removed what was mapped in its span, under the address-space lock,
+    /// before installing its new grant: page-table root, address, page count, and 0 or
+    /// negated errno. Its causes are a `MAP_FIXED` `mmap` (an `mm.map` record follows), a
+    /// fixed `mremap` or grant move destination (an `mm.move` record follows), and a
+    /// registered-buffer revoke, which maps zeroed memory in place.
+    ///
+    /// The span may have held nothing. A failure can follow partial removal, and the
+    /// operation then fails too.
+    pub const MM_REPLACE = 26 {
+        name: "mm.replace",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "addr", "pages", "ret"],
+    }
+
+    /// An `AddrSpaceWrapper::r#move` attempt completed under the destination's address-space
+    /// lock: the source and destination page-table roots (equal for `mremap` within one
+    /// space), source address and page count, requested destination address (0 without
+    /// one), new page count, raw `MapFlags`, and the destination address or negated errno.
+    ///
+    /// A move shorter than its source unmaps the source's tail; a longer one maps zeroed
+    /// pages past it. A failure can follow partial changes to either space.
+    pub const MM_MOVE = 27 {
+        name: "mm.move",
+        subsystem: Mm,
+        level: Info,
+        args: [
+            "src_space",
+            "dst_space",
+            "src_addr",
+            "src_pages",
+            "dst_addr",
+            "pages",
+            "flags",
+            "ret",
+        ],
+    }
+
+    /// `AddrSpaceWrapper::try_clone` (a `fork`) completed under the source's lock: the
+    /// source and new page-table roots, the grants and pages copied, and 0 or negated
+    /// errno. On failure `new_space`, `grants` and `pages` are 0; a partly built copy has
+    /// already been torn down with its own `mm.destroy` record. Grants a clone does not keep
+    /// are not counted; each has an `mm.clone_skip` record before this one, so the copy holds
+    /// the source's grants minus those.
+    pub const MM_CLONE = 28 {
+        name: "mm.clone",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "new_space", "grants", "pages", "ret"],
+    }
+
+    /// An address space's grants are being torn down because the address space is
+    /// dropped (its last context exited or exec'd, or a clone failed): page-table root and
+    /// the grants and pages it still held. After this record `space` may be reused.
+    pub const MM_DESTROY = 29 {
+        name: "mm.destroy",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "grants", "pages"],
+    }
+
+    /// A grant `AddrSpaceWrapper::try_clone` did not copy into the new address space, under
+    /// the source's lock and before the `mm.clone` record: the source and new page-table
+    /// roots, and the grant's address and page count. Pinned scheme borrows, physically
+    /// contiguous driver memory and file-mapping borrows are not kept across a fork.
+    pub const MM_CLONE_SKIP = 30 {
+        name: "mm.clone_skip",
+        subsystem: Mm,
+        level: Info,
+        args: ["space", "new_space", "addr", "pages"],
+    }
+}
+
+/// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
+/// manager's process lifecycle. Every other event is the kernel's own, and the kernel
+/// refuses to take it from user space.
+pub const USER_EVENTS: [&crate::Event; 4] = [
+    &SCHED_PROC_FORK,
+    &SCHED_PROC_EXEC,
+    &SCHED_PROC_EXIT,
+    &SCHED_PROC_WAIT,
+];
+
+/// The user-space event with id `id`, or `None` for a kernel event or an unknown id.
+pub fn user_event(id: crate::EventId) -> Option<&'static crate::Event> {
+    USER_EVENTS.into_iter().find(|event| event.id() == id)
 }
 
 /// The `flags` of an `mm.page_fault` record: what the access was and what the CPU found.
@@ -538,6 +677,15 @@ mod tests {
         assert_eq!(IOMMU_MAP.id().get(), 19);
         assert_eq!(IOMMU_PROTECT.id().get(), 20);
         assert_eq!(IOMMU_UNMAP.id().get(), 21);
+        assert_eq!(SCHED_PROC_FORK.id().get(), 22);
+        assert_eq!(SCHED_PROC_EXEC.id().get(), 23);
+        assert_eq!(SCHED_PROC_EXIT.id().get(), 24);
+        assert_eq!(SCHED_PROC_WAIT.id().get(), 25);
+        assert_eq!(MM_REPLACE.id().get(), 26);
+        assert_eq!(MM_MOVE.id().get(), 27);
+        assert_eq!(MM_CLONE.id().get(), 28);
+        assert_eq!(MM_DESTROY.id().get(), 29);
+        assert_eq!(MM_CLONE_SKIP.id().get(), 30);
     }
 
     #[test]
@@ -559,6 +707,11 @@ mod tests {
             &MM_MAP,
             &MM_PROTECT,
             &MM_UNMAP,
+            &MM_REPLACE,
+            &MM_MOVE,
+            &MM_CLONE,
+            &MM_DESTROY,
+            &MM_CLONE_SKIP,
             &IOMMU_MAP,
             &IOMMU_PROTECT,
             &IOMMU_UNMAP,
@@ -570,6 +723,10 @@ mod tests {
             &SCHED_CONTEXT_CREATE,
             &SCHED_CONTEXT_START,
             &SCHED_CONTEXT_EXIT,
+            &SCHED_PROC_FORK,
+            &SCHED_PROC_EXEC,
+            &SCHED_PROC_EXIT,
+            &SCHED_PROC_WAIT,
         ] {
             assert_eq!(event.level(), crate::Level::Info, "{}", event.name());
         }
@@ -587,6 +744,10 @@ mod tests {
             &SCHED_CONTEXT_CREATE,
             &SCHED_CONTEXT_START,
             &SCHED_CONTEXT_EXIT,
+            &SCHED_PROC_FORK,
+            &SCHED_PROC_EXEC,
+            &SCHED_PROC_EXIT,
+            &SCHED_PROC_WAIT,
         ] {
             assert_eq!(event.subsystem(), Subsystem::Sched);
             assert!(selected.contains(event.id()));
@@ -595,11 +756,45 @@ mod tests {
     }
 
     #[test]
+    fn only_process_lifecycle_events_come_from_user_space() {
+        for event in USER_EVENTS {
+            assert_eq!(
+                user_event(event.id()).map(crate::Event::name),
+                Some(event.name())
+            );
+            assert!(event.name().starts_with("sched.proc_"), "{}", event.name());
+            assert_eq!(
+                CATALOG.get(event.id()).map(crate::Event::name),
+                Some(event.name())
+            );
+        }
+        let kernel_events = CATALOG
+            .events()
+            .iter()
+            .filter(|event| user_event(event.id()).is_none())
+            .count();
+        assert_eq!(kernel_events, CATALOG.len() - USER_EVENTS.len());
+        assert!(user_event(SCHED_CONTEXT_START.id()).is_none());
+        assert!(user_event(SYSCALL_ENTER.id()).is_none());
+        assert!(user_event(crate::EventId::new(200)).is_none());
+    }
+
+    #[test]
     fn mapping_events_use_the_existing_memory_controls() {
         let selected = crate::select(&CATALOG, "mm").unwrap();
         let compiled = CATALOG.compiled_for(|f| f == "trace_mm" || f == "trace_level_info");
         let absent = CATALOG.compiled_for(|f| f == "trace_level_info");
-        for event in [&MM_PAGE_FAULT, &MM_MAP, &MM_PROTECT, &MM_UNMAP] {
+        for event in [
+            &MM_PAGE_FAULT,
+            &MM_MAP,
+            &MM_PROTECT,
+            &MM_UNMAP,
+            &MM_REPLACE,
+            &MM_MOVE,
+            &MM_CLONE,
+            &MM_DESTROY,
+            &MM_CLONE_SKIP,
+        ] {
             assert_eq!(event.subsystem(), Subsystem::Mm);
             assert!(selected.contains(event.id()));
             assert!(compiled.contains(event.id()));

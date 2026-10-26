@@ -16,7 +16,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, sync::atomic::AtomicU64};
 
 use ferric_trace::{
-    abi::CPU_RING_WORDS,
+    abi::{UserRecord, CPU_RING_WORDS},
     filter::{Filter, FilterError, Loaded, Slot},
     kernel::CATALOG,
     ring::{Ring, RingError, Shared, WhenFull, Words, SHARED_HEADER_WORDS},
@@ -327,6 +327,54 @@ pub fn filters() -> Vec<(&'static Event, Loaded)> {
         .map(|(event, slot)| (event, slot.load()))
         .filter(|(_, loaded)| *loaded != Loaded::Empty)
         .collect()
+}
+
+/// Why a user-space record was refused (`kernel.trace/emit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserEmitError {
+    /// The id names no event user space may write (`ferric_trace::kernel::USER_EVENTS`).
+    NotUserEvent,
+    /// The record does not have exactly the event's arguments.
+    ArgCount,
+    /// The event is not compiled into this kernel.
+    NotCompiled(&'static Event),
+}
+
+impl fmt::Display for UserEmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserEmitError::NotUserEvent => f.write_str("not an event user space may write"),
+            UserEmitError::ArgCount => f.write_str("wrong number of arguments for the event"),
+            UserEmitError::NotCompiled(event) => {
+                write!(f, "{} is not compiled into this kernel", event.name())
+            }
+        }
+    }
+}
+
+/// Stores a record user space wrote: one of `ferric_trace::kernel::USER_EVENTS`, with
+/// exactly its arguments, stamped and written like a kernel record if the event is on.
+/// Returns whether the event was on (a filter may still have dropped the record).
+///
+/// Call it where interrupts are off, as for `trace_event!` (a system call).
+///
+/// # Errors
+///
+/// [`UserEmitError`] for an event user space may not write, a wrong argument count, or an
+/// event this kernel does not compile in.
+pub fn emit_user(record: &UserRecord) -> Result<bool, UserEmitError> {
+    let event = ferric_trace::kernel::user_event(record.id()).ok_or(UserEmitError::NotUserEvent)?;
+    if record.args().len() != event.args().len() {
+        return Err(UserEmitError::ArgCount);
+    }
+    if !compiled_in(event) {
+        return Err(UserEmitError::NotCompiled(event));
+    }
+    if !is_on(event.id()) {
+        return Ok(false);
+    }
+    emit(event, record.args());
+    Ok(true)
 }
 
 /// Writes a record of `event` with `args` to this CPU's ring. The slow path of `trace_event!`.

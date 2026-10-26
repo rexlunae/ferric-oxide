@@ -141,6 +141,46 @@ fn grant_span_size(page_count: usize, base: Option<Page>, flags: MapFlags) -> Re
     Ok(size)
 }
 
+/// Ferric Oxide: records an `mm.replace`: a fixed mapping removed what was in `span` of the
+/// address space `mapper` translates, with `result`, before installing its own grant.
+fn trace_replace(mapper: &PageMapper, span: PageSpan, result: &Result<UnmapVec>) {
+    #[cfg(not(feature = "trace"))]
+    let _ = (mapper, span, result);
+    crate::trace::trace_event!(
+        ferric_trace::kernel::MM_REPLACE,
+        mapper.table().phys().data(),
+        span.base.start_address().data(),
+        span.count,
+        Error::mux(result.as_ref().map(|_| 0).map_err(|err| *err)),
+    );
+}
+
+/// Ferric Oxide: records an `mm.clone_skip`: a clone into the space `new` translates did not
+/// keep the grant of `pages` at `base` from the space `src` translates.
+fn trace_clone_skip(src: &PageMapper, new: &PageMapper, base: Page, pages: usize) {
+    #[cfg(not(feature = "trace"))]
+    let _ = (src, new, base, pages);
+    crate::trace::trace_event!(
+        ferric_trace::kernel::MM_CLONE_SKIP,
+        src.table().phys().data(),
+        new.table().phys().data(),
+        base.start_address().data(),
+        pages,
+    );
+}
+
+/// Ferric Oxide: how many grants `grants` holds and how many pages they span, for the
+/// `mm.clone` and `mm.destroy` records.
+#[cfg(feature = "trace")]
+fn grant_totals(grants: &UserGrants) -> (usize, usize) {
+    grants.iter().fold((0, 0), |(count, pages), (_, info)| {
+        (
+            count.saturating_add(1),
+            pages.saturating_add(info.page_count),
+        )
+    })
+}
+
 #[derive(Debug)]
 pub struct AddrSpaceWrapper {
     pub inner: RwLock<L5, AddrSpace>,
@@ -205,11 +245,41 @@ pub struct AddrSpace {
 }
 impl AddrSpaceWrapper {
     /// Attempt to clone an existing address space so that all mappings are copied (CoW).
+    /// Optional `mm.clone` tracing records the result before releasing the source's lock.
+    ///
+    /// # Errors
+    /// Returns `ENOMEM` when the new address space or its mappings cannot be allocated.
     pub fn try_clone(&self, token: &mut CleanLockToken) -> Result<Arc<AddrSpaceWrapper>> {
         let mut token = token.token();
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
+        #[cfg_attr(
+            not(feature = "trace"),
+            expect(unused_mut, reason = "only the mm.clone record looks into the result")
+        )]
+        let mut result = self.clone_grants(guard);
+        crate::trace::trace_event!(
+            ferric_trace::kernel::MM_CLONE,
+            guard.table.utable.table().phys().data(),
+            Self::new_space(&mut result).map_or(0, |new| new.table.utable.table().phys().data()),
+            Self::new_space(&mut result).map_or(0, |new| grant_totals(&new.grants).0),
+            Self::new_space(&mut result).map_or(0, |new| grant_totals(&new.grants).1),
+            Error::mux(result.as_ref().map(|_| 0).map_err(|err| *err)),
+        );
+        result
+    }
+    /// Ferric Oxide: the address space `try_clone` just made, which nothing else holds yet.
+    #[cfg(feature = "trace")]
+    fn new_space(result: &mut Result<Arc<AddrSpaceWrapper>>) -> Option<&mut AddrSpace> {
+        result
+            .as_mut()
+            .ok()
+            .and_then(Arc::get_mut)
+            .map(|new| new.inner.get_mut())
+    }
+    /// Copies the grants of `guard` into a new address space (the body of `try_clone`).
+    fn clone_grants(&self, guard: &mut AddrSpace) -> Result<Arc<AddrSpaceWrapper>> {
         let mut new_arc = AddrSpaceWrapper::new()?;
 
         let new =
@@ -229,25 +299,25 @@ impl AddrSpaceWrapper {
                 | Provider::AllocatedShared {
                     is_pinned_userscheme_borrow: true,
                     ..
-                } => continue,
+                } => None,
 
                 // No, physically contiguous driver memory won't either.
                 Provider::Allocated {
                     phys_contiguous: true,
                     ..
-                } => continue,
+                } => None,
 
-                Provider::PhysBorrowed { base } => Grant::physmap(
+                Provider::PhysBorrowed { base } => Some(Grant::physmap(
                     base,
                     PageSpan::new(grant_base, grant_info.page_count),
                     grant_info.flags,
                     &mut new.inner.get_mut().table.utable,
                     &mut NopFlusher,
-                )?,
+                )?),
                 Provider::Allocated {
                     ref cow_file_ref,
                     phys_contiguous: false,
-                } => Grant::copy_mappings(
+                } => Some(Grant::copy_mappings(
                     grant_base,
                     grant_base,
                     grant_info.page_count,
@@ -259,11 +329,11 @@ impl AddrSpaceWrapper {
                     CopyMappingsMode::Owned {
                         cow_file_ref: cow_file_ref.clone(),
                     },
-                )?,
+                )?),
                 // TODO: Merge Allocated and AllocatedShared, and make CopyMappingsMode a field?
                 Provider::AllocatedShared {
                     is_pinned_userscheme_borrow: false,
-                } => Grant::copy_mappings(
+                } => Some(Grant::copy_mappings(
                     grant_base,
                     grant_base,
                     grant_info.page_count,
@@ -273,7 +343,7 @@ impl AddrSpaceWrapper {
                     &mut this_flusher,
                     &mut NopFlusher,
                     CopyMappingsMode::Borrowed,
-                )?,
+                )?),
 
                 // MAP_SHARED grants are retained by reference, across address space clones (the
                 // "fork" analogue from monolithic kernels).
@@ -281,7 +351,7 @@ impl AddrSpaceWrapper {
                     ref address_space,
                     src_base,
                     ..
-                } => Grant::borrow_grant(
+                } => Some(Grant::borrow_grant(
                     Arc::clone(address_space),
                     src_base,
                     grant_base,
@@ -289,8 +359,18 @@ impl AddrSpaceWrapper {
                     &mut new.inner.get_mut().table.utable,
                     &mut NopFlusher,
                     false,
-                )?,
-                Provider::FmapBorrowed { .. } => continue,
+                )?),
+                Provider::FmapBorrowed { .. } => None,
+            };
+            // Ferric Oxide: the journal names each grant the copy leaves out (`mm.clone_skip`).
+            let Some(new_grant) = new_grant else {
+                trace_clone_skip(
+                    this_mapper,
+                    &new.inner.get_mut().table.utable,
+                    grant_base,
+                    grant_info.page_count,
+                );
+                continue;
             };
 
             new.inner.get_mut().grants.insert(new_grant);
@@ -455,13 +535,15 @@ impl AddrSpaceWrapper {
         let guard = &mut *guard;
 
         let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
-        let notify = AddrSpace::munmap_inner(
+        let unmapped = AddrSpace::munmap_inner(
             &mut guard.grants,
             &mut guard.table.utable,
             &mut flusher,
             span,
             true,
-        )?;
+        );
+        trace_replace(&guard.table.utable, span, &unmapped);
+        let notify = unmapped?;
         #[cfg(iommu_enabled)]
         crate::scheme::iommu::release(self, span);
         // Lazily backed by the shared zero frame, so this does not fail for want of memory.
@@ -471,10 +553,34 @@ impl AddrSpaceWrapper {
             &mut guard.table.utable,
             &mut flusher,
             false,
-        )?;
-        guard.grants.insert(zeroed);
+        );
+        // Ferric Oxide: the journal records the zeroed grant as the fixed private map it is.
+        crate::trace::trace_event!(
+            ferric_trace::kernel::MM_MAP,
+            guard.table.utable.table().phys().data(),
+            span.base.start_address().data(),
+            span.count,
+            (flags | MapFlags::MAP_FIXED | MapFlags::MAP_PRIVATE).bits(),
+            Error::mux(
+                zeroed
+                    .as_ref()
+                    .map(|_| span.base.start_address().data())
+                    .map_err(|_| Error::from(Enomem))
+            ),
+        );
+        guard.grants.insert(zeroed?);
         Ok(notify)
     }
+    /// Moves the grants of `src_span` (in `src_opt`'s address space, or this one) to this
+    /// address space, at `requested_dst_base` as `new_flags` asks or anywhere free, resized to
+    /// `new_page_count` pages. Optional `mm.move` tracing records the result before releasing
+    /// the destination's lock; a fixed destination first records its `mm.replace`.
+    ///
+    /// # Errors
+    /// Returns `EEXIST` for a conflicting `MAP_FIXED_NOREPLACE`, `ENOMEM` when no free span is
+    /// found, `EBUSY` for a pinned source grant or overlapping spans, `EPERM` for permissions a
+    /// source grant cannot have, or an error from unmapping or mapping. Earlier changes can
+    /// remain on failure.
     pub fn r#move(
         &self,
         src_opt: Option<(&AddrSpaceWrapper, &mut AddrSpace)>,
@@ -482,14 +588,58 @@ impl AddrSpaceWrapper {
         requested_dst_base: Option<Page>,
         new_page_count: usize,
         new_flags: MapFlags,
-        mut notify_files_out: Option<&mut UnmapVec>,
+        notify_files_out: Option<&mut UnmapVec>,
         token: LockToken<L5>,
     ) -> Result<Page> {
         let dst_lock = self;
         // SAFETY: This is moving data between two AddrSpace. Caller ensures the two is a different AddrSpace
         let mut dst = unsafe { dst_lock.acquire_rewrite(token) };
         let dst = &mut *dst;
+        #[cfg(feature = "trace")]
+        let src_space = src_opt
+            .as_ref()
+            .map(|(_, src)| src.table.utable.table().phys().data());
 
+        let result = Self::move_inner(
+            dst_lock,
+            dst,
+            src_opt,
+            src_span,
+            requested_dst_base,
+            new_page_count,
+            new_flags,
+            notify_files_out,
+        );
+        crate::trace::trace_event!(
+            ferric_trace::kernel::MM_MOVE,
+            src_space.unwrap_or_else(|| dst.table.utable.table().phys().data()),
+            dst.table.utable.table().phys().data(),
+            src_span.base.start_address().data(),
+            src_span.count,
+            requested_dst_base.map_or(0, |page| page.start_address().data()),
+            new_page_count,
+            new_flags.bits(),
+            Error::mux(
+                result
+                    .as_ref()
+                    .map(|page| page.start_address().data())
+                    .map_err(|err| *err)
+            ),
+        );
+        result
+    }
+    /// The body of `r#move`, with the destination locked.
+    #[expect(clippy::too_many_arguments, reason = "the arguments of r#move")]
+    fn move_inner(
+        dst_lock: &AddrSpaceWrapper,
+        dst: &mut AddrSpace,
+        src_opt: Option<(&AddrSpaceWrapper, &mut AddrSpace)>,
+        src_span: PageSpan,
+        requested_dst_base: Option<Page>,
+        new_page_count: usize,
+        new_flags: MapFlags,
+        mut notify_files_out: Option<&mut UnmapVec>,
+    ) -> Result<Page> {
         // Ferric Oxide: the moved memory leaves its DMA mappings behind (scheme/iommu.rs).
         #[cfg(iommu_enabled)]
         let src_owner: &AddrSpaceWrapper = src_opt.as_ref().map_or(dst_lock, |(aw, _)| *aw);
@@ -523,13 +673,19 @@ impl AddrSpaceWrapper {
             }
             Some(base) if new_flags.contains(MapFlags::MAP_FIXED) => {
                 let unpin = false;
-                let notify_files = AddrSpace::munmap_inner(
+                let unmapped = AddrSpace::munmap_inner(
                     &mut dst.grants,
                     &mut dst.table.utable,
                     &mut dst_flusher,
                     PageSpan::new(base, new_page_count),
                     unpin,
-                )?;
+                );
+                trace_replace(
+                    &dst.table.utable,
+                    PageSpan::new(base, new_page_count),
+                    &unmapped,
+                );
+                let notify_files = unmapped?;
                 // Ferric Oxide: see `munmap`.
                 #[cfg(iommu_enabled)]
                 crate::scheme::iommu::release(dst_lock, PageSpan::new(base, new_page_count));
@@ -952,13 +1108,15 @@ impl AddrSpace {
                         requested_span
                     } else if flags.contains(MapFlags::MAP_FIXED) {
                         let unpin = false;
-                        let mut notify_files = Self::munmap_inner(
+                        let unmapped = Self::munmap_inner(
                             &mut self.grants,
                             &mut self.table.utable,
                             &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
                             requested_span,
                             unpin,
-                        )?;
+                        );
+                        trace_replace(&self.table.utable, requested_span, &unmapped);
+                        let mut notify_files = unmapped?;
                         // Ferric Oxide: see `AddrSpaceWrapper::munmap`.
                         #[cfg(iommu_enabled)]
                         crate::scheme::iommu::release(dst_lock, requested_span);
@@ -1015,6 +1173,12 @@ impl AddrSpace {
     }
 
     fn inner_drop(&mut self, token: &mut CleanLockToken) {
+        crate::trace::trace_event!(
+            ferric_trace::kernel::MM_DESTROY,
+            self.table.utable.table().phys().data(),
+            grant_totals(&self.grants).0,
+            grant_totals(&self.grants).1,
+        );
         for mut grant in core::mem::take(&mut self.grants).into_iter() {
             // Unpinning the grant is allowed, because pinning only occurs in UserScheme calls to
             // prevent unmapping the mapped range twice (which would corrupt only the scheme

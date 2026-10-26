@@ -17,6 +17,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -1280,14 +1281,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferric-aligned-buffer"
-version = "0.1.0"
-
-[[package]]
 name = "fdt"
 version = "0.2.0-alpha3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
+
+[[package]]
+name = "ferric-aligned-buffer"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-amdvi"
@@ -1305,6 +1306,15 @@ name = "ferric-blkqueue"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-blocklayer"
+version = "0.1.0"
+dependencies = [
+ "ferric-luks",
+ "ferric-lvm",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-boot-time"
 version = "0.1.0"
 dependencies = [
@@ -1317,6 +1327,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.17",
 ]
@@ -1378,6 +1390,15 @@ dependencies = [
 [[package]]
 name = "ferric-irq"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-jbd2"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "flate2",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ferric-luks"

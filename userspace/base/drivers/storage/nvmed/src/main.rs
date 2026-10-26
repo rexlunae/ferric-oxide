@@ -264,7 +264,7 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         if libc::setpriority(libc::PRIO_PROCESS, 0, -10) == -1 {
             log::error!("nvmed: Failed to set nice value");
         } else {
-            log::error!("nvmed: Successfully set process priority to 10");
+            log::info!("nvmed: Successfully set process priority to 10");
         }
     }
 

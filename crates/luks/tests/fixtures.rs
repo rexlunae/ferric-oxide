@@ -3,8 +3,11 @@
 
 use std::io;
 
+use ferric_luks::cipher::Cipher;
+use ferric_luks::data::{DataSegment, SegmentError};
 use ferric_luks::luks2::CopyError;
 use ferric_luks::luks2::binary::{BinaryHeaderError, HeaderCopy};
+use ferric_luks::luks2::metadata::SegmentKind;
 use ferric_luks::{Header, Limits, ReadError, UnlockError, read};
 use sha2::{Digest, Sha256};
 
@@ -352,4 +355,87 @@ fn corruption_never_panics_or_gives_a_wrong_key() {
             }
         }
     }
+}
+
+#[test]
+fn data_segments_say_where_the_data_is() {
+    let image = fixture("luks1.img");
+    let header = read(&mut reader(&image)).expect("valid header");
+    assert_eq!(
+        header.data_segment(),
+        Ok(DataSegment {
+            offset: 4096 * 512,
+            size: None,
+            cipher: Cipher::AesXtsPlain64,
+            sector_size: 512,
+            iv_tweak: 0,
+        })
+    );
+    let image = fixture("luks2-pbkdf2.img");
+    assert_eq!(
+        Header::V2(luks2(&image)).data_segment(),
+        Ok(DataSegment {
+            offset: 1 << 20,
+            size: None,
+            cipher: Cipher::AesXtsPlain64,
+            // cryptsetup's choice for a file on a 4 KiB-block file system.
+            sector_size: 4096,
+            iv_tweak: 0,
+        })
+    );
+}
+
+#[test]
+fn unsettled_or_unsupported_segments_are_refused() {
+    let image = fixture("luks2-pbkdf2.img");
+    let refused = |change: &dyn Fn(&mut ferric_luks::luks2::Luks2)| {
+        let mut header = luks2(&image);
+        change(&mut header);
+        Header::V2(header).data_segment()
+    };
+    assert_eq!(
+        refused(&|h| h.metadata.segments.clear()),
+        Err(SegmentError::Count(0))
+    );
+    assert_eq!(
+        refused(&|h| {
+            let copy = h.metadata.segments[&0].clone();
+            h.metadata.segments.insert(1, copy);
+        }),
+        Err(SegmentError::Count(2))
+    );
+    assert_eq!(
+        refused(&|h| {
+            let segment = h.metadata.segments.get_mut(&0).unwrap();
+            segment.flags.push("backup-previous".into());
+        }),
+        Err(SegmentError::Flagged)
+    );
+    assert_eq!(
+        refused(&|h| h.metadata.segments.get_mut(&0).unwrap().kind = SegmentKind::Linear),
+        Err(SegmentError::NotCrypt)
+    );
+    fn set_crypt(
+        integrity: Option<&'static str>,
+        encryption: &'static str,
+    ) -> impl Fn(&mut ferric_luks::luks2::Luks2) {
+        move |h| {
+            h.metadata.segments.get_mut(&0).unwrap().kind = SegmentKind::Crypt {
+                iv_tweak: 0,
+                encryption: encryption.into(),
+                sector_size: 512,
+                integrity: integrity.map(Into::into),
+            }
+        }
+    }
+    assert_eq!(
+        refused(&set_crypt(Some("hmac(sha256)"), "aes-xts-plain64")),
+        Err(SegmentError::Integrity)
+    );
+    assert_eq!(
+        refused(&set_crypt(None, "aes-cbc-essiv:sha256")),
+        Err(SegmentError::Cipher(
+            ferric_luks::cipher::CipherError::Unsupported
+        ))
+    );
 }

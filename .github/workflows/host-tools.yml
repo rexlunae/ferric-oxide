@@ -1,8 +1,8 @@
 name: host-tools
 
 # Tests and lints the host workspace: tools/* and the shared crates in crates/.
-# Also runs RedoxFS's own unit tests and driver-block's, which build on the host, and
-# ext4d's (fs.ext4).
+# Also runs RedoxFS's own unit tests and driver-block's, which build on the host, ext4d's
+# (fs.ext4) and ferric-blockd's (fs.luks, fs.lvm).
 
 on:
   push:
@@ -23,7 +23,10 @@ on:
       - "config/**"
       - "userspace/redoxfs/**"
       - "userspace/ext4d/**"
+      - "recipes/core/ext4d/**"
       - "recipes/tests/ferric-ext4-test/**"
+      - "userspace/blockd/**"
+      - "recipes/tests/ferric-blocklayer-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
       - "recipes/tests/ferric-iobench/**"
       - ".github/workflows/host-tools.yml"
@@ -105,6 +108,15 @@ jobs:
           cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
           cargo test --locked -p ferric-blkqueue --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
+      # ferric-jbd2: JBD2 journal recovery planning, which ext4d's journal replay
+      # (fs.ext4_journal_replay) uses; no_std, so also built for a bare-metal target.
+      - name: ferric-jbd2
+        run: |
+          cargo clippy --locked --all-targets -p ferric-jbd2 -- -D warnings
+          cargo test --locked -p ferric-jbd2
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-jbd2
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-jbd2 --target x86_64-unknown-none
       # ferric-iobench: the disk benchmark's fio-style jobs, block order, latency histogram and
       # report (recipes/tests/ferric-iobench runs them on the target).
       - name: ferric-iobench
@@ -160,6 +172,17 @@ jobs:
           cargo clippy --locked --no-deps --all-targets --all-features -p ferric-luks -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-luks
           RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-luks --features force-soft -Zbuild-std=core,alloc --target x86_64-unknown-uefi
+      # ferric-blocklayer: the stackable slice, LUKS and LVM layers; no_std, each layer behind
+      # its feature (fs.luks, fs.lvm), so check every combination and a bare-metal build.
+      - name: ferric-blocklayer
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-blocklayer -- -D warnings
+          for features in "" alloc luks lvm; do
+            cargo clippy --locked --no-deps -p ferric-blocklayer --no-default-features --features "$features" -- -D warnings
+          done
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blocklayer
+          rustup target add x86_64-unknown-none
+          RUSTFLAGS="--cfg aes_force_soft" cargo build --locked -p ferric-blocklayer --no-default-features --features luks,lvm,ferric-luks/force-soft --target x86_64-unknown-none
 
   redoxfs:
     runs-on: ubuntu-24.04
@@ -180,8 +203,9 @@ jobs:
       - name: Test
         run: cargo test --locked --lib
 
-  # ext4d (fs.ext4): its tests on the committed ext4 image and on one mke2fs makes now, its
-  # lints and docs for the host and for Redox, and the on-target test's lints.
+  # ext4d (fs.ext4): its tests on the committed ext4 images and on ones e2fsprogs makes now
+  # (the journal replay, fs.ext4_journal_replay, against e2fsck's), its lints and docs for
+  # the host and for Redox with and without the replay, and the on-target test's lints.
   ext4d:
     runs-on: ubuntu-24.04
     defaults:
@@ -200,14 +224,67 @@ jobs:
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml
-      - name: Test (committed image)
-        run: cargo test --locked
-      - name: Test (fresh image from mke2fs)
+      - name: Test (committed images)
+        run: |
+          cargo test --locked
+          cargo test --locked --features journal-replay
+      - name: Test (fresh images from e2fsprogs)
         run: |
           mke2fs -V
           mkdir -p "$RUNNER_TEMP/ext4"
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
+      - name: Clippy and docs
+        run: |
+          rustup target add x86_64-unknown-redox
+          for features in "" "--features journal-replay"; do
+            cargo clippy --locked --all-targets $features -- -D warnings
+            cargo clippy --locked --all-targets --target x86_64-unknown-redox $features -- -D warnings
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps $features
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox $features
+          done
+          CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
+            --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
+
+  # ferric-blockd (fs.luks, fs.lvm): its tests, lints and docs for the host and for Redox, the
+  # on-target test's lints, and the block-layer tests on images cryptsetup and lvm2 make now.
+  blockd:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: userspace/blockd
+    steps:
+      - uses: actions/checkout@v4
+      # The fresh-image test builds ferric-blocklayer in the host workspace, whose lockfile
+      # names the cookbook's git dependencies.
+      - uses: ./.github/actions/prepare-cargo-git
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            userspace/blockd/target
+          key: blockd-${{ hashFiles('userspace/blockd/Cargo.lock', 'recipes/tests/ferric-blocklayer-test/files/Cargo.lock') }}
+          restore-keys: blockd-
+      - name: Format
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path ../../recipes/tests/ferric-blocklayer-test/files/Cargo.toml
+      - name: Test
+        run: |
+          cargo test --locked
+          cargo test --locked --no-default-features --features luks
+          cargo test --locked --no-default-features --features lvm
+      - name: Test the layers on fresh images
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cryptsetup-bin lvm2 python3-cryptography
+          cryptsetup --version
+          lvm version | head -1
+          mkdir -p "$RUNNER_TEMP/blocklayer"
+          sudo ../../crates/blocklayer/tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/blocklayer"
+          BLOCKLAYER_FIXTURES="$RUNNER_TEMP/blocklayer" CARGO_TARGET_DIR=target \
+            cargo test --locked --manifest-path ../../crates/blocklayer/Cargo.toml --test fixtures
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
@@ -216,7 +293,7 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
-            --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
+            --manifest-path ../../recipes/tests/ferric-blocklayer-test/files/Cargo.toml -- -D warnings
 
   # driver-block's concurrent-request and close-ordering tests run on the host.
   driver-block:

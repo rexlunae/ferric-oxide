@@ -1370,6 +1370,10 @@ impl UserInner {
         if metadata.is_empty() {
             return Err(Error::new(EINVAL));
         }
+        // Gate the per-call diagnostic behind `syscall_debug` (`kernel.syscall_debug`,
+        // default off, "very noisy; for debugging only"): it is on the hot path of every
+        // scheme `fread`, and the `debug!` macro serializes unconditionally on ARM64/riscv64.
+        #[cfg(feature = "syscall_debug")]
         crate::debug!(
             "call_fdread: payload: {} metadata: {}",
             payload.len(),

@@ -14,7 +14,8 @@
 //! | 0x10 | 4 | `s_free_inodes_count` |
 //! | 0x18 | 4 | `s_log_block_size`: the block size is `2 ^ (10 + s_log_block_size)` |
 //! | 0x38 | 2 | `s_magic`, 0xEF53 |
-//! | 0x60 | 4 | `s_feature_incompat`; 0x80 is `INCOMPAT_64BIT` |
+//! | 0x5C | 4 | `s_feature_compat`; 0x4 is `COMPAT_HAS_JOURNAL` |
+//! | 0x60 | 4 | `s_feature_incompat`; 0x4 is `INCOMPAT_RECOVER` (the journal needs replaying), 0x80 is `INCOMPAT_64BIT` |
 //! | 0x150 | 4 | `s_blocks_count_hi` (with `INCOMPAT_64BIT`) |
 //! | 0x154 | 4 | `s_r_blocks_count_hi` (with `INCOMPAT_64BIT`) |
 //! | 0x158 | 4 | `s_free_blocks_count_hi` (with `INCOMPAT_64BIT`) |
@@ -30,7 +31,11 @@ pub const SIZE: usize = 1024;
 /// `s_magic`.
 pub const MAGIC: u16 = 0xEF53;
 /// `INCOMPAT_64BIT` in `s_feature_incompat`: block counts have high halves.
-const INCOMPAT_64BIT: u32 = 0x80;
+pub(crate) const INCOMPAT_64BIT: u32 = 0x80;
+/// `COMPAT_HAS_JOURNAL` in `s_feature_compat`: the volume has a journal.
+pub(crate) const COMPAT_HAS_JOURNAL: u32 = 0x4;
+/// `INCOMPAT_RECOVER` in `s_feature_incompat`: the journal needs replaying.
+pub(crate) const INCOMPAT_RECOVER: u32 = 0x4;
 /// The largest `s_log_block_size` the format allows (64 KiB blocks).
 const MAX_LOG_BLOCK_SIZE: u32 = 6;
 
@@ -130,6 +135,11 @@ impl Geometry {
     }
 }
 
+/// Whether the volume was not cleanly unmounted: it has a journal and `INCOMPAT_RECOVER`.
+pub fn needs_recovery(sb: &[u8; SIZE]) -> bool {
+    le32(sb, 0x5C) & COMPAT_HAS_JOURNAL != 0 && le32(sb, 0x60) & INCOMPAT_RECOVER != 0
+}
+
 fn le32(sb: &[u8; SIZE], at: usize) -> u32 {
     u32::from_le_bytes([sb[at], sb[at + 1], sb[at + 2], sb[at + 3]])
 }
@@ -195,6 +205,16 @@ mod tests {
             Geometry::parse(&sb),
             Err(SuperblockError::BadBlockSize { log: 7 })
         );
+    }
+
+    #[test]
+    fn recovery_needs_a_journal_and_the_flag() {
+        let mut sb = superblock();
+        assert!(!needs_recovery(&sb));
+        sb[0x60..0x64].copy_from_slice(&INCOMPAT_RECOVER.to_le_bytes());
+        assert!(!needs_recovery(&sb), "no journal");
+        sb[0x5C..0x60].copy_from_slice(&COMPAT_HAS_JOURNAL.to_le_bytes());
+        assert!(needs_recovery(&sb));
     }
 
     #[test]

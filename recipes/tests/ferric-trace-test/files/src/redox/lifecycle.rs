@@ -14,8 +14,9 @@ pub(super) const CHILD_ARG: &str = "lifecycle-child";
 pub(super) const CHILD_STATUS: u8 = 23;
 const EVENTS: &str = "sched.context_create sched.context_start sched.context_exit";
 
-fn spawn_child() -> Result<u32, Failure> {
-    let step = "trace-lifecycle";
+/// Runs this program as the child that exits with `CHILD_STATUS` at once (a fork and an
+/// exec), checks its status for `step`, and returns its process id.
+pub(super) fn spawn_child(step: &'static str) -> Result<u32, Failure> {
     let exe = std::env::current_exe().map_err(io_failure(step, "current_exe"))?;
     let mut child = Command::new(exe)
         .arg(CHILD_ARG)
@@ -135,7 +136,7 @@ pub(super) fn check_lifecycle(cpus: &[u32]) -> Result<(), Failure> {
     command(step, &format!("disable {EVENTS}"))?;
     drain(step, cpus)?;
     command(step, &format!("enable {EVENTS}"))?;
-    let child = spawn_child()?;
+    let child = spawn_child(step)?;
     let parent = std::process::id();
     std::thread::Builder::new()
         .spawn(|| ())
@@ -163,7 +164,7 @@ pub(super) fn check_lifecycle(cpus: &[u32]) -> Result<(), Failure> {
     let child_count = verify(&trace, child, 1)?;
     let thread_count = verify(&trace, parent, 1)?;
     let worker_count = if workers { verify(&trace, 0, 0)? } else { 0 };
-    let untraced_child = spawn_child()?;
+    let untraced_child = spawn_child(step)?;
     let disabled = drain(step, cpus)?;
     if disabled.iter().flatten().any(|e| {
         e.is(&SCHED_CONTEXT_CREATE)

@@ -8,7 +8,8 @@ publish = false
 
 [dependencies]
 # The RustCrypto releases RedoxFS and relibc already build with (digest 0.10 / cipher 0.4).
-aes = { version = "0.8", default-features = false }
+# `zeroize` clears expanded round keys when a cipher is dropped.
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
@@ -16,7 +17,10 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 sha1 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 subtle = { version = "2.6", default-features = false }
-thiserror.workspace = true
+# Not inherited from the host workspace: recipes (ferric-blockd) build this crate through a
+# symlink outside that workspace, where `workspace = true` cannot be resolved. Keep the
+# version in step with the root Cargo.toml's [workspace.dependencies].
+thiserror = { version = "2", default-features = false }
 xts-mode = { version = "0.5", default-features = false }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
