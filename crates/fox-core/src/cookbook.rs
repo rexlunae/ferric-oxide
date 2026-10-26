@@ -213,7 +213,9 @@ impl RecipeName {
 
     /// The sub-package after the `.`, if there is one.
     pub fn suffix(&self) -> Option<&str> {
-        self.without_prefix().split_once('.').map(|(_, suffix)| suffix)
+        self.without_prefix()
+            .split_once('.')
+            .map(|(_, suffix)| suffix)
     }
 
     /// The same package with `prefix` as its build selector.
@@ -520,10 +522,26 @@ mod tests {
 
     #[test]
     fn reference_rules() {
-        for good in ["foo", "foo.bar", "host:foo", "host:foo.", "target:foo", ".dev", "a-b_c+1"] {
+        for good in [
+            "foo",
+            "foo.bar",
+            "host:foo",
+            "host:foo.",
+            "target:foo",
+            ".dev",
+            "a-b_c+1",
+        ] {
             assert!(RecipeName::new(good).is_ok(), "{good}");
         }
-        for bad in ["", "a/b", "a\0", "a.b.c", "dolphin.emu.lator", "ffmpeg:latest", "host:a:b"] {
+        for bad in [
+            "",
+            "a/b",
+            "a\0",
+            "a.b.c",
+            "dolphin.emu.lator",
+            "ffmpeg:latest",
+            "host:a:b",
+        ] {
             assert!(RecipeName::new(bad).is_err(), "{bad:?}");
         }
     }
@@ -540,7 +558,11 @@ mod tests {
         ];
         for (text, prefix, recipe, suffix) in cases {
             let n = name(text);
-            assert_eq!((n.prefix(), n.recipe(), n.suffix()), (prefix, recipe, suffix), "{text}");
+            assert_eq!(
+                (n.prefix(), n.recipe(), n.suffix()),
+                (prefix, recipe, suffix),
+                "{text}"
+            );
         }
     }
 
@@ -551,7 +573,10 @@ mod tests {
         assert_eq!(n.with_target().as_str(), "target:llvm21.dev");
         assert_eq!(name("llvm21").with_host().as_str(), "host:llvm21");
         assert_eq!(n.with_prefix(Prefix::Any).as_str(), "llvm21.dev");
-        assert_eq!(n.with_prefixed_suffix(Some("runtime")).as_str(), "host:llvm21.runtime");
+        assert_eq!(
+            n.with_prefixed_suffix(Some("runtime")).as_str(),
+            "host:llvm21.runtime"
+        );
         assert_eq!(n.with_prefixed_suffix(None).as_str(), "host:llvm21");
         assert_eq!(n.with_suffix(Some("runtime")).as_str(), "llvm21.runtime");
         assert_eq!(n.with_suffix(None).as_str(), "llvm21");
@@ -579,9 +604,15 @@ mod tests {
         "#;
         let info = PackageInfo::from_toml(text).unwrap();
         assert_eq!(info.name, name("gzdoom"));
-        assert_eq!(info.depends, vec![name("gtk3"), name("sdl2"), name("zmusic")]);
+        assert_eq!(
+            info.depends,
+            vec![name("gtk3"), name("sdl2"), name("zmusic")]
+        );
         assert_eq!(info.storage_size, 10);
-        assert_eq!(PackageInfo::from_toml(&info.to_toml().unwrap()).unwrap(), info);
+        assert_eq!(
+            PackageInfo::from_toml(&info.to_toml().unwrap()).unwrap(),
+            info
+        );
     }
 
     #[test]
@@ -589,7 +620,13 @@ mod tests {
         let info = PackageInfo::from_toml("name = \"dev-essentials\"\ntarget = \"t\"").unwrap();
         assert!(info.version.is_empty() && info.depends.is_empty());
         let text = info.to_toml().unwrap();
-        for omitted in ["version", "blake3", "storage_size", "network_size", "source_identifier"] {
+        for omitted in [
+            "version",
+            "blake3",
+            "storage_size",
+            "network_size",
+            "source_identifier",
+        ] {
             assert!(!text.contains(omitted), "{omitted} in {text}");
         }
     }
@@ -632,6 +669,9 @@ mod tests {
         assert_eq!(index.packages.get("foo").map(String::as_str), Some("1.0"));
         let outdated = &index.outdated_packages["gnu-make"];
         assert!(outdated.patch_identifier.is_empty());
-        assert_eq!(RepositoryIndex::from_toml(&index.to_toml().unwrap()).unwrap(), index);
+        assert_eq!(
+            RepositoryIndex::from_toml(&index.to_toml().unwrap()).unwrap(),
+            index
+        );
     }
 }

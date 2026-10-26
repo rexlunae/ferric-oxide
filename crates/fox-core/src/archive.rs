@@ -493,9 +493,11 @@ fn read_sidecar(
             sidecar: sidecar.to_path_buf(),
         });
     }
-    let package = crate::cookbook::PackageInfo::from_file(sidecar).map_err(|source| ArchiveError::Sidecar {
-        path: sidecar.to_path_buf(),
-        source: Box::new(source),
+    let package = crate::cookbook::PackageInfo::from_file(sidecar).map_err(|source| {
+        ArchiveError::Sidecar {
+            path: sidecar.to_path_buf(),
+            source: Box::new(source),
+        }
     })?;
     let expected = head.entries_blake3();
     if package.blake3.parse::<Blake3Digest>().ok() != Some(expected) {
