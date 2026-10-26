@@ -79,6 +79,23 @@ pub fn le32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
 }
 
+/// The byte offset of inode `number` in a volume whose inode is in group 0, from the
+/// superblock and the first group descriptor ("Finding an Inode" in "Ext4 Disk Layout").
+pub fn inode_at(image: &[u8], number: u32) -> usize {
+    let sb = &image[1024..2048];
+    let block_size = 1024usize << le32(sb, 0x18);
+    let first_data_block = le32(sb, 0x14) as usize;
+    let inode_size = usize::from(le16(sb, 0x58));
+    let descriptor = (first_data_block + 1) * block_size;
+    let table = le32(image, descriptor + 0x8) as usize;
+    table * block_size + (number as usize - 1) * inode_size
+}
+
+/// The little-endian `u16` at `at`.
+pub fn le16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
 /// Has `e2fsck` (named by `EXT4D_E2FSCK`) replay and then check `image`, and returns the
 /// volume it leaves. Without `EXT4D_E2FSCK` the image comes back as it is.
 pub fn e2fsck(name: &str, image: Vec<u8>) -> Vec<u8> {

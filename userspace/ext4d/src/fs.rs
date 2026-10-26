@@ -8,9 +8,10 @@
 //! `O_SYMLINK` or `O_STAT | O_NOFOLLOW` asks for the final link itself.
 //!
 //! [`OpenMode::wants_write`] opens and every changing call fail with [`Error::ReadOnly`],
-//! with one exception: on a volume mounted with `Fs::new_writable` (Cargo feature
-//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`] sets a file's times through
-//! the journal (`crate::write`). The inode to change is found from the handle's path by
+//! with three exceptions: on a volume mounted with `Fs::new_writable` (Cargo feature
+//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`], [`Fs::set_mode`] and
+//! [`Fs::set_owner`] set a file's times, permission bits, and owner and group through the
+//! journal (`crate::write`), each checking the caller's permission as POSIX says. The inode to change is found from the handle's path by
 //! `crate::lookup`. After each change the `ext4-view` reader is loaded again, since it keeps
 //! the blocks it has read, and every handle's metadata is read again from it.
 //!
@@ -280,6 +281,12 @@ pub enum ReadOnlyReason<E> {
     Device(#[source] E),
 }
 
+/// `i_mode`'s permission bits and the set-group-ID bit among them.
+#[cfg(feature = "write")]
+const PERMISSION_BITS: u16 = 0o7777;
+#[cfg(feature = "write")]
+const S_ISGID: u16 = 0o2000;
+
 /// A mounted ext4 volume and its open handles.
 pub struct Fs {
     ext4: Ext4,
@@ -307,11 +314,11 @@ trait Device {
 /// The device of a volume mounted with [`Fs::new_writable`], for changes.
 #[cfg(feature = "write")]
 trait Writable {
-    /// Sets inode `number`'s times through the journal.
-    fn set_times(
+    /// Makes `change` to inode `number` through the journal.
+    fn change(
         &self,
         number: u32,
-        times: &crate::write::Times,
+        change: &crate::write::Change,
     ) -> Result<(), crate::write::WriteError>;
 }
 
@@ -437,12 +444,12 @@ impl<R: crate::device::ReadAt + 'static> Device for Raw<R> {
 
 #[cfg(feature = "write")]
 impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device::Window<W>>> {
-    fn set_times(
+    fn change(
         &self,
         number: u32,
-        times: &crate::write::Times,
+        change: &crate::write::Change,
     ) -> Result<(), crate::write::WriteError> {
-        crate::write::set_times(&mut self.borrow_mut(), number, times)
+        crate::write::change(&mut self.borrow_mut(), number, change)
     }
 }
 
@@ -481,7 +488,8 @@ impl Fs {
     }
 
     /// Loads the volume `device` holds for reading and for the changes `crate::write`
-    /// makes: so far, setting times ([`Self::set_times`]).
+    /// makes: so far, setting times, mode and owner ([`Self::set_times`],
+    /// [`Self::set_mode`], [`Self::set_owner`]).
     ///
     /// # Errors
     ///
@@ -817,9 +825,9 @@ impl Fs {
         }
         #[cfg(feature = "write")]
         {
-            use crate::write::{Times, Timestamp};
+            use crate::write::{Change, Times, Timestamp};
 
-            let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
+            self.writer.as_ref().ok_or(Error::ReadOnly)?;
             if (accessed, modified) == (TimeChange::Omit, TimeChange::Omit) {
                 return Ok(());
             }
@@ -847,15 +855,124 @@ impl Fs {
                 modified: time(modified),
                 changed: now,
             };
-            let number = match handle.inode {
-                Some(number) => number,
-                None => self.device.inode_of(&handle.path)?,
-            };
-            let result = writer.set_times(number, &times);
-            // Even a failed change may have written part of the transaction.
-            self.reload();
-            Ok(result?)
+            self.commit(id, &Change::Times(times))
         }
+    }
+
+    /// Sets the permission bits of the file `id` names to `mode`'s (`mode & 0o7777`; its
+    /// file type bits are ignored), as `fchmod` does, and its change time to now, in one
+    /// journal transaction.
+    ///
+    /// Following POSIX `chmod`: the caller (`uid`, `gid`) must own the file, or be UID 0.
+    /// When a caller other than UID 0 is not in the file's group (`gid` is its one group)
+    /// and the file is a regular one, the set-group-ID bit is cleared.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadHandle`], [`Error::ReadOnly`] as for [`Self::set_times`],
+    /// [`Error::SymlinkMode`] for a symbolic link opened itself (its mode is not used),
+    /// [`Error::NotOwner`], `Error::Lookup` when the file's inode cannot be found, and
+    /// `Error::Write` when the change fails (see `write::change`).
+    pub fn set_mode(&mut self, id: usize, mode: u16, uid: u32, gid: u32) -> Result<(), Error> {
+        let handle = self.handle(id)?;
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = (handle, mode, uid, gid);
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            use crate::write::{Change, Mode, Timestamp};
+
+            self.writer.as_ref().ok_or(Error::ReadOnly)?;
+            let metadata = &handle.metadata;
+            if metadata.is_symlink() {
+                return Err(Error::SymlinkMode);
+            }
+            if uid != 0 && metadata.uid() != uid {
+                return Err(Error::NotOwner);
+            }
+            let mut permissions = mode & PERMISSION_BITS;
+            if uid != 0 && metadata.gid() != gid && metadata.file_type() == FileType::Regular {
+                permissions &= !S_ISGID;
+            }
+            let mode = Mode {
+                permissions,
+                changed: Timestamp::now(),
+            };
+            self.commit(id, &Change::Mode(mode))
+        }
+    }
+
+    /// Sets the owner and group of the file `id` names, as `fchown` does: `None` keeps one
+    /// (`-1` in the call). Its change time is set to now, in one journal transaction.
+    ///
+    /// Following POSIX `chown` with `_POSIX_CHOWN_RESTRICTED`: UID 0 may set any owner and
+    /// group. Any other caller (`uid`, `gid`) must own the file, may not give it to another
+    /// owner, and may set its group only to the one it has or to `gid`, the caller's group;
+    /// the set-user-ID and set-group-ID bits of a regular file are then cleared. UID 0 keeps
+    /// them (POSIX leaves that to the implementation). A symbolic link opened itself has its
+    /// own owner and group set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadHandle`], [`Error::ReadOnly`] as for [`Self::set_times`],
+    /// [`Error::NotOwner`] and [`Error::ChownRestricted`] as above, `Error::Lookup` when the
+    /// file's inode cannot be found, and `Error::Write` when the change fails (see
+    /// `write::change`: a new owner or group on a volume with `quota` is refused).
+    pub fn set_owner(
+        &mut self,
+        id: usize,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), Error> {
+        let handle = self.handle(id)?;
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = (handle, new_uid, new_gid, uid, gid);
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            use crate::write::{Change, Owner, Timestamp};
+
+            self.writer.as_ref().ok_or(Error::ReadOnly)?;
+            let metadata = &handle.metadata;
+            if uid != 0 {
+                if metadata.uid() != uid {
+                    return Err(Error::NotOwner);
+                }
+                let gives_away = new_uid.is_some_and(|new| new != metadata.uid());
+                let foreign_group = new_gid.is_some_and(|new| new != metadata.gid() && new != gid);
+                if gives_away || foreign_group {
+                    return Err(Error::ChownRestricted);
+                }
+            }
+            let owner = Owner {
+                uid: new_uid,
+                gid: new_gid,
+                drop_set_id: uid != 0,
+                changed: Timestamp::now(),
+            };
+            self.commit(id, &Change::Owner(owner))
+        }
+    }
+
+    /// Makes `change` to the inode of the file `id` names, then loads the volume again.
+    #[cfg(feature = "write")]
+    fn commit(&mut self, id: usize, change: &crate::write::Change) -> Result<(), Error> {
+        let handle = self.handle(id)?;
+        let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
+        let number = match handle.inode {
+            Some(number) => number,
+            None => self.device.inode_of(&handle.path)?,
+        };
+        let result = writer.change(number, change);
+        // Even a failed change may have written part of the transaction.
+        self.reload();
+        Ok(result?)
     }
 
     /// Loads `ext4-view`'s reader again after a change, as it keeps the blocks it has read,

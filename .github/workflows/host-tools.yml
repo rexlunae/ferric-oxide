@@ -245,7 +245,7 @@ jobs:
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test unreplayed
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
-            cargo test --locked --features write --test write --test futimens
+            cargo test --locked --features write --test write --test futimens --test chmod_chown
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
