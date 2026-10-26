@@ -4,7 +4,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use pkg::{Package, PackageError, PackageName};
+use fox_core::cookbook::{PackageInfo, RecipeName, RepositoryIndex};
+
+use crate::PackageError;
 
 use crate::bail_other_err;
 use crate::cook::fs;
@@ -14,7 +16,7 @@ use crate::cook::fs;
 // TODO: This file is previously resides in `pkg` crate,
 // and can actually be merged with other logic in this cookbook.
 
-static RECIPE_PATHS: LazyLock<HashMap<PackageName, PathBuf>> = LazyLock::new(|| {
+static RECIPE_PATHS: LazyLock<HashMap<RecipeName, PathBuf>> = LazyLock::new(|| {
     let mut recipe_paths = HashMap::new();
     for entry_res in ignore::Walk::new("recipes") {
         let Ok(entry) = entry_res else {
@@ -58,7 +60,7 @@ pub fn list_repo(repo_dir: impl AsRef<Path>) -> crate::Result<BTreeSet<PathBuf>>
     if !repo_toml_path.is_file() {
         bail_other_err!("The repository is not found: {}", repo_toml_path.display());
     };
-    let repos: pkg::Repository = fs::read_toml(&repo_toml_path)?;
+    let repos: RepositoryIndex = fs::read_toml(&repo_toml_path)?;
     Ok(repos
         .packages
         .keys()
@@ -66,12 +68,12 @@ pub fn list_repo(repo_dir: impl AsRef<Path>) -> crate::Result<BTreeSet<PathBuf>>
         .collect::<BTreeSet<_>>())
 }
 
-pub fn new(name: &PackageName) -> Result<Package, PackageError> {
-    let dir = find(name.name()).ok_or_else(|| PackageError::PackageNotFound(name.clone()))?;
+pub fn new(name: &RecipeName) -> Result<PackageInfo, PackageError> {
+    let dir = find(name.recipe()).ok_or_else(|| PackageError::PackageNotFound(name.clone()))?;
     from_path(dir, name.suffix())
 }
 
-pub fn from_path(dir: &Path, feature: Option<&str>) -> Result<Package, PackageError> {
+pub fn from_path(dir: &Path, feature: Option<&str>) -> Result<PackageInfo, PackageError> {
     let target = redoxer::target();
 
     let stage_name = match feature {
@@ -84,14 +86,14 @@ pub fn from_path(dir: &Path, feature: Option<&str>) -> Result<Package, PackageEr
         return Err(PackageError::FileMissing(file));
     }
 
-    Package::from_file(file)
+    Ok(PackageInfo::from_file(&file)?)
 }
 
 pub fn new_recursive(
-    names: &[PackageName],
+    names: &[RecipeName],
     nonstop: bool,
     recursion: usize,
-) -> Result<Vec<Package>, PackageError> {
+) -> Result<Vec<PackageInfo>, PackageError> {
     if names.is_empty() {
         return Ok(vec![]);
     }
@@ -109,11 +111,11 @@ pub fn new_recursive(
 /// List ordered success packages and map of failed packages.
 /// A package can be both success and failed if dependencies aren't satistied.
 pub fn new_recursive_nonstop(
-    names: &[PackageName],
+    names: &[RecipeName],
     recursion: usize,
 ) -> (
-    Vec<Package>,
-    BTreeMap<PackageName, Result<(), PackageError>>,
+    Vec<PackageInfo>,
+    BTreeMap<RecipeName, Result<(), PackageError>>,
 ) {
     let mut packages = Vec::new();
     let mut packages_map = BTreeMap::new();

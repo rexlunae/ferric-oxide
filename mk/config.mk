@@ -217,9 +217,9 @@ INSTALLER_OPTS+=--repo-binary
 COOKBOOK_OPTS+=--repo-binary
 endif
 ## Ferric Oxide: finish the image root with fox (features.toml
-## packages.manager = "fox" sets FERRIC_FOX_IMAGE=1). fox adopts the packages
-## the installer placed, syncs the package set FERRIC_FOX_PACKAGES if one is
-## given (packages.set; fox.lock is written beside it, and
+## packages.manager = "fox" sets FERRIC_FOX_IMAGE=1). The installer already
+## recorded the packages it placed in fox's store; fox syncs the package set
+## FERRIC_FOX_PACKAGES if one is given (packages.set; fox.lock is written beside it, and
 ## FERRIC_FOX_LOCKED=1 from packages.locked refuses anything it does not pin),
 ## and writes the image SBOM to $(FERRIC_FOX_SBOM). FERRIC_FOX_LEVEL (v3 or v4,
 ## from cpu.x86_64_level) is the x86-64 level the set's packages are

@@ -4367,18 +4367,6 @@ checksum = "436d45c2b6a5b159d43da708e62b25be3a4a3d5550d654b72216ade4c4bfd717"
 
 [[package]]
 name = "redox-pkg"
-version = "0.3.2"
-source = "git+https://github.com/rexlunae/pkgutils.git#5de8f295fdce141aa76ddba6f787b5589db18783"
-dependencies = [
- "hex",
- "serde",
- "serde_derive",
- "thiserror 2.0.17",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "redox-pkg"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "960488345d8f83ba3a074c96ce43e01512086476c44447eabf215a9900285f5e"
@@ -4411,6 +4399,7 @@ dependencies = [
  "ansi-to-tui",
  "blake3",
  "fox-core",
+ "fox-store",
  "globset",
  "ignore",
  "libc",
@@ -4419,7 +4408,6 @@ dependencies = [
  "pkgar-core 0.2.3",
  "pkgar-keys 0.2.3",
  "ratatui",
- "redox-pkg 0.3.2",
  "redox_installer",
  "redoxer",
  "regex",
@@ -4428,6 +4416,7 @@ dependencies = [
  "strip-ansi-escapes",
  "tempfile",
  "termion",
+ "thiserror 2.0.17",
  "toml 0.8.23",
  "walkdir",
 ]
@@ -4499,7 +4488,7 @@ dependencies = [
  "fuser",
  "libc",
  "proc-mounts",
- "redox-pkg 0.3.3",
+ "redox-pkg",
  "redox_installer",
  "redox_syscall 0.9.4",
  "redoxfs",

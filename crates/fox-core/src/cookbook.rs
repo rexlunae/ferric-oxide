@@ -53,6 +53,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::name::{NameError, PackageName};
 
+/// The public key file the cookbook signs its packages with, relative to
+/// the cookbook's root.
+pub const PUBLIC_KEY: &str = "build/id_ed25519.pub.toml";
+
 /// File name of the repository index at the top of a repository directory.
 pub const REPOSITORY_INDEX: &str = "repo.toml";
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    path::PathBuf,
     str::FromStr,
     sync::OnceLock,
 };
@@ -39,6 +40,13 @@ pub struct CookConfigOpt {
     pub clean_target: Option<bool>,
     /// whether to always write stage.files metadata
     pub write_filetree: Option<bool>,
+    /// Ferric Oxide: where prebuilt packages for recipes with rule "binary"
+    /// come from, as a URL with `{target}` standing for the target triple.
+    /// There is no default: without one, those recipes build from source.
+    pub remote: Option<String>,
+    /// Ferric Oxide: the public key file that must have signed the
+    /// remote's packages.
+    pub remote_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -55,6 +63,8 @@ pub struct CookConfig {
     pub clean_build: bool,
     pub clean_target: bool,
     pub write_filetree: bool,
+    pub remote: Option<String>,
+    pub remote_key: Option<PathBuf>,
 }
 
 impl From<CookConfigOpt> for CookConfig {
@@ -72,6 +82,8 @@ impl From<CookConfigOpt> for CookConfig {
             clean_build: value.clean_build.unwrap(),
             clean_target: value.clean_target.unwrap(),
             write_filetree: value.write_filetree.unwrap(),
+            remote: value.remote,
+            remote_key: value.remote_key,
         }
     }
 }
@@ -191,6 +203,12 @@ pub fn init_config() {
             config.cook_opt.clean_target.unwrap_or(false) || extract_env("COOKBOOK_WEB", false),
         ));
     }
+    if config.cook_opt.remote.is_none() {
+        config.cook_opt.remote = extract_env_opt("COOKBOOK_REMOTE");
+    }
+    if config.cook_opt.remote_key.is_none() {
+        config.cook_opt.remote_key = extract_env_opt("COOKBOOK_REMOTE_KEY");
+    }
     if config.mirrors.is_empty() {
         // The GNU FTP mirror below is automatically inserted for convenience
         // You can choose other mirrors by setting it on cookbook.toml
@@ -231,6 +249,22 @@ fn extract_env<T: FromStr>(key: &str, default: T) -> T {
     #[cfg(test)]
     {
         default
+    }
+}
+
+/// An optional setting from the environment; unset and empty are the same.
+#[allow(unused_variables)]
+fn extract_env_opt<T: From<String>>(key: &str) -> Option<T> {
+    #[cfg(not(test))]
+    {
+        std::env::var(key)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(T::from)
+    }
+    #[cfg(test)]
+    {
+        None
     }
 }
 
@@ -317,7 +351,9 @@ mod tests {
                 verbose_cmd: true,
                 clean_build: false,
                 clean_target: false,
-                write_filetree: false
+                write_filetree: false,
+                remote: None,
+                remote_key: None,
             }
         );
     }

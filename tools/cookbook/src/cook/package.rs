@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pkg::{InstallState, Package, PackageName, PackagePrefix, PackageState};
+use fox_core::cookbook::{PackageInfo, Prefix, RecipeName};
 use pkgar::{PackageFile, Transaction, ext::PackageSrcExt};
 use pkgar_core::HeaderFlags;
 use pkgar_keys::PublicKeyFile;
@@ -40,7 +40,7 @@ pub fn package(
     }
 
     let secret_path = "build/id_ed25519.toml";
-    let public_path = "build/id_ed25519.pub.toml";
+    let public_path = fox_core::cookbook::PUBLIC_KEY;
     if !Path::new(secret_path).is_file() || !Path::new(public_path).is_file() {
         if !Path::new("build").is_dir() {
             create_dir(Path::new("build"))?;
@@ -73,20 +73,20 @@ pub fn package(
         }
 
         let deps = if package.is_some() {
-            BTreeSet::from([name.with_prefix(PackagePrefix::Any)])
+            BTreeSet::from([name.with_prefix(Prefix::Any)])
         } else {
             auto_deps.clone()
         };
         let package_name = match package {
-            Some(p) => PackageName::new(format!("{}.{}", name.name(), p.name))?,
+            Some(p) => RecipeName::new(format!("{}.{}", name.recipe(), p.name))?,
             None => name.clone(),
         };
-        let package_deps: Vec<PackageName> = match package {
+        let package_deps: Vec<RecipeName> = match package {
             Some(p) => p
                 .dependencies
                 .iter()
                 .map(|dep| {
-                    if dep.name().is_empty() {
+                    if dep.recipe().is_empty() {
                         package_name.with_suffix(dep.suffix())
                     } else {
                         dep.clone()
@@ -151,9 +151,9 @@ pub fn package(
 /// The recipe's declared dependencies followed by the automatic ones it
 /// does not already list.
 fn merge_deps(
-    mut package_deps: Vec<PackageName>,
-    auto_deps: &BTreeSet<PackageName>,
-) -> Vec<PackageName> {
+    mut package_deps: Vec<RecipeName>,
+    auto_deps: &BTreeSet<RecipeName>,
+) -> Vec<RecipeName> {
     for dep in auto_deps {
         if !package_deps.contains(dep) {
             package_deps.push(dep.clone());
@@ -167,8 +167,8 @@ pub fn package_toml(
     recipe: &CookRecipe,
     package_file: Option<(&Path, &PathBuf)>,
     package_suffix: Option<&OptionalPackageRecipe>,
-    package_deps: Vec<PackageName>,
-    auto_deps: &BTreeSet<PackageName>,
+    package_deps: Vec<RecipeName>,
+    auto_deps: &BTreeSet<RecipeName>,
 ) -> Result<()> {
     let package_deps = merge_deps(package_deps, auto_deps);
 
@@ -210,8 +210,8 @@ pub fn package_toml(
 
     let ident_source = fetch::fetch_get_source_info(recipe)?;
 
-    let package = Package {
-        name: PackageName::new(get_package_name(
+    let package = PackageInfo {
+        name: RecipeName::new(get_package_name(
             recipe.name.without_prefix(),
             package_suffix,
         ))
@@ -232,7 +232,7 @@ pub fn package_toml(
     Ok(())
 }
 
-pub fn package_target(name: &PackageName) -> &'static str {
+pub fn package_target(name: &RecipeName) -> &'static str {
     if name.is_host() {
         redoxer::host_target()
     } else {
@@ -284,54 +284,92 @@ fn get_package_name_inner(name: &str, package: Option<&str>) -> String {
     prefix_name
 }
 
+/// Installs a built package, signed by the key in `pkey_path`, into a
+/// sysroot. With `store`, fox installs it and records it, and the key
+/// becomes one the sysroot trusts so fox there can check it later;
+/// without, its files are only extracted.
+///
+/// Returns whether the package was already installed as built.
 pub fn package_handle_push(
-    state: Option<&mut PackageState>,
+    store: Option<&fox_store::Store>,
+    pkey_path: &Path,
     archive_path: &Path,
     sysroot_dir: &Path,
 ) -> crate::Result<bool> {
-    let archive_toml = archive_path.with_extension("toml");
-    let pkey_path = "build/id_ed25519.pub.toml";
-    let pkg_toml = Package::from_file(&archive_toml)?;
-    // "local" is what remote name from installer is hardcoded into
-    let remote_name = "local".to_string();
-    let Some(state) = state else {
+    if !archive_path.is_file() {
+        // A meta-package: nothing to place.
+        return Ok(true);
+    }
+    let Some(store) = store else {
         // Bare install without metadata, cache mechanism or anything
-        if archive_path.is_file() {
-            let pkey = PublicKeyFile::open(pkey_path)?.pkey;
-            let mut package = PackageFile::new(archive_path, &pkey)?;
-            Transaction::install(&mut package, sysroot_dir)?.commit()?;
-        }
+        let pkey = PublicKeyFile::open(pkey_path)?.pkey;
+        let mut package = PackageFile::new(archive_path, &pkey)?;
+        Transaction::install(&mut package, sysroot_dir)?.commit()?;
         return Ok(false);
     };
-    let (cached, pstate) = match state.installed.get(&pkg_toml.name) {
-        Some(s) if pkg_toml.blake3 == s.blake3 => (true, None),
-        Some(s) => (false, Some((s.manual, s.dependents.clone()))),
-        None => {
-            // TODO: Handle manual & dependents
-            (false, Some((true, BTreeSet::new())))
-        }
+    let key =
+        fox_core::keys::install_key_file(pkey_path, sysroot_dir, fox_core::keys::COOKBOOK_LABEL)?;
+    let mut keys = fox_core::TrustedKeys::new();
+    keys.insert(key.label, key.key);
+    let archive = fox_core::archive::Archive::open(archive_path, &keys)?;
+    let installed = store.get(&archive.manifest().name)?;
+    if installed.is_some_and(|p| p.archive_blake3 == Some(archive.blake3())) {
+        return Ok(true);
+    }
+    // Without features.toml packages.signed_manifests, cookbook archives
+    // carry only the unsigned metadata file beside them.
+    let options = fox_store::InstallOptions {
+        force: false,
+        allow_unsigned_metadata: true,
     };
+    store.install(&archive, options)?;
+    Ok(false)
+}
 
-    if let Some((manual, dependents)) = pstate {
-        if archive_path.is_file() {
-            let pkey = PublicKeyFile::open(pkey_path)?.pkey;
-            let mut package = PackageFile::new(archive_path, &pkey)?;
-            Transaction::install(&mut package, sysroot_dir)?.commit()?;
-            let head_path = sysroot_dir.join(format!(
-                "var/lib/packages/{}.pkgar_head",
-                pkg_toml.name.as_str()
-            ));
-            let head_parent = head_path.parent();
-            if head_parent.is_some_and(|s| !s.is_dir()) {
-                create_dir(head_parent.unwrap())?;
-            }
-            package.split(&head_path, None::<&Path>)?;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fox_core::fixtures::{FixtureEntry, FixtureKey, build_package};
+    use fox_core::{Manifest, PackageName};
 
-        // TODO: Check if we need to inject remote key
-        let install_state = InstallState::from_package(&pkg_toml, remote_name, manual, dependents);
-        state.installed.insert(pkg_toml.name.clone(), install_state);
+    #[test]
+    fn push_installs_with_fox_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = FixtureKey::generate(dir.path(), "id_ed25519").unwrap();
+        let manifest = Manifest::new(PackageName::new("app").unwrap(), "1.0");
+        let file = [FixtureEntry::file("usr/bin/app", b"app", 0o755)];
+        let archive = build_package(dir.path(), &key, Some(&manifest), &file, false).unwrap();
+        let sysroot = dir.path().join("sysroot");
+        std::fs::create_dir(&sysroot).unwrap();
+        let store = fox_store::Store::open(&sysroot).unwrap();
+
+        let push = || package_handle_push(Some(&store), &key.public_path, &archive, &sysroot);
+        assert!(!push().unwrap());
+        assert!(sysroot.join("usr/bin/app").is_file());
+        assert!(sysroot.join("etc/fox/keys/cookbook.toml").is_file());
+        let installed = store.get(&manifest.name).unwrap().unwrap();
+        assert_eq!(installed.signer_label, fox_core::keys::COOKBOOK_LABEL);
+        assert!(push().unwrap(), "the same archive again is cached");
     }
 
-    Ok(cached)
+    #[test]
+    fn push_without_store_only_extracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = FixtureKey::generate(dir.path(), "id_ed25519").unwrap();
+        let file = [FixtureEntry::file("usr/bin/app", b"app", 0o755)];
+        let archive = build_package(dir.path(), &key, None, &file, false).unwrap();
+        let sysroot = dir.path().join("sysroot");
+
+        assert!(!package_handle_push(None, &key.public_path, &archive, &sysroot).unwrap());
+        assert!(sysroot.join("usr/bin/app").is_file());
+        assert!(!sysroot.join("var/lib/fox").exists());
+    }
+
+    #[test]
+    fn push_of_a_meta_package_places_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("group.pkgar");
+        let key = dir.path().join("none.pub.toml");
+        assert!(package_handle_push(None, &key, &missing, dir.path()).unwrap());
+    }
 }

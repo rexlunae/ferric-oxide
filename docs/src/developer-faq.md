@@ -364,7 +364,7 @@ If you just want to download the pre-built package of one recipe, run the follow
 make bcr.recipe-name
 ```
 
-If you want to download the pre-built packages of all recipes, insert the `REPO_BINARY?=1` environment variable to your `.config` file, it will download pre-compiled packages from the [build server](https://static.redox-os.org/pkg/) if available.
+If you want to download the pre-built packages of all recipes, insert the `REPO_BINARY?=1` environment variable to your `.config` file, it will download pre-compiled packages from the configured package remote if available (see [Prebuilt packages](./ferric-packaging.md#prebuilt-packages-repo_binary); there is no default remote).
 
 ### How can I disable recipe compilation except for a specific recipe?
 

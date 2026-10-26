@@ -1,223 +1,216 @@
+//! Prebuilt packages for recipes whose rule is "binary".
+//!
+//! Ferric Oxide: the remote is whatever `[cook] remote` in `cookbook.toml`
+//! (or `COOKBOOK_REMOTE`) names, a URL in which `{target}` stands for the
+//! target triple, and its packages must be signed by the key file
+//! `[cook] remote_key` (or `COOKBOOK_REMOTE_KEY`) names. There is no
+//! default remote: without one, every recipe builds from source.
+
 use std::{
-    cell::RefCell,
-    io::{PipeWriter, Write},
     path::{Path, PathBuf},
-    rc::Rc,
+    process::Command,
+    sync::OnceLock,
     time::Duration,
 };
 
-use crate::cook::fs;
-use pkg::{
-    PackageName, RepoManager, Repository,
-    callback::{Callback, PlainCallback, SilentCallback},
-    net_backend::{CurlBackend, DownloadBackend},
+use fox_core::cookbook::{REPOSITORY_INDEX, RepositoryIndex};
+use pkgar_keys::PublicKeyFile;
+
+use crate::{
+    Result, bail_other_err,
+    config::{CookConfig, get_config, translate_mirror},
+    cook::{
+        fs::{create_dir, rename, run_command},
+        pty::PtyOut,
+    },
+    log_to_pty, wrap_io_err,
 };
 
-// TODO: This is a workaround, but as long as whole
-// fetch operation is in single thread, this is ok
-thread_local! {
-static BINARY_REPO: RefCell<Option<(RepoManager, Repository)>> = const { RefCell::new(None) };
+/// How long a downloaded index is used before it is fetched again.
+const INDEX_LIFETIME: Duration = Duration::from_secs(8 * 3600);
+
+/// A configured remote and its index.
+pub struct BinaryRepo {
+    /// The remote's URL for this target, without a trailing `/`.
+    url: String,
+    key: PathBuf,
+    /// The packages the remote has.
+    pub index: RepositoryIndex,
 }
 
-fn load_cached_repo(path: &Path) -> Option<Repository> {
-    let metadata = std::fs::metadata(path).ok()?;
-
-    if !crate::config::get_config().cook.offline {
-        let stale_time = std::time::SystemTime::now().checked_sub(Duration::from_secs(8 * 3600))?;
-        if metadata.modified().ok()? < stale_time {
-            // stale cache
-            let _ = std::fs::remove_file(path);
-            return None;
-        }
+impl BinaryRepo {
+    /// The public key file the remote's packages must be signed by.
+    pub fn key(&self) -> &Path {
+        &self.key
     }
 
-    let toml_str = std::fs::read_to_string(path).ok()?;
-    Repository::from_toml(&toml_str).ok()
-}
-
-fn init_binary_repo() -> (RepoManager, Repository) {
-    let callback = Rc::new(RefCell::new(SilentCallback::new()));
-    let download_backend = CurlBackend::new().expect("Curl not found");
-    let mut repo = RepoManager::new(callback, Box::new(download_backend));
-    let target = redoxer::target();
-    let remote_source = crate::config::translate_mirror(crate::REMOTE_PKG_SOURCE);
-    repo.add_remote(&remote_source, target)
-        .expect("Unable to add remote");
-
-    let repo_path = PathBuf::from("build/remotes");
-    repo.set_download_path(repo_path.clone());
-    repo.sync_keys().expect("Unable to sync keys");
-
-    let repo_toml =
-        load_cached_repo(&repo_path.join(format!("repo_{}_{target}.toml", repo.remotes[0])))
-            .unwrap_or_else(|| {
-                download_repo(&repo, repo_path)
-                .map_err(|e| {
-                    eprintln!(
-                        "Unable to load server repo.toml, all recipes will build from source: {e}"
-                    );
-                    e
-                })
-                .unwrap_or_default()
-            });
-    // reset here to not clobber pty
-    repo.callback = Rc::new(RefCell::new(PlainCallback::new()));
-    (repo, repo_toml)
-}
-
-fn download_repo(repo: &RepoManager, repo_path: PathBuf) -> crate::Result<Repository> {
-    let (toml_str, _) = repo.get_package_toml(&PackageName::new("repo").unwrap())?;
-    let repo = Repository::from_toml(&toml_str)?;
-    let target = redoxer::target();
-    fs::serialize_and_write(&repo_path.join(format!("{target}_repo.toml")), &repo)?;
-    Ok(repo)
-}
-
-pub fn get_binary_repo() -> (RepoManager, Repository) {
-    BINARY_REPO.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if opt.is_none() {
-            *opt = Some(init_binary_repo());
-        }
-        let (repo, repo_toml) = opt.as_ref().unwrap();
-        ((*repo).clone(), repo_toml.clone())
-    })
-}
-pub fn get_binary_pubkey() -> PathBuf {
-    BINARY_REPO.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if opt.is_none() {
-            *opt = Some(init_binary_repo());
-        }
-        let (repo, _) = opt.as_ref().unwrap();
-        let repo_path = PathBuf::from("build/remotes");
-        repo_path.join(format!("pub_key_{}.toml", repo.remotes[0]))
-    })
-}
-
-pub struct PlainPtyCallback {
-    size: u64,
-    unknown_size: bool,
-    pos: u64,
-    fetch_processed: usize,
-    fetch_total: usize,
-    interactive: bool,
-    download_file: Option<String>,
-    pty: PipeWriter,
-}
-
-impl PlainPtyCallback {
-    pub fn new(pty: PipeWriter) -> Self {
-        Self {
-            size: 0,
-            unknown_size: false,
-            pos: 0,
-            fetch_processed: 0,
-            fetch_total: 0,
-            interactive: false,
-            download_file: None,
-            pty,
-        }
+    /// The URL of `file` on the remote.
+    pub fn url(&self, file: &str) -> String {
+        format!("{}/{file}", self.url)
     }
 
-    /// Set if user require to agree on terminal
-    pub fn set_interactive(&mut self, enabled: bool) {
-        self.interactive = enabled;
-    }
-
-    fn flush(&self) {
-        let _ = std::io::stderr().flush();
-    }
-
-    pub fn format_size(bytes: u64) -> String {
-        if bytes == 0 {
-            return "0 B".to_string();
-        }
-        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-        let i = (bytes as f64).log(1024.0).floor() as usize;
-        let size = bytes as f64 / 1024.0_f64.powi(i as i32);
-        format!("{:.2} {}", size, UNITS[i])
-    }
-
-    fn downloading_str(&self) -> &'static str {
-        "Downloading"
+    /// Downloads `file` from the remote to `dest`, through a temporary
+    /// file so an interrupted download leaves nothing at `dest`.
+    pub fn download(&self, file: &str, dest: &Path, logger: &PtyOut) -> Result<()> {
+        let url = self.url(file);
+        log_to_pty!(logger, "DEBUG: downloading {url}");
+        let tmp = dest.with_added_extension("tmp");
+        let mut command = curl(&url, &tmp);
+        command.arg("--progress-bar");
+        run_command(command, logger)?;
+        rename(&tmp, dest)
     }
 }
 
-const RESET_LINE: &str = "\r\x1b[2K";
+fn curl(url: &str, dest: &Path) -> Command {
+    let mut command = Command::new("curl");
+    command
+        .args(["--fail", "--location", "--retry", "3", "--output"])
+        .arg(dest)
+        .arg(url);
+    command
+}
 
-impl Callback for PlainPtyCallback {
-    fn fetch_start(&mut self, initial_count: usize) {
-        self.fetch_total = 0;
-        self.fetch_processed = 0;
-        self.fetch_package_increment(0, initial_count);
-    }
+/// The configured remote, or `None` if there is none or its index cannot
+/// be had (the reason is printed once).
+pub fn binary_repo() -> Option<&'static BinaryRepo> {
+    static BINARY_REPO: OnceLock<Option<BinaryRepo>> = OnceLock::new();
+    BINARY_REPO
+        .get_or_init(|| {
+            open(&get_config().cook, Path::new("build/remotes")).unwrap_or_else(|e| {
+                eprintln!("Unable to load the prebuilt package index, all recipes will build from source: {e}");
+                None
+            })
+        })
+        .as_ref()
+}
 
-    fn fetch_package_name(&mut self, pkg_name: &PackageName) {
-        // resuming after fetch_package_increment
-        let _ = write!(&self.pty, " {}", pkg_name.as_str());
-        self.flush();
-    }
-
-    fn fetch_package_increment(&mut self, added_processed: usize, added_count: usize) {
-        self.fetch_processed += added_processed;
-        self.fetch_total += added_count;
-
-        let _ = write!(
-            &self.pty,
-            "{RESET_LINE}Fetching: [{}/{}]",
-            self.fetch_processed, self.fetch_total
+/// Opens the remote `cook` configures, caching its index under
+/// `cache_root`.
+fn open(cook: &CookConfig, cache_root: &Path) -> Result<Option<BinaryRepo>> {
+    let Some(template) = &cook.remote else {
+        eprintln!(
+            "No prebuilt package remote is configured ([cook] remote in cookbook.toml or COOKBOOK_REMOTE), all recipes will build from source"
         );
-        self.flush();
-    }
-
-    fn fetch_end(&mut self) {
-        if self.fetch_processed == self.fetch_total {
-            let _ = writeln!(&self.pty, "{RESET_LINE}Fetch complete.");
-        } else {
-            let _ = writeln!(&self.pty, "{RESET_LINE}Fetch incomplete.");
-        }
-    }
-
-    fn download_start(&mut self, length: u64, file: &str) {
-        self.size = length;
-        self.unknown_size = length == 0;
-        self.pos = 0;
-        if !self.unknown_size {
-            let _ = write!(&self.pty, "{RESET_LINE}{} {file}", self.downloading_str());
-            self.download_file = Some(file.to_string());
-            self.flush();
-        }
-    }
-
-    fn download_increment(&mut self, downloaded: u64) {
-        self.pos += downloaded;
-        if self.unknown_size {
-            self.size += downloaded;
-        }
-        if self.unknown_size {
-            return;
-        }
-
-        // keep using MB for consistency
-        let pos_mb = self.pos as f64 / 1_048_576.0;
-        let size_mb = self.size as f64 / 1_048_576.0;
-        let file_name = self.download_file.as_deref().unwrap_or("");
-        let _ = write!(
-            &self.pty,
-            "{RESET_LINE}{} {} [{:.2} MB / {:.2} MB]",
-            self.downloading_str(),
-            file_name,
-            pos_mb,
-            size_mb
+        return Ok(None);
+    };
+    let Some(key) = &cook.remote_key else {
+        bail_other_err!(
+            "the remote {template} has no pinned key: set [cook] remote_key in cookbook.toml or COOKBOOK_REMOTE_KEY to its public key file"
         );
-        self.flush();
+    };
+    // Fail on a bad key now rather than on the first package.
+    PublicKeyFile::open(key)?;
+
+    let target = redoxer::target();
+    let url = translate_mirror(&template.replace("{target}", target));
+    let url = url.trim_end_matches('/').to_string();
+    // Keyed by URL, so changing the remote does not reuse another's index.
+    let cache_dir = cache_root.join(&blake3::hash(url.as_bytes()).to_hex()[..16]);
+    let cache = cache_dir.join(REPOSITORY_INDEX);
+
+    let index = match load_cached_index(&cache, cook.offline) {
+        Some(index) => index,
+        None if cook.offline => {
+            bail_other_err!(
+                "{} is not there and unable to continue in offline mode",
+                cache.display()
+            )
+        }
+        None => {
+            create_dir(&cache_dir)?;
+            let tmp = cache.with_added_extension("tmp");
+            let mut command = curl(&format!("{url}/{REPOSITORY_INDEX}"), &tmp);
+            command.arg("--silent").arg("--show-error");
+            let output = command
+                .output()
+                .map_err(wrap_io_err!("Running curl for the package index"))?;
+            if !output.status.success() {
+                bail_other_err!(
+                    "cannot download {url}/{REPOSITORY_INDEX}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            rename(&tmp, &cache)?;
+            RepositoryIndex::from_file(&cache)?
+        }
+    };
+    Ok(Some(BinaryRepo {
+        url,
+        key: key.clone(),
+        index,
+    }))
+}
+
+fn load_cached_index(path: &Path, offline: bool) -> Option<RepositoryIndex> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    if !offline && modified.elapsed().is_ok_and(|age| age > INDEX_LIFETIME) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    RepositoryIndex::from_file(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cook(remote: Option<String>, remote_key: Option<PathBuf>) -> CookConfig {
+        crate::config::init_config();
+        CookConfig {
+            remote,
+            remote_key,
+            ..Default::default()
+        }
     }
 
-    fn download_end(&mut self) {
-        if !self.unknown_size {
-            let _ = writeln!(&self.pty);
-            self.download_file = None;
-        }
+    #[test]
+    fn no_remote_means_no_prebuilt_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open(&cook(None, None), dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_remote_needs_a_pinned_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = cook(Some("https://example.invalid/{target}".into()), None);
+        let error = open(&config, dir.path()).err().unwrap();
+        assert!(error.to_string().contains("no pinned key"), "{error}");
+    }
+
+    #[test]
+    fn index_and_packages_come_from_the_target_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fox_core::fixtures::FixtureKey::generate(dir.path(), "remote").unwrap();
+        let target = redoxer::target();
+        let served = dir.path().join("served").join(target);
+        std::fs::create_dir_all(&served).unwrap();
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".into(), "abc".into());
+        std::fs::write(served.join(REPOSITORY_INDEX), index.to_toml().unwrap()).unwrap();
+        std::fs::write(served.join("app.toml"), "name = \"app\"\n").unwrap();
+
+        let template = format!("file://{}/served/{{target}}/", dir.path().display());
+        let config = cook(Some(template), Some(key.public_path.clone()));
+        let cache = dir.path().join("cache");
+        let repo = open(&config, &cache).unwrap().unwrap();
+        assert_eq!(repo.index, index);
+        assert_eq!(repo.key(), key.public_path);
+        assert_eq!(
+            repo.url("app.toml"),
+            format!("file://{}/app.toml", served.display())
+        );
+
+        let dest = dir.path().join("app.toml");
+        repo.download("app.toml", &dest, &None).unwrap();
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "name = \"app\"\n");
+        assert!(
+            repo.download("missing.pkgar", &dir.path().join("x"), &None)
+                .is_err()
+        );
+
+        // The cached index is used while it is fresh.
+        std::fs::remove_file(served.join(REPOSITORY_INDEX)).unwrap();
+        assert_eq!(open(&config, &cache).unwrap().unwrap().index, index);
     }
 }

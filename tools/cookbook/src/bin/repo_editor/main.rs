@@ -6,7 +6,7 @@ use cookbook::{
     recipe::CookRecipe,
     staged_pkg,
 };
-use pkg::PackageName;
+use fox_core::cookbook::RecipeName;
 use ratatui::{
     Terminal,
     backend::TermionBackend,

@@ -8,7 +8,7 @@ use std::{collections::HashMap, io::Write};
 
 use cookbook::cook::pty::{setup_pty_with_stdin, spawn_to_pipe};
 use cookbook::cook::tui::drain_buffer_to_lines;
-use pkg::PackageName;
+use fox_core::cookbook::RecipeName;
 
 pub type JobId = u64;
 
@@ -20,7 +20,7 @@ pub enum StatusUpdate {
 pub struct PackageJob {
     pub id: JobId,
     pub command: String,
-    pub targets: Vec<PackageName>,
+    pub targets: Vec<RecipeName>,
     pub logs: Vec<String>,
     pub buffer: Vec<u8>,
     pub scroll: usize,
@@ -83,7 +83,7 @@ impl ExecutionManager {
     pub fn spawn_job(
         &mut self,
         command: &str,
-        targets: Vec<PackageName>,
+        targets: Vec<RecipeName>,
         status_tx: mpsc::Sender<StatusUpdate>,
     ) {
         if targets.is_empty() {

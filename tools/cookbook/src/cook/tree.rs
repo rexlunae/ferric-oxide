@@ -1,4 +1,4 @@
-use pkg::{Package, PackageName};
+use fox_core::cookbook::{PackageInfo, RecipeName};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
@@ -25,9 +25,9 @@ impl WalkTreeEntry {
 
 pub struct TreeData {
     /// list of deduped packages
-    pub visited: HashSet<PackageName>,
+    pub visited: HashSet<RecipeName>,
     /// list of dependents, if requested
-    pub dependents: HashMap<PackageName, HashSet<PackageName>>,
+    pub dependents: HashMap<RecipeName, HashSet<RecipeName>>,
     /// total package size, only valid if tree_opt is push
     pub total_size: u64,
     /// count of packages that not exist in recipe_map
@@ -48,9 +48,9 @@ pub struct TreeItem<'a> {
     /// recipe status
     pub entry: WalkTreeEntry,
     /// dependencies, if not deduped
-    pub dependencies: Option<&'a HashSet<&'a PackageName>>,
+    pub dependencies: Option<&'a HashSet<&'a RecipeName>>,
     /// dependents, if supplied
-    pub dependents: Option<&'a HashSet<PackageName>>,
+    pub dependents: Option<&'a HashSet<RecipeName>>,
 }
 
 impl Default for TreeData {
@@ -116,8 +116,8 @@ impl FromStr for TreeOptions {
 }
 
 pub fn display_tree_entry(
-    package_roots: &[PackageName],
-    recipe_map: &HashMap<&PackageName, &CookRecipe>,
+    package_roots: &[RecipeName],
+    recipe_map: &HashMap<&RecipeName, &CookRecipe>,
     tree_opt: TreeOptions,
     display_opt: DisplayOptions,
 ) -> Result<TreeData> {
@@ -157,13 +157,13 @@ pub fn display_tree_entry(
 }
 
 pub fn build_dependents(
-    recipe_map: &HashMap<&PackageName, &CookRecipe>,
+    recipe_map: &HashMap<&RecipeName, &CookRecipe>,
     tree_opt: TreeOptions,
-) -> HashMap<PackageName, HashSet<PackageName>> {
-    let mut dependents_map: HashMap<PackageName, HashSet<PackageName>> = HashMap::new();
+) -> HashMap<RecipeName, HashSet<RecipeName>> {
+    let mut dependents_map: HashMap<RecipeName, HashSet<RecipeName>> = HashMap::new();
     for cook_recipe in recipe_map.values() {
-        let mut all_deps_set: HashSet<&PackageName> = HashSet::new();
-        let pkg_meta: Package;
+        let mut all_deps_set: HashSet<&RecipeName> = HashSet::new();
+        let pkg_meta: PackageInfo;
         match tree_opt {
             TreeOptions::Repo => {
                 // no dependency recursion
@@ -176,7 +176,7 @@ pub fn build_dependents(
             }
             TreeOptions::Push => {
                 // recursion from package.toml
-                if let Ok(pkg) = Package::from_file(&cook_recipe.stage_paths().2) {
+                if let Ok(pkg) = PackageInfo::from_file(&cook_recipe.stage_paths().2) {
                     pkg_meta = pkg;
                     all_deps_set.extend(pkg_meta.depends.iter());
                 }
@@ -197,9 +197,9 @@ pub fn build_dependents(
 /// this version does call `op` from root then to their deps.
 /// dependents can be precalculated with [`build_dependents`].
 pub fn walk_tree_entry(
-    package_name: &PackageName,
-    recipe_map: &HashMap<&PackageName, &CookRecipe>,
-    dependents_map: Option<&HashMap<PackageName, HashSet<PackageName>>>,
+    package_name: &RecipeName,
+    recipe_map: &HashMap<&RecipeName, &CookRecipe>,
+    dependents_map: Option<&HashMap<RecipeName, HashSet<RecipeName>>>,
     prefix: &str,
     is_last: bool,
     tree_opt: TreeOptions,
@@ -231,7 +231,7 @@ pub fn walk_tree_entry(
     let (_, pkg_path, pkg_toml) = cook_recipe.stage_paths();
 
     let deduped = data.visited.contains(package_name);
-    let pkg_meta: Package;
+    let pkg_meta: PackageInfo;
 
     let (entry, dependencies) = if deduped {
         (WalkTreeEntry::Deduped, None)
@@ -241,7 +241,7 @@ pub fn walk_tree_entry(
             (Err(_), true) => WalkTreeEntry::Built(0),
             (Err(_), false) => WalkTreeEntry::NotBuilt,
         };
-        let mut all_deps_set: HashSet<&PackageName> = HashSet::new();
+        let mut all_deps_set: HashSet<&RecipeName> = HashSet::new();
         match tree_opt {
             TreeOptions::Repo => {
                 // no dependency recursion
@@ -254,7 +254,7 @@ pub fn walk_tree_entry(
             }
             TreeOptions::Push => {
                 // recursion from package.toml
-                if let Ok(pkg) = Package::from_file(&pkg_toml) {
+                if let Ok(pkg) = PackageInfo::from_file(&pkg_toml) {
                     pkg_meta = pkg;
                     all_deps_set.extend(pkg_meta.depends.iter());
                 }

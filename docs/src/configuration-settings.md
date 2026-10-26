@@ -326,7 +326,7 @@ Done! The `acid` package is now included in your Redox image.
 
 ### Binary Recipe Mode
 
-By default, the Redox build system builds all packages from source (i.e., recipes). If you want to use [pre-built packages](https://static.redox-os.org/pkg/) from our build server, however, there's a recipe rule and filesystem configuration option for it.
+By default, the build system builds all packages from source (i.e., recipes). If you want to use pre-built packages from a package remote, however, there's a recipe rule and filesystem configuration option for it. Ferric Oxide's cookbook has no default remote: set `remote` and its signing key `remote_key` in the `[cook]` table of `cookbook.toml` (or `COOKBOOK_REMOTE` and `COOKBOOK_REMOTE_KEY`), as described in [Prebuilt packages](./ferric-packaging.md#prebuilt-packages-repo_binary). Without them, binary recipes are built from source.
 
 This is useful for some purposes, such as producing development builds, confirming package status from the package server, and reducing image build time with large programs.
 

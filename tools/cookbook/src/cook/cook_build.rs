@@ -1,8 +1,9 @@
-use pkg::{Package, PackageError, PackageName};
+use fox_core::cookbook::{PackageInfo, Prefix, RecipeName};
 use pkgar::{PackageFile, Transaction};
 use pkgar_core::PackageSrc;
 use pkgar_keys::PublicKeyFile;
 
+use crate::bail_other_err;
 use crate::config::CookConfig;
 use crate::cook::fetch_repo;
 use crate::cook::package::{package_source_paths, package_target};
@@ -21,9 +22,9 @@ use crate::{Error, Result, is_redox, log_to_pty, wrap_io_err};
 
 fn auto_deps_from_dynamic_linking(
     stage_dirs: &[PathBuf],
-    dep_pkgars: &BTreeSet<(PackageName, PathBuf)>,
+    dep_pkgars: &BTreeSet<(RecipeName, PathBuf)>,
     logger: &PtyOut,
-) -> BTreeSet<PackageName> {
+) -> BTreeSet<RecipeName> {
     let mut paths = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let verbose = crate::config::try_get_config()
@@ -120,7 +121,7 @@ fn auto_deps_from_dynamic_linking(
     }
 
     let mut deps = BTreeSet::new();
-    if let Ok(key_file) = pkgar_keys::PublicKeyFile::open("build/id_ed25519.pub.toml") {
+    if let Ok(key_file) = pkgar_keys::PublicKeyFile::open(fox_core::cookbook::PUBLIC_KEY) {
         for (dep, archive_path) in dep_pkgars.iter() {
             let Ok(mut package) = pkgar::PackageFile::new(archive_path, &key_file.pkey) else {
                 continue;
@@ -143,7 +144,7 @@ fn auto_deps_from_dynamic_linking(
                         if verbose {
                             log_to_pty!(logger, "DEBUG: {} provides {}", dep, child_name);
                         }
-                        deps.insert(dep.with_prefix(pkg::PackagePrefix::Any));
+                        deps.insert(dep.with_prefix(Prefix::Any));
                         missing.remove(child_name);
                     }
                 }
@@ -161,10 +162,10 @@ fn auto_deps_from_dynamic_linking(
 }
 
 fn auto_deps_from_static_package_deps(
-    build_dep_pkgars: &BTreeSet<(PackageName, PathBuf)>,
-    dynamic_dep_pkgars: &BTreeSet<PackageName>,
-) -> std::result::Result<BTreeSet<PackageName>, PackageError> {
-    let static_dep_pkgars: Vec<PackageName> = build_dep_pkgars
+    build_dep_pkgars: &BTreeSet<(RecipeName, PathBuf)>,
+    dynamic_dep_pkgars: &BTreeSet<RecipeName>,
+) -> std::result::Result<BTreeSet<RecipeName>, crate::PackageError> {
+    let static_dep_pkgars: Vec<RecipeName> = build_dep_pkgars
         .iter()
         .map(|x| x.0.clone())
         .filter(|x| !dynamic_dep_pkgars.contains(x))
@@ -176,12 +177,12 @@ fn auto_deps_from_static_package_deps(
 
 pub struct BuildResult {
     pub stage_dirs: Vec<PathBuf>,
-    pub auto_deps: BTreeSet<PackageName>,
+    pub auto_deps: BTreeSet<RecipeName>,
     pub cached: bool,
 }
 
 impl BuildResult {
-    pub fn new(stage_dirs: Vec<PathBuf>, auto_deps: BTreeSet<PackageName>) -> Self {
+    pub fn new(stage_dirs: Vec<PathBuf>, auto_deps: BTreeSet<RecipeName>) -> Self {
         BuildResult {
             stage_dirs,
             auto_deps,
@@ -189,7 +190,7 @@ impl BuildResult {
         }
     }
 
-    pub fn cached(stage_dirs: Vec<PathBuf>, auto_deps: BTreeSet<PackageName>) -> Self {
+    pub fn cached(stage_dirs: Vec<PathBuf>, auto_deps: BTreeSet<RecipeName>) -> Self {
         BuildResult {
             stage_dirs,
             auto_deps,
@@ -457,7 +458,7 @@ pub fn build(
             command.current_dir(&cookbook_build);
             command.env("TARGET", package_target(name));
             command.env("COOKBOOK_BUILD", &cookbook_build);
-            command.env("COOKBOOK_NAME", name.name());
+            command.env("COOKBOOK_NAME", name.recipe());
             command.env("COOKBOOK_HOST_TARGET", redoxer::host_target());
             command.env("COOKBOOK_RECIPE", &cookbook_recipe);
             command.env("COOKBOOK_ROOT", &cookbook_root);
@@ -651,9 +652,9 @@ pub fn get_sub_target_dir(target_dir: &Path, sub_path: &str) -> PathBuf {
 fn build_deps_dir(
     logger: &PtyOut,
     deps_dir: &PathBuf,
-    dep_pkgars: &BTreeSet<(PackageName, PathBuf)>,
+    dep_pkgars: &BTreeSet<(RecipeName, PathBuf)>,
 ) -> Result<bool> {
-    let pkey_path = "build/id_ed25519.pub.toml";
+    let pkey_path = fox_core::cookbook::PUBLIC_KEY;
     let pkey_file = match PublicKeyFile::open(pkey_path) {
         Ok(k) => k.pkey,
         Err(e) => {
@@ -754,9 +755,9 @@ fn build_auto_deps(
     stage_dirs: &Vec<PathBuf>,
     cached: bool,
     cook_config: &CookConfig,
-    mut dep_pkgars: BTreeSet<(PackageName, PathBuf)>,
+    mut dep_pkgars: BTreeSet<(RecipeName, PathBuf)>,
     logger: &PtyOut,
-) -> Result<BTreeSet<PackageName>> {
+) -> Result<BTreeSet<RecipeName>> {
     if auto_deps_path.is_file() && !cached {
         if cook_config.verbose {
             log_to_pty!(logger, "DEBUG: updating {}", auto_deps_path.display());
@@ -792,7 +793,10 @@ pub fn build_remote(
 ) -> Result<BuildResult> {
     let source_toml = target_dir.join("source.toml");
     let auto_deps_path = target_dir.join("auto_deps.toml");
-    let source_pubkey = fetch_repo::get_binary_pubkey();
+    let Some(remote) = fetch_repo::binary_repo() else {
+        bail_other_err!("There is no prebuilt package remote to check packages against")
+    };
+    let source_pubkey = remote.key();
 
     let packages = recipe.get_packages_list();
     let mut cached = auto_deps_path.is_file();
@@ -821,9 +825,9 @@ pub fn build_remote(
         let stage_dir = &stage_dirs[i];
         let (_, source_pkgar, _) = package_source_paths(package, target_dir);
         fs::create_dir_clean(stage_dir)?;
-        pkgar::extract(&source_pubkey, &source_pkgar, stage_dir).map_err(|e| {
+        pkgar::extract(source_pubkey, &source_pkgar, stage_dir).map_err(|e| {
             if matches!(e, pkgar::Error::Core(pkgar_core::Error::Dryoc(_))) {
-                hint_incorrect_pkey(logger, &source_pubkey, &source_pkgar);
+                hint_incorrect_pkey(logger, source_pubkey, &source_pkgar);
             }
             e
         })?
@@ -835,7 +839,7 @@ pub fn build_remote(
 
     let auto_deps = {
         let toml_content = fs::read_to_string(&source_toml)?;
-        let pkg_toml = Package::from_toml(&toml_content)?;
+        let pkg_toml = PackageInfo::from_toml(&toml_content)?;
         let wrapper = AutoDeps {
             packages: pkg_toml.depends.into_iter().collect(),
         };

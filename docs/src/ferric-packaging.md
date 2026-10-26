@@ -218,6 +218,36 @@ Remote (`REPO_BINARY`) packages are unpacked and signed again with the
 cookbook's key, so they get manifests too. Packages already packed keep
 what they had until they are repacked.
 
+### Prebuilt packages (`REPO_BINARY`)
+
+Recipes whose rule is `binary` (all of them with `REPO_BINARY=1`) take
+their packages from a remote instead of building them. The cookbook has no
+default remote, and it uses one only when both settings are given, in the
+`[cook]` table of `cookbook.toml` or in the environment:
+
+| `cookbook.toml` | Environment | Meaning |
+| --- | --- | --- |
+| `remote` | `COOKBOOK_REMOTE` | URL of the remote, with `{target}` for the target triple. The cookbook fetches `<url>/repo.toml`, `<url>/<name>.toml` and `<url>/<name>.pkgar` with `curl` |
+| `remote_key` | `COOKBOOK_REMOTE_KEY` | Public key file (`pkgar-keys` format) that must have signed every package from the remote |
+
+Without a remote, or when its index cannot be fetched, `binary` recipes
+are built from source and the cookbook says why once. A remote without a
+key is refused: nothing from a remote is unpacked unless a key pinned on
+this side signed it. The index is cached in `build/remotes/` for eight
+hours (indefinitely with `COOKBOOK_OFFLINE`). `[mirrors]` rewrites apply to
+the remote's URL as to source URLs.
+
+The image workflows still point the cookbook at Redox's package server,
+through `.github/actions/interim-prebuilts`, until Ferric Oxide publishes
+its own fox-signed prebuilt channel. That action is the only place left
+that names it.
+
+`repo push`, which installs built packages into a mounted image's root,
+installs them with fox's store the way the installer does: they are
+recorded in `/var/lib/fox/`, the cookbook's key goes to
+`/etc/fox/keys/cookbook.toml`, and a package whose archive is already
+installed is skipped. With `--no-metadata` it only extracts the files.
+
 The installer places the configuration's packages, and every dependency
 they name, from the cookbook's `repo/<target>/` with fox's store
 (`fox_store::deps`), so they are recorded in `/var/lib/fox/` as they are
@@ -267,7 +297,7 @@ over HTTPS yet, which `pkg` does. Choose `packages.manager = "pkgutils"` for
 that.
 
 The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
-requires every package to have been adopted with a signed manifest, then
+requires every package to have been installed with a signed manifest, then
 runs `fox verify --installed`.
 
 ## Hermetic builds and attestations

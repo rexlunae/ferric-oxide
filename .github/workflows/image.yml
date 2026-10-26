@@ -51,6 +51,8 @@ jobs:
 
       - uses: ./.github/actions/prepare-submodules
 
+      - uses: ./.github/actions/interim-prebuilts
+
       - name: Install Rust
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
