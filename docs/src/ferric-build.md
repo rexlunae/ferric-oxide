@@ -357,9 +357,10 @@ fetches from upstream Redox at build time.
   Each `Cargo.lock` pins the exact revision; when updating a mirror, keep the
   pinned revision so only the source moves.
 - The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
-- The subtree-sync workflow still reads upstream Redox to open synced pull
-  requests and never writes there. Recipes that fetch their own component
-  trees from upstream Redox are outside this list and remain to be migrated.
+- Nothing in this repository syncs from upstream Redox. Recipes that fetch
+  their own component trees from upstream Redox, and the prebuilt toolchain
+  and package downloads from `static.redox-os.org`, are outside this list and
+  remain to be migrated.
 
 Device-tree parsing for the kernel and ARM64/RISC-V bootloader goes through
 `crates/devicetree/` (`ferric-devicetree`), which uses crates.io's

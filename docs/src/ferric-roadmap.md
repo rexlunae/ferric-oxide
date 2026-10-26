@@ -16,13 +16,13 @@ done; the [dependency summary](#dependency-summary) shows how they connect.
 
 1. **Modern hardware only.** The default x86 target is **x86-64-v3** (AVX2, BMI1/2, FMA, MOVBE). An optional **x86-64-v4** build adds AVX-512. v3 is the right floor because Intel client chips from Alder Lake on ship without AVX-512, so a v4 floor would exclude most Intel laptops. AMD Zen 4/5 and Intel Xeon support v4. Hot libraries use runtime dispatch for AVX-512 (crypto, memcpy, checksums, compositor blits) so that v3 images can still use it when it's there. Besides the ISA level, the target platform assumes NX, SMEP, SMAP, UMIP, PCID/INVPCID, FSGSBASE, XSAVE/XSAVES, x2APIC, an IOMMU (VT-d or AMD-Vi), UEFI and a TPM 2.0, so the kernel is free to require them. Which of these a build actually checks or enforces today is in [Memory and CPU protection](ferric-memory.md) and [Build and configuration](ferric-build.md); TPM use arrives with the Phase 4 boot chain. It can *use* CET (shadow stacks and IBT), PKU/PKS and WAITPKG where they exist. Support for i586, BIOS boot and pre-v3 CPUs gets dropped. aarch64 (ARMv8.2+) stays as the second architecture. riscv64 is frozen until someone needs it.
 2. **File descriptors stay the control plane. Shared memory becomes the data plane.** That settles the bottleneck concern without losing the capability model (see Phase 2).
-3. **Stay mergeable with upstream.** Keep internal names. Put fork-only work in new crates or behind feature flags wherever possible. Sync with upstream on a regular cadence.
+3. **Independent of upstream.** The connection to Redox is historical: nothing syncs from Redox, and a Redox change is ported by hand when it is wanted (decided 26 October 2026). Internal names stay, because the Rust targets, tools and imported code depend on them. Optional work still goes behind feature flags.
 4. **Measure everything.** No performance claim lands without a benchmark in CI.
 5. **Userland is WebAssembly by default (goal).** User programs ship as **wasm32**, with **wasm64** reserved for programs that need more than 4 GiB of address space. Both are validated and compiled natively per CPU by a kernel-trusted compiler, with native code as an explicit exception list. This is gated on benchmarks (Phase W).
 
 ## Phase 0: Foundation
 
-- Import kernel, base, relibc, redoxfs, bootloader and book into this repository as git subtrees, so upstream history stays mergeable.
+- Import kernel, base, relibc, redoxfs, bootloader and book into this repository as git subtrees, keeping their history.
 - GitHub Actions builds the image and boots it in QEMU/KVM with a smoke test, using the existing `acid` and `os-test` suites.
 - **Feature configuration system:** `ferric.toml` (the selected configuration) plus `features.toml` (the feature catalog), edited by hand, by agents, or through `make menuconfig` (the TUI). Every optional item in this roadmap (KPTI, kernel-colocated drivers, AVX-512 paths, sandbox defaults) lands as a toggle there, and CI tests a set of named profiles.
 - **Benchmark harness against Linux on the same hardware:** syscall and IPC round trip, context switch, fio 4K random read at QD1 and QD32, sequential read, TCP throughput and latency (iperf3), nginx or a Rust HTTP server req/s, boot-to-shell time, and a kernel compile. Results go to a dashboard with each commit tracked over time.
@@ -287,10 +287,9 @@ call, and the answer is recorded here.
 1. **Native vs. compatibility-layer vs. driver-domain drivers** for Wi-Fi and GPU (Phases 5 and 6). Driver domains (Linux drivers in a Phase V VM) are a third option. This is mostly a licensing and time trade-off.
 2. **Whether PKS-only hardware is an acceptable requirement** for the colocated driver tier, or whether AMD machines get language isolation alone.
 3. **The default root filesystem:** RedoxFS (native, copy-on-write) or ext4/XFS on LVM and LUKS. The current proposal keeps RedoxFS as the default and gives the Linux filesystems full support.
-4. **The upstream sync cadence**, and whether to keep the fork's I/O changes in a form upstream could adopt, given that upstream does not accept AI-assisted contributions.
-5. **Where the wasm compiler lives:** in ring 0, or as an unprivileged service with a small in-kernel verifier. The current proposal is the verifier design, with an in-kernel JIT as a toggle.
-6. **Whether colocated (single address space) mode is a goal** or only an experiment, given Spectre between apps that share an address space.
-7. **Packaging (Phase P):** the working defaults listed under Phase P stand until the maintainer decides otherwise.
+4. **Where the wasm compiler lives:** in ring 0, or as an unprivileged service with a small in-kernel verifier. The current proposal is the verifier design, with an in-kernel JIT as a toggle.
+5. **Whether colocated (single address space) mode is a goal** or only an experiment, given Spectre between apps that share an address space.
+6. **Packaging (Phase P):** the working defaults listed under Phase P stand until the maintainer decides otherwise.
 
 ## Keeping this chapter current
 

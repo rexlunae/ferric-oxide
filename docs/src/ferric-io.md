@@ -365,6 +365,44 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### Where a request's time goes (drivers.nvmed_perf)
+
+`drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
+each I/O request's phases with the CPU cycle counter and logs a summary about
+once a second:
+
+```text
+nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+```
+
+- `read.service`/`write.service` cover request entry through return, including
+  partial errors, on both buffered and DMA paths. Timing belongs to the request
+  future, so interleaved requests on one executor thread remain separate.
+- `read.device`/`write.device` sum each request's command durations, starting
+  when a free submission-queue slot is accepted and ending when its completion
+  is observed by that future. Full-queue waits are excluded; doorbell batching,
+  controller service and completion wakeup latency are included. These are not
+  pure controller-time measurements. Each request publishes one sample of each
+  phase together, so the counts and interval boundaries match.
+- Service minus command time measures the remaining driver work, including
+  buffer preparation, free-slot waits and copies.
+
+A separate reporting thread takes and resets the counters once a second, so
+samples are reported even after an I/O burst goes idle. Logging happens outside
+the counter lock. Reports are time windows, not benchmark rounds: a short job
+may share a window with another job. Use isolated workloads or explicit trace
+markers for round attribution, rather than assigning a report to the last job.
+
+On x86 the counter reads add no system calls and are calibrated against the
+monotonic clock at startup; other architectures read the monotonic clock.
+The reporting thread adds its own timer/logging calls. Kernel tracing supplies
+thread identity and socket/request timing (`scheme.request`/`scheme.response`,
+`sched.switch`, `irq.deliver`/`irq.ack`, and debug-level `scheme.sqe_deliver`/
+`scheme.cqe_receive`). Historical measurements from before these accounting
+fixes need remeasurement before deriving per-request phase differences. The
+phase figures compare one boot; they are not a documented time source.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
