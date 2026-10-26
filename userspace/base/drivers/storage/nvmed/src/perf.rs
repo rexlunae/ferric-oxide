@@ -18,7 +18,9 @@
 //!
 //! The counters reset at each report. The scheme loop reports at most once every
 //! [`REPORT_EVERY`] as `nvmed: perf: ...` lines, one per phase with the count, mean, minimum
-//! and maximum in microseconds. The ticks are converted with a one-time calibration against
+//! and maximum in microseconds. Any scheme activity advances the report clock, so a probe
+//! that touches the disk scheme (an `ls` of its directory, say) just after a benchmark job
+//! forces the job's final report out. The ticks are converted with a one-time calibration against
 //! the monotonic clock ([`calibrate`]); they are only for comparing phases in one boot, not a
 //! documented time source.
 
@@ -27,7 +29,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Report at most this often, and the first report no earlier than one interval.
-const REPORT_EVERY: Duration = Duration::from_secs(5);
+/// One second keeps a report inside each benchmark round; five worked too, but
+/// a report then spans whole short jobs, which mixes their measurements.
+const REPORT_EVERY: Duration = Duration::from_secs(1);
 
 /// The phases a request is split into.
 #[derive(Clone, Copy)]
