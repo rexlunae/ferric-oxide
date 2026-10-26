@@ -113,6 +113,8 @@ acpi = []
 kaslr = ["dep:ferric-hwrand"]
 # Ferric Oxide: make PROT_NONE mappings inaccessible from user mode (guard pages).
 prot_none = []
+# Ferric Oxide: the idle context keeps the previous page table loaded (x86_64).
+lazy_tlb = []
 # Ferric Oxide: start each address space's mmap search at a random address (x86_64).
 aslr = ["dep:ferric-hwrand"]
 # Ferric Oxide: the kernel.regbuf scheme, registered buffers and zero-copy grants.

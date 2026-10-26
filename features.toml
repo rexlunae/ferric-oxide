@@ -396,6 +396,25 @@ which turns guard pages into ordinary memory. The kernel itself can still read
 such pages on behalf of a system call."""
 
 [[option]]
+id = "kernel.lazy_tlb"
+menu = "kernel"
+type = "bool"
+title = "Lazy TLB for the idle context"
+default = true
+depends = "target.arch == 'x86_64'"
+kernel_feature = "lazy_tlb"
+rebuild = ["kernel"]
+help = """
+When a CPU goes idle, keep the last process's page table loaded instead of
+switching to the empty table, and take it back without a reload if the same
+process runs next. A process waiting for one I/O interrupt then costs no TLB
+flush on that CPU instead of two. The idle CPU stays in the address space's
+CPU set, so it still receives that address space's TLB shootdowns, and a
+context that drops the address space (exit, exec) first makes idle CPUs let
+go of it. Off, or on other architectures, the idle context loads the empty
+table, as upstream."""
+
+[[option]]
 id = "kernel.kaslr"
 menu = "kernel"
 type = "bool"

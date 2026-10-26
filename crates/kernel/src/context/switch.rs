@@ -1429,6 +1429,10 @@ unsafe fn switch_to(
         .being_sigkilled
         .set(next_context.being_sigkilled);
 
+    // Ferric Oxide (kernel.lazy_tlb): while the previous context is still locked, so that a
+    // change of its address space is ordered after this; see `context::lazy_tlb`.
+    percpu.lazy_tlb.announce(percpu);
+
     unsafe {
         percpu.new_addrsp_guard.set(addr_space_guard);
         arch::switch_to(prev_context, next_context);

@@ -721,7 +721,7 @@ mod tests {
             "{mk}"
         );
         assert!(
-            mk.contains("export FERRIC_KERNEL_FEATURES:=acpi,aslr,kaslr,multi_core,prot_none,self_modifying,serial_debug,x86_kvm_pv\n"),
+            mk.contains("export FERRIC_KERNEL_FEATURES:=acpi,aslr,kaslr,lazy_tlb,multi_core,prot_none,self_modifying,serial_debug,x86_kvm_pv\n"),
             "{mk}"
         );
         let fs = file(&plan, "filesystem.toml");
@@ -879,7 +879,7 @@ mod tests {
         let plan = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
         let mk = file(&plan, "config.mk");
         assert!(
-            mk.contains("export FERRIC_KERNEL_FEATURES:=aslr,debugger,kaslr,prot_none,self_modifying,serial_debug,syscall_debug,x86_kvm_pv\n"),
+            mk.contains("export FERRIC_KERNEL_FEATURES:=aslr,debugger,kaslr,lazy_tlb,prot_none,self_modifying,serial_debug,syscall_debug,x86_kvm_pv\n"),
             "{mk}"
         );
     }

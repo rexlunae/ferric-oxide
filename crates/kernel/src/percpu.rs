@@ -14,6 +14,7 @@ use crate::{
     arch::device::ArchPercpuMisc,
     context::{
         empty_cr3,
+        lazy_tlb::{plan::SwitchPlan, LazyTlb},
         memory::{AddrSpaceSwitchReadGuard, AddrSpaceWrapper},
         switch::ContextSwitchPercpu,
     },
@@ -38,6 +39,8 @@ pub struct PercpuBlock {
     pub new_addrsp_tmp: Cell<Option<Arc<AddrSpaceWrapper>>>,
     pub new_addrsp_guard: Cell<Option<AddrSpaceSwitchReadGuard>>,
     pub wants_tlb_shootdown: AtomicBool,
+    /// Ferric Oxide (`kernel.lazy_tlb`): the address space kept loaded for the idle context.
+    pub lazy_tlb: LazyTlb,
 
     // TODO: Put mailbox queues here, e.g. for TLB shootdown? Just be sure to 128-byte align it
     // first to avoid cache invalidation.
@@ -136,6 +139,10 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
 }
 impl PercpuBlock {
     pub fn maybe_handle_tlb_shootdown(&self) {
+        // Ferric Oxide (kernel.lazy_tlb): another CPU is dropping the address space kept for
+        // the idle context.
+        self.lazy_tlb.poll_eviction(self);
+
         #[expect(clippy::bool_comparison)]
         if self.wants_tlb_shootdown.swap(false, Ordering::Relaxed) == false {
             return;
@@ -146,6 +153,10 @@ impl PercpuBlock {
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {
             addrsp.tlb_ack.fetch_add(1, Ordering::Release);
+        } else {
+            // Ferric Oxide (kernel.lazy_tlb): an idle CPU stays in the set of the address space
+            // it keeps, so the shootdown counted it.
+            self.lazy_tlb.acknowledge();
         }
     }
 }
@@ -176,14 +187,28 @@ pub unsafe fn switch_arch_hook() {
         let next_addrsp = percpu.new_addrsp_tmp.take();
         let next_addrsp_guard = percpu.new_addrsp_guard.take();
 
-        let retain_pgtbl = match (&*cur_addrsp, &next_addrsp) {
-            (Some(p), Some(n)) => Arc::ptr_eq(p, n),
-            (Some(_), None) | (None, Some(_)) => false,
-            (None, None) => true,
-        };
-        if retain_pgtbl {
+        // Ferric Oxide (kernel.lazy_tlb): the idle context keeps the previous table if
+        // `switch_to` announced it, and the same address space coming back takes it again
+        // without a load. See `context::lazy_tlb`.
+        match percpu
+            .lazy_tlb
+            .plan(cur_addrsp.as_ref(), next_addrsp.as_ref())
+        {
             // If we are not switching to a different address space, we can simply return early.
-            return;
+            SwitchPlan::Keep => return,
+            SwitchPlan::Lazy => {
+                drop(cur_addrsp);
+                let prev_addrsp = percpu.current_addrsp.borrow_mut().take();
+                percpu.lazy_tlb.keep(percpu, prev_addrsp);
+                return;
+            }
+            SwitchPlan::Resume => {
+                drop(cur_addrsp);
+                *percpu.current_addrsp.borrow_mut() = next_addrsp;
+                percpu.lazy_tlb.resume();
+                return;
+            }
+            SwitchPlan::Load => {}
         }
         if let Some(prev_addrsp) = &*cur_addrsp {
             prev_addrsp.used_by.atomic_clear(percpu.cpu_id);
@@ -200,6 +225,9 @@ pub unsafe fn switch_arch_hook() {
 
             percpu.maybe_handle_tlb_shootdown();
         }
+        // Ferric Oxide (kernel.lazy_tlb): the same for an address space kept for the idle
+        // context.
+        percpu.lazy_tlb.detach(percpu);
 
         drop(cur_addrsp);
 
@@ -219,6 +247,8 @@ pub unsafe fn switch_arch_hook() {
                 crate::memory::RmmA::set_table(rmm::TableKind::User, empty_cr3());
             }
         }
+        // Ferric Oxide (kernel.lazy_tlb): only once that table is no longer loaded.
+        percpu.lazy_tlb.finish();
     }
 }
 impl PercpuBlock {
@@ -230,6 +260,7 @@ impl PercpuBlock {
             new_addrsp_tmp: Cell::new(None),
             new_addrsp_guard: Cell::new(None),
             wants_tlb_shootdown: AtomicBool::new(false),
+            lazy_tlb: LazyTlb::new(),
             ptrace_flags: Cell::new(PtraceFlags::empty()),
             ptrace_session: RefCell::new(None),
             inside_syscall: Cell::new(false),

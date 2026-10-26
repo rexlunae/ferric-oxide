@@ -29,7 +29,6 @@ use crate::{
 use crate::syscall::error::{Error, Result, EAGAIN, EBADF, EEXIST, EINVAL, EMFILE, ENOMEM, ESRCH};
 
 use super::{
-    empty_cr3,
     memory::{AddrSpaceWrapper, GrantFileRef},
     ContextQueueKey,
 };
@@ -465,12 +464,15 @@ impl Context {
                         new_addrsp.table.utable.make_current();
                     }
                 }
-                _ => unsafe {
-                    crate::memory::RmmA::set_table(rmm::TableKind::User, empty_cr3());
-                },
+                _ => super::load_empty_table(),
             }
         } else {
             assert!(!self.running);
+        }
+        // Ferric Oxide (kernel.lazy_tlb): no idle CPU may keep the table on this reference's
+        // behalf once it is gone.
+        if let Some(ref old) = self.addr_space {
+            super::lazy_tlb::evict(old);
         }
 
         core::mem::replace(&mut self.addr_space, addr_space)

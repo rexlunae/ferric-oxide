@@ -56,6 +56,9 @@ pub(crate) mod idle;
 /// Context switch function
 pub mod switch;
 
+/// Ferric Oxide: lazy TLB, the idle context keeping the previous page table
+pub mod lazy_tlb;
+
 /// File struct - defines a scheme and a file number
 pub mod file;
 
@@ -77,6 +80,21 @@ pub use self::switch::switch_finish_hook;
 pub const CONTEXT_MAX_FILES: usize = 65_536;
 
 pub use self::arch::empty_cr3;
+
+/// Loads the empty user page table on this CPU, which maps the kernel half like every table and
+/// nothing below it.
+///
+/// # Panics
+/// Panics if called before [`init`] recorded the empty table.
+pub fn load_empty_table() {
+    let table = *self::arch::EMPTY_CR3
+        .get()
+        .expect("the empty table is recorded before any address space is loaded");
+    // SAFETY: the empty table maps the kernel exactly as the loaded one does, and the kernel
+    // keeps no references into user memory (user memory is reached only by the user-copy
+    // routines, which tolerate faults), so nothing it relies on is unmapped.
+    unsafe { RmmA::set_table(TableKind::User, table) };
+}
 
 // Set of weak references to all contexts available for scheduling. The only strong references are
 // the context file descriptors.

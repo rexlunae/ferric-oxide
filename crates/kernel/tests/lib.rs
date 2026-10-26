@@ -14,6 +14,8 @@ mod apic_id;
 mod cpu_set;
 #[path = "../src/context/idle.rs"]
 mod idle;
+#[path = "../src/context/lazy_tlb/plan.rs"]
+mod lazy_tlb_plan;
 #[path = "../src/sync/records.rs"]
 mod records;
 #[path = "../src/sync/spin_wait.rs"]

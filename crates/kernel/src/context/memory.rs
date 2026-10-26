@@ -2958,9 +2958,7 @@ impl Drop for Table {
             // to do?). Instead, we can garbage-collect such page tables in the idle kernel context
             // before it waits for interrupts. Or maybe not, depends on what future benchmarks will
             // indicate.
-            unsafe {
-                RmmA::set_table(TableKind::User, super::empty_cr3());
-            }
+            super::load_empty_table();
         }
         #[cfg(target_arch = "x86_64")]
         if self.kpti {

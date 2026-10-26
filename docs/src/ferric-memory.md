@@ -164,6 +164,46 @@ describes an experimental inherited path and currently names a Cargo feature
 absent from the kernel manifest. Use `kernel.cpu.kpti` for the implemented
 Ferric isolation path.
 
+## Lazy TLB for the idle context
+
+`kernel.lazy_tlb` (x86_64, on in the catalog defaults, off in a kernel built
+without a `ferric.toml`) stops a CPU from loading the empty page table when it
+goes idle. The idle context instead keeps the previous process's table loaded,
+and if that process runs next on the CPU, `switch_arch_hook` takes the table
+back without writing CR3. A process that waits for one I/O interrupt on an
+otherwise idle CPU then costs no TLB flush there, instead of two (one to the
+empty table, one back). Switching to any other address space, or to a
+kernel-only context other than the idle one, loads its table as before.
+
+The idle CPU stays in the kept address space's `used_by` set, so TLB
+shootdowns of that address space reach it, and the handler flushes and
+acknowledges them on the kept address space. Its TLB therefore stays as
+current as that of a CPU running the process. With KPTI and PCID nothing else
+changes: the per-CPU KPTI fields hold only bits ORed into the loaded table,
+the idle context never returns to user space, and every shootdown flush also
+invalidates the user PCID.
+
+The CPU holds a reference to the kept address space, so its page tables
+cannot be freed while they are loaded. A context that drops its address space
+(exit, exec, a ring worker's request) first makes every other CPU that keeps
+it load the empty table and drop the reference, through an interrupt and a
+handshake in each CPU's lazy-TLB slot, so the exiting context still tears the
+address space down itself. The design, the ordering arguments and the races
+the handshake closes are in the `context::lazy_tlb` module documentation.
+Every context's drop does this, not just the last one: a CPU announces the
+table it will keep while the context it switches away from is still locked,
+so that context's own drop is the one guaranteed to see the announcement. With `kernel.rings`, a worker's drop of the caller's
+address space after each request therefore also moves CPUs that keep the
+caller's table back to the empty one.
+
+Only the idle context runs on a kept table, because the idle loop never
+touches user memory; ring workers and the end of an exiting context still run
+on the empty table, where a stray user access faults. riscv64 has no
+inter-processor interrupts yet and aarch64 boots are not tested in CI, so the
+option changes nothing on those architectures. The switch decisions and the
+handshake are host-tested (including under Miri) in `crates/kernel/tests`;
+only image boots exercise the real switch and shootdown paths.
+
 ## CET: enforcement versus preparation
 
 `kernel.cpu.ibt` defaults to `never`. Selecting `auto` or `always` makes the
