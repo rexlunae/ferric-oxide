@@ -90,7 +90,7 @@ which pulls in the rest:
 3. `40_drivers.target`: `lived` for live images, `ps2d`, `hwd` (ACPI or device
    tree), and `pcid-spawner --initfs`, which starts the storage drivers listed
    in `userspace/base/drivers/initfs.toml` (AHCI, IDE, NVMe, VirtIO and others).
-4. `50_rootfs.service`: `redoxfs --uuid $REDOXFS_UUID file`, which mounts the
+4. `50_rootfs.service`: `redoxfs --uuid $REDOXFS_UUID file $REDOXFS_BLOCK`, which mounts the
    partition the bootloader chose as `/scheme/file`.
 
 ### Root file system stage

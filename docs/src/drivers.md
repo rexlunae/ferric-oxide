@@ -26,10 +26,13 @@ device trees) are started by `acpid`, `hwd` and the init configuration.
 
 A device that can do DMA can read and write any physical memory unless an
 IOMMU stops it. With `kernel.iommu` set to a policy other than `never` (the
-default), the kernel programs Intel VT-d or AMD-Vi, puts each device in its own
-DMA domain, and lets a driver map only memory it owns into that domain. A
-driver then gives its device I/O virtual addresses instead of physical ones,
-and the mappings are revoked when the driver exits. The
+default), the kernel programs Intel VT-d or AMD-Vi, puts each device that a
+driver is attached to in its own DMA domain, and lets the driver map only
+memory it owns into that domain. The driver then gives its device I/O virtual
+addresses instead of physical ones, and the mappings are revoked when the
+driver exits. Under `auto`, devices with no driver attached keep the
+compatibility identity mapping, so their DMA is not restricted; `enforce`
+blocks them. The
 [I/O chapter](./ferric-io.md#from-pci-discovery-to-a-drivers-dma-address)
 follows this path in detail.
 

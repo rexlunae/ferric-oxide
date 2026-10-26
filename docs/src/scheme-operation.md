@@ -51,7 +51,7 @@ then it will ask the kernel to place it in the `null` namespace (`setrens(0, 0)`
 
 To provide a scheme, a program performs the following steps:
 
- 1. Create the scheme, obtaining a file descriptor - `File::create(":myscheme")`
+ 1. Create the scheme socket and register it under its name - `Socket::create()`, then `register_sync_scheme(&socket, "myscheme", &mut handler)` (or the `daemon` crate's `ready_sync_scheme`). Older code did this in one step with `File::create(":myscheme")`, which the [example](./example.md) still uses
  2. Open a file descriptor for each resource that is required to provide the scheme's services, e.g. `File::open("/scheme/irq/{irq-name}")`
  3. Open a file descriptor for a timer if needed - `File::open("/scheme/time/{timer_type}")`
  4. Open a file descriptor for the event scheme (if needed) - `File::open("/scheme/event")`

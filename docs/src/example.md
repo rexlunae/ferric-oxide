@@ -11,6 +11,13 @@ The complete source for this example can be found at
 
 > TODO: the example has not been saved to the repo.
 
+> ⚠️ **Warning:** This example uses the older scheme API (`SchemeMut` and
+> `File::create(":vec")`). Current daemons create a socket with
+> `Socket::create()` and register it with `register_sync_scheme`; see
+> [Providing a Scheme](./scheme-operation.md#providing-a-scheme) and
+> [`ptyd`](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/ptyd/src/main.rs)
+> for the current flow.
+
 ## Setup
 
 In order to build and run this example for Ferric Oxide, you'll need to be set up to compile the OS from source. The process for getting a program included in a local build is laid out in the [Including Programs](./including-programs.md) page. Pause here and follow the `helloworld` example in that guide if you want to get this example running.
