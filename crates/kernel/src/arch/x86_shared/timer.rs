@@ -190,13 +190,23 @@ pub fn selftest(token: &mut CleanLockToken) {
         crate::info!("timer: one-shot selftest skipped (no TSC-deadline timer)");
         return;
     }
+    crate::info!(
+        "timer: one-shot selftest: tsc-deadline supported, tsc rate {} Hz",
+        crate::arch::time::tsc_rate()
+            .map(|rate| rate.get())
+            .unwrap_or(0)
+    );
 
     // Round 1: arm for one second, wait for the fire, measure the elapsed
     // monotonic time against the requested deadline.
     let start = time::monotonic(token);
     let deadline = Nanos::new(start as u64 + 1_000_000_000);
     match arm(deadline) {
-        ArmResult::Reprogrammed => {}
+        ArmResult::Reprogrammed => {
+            // SAFETY: reading the LVT confirms what the hardware latched.
+            let lvt = unsafe { the_local_apic().lvt_timer() };
+            crate::info!("timer: one-shot selftest round 1 armed, lvt read-back {lvt:#x}");
+        }
         other => {
             crate::info!("timer: one-shot selftest round 1 arm: {other:?}");
             return;
@@ -211,7 +221,13 @@ pub fn selftest(token: &mut CleanLockToken) {
         unsafe { arch::interrupt::enable_and_nop() };
     }
     if !fired() {
-        crate::info!("timer: one-shot selftest round 1: no fire (wedged)");
+        let entries = PercpuBlock::current().one_shot.entries.load(Ordering::Relaxed);
+        // SAFETY: reading the LVT shows what the hardware latched.
+        let lvt = unsafe { the_local_apic().lvt_timer() };
+        crate::info!(
+            "timer: one-shot selftest round 1: no fire (wedged): {} handler entries, lvt read-back {lvt:#x}",
+            entries
+        );
         disarm();
         return;
     }
