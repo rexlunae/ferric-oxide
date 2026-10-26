@@ -1,111 +1,128 @@
-# Native Build
+# Building Ferric Oxide
 
-This page explains how to build Redox in your operating system's native environment, without Podman.
+This page walks through building a Ferric Oxide image with the native Cargo
+build and booting it in QEMU. It is the recommended way to build. The
+reference for everything here, including its current limits, is
+[Build and Configuration](./ferric-build.md).
 
-> ⚠️ **Warning:** Building outside Podman is not guaranteed to succeed. Unless you have problems using Podman, we recommend you to use the [Podman Build](./podman-build.md) before trying the Native Build to avoid build environment bugs.
+## Prerequisites
 
-> 📝 **Note:** Read the [Build System Reference](./build-system-reference.md) page after installation for an explanation of the build system's organization and functionality.
+Install these with your usual tools first. The build never runs a system
+package manager, Homebrew or `sudo` for you.
 
-## Supported Unix-like Distributions and Podman Build
+- [rustup](https://rustup.rs/). The repository's `rust-toolchain.toml` pins
+  the nightly toolchain, and rustup installs it on first use.
+- Git, curl, tar and Make.
+- A native C/C++ compiler and SDK: Clang on Linux, or the Xcode Command Line
+  Tools on macOS. Clang must support `--gcc-install-dir`; recent versions do.
+- [NASM](https://nasm.us/), for x86-64 guests only (the kernel has an assembly
+  trampoline).
+- [QEMU](https://www.qemu.org/), only to run the image:
+  `qemu-system-x86_64` or `qemu-system-aarch64`, with its UEFI firmware.
 
-The following Unix-like systems are supported:
+The native build is developed on Linux and macOS, on both x86-64 and Apple
+Silicon hosts. CI builds on Ubuntu 24.04.
 
-- Pop_OS!
-- Ubuntu
-- Debian
-- Fedora
-- Arch Linux
-- OpenSUSE
-- Gentoo
-- FreeBSD (experimental)
-- MacOS (experimental, require [workarounds](./advanced-build.md#macos-users))
-- Nix (experimental)
-- Solus (not maintained)
-
-If you encounter a weird or difficult-to-fix problem, test the [Podman Build](./podman-build.md) to determine if the problem occurs there as well.
-
-## Preparing the Build
-
-### Bootstrap Prerequisites and Fetch Sources
-
-On supported Linux distributions, build system preparation can be performed automatically via the build system's bootstrap script:
-
- 1. Ensure you have the `curl` program installed. e.g., for Pop!_OS/Ubuntu/Debian:
-
-    ```sh
-    which curl || sudo apt-get install curl
-    ```
-
- 2. Create a new directory and run the `native_bootstrap.sh` script in it.
-
-    ```sh
-    mkdir -p ~/tryredox
-    ```
-
-    ```sh
-    cd ~/tryredox
-    ```
-
-    ```sh
-    curl -sf https://gitlab.redox-os.org/redox-os/redox/raw/master/native_bootstrap.sh -o native_bootstrap.sh
-    ```
-
-    ```sh
-    time bash -e native_bootstrap.sh
-    ```
-
-    You will be asked to confirm some steps: answer with `y` or `1`.
-
-    For an explanation of what the `native_bootstrap.sh` script does, read [this](./build-phases.md#native_bootstrapsh) section.
-
-    Note that `curl -sf` operates silently, so if there are errors, you may get an empty or incorrect version of `native_bootstrap.sh`. Check for typos in the command and try again. If you continue to have problems, join the [chat](./chat.md) and let us know.
-
-    Please be patient. The bootstrapping process can take anywhere from 5 minutes to an hour depending on the hardware and network it's being run on.
-
-    If the `native_bootstrap.sh` script does not work for you, please try reading the [Advanced Build](./advanced-build.md) page to install the right packages for your operating system.
-
- 3. After bootstrapping is completed, update the `PATH` environment variable for the current shell:
-
-    ```sh
-    source ~/.cargo/env
-    ```
-
-### Setting Configuration Values
-
-The build system uses several configuration files, which contain settings that you may wish to change. These are detailed in the [Configuration Settings](./configuration-settings.md) page. For the Native Build we recommend setting these in the `.config` file:
-
-- `ARCH=x86_64`
-- `CONFIG_NAME=desktop`
-- `PODMAN_BUILD=0` to disable Podman Build
-- `PREFIX_BINARY=0` to disable [prebuilt prefix binary](./advanced-build.md#prefix)
-- `PREFIX_USE_UPSTREAM_RUST_COMPILER=1` to [avoid compiling Rust compiler](./advanced-build.md#prefix-rust)
-
-The [build.sh](./configuration-settings.md#buildsh) script also allows the user to specify the CPU architecture and filesystem contents to be used in the build, although these settings needs to be written again every time the script is executed.
-
-## Compiling Redox
-
-At this point we have:
-
-- Downloaded the sources
-- Tweaked the settings to our liking
-- Probably added our recipe to the filesystem
-
-We are ready to build the Redox operating system image. Skip ahead to [Configuration Settings](./configuration-settings.md) if you want to build for a different CPU architecture or with different filesystem contents.
-
-### Build all system components and programs
-
-To build all the components and packages to be included in the filesystem.
+## Get the source
 
 ```sh
-cd ~/tryredox/redox
+git clone https://github.com/rexlunae/ferric-oxide
+cd ferric-oxide
 ```
+
+## Check and set up the toolchain
 
 ```sh
-time make all
+cargo xtask doctor
+cargo xtask setup
 ```
 
-This will build the target `build/x86_64/desktop/harddrive.img`, which can be run in a virtual machine.
+`doctor` lists the tools it finds and stops at the first required one that is
+missing. `setup` adds `rust-src` and `llvm-tools-preview` to the pinned
+toolchain (and the prebuilt Redox-target standard library for x86-64),
+installs `cbindgen` and `just` with Cargo if they are missing or outdated,
+initializes the source submodules, and writes a starting `ferric.toml` if you
+don't have one. `./native_bootstrap.sh` is an alias for `cargo xtask setup`.
 
-Give it a while. Redox is big. Read the [`make all` (first run)](./build-phases.md#make-all-first-run) section for an explanation of what the `make all` command does.
+Commands build for your host's architecture by default: ARM64 on Apple
+Silicon and x86-64 on Intel and AMD. To build for the other one, pass
+`--arch x86_64` or `--arch aarch64` to *every* command, starting with setup:
 
-> 💡 **Tip:** the filesystem parts are merged into the final system image using the [FUSE](https://github.com/libfuse/libfuse) library. The `bootstrap.sh` script installs `libfuse` automatically. If you encounter problems with the final Redox image, verify `libfuse` is installed and that you are able to use it.
+```sh
+cargo xtask --arch x86_64 setup
+cargo xtask --arch x86_64 build
+cargo xtask --arch x86_64 run
+```
+
+## Build the image
+
+```sh
+cargo xtask build
+```
+
+The first build downloads Rust components, target runtime libraries, Cargo
+dependencies and application packages, so it needs a network connection and
+takes a while. The image appears under `build/<arch>/<config>/`:
+`harddrive.img` (a persistent disk) for x86-64, and `redox-live.iso` (a
+RAM-backed live image) for ARM64.
+
+The starting configuration selects the `native` image, which builds the
+kernel, UEFI bootloader, relibc, base services and drivers, RedoxFS and the
+package manager from this repository, and installs other applications as
+prebuilt packages. Images are written with Rust tools, without FUSE or `sudo`.
+
+> 📝 **Note:** Prebuilt application packages and the target runtime libraries
+> currently still come from Redox's servers. Replacing those downloads with
+> packages built and distributed through [`fox`](./ferric-packaging.md) is in
+> progress.
+
+## Run it
+
+```sh
+cargo xtask run              # opens a QEMU window
+cargo xtask run --headless   # serial console in your terminal
+cargo xtask run --no-build   # boot the existing image without rebuilding
+```
+
+`run` builds the image first unless you pass `--no-build`. When the system
+boots, log in as `user` with an empty password, or as `root` with the
+password `password`. These are development credentials set in
+`config/base.toml`; change them before exposing an image to anyone else. See
+[Running in a Virtual Machine](./running-vm.md) for more options.
+
+## Change what gets built
+
+Your choices live in `ferric.toml`, which is not tracked by git. Edit them
+with the menu or the CLI:
+
+```sh
+make menuconfig
+cargo run -q -p ferric-config -- set image.config=desktop
+cargo run -q -p ferric-config -- explain kernel.iommu
+```
+
+Every option, its default and its dependencies are in `features.toml`. See
+[Configuration Settings](./configuration-settings.md) for an overview and
+[Build and Configuration](./ferric-build.md) for the details.
+
+Settings for a single command go after `--`, as Make assignments:
+
+```sh
+cargo xtask build -- REPO_BINARY=0        # build applications from source too
+cargo xtask run -- QEMU_MEM=4096 kvm=no   # more memory, no acceleration
+cargo xtask --dry-run build               # print what would run
+```
+
+## Updating
+
+Pull the latest `main` and build again. The build regenerates its
+configuration and rebuilds the recipes whose inputs changed.
+
+```sh
+git pull
+cargo xtask build
+```
+
+If a build breaks after an update, see
+[Troubleshooting the Build](./troubleshooting.md), and
+[report it](./creating-proper-bug-reports.md) if the problem persists.

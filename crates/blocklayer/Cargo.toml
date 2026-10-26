@@ -20,6 +20,8 @@ thiserror = { version = "2", default-features = false }
 default = ["luks", "lvm"]
 ## Heap-backed layers: the runtime [`Stack`] and the `Box`/`Arc` device impls.
 alloc = []
+## Files and devices as block devices (`file`), for the daemons that read disks.
+std = ["alloc"]
 ## The LUKS1/LUKS2 decryption layer (features.toml `fs.luks`).
 luks = ["alloc", "dep:ferric-luks"]
 ## The LVM2 logical-volume layer (features.toml `fs.lvm`).
