@@ -61,9 +61,9 @@ jobs:
       - name: Install cbindgen
         run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
-      # Several crates (relibc's, redoxfs's) have git dependencies on gitlab.redox-os.org.
+      # Several crates (relibc's, redoxfs's) have git dependencies (Ferric mirrors on GitHub).
       # Cargo only fetches a git dependency when its locked commit is missing from
-      # ~/.cargo/git/db, so caching that directory keeps a GitLab outage from failing
+      # ~/.cargo/git/db, so caching that directory keeps a fetch failure from failing
       # builds whose lockfiles have not moved. The key covers this repository's
       # lockfiles; a dependency the cookbook fetches mid-build has its own lockfile,
       # so a changed key still falls back to an older cache (restore-keys) and Cargo
