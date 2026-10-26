@@ -259,6 +259,21 @@ fn run_userspace(token: &mut CleanLockToken) -> ! {
                     interrupt::enable_and_nop();
                 }
                 SwitchResult::AllContextsIdle => {
+                    // Ferric Oxide (issue #200): a wake-up in the local list means a context
+                    // became runnable after the switch's own drain. Halting would leave it
+                    // there until another interrupt, which on an otherwise idle (tickless)
+                    // system may never come. The wake-up IPI handler switches instead of
+                    // returning into the halt when it drained into an idling CPU; this check
+                    // covers a wake-up that arrived another way.
+                    if !crate::percpu::PercpuBlock::current()
+                        .switch_internals
+                        .local_wakeup_list
+                        .borrow()
+                        .is_empty()
+                    {
+                        interrupt::enable_and_nop();
+                        continue;
+                    }
                     // Enable interrupts, then halt CPU (to save power) until the next interrupt is actually fired.
                     interrupt::enable_and_halt();
                 }
