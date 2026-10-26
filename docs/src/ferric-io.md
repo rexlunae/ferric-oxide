@@ -293,6 +293,21 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   thread's queue pair still serves one request at a time (its thread context
   and bounce buffer are shared): `MainQueue` requests queue for it on an
   async lock.
+- A client's submissions reach driver-block through its disk ring
+  (`redox-rings` shared queues; redoxfs is the main client). When the ring
+  worker finds the submission queue empty it sets its waiting bit in the
+  queue's head, re-checks the tail and waits for an event on the ring's pipe;
+  a client that sees the bit after pushing writes one byte to the pipe. The
+  pipe bytes do not pair up with pops: a submission that arrives while the
+  worker is still spinning or re-checking is popped with no byte written,
+  and a client can write several bytes before the worker wakes. So the worker
+  opens the pipe non-blocking and drains it after each event
+  (`RingEventSource`), instead of a blocking one-byte read after every pop,
+  which could stop the whole executor on an empty pipe with the request
+  unserved. Both sides fence between storing their own index and reading the
+  other's (the waiting-bit handshake in
+  [rexlunae/redox-rings#1](https://github.com/rexlunae/redox-rings/pull/1),
+  with stress tests and loom models there).
 - On QEMU, spilling overlapping requests to per-CPU workers cannot beat one
   queue. The emulated controller serves all its queues from one thread, and
   each hand-off costs cross-CPU wake-ups. With `Adaptive` served
