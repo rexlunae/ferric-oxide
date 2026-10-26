@@ -5,6 +5,9 @@
 # Usage: check-blkgrant-log.sh MODE LOG
 #   MODE is how the boot ran, as for check-iommu-log.sh: none (no IOMMU), auto, enforce,
 #   amdvi or amdvi-enforce.
+#   BLKGRANT_AB=report reports a failed queue-policy A/B as a warning instead of failing:
+#   for the boot with x2APIC hidden (image.yml), whose interrupt cost is the emulated
+#   xAPIC's, not nvmed's.
 #
 # With an IOMMU, nvmed (the NVMe controller at 00:04.0) must map the test's grants into the
 # DMA domain it bound (a 4 MiB read-write grant on two partition descriptors and a one-page
@@ -60,7 +63,11 @@ done
 if grep -aE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .* ab=fail" <<< "$clean"; then
     ab="$(grep -aoE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
     echo "::notice title=queue policy A/B ($mode)::$ab"
-    fail "nvmed's default queue policy is slower than its single queue in the same boot"
+    if [ "${BLKGRANT_AB:-enforce}" = report ]; then
+        echo "::warning::nvmed's default queue policy is slower than its single queue in the same boot (reported only: BLKGRANT_AB=report)"
+    else
+        fail "nvmed's default queue policy is slower than its single queue in the same boot"
+    fi
 fi
 
 case "$mode" in
