@@ -27,6 +27,22 @@ pub enum RateError {
     Zero,
 }
 
+impl core::fmt::Display for RateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Zero => f.write_str("a clock rate of zero"),
+        }
+    }
+}
+
+impl core::error::Error for RateError {}
+
+impl core::fmt::Display for TicksPerSecond {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} Hz", self.0)
+    }
+}
+
 impl TicksPerSecond {
     /// The rate `ticks_per_second`.
     ///
@@ -57,6 +73,29 @@ impl TicksPerSecond {
         } else {
             ticks as u64
         })
+    }
+
+    /// The fewest ticks that last at least `nanos` nanoseconds (rounded up, saturating
+    /// at [`Ticks::MAX`]): the interval a one-shot timer is programmed with, so it never
+    /// fires before the deadline it stands for.
+    pub const fn ticks_for_nanos_ceil(self, nanos: u64) -> Ticks {
+        let ticks = (nanos as u128 * self.0 as u128).div_ceil(crate::NANOS_PER_SEC as u128);
+        Ticks(if ticks > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            ticks as u64
+        })
+    }
+
+    /// `ticks` of this source as ticks of a source running at `other`, rounded up and
+    /// saturating: a TSC interval as a local APIC countdown that is not shorter.
+    pub const fn convert_ceil(self, ticks: u64, other: TicksPerSecond) -> u64 {
+        let out = (ticks as u128 * other.0 as u128).div_ceil(self.0 as u128);
+        if out > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            out as u64
+        }
     }
 
     /// How many nanoseconds `ticks` of this source are: a timestamps or
@@ -115,6 +154,40 @@ mod tests {
         assert_eq!(GHZ.nanos_for_ticks(4_292_000_000), 1_000_000_000);
         let max = ((u64::MAX as u128 * crate::NANOS_PER_SEC as u128) / 4_292_000_000u128) as u64;
         assert_eq!(GHZ.nanos_for_ticks(u64::MAX), max);
+    }
+
+    #[test]
+    fn ticks_for_nanos_ceil_is_the_fewest_ticks_that_are_not_early() {
+        let rate = TicksPerSecond::new(2_500_000_000).unwrap();
+        for ns in [0, 1, 2, 3, 999, 1_000, 12_345_678, 1 << 40] {
+            let ticks = rate.ticks_for_nanos_ceil(ns).get();
+            let exact_ns = ticks as u128 * crate::NANOS_PER_SEC as u128 / 2_500_000_000;
+            assert!(exact_ns >= ns as u128, "{ns} ns -> {ticks} ticks is early");
+            if ticks > 0 {
+                let shorter = (ticks - 1) as u128 * crate::NANOS_PER_SEC as u128 / 2_500_000_000;
+                assert!(
+                    shorter < ns as u128,
+                    "{ns} ns -> {ticks} ticks is not the fewest"
+                );
+            }
+        }
+        assert_eq!(GHZ.ticks_for_nanos_ceil(u64::MAX), Ticks::MAX);
+    }
+
+    #[test]
+    fn a_tsc_interval_becomes_an_apic_count_that_is_not_shorter() {
+        let tsc = TicksPerSecond::new(3_000_000_000).unwrap();
+        let apic = TicksPerSecond::new(1_000_000_000).unwrap();
+        assert_eq!(tsc.convert_ceil(3, apic), 1);
+        assert_eq!(tsc.convert_ceil(4, apic), 2);
+        assert_eq!(tsc.convert_ceil(0, apic), 0);
+        let max = TicksPerSecond::new(u64::MAX).unwrap();
+        assert_eq!(apic.convert_ceil(u64::MAX, max), u64::MAX);
+    }
+
+    #[test]
+    fn rates_display_in_hertz() {
+        assert_eq!(std::format!("{GHZ}"), "4292000000 Hz");
     }
 
     #[test]

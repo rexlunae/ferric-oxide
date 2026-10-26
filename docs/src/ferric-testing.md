@@ -322,8 +322,12 @@ futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
 posts the benchmark as a notice, and `check-iobench-log.sh` checks the disk
-benchmark's lines and A/B and writes its figures to the job summary. Read those
-scripts for the exact required marker set.
+benchmark's lines and A/B and writes its figures to the job summary.
+`check-oneshot-log.sh` checks that the BSP calibrated the TSC and chose a
+clock source, that each of the four CPUs fired every deadline of its one-shot
+timer lateness series, and that the BSP's selftest rounds passed
+(`kernel.time.one_shot`, on in the CI image), and posts the clock source and
+lateness as a notice. Read those scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
 (see [Kernel tracing](ferric-tracing.md#overhead-budget)). It discards each

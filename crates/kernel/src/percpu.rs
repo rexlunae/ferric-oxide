@@ -70,8 +70,17 @@ pub struct PercpuBlock {
 #[cfg(feature = "time_one_shot")]
 #[derive(Debug)]
 pub struct OneShotPercpu {
+    /// This CPU's timer backend, chosen at boot (`None` until then, or when it
+    /// has none).
+    pub backend: Cell<Option<ferric_timed::oneshot::Backend>>,
     /// Which deadline (if any) the hardware has, with the rearm logic.
     pub armed: ferric_timed::ArmedDeadline,
+    /// The armed deadline as a TSC reading, for the handler's due check.
+    pub tsc_deadline: Cell<u64>,
+    /// How late the last fire was served, in nanoseconds.
+    pub late_ns: Cell<u64>,
+    /// Early countdown interrupts re-armed since the selftest reset it.
+    pub early: Cell<u32>,
     /// Whether a fire happened since the last consume.
     pub fired: core::sync::atomic::AtomicBool,
     /// How many timer interrupts this CPU's handler has seen (diagnostics).
@@ -85,7 +94,11 @@ impl OneShotPercpu {
     /// A disarmed one-shot: nothing armed, nothing fired, nothing to restore.
     pub const fn new() -> Self {
         Self {
+            backend: Cell::new(None),
             armed: ferric_timed::ArmedDeadline::new(),
+            tsc_deadline: Cell::new(0),
+            late_ns: Cell::new(0),
+            early: Cell::new(0),
             fired: core::sync::atomic::AtomicBool::new(false),
             entries: core::sync::atomic::AtomicU64::new(0),
             previous_lvt: Cell::new(u32::MAX),

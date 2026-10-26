@@ -444,6 +444,88 @@ crate::events! {
         level: Debug,
         args: ["scheme", "count", "bytes"],
     }
+
+    /// The periodic scheduler tick advanced time on this CPU: the x86 PIT interrupt
+    /// handler just added one `pit::RATE` to `time::OFFSET`, and will broadcast the
+    /// `Pit` IPI, trigger time-scheme timeouts and call the scheduler's tick
+    /// accounting. One record per PIT interrupt, on the CPU that owns the PIT (the
+    /// BSP). Together with `sched.ipi_pit` it counts the periodic timer interrupts
+    /// the tickless work must stop.
+    pub const SCHED_TICK = 33 {
+        name: "sched.tick",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received the periodic `Pit` broadcast IPI the BSP sends after each
+    /// `sched.tick`, and is about to run the scheduler's tick accounting. One record
+    /// per pit IPI, on every non-BSP CPU.
+    pub const SCHED_IPI_PIT = 34 {
+        name: "sched.ipi_pit",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received a `Wakeup` IPI and is about to drain the cross-CPU wakeup
+    /// list into its local wakeup list: the number of contexts that were on the
+    /// cross-CPU list. The scheduler can only consider these wakeups when an
+    /// interrupt arrives, so busy CPUs whose interrupts are disabled can run stale
+    /// run queues until the next periodic tick or targeted IPI.
+    pub const SCHED_IPI_WAKE = 35 {
+        name: "sched.ipi_wake",
+        subsystem: Sched,
+        level: Info,
+        args: ["drained"],
+    }
+
+    /// A counter's rate was measured at boot (`kernel.time.one_shot`): which counter
+    /// (1 the TSC, once on the BSP; 2 this CPU's local APIC countdown timer), its rate in
+    /// Hz, the reference it was measured against (1 the HPET, 2 the PIT, 3 the TSC, 4 the
+    /// KVM clock) and how far the calibration windows disagreed, in parts per million.
+    pub const SCHED_TIMER_CALIBRATE = 36 {
+        name: "sched.timer_calibrate",
+        subsystem: Sched,
+        level: Info,
+        args: ["counter", "hz", "reference", "spread_ppm"],
+    }
+
+    /// This CPU armed its one-shot timer (`kernel.time.one_shot`): the deadline in
+    /// monotonic nanoseconds, the backend (1 TSC-deadline, 2 local APIC countdown), the value written
+    /// (the TSC deadline or the initial count) and flags: bit 0 the deadline was already
+    /// past or closer than the minimum lead, so the timer fires as soon as it can; bit 1
+    /// the interval did not fit a countdown, which will end early and be re-armed.
+    pub const SCHED_TIMER_ARM = 37 {
+        name: "sched.timer_arm",
+        subsystem: Sched,
+        level: Info,
+        args: ["deadline", "backend", "value", "flags"],
+    }
+
+    /// This CPU's one-shot timer interrupted (`kernel.time.one_shot`): the deadline it was
+    /// armed for (monotonic nanoseconds), how many nanoseconds after it the handler ran, and
+    /// `early` 1 when it came before the deadline instead (`late_ns` is then the time left
+    /// and the timer is re-armed for the same deadline). Lateness covers interrupt delivery
+    /// and the time interrupts were disabled on this CPU.
+    pub const SCHED_TIMER_FIRE = 38 {
+        name: "sched.timer_fire",
+        subsystem: Sched,
+        level: Info,
+        args: ["deadline", "late_ns", "early"],
+    }
+
+    /// A context woken from a blocked state was switched in on this CPU: its process id and
+    /// debug id, and how long it waited between being made runnable and running, in the
+    /// trace clock's units (the `clock` file says which). This is the wake-to-run latency the
+    /// tickless work and the per-CPU driver workers are judged by. A context woken while
+    /// still running (a wake-up before its block took effect) has no record.
+    pub const SCHED_WAKE_RUN = 39 {
+        name: "sched.wake_run",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "id", "wait"],
+    }
 }
 
 /// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
@@ -719,6 +801,13 @@ mod tests {
         assert_eq!(MM_CLONE.id().get(), 28);
         assert_eq!(MM_DESTROY.id().get(), 29);
         assert_eq!(MM_CLONE_SKIP.id().get(), 30);
+        assert_eq!(SCHED_TICK.id().get(), 33);
+        assert_eq!(SCHED_IPI_PIT.id().get(), 34);
+        assert_eq!(SCHED_IPI_WAKE.id().get(), 35);
+        assert_eq!(SCHED_TIMER_CALIBRATE.id().get(), 36);
+        assert_eq!(SCHED_TIMER_ARM.id().get(), 37);
+        assert_eq!(SCHED_TIMER_FIRE.id().get(), 38);
+        assert_eq!(SCHED_WAKE_RUN.id().get(), 39);
         assert_eq!(SCHEME_SQE_DELIVER.id().get(), 31);
         assert_eq!(SCHEME_SQE_DELIVER.subsystem(), Subsystem::Scheme);
         assert_eq!(SCHEME_CQE_RECEIVE.id().get(), 32);

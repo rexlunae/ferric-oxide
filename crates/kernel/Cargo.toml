@@ -28,7 +28,7 @@ ferric-pcache = { path = "../pcache", features = ["alloc"], optional = true }
 ferric-procinfo = { path = "../procinfo", features = ["alloc"], optional = true }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
 ferric-ring = { path = "../ring", optional = true, features = ["alloc"] }
-ferric-timed = { path = "../timed" }
+ferric-timed = { path = "../timed", optional = true }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
@@ -134,9 +134,9 @@ trace_scheme = ["trace"]
 trace_mm = ["trace"]
 trace_irq = ["trace"]
 trace_iommu = ["trace"]
-# Ferric Oxide: per-CPU one-shot scheduler timers (TSC-deadline LAPIC) and the boot
-# selftest (kernel.time.one_shot).
-time_one_shot = []
+# Ferric Oxide: the continuous TSC/HPET clock source, per-CPU one-shot scheduler timers
+# (LAPIC TSC-deadline or a calibrated countdown) and their boot selftest (kernel.time.one_shot).
+time_one_shot = ["dep:ferric-timed"]
 # Ferric Oxide: a panic leaves its message and the newest trace records in reserved memory that
 # survives a warm reboot, served by kernel.trace/crash on the next boot.
 trace_crash = ["trace"]

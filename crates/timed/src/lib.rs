@@ -17,6 +17,14 @@
 //!   one-shot rearm protocol: arming a later deadline is a no-op, arming an
 //!   earlier one says "the hardware must be reprogrammed", and a disarm plus
 //!   an explicit due recheck never drops an already-due deadline.
+//! - [`calibrate`](mod@calibrate) measures a counter's rate (the TSC, a local APIC
+//!   timer) against a reference (the HPET, the PIT, the KVM clock) over several windows,
+//!   extending narrow references past their wrap ([`calibrate::WrappingCounter`]) and
+//!   refusing windows that disagree.
+//! - [`oneshot`] turns a nanosecond interval into what a local APIC timer is programmed
+//!   with (a TSC-deadline value, or a one-shot countdown at a calibrated rate) and
+//!   classifies a timer interrupt as due or early.
+//! - [`selftest`] is the per-CPU lateness series of the boot selftest.
 //!
 //! The shared deadline service (#187) and the async executor binding (#181)
 //! build their earliest-deadline queues on the same types.
@@ -32,7 +40,13 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+extern crate std;
+
+pub mod calibrate;
+pub mod oneshot;
 pub mod rate;
+pub mod selftest;
 
 use core::cmp::Ordering;
 use core::fmt;
