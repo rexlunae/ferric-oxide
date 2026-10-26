@@ -948,10 +948,17 @@ since they were last clean) and says which are due, oldest first, and `flush`
 writes one object back, run by run in page order from page 0, each run
 starting where the last one ended, so a writer dirtying pages behind the pass
 does not keep it going; a run that fails is answered as failed and the pass
-goes on, and the failures are counted. `flush_run` writes one run, the one a
-run record names. `client` has the calls and
+goes on, and the failures are counted. `flush_run` writes the next dirty run at or after the
+record's starting page. `client` has the calls and
 `spawn_flush_timer`, a thread that wakes the file system once a second while
 some object is dirty.
+
+A page-cache sequential-write run notification is a starting hint, rather than
+an exact range restriction. If fsync or another pass cleaned its pages while
+the record waited in the pump, `flush_run` may take the next dirty run at or
+after that start, including newer pages beyond the recorded range. It still
+performs only one take, bounded to 1024 pages, and concurrent rewrites remain
+dirty. The host writeback regression covers this delayed-record ordering.
 
 Before arming the age timer for a writeback record, RedoxFS queries the object's
 current dirty-page count (`Request::DirtyPages`, verb 13, no payload). A record

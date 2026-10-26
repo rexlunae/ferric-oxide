@@ -352,6 +352,8 @@ pub enum WritebackReason {
     /// A sequential writer has dirtied a run of the object's pages, the record's pages
     /// ([`STREAM_RUN_PAGES`] or more): write one run back now, from the record's first page
     /// (`writeback::flush_run`), while the writer goes on.
+    /// Its page range is a starting hint: the consumer may take one later dirty run
+    /// when an intervening flush already cleaned the originally named pages.
     Run,
 }
 

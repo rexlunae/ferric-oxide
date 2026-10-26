@@ -684,3 +684,8 @@ the first dirty time, and another dirty file keeps its timer. ABI tests cover
 the `DirtyPages` request and reject extra metadata/packed flags. CI compiles
 the RedoxFS client and kernel query together; the writeback-enabled image's
 fsync, age, mapping and truncation smoke checks cover target integration.
+
+The shared page-cache writeback tests also cover delayed sequential-run hints:
+an intervening flush cleans the recorded pages, then the hint writes just one
+later dirty run while a concurrent rewrite remains dirty. This pins the
+intentional start-hint semantics and the take-size work bound.
