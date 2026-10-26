@@ -2,9 +2,8 @@
 //! do, on a FAT volume read by `fatfs`.
 //!
 //! Handles are numbers the scheme gives its clients. Each names an open file or directory
-//! with its path from the volume's root, so relative opens and `fpath` work. A path is first
-//! resolved as text ([`ferric_fspath::normalize`]): FAT has no symbolic links, so `..` always
-//! means the parent the path names. Each component is then looked up in its directory the
+//! with its path from the volume's root, so relative opens and `fpath` work. A path is
+//! resolved one component at a time, in order: each name is looked up in its directory the
 //! way the FAT specification asks, ignoring case and matching either the long name or the
 //! 8.3 short name, and the handle keeps the names as the directory stores them. So
 //! `/efi/boot/bootx64.efi` opens `/EFI/BOOT/BOOTX64.EFI`, and both get the same inode number.
@@ -358,10 +357,17 @@ impl<'v, D: Device> Fs<'v, D> {
             }
             _ => "/",
         };
-        if path.len() > PATH_MAX {
+        // The path as resolved, base included: a short name relative to a deep directory
+        // can still be too long.
+        let combined = if path.starts_with('/') {
+            path.len()
+        } else {
+            start.len() + 1 + path.len()
+        };
+        if combined > PATH_MAX {
             return Err(Error::PathTooLong);
         }
-        let (path, found) = self.resolve(&normalize(start, path))?;
+        let (path, found) = self.resolve(start, path)?;
         let attributes = match &found {
             Found::Root => Attributes::root(self.cluster_size),
             Found::Entry(entry) => Attributes::of(entry, &path, self.cluster_size),
@@ -485,25 +491,45 @@ impl<'v, D: Device> Fs<'v, D> {
         Err(Error::ReadOnly)
     }
 
-    /// Looks up each component of the normalized `path` from the root. Returns the path with
-    /// the names as stored, and what it names.
-    fn resolve(&self, path: &str) -> Result<(String, Found<'v, D>), Error> {
-        let mut stored = String::new();
-        let mut found = Found::Root;
-        for component in path.split('/').filter(|c| !c.is_empty()) {
-            let dir = match &found {
-                Found::Root => self.volume.root_dir(),
-                Found::Entry(entry) if entry.is_dir() => entry.to_dir(),
-                Found::Entry(_) => return Err(Error::NotADirectory),
+    /// Resolves `path` from the directory `start` (from the root when `path` is absolute),
+    /// one component at a time and in order, as POSIX does: each name is looked up in the
+    /// directory reached so far, `..` goes back to that directory's parent, and any component
+    /// after a file (`..` and `.` included) fails with [`Error::NotADirectory`]. So
+    /// `/hello.txt/../EFI` is `ENOTDIR` and `/missing/../EFI` is `ENOENT`, not `/EFI`.
+    /// Returns the path with the names as stored, and what it names.
+    fn resolve(&self, start: &str, path: &str) -> Result<(String, Found<'v, D>), Error> {
+        let start = if path.starts_with('/') { "" } else { start };
+        let components = start.split('/').chain(path.split('/'));
+        // The entries from the root to where the walk is; empty at the root.
+        let mut walked: Vec<(String, DirEntry<'v, D>)> = Vec::new();
+        for component in components {
+            let dir = match walked.last() {
+                None => self.volume.root_dir(),
+                Some((_, entry)) if entry.is_dir() => entry.to_dir(),
+                Some(_) => return Err(Error::NotADirectory),
             };
-            let entry = lookup(&dir, component)?;
+            match component {
+                "" | "." => {}
+                ".." => {
+                    walked.pop();
+                }
+                name => {
+                    let entry = lookup(&dir, name)?;
+                    walked.push((entry.file_name(), entry));
+                }
+            }
+        }
+        let mut stored = String::new();
+        for (name, _) in &walked {
             stored.push('/');
-            stored.push_str(&entry.file_name());
-            found = Found::Entry(entry);
+            stored.push_str(name);
         }
         if stored.is_empty() {
             stored.push('/');
         }
+        let found = walked
+            .pop()
+            .map_or(Found::Root, |(_, entry)| Found::Entry(entry));
         Ok((stored, found))
     }
 

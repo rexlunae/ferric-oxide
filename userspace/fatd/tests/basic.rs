@@ -340,3 +340,50 @@ fn other_bytes_are_not_mounted() {
     // Without the boot signature, the boot sector is refused.
     assert!(matches!(mount(Memory::new(unsigned)), Err(Error::Mount(_))));
 }
+
+#[test]
+fn components_resolve_in_order() {
+    for (_, volume) in volumes() {
+        let mut fs = Fs::new(&volume);
+        let read = OpenMode::read();
+        let errno = |r: Result<usize, Error>| r.unwrap_err().errno();
+        // `..` after a file, or after a name that is not there, is not skipped as text.
+        assert_eq!(errno(fs.open(None, "/hello.txt/../EFI", read)), ENOTDIR);
+        assert_eq!(errno(fs.open(None, "/hello.txt/.", read)), ENOTDIR);
+        assert_eq!(errno(fs.open(None, "/hello.txt/", read)), ENOTDIR);
+        assert_eq!(errno(fs.open(None, "/missing/../EFI", read)), ENOENT);
+        // A `..` after a directory goes back up.
+        let up = fs.open(None, "/dir/../EFI/BOOT", read).unwrap();
+        assert_eq!(fs.path(up).unwrap(), "/EFI/BOOT");
+        let dir = fs.open(None, "/dir", read).unwrap();
+        let file = fs.open(None, "/hello.txt", read).unwrap();
+        // A relative open from a file's handle is refused before any lookup.
+        assert_eq!(errno(fs.open(Some(file), "../EFI", read)), ENOTDIR);
+        let back = fs.open(Some(dir), "../dir/./nested.txt", read).unwrap();
+        assert_eq!(fs.path(back).unwrap(), "/dir/nested.txt");
+    }
+}
+
+#[test]
+fn the_length_limit_counts_the_base_directory() {
+    use fatd::fs::PATH_MAX;
+    use syscall::error::ENAMETOOLONG;
+    let volume = mount(Memory::new(load("fat16.img.gz"))).unwrap();
+    let mut fs = Fs::new(&volume);
+    let read = OpenMode::read();
+    // 4092 bytes of `./`: within the limit from the root, over it from `/dir`.
+    let relative = "./".repeat(2046);
+    let root = fs.root().unwrap();
+    let dir = fs.open(None, "/dir", read).unwrap();
+    assert!(1 + 1 + relative.len() <= PATH_MAX);
+    let same = fs.open(Some(root), &relative, read).unwrap();
+    assert_eq!(fs.path(same).unwrap(), "/");
+    assert!("/dir".len() + 1 + relative.len() > PATH_MAX);
+    let err = fs.open(Some(dir), &relative, read).unwrap_err();
+    assert_eq!(err.errno(), ENAMETOOLONG);
+    let absolute = format!("/{}", "x".repeat(PATH_MAX));
+    assert_eq!(
+        fs.open(Some(dir), &absolute, read).unwrap_err().errno(),
+        ENAMETOOLONG
+    );
+}
