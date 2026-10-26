@@ -251,7 +251,9 @@ impl Handle {
     }
 }
 
-static CPUS: Once<Vec<u8>> = Once::new();
+/// The MADT's local APICs as (ACPI processor UID, APIC ID); `irq:` lists the UIDs (Ferric Oxide:
+/// the APIC ID is kept to leave out the profiler CPU, see [`is_profiler_apic`]).
+static CPUS: Once<Vec<(u8, u8)>> = Once::new();
 
 pub struct IrqScheme;
 
@@ -267,17 +269,17 @@ impl IrqScheme {
                 Some(madt) => madt
                     .iter()
                     .filter_map(|entry| match entry {
-                        MadtEntry::LocalApic(apic) => Some(apic.processor),
+                        MadtEntry::LocalApic(apic) => Some((apic.processor, apic.id)),
                         _ => None,
                     })
                     .collect::<Vec<_>>(),
                 None => {
                     crate::warn!("no MADT found, defaulting to 1 CPU");
-                    alloc::vec![0]
+                    alloc::vec![(0, 0)]
                 }
             }
         } else {
-            alloc::vec![0]
+            alloc::vec![(0, 0)]
         };
 
         CPUS.call_once(|| cpus);
@@ -408,8 +410,39 @@ fn listed_cpus() -> Vec<u8> {
     }
     #[cfg(not(all(feature = "irq-percpu", target_arch = "x86_64")))]
     {
-        CPUS.get().expect("IRQ scheme not initialized").clone()
+        CPUS.get()
+            .expect("IRQ scheme not initialized")
+            .iter()
+            .filter(|&&(_, apic)| !is_profiler_apic(apic))
+            .map(|&(uid, _)| uid)
+            .collect()
     }
+}
+
+/// Ferric Oxide: whether local APIC `apic` is the `profiling` feature's profiler CPU, which
+/// `cpu-XX` refuses to open (#214), so the MADT listing leaves it out as well.
+#[cfg(all(
+    feature = "profiling",
+    not(all(feature = "irq-percpu", target_arch = "x86_64")),
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn is_profiler_apic(apic: u8) -> bool {
+    crate::percpu::all_percpu_blocks().any(|block| {
+        crate::profiling::is_profiler_cpu(block.cpu_id)
+            && block.misc_arch_info.apic_id_opt.get().map(|id| id.get()) == Some(u32::from(apic))
+    })
+}
+
+/// Without `profiling` (or off x86) there is no profiler CPU to leave out.
+#[cfg(all(
+    not(all(
+        feature = "profiling",
+        any(target_arch = "x86", target_arch = "x86_64")
+    )),
+    not(all(feature = "irq-percpu", target_arch = "x86_64"))
+))]
+fn is_profiler_apic(_apic: u8) -> bool {
+    false
 }
 
 /// Ferric Oxide (`irq-percpu`): the contents of `irq:cpus`, a [`ferric_irq::CpuEntry`] line for
