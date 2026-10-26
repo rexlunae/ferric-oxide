@@ -61,9 +61,9 @@ jobs:
       - name: Install cbindgen
         run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
-      # Several crates (relibc's, redoxfs's) have git dependencies on gitlab.redox-os.org.
+      # Several crates (relibc's, redoxfs's) have git dependencies (Ferric mirrors on GitHub).
       # Cargo only fetches a git dependency when its locked commit is missing from
-      # ~/.cargo/git/db, so caching that directory keeps a GitLab outage from failing
+      # ~/.cargo/git/db, so caching that directory keeps a fetch failure from failing
       # builds whose lockfiles have not moved. The key covers this repository's
       # lockfiles; a dependency the cookbook fetches mid-build has its own lockfile,
       # so a changed key still falls back to an older cache (restore-keys) and Cargo
@@ -763,6 +763,10 @@ jobs:
               if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
                 failed=1
                 echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
+                # The boot's own output went to /dev/null above, and the annotation keeps
+                # only the last markers: print every failed test with the 40 lines before
+                # it, so a failure early in the boot can be read from the job log.
+                scripts/ferric-ci/print-test-fails.sh "$log.clean" "$image boot $run"
               fi
               # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
               if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then

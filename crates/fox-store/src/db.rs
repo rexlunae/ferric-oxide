@@ -96,7 +96,7 @@ pub enum PackageState {
 }
 
 impl PackageState {
-    fn is_installed(&self) -> bool {
+    pub(crate) fn is_installed(&self) -> bool {
         *self == Self::Installed
     }
 }

@@ -91,7 +91,7 @@ The in-tree [system documentation](docs/src/ferric-oxide.md) describes the imple
 - [Running in a Virtual Machine](https://doc.redox-os.org/book/running-vm.html) and on [Real Hardware](https://doc.redox-os.org/book/real-hardware.html)
 - [Developer FAQ](https://doc.redox-os.org/book/developer-faq.html)
 
-Internal names such as the `x86_64-unknown-redox` target, `relibc`, `RedoxFS` and the `redox` paths in the build system are unchanged for now, so that the fork keeps building and can keep pulling fixes from upstream.
+Internal names such as the `x86_64-unknown-redox` target, `relibc`, `RedoxFS` and the `redox` paths in the build system are unchanged, because the Rust targets, existing tools and imported code depend on them.
 
 ## Contributing
 
@@ -99,9 +99,9 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [AI Contribution Policy](A
 
 ## Components
 
-The kernel, bootloader, relibc, base, RedoxFS and book are imported upstream trees. Host tools live under `tools/` and share the root Cargo workspace. Other packages still come from upstream recipes.
+The kernel, bootloader, relibc, base, RedoxFS and book were imported from Redox OS with their history and are now maintained here; Ferric Oxide does not sync from Redox. Host tools live under `tools/` and share the root Cargo workspace. Other packages still come from upstream recipes.
 
-| Component | Upstream repository |
+| Component | Originally from |
 |-----------|---------------------|
 | Kernel ([local](crates/kernel/)) | [redox-os/kernel](https://gitlab.redox-os.org/redox-os/kernel) |
 | Base (essential system components and drivers) | [redox-os/base](https://gitlab.redox-os.org/redox-os/base) |
@@ -132,9 +132,8 @@ cookbook, preserving their copyright notices:
 | `tools/installer` | `b5a11310e1ac915494efea6d18e242966da74f3f` |
 | `tools/redoxer` | `f50e0d7f490b60110ee6494a06d9b2f9981f8a5a` |
 
-These two snapshots are not yet registered with the subtree-sync workflow.
-Keep fork changes local so their upstream history can be attached when the
-imports are committed. The root lockfile controls host builds; the installer's
+These two snapshots were imported without their upstream history and are
+maintained here like the other imported trees. The root lockfile controls host builds; the installer's
 upstream lockfile and ring patch remain for the separate target recipe build.
 Its dependency versions also remain standalone for that recipe. The imported
 installer uses Rust 2024, and both host libraries enforce public API documentation.

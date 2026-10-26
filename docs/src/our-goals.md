@@ -1,65 +1,140 @@
 # Our Goals
 
-Redox is an attempt to make a complete, fully-functioning, general-purpose operating system with a focus on safety, freedom, stability, correctness, and pragmatism.
+Ferric Oxide aims to be a complete, general-purpose operating system written
+in Rust that is fast enough to choose on its merits. It keeps the safety and
+isolation of a microkernel and works to remove the performance cost that has
+historically come with one.
 
-We want to be able to use it, without obstructions, as a complete alternative to Linux/BSD on our computers. It should be able to run most Linux/BSD programs with minimal modifications.
+The [Roadmap](./ferric-roadmap.md) turns these goals into phases with
+testable exit criteria; [`ROADMAP.md`](https://github.com/rexlunae/ferric-oxide/blob/main/ROADMAP.md)
+tracks progress. This page explains what the goals are and why.
 
-We're aiming towards a complete, stable, and safe Rust ecosystem. This is a design choice, which hopefully improves correctness and security (see the [Why Rust](./why-rust.md) page).
+## Performance you can measure
 
-We want to improve the security design when compared to other Unix-like operating systems by using safe defaults and limiting insecure configurations where possible.
+Performance is the reason the fork exists. Kernel, scheduler, file system and
+network changes are judged by benchmarks, and regressions are bugs. The
+targets are stated against Linux on the same hardware: for example, the
+Phase 2 exit asks for NVMe 4K random reads at queue depth 32 to reach at least
+80% of Linux io_uring with IOMMU enforcement on.
 
-### Complete Alternative to Linux/BSD
+Today the project has the measurement tools (kernel tracing with an overhead
+budget enforced in CI, `ferric-iobench` for fio-style disk jobs, network queue
+benchmarks), but the comparison against Linux on reference hardware has not
+been run yet. No performance claim is made without numbers.
 
-Redox has its own kernel, drivers and filesystem written in Rust. The driver implementations are complete for QEMU, and [some hardware](./hardware-support.md) are known to work well. In terms of CPU architectures, Redox aims to have equal support for three major architectures: x86 (32 and 64 bit), ARM (64 bit) and RISC-V (64 bit).
+## A microkernel without the IPC tax
 
-Redox can run C, C++ and Rust programs with the aid of [relibc](https://gitlab.redox-os.org/redox-os/relibc), an almost [POSIX-compliant C Standard Library](https://en.wikipedia.org/wiki/C_POSIX_library) written in Rust. Relibc has the goal to support most C, C++ and Rust based software. Many programs and libraries can be built and executed without any patches, some maybe need patches to workaround some functions, especially if it relies on non-POSIX functions.
+A microkernel moves drivers and file systems into user space, where a crash
+or exploit is contained. The usual cost is that every I/O request travels
+through the kernel several times and its data is copied between processes.
+Ferric Oxide's approach is to keep file descriptors as the **control plane**
+(they name a resource and carry the permission to use it) while moving the
+**data plane** onto shared memory:
 
-Redox can also run GUI programs running on top of [Orbital](https://gitlab.redox-os.org/redox-os/orbital). C, C++ and Rust programs can draw windows with the help of [`orbclient`](https://gitlab.redox-os.org/redox-os/orbclient/) and [`liborbital`](https://gitlab.redox-os.org/redox-os/liborbital/) (our official Orbital client libraries).
+- **IOMMU domains** (implemented, off by default) so a user-space driver can
+  DMA only into memory it was given, which is what makes unprivileged drivers
+  actually safe.
+- **Registered buffers** (implemented, off by default) that an application
+  registers once and grants, revocably, to the services handling its requests,
+  so a device can DMA straight into the application's memory.
+- **Submission and completion rings** (implemented for kernel-brokered
+  operations, off by default) so the steady-state I/O path needs few or no
+  system calls.
+- **Per-core queues and interrupt steering** for NVMe, **kernel-bypass
+  network queues** and a **shared page cache** (partly implemented; see
+  [Implemented System](./ferric-oxide.md#implementation-status)).
+- A **kernel-colocated driver tier** for a few hot drivers, isolated by safe
+  Rust and protection keys and fenced by the IOMMU (planned).
 
-Both system services and drivers are working well to run [important programs](./important-programs.md). We aim to have more POSIX and Linux compatibility to port more programs and attract more users.
+The design is in [Registered Buffers, IOMMUs and Rings](./ferric-io.md) and
+Phase 2 of the roadmap.
 
-### Rust Ecosystem
+## Modern hardware only
 
-Rust officially supports Redox as both Tier II and Tier III [platforms](https://doc.rust-lang.org/nightly/rustc/platform-support/redox.html). The Rust community has accepted Redox-specific code for years. Some well-known Rust libraries (crates) that supports Redox are [`winit`](https://github.com/rust-windowing/winit/), [`nix`](https://github.com/nix-rust/nix), [`rustix`](https://github.com/bytecodealliance/rustix), and many more. These crates are backed by either [Rust's C Standard Library Bindings](https://github.com/rust-lang/libc) or a specific implementation of the [Rust Standard Library](https://doc.rust-lang.org/std/). We upstream changes into these libraries as the system get new features.
+Ferric Oxide targets machines made in roughly the last decade. The default
+x86 user-space baseline is **x86-64-v3** (AVX2, BMI1/2, FMA), with an optional
+**x86-64-v4** (AVX-512) build. Boot is UEFI only. ARM64 (ARMv8.0 and later) is
+the second architecture. i586, BIOS boot and older CPUs are not supported, and
+RISC-V is frozen until someone needs it.
 
-Libraries using Rust libc are statically linked with relibc at compile-time. By this design choice, compiling any Rust program to Redox requires relibc available at linking time. While it seems like an inconvenience, it allows us to do quick development without having to push changes each time relibc is improved. To alleviate this "inconvenience", we have [`redoxer`](https://crates.io/crates/redoxer) to allow developers to compile and test Rust programs into Redox without using our complete build system.
+Requiring modern hardware lets the kernel rely on features such as NX, SMEP,
+SMAP, PCID, XSAVE, x2APIC and an IOMMU instead of carrying fallbacks, and use
+CET, protection keys and AVX-512 where they exist. See
+[Hardware Support](./hardware-support.md).
 
-### Security Design
+## Security in depth
 
-The Redox kernel is a microkernel influenced by [some operating systems](./influences.md), thus many system services have been moved from the kernel to userspace daemons or drivers. Both drivers and system services are normal programs in userspace with higher permissions in a special namespace which allows them to access hardware interrupts managed by the kernel.
+Rust removes whole classes of memory errors, but not all of them, and not in
+`unsafe` code or hardware. Ferric Oxide therefore also uses conventional
+mitigations: KASLR, user ASLR, guard pages, KPTI where the CPU needs it,
+Spectre v1 hardening, and optional CET indirect-branch tracking and shadow
+stacks in the kernel. These are implemented; see
+[Memory and CPU Protection](./ferric-memory.md).
 
-All programs including the kernel, drivers and system services are talking to each other using an IPC system called "Scheme". Schemes live inside the `/scheme` filesystem directory and any program can access or create it using the standard file API. For more advanced usage software can use `libredox` and many other `redox-*` crates, detailed in [another page](./libraries-apis.md#crates).
+The next step is finishing the **capability model** (planned, Phase 4):
+replacing the remaining "is this root?" checks with explicit capability file
+descriptors, starting every system service sandboxed with a declared
+manifest, and a measured boot chain with TPM-sealed disk unlock.
 
-Schemes are secured mainly by namespaces. One namespace is invisible to another one. In case of programs talking to each other in the same namespace, the kernel and drivers use caller user ID or group ID, similar to Linux having `sudo`, but we're about to change it into [Capability-based security](https://en.wikipedia.org/wiki/Capability-based_security) in the near future.
+## Fit into the systems people already run
 
-## The non-goals of Redox
+- **Linux disks:** read ext4, LVM2 and LUKS volumes (implemented, read-only),
+  then write ext4 and XFS (planned), all written clean-room from published
+  format specifications so the project stays MIT licensed.
+- **Linux software:** run C and C++ programs through relibc, and run code that
+  needs a different OS's security model unmodified inside lightweight VMs
+  ("enclaves", planned in Phase V; the hardware formats and VM interface are
+  prepared).
+- **Rust software:** the Rust standard library and major crates already
+  support the `redox` targets, which Ferric Oxide keeps.
 
-We are not a Linux/BSD replacement, clone, or fully POSIX-compliant, nor crazy scientists who wish to redesign everything. Generally we stick to well-tested and proven correct designs: If it's not broken, don't fix it.
+## Packages you can verify
 
-It means that a large number of programs and libraries will be compatible with Redox. Some things that do not align with our design decisions will have to be ported.
+`fox` replaces Redox's `pkg` as the target package manager. Packages are built
+from git sources with Cargo, prebuilt binaries are protected by hashes and
+signed build attestations, registries are signed git repositories, and every
+package carries a CycloneDX SBOM. Local archives, signed git sources,
+registries, advisories and package sets are implemented; an official registry,
+dependency resolution and rollback are not yet. See
+[Package Tooling: fox](./ferric-packaging.md).
 
-The key here is the trade off between correctness and compatibility. Ideally, you should be able to achieve both, but unfortunately, you can't always do so.
+## Observable by default
 
-### Software Ports That Are Non-Goals
+A system you can't see into is a system you can't tune. Kernel tracing
+(implemented, off by default) provides typed tracepoints with build-time,
+boot-time and run-time switches, Perfetto and OpenTelemetry export, crash
+dumps that survive a warm reboot and flamegraphs from sampling profiles. See
+[Kernel Tracing](./ferric-tracing.md).
 
-Redox aims to support most software, especially that which is important. Software that is not ported is either:
+## A WebAssembly userland (goal)
 
-1. Not open source or libre, or known to have legal problems
-2. No longer maintained (depending on importance we can fork and maintain it) or there's a better alternative
-3. Only using non-portable APIs like the Linux kernel or Windows
-4. Has a lack of users and maintainers
-5. The program language compiler lacks Redox support
+The long-term goal is for most user programs to ship as WebAssembly (wasm32
+by default, wasm64 for programs that need more than 4 GiB), validated and
+compiled for the exact CPU by a trusted compiler service, with native code as
+an explicit exception list. This would give software-isolated processes, one
+package for every CPU level and architecture, and capabilities by
+construction. It is the most research-heavy part of the plan and is gated on
+benchmarks. Only the import ABI and code-cache formats exist so far; see
+[WebAssembly Interfaces](./ferric-wasm.md).
 
-A well known example of software being too complicated to port is Chromium as it's heavily tuned to use OS-specific function calls and doesn't accept OS support beyond Linux in upstream, FreeBSD has to maintain [hundreds of patches](https://github.com/freebsd/freebsd-ports/tree/main/www/chromium/files) to make sure it's working. It's easier for us to port less complicated alternatives like Firefox, WebKit and Servo given that our limited resources are better spent on improving Redox itself.
+## Configurable, not forked per use case
 
-This doesn't stop us from porting more programs even if they are non-POSIX. For example, Wayland is challenging to port as it depends on many Linux features. But given enough time, it will become available in Redox, just like how X11 is working on Redox.
+Anything a user might want on or off (a driver tier, tracing, a CPU level, a
+file system) is an option in `features.toml`, chosen in `ferric.toml` with
+`make menuconfig` or the `ferric-config` CLI. One tree serves the server,
+workstation and test images.
 
-### System Designs That Are Non-Goals
+## Non-goals
 
-Redox aims to have the answer to every system design challenge if possible. However, correctness and security is our top priority next to other aspect like "performance", "usability" or "stability". That may change as Redox gets close to releasing the 1.0 stable version.
-
-Redox has gotten through many major system design changes since its inception. Historically Redox was not designed to be a microkernel nor POSIX-compliant, however both those plans changed in early times. We also recently switched our system service interface (scheme) design and are about to change the security design to a [Capability-based security](https://en.wikipedia.org/wiki/Capability-based_security) approach.
-
-Nowadays all recent and future major changes into Redox are happening via [RFCs](https://gitlab.redox-os.org/redox-os/rfcs) and reviewed by Redox OS Board Members. Any Request For Changes that reduces correctness or security are likely not going to be accepted, but these terms are flexible and not enforced until the 1.0 stable version.
-
-One major example where the design trades security over usability is userspace exec which has been fully implemented. A userspace exec means `exec` is fully managed in userspace, this means that the kernel has no way of knowing how software is being executed (e.g. software arguments and environment variables), as the kernel is restricted from reading any userspace memory.
+- **Supporting old hardware.** Code paths for pre-v3 x86 CPUs, i586 and BIOS
+  boot are not extended. Their remains in imported sources are kept only to
+  ease upstream merges.
+- **Becoming Linux.** Ferric Oxide runs Linux programs through libraries,
+  ports and VMs. It does not implement the Linux kernel ABI.
+- **GPL code in the tree.** All code in this repository is MIT licensed, and
+  dependencies must use MIT-compatible licenses. Linux-compatible features are
+  written from specifications, not ported from GPL sources.
+- **Unmeasured complexity.** A faster design that can't show its numbers
+  doesn't land. Several roadmap items (the colocated driver tier, the
+  WebAssembly userland) are explicitly conditional on passing a benchmark
+  gate.
