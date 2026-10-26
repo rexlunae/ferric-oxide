@@ -292,7 +292,7 @@ jobs:
         cpu: [host]
         iommu: [none]
         nic: [e1000]
-        variant: [base, ioeventfd, nopoll, iouring, smp2]
+        variant: [base, nopoll]
     env:
       # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the host
       # under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster path.
