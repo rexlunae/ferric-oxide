@@ -12,6 +12,7 @@
 //! - [`abi`] is the one definition of the call that sets a disk's policy, shared by
 //!   driver-block and its clients (the same-boot benchmark compares the policies with it).
 //! - [`ab`] summarises that benchmark's rounds and holds its pass rule.
+//! - [`timing`] pairs request service/command samples and drains reporting windows.
 //! - [`ids`] reads the finished jobs' ids back from the workers' pipe, keeping a part of an
 //!   id that one read splits for the next, and reserves the id a worker reports as it exits.
 //! - `openers` (with the `alloc` feature) records which process opened each disk
@@ -47,6 +48,7 @@ pub mod openers;
 pub mod order;
 #[cfg(feature = "std")]
 pub mod slot;
+pub mod timing;
 
 /// How a disk driver with per-CPU queue pairs places requests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

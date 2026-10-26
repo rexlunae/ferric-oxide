@@ -16,6 +16,9 @@ mod nvme;
 // Ferric Oxide: one I/O queue pair and worker thread per CPU (drivers.nvme_percore).
 #[cfg(feature = "percore")]
 mod percore;
+// Ferric Oxide: request-phase timing (drivers.nvmed_perf).
+#[cfg(feature = "perf")]
+mod perf;
 
 #[derive(Clone)]
 struct NvmeDisk {
@@ -387,6 +390,12 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     // libredox::call::setrens(0, 0).expect("nvmed: failed to enter null namespace");
 
     log::debug!("Starting to listen for scheme events");
+
+    #[cfg(feature = "perf")]
+    if let Err(error) = perf::start_reporting() {
+        log::error!("cannot start NVMe phase reporter: {error}");
+        std::process::exit(1);
+    }
 
     // Ferric Oxide: a close held back for concurrent requests becomes ready when the last of
     // them ends, which is no scheme event, so the loop also wakes for that.

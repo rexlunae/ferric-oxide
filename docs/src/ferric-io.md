@@ -334,27 +334,24 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
-### Overlapping depth with per-CPU workers (drivers.nvme_overlap)
+### Overlapping requests with per-CPU workers (drivers.nvme_overlap)
 
-`drivers.nvme_overlap` builds nvmed with its `overlap` Cargo feature: the
-Adaptive policy keeps the first request of a burst on the
-main thread's queue pair and hands each request that arrives while another is
-in flight to a per-CPU worker that answers it itself ([`Disk::submit`], so
-the reply skips the main thread). With the feature off (the default) Adaptive
-serves one call at a time, exactly as upstream.
+`drivers.nvme_overlap` enables nvmed's `overlap` feature (including `percore`).
+Adaptive reads/writes enter the concurrent scheme path even when idle. Before
+examining the next request, the dispatcher counts the first request and starts
+it as an async task on the scheme thread. It holds the main queue's mutex while
+using that queue/bounce buffer. Later overlapping requests go to per-CPU workers
+that write responses directly. Worker jobs carry a shared atomic activity claim
+from enqueue through response or drop, including failed sends and worker exit.
+Completing the inline request therefore cannot make a still-busy worker appear
+idle. MainQueue stays serial, and Workers keeps its direct-response behavior.
 
-The same-boot measurement that keeps the default off: on QEMU/KVM (Kleya,
-`host,migratable=off`, 5 I/O queue pairs, `ferric-iobench` qd32 rounds), the
-adaptive-overlap rounds ran at 973/1006/967 permille of the main-queue IOPS
-(2 of 3 rounds about 3% behind), because each hand-off costs more than the
-emulated controller saves. The same rounds without overlap measure 1000-1021
-permille, so the serial default is the better QEMU behavior. The Phase 2 exit
-criterion (80% of Linux io_uring at qd32) cannot be met on the emulated
-controller at all: it processes every queue's commands on one thread at about
-52-67 us each, walling 4k random reads at roughly 15-19k IOPS whatever the
-driver does. On real NVMe hardware the controller is far faster than the
-per-request hand-off, and the overlap option is the path that keeps more than
-one request in flight; measure it there before changing the default.
+The option is off by default. The initial experiment's overlapping requests
+could remain serialized, so its 973/996/967 and 973/1006/967 permille comparisons
+are not evidence for this corrected path. Fresh paired measurements at QD1 and
+QD32, with evidence of actual overlap, are needed before selecting a default or
+claiming the real-hardware performance gate. The kernel's I/O chapter does not
+claim a hardware speedup from emulated-controller phase measurements.
 
 ### Where a request's time goes (drivers.nvmed_perf)
 
@@ -367,25 +364,32 @@ nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
 nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
 ```
 
-- `read.service`/`write.service` run from `namespace_read`/`namespace_write`
-  entry to return, on whichever thread serves the request: the scheme's main
-  thread, or a per-CPU worker answering a job or a direct request.
-- `read.device`/`write.device` sum, over the request's commands, the time from
-  just before the submission queue's doorbell to the observed completion,
-  including the controller's service time and the interrupt-to-worker wake-up
-  latency.
-- The difference (service minus device) is the driver's own work: queue-pair
-  and lock waits, bounce-buffer copies and executor wake-up latency not
-  charged to the device.
+- `read.service`/`write.service` cover request entry through return, including
+  partial errors, on both buffered and DMA paths. Timing belongs to the request
+  future, so interleaved requests on one executor thread remain separate.
+- `read.device`/`write.device` sum each request's command durations, starting
+  when a free submission-queue slot is accepted and ending when its completion
+  is observed by that future. Full-queue waits are excluded; doorbell batching,
+  controller service and completion wakeup latency are included. These are not
+  pure controller-time measurements. Each request publishes one sample of each
+  phase together, so the counts and interval boundaries match.
+- Service minus command time measures the remaining driver work, including
+  buffer preparation, free-slot waits and copies.
 
-The counter reads add no system calls, so an instrumented driver still shows
-the syscall counts of the unmodified one, and the ticks are calibrated once
-against the monotonic clock at driver start. Which thread served what, and
-the queueing and response legs, come from the kernel trace
-(`scheme.request`/`scheme.response`, `sched.switch`, `irq.deliver`/`irq.ack`,
-and the debug-level `scheme.sqe_deliver`/`scheme.cqe_receive`, which need
-`kernel.trace_max_level = "debug"`). The phase figures are for comparing one
-boot, not a documented time source.
+A separate reporting thread takes and resets the counters once a second, so
+samples are reported even after an I/O burst goes idle. Logging happens outside
+the counter lock. Reports are time windows, not benchmark rounds: a short job
+may share a window with another job. Use isolated workloads or explicit trace
+markers for round attribution, rather than assigning a report to the last job.
+
+On x86 the counter reads add no system calls and are calibrated against the
+monotonic clock at startup; other architectures read the monotonic clock.
+The reporting thread adds its own timer/logging calls. Kernel tracing supplies
+thread identity and socket/request timing (`scheme.request`/`scheme.response`,
+`sched.switch`, `irq.deliver`/`irq.ack`, and debug-level `scheme.sqe_deliver`/
+`scheme.cqe_receive`). Historical measurements from before these accounting
+fixes need remeasurement before deriving per-request phase differences. The
+phase figures compare one boot; they are not a documented time source.
 
 ## Disk benchmark (ferric-iobench)
 

@@ -179,6 +179,13 @@ Miri requires the `miri` component for the declared nightly toolchain. The
 kernel-lints workflow runs these tests, including Miri; the shared buffer also
 receives the host workspace's strict Clippy and Rustdoc checks.
 
+The helper package also compiles the actual ordered-lock and wait-condition
+code for empty-list destruction tests, including `drop_panic`. Its host-only
+context/shootdown stubs fail if those hardware paths are reached. The regression
+holds another lock while destroying an empty condition and verifies no further
+lock acquisition occurs. This covers the page-cache cleanup panic found during
+an ARM64 native boot; it does not simulate blocked waiters or context switches.
+
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
 out-of-range CPU IDs, duplicate/gapped/concurrent CPU publication, initialized
@@ -665,3 +672,13 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
