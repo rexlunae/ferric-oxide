@@ -9,7 +9,9 @@ The pages in this section expand on them.
 
 In short:
 
-- **Keep it MIT.** No GPL, LGPL or AGPL code or dependencies. Linux-compatible
+- **Keep it MIT.** No GPL, LGPL or AGPL code or dependencies in what Ferric
+  Oxide ships. A tool that is only referenced and not distributed with the
+  system, such as a host-side utility, can use another license. Linux-compatible
   features are written clean-room from published specifications.
 - **Make optional behavior a feature option** in `features.toml` rather than
   custom Make or environment-variable logic. Without a `ferric.toml`, the build
