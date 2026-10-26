@@ -145,22 +145,27 @@ pub enum ArmResult {
     Unsupported,
 }
 
-/// The handler for the local APIC timer interrupt: when the one-shot is armed
-/// and due, marks it fired (the switch path and the selftest consume that); a
-/// stale interrupt (nothing armed, or not due) changes nothing.
+/// The handler for the local APIC timer interrupt: when an interrupt arrives
+/// with an armed cell, the one-shot deadline fired (the TSC-deadline timer
+/// fires exactly at its deadline), so the fired flag is set for the switch
+/// path and the selftest; a stale interrupt (nothing armed - disarmed or
+/// covered) changes nothing. No clock read happens in the interrupt path.
 ///
 /// Called with interrupts off, from the IDT entry.
 pub fn handle_fire() {
     let percpu = PercpuBlock::current();
     let entries = percpu.one_shot.entries.fetch_add(1, Ordering::Relaxed);
-    let now = Nanos::new(time::monotonic(&mut unsafe { CleanLockToken::new() }) as u64);
-    let due = percpu.one_shot.armed.due(now);
-    if entries < 3 {
-        crate::info!("timer: handler entry {entries}: due={due} now={}", now.get());
+    if entries < 10 {
+        crate::debug!("timer: handler entry {entries}");
     }
-    if due {
-        // The TSC-deadline timer has already cleared itself; record the
-        // delivery, and leave the armed cell for the consumer to settle.
+    // The TSC-deadline one-shot fires exactly at its deadline, so a delivery
+    // with an armed cell is the deadline firing: mark it fired without
+    // reading the clock (a recheck would be racing the rearm protocol, and
+    // the clock source must not run in the interrupt path). A delivery after
+    // a disarm or with nothing armed is stale and changes nothing; the
+    // consumer (the switch path) re-checks the clock when it settles the
+    // cell.
+    if percpu.one_shot.armed.armed().is_some() {
         percpu.one_shot.fired.store(true, Ordering::Release);
     }
 }
