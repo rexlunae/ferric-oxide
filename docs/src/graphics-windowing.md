@@ -3,8 +3,9 @@
 Orbital remains the inherited default desktop, but is deprecated for new
 Ferric Oxide graphics development. The replacement direction is Wayland with
 Smithay, Mesa and Xwayland, as described in [Phase 6 of the roadmap](./ferric-roadmap.md#phase-6-graphics-and-desktop).
-Implementation is deferred until the current PR backlog is merged. Existing
-Orbital recipes and image defaults remain in place for legacy use.
+Implementation is deferred until the current PR backlog is merged. Orbital is
+not planned to be brought up to a working or supported state; existing recipes
+and image defaults remain only as legacy artifacts and may not work.
 
 ## Drivers
 

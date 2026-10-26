@@ -247,10 +247,11 @@ recipes are groundwork, not evidence of a working accelerated desktop.
   separate execution environment; display-protocol support is not Linux binary
   compatibility.
 
-**Orbital is deprecated.** Retain it only as an optional legacy bring-up and
-compatibility path, with limited maintenance needed to keep existing use
-working. New graphics investment goes into the stack above. Removing Orbital
-or changing image defaults is a separate future change.
+**Orbital is deprecated.** It is not planned to be brought up to a working or
+supported state; existing code and recipes may remain temporarily as legacy
+artifacts, but are not a compatibility commitment. New graphics investment
+goes into the stack above. Removing Orbital or changing image defaults is a
+separate future change.
 
 **Exit:** a Smithay-based Wayland session with hardware-accelerated composition
 and Vulkan on both reference machines, native Wayland toolkit applications and
