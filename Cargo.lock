@@ -1451,6 +1451,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-pcid-cache"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-procinfo"
 version = "0.1.0"
 dependencies = [

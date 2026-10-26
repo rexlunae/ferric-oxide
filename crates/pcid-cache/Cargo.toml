@@ -1,0 +1,9 @@
+[package]
+name = "ferric-pcid-cache"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Per-CPU cache of PCID slots for per-address-space TLB tagging: hit, replay, stale and miss decisions, no_std, with a tagged-TLB model checker"
+publish = false
+
+[dependencies]

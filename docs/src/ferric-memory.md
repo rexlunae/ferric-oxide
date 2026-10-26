@@ -148,6 +148,17 @@ entries across entry and return. Page invalidations and shootdowns invalidate
 the user PCID as well; switches between address spaces still flush because
 they share the pair. This is not a cache of a separate PCID pair per process.
 
+Per-address-space PCIDs are being prepared but are not active. The per-CPU
+slot cache they will use is the host-tested `no_std` crate `crates/pcid-cache`:
+each CPU keeps six PCID slots tagged with a never-reused context id and the
+TLB generation they are current to, and decides on each switch whether CR3 can
+be loaded without a flush, after replaying logged invalidations, or only with
+a flush. Its `tests/model.rs` checks that protocol against a model of a
+PCID-tagged TLB with paging-structure caches: random and exhaustive operation
+sequences over switches, page changes, delayed shootdown IPIs and teardown
+never use a stale translation, and deliberate protocol bugs are caught. The
+kernel does not use the crate yet.
+
 A CPU that waits for a contended lock keeps answering TLB shootdowns. Every
 ordered lock path, including the context switch's `write_arc` on a context
 lock and the upgrade of an upgradeable read guard, retries the lock and
