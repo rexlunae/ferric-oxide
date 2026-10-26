@@ -29,6 +29,31 @@ pub fn crc32c(parts: &[&[u8]]) -> u32 {
     !digest.finalize()
 }
 
+/// [`crc32c`] over `parts`, carried on from `seed`, a value [`crc32c`] (or this function)
+/// returned: `crc32c_seeded(crc32c(&[a]), &[b])` is `crc32c(&[a, b])`.
+///
+/// ext4 keeps such a seed in the superblock (`s_checksum_seed`, with the `metadata_csum_seed`
+/// feature) and starts every metadata checksum from it rather than from the volume UUID.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_jbd2::{crc32c, crc32c_seeded};
+///
+/// let seed = crc32c(&[b"volume uuid"]);
+/// assert_eq!(crc32c_seeded(seed, &[b"inode"]), crc32c(&[b"volume uuid", b"inode"]));
+/// ```
+pub fn crc32c_seeded(seed: u32, parts: &[&[u8]]) -> u32 {
+    // The stored form is the bit-reflected register itself; `digest_with_initial` takes the
+    // initial value unreflected and reflects it.
+    let mut digest = CRC32C.digest_with_initial(seed.reverse_bits());
+    for part in parts {
+        digest.update(part);
+    }
+    // The algorithm XORs the register with 0xFFFF_FFFF at the end; undo that.
+    !digest.finalize()
+}
+
 /// [`crc32c`] over `block` with the four bytes at `at` read as zero, after `prefix`: how
 /// every checksum stored inside the block it covers is computed.
 pub(crate) fn crc32c_without(prefix: &[&[u8]], block: &[u8], at: usize) -> u32 {
@@ -51,6 +76,15 @@ mod tests {
         // CRC32C("123456789") is 0xE3069283; JBD2's form is its inverse.
         assert_eq!(crc32c(&[b"123456789"]), !0xE306_9283);
         assert_eq!(crc32c(&[b"1234", b"56789"]), crc32c(&[b"123456789"]));
+    }
+
+    #[test]
+    fn a_seeded_crc_carries_on_from_the_seed() {
+        for split in 0..=9 {
+            let (a, b) = b"123456789".split_at(split);
+            assert_eq!(crc32c_seeded(crc32c(&[a]), &[b]), crc32c(&[b"123456789"]));
+        }
+        assert_eq!(crc32c_seeded(!0, &[b"123456789"]), crc32c(&[b"123456789"]));
     }
 
     #[test]
