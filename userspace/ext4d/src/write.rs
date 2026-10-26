@@ -47,11 +47,12 @@ use crate::journal::{
 use crate::superblock::COMPAT_HAS_JOURNAL;
 
 /// `s_feature_incompat` bits that writing an inode's times is safe under: `filetype`,
-/// `recover`, `meta_bg`, `extents`, `64bit`, `flex_bg`, `ea_inode`, `csum_seed`, `largedir`,
+/// `recover`, `extents`, `64bit`, `flex_bg`, `ea_inode`, `csum_seed`, `largedir`,
 /// `inline_data`, `encrypt` and `casefold`. Not `compression`, `journal_dev`, `mmp` (another
-/// host may have the volume) or `dirdata`, nor any bit the layout does not name.
+/// host may have the volume), `dirdata` or `meta_bg` (whose journal map the replay code
+/// does not check yet), nor any bit the layout does not name.
 const INCOMPAT_WRITABLE: u32 =
-    0x2 | 0x4 | 0x10 | 0x40 | 0x80 | 0x200 | 0x400 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000;
+    0x2 | 0x4 | 0x40 | 0x80 | 0x200 | 0x400 | 0x2000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000;
 /// `s_feature_ro_compat` bits likewise: `sparse_super`, `large_file`, `huge_file`,
 /// `gdt_csum`, `dir_nlink`, `extra_isize`, `quota`, `bigalloc`, `metadata_csum`, `project`,
 /// `verity` and `orphan_present`. Not `btree_dir`, `has_snapshot`, `replica`, `readonly` (the

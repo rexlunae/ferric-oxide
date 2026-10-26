@@ -389,6 +389,19 @@ fn volumes_this_cannot_write_are_refused() {
             flags: 0x100
         }
     ));
+    // INCOMPAT_META_BG: refused up front, as the journal map cannot be checked on it yet.
+    let mut meta_bg = clean("journal-v3");
+    let at = 1024 + 0x60;
+    let incompat = le32(&meta_bg, at) | 0x10;
+    meta_bg[at..at + 4].copy_from_slice(&incompat.to_le_bytes());
+    reseal(&mut meta_bg);
+    assert!(matches!(
+        refused(meta_bg, HELLO, &TIMES),
+        WriteError::UnsupportedFeature {
+            field: "incompat",
+            flags: 0x10
+        }
+    ));
     // No journal (COMPAT_HAS_JOURNAL clear).
     let mut unjournaled = clean("journal-v3");
     let at = 1024 + 0x5C;

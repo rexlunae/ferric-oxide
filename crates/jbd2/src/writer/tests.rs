@@ -36,6 +36,8 @@ struct Memory {
     home: Vec<u8>,
     writes_left: usize,
     flushes: usize,
+    /// The flush (counted from 1) that fails, if any.
+    failing_flush: Option<usize>,
 }
 
 impl Memory {
@@ -47,6 +49,7 @@ impl Memory {
             home: vec![0; 64 * BS],
             writes_left: usize::MAX,
             flushes: 0,
+            failing_flush: None,
         }
     }
 
@@ -56,6 +59,11 @@ impl Memory {
 
     fn writer(&self) -> Writer {
         Writer::new(&self.journal[..BS]).expect("an empty journal")
+    }
+
+    /// A writer for the journal as it was made, empty, whatever it holds now.
+    fn writer_unchecked(&self) -> Writer {
+        Writer::new(&raw(V3, 0)).expect("an empty journal")
     }
 
     fn spend(&mut self) -> Result<(), Crashed> {
@@ -109,6 +117,9 @@ impl JournalWrite for Memory {
 
     fn flush(&mut self) -> Result<(), Crashed> {
         self.flushes += 1;
+        if self.failing_flush == Some(self.flushes) {
+            return Err(Crashed);
+        }
         Ok(())
     }
 }
@@ -381,4 +392,66 @@ fn what_cannot_be_committed_is_refused_before_any_write() {
     writer
         .checkpoint(&mut memory, committed)
         .expect("checkpointed");
+}
+
+/// A flush that fails after the superblock was written leaves the transaction in the log;
+/// the writer must not then take it for empty and log over it.
+#[test]
+fn a_failed_flush_poisons_the_writer() {
+    let blocks = vec![(3, block(0x11))];
+    // The third flush of a commit follows the superblock write; the fifth is the
+    // checkpoint's last.
+    for failing in [1, 2, 3, 4, 5] {
+        let mut memory = Memory::new(V3);
+        memory.failing_flush = Some(failing);
+        let mut writer = memory.writer();
+        let done = writer
+            .commit(&mut memory, transaction(&writer, &blocks), TIME)
+            .and_then(|committed| writer.checkpoint(&mut memory, committed));
+        assert!(matches!(done, Err(WriteError::Flush(Crashed))), "{failing}");
+        if (3..5).contains(&failing) {
+            assert_eq!(memory.replay(), blocks, "{failing}: in the log");
+        }
+        if failing == 5 {
+            // The emptied superblock was written but its flush failed: the block is home.
+            assert_eq!(&memory.home[3 * BS..4 * BS], &block(0x11)[..]);
+        }
+        let writes = memory.writes_left;
+        let next = transaction(&writer, &[(4, block(0x22))]);
+        assert!(
+            matches!(
+                writer.commit(&mut memory, next, TIME),
+                Err(WriteError::Poisoned)
+            ),
+            "{failing}"
+        );
+        assert_eq!(memory.writes_left, writes, "{failing}: nothing written");
+    }
+}
+
+#[test]
+fn only_the_pending_transaction_can_be_checkpointed() {
+    let mut first = Memory::new(V3);
+    let mut second = Memory::new(V3);
+    let mut a = first.writer();
+    let mut b = second.writer();
+    let ours = a
+        .commit(&mut first, transaction(&a, &[(3, block(1))]), TIME)
+        .expect("committed");
+    let theirs = b
+        .commit(&mut second, transaction(&b, &[(3, block(2))]), TIME)
+        .expect("committed");
+    // Another writer's token, though the sequence number is the same.
+    assert_eq!(ours.sequence(), theirs.sequence());
+    assert!(matches!(
+        a.checkpoint(&mut first, theirs),
+        Err(WriteError::ForeignCommit)
+    ));
+    // A writer with nothing pending.
+    let mut clean = first.writer_unchecked();
+    assert!(matches!(
+        clean.checkpoint(&mut first, ours),
+        Err(WriteError::ForeignCommit)
+    ));
+    assert!(first.home.iter().all(|&b| b == 0), "nothing written home");
 }

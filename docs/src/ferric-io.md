@@ -983,7 +983,7 @@ does not reach yet, because `ext4-view` does not say which inode a path names.
   `s_checksum_seed` with `metadata_csum_seed`), sets `needs_recovery`, commits
   and checkpoints the transaction, and clears `needs_recovery`. It refuses
   volumes that need recovery (replay them first), have no journal, or have a
-  feature it does not know it can write under (`mmp`, `readonly`, unknown
+  feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
   bits), and inodes that are free or already fail their checksum.
 
 A crash at any write leaves the old times or a journal whose replay gives the

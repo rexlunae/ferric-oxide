@@ -1370,7 +1370,7 @@ crash at any point leaves the change made in full by a replay, or not at all.
 The only change so far sets an existing inode's access, modification and
 change times, and the scheme does not call it yet: volumes are still served
 read-only. Volumes that need recovery are replayed first, and volumes with a
-feature the writer does not know (mmp, readonly and others) are refused.
+feature the writer does not know (mmp, meta_bg, readonly and others) are refused.
 
 The writer is checked against e2fsprogs: e2fsck replays and checks what it
 leaves, including volumes crashed part-way through a change. Off, ext4d writes
