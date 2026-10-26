@@ -76,6 +76,15 @@ impl QueuePolicy {
         }
     }
 
+    /// The policy's name, as its variant is spelled.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Adaptive => "Adaptive",
+            Self::MainQueue => "MainQueue",
+            Self::Workers => "Workers",
+        }
+    }
+
     /// Where a new request runs, given how many requests are already in flight (on any
     /// queue pair).
     pub const fn route(self, in_flight: usize) -> Route {

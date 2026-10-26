@@ -76,7 +76,8 @@ impl Counts {
         max: 0,
     };
 
-    fn record(&mut self, ticks: u64) {
+    /// Adds one sample of `ticks`.
+    pub fn record(&mut self, ticks: u64) {
         self.min = if self.count == 0 {
             ticks
         } else {
