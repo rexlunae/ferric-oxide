@@ -338,7 +338,7 @@ woken, which held two-thread reads to about 400 IOPS.
 
 `drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
 each I/O request's phases with the CPU cycle counter and logs a summary about
-every five seconds:
+once a second:
 
 ```text
 nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
