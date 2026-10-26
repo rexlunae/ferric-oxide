@@ -307,14 +307,20 @@ pub fn package_handle_push(
         Transaction::install(&mut package, sysroot_dir)?.commit()?;
         return Ok(false);
     };
+    keep_replaced_cookbook_key(pkey_path, sysroot_dir)?;
     let key =
         fox_core::keys::install_key_file(pkey_path, sysroot_dir, fox_core::keys::COOKBOOK_LABEL)?;
     let mut keys = fox_core::TrustedKeys::new();
     keys.insert(key.label, key.key);
     let archive = fox_core::archive::Archive::open(archive_path, &keys)?;
-    let installed = store.get(&archive.manifest().name)?;
-    if installed.is_some_and(|p| p.archive_blake3 == Some(archive.blake3())) {
-        return Ok(true);
+    let name = &archive.manifest().name;
+    match store.get(name)? {
+        Some(p) if p.state == fox_store::PackageState::Removing => {
+            // An interrupted removal: finish it, then install afresh.
+            store.remove(name, false)?;
+        }
+        Some(p) if p.archive_blake3 == Some(archive.blake3()) => return Ok(true),
+        _ => {}
     }
     // Without features.toml packages.signed_manifests, cookbook archives
     // carry only the unsigned metadata file beside them.
@@ -324,6 +330,28 @@ pub fn package_handle_push(
     };
     store.install(&archive, options)?;
     Ok(false)
+}
+
+/// Before the sysroot's cookbook key is replaced by a different one (the
+/// cookbook's `build/` was regenerated, say), keeps the old key trusted
+/// under `cookbook-<key>`, so packages it signed still verify.
+fn keep_replaced_cookbook_key(pkey_path: &Path, sysroot_dir: &Path) -> crate::Result<()> {
+    let keys_dir = sysroot_dir.join(fox_core::keys::TRUSTED_KEYS_DIR);
+    let current = keys_dir.join(format!("{}.toml", fox_core::keys::COOKBOOK_LABEL));
+    if !current.is_file() {
+        return Ok(());
+    }
+    let old = fox_core::keys::load_key_file(&current)?.key;
+    if old == fox_core::keys::load_key_file(pkey_path)?.key {
+        return Ok(());
+    }
+    let kept = keys_dir.join(format!("{}-{old}.toml", fox_core::keys::COOKBOOK_LABEL));
+    std::fs::rename(&current, &kept).map_err(|source| Error::FileIo {
+        source,
+        src: current,
+        dst: kept,
+        context: "Renaming the replaced cookbook key",
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +378,68 @@ mod tests {
         let installed = store.get(&manifest.name).unwrap().unwrap();
         assert_eq!(installed.signer_label, fox_core::keys::COOKBOOK_LABEL);
         assert!(push().unwrap(), "the same archive again is cached");
+    }
+
+    #[test]
+    fn push_keeps_packages_signed_by_a_replaced_key_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_in = |name: &str| {
+            let keys = dir.path().join(name);
+            std::fs::create_dir(&keys).unwrap();
+            FixtureKey::generate(&keys, "id_ed25519").unwrap()
+        };
+        let (old_key, new_key) = (key_in("old"), key_in("new"));
+        let a = Manifest::new(PackageName::new("a").unwrap(), "1.0");
+        let b = Manifest::new(PackageName::new("b").unwrap(), "1.0");
+        let a_file = [FixtureEntry::file("usr/bin/a", b"a", 0o755)];
+        let b_file = [FixtureEntry::file("usr/bin/b", b"b", 0o755)];
+        let a_archive = build_package(dir.path(), &old_key, Some(&a), &a_file, false).unwrap();
+        let b_archive = build_package(dir.path(), &new_key, Some(&b), &b_file, false).unwrap();
+        let sysroot = dir.path().join("sysroot");
+        std::fs::create_dir(&sysroot).unwrap();
+        let store = fox_store::Store::open(&sysroot).unwrap();
+
+        package_handle_push(Some(&store), &old_key.public_path, &a_archive, &sysroot).unwrap();
+        package_handle_push(Some(&store), &new_key.public_path, &b_archive, &sysroot).unwrap();
+        let keys = fox_core::keys::trusted_keys_for_root(&sysroot).unwrap();
+        for name in [&a.name, &b.name] {
+            let report = store.verify(name, &keys).unwrap();
+            assert!(report.problems.is_empty(), "{name} verifies");
+        }
+    }
+
+    #[test]
+    fn push_finishes_an_interrupted_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = FixtureKey::generate(dir.path(), "id_ed25519").unwrap();
+        let manifest = Manifest::new(PackageName::new("app").unwrap(), "1.0");
+        let file = [FixtureEntry::file("usr/bin/app", b"app", 0o755)];
+        let archive = build_package(dir.path(), &key, Some(&manifest), &file, false).unwrap();
+        let sysroot = dir.path().join("sysroot");
+        std::fs::create_dir(&sysroot).unwrap();
+        let store = fox_store::Store::open(&sysroot).unwrap();
+        package_handle_push(Some(&store), &key.public_path, &archive, &sysroot).unwrap();
+
+        // A removal cut off after it marked the package and took one file.
+        let db = sysroot.join(fox_store::STATE_DIR).join("installed.toml");
+        let text = std::fs::read_to_string(&db).unwrap();
+        let removing = text.replacen(
+            "version = \"1.0\"\n",
+            "version = \"1.0\"\nstate = \"removing\"\n",
+            1,
+        );
+        assert_ne!(text, removing);
+        std::fs::write(&db, removing).unwrap();
+        assert_eq!(
+            store.get(&manifest.name).unwrap().unwrap().state,
+            fox_store::PackageState::Removing
+        );
+        std::fs::remove_file(sysroot.join("usr/bin/app")).unwrap();
+
+        assert!(!package_handle_push(Some(&store), &key.public_path, &archive, &sysroot).unwrap());
+        assert!(sysroot.join("usr/bin/app").is_file(), "the file is back");
+        let installed = store.get(&manifest.name).unwrap().unwrap();
+        assert_eq!(installed.state, fox_store::PackageState::Installed);
     }
 
     #[test]
