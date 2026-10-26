@@ -1324,6 +1324,8 @@ crates/blocklayer. Source: userspace/blockd."""
 when = "value"
 source_packages = ["ferric-blockd"]
 make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
+
+[[option]]
 id = "fs.ext4_journal_replay"
 menu = "fs"
 type = "bool"
