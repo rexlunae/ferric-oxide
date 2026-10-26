@@ -216,26 +216,33 @@ pub fn selftest(token: &mut CleanLockToken) {
             return;
         }
     }
-    // Bound the wait by the clock and a hard spin count, so a wedged timer
-    // is reported instead of stalling the boot on any CPU; report progress
-    // every half second while waiting.
-    let give_up = start + 5_000_000_000;
-    let mut last_report = start;
+    // Bound the wait by the raw TSC (the pvclock is not involved in the
+    // wait itself) and a hard spin count, so a wedged timer is reported
+    // instead of stalling the boot on any CPU; report progress every half
+    // second while waiting.
+    let rate = crate::arch::time::tsc_rate().expect("the selftest has a TSC rate");
+    // SAFETY: RDTSC reads a counter; it has no side effects. The raw ticks
+    // are only compared against each other here.
+    let start_ticks = unsafe { core::arch::x86_64::_rdtsc() };
+    let give_up_ticks = rate.ticks_for_nanos(5_000_000_000).get();
+    let report_ticks = rate.ticks_for_nanos(500_000_000).get();
+    let mut last_report_ticks = start_ticks;
     let mut spins = 0u64;
     while spins < 2_000_000_000 && !fired() {
         // SAFETY: interrupts on so the timer interrupt arrives; the spin is a
         // bounded wait for a boot selftest.
         unsafe { arch::interrupt::enable_and_nop() };
         spins += 1;
-        let now = time::monotonic(token);
-        if now.saturating_sub(last_report) >= 500_000_000 {
+        // SAFETY: RDTSC reads a counter; it has no side effects.
+        let ticks = unsafe { core::arch::x86_64::_rdtsc() };
+        if ticks.wrapping_sub(last_report_ticks) >= report_ticks {
             let fired = fired();
             let entries = PercpuBlock::current().one_shot.entries.load(Ordering::Relaxed);
             crate::info!(
-                "timer: selftest waiting: now={now} fired={fired} entries={entries}"
+                "timer: selftest waiting: ticks={ticks} fired={fired} entries={entries}"
             );
-            last_report = now;
-            if now > give_up {
+            last_report_ticks = ticks;
+            if ticks.wrapping_sub(start_ticks) >= give_up_ticks {
                 break;
             }
         }
@@ -276,11 +283,18 @@ pub fn selftest(token: &mut CleanLockToken) {
     let deadline = Nanos::new(time::monotonic(token) as u64 + 1_000_000_000);
     if arm(deadline) == ArmResult::Reprogrammed {
         disarm();
-        let quiet_until = time::monotonic(token) + u128::from(SELFTEST_QUIET_MS) * 1_000_000;
-        while time::monotonic(token) <= quiet_until {
+        // SAFETY: RDTSC reads a counter; it has no side effects. The raw
+        // ticks are only compared against each other here.
+        let quiet_until = unsafe { core::arch::x86_64::_rdtsc() }
+            .wrapping_add(rate.ticks_for_nanos(u128::from(SELFTEST_QUIET_MS) * 1_000_000).get());
+        loop {
             // SAFETY: interrupts on, bounded wait.
             unsafe { arch::interrupt::enable_and_nop() };
             core::hint::spin_loop();
+            // SAFETY: RDTSC reads a counter; it has no side effects.
+            if unsafe { core::arch::x86_64::_rdtsc() } >= quiet_until {
+                break;
+            }
             if fired() {
                 crate::info!("timer: one-shot selftest round 3: a disarmed timer fired!");
                 take_fired();
