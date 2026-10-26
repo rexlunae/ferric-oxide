@@ -334,6 +334,59 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+### Overlapping depth with per-CPU workers (drivers.nvme_overlap)
+
+`drivers.nvme_overlap` builds nvmed with its `overlap` Cargo feature: the
+Adaptive policy keeps the first request of a burst on the
+main thread's queue pair and hands each request that arrives while another is
+in flight to a per-CPU worker that answers it itself ([`Disk::submit`], so
+the reply skips the main thread). With the feature off (the default) Adaptive
+serves one call at a time, exactly as upstream.
+
+The same-boot measurement that keeps the default off: on QEMU/KVM (Kleya,
+`host,migratable=off`, 5 I/O queue pairs, `ferric-iobench` qd32 rounds), the
+adaptive-overlap rounds ran at 973/1006/967 permille of the main-queue IOPS
+(2 of 3 rounds about 3% behind), because each hand-off costs more than the
+emulated controller saves. The same rounds without overlap measure 1000-1021
+permille, so the serial default is the better QEMU behavior. The Phase 2 exit
+criterion (80% of Linux io_uring at qd32) cannot be met on the emulated
+controller at all: it processes every queue's commands on one thread at about
+52-67 us each, walling 4k random reads at roughly 15-19k IOPS whatever the
+driver does. On real NVMe hardware the controller is far faster than the
+per-request hand-off, and the overlap option is the path that keeps more than
+one request in flight; measure it there before changing the default.
+
+### Where a request's time goes (drivers.nvmed_perf)
+
+`drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
+each I/O request's phases with the CPU cycle counter and logs a summary about
+once a second:
+
+```text
+nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+```
+
+- `read.service`/`write.service` run from `namespace_read`/`namespace_write`
+  entry to return, on whichever thread serves the request: the scheme's main
+  thread, or a per-CPU worker answering a job or a direct request.
+- `read.device`/`write.device` sum, over the request's commands, the time from
+  just before the submission queue's doorbell to the observed completion,
+  including the controller's service time and the interrupt-to-worker wake-up
+  latency.
+- The difference (service minus device) is the driver's own work: queue-pair
+  and lock waits, bounce-buffer copies and executor wake-up latency not
+  charged to the device.
+
+The counter reads add no system calls, so an instrumented driver still shows
+the syscall counts of the unmodified one, and the ticks are calibrated once
+against the monotonic clock at driver start. Which thread served what, and
+the queueing and response legs, come from the kernel trace
+(`scheme.request`/`scheme.response`, `sched.switch`, `irq.deliver`/`irq.ack`,
+and the debug-level `scheme.sqe_deliver`/`scheme.cqe_receive`, which need
+`kernel.trace_max_level = "debug"`). The phase figures are for comparing one
+boot, not a documented time source.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.

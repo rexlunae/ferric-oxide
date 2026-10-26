@@ -37,6 +37,10 @@ grant-dma = ["driver-block/grant-dma", "dep:ferric-blkgrant"]
 # Ferric Oxide: one I/O queue pair, MSI-X entry and pinned worker thread per CPU
 # (features.toml: drivers.nvme_percore).
 percore = ["dep:ferric-irq", "dep:ferric-blkqueue"]
+# Ferric Oxide: let the Adaptive queue policy overlap requests that arrive while
+# another is in flight on the per-CPU workers (features.toml: drivers.nvme_overlap,
+# default off: the same-boot QEMU measurement loses ~1-3% at qd32).
+overlap = []
 
 [lints]
 workspace = true
