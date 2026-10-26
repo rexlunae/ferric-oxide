@@ -126,40 +126,19 @@ fn other_handles_read_what_was_written() {
 }
 
 #[test]
-fn a_write_that_needs_a_new_block_writes_nothing() {
-    let (mut fs, shared) = mount_writable(basic());
-    let untouched = shared.bytes();
-    let hello = open(&mut fs, "/hello.txt", READ_WRITE);
-    // Block 1 of hello.txt does not exist; 1020..1030 starts in block 0, which does.
-    for offset in [1024, 1020] {
-        let err = fs.write(hello, offset, b"0123456789").expect_err("refused");
-        assert!(
-            matches!(err, Error::Write(WriteError::NotAllocated { block: 1, .. })),
-            "{err:?}"
-        );
-        assert_eq!(err.errno(), 95);
-    }
-    assert!(shared.bytes() == untouched);
-    // A hole and an unwritten extent need a block too.
+fn a_write_into_an_unwritten_extent_writes_nothing() {
+    // Converting an unwritten extent is not done yet (tests/alloc.rs has the blocks that
+    // are allocated).
     let (mut fs, shared) = mount_writable(load("write-data.ext4.gz"));
     let untouched = shared.bytes();
-    for (path, block) in [("/sparse.bin", 3), ("/unwritten.bin", 1)] {
-        let id = open(&mut fs, path, READ_WRITE);
-        let err = fs.write(id, block * 1024, b"x").expect_err("refused");
-        assert!(
-            matches!(err, Error::Write(WriteError::NotAllocated { block: b, .. }) if b == block),
-            "{path}: {err:?}"
-        );
-    }
+    let id = open(&mut fs, "/unwritten.bin", READ_WRITE);
+    let err = fs.write(id, 1024, b"x").expect_err("refused");
+    assert!(
+        matches!(err, Error::Write(WriteError::NotAllocated { block: 1, .. })),
+        "{err:?}"
+    );
+    assert_eq!(err.errno(), 95);
     assert!(shared.bytes() == untouched);
-    // Around them, the blocks the files have are written.
-    let sparse = open(&mut fs, "/sparse.bin", READ_WRITE);
-    fs.write(sparse, 0, b"HEAD").expect("block 0");
-    fs.write(sparse, 8192, b"TAIL").expect("block 8");
-    let image = e2fsck("write-sparse", shared.bytes());
-    let data = contents(image, "/sparse.bin");
-    assert_eq!((&data[..4], &data[8192..]), (&b"HEAD"[..], &b"TAIL"[..]));
-    assert!(data[4..8192].iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -254,14 +233,16 @@ fn opens_for_writing_check_write_permission() {
 #[test]
 fn what_cannot_be_written_is_refused_at_open_or_write() {
     let (mut fs, _) = mount_writable(basic());
-    let create = OpenMode {
-        create_or_truncate: true,
+    // Only regular files are created.
+    let mkdir = OpenMode {
+        create: true,
+        directory: true,
         ..READ_WRITE
     };
     let err = fs
-        .open_as(None, "/hello.txt", create, 0, 0)
+        .open_as(None, "/new-dir", mkdir, 0, 0)
         .expect_err("refused");
-    assert!(matches!(err, Error::CreateOrTruncate));
+    assert!(matches!(err, Error::CreateKind));
     assert_eq!(err.errno(), 95);
     assert!(matches!(
         fs.open_as(None, "/dir", READ_WRITE, 0, 0),

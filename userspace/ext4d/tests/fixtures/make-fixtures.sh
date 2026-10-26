@@ -17,7 +17,8 @@
 #   empty/             an empty directory
 #   link               a symbolic link to hello.txt
 #   big.bin            200 KiB, byte i is (i * 7 + i / 4096) mod 251, over several blocks
-#   many/f000..f199    200 small files, so the directory is hashed (an htree)
+#   many/f000..f199    200 small files, in three linear directory blocks with
+#                      e2fsprogs 1.47.0's mke2fs -d (not hashed)
 #
 # dir-64k.ext4.gz: 4 MiB, 64 KiB blocks, no journal, metadata_csum or dir_index, with
 # d/a ("linked from a whole 64 KiB block\n") and d/b, a second link to it whose entry is
@@ -277,6 +278,40 @@ debugfs -w -R "set_inode_field /append.txt flags 0x80020" "$img" >/dev/null 2>&1
 debugfs -w -R "fallocate /unwritten.bin 1 3" "$img" >/dev/null 2>&1
 E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
 gzip -9 -n -c "$img" > "$out/write-data.ext4.gz"
+
+# alloc.ext4.gz: ext4 defaults, 4 MiB, 1 KiB blocks, for allocation (writes past a file's
+# blocks, truncation and creation): small.txt ("small\n"), islands.bin (blocks 0, 2, 4 and 6
+# hold "island N", so its four extents fill the tree's root), deep.bin (blocks 0, 2, ..., 10:
+# six extents, so a leaf block under the root), and full/, whose one block is filled to the
+# byte by 35 entries of 20-byte names.
+aroot=$work/aroot
+mkdir -p "$aroot/full"
+printf 'small\n' > "$aroot/small.txt"
+for block in 0 2 4 6; do
+    printf 'island %d' "$block" | dd of="$aroot/islands.bin" bs=1024 seek="$block" conv=notrunc 2>/dev/null
+done
+for block in 0 2 4 6 8 10; do
+    printf 'deep %d' "$block" | dd of="$aroot/deep.bin" bs=1024 seek="$block" conv=notrunc 2>/dev/null
+done
+i=0
+while [ $i -lt 35 ]; do
+    : > "$aroot/full/$(printf 'entry-%014d' $i)"
+    i=$((i + 1))
+done
+find "$aroot" -exec touch -h -d '2026-01-01 00:00:00 UTC' {} +
+img=$work/alloc.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a70 -E root_owner=0:0 -d "$aroot" "$img" 4M
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
+gzip -9 -n -c "$img" > "$out/alloc.ext4.gz"
+
+# alloc-gdt.ext4.gz: the same files on a volume with 32-byte group descriptors and CRC16
+# descriptor checksums (gdt_csum) instead of metadata_csum.
+img=$work/alloc-gdt.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 -O ^metadata_csum,^64bit,uninit_bg \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a80 -E root_owner=0:0 -d "$aroot" "$img" 4M
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
+gzip -9 -n -c "$img" > "$out/alloc-gdt.ext4.gz"
 
 if [ -n "${2:-}" ]; then
     for name in journal-v3 journal-v2 journal-ext3; do

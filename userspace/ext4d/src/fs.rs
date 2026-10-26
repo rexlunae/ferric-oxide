@@ -12,7 +12,10 @@
 //! `fs.ext4_write`): there [`Fs::set_times`], [`Fs::set_mode`] and [`Fs::set_owner`] set a
 //! file's times, permission bits, and owner and group through the journal
 //! (`crate::write`), each checking the caller's permission as POSIX says, and a file opened
-//! for writing (with write permission) is written into the blocks it has ([`Fs::write`]).
+//! for writing (with write permission) is written, with blocks allocated as needed
+//! ([`Fs::write`]) and resized ([`Fs::truncate`]). [`Fs::open_as`] creates a regular file for
+//! `O_CREAT` (with write and search permission on its directory) and empties one for
+//! `O_TRUNC`.
 //! The inode to change is found from the handle's path by `crate::lookup`. After each
 //! change the `ext4-view` reader is loaded again, since it keeps the blocks it has read,
 //! and every handle's metadata is read again from it, and every open file opened again.
@@ -40,8 +43,15 @@ pub struct OpenMode {
     pub write: bool,
     /// Write access without read access (`O_WRONLY`): only write permission is needed.
     pub write_only: bool,
-    /// Creation or truncation (`O_CREAT`, `O_TRUNC`).
-    pub create_or_truncate: bool,
+    /// Create the file if it does not exist (`O_CREAT`).
+    pub create: bool,
+    /// With `create`, fail if the file exists (`O_EXCL`).
+    pub exclusive: bool,
+    /// Empty a regular file that exists (`O_TRUNC`).
+    pub truncate: bool,
+    /// The permission bits a created file gets (the low 12 bits of the flags, with the
+    /// caller's umask applied by the C library).
+    pub permissions: u16,
     /// The path must be a directory (`O_DIRECTORY`).
     pub directory: bool,
     /// Open a final symbolic link itself, to read its target (`O_SYMLINK`).
@@ -58,7 +68,10 @@ impl OpenMode {
         Self {
             write: false,
             write_only: false,
-            create_or_truncate: false,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            permissions: 0,
             directory: false,
             symlink: false,
             no_follow: false,
@@ -69,14 +82,17 @@ impl OpenMode {
     /// Reads the mode from Redox `openat` flags.
     pub const fn from_flags(flags: usize) -> Self {
         use syscall::flag::{
-            O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK, O_TRUNC,
-            O_WRONLY,
+            O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK,
+            O_TRUNC, O_WRONLY,
         };
         let access = flags & O_ACCMODE;
         Self {
             write: access != O_RDONLY && access != 0,
             write_only: access == O_WRONLY,
-            create_or_truncate: flags & (O_CREAT | O_TRUNC) != 0,
+            create: flags & O_CREAT != 0,
+            exclusive: flags & O_EXCL != 0,
+            truncate: flags & O_TRUNC != 0,
+            permissions: (flags & 0o7777) as u16,
             directory: flags & O_DIRECTORY != 0,
             symlink: flags & O_SYMLINK != 0,
             no_follow: flags & O_NOFOLLOW != 0,
@@ -86,7 +102,7 @@ impl OpenMode {
 
     /// Whether the open would change the volume or allow changing it.
     pub const fn wants_write(&self) -> bool {
-        self.write || self.create_or_truncate
+        self.write || self.create || self.truncate
     }
 }
 
@@ -332,7 +348,7 @@ trait Writable {
         number: u32,
         change: &crate::write::Change,
     ) -> Result<(), crate::write::WriteError>;
-    /// Writes `data` at `offset` of inode `number`'s blocks (`write::write_data`).
+    /// Writes `data` at `offset` of inode `number` (`write::write_data`).
     fn write_data(
         &self,
         number: u32,
@@ -340,6 +356,20 @@ trait Writable {
         data: &[u8],
         changed: crate::write::Timestamp,
     ) -> Result<(), crate::write::WriteError>;
+    /// Sets inode `number`'s size (`write::truncate`).
+    fn truncate(
+        &self,
+        number: u32,
+        size: u64,
+        changed: crate::write::Timestamp,
+    ) -> Result<(), crate::write::WriteError>;
+    /// Creates a regular file `name` in directory `parent` (`write::create`).
+    fn create(
+        &self,
+        parent: u32,
+        name: &[u8],
+        file: &crate::write::NewFile,
+    ) -> Result<u32, crate::write::WriteError>;
 }
 
 /// The device, shared by `ext4-view`'s reader, [`Device`] and the writer. Fs is
@@ -443,6 +473,24 @@ impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device:
         changed: crate::write::Timestamp,
     ) -> Result<(), crate::write::WriteError> {
         crate::write::write_data(&mut self.borrow_mut(), number, offset, data, changed)
+    }
+
+    fn truncate(
+        &self,
+        number: u32,
+        size: u64,
+        changed: crate::write::Timestamp,
+    ) -> Result<(), crate::write::WriteError> {
+        crate::write::truncate(&mut self.borrow_mut(), number, size, changed)
+    }
+
+    fn create(
+        &self,
+        parent: u32,
+        name: &[u8],
+        file: &crate::write::NewFile,
+    ) -> Result<u32, crate::write::WriteError> {
+        crate::write::create(&mut self.borrow_mut(), parent, name, file)
     }
 }
 
@@ -619,16 +667,26 @@ impl Fs {
     /// bypasses permission checks. Supplementary groups and ACLs are not supported; access
     /// is restricted to the inode's owner/group/other mode bits.
     ///
-    /// Opens for writing need a volume mounted with `Fs::new_writable`; the file can then
-    /// be written in place with [`Self::write`]. Creating and truncating are not supported
-    /// yet.
+    /// Opens for writing, creating or truncating need a volume mounted with
+    /// `Fs::new_writable`; the file can then be written with [`Self::write`] and resized with
+    /// [`Self::truncate`]. With `O_CREAT`, a path that does not exist is created as an empty
+    /// regular file (`crate::write::create`) when the caller may write to and search its
+    /// directory: owned by the caller, in the directory's group if the directory has its
+    /// set-group-ID bit and in the caller's otherwise, with `mode.permissions` (less the
+    /// set-group-ID bit when the group is not the caller's and the caller is not UID 0).
+    /// The open that creates a file is not checked against the new file's permissions, as
+    /// POSIX says. With `O_TRUNC`, an existing regular file is emptied, which needs write
+    /// permission.
     ///
     /// # Errors
     /// Returns the errors of [`Self::open`], [`Error::PermissionDenied`] for denied access,
     /// [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file, [`Error::ReadOnly`] for
     /// an open for writing, creating or truncating on a read-only mount,
-    /// [`Error::CreateOrTruncate`] for `O_CREAT` or `O_TRUNC` on a writable one, and
-    /// [`Error::IsADirectory`] for a directory opened for writing.
+    /// [`Error::Exists`] for `O_CREAT` and `O_EXCL` on a path that exists,
+    /// [`Error::CreateKind`] for `O_CREAT` with `O_DIRECTORY` or `O_SYMLINK` on one that does
+    /// not, [`Error::IsADirectory`] for a directory opened for writing or truncating (or a
+    /// path to create that ends in `/`), and `Error::Write` and `Error::Lookup` when
+    /// creating or truncating fails.
     pub fn open_as(
         &mut self,
         base: Option<usize>,
@@ -640,20 +698,35 @@ impl Fs {
         if mode.wants_write() && !self.is_writable() {
             return Err(Error::ReadOnly);
         }
-        if mode.create_or_truncate {
-            return Err(Error::CreateOrTruncate);
-        }
         let start = match base {
             Some(base) if !path.starts_with('/') => {
                 let handle = self.handle(base)?;
                 if !handle.metadata.is_dir() {
                     return Err(Error::NotADirectory);
                 }
-                handle.path.as_str()
+                handle.path.clone()
             }
-            _ => "/",
+            _ => "/".to_owned(),
         };
-        let (path, metadata) = self.resolve(start, path, mode, uid, gid)?;
+        let (path, metadata, created) = match self.resolve(&start, path, mode, uid, gid) {
+            Ok(_) if mode.create && mode.exclusive => return Err(Error::Exists),
+            Ok((path, metadata)) => (path, metadata, false),
+            Err(Error::Ext4(ext4_view::Ext4Error::NotFound)) if mode.create => {
+                let path = self.create_file(&start, path, mode, uid, gid)?;
+                let metadata = self.ext4.symlink_metadata(path.as_str())?;
+                (path, metadata, true)
+            }
+            Err(err) => return Err(err),
+        };
+        if mode.truncate && !mode.stat && !created {
+            self.truncate_at_open(&path, &metadata, uid, gid)?;
+        }
+        // The metadata again, after a truncation.
+        let metadata = if mode.truncate && !created {
+            self.ext4.symlink_metadata(path.as_str())?
+        } else {
+            metadata
+        };
         if mode.directory && !metadata.is_dir() {
             return Err(Error::NotADirectory);
         }
@@ -670,9 +743,11 @@ impl Fs {
                 if metadata.is_dir() {
                     return Err(Error::IsADirectory);
                 }
-                require_access(&metadata, uid, gid, 0o2)?;
+                if !created {
+                    require_access(&metadata, uid, gid, 0o2)?;
+                }
             }
-            if !mode.write_only {
+            if !mode.write_only && !created {
                 require_access(&metadata, uid, gid, 0o4)?;
             }
             if metadata.is_dir() {
@@ -694,6 +769,141 @@ impl Fs {
         self.next += 1;
         self.handles.insert(id, handle);
         Ok(id)
+    }
+
+    /// Creates `path` (from `start`) as an empty regular file, for an `O_CREAT` open, and
+    /// returns its normalized path.
+    #[cfg(feature = "write")]
+    fn create_file(
+        &mut self,
+        start: &str,
+        path: &str,
+        mode: OpenMode,
+        uid: u32,
+        gid: u32,
+    ) -> Result<String, Error> {
+        if path.ends_with('/') {
+            return Err(Error::IsADirectory);
+        }
+        let (parent, name) = match path.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some((parent, name)) => (parent, name),
+            None => (".", path),
+        };
+        let (parent, directory) = self.resolve(start, parent, OpenMode::read(), uid, gid)?;
+        if !directory.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        require_access(&directory, uid, gid, 0o3)?;
+        if mode.directory || mode.symlink {
+            return Err(Error::CreateKind);
+        }
+        let number = match self.inode_of(&parent) {
+            Some(number) => number,
+            None => self.device.inode_of(&parent)?,
+        };
+        // A directory with the set-group-ID bit gives new files its group (POSIX leaves
+        // which one to the implementation; this is what BSD and Linux do).
+        let group = if directory.mode() & S_ISGID != 0 {
+            directory.gid()
+        } else {
+            gid
+        };
+        let mut permissions = mode.permissions & PERMISSION_BITS;
+        if group != gid && uid != 0 {
+            permissions &= !S_ISGID;
+        }
+        let file = crate::write::NewFile {
+            permissions,
+            uid,
+            gid: group,
+            created: crate::write::Timestamp::now(),
+        };
+        let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
+        let result = writer.create(number, name.as_bytes(), &file);
+        self.reload();
+        result?;
+        Ok(normalize(&parent, name))
+    }
+
+    #[cfg(not(feature = "write"))]
+    fn create_file(
+        &mut self,
+        _start: &str,
+        _path: &str,
+        _mode: OpenMode,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<String, Error> {
+        Err(Error::ReadOnly)
+    }
+
+    /// Empties the regular file at `path` for an `O_TRUNC` open, which needs write
+    /// permission. Other kinds of file are left as they are, except directories, which
+    /// cannot be truncated.
+    fn truncate_at_open(
+        &mut self,
+        path: &str,
+        metadata: &Metadata,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), Error> {
+        if metadata.is_dir() {
+            return Err(Error::IsADirectory);
+        }
+        if metadata.is_symlink() || metadata.file_type() != FileType::Regular {
+            return Ok(());
+        }
+        require_access(metadata, uid, gid, 0o2)?;
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = path;
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
+            let number = match self.inode_of(path) {
+                Some(number) => number,
+                None => self.device.inode_of(path)?,
+            };
+            let result = writer.truncate(number, 0, crate::write::Timestamp::now());
+            self.reload();
+            Ok(result?)
+        }
+    }
+
+    /// Sets the size of the file `id` names to `size` (`ftruncate`): a smaller size frees
+    /// the blocks past it, a larger one reads as zeros up to it. The file must be open for
+    /// writing, which checked the caller's permission. Its modification and change times
+    /// are set, also when the size does not change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadHandle`] for an unknown handle or one not opened for writing,
+    /// [`Error::IsADirectory`] for a directory, [`Error::ReadOnly`] on a read-only mount,
+    /// `Error::Lookup` when the file's inode cannot be found, and `Error::Write`
+    /// when the change fails.
+    pub fn truncate(&mut self, id: usize, size: u64) -> Result<(), Error> {
+        let handle = self.handle(id)?;
+        if !self.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        match handle.open {
+            Open::File(_) if handle.writable => {}
+            Open::Directory { .. } => return Err(Error::IsADirectory),
+            _ => return Err(Error::BadHandle { handle: id }),
+        }
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = size;
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            let changed = crate::write::Timestamp::now();
+            self.commit(id, |writer, number| writer.truncate(number, size, changed))
+        }
     }
 
     /// Closes `id`. Unknown handles are ignored, as a close has no answer.
@@ -982,8 +1192,9 @@ impl Fs {
     }
 
     /// Writes `buf` at byte `offset` of the file `id` names, which must be a regular file
-    /// opened for writing, into the blocks it already has (`write::write_data`), and sets
-    /// its modification and change times to now (and its size, if the write ends past it).
+    /// opened for writing, allocating the blocks it does not have yet
+    /// (`write::write_data`), and sets its modification and change times to now (and its
+    /// size, if the write ends past it).
     /// Returns how many bytes were written: all of `buf`, or none.
     ///
     /// # Errors
@@ -991,8 +1202,9 @@ impl Fs {
     /// [`Error::BadHandle`] for an unknown handle or one not opened for writing,
     /// [`Error::IsADirectory`] for a directory, `Error::Lookup` when the file's inode cannot
     /// be found, and `Error::Write` when the write fails: notably
-    /// `write::WriteError::NotAllocated` when it would need a block allocated, which is not
-    /// supported yet (`EOPNOTSUPP`).
+    /// `write::WriteError::NoSpace` (`ENOSPC`), `write::WriteError::ExtentTreeFull` when the
+    /// extent tree would have to grow, and `write::WriteError::NotAllocated` for an
+    /// unwritten extent, which are not supported yet (`EOPNOTSUPP`).
     pub fn write(&mut self, id: usize, offset: u64, buf: &[u8]) -> Result<usize, Error> {
         let handle = self.handle(id)?;
         match handle.open {

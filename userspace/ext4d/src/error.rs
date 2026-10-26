@@ -3,8 +3,8 @@
 
 use ext4_view::Ext4Error;
 use syscall::error::{
-    EACCES, EBADF, EFBIG, EILSEQ, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR,
-    EOPNOTSUPP, EPERM, EROFS,
+    EACCES, EBADF, EEXIST, EFBIG, EILSEQ, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT,
+    ENOTDIR, EOPNOTSUPP, EPERM, EROFS,
 };
 use thiserror::Error;
 
@@ -33,10 +33,13 @@ pub enum Error {
     /// `O_NOFOLLOW` without `O_SYMLINK` or `O_STAT` named a symbolic link.
     #[error("the path names a symbolic link and O_NOFOLLOW is set")]
     SymlinkNotFollowed,
-    /// `O_CREAT` or `O_TRUNC` on a volume mounted for changes: creating and truncating
-    /// files are not supported yet.
-    #[error("creating and truncating files is not supported yet")]
-    CreateOrTruncate,
+    /// `O_CREAT` with `O_DIRECTORY` or `O_SYMLINK` for a path that does not exist: only
+    /// regular files are created so far.
+    #[error("only regular files can be created")]
+    CreateKind,
+    /// `O_CREAT` and `O_EXCL` for a path that exists.
+    #[error("the file exists")]
+    Exists,
     /// The caller cannot search a directory or read the final inode.
     #[error("permission denied")]
     PermissionDenied,
@@ -93,7 +96,8 @@ impl Error {
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
             Self::NotOwner | Self::ChownRestricted => EPERM,
-            Self::SymlinkMode | Self::CreateOrTruncate => EOPNOTSUPP,
+            Self::SymlinkMode | Self::CreateKind => EOPNOTSUPP,
+            Self::Exists => EEXIST,
             Self::InvalidTime => EINVAL,
             #[cfg(feature = "write")]
             Self::Lookup(err) => lookup_errno(err),
@@ -128,10 +132,18 @@ fn write_errno(err: &crate::write::WriteError) -> i32 {
         | WriteError::IdOutOfRange { .. } => EINVAL,
         WriteError::QuotaTracked { .. }
         | WriteError::NotAllocated { .. }
-        | WriteError::UnsupportedFile { .. } => EOPNOTSUPP,
+        | WriteError::UnsupportedFile { .. }
+        | WriteError::NoExtents { .. }
+        | WriteError::ExtentTreeFull { .. }
+        | WriteError::UnsupportedDirectory { .. } => EOPNOTSUPP,
         WriteError::FileFlags { .. } => EPERM,
-        WriteError::NotAFile { .. } => EINVAL,
+        WriteError::NotAFile { .. } | WriteError::InvalidName => EINVAL,
+        WriteError::NameTooLong => ENAMETOOLONG,
         WriteError::FileTooLarge { .. } => EFBIG,
+        WriteError::NoSpace => syscall::error::ENOSPC,
+        WriteError::Exists { .. } => EEXIST,
+        WriteError::NotADirectory { .. } => ENOTDIR,
+        WriteError::Directory(err) => lookup_errno(err),
         // Damaged inodes, journals and devices, and anything added later.
         _ => EIO,
     }
