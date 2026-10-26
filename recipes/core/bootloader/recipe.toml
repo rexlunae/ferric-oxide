@@ -1,6 +1,6 @@
 [source]
 # The bootloader lives in this repository at crates/bootloader/, a git subtree of
-# gitlab.redox-os.org/redox-os/bootloader (see .github/workflows/subtree-sync.yml).
+# gitlab.redox-os.org/redox-os/bootloader (imported with its history; not synced).
 path = "crates/bootloader"
 
 [build]

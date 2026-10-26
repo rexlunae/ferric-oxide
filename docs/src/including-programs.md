@@ -1,8 +1,12 @@
-# Including Programs in Redox
+# Including Programs
+
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
 
 (Before reading this page you must read the [Build System](./build-system-reference.md) page)
 
-This page will teach you how to add programs on the Redox image, it's a simplified version of the [Application Porting](./porting-applications.md) page.
+This page will teach you how to add programs on the image, it's a simplified version of the [Application Porting](./porting-applications.md) page.
 
 - [Existing Recipe](#existing-recipe)
   - [Setup the Redox Build Environment](#setup-the-redox-build-environment)
@@ -14,7 +18,7 @@ This page will teach you how to add programs on the Redox image, it's a simplifi
 - [Create Your Own Hello World](#create-your-own-hello-world)
   - [Setting up the recipe](#setting-up-the-recipe)
   - [Writing the program](#writing-the-program)
-  - [Adding the program to the Redox image](#adding-the-program-to-the-redox-image)
+  - [Adding the program to the image](#adding-the-program-to-the-image)
 - [Running your program](#running-your-program)
 
 The Cookbook system makes the packaging process very simple. First, we will show how to add an existing program for inclusion. Then we will show how to create a new program to be included. In the [Coding and Building](./coding-and-building.md) page, we discuss the development cycle in more detail.
@@ -30,7 +34,7 @@ Redox has many programs that are available for inclusion. Each program has a rec
 - Run the system in **QEMU**.
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh
@@ -50,7 +54,7 @@ Read the [Configuration Settings](./configuration-settings.md) page and follow t
 - From your `redox` base directory, copy an existing configuration and edit it.
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh
@@ -86,10 +90,10 @@ CONFIG_NAME?=my-config
 
 ### Update The System Image
 
-- In your base `redox` folder, e.g. `~/tryredox/redox`, build the system and run it in **QEMU**.
+- In your base `redox` folder, e.g. `~/ferric-oxide`, build the system and run it in **QEMU**.
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh
@@ -161,11 +165,11 @@ cargo init --name="hello-world"
 
 This creates a `Cargo.toml` file and a `src` directory with the Hello World program.
 
-### Adding the program to the Redox image
+### Adding the program to the image
 
 To be able to run a program inside of Redox, it must be added to the filesystem. As [above](#existing-package), create a filesystem config `config/x86_64/myfiles.toml` or similar by copying an existing configuration, and modify `CONFIG_NAME` in [.config](./configuration-settings.md#config) to be `myfiles`. Open `config/x86_64/myfiles.toml` and add `hello-world = {}` below the `[packages]` section.
 
-During the creation of the Redox image, the build system installs those packages on the image filesystem.
+During the creation of the image, the build system installs those packages on the image filesystem.
 
 ```toml
 [packages]
@@ -173,10 +177,10 @@ During the creation of the Redox image, the build system installs those packages
 hello-world = {}
 ```
 
-To update the Redox image, including your program, run the following commands:
+To update the image, including your program, run the following commands:
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh

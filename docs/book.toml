@@ -1,17 +1,15 @@
 [book]
-title = "Ferric Oxide System"
-authors = ["The RedoxOS Developers", "Ferric Oxide contributors"]
-description = "The implemented Ferric Oxide operating system, with inherited Redox design and development documentation."
+title = "The Ferric Oxide Book"
+authors = ["Ferric Oxide contributors", "The Redox OS developers (original book)"]
+description = "Design, implementation, building and development of the Ferric Oxide operating system."
 src = "src"
 
 [output.html]
-theme = "./theme"
 
 # Optional PDF output
 [output.compress]
 highlight = "no-node"
 optional = true
-theme = "./theme"
 
 # Disabled until issues can be fixed
 # [output.linkcheck]
