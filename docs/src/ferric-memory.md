@@ -178,6 +178,14 @@ them can continue; that was the boot-smoke hang in
 in `crates/kernel/tests` model the wait with threads and an acknowledgement
 flag; only the image boots exercise the real context-switch path.
 
+On x86, adding a mapping where no present page-table entry was sends no TLB
+shootdown and does no local flush, because x86 never caches not-present
+entries. This covers each user-scheme request that maps a client buffer into
+the scheme daemon, and each anonymous `mmap`. AArch64 and RISC-V still flush
+after new mappings (`TlbShootdownActions::NEW_MAPPING` in
+`context/memory.rs`). Remaps, permission changes and unmaps flush on every
+architecture.
+
 On ARM64 every user address space uses ASID 0 (`TCR_EL1.A1` is clear and
 `TTBR0_EL1` carries no ASID), so the TLB is not tagged by process. Switching
 address spaces (`set_table` in `rmm/src/arch/aarch64.rs`) writes the table
