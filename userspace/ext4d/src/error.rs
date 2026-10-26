@@ -33,6 +33,10 @@ pub enum Error {
     /// `O_NOFOLLOW` without `O_SYMLINK` or `O_STAT` named a symbolic link.
     #[error("the path names a symbolic link and O_NOFOLLOW is set")]
     SymlinkNotFollowed,
+    /// `O_CREAT` or `O_TRUNC` on a volume mounted for changes: creating and truncating
+    /// files are not supported yet.
+    #[error("creating and truncating files is not supported yet")]
+    CreateOrTruncate,
     /// The caller cannot search a directory or read the final inode.
     #[error("permission denied")]
     PermissionDenied,
@@ -89,7 +93,7 @@ impl Error {
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
             Self::NotOwner | Self::ChownRestricted => EPERM,
-            Self::SymlinkMode => EOPNOTSUPP,
+            Self::SymlinkMode | Self::CreateOrTruncate => EOPNOTSUPP,
             Self::InvalidTime => EINVAL,
             #[cfg(feature = "write")]
             Self::Lookup(err) => lookup_errno(err),
@@ -122,7 +126,12 @@ fn write_errno(err: &crate::write::WriteError) -> i32 {
         WriteError::TimeOutOfRange { .. }
         | WriteError::InvalidPermissions { .. }
         | WriteError::IdOutOfRange { .. } => EINVAL,
-        WriteError::QuotaTracked { .. } => EOPNOTSUPP,
+        WriteError::QuotaTracked { .. }
+        | WriteError::NotAllocated { .. }
+        | WriteError::UnsupportedFile { .. } => EOPNOTSUPP,
+        WriteError::FileFlags { .. } => EPERM,
+        WriteError::NotAFile { .. } => EINVAL,
+        WriteError::FileTooLarge { .. } => EFBIG,
         // Damaged inodes, journals and devices, and anything added later.
         _ => EIO,
     }

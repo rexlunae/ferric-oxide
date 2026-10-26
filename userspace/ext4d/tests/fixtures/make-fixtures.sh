@@ -256,6 +256,28 @@ E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fy "$img" >/dev/null || [ $? -eq 1 ]
 E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
 gzip -9 -n -c "$img" > "$out/quota.ext4.gz"
 
+# write-data.ext4.gz: ext4 defaults, 2 MiB, 1 KiB blocks, with files a data write must
+# refuse: immutable.txt (i_flags IMMUTABLE), append.txt (APPEND), sparse.bin (8 KiB plus
+# "tail", "head" at its start and a hole over blocks 1 to 7) and unwritten.bin (10 bytes,
+# then an unwritten extent over blocks 1 to 3 that debugfs's fallocate adds).
+droot=$work/droot
+mkdir -p "$droot"
+printf 'immutable\n' > "$droot/immutable.txt"
+printf 'append only\n' > "$droot/append.txt"
+printf 'unwritten\n' > "$droot/unwritten.bin"
+dd if=/dev/zero of="$droot/sparse.bin" bs=1024 count=0 seek=8 2>/dev/null
+printf 'tail' >> "$droot/sparse.bin"
+printf 'head' | dd of="$droot/sparse.bin" conv=notrunc 2>/dev/null
+find "$droot" -exec touch -h -d '2026-01-01 00:00:00 UTC' {} +
+img=$work/write-data.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a60 -E root_owner=0:0 -d "$droot" "$img" 2M
+debugfs -w -R "set_inode_field /immutable.txt flags 0x80010" "$img" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /append.txt flags 0x80020" "$img" >/dev/null 2>&1
+debugfs -w -R "fallocate /unwritten.bin 1 3" "$img" >/dev/null 2>&1
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
+gzip -9 -n -c "$img" > "$out/write-data.ext4.gz"
+
 if [ -n "${2:-}" ]; then
     for name in journal-v3 journal-v2 journal-ext3; do
         debugfs -R "dump <8> $work/$name.jbd2" "$work/$name.ext4" >/dev/null 2>&1

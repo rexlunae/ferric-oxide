@@ -3,10 +3,11 @@
 //! The scheme's handles are [`Fs`] handles. Reads, directory listings, `fstat`, `fstatvfs`
 //! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
 //! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
-//! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]). Everything else that would
-//! change the volume (opens for writing or creating, `unlinkat`, `ftruncate`, `frename`,
-//! `flink`, and those three on a read-only mount) fails with `EROFS`, as
-//! [`Error::ReadOnly`] says. Errors become errnos only through [`Error::errno`]. Opens and
+//! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
+//! is written in place, into the blocks it has ([`Fs::write`]; with `O_APPEND`, at its end).
+//! Opens that create or truncate fail with `EOPNOTSUPP` there. Everything else that would
+//! change the volume (`unlinkat`, `ftruncate`, `frename`, `flink`, and all of the above on
+//! a read-only mount) fails with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through [`Error::errno`]. Opens and
 //! every change enforce the caller's UID/GID.
 
 use ferric_abi::id::requested;
@@ -185,12 +186,18 @@ impl SchemeSync for Ext4Scheme {
     fn write(
         &mut self,
         id: usize,
-        _buf: &[u8],
-        _offset: u64,
-        _fcntl_flags: u32,
+        buf: &[u8],
+        offset: u64,
+        fcntl_flags: u32,
         _ctx: &CallerCtx,
     ) -> syscall::Result<usize> {
-        self.fs.refuse_change(id).map(|()| 0).map_err(|e| errno(&e))
+        // The caller's permission was checked when the file was opened for writing.
+        let offset = if fcntl_flags as usize & syscall::flag::O_APPEND != 0 {
+            self.fs.attributes(id).map_err(|e| errno(&e))?.size
+        } else {
+            offset
+        };
+        self.fs.write(id, offset, buf).map_err(|e| errno(&e))
     }
 
     fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> syscall::Result<u64> {
