@@ -286,7 +286,7 @@ pub fn selftest(token: &mut CleanLockToken) {
         // SAFETY: RDTSC reads a counter; it has no side effects. The raw
         // ticks are only compared against each other here.
         let quiet_until = unsafe { core::arch::x86_64::_rdtsc() }
-            .wrapping_add(rate.ticks_for_nanos(u128::from(SELFTEST_QUIET_MS) * 1_000_000).get());
+            .wrapping_add(rate.ticks_for_nanos(u64::from(SELFTEST_QUIET_MS) * 1_000_000).get());
         loop {
             // SAFETY: interrupts on, bounded wait.
             unsafe { arch::interrupt::enable_and_nop() };
