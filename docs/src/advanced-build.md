@@ -1,5 +1,9 @@
 # Advanced Build
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 In this section, we provide the gory details that may be handy to know if you are contributing to or developing for **Redox**.
 
 Before reading through this section, make sure you have already read:
@@ -9,7 +13,7 @@ Before reading through this section, make sure you have already read:
 
 ## Setup Your Environment
 
-Advanced users may accomplish the same as the [**native_bootstrap.sh**](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/native_bootstrap.sh) script with the following steps:
+Advanced users may accomplish the same as the [**native_bootstrap.sh**](https://github.com/rexlunae/ferric-oxide/blob/main/native_bootstrap.sh) script with the following steps:
 
 - [Clone The Repository](#clone-the-repository)
 - [Install The Necessary Packages](#install-the-necessary-packages-and-emulators)
@@ -30,7 +34,7 @@ cd ~/tryredox
 ```
 
 ```sh
-git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream
+git clone https://github.com/rexlunae/ferric-oxide.git
 ```
 
 ```sh
@@ -422,7 +426,7 @@ Relibc is very active in development, so even with `PREFIX_BINARY=1` it will be 
 
 ## Cookbook
 
-The **Cookbook** system is an essential part of the Redox build system. Each Redox component package  is built and managed by the Cookbook toolset. The variable `REPO_BINARY` in `mk/config.mk` controls if the recipes are compiled from sources or use binary packages from Redox CI server, read the section [REPO_BINARY](./configuration-settings.md#repo_binary) for more details. See the [Including Programs in Redox](./including-programs.md) page for examples of using the Cookbook toolset. If you will be developing recipes to include in Redox.
+The **Cookbook** system is an essential part of the build system. Each Redox component package  is built and managed by the Cookbook toolset. The variable `REPO_BINARY` in `mk/config.mk` controls if the recipes are compiled from sources or use binary packages from Redox CI server, read the section [REPO_BINARY](./configuration-settings.md#repo_binary) for more details. See the [Including Programs in Redox](./including-programs.md) page for examples of using the Cookbook toolset. If you will be developing recipes to include in Redox.
 
 ## sccache
 
@@ -472,4 +476,4 @@ You can modify the size and contents of the filesystem for emulation and *livedi
 
 ## Next Steps
 
-Once this is all set up, we can finally build! See the [Compiling Redox](./building-redox.md#compiling-redox) section.
+Once this is all set up, we can finally build! See the [Compiling Redox](./building-redox.md#build-the-image) section.
