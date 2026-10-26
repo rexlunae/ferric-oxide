@@ -345,25 +345,32 @@ nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
 nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
 ```
 
-- `read.service`/`write.service` run from `namespace_read`/`namespace_write`
-  entry to return, on whichever thread serves the request: the scheme's main
-  thread, or a per-CPU worker answering a job or a direct request.
-- `read.device`/`write.device` sum, over the request's commands, the time from
-  just before the submission queue's doorbell to the observed completion,
-  including the controller's service time and the interrupt-to-worker wake-up
-  latency.
-- The difference (service minus device) is the driver's own work: queue-pair
-  and lock waits, bounce-buffer copies and executor wake-up latency not
-  charged to the device.
+- `read.service`/`write.service` cover request entry through return, including
+  partial errors, on both buffered and DMA paths. Timing belongs to the request
+  future, so interleaved requests on one executor thread remain separate.
+- `read.device`/`write.device` sum each request's command durations, starting
+  when a free submission-queue slot is accepted and ending when its completion
+  is observed by that future. Full-queue waits are excluded; doorbell batching,
+  controller service and completion wakeup latency are included. These are not
+  pure controller-time measurements. Each request publishes one sample of each
+  phase together, so the counts and interval boundaries match.
+- Service minus command time measures the remaining driver work, including
+  buffer preparation, free-slot waits and copies.
 
-The counter reads add no system calls, so an instrumented driver still shows
-the syscall counts of the unmodified one, and the ticks are calibrated once
-against the monotonic clock at driver start. Which thread served what, and
-the queueing and response legs, come from the kernel trace
-(`scheme.request`/`scheme.response`, `sched.switch`, `irq.deliver`/`irq.ack`,
-and the debug-level `scheme.sqe_deliver`/`scheme.cqe_receive`, which need
-`kernel.trace_max_level = "debug"`). The phase figures are for comparing one
-boot, not a documented time source.
+A separate reporting thread takes and resets the counters once a second, so
+samples are reported even after an I/O burst goes idle. Logging happens outside
+the counter lock. Reports are time windows, not benchmark rounds: a short job
+may share a window with another job. Use isolated workloads or explicit trace
+markers for round attribution, rather than assigning a report to the last job.
+
+On x86 the counter reads add no system calls and are calibrated against the
+monotonic clock at startup; other architectures read the monotonic clock.
+The reporting thread adds its own timer/logging calls. Kernel tracing supplies
+thread identity and socket/request timing (`scheme.request`/`scheme.response`,
+`sched.switch`, `irq.deliver`/`irq.ack`, and debug-level `scheme.sqe_deliver`/
+`scheme.cqe_receive`). Historical measurements from before these accounting
+fixes need remeasurement before deriving per-request phase differences. The
+phase figures compare one boot; they are not a documented time source.
 
 ## Disk benchmark (ferric-iobench)
 

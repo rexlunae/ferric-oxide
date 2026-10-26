@@ -432,10 +432,10 @@ need `kernel.trace_max_level = "debug"`.
   splits the kernel's queueing of a request (and the scheduling of the
   daemon) from the daemon's seeing it.
 - `scheme.cqe_receive` is recorded when the kernel accepts the daemon's
-  `write` of a batch of Cqe records: the scheme id, the response count and
-  the byte count. It fires after the whole batch is parsed and every matching
-  caller is freed, so together with `scheme.response` it splits the daemon's
-  writing an answer from the kernel's accepting it.
+  `write` of a batch of Cqe records: the scheme id, accepted record count
+  and byte count. It includes control commands such as `TriggerFevent` and
+  `ObtainFd`, so the count is not the number of responses or resumed callers.
+  Use `scheme.response` and its tag for actual response timing.
 - Both fire for every user scheme, not only the disk scheme, and only when a
   read or write moved records (a zero-length `write` is not a batch). The
   counts are whole records: `count * size_of::<Sqe>() == bytes` for a

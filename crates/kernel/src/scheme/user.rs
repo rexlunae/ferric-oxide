@@ -878,9 +878,7 @@ impl UserInner {
                 Err(error) => return Err(error),
             }
         }
-        // Ferric Oxide: the scheme.cqe_receive tracepoint (`kernel.trace`, debug level, for
-        // the I/O path): a batch of answered requests was accepted and their callers
-        // resumed. A write that gave the socket no Cqe is not recorded.
+        // This batch includes control CQEs as well as request responses.
         if bytes_read > 0 {
             crate::trace::trace_event!(
                 ferric_trace::kernel::SCHEME_CQE_RECEIVE,

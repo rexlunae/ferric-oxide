@@ -367,10 +367,11 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     log::debug!("Starting to listen for scheme events");
 
-    // Ferric Oxide: with the perf feature, a request-phase report at most every five
-    // seconds, so an instrumented boot shows where each request's time goes.
     #[cfg(feature = "perf")]
-    perf::calibrate();
+    if let Err(error) = perf::start_reporting() {
+        log::error!("cannot start NVMe phase reporter: {error}");
+        std::process::exit(1);
+    }
 
     // Ferric Oxide: a close held back for concurrent requests becomes ready when the last of
     // them ends, which is no scheme event, so the loop also wakes for that.
@@ -378,8 +379,6 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     executor.block_on(async {
         loop {
             log::trace!("new event iteration");
-            #[cfg(feature = "perf")]
-            perf::maybe_report();
             if let Err(err) = scheme.borrow_mut().tick().await {
                 log::error!("scheme error: {err}");
             }

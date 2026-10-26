@@ -429,8 +429,9 @@ crate::events! {
     }
 
     /// The kernel accepted a user scheme's `write` of Cqe records (the daemon's
-    /// "answer" step, `UserInner::write`): the scheme id, the response count and the
-    /// byte count.
+    /// socket receive step, `UserInner::write`): scheme id, accepted record count
+    /// and byte count. Records include control commands (TriggerFevent/ObtainFd)
+    /// as well as responses; this count does not count resumed callers.
     ///
     /// This is a debug-level event for the I/O path: together with `scheme.response` it
     /// separates the scheme's writing an answer from the kernel's accepting it. It fires
