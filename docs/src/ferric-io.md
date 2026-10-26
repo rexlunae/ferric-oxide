@@ -932,7 +932,9 @@ opened (read-only, write-only or read-write), and writes back an object:
   file, before it forgets the object;
 - before it serves a write, an `ftruncate` or an `mmap` itself, after holding
   the object's writes; the hold lasts while the file has any mapping, since
-  RedoxFS's mapped buffers are written back without a write call;
+  RedoxFS's mapped buffers are written back without a write call (a shared
+  writable mapping closes the object altogether, as on the read path, so
+  descriptions opened after it goes are cached again);
 - when the object has been dirty for 5 s (`DEFAULT_AGE_MS`), checked by its
   timer once a second;
 - every dirty object at once on an urgent record (the default limit is 8192
@@ -951,7 +953,8 @@ cached reader and by one RedoxFS serves (which writes the dirty pages back
 first), and survives `fsync`, close and reopen; a write left dirty at the last
 close reaches the file; a write nobody syncs is written back on its own within
 the age; and a mapping made over dirty pages sees them, writes are not cached
-while a shared writable mapping lasts, and are cached again once it goes. The
+while a shared writable mapping lasts, and a description opened once it goes
+is cached again. The
 modification time shows whether a write was cached (`cached=yes`), since a
 cached write does not move it until it is written back. The steps that need
 RedoxFS to serve a description open it `O_FSYNC`, so the read-path steps hold

@@ -526,9 +526,11 @@ unsafe fn mapped(page: *const u8) -> Vec<u8> {
 
 /// `pcache-redoxfs-writeback-mmap`: a mapping made over dirty pages sees them (RedoxFS
 /// writes them back before mapping), a write made while a shared writable mapping lasts goes
-/// to RedoxFS, and writes are cached again once it is unmapped. The write made while mapped
-/// is to another page than the mapped one: how RedoxFS's own mappings see writes to their
-/// pages is not the page cache's to test. Passes at once when writes are not cached.
+/// to RedoxFS, and once it is unmapped, writes through a description opened afterwards are
+/// cached again (the mapping closed the file's object, as on the read path, so descriptions
+/// open across it stay with RedoxFS). The write made while mapped is to another page than
+/// the mapped one: how RedoxFS's own mappings see writes to their pages is not the page
+/// cache's to test. Passes at once when writes are not cached.
 pub fn writeback_mappings() -> Result<(), Failure> {
     let mut want = bytes(15, 0, LEN);
     io("create the test file", fs::write(PATH, &want))?;
@@ -554,12 +556,14 @@ pub fn writeback_mappings() -> Result<(), Failure> {
             "a write was cached while the file had a shared writable mapping".into()
         })?;
         let patch = bytes(18, 60, 10);
-        check(write_cached(&file, &patch, 60)?, || {
+        let writer = open_writer()?;
+        check(write_cached(&writer, &patch, 60)?, || {
             "writes were not cached again after the mapping went".into()
         })?;
         want[60..70].copy_from_slice(&patch);
         expect(&file, &want, "writes around a mapping")?;
-        io("fsync", file.sync_all())?;
+        io("fsync", writer.sync_all())?;
+        drop(writer);
         expect(&open_fs(false)?, &want, "writes around a mapping and fsync")?;
     }
     drop(file);

@@ -48,7 +48,8 @@
 //! - `pcache-redoxfs-writeback-age`: a cached write nobody syncs is written back on its own
 //!   within the writeback age and RedoxFS's flush period.
 //! - `pcache-redoxfs-writeback-mmap`: a mapping made over cached writes sees them, writes are
-//!   not cached while a shared writable mapping lasts, and are again once it goes.
+//!   not cached while a shared writable mapping lasts, and those of a description opened
+//!   once it goes are again.
 //!   The last two pass at once when writes are not cached.
 //! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
 //!   through a read-only description (cached) against an `O_FSYNC` one (served by RedoxFS,
