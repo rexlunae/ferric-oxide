@@ -50,6 +50,8 @@ jobs:
         run: bash scripts/ferric-ci/test-boot-smoke.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
+      - name: Perf A/B gate regression tests
+        run: bash scripts/ferric-ci/test-perf-ab.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
