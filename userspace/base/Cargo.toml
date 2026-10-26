@@ -105,6 +105,7 @@ redox-scheme = { version = "0.11.2", default-features = false }
 redox_syscall = { version = "0.9.4",  features = ["std"] }
 # Ferric Oxide: shared crates of the repository (../../crates; the base recipe links them
 # next to its copy of this tree).
+ferric-abi = { path = "../../crates/abi" }
 ferric-iommu = { path = "../../crates/iommu" }
 ferric-irq = { path = "../../crates/irq" }
 ferric-rtl8125 = { path = "../../crates/rtl8125" }

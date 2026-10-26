@@ -1118,7 +1118,9 @@ read-only medium) is also served read-only, with the reason logged
   not give it to another owner, and may set its group only to its own or the
   caller's GID (`EPERM` otherwise), and then the set-user-ID and set-group-ID
   bits of a regular file are cleared. A symbolic link opened itself gets its
-  own owner and group.
+  own owner and group. The kernel checks first, before the scheme sees the
+  call: a caller other than root may name only its own effective UID and GID,
+  or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
 
 A crash at any write leaves the old inode or a journal whose replay gives the
 new one. The tests crash a change before each of its eight writes and check

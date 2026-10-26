@@ -53,6 +53,9 @@ pub mod acpi;
 
 pub mod dtb;
 
+/// Ferric Oxide: which `fchown` calls are passed on to user schemes
+pub mod chown;
+
 /// `debug:` - provides access to serial console
 pub mod debug;
 

@@ -704,6 +704,16 @@ unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
 
+### Portable executor core
+
+`cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
+races, detached cancellation, live-only deadlines, stale and invalid ids, and
+bounded notification storage. Paused producers are coordinated by channels,
+without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib`
+runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
+The crate is not linked into the kernel yet; these tests do not exercise actual
+interrupts, scheduler wait registration or timer hardware.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual
