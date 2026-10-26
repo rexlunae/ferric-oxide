@@ -3,7 +3,7 @@
   "clippy::assertions_on_constants": 5,
   "clippy::indexing_slicing": 164,
   "clippy::missing_safety_doc": 31,
-  "clippy::undocumented_unsafe_blocks": 539,
+  "clippy::undocumented_unsafe_blocks": 537,
   "clippy::unwrap_used": 74,
   "dead_code": 16,
   "unsafe keyword": 1137,

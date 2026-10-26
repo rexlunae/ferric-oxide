@@ -93,9 +93,13 @@ pub trait Arch: Clone + Copy {
         unsafe { ptr::write_bytes(address.data() as *mut u8, value, count) }
     }
 
+    /// Drops the translation of `address` in the loaded address space from this CPU's TLB.
     fn invalidate(address: VirtualAddress);
+    /// Drops every non-global translation of the loaded address space from this CPU's TLB.
     fn invalidate_all();
 
+    /// The physical address of the loaded top-level table of `table_kind`, without any tag or
+    /// control bits the register holds beside it (on x86_64, the PCID in CR3 bits 0 to 11).
     fn table(table_kind: TableKind) -> PhysicalAddress;
     unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress);
 

@@ -148,6 +148,15 @@ entries across entry and return. Page invalidations and shootdowns invalidate
 the user PCID as well; switches between address spaces still flush because
 they share the pair. This is not a cache of a separate PCID pair per process.
 
+Changes to kernel mappings that every address space shares, patched kernel
+text and tracepoint static keys, go through `rmm`'s `invalidate_kernel_page`,
+which drops the page from every PCID that may cache it, not only the loaded
+one. `invalidate_kernel_all` flushes every PCID, global entries included, with
+`INVPCID` type 2 when PCIDs are on and a CR4.PGE toggle otherwise. `rmm`
+reports the loaded table without CR3's PCID bits, and takes the user PCID it
+invalidates from the live CR3. With the fixed pair these behave exactly as
+before; they are groundwork for per-address-space PCIDs.
+
 A CPU that waits for a contended lock keeps answering TLB shootdowns. Every
 ordered lock path, including the context switch's `write_arc` on a context
 lock and the upgrade of an upgradeable read guard, retries the lock and

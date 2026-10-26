@@ -272,7 +272,7 @@ fn ack() -> bool {
     }
     let patching = PATCHING.load(Ordering::SeqCst);
     for site in sites().iter().filter(|site| site.key == patching) {
-        RmmA::invalidate(VirtualAddress::new(site.code & !(PAGE_SIZE - 1)));
+        RmmA::invalidate_kernel_page(VirtualAddress::new(site.code & !(PAGE_SIZE - 1)));
     }
     acked.store(generation, Ordering::Release);
     true

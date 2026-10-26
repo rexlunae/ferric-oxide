@@ -6,7 +6,7 @@ use x86::controlregs::{Cr4, Xcr0};
 use crate::{
     arch::cpuid::{cpuid, feature_info, has_ext_feat},
     context::memory::PageSpan,
-    memory::{KernelMapper, Page, PageFlags, VirtualAddress, PAGE_SIZE},
+    memory::{KernelMapper, Page, PageFlags, RmmA, VirtualAddress, PAGE_SIZE},
 };
 
 #[cfg(all(cpu_feature_never = "xsave", not(cpu_feature_never = "xsaveopt")))]
@@ -326,7 +326,8 @@ pub(crate) unsafe fn patch_text(code_start: *mut u8, len: usize, write: impl FnO
                     PageFlags::new().write(true).execute(true).global(true),
                 )
                 .unwrap()
-                .flush();
+                .ignore();
+            RmmA::invalidate_kernel_page(page.start_address());
         }
 
         write(core::slice::from_raw_parts_mut(code_start, len));
@@ -338,7 +339,10 @@ pub(crate) unsafe fn patch_text(code_start: *mut u8, len: usize, write: impl FnO
                     PageFlags::new().write(false).execute(true).global(true),
                 )
                 .unwrap()
-                .flush();
+                .ignore();
+            // Kernel text is cached under every PCID: a writable translation left under another
+            // would be a W^X hole.
+            RmmA::invalidate_kernel_page(page.start_address());
         }
     }
 }

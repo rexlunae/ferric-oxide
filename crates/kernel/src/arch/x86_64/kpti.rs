@@ -47,11 +47,19 @@
 //! `rmm`'s `X8664Arch` does this when [`rmm::x86_64::X8664Arch::set_user_pcid`] is on:
 //!
 //! - `invalidate` (one page, every `PageFlush::flush`) adds `INVPCID` type 0 for the user PCID.
-//! - `set_table` (address-space switches, and `invalidate_all`, which every `PageFlushAll`, the
-//!   kernel's `Flusher` and the TLB shootdown IPI handler use) adds `INVPCID` type 1, a flush of
-//!   the whole user PCID.
+//! - `set_table` (address-space switches) and `invalidate_all` (every `PageFlushAll`, the
+//!   kernel's `Flusher` and the TLB shootdown IPI handler) add `INVPCID` type 1, a flush of the
+//!   whole user PCID.
+//! - `invalidate_kernel_page` (patched kernel text, static keys) drops a kernel page from every
+//!   PCID that may cache it, and `invalidate_kernel_all` flushes every PCID, global entries
+//!   included. Kernel mappings are shared by every address space, so a change to one must not
+//!   stop at the loaded PCID.
 //!
-//! The kernel never writes CR3 or runs `invlpg` other than through those two functions (the AP
+//! `invalidate` and `invalidate_all` take the user PCID from the live CR3 (its PCID with bit 11
+//! set), and `table` masks the PCID bits out of CR3, so neither depends on kernel tables being
+//! loaded under PCID 0.
+//!
+//! The kernel never writes CR3 or runs `invlpg` other than through those functions (the AP
 //! trampoline, [`init_cpu`](crate::arch::kpti::init_cpu) and the entry code aside, none of which needs to invalidate), so no
 //! flush site is missed and no flush is ever deferred. The paranoid NMI, #MC and #DB paths can
 //! therefore also switch back without flushing. Since `INVPCID` with a non-zero PCID faults
@@ -98,9 +106,6 @@ static PCID: AtomicBool = AtomicBool::new(false);
 
 /// CR3 bit 63 with CR4.PCIDE: keep the TLB entries of the PCID being loaded.
 const CR3_NOFLUSH: usize = 1 << 63;
-
-/// The PCID bits of CR3.
-const CR3_PCID_MASK: usize = 0xFFF;
 
 /// The kernel half shared by all shadows: a top-level table whose upper entries every shadow
 /// copies. Its lower half is unused.
@@ -272,8 +277,8 @@ pub unsafe fn init_cpu() {
         cr4_write(cr4);
         if pcid {
             let table = cr3();
-            if table & CR3_PCID_MASK as u64 != 0 {
-                cr3_write(table & !(CR3_PCID_MASK as u64));
+            if table & rmm::x86_64::CR3_PCID_MASK as u64 != 0 {
+                cr3_write(table & !(rmm::x86_64::CR3_PCID_MASK as u64));
             }
             cr4_write(cr4 | Cr4::CR4_ENABLE_PCID);
         }
