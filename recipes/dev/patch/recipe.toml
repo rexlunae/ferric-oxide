@@ -7,7 +7,7 @@ patches = [
     "03_renameat2.patch",
 ]
 script = """
-wget -O build-aux/config.sub "https://gitlab.redox-os.org/redox-os/gnu-config/-/raw/master/config.sub?inline=false"
+GNU_CONFIG_GET build-aux/config.sub
 autoreconf
 """
 
