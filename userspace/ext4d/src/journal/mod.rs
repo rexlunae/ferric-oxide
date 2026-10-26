@@ -19,6 +19,10 @@
 //! describes every block, so replaying again gives the same result. That is the order
 //! `e2fsck -E journal_only` leaves its results in; the tests compare the two block by block.
 //!
+//! The same journal inode map, opened journal superblock and block access also serve
+//! `crate::write` (features.toml `fs.ext4_write`), which writes new transactions through the
+//! journal.
+//!
 //! Only internal journals are replayed; a journal on another device is refused with
 //! [`JournalError::ExternalJournal`]. Orphan-inode processing, which e2fsck also does after
 //! a crash, is not part of journal replay and is left for writable ext4.
@@ -29,7 +33,9 @@
 //! "Ext4 Disk Layout" on the ext4 wiki at kernel.org. No code here comes from the Linux
 //! kernel or from e2fsprogs.
 
-mod map;
+pub(crate) mod map;
+
+use core::ops::{Deref, DerefMut};
 
 use ferric_jbd2::{JournalRead, Recovery, RecoveryError, Superblock, SuperblockError};
 use thiserror::Error;
@@ -127,23 +133,29 @@ pub enum JournalError {
     JournalSuperblock(#[from] SuperblockError),
     /// Scanning the log or reading a block to replay failed.
     #[error("journal recovery failed")]
-    Recovery(#[from] RecoveryError<ReadError>),
+    Recovery(#[from] RecoveryError<BlockError>),
     /// Reading or writing the volume failed.
     #[error("device")]
     Device(#[from] WindowError),
 }
 
-/// Why reading a journal block failed.
+/// Why reading or writing a journal block failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum ReadError {
+pub enum BlockError {
     /// The block is past the end of the journal inode.
     #[error("journal block {block} is not mapped")]
     Unmapped {
         /// The journal block.
         block: u32,
     },
-    /// The device failed the read.
+    /// A file-system block to write is past the end of the volume.
+    #[error("block {block} is past the end of the volume")]
+    OutOfRange {
+        /// The block number.
+        block: u64,
+    },
+    /// The device failed the read or write.
     #[error("device")]
     Device(#[from] WindowError),
 }
@@ -208,31 +220,7 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
         return Ok(Outcome::Clean);
     }
     let map = BlockMap::load(&volume, window)?;
-    let journal = Journal {
-        window: &*window,
-        map: &map,
-        volume: &volume,
-    };
-    let journal_sb_at = journal
-        .offset(0)
-        .map_err(|source| RecoveryError::Read { block: 0, source })?;
-    let mut raw = vec![0; volume.block_size as usize];
-    journal
-        .read_block(0, &mut raw)
-        .map_err(|source| RecoveryError::Read { block: 0, source })?;
-    let jsb = Superblock::parse(&raw)?;
-    if jsb.block_size() != volume.block_size {
-        return Err(JournalError::BlockSize {
-            journal: jsb.block_size(),
-            volume: volume.block_size,
-        });
-    }
-    if jsb.max_len() > map.len {
-        return Err(JournalError::Length {
-            claimed: jsb.max_len(),
-            mapped: map.len,
-        });
-    }
+    let (journal_sb_at, mut raw, jsb) = open_journal(&*window, &map, &volume)?;
     if !jsb.needs_recovery() {
         // The journal was emptied but the flag not cleared: a replay that stopped between
         // steps 4 and 5. Only step 5 is left.
@@ -243,6 +231,11 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
             journal_errno: jsb.errno(),
         });
     }
+    let journal = Journal {
+        window: &*window,
+        map: &map,
+        volume: &volume,
+    };
     let recovery = Recovery::scan(&journal, &jsb)?;
     for write in recovery.writes() {
         if write.target >= volume.blocks {
@@ -266,6 +259,41 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
         blocks: recovery.writes().len(),
         journal_errno: jsb.errno(),
     })
+}
+
+/// Reads and checks the journal superblock: returns where it is on the volume, journal block
+/// 0's bytes and the parsed superblock.
+pub(crate) fn open_journal<R: ReadAt>(
+    window: &Window<R>,
+    map: &BlockMap,
+    volume: &Volume,
+) -> Result<(u64, Vec<u8>, Superblock), JournalError> {
+    let journal = Journal {
+        window,
+        map,
+        volume,
+    };
+    let journal_sb_at = journal
+        .offset(0)
+        .map_err(|source| RecoveryError::Read { block: 0, source })?;
+    let mut raw = vec![0; volume.block_size as usize];
+    journal
+        .read_block(0, &mut raw)
+        .map_err(|source| RecoveryError::Read { block: 0, source })?;
+    let jsb = Superblock::parse(&raw)?;
+    if jsb.block_size() != volume.block_size {
+        return Err(JournalError::BlockSize {
+            journal: jsb.block_size(),
+            volume: volume.block_size,
+        });
+    }
+    if jsb.max_len() > map.len {
+        return Err(JournalError::Length {
+            claimed: jsb.max_len(),
+            mapped: map.len,
+        });
+    }
+    Ok((journal_sb_at, raw, jsb))
 }
 
 /// Writes every planned block, then flushes.
@@ -294,8 +322,20 @@ fn write_blocks<R: WriteAt>(
 /// The superblock is read again, and its own features decide the checksum, since the replay
 /// may have rewritten it.
 fn clear_recover_flag<R: WriteAt>(window: &mut Window<R>) -> Result<(), JournalError> {
+    set_recover_flag(window, false)
+}
+
+/// Sets or clears `INCOMPAT_RECOVER` in the volume superblock, updates its checksum, and
+/// flushes.
+pub(crate) fn set_recover_flag<R: WriteAt>(
+    window: &mut Window<R>,
+    recover: bool,
+) -> Result<(), JournalError> {
     let mut sb = read_volume_superblock(window)?;
-    let incompat = map::le32(&sb, INCOMPAT_AT) & !INCOMPAT_RECOVER;
+    let mut incompat = map::le32(&sb, INCOMPAT_AT) & !INCOMPAT_RECOVER;
+    if recover {
+        incompat |= INCOMPAT_RECOVER;
+    }
     sb[INCOMPAT_AT..INCOMPAT_AT + 4].copy_from_slice(&incompat.to_le_bytes());
     if map::le32(&sb, RO_COMPAT_AT) & RO_COMPAT_METADATA_CSUM != 0 {
         let crc = ferric_jbd2::crc32c(&[&sb[..CHECKSUM_AT]]);
@@ -306,7 +346,7 @@ fn clear_recover_flag<R: WriteAt>(window: &mut Window<R>) -> Result<(), JournalE
     Ok(())
 }
 
-fn read_volume_superblock<R: ReadAt>(
+pub(crate) fn read_volume_superblock<R: ReadAt>(
     window: &Window<R>,
 ) -> Result<[u8; superblock::SIZE], JournalError> {
     let mut sb = [0; superblock::SIZE];
@@ -314,30 +354,50 @@ fn read_volume_superblock<R: ReadAt>(
     Ok(sb)
 }
 
-/// The journal inode's blocks, read through the volume.
-struct Journal<'a, R> {
-    window: &'a Window<R>,
-    map: &'a BlockMap,
-    volume: &'a Volume,
+/// The journal inode's blocks, read (and, through a `&mut Window`, written) through the
+/// volume.
+pub(crate) struct Journal<'a, W> {
+    pub(crate) window: W,
+    pub(crate) map: &'a BlockMap,
+    pub(crate) volume: &'a Volume,
 }
 
-impl<R: ReadAt> Journal<'_, R> {
+impl<R: ReadAt, W: Deref<Target = Window<R>>> Journal<'_, W> {
     /// The byte offset of journal block `block` on the volume.
-    fn offset(&self, block: u32) -> Result<u64, ReadError> {
+    fn offset(&self, block: u32) -> Result<u64, BlockError> {
         let physical = self
             .map
             .physical(block)
             .filter(|&physical| physical < self.volume.blocks)
-            .ok_or(ReadError::Unmapped { block })?;
+            .ok_or(BlockError::Unmapped { block })?;
         Ok(physical * u64::from(self.volume.block_size))
     }
 }
 
-impl<R: ReadAt> JournalRead for Journal<'_, R> {
-    type Error = ReadError;
+impl<R: ReadAt, W: Deref<Target = Window<R>>> JournalRead for Journal<'_, W> {
+    type Error = BlockError;
 
-    fn read_block(&self, block: u32, buf: &mut [u8]) -> Result<(), ReadError> {
+    fn read_block(&self, block: u32, buf: &mut [u8]) -> Result<(), BlockError> {
         let offset = self.offset(block)?;
         Ok(self.window.read_exact_at(buf, offset)?)
+    }
+}
+
+impl<R: WriteAt, W: DerefMut<Target = Window<R>>> ferric_jbd2::JournalWrite for Journal<'_, W> {
+    fn write_block(&mut self, block: u32, buf: &[u8]) -> Result<(), BlockError> {
+        let offset = self.offset(block)?;
+        Ok(self.window.write_all_at(buf, offset)?)
+    }
+
+    fn write_home(&mut self, target: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if target >= self.volume.blocks {
+            return Err(BlockError::OutOfRange { block: target });
+        }
+        let offset = target * u64::from(self.volume.block_size);
+        Ok(self.window.write_all_at(buf, offset)?)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        Ok(self.window.flush()?)
     }
 }
