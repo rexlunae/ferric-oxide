@@ -15,7 +15,7 @@
 
 use std::any::Any;
 use std::io::{self, BufReader, Cursor, Read, Write};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use gix::protocol::transport::client::blocking_io::http::{
     GetResponse, Http, PostBodyDataKind, PostResponse,
@@ -111,7 +111,10 @@ fn request_error(url: &str) -> impl FnOnce(ureq::Error) -> HttpError + '_ {
 /// [`HttpError::Request`] if the request fails and [`HttpError::Status`]
 /// for an error status.
 pub(crate) fn get(url: &str) -> Result<impl Read + use<>, HttpError> {
-    let response = agent(BLOB_REDIRECTS)
+    // One agent for every download, so its connection pool is reused.
+    static BLOB_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let response = BLOB_AGENT
+        .get_or_init(|| agent(BLOB_REDIRECTS))
         .get(url)
         .call()
         .map_err(request_error(url))?;
