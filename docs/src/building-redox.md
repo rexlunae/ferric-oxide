@@ -86,8 +86,9 @@ cargo xtask run --no-build   # boot the existing image without rebuilding
 
 `run` builds the image first unless you pass `--no-build`. When the system
 boots, log in as `user` with an empty password, or as `root` with the
-password `password`. See [Running in a Virtual Machine](./running-vm.md) for
-more options.
+password `password`. These are development credentials set in
+`config/base.toml`; change them before exposing an image to anyone else. See
+[Running in a Virtual Machine](./running-vm.md) for more options.
 
 ## Change what gets built
 

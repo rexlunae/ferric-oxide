@@ -72,8 +72,9 @@ whose settings changed so they rebuild. See [Build and Configuration](./ferric-b
 
 ### make pull
 
-- Update the repository and its submodules to the latest pinned commits.
-  (`git pull` followed by a build does the same.)
+- Run `git pull` and remove the filesystem-tools tag so the host tools are
+  rebuilt. It doesn't update submodules; run
+  `git submodule update --init --recursive` for that.
 
 ### make all (first execution)
 
