@@ -31,6 +31,7 @@ on:
       - "recipes/core/fatd/**"
       - "recipes/tests/ferric-fat-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
+      - "userspace/base/drivers/storage/nvmed/**"
       - "recipes/tests/ferric-iobench/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
@@ -53,6 +54,8 @@ jobs:
         run: bash scripts/ferric-ci/test-boot-smoke.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
+      - name: Perf A/B gate regression tests
+        run: bash scripts/ferric-ci/test-perf-ab.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
@@ -373,3 +376,9 @@ jobs:
           restore-keys: userspace-base-
       - name: Test
         run: cargo test --locked -p driver-block -p netstack -p rtl8125d
+      - name: Compile NVMe timing with buffered and DMA paths
+        run: |
+          rustup target add x86_64-unknown-redox
+          cargo check --locked -p nvmed --target x86_64-unknown-redox
+          cargo check --locked -p nvmed --target x86_64-unknown-redox --features perf
+          cargo check --locked -p nvmed --target x86_64-unknown-redox --features perf,percore,grant-dma
