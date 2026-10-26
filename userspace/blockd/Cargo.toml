@@ -25,6 +25,8 @@ path = "src/unlock_main.rs"
 required-features = ["unlock"]
 
 [dependencies]
+# The readiness handshake with ferric-unlock, on both sides.
+ferric-ready = { path = "../../crates/ready" }
 ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["alloc"] }
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }

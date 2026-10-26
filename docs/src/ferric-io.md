@@ -1071,10 +1071,16 @@ scratch  dev:/scheme/disk.nvme/0p3 luks:/etc/keys/scratch
 Each line is a `ferric-blockd` command line (the scheme name, then the steps),
 with an optional last field `ext4:SCHEME` that has `ext4d` (`fs.ext4`) mount
 the volume at `/scheme/SCHEME`. `#` starts a comment, and every scheme name in
-the table must be unique. For each line in order, `ferric-unlock` starts
-`ferric-blockd`, waits up to 60 seconds for `/scheme/NAME` (LUKS key derivation
-is slow on purpose) or for the daemon to exit, and then does the same for the
-file system daemon. The daemons keep serving after it exits. A line that fails
+the table must be unique. For each line in order, `ferric-unlock` refuses the
+line if `/scheme/NAME` is already served, starts `ferric-blockd`, and waits up
+to 60 seconds (LUKS key derivation is slow on purpose) for the daemon's
+readiness line (`crates/ready`, `ferric-ready`): started with
+`FERRIC_READY=stdout`, `ferric-blockd` and `ext4d` write `ready` to stdout once
+they have registered their scheme themselves, so another process's scheme of
+the same name is never taken for the volume. A daemon that exits, says
+anything else or misses the deadline has failed, and one still running is
+killed, so a volume cannot appear after its failure was logged. Then it does
+the same for the file system daemon. The daemons keep serving after it exits. A line that fails
 is logged with its whole error chain and does not stop the others; a table
 that does not parse starts nothing; with no table it does nothing. The table
 is Ferric Oxide's own format (`userspace/blockd/src/crypttab.rs`), shaped like

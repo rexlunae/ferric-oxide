@@ -60,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "ext4-view",
  "ferric-jbd2",
+ "ferric-ready",
  "flate2",
  "libredox",
  "log",
@@ -75,6 +76,10 @@ dependencies = [
  "crc",
  "thiserror",
 ]
+
+[[package]]
+name = "ferric-ready"
+version = "0.1.0"
 
 [[package]]
 name = "flate2"
