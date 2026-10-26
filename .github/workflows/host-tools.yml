@@ -48,6 +48,8 @@ jobs:
           restore-keys: host-
       - name: Smoke runner regression tests
         run: bash scripts/ferric-ci/test-boot-smoke.sh
+      - name: Failed-test log printer tests
+        run: bash scripts/ferric-ci/test-print-test-fails.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Format

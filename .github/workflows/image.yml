@@ -744,16 +744,8 @@ jobs:
                 echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
                 # The boot's own output went to /dev/null above, and the annotation keeps
                 # only the last markers: print every failed test with the 40 lines before
-                # it, so a failure early in the boot can be read from the job log. The
-                # console's text is not read as workflow commands meanwhile.
-                if grep -qaF "FERRIC_TEST_FAIL" "$log.clean"; then
-                  echo "::group::$image boot $run: each FERRIC_TEST_FAIL with the 40 lines before it"
-                  stop="console-$image-$run-$RANDOM"
-                  echo "::stop-commands::$stop"
-                  grep -aF -B 40 "FERRIC_TEST_FAIL" "$log.clean" || true
-                  echo "::$stop::"
-                  echo "::endgroup::"
-                fi
+                # it, so a failure early in the boot can be read from the job log.
+                scripts/ferric-ci/print-test-fails.sh "$log.clean" "$image boot $run"
               fi
               # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
               if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then
