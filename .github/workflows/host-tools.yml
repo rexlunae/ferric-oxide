@@ -29,6 +29,7 @@ on:
       - "recipes/tests/ferric-blocklayer-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
       - "recipes/tests/ferric-iobench/**"
+      - "recipes/tests/ferric-ring-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
