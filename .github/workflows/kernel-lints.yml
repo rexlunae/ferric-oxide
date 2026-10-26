@@ -26,6 +26,12 @@ on:
       - ".github/workflows/kernel-lints.yml"
       - ".github/actions/prepare-cargo-git/**"
 
+concurrency:
+  # A new push to a pull request supersedes its older run; runs on main and
+  # ci/** branches are kept.
+  group: kernel-lints-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   host-tests:
     runs-on: ubuntu-24.04
