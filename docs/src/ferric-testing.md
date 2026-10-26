@@ -665,3 +665,13 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Delayed page-cache writeback notifications
+
+`cargo test --locked -p ferric-pcache --all-features` includes the delayed
+notification regression: fsync cleans a file before its record is delivered,
+writes race on either side of the current-count query, duplicate records keep
+the first dirty time, and another dirty file keeps its timer. ABI tests cover
+the `DirtyPages` request and reject extra metadata/packed flags. CI compiles
+the RedoxFS client and kernel query together; the writeback-enabled image's
+fsync, age, mapping and truncation smoke checks cover target integration.

@@ -15,6 +15,7 @@
 //! | [`Request::AttachAccess`] | an object | metadata `[verb, handle, access]` |
 //! | [`Request::HoldWrites`] | an object | metadata `[verb, 0 or 1]` |
 //! | [`Request::TakeDirty`] | an object | `SYS_CALL` with `READ`, metadata `[verb, first page]`, payload room for the pages; returns [`decode_taken`]'s word |
+//! | [`Request::DirtyPages`] | an object | metadata `[verb]`; returns its current dirty page count |
 //! | read records | a queue | `read(queue, buf)`: whole [`Record::BYTES`]-byte records |
 //!
 //! Every call fits the four metadata words the kernel passes a kernel scheme
@@ -639,6 +640,11 @@ pub enum Request {
         /// The first page to look at.
         from: u64,
     },
+    /// On an object: returns its current dirty page count without starting writeback.
+    /// A delayed [`Record::Writeback`] can outlive fsync; recheck this count before
+    /// arming an age timer. A later write from a clean state posts a fresh record.
+    /// Refused with `EOPNOTSUPP` without `page_cache_writeback`.
+    DirtyPages,
     /// On an object: the file's bytes in `pages` changed outside the cache (the file system
     /// served a write of them itself). Their cached copies are dropped, and a fill of them in
     /// flight is stale: its answer is not taken, and the readers waiting for it fill again.
@@ -664,6 +670,7 @@ enum Verb {
     AttachAccess = 10,
     HoldWrites = 11,
     TakeDirty = 12,
+    DirtyPages = 13,
 }
 
 impl Verb {
@@ -681,6 +688,7 @@ impl Verb {
             10 => Self::AttachAccess,
             11 => Self::HoldWrites,
             12 => Self::TakeDirty,
+            13 => Self::DirtyPages,
             _ => return None,
         })
     }
@@ -701,6 +709,7 @@ impl Request {
     pub const fn encode(self) -> ([u64; Self::MAX_WORDS], usize) {
         match self {
             Self::Bind => ([Verb::Bind as u64, 0, 0, 0], 1),
+            Self::DirtyPages => ([Verb::DirtyPages as u64, 0, 0, 0], 1),
             Self::SetSize { size } => ([Verb::SetSize as u64, size, 0, 0], 2),
             Self::Attach { handle } => ([Verb::Attach as u64, handle, 0, 0], 2),
             Self::Detach { handle } => ([Verb::Detach as u64, handle, 0, 0], 2),
@@ -764,6 +773,7 @@ impl Request {
         }
         match (verb, args) {
             (Verb::Bind, &[]) => Ok(Self::Bind),
+            (Verb::DirtyPages, &[]) => Ok(Self::DirtyPages),
             (Verb::SetSize, &[size]) => Ok(Self::SetSize { size }),
             (Verb::Attach, &[handle]) => Ok(Self::Attach { handle }),
             (Verb::Detach, &[handle]) => Ok(Self::Detach { handle }),
@@ -1392,6 +1402,7 @@ mod tests {
     fn requests_round_trip() {
         let all = [
             Request::Bind,
+            Request::DirtyPages,
             Request::SetSize { size: 12_345 },
             Request::Attach { handle: 9 },
             Request::Detach { handle: 9 },
@@ -1452,6 +1463,8 @@ mod tests {
 
     #[test]
     fn bad_requests_are_refused() {
+        assert_eq!(Request::decode(&[13, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[13 | (1 << 16)]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[99]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[1]), Err(DecodeError::Length));

@@ -95,6 +95,21 @@ impl<K: Ord + Copy, T: Ord + Copy> DirtyObjects<K, T> {
         }
     }
 
+    /// Rechecks a notification against the object's current dirty-page count.
+    /// Returns whether an age timer is needed for any tracked object.
+    ///
+    /// The file system serializes this with its own flush completions. If the
+    /// count is zero, a later cached write posts another first-dirty record.
+    /// This avoids rearming a timer from a record delayed past fsync.
+    pub fn observe(&mut self, key: K, dirty_pages: usize, at: T) -> bool {
+        if dirty_pages == 0 {
+            self.cleaned(key);
+        } else {
+            self.dirtied(key, at);
+        }
+        !self.is_empty()
+    }
+
     /// `key` has no dirty page any more (or is gone); returns whether it had.
     pub fn cleaned(&mut self, key: K) -> bool {
         match self.since.remove(&key) {
@@ -235,6 +250,27 @@ mod tests {
     use crate::abi::{PAGE_SIZE, PageRange};
     use crate::object::{Attempt, PageIndex, Read, WritebackError};
     use std::vec;
+
+    #[test]
+    fn delayed_notifications_do_not_rearm_clean_files_or_lose_new_writes() {
+        let mut dirty = DirtyObjects::new();
+        assert!(dirty.observe(7, 1, 100));
+        dirty.cleaned(7); // fsync completes before the pump forwards the record.
+        assert!(!dirty.observe(7, 0, 200));
+        assert!(dirty.due(10_000).is_empty());
+        // A write racing before the query is dirty and must still get an age timer.
+        assert!(dirty.observe(7, 1, 300));
+        assert!(dirty.observe(7, 1, 400));
+        assert_eq!(dirty.since(7), Some(300));
+        // A clean notification for another file cannot disarm this one's timer.
+        assert!(dirty.observe(9, 0, 500));
+        assert_eq!(dirty.due(300), alloc::vec![7]);
+        dirty.cleaned(7);
+        // A write after a clean query sends a fresh record and arms the timer again.
+        assert!(!dirty.observe(7, 0, 600));
+        assert!(dirty.observe(7, 2, 700));
+        assert_eq!(dirty.since(7), Some(700));
+    }
 
     #[test]
     fn objects_are_due_oldest_first_and_keep_their_first_time() {

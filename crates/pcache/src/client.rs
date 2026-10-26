@@ -99,6 +99,8 @@ pub enum Call {
     TakeDirty,
     /// [`Request::WrittenBack`].
     WrittenBack,
+    /// [`Request::DirtyPages`].
+    DirtyPages,
 }
 
 impl fmt::Display for Call {
@@ -119,6 +121,7 @@ impl fmt::Display for Call {
             Self::HoldWrites => "holding an object's writes",
             Self::TakeDirty => "taking dirty pages for writeback",
             Self::WrittenBack => "answering a writeback",
+            Self::DirtyPages => "reading an object's dirty page count",
         })
     }
 }
@@ -436,6 +439,15 @@ impl Object {
             Request::HoldWrites { hold },
             &[],
         )
+    }
+
+    /// Returns the current dirty page count without starting writeback.
+    /// Recheck delayed writeback notifications before arming an age timer.
+    ///
+    /// # Errors
+    /// [`ClientError::Call`] when the kernel refuses the query.
+    pub fn dirty_pages(&self) -> Result<usize, ClientError> {
+        call_with(&self.fd, Call::DirtyPages, Request::DirtyPages, &[])
     }
 
     /// Takes the next run of dirty pages at or after page `from` for writeback
