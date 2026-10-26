@@ -334,6 +334,24 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+A wake-up drained into an idling CPU must not be left behind either (#200).
+The wake-up IPI handler moves the wake-ups into the CPU's local list, which
+only the next `switch` processes. So on a CPU that runs its idle context, the
+handler switches at once. The idle loop also re-checks the local list, with
+interrupts disabled, before it halts. A `Contended` result from the handler's
+switch is not retried inside the handler: spinning there with interrupts off
+could wait on a CPU that is waiting for this one. Instead, the handler returns
+to the idle loop past its `hlt`, and the loop switches again. The handler asks
+whether the CPU is idling through `try_idle_context` (#214). The reason is
+`kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
+this handler and never sets up contexts. Asking that CPU for its idle context
+panicked; it then stopped answering TLB shootdowns, and the profile image hung
+with the other CPUs waiting for it. Because the TLB shootdown vector is among
+those routed vectors, the handler now answers a pending shootdown on such a
+CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
+set, and the next broadcast shootdown (sent when a kernel shadow stack is
+freed) spins on it forever.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
