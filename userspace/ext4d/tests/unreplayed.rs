@@ -1,0 +1,139 @@
+//! Read-only mounts of volumes that need recovery, without `journal-replay`: the journal
+//! fixtures (`tests/fixtures/make-fixtures.sh`), each against `NAME.replayed.ext4.gz`, the
+//! same volume after `e2fsck -E journal_only`.
+//!
+//! `ext4-view` 1.0.0's own view of the journal refuses a journal with an escaped block and
+//! does not follow a log that wraps round, serving the blocks as they were before it. ext4d
+//! therefore gives it the volume as a replay would leave it (`journal::replayed_blocks`),
+//! so every file, its contents and all of its metadata come from the committed journal.
+
+mod common;
+
+use common::load;
+use ext4d::device::Window;
+use ext4d::fs::{Attributes, Fs, Kind, OpenMode};
+
+const NAMES: [&str; 7] = [
+    "journal-v3",
+    "journal-v2",
+    "journal-v2-64",
+    "journal-ext3",
+    "journal-4k",
+    "journal-wrap",
+    "journal-wrap-inode",
+];
+
+fn mount(image: Vec<u8>) -> Fs {
+    Fs::new(Window::whole(image).expect("its length")).expect("an ext4 volume")
+}
+
+/// Every file on the volume, by path: its attributes and, for a regular file, its contents.
+fn tree(fs: &mut Fs) -> Vec<(String, Attributes, Vec<u8>)> {
+    let mut out = Vec::new();
+    let root = fs.root().expect("the root");
+    walk(fs, root, "", &mut out);
+    out
+}
+
+fn walk(fs: &mut Fs, dir: usize, path: &str, out: &mut Vec<(String, Attributes, Vec<u8>)>) {
+    let entries = fs.entries(dir).expect("a directory").to_vec();
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        let path = format!("{path}/{}", entry.name);
+        let mode = OpenMode {
+            stat: true,
+            no_follow: true,
+            ..OpenMode::read()
+        };
+        let id = fs.open(None, &path, mode).expect("the entry");
+        let attributes = fs.attributes(id).expect("open");
+        let mut contents = Vec::new();
+        match entry.kind {
+            Kind::Directory => {
+                let sub = fs.open(None, &path, OpenMode::read()).expect("a directory");
+                walk(fs, sub, &path, out);
+            }
+            Kind::File => {
+                let file = fs.open(None, &path, OpenMode::read()).expect("a file");
+                let mut buf = vec![0; 1 << 16];
+                loop {
+                    let offset = u64::try_from(contents.len()).expect("fits");
+                    let n = fs.read(file, offset, &mut buf).expect("readable");
+                    if n == 0 {
+                        break;
+                    }
+                    contents.extend_from_slice(&buf[..n]);
+                }
+            }
+            _ => {}
+        }
+        out.push((path, attributes, contents));
+    }
+}
+
+#[test]
+fn a_read_only_mount_serves_what_a_replay_leaves() {
+    for name in NAMES {
+        let mut ours = mount(load(&format!("{name}.ext4.gz")));
+        assert!(ours.needs_recovery(), "{name}");
+        let mut theirs = mount(load(&format!("{name}.replayed.ext4.gz")));
+        assert!(!theirs.needs_recovery(), "{name}");
+        let (ours, theirs) = (tree(&mut ours), tree(&mut theirs));
+        assert!(!theirs.is_empty(), "{name}");
+        assert_eq!(ours, theirs, "{name}");
+    }
+}
+
+#[test]
+fn the_journaled_contents_are_served() {
+    for name in &NAMES[..6] {
+        let mut fs = mount(load(&format!("{name}.ext4.gz")));
+        let hello = fs
+            .open(None, "/hello.txt", OpenMode::read())
+            .expect("hello.txt");
+        let mut buf = [0; 64];
+        let n = fs.read(hello, 0, &mut buf).expect("readable");
+        assert_eq!(&buf[..n], b"journaled hello\n", "{name}");
+    }
+}
+
+/// Why ext4d does not leave the journal to `ext4-view`: as of 1.0.0 it refuses every
+/// volume here that logs an escaped block, and serves journal-wrap's hello.txt and
+/// journal-wrap-inode's times as they were before the journal.
+#[test]
+fn ext4_view_alone_cannot_serve_these_volumes() {
+    for name in NAMES {
+        let result = ext4_view::Ext4::load(Box::new(load(&format!("{name}.ext4.gz"))));
+        match name {
+            "journal-wrap" => {
+                let ext4 = result.expect("loads");
+                assert_eq!(
+                    ext4.read("/hello.txt").expect("readable"),
+                    b"hello from ext4\n",
+                    "{name}: stale"
+                );
+            }
+            "journal-wrap-inode" => {
+                let ext4 = result.expect("loads");
+                let modified = ext4.metadata("/hello.txt").expect("hello.txt").modified();
+                assert_eq!(modified.seconds(), 0x6955_B900, "{name}: stale");
+            }
+            _ => assert!(result.is_err(), "{name}"),
+        }
+    }
+}
+
+#[test]
+fn a_wrapped_journal_does_not_mix_two_versions_of_an_inode() {
+    let journaled = ((0x7000_0000, 0), (0x7000_0001, 0), (0x7000_0002, 0));
+    for name in ["journal-wrap-inode.replayed", "journal-wrap-inode"] {
+        let mut fs = mount(load(&format!("{name}.ext4.gz")));
+        let file = fs
+            .open(None, "/hello.txt", OpenMode::read())
+            .expect("hello.txt");
+        let a = fs.attributes(file).expect("open");
+        assert_eq!((a.accessed, a.modified, a.changed), journaled, "{name}");
+    }
+}

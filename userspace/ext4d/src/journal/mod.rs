@@ -2,15 +2,20 @@
 //! (features.toml `fs.ext4_journal_replay`, Cargo feature `journal-replay`, off by default).
 //!
 //! The module is in every build: `crate::lookup` uses its volume superblock and inode block
-//! map (`map`) to find the inodes whose change times `fstat` reports. Only the daemon built
-//! with `journal-replay` calls [`replay`]; without it the device is never opened for
+//! map (`map`) to find the inodes whose change times `fstat` reports, and a read-only mount
+//! of a volume that needs recovery reads it through [`replayed_blocks`]. Only the daemon
+//! built with `journal-replay` calls [`replay`]; without it the device is never opened for
 //! writing.
 //!
 //! A volume that was not cleanly unmounted has `INCOMPAT_RECOVER` set: its journal holds
-//! committed transactions whose blocks may not have reached their home locations. The
-//! `ext4-view` reader copes by overlaying the journal in memory, which is all a read-only
-//! mount needs. Writing to the volume needs the replay on disk first; this module does it,
-//! as the groundwork for writable ext4:
+//! committed transactions whose blocks may not have reached their home locations. A
+//! read-only mount needs only to read the volume as a replay would leave it:
+//! [`replayed_blocks`] works out, in memory, every block the replay would write, and
+//! [`Overlaid`] reads the volume with them in place. (`ext4-view` has its own view of the
+//! journal, but as of 1.0.0 it refuses a journal with an escaped block and does not follow
+//! a log that wraps round, so ext4d gives it the overlaid volume instead, which looks
+//! clean.) Writing to the volume needs the replay on disk first; this module does it, as
+//! the groundwork for writable ext4:
 //!
 //! 1. `map` finds the journal inode (`s_journal_inum`, normally 8) and its blocks.
 //! 2. `ferric-jbd2` scans the log and plans the writes, checking every checksum before
@@ -270,8 +275,7 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
 /// The blocks a replay of the volume in `window` would write, by block number, with the
 /// contents it would write: the committed journal transactions, read and checked as
 /// [`replay`] reads them, but kept in memory. Empty for a volume that does not need
-/// recovery. Reading through [`Overlaid`] then sees the volume as a replay would leave it,
-/// as `ext4-view`'s own in-memory view of the journal does, without writing anything.
+/// recovery. [`replayed_blocks`] adds the superblock the replay leaves.
 ///
 /// # Errors
 ///
@@ -304,6 +308,46 @@ pub fn committed_blocks<R: ReadAt>(
         recovery.read(&journal, &jsb, write, &mut buf)?;
         blocks.insert(write.target, buf);
     }
+    Ok(blocks)
+}
+
+/// The blocks that differ on the volume in `window` once a replay has finished, by block
+/// number: the [`committed_blocks`], and the block holding the volume superblock with
+/// `INCOMPAT_RECOVER` cleared (and its checksum updated), as the replay's last step leaves
+/// it. Empty for a volume that does not need recovery.
+///
+/// Read through [`Overlaid`], the volume then looks clean, so a reader that has its own view
+/// of the journal (`ext4-view`) does not use it, and reads the committed state from these
+/// blocks instead. The journal itself is left as it is: a reader never needs it once the
+/// volume superblock says there is nothing to recover.
+///
+/// # Errors
+///
+/// Those of [`committed_blocks`].
+pub fn replayed_blocks<R: ReadAt>(
+    window: &Window<R>,
+) -> Result<BTreeMap<u64, Vec<u8>>, JournalError> {
+    let mut blocks = committed_blocks(window)?;
+    let volume = Volume::parse(&read_volume_superblock(window)?)?;
+    if !volume.needs_replay()? {
+        return Ok(blocks);
+    }
+    let block_size = u64::from(volume.block_size);
+    let (home, within) = (
+        superblock::OFFSET / block_size,
+        (superblock::OFFSET % block_size) as usize,
+    );
+    // The journal may have logged the superblock's block itself.
+    let mut block = match blocks.remove(&home) {
+        Some(block) => block,
+        None => {
+            let mut block = vec![0; volume.block_size as usize];
+            window.read_exact_at(&mut block, home * block_size)?;
+            block
+        }
+    };
+    put_recover_flag(&mut block[within..within + superblock::SIZE], false);
+    blocks.insert(home, block);
     Ok(blocks)
 }
 
@@ -422,18 +466,24 @@ pub(crate) fn set_recover_flag<R: WriteAt>(
     recover: bool,
 ) -> Result<(), JournalError> {
     let mut sb = read_volume_superblock(window)?;
-    let mut incompat = map::le32(&sb, INCOMPAT_AT) & !INCOMPAT_RECOVER;
+    put_recover_flag(&mut sb, recover);
+    window.write_all_at(&sb, superblock::OFFSET)?;
+    window.flush()?;
+    Ok(())
+}
+
+/// Sets or clears `INCOMPAT_RECOVER` in the volume superblock `sb`, in memory, and updates
+/// its checksum when the volume has `metadata_csum`.
+fn put_recover_flag(sb: &mut [u8], recover: bool) {
+    let mut incompat = map::le32(sb, INCOMPAT_AT) & !INCOMPAT_RECOVER;
     if recover {
         incompat |= INCOMPAT_RECOVER;
     }
     sb[INCOMPAT_AT..INCOMPAT_AT + 4].copy_from_slice(&incompat.to_le_bytes());
-    if map::le32(&sb, RO_COMPAT_AT) & RO_COMPAT_METADATA_CSUM != 0 {
+    if map::le32(sb, RO_COMPAT_AT) & RO_COMPAT_METADATA_CSUM != 0 {
         let crc = ferric_jbd2::crc32c(&[&sb[..CHECKSUM_AT]]);
-        sb[CHECKSUM_AT..].copy_from_slice(&crc.to_le_bytes());
+        sb[CHECKSUM_AT..CHECKSUM_AT + 4].copy_from_slice(&crc.to_le_bytes());
     }
-    window.write_all_at(&sb, superblock::OFFSET)?;
-    window.flush()?;
-    Ok(())
 }
 
 pub(crate) fn read_volume_superblock<R: ReadAt>(
