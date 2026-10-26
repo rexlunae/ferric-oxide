@@ -329,4 +329,3 @@ jobs:
           cargo check --locked -p nvmed --target x86_64-unknown-redox
           cargo check --locked -p nvmed --target x86_64-unknown-redox --features perf
           cargo check --locked -p nvmed --target x86_64-unknown-redox --features perf,percore,grant-dma
-          cargo check --locked -p nvmed --target x86_64-unknown-redox --features perf,overlap,grant-dma

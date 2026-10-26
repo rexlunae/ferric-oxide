@@ -703,16 +703,13 @@ nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
 This checks accounting and feature integration; controller timing and idle-burst
 reporting still need an instrumented target boot.
 
-### Adaptive NVMe overlap
+### NVMe request lifetime accounting
 
-The smoke image explicitly enables `drivers.nvme_overlap` and requires the
-one-time `nvmed: Adaptive overlap dispatched` marker, emitted after a worker
-accepts an Adaptive request while another claim remains live. Its multi-depth
-I/O benchmark exercises both the serial MainQueue baseline and Adaptive in the
-same boot. This proves the optional dispatch path is reached; it does not prove
-simultaneous controller execution or a real-hardware speedup.
-`ferric-blkqueue` host tests cover idle async-dispatch eligibility and atomic
-activity claims surviving inline completion, worker completion and failed send.
+`ferric-blkqueue`'s activity tests cover claims surviving inline completion,
+cross-thread worker completion and failed delivery. The existing Redox driver
+builds cover percore, perf and grant-DMA integration. Smoke CI retains the
+serial Adaptive default and its enforced same-boot queue performance gates.
+
 
 ### Profiler CPU wakeup acknowledgements
 

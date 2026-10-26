@@ -365,24 +365,16 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
-### Overlapping requests with per-CPU workers (drivers.nvme_overlap)
+### NVMe request lifetime accounting
 
-`drivers.nvme_overlap` enables nvmed's `overlap` feature (including `percore`).
-Adaptive reads/writes enter the concurrent scheme path even when idle. Before
-examining the next request, the dispatcher counts the first request and starts
-it as an async task on the scheme thread. It holds the main queue's mutex while
-using that queue/bounce buffer. Later overlapping requests go to per-CPU workers
-that write responses directly. Worker jobs carry a shared atomic activity claim
-from enqueue through response or drop, including failed sends and worker exit.
-Completing the inline request therefore cannot make a still-busy worker appear
-idle. MainQueue stays serial, and Workers keeps its direct-response behavior.
-
-The option is off by default. The initial experiment's overlapping requests
-could remain serialized, so its 973/996/967 and 973/1006/967 permille comparisons
-are not evidence for this corrected path. Fresh paired measurements at QD1 and
-QD32, with evidence of actual overlap, are needed before selecting a default or
-claiming the real-hardware performance gate. The kernel's I/O chapter does not
-claim a hardware speedup from emulated-controller phase measurements.
+The dispatcher counts inline requests, awaited worker jobs and requests that
+workers answer directly through one `ferric-blkqueue::activity::Claim` per
+request. A direct job carries its claim from enqueue until its response or
+drop, including failed delivery and worker exit. Completing another inline
+request cannot hide a worker that is still active when the queue policy changes.
+The shared counter uses atomics because direct jobs finish on worker threads.
+Adaptive and MainQueue continue serving requests serially; explicit Workers
+continues to use concurrent direct responses.
 
 ### Where a request's time goes (drivers.nvmed_perf)
 

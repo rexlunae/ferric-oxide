@@ -631,25 +631,6 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
-id = "drivers.nvme_overlap"
-menu = "drivers"
-type = "bool"
-title = "Overlap Adaptive queue-policy requests on per-CPU workers"
-default = false
-depends = "drivers.nvme_percore"
-rebuild = ["base"]
-help = """
-Run the first Adaptive request asynchronously on the scheme thread's queue,
-then hand overlapping requests to per-CPU workers that answer them directly.
-All queued/running requests stay counted until completion or drop. Off by
-default; the corrected path needs hardware benchmarks before changing defaults.
-Builds nvmed with its overlap Cargo feature (which includes percore)."""
-
-[[option.effect]]
-when = "value"
-make_append = { FERRIC_INITFS_FEATURES = "nvmed/overlap" }
-
-[[option]]
 id = "drivers.nvmed_perf"
 menu = "drivers"
 type = "bool"

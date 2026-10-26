@@ -64,15 +64,15 @@ impl Disk for NvmeDisk {
         Ok(())
     }
 
-    /// Async dispatch is enabled before the first Adaptive request arrives.
-    /// The dispatcher keeps that first request on the scheme thread's queue.
+    /// With per-CPU workers and a policy that serves requests concurrently
+    /// ([`QueuePolicy::serves_concurrently`](ferric_blkqueue::QueuePolicy::serves_concurrently)).
+    /// The main thread's queue pair serves one request at a time either way (see
+    /// `percore::Dispatcher::claim_inline`).
     #[cfg(feature = "percore")]
     fn concurrent(&self) -> bool {
-        self.workers.as_ref().is_some_and(|workers| {
-            workers
-                .policy()
-                .serves_concurrently_with_overlap(cfg!(feature = "overlap"))
-        })
+        self.workers
+            .as_ref()
+            .is_some_and(|workers| workers.policy().serves_concurrently())
     }
 
     /// With per-CPU workers, a concurrent read or write goes to a worker, which writes the
@@ -80,7 +80,7 @@ impl Disk for NvmeDisk {
     #[cfg(feature = "percore")]
     fn submit(&mut self, io: driver_block::PendingIo) -> Result<(), driver_block::PendingIo> {
         match &self.workers {
-            Some(workers) => workers.submit(&self.nvme, self.ns, io),
+            Some(workers) => workers.submit(self.ns, io),
             None => Err(io),
         }
     }

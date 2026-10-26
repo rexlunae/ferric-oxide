@@ -134,7 +134,7 @@ pub struct Dispatcher {
     started: RefCell<HashMap<u64, Started>>,
     /// How requests are placed.
     policy: Cell<QueuePolicy>,
-    /// Requests in flight on any queue pair, the main thread's included.
+    /// Requests in flight on any queue pair, including direct-response worker jobs.
     in_flight: Activity,
     /// Held by the request running on the main thread's queue pair: its thread context (and
     /// bounce buffer) serves one request at a time, and its lock is reentrant, so concurrent
@@ -257,28 +257,7 @@ impl Dispatcher {
     ///
     /// Gives `io` back, untouched, when every worker has ended; the scheme then serves it on
     /// its own thread.
-    pub fn submit(
-        self: &Rc<Self>,
-        nvme: &Arc<Nvme>,
-        namespace: NvmeNamespace,
-        io: PendingIo,
-    ) -> Result<(), PendingIo> {
-        #[cfg(feature = "overlap")]
-        if self.policy.get() == QueuePolicy::Adaptive && self.in_flight.count() == 0 {
-            // Claim before spawning: tick may inspect another request before
-            // this future is first polled. The main queue remains exclusive.
-            let counted = self.in_flight.claim();
-            let dispatcher = Rc::clone(self);
-            let nvme = Arc::clone(nvme);
-            let _task = NvmeExecutor::current().spawn(async move {
-                let _counted = counted;
-                let _main = dispatcher.main_queue.lock().await;
-                answer(&nvme, namespace, io).await;
-            });
-            return Ok(());
-        }
-        #[cfg(not(feature = "overlap"))]
-        let _ = nvme;
+    pub fn submit(&self, namespace: NvmeNamespace, io: PendingIo) -> Result<(), PendingIo> {
         let mut work = Work::Answer {
             namespace,
             io,
@@ -288,13 +267,6 @@ impl Dispatcher {
             let worker = &self.workers[index];
             match worker.jobs.send(work) {
                 Ok(()) => {
-                    #[cfg(feature = "overlap")]
-                    if self.policy.get() == QueuePolicy::Adaptive && self.in_flight.count() >= 2 {
-                        static REPORTED: AtomicBool = AtomicBool::new(false);
-                        if !REPORTED.swap(true, Ordering::Relaxed) {
-                            log::info!("nvmed: Adaptive overlap dispatched");
-                        }
-                    }
                     if let Err(err) = (&worker.wake).write_all(&[1]) {
                         // Queued all the same: the next wake-up finds it, and the worker's
                         // end answers it if none comes.
@@ -903,6 +875,7 @@ enum Work {
     Answer {
         namespace: NvmeNamespace,
         io: PendingIo,
+        /// Retained through enqueue, response, failure and worker-exit cleanup.
         _counted: InFlightGuard,
     },
 }
