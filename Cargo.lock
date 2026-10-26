@@ -17,6 +17,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -1305,6 +1306,15 @@ name = "ferric-blkqueue"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-blocklayer"
+version = "0.1.0"
+dependencies = [
+ "ferric-luks",
+ "ferric-lvm",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-boot-time"
 version = "0.1.0"
 dependencies = [
@@ -1317,6 +1327,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.17",
 ]
@@ -1361,6 +1373,10 @@ name = "ferric-elfreloc"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-exec-core"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-hwrand"
 version = "0.1.0"
 
@@ -1378,6 +1394,15 @@ dependencies = [
 [[package]]
 name = "ferric-irq"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-jbd2"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "flate2",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ferric-luks"
@@ -1671,7 +1696,6 @@ dependencies = [
  "pkgar 0.2.4",
  "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
- "redox-pkg 0.3.3",
  "serde",
  "ssh-key",
  "tempfile",

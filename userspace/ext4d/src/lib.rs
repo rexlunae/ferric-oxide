@@ -13,6 +13,13 @@
 //! - [`fs`]: the open-file table on top of the `ext4-view` crate, which does the real work
 //!   of reading ext4 (extents, hashed directories, checksums, the journal). Every call
 //!   that would change the file system fails with [`Error::ReadOnly`] (`EROFS`).
+//! - `journal` (Cargo feature `journal-replay`, features.toml `fs.ext4_journal_replay`):
+//!   replays a volume's journal onto the disk before it is served, with the `ferric-jbd2`
+//!   crate. Without it, a volume that needs recovery is read through `ext4-view`'s
+//!   in-memory view of the journal and nothing is written.
+//! - `write` (Cargo feature `write`, features.toml `fs.ext4_write`): changes the volume
+//!   through its journal, one JBD2 transaction per change, with `ferric-jbd2`'s writer. So
+//!   far it sets an inode's times; the scheme still serves the volume read-only.
 //! - [`error`]: [`Error`], and the one place it becomes an errno.
 //! - `scheme` (Redox only): the scheme handler, a thin layer from scheme calls to [`fs`].
 //!
@@ -50,8 +57,12 @@
 pub mod device;
 pub mod error;
 pub mod fs;
+#[cfg(feature = "journal-replay")]
+pub mod journal;
 #[cfg(target_os = "redox")]
 pub mod scheme;
 pub mod superblock;
+#[cfg(feature = "write")]
+pub mod write;
 
 pub use error::Error;

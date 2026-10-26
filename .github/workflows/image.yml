@@ -61,9 +61,9 @@ jobs:
       - name: Install cbindgen
         run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
-      # Several crates (relibc's, redoxfs's) have git dependencies on gitlab.redox-os.org.
+      # Several crates (relibc's, redoxfs's) have git dependencies (Ferric mirrors on GitHub).
       # Cargo only fetches a git dependency when its locked commit is missing from
-      # ~/.cargo/git/db, so caching that directory keeps a GitLab outage from failing
+      # ~/.cargo/git/db, so caching that directory keeps a fetch failure from failing
       # builds whose lockfiles have not moved. The key covers this repository's
       # lockfiles; a dependency the cookbook fetches mid-build has its own lockfile,
       # so a changed key still falls back to an older cache (restore-keys) and Cargo
@@ -114,14 +114,17 @@ jobs:
           # into e1000d, so the boot's network checks run with copy mode compiled in. The
           # experimental RTL8125B driver (drivers.rtl8125, off by default) is in, so the
           # image compiles it and installs its PCI match, and ext4d (fs.ext4, off by
-          # default) is in, so ferric-ext4-test mounts its ext4 image.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\n' > "$out/ferric.toml"
+          # default) is in, so ferric-ext4-test mounts its ext4 image, with the journal replay
+          # (fs.ext4_journal_replay, also off by default), so it also mounts one that needs
+          # recovery, and so is ferric-blockd with both its layers (fs.luks and fs.lvm, off by
+          # default), so ferric-blocklayer-test serves its LUKS and LVM images.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          # Pass the recipe-facing settings (kernel, relibc and initfs features,
+          # Pass the recipe-facing settings (kernel, relibc, initfs and ext4d features,
           # kernel link arguments, bootloader features, signed fox manifests)
           # on to the build.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_BASE_DRIVERS FERRIC_FOX_MANIFEST; do
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_BASE_DRIVERS FERRIC_BLOCKD_FEATURES FERRIC_EXT4D_FEATURES FERRIC_FOX_MANIFEST; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
@@ -304,7 +307,21 @@ jobs:
           - cpu: host
             iommu: none
             nic: virtio
+          # The same image with x2APIC hidden from the guest, so the kernel drives its local
+          # APICs in xAPIC mode: LocalApic::id's xAPIC decoding (#214) and the targeted IPIs
+          # (TLB shootdowns) that send to the IDs it returns run on every PR.
+          - cpu: host,-x2apic
+            iommu: none
+            nic: e1000
     env:
+      # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the host
+      # under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster path.
+      # nvmed's per-CPU policies take more interrupts and IPIs than its single queue, so their
+      # same-boot A/Bs there (NVMe t4 ratios of 0.81 to 0.85, against 0.90 to 1.05 with
+      # x2APIC) measure the APIC emulation more than nvmed. That boot checks xAPIC
+      # correctness, so its perf A/B gates (check-blkgrant-log.sh, check-iobench-log.sh) still
+      # report their numbers but only warn on a failure (scripts/ferric-ci/perf-ab.sh).
+      PERF_AB: ${{ matrix.cpu == 'host,-x2apic' && 'report' || 'enforce' }}
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}.log
     steps:
       - uses: actions/checkout@v4
@@ -433,7 +450,8 @@ jobs:
       # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
       # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
       # in the same boot. The figures go to a notice and the job summary; the per-CPU default
-      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab).
+      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab), except in the
+      # x2APIC-off boot, where a failure only warns (PERF_AB in the job env).
       - name: Check the disk benchmark
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
@@ -443,7 +461,7 @@ jobs:
           grep -aF "trace: sched.switch on from boot (trace.boot)" "$LOG"
           # Bootstrap applied the initfs trace.toml; the kernel logs the command.
           grep -aF "trace: enable scheme.cancel (1 event(s) changed)" "$LOG"
-          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault mapping futex lifecycle irq filter clock cap; do
+          for step in initfs boot enable decode order write read yield sched scheme disable mmap fault mapping journal futex lifecycle proc irq filter clock cap; do
             grep -aF "FERRIC_TEST_PASS trace-$step" "$LOG"
           done
           # The page fault and interrupt steps' details: record counts, and the interrupt
@@ -452,7 +470,7 @@ jobs:
             echo "::notice::$line"
           done
           # trace-irq comes from ferric-iommu-test, which acknowledges an interrupt itself.
-          echo "::notice::ferric-trace-test passed all 19 steps, ferric-iommu-test trace-irq"
+          echo "::notice::ferric-trace-test passed all 21 steps, ferric-iommu-test trace-irq"
           # The kernel logged the argument filter trace-filter set (T3c).
           grep -aF "trace: filter syscall.enter nr == " "$LOG"
           # The kernel logged the timestamp clock it picked (T3d); trace-clock checked its
@@ -538,14 +556,25 @@ jobs:
             | tr -d '\r' | while read -r line; do
             echo "::notice::$line"
           done
-      # fs.ext4 is on, so ferric-ext4-test mounts its image with ext4d and runs every step.
+      # fs.ext4 is on, so ferric-ext4-test mounts its image with ext4d and runs every step;
+      # fs.ext4_journal_replay is on too, so ext4-journal replays a journal and must pass.
       - name: Check ext4
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: |
-          for step in image mount list read stat erofs; do
+          for step in image mount list read stat erofs journal; do
             grep -aF "FERRIC_TEST_PASS ext4-$step" "$LOG"
           done
-          echo "::notice::ferric-ext4-test passed all 6 steps"
+          echo "::notice::ferric-ext4-test passed all 7 steps"
+
+      # fs.luks and fs.lvm are on, so ferric-blocklayer-test serves LVM on LUKS (4 KiB
+      # sectors), LUKS on LVM and LUKS1 with ferric-blockd and runs every step.
+      - name: Check the block layer
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          for step in image lvm-on-luks luks-on-lvm luks1 erofs access refuse; do
+            grep -aF "FERRIC_TEST_PASS blocklayer-$step" "$LOG"
+          done
+          echo "::notice::ferric-blocklayer-test passed all 7 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and
@@ -728,6 +757,10 @@ jobs:
               if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
                 failed=1
                 echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
+                # The boot's own output went to /dev/null above, and the annotation keeps
+                # only the last markers: print every failed test with the 40 lines before
+                # it, so a failure early in the boot can be read from the job log.
+                scripts/ferric-ci/print-test-fails.sh "$log.clean" "$image boot $run"
               fi
               # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
               if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then

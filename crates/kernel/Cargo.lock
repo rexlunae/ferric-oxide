@@ -147,6 +147,7 @@ version = "0.1.0"
 dependencies = [
  "ferric-irq",
  "redox_syscall",
+ "spin",
 ]
 
 [[package]]

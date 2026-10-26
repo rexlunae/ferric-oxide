@@ -196,6 +196,10 @@ mod tests {
                 crate::kernel::SCHED_CONTEXT_CREATE.id(),
                 crate::kernel::SCHED_CONTEXT_START.id(),
                 crate::kernel::SCHED_CONTEXT_EXIT.id(),
+                crate::kernel::SCHED_PROC_FORK.id(),
+                crate::kernel::SCHED_PROC_EXEC.id(),
+                crate::kernel::SCHED_PROC_EXIT.id(),
+                crate::kernel::SCHED_PROC_WAIT.id(),
             ]
         );
     }

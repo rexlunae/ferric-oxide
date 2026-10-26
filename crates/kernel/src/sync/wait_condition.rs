@@ -2,6 +2,8 @@
 //!
 //! A normal notification removes registrations. Signal-style notification keeps
 //! them, letting a resumed waiter distinguish interruption from normal delivery.
+//! Empty lists need no token or wakeup during destruction; nonempty lists need
+//! explicit cleanup when the caller already holds a token or other locks.
 
 use core::mem::ManuallyDrop;
 
@@ -173,6 +175,11 @@ impl WaitCondition {
 
 impl Drop for WaitCondition {
     fn drop(&mut self) {
+        // Closed page-cache objects and queues have already notified their
+        // waiters. An empty list needs neither wakeups nor a new lock token.
+        if self.contexts.get_mut().is_empty() {
+            return;
+        }
         // SAFETY: Implicit destruction is only valid without held locks or a
         // live clean token. Callers holding a token use into_drop[_locked].
         let mut token = unsafe { CleanLockToken::new() };
@@ -181,5 +188,16 @@ impl Drop for WaitCondition {
         {
             panic!("WaitCondition dropped");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WaitCondition;
+
+    #[test]
+    fn empty_condition_can_drop_without_wakeups() {
+        drop(WaitCondition::new());
+        // In particular, this must also pass with the drop_panic diagnostic.
     }
 }

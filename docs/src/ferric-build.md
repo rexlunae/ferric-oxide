@@ -162,12 +162,59 @@ selected architecture's image. `live=yes` or `live=no` after `--` explicitly
 selects a live image or persistent disk, overriding `qemu.live`.
 
 The Cargo architecture selection overrides a saved `target.arch` without
-rewriting `ferric.toml`. As with existing Make overrides, image/CPU/kernel
-feature settings from a different saved architecture are ignored, while its
-image profile name is retained. To apply saved feature settings to the new
-architecture, set `target.arch` with `make menuconfig` or `ferric-config set`
-before building. Plain Make uses the saved architecture when configured and
-the host architecture otherwise (`arm64` is normalized to `aarch64`).
+rewriting `ferric.toml`. Make resolves explicit `ARCH`, `BOARD` and `CONFIG_NAME`
+assignments before validating and generating configuration. Saved feature
+choices are resolved for that target: applicable settings remain active, while
+x86-only tracing, profiling and PTI are inactive on ARM64. A saved x86 tracing/
+profiling conflict therefore does not prevent an ARM64 build. Selecting x86-64
+still diagnoses that conflict. Plain Make uses the saved architecture when
+configured and the host architecture otherwise (`arm64` is normalized to
+`aarch64`).
+
+Configured builds resolve these inputs on every Make invocation, including
+changes to or removal of command-line overrides without a TOML edit. This adds
+a cached `ferric-config` invocation; unchanged generated files retain their
+timestamps. Configuration-only goals (`menuconfig`, `config-check`,
+`config-list`, `config-generate`) skip automatic generation so an invalid
+configuration can be inspected and repaired. `make menuconfig` edits saved
+choices; `make config-check ARCH=aarch64` checks the temporary ARM64 selection.
+
+## CPU baselines and independent build variants
+
+The processor menu contains x86-64 and ARM64 submenus. Each keeps a minimum
+baseline and separate, nonexclusive variant checkboxes, editable even when the
+other architecture is the active build target. Existing `cpu.x86_64_level` and
+`cpu.aarch64_level` settings retain their baseline meaning. Normal build/run
+commands use the selected architecture's baseline.
+
+Variant selections are `cpu.x86_64_v3`, `cpu.x86_64_v4`, `cpu.aarch64_v8_0`,
+`cpu.aarch64_v8_2` and `cpu.aarch64_v9`. Defaults select v3 and ARMv8.0-A;
+raising a minimum makes lower variants inactive and defaults its matching
+variant on. Explicit checkbox choices are preserved. Enabling v4 does not
+raise the saved x86 minimum or affect ARM's minimum.
+
+```sh
+cargo run -p ferric-config -- variants --json
+cargo xtask build --all-variants
+cargo xtask --arch aarch64 build --all-variants
+cargo xtask --arch x86_64 build --cpu-variant v4
+cargo xtask --arch aarch64 run --cpu-variant armv8.0-a --no-build --headless
+```
+
+`--all-variants` builds each enabled target/level sequentially; explicit `--arch`
+or `ARCH=` filters the list. Prepare each architecture with its `xtask setup`
+command first. The resolver validates each effective build configuration, and
+the build stops on failure. The variant listing describes CPU selections;
+it does not validate all image profiles or kernel combinations for every target.
+
+Each variant gets `build/<arch>/<image>/variants/<level>/`, including its live or
+persistent image, instead of replacing another variant's output. Shared recipe
+caches use the resolver's applied fingerprints, so changing the active level
+marks affected source recipes stale. Variants use their own level for compiler
+flags and kernel CPU-state/boot checks without rewriting saved baselines.
+Prebuilt application packages keep their published baseline. Dry runs print the
+variant query without executing it. These commands produce separate images;
+putting multiple architectures in a single image is future work.
 
 ## Optional container and inherited toolchain
 
@@ -310,9 +357,10 @@ fetches from upstream Redox at build time.
   Each `Cargo.lock` pins the exact revision; when updating a mirror, keep the
   pinned revision so only the source moves.
 - The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
-- The subtree-sync workflow still reads upstream Redox to open synced pull
-  requests and never writes there. Recipes that fetch their own component
-  trees from upstream Redox are outside this list and remain to be migrated.
+- Nothing in this repository syncs from upstream Redox. Recipes that fetch
+  their own component trees from upstream Redox, and the prebuilt toolchain
+  and package downloads from `static.redox-os.org`, are outside this list and
+  remain to be migrated.
 
 Device-tree parsing for the kernel and ARM64/RISC-V bootloader goes through
 `crates/devicetree/` (`ferric-devicetree`), which uses crates.io's

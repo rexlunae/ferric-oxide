@@ -135,6 +135,29 @@ mod tests {
     }
 
     #[test]
+    fn process_lifecycle_records_name_every_process() {
+        use ferric_trace::kernel::{
+            SCHED_PROC_EXEC, SCHED_PROC_EXIT, SCHED_PROC_FORK, SCHED_PROC_WAIT,
+        };
+        let b = bytes(&[
+            (&SCHED_PROC_FORK, 10, &[7, 42]),
+            (&SCHED_PROC_EXEC, 20, &[42]),
+            (&SCHED_PROC_EXIT, 30, &[42, 23, 0]),
+            (&SCHED_PROC_EXIT, 35, &[43, 0, 9]),
+            (&SCHED_PROC_WAIT, 40, &[7, 42, 23 << 8]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(1, &b).unwrap()]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("sched.proc_fork parent=0x7 child=0x2a"));
+        assert!(text.contains("sched.proc_exec pid=0x2a"));
+        assert!(text.contains("sched.proc_exit pid=0x2a status=0x17 signal=0x0"));
+        assert!(text.contains("sched.proc_exit pid=0x2b status=0x0 signal=0x9"));
+        assert!(text.contains("sched.proc_wait waiter=0x7 pid=0x2a status=0x1700"));
+    }
+
+    #[test]
     fn mapping_operations_preserve_space_requests_and_failures() {
         use ferric_trace::kernel::{MM_MAP, MM_PROTECT, MM_UNMAP};
         let b = bytes(&[
@@ -153,6 +176,42 @@ mod tests {
         ));
         assert!(text.contains("mm.protect space=0x1000 addr=0x8000 pages=0x1 flags=0x1 ret=0x0"));
         assert!(text.contains("mm.unmap space=0x1000 addr=0x8000 pages=0x2 unpin=0x0 ret=0x0"));
+    }
+
+    #[test]
+    fn mapping_journal_preserves_replacements_moves_clones_and_teardown() {
+        use ferric_trace::kernel::{MM_CLONE, MM_CLONE_SKIP, MM_DESTROY, MM_MOVE, MM_REPLACE};
+        let b = bytes(&[
+            (&MM_REPLACE, 10, &[0x1000, 0x8000, 2, 0]),
+            (
+                &MM_MOVE,
+                20,
+                &[0x1000, 0x1000, 0x8000, 2, 0x20000, 4, 0x10_0003, 0x20000],
+            ),
+            (&MM_CLONE_SKIP, 25, &[0x1000, 0x5000, 0x30000, 1]),
+            (&MM_CLONE, 30, &[0x1000, 0x5000, 7, 40, 0]),
+            (&MM_CLONE, 40, &[0x1000, 0, 0, 0, u64::MAX - 11]),
+            (&MM_DESTROY, 50, &[0x5000, 7, 40]),
+        ]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(2, &b).unwrap()]);
+        let mut out = Vec::new();
+        write(&capture, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("mm.replace space=0x1000 addr=0x8000 pages=0x2 ret=0x0"));
+        assert!(text.contains(
+            "mm.move src_space=0x1000 dst_space=0x1000 src_addr=0x8000 src_pages=0x2 \
+             dst_addr=0x20000 pages=0x4 flags=0x100003 ret=0x20000"
+        ));
+        assert!(
+            text.contains("mm.clone space=0x1000 new_space=0x5000 grants=0x7 pages=0x28 ret=0x0")
+        );
+        assert!(text.contains(
+            "mm.clone space=0x1000 new_space=0x0 grants=0x0 pages=0x0 ret=0xfffffffffffffff4"
+        ));
+        assert!(
+            text.contains("mm.clone_skip space=0x1000 new_space=0x5000 addr=0x30000 pages=0x1")
+        );
+        assert!(text.contains("mm.destroy space=0x5000 grants=0x7 pages=0x28"));
     }
 
     #[test]

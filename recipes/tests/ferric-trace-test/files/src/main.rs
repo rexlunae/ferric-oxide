@@ -46,6 +46,13 @@
 //! - `trace-mapping`: map/protect/unmap results retain the target page-table root and
 //!   order across a peer context, including overlap and permission refusals. Early
 //!   unaligned validation failures produce no API result; live disable stops recording.
+//! - `trace-journal`: the mapping journal. A `MAP_FIXED` `mmap` over a live mapping has an
+//!   `mm.replace` before its `mm.map`; `mremap` to an address the kernel picks, and with
+//!   `FIXED_REPLACE` onto another live mapping (an `mm.replace` first), each has an exact
+//!   `mm.move` within this address space; forking a child has one successful `mm.clone` of
+//!   this address space with grants and pages copied, an `mm.clone_skip` before it for a page
+//!   of physically contiguous memory (which a fork does not copy), and the copy has an
+//!   `mm.destroy` once the child execs and exits. Disabling the events stops all of them.
 //! - `trace-futex`: 32/64-bit waits produce a queued wait and matching resume with the
 //!   timeout or wake result; mismatched waits produce neither. Empty, zero-count and
 //!   successful peer wakes record their returned counts, and disabling the events stops
@@ -58,6 +65,11 @@
 //!   The kernel records do not carry the child's process exit status; `wait` checks it.
 //!   When kernel rings are available, asynchronous chain and close probes also require
 //!   kernel worker create/start/exit records with PID 0 after serving user requests.
+//! - `trace-proc`: procmgr reports a child process's fork (naming this process as its
+//!   parent), exec, exit (status 23, no signal) and this process's wait (`23 << 8`), in that
+//!   order, through `kernel.trace/emit`; disabling the events suppresses a second child's
+//!   records, and the kernel refuses records of kernel events, reserved header bits and
+//!   partial words with `EINVAL`. See `redox::proc`.
 //! - `trace-filter`: an argument filter on `syscall.enter` (`nr == write && a == <closed fd>`)
 //!   is listed in `filters` and keeps only the matching `syscall.enter` records, while
 //!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
@@ -69,7 +81,7 @@
 //!   frequency they imply is printed.
 //! - `trace-cap`: a process that is not root cannot open the scheme by path, but can through
 //!   a capability (`cap/read`, `cap/control`) root handed it, with that capability's access
-//!   and no more; see `redox::cap`.
+//!   and no more, and cannot open `emit` by path or through `cap/read`; see `redox::cap`.
 //!
 //! Each prints `FERRIC_TEST_PASS <name>` or `FERRIC_TEST_FAIL <name>: <why>`; the run stops at
 //! the first failure and exits non-zero. `trace-fault` prints `FERRIC_TEST_SKIP trace-fault` on a

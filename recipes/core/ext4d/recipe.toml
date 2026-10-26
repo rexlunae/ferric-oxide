@@ -7,5 +7,12 @@ path = "userspace/ext4d"
 [build]
 template = "custom"
 script = """
-cookbook_cargo
+# The journal replay (features.toml fs.ext4_journal_replay) is crates/jbd2, a path
+# dependency at ../../crates from userspace/ext4d/. The cookbook builds a copy of
+# userspace/ext4d/ in this recipe's source/, so give that copy the same relative path to it.
+ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
+# fs.ext4_journal_replay adds journal-replay to FERRIC_EXT4D_FEATURES (and fs.ext4_write adds
+# write); without them (and without a ferric.toml) ext4d is the read-only daemon that never
+# writes.
+cookbook_cargo ${FERRIC_EXT4D_FEATURES:+--features "${FERRIC_EXT4D_FEATURES}"}
 """

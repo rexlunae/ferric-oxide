@@ -334,6 +334,75 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+A wake-up drained into an idling CPU must not be left behind either (#200).
+The wake-up IPI handler moves the wake-ups into the CPU's local list, which
+only the next `switch` processes, so on a CPU that runs its idle context the
+handler switches at once. Before it halts, the idle loop re-checks the local
+list with interrupts disabled. That check is for wake-ups that have no
+interrupt behind them: a contended switch's re-push, or a direct switch back.
+A wake-up IPI cannot strand anything at the halt. `sti; hlt` holds interrupts
+until the `hlt` has executed, and an interrupt that ends a halt returns past
+the `hlt` (Intel SDM, STI and HLT), so the loop always runs again. A
+`Contended` result from the handler's switch is therefore not retried inside
+the handler, where spinning with interrupts off could wait on a CPU that is
+waiting for this one. The loop it returns to retries with interrupts on. The handler asks
+whether the CPU is idling through `try_idle_context` (#214). The reason is
+`kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
+this handler and never sets up contexts. Asking that CPU for its idle context
+panicked; it then stopped answering TLB shootdowns, and the profile image hung
+with the other CPUs waiting for it. Because the TLB shootdown vector is among
+those routed vectors, the handler now answers a pending shootdown on such a
+CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
+set, and the next broadcast shootdown (sent when a kernel shadow stack is
+freed) spins on it forever.
+
+The context-free acknowledgement branch is shared with host/Miri regression
+tests: it returns no idle context, services a pending TLB shootdown before EOI
+and never reads current-context state. This is control-flow coverage; actual
+interrupt entry/TLB hardware remain covered by target boots and hardware tests.
+Device IRQ targeting now excludes the profiler CPU from `irq:` listings,
+steering and IOMMU destinations. The xAPIC ID register is decoded from bits
+31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
+modes, and smoke CI also boots with x2APIC disabled.
+
+### Where a request's time goes (drivers.nvmed_perf)
+
+`drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
+each I/O request's phases with the CPU cycle counter and logs a summary about
+once a second:
+
+```text
+nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+```
+
+- `read.service`/`write.service` cover request entry through return, including
+  partial errors, on both buffered and DMA paths. Timing belongs to the request
+  future, so interleaved requests on one executor thread remain separate.
+- `read.device`/`write.device` sum each request's command durations, starting
+  when a free submission-queue slot is accepted and ending when its completion
+  is observed by that future. Full-queue waits are excluded; doorbell batching,
+  controller service and completion wakeup latency are included. These are not
+  pure controller-time measurements. Each request publishes one sample of each
+  phase together, so the counts and interval boundaries match.
+- Service minus command time measures the remaining driver work, including
+  buffer preparation, free-slot waits and copies.
+
+A separate reporting thread takes and resets the counters once a second, so
+samples are reported even after an I/O burst goes idle. Logging happens outside
+the counter lock. Reports are time windows, not benchmark rounds: a short job
+may share a window with another job. Use isolated workloads or explicit trace
+markers for round attribution, rather than assigning a report to the last job.
+
+On x86 the counter reads add no system calls and are calibrated against the
+monotonic clock at startup; other architectures read the monotonic clock.
+The reporting thread adds its own timer/logging calls. Kernel tracing supplies
+thread identity and socket/request timing (`scheme.request`/`scheme.response`,
+`sched.switch`, `irq.deliver`/`irq.ack`, and debug-level `scheme.sqe_deliver`/
+`scheme.cqe_receive`). Historical measurements from before these accounting
+fixes need remeasurement before deriving per-request phase differences. The
+phase figures compare one boot; they are not a documented time source.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
@@ -878,22 +947,216 @@ device) and serves in the foreground until it is stopped.
   without permitting data reads, and `O_STAT | O_NOFOLLOW` stats the link itself.
   `O_SYMLINK` on a regular file fails with `EINVAL`; relative opens require a
   directory handle, including paths containing `..`.
-- **Layers:** the daemon reads through `ext4d::device::ReadAt`, which a LUKS
-  (`ferric-luks`) or LVM (`ferric-lvm`) volume can implement to put ext4 on top
-  of it; no such layer is wired up yet.
+- **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
+  serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
+  [Block layers](#block-layers-luks-and-lvm-read-only)).
 - **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
   hash of the path (hard links get different numbers) and `st_ctime` is the
   modification time; `mmap` is not served; encrypted files and devices are
   refused (`EOPNOTSUPP`).
 
+### Journal replay
+
+A volume that was not cleanly unmounted has `needs_recovery` set: its journal
+holds committed transactions that may not have reached their home blocks.
+Without help, ext4d reads it through `ext4-view`'s view of the journal in
+memory, which is enough for most volumes but not all: as of `ext4-view` 1.0.0
+it refuses a journal that holds an escaped block (one whose data starts with
+the JBD2 magic number), and on a log that wraps round from the end of the
+journal to its start it ignores the committed transactions and serves the old
+contents. The tests pin both behaviours down.
+
+`fs.ext4_journal_replay` (default off, needs `fs.ext4`; Cargo feature
+`journal-replay`) has ext4d replay the journal onto the disk before it serves
+the volume, as `e2fsck -E journal_only` does. ext4d opens the device for
+writing only when the volume needs recovery, and only for the replay; it still
+serves the volume read-only. This is the groundwork for writable ext4, which
+has to start from a replayed journal.
+
+- **`ferric-jbd2`** (`crates/jbd2`, `no_std`, host-tested) reads the JBD2
+  log: the journal superblock, descriptor blocks and their tags, revoke blocks
+  and commit blocks, with version 2 and 3 CRC32C checksums. It keeps the
+  transactions that have a valid commit block, applies the revoke records (a
+  revoke in transaction *r* cancels copies of the block logged in transactions
+  up to *r*) and yields the newest surviving copy of each block. Every logged
+  block is checked against its tag checksum when its transaction's commit
+  block is reached, before anything is written. Under a journal with
+  `INCOMPAT_ASYNC_COMMIT` (where the commit block need not be written last) a
+  damaged block marks its transaction as torn: the log ends there and the
+  transactions before it are replayed. Otherwise a damaged block stops the
+  replay if it is the copy that would be written; a copy that a newer one
+  replaces or that is revoked is never written, so it does not. Fast commits
+  and external journal devices are refused; version 1 commit checksums are not
+  verified.
+- **ext4d** (`userspace/ext4d/src/journal/`) finds the journal inode through
+  its group descriptor and extent tree (or ext3 block map). It checks the map
+  before trusting it: the inode's block map and size must match the backup in
+  the superblock (`s_jnl_blocks`), the superblock checksum must hold, and the
+  journal must lie inside the volume, without holes, and clear of the
+  superblocks, group descriptors, reserved GDT blocks, bitmaps and inode
+  tables (volumes with `meta_bg` are refused for now). No replayed block may
+  land inside the journal. It then writes the planned
+  blocks and flushes, then empties the journal (`s_start` 0) and flushes, then
+  clears `needs_recovery`, updates the superblock checksum and flushes. A replay
+  interrupted at any point can be run again and gives the same volume; the
+  tests crash a replay before each write to check that.
+
+Both are written from "Journal (jbd2)" and the superblock, group descriptor,
+inode and extent tree sections of "Ext4 Disk Layout" on the ext4 wiki at
+kernel.org. Where that document is silent, the behaviour was settled by
+experiment with e2fsprogs 1.47: `debugfs` (`journal_open -c -v N`,
+`journal_write`) wrote transactions into test volumes, `e2fsck -E
+journal_only` replayed them, and the bytes were compared. That is how these
+were found:
+
+- every checksum is CRC32C started from `0xFFFF_FFFF` and not inverted at the
+  end, run over the journal UUID and then the covered bytes;
+- with version 2 checksums a tag is two bytes longer than its fields (10
+  bytes, or 14 with 64-bit block numbers);
+- the tag checksum of an escaped block covers the block as stored, with its
+  magic number zeroed (ext4d accepts the other form too, since the layout does
+  not say);
+- after a replay, `s_sequence` is one past the first sequence that had no
+  commit.
+
+The fixtures are volumes `make-fixtures.sh` builds this way, gzipped (about
+70 KB in all): version 3 and version 2 checksums with 32- and 64-bit tags, an
+ext3 volume with no checksums and an indirect-mapped journal, 4 KiB blocks, and
+a log that wraps round. Each comes with `e2fsck`'s replay of it, and the tests
+compare ext4d's replay with it block by block (apart from the write time and
+write count e2fsck also updates). CI also builds fresh ones with the runner's
+e2fsprogs and runs the same tests on them.
+
+### Writing through the journal
+
+`fs.ext4_write` (default off, needs `fs.ext4_journal_replay`; Cargo feature
+`write`) is the first step towards writable ext4: changing a volume through its
+journal. The scheme still serves volumes read-only; the one change so far,
+setting an existing inode's access, modification and change times
+(`ext4d::write::set_times`), is a library call that the scheme's `futimens`
+does not reach yet, because `ext4-view` does not say which inode a path names.
+
+- **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
+  changed block) into an empty journal from `s_first`: descriptor blocks with
+  a tag per block (the UUID after the first, `LAST_TAG` on the last, a block
+  that starts with the magic number logged with it zeroed and marked
+  `ESCAPE`), the copies, and a commit block. Descriptor tails, tags and the
+  commit block carry version 2 or 3 CRC32C checksums when the journal has
+  them; journals with version 1 checksums are refused. After a flush the
+  journal superblock is pointed at the transaction (`s_start`), and from then
+  on a replay finds it. `checkpoint` writes the blocks home, flushes, and
+  empties the journal again with the next sequence number.
+- **ext4d** (`userspace/ext4d/src/write.rs`) builds the new inode table block
+  (the times, with the epoch bits and nanoseconds in the `_extra` fields when
+  the inode has them, and the inode checksum from the volume's checksum seed,
+  `s_checksum_seed` with `metadata_csum_seed`), sets `needs_recovery`, commits
+  and checkpoints the transaction, and clears `needs_recovery`. It refuses
+  volumes that need recovery (replay them first), have no journal, or have a
+  feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
+  bits), and inodes that are free or already fail their checksum.
+
+A crash at any write leaves the old times or a journal whose replay gives the
+new ones. The tests crash a change before each of its eight writes and check
+that both ext4d's replay and `e2fsck`'s give one or the other, never a mix;
+with `EXT4D_E2FSCK` set (CI sets it) `e2fsck -fy` replays and `e2fsck -fn`
+must then find nothing to fix, on every volume the tests leave. The format
+comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
+"Inode Timestamps" and "Checksums" in "Ext4 Disk Layout", and experiments with
+e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
+
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
-`tests/fixtures/make-fixtures.sh`; `ferric-ext4-test` mounts the same image on
-the target, including `symlink_metadata` and refusal of `read_link` on a regular
+`tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
+`ferric-ext4-test` mounts the same image on the target, and with
+`fs.ext4_journal_replay` replays and mounts `journal-v3` (`ext4-journal`), including `symlink_metadata` and refusal of `read_link` on a regular
 file. A UID/GID 2000 child must read a public file and receive `EACCES` for
 protected files, directories and symlink targets. Host fixtures additionally
 cover owner and primary-group access.
 The image workflow checks the ext4 markers only for smoke boots, since the
 nightly fuzz script runs only the fuzzer and package verification.
+
+## Block layers: LUKS and LVM, read-only
+
+`ferric-blocklayer` (`crates/blocklayer/`) is a stack of read-only block
+layers, each a `BlockDevice` (a size and a positioned read) built on the
+devices below it, so they nest in whatever order the disk was set up in:
+
+- **`Slice`**: a byte window of a device, such as a partition.
+- **`Crypt`** (feature `luks`): opens a LUKS1 or LUKS2 volume through
+  `ferric-luks` (header, passphrase, volume key, data segment) and decrypts
+  AES-XTS sectors of 512 to 4096 bytes with `plain64` IVs, or `plain` ones,
+  which wrap to 0 at sector 2^32 (2 TiB in). Whole sectors are
+  decrypted in the caller's buffer; a partial sector at either end goes through
+  one sector of scratch space. Segments that are flagged (reencryption),
+  integrity-protected, or more than one are refused.
+- **`Lvm`** (feature `lvm`): reads every PV's label and metadata through
+  `ferric-lvm`, takes the newest metadata (highest `seqno`), matches each PV of
+  the group to a device by its label's UUID, and splits reads wherever the
+  logical volume moves to another extent run, stripe chunk or PV. Every PV of the
+  group must be given; mirror, RAID, thin, cache and snapshot segments are
+  refused.
+- **`Stack`**: one type for a stack chosen at run time, whose error
+  (`StackError`) keeps each layer's error in its source chain.
+
+The crate is `no_std` (`alloc` for the LUKS, LVM and `Stack` layers) and has
+no `unsafe` code. It builds for bare-metal targets, with
+`RUSTFLAGS="--cfg aes_force_soft"` and `ferric-luks/force-soft` where SIMD is
+not available, as for the bootloader.
+
+**IVs of large sectors.** The LUKS2 specification (1.1.4, section 3.3) gives a
+crypt segment's `sector_size` and its `iv_tweak` ("the starting offset for the
+Initialization Vector") but not the unit the IV counts in when sectors are
+larger than 512 bytes. This was settled by experiment, without reading any
+implementation's source: cryptsetup 2.7 encrypted a volume with 4096-byte
+sectors (`crates/blocklayer/tests/fixtures/make-fixtures.sh`), and its data
+decrypts only when the IV of the sector at byte `b` of the segment is
+`iv_tweak + b / 512`; counting in 4096-byte units gives noise from the second
+sector on. So the IV always counts 512-byte units (`ferric_luks::data::IV_UNIT`),
+and the fixture test `lvm_on_luks_with_4k_sectors_decrypts` reads sectors whose
+IVs differ under the two readings.
+
+`ferric-blockd` (`userspace/blockd/`, features.toml `fs.luks` and `fs.lvm`, off
+by default; each builds in its layer) serves the top of a stack as a read-only
+scheme:
+
+```text
+ferric-blockd SCHEME STEP...
+  dev:PATH              push a disk, partition or image file
+  slice:OFFSET:LENGTH   the top volume's bytes OFFSET..OFFSET+LENGTH (LENGTH "-": to the end)
+  luks:KEYFILE          the LUKS volume on the top volume
+  lvm:NAME              logical volume NAME of the group whose PVs are all the volumes so far
+```
+
+For example, LVM on LUKS on a partition, with ext4 on the logical volume:
+
+```text
+ferric-blockd root dev:/scheme/disk.nvme/0p2 luks:/etc/keys/root lvm:root
+ext4d /scheme/root rootfs
+```
+
+- **Disks:** a Redox disk scheme serves only whole, aligned blocks, so every
+  read is widened to the device's blocks (`st_blksize`): the aligned middle goes
+  straight into the caller's buffer and a partial first or last block through a
+  one-block bounce buffer.
+- **Passphrase:** the whole content of `KEYFILE`, byte for byte (a trailing
+  newline is part of it), as cryptsetup reads `--key-file`; never from the
+  command line. The daemon reads key files and opens devices before it enters
+  the null namespace.
+- **Access:** the scheme holds one file, the volume, at its root. Only UID 0
+  may open it (it is decrypted data), and the scheme root handle itself serves
+  no data or metadata (`EBADF`), so every read goes through a checked open.
+  Opens for writing, creating or truncating, and writes, `ftruncate`, `fchmod`, `fchown` and `futimens`, fail
+  with `EROFS`. Reads stop at the end of the volume.
+- **Limits:** read-only; no keyslot management, tokens, detached headers or
+  reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
+  started by hand, not by init, the installer or the bootloader.
+
+The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
+as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
+hold a known byte pattern in every volume: LUKS2 (512-byte sectors) on an LV
+split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
+data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
+Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
+serves the same images through `ferric-blockd` on the target.
 
 ## Kernel-bypass network queues
 

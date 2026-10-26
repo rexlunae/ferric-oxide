@@ -56,11 +56,11 @@ Its MMIO translation follows every ancestor bus and rejects range crossings and
 overflow. The kernel retains its independent reservation-map and reserved-memory
 policy checks. This does not replace drivers or validate every device binding.
 
-The six imported subtrees are `crates/kernel/`, `crates/bootloader/`,
-`crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/`.
-`.github/workflows/subtree-sync.yml` pulls their upstream changes into this
-fork and proposes local pull requests. Installer and Redoxer are local snapshots
-and are not in that workflow's sync matrix. relibc's `openlibm` and
+`crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`,
+`userspace/redoxfs/` and `docs/` were imported from Redox OS as git subtrees,
+so their history is preserved, and Installer and Redoxer as snapshots. None of
+them is synced from Redox: they are maintained here, and a Redox change is
+ported by hand when it is wanted. relibc's `openlibm` and
 `dlmalloc-rs` remain nested submodules, registered in the root `.gitmodules`.
 
 ## From firmware to user programs
@@ -126,6 +126,18 @@ their deadlines so blocked scheme handlers can still wake. Futex wait setup
 and wakeups synchronize through the futex table in `syscall/futex.rs` so a
 wakeup cannot pass between the comparison and waiter registration. Expired
 waiters cannot consume a later wake intended for another waiter.
+
+A wake-up for a context that last ran on another CPU goes on that CPU's
+cross-CPU wake-up list, and the waker sends the wake-up IPI to that CPU only
+(`context::wakeup_context`; contexts the scheduler hands to a CPU their
+affinity allows go the same way). Upstream broadcast the IPI to every other
+CPU, so each cross-CPU wake-up interrupted every CPU, and every CPU drained
+its own list as a side effect of other CPUs' wake-ups. Ferric Oxide's
+`schedule` drains the CPU's cross-CPU list too, so a wake-up whose IPI is not
+delivered (the target's APIC ID not yet recorded, or a port without IPIs) runs
+at that CPU's next switch rather than waiting for a later wake-up. The IPI does
+not preempt a busy CPU: the woken context waits for that CPU's next switch,
+which today is at most one scheduler tick away.
 
 ### Timers and timekeeping
 

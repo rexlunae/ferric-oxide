@@ -1,0 +1,20 @@
+Block-layer test images, made by make-fixtures.sh (as root, with cryptsetup 2.7, lvm2 2.03 and
+Python's cryptography package; no device-mapper). The script's header says what each image
+holds; every volume is filled with the pattern
+
+    byte i = (i * 7 + i / 4096 + seed) mod 251
+
+so tests check decrypted and mapped bytes against data no Ferric Oxide code wrote. The
+passphrase is "correct horse".
+
+lvm.img          LV "data" over two extent runs (seed 4); LUKS2, 512-byte sectors, in LV
+                 "sealed" (seed 5), also over two runs, with data kept across the jump
+lvm-on-luks.img  LV "inner" (seed 6) in LUKS2 with 4096-byte sectors
+luks1-data.bin   the first 8 KiB of LUKS1 data (seed 3) for ../../../luks/tests/fixtures/luks1.img,
+                 whose payload starts at sector 4096
+
+Bytes no test reads (unused keyslot space, encrypted data no test reads) are zeroed,
+so the images compress well. To check against the tools as they are now:
+
+    sudo tests/fixtures/make-fixtures.sh /some/empty/dir
+    BLOCKLAYER_FIXTURES=/some/empty/dir cargo test -p ferric-blocklayer --test fixtures

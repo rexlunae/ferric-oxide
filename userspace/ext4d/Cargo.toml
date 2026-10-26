@@ -3,7 +3,7 @@ name = "ext4d"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Read-only ext4 file system daemon for Ferric Oxide (features.toml fs.ext4)"
+description = "Read-only ext4 file system daemon for Ferric Oxide (features.toml fs.ext4), with optional journal replay (fs.ext4_journal_replay)"
 publish = false
 
 # Builds on its own, outside any workspace above it (the cookbook builds it for Redox; CI
@@ -18,12 +18,25 @@ path = "src/lib.rs"
 name = "ext4d"
 path = "src/main.rs"
 
+[features]
+# Replay a volume's journal onto the disk before serving it (features.toml
+# fs.ext4_journal_replay). Off by default: without it ext4d never writes.
+journal-replay = ["dep:ferric-jbd2"]
+# Change the volume through its journal (features.toml fs.ext4_write): so far, setting an
+# inode's times. Off by default; needs the replay, since a volume is replayed before it is
+# written.
+write = ["journal-replay"]
+
 [dependencies]
 ext4-view = { version = "1.0.0", features = ["std"] }
+ferric-jbd2 = { path = "../../crates/jbd2", optional = true }
 log = "0.4.27"
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
 thiserror = "2.0.17"
+
+[dev-dependencies]
+flate2 = "1"
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libredox = "0.1.25"

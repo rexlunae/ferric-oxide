@@ -9,7 +9,7 @@ use crate::{
         self, arch, memory::AddrSpaceSwitchReadGuard, ArcContextLockWriteGuard, Context,
         ContextLock, ContextQueueKey, ContextQueueValue, RunContextData, WeakContextRef,
     },
-    cpu_set::LogicalCpuId,
+    cpu_set::{LogicalCpuId, LogicalCpuSet},
     cpu_stats::{self, CpuState},
     percpu::{get_percpu_block, PercpuBlock},
     sync::{ArcRwLockWriteGuard, CleanLockToken, Mutex, L4},
@@ -149,7 +149,12 @@ pub unsafe extern "C" fn switch_finish_hook() {
 }
 
 /// Drains the cross_cpu_wakeup_list into local_wakeup_list.
-/// This is called from the ipi handler.
+///
+/// This is called from the wake-up IPI handler and, in Ferric Oxide, at the start of every
+/// `schedule`. A cross-CPU wake-up sends its IPI only to the CPU that owns the list, so no
+/// other CPU's IPI drains it as a side effect; draining here as well means a wake-up whose
+/// IPI was not delivered (the target's APIC ID not yet known, or a port whose IPIs are not
+/// implemented) still runs at that CPU's next switch instead of waiting for another wake-up.
 pub fn drain_ipi_context_wakeups(token: &mut CleanLockToken) {
     let percpu = PercpuBlock::current();
     let mut cross_cpu_wake = percpu
@@ -356,6 +361,8 @@ fn schedule(
             .extend(timers.drain(..));
 
         // Drain from percpu
+        // Ferric Oxide: cross-CPU wake-ups too (see `drain_ipi_context_wakeups`).
+        drain_ipi_context_wakeups(token);
         {
             let mut local_wake = percpu.switch_internals.local_wakeup_list.borrow_mut();
             wakeups.extend(local_wake.drain(..).map(|ctx| (None, ctx)));
@@ -549,26 +556,29 @@ fn affinity_elsewhere(context: &Context, cpu_id: LogicalCpuId) -> Option<Logical
         .find(|&cpu| get_percpu_block(cpu).is_some())
 }
 
-/// Ferric Oxide: queues each of `forward` on its CPU's cross-CPU wake-up list and sends the
-/// wake-up IPI, as a wake-up from another CPU does (`context::wakeup_context`). The caller holds
-/// no run queue lock.
+/// Ferric Oxide: queues each of `forward` on its CPU's cross-CPU wake-up list and sends each
+/// such CPU one wake-up IPI, as a wake-up from another CPU does (`context::wakeup_context`).
+/// The caller holds no run queue lock.
 fn forward_contexts(
     forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
     token: &mut CleanLockToken,
 ) {
-    if forward.is_empty() {
-        return;
-    }
+    let targets = LogicalCpuSet::empty();
     for (target, context_ref) in forward.drain(..) {
-        if let Some(target) = get_percpu_block(target) {
-            target
+        if let Some(percpu) = get_percpu_block(target) {
+            percpu
                 .switch_internals
                 .ipi_context_wakeup_list
                 .lock(token.token())
                 .push(context_ref);
+            targets.atomic_set(target);
         }
     }
-    crate::ipi::ipi(crate::ipi::IpiKind::Wakeup, crate::ipi::IpiTarget::Other);
+    for target in targets.iter() {
+        if let Some(percpu) = get_percpu_block(target) {
+            crate::ipi::ipi_single(crate::ipi::IpiKind::Wakeup, percpu);
+        }
+    }
 }
 
 fn select_next_context(
@@ -1540,6 +1550,12 @@ impl ContextSwitchPercpu {
     /// This function is unsafe as it modifies the idle context state directly.
     pub unsafe fn set_idle_context(&self, new: Arc<ContextLock>) {
         *self.idle_ctxt.borrow_mut() = Some(new);
+    }
+
+    /// Ferric Oxide: the idle context, or `None` on a CPU that never set up contexts (the
+    /// `kernel.profiling` profiler CPU).
+    pub fn try_idle_context(&self) -> Option<Ref<'_, Arc<ContextLock>>> {
+        super::idle::get(&self.idle_ctxt)
     }
 
     /// Retrieves the current idle context.

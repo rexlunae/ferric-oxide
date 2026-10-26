@@ -12,6 +12,7 @@
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
 //! | [`CRASH_PATH`] | the previous boot's crash dump | [`CRASH_TEST_COMMAND`], on a crash-test kernel |
 //! | `cap/read`, `cap/control` ([`Path::Cap`]) | — (a capability) | — |
+//! | [`EMIT_PATH`] | — | one [`UserRecord`] of a [user event](crate::kernel::USER_EVENTS), with control access |
 //!
 //! A selection is the syntax of [`select`](crate::select()). Lines end with `\n` and their fields
 //! are separated by single spaces.
@@ -53,6 +54,18 @@
 //! another capability of the same or less access, and `EACCES` for more, so a capability can
 //! be narrowed before it is passed on, never widened.
 //!
+//! # User-space events
+//!
+//! A few events are reported by user space rather than by the kernel: the process
+//! manager's [`USER_EVENTS`](crate::kernel::USER_EVENTS). A holder of control access opens
+//! [`EMIT_PATH`] and writes one [`UserRecord`] per write. The kernel checks that the event is
+//! a user event and that the record has exactly the event's arguments, then stamps it with
+//! the clock and stores it in the writing CPU's ring like its own records, after the event's
+//! argument filter. A write for an event that is off stores nothing and succeeds; one for an
+//! event this kernel does not compile in fails with `EOPNOTSUPP`, so a writer can stop. Any
+//! other event, or a malformed record, fails with `EINVAL`. The kernel vouches only for the
+//! time and CPU, not for the arguments.
+//!
 //! [`Peek::end`]: crate::ring::Peek::end
 
 use core::fmt;
@@ -90,6 +103,10 @@ pub const CRASH_PATH: &str = "crash";
 /// The command that, written to [`CRASH_PATH`], panics a kernel built for testing the crash
 /// dump; the kernel resets the machine once the dump is written.
 pub const CRASH_TEST_COMMAND: &str = "panic";
+
+/// The file user space writes [user events](crate::kernel::USER_EVENTS) to, one
+/// [`UserRecord`] per write (see [User-space events](self#user-space-events)).
+pub const EMIT_PATH: &str = "emit";
 
 /// The longest command, in bytes, one write to [`EVENTS_PATH`] may carry; the kernel refuses
 /// longer writes.
@@ -176,6 +193,8 @@ pub enum Path {
     Crash,
     /// `cap/<access>`: a capability ([`Access`]).
     Cap(Access),
+    /// [`EMIT_PATH`].
+    Emit,
 }
 
 impl Path {
@@ -188,6 +207,7 @@ impl Path {
             FILTERS_PATH => Some(Path::Filters),
             CLOCK_PATH => Some(Path::Clock),
             CRASH_PATH => Some(Path::Crash),
+            EMIT_PATH => Some(Path::Emit),
             other => {
                 if let Some(name) = other
                     .strip_prefix(CAP_DIR)
@@ -527,6 +547,142 @@ impl fmt::Display for StatsLine {
     }
 }
 
+/// One user-space event record, as written to [`EMIT_PATH`]: little-endian 64-bit words, the
+/// first holding the event id in bits 15:0 and the argument count in bits 23:16 (the rest
+/// zero), then one word per argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserRecord {
+    id: EventId,
+    len: usize,
+    args: [u64; crate::MAX_ARGS],
+}
+
+impl UserRecord {
+    /// The longest record, in bytes.
+    pub const MAX_BYTES: usize = (1 + crate::MAX_ARGS) * 8;
+
+    /// A record of `event` with `args`.
+    ///
+    /// # Errors
+    ///
+    /// [`UserRecordError::ArgCount`] when `args` is not exactly the event's arguments.
+    pub fn new(event: &Event, args: &[u64]) -> Result<Self, UserRecordError> {
+        if args.len() != event.args().len() {
+            return Err(UserRecordError::ArgCount {
+                expected: event.args().len(),
+                found: args.len(),
+            });
+        }
+        let mut words = [0; crate::MAX_ARGS];
+        words[..args.len()].copy_from_slice(args);
+        Ok(Self {
+            id: event.id(),
+            len: args.len(),
+            args: words,
+        })
+    }
+
+    /// The event's id.
+    pub const fn id(&self) -> EventId {
+        self.id
+    }
+
+    /// The arguments.
+    pub fn args(&self) -> &[u64] {
+        &self.args[..self.len]
+    }
+
+    /// The record's bytes, written into `buf`; returns how many.
+    pub fn encode(&self, buf: &mut [u8; Self::MAX_BYTES]) -> usize {
+        let header = u64::from(self.id.get()) | ((self.len as u64) << 16);
+        buf[..8].copy_from_slice(&header.to_le_bytes());
+        for (chunk, arg) in buf[8..].chunks_exact_mut(8).zip(self.args()) {
+            chunk.copy_from_slice(&arg.to_le_bytes());
+        }
+        8 * (1 + self.len)
+    }
+
+    /// The record `bytes` hold. It does not check that the id names an event; the reader
+    /// looks it up and compares [`UserRecord::args`] with the event's arguments.
+    ///
+    /// # Errors
+    ///
+    /// [`UserRecordError::Length`] when `bytes` is not a whole number of words between one
+    /// and [`UserRecord::MAX_BYTES`] bytes, [`UserRecordError::Reserved`] when the header sets
+    /// bits above 23, and [`UserRecordError::ArgCount`] when the header's count does not match
+    /// the words that follow it.
+    pub fn decode(bytes: &[u8]) -> Result<Self, UserRecordError> {
+        if bytes.is_empty() || bytes.len() > Self::MAX_BYTES || !bytes.len().is_multiple_of(8) {
+            return Err(UserRecordError::Length { bytes: bytes.len() });
+        }
+        let mut words = bytes.chunks_exact(8).map(|chunk| {
+            let mut word = [0; 8];
+            word.copy_from_slice(chunk);
+            u64::from_le_bytes(word)
+        });
+        let header = words.next().unwrap_or_default();
+        if header >> 24 != 0 {
+            return Err(UserRecordError::Reserved);
+        }
+        let len = ((header >> 16) & 0xff) as usize;
+        let found = bytes.len() / 8 - 1;
+        if len != found {
+            return Err(UserRecordError::ArgCount {
+                expected: len,
+                found,
+            });
+        }
+        let mut args = [0; crate::MAX_ARGS];
+        for (slot, word) in args.iter_mut().zip(words) {
+            *slot = word;
+        }
+        Ok(Self {
+            id: EventId::new((header & 0xffff) as u16),
+            len,
+            args,
+        })
+    }
+}
+
+/// Why a [`UserRecord`] could not be made or decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UserRecordError {
+    /// The record is empty, too long, or not whole words.
+    Length {
+        /// Its length in bytes.
+        bytes: usize,
+    },
+    /// The header sets reserved bits.
+    Reserved,
+    /// The number of arguments is wrong.
+    ArgCount {
+        /// The arguments the event or header names.
+        expected: usize,
+        /// The arguments given.
+        found: usize,
+    },
+}
+
+impl fmt::Display for UserRecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserRecordError::Length { bytes } => {
+                write!(
+                    f,
+                    "a user record of {bytes} bytes is not 1 to 9 whole words"
+                )
+            }
+            UserRecordError::Reserved => f.write_str("a user record header sets reserved bits"),
+            UserRecordError::ArgCount { expected, found } => {
+                write!(f, "a user record has {found} arguments, not {expected}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for UserRecordError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +698,7 @@ mod tests {
         assert_eq!(Path::parse("filters"), Some(Path::Filters));
         assert_eq!(Path::parse("clock"), Some(Path::Clock));
         assert_eq!(Path::parse("crash"), Some(Path::Crash));
+        assert_eq!(Path::parse("/emit"), Some(Path::Emit));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));
         assert_eq!(Path::parse("cpu/17"), Some(Path::Cpu(17)));
         assert_eq!(Path::parse("cpu"), None);
@@ -724,6 +881,70 @@ mod tests {
         assert_eq!(
             StatsLine::parse("cpu 3 queued 48 lost 2"),
             Err(LineError::Fields)
+        );
+    }
+
+    #[test]
+    fn user_records_round_trip() {
+        use crate::kernel::{SCHED_PROC_EXIT, SCHED_PROC_FORK};
+        let record = UserRecord::new(&SCHED_PROC_EXIT, &[42, 23, 0]).expect("three arguments");
+        let mut buf = [0; UserRecord::MAX_BYTES];
+        let len = record.encode(&mut buf);
+        assert_eq!(len, 32);
+        assert_eq!(buf[..8], (24u64 | (3 << 16)).to_le_bytes());
+        let back = UserRecord::decode(&buf[..len]).expect("valid");
+        assert_eq!(back, record);
+        assert_eq!(back.id(), SCHED_PROC_EXIT.id());
+        assert_eq!(back.args(), [42, 23, 0]);
+        assert_eq!(
+            UserRecord::new(&SCHED_PROC_FORK, &[1]),
+            Err(UserRecordError::ArgCount {
+                expected: 2,
+                found: 1
+            })
+        );
+    }
+
+    #[test]
+    fn bad_user_records_are_refused() {
+        let mut buf = [0; UserRecord::MAX_BYTES];
+        let len = UserRecord::new(&crate::kernel::SCHED_PROC_EXEC, &[7])
+            .expect("one argument")
+            .encode(&mut buf);
+        assert_eq!(
+            UserRecord::decode(&[]),
+            Err(UserRecordError::Length { bytes: 0 })
+        );
+        assert_eq!(
+            UserRecord::decode(&buf[..len - 1]),
+            Err(UserRecordError::Length { bytes: len - 1 })
+        );
+        assert_eq!(
+            UserRecord::decode(&[0; UserRecord::MAX_BYTES + 8]),
+            Err(UserRecordError::Length {
+                bytes: UserRecord::MAX_BYTES + 8
+            })
+        );
+        // One argument word missing, and one too many.
+        assert_eq!(
+            UserRecord::decode(&buf[..8]),
+            Err(UserRecordError::ArgCount {
+                expected: 1,
+                found: 0
+            })
+        );
+        assert_eq!(
+            UserRecord::decode(&buf[..len + 8]),
+            Err(UserRecordError::ArgCount {
+                expected: 1,
+                found: 2
+            })
+        );
+        let mut reserved = buf;
+        reserved[3] = 1;
+        assert_eq!(
+            UserRecord::decode(&reserved[..len]),
+            Err(UserRecordError::Reserved)
         );
     }
 }

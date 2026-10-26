@@ -31,10 +31,19 @@ Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Its selected-package Clippy check use
 including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
-job tests `userspace/ext4d/` twice, on the committed ext4 image in
-`tests/fixtures/` and on one `make-fixtures.sh` builds with the runner's
-`mke2fs` (`EXT4D_FIXTURES`), and lints and documents it for the host and for
-`x86_64-unknown-redox`.
+job tests `userspace/ext4d/` twice, on the committed ext4 images in
+`tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
+e2fsprogs (`EXT4D_FIXTURES`), each time without and with the journal replay
+(`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s) and with
+the journaled writer (`write`, whose tests hand every volume they leave,
+including ones crashed part-way through a change, to `e2fsck` through
+`EXT4D_E2FSCK`), and lints and documents it for the host and for
+`x86_64-unknown-redox` with each of those feature sets. The `ferric-jbd2` step tests, lints and documents the
+journal crate, and builds it for `x86_64-unknown-none` to keep it `no_std`.
+Its `blockd` job does the same for `userspace/blockd/` (with each
+of its layers alone and both), and runs `ferric-blocklayer`'s fixture tests
+again on images `crates/blocklayer/tests/fixtures/make-fixtures.sh` makes as
+root with the runner's cryptsetup and lvm2 (`BLOCKLAYER_FIXTURES`).
 
 Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
 running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
@@ -124,8 +133,8 @@ hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
 
-`ferric-lvm` is a prepared library that nothing in the image uses yet, so its
-host tests are its only coverage. `crates/lvm/tests/fixtures.rs` reads PVs
+`ferric-lvm` is used in the image through `ferric-blockd` (`fs.lvm`); its own
+host tests cover the formats. `crates/lvm/tests/fixtures.rs` reads PVs
 that lvm2 wrote (`crates/lvm/tests/fixtures/README` has the commands): a
 two-PV striped group, metadata text that wraps round its area, and a volume
 extended after another one. It checks the parsed groups and mappings against
@@ -133,8 +142,8 @@ extended after another one. It checks the parsed groups and mappings against
 and metadata-area headers to test areas that are empty, broken or past the
 device.
 
-`ferric-luks` is a prepared library that nothing in the image uses yet, so its
-host tests are its only coverage. `crates/luks/tests/fixtures.rs` reads LUKS1
+`ferric-luks` is used in the image through `ferric-blockd` (`fs.luks`); its own
+host tests cover the formats. `crates/luks/tests/fixtures.rs` reads LUKS1
 and LUKS2 headers that cryptsetup wrote (`crates/luks/tests/fixtures/README`
 has the commands) and checks the recovered volume keys against
 `cryptsetup luksDump --dump-volume-key`, header-copy fallback and random
@@ -142,12 +151,21 @@ corruption. Because the bootloader is a soft-float UEFI target, CI also builds
 it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
 `x86_64-unknown-uefi`; check that build when changing its dependencies.
 
+`ferric-blocklayer`'s host tests (`crates/blocklayer/tests/fixtures.rs`) read
+volumes cryptsetup and lvm2 made, each holding a known byte pattern: a logical
+volume across two extent runs, LUKS2 inside an LV, an LV inside LUKS2 with
+4096-byte sectors (which pins the IV unit; see
+[Block layers](ferric-io.md#block-layers-luks-and-lvm-read-only)), and LUKS1
+data OpenSSL encrypted, with reads that start and end inside sectors, wrong
+passphrases, missing or duplicate PVs, PVs of two groups and a device cut short.
+CI checks each feature combination and a bare-metal build.
+
 ## Kernel helper tests
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set` and `sync/records`
-modules, rather than duplicating their implementations. Run from the root:
+It includes the actual `cpu_set`, `sync/records` and local APIC ID decoding
+(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
 
 ```sh
 cargo test --locked -p ferric-aligned-buffer
@@ -163,9 +181,16 @@ Miri requires the `miri` component for the declared nightly toolchain. The
 kernel-lints workflow runs these tests, including Miri; the shared buffer also
 receives the host workspace's strict Clippy and Rustdoc checks.
 
+The helper package also compiles the actual ordered-lock and wait-condition
+code for empty-list destruction tests, including `drop_panic`. Its host-only
+context/shootdown stubs fail if those hardware paths are reached. The regression
+holds another lock while destroying an empty condition and verifies no further
+lock acquisition occurs. This covers the page-cache cleanup panic found during
+an ARM64 native boot; it does not simulate blocked waiters or context switches.
+
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
-out-of-range CPU IDs, duplicate/gapped/concurrent CPU publication, initialized
+out-of-range CPU IDs, nonzero xAPIC and x2APIC IDs, duplicate/gapped/concurrent CPU publication, initialized
 event/SQE ABI bytes, wrapped queues, whole-record reads and copy-failure rollback.
 Wait queues return zero immediately for an empty destination, reject nonempty
 destinations smaller than one record with `EINVAL`, and leave queued records
@@ -207,6 +232,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
+| `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -263,8 +289,9 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), disable, and read-only mapping of the rings with `commit` checks |
-| `ferric-ext4-test` | Mounts the `ext4d` fixture image (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), the mapping journal (fixed replacement, kernel-placed and fixed `mremap`, a fork's clone and its teardown, and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), `procmgr`'s fork/exec/exit/wait records for a child with its exit status and the refusal of forged `emit` records, and read-only mapping of the rings with `commit` checks |
+| `ferric-ext4-test` | Mounts the `ext4d` fixture image (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS`. `ext4-journal` mounts a volume that needs recovery: ext4d must replay its journal (`fs.ext4_journal_replay`), serve the journaled contents and leave the image clean. The step is skipped only when `ext4d --features` does not list `journal-replay`; once it does, a replay error fails the step |
+| `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) completed DMA map/protect/unmap records, cached translations and live disable (`iommu-mapping-trace`), and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
@@ -299,7 +326,10 @@ benchmark's lines and A/B and writes its figures to the job summary. Read those
 scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
-(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)). It discards each
+boot's output, so when a boot fails it runs `print-test-fails.sh` on the boot's
+console log, and a test that failed early in the boot can be read from the job
+log.
 
 The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
 `cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a
@@ -348,6 +378,7 @@ image=build/x86_64/ferric-smoke/harddrive.img
 scripts/ferric-ci/boot-smoke.sh "$image" serial.log
 BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh "$image" serial-vtd.log
 BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log
+scripts/ferric-ci/boot-smoke.sh "$image" serial-host,-x2apic.log host,-x2apic
 ```
 
 The script expects QEMU, OVMF and Linux utilities. It uses a copy of the image,
@@ -358,6 +389,23 @@ otherwise TCG with `max`. `BOOT_TIMEOUT` changes the default 300-second limit.
 remapping requires QEMU 10 or later; the workflow uses a newer-QEMU container
 for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
 the usual paths.
+
+The third argument is the QEMU `-cpu` model. The image workflow's boot matrix
+also runs `host,-x2apic` (the last line above, KVM only): with x2APIC hidden
+from the guest, the kernel drives its local APICs in xAPIC mode, so the decoding
+of the xAPIC ID register (its ID sits in bits 31:24) and the targeted IPIs, such
+as per-CPU TLB shootdowns, that are sent to those IDs get a real boot. The other
+boots use `host`, which runs in x2APIC mode. The decoding itself is also
+host-tested (`apic_id` in the kernel helper tests). That boot checks
+correctness, so its performance A/B gates, the NVMe queue-policy A/B
+(`check-blkgrant-log.sh`) and the disk benchmark's adaptive-against-main A/B
+(`check-iobench-log.sh`), only warn when they fail (`PERF_AB=report`, set for
+the whole boot job; see `scripts/ferric-ci/perf-ab.sh`): every EOI and IPI is
+then an xAPIC MMIO access that exits to the host under nested KVM, so nvmed's
+per-CPU policies, which take more of them, measure the APIC emulation more
+than nvmed. The figures are still reported.
+`scripts/ferric-ci/test-perf-ab.sh` (host-tools CI) runs both checks on
+fixture logs with and without `PERF_AB=report`.
 
 The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
@@ -417,6 +465,13 @@ the runner adds both HDA controllers. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.
+
+`scripts/ferric-ci/test-print-test-fails.sh` checks `print-test-fails.sh`
+against fixture console logs: a log with no failed test prints nothing; with two
+failures it prints exactly the 40 lines before the first and everything up to
+the second, inside a log group; and a console line that looks like a workflow
+command (`::error::`) is printed only while workflow commands are stopped. The
+host-tools workflow runs it after `test-boot-smoke.sh`.
 
 ### CET image and Kleya rerun
 
@@ -648,3 +703,33 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Portable executor core
+
+`cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
+races, detached cancellation, live-only deadlines, stale and invalid ids, and
+bounded notification storage. Paused producers are coordinated by channels,
+without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib`
+runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
+The crate is not linked into the kernel yet; these tests do not exercise actual
+interrupts, scheduler wait registration or timer hardware.
+
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
+
+### Profiler CPU wakeup acknowledgements
+
+The host kernel helper suite includes `context/idle.rs`, used by the real
+`try_idle_context` accessor and x86 wakeup handler. It verifies an uninitialized
+idle slot returns `None`, then checks a pending shootdown is serviced before
+EOI without reading current-context state. Ordinary idle/running CPU decisions
+and exactly one EOI are checked too. These callbacks test dispatch/order, not
+TLB hardware; the profile-image boot remains the on-target regression, and
+profiling plus CET shadow-stack teardown still needs hardware validation.

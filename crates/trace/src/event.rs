@@ -20,7 +20,8 @@ pub const MAX_EVENTS: usize = 256;
 pub enum Subsystem {
     /// System call entry and exit.
     Syscall = 0,
-    /// The scheduler: context switches, futex operations and context creation/start/exit.
+    /// The scheduler: context switches, futex operations, context creation/start/exit, and
+    /// the process manager's process fork/exec/exit/wait records.
     Sched = 1,
     /// User-space scheme requests and responses, tagged with their ring SQE/CQE tags.
     Scheme = 2,

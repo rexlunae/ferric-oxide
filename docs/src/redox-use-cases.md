@@ -1,29 +1,62 @@
 # Use Cases
 
-Redox is a general-purpose operating system that can be used in many scenarios. Some of the key use cases for Redox are as follows.
+Ferric Oxide is a general-purpose operating system, but it has an order of
+priorities. The roadmap's two release milestones say what "usable" means
+first: **M1, server and VM usable**, then **M2, workstation usable**. Neither
+milestone has been reached yet; see [`ROADMAP.md`](https://github.com/rexlunae/ferric-oxide/blob/main/ROADMAP.md)
+for progress.
 
-## Server
+## Servers and virtual machines (M1)
 
-Redox has the potential to be a secure server platform for cloud services and web hosting. The improved safety and reliability that Redox can provide, as it matures, makes it an excellent fit for the server world. Work remains to be done on support for important server technologies such as databases and web servers, as well as compatibility with high-end server hardware.
+The first target is running real services, as a VM guest and on servers, with
+hardening and sandboxing on by default. That is where the project's I/O work
+pays off most: NVMe and network paths built on shared-memory rings,
+registered buffers and per-core queues, with every driver's DMA confined by an
+IOMMU (Phase 2, partly implemented). Read-only ext4, LVM2 and LUKS support
+(implemented) lets Ferric Oxide read disks provisioned the Linux way;
+writable ext4 and XFS are planned.
 
-Redox has plans underway for [virtualization](https://en.wikipedia.org/wiki/OS-level_virtualization) support. Although running an instance of Linux in a container on Redox will lose some of the benefits of Redox, it can limit the scope of vulnerabilities. Redox-on-Redox and Linux-on-Redox virtualization have the potential to be much more secure than Linux-on-Linux. These capabilities are still a ways off, but are among the goals of the Redox team.
+Ferric Oxide also plans to host virtual machines (Phase V). A hypervisor core
+in the kernel with a Rust VMM in user space would run full guests, and
+**enclaves**: lightweight microVMs that boot in milliseconds and run software
+written for another OS's security model, unmodified, with access to only the
+files, sockets and devices the host grants them. Enclaves are meant as a
+porting tool as much as a server feature. Only the hardware formats and the VM
+interface exist so far; see [Virtualization](./ferric-virt.md).
 
-## Desktop
+## Workstations (M2)
 
-The development of Redox for the desktop is well underway. Although support for accelerated graphics is limited at this time, Redox does include a graphical user interface, and support on Rust-written GUI libraries like [winit](https://github.com/rust-windowing/winit), [Iced](https://iced.rs/) and [Slint](https://slint-ui.com/).
+The second target is a desktop or laptop for daily development work: an
+accelerated COSMIC desktop, Wi-Fi, suspend and resume, a browser, and the
+ability to build Ferric Oxide on Ferric Oxide. This depends on real-hardware
+work (ACPI power management, USB, Wi-Fi) and graphics work (virtio-gpu, then
+Mesa drivers on a DRM/KMS-compatible interface), which are Phases 5 and 6 of
+the roadmap and mostly not started.
 
-A demo version of Redox is available with several games and programs to try. However, the most important objective for desktop is to host the development of Redox. We are working through issues with some of our build tools, and other developer tools such as editors have not been tested under daily use, but we continue to make this a priority.
+Today, Ferric Oxide inherits Redox's desktop: the Orbital display server,
+several COSMIC applications and a set of SDL and X11 programs (see
+[Important Programs](./important-programs.md)), running mainly in QEMU.
 
-Due to a fairly limited list of currently supported hardware, once self-hosted development is available the development can be done inside of Redox with more quick testing. We are adding more hardware compatibility as quickly as we can, and we hope to be able to support the development on a wide array of desktops and laptops in the near future.
+## Sandboxed and portable software
 
-## Infrastructure
+The long-term plan for user programs is WebAssembly (Phase W): one package that
+runs on every CPU level and architecture, compiled for the exact CPU, with no
+ambient authority. Combined with the capability model (Phase 4) and enclaves,
+that would make Ferric Oxide a good host for software you don't fully trust.
+This is the most experimental part of the plan and is gated on benchmarks.
 
-Redox's modular architecture make it ideal for many telecom infrastructure applications, such as routers, telecom components, edge servers, etc. specially as more functionality is added to these devices. The Redox's potential for security and reliability make it ideal for this type of application.
+## Infrastructure and appliances
 
-## Embedded and IoT
+Routers, edge servers and similar appliances benefit from the same properties
+servers do: a small privileged core, restartable drivers, kernel-bypass network
+queues and a verifiable software supply chain through `fox`. These are not a
+separate target; they follow from the server work.
 
-For embedded systems with complex user interfaces and broad feature sets, Redox has the potential to be an ideal fit. As everyday appliances become Internet-connected devices with sensors, microphones and cameras, they have the potential for attacks that violate the privacy of consumers in the sanctity of their homes. Redox can provide a full-featured, reliable operating system while limiting the likelihood of attacks. At this time, Redox does not yet have touchscreen support, video capture, or support for sensors and buttons, but these are well-understood technologies and can be added as it becomes a priority.
+## Not a focus
 
-## Mission-Critical Applications
-
-Although there are no current plans to create a version of Redox for mission-critical applications such as satellites or air safety systems, it's not beyond the realm of possibility. As tools for correctness proofs of Rust software improve, it may be possible to create a version of Redox that is proven correct, within some practical limits.
+- **Older and low-end hardware.** Ferric Oxide requires x86-64-v3 or ARMv8 and
+  UEFI. See [Hardware Support](./hardware-support.md).
+- **Small embedded and real-time systems.** Microcontrollers and hard real-time
+  systems are outside the project's scope for now. Real-time scheduling
+  classes are being explored as part of the scheduler rework, but there is no
+  plan for safety-certified use.

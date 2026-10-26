@@ -7,12 +7,13 @@ mod model;
 mod schema;
 mod tui;
 mod value;
+mod variants;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use model::{Diag, Resolved, Source, UserConfig};
 use schema::{Kind, Level, Schema};
@@ -67,9 +68,14 @@ enum Cmd {
     /// Describe an option: help, type, choices, dependencies
     Explain { id: String },
     /// Validate the configuration; exits non-zero on errors
-    Check,
+    Check {
+        #[command(flatten)]
+        overrides: Overrides,
+    },
     /// Write build/ferric/*: config.mk, filesystem.toml, kernel-config.toml
     Generate {
+        #[command(flatten)]
+        overrides: Overrides,
         /// Write outputs without marking recipes stale or committing rebuild fingerprints
         #[arg(long)]
         no_touch: bool,
@@ -78,6 +84,65 @@ enum Cmd {
     },
     /// Print the whole catalog as JSON
     Schema,
+    /// List independently enabled CPU build variants (does not build images).
+    Variants {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Default)]
+struct Overrides {
+    /// Resolve an option=value for this invocation without editing ferric.toml.
+    #[arg(long = "override", value_name = "OPTION=VALUE")]
+    values: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("cannot find features.toml; pass --root")]
+    RootNotFound,
+    #[error("cannot load catalog {}: {message}", path.display())]
+    Catalog { path: PathBuf, message: String },
+    #[error(transparent)]
+    Load(#[from] model::LoadError),
+    #[error("unknown option {id}{hint}")]
+    UnknownOption { id: String, hint: String },
+    #[error("expected option=value, got `{0}`")]
+    Assignment(String),
+    #[error("invalid value for {id}: {message}")]
+    Value { id: String, message: String },
+    #[error("cannot edit configuration: {0}")]
+    Edit(String),
+    #[error("cannot save configuration: {0}")]
+    Save(String),
+    #[error("interactive editor: {0}")]
+    Editor(String),
+    #[error("fix ferric.toml before editing it interactively")]
+    InvalidEditorInput,
+    #[error(transparent)]
+    Variants(#[from] variants::VariantError),
+}
+
+fn assignment(raw: &str) -> Result<(&str, &str), CliError> {
+    raw.split_once('=')
+        .map(|(id, value)| (id.trim(), value.trim()))
+        .ok_or_else(|| CliError::Assignment(raw.to_owned()))
+}
+
+fn option_value(ctx: &Ctx, id: &str, raw: &str) -> Result<value::Value, CliError> {
+    let option = ctx.schema.get(id).ok_or_else(|| CliError::UnknownOption {
+        id: id.to_owned(),
+        hint: ctx
+            .schema
+            .suggest(id)
+            .map(|s| format!(" (did you mean {s}?)"))
+            .unwrap_or_default(),
+    })?;
+    option.parse_cli(raw).map_err(|message| CliError::Value {
+        id: id.to_owned(),
+        message,
+    })
 }
 
 pub struct Ctx {
@@ -162,9 +227,21 @@ fn dotconfig_shadowing(root: &Path) -> Vec<Diag> {
         .collect()
 }
 
-fn load(ctx: &Ctx) -> Result<(UserConfig, Resolved, Vec<Diag>), String> {
+fn load(ctx: &Ctx) -> Result<(UserConfig, Resolved, Vec<Diag>), CliError> {
+    load_with_overrides(ctx, &Overrides::default())
+}
+
+fn load_with_overrides(
+    ctx: &Ctx,
+    overrides: &Overrides,
+) -> Result<(UserConfig, Resolved, Vec<Diag>), CliError> {
     let (user, mut diags) = UserConfig::load(&ctx.config_path, &ctx.schema)?;
-    let r = model::resolve(&ctx.schema, &user.values);
+    let mut values = user.values.clone();
+    for raw in &overrides.values {
+        let (id, raw) = assignment(raw)?;
+        values.insert(id.to_owned(), option_value(ctx, id, raw)?);
+    }
+    let r = model::resolve(&ctx.schema, &values);
     diags.extend(r.diags.iter().cloned());
     Ok((user, r, diags))
 }
@@ -182,10 +259,10 @@ fn option_json(ctx: &Ctx, r: &Resolved, i: usize) -> serde_json::Value {
     })
 }
 
-fn run(cli: Cli) -> Result<ExitCode, String> {
+fn run(cli: Cli) -> Result<ExitCode, CliError> {
     let root = match cli.root {
         Some(r) => r,
-        None => find_root().ok_or("cannot find features.toml; pass --root")?,
+        None => find_root().ok_or(CliError::RootNotFound)?,
     };
     let schema_path = cli.schema.unwrap_or_else(|| root.join("features.toml"));
     let config_path = match cli.config {
@@ -194,7 +271,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         None => root.join("ferric.toml"),
     };
     let ctx = Ctx {
-        schema: Schema::load(&schema_path)?,
+        schema: Schema::load(&schema_path).map_err(|message| CliError::Catalog {
+            path: schema_path,
+            message,
+        })?,
         root,
         config_path,
         out: cli.out,
@@ -218,9 +298,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 .any(|d| d.message.contains("unknown option") || d.message.contains("expects"))
             {
                 print_diags(&diags);
-                return Err("fix ferric.toml before editing it interactively".into());
+                return Err(CliError::InvalidEditorInput);
             }
-            tui::run(&ctx, user)?;
+            tui::run(&ctx, user).map_err(CliError::Editor)?;
         }
         Cmd::List { json, changed } => {
             let (_, r, diags) = load(&ctx)?;
@@ -253,7 +333,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let i = ctx
                 .schema
                 .position(&id)
-                .ok_or_else(|| format!("unknown option {id}"))?;
+                .ok_or_else(|| CliError::UnknownOption {
+                    id: id.clone(),
+                    hint: String::new(),
+                })?;
             if json {
                 println!(
                     "{}",
@@ -270,25 +353,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 pairs.push((args[0].clone(), args[1].clone()));
             } else {
                 for a in &args {
-                    let (k, v) = a
-                        .split_once('=')
-                        .ok_or_else(|| format!("expected option=value, got `{a}`"))?;
-                    pairs.push((k.trim().to_owned(), v.trim().to_owned()));
+                    let (k, v) = assignment(a)?;
+                    pairs.push((k.to_owned(), v.to_owned()));
                 }
             }
             for (id, raw) in pairs {
-                let o = ctx.schema.get(&id).ok_or_else(|| {
-                    let hint = ctx
-                        .schema
-                        .suggest(&id)
-                        .map(|s| format!(" (did you mean {s}?)"))
-                        .unwrap_or_default();
-                    format!("unknown option {id}{hint}")
-                })?;
-                let v = o.parse_cli(&raw)?;
-                user.set(&id, v)?;
+                let v = option_value(&ctx, &id, &raw)?;
+                user.set(&id, v).map_err(CliError::Edit)?;
             }
-            user.save()?;
+            user.save().map_err(CliError::Save)?;
             let r = model::resolve(&ctx.schema, &user.values);
             print_diags(&r.diags);
             if r.errors() > 0 {
@@ -299,22 +372,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let (mut user, _, _) = load(&ctx)?;
             for id in ids {
                 if ctx.schema.get(&id).is_none() && !user.values.contains_key(&id) {
-                    return Err(format!("unknown option {id}"));
+                    return Err(CliError::UnknownOption {
+                        id,
+                        hint: String::new(),
+                    });
                 }
                 user.unset(&id);
             }
-            user.save()?;
+            user.save().map_err(CliError::Save)?;
         }
         Cmd::Explain { id } => {
             let (_, r, _) = load(&ctx)?;
             let i = ctx
                 .schema
                 .position(&id)
-                .ok_or_else(|| format!("unknown option {id}"))?;
+                .ok_or_else(|| CliError::UnknownOption {
+                    id: id.clone(),
+                    hint: String::new(),
+                })?;
             print!("{}", tui::describe(&ctx.schema, &r, i));
         }
-        Cmd::Check => {
-            let (_, r, mut diags) = load(&ctx)?;
+        Cmd::Check { overrides } => {
+            let (_, r, mut diags) = load_with_overrides(&ctx, &overrides)?;
             diags.extend(dotconfig_shadowing(&ctx.root));
             if let Err(errs) = generate::plan(&ctx.schema, &r, &ctx.root, &ctx.out) {
                 diags.extend(errs);
@@ -326,8 +405,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             eprintln!("ferric-config: {} ok", ctx.config_path.display());
         }
-        Cmd::Generate { no_touch, quiet } => {
-            let (_, r, mut diags) = load(&ctx)?;
+        Cmd::Generate {
+            no_touch,
+            quiet,
+            overrides,
+        } => {
+            let (_, r, mut diags) = load_with_overrides(&ctx, &overrides)?;
             diags.extend(dotconfig_shadowing(&ctx.root));
             let plan = match generate::plan(&ctx.schema, &r, &ctx.root, &ctx.out) {
                 Ok(p) => p,
@@ -393,6 +476,25 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&items).unwrap());
         }
+        Cmd::Variants { json } => {
+            let (user, diags) = UserConfig::load(&ctx.config_path, &ctx.schema)?;
+            print_diags(&diags);
+            if diags.iter().any(|d| d.level == Level::Error) {
+                return Ok(ExitCode::FAILURE);
+            }
+            let resolved = model::resolve(&ctx.schema, &user.values);
+            let variants = variants::enabled(&ctx.schema, &resolved)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&variants).unwrap());
+            } else {
+                for variant in variants {
+                    println!(
+                        "{} {} (minimum {}, image {})",
+                        variant.arch, variant.level, variant.minimum, variant.image
+                    );
+                }
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -401,7 +503,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("ferric-config: error: {e}");
+            eprintln!("ferric-config: error: {}", error_chain(&e));
             ExitCode::FAILURE
         }
     }

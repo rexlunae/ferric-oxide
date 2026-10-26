@@ -17,9 +17,9 @@ what is on at run time.
 | --- | --- | --- |
 | `kernel.trace` | `false` | Builds the tracing code and the `kernel.trace` scheme (x86_64 only) |
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
-| `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, and `sched.context_create`/`context_start`/`context_exit` |
-| `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel` |
-| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap` |
+| `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, `sched.context_create`/`context_start`/`context_exit`, and `procmgr`'s `sched.proc_fork`/`proc_exec`/`proc_exit`/`proc_wait` |
+| `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel`, and, with `kernel.trace_max_level = "debug"`, the I/O-path [`scheme.sqe_deliver` and `scheme.cqe_receive`](#scheme-socket-batches) |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip` and `mm.destroy` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
 | `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
@@ -122,6 +122,8 @@ The events are:
 | `scheme.request` | `scheme`, `tag`, `opcode`, `caller`, `arg0`, `arg2` |
 | `scheme.response` | `scheme`, `tag`, `ret`, `responder` |
 | `scheme.cancel` | `scheme`, `tag` |
+| `scheme.sqe_deliver` | `scheme`, `count`, `bytes` (debug level; see [Scheme socket batches](#scheme-socket-batches)) |
+| `scheme.cqe_receive` | `scheme`, `count`, `bytes` (debug level; see [Scheme socket batches](#scheme-socket-batches)) |
 | `mm.page_fault` | `addr`, `ip`, `flags`, `outcome` |
 | `irq.deliver` | `irq`, `cpu`, `source`, `count`, `handles` |
 | `irq.ack` | `irq`, `cpu`, `count` |
@@ -132,6 +134,10 @@ The events are:
 | `sched.context_create` | `context`, `user_mode` |
 | `sched.context_start` | `pid`, `context` |
 | `sched.context_exit` | `pid`, `context`, `exception`, `kind`, `code`, `addr` |
+| `sched.proc_fork` | `parent`, `child` (from `procmgr`) |
+| `sched.proc_exec` | `pid` (from `procmgr`) |
+| `sched.proc_exit` | `pid`, `status`, `signal` (from `procmgr`) |
+| `sched.proc_wait` | `waiter`, `pid`, `status` (from `procmgr`) |
 
 ### Mapping-operation results
 
@@ -153,19 +159,69 @@ x86-64), not bytes. Map/protect carry the requested raw
 successful protect/unmap, or a negated errno. Map's `addr` is the requested
 hint, or 0 without one; flags distinguish a fixed request at address 0.
 
-These are operation results, not a complete mapping journal. Refusals before
-these APIs (for example, an unaligned system-call range or a scheme's earlier
-refusal) produce no such record. A failed operation can still have changed
-earlier grants: fixed replacement unmaps before allocation, and protection
-and unmap process overlapping grants in turn. Unmap can succeed over holes.
-Flags describe the request, not necessarily hardware-enforced read access.
-Clone, move, address-space destruction and internal replacement paths are
-not comprehensively recorded. An mmap return does not imply physical pages
-have been populated; anonymous pages can fault in later.
+Refusals before these APIs (for example, an unaligned system-call range or a
+scheme's earlier refusal) produce no such record. A failed operation can still
+have changed earlier grants: fixed replacement unmaps before allocation (its
+`mm.replace` says so), and protection and unmap process overlapping grants in
+turn. Unmap can succeed over holes. Flags describe the request, not
+necessarily hardware-enforced read access. An mmap return does not imply
+physical pages have been populated; anonymous pages can fault in later.
 
 ```text
 enable mm.map mm.protect mm.unmap
 ```
+
+### Mapping journal
+
+Five more info-level `kernel.trace_mm` events record the changes to a user
+address space's grants that do not go through those three calls. With them,
+the `mm` events record every change: a reader that replays `mm.map`,
+`mm.protect`, `mm.unmap`, `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip`
+and `mm.destroy` in order can follow each space's grants, except that a failed operation's
+record says only that it failed, not how far it got. An empty space appears
+with its first `mm.map`. Page-table entries filled in later by faults are
+not grant changes (`mm.page_fault` records those).
+
+| Event | Arguments |
+| --- | --- |
+| `mm.replace` | `space`, `addr`, `pages`, `ret` |
+| `mm.move` | `src_space`, `dst_space`, `src_addr`, `src_pages`, `dst_addr`, `pages`, `flags`, `ret` |
+| `mm.clone` | `space`, `new_space`, `grants`, `pages`, `ret` |
+| `mm.clone_skip` | `space`, `new_space`, `addr`, `pages` |
+| `mm.destroy` | `space`, `grants`, `pages` |
+
+- `mm.replace`: a fixed request removed what was mapped in its span before
+  installing its own grant, under the same lock. Its causes are a `MAP_FIXED`
+  `mmap` (the `mm.map` follows), a fixed `mremap` or grant-move destination
+  (the `mm.move` follows) and a registered-buffer revoke, which maps zeroed
+  memory in place. A revoke then records that zeroed grant as an `mm.map` with
+  `MAP_FIXED | MAP_PRIVATE` and the grant's protection. The span may have held nothing; `ret` is 0 or a negated
+  errno, after which the operation fails too.
+- `mm.move`: `AddrSpaceWrapper::r#move`, for `mremap` (both spaces the same)
+  and the proc scheme's grant moves between spaces, recorded under the
+  destination's lock. `dst_addr` is the requested destination, or 0 when the
+  kernel picks one; `pages` is the new size, `flags` the raw `MapFlags`, and
+  `ret` the destination address or a negated errno. A move shorter than its
+  source unmaps the source's tail; a longer one maps zeroed pages past it.
+- `mm.clone`: `AddrSpaceWrapper::try_clone`, the copy-on-write copy a `fork`
+  makes, recorded under the source's lock, with the grants and pages the copy
+  holds. On failure
+  `new_space`, `grants` and `pages` are 0, and a partly built copy has already
+  had its own `mm.destroy`.
+- `mm.clone_skip`: a grant the clone did not copy, recorded before the
+  `mm.clone`: pinned scheme borrows, physically contiguous driver memory and
+  file-mapping borrows are not kept across a fork. The copy holds the source's
+  grants minus these.
+- `mm.destroy`: an address space is being torn down because nothing uses it
+  any more (its last context exited or exec'd into another space, or a clone
+  failed), with the grants and pages it still held. After it, `space` can be
+  reused by a new address space.
+
+```text
+enable mm.map mm.protect mm.unmap mm.replace mm.move mm.clone mm.clone_skip mm.destroy
+```
+
+`enable mm` turns on all of them and `mm.page_fault`.
 
 ### Completed DMA domain operations
 
@@ -248,6 +304,45 @@ incomplete lifecycles. Enable all three with:
 enable sched.context_create sched.context_start sched.context_exit
 ```
 
+### Process lifecycle
+
+The kernel does not know when a process forks, execs, exits or is reaped:
+user-space `procmgr` does. So `procmgr` reports these four events itself, by
+writing a record to `kernel.trace/emit` ([User-space records](#user-space-records)),
+and the kernel stamps and stores it in the writing CPU's ring like its own.
+They are `sched` events, compiled in with `kernel.trace_sched`. On a kernel
+without them the first write fails with `EOPNOTSUPP` and `procmgr` stops
+writing; on a kernel without `kernel.trace` it opens nothing. While an event
+is off, each report costs `procmgr` one system call and stores nothing.
+
+- `sched.proc_fork` records that `procmgr` created the `child` process for
+  a `fork` by `parent`. The parent then copies its address space and file
+  table into the child and starts it. If that fails, `fork` returns an error
+  and the child never runs, so a fork record without a `sched.context_start`
+  for the child is a failed fork.
+- `sched.proc_exec` records that `pid` committed to an `execve`. `redox-rt`
+  tells `procmgr` once it has loaded the new program, and then switches to
+  it. An `execve` that fails while loading reports nothing. If one of the
+  few descriptor operations of the switch itself fails, the record stays
+  but the process keeps its old image. `procmgr` already treats the process
+  as exec'd at that point; for example, its parent can no longer
+  `setpgid` it.
+- `sched.proc_exit` records that the last thread of `pid` has gone and the
+  process is a zombie: `status` is the exit status, `signal` the signal that
+  killed it, or 0.
+- `sched.proc_wait` records a `waitpid` that returned `pid` to `waiter`, with
+  `status` as `waitpid` reports it (`exit status << 8 | signal`, or a stop or
+  continue status). A `WNOHANG` wait that found nothing reports nothing.
+
+These records are the process-level view; join them to the context
+lifecycle records by `pid`. The kernel vouches for their time and CPU, and
+for their event, but not for their arguments, which are what `procmgr` wrote.
+Enable all four with:
+
+```text
+enable sched.proc_fork sched.proc_exec sched.proc_exit sched.proc_wait
+```
+
 ### Futex waits and wakes
 
 The futex events cover the kernel's queued waits and wake calls
@@ -322,6 +417,31 @@ with RedoxFS as `caller`, before it answers as `responder`.
 
 These events do not cover one-way messages (`close`, `detach`) or the kernel's
 own mmap requests.
+
+### Scheme socket batches
+
+`scheme.sqe_deliver` and `scheme.cqe_receive` are debug-level events that see
+the scheme socket itself (`crates/kernel/src/scheme/user.rs`,
+`UserInner::read` and `UserInner::write`), for I/O-path performance work. They
+need `kernel.trace_max_level = "debug"`.
+
+- `scheme.sqe_deliver` is recorded when the kernel copies whole Sqe records to
+  the scheme daemon's `read`: the scheme id, the request count and the byte
+  count. The record's timestamp is the end of the user copy, which is also
+  when the daemon's `read` returns, so together with `scheme.request` it
+  splits the kernel's queueing of a request (and the scheduling of the
+  daemon) from the daemon's seeing it.
+- `scheme.cqe_receive` is recorded when the kernel accepts the daemon's
+  `write` of a batch of Cqe records: the scheme id, accepted record count
+  and byte count. It includes control commands such as `TriggerFevent` and
+  `ObtainFd`, so the count is not the number of responses or resumed callers.
+  Use `scheme.response` and its tag for actual response timing.
+- Both fire for every user scheme, not only the disk scheme, and only when a
+  read or write moved records (a zero-length `write` is not a batch). The
+  counts are whole records: `count * size_of::<Sqe>() == bytes` for a
+  delivery and `count * size_of::<Cqe>() == bytes` for a receive. In a
+  capture, prefer matching `scheme.request`/`scheme.response` by tag for
+  per-request timing; use the batch events for the socket's batching shape.
 
 ### Faults and interrupts
 
@@ -431,6 +551,25 @@ over ([Capabilities](#capabilities)). The paths are defined in
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
 | `cap/read`, `cap/control` | — (a capability, see below) | — |
+| `emit` | — | One user-space record ([User-space records](#user-space-records)); opening it needs control access |
+
+### User-space records
+
+A few events are reported by user space: the process lifecycle events
+(`ferric_trace::kernel::USER_EVENTS`). A holder of control access opens `emit`
+and writes one `ferric_trace::abi::UserRecord` per write: little-endian 64-bit
+words, the first holding the event id in bits 15:0 and the argument count in
+bits 23:16 (the rest zero), then one word per argument. The kernel refuses any
+other event, a wrong argument count, reserved bits or a partial word with
+`EINVAL`, and an event it does not compile in with `EOPNOTSUPP`. A record for
+an event that is off is accepted and dropped; one that is on goes through the
+event's argument filter like a kernel record.
+
+Only root, or a process root gave a `cap/control` capability, can open
+`emit`. A record from user space cannot pass for a kernel record. The kernel
+accepts only the process lifecycle event ids, and no kernel tracepoint emits
+those ids. So the event id alone says a record came from `emit`, and no
+kernel event can be forged. In a stock image only `procmgr` opens `emit`.
 
 ### Capabilities
 
@@ -916,7 +1055,8 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
      capability. Writing `disable scheme.cancel` (a no-op by then) to `events`
      through the capability is refused with `read` access and done with
      `control`. Narrowing to `cap/read` works, and widening `read` to
-     `cap/control` is refused (`trace-cap`).
+     `cap/control` is refused. The child cannot open `emit` by path, and opens
+     it through the capability only with `control` (`trace-cap`).
   13. checks 32/64-bit queued futex waits with timeout and peer wake, mismatched
       comparisons, zero-count and empty wakes, and disable. A successful wake
       must precede its matching resume. It drains all CPU rings while polling
@@ -926,13 +1066,34 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
       When rings are available, it runs `ferric-ring-test --async-only` and
       checks the same lifecycle for kernel workers after normal requests and
       cancellation, with PID 0 at both start and exit (`trace-lifecycle`).
+  15. runs a child that exits with status 23 and waits for it, and checks that
+      `procmgr` reported its fork (naming the test as its parent), exec, exit
+      (status 23, no signal) and the test's wait (`23 << 8`), in that order.
+      It checks that `emit` refuses a kernel event's record, reserved header
+      bits and a partial word, and that disabling the four events suppresses a
+      second child's records (`trace-proc`).
 
-  15. checks mapping-operation results for an anonymous allocation, refused
+  16. checks mapping-operation results for an anonymous allocation, refused
       overlapping fixed allocation, protection changes from the current context
       and a peer thread, refused widening of a read-only ring, and unmap. All
       records must retain the same target page-table root and operation order.
       Unaligned requests refused before these APIs produce no result; disabling
       the three events suppresses a second allocation/unmap (`trace-mapping`).
+
+  17. checks the mapping journal: a `MAP_FIXED` `mmap` over a live mapping has
+      an `mm.replace` before its `mm.map`; an `mremap` to an address the kernel
+      picks, and one with `FIXED_REPLACE` onto another live mapping (after its
+      `mm.replace`), each have an exact `mm.move` within this space; forking a
+      child has one successful `mm.clone` of this space with grants and pages
+      copied, an `mm.clone_skip` before it for a page of physically contiguous
+      memory, and the copy an `mm.destroy` once the child execs and exits.
+      The rings drop records once full while the journal events are on (every
+      process's mapping operations are recorded), so the step drains before
+      the fork and keeps draining in a loop until the clone and its teardown
+      are both in: a record a drain missed (dropped from a full ring, or
+      written to a ring a drain already passed) is waited for, and only the
+      5-second limit without the pair fails. Disabling the events suppresses
+      the same operations' records (`trace-journal`).
 
   It prints `FERRIC_TEST_PASS trace-<step>` for each step, or
   `FERRIC_TEST_SKIP trace` without the scheme (and `FERRIC_TEST_SKIP
@@ -1171,9 +1332,7 @@ is refused the file.
 
 ## Not implemented yet
 
-- A complete mapping journal (clone, move, replacement and destruction),
-  user-space process creation/exec/wait tracepoints, and
-  tracepoints for the interrupts the kernel handles
+- Tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
 - Live viewing on the target and Perfetto's protobuf format.
 - Architectures other than x86_64.

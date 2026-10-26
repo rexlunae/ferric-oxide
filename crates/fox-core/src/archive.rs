@@ -154,7 +154,7 @@ pub enum ArchiveError {
         path: PathBuf,
         /// The underlying error.
         #[source]
-        source: Box<pkg::PackageError>,
+        source: Box<crate::cookbook::CookbookError>,
     },
     /// The cookbook metadata file belongs to a different archive.
     #[error("metadata {} is for entry table {found:?}, archive has {expected}", path.display())]
@@ -493,9 +493,11 @@ fn read_sidecar(
             sidecar: sidecar.to_path_buf(),
         });
     }
-    let package = pkg::Package::from_file(sidecar).map_err(|source| ArchiveError::Sidecar {
-        path: sidecar.to_path_buf(),
-        source: Box::new(source),
+    let package = crate::cookbook::PackageInfo::from_file(sidecar).map_err(|source| {
+        ArchiveError::Sidecar {
+            path: sidecar.to_path_buf(),
+            source: Box::new(source),
+        }
     })?;
     let expected = head.entries_blake3();
     if package.blake3.parse::<Blake3Digest>().ok() != Some(expected) {
@@ -520,22 +522,16 @@ fn read_sidecar(
     manifest.depends = package
         .depends
         .iter()
-        .map(|dep| sidecar_name(sidecar, &resolve_relative(&manifest.name, dep.as_str())))
+        .map(|dep| {
+            dep.package_name(Some(&manifest.name))
+                .map_err(|source| ArchiveError::SidecarName {
+                    path: sidecar.to_path_buf(),
+                    name: dep.to_string(),
+                    source,
+                })
+        })
         .collect::<Result<_, _>>()?;
     Ok(manifest)
-}
-
-/// Resolves a cookbook dependency written relative to its own recipe:
-/// `.runtime` in `llvm21.dev` names `llvm21.runtime`, as the cookbook's
-/// `PackageName::with_suffix` does. Other names are returned unchanged.
-fn resolve_relative(package: &PackageName, dep: &str) -> String {
-    match dep.strip_prefix('.') {
-        Some(suffix) => {
-            let base = package.as_str().split('.').next().unwrap_or_default();
-            format!("{base}.{suffix}")
-        }
-        None => dep.to_owned(),
-    }
 }
 
 fn sidecar_name(sidecar: &Path, name: &str) -> Result<PackageName, ArchiveError> {
@@ -549,15 +545,6 @@ fn sidecar_name(sidecar: &Path, name: &str) -> Result<PackageName, ArchiveError>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn relative_dependencies() {
-        let dev = PackageName::new("llvm21.dev").unwrap();
-        assert_eq!(resolve_relative(&dev, ".runtime"), "llvm21.runtime");
-        assert_eq!(resolve_relative(&dev, "zlib"), "zlib");
-        let plain = PackageName::new("llvm21").unwrap();
-        assert_eq!(resolve_relative(&plain, ".runtime"), "llvm21.runtime");
-    }
 
     #[test]
     fn manifest_paths() {

@@ -12,7 +12,7 @@ use crate::{
     context::memory::AddrSpaceWrapper,
     cpu_set::{LogicalCpuId, LogicalCpuSet},
     cpu_stats::CpuStatsData,
-    ipi::{ipi, IpiKind, IpiTarget},
+    ipi::{ipi_single, IpiKind},
     memory::{RmmA, RmmArch, TableKind},
     percpu::{get_percpu_block, PercpuBlock},
     sync::{
@@ -49,6 +49,9 @@ mod arch;
 
 /// Context struct
 pub mod context;
+
+/// Optional idle-context access and interrupt acknowledgement.
+pub(crate) mod idle;
 
 /// Context switch function
 pub mod switch;
@@ -195,7 +198,9 @@ pub fn wakeup_context(
             .ipi_context_wakeup_list
             .lock(token.token())
             .push(weak);
-        ipi(IpiKind::Wakeup, IpiTarget::Other);
+        // Ferric Oxide: interrupt only the CPU that owns the list, not every other CPU
+        // (see `switch::drain_ipi_context_wakeups` for why a lost IPI cannot strand it).
+        ipi_single(IpiKind::Wakeup, percpu);
         return;
     }
 
