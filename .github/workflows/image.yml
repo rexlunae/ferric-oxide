@@ -284,6 +284,7 @@ jobs:
 
   boot:
     needs: build
+    if: false # stress branch: only the trace-overhead boots
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -615,7 +616,7 @@ jobs:
   # second boot finds the dump, and ferric-trace-test checks its message and records.
   crash:
     needs: build
-    if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
+    if: false # stress branch
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -703,7 +704,11 @@ jobs:
     needs: build
     if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
@@ -734,7 +739,7 @@ jobs:
         env:
           # A boot takes about 20 seconds. The check takes the median over boots, and the
           # spread between boots (about 3% here) is larger than the 1% budget.
-          BENCH_BOOTS: "10"
+          BENCH_BOOTS: "15"
         run: |
           for image in notrace trace; do
             zstd -q -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
@@ -789,6 +794,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trace-overhead-logs
+          name: trace-overhead-logs-${{ matrix.run }}
           path: bench-*.log
           retention-days: 14
