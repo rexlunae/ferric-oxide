@@ -102,8 +102,7 @@ pub fn now() -> u64 {
 
 /// The TSC.
 fn tsc() -> u64 {
-    // SAFETY: RDTSC reads a counter; it has no side effects and every x86_64 CPU has it.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    crate::arch::misc::rdtsc()
 }
 
 /// The KVM clock in nanoseconds. Every CPU sets its clock up before it runs anything that

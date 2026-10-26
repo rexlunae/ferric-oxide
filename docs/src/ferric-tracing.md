@@ -19,9 +19,9 @@ what is on at run time.
 | `kernel.trace_syscall` | `true` | Compiles in `syscall.enter` and `syscall.exit` |
 | `kernel.trace_sched` | `true` | Compiles in `sched.switch`, `sched.futex_wait`/`futex_resume`/`futex_wake`, `sched.context_create`/`context_start`/`context_exit`, and `procmgr`'s `sched.proc_fork`/`proc_exec`/`proc_exit`/`proc_wait` |
 | `kernel.trace_scheme` | `true` | Compiles in `scheme.request`, `scheme.response` and `scheme.cancel`, and, with `kernel.trace_max_level = "debug"`, the I/O-path [`scheme.sqe_deliver` and `scheme.cqe_receive`](#scheme-socket-batches) |
-| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip` and `mm.destroy` |
+| `kernel.trace_mm` | `true` | Compiles in `mm.page_fault`, `mm.map`, `mm.protect` and `mm.unmap`, and the mapping journal's `mm.replace`, `mm.move`, `mm.clone`, `mm.clone_skip` and `mm.destroy`, and, with `kernel.trace_max_level = "debug"`, the [TLB maintenance](#tlb-maintenance) events `mm.tlb_flush`, `mm.tlb_ipi` and `mm.cr3_switch` |
 | `kernel.trace_irq` | `true` | Compiles in `irq.deliver` and `irq.ack` |
-| `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`) |
+| `kernel.trace_iommu` | `true` | Compiles in `iommu.fault` (`error`, kept at every maximum level) and completed DMA operations `iommu.map`/`protect`/`unmap` (`info`), and `iommu.iotlb_flush` (`debug`, see [TLB maintenance](#tlb-maintenance)) |
 | `kernel.trace_max_level` | `"info"` | Leaves out tracepoints more verbose than this level (`error` < `warn` < `info` < `debug` < `trace`) |
 | `kernel.trace_boot` | `""` | Events to turn on at boot, written to the kernel `config.toml` as `trace.boot` |
 | `kernel.trace_initfs_enable` | `[]` | Selections bootstrap turns on before `init` starts, from the initfs `trace.toml` |
@@ -145,6 +145,10 @@ The events are:
 | `sched.timer_arm` | `deadline`, `backend`, `value`, `flags` |
 | `sched.timer_fire` | `deadline`, `late_ns`, `early` |
 | `sched.wake_run` | `pid`, `id`, `wait` (wake-to-run latency in trace clock units) |
+| `mm.tlb_flush` | `targets`, `pages`, `local`, `wait_cycles` (debug level; see [TLB maintenance](#tlb-maintenance)) |
+| `mm.tlb_ipi` | `handled` (debug level) |
+| `mm.cr3_switch` | `kind`, `space` (debug level) |
+| `iommu.iotlb_flush` | `domain`, `iova`, `bytes`, `units`, `cycles` (debug level) |
 
 ### Mapping-operation results
 
@@ -530,6 +534,42 @@ The codes in the memory, IRQ and IOMMU events have one definition, next to the e
   - `count` is how many identical reports in a row the record stands for
     (AMD-Vi runs are folded; VT-d records are one each).
   It is an `error`-level event: every maximum level keeps it.
+
+### TLB maintenance
+
+Four debug-level events show what TLB maintenance costs, for I/O-path
+performance work. They need `kernel.trace_max_level = "debug"` and
+`kernel.trace_mm` (or `kernel.trace_iommu` for the last). The
+`/scheme/sys/tlb` counters ([TLB and address-space switch
+counters](#tlb-and-address-space-switch-counters)) count the same without a
+capture. The kernel writes them in `crates/kernel/src/tlb_stats.rs`,
+`percpu.rs` and the TLB IPI handler.
+
+- `mm.tlb_flush` is recorded when a `Flusher` batch finishes
+  (`context/memory.rs`): a change to a user address space's mappings, or 32
+  queued pages of a larger one, is then visible on every CPU. `targets` is how
+  many other CPUs had the address space loaded and were made to flush (a
+  shootdown; 0 means none), `pages` the batch's queued page entries, `local`
+  whether this CPU flushed its own TLB (0 or 1), and `wait_cycles` the TSC
+  ticks it spun for the targets' acknowledgements. The kernel flushes whole
+  TLBs for a batch, never single pages.
+- `mm.tlb_ipi` is recorded when a CPU takes a TLB shootdown IPI: `handled` is
+  1 when the request was still pending and the CPU flushed now, 0 when it had
+  already answered by polling (while waiting on a shootdown of its own, or at
+  a context switch).
+- `mm.cr3_switch` is recorded when a context switch loads CR3: `kind` is a
+  `Cr3SwitchKind` (0 another address space, 1 the empty table of a kernel
+  context) and `space` the user page-table root loaded (the `space` of
+  `mm.map`; 0 for the empty table). The kernel never sets CR3's no-flush bit
+  there, so every one flushes the CPU's TLB; with KPTI and PCID it also
+  flushes the user PCID. Switches that keep the address space load nothing
+  and have no record: they are the `sched.switch` records without one.
+- `iommu.iotlb_flush` is recorded when a DMA domain map, unmap or protect has
+  invalidated its units' IOTLBs: domain id, IOVA, bytes, the number of units
+  and the TSC ticks the invalidations took. A map on VT-d units outside
+  caching mode invalidates nothing and has no record.
+
+`ferric-trace text` names a `mm.cr3_switch` record's kind.
 
 ## Records and rings
 
@@ -935,6 +975,81 @@ time since the first record. Later times use the capture's clock and
 and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), so two
 captures sent to one backend keep separate traces. The mapping is described in
 `tools/ferric-trace/src/otlp.rs`.
+
+## TLB and address-space switch counters
+
+`kernel.tlb_stats` (Kernel menu, off by default; kernel feature `tlb_stats`)
+counts, on every CPU, the TLB work that I/O-bound workloads pay for: address
+space switches, local flushes, TLB shootdowns and their IPIs, and IOMMU IOTLB
+invalidations. The `sys` scheme serves the counts as `/scheme/sys/tlb`, which
+anyone may read, in the line format of `ferric_trace::tlb`:
+
+```text
+tlb kpti on pcid off
+cpu 0 syscalls 812 irqs 40 context_switches 96 cr3_switch 51 cr3_empty 9 cr3_same 36 flush_page 4 flush_full 30 ...
+cpu 1 syscalls 77 irqs 12 context_switches 31 cr3_switch 18 cr3_empty 4 cr3_same 9 flush_page 0 flush_full 11 ...
+```
+
+The first line says what a CR3 load costs on this boot: every CR3 load the
+kernel makes flushes (it never sets the no-flush bit), with KPTI and PCID it
+also flushes the user PCID, and with KPTI but without PCID every entry from
+and return to user space flushes too (see [Memory and CPU
+protection](ferric-memory.md)). Each CPU line has every counter, in this
+order:
+
+| Counter | Counts, on this CPU |
+| --- | --- |
+| `syscalls` | System calls entered; with KPTI each is a pair of CR3 switches |
+| `irqs`, `context_switches` | The `sys:stat` interrupt and context-switch counts, repeated so one snapshot has everything |
+| `cr3_switch` | Context switches that loaded another address space's table |
+| `cr3_empty` | Context switches that loaded the empty table (to a kernel context) |
+| `cr3_same` | Context switches that kept the address space: no CR3 load |
+| `flush_page` | Single-page invalidations on the paths that change user mappings (page faults, grants) |
+| `flush_full` | Full flushes other than switches: each `Flusher` batch's local flush and each shootdown answered |
+| `flush_batches`, `flush_batch_pages` | `Flusher` batches (one per mapping change, or per 32 pages), and their queued page entries |
+| `shootdowns` | Batches that also made other CPUs flush |
+| `shootdown_targets`, `shootdown_pages` | Their target CPUs and queued pages, summed |
+| `shootdown_wait_cycles` | TSC ticks spent spinning for the targets' acknowledgements |
+| `tlb_ipi_sent`, `tlb_ipi_received` | Shootdown IPIs sent and taken |
+| `shootdowns_handled` | Shootdown requests answered, in the IPI handler, by polling, or at a switch |
+| `iotlb_flushes`, `iotlb_unit_flushes`, `iotlb_bytes`, `iotlb_cycles` | IOMMU domain operations that invalidated IOTLBs, the unit invalidations, the IOVA bytes and the TSC ticks they took |
+
+The counters only grow, and a read is a snapshot taken when the read starts;
+there is no reset, so readers never disturb each other. A benchmark reads the
+file before and after a run and subtracts (`ferric_trace::tlb::Snapshot` and
+`Counters::delta`). From a shell:
+
+```sh
+cat /scheme/sys/tlb > /tmp/before; my-workload; cat /scheme/sys/tlb > /tmp/after
+```
+
+`ferric-iobench` does this around the timed part of every round when the file
+exists, and prints, per queue policy, the deltas per read
+(`ferric_trace::tlb::PerOp`):
+
+```text
+FERRIC_BENCH iobench-randread-4k-qd32 tlb_policy=adaptive kpti=on pcid=on tlb_ops=…
+    flushes_per_op=… flush_full_per_op=… flush_page_per_op=… shootdowns_per_op=…
+    tlb_ipis_per_op=… cr3_loads_per_op=… syscalls_per_op=… iotlb_flushes_per_op=…
+    targets_per_shootdown=… pages_per_shootdown=… wait_cycles_per_shootdown=…
+```
+
+(one line, wrapped here; ratios have three decimals). The
+counters are system-wide, so the daemons serving the reads (the file system,
+`nvmed`) are included, as they should be. The key is `tlb_policy`, not
+`policy`, so `check-iobench-log.sh` does not take these lines for results.
+The TSC ticks are not calibrated; divide by the traced machine's TSC rate
+for time.
+
+The counters are plain per-CPU words in the per-CPU block, written only by
+their CPU with a relaxed load and store, as `sys:stat`'s are, on paths that
+already flush a TLB or load CR3, except `syscalls` and `cr3_same`, which add
+one load and store to every system call and context switch. The shootdown and
+IOTLB wait times cost one `rdtsc` at each end. Without `kernel.tlb_stats`
+nothing is compiled in. KPTI's own CR3 switches on entry and exit are not
+counted (they are in the entry assembly); `syscalls`, `irqs` and the mode line
+bound them. Boot-time and kernel-text page invalidations (the static-key and
+alternatives patching) are not counted either.
 
 ## Sampling profiles
 

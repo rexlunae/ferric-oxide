@@ -51,6 +51,16 @@ crate::interrupt!(wakeup, || {
 });
 
 crate::interrupt!(tlb, || {
+    // Ferric Oxide: TLB accounting (`tlb_stats`) and the mm.tlb_ipi tracepoint
+    // (`kernel.trace`): whether the request was still pending, or already answered by
+    // this CPU's polling.
+    crate::tlb_stats::tlb_count!(TlbIpiReceived);
+    crate::trace::trace_event!(
+        ferric_trace::kernel::MM_TLB_IPI,
+        PercpuBlock::current()
+            .wants_tlb_shootdown
+            .load(core::sync::atomic::Ordering::Relaxed),
+    );
     PercpuBlock::current().maybe_handle_tlb_shootdown();
 
     local_apic::eoi();

@@ -147,6 +147,9 @@ pub unsafe extern "C" fn __inner_syscall_instruction(stack: *mut InterruptStack)
                 scratch.r10,
             );
 
+            // Ferric Oxide: with KPTI each system call is a pair of CR3 switches (`tlb_stats`).
+            crate::tlb_stats::tlb_count!(Syscalls);
+
             let ret = syscall::syscall(
                 nr,
                 scratch.rdi,
