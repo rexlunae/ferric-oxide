@@ -1,0 +1,11 @@
+[unit]
+description = "Unlock and mount the volumes in /etc/ferric/crypttab"
+
+# features.toml fs.unlock_at_boot. Runs once, before the services numbered 10 and up:
+# init waits for it to exit, and it exits once every volume in the table is served (or has
+# failed). The ferric-blockd and ext4d daemons it starts keep serving after it exits. With no
+# /etc/ferric/crypttab it does nothing. A service that needs a volume can also name this unit
+# in requires_weak.
+[service]
+cmd = "ferric-unlock"
+type = "oneshot"

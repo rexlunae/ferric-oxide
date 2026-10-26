@@ -52,7 +52,9 @@ ext4d = "source"
 # which CI turns on) and reads them back; skips without it.
 ferric-blocklayer-test = "source"
 # ferric-blockd, as features.toml fs.luks or fs.lvm adds it; named here for the same reason as
-# ext4d above. Built by name, it has both layers.
+# ext4d above. Built by name, it has both layers; CI passes FERRIC_BLOCKD_FEATURES from its
+# ferric.toml, whose fs.unlock_at_boot adds ferric-unlock and its 05_ferric-unlock.service, so
+# the test's /etc/ferric/crypttab is unlocked at boot.
 ferric-blockd = "source"
 # Reads and writes the NVMe disk through a registered-buffer grant (drivers.grant_dma,
 # which CI turns on) and times it against ordinary reads.

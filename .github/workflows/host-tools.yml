@@ -247,7 +247,7 @@ jobs:
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
 
-  # ferric-blockd (fs.luks, fs.lvm): its tests, lints and docs for the host and for Redox, the
+  # ferric-blockd (fs.luks, fs.lvm, fs.unlock_at_boot): its tests, lints and docs for the host and for Redox, the
   # on-target test's lints, and the block-layer tests on images cryptsetup and lvm2 make now.
   blockd:
     runs-on: ubuntu-24.04
@@ -275,6 +275,9 @@ jobs:
           cargo test --locked
           cargo test --locked --no-default-features --features luks
           cargo test --locked --no-default-features --features lvm
+          # ferric-unlock and its crypttab (fs.unlock_at_boot), with both layers and with one.
+          cargo test --locked --features unlock
+          cargo test --locked --no-default-features --features luks,unlock
       - name: Test the layers on fresh images
         run: |
           sudo apt-get update
@@ -288,10 +291,11 @@ jobs:
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --target x86_64-unknown-redox -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
+          # The unlock feature only adds code, so building with it lints and documents all of it.
+          cargo clippy --locked --all-targets --features unlock -- -D warnings
+          cargo clippy --locked --all-targets --features unlock --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features unlock
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features unlock --target x86_64-unknown-redox
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-blocklayer-test/files/Cargo.toml -- -D warnings
 
