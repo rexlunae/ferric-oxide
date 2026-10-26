@@ -109,7 +109,7 @@ ferric-iommu = { path = "../../crates/iommu" }
 ferric-irq = { path = "../../crates/irq" }
 ferric-rtl8125 = { path = "../../crates/rtl8125" }
 ferric-vtd = { path = "../../crates/vtd", default-features = false }
-redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
+redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", rev = "1b9cdbcd0e2404cef33044c6b199770884e61ca6", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
 redox_termios = "0.1.4"
 ron = "0.8.1"
 serde = { version = "1", features = ["derive"] }
