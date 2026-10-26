@@ -1,6 +1,6 @@
 [source]
 # base lives in this repository at userspace/base/, a git subtree of
-# gitlab.redox-os.org/redox-os/base (see .github/workflows/subtree-sync.yml).
+# gitlab.redox-os.org/redox-os/base (imported with its history; not synced).
 path = "userspace/base"
 
 [build]

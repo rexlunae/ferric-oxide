@@ -24,7 +24,7 @@ Start with the [implemented-system guide](docs/src/ferric-oxide.md) for the curr
 | Work on host image installation or component execution | [Installer README](tools/installer/README.md), [Redoxer README](tools/redoxer/README.md) and their in-tree public API docs; check examples against the current CLI |
 | Report hardware results | [HARDWARE.md](HARDWARE.md); inherited reports are not proof of current Ferric support |
 | See what is planned, which phase a change belongs to, or what is in progress | [Roadmap chapter](docs/src/ferric-roadmap.md) for the plan and exit criteria; [ROADMAP.md](ROADMAP.md) for per-phase status and pull requests |
-| Contribute, review or handle upstream imports | [CONTRIBUTING.md](CONTRIBUTING.md), [AI_POLICY.md](AI_POLICY.md), [PR template](.github/pull_request_template.md), [subtree-sync workflow](.github/workflows/subtree-sync.yml) |
+| Contribute or review | [CONTRIBUTING.md](CONTRIBUTING.md), [AI_POLICY.md](AI_POLICY.md), [PR template](.github/pull_request_template.md) |
 | Check licensing or user-facing names | [LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [TRADEMARK.md](TRADEMARK.md) |
 | Add or render book pages | [Book README](docs/README.md), [writing docs](docs/src/writing-docs-correctly.md) and [documentation checks](docs/src/ferric-testing.md#documentation-checks) |
 
@@ -35,7 +35,7 @@ Source and tests establish what is implemented; `features.toml` establishes conf
 - **Update documentation in the same change as the implementation.** Changes to behavior, architecture, public interfaces, feature defaults, build/configuration commands, package formats or validation requirements must update the relevant system chapter in `docs/src/` and any affected component README or Rustdoc. Documentation updates are part of completing the task.
 - Document the implemented behavior, enabling configuration, constraints and relevant checks. Distinguish prepared interfaces or planned work from active enforcement; do not claim a successful test, boot, benchmark or hardware result without evidence.
 - Keep the [system status table](docs/src/ferric-oxide.md#implementation-status) and this document map accurate when adding components or completing previously unfinished work. Prefer links to authoritative catalog/API/workflow details over copying lists that will diverge.
-- Put system documentation in `docs/`. Add Ferric-specific pages locally and list them in `docs/src/SUMMARY.md`; preserve inherited upstream content and avoid unrelated reorganization of the book subtree.
+- Put system documentation in `docs/` and list new pages in `docs/src/SUMMARY.md`. The book was imported from the Redox book and is maintained here; revise inherited chapters when they are out of date, and keep credit to Redox where a page describes components that came from it.
 - When you land work that belongs to a roadmap phase, update the status table in [ROADMAP.md](ROADMAP.md) in the same pull request: add the pull request to its phase and move finished items. Change the [Roadmap chapter](docs/src/ferric-roadmap.md) only when the plan itself changes.
 - Run the book checks described in [Validation and debugging](docs/src/ferric-testing.md#documentation-checks) when changing its pages. Report unavailable tooling and validation limits. Never commit generated `docs/book/` output.
 
@@ -54,14 +54,14 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `tools/ferric-trace/` | Kernel trace tool: capture on the target (recipe `recipes/tools/ferric-trace`), text view and Perfetto/Chrome JSON export | host, and `x86_64-unknown-redox` through the recipe |
 | `tools/cargo-fox/` | `cargo fox`: hermetic builds, signed archives, build attestations and signed release tags for package authors | host |
 | `tools/fox-registry/` | `fox-registry`: package registry creation, admission, release checks, registry CI builds and rebuilds, advisories, VEX documents, recipe import and metadata signing | host |
-| `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Upstream subtree | kernel |
-| `crates/bootloader/` | UEFI bootloader. Upstream subtree | bootloader |
-| `crates/relibc/` | C library. Upstream subtree | relibc |
+| `crates/kernel/` | Kernel and memory manager, `no_std`, custom target. Imported from Redox | kernel |
+| `crates/bootloader/` | UEFI bootloader. Imported from Redox | bootloader |
+| `crates/relibc/` | C library. Imported from Redox | relibc |
 | `crates/` (others) | Shared protection, relocation, registered-buffer, IOMMU, fox and wasm interface libraries, `no_std` where possible | host-tested members, consumed by path across targets |
-| `userspace/` | Daemons, drivers and file system. `base/` and `redoxfs/` are upstream subtrees; RedoxFS also supplies host tools | separate base workspace and standalone RedoxFS/bootstrap builds |
+| `userspace/` | Daemons, drivers and file system. `base/` and `redoxfs/` were imported from Redox; RedoxFS also supplies host tools | separate base workspace and standalone RedoxFS/bootstrap builds |
 | `recipes/`, `config/`, `mk/` | Package recipes, image configs, Makefile fragments | — |
 | `features.toml` | Catalog of build-time feature options | — |
-| `docs/` | The book: implemented Ferric system chapters and inherited Redox background. Upstream subtree with local additions | — |
+| `docs/` | The book: Ferric system chapters, plus chapters revised from the Redox book it was imported from | — |
 
 Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` and a general `ferric-abi` crate do not exist yet. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
 
@@ -69,7 +69,7 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 
 - **Licensing.** All code is MIT. Keep existing copyright notices, including `Copyright (c) 2016 Redox OS Developers` in [LICENSE](LICENSE). Only add dependencies under MIT-compatible licenses (MIT, Apache-2.0, BSD, Zlib, ISC, Unicode). No GPL, LGPL or AGPL code or crates.
 - **Clean-room Linux compatibility.** Linux file systems (ext4, XFS, LVM, LUKS) and other Linux-compatible features are written from published format specifications and documentation, never ported or translated from GPL source. Do not read Linux kernel source while implementing them, and say which specification you used in the module docs.
-- **Keep internal Redox names.** The `redox` target triple, `relibc`, `RedoxFS`, `redox_syscall`, scheme names and existing paths stay as they are so upstream changes keep merging. The rebrand is user-facing only. Do not use the Redox name or logo for the fork itself (see [TRADEMARK.md](TRADEMARK.md)).
+- **Keep internal Redox names.** The `redox` target triple, `relibc`, `RedoxFS`, `redox_syscall`, scheme names and existing paths stay as they are, because the Rust targets, existing tools, binaries and imported code depend on them. The rebrand is user-facing only. Do not use the Redox name or logo for the fork itself (see [TRADEMARK.md](TRADEMARK.md)).
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
@@ -163,4 +163,4 @@ Then:
 - Include the documentation updates required above and check that new book pages appear in `docs/src/SUMMARY.md`.
 - Sign off each commit (`git commit -s`).
 - Do not commit `ferric.toml`, `build/` or other generated output.
-- Do not mix formatting-only changes in upstream subtrees with real changes; they make upstream merges conflict.
+- Do not mix formatting-only changes to imported code with real changes; they bury the real change in review.
