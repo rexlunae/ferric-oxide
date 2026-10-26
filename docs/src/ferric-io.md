@@ -356,6 +356,15 @@ CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
 set, and the next broadcast shootdown (sent when a kernel shadow stack is
 freed) spins on it forever.
 
+The context-free acknowledgement branch is shared with host/Miri regression
+tests: it returns no idle context, services a pending TLB shootdown before EOI
+and never reads current-context state. This is control-flow coverage; actual
+interrupt entry/TLB hardware remain covered by target boots and hardware tests.
+Device IRQ targeting now excludes the profiler CPU from `irq:` listings,
+steering and IOMMU destinations. The xAPIC ID register is decoded from bits
+31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
+modes, and smoke CI also boots with x2APIC disabled.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.

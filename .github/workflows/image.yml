@@ -307,6 +307,12 @@ jobs:
           - cpu: host
             iommu: none
             nic: virtio
+          # The same image with x2APIC hidden from the guest, so the kernel drives its local
+          # APICs in xAPIC mode: LocalApic::id's xAPIC decoding (#214) and the targeted IPIs
+          # (TLB shootdowns) that send to the IDs it returns run on every PR.
+          - cpu: host,-x2apic
+            iommu: none
+            nic: e1000
     env:
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}.log
     steps:

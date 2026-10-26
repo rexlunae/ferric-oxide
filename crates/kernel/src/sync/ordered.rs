@@ -296,6 +296,11 @@ impl<L: Level, T> Mutex<L, T> {
     pub fn into_inner(self) -> T {
         self.inner.into_inner()
     }
+
+    /// Borrows the protected value without locking; exclusive access excludes guards.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
 }
 
 /// An RAII implementation of a "scoped lock" of a mutex. When this structure is
