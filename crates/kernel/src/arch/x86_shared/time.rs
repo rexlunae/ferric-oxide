@@ -236,6 +236,14 @@ fn hpet_ns() -> u128 {
 static LAST_CONTINUOUS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// When the KVM clock hiccups (its page re-bases and every later read is
+/// behind the last value, so its scale is over), the handover offset bridges
+/// the last good pvclock value onto the fallback scale: after the handover,
+/// `time = fallback_time + KVM_HANDOVER` continues without freezing or
+/// jumping backward. 0 means no handover happened yet.
+static KVM_HANDOVER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// The continuous sources without the KVM clock: the calibrated invariant
 /// TSC, else the HPET, else the `OFFSET + interpolation` fallback. Used as
 /// the KVM clock's degradation path (which cannot consult the selected
@@ -259,14 +267,34 @@ fn continuous_without_kvm(token: &mut CleanLockToken) -> u128 {
 /// picked.
 pub fn monotonic_absolute(token: &mut CleanLockToken) -> u128 {
     let ns = match source() {
-        Source::Kvm => super::device::tsc::monotonic_absolute()
-            .unwrap_or_else(|| continuous_without_kvm(token)),
-        _ => continuous_without_kvm(token),
+        Source::Kvm => match super::device::tsc::monotonic_absolute() {
+            Some(ns) => ns,
+            None => {
+                // The pvclock stepped backward (its page re-based): its
+                // scale is over. The first failure bridges the scales, then
+                // the fallback clock carries on with the offset; the clamped
+                // value frozen here is exactly the last good pvclock value.
+                let offset = KVM_HANDOVER.load(core::sync::atomic::Ordering::Relaxed);
+                if offset == 0 {
+                    let fallback_now = continuous_without_kvm(token);
+                    let last = LAST_CONTINUOUS.load(core::sync::atomic::Ordering::Relaxed);
+                    KVM_HANDOVER.store(
+                        last.saturating_sub(fallback_now as u64),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    u128::from(last)
+                } else {
+                    continuous_without_kvm(token).saturating_add(u128::from(offset))
+                }
+            }
+        },
+        _ => continuous_without_kvm(token)
+            .saturating_add(u128::from(KVM_HANDOVER.load(core::sync::atomic::Ordering::Relaxed))),
     };
-    // Clamp against the last returned value: the sources are continuous, but
-    // their handover and the KVM clock's page re-basing can produce a brief
-    // backward step, which would turn wake timers into long sleeps. Clamping
-    // freezes the clock for that step instead (bounded by the step).
+    // Clamp against the last returned value: the sources are continuous,
+    // but their handover and the KVM clock's page re-basing can produce a
+    // brief backward step, which would turn wake timers into long sleeps.
+    // Clamping freezes the clock for that step instead (bounded by it).
     let last = LAST_CONTINUOUS.load(core::sync::atomic::Ordering::Relaxed);
     let ns = ns.max(u128::from(last));
     LAST_CONTINUOUS.store(ns as u64, core::sync::atomic::Ordering::Relaxed);
