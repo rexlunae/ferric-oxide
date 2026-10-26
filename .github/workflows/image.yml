@@ -314,6 +314,14 @@ jobs:
             iommu: none
             nic: e1000
     env:
+      # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the host
+      # under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster path.
+      # nvmed's per-CPU policies take more interrupts and IPIs than its single queue, so their
+      # same-boot A/Bs there (NVMe t4 ratios of 0.81 to 0.85, against 0.90 to 1.05 with
+      # x2APIC) measure the APIC emulation more than nvmed. That boot checks xAPIC
+      # correctness, so its perf A/B gates (check-blkgrant-log.sh, check-iobench-log.sh) still
+      # report their numbers but only warn on a failure (scripts/ferric-ci/perf-ab.sh).
+      PERF_AB: ${{ matrix.cpu == 'host,-x2apic' && 'report' || 'enforce' }}
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}.log
     steps:
       - uses: actions/checkout@v4
@@ -438,19 +446,12 @@ jobs:
       # its domain (drivers.grant_dma); without an IOMMU the grant steps skip. Both print the
       # read benchmark, which the step repeats as a notice.
       - name: Check storage DMA into registered buffers
-        env:
-          # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the
-          # host under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster
-          # path. The per-CPU worker policy takes more interrupts and IPIs than the single
-          # queue, so its A/B there (t4 ratios of 0.81 to 0.85, against 0.90 to 1.05 with
-          # x2APIC) measures the APIC emulation more than nvmed: the numbers are still
-          # reported, and a failure is a warning.
-          BLKGRANT_AB: ${{ matrix.cpu == 'host,-x2apic' && 'report' || 'enforce' }}
         run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
       # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
       # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
       # in the same boot. The figures go to a notice and the job summary; the per-CPU default
-      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab).
+      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab), except in the
+      # x2APIC-off boot, where a failure only warns (PERF_AB in the job env).
       - name: Check the disk benchmark
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
