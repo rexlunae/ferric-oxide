@@ -631,6 +631,27 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
+id = "drivers.nvmed_perf"
+menu = "drivers"
+type = "bool"
+title = "nvmed request-phase timing"
+default = false
+rebuild = ["base"]
+help = """
+Build nvmed with its perf Cargo feature. Buffered and DMA requests each record
+whole-request service time and summed command time (SQ-slot acceptance through
+observed completion). A separate thread logs and resets summaries once a second,
+even when I/O is idle. Command time includes doorbell batching and wakeup latency,
+but excludes waiting for a free SQ slot; it is not pure controller service time.
+Windows are not benchmark-round boundaries. x86 uses CPU counter reads; other
+architectures use the monotonic clock. Reporting adds timer/logging system calls
+on its own thread. Off by default; without it nvmed's timing path is absent."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/perf" }
+
+[[option]]
 id = "drivers.net_bypass"
 menu = "drivers"
 type = "bool"
