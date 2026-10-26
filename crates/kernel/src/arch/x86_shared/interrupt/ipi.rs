@@ -18,7 +18,12 @@ crate::interrupt!(wakeup, || {
     // `Runnable` in no run queue, requests are never served, and every CPU idles forever
     // (the boot-smoke hang). If this CPU is idling, do the switch right here instead of
     // returning into the halt.
-    let idle = PercpuBlock::current().switch_internals.idle_context();
+    //
+    // The profiling helper CPU (kernel.profiling) routes every interrupt here but never
+    // schedules contexts, so it has no idle context and nothing to switch to.
+    let Some(idle) = PercpuBlock::current().switch_internals.try_idle_context() else {
+        return;
+    };
     if context::is_current(&idle)
         && !PercpuBlock::current()
             .switch_internals

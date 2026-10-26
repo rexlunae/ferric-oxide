@@ -1558,6 +1558,13 @@ impl ContextSwitchPercpu {
             opt.as_ref().expect("no idle context present")
         })
     }
+
+    /// The idle context, or `None` on a CPU that never set one up: the profiling helper
+    /// CPU (kernel.profiling) stays in its own loop instead of calling `context::init`, but
+    /// still takes interrupts through the wake-up handler.
+    pub fn try_idle_context(&self) -> Option<Ref<'_, Arc<ContextLock>>> {
+        Ref::filter_map(self.idle_ctxt.borrow(), Option::as_ref).ok()
+    }
 }
 
 #[cfg(test)]
