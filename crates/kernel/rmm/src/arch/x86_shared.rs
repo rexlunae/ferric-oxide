@@ -35,3 +35,36 @@ pub unsafe fn init_pat() {
         core::arch::asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high);
     }
 }
+
+/// CR4.PGE: global pages enabled.
+const CR4_PGE: usize = 1 << 7;
+
+/// Ferric Oxide: flushes every TLB and paging-structure-cache entry, global ones and those of
+/// every PCID included, by clearing and restoring CR4.PGE (Intel SDM vol. 3A, 4.10.4.1). Returns
+/// `false`, doing nothing, when PGE is off: then no entry is global.
+///
+/// Built on every 64-bit target like the rest of `x86_64.rs`, but only emitted where used.
+#[inline(always)]
+pub(crate) fn toggle_global_pages() -> bool {
+    use core::arch::asm;
+
+    let cr4: usize;
+    // SAFETY: reading CR4 has no side effects.
+    unsafe { asm!("mov {0}, cr4", out(reg) cr4, options(nostack, preserves_flags)) };
+    if cr4 & CR4_PGE == 0 {
+        return false;
+    }
+    // SAFETY: only PGE changes, and only until the second write; every other bit (CET, SMEP,
+    // PCIDE and the rest) is written back as read, so nothing but the TLB is affected. The raw
+    // `mov` keeps bits that `x86::controlregs::cr4` would drop, such as CR4.CET.
+    unsafe {
+        asm!(
+            "mov cr4, {0}",
+            "mov cr4, {1}",
+            in(reg) cr4 & !CR4_PGE,
+            in(reg) cr4,
+            options(nostack, preserves_flags),
+        )
+    };
+    true
+}

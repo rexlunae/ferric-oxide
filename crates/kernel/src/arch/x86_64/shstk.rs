@@ -333,7 +333,8 @@ mod stacks {
     }
 
     /// Page flags of a mapped shadow-stack page: [`shstk::SHADOW_STACK_PTE_FLAGS`] in `rmm`
-    /// terms. Global like the rest of the kernel half (KPTI turns global pages off itself).
+    /// terms. Global like the rest of the kernel half (KPTI turns global pages off itself), so
+    /// `unmap` broadcasts its shootdown, which drops global entries too.
     fn page_flags() -> PageFlags<RmmA> {
         PageFlags::new()
             .write(false)
