@@ -270,7 +270,7 @@ rate. Verify GPU use separately from software fallback.
 
 There are two release milestones:
 - **M1 "Server/VM usable":** Phases 0–4, Phase P (through P5), Phase T and Phase V (hypervisor and enclaves), plus guest virtualization. An installable image runs real services in a VM with hardening and sandboxing on by default.
-- **M2 "Workstation usable":** M1 plus Phases 5–6. It installs on the reference laptop and desktop, gives an accelerated COSMIC desktop with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
+- **M2 "Workstation usable":** M1 plus Phases 5–6. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering and Xwayland compatibility described in Phase 6, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
 
 Both milestones need versioned releases with signed images, a signed package repository with an update channel, release notes and an upstream-sync policy.
 
