@@ -274,7 +274,10 @@ fn a_quota_volume_takes_a_new_mode_but_not_a_new_owner() {
     let (mut fs, shared) = mount_writable(load("quota.ext4.gz"));
     let hello = open(&mut fs, "hello.txt");
     let untouched = shared.bytes();
-    for (uid, gid) in [(Some(5), None), (None, Some(5))] {
+    // mke2fs -d gives hello.txt the owner of the file it copied: 0 for the committed
+    // image, the runner's user for CI's fresh ones.
+    let a = fs.attributes(hello).expect("open");
+    for (uid, gid) in [(Some(a.uid + 1), None), (None, Some(a.gid + 1))] {
         assert!(matches!(
             fs.set_owner(hello, uid, gid, 0, 0),
             Err(Error::Write(WriteError::QuotaTracked { number: 12 }))
@@ -286,7 +289,7 @@ fn a_quota_volume_takes_a_new_mode_but_not_a_new_owner() {
         95
     );
     // The same owner and group move no usage.
-    fs.set_owner(hello, Some(0), Some(0), 0, 0)
+    fs.set_owner(hello, Some(a.uid), Some(a.gid), 0, 0)
         .expect("unchanged");
     fs.set_mode(hello, 0o600, 0, 0)
         .expect("a mode is not counted");
