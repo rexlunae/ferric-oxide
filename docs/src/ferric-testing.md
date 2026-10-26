@@ -164,8 +164,8 @@ CI checks each feature combination and a bare-metal build.
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set` and `sync/records`
-modules, rather than duplicating their implementations. Run from the root:
+It includes the actual `cpu_set`, `sync/records` and local APIC ID decoding
+(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
 
 ```sh
 cargo test --locked -p ferric-aligned-buffer
@@ -190,7 +190,7 @@ an ARM64 native boot; it does not simulate blocked waiters or context switches.
 
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
-out-of-range CPU IDs, duplicate/gapped/concurrent CPU publication, initialized
+out-of-range CPU IDs, nonzero xAPIC and x2APIC IDs, duplicate/gapped/concurrent CPU publication, initialized
 event/SQE ABI bytes, wrapped queues, whole-record reads and copy-failure rollback.
 Wait queues return zero immediately for an empty destination, reject nonempty
 destinations smaller than one record with `EINVAL`, and leave queued records
@@ -374,6 +374,7 @@ image=build/x86_64/ferric-smoke/harddrive.img
 scripts/ferric-ci/boot-smoke.sh "$image" serial.log
 BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh "$image" serial-vtd.log
 BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log
+scripts/ferric-ci/boot-smoke.sh "$image" serial-host,-x2apic.log host,-x2apic
 ```
 
 The script expects QEMU, OVMF and Linux utilities. It uses a copy of the image,
@@ -384,6 +385,23 @@ otherwise TCG with `max`. `BOOT_TIMEOUT` changes the default 300-second limit.
 remapping requires QEMU 10 or later; the workflow uses a newer-QEMU container
 for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
 the usual paths.
+
+The third argument is the QEMU `-cpu` model. The image workflow's boot matrix
+also runs `host,-x2apic` (the last line above, KVM only): with x2APIC hidden
+from the guest, the kernel drives its local APICs in xAPIC mode, so the decoding
+of the xAPIC ID register (its ID sits in bits 31:24) and the targeted IPIs, such
+as per-CPU TLB shootdowns, that are sent to those IDs get a real boot. The other
+boots use `host`, which runs in x2APIC mode. The decoding itself is also
+host-tested (`apic_id` in the kernel helper tests). That boot checks
+correctness, so its performance A/B gates, the NVMe queue-policy A/B
+(`check-blkgrant-log.sh`) and the disk benchmark's adaptive-against-main A/B
+(`check-iobench-log.sh`), only warn when they fail (`PERF_AB=report`, set for
+the whole boot job; see `scripts/ferric-ci/perf-ab.sh`): every EOI and IPI is
+then an xAPIC MMIO access that exits to the host under nested KVM, so nvmed's
+per-CPU policies, which take more of them, measure the APIC emulation more
+than nvmed. The figures are still reported.
+`scripts/ferric-ci/test-perf-ab.sh` (host-tools CI) runs both checks on
+fixture logs with and without `PERF_AB=report`.
 
 The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
@@ -674,3 +692,13 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Profiler CPU wakeup acknowledgements
+
+The host kernel helper suite includes `context/idle.rs`, used by the real
+`try_idle_context` accessor and x86 wakeup handler. It verifies an uninitialized
+idle slot returns `None`, then checks a pending shootdown is serviced before
+EOI without reading current-context state. Ordinary idle/running CPU decisions
+and exactly one EOI are checked too. These callbacks test dispatch/order, not
+TLB hardware; the profile-image boot remains the on-target regression, and
+profiling plus CET shadow-stack teardown still needs hardware validation.
