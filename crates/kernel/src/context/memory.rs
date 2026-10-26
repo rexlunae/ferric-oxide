@@ -2072,18 +2072,16 @@ impl Grant {
                             } = cow(frame, page_info, RefKind::Shared)
                                 .map_err(|_| Error::new(ENOMEM))?;
 
-                            let (old_flags, _, _flush) = src_addrspace
+                            let (old_flags, _, flush) = src_addrspace
                                 .table
                                 .utable
                                 .remap_with_full(src_page.start_address(), |_, flags| {
                                     Some((new_cow_frame.base(), flags))
                                 })
                                 .expect("page did exist");
-
-                            // TODO: flush.ignore() is correct, but seems to be amplifying a
-                            // userspace race condition
-                            //
-                            //flush.ignore();
+                            // The source flusher, flushed after the loop, invalidates this page
+                            // on every CPU using the source address space, this one included.
+                            flush.ignore();
 
                             let mut src_flusher = Flusher {
                                 active_cpus: &src.addr_space_lock.used_by,
@@ -2132,6 +2130,15 @@ impl Grant {
                     flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
                 }
             }
+
+            // `FlusherState` has no `Drop`: without this the remaps above are never invalidated
+            // and the old CoW frames queued as FREE are never released. `guard` still holds the
+            // source address space's lock, as `Flusher::flush` requires.
+            Flusher {
+                active_cpus: &src.addr_space_lock.used_by,
+                state: src_flusher_state,
+            }
+            .flush();
         }
 
         Ok(Self {
