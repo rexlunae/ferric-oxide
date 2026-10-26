@@ -164,7 +164,8 @@ CI checks each feature combination and a bare-metal build.
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set`, `sync/records` and local APIC ID decoding
+It includes the actual `cpu_set`, `sync/records`, TLB shootdown mailbox
+(`memory/tlb.rs`) and local APIC ID decoding
 (`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
 
 ```sh

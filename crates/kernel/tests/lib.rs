@@ -18,6 +18,8 @@ mod idle;
 mod records;
 #[path = "../src/sync/spin_wait.rs"]
 mod spin_wait;
+#[path = "../src/memory/tlb.rs"]
+mod tlb;
 
 #[cfg(test)]
 mod wait_support;

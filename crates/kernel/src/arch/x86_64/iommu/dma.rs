@@ -225,7 +225,7 @@ impl Pins {
     /// Drops the references, freeing frames nothing else uses.
     fn release(self) {
         for frame in self.0 {
-            NopFlusher.queue(frame, None, TlbShootdownActions::FREE);
+            NopFlusher.queue(None, frame, None, TlbShootdownActions::FREE);
         }
     }
 }
