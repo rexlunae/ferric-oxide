@@ -3,4 +3,12 @@
 path = "tools/installer"
 
 [build]
-template = "cargo"
+template = "custom"
+script = """
+# The installer is a member of the host workspace at the repository root:
+# it takes its dependency versions and lockfile from there, and places
+# packages with ../../crates/fox-store. The cookbook's copy in source/ has
+# neither, so build the in-tree crate instead, as recipes/core/fox does.
+export CARGO_TARGET_DIR="${COOKBOOK_BUILD}/target"
+COOKBOOK_SOURCE="${COOKBOOK_ROOT}/tools/installer" cookbook_cargo
+"""
