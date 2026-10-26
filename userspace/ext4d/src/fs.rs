@@ -8,9 +8,10 @@
 //! `O_SYMLINK` or `O_STAT | O_NOFOLLOW` asks for the final link itself.
 //!
 //! [`OpenMode::wants_write`] opens and every changing call fail with [`Error::ReadOnly`],
-//! with one exception: on a volume mounted with `Fs::new_writable` (Cargo feature
-//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`] sets a file's times through
-//! the journal (`crate::write`). The inode to change is found from the handle's path by
+//! with three exceptions: on a volume mounted with `Fs::new_writable` (Cargo feature
+//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`], [`Fs::set_mode`] and
+//! [`Fs::set_owner`] set a file's times, permission bits, and owner and group through the
+//! journal (`crate::write`), each checking the caller's permission as POSIX says. The inode to change is found from the handle's path by
 //! `crate::lookup`. After each change the `ext4-view` reader is loaded again, since it keeps
 //! the blocks it has read, and every handle's metadata is read again from it.
 //!
@@ -450,7 +451,8 @@ impl Fs {
     }
 
     /// Loads the volume `device` holds for reading and for the changes `crate::write`
-    /// makes: so far, setting times ([`Self::set_times`]).
+    /// makes: so far, setting times, mode and owner ([`Self::set_times`],
+    /// [`Self::set_mode`], [`Self::set_owner`]).
     ///
     /// # Errors
     ///
