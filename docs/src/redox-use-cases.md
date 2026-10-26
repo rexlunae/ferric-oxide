@@ -26,16 +26,19 @@ interface exist so far; see [Virtualization](./ferric-virt.md).
 
 ## Workstations (M2)
 
-The second target is a desktop or laptop for daily development work: an
-accelerated COSMIC desktop, Wi-Fi, suspend and resume, a browser, and the
-ability to build Ferric Oxide on Ferric Oxide. This depends on real-hardware
-work (ACPI power management, USB, Wi-Fi) and graphics work (virtio-gpu, then
-Mesa drivers on a DRM/KMS-compatible interface), which are Phases 5 and 6 of
-the roadmap and mostly not started.
+The second target is a desktop or laptop for daily development work: a
+hardware-accelerated Wayland desktop built on Smithay, Mesa rendering and
+Xwayland compatibility, Wi-Fi, suspend and resume, a browser, and the ability
+to build Ferric Oxide on Ferric Oxide. This depends on real-hardware work
+(ACPI power management, USB, Wi-Fi) and the graphics stack described in
+[Phase 6](./ferric-roadmap.md#phase-6-graphics-and-desktop). Graphics
+implementation is deferred until the current PR backlog is merged.
 
-Today, Ferric Oxide inherits Redox's desktop: the Orbital display server,
-several COSMIC applications and a set of SDL and X11 programs (see
-[Important Programs](./important-programs.md)), running mainly in QEMU.
+The repository still contains inherited recipes for Orbital, COSMIC
+applications, and SDL and X11 programs (see [Important Programs](./important-programs.md)).
+Their presence is not evidence of a working Ferric desktop. Orbital is
+deprecated and is not planned to be brought up to a working or supported
+state; those recipes remain legacy artifacts.
 
 ## Sandboxed and portable software
 

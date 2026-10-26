@@ -118,8 +118,8 @@ The scheduler in `crates/kernel/src/context/switch.rs` implements EEVDF
 (earliest eligible virtual deadline first). It tracks virtual execution time
 and deadlines, chooses eligible runnable contexts, and accounts for CPU
 eligibility and an existing time slice. It also supports direct context
-switches for scheme requests. The inherited scheduling chapter still contains
-an older round-robin description; use the source for current scheduling work.
+switches for scheme requests. [Scheduling](scheduling.md) describes it and
+the planned tickless, asynchronous and real-time work.
 
 Timed waits are tracked by `context/timeout.rs`; direct switches preserve
 their deadlines so blocked scheme handlers can still wake. Futex wait setup
