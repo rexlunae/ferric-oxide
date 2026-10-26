@@ -820,8 +820,8 @@ holds the policies, host-tested:
 RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
 mounts and the kernel has the scheme. Each regular file with a description
 opened `O_RDONLY` gets an object (the node ID is the object ID), and those
-descriptions are attached; writers, directories, `mmap` and `fstat` stay with
-RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
+descriptions are attached, except `O_FSYNC` ones; writers, directories, `mmap`
+and `fstat` stay with RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
 description it makes from the scheme socket, since RedoxFS runs in the null
 namespace once mounted and cannot open its own path) as a
 call, so the main loop answers them in order with the writes it serves,

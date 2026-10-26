@@ -2,10 +2,10 @@
 //! (`kernel.page_cache`, io/pagecache-design.md in the project files, PR 2b).
 //!
 //! When the kernel has a `kernel.pcache` scheme, RedoxFS binds a queue to its scheme socket at
-//! mount. Each regular file with a description opened `O_RDONLY` gets a kernel object (its
-//! node ID is the object ID), and those descriptions are attached to it, so the kernel serves
-//! their `read` and `pread` from the cached pages without a round trip to RedoxFS. Everything
-//! else (writers, directories, `mmap`, `fstat`) still comes here.
+//! mount. Each regular file with a description opened `O_RDONLY` (and not `O_FSYNC`) gets a
+//! kernel object (its node ID is the object ID), and those descriptions are attached to it,
+//! so the kernel serves their `read` and `pread` from the cached pages without a round trip
+//! to RedoxFS. Everything else (writers, directories, `mmap`, `fstat`) still comes here.
 //!
 //! A file with a shared writable mapping is not cached while the mapping lasts: RedoxFS
 //! writes such mappings back to the file on `fsync` and `munmap` (`Fmap::sync`), which
@@ -289,14 +289,16 @@ impl PageCache {
     }
 
     /// What the kernel should serve of a description opened with `flags`, `None` for one
-    /// RedoxFS keeps: with cached writes, any but an `O_FSYNC` one, as opened; without,
-    /// only one opened read-only, for reading.
+    /// RedoxFS keeps: never an `O_FSYNC` one; with cached writes, any other, as opened;
+    /// without, only one opened read-only, for reading. `O_FSYNC` descriptions staying with
+    /// RedoxFS either way is what lets a program (and the tests and benchmarks) reach
+    /// RedoxFS itself whether or not the cache is on.
     fn access(&self, flags: usize) -> Option<Access> {
-        if self.writeback.is_none() {
-            return (flags & O_ACCMODE == O_RDONLY).then_some(Access::Read);
-        }
         if flags & O_FSYNC != 0 {
             return None;
+        }
+        if self.writeback.is_none() {
+            return (flags & O_ACCMODE == O_RDONLY).then_some(Access::Read);
         }
         match flags & O_ACCMODE {
             O_RDONLY => Some(Access::Read),
