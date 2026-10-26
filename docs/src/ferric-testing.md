@@ -683,3 +683,13 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Profiler CPU wakeup acknowledgements
+
+The host kernel helper suite includes `context/idle.rs`, used by the real
+`try_idle_context` accessor and x86 wakeup handler. It verifies an uninitialized
+idle slot returns `None`, then checks a pending shootdown is serviced before
+EOI without reading current-context state. Ordinary idle/running CPU decisions
+and exactly one EOI are checked too. These callbacks test dispatch/order, not
+TLB hardware; the profile-image boot remains the on-target regression, and
+profiling plus CET shadow-stack teardown still needs hardware validation.

@@ -20,16 +20,12 @@ crate::interrupt!(wakeup, || {
     // reschedule, `irq:` and the IOMMU refuse to aim device interrupts at this CPU
     // (`percpu::interrupt_target`), and features.toml rejects `kernel.trace` with
     // `kernel.profiling`, whose tracepoint sync waits for every CPU's answer.
-    let Some(idling) = percpu
-        .switch_internals
-        .try_idle_context()
-        .map(|idle| context::is_current(&idle))
-    else {
-        percpu.maybe_handle_tlb_shootdown();
-        local_apic::eoi();
-        return;
-    };
-    local_apic::eoi();
+    let action = context::idle::acknowledge(
+        percpu.switch_internals.try_idle_context(),
+        |idle| context::is_current(&idle),
+        || percpu.maybe_handle_tlb_shootdown(),
+        local_apic::eoi,
+    );
     // Ferric Oxide (issue #200): the drain moved the wake-ups into this CPU's local list,
     // which only the next `context::switch` processes. On an idling CPU, switch right here
     // so they run without waiting for the idle loop's next pass. The loop would get there
@@ -43,7 +39,7 @@ crate::interrupt!(wakeup, || {
     // A `Contended` result needs no retry here (#214): spinning in this handler with
     // interrupts off could wait on a CPU that is itself waiting for this one, and the loop
     // it returns to switches again and retries a contended switch with interrupts on.
-    if idling
+    if action == context::idle::WakeupAction::Schedule
         && !percpu
             .switch_internals
             .local_wakeup_list

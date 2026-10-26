@@ -1545,7 +1545,7 @@ impl ContextSwitchPercpu {
     /// Ferric Oxide: the idle context, or `None` on a CPU that never set up contexts (the
     /// `kernel.profiling` profiler CPU).
     pub fn try_idle_context(&self) -> Option<Ref<'_, Arc<ContextLock>>> {
-        Ref::filter_map(self.idle_ctxt.borrow(), Option::as_ref).ok()
+        super::idle::get(&self.idle_ctxt)
     }
 
     /// Retrieves the current idle context.

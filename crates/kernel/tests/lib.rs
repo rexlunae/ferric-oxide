@@ -12,6 +12,8 @@ extern crate alloc;
 mod apic_id;
 #[path = "../src/cpu_set.rs"]
 mod cpu_set;
+#[path = "../src/context/idle.rs"]
+mod idle;
 #[path = "../src/sync/records.rs"]
 mod records;
 #[path = "../src/sync/spin_wait.rs"]
