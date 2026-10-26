@@ -12,7 +12,9 @@
 //!
 //! Built with `journal-replay` (features.toml `fs.ext4_journal_replay`), it first replays the
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
-//! for that. Without it the device is only ever opened for reading. `ext4d --features`
+//! for that. Without it the device is only ever opened for reading. `write` (features.toml
+//! `fs.ext4_write`) adds the library's journaled writes, which the scheme does not call yet.
+//! `ext4d --features`
 //! prints the optional features it was built with, one per line, so tests can tell.
 
 #![forbid(unsafe_code)]
@@ -23,6 +25,8 @@ use std::process::ExitCode;
 const FEATURES: &[&str] = &[
     #[cfg(feature = "journal-replay")]
     "journal-replay",
+    #[cfg(feature = "write")]
+    "write",
 ];
 
 fn main() -> ExitCode {
