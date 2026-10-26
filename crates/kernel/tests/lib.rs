@@ -16,6 +16,8 @@ mod chown;
 mod cpu_set;
 #[path = "../src/context/fmap_reply.rs"]
 mod fmap_reply;
+#[path = "../src/percpu/global_flush.rs"]
+mod global_flush;
 #[path = "../src/context/idle.rs"]
 mod idle;
 #[path = "../src/sync/records.rs"]

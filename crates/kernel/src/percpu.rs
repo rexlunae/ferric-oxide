@@ -111,6 +111,12 @@ impl OneShotPercpu {
     }
 }
 
+mod global_flush;
+
+/// Ferric Oxide: global-flush requests from broadcast shootdowns (see [`global_flush`]).
+static GLOBAL_FLUSH: global_flush::GlobalFlushRequests<{ MAX_CPU_COUNT as usize }> =
+    global_flush::GlobalFlushRequests::new();
+
 pub static ALL_PERCPU_BLOCKS: [AtomicPtr<PercpuBlock>; MAX_CPU_COUNT as usize] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPU_COUNT as usize];
 
@@ -150,6 +156,10 @@ pub fn get_all_stats() -> Vec<(LogicalCpuId, CpuStatsData)> {
 
 // PercpuBlock::current() is implemented somewhere in the arch-specific modules
 
+/// Asks `target`, or with `None` every other CPU, to flush its TLB. Does not wait for the flush.
+///
+/// A broadcast (`None`) is meant for kernel mappings and also drops global TLB entries; a
+/// targeted shootdown reloads the page table, which keeps them unless a broadcast is pending.
 pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
     if cfg!(not(feature = "multi_core")) {
         return;
@@ -179,6 +189,8 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
         crate::ipi::ipi_single(crate::ipi::IpiKind::Tlb, percpublock);
         crate::tlb_stats::tlb_count!(TlbIpiSent);
     } else {
+        // A broadcast is for kernel mappings, which may be global: ask for those to go too.
+        GLOBAL_FLUSH.request();
         let current = crate::cpu_id();
         for id in 0..crate::cpu_count() {
             // TODO: Optimize: use global counter and percpu ack counters, send IPI using
@@ -198,7 +210,11 @@ impl PercpuBlock {
         }
 
         // TODO: Finer-grained flush
-        crate::memory::RmmA::invalidate_all();
+        if GLOBAL_FLUSH.take(self.cpu_id.get() as usize) {
+            crate::memory::RmmA::invalidate_all_global();
+        } else {
+            crate::memory::RmmA::invalidate_all();
+        }
         crate::tlb_stats::shootdown_handled();
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {

@@ -219,6 +219,16 @@ checks every reserved page after constructing its boot mappings and invalidates
 old bootloader translations before AP startup. Pool frames are mapped only with
 read-only shadow-stack PTEs and an unmapped guard below each stack.
 
+Shadow-stack PTEs are global, like the rest of the kernel half while KPTI is
+off, and a page-table reload does not drop global TLB entries. Freeing a shadow
+stack therefore broadcasts a shootdown (`shootdown_tlb_ipi(None)`) that asks
+every CPU to drop global entries as well: each CPU that sees a new request,
+counted by a generation in `percpu/global_flush.rs`, invalidates with `INVPCID`
+type 2 when the CPU has it, or by toggling CR4.PGE (Intel SDM Volume 3A,
+4.10.4.1). Shootdowns for user address spaces still only reload the page table
+([#260](https://github.com/rexlunae/ferric-oxide/issues/260)). The broadcast
+does not wait for the other CPUs to finish.
+
 Live CPUs write entries with `WRSS`. Pre-enable initialization makes a bounded
 store through the same read-only mapping while interrupts are masked and the
 CPU's CET/WP state is temporarily disabled. It restores CR0, CR4 and RFLAGS

@@ -30,6 +30,12 @@ pub unsafe fn init(cpu_id: LogicalCpuId) {
             x86::controlregs::cr4_write(x86::controlregs::cr4() | Cr4::CR4_ENABLE_SMEP);
         }
 
+        // Ferric Oxide: `RmmA::invalidate_all_global` (broadcast TLB shootdowns) can then use
+        // INVPCID. The BSP decides for every CPU, as KPTI's PCID support does.
+        if cpu_id == LogicalCpuId::BSP {
+            crate::memory::RmmA::set_invpcid_available(has_ext_feat(|feat| feat.has_invpcid()));
+        }
+
         if let Some(feats) = cpuid().get_extended_processor_and_feature_identifiers()
             && feats.has_rdtscp()
         {
