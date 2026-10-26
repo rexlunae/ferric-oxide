@@ -153,11 +153,12 @@ pub enum ArmResult {
 pub fn handle_fire() {
     let percpu = PercpuBlock::current();
     let entries = percpu.one_shot.entries.fetch_add(1, Ordering::Relaxed);
-    if entries < 3 {
-        crate::debug!("timer: handler entry {entries}");
-    }
     let now = Nanos::new(time::monotonic(&mut unsafe { CleanLockToken::new() }) as u64);
-    if percpu.one_shot.armed.due(now) {
+    let due = percpu.one_shot.armed.due(now);
+    if entries < 3 {
+        crate::info!("timer: handler entry {entries}: due={due} now={}", now.get());
+    }
+    if due {
         // The TSC-deadline timer has already cleared itself; record the
         // delivery, and leave the armed cell for the consumer to settle.
         percpu.one_shot.fired.store(true, Ordering::Release);
@@ -215,13 +216,29 @@ pub fn selftest(token: &mut CleanLockToken) {
             return;
         }
     }
-    // Bound the wait by the clock, not a spin count, so a wedged timer is
-    // reported after three seconds on any CPU.
-    let give_up = start + 3_000_000_000;
-    while !fired() && time::monotonic(token) <= give_up {
+    // Bound the wait by the clock and a hard spin count, so a wedged timer
+    // is reported instead of stalling the boot on any CPU; report progress
+    // every half second while waiting.
+    let give_up = start + 5_000_000_000;
+    let mut last_report = start;
+    let mut spins = 0u64;
+    while spins < 2_000_000_000 && !fired() {
         // SAFETY: interrupts on so the timer interrupt arrives; the spin is a
         // bounded wait for a boot selftest.
         unsafe { arch::interrupt::enable_and_nop() };
+        spins += 1;
+        let now = time::monotonic(token);
+        if now.saturating_sub(last_report) >= 500_000_000 {
+            let fired = fired();
+            let entries = PercpuBlock::current().one_shot.entries.load(Ordering::Relaxed);
+            crate::info!(
+                "timer: selftest waiting: now={now} fired={fired} entries={entries}"
+            );
+            last_report = now;
+            if now > give_up {
+                break;
+            }
+        }
     }
     if !fired() {
         let entries = PercpuBlock::current().one_shot.entries.load(Ordering::Relaxed);
@@ -259,8 +276,8 @@ pub fn selftest(token: &mut CleanLockToken) {
     let deadline = Nanos::new(time::monotonic(token) as u64 + 1_000_000_000);
     if arm(deadline) == ArmResult::Reprogrammed {
         disarm();
-        let mut quiet = 0u32;
-        while quiet < SELFTEST_QUIET_MS / 10 {
+        let quiet_until = time::monotonic(token) + u128::from(SELFTEST_QUIET_MS) * 1_000_000;
+        while time::monotonic(token) <= quiet_until {
             // SAFETY: interrupts on, bounded wait.
             unsafe { arch::interrupt::enable_and_nop() };
             core::hint::spin_loop();
@@ -269,7 +286,6 @@ pub fn selftest(token: &mut CleanLockToken) {
                 take_fired();
                 return;
             }
-            quiet += 1;
         }
         crate::info!("timer: one-shot selftest round 3: a disarmed timer stayed quiet");
     }
