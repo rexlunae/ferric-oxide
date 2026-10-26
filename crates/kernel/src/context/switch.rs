@@ -1542,6 +1542,12 @@ impl ContextSwitchPercpu {
         *self.idle_ctxt.borrow_mut() = Some(new);
     }
 
+    /// Ferric Oxide: the idle context, or `None` on a CPU that never set up contexts (the
+    /// `kernel.profiling` profiler CPU).
+    pub fn try_idle_context(&self) -> Option<Ref<'_, Arc<ContextLock>>> {
+        super::idle::get(&self.idle_ctxt)
+    }
+
     /// Retrieves the current idle context.
     pub fn idle_context(&self) -> Ref<'_, Arc<ContextLock>> {
         Ref::map(self.idle_ctxt.borrow(), |opt| {
