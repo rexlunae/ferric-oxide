@@ -16,13 +16,13 @@ However, we have an advantage: enforced memory and type safety. This is Rust's s
 
 The design of Linux and BSD is secure, the implementation is not. Many bugs in Linux originate in unsafe conditions (which Rust effectively eliminates) like buffer overflows, not the overall design.
 
-We hope that using Rust we will produce a more secure and stable operating system in the end.
+Using Rust gives Ferric Oxide, like Redox before it, a head start on a more secure and stable operating system.
 
 ## Unsafes
 
 `unsafe` is a way to tell Rust that "I know what I'm doing!", which is often necessary when writing low-level code, providing safe abstractions. You cannot write a kernel without `unsafe`.
 
-In that light, a kernel cannot be 100% verified by the Rust compiler, however the unsafe parts have to be marked with an `unsafe`, which keeps the unsafe parts segregated from the safe code. We seek to eliminate the `unsafe`s where we can, and when we use `unsafe`s, we are extremely careful.
+In that light, a kernel cannot be 100% verified by the Rust compiler, however the unsafe parts have to be marked with an `unsafe`, which keeps the unsafe parts segregated from the safe code. We seek to eliminate the `unsafe`s where we can, and when we use `unsafe`s, we are extremely careful. Ferric Oxide's CI tracks the kernel's `unsafe` count and lint warnings with a ratchet, so they can go down but not up (see [Validation and Debugging](./ferric-testing.md)).
 
 This contrasts with kernels written in C, which cannot make guarantees about security without costly formal analysis.
 
@@ -44,17 +44,17 @@ The type system verifies invalid type usage at compile-time and allow the creati
 
 The Rust compiler helps the programmer to avoid memory errors and race conditions, which reduces the probability of data corruption bugs.
 
-### No need for memory exploit mitigations
+### Fewer memory defects, with mitigations as a backstop
 
-The microkernel design written in Rust protects against memory defects that one might see in software written in C/C++, which reduces the system complexity by not using memory exploit mitigations.
+A microkernel written in Rust avoids most of the memory defects found in C and C++ systems, and isolating system components from the kernel keeps the [attack surface](https://en.wikipedia.org/wiki/Attack_surface) small.
 
-By isolating the system components from the kernel, the [attack surface](https://en.wikipedia.org/wiki/Attack_surface) is very limited.
+Ferric Oxide still uses conventional exploit mitigations. The kernel contains `unsafe` code, imported C code runs in user space, the compiler can have bugs, and hardware has its own flaws (Spectre, Meltdown). KASLR, user ASLR, guard pages, KPTI, Spectre v1 index hardening and optional CET are cheap insurance against all of these. See [Memory and CPU Protection](./ferric-memory.md).
 
 ### Improved security and reliability without significant performance impact
 
-As the kernel is small, it uses less memory to do its work. The limited kernel code size helps us to achieve a possible bug-free status ([KISS](https://en.wikipedia.org/wiki/KISS_principle)).
+As the kernel is small, it uses less memory to do its work, and its limited code size makes it practical to review and test thoroughly ([KISS](https://en.wikipedia.org/wiki/KISS_principle)).
 
-Rust's safe and fast language design, combined with the small kernel code size, helps ensure a reliable, performant and easy to maintain the system core.
+Rust's abstractions compile to code as fast as hand-written C, so safety doesn't have to cost speed. Combined with a small kernel, that makes the system core reliable, fast and maintainable.
 
 ### Thread-safety
 

@@ -37,6 +37,9 @@ grant-dma = ["driver-block/grant-dma", "dep:ferric-blkgrant"]
 # Ferric Oxide: one I/O queue pair, MSI-X entry and pinned worker thread per CPU
 # (features.toml: drivers.nvme_percore).
 percore = ["dep:ferric-irq", "dep:ferric-blkqueue"]
+# Ferric Oxide: per-request phase timing with the CPU cycle counter
+# (features.toml: drivers.nvmed_perf).
+perf = ["dep:ferric-blkqueue"]
 
 [lints]
 workspace = true

@@ -333,6 +333,13 @@ fn profiler_cpu() -> LogicalCpuId {
     return LogicalCpuId::new(u32::MAX);
 }
 
+/// Ferric Oxide: whether `cpu` is the profiler CPU. It runs no contexts and its IDT sends every
+/// vector from 33 up to `ipi::wakeup`, which answers only TLB shootdowns (issue #214), so it
+/// must never be the target of a device interrupt. Always `false` without `profiling`.
+pub fn is_profiler_cpu(cpu: LogicalCpuId) -> bool {
+    cfg!(feature = "profiling") && cpu == profiler_cpu()
+}
+
 // SAFETY: must be called before any init()
 pub unsafe fn allocate(total_cpu_count: u32) {
     if cfg!(not(feature = "profiling")) {

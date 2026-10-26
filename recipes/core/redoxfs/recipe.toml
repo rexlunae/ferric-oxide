@@ -1,6 +1,6 @@
 [source]
 # RedoxFS lives in this repository at userspace/redoxfs/, a git subtree of
-# gitlab.redox-os.org/redox-os/redoxfs (see .github/workflows/subtree-sync.yml).
+# gitlab.redox-os.org/redox-os/redoxfs (imported with its history; not synced).
 path = "userspace/redoxfs"
 
 [build]

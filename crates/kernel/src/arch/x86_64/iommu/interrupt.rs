@@ -321,9 +321,9 @@ fn units() -> &'static [Unit] {
     UNITS.get().map_or(&[], Vec::as_slice)
 }
 
-/// The APIC ID of logical CPU `cpu`.
+/// The APIC ID of logical CPU `cpu`, when it can take device interrupts (not the profiler CPU).
 fn apic_id(cpu: u32) -> Result<u32, IrqError> {
-    crate::percpu::get_percpu_block(LogicalCpuId::new(cpu))
+    crate::percpu::interrupt_target(LogicalCpuId::new(cpu))
         .and_then(|block| block.misc_arch_info.apic_id_opt.get())
         .map(|id| id.get())
         .ok_or(IrqError::NoCpu { cpu })

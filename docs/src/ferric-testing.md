@@ -164,8 +164,8 @@ CI checks each feature combination and a bare-metal build.
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set` and `sync/records`
-modules, rather than duplicating their implementations. Run from the root:
+It includes the actual `cpu_set`, `sync/records` and local APIC ID decoding
+(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
 
 ```sh
 cargo test --locked -p ferric-aligned-buffer
@@ -190,7 +190,7 @@ an ARM64 native boot; it does not simulate blocked waiters or context switches.
 
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
-out-of-range CPU IDs, duplicate/gapped/concurrent CPU publication, initialized
+out-of-range CPU IDs, nonzero xAPIC and x2APIC IDs, duplicate/gapped/concurrent CPU publication, initialized
 event/SQE ABI bytes, wrapped queues, whole-record reads and copy-failure rollback.
 Wait queues return zero immediately for an empty destination, reject nonempty
 destinations smaller than one record with `EINVAL`, and leave queued records
@@ -232,6 +232,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
+| `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -325,7 +326,10 @@ benchmark's lines and A/B and writes its figures to the job summary. Read those
 scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
-(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)). It discards each
+boot's output, so when a boot fails it runs `print-test-fails.sh` on the boot's
+console log, and a test that failed early in the boot can be read from the job
+log.
 
 The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
 `cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a
@@ -374,6 +378,7 @@ image=build/x86_64/ferric-smoke/harddrive.img
 scripts/ferric-ci/boot-smoke.sh "$image" serial.log
 BOOT_IOMMU=vtd scripts/ferric-ci/boot-smoke.sh "$image" serial-vtd.log
 BOOT_IOMMU=amdvi scripts/ferric-ci/boot-smoke.sh "$image" serial-amdvi.log
+scripts/ferric-ci/boot-smoke.sh "$image" serial-host,-x2apic.log host,-x2apic
 ```
 
 The script expects QEMU, OVMF and Linux utilities. It uses a copy of the image,
@@ -384,6 +389,23 @@ otherwise TCG with `max`. `BOOT_TIMEOUT` changes the default 300-second limit.
 remapping requires QEMU 10 or later; the workflow uses a newer-QEMU container
 for that variant. `OVMF_FIRMWARE` selects a firmware file instead of searching
 the usual paths.
+
+The third argument is the QEMU `-cpu` model. The image workflow's boot matrix
+also runs `host,-x2apic` (the last line above, KVM only): with x2APIC hidden
+from the guest, the kernel drives its local APICs in xAPIC mode, so the decoding
+of the xAPIC ID register (its ID sits in bits 31:24) and the targeted IPIs, such
+as per-CPU TLB shootdowns, that are sent to those IDs get a real boot. The other
+boots use `host`, which runs in x2APIC mode. The decoding itself is also
+host-tested (`apic_id` in the kernel helper tests). That boot checks
+correctness, so its performance A/B gates, the NVMe queue-policy A/B
+(`check-blkgrant-log.sh`) and the disk benchmark's adaptive-against-main A/B
+(`check-iobench-log.sh`), only warn when they fail (`PERF_AB=report`, set for
+the whole boot job; see `scripts/ferric-ci/perf-ab.sh`): every EOI and IPI is
+then an xAPIC MMIO access that exits to the host under nested KVM, so nvmed's
+per-CPU policies, which take more of them, measure the APIC emulation more
+than nvmed. The figures are still reported.
+`scripts/ferric-ci/test-perf-ab.sh` (host-tools CI) runs both checks on
+fixture logs with and without `PERF_AB=report`.
 
 The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
@@ -443,6 +465,13 @@ the runner adds both HDA controllers. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.
+
+`scripts/ferric-ci/test-print-test-fails.sh` checks `print-test-fails.sh`
+against fixture console logs: a log with no failed test prints nothing; with two
+failures it prints exactly the 40 lines before the first and everything up to
+the second, inside a log group; and a console line that looks like a workflow
+command (`::error::`) is printed only while workflow commands are stopped. The
+host-tools workflow runs it after `test-boot-smoke.sh`.
 
 ### CET image and Kleya rerun
 
@@ -674,3 +703,33 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Portable executor core
+
+`cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
+races, detached cancellation, live-only deadlines, stale and invalid ids, and
+bounded notification storage. Paused producers are coordinated by channels,
+without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib`
+runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
+The crate is not linked into the kernel yet; these tests do not exercise actual
+interrupts, scheduler wait registration or timer hardware.
+
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
+
+### Profiler CPU wakeup acknowledgements
+
+The host kernel helper suite includes `context/idle.rs`, used by the real
+`try_idle_context` accessor and x86 wakeup handler. It verifies an uninitialized
+idle slot returns `None`, then checks a pending shootdown is serviced before
+EOI without reading current-context state. Ordinary idle/running CPU decisions
+and exactly one EOI are checked too. These callbacks test dispatch/order, not
+TLB hardware; the profile-image boot remains the on-target regression, and
+profiling plus CET shadow-stack teardown still needs hardware validation.
