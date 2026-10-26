@@ -1276,6 +1276,51 @@ directories, checksums and the journal. Source: userspace/ext4d."""
 when = "value"
 source_packages = ["ext4d"]
 
+[[option]]
+id = "fs.luks"
+menu = "fs"
+type = "bool"
+title = "LUKS encrypted volumes, read-only (ferric-blockd)"
+default = false
+rebuild = ["ferric-blockd"]
+help = """
+Add ferric-blockd with its LUKS layer: a daemon that opens a LUKS1 or LUKS2
+volume (AES-XTS, plain64 IVs, 512- to 4096-byte sectors) with a passphrase
+from a key file and serves the decrypted volume read-only as a scheme, for a
+file system daemon such as ext4d or RedoxFS to mount. Run it as
+`ferric-blockd SCHEME dev:DEVICE luks:KEYFILE`; the steps stack with LVM
+(fs.lvm) and byte windows (`slice:OFFSET:LENGTH`) in any order. Only root may
+open the volume, and every change fails with EROFS. Headers and keyslots are
+read by crates/luks, written from the LUKS1 and LUKS2 on-disk format
+specifications; the layers are crates/blocklayer. Source: userspace/blockd."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["ferric-blockd"]
+make_append = { FERRIC_BLOCKD_FEATURES = "luks" }
+
+[[option]]
+id = "fs.lvm"
+menu = "fs"
+type = "bool"
+title = "LVM2 logical volumes, read-only (ferric-blockd)"
+default = false
+rebuild = ["ferric-blockd"]
+help = """
+Add ferric-blockd with its LVM layer: a daemon that reads the LVM2 metadata of
+a volume group's physical volumes and serves one linear or striped logical
+volume read-only as a scheme. Run it as
+`ferric-blockd SCHEME dev:PV... lvm:NAME`, with every PV of the group; the
+steps stack with LUKS (fs.luks), so LVM on LUKS and LUKS on LVM both work.
+Mirrors, RAID, thin pools, caches and snapshots are refused. Metadata is read
+by crates/lvm, written from published format documentation; the layers are
+crates/blocklayer. Source: userspace/blockd."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["ferric-blockd"]
+make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
+
 # ---------------------------------------------------------------- packages
 
 [[option]]

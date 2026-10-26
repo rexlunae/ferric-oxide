@@ -34,7 +34,10 @@ runs `cargo test --locked --lib` in
 job tests `userspace/ext4d/` twice, on the committed ext4 image in
 `tests/fixtures/` and on one `make-fixtures.sh` builds with the runner's
 `mke2fs` (`EXT4D_FIXTURES`), and lints and documents it for the host and for
-`x86_64-unknown-redox`.
+`x86_64-unknown-redox`. Its `blockd` job does the same for `userspace/blockd/` (with each
+of its layers alone and both), and runs `ferric-blocklayer`'s fixture tests
+again on images `crates/blocklayer/tests/fixtures/make-fixtures.sh` makes as
+root with the runner's cryptsetup and lvm2 (`BLOCKLAYER_FIXTURES`).
 
 Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
 running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
@@ -124,8 +127,8 @@ hash. The
 IOMMU vendor crates include known QEMU DMAR/IVRS byte fixtures under
 `crates/vtd/tests/fixtures/` and `crates/amdvi/tests/fixtures/`.
 
-`ferric-lvm` is a prepared library that nothing in the image uses yet, so its
-host tests are its only coverage. `crates/lvm/tests/fixtures.rs` reads PVs
+`ferric-lvm` is used in the image through `ferric-blockd` (`fs.lvm`); its own
+host tests cover the formats. `crates/lvm/tests/fixtures.rs` reads PVs
 that lvm2 wrote (`crates/lvm/tests/fixtures/README` has the commands): a
 two-PV striped group, metadata text that wraps round its area, and a volume
 extended after another one. It checks the parsed groups and mappings against
@@ -133,14 +136,23 @@ extended after another one. It checks the parsed groups and mappings against
 and metadata-area headers to test areas that are empty, broken or past the
 device.
 
-`ferric-luks` is a prepared library that nothing in the image uses yet, so its
-host tests are its only coverage. `crates/luks/tests/fixtures.rs` reads LUKS1
+`ferric-luks` is used in the image through `ferric-blockd` (`fs.luks`); its own
+host tests cover the formats. `crates/luks/tests/fixtures.rs` reads LUKS1
 and LUKS2 headers that cryptsetup wrote (`crates/luks/tests/fixtures/README`
 has the commands) and checks the recovered volume keys against
 `cryptsetup luksDump --dump-volume-key`, header-copy fallback and random
 corruption. Because the bootloader is a soft-float UEFI target, CI also builds
 it with `RUSTFLAGS="--cfg aes_force_soft"` and `--features force-soft` for
 `x86_64-unknown-uefi`; check that build when changing its dependencies.
+
+`ferric-blocklayer`'s host tests (`crates/blocklayer/tests/fixtures.rs`) read
+volumes cryptsetup and lvm2 made, each holding a known byte pattern: a logical
+volume across two extent runs, LUKS2 inside an LV, an LV inside LUKS2 with
+4096-byte sectors (which pins the IV unit; see
+[Block layers](ferric-io.md#block-layers-luks-and-lvm-read-only)), and LUKS1
+data OpenSSL encrypted, with reads that start and end inside sectors, wrong
+passphrases, missing or duplicate PVs, PVs of two groups and a device cut short.
+CI checks each feature combination and a bare-metal build.
 
 ## Kernel helper tests
 
@@ -265,6 +277,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), `procmgr`'s fork/exec/exit/wait records for a child with its exit status and the refusal of forged `emit` records, and read-only mapping of the rings with `commit` checks |
 | `ferric-ext4-test` | Mounts the `ext4d` fixture image (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
+| `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) completed DMA map/protect/unmap records, cached translations and live disable (`iommu-mapping-trace`), and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |

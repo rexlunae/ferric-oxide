@@ -1,0 +1,42 @@
+[package]
+name = "ferric-blockd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only block-layer daemon for Ferric Oxide: LUKS and LVM volumes as a scheme (features.toml fs.luks, fs.lvm)"
+publish = false
+
+# Builds on its own, outside any workspace above it (the cookbook builds it for Redox; CI
+# runs its host tests with --manifest-path).
+[workspace]
+
+[lib]
+name = "ferric_blockd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferric-blockd"
+path = "src/main.rs"
+
+[dependencies]
+ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["alloc"] }
+# Errno values and the Stat layout of the scheme ABI; usable on the host too.
+redox_syscall = { version = "0.9.5", features = ["std"] }
+thiserror = "2.0.17"
+zeroize = { version = "1.8", features = ["alloc"] }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "0.1.25"
+redox-scheme = "0.11.4"
+
+[features]
+# Both layers unless the build picks (the recipe passes FERRIC_BLOCKD_FEATURES from
+# features.toml fs.luks and fs.lvm).
+default = ["luks", "lvm"]
+## The LUKS1/LUKS2 decryption layer (`luks:KEYFILE`), features.toml fs.luks.
+luks = ["ferric-blocklayer/luks"]
+## The LVM2 logical-volume layer (`lvm:NAME`), features.toml fs.lvm.
+lvm = ["ferric-blocklayer/lvm"]
+
+[profile.release]
+debug = false

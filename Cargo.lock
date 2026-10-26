@@ -17,6 +17,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -1303,6 +1304,15 @@ version = "0.1.0"
 [[package]]
 name = "ferric-blkqueue"
 version = "0.1.0"
+
+[[package]]
+name = "ferric-blocklayer"
+version = "0.1.0"
+dependencies = [
+ "ferric-luks",
+ "ferric-lvm",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "ferric-boot-time"
