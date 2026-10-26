@@ -440,6 +440,14 @@ jobs:
       # its domain (drivers.grant_dma); without an IOMMU the grant steps skip. Both print the
       # read benchmark, which the step repeats as a notice.
       - name: Check storage DMA into registered buffers
+        env:
+          # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the
+          # host under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster
+          # path. The per-CPU worker policy takes more interrupts and IPIs than the single
+          # queue, so its A/B there (t4 ratios of 0.81 to 0.85, against 0.90 to 1.05 with
+          # x2APIC) measures the APIC emulation more than nvmed: the numbers are still
+          # reported, and a failure is a warning.
+          BLKGRANT_AB: ${{ matrix.cpu == 'host,-x2apic' && 'report' || 'enforce' }}
         run: scripts/ferric-ci/check-blkgrant-log.sh ${{ matrix.iommu == 'vtd' && 'auto' || matrix.iommu }} "$LOG"
       # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
       # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
