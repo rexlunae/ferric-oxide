@@ -163,6 +163,37 @@ fn a_write_that_needs_a_new_block_writes_nothing() {
 }
 
 #[test]
+fn a_time_the_inode_cannot_hold_is_refused_before_any_data_is_written() {
+    let image = basic();
+    let window = Window::whole(image.clone()).expect("its length");
+    let number = lookup::inode_of(&window, "/hello.txt").expect("hello.txt");
+    // Past 2446 (or 2038 without the extra fields), and nanoseconds of a whole second: the
+    // inode's new times would not fit, so the data, which goes home first, must not either.
+    for changed in [
+        Timestamp {
+            seconds: 1 << 40,
+            nanoseconds: 0,
+        },
+        Timestamp {
+            seconds: 0,
+            nanoseconds: 1_000_000_000,
+        },
+    ] {
+        let mut window = Window::whole(image.clone()).expect("its length");
+        // Inside the file's one block, and past its end, so a grown size is checked too.
+        for offset in [0, 10] {
+            let err = write::write_data(&mut window, number, offset, b"0123456789", changed)
+                .expect_err("refused");
+            assert!(
+                matches!(err, WriteError::TimeOutOfRange { number: n, .. } if n == number),
+                "{changed:?}: {err:?}"
+            );
+        }
+        assert!(window.into_inner() == image, "{changed:?}: nothing written");
+    }
+}
+
+#[test]
 fn immutable_and_append_only_files_are_refused() {
     let (mut fs, shared) = mount_writable(load("write-data.ext4.gz"));
     let untouched = shared.bytes();
@@ -202,6 +233,22 @@ fn opens_for_writing_check_write_permission() {
     };
     let id = write(&mut fs, 1000, 100, write_only).expect("write permission is enough");
     fs.write(id, 1, b"R").expect("written");
+    // It did not check read permission, so it cannot read: EBADF, as for any handle not
+    // opened for reading, and so for root's write-only handles too.
+    let mut buf = [0; 4];
+    let err = fs
+        .read(id, 0, &mut buf)
+        .expect_err("not opened for reading");
+    assert!(
+        matches!(err, Error::BadHandle { handle } if handle == id),
+        "{err:?}"
+    );
+    assert_eq!(err.errno(), syscall::error::EBADF);
+    let root = write(&mut fs, 0, 0, write_only).expect("root");
+    assert!(matches!(
+        fs.read(root, 0, &mut buf),
+        Err(Error::BadHandle { .. })
+    ));
 }
 
 #[test]

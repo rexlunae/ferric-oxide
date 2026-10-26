@@ -576,8 +576,8 @@ fn put_owner(
 /// blocks and flushed before the inode's transaction is logged, so after a crash the inode
 /// never claims a size whose data is not on the disk. A crash before the commit leaves the
 /// new data in place with the old size and times. Nothing is allocated: every block the
-/// write touches must already be an initialized block of the file, or nothing is written.
-/// An empty `data` writes nothing.
+/// write touches must already be an initialized block of the file, and the new size and
+/// times must fit in the inode, or nothing is written. An empty `data` writes nothing.
 ///
 /// # Errors
 ///
@@ -622,6 +622,19 @@ pub fn write_data<R: WriteAt>(
             number,
             size: u64::MAX,
         })?;
+    let size = u64::from(le32(&inode, I_SIZE_HIGH)) << 32 | u64::from(le32(&inode, I_SIZE_LO));
+    let written = Written {
+        size: (end > size).then_some(end),
+        changed,
+    };
+    // A size or time the inode cannot hold must be refused before any data is written,
+    // not after: the change that records them is made on a copy first.
+    apply(
+        &target,
+        number,
+        &mut inode.clone(),
+        &Change::Written(written),
+    )?;
     let blocks = data_blocks(&target.volume, window, number, &inode, offset, end)?;
     let block_size = u64::from(target.volume.block_size);
     let mut buf = vec![0; target.volume.block_size as usize];
@@ -642,11 +655,6 @@ pub fn write_data<R: WriteAt>(
         }
     }
     window.flush()?;
-    let size = u64::from(le32(&inode, I_SIZE_HIGH)) << 32 | u64::from(le32(&inode, I_SIZE_LO));
-    let written = Written {
-        size: (end > size).then_some(end),
-        changed,
-    };
     change(window, number, &Change::Written(written))
 }
 

@@ -14,7 +14,7 @@ wasm userland as default if its benchmark gate passes).
 
 ## Status
 
-Last updated 24 October 2026.
+Last updated 26 October 2026.
 
 | Phase | Status | Merged | Open or next |
 | --- | --- | --- | --- |

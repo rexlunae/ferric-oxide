@@ -275,6 +275,9 @@ struct Handle {
     open: Open,
     /// Opened for writing, on a volume mounted for changes: [`Fs::write`] may write to it.
     writable: bool,
+    /// Opened for reading (not `O_WRONLY`, whose open does not check read permission):
+    /// [`Fs::read`] may read from it.
+    readable: bool,
 }
 
 /// Why [`Fs::mount_preferring_write`] mounted a volume read-only.
@@ -684,6 +687,7 @@ impl Fs {
             inode,
             metadata,
             writable: mode.write && !mode.stat,
+            readable: !mode.write_only,
             open,
         };
         let id = self.next;
@@ -703,10 +707,16 @@ impl Fs {
     ///
     /// # Errors
     ///
-    /// [`Error::BadHandle`], [`Error::IsADirectory`] for a directory, and [`Error::Ext4`]
+    /// [`Error::BadHandle`] for an unknown handle, one opened with `O_STAT` or one opened
+    /// write-only (`O_WRONLY`), [`Error::IsADirectory`] for a directory, and [`Error::Ext4`]
     /// when the reader fails.
     pub fn read(&mut self, id: usize, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        match &mut self.handle_mut(id)?.open {
+        let handle = self.handle_mut(id)?;
+        // A write-only open did not check read permission, so it must not read.
+        if !handle.readable {
+            return Err(Error::BadHandle { handle: id });
+        }
+        match &mut handle.open {
             Open::Metadata => Err(Error::BadHandle { handle: id }),
             Open::Directory { .. } => Err(Error::IsADirectory),
             Open::Symlink { target } => {

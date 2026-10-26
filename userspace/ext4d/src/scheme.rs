@@ -4,7 +4,8 @@
 //! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
 //! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
 //! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
-//! is written in place, into the blocks it has ([`Fs::write`]; with `O_APPEND`, at its end).
+//! is written in place, into the blocks it has ([`Fs::write`]; with `O_APPEND`, at its end,
+//! as RedoxFS does; the kernel still moves the cursor from where it was, issue #244).
 //! Opens that create or truncate fail with `EOPNOTSUPP` there. Everything else that would
 //! change the volume (`unlinkat`, `ftruncate`, `frename`, `flink`, and all of the above on
 //! a read-only mount) fails with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through [`Error::errno`]. Opens and
