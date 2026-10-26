@@ -140,6 +140,7 @@ fn sample() -> Option<(u64, u128, u64, u128)> {
 /// A bounded busy wait of `ns` nanoseconds against the HPET counter, or a
 /// spin loop when no HPET reference was given (the KVM-clock path, where the
 /// reference read happens around it).
+#[allow(clippy::arithmetic_side_effects)] // unit conversion on u128 intermediates
 fn delay_ns(ns: u128) {
     let mut i = 0u128;
     while i < ns / 10 {
@@ -229,21 +230,47 @@ fn hpet_ns() -> u128 {
 /// The monotonic time in nanoseconds: continuous while the periodic
 /// interrupt is masked, comparable across CPUs, from the source [`source`]
 /// picked.
-pub fn monotonic_absolute(_token: &mut CleanLockToken) -> u128 {
-    match source() {
-        Source::Kvm => super::device::tsc::monotonic_absolute()
-            .expect("the selected clock is the pvclock"),
-        Source::Tsc(rate) => {
-            // SAFETY: RDTSC reads a counter; it has no side effects.
-            let ticks = unsafe { core::arch::x86_64::_rdtsc() };
-            u128::from(rate.nanos_for_ticks(ticks))
-        }
-        Source::Hpet => hpet_ns(),
-        Source::PitFallback => {
-            let offset = { *crate::time::OFFSET.read(_token.token()) };
-            offset + hpet_or_pit()
-        }
+/// The last continuous-clock value this source returned, so a source hiccup
+/// (the KVM clock briefly stepping backward while it re-bases its page, for
+/// example) can be clamped instead of panicking or jumping the clock back.
+static LAST_CONTINUOUS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// The continuous sources without the KVM clock: the calibrated invariant
+/// TSC, else the HPET, else the `OFFSET + interpolation` fallback. Used as
+/// the KVM clock's degradation path (which cannot consult the selected
+/// source: on a KVM clock hiccup the selection is still Kvm).
+#[allow(clippy::arithmetic_side_effects)] // unit conversion with u128 intermediates
+fn continuous_without_kvm(token: &mut CleanLockToken) -> u128 {
+    if let Some(rate) = tsc_rate() {
+        // SAFETY: RDTSC reads a counter; it has no side effects.
+        let ticks = unsafe { core::arch::x86_64::_rdtsc() };
+        u128::from(rate.nanos_for_ticks(ticks))
+    } else if hpet_cached().is_some() {
+        hpet_ns()
+    } else {
+        let offset = { *crate::time::OFFSET.read(token.token()) };
+        offset + hpet_or_pit()
     }
+}
+
+/// The monotonic time in nanoseconds: continuous while the periodic
+/// interrupt is masked, comparable across CPUs, from the source [`source`]
+/// picked.
+pub fn monotonic_absolute(token: &mut CleanLockToken) -> u128 {
+    let ns = match source() {
+        Source::Kvm => super::device::tsc::monotonic_absolute()
+            .unwrap_or_else(|| continuous_without_kvm(token)),
+        _ => continuous_without_kvm(token),
+    };
+    // Clamp against the last returned value: the sources are continuous, but
+    // their handover and the KVM clock's page re-basing can produce a brief
+    // backward step, which would turn wake timers into long sleeps. Clamping
+    // freezes the clock for that step instead (bounded by the step).
+    let last = LAST_CONTINUOUS.load(core::sync::atomic::Ordering::Relaxed);
+    let ns = ns.max(u128::from(last));
+    LAST_CONTINUOUS.store(ns as u64, core::sync::atomic::Ordering::Relaxed);
+    ns
 }
 
 /// The resolution of [`monotonic_absolute`], in nanoseconds.
@@ -262,6 +289,7 @@ pub fn monotonic_resolution() -> u128 {
 /// The previous OFFSET + interpolation path, kept for the fallback source:
 /// OFFSET carries the ticks the periodic interrupt advanced, and the counter
 /// interpolation the part of the current period already elapsed.
+#[allow(clippy::arithmetic_side_effects)] // unit conversions with u128 intermediates
 fn hpet_or_pit() -> u128 {
     if cfg!(feature = "acpi")
         && let Some(ref hpet) = *crate::acpi::ACPI_TABLE.hpet.read()
