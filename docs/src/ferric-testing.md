@@ -696,6 +696,15 @@ macFUSE.
 
 ## Focused regression checks
 
+### Scheduler baseline accounting
+
+The trace CLI's `counts::tests` includes a multi-CPU capture with unequal rates
+and a merged rate over the same interval. The ring-test recipe's host tests
+(`cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml`)
+exercise the same CQE validator used by the target workload, rejecting missing,
+duplicate, wrong-request, failed and short completions. The scheduler benchmark
+image/boot remains the check for measured wake latency and real completions.
+
 ### Portable executor core
 
 `cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication

@@ -13,6 +13,7 @@
 #   BOOT_REBOOT=1 lets the guest reset and boot again (no -no-reboot), and does not
 #   treat a kernel panic as a failure: for the crash-dump image, whose first boot
 #   panics on purpose and resets (see image.yml's crash job, which checks the log).
+#   BOOT_SMP=N boots N vCPUs instead of the default 4 (the scheduler baseline runs 1).
 set -euo pipefail
 
 image="$1"
@@ -115,7 +116,7 @@ trap 'rm -f "$disk" "$monitor"' EXIT
 # ends the run at once instead of waiting for the timeout.
 : > "$log"
 qemu-system-x86_64 \
-    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp 4 -m 2048 \
+    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp "${BOOT_SMP:-4}" -m 2048 \
     -bios "$firmware" \
     "${iommu[@]}" \
     -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \

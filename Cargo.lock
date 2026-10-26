@@ -1498,6 +1498,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ferric-amdvi",
+ "ferric-iobench",
  "ferric-procinfo",
  "ferric-trace",
  "ferric-trace-map",
