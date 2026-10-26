@@ -3723,24 +3723,26 @@ impl Drop for Flusher<'_, '_> {
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct TlbShootdownActions: usize {
-        // Delay the deallocation of one or more contiguous frames.
+        /// Delay the deallocation of one or more contiguous frames.
         const FREE = 1;
 
-        // Revoke various access flags from a page
+        /// Revoke read access from a page.
         const REVOKE_READ = 1 << 1;
+        /// Revoke write access from a page.
         const REVOKE_WRITE = 1 << 2;
+        /// Revoke execute access from a page.
         const REVOKE_EXEC = 1 << 3;
 
-        // Unmap a page from one address space without deallocating it.
+        /// Unmap a page from one address space without deallocating it.
         const MOVE = 1 << 4;
 
-        // Delay the deallocation of a page-table frame that an unmap emptied. Unlike FREE, the
-        // frame has no PageInfo reference count; it goes straight back to the allocator. Always
-        // forces a shootdown round, which must also invalidate paging-structure caches.
+        /// Delay the deallocation of a page-table frame that an unmap emptied. Unlike FREE, the
+        /// frame has no PageInfo reference count; it goes straight back to the allocator. Always
+        /// forces a shootdown round, which must also invalidate paging-structure caches.
         const FREE_TABLE = 1 << 5;
 
-        // Add a new mapping to an address space.
-        // Not really a TLB shootdown action on most architectures, so almost always a no-op.
+        /// Add a new mapping to an address space.
+        /// Not really a TLB shootdown action on most architectures, so almost always a no-op.
         const NEW_MAPPING = 1 << 31;
     }
 }
