@@ -693,6 +693,16 @@ unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
 
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
+
 ### Profiler CPU wakeup acknowledgements
 
 The host kernel helper suite includes `context/idle.rs`, used by the real
