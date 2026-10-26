@@ -1,4 +1,5 @@
-//! Shared page cache read path test for Ferric Oxide (`kernel.page_cache`).
+//! Shared page cache test for Ferric Oxide (`kernel.page_cache`, and its cached writes,
+//! `kernel.page_cache_writeback`).
 //!
 //! The program is its own file system: one thread serves a scheme, `pcache-test`, holding a
 //! single read-only file of 64 pages and 100 bytes whose every byte is a known function of its
@@ -25,7 +26,8 @@
 //!   with bytes that are not the file's; its reader fills again and gets the right ones.
 //!
 //! Then on RedoxFS, which serves files opened read-only from the cache when the kernel has
-//! one:
+//! one, and with cached writes every description but an `O_FSYNC` one, writes too (the steps
+//! that need RedoxFS to serve a description open it `O_FSYNC`, so they hold either way):
 //!
 //! - `pcache-redoxfs`: a read-only description of a file in `/tmp` reads the new bytes after
 //!   writes, a write past the end, a truncation and a growing truncation made through another
@@ -37,8 +39,19 @@
 //!   caching.
 //!   Whether a read was served from the cache shows in the access time, which RedoxFS moves
 //!   when it reads a file and the cache does not.
+//! - `pcache-redoxfs-writeback`: data written through a plain description survives write,
+//!   reread, `fsync`, close and reopen, and a write left dirty at the last close or read
+//!   through a description RedoxFS serves reaches the file. Prints
+//!   `pcache-redoxfs-writeback cached=yes` when the writes were cached
+//!   (`kernel.page_cache_writeback`) and `cached=no` otherwise; whether a write was cached
+//!   shows in the modification time, which RedoxFS moves when it writes the file.
+//! - `pcache-redoxfs-writeback-age`: a cached write nobody syncs is written back on its own
+//!   within the writeback age and RedoxFS's flush period.
+//! - `pcache-redoxfs-writeback-mmap`: a mapping made over cached writes sees them, writes are
+//!   not cached while a shared writable mapping lasts, and are again once it goes.
+//!   The last two pass at once when writes are not cached.
 //! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
-//!   through a read-only description (cached) against a read-write one (served by RedoxFS,
+//!   through a read-only description (cached) against an `O_FSYNC` one (served by RedoxFS,
 //!   as with the option off), in the same boot with `ferric_blkqueue::ab`'s paired rule.
 //!   Prints `FERRIC_BENCH pcache-redoxfs-pread4k` and `pcache-redoxfs-seq1m` lines and fails
 //!   when the cache is slower.

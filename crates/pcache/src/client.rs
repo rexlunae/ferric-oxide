@@ -22,24 +22,33 @@
 //!
 //! Closing a description in the client detaches it in the kernel; dropping the [`Object`]
 //! ends the cache of the file.
+//!
+//! For cached writes (the kernel's `page_cache_writeback` feature), [`Queue::set_writeback`]
+//! turns them on, [`Object::attach_access`] attaches a description that writes, and the file
+//! system writes dirty pages back with [`Object::take_dirty`] and [`Object::written_back`]
+//! (driven by [`crate::writeback::flush`]), holding the object's writes with
+//! [`Object::hold_writes`] around the changes it makes itself. [`spawn_flush_timer`] starts a
+//! thread that wakes the file system's loop once a period while it has dirty objects, as a
+//! call on its own scheme ([`FLUSH_DUE`]), so it writes back those past the age limit.
 
 extern crate std;
 
 use alloc::sync::Arc;
 use core::fmt;
-use core::num::NonZeroU16;
+use core::num::{NonZeroU16, NonZeroU32};
+use core::time::Duration;
 use std::io;
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_RDWR};
 use syscall::CallFlags;
-use syscall::error::{EBADF, EINTR, ENODEV, ENOENT};
+use syscall::error::{EBADF, EINTR, ENODEV, ENOENT, EOPNOTSUPP};
 
 use crate::abi::{
-    FillRef, ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record, RecordError, Request,
-    SCHEME_NAME,
+    Access, DecodeError, FillRef, ObjectId, Outcome, PageRange, QUEUE_PATH, ReadaheadMax, Record,
+    RecordError, RecordPages, Request, SCHEME_NAME, decode_taken,
 };
 use crate::pump::{FailFillsError, FailedFill, fail_fills};
 
@@ -47,6 +56,11 @@ use crate::pump::{FailFillsError, FailedFill, fail_fills};
 /// scheme (see [`spawn_pump`]); the payload is the records' bytes. The value spells
 /// `"pcacherc"` so it cannot be mistaken for a small verb of another protocol.
 pub const FORWARDED_RECORDS: u64 = u64::from_be_bytes(*b"pcacherc");
+
+/// The first metadata word of the call [`spawn_flush_timer`]'s thread makes on the file
+/// system's own scheme: write back the objects past the age limit. It has no payload. The
+/// value spells `"pcachewb"`.
+pub const FLUSH_DUE: u64 = u64::from_be_bytes(*b"pcachewb");
 
 /// Records the pump reads from the queue at most at once.
 const BATCH: usize = 64;
@@ -75,6 +89,16 @@ pub enum Call {
     ReadQueue,
     /// Handing records on to the file system ([`Pump::forward`]).
     Forward,
+    /// [`Request::SetWriteback`].
+    SetWriteback,
+    /// [`Request::AttachAccess`].
+    AttachAccess,
+    /// [`Request::HoldWrites`].
+    HoldWrites,
+    /// [`Request::TakeDirty`].
+    TakeDirty,
+    /// [`Request::WrittenBack`].
+    WrittenBack,
 }
 
 impl fmt::Display for Call {
@@ -90,6 +114,11 @@ impl fmt::Display for Call {
             Self::Filled => "answering a fill",
             Self::ReadQueue => "reading the pcache queue",
             Self::Forward => "forwarding records to the file system",
+            Self::SetWriteback => "turning cached writes on",
+            Self::AttachAccess => "attaching a description to write",
+            Self::HoldWrites => "holding an object's writes",
+            Self::TakeDirty => "taking dirty pages for writeback",
+            Self::WrittenBack => "answering a writeback",
         })
     }
 }
@@ -114,6 +143,8 @@ pub enum ClientError {
     /// The pump could not answer the fills of a batch it failed to forward, and closed the
     /// queue.
     Unanswered(alloc::boxed::Box<FailFillsError<ClientError>>),
+    /// [`Request::TakeDirty`] returned a value that names no pages.
+    Taken(DecodeError),
 }
 
 impl fmt::Display for ClientError {
@@ -126,6 +157,7 @@ impl fmt::Display for ClientError {
             Self::Unanswered(_) => {
                 f.write_str("fills the pump could not forward went unanswered; queue closed")
             }
+            Self::Taken(_) => f.write_str("the kernel's dirty pages answer names no pages"),
         }
     }
 }
@@ -138,6 +170,7 @@ impl core::error::Error for ClientError {
             Self::Spawn(source) => Some(source),
             Self::Closed => None,
             Self::Unanswered(source) => Some(&**source),
+            Self::Taken(source) => Some(source),
         }
     }
 }
@@ -150,7 +183,7 @@ impl ClientError {
             Self::Record(_) => syscall::error::EIO,
             Self::Spawn(source) => source.raw_os_error().unwrap_or(syscall::error::EIO),
             Self::Closed => EBADF,
-            Self::Unanswered(_) => syscall::error::EIO,
+            Self::Unanswered(_) | Self::Taken(_) => syscall::error::EIO,
         }
     }
 }
@@ -272,6 +305,27 @@ impl Queue {
         )
     }
 
+    /// Turns cached writes on for the queue's objects, with `max_dirty` pages as its dirty
+    /// limit ([`Request::SetWriteback`]). Returns false, changing nothing, when the kernel
+    /// was built without them (`page_cache_writeback`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Call`] when the kernel refuses otherwise, and [`ClientError::Closed`]
+    /// after [`Queue::close`].
+    pub fn set_writeback(&self, max_dirty: NonZeroU32) -> Result<bool, ClientError> {
+        match send(
+            self.fd().get()?,
+            Call::SetWriteback,
+            Request::SetWriteback { max_dirty },
+            &[],
+        ) {
+            Ok(()) => Ok(true),
+            Err(ClientError::Call { source, .. }) if source.errno() == EOPNOTSUPP => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Creates the object `id`, empty and of size 0.
     ///
     /// # Errors
@@ -350,6 +404,77 @@ impl Object {
     pub fn attach(&self, handle: usize) -> Result<(), ClientError> {
         let handle = handle as u64;
         send(&self.fd, Call::Attach, Request::Attach { handle }, &[])
+    }
+
+    /// Serves the description with handle number `handle` from this object for `access`
+    /// ([`Request::AttachAccess`]); writing needs [`Queue::set_writeback`] first.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Call`] when the kernel refuses (the handle is attached already, or
+    /// cached writes are off).
+    pub fn attach_access(&self, handle: usize, access: Access) -> Result<(), ClientError> {
+        let handle = handle as u64;
+        send(
+            &self.fd,
+            Call::AttachAccess,
+            Request::AttachAccess { handle, access },
+            &[],
+        )
+    }
+
+    /// Stops (`hold`) or resumes the kernel serving writes from this object
+    /// ([`Request::HoldWrites`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Call`] when the kernel refuses.
+    pub fn hold_writes(&self, hold: bool) -> Result<(), ClientError> {
+        send(
+            &self.fd,
+            Call::HoldWrites,
+            Request::HoldWrites { hold },
+            &[],
+        )
+    }
+
+    /// Takes the next run of dirty pages at or after page `from` for writeback
+    /// ([`Request::TakeDirty`]), at most as many as `buf` holds whole pages, and copies their
+    /// bytes to the start of `buf`; `None` when no page there is dirty. Answer it with
+    /// [`Object::written_back`].
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Call`] when the kernel refuses (a run is under writeback already, or
+    /// `buf` holds no page), and [`ClientError::Taken`] for an answer that names no pages.
+    pub fn take_dirty(
+        &self,
+        from: u64,
+        buf: &mut [u8],
+    ) -> Result<Option<RecordPages>, ClientError> {
+        let (words, len) = Request::TakeDirty { from }.encode();
+        let taken = tag(
+            Call::TakeDirty,
+            self.fd.call_ro(buf, CallFlags::empty(), &words[..len]),
+        )?;
+        decode_taken(taken as u64).map_err(ClientError::Taken)
+    }
+
+    /// Tells the kernel how the writeback of `pages` ([`Object::take_dirty`]) ended
+    /// ([`Request::WrittenBack`]), and returns the object's dirty pages left.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Call`] when the kernel refuses (`pages` is not the run under
+    /// writeback).
+    pub fn written_back(&self, pages: RecordPages, outcome: Outcome) -> Result<u64, ClientError> {
+        call_with(
+            &self.fd,
+            Call::WrittenBack,
+            Request::WrittenBack { pages, outcome },
+            &[],
+        )
+        .map(|left| left as u64)
     }
 
     /// Drops the cached copies of bytes `start..end`, which the file system changed itself;
@@ -471,4 +596,69 @@ fn pump_records<P: Pump>(queue: &Queue, pump: &mut P) -> Result<(), ClientError>
             Err(err) => return Err(ClientError::Unanswered(alloc::boxed::Box::new(err))),
         }
     }
+}
+
+/// Wakes the thread [`spawn_flush_timer`] started while the file system has dirty objects.
+#[derive(Clone, Debug, Default)]
+pub struct FlushTimer {
+    armed: alloc::sync::Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl FlushTimer {
+    /// The file system has dirty objects: tick once a period until [`FlushTimer::disarm`].
+    pub fn arm(&self) {
+        let (armed, wake) = &*self.armed;
+        let mut armed = armed.lock().unwrap_or_else(|p| p.into_inner());
+        if !*armed {
+            *armed = true;
+            wake.notify_one();
+        }
+    }
+
+    /// The file system has no dirty object: stop ticking.
+    pub fn disarm(&self) {
+        let (armed, _) = &*self.armed;
+        *armed.lock().unwrap_or_else(|p| p.into_inner()) = false;
+    }
+
+    /// Waits until armed, then for `period`; returns whether it is still armed.
+    fn wait(&self, period: Duration) -> bool {
+        let (armed, wake) = &*self.armed;
+        let mut guard = armed.lock().unwrap_or_else(|p| p.into_inner());
+        while !*guard {
+            guard = wake.wait(guard).unwrap_or_else(|p| p.into_inner());
+        }
+        drop(guard);
+        thread::sleep(period);
+        *armed.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Starts a thread that, while the returned [`FlushTimer`] is armed, calls `tick` once every
+/// `period`: the file system arms it when an object becomes dirty and disarms it when none
+/// is left, and `tick` makes the [`FLUSH_DUE`] call on its own scheme, so its loop writes back
+/// the objects past the age limit. The thread idles while the timer is disarmed, and runs for
+/// as long as the process does.
+///
+/// # Errors
+///
+/// [`ClientError::Spawn`] when the thread cannot be started.
+pub fn spawn_flush_timer<T>(period: Duration, mut tick: T) -> Result<FlushTimer, ClientError>
+where
+    T: FnMut() + Send + 'static,
+{
+    let timer = FlushTimer::default();
+    let waiter = timer.clone();
+    thread::Builder::new()
+        .name("pcache-flush".into())
+        .spawn(move || {
+            loop {
+                if waiter.wait(period) {
+                    tick();
+                }
+            }
+        })
+        .map(drop)
+        .map_err(ClientError::Spawn)?;
+    Ok(timer)
 }

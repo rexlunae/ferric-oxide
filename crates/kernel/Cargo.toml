@@ -121,6 +121,8 @@ regbuf = ["dep:ferric-regbuf"]
 rings = ["dep:ferric-ring"]
 # Ferric Oxide: the kernel.pcache scheme, the shared page cache (read path).
 page_cache = ["dep:ferric-pcache"]
+# Ferric Oxide: cached writes into the page cache, written back by the file system.
+page_cache_writeback = ["page_cache"]
 # Ferric Oxide: tracepoints, per-CPU trace rings and the kernel.trace scheme (x86_64).
 trace = ["dep:ferric-trace"]
 # Ferric Oxide: count and deliver irq: interrupts per (CPU, vector), and the root-only

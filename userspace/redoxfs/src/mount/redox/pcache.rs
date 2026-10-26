@@ -27,21 +27,51 @@
 //! the pages it changed ([`PageCache::changed`]) before it replies, so a read after a write
 //! sees the new bytes.
 //!
+//! When the kernel also has cached writes (`kernel.page_cache_writeback`), RedoxFS turns them
+//! on at mount and attaches every description of a regular file, for reading, writing or
+//! both as it was opened, except `O_SYNC` (`O_FSYNC`) ones, which it keeps serving itself.
+//! A write inside the file's size then lands in the kernel's pages, and RedoxFS writes the
+//! dirty pages back with `ferric_pcache::writeback::flush`, in page order:
+//!
+//! - on `fsync`, before it syncs the file, so `fsync` returns once the data is committed (and
+//!   fails with `EIO` if a page could not be written; the page stays dirty);
+//! - before it reads the file itself (a read of a description it serves, a mapping), and
+//!   before it changes it (a write it serves, a truncation): those also hold the object's
+//!   cached writes from before the writeback until the change is done
+//!   ([`PageCache::begin_change`], [`PageCache::changed`]), so no cached write slips in
+//!   between;
+//! - when the last attached description closes, before the object goes;
+//! - when a file has been dirty for `DEFAULT_AGE_MS` (5 s): the kernel's writeback record
+//!   says it became dirty, and a timer thread wakes the main loop once a second while any
+//!   file is ([`PageCache::flush_due`]);
+//! - at once, every dirty file oldest first, on an urgent record (the cache is past its dirty
+//!   limit);
+//! - at unmount ([`PageCache::flush_all`]).
+//!
+//! A mapped file's cached writes are held while it has any mapping, so the mapped pages,
+//! which RedoxFS keeps, see every write. Without cached writes in the kernel nothing of this
+//! runs, and only descriptions opened read-only are attached, as before.
+//!
 //! Without a `kernel.pcache` scheme nothing here runs and RedoxFS behaves as upstream.
 
-use std::collections::BTreeMap;
-use std::num::NonZeroU16;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
-use ferric_pcache::abi::{ObjectId, Record, PAGE_SIZE};
+use ferric_pcache::abi::{Access, ObjectId, Outcome, Record, RecordPages, PAGE_SIZE};
 use ferric_pcache::client::{
-    self, Answered, Call, ClientError, Object, Pump, Queue, FORWARDED_RECORDS,
+    self, Answered, Call, ClientError, FlushTimer, Object, Pump, Queue, FLUSH_DUE,
+    FORWARDED_RECORDS,
 };
 use ferric_pcache::pump::FailedFill;
+use ferric_pcache::writeback::{
+    self, DirtyObjects, Flush, Flushed, DEFAULT_AGE_MS, DEFAULT_MAX_DIRTY_PAGES, FLUSH_PAGES,
+};
 use libredox::Fd;
 use redox_scheme::Socket;
 use syscall::error::EIO;
-use syscall::flag::O_RDWR;
+use syscall::flag::{O_ACCMODE, O_FSYNC, O_RDONLY, O_RDWR, O_WRONLY};
 use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
@@ -95,6 +125,50 @@ struct Cached {
 /// has closed no longer upgrades.
 type Objects = Arc<Mutex<BTreeMap<u32, Weak<Object>>>>;
 
+/// Cached writes: the dirty files, the timer that wakes the loop for them, and the buffer
+/// their pages are written back from.
+struct Writeback {
+    /// Dirty files by node ID, since when.
+    dirty: DirtyObjects<u32, Instant>,
+    timer: FlushTimer,
+    /// [`FLUSH_PAGES`] pages.
+    buf: Vec<u8>,
+    /// Nodes with a mapping: their cached writes are held while it lasts.
+    mapped: BTreeSet<u32>,
+}
+
+/// Why a file's dirty pages were not all written back.
+#[derive(Debug)]
+enum FlushError {
+    /// A call on the object failed.
+    Client(ClientError),
+    /// RedoxFS could not write some of the pages (they stay dirty).
+    Write(NonZeroU16),
+}
+
+impl std::fmt::Display for FlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(_) => f.write_str("a writeback call failed"),
+            Self::Write(errno) => write!(f, "writing dirty pages failed with errno {errno}"),
+        }
+    }
+}
+
+impl std::error::Error for FlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(err) => Some(err),
+            Self::Write(_) => None,
+        }
+    }
+}
+
+/// The error a client gets for a file whose dirty pages could not be written back.
+fn flush_errno(_err: &FlushError) -> syscall::Error {
+    syscall::Error::new(EIO)
+}
+
 /// RedoxFS's queue and the objects of its cached files.
 pub struct PageCache {
     queue: Arc<Queue>,
@@ -109,6 +183,8 @@ pub struct PageCache {
     writable: BTreeMap<u32, usize>,
     /// The buffer fills are read into.
     buf: Vec<u8>,
+    /// Cached writes, when the kernel has them.
+    writeback: Option<Writeback>,
 }
 
 /// The pump's side: forwards records to RedoxFS's own scheme, and fails their fills when
@@ -195,7 +271,12 @@ impl PageCache {
         if let Err(err) = watched {
             log::warn!("page cache: cannot watch the pump: {err}");
         }
-        log::info!("page cache on: reads of read-only files are served by the kernel");
+        let writeback = start_writeback(socket, &queue);
+        if writeback.is_some() {
+            log::info!("page cache on: reads and writes of files are served by the kernel");
+        } else {
+            log::info!("page cache on: reads of read-only files are served by the kernel");
+        }
         Ok(Some(Self {
             queue,
             files: BTreeMap::new(),
@@ -203,19 +284,43 @@ impl PageCache {
             attached: BTreeMap::new(),
             writable: BTreeMap::new(),
             buf: Vec::new(),
+            writeback,
         }))
     }
 
-    /// Serves the description `handle` of `node_ptr` from the file's object, creating it for
-    /// the first such description, when it is a regular file. A failure is logged and leaves
-    /// the description to RedoxFS.
+    /// What the kernel should serve of a description opened with `flags`, `None` for one
+    /// RedoxFS keeps: with cached writes, any but an `O_FSYNC` one, as opened; without,
+    /// only one opened read-only, for reading.
+    fn access(&self, flags: usize) -> Option<Access> {
+        if self.writeback.is_none() {
+            return (flags & O_ACCMODE == O_RDONLY).then_some(Access::Read);
+        }
+        if flags & O_FSYNC != 0 {
+            return None;
+        }
+        match flags & O_ACCMODE {
+            O_RDONLY => Some(Access::Read),
+            O_WRONLY => Some(Access::Write),
+            O_RDWR => Some(Access::ReadWrite),
+            _ => None,
+        }
+    }
+
+    /// Serves the description `handle` of `node_ptr`, opened with `flags`, from the file's
+    /// object, creating it for the first such description, when it is a regular file and
+    /// the kernel should serve the description ([`PageCache::access`]). A failure is logged
+    /// and leaves the description to RedoxFS.
     pub fn attach<D: Disk>(
         &mut self,
         fs: &mut FileSystem<D>,
         handle: usize,
         node_ptr: TreePtr<Node>,
+        flags: usize,
     ) {
         let node_id = node_ptr.id();
+        let Some(access) = self.access(flags) else {
+            return;
+        };
         if self.writable.contains_key(&node_id) {
             return;
         }
@@ -225,15 +330,29 @@ impl PageCache {
         if !node.data().is_file() {
             return;
         }
-        if let Err(err) = self.try_attach(handle, node.data().size(), node_id) {
+        if let Err(err) = self.try_attach(handle, node.data().size(), node_id, access) {
             log::warn!("page cache: not caching node {node_id}: {}", Chain(&err));
         }
     }
 
-    fn try_attach(&mut self, handle: usize, size: u64, node_id: u32) -> Result<(), ClientError> {
+    fn try_attach(
+        &mut self,
+        handle: usize,
+        size: u64,
+        node_id: u32,
+        access: Access,
+    ) -> Result<(), ClientError> {
         if !self.files.contains_key(&node_id) {
             let object = Arc::new(self.queue.create_object(ObjectId::new(node_id.into()))?);
             object.set_size(size)?;
+            // A file mapped already keeps its writes with RedoxFS while it is.
+            if self
+                .writeback
+                .as_ref()
+                .is_some_and(|wb| wb.mapped.contains(&node_id))
+            {
+                object.hold_writes(true)?;
+            }
             self.objects_mut().insert(node_id, Arc::downgrade(&object));
             self.files.insert(node_id, Cached { object, handles: 0 });
         }
@@ -241,46 +360,228 @@ impl PageCache {
             .files
             .get_mut(&node_id)
             .expect("inserted above when missing");
-        cached.object.attach(handle)?;
+        // A read-only attachment is the call a kernel without cached writes knows.
+        match access {
+            Access::Read => cached.object.attach(handle)?,
+            access => cached.object.attach_access(handle, access)?,
+        }
         cached.handles += 1;
         self.attached.insert(handle, node_id);
         Ok(())
     }
 
     /// Forgets `handle`, which its client closed (the kernel has detached it); the file's
-    /// object goes with its last attached description.
-    pub fn closed(&mut self, handle: usize) {
+    /// object goes with its last attached description, once its dirty pages are written
+    /// back. If they cannot be, they are lost with the object (logged), as a failed
+    /// writeback at `close` loses them on any system: the node may be freed now.
+    pub fn closed<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, handle: usize) {
         let Some(node_id) = self.attached.remove(&handle) else {
             return;
         };
-        if let Some(cached) = self.files.get_mut(&node_id) {
-            cached.handles -= 1;
-            if cached.handles == 0 {
-                self.forget(node_id);
+        let Some(cached) = self.files.get_mut(&node_id) else {
+            return;
+        };
+        cached.handles -= 1;
+        if cached.handles == 0 {
+            if let Err(err) = self.flush(fs, fmaps, node_id) {
+                log::error!(
+                    "page cache: node {node_id} closed with dirty pages not written: {}",
+                    Chain(&err)
+                );
+            }
+            self.forget(node_id);
+        }
+    }
+
+    /// RedoxFS is about to change `node_ptr` itself (a write or a truncation it serves):
+    /// holds the file's cached writes and writes its dirty pages back, so the change works
+    /// from the newest bytes and no cached write lands in the middle of it. Returns the size
+    /// before the change when the file is cached; pass it to [`PageCache::changed`]
+    /// afterwards, which releases the hold.
+    ///
+    /// # Errors
+    ///
+    /// `EIO` when dirty pages could not be written back; the hold is released, nothing has
+    /// changed, and the change must not be made (it would drop them).
+    pub fn begin_change<D: Disk>(
+        &mut self,
+        fs: &mut FileSystem<D>,
+        fmaps: &mut Fmaps,
+        node_ptr: TreePtr<Node>,
+    ) -> syscall::Result<Option<u64>> {
+        if !self.files.contains_key(&node_ptr.id()) {
+            return Ok(None);
+        }
+        self.before_map(fs, fmaps, node_ptr)?;
+        // If the size cannot be read, the change will fail the same way.
+        Ok(fs
+            .tx(|tx| tx.read_tree(node_ptr))
+            .ok()
+            .map(|n| n.data().size()))
+    }
+
+    /// RedoxFS is about to map `node_ptr` (or change it, for [`PageCache::begin_change`]):
+    /// with cached writes, holds the file's writes and writes its dirty pages back, so the
+    /// mapping shows the newest bytes. [`PageCache::mappings_changed`] then keeps the hold
+    /// while the file is mapped, or releases it.
+    ///
+    /// # Errors
+    ///
+    /// `EIO` when dirty pages could not be written back; the hold is released.
+    pub fn before_map<D: Disk>(
+        &mut self,
+        fs: &mut FileSystem<D>,
+        fmaps: &mut Fmaps,
+        node_ptr: TreePtr<Node>,
+    ) -> syscall::Result<()> {
+        let node_id = node_ptr.id();
+        let (Some(_), Some(cached)) = (&self.writeback, self.files.get(&node_id)) else {
+            return Ok(());
+        };
+        if let Err(err) = cached.object.hold_writes(true) {
+            // An object the kernel no longer takes calls on is no use: close it.
+            log::error!("page cache: node {node_id}: {}", Chain(&err));
+            self.forget(node_id);
+            return Ok(());
+        }
+        if let Err(err) = self.flush(fs, fmaps, node_id) {
+            log::error!("page cache: node {node_id}: {}", Chain(&err));
+            self.release(node_id);
+            return Err(flush_errno(&err));
+        }
+        Ok(())
+    }
+
+    /// RedoxFS is about to read `node_ptr` itself (a read it serves, a mapping): writes the
+    /// file's dirty pages back first, so it reads the newest bytes.
+    ///
+    /// # Errors
+    ///
+    /// `EIO` when they could not be written back.
+    pub fn before_read<D: Disk>(
+        &mut self,
+        fs: &mut FileSystem<D>,
+        fmaps: &mut Fmaps,
+        node_ptr: TreePtr<Node>,
+    ) -> syscall::Result<()> {
+        let node_id = node_ptr.id();
+        self.flush(fs, fmaps, node_id).map_err(|err| {
+            log::error!("page cache: node {node_id}: {}", Chain(&err));
+            flush_errno(&err)
+        })
+    }
+
+    /// Writes `node_ptr`'s dirty pages back, for `fsync`: it then syncs the file.
+    ///
+    /// # Errors
+    ///
+    /// `EIO` when some could not be written; they stay dirty for a later writeback.
+    pub fn fsync<D: Disk>(
+        &mut self,
+        fs: &mut FileSystem<D>,
+        fmaps: &mut Fmaps,
+        node_ptr: TreePtr<Node>,
+    ) -> syscall::Result<()> {
+        self.before_read(fs, fmaps, node_ptr)
+    }
+
+    /// Writes back the files that have been dirty for the age limit, oldest first (the
+    /// timer's [`FLUSH_DUE`] call), and stops the timer once no file is dirty.
+    pub fn flush_due<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps) {
+        let Some(wb) = &self.writeback else {
+            return;
+        };
+        let due = Instant::now()
+            .checked_sub(Duration::from_millis(DEFAULT_AGE_MS))
+            .map_or_else(Vec::new, |before| wb.dirty.due(before));
+        self.flush_each(fs, fmaps, &due);
+    }
+
+    /// Writes back every dirty file, oldest first: on an urgent record, and at unmount.
+    pub fn flush_all<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps) {
+        let Some(wb) = &self.writeback else {
+            return;
+        };
+        let all = wb.dirty.all();
+        self.flush_each(fs, fmaps, &all);
+    }
+
+    /// Writes back `nodes` in order, logging failures, and stops the timer if no file is
+    /// dirty after.
+    fn flush_each<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, nodes: &[u32]) {
+        for &node_id in nodes {
+            if let Err(err) = self.flush(fs, fmaps, node_id) {
+                log::warn!("page cache: writeback of node {node_id}: {}", Chain(&err));
+            }
+        }
+        if let Some(wb) = &self.writeback {
+            if wb.dirty.is_empty() {
+                wb.timer.disarm();
             }
         }
     }
 
-    /// The size of `node_ptr` before RedoxFS changes it, when the file is cached; pass it to
-    /// [`PageCache::changed`] afterwards.
-    pub fn size_before<D: Disk>(
-        &self,
+    /// Writes `node_id`'s dirty pages back, when it is cached with cached writes, and notes
+    /// whether it is still dirty after (written to meanwhile, or not all written).
+    fn flush<D: Disk>(
+        &mut self,
         fs: &mut FileSystem<D>,
-        node_ptr: TreePtr<Node>,
-    ) -> Option<u64> {
-        if !self.files.contains_key(&node_ptr.id()) {
-            return None;
+        fmaps: &mut Fmaps,
+        node_id: u32,
+    ) -> Result<(), FlushError> {
+        let (Some(wb), Some(cached)) = (self.writeback.as_mut(), self.files.get(&node_id)) else {
+            return Ok(());
+        };
+        let mut target = NodeFlush {
+            object: &cached.object,
+            fs,
+            fmaps,
+            node_id,
+            buf: &mut wb.buf,
+        };
+        let flushed = writeback::flush(&mut target);
+        match &flushed {
+            Ok(Flushed { dirty_left: 0, .. }) => {
+                wb.dirty.cleaned(node_id);
+            }
+            Ok(_) | Err(_) => {
+                wb.dirty.dirtied(node_id, Instant::now());
+                wb.timer.arm();
+            }
         }
-        // If the size cannot be read, the change will fail the same way.
-        fs.tx(|tx| tx.read_tree(node_ptr))
-            .ok()
-            .map(|n| n.data().size())
+        match flushed {
+            Ok(Flushed {
+                failed: Some(errno),
+                ..
+            }) => Err(FlushError::Write(errno)),
+            Ok(_) => Ok(()),
+            Err(err) => Err(FlushError::Client(err)),
+        }
+    }
+
+    /// Serves `node_id`'s cached writes again after [`PageCache::begin_change`], unless it is
+    /// mapped (they stay held while it is).
+    fn release(&mut self, node_id: u32) {
+        let Some(wb) = &self.writeback else {
+            return;
+        };
+        if wb.mapped.contains(&node_id) {
+            return;
+        }
+        let Some(cached) = self.files.get(&node_id) else {
+            return;
+        };
+        if let Err(err) = cached.object.hold_writes(false) {
+            log::error!("page cache: node {node_id}: {}", Chain(&err));
+            self.forget(node_id);
+        }
     }
 
     /// RedoxFS changed bytes `start..end` of `node_ptr` itself (a write, or a truncation with
-    /// `start == end` at the new size), and the file had `before` bytes: drops the pages that
-    /// changed from its object and sets its new size. On failure the object is closed, so no
-    /// stale page is ever served.
+    /// `start == end` at the new size), and the file had `before` bytes: sets the object's
+    /// new size (a truncation drops the pages past it, dirty or not), drops the pages that
+    /// changed, and serves the file's cached writes again ([`PageCache::begin_change`]). On
+    /// failure the object is closed, so no stale page is ever served.
     pub fn changed<D: Disk>(
         &mut self,
         fs: &mut FileSystem<D>,
@@ -299,28 +600,50 @@ impl PageCache {
             .and_then(|node| {
                 let size = node.data().size();
                 // Bytes between the old and the new end changed too (zero-filled or cut).
+                // The size first: a truncation discards the dirty pages past the new end.
                 cached
                     .object
-                    .invalidate(start.min(before), end.max(size).max(before))
-                    .and_then(|()| cached.object.set_size(size))
+                    .set_size(size)
+                    .and_then(|()| {
+                        cached
+                            .object
+                            .invalidate(start.min(before), end.max(size).max(before))
+                    })
                     .map_err(|err| log::error!("page cache: node {node_id}: {}", Chain(&err)))
             });
         if result.is_err() {
             self.forget(node_id);
+        } else {
+            self.release(node_id);
         }
     }
 
-    /// `node_ptr` was mapped or unmapped, and now has `writable` references to mapped ranges
-    /// that `Fmap::sync` writes back ([`super::resource::FileMmapInfo::writable_mappings`]).
-    /// While there are any the file is not cached: the first closes its object, dropping
-    /// every cached page, and its descriptions go back to RedoxFS. At 0, descriptions opened
-    /// read-only afterwards are cached again.
-    pub fn mappings_changed(&mut self, node_ptr: TreePtr<Node>, writable: usize) {
+    /// `node_ptr` was mapped or unmapped, and now has `mapped` references to mapped ranges,
+    /// `writable` of them ranges that `Fmap::sync` writes back
+    /// ([`super::resource::FileMmapInfo::writable_mappings`]). While there are writable ones
+    /// the file is not cached: the first closes its object, dropping every cached page (a
+    /// mapping is made after [`PageCache::begin_change`], so none is dirty), and its
+    /// descriptions go back to RedoxFS. At 0, descriptions opened afterwards are cached
+    /// again. With cached writes, the file's writes are held while it has any mapping, so
+    /// the mapped pages see them, and served again when the last one goes.
+    pub fn mappings_changed(&mut self, node_ptr: TreePtr<Node>, mapped: usize, writable: usize) {
         let node_id = node_ptr.id();
+        if let Some(wb) = &mut self.writeback {
+            if mapped == 0 {
+                wb.mapped.remove(&node_id);
+            } else {
+                wb.mapped.insert(node_id);
+            }
+        }
         if writable == 0 {
             self.writable.remove(&node_id);
         } else if self.writable.insert(node_id, writable).is_none() {
             self.forget(node_id);
+            return;
+        }
+        // Held from `begin_change` before the mapping: keep it while mapped.
+        if mapped == 0 {
+            self.release(node_id);
         }
     }
 
@@ -331,6 +654,9 @@ impl PageCache {
         if self.files.remove(&node_id).is_some() {
             self.attached.retain(|_, node| *node != node_id);
         }
+        if let Some(wb) = &mut self.writeback {
+            wb.dirty.cleaned(node_id);
+        }
     }
 
     /// The objects the pump sees. A poisoned lock still holds them.
@@ -338,9 +664,22 @@ impl PageCache {
         self.objects.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Answers the fill records in `records` (forwarded by the pump) with the files' bytes.
+    /// Handles the records in `records` (forwarded by the pump): answers fills with the
+    /// files' bytes, and notes the files writeback records say are dirty, writing every
+    /// dirty file back at once after an urgent one.
     pub fn fill<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, records: &[u8]) {
+        let mut urgent = false;
         for record in Record::decode_all(records) {
+            if let Ok(Record::Writeback {
+                object,
+                urgent: now,
+                ..
+            }) = record
+            {
+                urgent |= now;
+                self.dirtied(object);
+                continue;
+            }
             match record.as_ref().map(Record::fill) {
                 Ok(Some((object, fill))) => {
                     let Ok(node_id) = u32::try_from(object.get()) else {
@@ -374,12 +713,132 @@ impl PageCache {
                         }
                     }
                 }
-                // Writeback, release and access records come with later steps.
+                // Release and access records come with later steps.
                 Ok(None) => {}
                 Err(err) => log::error!("page cache: bad record from the kernel: {err}"),
             }
         }
+        if urgent {
+            self.flush_all(fs, fmaps);
+        }
     }
+
+    /// The kernel says `object` became dirty: writes it back once the age limit has passed.
+    fn dirtied(&mut self, object: ObjectId) {
+        let (Some(wb), Ok(node_id)) = (&mut self.writeback, u32::try_from(object.get())) else {
+            return;
+        };
+        // An object closed since the record was posted was written back as it went.
+        if self.files.contains_key(&node_id) {
+            wb.dirty.dirtied(node_id, Instant::now());
+            wb.timer.arm();
+        }
+    }
+}
+
+/// Turns cached writes on for `queue`, with a timer thread that makes the [`FLUSH_DUE`] call
+/// through a description of RedoxFS's own scheme; `None` when the kernel has no cached
+/// writes, or when that fails (logged).
+fn start_writeback(socket: &Socket, queue: &Queue) -> Option<Writeback> {
+    let max = NonZeroU32::new(DEFAULT_MAX_DIRTY_PAGES).expect("the default limit is not 0");
+    match queue.set_writeback(max) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(err) => {
+            log::warn!("page cache: cached writes off: {}", Chain(&err));
+            return None;
+        }
+    }
+    // Once on, every object the queue makes takes writes: a timer that cannot start would
+    // leave dirty files to fsync and close alone, so turn them off again.
+    let timer = socket
+        .create_this_scheme_fd(0, PUMP_HANDLE, O_RDWR, 0)
+        .map_err(|err| log::warn!("page cache: cached writes off: no timer description: {err}"))
+        .ok()
+        .map(Fd::new)
+        .and_then(|own| {
+            let tick = move || {
+                if let Err(err) = own.call_wo(&[], CallFlags::empty(), &[FLUSH_DUE]) {
+                    log::warn!("page cache: writeback timer: {err}");
+                }
+            };
+            client::spawn_flush_timer(Duration::from_secs(1), tick)
+                .map_err(|err| log::warn!("page cache: cached writes off: {}", Chain(&err)))
+                .ok()
+        });
+    let Some(timer) = timer else {
+        // A limit the kernel takes but no description is attached to write with: harmless.
+        return None;
+    };
+    Some(Writeback {
+        dirty: DirtyObjects::new(),
+        timer,
+        buf: vec![0; FLUSH_PAGES as usize * PAGE_SIZE as usize],
+        mapped: BTreeSet::new(),
+    })
+}
+
+/// One file's writeback: the kernel's object and the file its pages go to.
+struct NodeFlush<'a, D: Disk> {
+    object: &'a Object,
+    fs: &'a mut FileSystem<D>,
+    fmaps: &'a mut Fmaps,
+    node_id: u32,
+    /// Holds the run taken.
+    buf: &'a mut [u8],
+}
+
+impl<D: Disk> Flush for NodeFlush<'_, D> {
+    type Error = ClientError;
+
+    fn take(&mut self, from: u64) -> Result<Option<RecordPages>, ClientError> {
+        self.object.take_dirty(from, self.buf)
+    }
+
+    fn write(&mut self, pages: RecordPages) -> Result<(), NonZeroU16> {
+        let range = pages.pages();
+        let offset = range.first() * PAGE_SIZE;
+        let len = range.count() as usize * PAGE_SIZE as usize;
+        let Some(bytes) = self.buf.get(..len) else {
+            return Err(NonZeroU16::new(EIO as u16).expect("EIO"));
+        };
+        write_pages(self.fs, self.fmaps, self.node_id, offset, bytes).map_err(|err| {
+            u16::try_from(err.errno)
+                .ok()
+                .and_then(NonZeroU16::new)
+                .unwrap_or(NonZeroU16::new(EIO as u16).expect("EIO"))
+        })
+    }
+
+    fn answer(&mut self, pages: RecordPages, outcome: Outcome) -> Result<u64, ClientError> {
+        self.object.written_back(pages, outcome)
+    }
+}
+
+/// Writes `bytes`, pages of `node_id` from `offset`, back to the file as a client `write`
+/// would, up to the file's end (the bytes past it are the zero tail of its last page).
+fn write_pages<D: Disk>(
+    fs: &mut FileSystem<D>,
+    fmaps: &mut Fmaps,
+    node_id: u32,
+    offset: u64,
+    bytes: &[u8],
+) -> syscall::Result<()> {
+    let node_ptr: TreePtr<Node> = TreePtr::new(node_id);
+    let size = fs.tx(|tx| tx.read_tree(node_ptr))?.data().size();
+    let len = usize::try_from(size.saturating_sub(offset))
+        .map_or(bytes.len(), |left| left.min(bytes.len()));
+    let mut file = FileResource::new(String::new(), None, node_ptr, O_WRONLY, 0);
+    let mut done = 0;
+    while done < len {
+        let at = offset + done as u64;
+        let n = fs.tx(|tx| Resource::<D>::write(&mut file, fmaps, &bytes[done..len], at, tx))?;
+        if n == 0 {
+            return Err(syscall::Error::new(EIO));
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// Reads `buf.len()` bytes of `node_id` from `offset` as a client `read` would, zero past the

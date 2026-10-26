@@ -3,10 +3,11 @@
 //!
 //! The kernel keeps a *cache object* for each file a file system chooses to cache: the file's
 //! size and the frames holding its pages. A `read` on a file description attached to an object
-//! is served from its pages with no IPC; a miss is a *fill* the file system performs, and dirty
-//! pages go back to it as *writeback*. The file system owns the file's contents, size,
-//! permissions at open, allocation and durability; the kernel owns only the memory and the
-//! index.
+//! is served from its pages with no IPC; a miss is a *fill* the file system performs. With
+//! the kernel's `page_cache_writeback` feature a `write` inside the file is copied into its
+//! pages too, which become dirty and go back to the file system as *writeback*. The file
+//! system owns the file's contents, size, permissions at open, allocation and durability;
+//! the kernel owns only the memory and the index.
 //!
 //! This crate is the one definition the kernel and file systems share, and the kernel's
 //! policies, kept here so they are tested on the host:
@@ -19,11 +20,15 @@
 //! - [`copy`]: how the kernel copies a cached page to a reader through a small bounce buffer
 //!   on its stack, so the copy is not 4K-aliased and never allocates.
 //! - `object` (with the `alloc` feature): one object's page index, which says what a read
-//!   needs (fills to queue, fills to wait for) and applies the file system's answers.
+//!   or a cached write needs (fills to queue, fills to wait for), applies the file system's
+//!   answers, counts dirty pages, hands out runs of them for writeback in page order, and
+//!   gives reclaim only pages the file system has.
 //! - `clock` (with the `alloc` feature): the two-list CLOCK replacement that picks pages to
 //!   evict under memory pressure.
 //! - `rmap` (with the `alloc` feature): an object's reverse map, from a file page to the
 //!   mappings that show it, for unmapping on truncation and eviction.
+//! - `writeback` (with the `alloc` feature): the file system's side of writeback, which
+//!   objects are dirty and since when, and the pass that writes an object back.
 //! - `client` (with the `client` feature, on Redox): the file system's side, its queue,
 //!   objects and the thread that takes fill records off the queue.
 //! - [`pump`]: how that thread answers the fills of a batch it could not hand on, so no
@@ -85,3 +90,5 @@ pub mod pump;
 pub mod readahead;
 #[cfg(feature = "alloc")]
 pub mod rmap;
+#[cfg(feature = "alloc")]
+pub mod writeback;

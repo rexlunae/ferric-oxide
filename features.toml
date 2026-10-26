@@ -499,10 +499,36 @@ and pread of those files from them, copying from memory with no round trip to
 the file system once the pages are there. A miss becomes a fill request on the
 file system's queue, with readahead past it; a failed fill fails its readers
 with EIO and the next read tries again. RedoxFS caches the files its clients
-open read-only; writes still go to RedoxFS, which drops the pages they change.
-Mappings, cached writes and reclaim come later, so an object keeps every page
-read until the file system closes it. Off by default; without it the kernel
-has no such scheme and every read goes to the file system, as upstream."""
+open read-only; writes still go to RedoxFS, which drops the pages they change
+(kernel.page_cache_writeback caches them too). Mappings and reclaim come later,
+so an object keeps every page read until the file system closes it. Off by
+default; without it the kernel has no such scheme and every read goes to the
+file system, as upstream."""
+
+[[option]]
+id = "kernel.page_cache_writeback"
+menu = "kernel"
+type = "bool"
+title = "Shared page cache: cached writes with writeback"
+default = false
+depends = "kernel.page_cache"
+kernel_feature = "page_cache_writeback"
+rebuild = ["kernel"]
+help = """
+Let the page cache take writes too (Phase 2.6). A positioned write or pwrite
+inside a cached file's size is copied into its pages, which become dirty, and
+returns without a round trip to the file system; writes that extend the file,
+appends and O_SYNC descriptions still go to it. The file system writes dirty
+pages back: on fsync (which returns once they are on disk), before it reads or
+changes the file itself, when the file has been dirty for 5 seconds, and at
+once when the cache holds more than 32 MiB of dirty pages (at 64 MiB writes go
+to the file system, which slows writers down to the disk). A failed writeback
+keeps the pages dirty, and nothing drops a dirty page but a truncation.
+RedoxFS then caches every regular file it opens, not only read-only ones,
+except while the file is mapped. Dirty data not yet written back is lost if
+the system stops without unmounting, as with any write-back cache: use fsync.
+Off by default; without it RedoxFS's page cache serves reads only, as with
+kernel.page_cache alone."""
 
 [[option]]
 id = "drivers.rtl8125"

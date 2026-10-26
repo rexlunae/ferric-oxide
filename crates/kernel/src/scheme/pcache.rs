@@ -30,15 +30,29 @@
 //!   cache of it: outstanding fills fail, their readers get `EIO`, and later reads of its
 //!   descriptions go to the file system's scheme as before.
 //!
-//! Only reads are served here. Mappings, cached writes, writeback and reclaim are later steps of the
-//! design, so an object holds every page read until it closes. The page index, fill planning
-//! and readahead are the host-tested `ferric-pcache` crate (`crates/pcache`), which also has
-//! the call encoding file systems use.
+//! - With the `page_cache_writeback` feature, a file system that asks for it
+//!   ([`Request::SetWriteback`](ferric_pcache::abi::Request::SetWriteback)) also has the
+//!   kernel serve writes inside the file's size of the descriptions it attaches for writing
+//!   (`UserScheme::kwriteoff` comes to `writeback::write_attached` first), and writes the
+//!   dirty pages back when the kernel tells it to (see `writeback`). Without the feature,
+//!   or without that request, every write goes to the file system's scheme.
+//!
+//! Mappings and reclaim are later steps of the design, so an object holds every page read
+//! until it closes. The page index, fill and write planning, writeback order and readahead
+//! are the host-tested `ferric-pcache` crate (`crates/pcache`), which also has the call
+//! encoding file systems use.
 //!
 //! Locks: the attachment table may be held while a queue's or an object's state is taken,
 //! never the other way round; the handle table, a queue's state and an object's state are
-//! otherwise taken alone. A reader waits on an object's `changed` condition holding only that
-//! object's lock. Nothing is copied to or from user memory while any of them is held.
+//! otherwise taken alone. A reader or writer waits on an object's `changed` condition holding
+//! only that object's lock. Nothing is copied to or from user memory while any of them is
+//! held. A queue's dirty-page count is an atomic, kept in step with its objects' indexes
+//! (`with_index`).
+
+#[cfg(feature = "page_cache_writeback")]
+mod writeback;
+#[cfg(feature = "page_cache_writeback")]
+pub use writeback::write_attached;
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -49,7 +63,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ferric_pcache::{
     abi::{
-        FillId, Generation, ObjectId, Outcome, PathError, Record, RecordPages, Request,
+        Access, FillId, Generation, ObjectId, Outcome, PathError, Record, RecordPages, Request,
         OBJECT_PREFIX, QUEUE_PATH,
     },
     object::{Attempt, Fill, FillError, PageIndex, Read},
@@ -136,6 +150,11 @@ struct Queue {
     state: Mutex<QueueState>,
     /// Notified when records arrive or the queue closes.
     records_ready: WaitCondition,
+    /// The dirty pages of the queue's objects ([`with_index`] keeps it).
+    dirty: AtomicUsize,
+    /// Cached writes: off until the file system turns them on.
+    #[cfg(feature = "page_cache_writeback")]
+    writeback: writeback::QueueWriteback,
 }
 
 struct QueueState {
@@ -165,12 +184,33 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// `EIO` when the queue has closed.
+    /// `EIO` when the queue has closed, `ENOMEM` when there is no room for the records.
     fn push(
         &self,
         object: ObjectId,
         generation: Generation,
         fills: &[Fill],
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        self.push_records(
+            fills.iter().map(|fill| Record::Fill {
+                object,
+                generation,
+                fill: fill.id,
+                pages: fill.pages,
+            }),
+            token,
+        )
+    }
+
+    /// Puts `records` on the queue and wakes the file system.
+    ///
+    /// # Errors
+    ///
+    /// `EIO` when the queue has closed, `ENOMEM` when there is no room for the records.
+    fn push_records(
+        &self,
+        records: impl ExactSizeIterator<Item = Record>,
         token: &mut CleanLockToken,
     ) -> Result<()> {
         {
@@ -180,14 +220,9 @@ impl Queue {
             }
             state
                 .records
-                .try_reserve(fills.len())
+                .try_reserve(records.len())
                 .map_err(|_| Error::new(ENOMEM))?;
-            state.records.extend(fills.iter().map(|fill| Record::Fill {
-                object,
-                generation,
-                fill: fill.id,
-                pages: fill.pages,
-            }));
+            state.records.extend(records);
         }
         self.wake(token);
         Ok(())
@@ -220,13 +255,52 @@ struct ObjectState {
     index: PageIndex<Arc<RaiiFrame>>,
     /// The object or its queue closed: nothing more is served from it.
     gone: bool,
+    /// The file system holds the object's writes ([`Request::HoldWrites`]): they go to its
+    /// scheme.
+    #[cfg(feature = "page_cache_writeback")]
+    held: bool,
 }
 
-/// An attached description: the object it reads and its readahead state.
+/// Runs `f` on `object`'s state, under its lock, and moves the queue's dirty-page count by
+/// the change `f` made to the object's: every change to an index that can drop or dirty a
+/// page goes through here, so the count follows writes, writebacks, truncations and
+/// invalidations.
+fn with_index<R>(object: &Object, f: impl FnOnce(&mut ObjectState) -> R) -> R {
+    let (result, before, after) = {
+        let mut state = object.state.lock();
+        let before = state.index.dirty_pages();
+        let result = f(&mut state);
+        (result, before, state.index.dirty_pages())
+    };
+    object.queue.account(before, after);
+    result
+}
+
+impl Queue {
+    /// One of the queue's objects went from `before` dirty pages to `after`.
+    fn account(&self, before: usize, after: usize) {
+        if let Some(more) = after.checked_sub(before) {
+            self.dirty.fetch_add(more, Ordering::Relaxed);
+        } else {
+            let gone = before.saturating_sub(after);
+            let _ = self
+                .dirty
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(gone))
+                });
+            #[cfg(feature = "page_cache_writeback")]
+            self.writeback.cleaned(self.dirty.load(Ordering::Relaxed));
+        }
+    }
+}
+
+/// An attached description: the object it reads (or writes) and its readahead state.
 #[derive(Clone)]
 struct Attachment {
     object: Arc<Object>,
     readahead: Arc<Mutex<Readahead>>,
+    /// What the kernel serves of it.
+    access: Access,
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(ROOT + 1);
@@ -276,7 +350,7 @@ pub fn read_attached(
         .lock()
         .get(&(inner.scheme_id.get(), handle))
         .cloned()?;
-    if !attachment.object.queue.serves(inner) {
+    if !attachment.access.reads() || !attachment.object.queue.serves(inner) {
         return None;
     }
     read(&attachment, buf, offset, token)
@@ -460,6 +534,9 @@ fn open_queue(caller: &CallerCtx, token: &mut CleanLockToken) -> Result<Handle> 
             readahead: ReadaheadConfig::DEFAULT,
         }),
         records_ready: WaitCondition::new(),
+        dirty: AtomicUsize::new(0),
+        #[cfg(feature = "page_cache_writeback")]
+        writeback: writeback::QueueWriteback::new(),
     })))
 }
 
@@ -487,6 +564,8 @@ fn open_object(queue: &Arc<Queue>, path: &[u8]) -> Result<Handle> {
         state: Mutex::new(ObjectState {
             index: PageIndex::new(),
             gone: false,
+            #[cfg(feature = "page_cache_writeback")]
+            held: false,
         }),
         changed: WaitCondition::new(),
     });
@@ -494,17 +573,25 @@ fn open_object(queue: &Arc<Queue>, path: &[u8]) -> Result<Handle> {
     Ok(Handle::Object(object))
 }
 
-/// Ends the cache of `object`: outstanding fills fail, waiting readers wake, and its
-/// descriptions are detached.
+/// Ends the cache of `object`: outstanding fills fail, waiting readers and writers wake, and
+/// its descriptions are detached. Its dirty pages leave the queue's count; a file system
+/// writes them back before it closes an object, so any left are logged.
 fn end_object(object: &Arc<Object>, token: &mut CleanLockToken) {
-    let failed = {
+    let (failed, dirty) = {
         let mut state = object.state.lock();
         state.gone = true;
-        state.index.fail_all()
+        (state.index.fail_all(), state.index.dirty_pages())
     };
+    object.queue.account(dirty, 0);
     if failed != 0 {
         crate::info!(
             "pcache: object {} went with {failed} page(s) being filled",
+            object.id.get()
+        );
+    }
+    if dirty != 0 {
+        crate::warn!(
+            "pcache: object {} went with {dirty} dirty page(s) not written back",
             object.id.get()
         );
     }
@@ -579,9 +666,18 @@ fn bind(
     Ok(0)
 }
 
-/// [`Request::Attach`]: serves `handle` of the queue's scheme from `object`.
-fn attach(object: &Arc<Object>, handle: u64) -> Result<usize> {
+/// [`Request::Attach`] and [`Request::AttachAccess`]: serves `handle` of the queue's scheme
+/// from `object` for `access`. Writing needs cached writes on for the queue
+/// ([`Request::SetWriteback`]), and refuses with `EOPNOTSUPP` without them.
+fn attach(object: &Arc<Object>, handle: u64, access: Access) -> Result<usize> {
     let handle = usize::try_from(handle).map_err(|_| Error::new(EINVAL))?;
+    #[cfg(feature = "page_cache_writeback")]
+    let writes = object.queue.writeback.on();
+    #[cfg(not(feature = "page_cache_writeback"))]
+    let writes = false;
+    if access.writes() && !writes {
+        return Err(Error::new(EOPNOTSUPP));
+    }
     let (scheme, config) = {
         let queue = object.queue.state.lock();
         let bound = queue.bound.as_ref().ok_or(Error::new(EINVAL))?;
@@ -603,6 +699,7 @@ fn attach(object: &Arc<Object>, handle: u64) -> Result<usize> {
         Attachment {
             object: Arc::clone(object),
             readahead: Arc::new(Mutex::new(Readahead::new(config))),
+            access,
         },
     );
     Ok(0)
@@ -874,15 +971,27 @@ impl KernelScheme for PcacheScheme {
         }
         match (request, target) {
             (Request::SetSize { size }, Handle::Object(object)) => {
-                object.state.lock().index.set_size(size);
+                with_index(&object, |state| state.index.set_size(size));
                 Ok(0)
             }
-            (Request::Attach { handle }, Handle::Object(object)) => attach(&object, handle),
+            (Request::Attach { handle }, Handle::Object(object)) => {
+                attach(&object, handle, Access::Read)
+            }
+            (Request::AttachAccess { handle, access }, Handle::Object(object)) => {
+                attach(&object, handle, access)
+            }
             (Request::Detach { handle }, Handle::Object(object)) => detach(&object, handle),
             (Request::Invalidate { pages }, Handle::Object(object)) => {
                 // Readers of pages being filled keep waiting; the stale fill's answer wakes
                 // them and they fill again (`PageIndex::invalidate`).
-                object.state.lock().index.invalidate(pages);
+                let gone = with_index(&object, |state| state.index.invalidate(pages));
+                if gone.dirty != 0 {
+                    crate::warn!(
+                        "pcache: object {}: invalidating dropped {} dirty page(s)",
+                        object.id.get(),
+                        gone.dirty
+                    );
+                }
                 Ok(0)
             }
             (
@@ -902,8 +1011,32 @@ impl KernelScheme for PcacheScheme {
                 }
                 filled(&object, fill, pages, outcome, payload, token)
             }
-            // Writeback comes with writes, a later step.
-            (Request::WrittenBack { .. }, Handle::Object(_)) => Err(Error::new(EOPNOTSUPP)),
+            #[cfg(feature = "page_cache_writeback")]
+            (Request::SetWriteback { max_dirty }, Handle::Queue(queue)) => {
+                queue.writeback.set_max_dirty(max_dirty);
+                Ok(0)
+            }
+            #[cfg(feature = "page_cache_writeback")]
+            (Request::HoldWrites { hold }, Handle::Object(object)) => {
+                writeback::hold(&object, hold)
+            }
+            #[cfg(feature = "page_cache_writeback")]
+            (Request::TakeDirty { from }, Handle::Object(object)) => {
+                writeback::take_dirty(&object, from, payload)
+            }
+            #[cfg(feature = "page_cache_writeback")]
+            (Request::WrittenBack { pages, outcome }, Handle::Object(object)) => {
+                writeback::written_back(&object, pages, outcome, token)
+            }
+            // Cached writes are the `page_cache_writeback` feature.
+            #[cfg(not(feature = "page_cache_writeback"))]
+            (Request::SetWriteback { .. }, Handle::Queue(_))
+            | (
+                Request::HoldWrites { .. }
+                | Request::TakeDirty { .. }
+                | Request::WrittenBack { .. },
+                Handle::Object(_),
+            ) => Err(Error::new(EOPNOTSUPP)),
             (Request::SetReadaheadMax { pages }, Handle::Queue(queue)) => {
                 let max = pages.get();
                 let initial = ReadaheadConfig::DEFAULT.initial().min(max);
