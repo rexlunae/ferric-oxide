@@ -137,7 +137,11 @@ for the dependencies of what it found, then installs everything with
 dependencies first. Each archive must verify against the trusted keys like
 a named one, and one that does not stops the command before anything is
 installed. An installed dependency is not upgraded. Dependency cycles are
-allowed. `--no-deps` installs only what was named. `fox sync` does not add
+allowed. A `<name>.toml` in a repository directory with no `<name>.pkgar`
+beside it is a meta-package, such as a cookbook group (`recipes/groups/`):
+installing it installs the packages its `depends` lists, and it is not
+recorded itself. `--no-deps` installs only what was named, and refuses a
+meta-package. `fox sync` does not add
 dependencies: a package set lists every package it installs, so its lock
 pins all of them.
 

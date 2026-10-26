@@ -258,6 +258,34 @@ fn install_no_deps_installs_only_what_is_named() {
 }
 
 #[test]
+fn install_expands_meta_packages_from_repositories() {
+    let env = Env::new();
+    env.trust_in_root();
+    env.repo_package("lib", &[]);
+    let repo = env.repo_package("tool", &["lib"]);
+    fs::write(
+        repo.join("group.toml"),
+        "name = \"group\"\ntarget = \"x86_64-unknown-redox\"\ndepends = [\"tool\"]\n",
+    )
+    .unwrap();
+
+    let output = env.fox(&["install", "--repo", path_str(&repo), "group"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout(&output).contains("meta-package group"));
+    assert!(env.root.path().join("usr/share/tool").is_file());
+    assert!(env.root.path().join("usr/share/lib").is_file());
+
+    let no_deps = env.fox(&["install", "--no-deps", "--repo", path_str(&repo), "group"]);
+    assert!(!no_deps.status.success());
+    let unknown = env.fox(&["install", "--repo", path_str(&repo), "absent"]);
+    assert!(!unknown.status.success());
+}
+
+#[test]
 fn install_refuses_untrusted_dependencies() {
     let env = Env::new();
     env.trust_in_root();
