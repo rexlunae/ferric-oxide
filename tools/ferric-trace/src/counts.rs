@@ -84,10 +84,10 @@ impl EventCounts {
     }
 
     /// The event's rate over `elapsed_ns`, per second, rounded down.
-    fn rate(&self, elapsed_ns: u64) -> u64 {
+    fn rate(count: u64, elapsed_ns: u64) -> u64 {
         match elapsed_ns {
             0 => 0,
-            ns => u64::try_from(u128::from(self.total) * 1_000_000_000 / u128::from(ns))
+            ns => u64::try_from(u128::from(count) * 1_000_000_000 / u128::from(ns))
                 .unwrap_or(u64::MAX),
         }
     }
@@ -186,7 +186,7 @@ pub fn write(
             write!(
                 out,
                 "counts {name} cpu={cpu} count={count} rate_per_s={}",
-                counts.rate(elapsed_ns)
+                EventCounts::rate(count, elapsed_ns)
             )?;
             if let Some(gaps) = counts.gaps.get(&cpu) {
                 write!(out, " {}", gap_fields(gaps))?;
@@ -199,7 +199,7 @@ pub fn write(
         let mut line = format!(
             "counts {name} cpu=all count={} rate_per_s={}",
             counts.total,
-            counts.rate(elapsed_ns)
+            EventCounts::rate(counts.total, elapsed_ns)
         );
         if !counts.gaps.is_empty() {
             line.push(' ');
@@ -290,6 +290,31 @@ mod tests {
                 "counts sched.tick cpu=1 count=1 rate_per_s=0",
                 "counts sched.tick cpu=all count=2 rate_per_s=0",
             ]
+        );
+    }
+
+    #[test]
+    fn per_cpu_rates_use_each_cpu_count_and_merged_rates_use_the_total() {
+        let cpu0 = record_bytes(&[
+            (&SCHED_TICK, 0, &[]),
+            (&SCHED_TICK, 500_000_000, &[]),
+            (&SCHED_TICK, 1_000_000_000, &[]),
+        ]);
+        let cpu1 = record_bytes(&[(&SCHED_TICK, 500_000_000, &[])]);
+        let capture = capture(Some(clock()), &[(&cpu0, 0), (&cpu1, 1)]);
+        let mut out = Vec::new();
+        write(
+            &capture,
+            &[],
+            &BTreeMap::new(),
+            TscMhz::new(1000.0).unwrap(),
+            &mut out,
+        )
+        .unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "counts sched.tick cpu=0 count=3 rate_per_s=3\ncounts sched.tick cpu=1 count=1 rate_per_s=1\ncounts sched.tick cpu=all count=4 rate_per_s=4\n"
         );
     }
 

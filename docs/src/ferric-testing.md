@@ -672,3 +672,12 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Scheduler baseline accounting
+
+The trace CLI's `counts::tests` includes a multi-CPU capture with unequal rates
+and a merged rate over the same interval. The ring-test recipe's host tests
+(`cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml`)
+exercise the same CQE validator used by the target workload, rejecting missing,
+duplicate, wrong-request, failed and short completions. The scheduler benchmark
+image/boot remains the check for measured wake latency and real completions.

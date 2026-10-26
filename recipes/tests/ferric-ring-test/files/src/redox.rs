@@ -31,6 +31,11 @@ const PAGE: usize = 4096;
 /// Why a step failed.
 #[derive(Debug)]
 enum Failure {
+    /// A completion batch failed its count, identity or result check.
+    Completion {
+        what: &'static str,
+        source: crate::completions::Mismatch,
+    },
     /// A call failed with an errno.
     Errno { what: &'static str, errno: i32 },
     /// A call that must fail with `expected` returned `got` (minus an errno, or a result).
@@ -48,6 +53,7 @@ enum Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Completion { what, source } => write!(f, "{what}: {source}"),
             Self::Errno { what, errno } => write!(f, "{what}: errno {errno}"),
             Self::Expected {
                 what,
@@ -285,12 +291,7 @@ fn enter_on(fd: &Fd, n: u32, min_complete: u32) -> i64 {
 
 /// Checks `cqes` are, in order, the `(user_data, result)` pairs of `expected`.
 fn check_cqes(what: &'static str, cqes: &[Cqe], expected: &[(u64, i64)]) -> Result<(), Failure> {
-    expect(what, expected.len() as i64, cqes.len() as i64)?;
-    for (cqe, &(user_data, result)) in cqes.iter().zip(expected) {
-        expect(what, user_data as i64, cqe.user_data as i64)?;
-        expect(what, result, cqe.result)?;
-    }
-    Ok(())
+    crate::completions::check(cqes, expected).map_err(|source| Failure::Completion { what, source })
 }
 
 /// A RedoxFS file of `len` bytes of a pattern, opened read-write.
@@ -1222,7 +1223,7 @@ fn scale(rings_n: usize, quiet_seconds: u64) -> Result<(), Failure> {
     let mut writers: Vec<c_int> = Vec::with_capacity(rings_n);
     let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(rings_n);
     let started = Instant::now();
-    for _ in 0..rings_n {
+    for i in 0..rings_n {
         let mut ring = Ring::new(8, 8)?;
         let [rd, wr] = pipe()?;
         let mut buf = vec![0u8; 1];
@@ -1231,7 +1232,7 @@ fn scale(rings_n: usize, quiet_seconds: u64) -> Result<(), Failure> {
             CURRENT_POSITION,
             buf.as_mut_ptr() as u64,
             1,
-            0,
+            i as u64,
         )
         .run_async()])?;
         expect("Enter of an asynchronous read", 1, ring.enter(1))?;
@@ -1251,15 +1252,15 @@ fn scale(rings_n: usize, quiet_seconds: u64) -> Result<(), Failure> {
     std::thread::sleep(Duration::from_secs(quiet_seconds));
     println!("FERRIC_SCALE_WAKE rings={rings_n}");
     let mut latencies = ferric_iobench::latency::Histogram::new();
-    let mut completions = vec![0u64; rings_n];
-    for (i, (ring, &wr)) in rings.iter_mut().zip(&writers).collect::<Vec<_>>().into_iter().enumerate() {
+    for (i, (ring, &wr)) in rings.iter_mut().zip(&writers).enumerate() {
+        let wake = Instant::now();
         // SAFETY: the pipe's write end with one byte to write.
         let n = unsafe { libc::write(wr, [SCALE_BYTE].as_ptr().cast(), 1) };
         expect("write to the pipe", 1, n as i64)?;
-        let wake = Instant::now();
-        loop {
-            if !ring.reap()?.is_empty() {
-                break;
+        let completions = loop {
+            let cqes = ring.reap()?;
+            if !cqes.is_empty() {
+                break cqes;
             }
             if wake.elapsed() > SCALE_WAKE_TIMEOUT {
                 return Err(Failure::Timeout {
@@ -1267,12 +1268,16 @@ fn scale(rings_n: usize, quiet_seconds: u64) -> Result<(), Failure> {
                 });
             }
             std::thread::sleep(SCALE_POLL);
-        }
+        };
         latencies.record(wake.elapsed().as_nanos() as u64);
-        completions[i] += 1;
+        check_cqes(
+            "one successful waiting-ring read",
+            &completions,
+            &[(i as u64, 1)],
+        )?;
     }
-    for (i, (_, buf)) in rings.iter().zip(&buffers).enumerate() {
-        expect("exactly one completion per ring", 1, completions[i] as i64)?;
+    for (ring, buf) in rings.iter_mut().zip(&buffers) {
+        check_cqes("no duplicate waiting-ring completion", &ring.reap()?, &[])?;
         if buf != &[SCALE_BYTE] {
             return Err(Failure::Mismatch {
                 what: "the byte a waiting read got",

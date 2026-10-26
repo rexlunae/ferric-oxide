@@ -752,6 +752,9 @@ mod tests {
         assert_eq!(MM_CLONE.id().get(), 28);
         assert_eq!(MM_DESTROY.id().get(), 29);
         assert_eq!(MM_CLONE_SKIP.id().get(), 30);
+        assert_eq!(SCHED_TICK.id().get(), 33);
+        assert_eq!(SCHED_IPI_PIT.id().get(), 34);
+        assert_eq!(SCHED_IPI_WAKE.id().get(), 35);
     }
 
     #[test]

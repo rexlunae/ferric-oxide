@@ -880,6 +880,12 @@ configuration, collects raw captures and machine-readable lines, and states
 the machine and boot it measured. Success thresholds for later work are frozen
 from these numbers before candidate tuning.
 
+The scheduler event IDs are `sched.tick=33`, `sched.ipi_pit=34` and
+`sched.ipi_wake=35`. Build and decode baseline captures with the same pinned
+commit/catalog. Captures from early development catalogs using IDs 22–24 need
+regeneration; those IDs now describe process lifecycle events and cannot be
+silently interpreted using the current catalog.
+
 The baseline image is `config/ferric-sched-bench.toml` (`make all
 CONFIG_NAME=ferric-sched-bench`), built with the CI `ferric.toml` (image.yml
 writes it), which turns `kernel.trace` and the `trace_sched` events on. The
@@ -898,7 +904,10 @@ image's console script, `/usr/lib/ferric-sched-bench.ion`, runs four windows:
    ring model). The window covers the setup (each ring's `sched.context_create`
    and `sched.context_start`), the quiet hold, and the wake of every ring; the
    run prints the wake latency (write to completion, per ring, with
-   fio-style percentiles) as a `FERRIC_BENCH ring-scale` line.
+   fio-style percentiles) as a `FERRIC_BENCH ring-scale` line. Timing starts
+   immediately before the releasing pipe write. The workload validates each
+   actual CQE's request id, successful one-byte result and count, then checks
+   for extra completions; a local loop counter is not completion evidence.
 4. **Benchmarks with tracing on.** `ferric-ring-test`, `ferric-trace-bench`
    and `ferric-iobench` run and print their usual `FERRIC_BENCH` lines; the
    trace-bench lines also report the tracing overhead and lost records.
@@ -914,9 +923,10 @@ counts sched.tick cpu=all count=2440 rate_per_s=243 gap_ns_min=4050000 gap_ns_me
 ```
 
 A `counts` line has the event, the CPU (`cpu=all` for the merged line), the
-record count, the rate over the capture (first to last record), and, with
+record count, that CPU's rate over the capture (first to last record), and, with
 `--gap <event>`, the gaps between a CPU's consecutive records of that event as
-fio-style percentiles in nanoseconds. A capture directory's `stats.start` and
+fio-style percentiles in nanoseconds. The merged rate uses the total count
+over the same capture duration. A capture directory's `stats.start` and
 `stats.end` snapshots add `lost_before` and `lost_during` to the CPU lines, so
 a window that overflowed its ring reports the loss instead of silently
 undercounting. The tool takes the same inputs as `text`:
