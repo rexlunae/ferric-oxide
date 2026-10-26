@@ -154,8 +154,15 @@ impl LocalApic {
         }
     }
 
+    /// This CPU's APIC ID, as the MADT, the ICR destination field and interrupt messages name it.
+    ///
+    /// Ferric Oxide (#214): the x2APIC ID MSR holds the 32-bit ID as it is, but the xAPIC ID
+    /// register keeps its 8-bit ID in bits 31:24 (Intel SDM Vol. 3A, "Local APIC ID"), so the raw
+    /// xAPIC value is shifted down. Every user of `apic_id_opt` (targeted IPIs, the MADT's
+    /// own-APIC check, NUMA, `irq:`, IOMMU interrupt destinations) expects the ID itself.
     pub fn id(&self) -> ApicId {
-        ApicId::new(self.identification(IdentificationRegister::Id))
+        let raw = self.identification(IdentificationRegister::Id);
+        ApicId::new(if self.x2 { raw } else { raw >> 24 })
     }
 
     pub fn version(&self) -> u32 {
