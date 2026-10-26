@@ -2,7 +2,7 @@
 //! the way RedoxFS serves its own (features.toml option `fs.fat`, off by default). It is for
 //! the EFI system partition and for removable media. With the Cargo feature `exfat`
 //! (features.toml `fs.exfat`, off by default) it serves exFAT volumes too, read by
-//! [`ferric_exfat`].
+//! `ferric-exfat`.
 //!
 //! The pieces, from the disk up:
 //!

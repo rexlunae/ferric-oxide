@@ -93,13 +93,13 @@ const FILE_MODE: u16 = 0o444;
 ///
 /// [`Error::Mount`] when `device` cannot be read or does not start with a FAT boot sector
 /// `fatfs` accepts, [`Error::ExFatDisabled`] for an exFAT volume when the `exfat` feature
-/// is off, and [`Error::ExFat`] when the exFAT reader refuses the volume.
+/// is off, and `Error::ExFat` (with the `exfat` feature) when the exFAT reader refuses the volume.
 pub fn mount<D: Device>(device: D) -> Result<Volume<D>, Error> {
-    let mut first = [0; ferric_exfat::boot::SECTOR_PREFIX];
+    let mut first = [0; ferric_fat_types::BOOT_SECTOR_PREFIX];
     device
         .read_at(0, &mut first)
         .map_err(|e| Error::Mount(io::Error::other(e)))?;
-    if &first[3..11] == ferric_exfat::boot::SIGNATURE {
+    if &first[3..11] == ferric_fat_types::EXFAT_NAME {
         return mount_exfat(device);
     }
     // The default options leave access dates alone, so reading a file writes nothing.
@@ -426,7 +426,7 @@ impl<'v, D: Device> Fs<'v, D> {
     ///
     /// # Errors
     ///
-    /// [`Error::Read`] or [`Error::ExFat`] when the table or bitmap cannot be read.
+    /// [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when the table or bitmap cannot be read.
     pub fn geometry(&self) -> Result<Geometry, Error> {
         match self.volume {
             Volume::Fat(fat) => {
@@ -464,7 +464,7 @@ impl<'v, D: Device> Fs<'v, D> {
     /// for an unknown `base`, [`Error::NotADirectory`] when `base` or a component on the way
     /// is not a directory or `mode.directory` is set and the path is not one,
     /// [`Error::NotASymlink`] for `O_SYMLINK`, [`Error::PathTooLong`], [`Error::NotFound`],
-    /// and [`Error::Read`] or [`Error::ExFat`] when a directory cannot be read.
+    /// and [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when a directory cannot be read.
     pub fn open(
         &mut self,
         base: Option<usize>,
@@ -536,7 +536,7 @@ impl<'v, D: Device> Fs<'v, D> {
     /// # Errors
     ///
     /// [`Error::BadHandle`] (also for a handle opened with `O_STAT`), [`Error::IsADirectory`]
-    /// for a directory, and [`Error::Read`] or [`Error::ExFat`] when the file's clusters
+    /// for a directory, and [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when the file's clusters
     /// cannot be read.
     pub fn read(&mut self, id: usize, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let handle = self.handle_mut(id)?;
@@ -566,7 +566,7 @@ impl<'v, D: Device> Fs<'v, D> {
     /// # Errors
     ///
     /// [`Error::BadHandle`], [`Error::NotADirectory`] for anything else, and [`Error::Read`]
-    /// or [`Error::ExFat`] when the directory cannot be read.
+    /// or `Error::ExFat` (with the `exfat` feature) when the directory cannot be read.
     pub fn entries(&mut self, id: usize) -> Result<&[Entry], Error> {
         let handle = self
             .handles

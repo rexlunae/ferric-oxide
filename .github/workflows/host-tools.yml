@@ -181,11 +181,11 @@ jobs:
       # job.
       - name: ferric-exfat
         run: |
-          cargo clippy --locked --no-deps --all-targets -p ferric-exfat -- -D warnings
-          cargo test --locked -p ferric-exfat
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-exfat
+          cargo clippy --locked --no-deps --all-targets -p ferric-exfat -p ferric-fat-types -- -D warnings
+          cargo test --locked -p ferric-exfat -p ferric-fat-types
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-exfat -p ferric-fat-types
           rustup target add x86_64-unknown-none
-          cargo build --locked -p ferric-exfat --target x86_64-unknown-none
+          cargo build --locked -p ferric-exfat -p ferric-fat-types --target x86_64-unknown-none
       # ferric-lvm: read-only LVM2 labels, metadata and LV mapping; no_std, so check it
       # builds for a bare-metal target as the kernel and the bootloader would use it.
       - name: ferric-lvm
@@ -356,6 +356,14 @@ jobs:
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path ../../recipes/tests/ferric-fat-test/files/Cargo.toml
+      - name: Check optional parser dependency
+        run: |
+          cargo tree --locked --no-default-features -e normal > "$RUNNER_TEMP/fatd-base-tree.txt"
+          if grep -q 'ferric-exfat' "$RUNNER_TEMP/fatd-base-tree.txt"; then
+            echo "fatd without exfat must not compile the exFAT parser" >&2
+            exit 1
+          fi
+          cargo tree --locked --features exfat -e normal | grep 'ferric-exfat'
       - name: Test (committed images)
         run: |
           cargo test --locked

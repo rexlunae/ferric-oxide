@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use thiserror::Error;
 
 use crate::time::Timestamp;
+use crate::wire::{BitmapRecord, FileRecord, LabelRecord, NameRecord, StreamRecord, UpcaseRecord};
 
 /// The size of a directory entry.
 pub const ENTRY_SIZE: usize = 32;
@@ -126,29 +127,6 @@ pub struct Listing {
     pub system: System,
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from(le32(b, at)) | u64::from(le32(b, at + 4)) << 32
-}
-
-/// The location fields every entry with data shares (bytes 20..32), for system entries.
-fn system_stream(e: &[u8]) -> Stream {
-    let length = le64(e, 24);
-    Stream {
-        first_cluster: le32(e, 20),
-        valid_length: length,
-        length,
-        contiguous: false,
-    }
-}
-
 /// The `SetChecksum` of an entry set: the 16-bit rotate-and-add over its bytes, skipping
 /// the checksum field itself (bytes 2 and 3 of the File entry).
 pub fn set_checksum(set: &[u8]) -> u16 {
@@ -181,20 +159,41 @@ pub fn parse(bytes: &[u8]) -> Result<Listing, DirError> {
             END => break,
             // Deleted entries, and secondaries whose primary was skipped.
             _ if kind & IN_USE == 0 || kind & SECONDARY != 0 => {}
-            BITMAP => listing.system.bitmaps[usize::from(e[1] & 1)] = Some(system_stream(e)),
-            UPCASE => listing.system.upcase = Some((system_stream(e), le32(e, 4))),
+            BITMAP => {
+                let record = BitmapRecord::read(e).ok_or(DirError::Malformed { offset })?;
+                listing.system.bitmaps[usize::from(record.flags & 1)] = Some(Stream {
+                    first_cluster: record.first_cluster,
+                    valid_length: record.length,
+                    length: record.length,
+                    contiguous: false,
+                });
+            }
+            UPCASE => {
+                let record = UpcaseRecord::read(e).ok_or(DirError::Malformed { offset })?;
+                listing.system.upcase = Some((
+                    Stream {
+                        first_cluster: record.first_cluster,
+                        valid_length: record.length,
+                        length: record.length,
+                        contiguous: false,
+                    },
+                    record.checksum,
+                ));
+            }
             LABEL => {
-                let n = usize::from(e[1]).min(11);
-                listing.system.label = (0..n).map(|k| le16(e, 2 + 2 * k)).collect();
+                let record = LabelRecord::read(e).ok_or(DirError::Malformed { offset })?;
+                let n = usize::from(record.count).min(record.units.len());
+                listing.system.label = record.units[..n].to_vec();
             }
             FILE => {
-                let secondaries = usize::from(e[1]);
+                let record = FileRecord::read(e).ok_or(DirError::Malformed { offset })?;
+                let secondaries = usize::from(record.secondaries);
                 let end = i + secondaries;
                 if secondaries < 2 || end > count {
                     return Err(DirError::Malformed { offset });
                 }
                 let set = &bytes[offset..end * ENTRY_SIZE];
-                if set_checksum(set) != le16(e, 2) {
+                if set_checksum(set) != record.checksum {
                     return Err(DirError::SetChecksum { offset });
                 }
                 listing.entries.push(file(set, offset)?);
@@ -217,12 +216,12 @@ pub fn parse(bytes: &[u8]) -> Result<Listing, DirError> {
 /// A File entry set, already checked against its checksum.
 fn file(set: &[u8], offset: usize) -> Result<Entry, DirError> {
     let malformed = DirError::Malformed { offset };
-    let f = &set[..ENTRY_SIZE];
-    let stream = &set[ENTRY_SIZE..2 * ENTRY_SIZE];
-    if stream[0] != STREAM {
+    let f = FileRecord::read(&set[..ENTRY_SIZE]).ok_or(malformed)?;
+    let stream = StreamRecord::read(&set[ENTRY_SIZE..2 * ENTRY_SIZE]).ok_or(malformed)?;
+    if stream.kind != STREAM {
         return Err(malformed);
     }
-    let name_len = usize::from(stream[3]);
+    let name_len = usize::from(stream.name_len);
     let name_entries = name_len.div_ceil(15);
     let names = &set[2 * ENTRY_SIZE..];
     if name_len == 0 || names.len() < name_entries * ENTRY_SIZE {
@@ -234,11 +233,12 @@ fn file(set: &[u8], offset: usize) -> Result<Entry, DirError> {
         .take(name_entries)
         .enumerate()
     {
-        if n[0] != NAME {
+        let n = NameRecord::read(n).ok_or(malformed)?;
+        if n.kind != NAME {
             return Err(malformed);
         }
         let units = (name_len - k * 15).min(15);
-        name.extend((0..units).map(|u| le16(n, 2 + 2 * u)));
+        name.extend_from_slice(&n.units[..units]);
     }
     // Secondaries after the names must be benign (vendor extensions); a critical one this
     // reader does not know means it cannot read the file correctly.
@@ -250,30 +250,39 @@ fn file(set: &[u8], offset: usize) -> Result<Entry, DirError> {
             });
         }
     }
-    let timestamp = |at: usize, ten_ms: Option<usize>, utc: usize| Timestamp {
-        packed: le32(f, at),
-        ten_ms: ten_ms.map_or(0, |t| f[t]),
-        utc_offset: f[utc],
-    };
     Ok(Entry {
         name,
-        attributes: le16(f, 4),
-        created: timestamp(8, Some(20), 22),
-        modified: timestamp(12, Some(21), 23),
-        accessed: timestamp(16, None, 24),
-        stream: Stream {
-            first_cluster: le32(stream, 20),
-            valid_length: le64(stream, 8),
-            length: le64(stream, 24),
-            contiguous: stream[1] & 2 != 0,
+        attributes: f.attributes,
+        created: Timestamp {
+            packed: f.created,
+            ten_ms: f.created_ten_ms,
+            utc_offset: f.created_utc,
         },
-        name_hash: le16(stream, 4),
+        modified: Timestamp {
+            packed: f.modified,
+            ten_ms: f.modified_ten_ms,
+            utc_offset: f.modified_utc,
+        },
+        accessed: Timestamp {
+            packed: f.accessed,
+            ten_ms: 0,
+            utc_offset: f.accessed_utc,
+        },
+        stream: Stream {
+            first_cluster: stream.first_cluster,
+            valid_length: stream.valid_length,
+            length: stream.length,
+            contiguous: stream.flags & 2 != 0,
+        },
+        name_hash: stream.name_hash,
     })
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_support::encode;
+    use simple_endian::LittleEndian;
 
     /// The entry set of a file `name` with the given stream, checksummed.
     pub(crate) fn file_set(name: &str, attributes: u16, stream: Stream) -> Vec<u8> {
@@ -282,24 +291,24 @@ pub(crate) mod tests {
         let mut set = alloc::vec![0u8; (2 + names) * ENTRY_SIZE];
         set[0] = FILE;
         set[1] = (1 + names) as u8;
-        set[4..6].copy_from_slice(&attributes.to_le_bytes());
-        set[12..16].copy_from_slice(&0x5C21_6000u32.to_le_bytes());
+        set[4..6].copy_from_slice(&encode(LittleEndian::from(attributes)));
+        set[12..16].copy_from_slice(&encode(LittleEndian::from(0x5C21_6000u32)));
         let s = &mut set[ENTRY_SIZE..2 * ENTRY_SIZE];
         s[0] = STREAM;
         s[1] = 1 | if stream.contiguous { 2 } else { 0 };
         s[3] = units.len() as u8;
-        s[8..16].copy_from_slice(&stream.valid_length.to_le_bytes());
-        s[20..24].copy_from_slice(&stream.first_cluster.to_le_bytes());
-        s[24..32].copy_from_slice(&stream.length.to_le_bytes());
+        s[8..16].copy_from_slice(&encode(LittleEndian::from(stream.valid_length)));
+        s[20..24].copy_from_slice(&encode(LittleEndian::from(stream.first_cluster)));
+        s[24..32].copy_from_slice(&encode(LittleEndian::from(stream.length)));
         for (k, chunk) in units.chunks(15).enumerate() {
             let n = &mut set[(2 + k) * ENTRY_SIZE..(3 + k) * ENTRY_SIZE];
             n[0] = NAME;
             for (u, unit) in chunk.iter().enumerate() {
-                n[2 + 2 * u..4 + 2 * u].copy_from_slice(&unit.to_le_bytes());
+                n[2 + 2 * u..4 + 2 * u].copy_from_slice(&encode(LittleEndian::from(*unit)));
             }
         }
         let sum = set_checksum(&set);
-        set[2..4].copy_from_slice(&sum.to_le_bytes());
+        set[2..4].copy_from_slice(&encode(LittleEndian::from(sum)));
         set
     }
 

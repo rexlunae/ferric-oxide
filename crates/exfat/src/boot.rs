@@ -7,11 +7,13 @@
 
 use thiserror::Error;
 
+use crate::wire::BootRecord;
+
 /// The `FileSystemName` field of an exFAT boot sector.
-pub const SIGNATURE: &[u8; 8] = b"EXFAT   ";
+pub const SIGNATURE: &[u8; 8] = ferric_fat_types::EXFAT_NAME;
 
 /// How many bytes of the boot sector [`BootSector::parse`] reads.
-pub const SECTOR_PREFIX: usize = 512;
+pub const SECTOR_PREFIX: usize = ferric_fat_types::BOOT_SECTOR_PREFIX;
 
 /// The sectors the boot checksum covers: the boot sector up to the OEM and reserved ones.
 pub const CHECKSUMMED_SECTORS: u64 = 11;
@@ -90,18 +92,6 @@ pub struct BootSector {
     pub dirty: bool,
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from(le32(b, at)) | u64::from(le32(b, at + 4)) << 32
-}
-
 impl BootSector {
     /// Reads and checks the first [`SECTOR_PREFIX`] bytes of a boot sector.
     ///
@@ -109,45 +99,46 @@ impl BootSector {
     ///
     /// The [`BootSectorError`] for the first field that is wrong.
     pub fn parse(b: &[u8; SECTOR_PREFIX]) -> Result<Self, BootSectorError> {
-        if &b[3..11] != SIGNATURE {
+        let record = BootRecord::read(b).ok_or(BootSectorError::Layout)?;
+        if &record.name != SIGNATURE {
             return Err(BootSectorError::NotExfat);
         }
-        if b[510..512] != [0x55, 0xAA] {
+        if record.signature != 0xaa55 {
             return Err(BootSectorError::NoSignature);
         }
-        if b[11..64].iter().any(|&x| x != 0) {
+        if record.must_zero.iter().any(|&x| x != 0) {
             return Err(BootSectorError::FatBpb);
         }
-        let revision = le16(b, 104);
+        let revision = record.revision;
         let (major, minor) = ((revision >> 8) as u8, revision as u8);
         if major != 1 {
             return Err(BootSectorError::Revision { major, minor });
         }
-        let sector_shift = b[108];
+        let sector_shift = record.sector_shift;
         if !(9..=12).contains(&sector_shift) {
             return Err(BootSectorError::SectorShift {
                 shift: sector_shift,
             });
         }
-        let cluster_shift = b[109];
+        let cluster_shift = record.cluster_shift;
         if u32::from(sector_shift) + u32::from(cluster_shift) > 25 {
             return Err(BootSectorError::ClusterShift {
                 shift: cluster_shift,
             });
         }
-        let fat_count = b[110];
+        let fat_count = record.fat_count;
         if !(1..=2).contains(&fat_count) {
             return Err(BootSectorError::FatCount { count: fat_count });
         }
-        let flags = le16(b, 106);
+        let flags = record.flags;
         let boot = Self {
-            volume_sectors: le64(b, 72),
-            fat_offset: le32(b, 80),
-            fat_length: le32(b, 84),
-            heap_offset: le32(b, 88),
-            cluster_count: le32(b, 92),
-            root_cluster: le32(b, 96),
-            serial: le32(b, 100),
+            volume_sectors: record.volume_sectors,
+            fat_offset: record.fat_offset,
+            fat_length: record.fat_length,
+            heap_offset: record.heap_offset,
+            cluster_count: record.cluster_count,
+            root_cluster: record.root_cluster,
+            serial: record.serial,
             sector_shift,
             cluster_shift,
             fat_count,
@@ -225,19 +216,21 @@ pub fn checksum(mut sum: u32, index: u64, sector: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::encode;
+    use simple_endian::LittleEndian;
 
     /// A minimal valid boot sector: 512-byte sectors, 4 KiB clusters.
     pub(crate) fn sector() -> [u8; SECTOR_PREFIX] {
         let mut b = [0; SECTOR_PREFIX];
         b[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
         b[3..11].copy_from_slice(SIGNATURE);
-        b[72..80].copy_from_slice(&65_536u64.to_le_bytes());
-        b[80..84].copy_from_slice(&128u32.to_le_bytes());
-        b[84..88].copy_from_slice(&64u32.to_le_bytes());
-        b[88..92].copy_from_slice(&256u32.to_le_bytes());
-        b[92..96].copy_from_slice(&8000u32.to_le_bytes());
-        b[96..100].copy_from_slice(&5u32.to_le_bytes());
-        b[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+        b[72..80].copy_from_slice(&encode(LittleEndian::from(65_536u64)));
+        b[80..84].copy_from_slice(&encode(LittleEndian::from(128u32)));
+        b[84..88].copy_from_slice(&encode(LittleEndian::from(64u32)));
+        b[88..92].copy_from_slice(&encode(LittleEndian::from(256u32)));
+        b[92..96].copy_from_slice(&encode(LittleEndian::from(8000u32)));
+        b[96..100].copy_from_slice(&encode(LittleEndian::from(5u32)));
+        b[104..106].copy_from_slice(&encode(LittleEndian::from(0x0100u16)));
         b[108] = 9;
         b[109] = 3;
         b[110] = 1;

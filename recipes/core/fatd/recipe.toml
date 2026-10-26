@@ -7,7 +7,7 @@ path = "userspace/fatd"
 [build]
 template = "custom"
 script = """
-# ferric-blocklayer, ferric-exfat and ferric-fspath are path dependencies at ../../crates from
+# ferric-blocklayer, ferric-fat-types, optional ferric-exfat and ferric-fspath are path dependencies at ../../crates from
 # userspace/fatd/. The cookbook builds a copy of userspace/fatd/ in this recipe's source/, so
 # give that copy the same relative path to them, as ext4d's recipe does.
 ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"

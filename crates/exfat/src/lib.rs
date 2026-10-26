@@ -49,10 +49,15 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 pub mod boot;
 pub mod dir;
-pub mod time;
+pub use ferric_fat_types::time;
 pub mod upcase;
+mod wire;
 
 use alloc::string::String;
 use alloc::vec;
@@ -60,6 +65,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use ferric_blocklayer::BlockDevice;
+use simple_endian::{FromSlice, LittleEndian};
 use thiserror::Error;
 
 pub use boot::{BootSector, BootSectorError};
@@ -263,6 +269,8 @@ impl<D: BlockDevice> ExFat<D> {
             });
         }
         let (table, checksum) = system.upcase.ok_or(Error::NoUpcase)?;
+        // Validate the directory's untrusted length before read_all allocates it.
+        Upcase::check_length(table.length)?;
         fs.upcase = Upcase::parse(&fs.read_all(&table)?, checksum)?;
         fs.label = String::from_utf16_lossy(&system.label);
         Ok(fs)
@@ -477,7 +485,9 @@ impl<D: BlockDevice> ExFat<D> {
             }
         };
         let i = (at - block_start) as usize;
-        let next = u32::from_le_bytes([block[i], block[i + 1], block[i + 2], block[i + 3]]);
+        let next = LittleEndian::<u32>::read_from_slice(&block[i..i + 4])
+            .map_err(|_| Error::BadCluster { cluster })?
+            .to_native();
         match next {
             END_OF_CHAIN => Ok(None),
             BAD_CLUSTER => Err(Error::BadCluster { cluster }),
@@ -530,7 +540,9 @@ fn check_boot_region<D: BlockDevice>(device: &D, boot: &BootSector) -> Result<()
         .read_at(boot::CHECKSUMMED_SECTORS * boot.sector_size(), &mut sector)
         .map_err(Error::Device)?;
     for word in sector.chunks_exact(4) {
-        let stored = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let stored = LittleEndian::<u32>::read_from_slice(word)
+            .map_err(|_| Error::BootSector(BootSectorError::Layout))?
+            .to_native();
         if stored != computed {
             return Err(Error::BootChecksum { stored, computed });
         }

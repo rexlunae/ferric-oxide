@@ -1,8 +1,12 @@
 //! The reader on exFAT images `tests/fixtures/make-fixtures.sh` builds with `mkfs.exfat`
 //! (see that script for what they hold).
 
+mod support;
+
+use simple_endian::{FromSlice, LittleEndian};
 use std::io::Read;
 use std::path::PathBuf;
+use support::encode;
 
 use ferric_blocklayer::Memory;
 use ferric_exfat::time::Timestamp;
@@ -220,7 +224,7 @@ fn damage_is_detected() {
 /// Writes `value` as the FAT entry of `cluster` in `bytes`, the image `volume` was read from.
 fn set_fat(bytes: &mut [u8], volume: &Volume, cluster: u32, value: u32) {
     let at = (volume.boot_sector().fat_start() + u64::from(cluster) * 4) as usize;
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    bytes[at..at + 4].copy_from_slice(&encode(LittleEndian::from(value)));
 }
 
 #[test]
@@ -237,7 +241,9 @@ fn chains_that_loop_or_end_early_are_errors() {
         // The second cluster's first byte is the pattern's, so the chain was followed.
         assert_eq!(one[0], big_byte(4096));
         let at = (volume.boot_sector().fat_start() + u64::from(first) * 4) as usize;
-        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        LittleEndian::<u32>::read_from_slice(&bytes[at..at + 4])
+            .unwrap()
+            .to_native()
     };
     let broken = |change: &dyn Fn(&mut Vec<u8>)| {
         let mut image = bytes.clone();
@@ -283,7 +289,7 @@ fn a_bitmap_shorter_than_the_heap_is_refused() {
         .find(|&at| bytes[at] == 0x81)
         .expect("a bitmap entry");
     let mut short = bytes.clone();
-    short[entry + 24..entry + 32].copy_from_slice(&(needed / 2).to_le_bytes());
+    short[entry + 24..entry + 32].copy_from_slice(&encode(LittleEndian::from(needed / 2)));
     let err = ExFat::open(Memory::new(short)).unwrap_err();
     assert!(
         matches!(err, Error::Bitmap { length, needed: n, .. } if length == needed / 2 && n == needed),
@@ -326,13 +332,13 @@ fn a_root_directory_over_256_mib_is_refused_before_it_is_read() {
     let b = &mut image[..512];
     b[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
     b[3..11].copy_from_slice(SIGNATURE);
-    b[72..80].copy_from_slice(&volume_sectors.to_le_bytes());
-    b[80..84].copy_from_slice(&fat_offset.to_le_bytes());
-    b[84..88].copy_from_slice(&8u32.to_le_bytes());
-    b[88..92].copy_from_slice(&heap_offset.to_le_bytes());
-    b[92..96].copy_from_slice(&clusters.to_le_bytes());
-    b[96..100].copy_from_slice(&2u32.to_le_bytes());
-    b[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+    b[72..80].copy_from_slice(&encode(LittleEndian::from(volume_sectors)));
+    b[80..84].copy_from_slice(&encode(LittleEndian::from(fat_offset)));
+    b[84..88].copy_from_slice(&encode(LittleEndian::from(8u32)));
+    b[88..92].copy_from_slice(&encode(LittleEndian::from(heap_offset)));
+    b[92..96].copy_from_slice(&encode(LittleEndian::from(clusters)));
+    b[96..100].copy_from_slice(&encode(LittleEndian::from(2u32)));
+    b[104..106].copy_from_slice(&encode(LittleEndian::from(0x0100u16)));
     b[108] = 9;
     b[109] = 16;
     b[110] = 1;
@@ -343,7 +349,7 @@ fn a_root_directory_over_256_mib_is_refused_before_it_is_read() {
         checksum(sum, i as u64, &image[i * 512..(i + 1) * 512])
     });
     for word in image[11 * 512..12 * 512].chunks_exact_mut(4) {
-        word.copy_from_slice(&sum.to_le_bytes());
+        word.copy_from_slice(&encode(LittleEndian::from(sum)));
     }
     // The root chain: clusters 2 to 10, one after another, then the end.
     let fat = fat_offset as usize * 512;
@@ -354,7 +360,7 @@ fn a_root_directory_over_256_mib_is_refused_before_it_is_read() {
             cluster + 1
         };
         let at = fat + cluster as usize * 4;
-        image[at..at + 4].copy_from_slice(&next.to_le_bytes());
+        image[at..at + 4].copy_from_slice(&encode(LittleEndian::from(next)));
     }
     let device = Sparse {
         prefix: image,
@@ -365,4 +371,55 @@ fn a_root_directory_over_256_mib_is_refused_before_it_is_read() {
         matches!(err, Error::DirectoryTooLarge { length } if length == 9 << 25),
         "{err:?}"
     );
+}
+
+#[test]
+fn invalid_upcase_lengths_are_rejected_before_reading_the_payload() {
+    use ferric_blocklayer::{BlockDevice, OutOfRange};
+    use ferric_exfat::UpcaseError;
+
+    #[derive(Debug)]
+    struct Guarded {
+        disk: Memory<Vec<u8>>,
+        payload: std::ops::Range<u64>,
+    }
+    impl BlockDevice for Guarded {
+        type Error = OutOfRange;
+        fn size(&self) -> u64 {
+            self.disk.size()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            assert!(
+                offset + buf.len() as u64 <= self.payload.start || offset >= self.payload.end,
+                "an invalid upcase stream must be rejected before its payload is read"
+            );
+            self.disk.read_at(offset, buf)
+        }
+    }
+    for (file, _) in IMAGES {
+        let bytes = load(file);
+        let boot = ferric_exfat::BootSector::parse(bytes[..512].try_into().unwrap()).unwrap();
+        let root = boot.cluster_start(boot.root_cluster) as usize;
+        let entry = (root..root + boot.cluster_size() as usize)
+            .step_by(32)
+            .find(|&at| bytes[at] == 0x82)
+            .expect("the upcase entry");
+        let first = LittleEndian::<u32>::read_from_slice(&bytes[entry + 20..entry + 24])
+            .unwrap()
+            .to_native();
+        let payload = boot.cluster_start(first)..boot.cluster_start(first) + boot.cluster_size();
+        for len in [131_074u64, 131_071, 1 << 30, u64::MAX] {
+            let mut damaged = bytes.clone();
+            damaged[entry + 24..entry + 32].copy_from_slice(&encode(LittleEndian::from(len)));
+            let err = ExFat::open(Guarded {
+                disk: Memory::new(damaged),
+                payload: payload.clone(),
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::Upcase(UpcaseError::Length { len: found }) if found == len),
+                "{file}, {len}: {err:?}"
+            );
+        }
+    }
 }

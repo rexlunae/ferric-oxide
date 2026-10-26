@@ -1135,17 +1135,24 @@ With `fs.exfat` (off by default; it needs `fs.fat`), fatd is built with its
 USB sticks over 32 GiB. It looks at the boot sector's file system name: an
 `EXFAT` volume goes to the exFAT reader, everything else to `fatfs`. Without the
 option, fatd refuses an exFAT volume with `EOPNOTSUPP` ("built without exFAT
-support") rather than as a damaged FAT volume.
+support") rather than as a damaged FAT volume. The parser dependency is optional:
+without this feature, fatd compiles only the shared identification constants and
+timestamp arithmetic in `ferric-fat-types` (`crates/fat-types/`), not `ferric-exfat`.
 
 The reader is `ferric-exfat` (`crates/exfat/`), a `no_std` crate written from
 Microsoft's published "exFAT file system specification" (revision 1.00 of the
 format). No suitable maintained crate existed, and no code comes from Linux or
 other exFAT implementations. It reads through the same `BlockDevice`, so exFAT
-on a partition, on LUKS or on LVM works as FAT does.
+on a partition, on LUKS or on LVM works as FAT does. Its disk records use native
+`Endianize` layouts and generated `simple_endian` wire types. A safe slice
+adapter reads those fields without casts, including from unaligned buffers;
+the crate forbids unsafe code.
 
 - **Checks:** the boot sector's fields and layout, the boot region's checksum
   (sector 11), the up-case table's checksum, and every directory entry set's
-  checksum. A critical entry type it does not know is an error; benign ones
+  checksum. The up-case table's declared length must be even and at most
+  128 KiB before its buffer is allocated or its payload read; compressed tables
+  cannot expand beyond 65536 UTF-16 entries. A critical entry type it does not know is an error; benign ones
   are skipped. The allocation bitmap must cover every cluster, the root
   directory's chain is refused once it passes the 256 MiB a directory may be
   (before anything is read into memory), and each file's FAT chain is checked

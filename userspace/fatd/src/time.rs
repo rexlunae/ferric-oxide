@@ -5,18 +5,18 @@
 //! date as years since 1980, month and day, and a time as hours, minutes and two-second
 //! units, with an optional count of hundredths of a second for creation times. `fatfs`
 //! decodes the fields into [`fatfs::Date`] and [`fatfs::Time`]; this module turns them into
-//! seconds and nanoseconds since 1970, with the calendar arithmetic `ferric-exfat` uses for
+//! seconds and nanoseconds since 1970, with the calendar arithmetic `ferric-fat-types` provides for
 //! exFAT's timestamps, which keep FAT's format.
 //!
 //! The specification does not say which time zone the fields are in, and FAT records none.
 //! `fatd` reads them as UTC, as the UEFI firmware and most other readers do.
 
-pub use ferric_exfat::time::UnixTime;
+pub use ferric_fat_types::time::UnixTime;
 
 /// The start of `date`, or `None` for a date the fields cannot hold (month 0 or above 12,
 /// day 0): FAT writes zero for "no date", which decodes to 1980-00-00.
 pub fn date(date: fatfs::Date) -> Option<UnixTime> {
-    let seconds = ferric_exfat::time::from_fields(date.year, date.month, date.day, 0, 0, 0)?;
+    let seconds = ferric_fat_types::time::from_fields(date.year, date.month, date.day, 0, 0, 0)?;
     Some((seconds, 0))
 }
 

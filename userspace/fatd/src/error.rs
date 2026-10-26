@@ -48,6 +48,7 @@ pub enum Error {
     ExFatDisabled,
     /// The exFAT reader refused the volume, or failed reading it.
     #[error("cannot read the exFAT volume")]
+    #[cfg(feature = "exfat")]
     ExFat(#[source] ferric_exfat::Error<io::Error>),
 }
 
@@ -65,15 +66,19 @@ impl Error {
             Self::Mount(_) => EINVAL,
             Self::Read(err) => io_errno(err),
             Self::ExFatDisabled => EOPNOTSUPP,
+            #[cfg(feature = "exfat")]
             Self::ExFat(ferric_exfat::Error::Device(err)) => io_errno(err),
+            #[cfg(feature = "exfat")]
             Self::ExFat(err) if err.is_mount_error() => EINVAL,
             // Damage found while reading: a bad chain, cluster or directory entry set.
+            #[cfg(feature = "exfat")]
             Self::ExFat(_) => EIO,
         }
     }
 
     /// An error of the exFAT reader, with the device's error carried as an [`io::Error`]
     /// like `fatfs` carries it.
+    #[cfg(feature = "exfat")]
     pub fn from_exfat<E>(err: ferric_exfat::Error<E>) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -115,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exfat")]
     fn exfat_errors_map_by_kind() {
         use ferric_exfat::{BootSectorError, Error as ExFatError};
         let mount = Error::from_exfat::<io::Error>(ExFatError::BootSector(BootSectorError::Layout));

@@ -52,6 +52,11 @@ and `ferric-exfat`'s fixture tests on exFAT images
 exfatprogs (`EXFAT_FIXTURES`), and lints and documents fatd both ways for the
 host and for `x86_64-unknown-redox`.
 
+The exFAT regressions reject oversized and odd-length up-case streams before
+reading their payload, and check generated wire layouts against literal byte
+fixtures. CI also checks `ferric-fat-types` on the host and bare metal and verifies
+that fatd's default dependency graph excludes `ferric-exfat`.
+
 Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
 running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
 rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining

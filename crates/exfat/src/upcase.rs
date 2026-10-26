@@ -8,6 +8,7 @@
 
 use alloc::vec::Vec;
 
+use simple_endian::{FromSlice, LittleEndian};
 use thiserror::Error;
 
 /// Why an up-case table was refused.
@@ -48,42 +49,60 @@ pub fn table_checksum(bytes: &[u8]) -> u32 {
 }
 
 impl Upcase {
+    /// Checks the declared byte length before allocating or reading a table.
+    ///
+    /// # Errors
+    ///
+    /// [`UpcaseError::Length`] for an odd length or more than 65536 UTF-16 units.
+    pub fn check_length(len: u64) -> Result<(), UpcaseError> {
+        if !len.is_multiple_of(2) || len > 2 * 65_536 {
+            return Err(UpcaseError::Length { len });
+        }
+        Ok(())
+    }
+
     /// Reads a table's bytes, checking them against the `stored` checksum.
     ///
     /// # Errors
     ///
     /// [`UpcaseError::Length`], [`UpcaseError::Checksum`] and [`UpcaseError::TooLong`].
     pub fn parse(bytes: &[u8], stored: u32) -> Result<Self, UpcaseError> {
-        let len = bytes.len() as u64;
-        if !len.is_multiple_of(2) || len > 2 * 65_536 {
-            return Err(UpcaseError::Length { len });
-        }
+        Self::check_length(bytes.len() as u64)?;
         let computed = table_checksum(bytes);
         if computed != stored {
             return Err(UpcaseError::Checksum { stored, computed });
         }
-        let mut units = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]));
+        let mut units = bytes.chunks_exact(2).map(|c| {
+            LittleEndian::<u16>::read_from_slice(c)
+                .map(|unit| unit.to_native())
+                .map_err(|_| UpcaseError::Length {
+                    len: bytes.len() as u64,
+                })
+        });
         let mut map = Vec::with_capacity(bytes.len() / 2);
         while let Some(unit) = units.next() {
+            let unit = unit?;
             if unit == 0xFFFF {
                 // A run of identity mappings; a trailing FFFF with no count maps U+FFFF.
                 let Some(count) = units.next() else {
+                    if map.len() == 65_536 {
+                        return Err(UpcaseError::TooLong);
+                    }
                     map.push(0xFFFF);
                     break;
                 };
+                let count = count?;
+                if map.len() + usize::from(count) > 65_536 {
+                    return Err(UpcaseError::TooLong);
+                }
                 for _ in 0..count {
                     map.push(map.len() as u16);
-                    if map.len() > 65_536 {
-                        return Err(UpcaseError::TooLong);
-                    }
                 }
             } else {
+                if map.len() == 65_536 {
+                    return Err(UpcaseError::TooLong);
+                }
                 map.push(unit);
-            }
-            if map.len() > 65_536 {
-                return Err(UpcaseError::TooLong);
             }
         }
         Ok(Self { map })
@@ -103,9 +122,10 @@ impl Upcase {
     /// low byte first ("NameHash Field" in the specification).
     pub fn name_hash(&self, name: &[u16]) -> u16 {
         name.iter().fold(0u16, |hash, &unit| {
-            let [lo, hi] = self.up(unit).to_le_bytes();
-            let hash = hash.rotate_right(1).wrapping_add(u16::from(lo));
-            hash.rotate_right(1).wrapping_add(u16::from(hi))
+            // NameHash is defined arithmetically on the low then high byte.
+            let unit = self.up(unit);
+            let hash = hash.rotate_right(1).wrapping_add(unit & 0xff);
+            hash.rotate_right(1).wrapping_add(unit >> 8)
         })
     }
 }
@@ -113,6 +133,8 @@ impl Upcase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::encode;
+    use simple_endian::LittleEndian;
 
     /// A compressed table: identity for 0..0x61, then a..z to A..Z, then identity for the
     /// rest of the first 256.
@@ -120,7 +142,10 @@ mod tests {
         let mut units = alloc::vec![0xFFFF, 0x61];
         units.extend((0x41..=0x5A).map(|u| u as u16));
         units.extend([0xFFFF, 256 - 0x7B]);
-        units.iter().flat_map(|u: &u16| u.to_le_bytes()).collect()
+        units
+            .iter()
+            .flat_map(|u: &u16| encode(LittleEndian::from(*u)))
+            .collect()
     }
 
     #[test]
@@ -152,7 +177,7 @@ mod tests {
         );
         let long: Vec<u8> = [0xFFFFu16, 0xFFFF, 0xFFFF, 0xFFFF]
             .iter()
-            .flat_map(|u| u.to_le_bytes())
+            .flat_map(|u| encode(LittleEndian::from(*u)))
             .collect();
         assert_eq!(
             Upcase::parse(&long, table_checksum(&long)),
