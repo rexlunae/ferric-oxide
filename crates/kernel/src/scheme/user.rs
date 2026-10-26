@@ -845,7 +845,21 @@ impl UserInner {
             .receive_into_user(buf, !nonblock, "UserInner::read (v2)", token)
         {
             // If we received requests, return them to the scheme handler
-            Ok(byte_count) => Ok(byte_count),
+            Ok(byte_count) => {
+                // Ferric Oxide: the scheme.sqe_deliver tracepoint (`kernel.trace`, debug
+                // level, for the I/O path). The record count is `byte_count` over the Sqe
+                // size: `receive_into_user` copies whole records only, and returns 0 for an
+                // empty buffer.
+                if byte_count > 0 {
+                    crate::trace::trace_event!(
+                        ferric_trace::kernel::SCHEME_SQE_DELIVER,
+                        self.scheme_id.get(),
+                        byte_count / size_of::<Sqe>(),
+                        byte_count,
+                    );
+                }
+                Ok(byte_count)
+            },
             // If there were no requests and O_NONBLOCK was used (EAGAIN), or some other error
             // occurred, return that.
             Err(error) => Err(error),
@@ -863,6 +877,15 @@ impl UserInner {
                 Err(_) if bytes_read > 0 => break,
                 Err(error) => return Err(error),
             }
+        }
+        // This batch includes control CQEs as well as request responses.
+        if bytes_read > 0 {
+            crate::trace::trace_event!(
+                ferric_trace::kernel::SCHEME_CQE_RECEIVE,
+                self.scheme_id.get(),
+                bytes_read / size_of::<Cqe>(),
+                bytes_read,
+            );
         }
         Ok(bytes_read)
     }
