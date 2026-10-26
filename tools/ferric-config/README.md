@@ -31,7 +31,7 @@ Redox.
 make menuconfig     # interactive editor; creates ferric.toml on first save
 make config-check   # validate ferric.toml
 make config-list    # every option, its value, and where the value came from
-make all            # regenerates build/ferric/ first if ferric.toml changed
+make all            # resolves the current target and generates build/ferric/
 ```
 
 The editor is a tree of menus:
@@ -88,8 +88,10 @@ kvm = "yes"
 ```
 
 Comments and layout are kept when the editor or `ferric-config set` changes
-the file. The next `make` regenerates `build/ferric/` and stops with a clear
-message if a value is unknown or invalid.
+the file. A build resolves the effective configuration before including
+`build/ferric/config.mk` and stops with a clear message if it is invalid.
+Configuration-only Make goals skip this automatic generation, so `make
+menuconfig` remains available to repair conflicting choices.
 
 The command line covers everything the editor does, which is the easiest
 route for agents:
@@ -105,7 +107,23 @@ $T unset kernel.numa           # back to the default
 $T explain kernel.cpu.smap     # help, choices, dependencies, conditional defaults
 $T schema                      # the whole catalog as JSON
 $T check                       # exit status 1 on errors
+$T check --override target.arch=aarch64
+$T generate --override target.arch=aarch64 --override image.config=native
+$T variants --json             # enabled CPU variants and each CPU type's minimum
 ```
+
+`check` and `generate` accept repeated `--override OPTION=VALUE` arguments.
+They apply before dependency resolution and validation, and do not edit
+`ferric.toml`. `menu` and `set` operate on saved choices.
+
+The processor menu has independent x86-64 and ARM64 submenus. Both can be
+configured from either host. Minimum baselines remain separate from the boolean
+variant options (`cpu.x86_64_v3`, `cpu.x86_64_v4`, `cpu.aarch64_v8_0`,
+`cpu.aarch64_v8_2`, `cpu.aarch64_v9`). Multiple boxes can be checked; variants
+below a CPU type's minimum are inactive. `cargo xtask build --all-variants`
+builds the checked variants into separate image directories. A normal build
+uses the active target's baseline. See the build chapter for filtering, running
+a variant and the remaining combined-image limitation.
 
 ## How options reach the build
 
@@ -127,9 +145,14 @@ see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reprod
 | Kernel Cargo features | `FERRIC_KERNEL_FEATURES`, passed by `recipes/core/kernel/recipe.toml` as `KERNEL_CARGO_FEATURES` together with `--no-default-features`, so turning a default feature off works. |
 | Kernel CPU feature policy | `build/ferric/kernel-config.toml`, copied into the kernel source as `config.toml`, which the kernel's `build.rs` reads (`always`/`auto`/`never` for SMAP, FSGSBASE, XSAVE, XSAVEOPT). |
 
-If `ARCH`, `BOARD` or `CONFIG_NAME` is overridden on the command line, the
-CPU, kernel and image settings are skipped for that run rather than applied to
-the wrong target.
+Make passes explicit `ARCH`, `BOARD` and `CONFIG_NAME` assignments (including
+legacy `.config` assignments) to the resolver as temporary overrides. Feature
+dependencies, CPU flags, kernel settings and image contents are then generated
+for the effective target. Inapplicable options are inactive; shared choices
+remain in effect. Every configured build resolves its inputs again, so switching
+or removing an override cannot reuse settings from the preceding target.
+Unchanged outputs retain their timestamps. Directly including an already
+generated `config.mk` retains its target guard as a defensive check.
 
 ### Rebuilds
 

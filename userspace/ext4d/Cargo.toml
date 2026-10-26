@@ -22,6 +22,10 @@ path = "src/main.rs"
 # Replay a volume's journal onto the disk before serving it (features.toml
 # fs.ext4_journal_replay). Off by default: without it ext4d never writes.
 journal-replay = ["dep:ferric-jbd2"]
+# Change the volume through its journal (features.toml fs.ext4_write): so far, setting an
+# inode's times. Off by default; needs the replay, since a volume is replayed before it is
+# written.
+write = ["journal-replay"]
 
 [dependencies]
 ext4-view = { version = "1.0.0", features = ["std"] }

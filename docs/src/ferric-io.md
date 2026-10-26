@@ -980,6 +980,43 @@ compare ext4d's replay with it block by block (apart from the write time and
 write count e2fsck also updates). CI also builds fresh ones with the runner's
 e2fsprogs and runs the same tests on them.
 
+### Writing through the journal
+
+`fs.ext4_write` (default off, needs `fs.ext4_journal_replay`; Cargo feature
+`write`) is the first step towards writable ext4: changing a volume through its
+journal. The scheme still serves volumes read-only; the one change so far,
+setting an existing inode's access, modification and change times
+(`ext4d::write::set_times`), is a library call that the scheme's `futimens`
+does not reach yet, because `ext4-view` does not say which inode a path names.
+
+- **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
+  changed block) into an empty journal from `s_first`: descriptor blocks with
+  a tag per block (the UUID after the first, `LAST_TAG` on the last, a block
+  that starts with the magic number logged with it zeroed and marked
+  `ESCAPE`), the copies, and a commit block. Descriptor tails, tags and the
+  commit block carry version 2 or 3 CRC32C checksums when the journal has
+  them; journals with version 1 checksums are refused. After a flush the
+  journal superblock is pointed at the transaction (`s_start`), and from then
+  on a replay finds it. `checkpoint` writes the blocks home, flushes, and
+  empties the journal again with the next sequence number.
+- **ext4d** (`userspace/ext4d/src/write.rs`) builds the new inode table block
+  (the times, with the epoch bits and nanoseconds in the `_extra` fields when
+  the inode has them, and the inode checksum from the volume's checksum seed,
+  `s_checksum_seed` with `metadata_csum_seed`), sets `needs_recovery`, commits
+  and checkpoints the transaction, and clears `needs_recovery`. It refuses
+  volumes that need recovery (replay them first), have no journal, or have a
+  feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
+  bits), and inodes that are free or already fail their checksum.
+
+A crash at any write leaves the old times or a journal whose replay gives the
+new ones. The tests crash a change before each of its eight writes and check
+that both ext4d's replay and `e2fsck`'s give one or the other, never a mix;
+with `EXT4D_E2FSCK` set (CI sets it) `e2fsck -fy` replays and `e2fsck -fn`
+must then find nothing to fix, on every volume the tests leave. The format
+comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
+"Inode Timestamps" and "Checksums" in "Ext4 Disk Layout", and experiments with
+e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
+
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
 `ferric-ext4-test` mounts the same image on the target, and with

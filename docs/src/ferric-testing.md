@@ -33,10 +33,12 @@ runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
 job tests `userspace/ext4d/` twice, on the committed ext4 images in
 `tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
-e2fsprogs (`EXT4D_FIXTURES`), each time with and without the journal replay
-(`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s), and
-lints and documents it for the host and for `x86_64-unknown-redox`, with and
-without the replay. The `ferric-jbd2` step tests, lints and documents the
+e2fsprogs (`EXT4D_FIXTURES`), each time without and with the journal replay
+(`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s) and with
+the journaled writer (`write`, whose tests hand every volume they leave,
+including ones crashed part-way through a change, to `e2fsck` through
+`EXT4D_E2FSCK`), and lints and documents it for the host and for
+`x86_64-unknown-redox` with each of those feature sets. The `ferric-jbd2` step tests, lints and documents the
 journal crate, and builds it for `x86_64-unknown-none` to keep it `no_std`.
 Its `blockd` job does the same for `userspace/blockd/` (with each
 of its layers alone and both, and with `ferric-unlock`'s `unlock` feature), and runs `ferric-blocklayer`'s fixture tests
@@ -178,6 +180,13 @@ cargo miri test --locked --manifest-path crates/kernel/tests/Cargo.toml --all-fe
 Miri requires the `miri` component for the declared nightly toolchain. The
 kernel-lints workflow runs these tests, including Miri; the shared buffer also
 receives the host workspace's strict Clippy and Rustdoc checks.
+
+The helper package also compiles the actual ordered-lock and wait-condition
+code for empty-list destruction tests, including `drop_panic`. Its host-only
+context/shootdown stubs fail if those hardware paths are reached. The regression
+holds another lock while destroying an empty condition and verifies no further
+lock acquisition occurs. This covers the page-cache cleanup panic found during
+an ARM64 native boot; it does not simulate blocked waiters or context switches.
 
 Coverage includes alignment, zero-length buffers, layout overflow and exact
 deallocation layouts, independent buffer clones, every CPU-mask word boundary,
