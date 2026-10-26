@@ -14,7 +14,7 @@ wasm userland as default if its benchmark gate passes).
 
 ## Status
 
-Last updated 24 October 2026.
+Last updated 26 October 2026.
 
 | Phase | Status | Merged | Open or next |
 | --- | --- | --- | --- |
@@ -28,7 +28,7 @@ Last updated 24 October 2026.
 | **3 Storage and filesystems** | In progress | Linux volumes, read-only: LUKS1/LUKS2 headers and volume-key recovery (`ferric-luks`) [#115](https://github.com/rexlunae/ferric-oxide/pull/115), LVM2 labels, metadata and LV mapping (`ferric-lvm`) [#116](https://github.com/rexlunae/ferric-oxide/pull/116) | Read-only ext4 scheme (`fs.ext4`) [#159](https://github.com/rexlunae/ferric-oxide/pull/159); stackable read-only block layer (`ferric-blocklayer`) with LUKS and LVM layers served by `ferric-blockd` (`fs.luks`, `fs.lvm`; LVM on LUKS and LUKS on LVM, on-target test) [#195](https://github.com/rexlunae/ferric-oxide/pull/195). Writable ext4 groundwork: JBD2 journal replay onto the disk (`ferric-jbd2`, `fs.ext4_journal_replay`), checked against `e2fsck` [#197](https://github.com/rexlunae/ferric-oxide/pull/197). Writing through the journal: a JBD2 transaction writer (`ferric-jbd2`, `fs.ext4_write`) that ext4d uses to set an inode's times, checked by `e2fsck` including after crashes. Remaining: unlocking at boot (bootloader/init), writable ext4 (allocation, directories, the scheme's write calls), XFS, FAT/exFAT, RedoxFS on rings, TRIM |
 | **4 Capability model** | Not started | | |
 | **5 Real hardware** | Started | | [#167](https://github.com/rexlunae/ferric-oxide/pull/167) (recovered hardware bring-up and multi-controller audio). Realtek 2.5G Ethernet: the RTL8125B driver `rtl8125d` (in progress, compiles for the target but has not run on the machine; QEMU does not emulate the controller), with the MAC and PHY firmware data in the host-tested `crates/rtl8125`. Not started: ACPI, USB, Wi-Fi and Bluetooth, multi-queue NVMe and virtio-net, Intel `ice`/`ixgbe` |
-| **6 Graphics and desktop** | Not started | | |
+| **6 Graphics and desktop** | Not started; deferred until the current PR backlog is merged | | Direction documented in [#227](https://github.com/rexlunae/ferric-oxide/pull/227): Wayland and Smithay, Mesa acceleration, Xwayland compatibility; Orbital deprecated as a legacy option. See [Phase 6](docs/src/ferric-roadmap.md#phase-6-graphics-and-desktop) for the plan and exit criteria |
 | **7 Server** | Not started | | |
 | **8 Releases** (M1, M2) | Not started | | |
 | **W WebAssembly userland** | In progress | W1 interfaces [#113](https://github.com/rexlunae/ferric-oxide/pull/113): host-tested `ferric:sys@1` import ABI and sealed code-cache entry format | Prepared interfaces only; no runtime or image integration. Next: W1 user-space runtime and native comparison; W2–W5 remain planned. See [WebAssembly interfaces](docs/src/ferric-wasm.md) |

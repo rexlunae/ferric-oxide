@@ -3,7 +3,7 @@
 The **scheme**, which takes its name from [URI schemes](https://en.wikipedia.org/wiki/List_of_URI_schemes), identifies the type of resource,
 and identifies the manager daemon responsible for that resource.
 
-Within Redox, a scheme may be thought of in a few ways. It is all of these things:
+Within Ferric Oxide, a scheme may be thought of in a few ways. It is all of these things:
 
 - The **type** of a resource, such as "file", "NVMe drive", "TCP connection", etc. (Note that these are not valid scheme names, they are just given by way of example.)
 - The starting point for locating the resource, i.e. it is the root of the path to the resource, which the system can then use in establishing a connection to the resource.
@@ -48,108 +48,72 @@ Some schemes implement `fmap`, which creates a memory-mapped area that is shared
 
 ## Userspace Schemes
 
-Redox creates user-space schemes during initialization, starting various daemon-style programs, each of which can provide one or more schemes.
+User-space schemes are served by daemons, most of which init starts during
+boot (see [Boot Process](./boot-process.md)). Each daemon can provide one or
+more schemes.
 
 | **Scheme** | **Daemon** | **Description** |
 |------------|------------|-----------------|
-| disk.* | ided, ahcid, nvmed | Storage drivers |
-| disk.live | lived | RAM-disk driver that loads the bootable USB data into RAM |
+| disk.* | ided, ahcid, nvmed, virtio-blkd | Storage drivers |
+| disk.live | lived | RAM-disk driver that loads the live image into RAM |
 | disk.usb-{id}+{port}-scsi | usbscsid | USB SCSI driver |
-| logging | [ramfs](https://gitlab.redox-os.org/redox-os/base/-/tree/main/ramfs?ref_type=heads) | Error logging scheme, using an in-memory temporary filesystem |
-| initfs | [bootstrap](https://gitlab.redox-os.org/redox-os/base/-/tree/main/bootstrap?ref_type=heads) | Startup filesystem |
-| file | [redoxfs](https://gitlab.redox-os.org/redox-os/redoxfs) | Main filesystem |
-| network | e1000d, rtl8168d | Link-level network send/receive |
-| ip | [smolnetd](https://gitlab.redox-os.org/redox-os/base/-/blob/main/netstack/src/scheme/ip.rs?ref_type=heads) | Raw IP packet send/receive |
-| tcp | [smolnetd](https://gitlab.redox-os.org/redox-os/base/-/blob/main/netstack/src/scheme/tcp.rs?ref_type=heads) | TCP sockets |
-| udp | [smolnetd](https://gitlab.redox-os.org/redox-os/base/-/blob/main/netstack/src/scheme/udp.rs?ref_type=heads) | UDP sockets |
-| icmp | [smolnetd](https://gitlab.redox-os.org/redox-os/base/-/blob/main/netstack/src/scheme/icmp.rs?ref_type=heads) | ICMP protocol |
-| netcfg | [smolnetd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/netstack/src/scheme/netcfg?ref_type=heads) | Network configuration |
-| display.vesa | vesad | VESA driver |
+| logging | [ramfs](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/ramfs) | Error logging scheme, using an in-memory temporary filesystem |
+| initfs | [bootstrap](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/bootstrap) | Startup filesystem |
+| file | [redoxfs](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/redoxfs) | Main filesystem |
+| network.* | e1000d, ixgbed, rtl8139d, rtl8168d, rtl8125d, virtio-netd | Link-level network send/receive; with `drivers.net_bypass`, also kernel-bypass queue sockets |
+| ip | [smolnetd](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/netstack/src/scheme/ip.rs) | Raw IP packet send/receive |
+| tcp | [smolnetd](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/netstack/src/scheme/tcp.rs) | TCP sockets |
+| udp | [smolnetd](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/netstack/src/scheme/udp.rs) | UDP sockets |
+| icmp | [smolnetd](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/netstack/src/scheme/icmp.rs) | ICMP protocol |
+| netcfg | [smolnetd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/netstack/src/scheme/netcfg) | Network configuration |
+| display.vesa | vesad | Firmware framebuffer driver |
 | display.virtio-gpu | virtio-gpud | VirtIO GPU driver |
-| orbital | [orbital](https://gitlab.redox-os.org/redox-os/orbital) | Windowing system (window manager and virtual driver) |
-| pty | [ptyd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/ptyd?ref_type=heads) | Pseudoterminals, used by terminal emulators |
+| orbital | orbital (recipe `gui/orbital`) | Windowing system (window manager and virtual driver) |
+| pty | [ptyd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/ptyd) | Pseudoterminals, used by terminal emulators |
 | audiorw | sb16d, ac97d, ihdad | Sound drivers |
-| audio | [audiod](https://gitlab.redox-os.org/redox-os/base/-/tree/main/audiod?ref_type=heads) | Audio manager and virtual device |
-| usb.* | usb*d | USB drivers |
+| audio | [audiod](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/audiod) | Audio manager and virtual device |
+| usb.* | xhcid | USB host controller; hub and HID drivers attach through it |
 | acpi | acpid | ACPI driver |
+| pci | pcid | PCI devices and the driver interface |
 | input | inputd | Virtual device |
-| sudo | sudo | Privilege manager |
-| chan | [ipcd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/ipcd?ref_type=heads) | Inter-process communication |
-| shm | [ipcd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/ipcd?ref_type=heads) | Shared memory manager |
-| log | [logd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/logd?ref_type=heads) | Logging |
-| rand | [randd](https://gitlab.redox-os.org/redox-os/base/-/tree/main/randd?ref_type=heads) | Pseudo-random number generator |
-| zero | [zerod](https://gitlab.redox-os.org/redox-os/base/-/tree/main/zerod?ref_type=heads) | Discard all writes, and always fill read buffers with zeroes |
-| null | [nulld](https://gitlab.redox-os.org/redox-os/base/-/tree/main/nulld?ref_type=heads) | Discard all writes, and read no bytes |
+| sudo | sudo (recipe `core/userutils`) | Privilege manager |
+| chan | [ipcd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/ipcd) | Inter-process communication |
+| shm | [ipcd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/ipcd) | Shared memory manager |
+| log | [logd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/logd) | Logging |
+| rand | [randd](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/randd) | Pseudo-random number generator |
+| zero | [zerod](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/zerod) | Discard all writes, and always fill read buffers with zeroes |
+| null | [zerod](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/zerod) | Discard all writes, and read no bytes |
+
+Daemons started by hand add their own schemes, for example `ext4d` for an ext4
+volume and `ferric-blockd` for LUKS and LVM volumes; see the
+[I/O chapter](./ferric-io.md).
 
 ## Kernel Schemes
 
-The kernel provides a small number of schemes in order to support userspace.
+The kernel provides a small number of schemes in order to support user space.
+Their code is in [`crates/kernel/src/scheme/`](https://github.com/rexlunae/ferric-oxide/tree/main/crates/kernel/src/scheme/). The schemes marked
+"Ferric Oxide" exist only when their feature option is on.
 
-| **Name** | **Documentation** | **Description**  |
-|----------|-------------------|------------------|
-| namespace | [root.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/root.rs) | Namespace manager |
-| user | [user.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/user.rs) | Dispatch for user-space schemes |
-| debug | [debug.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/debug.rs) | Debug messages that can't use the `log:` scheme |
-| event | [event.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/event.rs) | epoll-like file descriptor read/write "ready" events |
-| irq | [irq.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/irq.rs) | Interrupt manager (converts interrupts to messages) |
-| pipe | [pipe.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/pipe.rs) | Kernel manager for pipes |
-| proc | [proc.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/proc.rs) | Process context manager |
-| thisproc | [proc.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/proc.rs) | Process context manager |
-| sys | [mod.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/sys/mod.rs) | System hardware resources information |
-| kernel.acpi | [acpi.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/acpi.rs) | Read the CPU configuration (number of cores, etc) |
-| memory | [memory.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/memory.rs) | Physical memory mapping manager |
-| time | [time.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/time.rs) | Real-time clock timer |
-| itimer | [time.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/itimer.rs) | Interval timer |
-| serio | [serio.rs](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/scheme/serio.rs) | Serial I/O (PS/2) driver (must stay in the kernel due to PS/2 protocol issues) |
+| **Name** | **Source** | **Description**  |
+|----------|------------|------------------|
+| debug | [debug.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/debug.rs) | Debug messages that can't use the `log:` scheme |
+| event | [event.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/event.rs) | epoll-like file descriptor read/write "ready" events |
+| memory | [memory.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/memory.rs) | Physical memory mapping and, with an IOMMU, DMA address translation |
+| pipe | [pipe.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/pipe.rs) | Kernel manager for pipes |
+| serio | [serio.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/serio.rs) | Serial I/O (PS/2) driver (must stay in the kernel due to PS/2 protocol issues) |
+| irq | [irq.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/irq.rs) | Interrupt manager (converts interrupts to messages); per-CPU counts and steering with `kernel.irq_percpu` |
+| time | [time.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/time.rs) | Clocks and timers |
+| sys | [sys/](https://github.com/rexlunae/ferric-oxide/tree/main/crates/kernel/src/scheme/sys) | System information: contexts, CPUs, block and I/O statistics, the kernel log |
+| kernel.proc | [proc.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/proc.rs) | Process and context management |
+| kernel.acpi | [acpi.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/acpi.rs) | ACPI tables |
+| kernel.dtb | [dtb.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/dtb.rs) | The device tree, on device-tree platforms |
+| kernel.iommu | [iommu.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/iommu.rs) | Ferric Oxide: IOMMU DMA domains (`kernel.iommu`) |
+| kernel.regbuf | [regbuf.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/regbuf.rs) | Ferric Oxide: registered buffers and grants (`kernel.regbuf`) |
+| kernel.ring | [ring.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/ring.rs) | Ferric Oxide: submission/completion rings (`kernel.rings`) |
+| kernel.pcache | [pcache.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/pcache.rs) | Ferric Oxide: page cache read path (`kernel.page_cache`) |
+| kernel.trace | [trace.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/trace.rs) | Ferric Oxide: tracepoints, trace rings and profiles (`kernel.trace`) |
 
-## Scheme List
-
-This section has all Redox schemes in a list format to improve organization, coordination and focus.
-
-### Userspace
-
-- disk.*
-- disk.live
-- disk.usb-{id}+{port}-scsi
-- logging
-- initfs
-- file
-- network
-- ip
-- tcp
-- udp
-- icmp
-- netcfg
-- display.vesa
-- display.virtio-gpu
-- orbital
-- pty
-- audiorw
-- audio
-- usb.*
-- sudo
-- acpi
-- input
-- chan
-- shm
-- log
-- rand
-- zero
-- null
-
-### Kernel
-
-- namespace
-- user
-- debug
-- event
-- irq
-- pipe
-- proc
-- thisproc
-- sys
-- kernel.acpi
-- memory
-- time
-- itimer
-- serio
+User-space schemes reach the kernel through [user.rs](https://github.com/rexlunae/ferric-oxide/blob/main/crates/kernel/src/scheme/user.rs),
+which turns system calls on their descriptors into messages to the daemon.
+Namespaces are served in user space, by the namespace manager that bootstrap
+starts.
