@@ -127,6 +127,18 @@ and wakeups synchronize through the futex table in `syscall/futex.rs` so a
 wakeup cannot pass between the comparison and waiter registration. Expired
 waiters cannot consume a later wake intended for another waiter.
 
+A wake-up for a context that last ran on another CPU goes on that CPU's
+cross-CPU wake-up list, and the waker sends the wake-up IPI to that CPU only
+(`context::wakeup_context`; contexts the scheduler hands to a CPU their
+affinity allows go the same way). Upstream broadcast the IPI to every other
+CPU, so each cross-CPU wake-up interrupted every CPU, and every CPU drained
+its own list as a side effect of other CPUs' wake-ups. Ferric Oxide's
+`schedule` drains the CPU's cross-CPU list too, so a wake-up whose IPI is not
+delivered (the target's APIC ID not yet recorded, or a port without IPIs) runs
+at that CPU's next switch rather than waiting for a later wake-up. The IPI does
+not preempt a busy CPU: the woken context waits for that CPU's next switch,
+which today is at most one scheduler tick away.
+
 Address-space mappings, sharing and copy-on-write live under
 `crates/kernel/src/context/`; physical allocation and page tables are in
 `src/memory/` and the kernel's `rmm/`. Registered buffers and DMA retain frame
