@@ -334,6 +334,75 @@ Before, the context waited for the CPU's next timer interrupt (up to about
 client's buffer kept tripping this on the CPU of the worker it had just
 woken, which held two-thread reads to about 400 IOPS.
 
+A wake-up drained into an idling CPU must not be left behind either (#200).
+The wake-up IPI handler moves the wake-ups into the CPU's local list, which
+only the next `switch` processes, so on a CPU that runs its idle context the
+handler switches at once. Before it halts, the idle loop re-checks the local
+list with interrupts disabled. That check is for wake-ups that have no
+interrupt behind them: a contended switch's re-push, or a direct switch back.
+A wake-up IPI cannot strand anything at the halt. `sti; hlt` holds interrupts
+until the `hlt` has executed, and an interrupt that ends a halt returns past
+the `hlt` (Intel SDM, STI and HLT), so the loop always runs again. A
+`Contended` result from the handler's switch is therefore not retried inside
+the handler, where spinning with interrupts off could wait on a CPU that is
+waiting for this one. The loop it returns to retries with interrupts on. The handler asks
+whether the CPU is idling through `try_idle_context` (#214). The reason is
+`kernel.profiling`'s profiler CPU, which routes every vector from 33 up to
+this handler and never sets up contexts. Asking that CPU for its idle context
+panicked; it then stopped answering TLB shootdowns, and the profile image hung
+with the other CPUs waiting for it. Because the TLB shootdown vector is among
+those routed vectors, the handler now answers a pending shootdown on such a
+CPU, as the `tlb` handler would. Otherwise its `wants_tlb_shootdown` stays
+set, and the next broadcast shootdown (sent when a kernel shadow stack is
+freed) spins on it forever.
+
+The context-free acknowledgement branch is shared with host/Miri regression
+tests: it returns no idle context, services a pending TLB shootdown before EOI
+and never reads current-context state. This is control-flow coverage; actual
+interrupt entry/TLB hardware remain covered by target boots and hardware tests.
+Device IRQ targeting now excludes the profiler CPU from `irq:` listings,
+steering and IOMMU destinations. The xAPIC ID register is decoded from bits
+31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
+modes, and smoke CI also boots with x2APIC disabled.
+
+### Where a request's time goes (drivers.nvmed_perf)
+
+`drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
+each I/O request's phases with the CPU cycle counter and logs a summary about
+once a second:
+
+```text
+nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+```
+
+- `read.service`/`write.service` cover request entry through return, including
+  partial errors, on both buffered and DMA paths. Timing belongs to the request
+  future, so interleaved requests on one executor thread remain separate.
+- `read.device`/`write.device` sum each request's command durations, starting
+  when a free submission-queue slot is accepted and ending when its completion
+  is observed by that future. Full-queue waits are excluded; doorbell batching,
+  controller service and completion wakeup latency are included. These are not
+  pure controller-time measurements. Each request publishes one sample of each
+  phase together, so the counts and interval boundaries match.
+- Service minus command time measures the remaining driver work, including
+  buffer preparation, free-slot waits and copies.
+
+A separate reporting thread takes and resets the counters once a second, so
+samples are reported even after an I/O burst goes idle. Logging happens outside
+the counter lock. Reports are time windows, not benchmark rounds: a short job
+may share a window with another job. Use isolated workloads or explicit trace
+markers for round attribution, rather than assigning a report to the last job.
+
+On x86 the counter reads add no system calls and are calibrated against the
+monotonic clock at startup; other architectures read the monotonic clock.
+The reporting thread adds its own timer/logging calls. Kernel tracing supplies
+thread identity and socket/request timing (`scheme.request`/`scheme.response`,
+`sched.switch`, `irq.deliver`/`irq.ack`, and debug-level `scheme.sqe_deliver`/
+`scheme.cqe_receive`). Historical measurements from before these accounting
+fixes need remeasurement before deriving per-request phase differences. The
+phase figures compare one boot; they are not a documented time source.
+
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
