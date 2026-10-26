@@ -36,14 +36,18 @@ pub(crate) const COMMIT: u32 = 2;
 pub(crate) const REVOKE: u32 = 5;
 
 /// The block's first four bytes were the magic number and were zeroed in the log.
-const FLAG_ESCAPE: u32 = 0x1;
+pub(crate) const FLAG_ESCAPE: u32 = 0x1;
 /// No UUID follows this tag.
-const FLAG_SAME_UUID: u32 = 0x2;
+pub(crate) const FLAG_SAME_UUID: u32 = 0x2;
 /// This is the descriptor's last tag.
-const FLAG_LAST_TAG: u32 = 0x8;
+pub(crate) const FLAG_LAST_TAG: u32 = 0x8;
 
 /// Where a commit block keeps its checksum.
-const COMMIT_CHECKSUM_AT: usize = 0x10;
+pub(crate) const COMMIT_CHECKSUM_AT: usize = 0x10;
+/// Where descriptor tags start, after the block header.
+pub(crate) const TAGS_AT: usize = 12;
+/// The length of the UUID that follows a tag without `SAME_UUID`.
+pub(crate) const UUID_LEN: usize = 16;
 /// Where revoke records start.
 const REVOKE_RECORDS_AT: usize = 16;
 
@@ -62,7 +66,7 @@ pub(crate) struct Tag {
 }
 
 /// The bytes at the end of a descriptor or revoke block that hold its checksum, if any.
-fn tail_len(sb: &Superblock) -> usize {
+pub(crate) fn tail_len(sb: &Superblock) -> usize {
     if sb.checksum().is_crc32c() { 4 } else { 0 }
 }
 
@@ -83,23 +87,28 @@ pub(crate) fn commit_ok(block: &[u8], sb: &Superblock) -> bool {
     be32(block, COMMIT_CHECKSUM_AT) == crc32c_without(&[sb.uuid()], block, COMMIT_CHECKSUM_AT)
 }
 
-/// The tags of a descriptor block, in order. Parsing stops at `LAST_TAG` or where the next
-/// tag would run into the tail.
-pub(crate) fn tags(block: &[u8], sb: &Superblock) -> Vec<Tag> {
-    let v3 = sb.checksum() == ChecksumKind::V3;
+/// The bytes one descriptor tag takes, not counting a UUID after it.
+pub(crate) fn tag_size(sb: &Superblock) -> usize {
     let v2_padding = if sb.checksum() == ChecksumKind::V2 {
         2
     } else {
         0
     };
-    let size = match (v3, sb.is_64bit()) {
+    match (sb.checksum() == ChecksumKind::V3, sb.is_64bit()) {
         (true, _) => 16,
         (false, true) => 12 + v2_padding,
         (false, false) => 8 + v2_padding,
-    };
+    }
+}
+
+/// The tags of a descriptor block, in order. Parsing stops at `LAST_TAG` or where the next
+/// tag would run into the tail.
+pub(crate) fn tags(block: &[u8], sb: &Superblock) -> Vec<Tag> {
+    let v3 = sb.checksum() == ChecksumKind::V3;
+    let size = tag_size(sb);
     let end = block.len() - tail_len(sb);
     let mut tags = Vec::new();
-    let mut at = 12;
+    let mut at = TAGS_AT;
     while at + size <= end {
         let (low, flags, high, checksum) = if v3 {
             (
@@ -125,13 +134,39 @@ pub(crate) fn tags(block: &[u8], sb: &Superblock) -> Vec<Tag> {
         });
         at += size;
         if flags & FLAG_SAME_UUID == 0 {
-            at += 16;
+            at += UUID_LEN;
         }
         if flags & FLAG_LAST_TAG != 0 {
             break;
         }
     }
     tags
+}
+
+/// Writes `tag` at `at` in a descriptor block, the inverse of [`tags`]: `flags` are the
+/// `SAME_UUID` and `LAST_TAG` bits, and `ESCAPE` is added from the tag. The high half of the
+/// block number is dropped without `INCOMPAT_64BIT`, and the checksum is cut to 16 bits
+/// without version 3 checksums; the caller checks both fit.
+pub(crate) fn put_tag(block: &mut [u8], at: usize, sb: &Superblock, tag: &Tag, flags: u32) {
+    let flags = flags | if tag.escaped { FLAG_ESCAPE } else { 0 };
+    // Truncation is the format: the low and high halves are separate fields.
+    let (low, high) = (tag.target as u32, (tag.target >> 32) as u32);
+    put32(block, at, low);
+    if sb.checksum() == ChecksumKind::V3 {
+        put32(block, at + 4, flags);
+        put32(block, at + 8, high);
+        put32(block, at + 12, tag.checksum);
+    } else {
+        put32(block, at + 4, (tag.checksum & 0xFFFF) << 16 | flags);
+        if sb.is_64bit() {
+            put32(block, at + 8, high);
+        }
+    }
+}
+
+/// Stores `value` big-endian at `at`; `block` is long enough for every caller.
+pub(crate) fn put32(block: &mut [u8], at: usize, value: u32) {
+    block[at..at + 4].copy_from_slice(&value.to_be_bytes());
 }
 
 /// A revoke block whose `r_count` does not fit it.
@@ -260,6 +295,39 @@ mod tests {
         }
         block[1020..].fill(0xFF);
         assert_eq!(tags(&block[..], &sb).len(), 63);
+    }
+
+    #[test]
+    fn tags_read_back_as_they_were_put() {
+        for incompat in [0, 0x2, 0x8, 0x8 | 0x2, 0x10, 0x10 | 0x2] {
+            let sb = sb(incompat);
+            let wide = sb.is_64bit();
+            let first = Tag {
+                target: if wide { 0x7_0000_0001 } else { 0x7001 },
+                escaped: true,
+                checksum: if sb.checksum() == ChecksumKind::V3 {
+                    0xDEAD_BEEF
+                } else {
+                    0xBEEF
+                },
+            };
+            let second = Tag {
+                target: 42,
+                escaped: false,
+                checksum: 0,
+            };
+            let mut block = [0u8; 1024];
+            put_tag(&mut block, TAGS_AT, &sb, &first, 0);
+            let next = TAGS_AT + tag_size(&sb) + UUID_LEN;
+            put_tag(
+                &mut block,
+                next,
+                &sb,
+                &second,
+                FLAG_SAME_UUID | FLAG_LAST_TAG,
+            );
+            assert_eq!(tags(&block, &sb), [first, second], "{incompat:#x}");
+        }
     }
 
     #[test]
