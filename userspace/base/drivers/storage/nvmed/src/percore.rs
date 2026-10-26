@@ -88,6 +88,10 @@ struct Job {
     lba: u64,
     op: Op,
     claim: Claim<syscall::Result<usize>>,
+    /// When the job was queued and, once the worker settles it, when that happened
+    /// ([`crate::perf::ticks`]), for the hand-off timing.
+    #[cfg(feature = "perf")]
+    hops: (u64, Arc<AtomicU64>),
 }
 
 // SAFETY: the pointers in `op` stay valid until the job is settled: the scheme future that
@@ -153,6 +157,8 @@ impl Dispatcher {
     /// Sets how requests are placed from now on.
     pub fn set_policy(&self, policy: QueuePolicy) {
         log::info!("nvmed: queue policy {policy:?}");
+        #[cfg(feature = "perf")]
+        crate::perf::policy_changed(policy.name());
         self.policy.set(policy);
     }
 
@@ -216,12 +222,16 @@ impl Dispatcher {
         };
         let worker = &self.workers[index];
         let (slot, claim) = JobSlot::new();
+        #[cfg(feature = "perf")]
+        let settled = Arc::new(AtomicU64::new(0));
         let job = Job {
             id,
             namespace,
             lba,
             op,
             claim,
+            #[cfg(feature = "perf")]
+            hops: (crate::perf::ticks(), Arc::clone(&settled)),
         };
         if worker.jobs.send(Work::Job(job)).is_err() {
             log::error!("nvmed: the worker on CPU {} is gone", worker.cpu.get());
@@ -246,6 +256,12 @@ impl Dispatcher {
             slot,
         }
         .await;
+        // An abandoned job never got a settle time.
+        #[cfg(feature = "perf")]
+        match settled.load(Ordering::Acquire) {
+            0 => {}
+            at => crate::perf::hop(crate::perf::Hop::Return, at),
+        }
         self.started.borrow_mut().remove(&id);
         result
     }
@@ -262,6 +278,8 @@ impl Dispatcher {
             namespace,
             io,
             _counted: self.in_flight.claim(),
+            #[cfg(feature = "perf")]
+            queued: crate::perf::ticks(),
         };
         while let Some(index) = self.next_live_worker() {
             let worker = &self.workers[index];
@@ -843,6 +861,8 @@ fn serve(
             loop {
                 match end.next_job() {
                     Next::Job(Work::Job(job)) => {
+                        #[cfg(feature = "perf")]
+                        crate::perf::hop(crate::perf::Hop::Handoff, job.hops.0);
                         let id = job.id;
                         in_flight.set(Some((id, Instant::now())));
                         run(&nvme, job).await;
@@ -853,7 +873,11 @@ fn serve(
                         namespace,
                         io,
                         _counted,
+                        #[cfg(feature = "perf")]
+                        queued,
                     }) => {
+                        #[cfg(feature = "perf")]
+                        crate::perf::hop(crate::perf::Hop::Handoff, queued);
                         in_flight.set(Some((WORKER_GONE, Instant::now())));
                         answer(&nvme, namespace, io).await;
                         in_flight.set(None);
@@ -877,6 +901,9 @@ enum Work {
         io: PendingIo,
         /// Retained through enqueue, response, failure and worker-exit cleanup.
         _counted: InFlightGuard,
+        /// When it was queued ([`crate::perf::ticks`]), for the hand-off timing.
+        #[cfg(feature = "perf")]
+        queued: u64,
     },
 }
 
@@ -897,6 +924,8 @@ async fn run(nvme: &Nvme, job: Job) {
         lba,
         op,
         claim,
+        #[cfg(feature = "perf")]
+        hops,
         ..
     } = job;
     let result = match op {
@@ -919,5 +948,7 @@ async fn run(nvme: &Nvme, job: Job) {
             .await
             .map(|()| 0),
     };
+    #[cfg(feature = "perf")]
+    hops.1.store(crate::perf::ticks(), Ordering::Release);
     claim.complete(result);
 }
