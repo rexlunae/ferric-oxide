@@ -689,20 +689,7 @@ execution/FUSE feature. On macOS that optional tool requires a libfuse setup;
 the native build and the targeted commands above require neither FUSE nor
 macFUSE.
 
-## Documentation checks
-
-The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
-From `docs/`, run:
-
-```sh
-./unused_pages.sh
-mdbook build
-```
-
-`lychee src` is the book's optional link-checking command. If those tools are
-unavailable, report that limitation and at least check local page links,
-anchors, source paths and table-of-contents coverage. Do not report an unrun
-render or OS boot as successful.
+## Focused regression checks
 
 ### Portable executor core
 
@@ -733,3 +720,18 @@ EOI without reading current-context state. Ordinary idle/running CPU decisions
 and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
+
+## Documentation checks
+
+The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
+From `docs/`, run:
+
+```sh
+./unused_pages.sh
+mdbook build
+```
+
+`lychee src` is the book's optional link-checking command. If those tools are
+unavailable, report that limitation and at least check local page links,
+anchors, source paths and table-of-contents coverage. Do not report an unrun
+render or OS boot as successful.
