@@ -41,6 +41,8 @@ extern crate alloc;
 
 pub mod ab;
 pub mod abi;
+#[cfg(feature = "alloc")]
+pub mod activity;
 pub mod ids;
 #[cfg(feature = "alloc")]
 pub mod openers;

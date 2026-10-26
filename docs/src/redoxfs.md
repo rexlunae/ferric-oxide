@@ -1,21 +1,19 @@
 # RedoxFS
 
-This is the default filesystem of Redox OS, inspired by ZFS and adapted to a microkernel architecture.
+RedoxFS is the default file system of Ferric Oxide. It was written for Redox OS, inspired by ZFS and adapted to a microkernel architecture, and its source is in `userspace/redoxfs/`. Ferric Oxide keeps the name, because images, tools and the bootloader depend on it.
 
-Redox had a read-only ZFS driver but it was abandoned because of the monolithic nature of ZFS that created problems with the Redox microkernel design.
-
-(It's a replacement for [TFS](https://gitlab.redox-os.org/redox-os/tfs))
+Ferric Oxide also reads ext4 volumes, and LUKS and LVM volumes under them, through separate daemons; see the [I/O chapter](./ferric-io.md#ext4-read-only). With `kernel.page_cache`, RedoxFS serves reads of files opened read-only through the kernel's page cache.
 
 Current features:
 
-- Compatible with Redox and Linux (FUSE)
+- Usable on Ferric Oxide and, through FUSE, on Linux
 - Copy-on-write
 - Data/metadata checksums
 - Transparent encryption
 - Standard Unix file attributes
 - File/directory size limit up to 193TiB (212TB)
 - File/directory quantity limit up to 4 billion per 193TiB (2^32 - 1 = 4294967295)
-- Disk encryption fully supported by the Redox bootloader, letting it load the kernel off an encrypted partition.
+- Disk encryption fully supported by the bootloader, letting it load the kernel off an encrypted partition.
 - MIT licensed
 
 Being MIT licensed, RedoxFS can be bundled on GPL-licensed operating systems (Linux, for example).

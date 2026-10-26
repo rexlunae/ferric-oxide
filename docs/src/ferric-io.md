@@ -365,7 +365,16 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### NVMe request lifetime accounting
 
+The dispatcher counts inline requests, awaited worker jobs and requests that
+workers answer directly through one `ferric-blkqueue::activity::Claim` per
+request. A direct job carries its claim from enqueue until its response or
+drop, including failed delivery and worker exit. Completing another inline
+request cannot hide a worker that is still active when the queue policy changes.
+The shared counter uses atomics because direct jobs finish on worker threads.
+Adaptive and MainQueue continue serving requests serially; explicit Workers
+continues to use concurrent direct responses.
 
 ### Where a request's time goes (drivers.nvmed_perf)
 

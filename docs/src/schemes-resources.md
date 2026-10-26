@@ -1,9 +1,7 @@
 # Schemes and Resources
 
-TODO: update outdated information on this chapter pages
-
-An essential design choice made for Redox is to refer to resources using scheme-rooted paths.
-This gives Redox the ability to:
+An essential design choice, inherited from Redox, is to refer to resources using scheme-rooted paths.
+This makes it possible to:
 
 - Treat resources (files, devices, etc.) in a consistent manner
 - Provide resource-specific behaviors with a common interface
