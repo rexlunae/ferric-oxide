@@ -411,6 +411,72 @@ crate::events! {
         level: Info,
         args: ["space", "new_space", "addr", "pages"],
     }
+    /// The kernel copied whole Sqe records to a user scheme's `read` (the daemon's
+    /// "next request" step, `UserInner::read`): the scheme id, the request count and the
+    /// byte count.
+    ///
+    /// This is a debug-level event for the I/O path: together with `scheme.request` it
+    /// separates the kernel's queueing of a request from the scheme's seeing it, so a
+    /// capture can attribute the gap to scheduling or the socket copy. It fires for every
+    /// user scheme, not only the disk. Only whole records are copied, so `count` is
+    /// `bytes / size_of::<Sqe>()`.
+    pub const SCHEME_SQE_DELIVER = 31 {
+        name: "scheme.sqe_deliver",
+        subsystem: Scheme,
+        level: Debug,
+        args: ["scheme", "count", "bytes"],
+    }
+
+    /// The kernel accepted a user scheme's `write` of Cqe records (the daemon's
+    /// "answer" step, `UserInner::write`): the scheme id, the response count and the
+    /// byte count.
+    ///
+    /// This is a debug-level event for the I/O path: together with `scheme.response` it
+    /// separates the scheme's writing an answer from the kernel's accepting it. It fires
+    /// for every user scheme, not only the disk. Only whole Cqe records are accepted, so
+    /// `count` is `bytes / size_of::<Cqe>()`. Commands that produced no Cqe batch
+    /// (a zero-length write) are not recorded.
+    pub const SCHEME_CQE_RECEIVE = 32 {
+        name: "scheme.cqe_receive",
+        subsystem: Scheme,
+        level: Debug,
+        args: ["scheme", "count", "bytes"],
+    }
+    /// The periodic scheduler tick advanced time on this CPU: the x86 PIT interrupt
+    /// handler just added one `pit::RATE` to `time::OFFSET`, and will broadcast the
+    /// `Pit` IPI, trigger time-scheme timeouts and call the scheduler's tick
+    /// accounting. One record per PIT interrupt, on the CPU that owns the PIT (the
+    /// BSP). Together with `sched.ipi_pit` it counts the periodic timer interrupts
+    /// the tickless work must stop.
+    pub const SCHED_TICK = 33 {
+        name: "sched.tick",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received the periodic `Pit` broadcast IPI the BSP sends after each
+    /// `sched.tick`, and is about to run the scheduler's tick accounting. One record
+    /// per pit IPI, on every non-BSP CPU.
+    pub const SCHED_IPI_PIT = 34 {
+        name: "sched.ipi_pit",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received a `Wakeup` IPI and is about to drain the cross-CPU wakeup
+    /// list into its local wakeup list: the number of contexts that were on the
+    /// cross-CPU list. The scheduler can only consider these wakeups when an
+    /// interrupt arrives, so busy CPUs whose interrupts are disabled can run stale
+    /// run queues until the next periodic tick or targeted IPI.
+    pub const SCHED_IPI_WAKE = 35 {
+        name: "sched.ipi_wake",
+        subsystem: Sched,
+        level: Info,
+        args: ["drained"],
+    }
+
 }
 
 /// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
