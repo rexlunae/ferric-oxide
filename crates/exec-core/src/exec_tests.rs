@@ -579,6 +579,7 @@ fn wake_during_a_poll_is_seen_by_the_sleep_handshake() {
     let clock = clock();
     let mut exec = executor(&clock);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (notified_tx, notified_rx) = std::sync::mpsc::channel();
     let runs = Arc::new(AtomicU64::new(0));
     let id = exec
         .spawn({
@@ -586,13 +587,11 @@ fn wake_during_a_poll_is_seen_by_the_sleep_handshake() {
             move |_| {
                 let n = runs.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 {
-                    // The long first poll: it signals, spins long enough for the
-                    // waker to land, then returns `Wait`.
+                    // Hold this poll until the producer confirms its wake.
                     let _ = started_tx.send(());
-                    let end = std::time::Instant::now() + std::time::Duration::from_millis(50);
-                    while std::time::Instant::now() < end {
-                        std::hint::spin_loop();
-                    }
+                    notified_rx
+                        .recv()
+                        .expect("notification happened during this poll");
                     Step::Wait
                 } else {
                     Step::Done { result: n }
@@ -603,8 +602,8 @@ fn wake_during_a_poll_is_seen_by_the_sleep_handshake() {
     let waker = exec.waker(id).expect("a live waker");
     let waker_thread = std::thread::spawn(move || {
         started_rx.recv().expect("the task started");
-        std::thread::sleep(std::time::Duration::from_millis(5));
         waker.wake();
+        notified_tx.send(()).expect("the task is still polling");
     });
     let outcome = exec.poll();
     waker_thread.join().expect("the waker thread");
@@ -618,6 +617,7 @@ fn a_cancel_during_a_poll_settles_at_the_step_boundary() {
     let clock = clock();
     let mut exec = executor(&clock);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (notified_tx, notified_rx) = std::sync::mpsc::channel();
     let runs = Arc::new(AtomicU64::new(0));
     let id = exec
         .spawn({
@@ -625,10 +625,9 @@ fn a_cancel_during_a_poll_settles_at_the_step_boundary() {
             move |_| {
                 runs.fetch_add(1, Ordering::Relaxed);
                 let _ = started_tx.send(());
-                let end = std::time::Instant::now() + std::time::Duration::from_millis(50);
-                while std::time::Instant::now() < end {
-                    std::hint::spin_loop();
-                }
+                notified_rx
+                    .recv()
+                    .expect("notification happened during this poll");
                 Step::Wait
             }
         })
@@ -636,8 +635,8 @@ fn a_cancel_during_a_poll_settles_at_the_step_boundary() {
     let waker = exec.waker(id).expect("a live waker");
     let waker_thread = std::thread::spawn(move || {
         started_rx.recv().expect("the task started");
-        std::thread::sleep(std::time::Duration::from_millis(5));
         waker.cancel();
+        notified_tx.send(()).expect("the task is still polling");
     });
     let outcome = exec.poll();
     waker_thread.join().expect("the waker thread");
