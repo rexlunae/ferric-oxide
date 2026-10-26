@@ -5,9 +5,8 @@
 # Usage: check-blkgrant-log.sh MODE LOG
 #   MODE is how the boot ran, as for check-iommu-log.sh: none (no IOMMU), auto, enforce,
 #   amdvi or amdvi-enforce.
-#   BLKGRANT_AB=report reports a failed queue-policy A/B as a warning instead of failing:
-#   for the boot with x2APIC hidden (image.yml), whose interrupt cost is the emulated
-#   xAPIC's, not nvmed's.
+#   PERF_AB=report reports a failed queue-policy A/B as a warning instead of failing
+#   (perf-ab.sh): image.yml sets it for the boot with x2APIC hidden.
 #
 # With an IOMMU, nvmed (the NVMe controller at 00:04.0) must map the test's grants into the
 # DMA domain it bound (a 4 MiB read-write grant on two partition descriptors and a one-page
@@ -17,6 +16,8 @@
 # grant steps skip. Either way the benchmark lines must be there; a notice annotation repeats
 # them, so the numbers can be read without the job log.
 set -euo pipefail
+# shellcheck source=perf-ab.sh
+. "$(dirname "$0")/perf-ab.sh"
 
 mode="$1"
 log="$2"
@@ -63,11 +64,7 @@ done
 if grep -aE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .* ab=fail" <<< "$clean"; then
     ab="$(grep -aoE "FERRIC_BENCH nvme-read-4k-t[0-9]+ .*" <<< "$clean" | sed 's/^FERRIC_BENCH //' | paste -sd ';' -)"
     echo "::notice title=queue policy A/B ($mode)::$ab"
-    if [ "${BLKGRANT_AB:-enforce}" = report ]; then
-        echo "::warning::nvmed's default queue policy is slower than its single queue in the same boot (reported only: BLKGRANT_AB=report)"
-    else
-        fail "nvmed's default queue policy is slower than its single queue in the same boot"
-    fi
+    perf_ab_failed "queue policy A/B ($mode)" "nvmed's default queue policy is slower than its single queue in the same boot"
 fi
 
 case "$mode" in
