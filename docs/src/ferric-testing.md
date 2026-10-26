@@ -33,10 +33,12 @@ runs `cargo test --locked --lib` in
 `userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
 job tests `userspace/ext4d/` twice, on the committed ext4 images in
 `tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
-e2fsprogs (`EXT4D_FIXTURES`), each time with and without the journal replay
-(`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s), and
-lints and documents it for the host and for `x86_64-unknown-redox`, with and
-without the replay. The `ferric-jbd2` step tests, lints and documents the
+e2fsprogs (`EXT4D_FIXTURES`), each time without and with the journal replay
+(`journal-replay`, whose tests compare ext4d's replay with `e2fsck`'s) and with
+the journaled writer (`write`, whose tests hand every volume they leave,
+including ones crashed part-way through a change, to `e2fsck` through
+`EXT4D_E2FSCK`), and lints and documents it for the host and for
+`x86_64-unknown-redox` with each of those feature sets. The `ferric-jbd2` step tests, lints and documents the
 journal crate, and builds it for `x86_64-unknown-none` to keep it `no_std`.
 Its `blockd` job does the same for `userspace/blockd/` (with each
 of its layers alone and both), and runs `ferric-blocklayer`'s fixture tests
@@ -390,7 +392,16 @@ from the guest, the kernel drives its local APICs in xAPIC mode, so the decoding
 of the xAPIC ID register (its ID sits in bits 31:24) and the targeted IPIs, such
 as per-CPU TLB shootdowns, that are sent to those IDs get a real boot. The other
 boots use `host`, which runs in x2APIC mode. The decoding itself is also
-host-tested (`apic_id` in the kernel helper tests).
+host-tested (`apic_id` in the kernel helper tests). That boot checks
+correctness, so its performance A/B gates, the NVMe queue-policy A/B
+(`check-blkgrant-log.sh`) and the disk benchmark's adaptive-against-main A/B
+(`check-iobench-log.sh`), only warn when they fail (`PERF_AB=report`, set for
+the whole boot job; see `scripts/ferric-ci/perf-ab.sh`): every EOI and IPI is
+then an xAPIC MMIO access that exits to the host under nested KVM, so nvmed's
+per-CPU policies, which take more of them, measure the APIC emulation more
+than nvmed. The figures are still reported.
+`scripts/ferric-ci/test-perf-ab.sh` (host-tools CI) runs both checks on
+fixture logs with and without `PERF_AB=report`.
 
 The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
@@ -690,6 +701,16 @@ and a merged rate over the same interval. The ring-test recipe's host tests
 exercise the same CQE validator used by the target workload, rejecting missing,
 duplicate, wrong-request, failed and short completions. The scheduler benchmark
 image/boot remains the check for measured wake latency and real completions.
+
+### NVMe phase accounting
+
+`cargo test --locked -p ferric-blkqueue --all-features` tests the actual
+request-owned timing and resettable reporting windows used by
+`drivers.nvmed_perf`, including interleaved requests, multiple commands,
+zero-length durations and overflow. The host-tools driver job also compiles
+nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
+This checks accounting and feature integration; controller timing and idle-burst
+reporting still need an instrumented target boot.
 
 ### Profiler CPU wakeup acknowledgements
 
