@@ -311,15 +311,7 @@ crate::interrupt!(lapic_timer, || {
     // The one-shot scheduler timer (kernel.time.one_shot): the handler marks
     // the armed deadline fired; the periodic path kept the log before.
     #[cfg(feature = "time_one_shot")]
-    {
-        static DELIVERED: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
-        let n = DELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 10 {
-            crate::info!("timer: vector 48 delivery {n}");
-        }
-        crate::arch::timer::handle_fire();
-    }
+    crate::arch::timer::handle_fire();
     #[cfg(not(feature = "time_one_shot"))]
     crate::println!("Local apic timer interrupt");
     lapic_eoi();

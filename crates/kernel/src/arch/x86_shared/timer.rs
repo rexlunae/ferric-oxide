@@ -243,7 +243,7 @@ pub fn selftest(token: &mut CleanLockToken) {
         if ticks.wrapping_sub(last_report_ticks) >= report_ticks {
             let fired = fired();
             let entries = PercpuBlock::current().one_shot.entries.load(Ordering::Relaxed);
-            crate::info!(
+            crate::debug!(
                 "timer: selftest waiting: ticks={ticks} fired={fired} entries={entries}"
             );
             last_report_ticks = ticks;
