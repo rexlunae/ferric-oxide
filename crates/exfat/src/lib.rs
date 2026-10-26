@@ -121,11 +121,23 @@ pub enum Error<E> {
         /// The cluster number.
         cluster: u32,
     },
-    /// A cluster chain ends before its file's length, or never ends.
+    /// A cluster chain ends before or after its file's length, or never ends (loops back on
+    /// itself).
     #[error("a cluster chain from cluster {first} does not match its length")]
     Chain {
         /// The chain's first cluster.
         first: u32,
+    },
+    /// The Allocation Bitmap is shorter than one bit per cluster of the heap, or has fewer
+    /// bytes written than that.
+    #[error("an allocation bitmap of {length} bytes ({valid} written) for {needed} needed")]
+    Bitmap {
+        /// The bitmap's length, from its directory entry.
+        length: u64,
+        /// The bytes of it written (its valid data length).
+        valid: u64,
+        /// The bytes the heap's cluster count needs.
+        needed: u64,
     },
     /// A directory is larger than the 256 MiB the specification allows, or than memory can
     /// address.
@@ -151,6 +163,15 @@ impl<E> Error<E> {
             Self::Directory(e) => Error::Directory(e),
             Self::BadCluster { cluster } => Error::BadCluster { cluster },
             Self::Chain { first } => Error::Chain { first },
+            Self::Bitmap {
+                length,
+                valid,
+                needed,
+            } => Error::Bitmap {
+                length,
+                valid,
+                needed,
+            },
             Self::DirectoryTooLarge { length } => Error::DirectoryTooLarge { length },
         }
     }
@@ -166,16 +187,20 @@ impl<E> Error<E> {
                 | Self::NoBitmap
                 | Self::NoUpcase
                 | Self::Upcase(_)
+                | Self::Bitmap { .. }
         )
     }
 }
 
 /// Where a read left off in a cluster chain: the `index`th cluster of the file is `cluster`.
-/// Start with [`Cursor::default`]; [`ExFat::read`] keeps it up to date.
+/// Start with [`Cursor::default`]; [`ExFat::read`] keeps it up to date, and the first read
+/// through a cursor checks the whole chain once (see [`ExFat::read`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     index: u64,
     cluster: u32,
+    /// Whether the chain has been checked to end where the stream's length says.
+    checked: bool,
 }
 
 /// A mounted exFAT volume.
@@ -200,7 +225,9 @@ impl<D: BlockDevice> ExFat<D> {
     /// file systems are told apart), [`Error::BootChecksum`], [`Error::Truncated`],
     /// [`Error::NoBitmap`], [`Error::NoUpcase`] and [`Error::Upcase`] for a volume that is
     /// damaged, and [`Error::Device`], [`Error::Chain`], [`Error::BadCluster`] and
-    /// [`Error::Directory`] when the root directory cannot be read.
+    /// [`Error::Directory`] when the root directory cannot be read, [`Error::DirectoryTooLarge`]
+    /// when its chain is over 256 MiB, and [`Error::Bitmap`] when the allocation bitmap
+    /// cannot cover every cluster.
     pub fn open(device: D) -> Result<Self, Error<D::Error>> {
         let mut first = [0; boot::SECTOR_PREFIX];
         device.read_at(0, &mut first).map_err(Error::Device)?;
@@ -222,10 +249,19 @@ impl<D: BlockDevice> ExFat<D> {
             label: String::new(),
             fat_block: RefCell::new(None),
         };
+        // root_stream stops counting past MAX_DIRECTORY, so this is all the root can be.
         fs.root = fs.root_stream()?;
         let listing = dir::parse(&fs.read_all(&fs.root)?)?;
         let system = listing.system;
         fs.bitmap = system.bitmaps[usize::from(fs.boot.active_fat)].ok_or(Error::NoBitmap)?;
+        let needed = u64::from(fs.boot.cluster_count).div_ceil(8);
+        if fs.bitmap.length < needed || fs.bitmap.valid_length < needed {
+            return Err(Error::Bitmap {
+                length: fs.bitmap.length,
+                valid: fs.bitmap.valid_length,
+                needed,
+            });
+        }
         let (table, checksum) = system.upcase.ok_or(Error::NoUpcase)?;
         fs.upcase = Upcase::parse(&fs.read_all(&table)?, checksum)?;
         fs.label = String::from_utf16_lossy(&system.label);
@@ -259,12 +295,14 @@ impl<D: BlockDevice> ExFat<D> {
     /// As [`Self::read`], for the bitmap.
     pub fn free_clusters(&self) -> Result<u64, Error<D::Error>> {
         let bits = u64::from(self.boot.cluster_count);
-        let mut bitmap = Stream {
-            length: bits.div_ceil(8),
-            ..self.bitmap
-        };
-        bitmap.valid_length = bitmap.valid_length.min(bitmap.length);
-        let bytes = self.read_all(&bitmap)?;
+        // `open` checked that the bitmap has this many bytes, all of them written.
+        let needed = usize::try_from(bits.div_ceil(8)).map_err(|_| Error::Bitmap {
+            length: self.bitmap.length,
+            valid: self.bitmap.valid_length,
+            needed: bits.div_ceil(8),
+        })?;
+        let mut bytes = vec![0; needed];
+        self.read(&self.bitmap, &mut Cursor::default(), 0, &mut bytes)?;
         let used: u64 = bytes
             .iter()
             .enumerate()
@@ -311,6 +349,11 @@ impl<D: BlockDevice> ExFat<D> {
     /// Reads into `buf` from byte `offset` of the data `stream` describes, moving `cursor`
     /// to where the read ended. Returns how many bytes were read: fewer than `buf.len()` only
     /// at the end of the data. Bytes past the valid data length read as zero.
+    ///
+    /// The first read through a fresh `cursor` of a stream with a FAT chain follows the whole
+    /// chain once and checks that it ends exactly at the last cluster the stream's length
+    /// needs, so a chain that loops or ends early or late is an error before any of its data
+    /// is returned. Later reads through the same cursor skip the check.
     ///
     /// # Errors
     ///
@@ -379,10 +422,15 @@ impl<D: BlockDevice> ExFat<D> {
         if !self.boot.is_cluster(first) {
             return Err(bad(first));
         }
+        if !cursor.checked {
+            self.check_chain(stream)?;
+            cursor.checked = true;
+        }
         if cursor.cluster == 0 || cursor.index > index {
             *cursor = Cursor {
                 index: 0,
                 cluster: first,
+                checked: true,
             };
         }
         while cursor.index < index {
@@ -392,6 +440,25 @@ impl<D: BlockDevice> ExFat<D> {
             cursor.index += 1;
         }
         Ok(cursor.cluster)
+    }
+
+    /// Checks that the FAT chain of `stream` has exactly the clusters its length needs: a
+    /// chain that loops never reaches its end marker, so it fails here too. A stream needing
+    /// more clusters than the heap has is refused without walking.
+    fn check_chain(&self, stream: &Stream) -> Result<(), Error<D::Error>> {
+        let first = stream.first_cluster;
+        let clusters = stream.length.div_ceil(self.boot.cluster_size()).max(1);
+        if clusters > u64::from(self.boot.cluster_count) {
+            return Err(Error::Chain { first });
+        }
+        let mut cluster = first;
+        for _ in 1..clusters {
+            cluster = self.next_cluster(cluster)?.ok_or(Error::Chain { first })?;
+        }
+        match self.next_cluster(cluster)? {
+            None => Ok(()),
+            Some(_) => Err(Error::Chain { first }),
+        }
     }
 
     /// The cluster after `cluster` in its chain, or `None` at the chain's end.
@@ -419,13 +486,19 @@ impl<D: BlockDevice> ExFat<D> {
         }
     }
 
-    /// The root directory: its chain, counted, as a stream.
+    /// The root directory: its chain, counted, as a stream. Counting stops with
+    /// [`Error::DirectoryTooLarge`] as soon as the chain is longer than the 256 MiB a
+    /// directory may be, so neither the walk nor the read after it is unbounded.
     fn root_stream(&self) -> Result<Stream, Error<D::Error>> {
         let first = self.boot.root_cluster;
         let mut clusters = 1u64;
         let mut cluster = first;
         while let Some(next) = self.next_cluster(cluster)? {
             clusters += 1;
+            let length = clusters * self.boot.cluster_size();
+            if length > MAX_DIRECTORY {
+                return Err(Error::DirectoryTooLarge { length });
+            }
             // A chain longer than the heap loops.
             if clusters > u64::from(self.boot.cluster_count) {
                 return Err(Error::Chain { first });

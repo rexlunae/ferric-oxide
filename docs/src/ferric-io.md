@@ -1140,7 +1140,11 @@ on a partition, on LUKS or on LVM works as FAT does.
 - **Checks:** the boot sector's fields and layout, the boot region's checksum
   (sector 11), the up-case table's checksum, and every directory entry set's
   checksum. A critical entry type it does not know is an error; benign ones
-  are skipped.
+  are skipped. The allocation bitmap must cover every cluster, the root
+  directory's chain is refused once it passes the 256 MiB a directory may be
+  (before anything is read into memory), and each file's FAT chain is checked
+  on its first read to end exactly where the file's length says, so a chain
+  that loops or ends early is an error rather than repeated or missing data.
 - **Names** are compared through the volume's own up-case table, as the
   specification asks; exFAT has no short names. `fpath` gives the names as
   stored.

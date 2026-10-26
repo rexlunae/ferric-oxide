@@ -216,3 +216,153 @@ fn damage_is_detected() {
         Err(Error::Truncated { .. })
     ));
 }
+
+/// Writes `value` as the FAT entry of `cluster` in `bytes`, the image `volume` was read from.
+fn set_fat(bytes: &mut [u8], volume: &Volume, cluster: u32, value: u32) {
+    let at = (volume.boot_sector().fat_start() + u64::from(cluster) * 4) as usize;
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn chains_that_loop_or_end_early_are_errors() {
+    let bytes = load("exfat-4k.img.gz");
+    let volume = ExFat::open(Memory::new(bytes.clone())).unwrap();
+    let big = walk(&volume, "/big.bin");
+    assert!(!big.contiguous);
+    let first = big.first_cluster;
+    let second = {
+        let mut cursor = Cursor::default();
+        let mut one = [0];
+        volume.read(&big, &mut cursor, 4096, &mut one).unwrap();
+        // The second cluster's first byte is the pattern's, so the chain was followed.
+        assert_eq!(one[0], big_byte(4096));
+        let at = (volume.boot_sector().fat_start() + u64::from(first) * 4) as usize;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    };
+    let broken = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut image = bytes.clone();
+        change(&mut image);
+        ExFat::open(Memory::new(image)).unwrap()
+    };
+    // The first cluster points at itself, or the second back at the first: either way the
+    // chain never ends, and no read returns the repeated cluster.
+    for (cluster, next) in [(first, first), (second, first)] {
+        let looped = broken(&|image| set_fat(image, &volume, cluster, next));
+        for offset in [0, 4096, 8192] {
+            let err = looped
+                .read(&big, &mut Cursor::default(), offset, &mut [0; 16])
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Chain { first: f } if f == first),
+                "{err:?}"
+            );
+        }
+    }
+    // The chain ends after one cluster, shorter than the file.
+    let short = broken(&|image| set_fat(image, &volume, first, 0xFFFF_FFFF));
+    let err = short
+        .read(&big, &mut Cursor::default(), 0, &mut [0; 16])
+        .unwrap_err();
+    assert!(matches!(err, Error::Chain { .. }), "{err:?}");
+}
+
+fn big_byte(i: usize) -> u8 {
+    ((i * 7 + i / 4096) % 251) as u8
+}
+
+#[test]
+fn a_bitmap_shorter_than_the_heap_is_refused() {
+    let bytes = load("exfat-4k.img.gz");
+    let volume = ExFat::open(Memory::new(bytes.clone())).unwrap();
+    let boot = *volume.boot_sector();
+    let needed = u64::from(boot.cluster_count).div_ceil(8);
+    // The Allocation Bitmap entry (type 0x81) in the root directory's first cluster.
+    let root = boot.cluster_start(boot.root_cluster) as usize;
+    let entry = (0..boot.cluster_size() as usize / 32)
+        .map(|i| root + i * 32)
+        .find(|&at| bytes[at] == 0x81)
+        .expect("a bitmap entry");
+    let mut short = bytes.clone();
+    short[entry + 24..entry + 32].copy_from_slice(&(needed / 2).to_le_bytes());
+    let err = ExFat::open(Memory::new(short)).unwrap_err();
+    assert!(
+        matches!(err, Error::Bitmap { length, needed: n, .. } if length == needed / 2 && n == needed),
+        "{err:?}"
+    );
+}
+
+/// A device of `size` bytes whose first bytes are `prefix` and the rest zeros, so a volume
+/// far larger than memory can be described without allocating it.
+#[derive(Debug)]
+struct Sparse {
+    prefix: Vec<u8>,
+    size: u64,
+}
+
+impl ferric_blocklayer::BlockDevice for Sparse {
+    type Error = ferric_blocklayer::OutOfRange;
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        ferric_blocklayer::OutOfRange::check(offset, buf.len(), self.size)?;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let at = offset as usize + i;
+            *b = self.prefix.get(at).copied().unwrap_or(0);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_root_directory_over_256_mib_is_refused_before_it_is_read() {
+    use ferric_exfat::boot::{CHECKSUMMED_SECTORS, SIGNATURE, checksum};
+    // 512-byte sectors and 32 MiB clusters: nine clusters of root directory are 288 MiB.
+    let (fat_offset, heap_offset, clusters) = (24u32, 32u32, 9u32);
+    let volume_sectors = u64::from(heap_offset) + u64::from(clusters) * 65_536;
+    let mut image = vec![0u8; heap_offset as usize * 512];
+    let b = &mut image[..512];
+    b[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
+    b[3..11].copy_from_slice(SIGNATURE);
+    b[72..80].copy_from_slice(&volume_sectors.to_le_bytes());
+    b[80..84].copy_from_slice(&fat_offset.to_le_bytes());
+    b[84..88].copy_from_slice(&8u32.to_le_bytes());
+    b[88..92].copy_from_slice(&heap_offset.to_le_bytes());
+    b[92..96].copy_from_slice(&clusters.to_le_bytes());
+    b[96..100].copy_from_slice(&2u32.to_le_bytes());
+    b[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+    b[108] = 9;
+    b[109] = 16;
+    b[110] = 1;
+    b[510] = 0x55;
+    b[511] = 0xAA;
+    let sum = (0..CHECKSUMMED_SECTORS).fold(0, |sum, i| {
+        let i = i as usize;
+        checksum(sum, i as u64, &image[i * 512..(i + 1) * 512])
+    });
+    for word in image[11 * 512..12 * 512].chunks_exact_mut(4) {
+        word.copy_from_slice(&sum.to_le_bytes());
+    }
+    // The root chain: clusters 2 to 10, one after another, then the end.
+    let fat = fat_offset as usize * 512;
+    for cluster in 2..=10u32 {
+        let next = if cluster == 10 {
+            0xFFFF_FFFF
+        } else {
+            cluster + 1
+        };
+        let at = fat + cluster as usize * 4;
+        image[at..at + 4].copy_from_slice(&next.to_le_bytes());
+    }
+    let device = Sparse {
+        prefix: image,
+        size: volume_sectors * 512,
+    };
+    let err = ExFat::open(device).unwrap_err();
+    assert!(
+        matches!(err, Error::DirectoryTooLarge { length } if length == 9 << 25),
+        "{err:?}"
+    );
+}
