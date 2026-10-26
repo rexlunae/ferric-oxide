@@ -9,7 +9,7 @@ use crate::{
         self, arch, memory::AddrSpaceSwitchReadGuard, ArcContextLockWriteGuard, Context,
         ContextLock, ContextQueueKey, ContextQueueValue, RunContextData, WeakContextRef,
     },
-    cpu_set::LogicalCpuId,
+    cpu_set::{LogicalCpuId, LogicalCpuSet},
     cpu_stats::{self, CpuState},
     percpu::{get_percpu_block, PercpuBlock},
     sync::{ArcRwLockWriteGuard, CleanLockToken, Mutex, L4},
@@ -556,21 +556,27 @@ fn affinity_elsewhere(context: &Context, cpu_id: LogicalCpuId) -> Option<Logical
         .find(|&cpu| get_percpu_block(cpu).is_some())
 }
 
-/// Ferric Oxide: queues each of `forward` on its CPU's cross-CPU wake-up list and sends that
-/// CPU the wake-up IPI, as a wake-up from another CPU does (`context::wakeup_context`). The
-/// caller holds no run queue lock.
+/// Ferric Oxide: queues each of `forward` on its CPU's cross-CPU wake-up list and sends each
+/// such CPU one wake-up IPI, as a wake-up from another CPU does (`context::wakeup_context`).
+/// The caller holds no run queue lock.
 fn forward_contexts(
     forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
     token: &mut CleanLockToken,
 ) {
+    let targets = LogicalCpuSet::empty();
     for (target, context_ref) in forward.drain(..) {
-        if let Some(target) = get_percpu_block(target) {
-            target
+        if let Some(percpu) = get_percpu_block(target) {
+            percpu
                 .switch_internals
                 .ipi_context_wakeup_list
                 .lock(token.token())
                 .push(context_ref);
-            crate::ipi::ipi_single(crate::ipi::IpiKind::Wakeup, target);
+            targets.atomic_set(target);
+        }
+    }
+    for target in targets.iter() {
+        if let Some(percpu) = get_percpu_block(target) {
+            crate::ipi::ipi_single(crate::ipi::IpiKind::Wakeup, percpu);
         }
     }
 }
