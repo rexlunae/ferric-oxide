@@ -25,3 +25,12 @@ These tables retain their BSD-4-Clause terms in
 [`crates/rtl8125/LICENSE-BSD-4-Clause`](crates/rtl8125/LICENSE-BSD-4-Clause).
 Binary distributions containing them must reproduce that notice and disclaimer.
 This product includes software developed by Bill Paul.
+
+## GNU config.sub
+
+`tools/cookbook/res/config.sub` is GNU `config.sub` (timestamp `2022-01-03`)
+from the [GNU config project](https://savannah.gnu.org/projects/config), Copyright
+1992-2022 Free Software Foundation, Inc. It is GPL-3.0-or-later with the Autoconf
+exception stated in its header, which lets it be distributed with the packages
+whose configure scripts use it. The cookbook's `GNU_CONFIG_GET` writes this copy
+instead of downloading one.

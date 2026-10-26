@@ -61,9 +61,9 @@ jobs:
       - name: Install cbindgen
         run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
-      # Several crates (relibc's, redoxfs's) have git dependencies on gitlab.redox-os.org.
+      # Several crates (relibc's, redoxfs's) have git dependencies (Ferric mirrors on GitHub).
       # Cargo only fetches a git dependency when its locked commit is missing from
-      # ~/.cargo/git/db, so caching that directory keeps a GitLab outage from failing
+      # ~/.cargo/git/db, so caching that directory keeps a fetch failure from failing
       # builds whose lockfiles have not moved. The key covers this repository's
       # lockfiles; a dependency the cookbook fetches mid-build has its own lockfile,
       # so a changed key still falls back to an older cache (restore-keys) and Cargo
@@ -307,7 +307,21 @@ jobs:
           - cpu: host
             iommu: none
             nic: virtio
+          # The same image with x2APIC hidden from the guest, so the kernel drives its local
+          # APICs in xAPIC mode: LocalApic::id's xAPIC decoding (#214) and the targeted IPIs
+          # (TLB shootdowns) that send to the IDs it returns run on every PR.
+          - cpu: host,-x2apic
+            iommu: none
+            nic: e1000
     env:
+      # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the host
+      # under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster path.
+      # nvmed's per-CPU policies take more interrupts and IPIs than its single queue, so their
+      # same-boot A/Bs there (NVMe t4 ratios of 0.81 to 0.85, against 0.90 to 1.05 with
+      # x2APIC) measure the APIC emulation more than nvmed. That boot checks xAPIC
+      # correctness, so its perf A/B gates (check-blkgrant-log.sh, check-iobench-log.sh) still
+      # report their numbers but only warn on a failure (scripts/ferric-ci/perf-ab.sh).
+      PERF_AB: ${{ matrix.cpu == 'host,-x2apic' && 'report' || 'enforce' }}
       LOG: serial-${{ matrix.cpu }}${{ matrix.iommu != 'none' && format('-{0}', matrix.iommu) || '' }}${{ matrix.nic != 'e1000' && format('-{0}', matrix.nic) || '' }}.log
     steps:
       - uses: actions/checkout@v4
@@ -435,7 +449,8 @@ jobs:
       # The Phase 2 disk benchmark (ferric-iobench): IOPS, bandwidth and latency percentiles of
       # fio-style jobs with each of nvmed's queue policies, one queue against per-CPU queues
       # in the same boot. The figures go to a notice and the job summary; the per-CPU default
-      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab).
+      # must reach the single queue within the A/B gate's noise (ferric_blkqueue::ab), except in the
+      # x2APIC-off boot, where a failure only warns (PERF_AB in the job env).
       - name: Check the disk benchmark
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: scripts/ferric-ci/check-iobench-log.sh ${{ matrix.iommu }} "$LOG"
@@ -741,6 +756,10 @@ jobs:
               if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
                 failed=1
                 echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
+                # The boot's own output went to /dev/null above, and the annotation keeps
+                # only the last markers: print every failed test with the 40 lines before
+                # it, so a failure early in the boot can be read from the job log.
+                scripts/ferric-ci/print-test-fails.sh "$log.clean" "$image boot $run"
               fi
               # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
               if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then

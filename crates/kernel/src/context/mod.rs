@@ -50,6 +50,9 @@ mod arch;
 /// Context struct
 pub mod context;
 
+/// Optional idle-context access and interrupt acknowledgement.
+pub(crate) mod idle;
+
 /// Context switch function
 pub mod switch;
 

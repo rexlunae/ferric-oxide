@@ -16,13 +16,13 @@ done; the [dependency summary](#dependency-summary) shows how they connect.
 
 1. **Modern hardware only.** The default x86 target is **x86-64-v3** (AVX2, BMI1/2, FMA, MOVBE). An optional **x86-64-v4** build adds AVX-512. v3 is the right floor because Intel client chips from Alder Lake on ship without AVX-512, so a v4 floor would exclude most Intel laptops. AMD Zen 4/5 and Intel Xeon support v4. Hot libraries use runtime dispatch for AVX-512 (crypto, memcpy, checksums, compositor blits) so that v3 images can still use it when it's there. Besides the ISA level, the target platform assumes NX, SMEP, SMAP, UMIP, PCID/INVPCID, FSGSBASE, XSAVE/XSAVES, x2APIC, an IOMMU (VT-d or AMD-Vi), UEFI and a TPM 2.0, so the kernel is free to require them. Which of these a build actually checks or enforces today is in [Memory and CPU protection](ferric-memory.md) and [Build and configuration](ferric-build.md); TPM use arrives with the Phase 4 boot chain. It can *use* CET (shadow stacks and IBT), PKU/PKS and WAITPKG where they exist. Support for i586, BIOS boot and pre-v3 CPUs gets dropped. aarch64 (ARMv8.2+) stays as the second architecture. riscv64 is frozen until someone needs it.
 2. **File descriptors stay the control plane. Shared memory becomes the data plane.** That settles the bottleneck concern without losing the capability model (see Phase 2).
-3. **Stay mergeable with upstream.** Keep internal names. Put fork-only work in new crates or behind feature flags wherever possible. Sync with upstream on a regular cadence.
+3. **Independent of upstream.** The connection to Redox is historical: nothing syncs from Redox, and a Redox change is ported by hand when it is wanted (decided 26 October 2026). Internal names stay, because the Rust targets, tools and imported code depend on them. Optional work still goes behind feature flags.
 4. **Measure everything.** No performance claim lands without a benchmark in CI.
 5. **Userland is WebAssembly by default (goal).** User programs ship as **wasm32**, with **wasm64** reserved for programs that need more than 4 GiB of address space. Both are validated and compiled natively per CPU by a kernel-trusted compiler, with native code as an explicit exception list. This is gated on benchmarks (Phase W).
 
 ## Phase 0: Foundation
 
-- Import kernel, base, relibc, redoxfs, bootloader and book into this repository as git subtrees, so upstream history stays mergeable.
+- Import kernel, base, relibc, redoxfs, bootloader and book into this repository as git subtrees, keeping their history.
 - GitHub Actions builds the image and boots it in QEMU/KVM with a smoke test, using the existing `acid` and `os-test` suites.
 - **Feature configuration system:** `ferric.toml` (the selected configuration) plus `features.toml` (the feature catalog), edited by hand, by agents, or through `make menuconfig` (the TUI). Every optional item in this roadmap (KPTI, kernel-colocated drivers, AVX-512 paths, sandbox defaults) lands as a toggle there, and CI tests a set of named profiles.
 - **Benchmark harness against Linux on the same hardware:** syscall and IPC round trip, context switch, fio 4K random read at QD1 and QD32, sequential read, TCP throughput and latency (iperf3), nginx or a Rust HTTP server req/s, boot-to-shell time, and a kernel compile. Results go to a dashboard with each commit tracked over time.
@@ -64,6 +64,43 @@ This runs alongside Phases 1–2 because every later benchmark depends on it. Be
 - **Overhead budget in CI:** the Phase 0 benchmarks run with the default tracing profile, and CI fails if the "all compiled in, all disabled" build is more than 1% slower than the "compiled out" build, or if enabling the default event set costs more than about 5%.
 
 **Exit:** one storage request can be traced end to end across the app, RedoxFS, the NVMe driver and the IRQ path, from a TOML toggle, with no reboot, and the overhead budgets above hold.
+
+## Phase S: Timers, scheduling and kernel async
+
+The proposal in [issue #177](https://github.com/rexlunae/ferric-oxide/issues/177)
+and its issue track defines this phase: a new modular event-driven kernel
+scheduler with per-CPU one-shot timers, an initial best-effort EEVDF policy,
+an optional admitted partitioned EDF/CBS real-time class, and an optional
+kernel async runtime whose workers the scheduler wakes with explicit events —
+never a periodic poll. Core class, SMT/cache and NUMA geometry are first-class
+inputs to placement and RT admission ([#191], [#192]); the scheduler/timer
+files are x86-64 only (32-bit x86 retirement is confirmed). Performance and
+latency benefits are hypotheses to measure: the phase opens with a measured
+baseline protocol ([#179], [#185]) whose numbers decide rollout.
+
+| Step | Delivers | Depends on |
+|---|---|---|
+| S1 Baseline protocol | Reproducible periodic-tick measurements: timer IRQ rate, wake jitter, switch cost, waiting-ring worker cost ([#179], [#185]) | T |
+| S2 Timekeeping | Independent ClockSource/ClockEvent; per-CPU one-shot timers (TSC-deadline, calibrated LAPIC, HPET fallback) ([#186]) | S1, S6 |
+| S3 Scheduler core | Event-driven EEVDF with measured-time accounting; one shared deadline service and rearm protocol ([#187]) | S1, S2, S6 |
+| S4 Preemption | Bounded IRQ/preemption-off sections; safe worker preemption points ([#188]) | S1 |
+| S5 Async runtime | Portable executor core ([#180]) bound as kernel workers with wake/timer integration ([#181]); nonblocking scheme completion ([#182]); optional `kernel.ring` async backend ([#183]) | S3, S4 |
+| S6 Topology | Host-tested core-class/SMT/cache/NUMA model with a versioned snapshot ([#191]) | S1 |
+| S7 Placement | Capacity- and NUMA-aware placement and steal domains ([#192]) | S3, S6 |
+| S8 Real time | Admitted per-CPU EDF/CBS reservations ([#189]) and their propagation through async work and scheme IPC ([#190]) | S3, S4, S5, S7 |
+| S9 Validation | Deterministic interleaving, fault injection and teardown stress ([#184]) | S2–S8 |
+| S10 Decision | The P0–P6 factorial comparison and the keep/expand/retire decision ([#185]) | S1–S9 |
+
+**Exit:** on the declared x86-64 profile, a tickless idle system generates zero
+scheduler timer IRQs and Pit broadcasts over a controlled 10-second
+no-deadline window; the waiting-ring workload shows at least 75% less
+execution-overhead memory at 256 rings with no more than a 5% controlled-
+hardware throughput/p99 regression; admitted reservations show zero observed
+deadline misses over a million releases with bounded dispatch latency; and the
+phase publishes the baseline-vs-candidate evidence and an explicit decision.
+Real-time service claims stay soft/firm unless a separate schedulability and
+platform-interference argument supports them. Design of the runtime:
+[Kernel async executor](ferric-async.md).
 
 ## Phase 1: Modern baseline and hardening
 
@@ -287,10 +324,9 @@ call, and the answer is recorded here.
 1. **Native vs. compatibility-layer vs. driver-domain drivers** for Wi-Fi and GPU (Phases 5 and 6). Driver domains (Linux drivers in a Phase V VM) are a third option. This is mostly a licensing and time trade-off.
 2. **Whether PKS-only hardware is an acceptable requirement** for the colocated driver tier, or whether AMD machines get language isolation alone.
 3. **The default root filesystem:** RedoxFS (native, copy-on-write) or ext4/XFS on LVM and LUKS. The current proposal keeps RedoxFS as the default and gives the Linux filesystems full support.
-4. **The upstream sync cadence**, and whether to keep the fork's I/O changes in a form upstream could adopt, given that upstream does not accept AI-assisted contributions.
-5. **Where the wasm compiler lives:** in ring 0, or as an unprivileged service with a small in-kernel verifier. The current proposal is the verifier design, with an in-kernel JIT as a toggle.
-6. **Whether colocated (single address space) mode is a goal** or only an experiment, given Spectre between apps that share an address space.
-7. **Packaging (Phase P):** the working defaults listed under Phase P stand until the maintainer decides otherwise.
+4. **Where the wasm compiler lives:** in ring 0, or as an unprivileged service with a small in-kernel verifier. The current proposal is the verifier design, with an in-kernel JIT as a toggle.
+5. **Whether colocated (single address space) mode is a goal** or only an experiment, given Spectre between apps that share an address space.
+6. **Packaging (Phase P):** the working defaults listed under Phase P stand until the maintainer decides otherwise.
 
 ## Keeping this chapter current
 

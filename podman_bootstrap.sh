@@ -562,13 +562,13 @@ rustInstall()
 ###########################################################################
 boot()
 {
-    echo "Cloning gitlab repo..."
-    git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream
+    echo "Cloning the Ferric Oxide repository..."
+    git clone https://github.com/rexlunae/ferric-oxide.git
     echo "Creating .config with PODMAN_BUILD=1"
-    echo 'PODMAN_BUILD?=1' > redox/.config
+    echo 'PODMAN_BUILD?=1' > ferric-oxide/.config
     if [[ "$(uname -m)" == "arm64" ]]; then
         echo "Appending .config with ARCH=aarch64"
-        echo 'ARCH=aarch64' >> redox/.config
+        echo 'ARCH=aarch64' >> ferric-oxide/.config
     fi
     echo "Cleaning up..."
     rm podman_bootstrap.sh
@@ -576,13 +576,13 @@ boot()
     echo "---------------------------------------"
     echo "Well it looks like you are ready to go!"
     echo "---------------------------------------"
-    echo "The file redox/.config was created with PODMAN_BUILD=1."
+    echo "The file ferric-oxide/.config was created with PODMAN_BUILD=1."
     echo "If you need a much quicker installation, run: "
-    echo "  echo REPO_BINARY=1 >> redox/.config"
+    echo "  echo REPO_BINARY=1 >> ferric-oxide/.config"
     echo
-    echo "Run the following commands to build Redox using Podman:"
+    echo "Run the following commands to build Ferric Oxide using Podman:"
     echo
-    echo "cd redox"
+    echo "cd ferric-oxide"
     MAKE="make"
     if [[ "$(uname)" == "FreeBSD" ]]; then
         MAKE="gmake"
