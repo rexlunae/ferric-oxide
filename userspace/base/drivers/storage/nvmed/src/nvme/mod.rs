@@ -520,6 +520,7 @@ impl Nvme {
         lba: u64,
         blocks_1: u16,
         write: bool,
+        #[cfg(feature = "perf")] timing: &mut crate::perf::RequestTiming,
     ) -> Result<()> {
         let block_size = namespace.block_size;
 
@@ -534,16 +535,25 @@ impl Nvme {
         };
 
         let mut cmd = NvmeCmd::default();
+        #[cfg(feature = "perf")]
+        let mut perf_device_start = 0;
         let comp = self
             .submit_and_complete_command(ctxt.io_queue, |cid| {
+                // The executor calls this only after it has an SQ slot.
+                #[cfg(feature = "perf")]
+                {
+                    perf_device_start = crate::perf::ticks();
+                }
                 cmd = if write {
                     NvmeCmd::io_write(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 } else {
                     NvmeCmd::io_read(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 };
-                cmd.clone()
+                cmd
             })
             .await;
+        #[cfg(feature = "perf")]
+        timing.command(perf_device_start);
 
         let status = comp.status >> 1;
         if status == 0 {
@@ -560,19 +570,29 @@ impl Nvme {
         mut lba: u64,
         buf: &mut [u8],
     ) -> Result<usize> {
+        #[cfg(feature = "perf")]
+        let mut timing = crate::perf::RequestTiming::new(false);
         let ctxt = self.cur_thread_ctxt();
         let ctxt = ctxt.lock();
 
         let block_size = namespace.block_size as usize;
 
         for chunk in buf.chunks_mut(/* TODO: buf len */ 8192) {
-            let blocks = (chunk.len() + block_size - 1) / block_size;
+            let blocks = chunk.len().div_ceil(block_size);
 
             assert!(blocks > 0);
             assert!(blocks <= 0x1_0000);
 
-            self.namespace_rw(&*ctxt, namespace, lba, (blocks - 1) as u16, false)
-                .await?;
+            self.namespace_rw(
+                &ctxt,
+                namespace,
+                lba,
+                (blocks - 1) as u16,
+                false,
+                #[cfg(feature = "perf")]
+                &mut timing,
+            )
+            .await?;
 
             chunk.copy_from_slice(&ctxt.buffer.borrow()[..chunk.len()]);
 
@@ -588,21 +608,31 @@ impl Nvme {
         mut lba: u64,
         buf: &[u8],
     ) -> Result<usize> {
+        #[cfg(feature = "perf")]
+        let mut timing = crate::perf::RequestTiming::new(true);
         let ctxt = self.cur_thread_ctxt();
         let ctxt = ctxt.lock();
 
         let block_size = namespace.block_size as usize;
 
         for chunk in buf.chunks(/* TODO: buf len */ 8192) {
-            let blocks = (chunk.len() + block_size - 1) / block_size;
+            let blocks = chunk.len().div_ceil(block_size);
 
             assert!(blocks > 0);
             assert!(blocks <= 0x1_0000);
 
             ctxt.buffer.borrow_mut()[..chunk.len()].copy_from_slice(chunk);
 
-            self.namespace_rw(&*ctxt, namespace, lba, (blocks - 1) as u16, true)
-                .await?;
+            self.namespace_rw(
+                &ctxt,
+                namespace,
+                lba,
+                (blocks - 1) as u16,
+                true,
+                #[cfg(feature = "perf")]
+                &mut timing,
+            )
+            .await?;
 
             lba += blocks as u64;
         }
@@ -647,6 +677,7 @@ impl Nvme {
         blocks_1: u16,
         write: bool,
         phys_addr: u64,
+        #[cfg(feature = "perf")] timing: &mut crate::perf::RequestTiming,
     ) -> Result<()> {
         let block_size = namespace.block_size;
 
@@ -676,16 +707,26 @@ impl Nvme {
         let mut cmd = NvmeCmd::default();
         // Ferric Oxide: this thread's I/O queue.
         let io_queue = self.cur_thread_ctxt().lock().io_queue;
+        #[cfg(feature = "perf")]
+        let mut perf_device_start = 0;
         let comp = self
             .submit_and_complete_command(io_queue, |cid| {
+                // The executor calls this only after it has an SQ slot.
+                #[cfg(feature = "perf")]
+                {
+                    perf_device_start = crate::perf::ticks();
+                }
                 cmd = if write {
                     NvmeCmd::io_write(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 } else {
                     NvmeCmd::io_read(cid, namespace.id, lba, blocks_1, ptr0, ptr1)
                 };
-                cmd.clone()
+                cmd
             })
             .await;
+
+        #[cfg(feature = "perf")]
+        timing.command(perf_device_start);
 
         // Ferric Oxide: the controller is done with the list once the command completed.
         #[cfg(feature = "grant-dma")]
@@ -709,6 +750,8 @@ impl Nvme {
         mut phys_addr: u64,
         num_sectors: u64,
     ) -> Result<()> {
+        #[cfg(feature = "perf")]
+        let mut timing = crate::perf::RequestTiming::new(false);
         let end_lba = start_lba + num_sectors;
 
         // TODO: PRP
@@ -718,8 +761,16 @@ impl Nvme {
         while lba < end_lba {
             let blocks = (end_lba - lba).min(max_blocks);
 
-            self.namespace_rw_zerocopy(namespace, lba, (blocks - 1) as u16, false, phys_addr)
-                .await?;
+            self.namespace_rw_zerocopy(
+                namespace,
+                lba,
+                (blocks - 1) as u16,
+                false,
+                phys_addr,
+                #[cfg(feature = "perf")]
+                &mut timing,
+            )
+            .await?;
 
             phys_addr += blocks * namespace.block_size;
             lba += blocks;
@@ -735,6 +786,8 @@ impl Nvme {
         mut phys_addr: u64,
         num_sectors: u64,
     ) -> Result<()> {
+        #[cfg(feature = "perf")]
+        let mut timing = crate::perf::RequestTiming::new(true);
         let end_lba = start_lba + num_sectors;
         // TODO: PRP
         let max_blocks = self.max_zerocopy() / namespace.block_size;
@@ -743,8 +796,16 @@ impl Nvme {
         while lba < end_lba {
             let blocks = (end_lba - lba).min(max_blocks);
 
-            self.namespace_rw_zerocopy(namespace, lba, (blocks - 1) as u16, true, phys_addr)
-                .await?;
+            self.namespace_rw_zerocopy(
+                namespace,
+                lba,
+                (blocks - 1) as u16,
+                true,
+                phys_addr,
+                #[cfg(feature = "perf")]
+                &mut timing,
+            )
+            .await?;
 
             phys_addr += blocks * namespace.block_size;
             lba += blocks;
