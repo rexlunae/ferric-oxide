@@ -183,10 +183,10 @@ if [ -z "$status" ]; then
     # addresses (and IF clear when it spins with interrupts off).
     echo "boot-smoke: CPU state at the timeout" >&2
     # Before anything disturbs the guest: every CPU's registers, sampled a few times, and for
-    # each CPU spinning in the kernel (CPL 0, not halted) its frame-pointer chain, read through
-    # the monitor. Only then an NMI, whose dump on the serial log gives the kernel image's
-    # KASLR slide (its RIP against the link address it prints), so the raw addresses can be
-    # named below.
+    # each CPU spinning (not halted, in the kernel or in user space) its frame-pointer chain,
+    # read through the monitor. Only then an NMI, whose dump on the serial log gives the
+    # kernel image's KASLR slide (its RIP against the link address it prints), so the raw
+    # addresses can be named below.
     probe_log="$(mktemp)"
     python3 - "$monitor" <<'PY' | tee "$probe_log" >&2 || true
 import re, socket, sys, time
@@ -225,19 +225,23 @@ for sample in range(5):
               f"rbp=0x{r.get('RBP', '0')} rfl={r.get('RFL', '?')} cpl={r.get('CPL', '?')} "
               f"hlt={r.get('HLT', '?')}")
     time.sleep(0.2)
+# A CPU spinning in user space (CPL 3) gets its user frame-pointer chain too: the NMI's
+# context list names the program running there, and the return addresses name the loop.
 for n, r in sorted(last.items()):
-    if r.get("CPL") != "0" or r.get("HLT") != "0":
+    if r.get("CPL") not in ("0", "3") or r.get("HLT") != "0":
         continue
+    user = r.get("CPL") == "3"
     cmd(f"cpu {n}")
     rbp = int(r.get("RBP", "0"), 16)
     for depth in range(24):
-        if rbp < 0xffff800000000000 or rbp % 8:
+        in_range = (0 < rbp < 0x0000800000000000) if user else rbp >= 0xffff800000000000
+        if not in_range or rbp % 8:
             break
         m = re.search(r":\s*0x([0-9a-f]+)\s+0x([0-9a-f]+)", cmd(f"x /2gx {rbp:#x}"))
         if not m:
             break
         rbp, ret = int(m.group(1), 16), int(m.group(2), 16)
-        print(f"boot-smoke-cpu: cpu {n} frame {depth} ret=0x{ret:x}")
+        print(f"boot-smoke-cpu: cpu {n} {'user ' if user else ''}frame {depth} ret=0x{ret:x}")
 cmd("cpu 0")
 cmd("nmi")
 time.sleep(3)

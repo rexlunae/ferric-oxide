@@ -651,7 +651,15 @@ impl Kstack {
         let must_be_zero = true;
         #[cfg_attr(not(shstk_compiled), expect(unused_mut))]
         let mut this = Self {
-            base: allocate_p2frame(4, must_be_zero).ok_or(Enomem)?,
+            // Ferric Oxide: say so when a context cannot get its stack, so a thread or process
+            // creation that fails now and then (ENOMEM in user space) shows why in the boot log.
+            base: allocate_p2frame(4, must_be_zero).ok_or_else(|| {
+                crate::warn!(
+                    "no 64 KiB kernel stack for a new context: {} frames free",
+                    crate::memory::free_frames()
+                );
+                Enomem
+            })?,
             #[cfg(shstk_compiled)]
             shadow: None,
         };

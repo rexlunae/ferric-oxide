@@ -421,11 +421,23 @@ exercises these cases against a fake QEMU, without firmware or virtualization.
 This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
+ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
+for the last failed search or open (the path whose `access` or open failed and
+its errno, or the search paths a library is in none of), so the next
+occurrence names the file and error without `LD_DEBUG`.
+
+relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
+failure as `EAGAIN`. It logs the step that failed and the underlying errno at
+`warn` level, which relibc writes to stderr by default (`RELIBC_LOG_LEVEL`
+changes the level): the stack `mmap`, the guard `mprotect`, the TCB, or
+creating the thread itself. When creating the thread fails because the kernel
+cannot allocate a context's 64 KiB kernel stack, the kernel logs that with the
+number of free frames.
 
 When the marker does not arrive within the timeout, the script first samples
 every CPU's registers through the QEMU monitor (several times, with the
-frame-pointer chain of each CPU spinning in the kernel), then sends an NMI to
-CPU 0. The NMI handler prints its stack trace and then one line per context:
+frame-pointer chain of each CPU spinning in the kernel, or in user space for a
+CPU at CPL 3, as `user frame` lines), then sends an NMI to CPU 0. The NMI handler prints its stack trace and then one line per context:
 
 ```text
 NMI: 41 contexts

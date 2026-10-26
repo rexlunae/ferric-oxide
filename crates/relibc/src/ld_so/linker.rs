@@ -12,13 +12,14 @@ use object::{
     read::elf::{Rela as _, Sym},
 };
 
-use core::ptr;
+use core::{cell::RefCell, ptr};
 
 use crate::{
     c_str::{CStr, CString},
     error::Errno,
     header::{
         dl_tls::{__tls_get_addr, dl_tls_index},
+        errno::ENOENT,
         fcntl, sys_mman,
         unistd::F_OK,
     },
@@ -396,6 +397,10 @@ pub struct Linker {
     tls_size: usize,
     objects: BTreeMap<usize, Arc<DSO>>,
     name_to_object_id_map: BTreeMap<String, usize>,
+    /// Ferric Oxide: why the last object search or file open failed, for the fatal "failed to
+    /// link" message. `DlError::NotFound` alone cannot tell a missing library from a file the
+    /// file system refused to open, which made intermittent boot failures (#155) undiagnosable.
+    last_failure: RefCell<Option<String>>,
 }
 
 const ROOT_ID: usize = 1;
@@ -410,7 +415,17 @@ impl Linker {
             tls_size: 0,
             objects: BTreeMap::new(),
             name_to_object_id_map: BTreeMap::new(),
+            last_failure: RefCell::new(None),
         }
+    }
+
+    /// Why the last object search or file open failed, if one has failed.
+    pub fn last_failure(&self) -> Option<String> {
+        self.last_failure.borrow().clone()
+    }
+
+    fn record_failure(&self, reason: String) {
+        *self.last_failure.borrow_mut() = Some(reason);
     }
 
     pub fn load_program(&mut self, path: &str, base_addr: Option<usize>) -> Result<usize> {
@@ -932,33 +947,51 @@ impl Linker {
             eprintln!("[ld.so]: looking for '{}'", name);
         }
 
-        if name.contains('/') && accessible(name, F_OK).is_ok() {
-            if debug {
-                eprintln!("[ld.so]: found at '{}'!", name);
-            }
-            return Ok(name.into());
-        } else {
-            let mut search_paths = Vec::new();
-            if let Some(runpath) = parent_runpath {
-                search_paths.extend(runpath.split(PATH_SEP));
-            }
-            if let Some(ld_path) = self.config.library_path.as_ref() {
-                search_paths.extend(ld_path.split(PATH_SEP));
-            }
-            search_paths.push("/lib");
-            for part in search_paths.iter() {
-                let full_path = format!("{}/{}", part, name);
-                if debug {
-                    eprintln!("[ld.so]: trying path '{}'", full_path);
+        // A missing candidate is normal; any other error is worth reporting.
+        let mut access_error = None;
+        if name.contains('/') {
+            match accessible(name, F_OK) {
+                Ok(()) => {
+                    if debug {
+                        eprintln!("[ld.so]: found at '{}'!", name);
+                    }
+                    return Ok(name.into());
                 }
-                if accessible(&full_path, F_OK).is_ok() {
+                Err(Errno(errno)) if errno != ENOENT => {
+                    access_error = Some(format!("access '{name}' failed: errno {errno}"));
+                }
+                Err(_) => {}
+            }
+        }
+        let mut search_paths = Vec::new();
+        if let Some(runpath) = parent_runpath {
+            search_paths.extend(runpath.split(PATH_SEP));
+        }
+        if let Some(ld_path) = self.config.library_path.as_ref() {
+            search_paths.extend(ld_path.split(PATH_SEP));
+        }
+        search_paths.push("/lib");
+        for part in search_paths.iter() {
+            let full_path = format!("{}/{}", part, name);
+            if debug {
+                eprintln!("[ld.so]: trying path '{}'", full_path);
+            }
+            match accessible(&full_path, F_OK) {
+                Ok(()) => {
                     if debug {
                         eprintln!("[ld.so]: found at '{}'!", full_path);
                     }
                     return Ok(full_path.into());
                 }
+                Err(Errno(errno)) if errno != ENOENT => {
+                    access_error = Some(format!("access '{full_path}' failed: errno {errno}"));
+                }
+                Err(_) => {}
             }
         }
+        self.record_failure(
+            access_error.unwrap_or_else(|| format!("'{name}' is in none of {search_paths:?}")),
+        );
 
         if debug {
             eprintln!("[ld.so]: failed to locate '{}'", name);
@@ -984,6 +1017,7 @@ impl Linker {
                 if debug {
                     eprintln!("[ld.so]: failed to open '{}': {}", path, err)
                 }
+                self.record_failure(format!("opening '{path}' failed: {err}"));
 
                 DlError::NotFound
             })?
