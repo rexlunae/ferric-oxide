@@ -51,8 +51,9 @@
 //!   not cached while a shared writable mapping lasts, and those of a description opened
 //!   once it goes are again.
 //! - `pcache-redoxfs-writeback-trunc`: an `O_TRUNC` open through another description
-//!   writes cached writes back before truncating, and the writer's later cached writes
-//!   reach the file with zeros before them.
+//!   writes cached writes back before truncating, and the writer's later writes (one
+//!   growing the file, one inside it and cached again) reach the file with zeros before
+//!   them.
 //!   The `-age` and `-mmap` steps pass at once when writes are not cached.
 //! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
 //!   through a read-only description (cached) against an `O_FSYNC` one (served by RedoxFS,
