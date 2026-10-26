@@ -2,7 +2,7 @@
 //!
 //! A scheme handle names a file by its path from the volume's root, so that relative opens
 //! and `fpath` work without the daemon keeping directory handles open. Two helpers make that
-//! work the same way in every daemon:
+//! work the same way in `fatd` and `ext4d`, which both use this crate:
 //!
 //! - [`normalize`] resolves a path against a directory as text: `.` and empty components
 //!   vanish, `..` goes up one level and stops at the root.

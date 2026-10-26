@@ -1,8 +1,12 @@
 # Coding and Building
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 (Before reading this page you must read the [Build System](./build-system-reference.md) page)
 
-This page explains common development tasks on the Redox build system.
+This page explains common development tasks on the build system.
 
 - [Visual Studio Code Configuration](#visual-studio-code-configuration)
 - [VS Code Tips and Tricks](#vs-code-tips-and-tricks)
@@ -16,7 +20,7 @@ This page explains common development tasks on the Redox build system.
 - [Verify Your Code on Linux](#verify-your-code-on-linux)
 - [Update The Redox Image](#update-the-redox-image)
 - [Test Your Changes](#test-your-changes)
-  - [Test Your Changes (out of the Redox build system)](#test-your-changes-out-of-the-redox-build-system)
+  - [Test Your Changes (out of the build system)](#test-your-changes-out-of-the-build-system)
   - [Testing On Real Hardware](#testing-on-real-hardware)
     - [Full bootable image creation](#full-bootable-image-creation)
     - [Partial bootable image creation](#partial-bootable-image-creation)
@@ -29,7 +33,7 @@ This page explains common development tasks on the Redox build system.
   - [Make A New Redox Image](#make-a-new-redox-image)
   - [Most Quick Way To Test Your Changes](#most-quick-way-to-test-your-changes)
   - [Insert Text Files On QEMU (quickest method)](#insert-text-files-on-qemu-quickest-method)
-  - [Insert Files In The Redox image Using a Recipe](#insert-files-in-the-redox-image-using-a-recipe)
+  - [Insert Files In The Image Using a Recipe](#insert-files-on-the-image-using-a-recipe)
   - [Insert Files In The QEMU Image](#insert-files-in-the-qemu-image)
 - [Working with an unpublished version of a crate](#working-with-an-unpublished-version-of-a-crate)
 - [How to update RedoxFS](#how-to-update-redoxfs)
@@ -50,7 +54,7 @@ If the code that you are working on includes directives like `#[cfg(target_os = 
 "rust-analyzer.cargo.target": "x86_64-unknown-redox"
 ```
 
-If you are browsing a codebase that contains native dependencies (e.g. the kernel repository), you might get analyzer errors because of lacking GCC toolchain. To fix it, install [Redoxer](https://gitlab.redox-os.org/redox-os/redoxer) and its toolchain `redoxer toolchain`, then add the GCC toolchain to your `PATH` configuration (e.g. in `~/.bashrc`):
+If you are browsing a codebase that contains native dependencies (e.g. the kernel repository), you might get analyzer errors because of lacking GCC toolchain. To fix it, install [Redoxer](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer) and its toolchain `redoxer toolchain`, then add the GCC toolchain to your `PATH` configuration (e.g. in `~/.bashrc`):
 
 ```sh
 export PATH="$PATH:$HOME/.redoxer/x86_64-unknown-redox/toolchain/bin"
@@ -80,7 +84,7 @@ Using VS Code on recipes works pretty well, although it sometimes takes a couple
 In your "Coding" shell, start VS Code specifying the `source` directory:
 
 ```sh
-code ~/tryredox/redox/recipes/games/source
+code ~/ferric-oxide/recipes/games/source
 ```
 
 Or if you are in the `source` directory, just write `code .` with the period meaning the `source` directory.
@@ -101,7 +105,7 @@ If you have made significant changes `rust-analyzer` can get confused, but this 
 
 ### Don't Use For The Whole Redox Build System
 
-VS Code cannot grok the gestalt of Redox, so it doesn't work very well if you start it in your `redox` base directory. It can be handy for editing recipes, configuration and GNU Make files. And if you want to see what you have changed in the Redox project, click on the "Source Control" icon on the left side, then select the file you want to compare against the repository.
+VS Code cannot grok the gestalt of Redox, so it doesn't work very well if you start it in your `redox` base directory. It can be handy for editing recipes, configuration and GNU Make files. And if you want to see what you have changed in Ferric Oxide, click on the "Source Control" icon on the left side, then select the file you want to compare against the repository.
 
 ### Don't Build the System in a VS Code Terminal
 
@@ -149,7 +153,7 @@ git config --global user.email '<>'
 
 For clarity and easy usage, we will be using two terminal tabs on the example below, each running a different GNU Bash shell instance.
 
-1. The "Build" shell, normally at `~/tryredox/redox` or where your base `redox` directory is.
+1. The "Build" shell, normally at `~/ferric-oxide` or where your base `redox` directory is.
 2. The "Coding" shell, at `recipes/games/redox-games/source`
 
 ## Setup Your Configuration
@@ -179,7 +183,7 @@ Edit the recipe so it does not try to automatically download the sources.
 - Open the `recipe.toml` file in a text editor:
 
 ```sh
-cd ~/tryredox/redox/recipes/games/redox-games
+cd ~/ferric-oxide/recipes/games/redox-games
 ```
 
 ```sh
@@ -263,7 +267,7 @@ cargo run --bin minesweeper
 
 ## Update The Redox Image
 
-After making changes to your recipe you can use the `make rp.redox-games` command, which will check for any changes in the recipe, rebuild it and update the existing Redox image. The `make all` and `make qemu` commands do not check for recipes that need to be rebuilt, so if you use them, your changes may not be included in the system.
+After making changes to your recipe you can use the `make rp.redox-games` command, which will check for any changes in the recipe, rebuild it and update the existing image. The `make all` and `make qemu` commands do not check for recipes that need to be rebuilt, so if you use them, your changes may not be included in the system.
 
 - Within your "Build" shell, in your `redox` directory, run:
 
@@ -294,9 +298,9 @@ make live
 
 In the directory `build/x86_64/my-config`, you will find the file `redox-live.iso`. Follow the instructions on the [Testing on Real Hardware](#testing-on-real-hardware) section and test out your change.
 
-### Test Your Changes (out of the Redox build system)
+### Test Your Changes (out of the build system)
 
-[Redoxer](https://gitlab.redox-os.org/redox-os/redoxer) is the tool used to quickly build and run Rust, C and C++ programs for Redox, it downloads the Redox toolchain, builds the program and runs it inside of a Redox VM.
+[Redoxer](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer) is the tool used to quickly build and run Rust, C and C++ programs for Redox, it downloads the Redox toolchain, builds the program and runs it inside of a Redox VM.
 
 #### Commands
 
@@ -451,7 +455,7 @@ Options context:
 
 ## Redox Image
 
-This section explain how to update recipes, create and change the Redox image.
+This section explain how to update recipes, create and change the image.
 
 ### Build Your Recipe For Redox
 
@@ -465,7 +469,7 @@ make r.redox-games
 
 The build system Makefiles have a rule for the `r.recipe` recipe target, where `recipe` is the name of a recipe. It will make that recipe ready to load into the Redox filesystem.
 
-Once your Redox recipe has been successfully built, you can run the `make p.redox-games` command to install the recipe in the existing Redox image.
+Once your Redox recipe has been successfully built, you can run the `make p.redox-games` command to install the recipe in the existing image.
 
 If you had a problem, use this command to log any possible errors on your terminal output:
 
@@ -475,7 +479,7 @@ make cr.recipe-name 2>&1 | tee recipe-name.log
 
 ### Make A New Redox Image
 
-If the `make p.redox-games` command didn't work you need to create a new Redox image.
+If the `make p.redox-games` command didn't work you need to create a new image.
 
 - In your "Build" shell, in the `redox` directory, run:
 
@@ -499,7 +503,7 @@ Or (if your change don't allow incremental compilation)
 make crp.recipe-name qemu
 ```
 
-This command will [build just your modified recipe](#build-your-recipe-for-redox), then [update your Redox image with your modified recipe](#make-a-new-redox-image) and run QEMU with Orbital.
+This command will [build just your modified recipe](#build-your-recipe-for-redox), then [update your image with your modified recipe](#make-a-new-redox-image) and run QEMU with Orbital.
 
 ### Insert Text Files On QEMU (quickest method)
 
@@ -538,17 +542,17 @@ cat > mylog.log << EOF
   EOF
 ```
 
-If your file is large, or non-ASCII, or you have many files to copy, you can use the process described in the [Insert Files On QEMU Image](#insert-files-on-qemu-image) section. However, there's a risk of data corruption.
+If your file is large, or non-ASCII, or you have many files to copy, you can use the process described in the [Insert Files In The QEMU Image](#insert-files-in-the-qemu-image) section. However, there's a risk of data corruption.
 
-Files that you create while running QEMU remain in the Redox image, while you don't rebuild the image (the same applies to files that you add in the Redox image).
+Files that you create while running QEMU remain in the image, while you don't rebuild the image (the same applies to files that you add in the image).
 
 Make sure you are **not running QEMU** and run the `make mount` command. You can now use your file manager to navigate to `build/x86_64/my-config/filesystem`. Copy your files into or out of the Redox filesystem as required. Make sure to exit your file browser window, and run `make unmount` before running `make qemu`
 
-Note that in some circumstances, `make qemu` may trigger a rebuild (e.g. `make` detects files with timestamp changes). If that happen the files you copied into the Redox image will be lost.
+Note that in some circumstances, `make qemu` may trigger a rebuild (e.g. `make` detects files with timestamp changes). If that happen the files you copied into the image will be lost.
 
-### Insert files on the Redox image using a recipe
+### Insert files on the image using a recipe
 
-You can use a Redox recipe to put your files inside the Redox image, in this example we will use the recipe `myfiles` for this:
+You can use a Redox recipe to put your files inside the image, in this example we will use the recipe `myfiles` for this:
 
 - Create the `source` folder inside the `myfiles` recipe directory and copy or move your files to it:
 
@@ -556,7 +560,7 @@ You can use a Redox recipe to put your files inside the Redox image, in this exa
 mkdir recipes/other/myfiles/source
 ```
 
-- Build the recipe and add on the Redox image:
+- Build the recipe and add on the image:
 
 ```sh
 make rp.myfiles
@@ -581,7 +585,7 @@ This recipe will make Cookbook package all files in the `source` folder to be in
 
 ### Insert Files In The QEMU Image
 
-If you feel the need to skip creating a new image, and you want to directly add a file to the existing Redox image, it is possible to do so. However, this is not recommended. You should use a recipe to make the process repeatable. You can see below how to access the Redox image as if it were a Linux filesystem.
+If you feel the need to skip creating a new image, and you want to directly add a file to the existing image, it is possible to do so. However, this is not recommended. You should use a recipe to make the process repeatable. You can see below how to access the image as if it were a Linux filesystem.
 
 **Redox can't be running on QEMU while you do this**
 
@@ -591,12 +595,12 @@ If you feel the need to skip creating a new image, and you want to directly add 
 make mount
 ```
 
-The Redox image is now mounted as a directory at: `build/x86_64/your-config/filesystem`
+The image is now mounted as a directory at: `build/x86_64/your-config/filesystem`
 
 - Unmount the filesystem and test your image. **You must unmount before you start QEMU**
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh
@@ -618,7 +622,7 @@ To test your changes quickly, follow the following tutorials on Cargo documentat
 
 ## How to update RedoxFS
 
-if you make changes in the RedoxFS recipe source you also need to manually update the `base` recipe to include your changes in `initfs`, to update the `base` recipe with your changes and install in the existing Redox image, run the following command:
+if you make changes in the RedoxFS recipe source you also need to manually update the `base` recipe to include your changes in `initfs`, to update the `base` recipe with your changes and install in the existing image, run the following command:
 
 ```sh
 make rp.redoxfs,base

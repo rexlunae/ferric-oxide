@@ -20,6 +20,10 @@
 //! signed heads it keeps, so `fox` can take over a root without
 //! reinstalling anything.
 //!
+//! [`deps`] adds the dependencies a package is missing from a
+//! [`deps::PackageSource`], such as a directory of archives, and orders them
+//! for [`Store::install_plan`].
+//!
 //! Install rules:
 //!
 //! - archives must already be verified ([`Archive::open`]);
@@ -74,6 +78,7 @@
 
 mod adopt;
 mod db;
+pub mod deps;
 mod fsutil;
 
 use std::collections::{BTreeMap, BTreeSet};

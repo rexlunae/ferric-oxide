@@ -36,6 +36,12 @@ on:
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
+concurrency:
+  # A new push to a pull request supersedes its older run; runs on main and
+  # ci/** branches are kept.
+  group: host-tools-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -52,6 +58,8 @@ jobs:
           restore-keys: host-
       - name: Smoke runner regression tests
         run: bash scripts/ferric-ci/test-boot-smoke.sh
+      - name: Failed-test log printer tests
+        run: bash scripts/ferric-ci/test-print-test-fails.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Perf A/B gate regression tests
@@ -63,9 +71,9 @@ jobs:
       - name: Device-tree memory safety
         run: |
           rustup component add miri
-          cargo miri test --locked -p ferric-devicetree
+          cargo miri test --locked -p ferric-exec-core -p ferric-devicetree
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-build -p ferric-aligned-buffer -p ferric-boot-time -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-build -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -73,7 +81,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-aligned-buffer -p ferric-boot-time -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)

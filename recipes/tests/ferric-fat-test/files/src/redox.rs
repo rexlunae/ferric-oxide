@@ -250,7 +250,7 @@ fn stat(v: &Volume) -> Result<(), Failure> {
 fn erofs<T>(what: &'static str, result: io::Result<T>) -> Result<(), Failure> {
     match result {
         Ok(_) => Err(Failure::Changed { what }),
-        Err(err) if err.raw_os_error() == Some(libc::EROFS) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(syscall::EROFS) => Ok(()),
         Err(source) => Err(Failure::NotErofs { what, source }),
     }
 }

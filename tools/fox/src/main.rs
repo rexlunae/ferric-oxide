@@ -146,6 +146,14 @@ enum Command {
         /// the trust store and name the same repository, commit and tree.
         #[arg(long, value_name = "FILE")]
         prebuilt: Option<PathBuf>,
+        /// A directory of archives named `<name>.pkgar`, such as the
+        /// cookbook's `repo/<target>`, to take named packages and missing
+        /// dependencies from before trying registries. Repeatable.
+        #[arg(long = "repo", value_name = "DIR")]
+        repos: Vec<PathBuf>,
+        /// Install only what is named, not the dependencies it is missing.
+        #[arg(long)]
+        no_deps: bool,
         #[command(flatten)]
         source: SourceArgs,
         /// Archives (`.pkgar` files), git URLs or local repositories, each
