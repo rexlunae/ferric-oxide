@@ -355,7 +355,12 @@ fetches from upstream Redox at build time.
   `redox-rings`, `redox-buffer-pool`, `redox-log`, `rehid`, `acpi`, `uefi`,
   `ring` and relibc's `object` fork) come from full-history mirror repositories.
   Each `Cargo.lock` pins the exact revision; when updating a mirror, keep the
-  pinned revision so only the source moves.
+  pinned revision so only the source moves. `redox-rings` is pinned with `rev`
+  in `crates/relibc`, `userspace/base` and `userspace/redoxfs` to a Ferric
+  commit that adds the memory fences its wait protocol needs (a waiter could
+  otherwise sleep through a wake-up, see
+  [rexlunae/redox-rings#1](https://github.com/rexlunae/redox-rings/pull/1));
+  all three use the same revision.
 - The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
 - Nothing in this repository syncs from upstream Redox. Recipes that fetch
   their own component trees from upstream Redox, and the prebuilt toolchain
