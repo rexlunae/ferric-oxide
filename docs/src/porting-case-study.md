@@ -317,7 +317,7 @@ make crp.relibc,gitoxide
 Now we need to build a full image and run it in QEMU. Let's make a configuration file.
 
 ```sh
-cd ~/ferric-oxide/config/x86_64
+cd ~/ferric-oxide/config
 ```
 
 ```sh

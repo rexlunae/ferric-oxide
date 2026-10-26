@@ -1686,6 +1686,6 @@ See the size of the `stage.pkgar` and `stage.tar.gz` files.
 
 ## Submitting pull requests
 
-If you want to add your recipe to this repository, read the [package policy](#package-policy) below.
+If you want to add your recipe to this repository, read the [package policy](#packaging-policy) below.
 
 After this you can open a pull request with the proper category, dependencies and comments; see [Creating Proper Pull Requests](./creating-proper-pull-requests.md).

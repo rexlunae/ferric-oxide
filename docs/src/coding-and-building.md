@@ -33,7 +33,7 @@ This page explains common development tasks on the build system.
   - [Make A New Redox Image](#make-a-new-redox-image)
   - [Most Quick Way To Test Your Changes](#most-quick-way-to-test-your-changes)
   - [Insert Text Files On QEMU (quickest method)](#insert-text-files-on-qemu-quickest-method)
-  - [Insert Files In The image Using a Recipe](#insert-files-in-the-redox-image-using-a-recipe)
+  - [Insert Files In The Image Using a Recipe](#insert-files-on-the-image-using-a-recipe)
   - [Insert Files In The QEMU Image](#insert-files-in-the-qemu-image)
 - [Working with an unpublished version of a crate](#working-with-an-unpublished-version-of-a-crate)
 - [How to update RedoxFS](#how-to-update-redoxfs)
@@ -542,7 +542,7 @@ cat > mylog.log << EOF
   EOF
 ```
 
-If your file is large, or non-ASCII, or you have many files to copy, you can use the process described in the [Insert Files On QEMU Image](#insert-files-on-qemu-image) section. However, there's a risk of data corruption.
+If your file is large, or non-ASCII, or you have many files to copy, you can use the process described in the [Insert Files In The QEMU Image](#insert-files-in-the-qemu-image) section. However, there's a risk of data corruption.
 
 Files that you create while running QEMU remain in the image, while you don't rebuild the image (the same applies to files that you add in the image).
 

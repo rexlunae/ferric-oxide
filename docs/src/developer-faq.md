@@ -472,7 +472,7 @@ Read the [Search For Functions in Relibc](./porting-applications.md#search-for-f
 
 ### Which are the upstream requirements to accept my recipe?
 
-Read the [Package Policy](./porting-applications.md#package-policy) section.
+Read the [Package Policy](./porting-applications.md#packaging-policy) section.
 
 ### What are the possible problems when porting applications and libraries?
 
