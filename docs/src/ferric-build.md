@@ -358,7 +358,8 @@ fetches from upstream Redox at build time.
   pinned revision so only the source moves. `redox-rings` is pinned with `rev`
   in `crates/relibc`, `userspace/base` and `userspace/redoxfs` to a Ferric
   commit that adds the memory fences its wait protocol needs (a waiter could
-  otherwise sleep through a wake-up, see
+  otherwise sleep through a wake-up) and the stress tests and loom models
+  that check them (see
   [rexlunae/redox-rings#1](https://github.com/rexlunae/redox-rings/pull/1));
   all three use the same revision.
 - The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
