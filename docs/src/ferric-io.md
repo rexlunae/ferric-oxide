@@ -1076,6 +1076,12 @@ nightly fuzz script runs only the fuzzer and package verification.
 
 ## FAT, read-only
 
+FAT and ext4 daemons both use `ferric-fspath` for text path normalization and
+stable path-derived inode numbers. ext4d re-exports its existing `normalize`
+entry point from the shared crate. Each daemon still walks and validates
+components against its own filesystem; the text helper does no lookup or
+symlink resolution.
+
 `fatd` (`userspace/fatd/`, features.toml `fs.fat`, off by default) serves a
 FAT12, FAT16 or FAT32 volume read-only as a scheme: the EFI system partition, a
 USB stick or an SD card. It takes the same arguments as ext4d:
