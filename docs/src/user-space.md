@@ -14,6 +14,4 @@ Schemes are implemented as a regular Rust trait in the kernel. Some builtin kern
 
 So all file-based syscalls on files owned by user-space, will send a message to that scheme daemon, and when the result is sent back, the kernel will return that result back to the process doing the syscall.
 
-Communication between user-space and the kernel, is generally fast, even though the current syscall handler implementation is somewhat unoptimized. Systems with Meltdown mitigations would be an exception, although such mitigations are not yet implemented.
-
-- [Kernel and User-Space Separation Policy](https://gitlab.redox-os.org/redox-os/redox/-/issues/1412)
+Communication between user space and the kernel is generally fast. On Intel CPUs affected by Meltdown, kernel page-table isolation (`kernel.cpu.kpti`) adds a page-table switch to every system call and interrupt; PCIDs (`kernel.cpu.pcid`) avoid the TLB flushes that would otherwise come with it. To cut the number of calls, Ferric Oxide adds shared submission and completion rings and registered buffers; see [Registered buffers, IOMMUs and rings](./ferric-io.md).

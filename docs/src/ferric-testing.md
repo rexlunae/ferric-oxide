@@ -726,6 +726,14 @@ nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
 This checks accounting and feature integration; controller timing and idle-burst
 reporting still need an instrumented target boot.
 
+### NVMe request lifetime accounting
+
+`ferric-blkqueue`'s activity tests cover claims surviving inline completion,
+cross-thread worker completion and failed delivery. The existing Redox driver
+builds cover percore, perf and grant-DMA integration. Smoke CI retains the
+serial Adaptive default and its enforced same-boot queue performance gates.
+
+
 ### Profiler CPU wakeup acknowledgements
 
 The host kernel helper suite includes `context/idle.rs`, used by the real
