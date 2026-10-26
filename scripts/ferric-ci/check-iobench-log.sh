@@ -4,6 +4,8 @@
 #
 # Usage: check-iobench-log.sh MODE LOG
 #   MODE names the boot in the annotations and the summary table (none, vtd, enforce, ...).
+#   PERF_AB=report reports a failed A/B as a warning instead of failing (perf-ab.sh):
+#   image.yml sets it for the boot with x2APIC hidden.
 #
 # Every default job must print a line per queue policy (main: the one-queue path; adaptive:
 # the per-CPU default; workers) and an A/B line. drivers.nvme_percore is on in every CI image,
@@ -14,6 +16,8 @@
 # write job's two paths are the same path. The figures go out as a notice and, when
 # GITHUB_STEP_SUMMARY is set, as a table in the job summary.
 set -euo pipefail
+# shellcheck source=perf-ab.sh
+. "$(dirname "$0")/perf-ab.sh"
 
 mode="$1"
 log="$2"
@@ -85,6 +89,6 @@ fi
 
 # Only the disk jobs' A/B is a gate; the file jobs' is reported above.
 if grep -aE "^iobench-[^ ]+ ab_.* ab=fail" <<< "$lines" | grep -avE "^iobench-file-"; then
-    fail "nvmed's per-CPU default policy is slower than its single queue in the same boot"
+    perf_ab_failed "iobench ($mode)" "nvmed's per-CPU default policy is slower than its single queue in the same boot"
 fi
 echo "check-iobench-log: $mode OK"

@@ -3,6 +3,8 @@ use spin::Mutex;
 use crate::memory::KernelMapper;
 use core::cell::Cell;
 
+/// Ferric Oxide: decoding the local APIC ID register.
+pub mod apic_id;
 pub mod cpu;
 pub mod hpet;
 pub mod ioapic;
