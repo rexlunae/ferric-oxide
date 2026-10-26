@@ -89,7 +89,7 @@ fuser = { version = "0.16", optional = true }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 ferric-pcache = { path = "../../crates/pcache", features = ["client"] } # Ferric Oxide: the kernel page cache
-redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
+redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", rev = "1b9cdbcd0e2404cef33044c6b199770884e61ca6", features = ["userspace", "sync"] } # Ferric mirror of redox-os/redox-rings
 libredox = { version = "0.1.20", optional = true }
 redox-path = "0.4.1"
 redox-scheme = { version = "0.11.4", optional = true }
