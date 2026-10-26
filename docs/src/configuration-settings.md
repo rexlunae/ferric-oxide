@@ -105,6 +105,8 @@ Each Cookbook configuration defaults to environment variables:
 | `COOKBOOK_CLEAN_BUILD`  | `COOKBOOK_CLEAN_BUILD=true`  | Clean build directory before build     |
 | `COOKBOOK_COMPRESSED`   | `COOKBOOK_COMPRESSED=true`   | Override package compression           |
 | `COOKBOOK_WEB`          | `COOKBOOK_WEB=true`          | Override web content generation        |
+| `REDOXER_USE_CLANG`     | `REDOXER_USE_CLANG=true`     | Use Clang as the default compiler      |
+| `REDOXER_USE_LTO`       | `REDOXER_USE_LTO=true`       | Enable LTO compilation by default      |
 
 > 📝 **Note:** `REPO_OFFLINE=1` and `REPO_NONSTOP=1` are the recommended ways to set options instead of `export COOKBOOK_OFFLINE=true` and `export COOKBOOK_NONSTOP=true`
 > 💡 **Tip:** Running Cookbook with `CI=1 COOKBOOK_LOGS=true COOKBOOK_VERBOSE=false` will hide successful build logs in the terminal
