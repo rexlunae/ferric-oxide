@@ -45,7 +45,7 @@ let _ = event_file.write(&Event{ id: scheme_file.as_raw_fd(), ... });
 // write one message per file descriptor
 ```
 
-Note that timers in Redox are also handled via a scheme, so if you will be using a timer, you will need to open the `timer` scheme, and include that file descriptor among the ones your `event_file` should listen to.
+Note that timers are also handled via a scheme, so if you will be using a timer, you will need to open the `time` scheme, and include that file descriptor among the ones your `event_file` should listen to.
 
 Once your setup of the `event` scheme is complete, you begin your main loop:
 

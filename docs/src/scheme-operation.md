@@ -23,13 +23,12 @@ the `event` scheme makes it easy for the daemon (scheme provider) to block until
 
 ## Daemons and Userspace Scheme Providers
 
-A daemon is a program, normally started during system initialization. It runs with root permissions. It is intended to run continuously, handling requests and other relevant events. On some operating systems, daemons are automatically restarted if they exit unexpectedly. Redox does not currently do this but is likely to do so in the future.
+A daemon is a program, normally started during system initialization. It runs with root permissions. It is intended to run continuously, handling requests and other relevant events. On some operating systems, daemons are automatically restarted if they exit unexpectedly. Ferric Oxide's `init` does not currently do this.
 
-On Redox, a userspace scheme provider is a typically a daemon, although it doesn't have to be.
-The scheme provider informs the kernel that it will provide the scheme by creating it, e.g. `File::create(":myscheme")` will create the scheme `myscheme`.
-Notice that the name used to create the scheme starts with ":", indicating that it is a new entry in the root scheme.
-Since it is created in the root scheme, the kernel knows that it is a new scheme, as named schemes are the only thing that can exist in the root scheme.
-In future, the scheme will register in a namespace using a different path format.
+A userspace scheme provider is typically a daemon, although it doesn't have to be.
+The provider creates a scheme socket with `Socket::create()` from the `redox-scheme` crate, then registers it under a name in its namespace.
+A daemon started by init usually does both through the `daemon` crate (for example `ready_sync_scheme`), which also tells init the daemon is ready; the unit file names the scheme it waits for, as in `type = { scheme = "zero" }`.
+The kernel then forwards requests on that scheme's paths to the socket.
 
 ## Namespaces
 
@@ -39,14 +38,14 @@ When a process starts another program, the `namespace` is inherited,
 so a new process can only access the schemes, files and directories that its parent process had available.
 If a parent process wants to limit (**sandbox**) a child process, it would do so as part of creating the child process.
 
-Currently, Redox starts all processes in the "root" namespace.
-This will be changed in the future, sandboxing all user programs so most schemes and system resources are hidden.
+Currently, all processes start in the "root" namespace.
+Phase 4 of the [roadmap](./ferric-roadmap.md#phase-4-finish-the-capability-security-model) changes this, starting every service with a declared, minimal namespace and sandboxing user programs so most schemes and system resources are hidden.
 
-Redox also provides a `null` namespace.
+There is also a `null` namespace.
 A process that exists in the `null` namespace cannot open files or schemes by name, and can only use file descriptors that are already open.
 This is a security mechanism, mostly used to by daemons running with `root` permission to prevent themselves from being hijacked into opening things they should not be accessing.
 A daemon will typically open its scheme and any resources it needs during its initialization,
-then it will ask the kernel to place it in the `null` namespace so no further resources can be opened.
+then it will ask the kernel to place it in the `null` namespace (`setrens(0, 0)`) so no further resources can be opened.
 
 ## Providing a Scheme
 

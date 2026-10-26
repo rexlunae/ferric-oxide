@@ -2,9 +2,9 @@
 
 ### coreutils
 
-Coreutils is a collection of basic command line utilities included with Redox (or with Linux, BSD, etc.). This includes programs like `ls`, `cp`, `cat` and various other tools necessary for basic command line interaction.
+Coreutils is a collection of basic command line utilities included with Ferric Oxide (or with Linux, BSD, etc.). This includes programs like `ls`, `cp`, `cat` and various other tools necessary for basic command line interaction.
 
-Redox uses the Rust implementation of the GNU Coreutils, [uutils](https://github.com/uutils/coreutils).
+Ferric Oxide uses the Rust implementation of the GNU Coreutils, [uutils](https://github.com/uutils/coreutils).
 
 Available programs:
 
@@ -37,9 +37,9 @@ Available programs:
 
 ### userutils
 
-Userutils contains the utilities for dealing with users and groups in Redox OS.
+Userutils contains the utilities for dealing with users and groups.
 
-They are heavily influenced by Unix and are, when needed, tailored to specific Redox use cases.
+They are heavily influenced by Unix and are, when needed, tailored to this system.
 
 These implementations strive to be as simple as possible drawing particular
 inspiration by BSD systems. They are indeed small, by choice.
@@ -96,18 +96,18 @@ Available programs:
 
 ### contain
 
-This program provides containers (namespaces) on Redox.
+This program provides containers (namespaces).
 
 - [Repository](https://gitlab.redox-os.org/redox-os/contain)
 
 ### acid
 
-The general-purpose test suite of Redox to detect crashes, regressions and race conditions.
+The general-purpose test suite, from Redox, to detect crashes, regressions and race conditions.
 
 - [Repository](https://gitlab.redox-os.org/redox-os/acid)
 
 ### resist
 
-The POSIX test suite of Redox to see how much % the system is compliant to the [POSIX](https://en.wikipedia.org/wiki/POSIX) specification (more means better compatibility).
+The POSIX test suite, from Redox, to see how much % the system is compliant to the [POSIX](https://en.wikipedia.org/wiki/POSIX) specification (more means better compatibility).
 
 - [Repository](https://gitlab.redox-os.org/redox-os/resist)

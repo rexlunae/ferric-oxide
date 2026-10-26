@@ -1,107 +1,119 @@
 # Boot Process
 
+This page follows a Ferric Oxide machine from firmware to the login prompt.
+[Architecture: from firmware to user programs](./ferric-architecture.md#from-firmware-to-user-programs)
+gives the same path in short, with source locations.
+
 ## Boot Loader
 
-The boot loader source can be found in `cookbook/recipes/bootloader/source` after a successful build or in the [Boot Loader](https://gitlab.redox-os.org/redox-os/bootloader) repository.
-
-### BIOS Boot
-
-BIOS Boot is a boot process that dates back to the [IBM PC](https://dosdays.co.uk/topics/pc_bios.php). Because of its lengthy history, BIOS starts up in 16-bit mode (Real Mode), and the boot loader needs to load in multiple stages to move into higher bit environments. The firmware will execute the boot sector located in the first sector of the main storage device, which is known as the stage 1 bootloader ([OSDev Wiki](https://wiki.osdev.org/Boot_Sequence#Master_Boot_Record)).
-
-The stage 1 bootloader is written in Assembly and can be found in `asm/x86-unknown-none/stage1.asm`. The stage 1 main task is to allow reading of the whole disk to load stage 2 in another sector of the storage device. The stage 2 bootloader is also written in Assembly. The main task is transferring [BIOS functions](https://wiki.osdev.org/BIOS#BIOS_functions) from real mode to protected mode (32-bit), then switches to protected mode or long mode (64-bit) and finally loads the Rust-written boot loader, called stage 3.
-
-These three boot loader stages are combined in one executable written to the first megabyte of the storage device. The first code that is executed in Rust-written code is `pub extern "C" fn start()` in `src/os/bios/mod.rs`. At this point, the bootloader follows the same common boot process on all boot methods, which can be seen in a later section.
+The boot loader is in `crates/bootloader/`.
 
 ### UEFI Boot
 
-Redox supports UEFI booting on x86-64, ARM64, and RISC-V 64-bit machines. UEFI starts up in 64-bit mode; thus, the boot process doesn't need multiple stages. The firmware will find the EFI System Partition (ESP) on the storage device, then load and execute PE32+ UEFI programs typically located at `/EFI/BOOT/BOOTX64.efi` ([OSDev Wiki](https://wiki.osdev.org/UEFI#Bootable_UEFI_applications)).
+UEFI is the boot method Ferric Oxide develops for, on x86-64 and ARM64 (RISC-V
+64-bit support is inherited and frozen). UEFI starts up in 64-bit mode, so the
+boot process doesn't need multiple stages. The firmware finds the EFI System
+Partition (ESP) on the storage device, then loads and executes a PE32+ UEFI
+program, typically `/EFI/BOOT/BOOTX64.EFI`
+([OSDev Wiki](https://wiki.osdev.org/UEFI#Bootable_UEFI_applications)).
 
-In the case of our bootloader, the first code that is executed is `pub extern "C" fn main()` in `src/os/uefi/mod.rs`. At this point, the bootloader follows the same common boot process on all boot methods, which can be seen in the section below.
+The first code that runs in our boot loader is `pub extern "C" fn main()` in
+`src/os/uefi/mod.rs`. From there it follows the common boot process below.
+
+### BIOS Boot
+
+BIOS boot code from Redox is still in `src/os/bios/` and the `asm/`
+directory, but Ferric Oxide targets UEFI machines and does not develop or test
+BIOS boot; the [roadmap](./ferric-roadmap.md#guiding-decisions) drops it. In
+short: the firmware runs a stage 1 loader from the first sector of the disk,
+which loads a stage 2 that switches the CPU from 16-bit real mode to protected
+or long mode and runs the Rust stage 3, entering at `pub extern "C" fn start()`
+in `src/os/bios/mod.rs` ([OSDev Wiki](https://wiki.osdev.org/Boot_Sequence#Master_Boot_Record)).
 
 ### Common boot process
 
-The bootloader initializes the memory map and the display mode, both of which rely on firmware mechanisms that are not accessible after control is switched to the kernel. The bootloader then finds the RedoxFS boot partition on the disk and loads `/boot/kernel` and `/boot/initfs` files into memory.
+The bootloader reads the memory map and sets the display mode, both of which
+rely on firmware services that are gone once the kernel runs. It then finds
+the RedoxFS boot partition on the disk and loads `/boot/kernel` and
+`/boot/initfs` into memory. For a live image, it loads the whole partition into
+memory first.
 
-For a live disk, it does load the whole partition into memory. It then loads `/boot/kernel` and `/boot/initfs` also at a different location in memory.
-
-After the kernel and initfs have been loaded, it sets up a virtual paging for kernel and environment variables, including the location of the RedoxFS boot partition to be passed into it. Then, it maps the kernel to its expected virtual address and jumps to its entry function.
+It then sets up the initial page tables and passes the kernel its environment,
+including the location of the RedoxFS boot partition. With `kernel.kaslr_image`
+(on by default) and an entropy source, the bootloader applies the kernel's
+retained relocations and loads it at a randomized virtual address; otherwise
+it uses the link address. Finally it jumps to the kernel's entry point.
 
 ## Kernel
 
-The Redox kernel is a single ELF program in `/boot/kernel`. This kernel performs (fairly significant) architecture-specific initialization in the `kstart` function before jumping to the `kmain` function. At this point, the user-space bootstrap, a specially prepared executable that limits the required kernel parsing, sets up the `/scheme/initfs` scheme, and loads and executes the `init` program.
+The kernel is a single ELF program, `/boot/kernel`, built from
+`crates/kernel/`. It performs architecture-specific initialization in `kstart`
+(memory, CPU features, interrupts, and the mitigations described in
+[Memory and CPU protection](./ferric-memory.md)) before jumping to `kmain`. It
+then starts the user-space **bootstrap**, a small executable embedded with the
+initfs that needs little parsing from the kernel.
 
-The kernel creates three different namespaces during the bootstrap process. Each namespace has its schemes that can be accessed by userspace programs, depending on where it is loaded:
+Bootstrap publishes the kernel's schemes, sets up `/scheme/initfs` and the
+initial namespace manager, and executes `init`. If the initfs contains a
+`lib/trace.toml` (written by the `kernel.trace_initfs_*` options), bootstrap
+turns those trace events on first, so early boot can be traced; see
+[Kernel tracing](./ferric-tracing.md#the-initfs-trace-configuration).
 
-1. the `null` (0) namespace, a namespace that drivers are running on:
-    - `/scheme/memory`
-    - `/scheme/pipe`
-
-2. the `root` (1) namespace, the initial namespace set up during boot:
-    - `/scheme/kernel.acpi`
-    - `/scheme/kernel.dtb`
-    - `/scheme/kernel.proc`
-    - `/scheme/debug`
-    - `/scheme/irq`
-    - `/scheme/serio`
-
-3. Additional namespaces requested by user, also loaded for `root` namespace:
-    - `/scheme/event`
-    - `/scheme/memory`
-    - `/scheme/pipe`
-    - `/scheme/sys`
-    - `/scheme/time`
+The schemes the kernel provides include `memory`, `pipe`, `event`, `irq`,
+`sys`, `time`, `debug`, `serio`, `kernel.acpi`, `kernel.dtb` and `kernel.proc`,
+plus, when their options are on, `kernel.iommu`, `kernel.regbuf`,
+`kernel.ring`, `kernel.pcache` and `kernel.trace`.
 
 ## Init
 
-Redox has a multi-staged init process, designed to allow for the loading of storage drivers in a modular and configurable fashion. This is commonly referred to as an init RAMdisk (initfs). The RAMdisk is contained in `/boot/initfs`, which is a special file format containing the bootstrap code in ELF format and packed files which was loaded into `/scheme/initfs` by the kernel program.
+`init` (`userspace/base/init/`) starts services from **unit files**, similar to
+systemd units: `.service` files describe a daemon (its command, arguments and
+how it reports readiness, for example by registering a scheme) and `.target`
+files group units. Units declare what they need with `requires_weak`, and init
+starts them in dependency order.
 
-### RAMdisk Init
+Boot has two stages. The first runs from the initfs, a RAM disk in
+`/boot/initfs`, and has to make the root file system reachable. The second runs
+from the root file system.
 
-The ramdisk init has the job of loading the drivers and daemons required to access the root filesystem and then transferring control to the filesystem init. The load order is defined in `/etc/init.rc` in initfs:
+### RAM disk stage
 
-1. Daemons required for `relibc`
-    - `rtcd` loads machine-specific RTC into `/scheme/time`
-    - `nulld` null handler, creates `/scheme/null`
-    - `zero` zero handler, creates `/scheme/zero`
-    - `randd` rand handler, creates `/scheme/rand`
-2. Logging
-    - `logd` system log handler, creates `/scheme/log`
-    - `ramfs` loads in-memory FS handling into `/scheme/memory`
-3. Graphics buffers
-    - `inputd` virtual terminal (VT) handler, creates `/scheme/input`
-    - `vesad` VESA interface handler, creates `/scheme/display.vesa`
-    - `fbbootlogd` forwards log from logd to VT
-    - `fbcond` handles keyboard interaction for VT
-4. Live daemon
-    - `lived` livedisk handler, creates `/scheme/disk.live`
-5. Drivers in `/etc/init_drivers.rc`
-    - `ps2d` loads PS/2 handling into `/scheme/serio`
-    - `acpid` loads ACPI handling into `/scheme/kernel.acpi`
-    - `pcid` PCI handler, creates `/scheme/pci`
-    - `pcid-spawner` spawns drivers depending on available hardware
-        - `ahcid` AHCI storage driver
-        - `ided` IDE storage driver
-        - `nvmed` NVME storage driver
-        - `virtio-blkd` VirtIO BLK storage driver
-        - `virtio-gpud` VirtIO GPU driver
+The initfs units come from `userspace/base/init.initfs.d/`. Init first starts
+`00_runtime.target`, the services relibc needs, and then `90_initfs.target`,
+which pulls in the rest:
 
-After loading all drivers and daemons above, the `redoxfs` driver is executed with `--uuid $REDOXFS_UUID` where `$REDOXFS_UUID` is the partition chosen by the bootloader and creates `/scheme/file`. The command `set-default-scheme file` is then executed, so that the default path handler is set to `/scheme/file`.
+1. `00_runtime.target`: `ipcd`, `logd` (`/scheme/log`), `nulld`, `zerod`,
+   `randd` (`/scheme/rand`), `rtcd` (sets the clock from the real-time clock)
+   and a `ramfs` instance for logging.
+2. `10_inputd.service` and `20_graphics.target`: the input and virtual-terminal
+   multiplexer, `vesad` (the firmware framebuffer) and `fbbootlogd`.
+3. `40_drivers.target`: `lived` for live images, `ps2d`, `hwd` (ACPI or device
+   tree), and `pcid-spawner --initfs`, which starts the storage drivers listed
+   in `userspace/base/drivers/initfs.toml` (AHCI, IDE, NVMe, VirtIO and others).
+4. `50_rootfs.service`: `redoxfs --uuid $REDOXFS_UUID file`, which mounts the
+   partition the bootloader chose as `/scheme/file`.
 
-### Filesystem Init
+### Root file system stage
 
-The filesystem init continues the loading of drivers for all other functionality. This includes audio, networking, and anything not required for storage device access. The drivers' init configuration is mainly found in `/usr/lib/init.d` and `/etc/pcid.d`. In the redox builder repository, it's configurable in the [config directory](https://gitlab.redox-os.org/redox-os/redox/-/tree/master/config/base.toml). After this, the login prompt is shown.
+Init then switches its root to the file system: programs come from `/usr`, and
+unit files from `/usr/lib/init.d` and `/etc/init.d`. The defaults are in
+`userspace/base/init.d/`: `pcid-spawner` starts the remaining PCI drivers
+(audio, network, USB and so on, configured in `/usr/lib/pcid.d` and
+`/etc/pcid.d`), followed by networking, audio and the consoles. The image
+configuration (`config/base.toml` and the chosen `config/<name>.toml`) decides
+which packages and units are installed.
 
-If Orbital is enabled, the display server is launched.
+If the image has a desktop, the Orbital display server is started.
 
 ## Login
 
-After the init processes have set up drivers and daemons, the user can log in to the system. The login program accepts a username, with a default user called `user`, prints the `/etc/motd` file, and then executes the user's login shell, usually `ion`. At this point, the user will now be able to access the [shell](./shell.md)
+After the init processes have set up drivers and daemons, the user can log in to the system. The login program accepts a username, with a default user called `user`, prints the `/etc/motd` file, and then executes the user's login shell, usually `ion`. At this point, the user will now be able to access the [shell](./shell.md).
 
 ## Graphical overview
 
-Here is an overview of the initialization process with scheme creation and usage. For simplicity's sake, we do not depict all scheme interaction but at least the major ones. **this is currently out of date, but still informative**
+Here is an overview of the initialization process with scheme creation and usage. For simplicity's sake, we do not depict all scheme interaction but at least the major ones. It comes from Redox and predates the unit-file init, but the order of the main stages still holds.
 
-![Redox initialization graph](./assets/init.svg "Redox initialization graph")
+![Initialization graph](./assets/init.svg "Initialization graph")
 
 ## Boot process documentation
 

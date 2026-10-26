@@ -16,11 +16,13 @@ The `ihdgd` driver supports mode setting in Tiger Lake GPUs and later.
 
 On Linux/BSDs, the kernel communication with GPU is done by the Linux DRM drivers (Direct Rendering Manager) and user-space applications use the `libdrm` library to access them, which Mesa3D drivers use to work (Mesa3D implements OpenGL/Vulkan drivers, DRM exposes the hardware interfaces).
 
-That said, in Redox a "Linux DRM driver" needs to be a user-space driver daemon which uses the system calls/schemes to communicate with the hardware.
+That said, here a "Linux DRM driver" needs to be a user-space driver daemon which uses the system calls/schemes to communicate with the hardware.
 
 Our windowing system (Orbital) support the user-space side of Linux DRM API (`libdrm` C library and Rust equivalent) to reduce user-space porting effort to use our GPU driver API.
 
-For software rendering we implemented a Redox backend in our Mesa3D [fork](https://gitlab.redox-os.org/redox-os/mesa)/[recipe](https://gitlab.redox-os.org/redox-os/cookbook/-/blob/master/recipes/mesa/recipe.toml) to use LLVMPipe.
+For software rendering, the `mesa` recipe builds Mesa3D with a backend for this system (from the Redox project's [fork](https://gitlab.redox-os.org/redox-os/mesa)) to use LLVMPipe.
+
+GPU drivers, with their buffers shared as capabilities through the registered-buffer grants, are planned for Phase 6 of the [roadmap](./ferric-roadmap.md#phase-6-graphics-and-desktop).
 
 ## Software Rendering
 
@@ -28,9 +30,9 @@ As we don't support 2D/3D hardware acceleration yet, we use [LLVMpipe](https://d
 
 ## Orbital
 
-Orbital is the default Redox desktop environment which have a display server, window manager, wallpaper daemon, effects compositor, image viewer and basic terminal.
+Orbital is the default desktop environment, inherited from Redox, which have a display server, window manager, wallpaper daemon, effects compositor, image viewer and basic terminal.
 
-It was preferred over Wayland and X11 to avoid their requirements, dependencies, and limitations (EGL on Wayland and GLX on X11). Orbital was much more simple and easier for the immature Redox API and had the fastest native software rendering performance.
+It was preferred over Wayland and X11 to avoid their requirements, dependencies, and limitations (EGL on Wayland and GLX on X11). Orbital was much more simple and easier for the young system API and had the fastest native software rendering performance.
 
 ### Comparison with X11/Wayland
 
@@ -38,7 +40,7 @@ This display server is more simple than X11 and Wayland making the porting task 
 
 Compared to Wayland, Orbital has one protocol server implementation (like X11 for a long time), while Wayland provides protocols for compositors and clients.
 
-Also native software rendering on X11 and Wayland applications is rare, which would reduce Redox performance by partially or fully using LLVMPipe on applications or user session.
+Also native software rendering on X11 and Wayland applications is rare, which would reduce performance by partially or fully using LLVMPipe on applications or user session.
 
 ### Features
 
