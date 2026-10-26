@@ -114,7 +114,7 @@
   - [References](./references.md)
   - [Libraries and APIs](./libraries-apis.md)
   - [Coding and Building](./coding-and-building.md)
-  - [Including Programs in Redox](./including-programs.md)
+  - [Including Programs](./including-programs.md)
   - [Application Porting](./porting-applications.md)
   - [Porting Case Study](./porting-case-study.md)
   - [Continuous Integration](./ci.md)

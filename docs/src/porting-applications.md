@@ -1,5 +1,9 @@
 # Application Porting
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 The [Including Applications in Redox](./including-programs.md) page gives an example to port/modify a pure Rust application, in this page we explain the advanced way to port pure Rust applications, mixed Rust applications (Rust and C/C++ libraries, for example), C/C++ applications and others.
 
 (Before reading this page you must read the [Build System](./build-system-reference.md) page)
@@ -74,7 +78,7 @@ The [Including Applications in Redox](./including-programs.md) page gives an exa
 - [Search for functions on relibc](#search-for-functions-on-relibc)
 - [Create a BLAKE3 hash for your recipe](#create-a-blake3-hash-for-your-recipe)
 - [Verify the size of your package](#verify-the-size-of-your-package)
-- [Submitting MRs](#submitting-mrs)
+- [Submitting MRs](#submitting-pull-requests)
 
 ## Notes
 
@@ -88,7 +92,7 @@ This section contains quick important information for porting.
 
 ### Cross-compilation
 
-- The Redox build system does cross-compilation and the application or library need to be configured for that, read [this](./developer-faq.md#why-does-redox-do-cross-compilation) section to learn why it's needed
+- The build system does cross-compilation and the application or library need to be configured for that, read [this](./developer-faq.md#why-does-redox-do-cross-compilation) section to learn why it's needed
 - Meson and CMake build system configurations have better cross-compilation support than GNU Autotools and GNU Make configurations, in case the application or library allows you to choose them
 - The cross-compilation configuration of GNU Make configuration may require extensive and time-consuming patching, thus it's recommend to search if a version, branch, fork or patch with GNU Autotools, CMake or Meson support exist
 - Most build instructions were made for native compilation and not cross-compilation, with some poor documentation exceptions
@@ -164,8 +168,8 @@ Read [this](./developer-faq.md#why-are-cc-applications-and-libraries-hard-and-ti
 ### License
 
 - Don't package applications or libraries lacking a license.
-- Verify if the application has a known license violation, in case of doubt ask us on the [chat](https://doc.redox-os.org/book/chat.html).
-- Non-free applications and assets should be approved by Jeremy Soller before and added to a subcategory of the `nonfree` category.
+- Verify if the application has a known license violation, in case of doubt ask in an [issue](https://github.com/rexlunae/ferric-oxide/issues).
+- Non-free applications and assets need the maintainer's approval first, and go in a subcategory of the `nonfree` category.
 
 ## Testing Area
 
@@ -200,7 +204,7 @@ Create a directory at `recipes/application-category` with a file named as `recip
 - Recipe creation from terminal with GNU Nano:
 
 ```sh
-cd ~/tryredox/redox
+cd ~/ferric-oxide
 ```
 
 ```sh
@@ -412,9 +416,9 @@ Each template (except `custom`) script supports build flags, you can add flags a
 - `mesonflags = [ "foo" ]`
 - `pipflags = [ "foo" ]`
 
-To find the supported Cookbook Bash functions, look the recipes using a `script =` field on their `recipe.toml` or read the [source code](https://gitlab.redox-os.org/redox-os/redox/-/tree/master/src).
+To find the supported Cookbook Bash functions, look the recipes using a `script =` field on their `recipe.toml` or read the [source code](https://github.com/rexlunae/ferric-oxide/tree/main/tools/cookbook/src).
 
-- [Recipes](https://gitlab.redox-os.org/redox-os/redox/-/tree/master/recipes)
+- [Recipes](https://github.com/rexlunae/ferric-oxide/tree/main/recipes)
 
 #### Cases
 
@@ -538,7 +542,7 @@ The `"${COOKBOOK_STAGE}"/` path is used to specify where the recipe files will b
 You can see path examples for most customized recipes below:
 
 ```sh
-"${COOKBOOK_STAGE}"/ # The root of the Redox build system
+"${COOKBOOK_STAGE}"/ # The root of the build system
 "${COOKBOOK_STAGE}"/usr/bin # System-wide executables directory
 "${COOKBOOK_STAGE}"/usr/lib # System-wide shared and static library objects directory
 "${COOKBOOK_STAGE}"/usr/share # System-wide application static data files
@@ -1482,7 +1486,7 @@ In maintained Rust applications you just need to update some crates to have Redo
 
 We recommend that you do this based on the errors you get during the compilation, this method is recommended for maintained applications.
 
-- Expose the Redox build system environment variables to the current shell, go to the `source` directory of your recipe and update the crates, example:
+- Expose the build system environment variables to the current shell, go to the `source` directory of your recipe and update the crates, example:
 
 ```sh
 make env
@@ -1520,7 +1524,7 @@ Be aware that some crates break the API stability frequently and make the applic
 
 (Also good to test the latest improvements of the libraries)
 
-- Expose the Redox build system environment variables to the current shell, go to the `source` directory of your recipe and update the crates, example:
+- Expose the build system environment variables to the current shell, go to the `source` directory of your recipe and update the crates, example:
 
 ```sh
 make env
@@ -1680,8 +1684,8 @@ ls -1sh recipes/your-category/recipe-name/target/$TARGET
 
 See the size of the `stage.pkgar` and `stage.tar.gz` files.
 
-## Submitting MRs
+## Submitting pull requests
 
-If you want to add your recipe on the [build system](https://gitlab.redox-os.org/redox-os/redox) to become a Redox package on the [build server](https://static.redox-os.org/pkg/), read the [package policy](#package-policy) below.
+If you want to add your recipe to this repository, read the [package policy](#package-policy) below.
 
-After this you can submit your merge request with proper category, dependencies and comments.
+After this you can open a pull request with the proper category, dependencies and comments; see [Creating Proper Pull Requests](./creating-proper-pull-requests.md).
