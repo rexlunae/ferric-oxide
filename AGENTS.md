@@ -97,6 +97,18 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - Turn off default features you do not need (`default-features = false`), especially in `no_std` code.
 - Do not add a dependency for a few lines of trivial code, and do not add two crates that do the same job.
 
+### Endian-sensitive data uses `simple_endian`
+
+Any structure with a fixed byte order is defined with [`simple_endian`](https://crates.io/crates/simple_endian) and `#[derive(Endianize)]`. That covers on-disk formats (ext4, jbd2, XFS, LVM, LUKS, RedoxFS, partition tables, initfs), network and protocol headers, firmware tables, SCSI/ATA/NVMe commands, and device registers and DMA descriptors whose layout a specification fixes.
+
+- Write the layout once as a native struct with `#[derive(Endianize)]`, `#[endian(le)]` or `#[endian(be)]` as the specification says, and `#[repr(C)]` (or `#[repr(C, packed)]` when the format is packed). The macro generates the `*Wire` type with endian-wrapped fields. Use the native type in program logic and the `*Wire` type at the I/O boundary; convert with `From`/`TryFrom`, or the `read_native`/`write_native` helpers where `std` I/O is available.
+- Nest native types inside native types and `*Wire` types inside `*Wire` types. When a format mixes byte orders, mark each part explicitly rather than relying on the outer struct.
+- For a single value outside a struct, use the crate's `LittleEndian<T>`/`BigEndian<T>` wrappers (or their `u32le`/`u16be`-style aliases), not a bare integer.
+- Do not hand-roll conversions: no `to_le`/`from_be`/`swap_bytes`, no `u32::from_le_bytes(buf[at..at + 4])`, and no per-crate `le32`/`be32` helpers for format fields. Do not add `byteorder`, `endian-num`, `scroll` or zerocopy's byte-order types for this job. Native-endian `to_ne_bytes` for in-memory, same-machine ABIs is fine.
+- In `no_std` crates, depend on it with `default-features = false` and only the features you need, for example `features = ["derive", "integer_impls", "both_endian", "byte_impls"]`, plus `io-core` for slice-based reads. Declare the version once in each workspace's `[workspace.dependencies]`.
+- `zerocopy` or `bytemuck` may still cast byte buffers to and from `*Wire` types; they do not decide byte order.
+- Existing code that converts by hand predates this rule. Move a format to `Endianize` types when you change it, with a byte-fixture test showing the encoding is unchanged.
+
 ### Document all public APIs
 
 - Every public item (crate, module, type, trait, function, method, constant, macro, feature flag) has a doc comment. New crates start with `#![deny(missing_docs)]`; existing crates use at least `#![warn(missing_docs)]` once they are cleaned up.
