@@ -187,15 +187,15 @@ pub fn take_fired() -> bool {
 /// ticking underneath.
 pub fn selftest(token: &mut CleanLockToken) {
     crate::info!("timer: one-shot selftest entered");
-    if !tsc_deadline_supported() {
-        crate::info!("timer: one-shot selftest skipped (no TSC-deadline timer)");
+    let supported = tsc_deadline_supported();
+    crate::info!("timer: one-shot selftest: tsc-deadline supported = {supported}");
+    if !supported {
         return;
     }
+    let rate = crate::arch::time::tsc_rate();
     crate::info!(
-        "timer: one-shot selftest: tsc-deadline supported, tsc rate {} Hz",
-        crate::arch::time::tsc_rate()
-            .map(|rate| rate.get())
-            .unwrap_or(0)
+        "timer: one-shot selftest: tsc rate {} Hz",
+        rate.map(|rate| rate.get()).unwrap_or(0)
     );
     crate::info!("timer: one-shot selftest: rate ready");
 
