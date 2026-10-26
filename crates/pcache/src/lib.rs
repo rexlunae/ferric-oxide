@@ -77,6 +77,8 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod wire;
+
 pub mod abi;
 #[cfg(all(feature = "client", target_os = "redox"))]
 pub mod client;

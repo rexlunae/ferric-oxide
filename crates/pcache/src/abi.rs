@@ -940,7 +940,7 @@ impl FillRef {
 
 impl Record {
     /// The size of a record on the queue, in bytes.
-    pub const BYTES: usize = 40;
+    pub const BYTES: usize = crate::wire::BYTES;
 
     /// The object a fill record is for, and what its answer repeats; `None` for other
     /// records.
@@ -972,7 +972,8 @@ impl Record {
     /// `first: u64`, `generation: u64`, `fill: u64`, all little-endian. Records without pages
     /// have `first` and `count` zero; a writeback record has its [`WritebackReason`] in the
     /// `fill` word (0 dirtied, 1 urgent, 2 run), and the other records other than fills have
-    /// it zero.
+    /// it zero. Native fields are converted through a generated `Endianize` wire
+    /// layout; serialization needs neither allocation nor aligned input.
     pub fn to_bytes(self) -> [u8; Self::BYTES] {
         let pages = match self {
             Self::Fill { pages, .. } | Self::Writeback { pages, .. } => Some(pages),
@@ -987,19 +988,21 @@ impl Record {
         let object = self.object();
         // A record's count is at most `MAX_RECORD_PAGES`, which fits 16 bits.
         let (first, count) = pages.map_or((0, 0), |p| (p.0.first, p.0.count as u16));
-        let mut bytes = [0; Self::BYTES];
-        bytes[0..2].copy_from_slice(&kind.to_le_bytes());
-        bytes[2..4].copy_from_slice(&count.to_le_bytes());
-        bytes[8..16].copy_from_slice(&object.0.to_le_bytes());
-        bytes[16..24].copy_from_slice(&first.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.generation().0.to_le_bytes());
         let word = match self {
             Self::Fill { fill, .. } => fill.0,
             Self::Writeback { reason, .. } => reason.to_word(),
             Self::Release { .. } | Self::Accessed { .. } => 0,
         };
-        bytes[32..40].copy_from_slice(&word.to_le_bytes());
-        bytes
+        crate::wire::QueueRecord {
+            kind,
+            count,
+            reserved: 0,
+            object: object.0,
+            first,
+            generation: self.generation().0,
+            fill: word,
+        }
+        .bytes()
     }
 
     /// Decodes a record.
@@ -1012,19 +1015,14 @@ impl Record {
     /// empty, overflowing or too long page range.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordError> {
         let bytes: &[u8; Self::BYTES] = bytes.try_into().map_err(|_| RecordError::Length)?;
-        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-        let u64_at = |at: usize| {
-            let mut word = [0; 8];
-            word.copy_from_slice(&bytes[at..at + 8]);
-            u64::from_le_bytes(word)
-        };
-        if bytes[4..8] != [0; 4] {
+        let record = crate::wire::QueueRecord::read(bytes).ok_or(RecordError::Length)?;
+        if record.reserved != 0 {
             return Err(RecordError::Reserved);
         }
-        let object = ObjectId(u64_at(8));
-        let (first, count) = (u64_at(16), u16_at(2));
-        let generation = Generation(u64_at(24));
-        let fill = u64_at(32);
+        let object = ObjectId(record.object);
+        let (first, count) = (record.first, record.count);
+        let generation = Generation(record.generation);
+        let fill = record.fill;
         let no_fill = || {
             if fill == 0 {
                 Ok(())
@@ -1040,7 +1038,7 @@ impl Record {
                 Err(RecordError::Reserved)
             }
         };
-        match u16_at(0) {
+        match record.kind {
             Self::KIND_FILL => Ok(Self::Fill {
                 object,
                 generation,
@@ -1556,6 +1554,56 @@ mod tests {
     }
 
     #[test]
+    fn records_match_literal_little_endian_fixtures() {
+        let object = ObjectId::new(0x1122_3344_5566_7788);
+        let generation = Generation::new(0x0102_0304_0506_0708);
+        let pages = record(0x1234_5678_9abc_def0, 258);
+        let mut fixture = [
+            2, 0, 2, 1, 0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xf0, 0xde,
+            0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        for (reason, value) in [
+            (WritebackReason::Dirtied, 0),
+            (WritebackReason::Urgent, 1),
+            (WritebackReason::Run, 2),
+        ] {
+            fixture[32] = value;
+            let record = Record::Writeback {
+                object,
+                generation,
+                pages,
+                reason,
+            };
+            assert_eq!(record.to_bytes(), fixture);
+            assert_eq!(Record::from_bytes(&fixture), Ok(record));
+            let mut unaligned = [0; 41];
+            unaligned[1..].copy_from_slice(&fixture);
+            assert_eq!(Record::from_bytes(&unaligned[1..]), Ok(record));
+        }
+        fixture[0] = 1;
+        fixture[32..40].copy_from_slice(&[0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76]);
+        let fill = Record::Fill {
+            object,
+            generation,
+            pages,
+            fill: FillId::new(0x7654_3210_fedc_ba98),
+        };
+        assert_eq!(fill.to_bytes(), fixture);
+        assert_eq!(Record::from_bytes(&fixture), Ok(fill));
+        fixture[2..4].fill(0);
+        fixture[16..24].fill(0);
+        fixture[32..40].fill(0);
+        for (kind, record) in [
+            (3, Record::Release { object, generation }),
+            (4, Record::Accessed { object, generation }),
+        ] {
+            fixture[0] = kind;
+            assert_eq!(record.to_bytes(), fixture);
+            assert_eq!(Record::from_bytes(&fixture), Ok(record));
+        }
+    }
+
+    #[test]
     fn bad_records_are_refused() {
         let fill = Record::Fill {
             object: ObjectId::new(1),
@@ -1572,10 +1620,10 @@ mod tests {
         bad[6] = 1;
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Reserved));
         let mut bad = fill;
-        bad[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        bad[2..4].copy_from_slice(&[0, 0]);
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
         let mut bad = fill;
-        bad[2..4].copy_from_slice(&(MAX_RECORD_PAGES as u16 + 1).to_le_bytes());
+        bad[2..4].copy_from_slice(&[1, 4]);
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
         let mut release = Record::Release {
             object: ObjectId::new(1),

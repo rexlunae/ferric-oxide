@@ -799,6 +799,13 @@ versus system call timings, by descriptor, by slot and on the worker.
 
 ## Page cache
 
+The fill queue's fixed 40-byte little-endian records use a native `Endianize`
+layout and its generated `simple_endian` wire type. Serialization and parsing
+use safe slice I/O without allocation or alignment requirements. Literal-byte
+regressions cover fills, releases, accesses and all writeback reasons (dirtied,
+urgent and run), retaining their existing encoding and reserved-field checks.
+
+
 With `kernel.page_cache = true` in `ferric.toml` (Kernel menu, off by
 default), the kernel has a `kernel.pcache` scheme that caches file contents in
 kernel memory and serves `read` and `pread` from it, without a round trip to

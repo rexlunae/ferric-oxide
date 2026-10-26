@@ -157,6 +157,9 @@ version = "0.1.0"
 [[package]]
 name = "ferric-pcache"
 version = "0.1.0"
+dependencies = [
+ "simple_endian",
+]
 
 [[package]]
 name = "ferric-procinfo"
@@ -531,6 +534,26 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "simple_endian"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fefb7154bf9471272770ebfc50bc8ce4c52b8394ac189288655966948ad611fa"
+dependencies = [
+ "simple_endian_derive",
+]
+
+[[package]]
+name = "simple_endian_derive"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eff6284c89365acc991ef7104aba51708740641a71296c933b7be99e17a5663"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "slab"

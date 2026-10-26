@@ -708,6 +708,10 @@ interrupts, scheduler wait registration or timer hardware.
 
 ### Delayed page-cache writeback notifications
 
+`ferric-pcache` also checks its 40-byte queue record against literal little-endian
+fixtures, including every writeback reason and unaligned input. The generated
+wire layout is shared by kernel and file-system consumers.
+
 `cargo test --locked -p ferric-pcache --all-features` includes the delayed
 notification regression: fsync cleans a file before its record is delivered,
 writes race on either side of the current-count query, duplicate records keep
