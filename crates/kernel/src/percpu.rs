@@ -66,6 +66,12 @@ pub fn get_percpu_block(idx: LogicalCpuId) -> Option<&'static PercpuBlock> {
         .load(Ordering::Relaxed);
     unsafe { ptr.as_ref() }
 }
+/// Ferric Oxide: the per-CPU block of `cpu` when it is running and can take device interrupts,
+/// that is, unless it is the `profiling` feature's profiler CPU
+/// ([`crate::profiling::is_profiler_cpu`]), which would drop them.
+pub fn interrupt_target(cpu: LogicalCpuId) -> Option<&'static PercpuBlock> {
+    get_percpu_block(cpu).filter(|_| !crate::profiling::is_profiler_cpu(cpu))
+}
 pub fn all_percpu_blocks() -> impl Iterator<Item = &'static PercpuBlock> {
     (0..ALL_PERCPU_BLOCKS.len()).filter_map(|i| get_percpu_block(LogicalCpuId::new(i as u32)))
 }

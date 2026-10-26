@@ -1,6 +1,6 @@
 [source]
 # The kernel lives in this repository at crates/kernel/, a git subtree of
-# gitlab.redox-os.org/redox-os/kernel (see .github/workflows/subtree-sync.yml).
+# gitlab.redox-os.org/redox-os/kernel (imported with its history; not synced).
 # The path is relative to the repository root, where the cookbook runs.
 path = "crates/kernel"
 

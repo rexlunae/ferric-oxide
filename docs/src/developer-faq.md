@@ -1,5 +1,9 @@
 # Developer FAQ
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 The [General FAQ](https://www.redox-os.org/faq/) have questions and answers of/for newcomers and end-users, while this FAQ contain organization, technical questions and answers of/for developers and testers, feel free to suggest new questions and answers.
 
 (If the following questions aren't enough, ask us in the [Chat](./chat.md))
@@ -23,12 +27,12 @@ The [General FAQ](https://www.redox-os.org/faq/) have questions and answers of/f
     - [What is a recipe?](#what-is-a-recipe)
     - [When I should rebuild the build system or recipes from scratch?](#when-i-should-rebuild-the-build-system-or-recipes-from-scratch)
     - [How can I test my changes on real hardware?](#how-can-i-test-my-changes-on-real-hardware)
-    - [How can I insert files into the Redox image?](#how-can-i-insert-files-into-the-redox-image)
+    - [How can I insert files into the image?](#how-can-i-insert-files-into-the-image)
     - [How can I change my Redox variant?](#how-can-i-change-my-redox-variant)
     - [How can I increase the filesystem size of my QEMU image?](#how-can-i-increase-the-filesystem-size-of-my-qemu-image)
     - [How can I change the CPU architecture of my build system?](#how-can-i-change-the-cpu-architecture-of-my-build-system)
     - [How can I cross-compile to ARM64 from a x86-64 computer?](#how-can-i-cross-compile-to-arm64-from-a-x86-64-computer)
-    - [How can I use a recipe in my Redox image?](#how-can-i-use-a-recipe-in-my-redox-image)
+    - [How can I use a recipe in my image?](#how-can-i-use-a-recipe-in-my-image)
     - [How to update RedoxFS?](#how-to-update-redoxfs)
     - [I made changes to my recipe. What is the quickest way to test it in QEMU?](#i-made-changes-to-my-recipe-what-is-the-quickest-way-to-test-it-in-qemu)
     - [I made changes to multiple recipes. What is the quickest way to test it in QEMU?](#i-made-changes-to-multiple-recipes-what-is-the-quickest-way-to-test-it-in-qemu)
@@ -78,7 +82,7 @@ The [General FAQ](https://www.redox-os.org/faq/) have questions and answers of/f
         - [When I run "make r.recipe" I get a syntax error, how can I fix that?](#when-i-run-make-rrecipe-i-get-a-syntax-error-how-can-i-fix-that)
         - [When I run "cargo update" on some recipe source it calls Rustup to install other Rust toolchain version, how can I fix that?](#when-i-run-cargo-update-on-some-recipe-source-it-calls-rustup-to-install-other-rust-toolchain-version-how-can-i-fix-that)
         - [I added the dependency of my program in the "recipe.toml" file but the program build system doesn't detect it, then I installed the program dependency on my Linux distribution and it detected it, why?](#i-added-the-dependency-of-my-program-in-the-recipetoml-file-but-the-program-build-system-doesnt-detect-it-then-i-installed-the-program-dependency-on-my-linux-distribution-and-it-detected-it-why)
-        - [I made changes to system daemons, drivers and RedoxFS but they aren't applied in the Redox image, how can I fix that?](#i-made-changes-to-system-daemons-drivers-and-redoxfs-but-they-arent-applied-in-the-redox-image-how-can-i-fix-that)
+        - [I made changes to system daemons, drivers and RedoxFS but they aren't applied in the image, how can I fix that?](#i-made-changes-to-system-daemons-drivers-and-redoxfs-but-they-arent-applied-in-the-image-how-can-i-fix-that)
     - [QEMU](#qemu)
         - [How can I kill the QEMU process if Redox freezes or gets a kernel panic?](#how-can-i-kill-the-qemu-process-if-redox-freezes-or-gets-a-kernel-panic)
     - [Real Hardware](#real-hardware)
@@ -176,7 +180,7 @@ Read [this](./hardware-support.md#cpu-requirements) section.
 
 ### Why Redox have its own build system?
 
-The Redox build system (mostly Cookbook) was created to be fully adapted to easy/fast Redox development, cross-compilation and porting. Not easily or not available in other build systems.
+The build system (mostly Cookbook) was created to be fully adapted to easy/fast Redox development, cross-compilation and porting. Not easily or not available in other build systems.
 
 There's a minimal variant of the build system (Redoxer) focused on quick system/application/CI testing without complex C/C++ dependency, QEMU and development configuration.
 
@@ -186,7 +190,7 @@ Read the [Application Porting](./porting-applications.md) page.
 
 ### How can I write a driver?
 
-Read the [drivers repository README](https://gitlab.redox-os.org/redox-os/drivers/-/blob/master/README.md).
+Read the [drivers README](https://github.com/rexlunae/ferric-oxide/tree/main/userspace/base/drivers/README.md) and [Drivers](./drivers.md).
 
 ### How can I debug?
 
@@ -216,7 +220,7 @@ Read the [Update The Build System](./build-system-reference.md#update-the-build-
 
 ### How can I verify if my build system is up-to-date?
 
-After the `make pull` command, run the `git rev-parse HEAD` command to verify if it matches the latest commit hash on [GitLab](https://gitlab.redox-os.org/redox-os/redox/-/commits/master?ref_type=HEADS).
+After `git pull`, run `git rev-parse HEAD` to verify that it matches the latest commit on [GitHub](https://github.com/rexlunae/ferric-oxide/commits/main).
 
 ### What is a recipe?
 
@@ -236,7 +240,7 @@ Sometimes the execution of the `make pull rebuild` command is not enough to upda
 
 Read the [Testing on Real Hardware](./coding-and-building.md#testing-on-real-hardware) section.
 
-### How can I insert files into the Redox image?
+### How can I insert files into the image?
 
 If you use a [recipe](./coding-and-building.md#insert-files-on-the-qemu-image-using-a-recipe) your changes will persist after the `make image` command, but you can also [mount](./coding-and-building.md#insert-files-on-the-qemu-image) the Redox filesystem to insert them directly.
 
@@ -266,7 +270,7 @@ Insert the `ARCH?=aarch64` environment variable on your `.config` file and run t
 
 If you want to do it temporarily run the `make all ARCH=aarch64` command.
 
-### How can I use a recipe in my Redox image?
+### How can I use a recipe in my image?
 
 If you want to quickly install the recipe package until the next image creation, run the following command:
 
@@ -387,7 +391,7 @@ recipe-name = "source"
 ...
 ```
 
-- Install the recipe package in the Redox image
+- Install the recipe package in the image
 
 ```sh
 make rp.recipe-name
@@ -468,7 +472,7 @@ Read the [Search For Functions in Relibc](./porting-applications.md#search-for-f
 
 ### Which are the upstream requirements to accept my recipe?
 
-Read the [Package Policy](./porting-applications.md#package-policy) section.
+Read the [Package Policy](./porting-applications.md#packaging-policy) section.
 
 ### What are the possible problems when porting applications and libraries?
 
@@ -522,7 +526,7 @@ When a regular program calls `open`, `read`, `write`, etc. on a file-like resour
 
 ### How are the system calls used by userspace daemons?
 
-All userspace daemons use the system calls through [relibc](https://gitlab.redox-os.org/redox-os/relibc) like any normal program.
+All userspace daemons use the system calls through [relibc](https://github.com/rexlunae/ferric-oxide/tree/main/crates/relibc) like any normal program.
 
 ## GitLab Questions
 
@@ -637,15 +641,15 @@ Verify if your `recipe.toml` file has some typo, missing data type or value.
 
 #### When I run "cargo update" on some recipe source it calls rustup to install other Rust toolchain version, how can I fix that?
 
-It happens because Cargo is not using the Redox fork of the Rust compiler, to fix that run `make env` from the Redox build system root.
+It happens because Cargo is not using the Redox fork of the Rust compiler, to fix that run `make env` from the build system root.
 
-It will import the Redox Makefile environment variables to your active shell (it already does that when you run other `make` commands from the Redox build system root).
+It will import the Redox Makefile environment variables to your active shell (it already does that when you run other `make` commands from the build system root).
 
 #### I added the dependency of my program in the "recipe.toml" file but the program build system doesn't detect it, then I installed the program dependency on my Linux distribution and it detected it, why?
 
 Read the [Environment Leakage](./troubleshooting.md#environment-leakage) section.
 
-#### I made changes to system daemons, drivers and RedoxFS but they aren't applied in the Redox image, how can I fix that?
+#### I made changes to system daemons, drivers and RedoxFS but they aren't applied in the image, how can I fix that?
 
 You forgot to update initfs which is manual, read [this](./coding-and-building.md#how-to-update-initfs) section to learn how to do this.
 
