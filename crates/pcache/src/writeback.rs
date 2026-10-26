@@ -36,8 +36,11 @@ pub const DEFAULT_AGE_MS: u64 = 5_000;
 /// ([`crate::abi::Request::SetWriteback`]): 8192 pages, 32 MiB.
 pub const DEFAULT_MAX_DIRTY_PAGES: u32 = 8192;
 
-/// The pages a [`flush`] pass takes at most at once: 256, 1 MiB.
-pub const FLUSH_PAGES: u32 = 256;
+/// The pages a [`flush`] pass takes at most at once: 1024, 4 MiB, the longest run the kernel
+/// hands out ([`crate::abi::MAX_RECORD_PAGES`]), so a pass makes as few round trips and
+/// file-system writes as it can. With 256 pages, a 32 MiB sequential write and its `fsync`
+/// were slower through the cache than straight to RedoxFS.
+pub const FLUSH_PAGES: u32 = crate::abi::MAX_RECORD_PAGES;
 
 /// Objects with dirty pages, each with the time it became dirty (`T`, any ordered time such
 /// as an `Instant` or a count of milliseconds), oldest first.
