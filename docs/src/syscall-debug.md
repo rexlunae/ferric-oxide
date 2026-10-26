@@ -1,65 +1,85 @@
 # System Call Tracing
 
-If you want to monitor what system calls are being made by a program, to investigate behavior, bugs or performance, there is a mechanism set up to do this.
+To see which system calls a program makes, to investigate behavior, bugs or
+performance, use [kernel tracing](./ferric-tracing.md). It records system
+calls, scheme requests, context switches, page faults and more into per-CPU
+rings, which you can turn on and off while the system runs and read on the
+host as text or as a Perfetto timeline. It is available on x86-64.
 
-You will learn how to configure the kernel to print a trace of system calls.
+An older mechanism inherited from Redox, the kernel's `syscall_debug` feature,
+is described at the end of this page. It prints to the console and needs a
+kernel change for each program you want to watch.
 
-## Modifying the Kernel
+## Tracing system calls
 
-You will be modifying the kernel, but you won't be making extensive changes, so you don't need to bother with GitLab stuff, unless you intend to do this frequently. This description assumes you will look after that yourself.
+1. Turn tracing on in `ferric.toml` and rebuild the image:
 
-- The kernel source is in the directory `recipes/core/kernel/source`
-- If the directory is missing, go to your `redox` directory and run `make f.kernel`
+   ```sh
+   cargo run -q -p ferric-config -- set kernel.trace=true
+   cargo xtask build
+   ```
 
-Once you have fetched the kernel source into its "source" directory, you should disable the `[source]` section of the kernel recipe, so the build system doesn't try to update the kernel code.
+   `kernel.trace_syscall` and `kernel.trace_scheme` are on by default once
+   `kernel.trace` is, so `syscall.enter`/`syscall.exit` and the matching scheme
+   requests are compiled in. Include the `ferric-trace` package in the image to
+   capture on the target (the `ferric-smoke` image has it).
 
-- In the file `recipes/core/kernel/recipe.toml`, comment out the lines in the source section:
+2. Boot the image (`cargo xtask run`) and, as root, record a workload:
 
+   ```sh
+   echo "enable syscall scheme sched" > /scheme/kernel.trace/events
+   my-program
+   echo "disable syscall scheme sched" > /scheme/kernel.trace/events
+   ferric-trace capture capture/
+   ```
+
+   To keep only some calls, set a filter first, for example
+   `echo "filter syscall.enter nr == 3" > /scheme/kernel.trace/events`.
+   [Argument filters](./ferric-tracing.md#argument-filters) lists the
+   syntax.
+
+3. Copy `capture/` to the host and decode it:
+
+   ```sh
+   cargo run -p ferric-trace-cli -- text capture/
+   cargo run -p ferric-trace-cli -- perfetto --tsc-mhz 3000 -o trace.json capture/
+   ```
+
+   Open `trace.json` in [Perfetto](https://ui.perfetto.dev/). With `sched`
+   events recorded, the timeline shows which process made each call.
+
+To trace a boot, put the events in `kernel.trace_boot` instead (for example
+`cargo run -q -p ferric-config -- set kernel.trace_boot=syscall`), or use the
+`kernel.trace_initfs_*` options to trace from just before `init` starts.
+[Kernel tracing](./ferric-tracing.md) covers every event, the overhead
+budget, crash dumps and sampling profiles.
+
+## The `syscall_debug` feature
+
+This prints system calls to the kernel console as they happen. It works on
+every architecture but needs a kernel rebuild, and you choose the program by
+editing kernel code. Don't commit these changes.
+
+### Enable the feature
+
+Turn on the `kernel.syscall_debug` option, which builds the kernel with its
+`syscall_debug` Cargo feature:
+
+```sh
+cargo run -q -p ferric-config -- set kernel.syscall_debug=true
 ```
-# [source]
-# git = "https://gitlab.redox-os.org/redox-os/kernel.git"
-```
 
-## feature "syscall_debug"
+(Without a `ferric.toml`, the build uses the kernel's Cargo defaults instead;
+then uncomment `"syscall_debug"` in the default features of
+`crates/kernel/Cargo.toml`.)
 
-In order to configure printing out of system calls, you will need to enable the feature "syscall_debug" for the kernel.
+### Choose what to print
 
-- In the file `recipes/core/kernel/source/Cargo.toml`, scroll down to the default features list (maybe around line 50), and add the feature "syscall_debug":
+The file `crates/kernel/src/syscall/debug.rs` contains the code to print out the system calls that match a particular set of conditions.
 
-```
-default = [
-  "acpi",
-  "multi_core",
-  "graphical_debug",
-  "serial_debug",
-  "self_modifying",
-  "x86_kvm_pv",
-  "syscall_debug", <---- Like this
-]
-```
+In the function `debug_start`, the boolean `do_debug` determines if the system calls should be printed.
 
-## Modify the "debug.rs" file
-
-The file `src/syscall/debug.rs` contains the code to print out the system calls that match a particular set of conditions.
-
-In the function `debug_start` (maybe around line 228), the boolean `do_debug` determines if the system calls should be printed.
-
-It looks like this right now:
-
-```
-pub fn debug_start([a, b, c, d, e, f]: [usize; 6]) {
-    let do_debug = if false && crate::context::current().read().name.contains("acpid") {
-        if a == SYS_CLOCK_GETTIME || a == SYS_YIELD || a == SYS_FUTEX {
-            false
-        } else if (a == SYS_WRITE || a == SYS_FSYNC) && (b == 1 || b == 2) {
-            false
-        } else {
-            true
-        }
-    } else {
-        false
-    };
-```
+It starts with `let do_debug = if false && { ... }`, where the block reads the current context's name.
 
 Obviously, the condition `false && whatever` will evaluate to false, so remove the first bit (it's to prevent accidentally turning tracing on)
 
@@ -79,28 +99,15 @@ A message will be printed at the start of the system call, and a message will be
 
 (A flag is set so the kernel knows to print the result.)
 
-## Building The Changes
+### Build and run
 
-To include these changes in your Redox image, run the following command:
+Rebuild and boot the image:
 
-```
-make rp.kernel
-```
-
-Or (if the above doesn't work)
-
-```
-make r.kernel image
+```sh
+cargo xtask run
 ```
 
-## Where Do The Messages Go
-
-The kernel will print the messages on the console, if you are running `make qemu` the messages will appear in that terminal.
-
-- Consider to run the following command to capture the output:
-
-```
-make qemu |& tee my_log.txt
-```
-
-If you are doing the testing on real hardware you should probably use the `server` variant and run commands from the console.
+The kernel prints the messages on its console. With `cargo xtask run
+--headless` they appear in your terminal; to keep them, run
+`cargo xtask run --headless |& tee my_log.txt`. On real hardware, use a serial
+console or the `server` configuration and run commands from the console.

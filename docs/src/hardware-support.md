@@ -1,42 +1,73 @@
 # Hardware Support
 
-There are billions of devices with hundreds of models and architectures in the world. We try to write drivers for the most used devices to support more people. Support depends on the specific hardware, since some drivers are device-specific and others are architecture-specific.
+Ferric Oxide targets modern machines. Support depends on the specific
+hardware: some drivers are device-specific and others work across a whole
+class of devices.
 
-Have a look at the [HARDWARE.md](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/HARDWARE.md) document to see all tested computers.
+[HARDWARE.md](https://github.com/rexlunae/ferric-oxide/blob/main/HARDWARE.md)
+lists tested computers. Most of its current entries were inherited from Redox
+OS and describe Redox images; they are not proof that a Ferric Oxide image
+boots on that machine. New reports name the Ferric Oxide commit they tested.
+[Hardware Bring-up](./ferric-hardware.md) maps the project's development
+machine to the drivers in this repository.
 
-## CPU Requirements
+## Architectures and firmware
 
-The following requirements are mandatory to make Redox work, non-x86 CPUs have equivalents for them.
+| Architecture | Status |
+| --- | --- |
+| x86-64 | Primary. User space is built for **x86-64-v3** by default; an optional **x86-64-v4** (AVX-512) build is available |
+| ARM64 (aarch64) | Second architecture. ARMv8.0-A minimum, with ARMv8.2-A and ARMv9 variants. Boots a RAM-backed live image in QEMU; persistent storage and hardware acceleration are incomplete |
+| RISC-V 64 | Frozen: imported code remains, but it is not being developed |
+| i586 / 32-bit x86 | Not supported |
 
-- [MMU](https://en.wikipedia.org/wiki/Memory_management_unit) : Introduced by the Intel 8086 CPU line in 1978 and present in all CPUs since then
-- [FPU](https://en.wikipedia.org/wiki/Floating-point_unit) : Introduced by the Intel 8087 coprocessor in 1980 for the Intel 8086 CPU line and present in almost all CPUs since then
-- FXSAVE extension or non-x86 CPU equivalent
-- [Page Size Extension](https://en.wikipedia.org/wiki/Page_Size_Extension) or non-x86 CPU equivalent
-- Paging global extension or non-x86 CPU equivalent
+Boot is **UEFI only**. BIOS boot code remains in imported sources but is not
+supported or extended.
 
-## I have a low-end computer, would Redox work on it?
+## CPU requirements on x86-64
 
-A CPU is the most complex machine of the world: even the oldest processors are powerful for some tasks but not for others.
+x86-64-v3 means a CPU with AVX2, BMI1/2, FMA, F16C, LZCNT and MOVBE: Intel
+Haswell (2013) and later, or AMD Excavator/Zen and later. This floor was
+chosen over v4 because Intel client chips from Alder Lake on ship without
+AVX-512, so a v4 floor would exclude most Intel laptops. AMD Zen 4 and 5 and
+Intel Xeon support v4.
 
-The main problem with old computers is the amount of DRAM memory available (they were sold in a era where RAM chips were expensive) and the lack of SSE/AVX extensions (programs use them to speed up the algorithms). Because of this some modern programs may not work (if a SIMD compatibility layer is not used) or require a lot of RAM to perform complex tasks.
+The kernel checks the CPU against the configured level at boot and halts with
+a list of missing features, instead of letting user space fail later with an
+invalid-opcode fault.
 
-Redox itself will work normally if the CPU architecture is supported by the system, but the performance and stability may vary per program.
+The platform the roadmap assumes also has NX, SMEP, SMAP, UMIP, PCID,
+FSGSBASE, XSAVE, x2APIC, an IOMMU (Intel VT-d or AMD-Vi) and a TPM 2.0. Not
+all of these are enforced yet; [Memory and CPU Protection](./ferric-memory.md)
+says which are checked and used today. Where the CPU has them, Ferric Oxide
+can use CET (indirect-branch tracking and shadow stacks, in the kernel),
+AVX-512 and, in future, protection keys.
 
-## Why choosing i586 as the minimal supported x86 CPU?
+## I have an older computer. Will Ferric Oxide work on it?
 
-- i686 ([Pentium Pro](https://en.wikipedia.org/wiki/Pentium_Pro)) introduced MMX, SSE, and SSE2 [extensions](https://en.wikipedia.org/wiki/P6_(microarchitecture)). Fortunately the kernel and other critical system components don't use them.
-- i586 ([Original Pentium](https://en.wikipedia.org/wiki/Pentium_(original))) introduced a more efficient FPU and MMX extension which are critical for programs, also the most minimal CPU architecture supported by [Rust](https://doc.rust-lang.org/beta/rustc/platform-support.html) and perhaps most Rust packages.
-- [i486](https://en.wikipedia.org/wiki/I486) introduced FPU and atomic operations, which are used by the kernel and other critical system components. It would be possible to go all the way back to i486, but Redox will run with much less programs.
-- [i386](https://en.wikipedia.org/wiki/I386) has no atomics and floating instructions (at all), which makes it not a target for both the kernel and other critical system components.
+Not if it predates x86-64-v3. Supporting older CPUs would mean keeping
+fallback paths in the kernel and building every package for a lower baseline,
+which costs performance on the hardware the project targets. Redox OS supports
+a much wider range of hardware, down to i586, and is the better choice for
+older machines.
 
-## Compatibility Table
+The feature catalog still offers the v1 and v2 levels inherited from
+upstream, but new Ferric Oxide development does not target them.
 
-| **Category** | **Items** |
+## Devices
+
+The drivers below are inherited from Redox unless noted. "In the tree" means a
+driver exists; it does not mean every device of that class has been tested.
+
+| Category | In the tree |
 |--------------|-----------|
-| CPU | - Intel 64-bit (x86_64) <br>- Intel 32-bit (i586) from Pentium II and after with limitations <br>- AMD 32/64-bit <br>- ARM 64-bit (aarch64) with limitations <br>- RISC-V 64-bit (riscv64gc) with limitations |
-| Hardware Interfaces | - ACPI, PCI, USB |
-| Storage | - IDE (PATA), SATA (AHCI), NVMe |
-| Video | - BIOS VESA, UEFI GOP, Intel GPU |
-| Sound | - Intel, Realtek chipsets |
-| Input | - PS/2 keyboards, mouse, and touchpad <br> - USB keyboards, mouse and touchpad |
-| Ethernet | - Intel Gigabit and 10 Gigabit ethernet <br>- Realtek ethernet |
+| Hardware interfaces | ACPI, PCI and PCIe with MSI/MSI-X, USB (xHCI) |
+| DMA isolation | Intel VT-d and AMD-Vi IOMMU domains (Ferric Oxide; off by default) |
+| Storage | NVMe (with optional per-CPU queues and registered-buffer DMA), SATA (AHCI), IDE, USB mass storage, virtio-blk |
+| Video | UEFI GOP framebuffer, Intel GPU, virtio-gpu |
+| Sound | Intel HDA, AC'97, Sound Blaster 16 |
+| Input | PS/2 and USB keyboards, mice and touchpads |
+| Ethernet | Intel e1000 and ixgbe, Realtek RTL8139 and RTL8168, virtio-net; Realtek RTL8125B (`rtl8125d`, Ferric Oxide, compiled but not yet run on hardware) |
+| Wi-Fi, Bluetooth | None yet (planned, Phase 5) |
+
+Under QEMU, the emulated NVMe, e1000, virtio and xHCI devices are the
+best-tested configuration.
