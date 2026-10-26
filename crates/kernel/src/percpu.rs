@@ -74,6 +74,8 @@ pub struct OneShotPercpu {
     pub armed: ferric_timed::ArmedDeadline,
     /// Whether a fire happened since the last consume.
     pub fired: core::sync::atomic::AtomicBool,
+    /// How many timer interrupts this CPU's handler has seen (diagnostics).
+    pub entries: core::sync::atomic::AtomicU64,
     /// The LVT timer entry that was replaced, or `u32::MAX` when none was.
     pub previous_lvt: Cell<u32>,
 }
@@ -85,6 +87,7 @@ impl OneShotPercpu {
         Self {
             armed: ferric_timed::ArmedDeadline::new(),
             fired: core::sync::atomic::AtomicBool::new(false),
+            entries: core::sync::atomic::AtomicU64::new(0),
             previous_lvt: Cell::new(u32::MAX),
         }
     }

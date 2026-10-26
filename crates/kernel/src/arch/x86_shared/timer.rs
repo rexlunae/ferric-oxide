@@ -152,6 +152,10 @@ pub enum ArmResult {
 /// Called with interrupts off, from the IDT entry.
 pub fn handle_fire() {
     let percpu = PercpuBlock::current();
+    let entries = percpu.one_shot.entries.fetch_add(1, Ordering::Relaxed);
+    if entries < 3 {
+        crate::debug!("timer: handler entry {entries}");
+    }
     let now = Nanos::new(time::monotonic(&mut unsafe { CleanLockToken::new() }) as u64);
     if percpu.one_shot.armed.due(now) {
         // The TSC-deadline timer has already cleared itself; record the
