@@ -3199,18 +3199,33 @@ fn correct_inner<'l>(
                 .ok_or(PfError::Segv)?;
 
             let offset = file_ref.base_offset as u64 + (pages_from_grant_start * PAGE_SIZE) as u64;
+            let context_lock = Arc::clone(&crate::context::current());
+            // Ferric Oxide (#202): a reply that arrives between the request and this fault's
+            // block is stored in `fmap_ret` and wakes nobody (the reply wakes only a context
+            // that is already blocked). A stale answer from an earlier request must not
+            // satisfy this one either. So clear the slot before the request goes out, and
+            // block only while it is still empty, under the same context write lock the reply
+            // takes: a reply is either already here (no block, no wake-up needed) or lands
+            // after this fault registered itself, where the reply's wake-up finds it.
+            let _ = context_lock.write(token.token()).fmap_ret.take();
             user_inner
                 .request_fmap(scheme_number, offset, 1, flags, &mut token)
-                .unwrap();
+                .map_err(|_| PfError::Segv)?;
 
             // The fault blocks on the scheme: release the per-CPU current-context borrow
             // before switching, while keeping this context alive until the reply arrives.
-            let context_lock = Arc::clone(&crate::context::current());
-            context_lock
-                .write(token.token())
-                .hard_block(HardBlockedReason::AwaitingMmap { file_ref });
-
-            super::switch(&mut token);
+            let blocked = {
+                let mut context = context_lock.write(token.token());
+                if context.fmap_ret.is_none() {
+                    context.hard_block(HardBlockedReason::AwaitingMmap { file_ref });
+                    true
+                } else {
+                    false
+                }
+            };
+            if blocked {
+                super::switch(&mut token);
+            }
 
             let frame = context_lock
                 .write(token.token())
