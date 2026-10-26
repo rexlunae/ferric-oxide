@@ -959,7 +959,12 @@ Writeback is pulled by the file system, so the kernel never waits on it:
    both (`Attach` stays read-only).
 2. When an object gets its first dirty page, the kernel puts a `Writeback`
    record on the queue. When the queue goes past its dirty limit, it puts an
-   *urgent* one, once, until the count is back under half the limit.
+   *urgent* one, once, until the count is back under half the limit. When a
+   sequential writer (each write starting where the last ended) has dirtied
+   256 whole pages (1 MiB, `abi::STREAM_RUN_PAGES`) that no writeback has
+   taken, and no run of the object is in flight, it puts a *run* record
+   naming them, once, until the file system next takes dirty pages of the
+   object. The record's reason (`WritebackReason`) is in its last word.
 3. `TakeDirty { from }` on an object marks the next run of dirty pages at or
    after page `from` (up to 1024 pages, and as many as the payload holds) as
    under writeback, copies them into the payload, and returns the run's first
@@ -990,9 +995,17 @@ since they were last clean) and says which are due, oldest first, and `flush`
 writes one object back, run by run in page order from page 0, each run
 starting where the last one ended, so a writer dirtying pages behind the pass
 does not keep it going; a run that fails is answered as failed and the pass
-goes on, and the failures are counted. `client` has the calls and
+goes on, and the failures are counted. `flush_run` writes the next dirty run at or after the
+record's starting page. `client` has the calls and
 `spawn_flush_timer`, a thread that wakes the file system once a second while
 some object is dirty.
+
+A page-cache sequential-write run notification is a starting hint, rather than
+an exact range restriction. If fsync or another pass cleaned its pages while
+the record waited in the pump, `flush_run` may take the next dirty run at or
+after that start, including newer pages beyond the recorded range. It still
+performs only one take, bounded to 1024 pages, and concurrent rewrites remain
+dirty. The host writeback regression covers this delayed-record ordering.
 
 Before arming the age timer for a writeback record, RedoxFS queries the object's
 current dirty-page count (`Request::DirtyPages`, verb 13, no payload). A record
@@ -1017,7 +1030,13 @@ opened (read-only, write-only or read-write), and writes back an object:
 - when the object has been dirty for 5 s (`DEFAULT_AGE_MS`), checked by its
   timer once a second;
 - every dirty object at once on an urgent record (the default limit is 8192
-  pages, 32 MiB, per mount), and every one at unmount.
+  pages, 32 MiB, per mount), and every one at unmount;
+- one run at once on a run record. The writer keeps filling the cache while
+  RedoxFS writes the run, and the kernel posts the next record once it has
+  dirtied another run, so a large sequential write is mostly on disk by the
+  time `fsync` comes, instead of all of it being written then. Random writes
+  never form a run, so they still coalesce in the cache until the age or
+  `fsync`.
 
 It writes a run through its usual write path, clipped at the file's size, so
 the run is stored (compressed or encrypted where the file system is) as any

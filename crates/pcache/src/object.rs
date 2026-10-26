@@ -239,6 +239,8 @@ pub struct PageIndex<F> {
     dirty: usize,
     /// The run of pages under writeback, if any: one at a time.
     writeback: Option<RecordPages>,
+    /// The sequential writer it follows, for early writeback.
+    stream: write::Stream,
 }
 
 impl<F> Default for PageIndex<F> {
@@ -256,6 +258,7 @@ impl<F> PageIndex<F> {
             next_fill: Some(FillId::new(1)),
             dirty: 0,
             writeback: None,
+            stream: write::Stream::new(),
         }
     }
 

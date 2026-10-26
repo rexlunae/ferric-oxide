@@ -24,6 +24,16 @@
 //! writes every page that was dirty when it started, in order, and stops: pages written to
 //! behind it are left for the next pass, so a busy writer cannot keep it going for good.
 //!
+//! The index also follows a sequential writer, so writeback of a large write can overlap
+//! the writer instead of all of it waiting for `fsync`: a write that starts where the one
+//! before ended continues the stream, any other starts a new one. Once the stream has
+//! [`STREAM_RUN_PAGES`] whole pages dirty that no writeback has taken yet, and no run is
+//! under writeback, [`PageIndex::write`] returns them as [`Written::run`], once, and the
+//! kernel asks the file system to write that run back now
+//! ([`crate::abi::WritebackReason::Run`]). The next writeback taken, whatever it is, lets
+//! the stream ask again. Random writes never form a stream, so they still coalesce until
+//! the age limit or `fsync`.
+//!
 //! [`PageIndex::evict`] takes a clean page's frame for reclaim. It refuses a dirty page, one
 //! under writeback (which can still fail) and one being filled, so reclaim never drops data
 //! the file system does not have: [`PageIndex::evictable`] is the test to give
@@ -34,7 +44,7 @@ use core::fmt;
 use core::ops::Range;
 
 use super::{Attempt, Entry, PageIndex, Read, ReadStep};
-use crate::abi::{MAX_RECORD_PAGES, Outcome, PAGE_SIZE, PageRange, RecordPages};
+use crate::abi::{MAX_RECORD_PAGES, Outcome, PAGE_SIZE, PageRange, RecordPages, STREAM_RUN_PAGES};
 use crate::page::{Event, PageState, TransitionError};
 
 /// The page size as a `usize`, for offsets in a page.
@@ -130,6 +140,70 @@ pub struct Written {
     pub dirtied: u32,
     /// The object had no dirty page before: the file system should hear of it.
     pub first: bool,
+    /// A sequential writer's run of dirty pages (see the module docs), at most a record's
+    /// worth: the file system should write it back now.
+    pub run: Option<RecordPages>,
+}
+
+/// The sequential writer an index follows (see the module docs).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Stream {
+    /// Where the last write ended, in bytes.
+    end: u64,
+    /// The stream's first page that no writeback has taken since the stream began.
+    from: u64,
+    /// The run returned, while no writeback has been taken since and the stream has not
+    /// moved on to another region.
+    signalled: Option<RecordPages>,
+}
+
+impl Stream {
+    /// No write seen yet: a write at offset 0 starts the stream.
+    pub(super) const fn new() -> Self {
+        Self {
+            end: 0,
+            from: 0,
+            signalled: None,
+        }
+    }
+
+    /// A write of bytes `offset..offset + len` landed. One anywhere but at the stream's end
+    /// starts a new stream, which may signal its own run whatever the old one's record is
+    /// doing.
+    fn wrote(&mut self, offset: u64, len: usize) {
+        if offset != self.end {
+            self.from = offset / PAGE_SIZE;
+            self.signalled = None;
+        }
+        self.end = offset.saturating_add(len as u64);
+    }
+
+    /// The run to write back now, if one is due: [`STREAM_RUN_PAGES`] or more whole pages
+    /// behind the stream's end, none signalled yet, and no run under writeback (`idle`).
+    /// The page the stream ends inside is left out, as the next write will likely change
+    /// it.
+    fn run(&mut self, idle: bool) -> Option<RecordPages> {
+        let whole = (self.end / PAGE_SIZE).saturating_sub(self.from);
+        if !idle || self.signalled.is_some() || whole < u64::from(STREAM_RUN_PAGES) {
+            return None;
+        }
+        let count = u32::try_from(whole).map_or(MAX_RECORD_PAGES, |n| n.min(MAX_RECORD_PAGES));
+        let run = RecordPages::from_parts(self.from, count)?;
+        self.signalled = Some(run);
+        Some(run)
+    }
+
+    /// A writeback took `pages`: the stream may signal again, and pages of it that writeback
+    /// took are no longer counted.
+    fn taken(&mut self, pages: Option<PageRange>) {
+        self.signalled = None;
+        if let Some(pages) = pages
+            && pages.first() <= self.end / PAGE_SIZE
+            && pages.end() > self.from
+        {
+            self.from = pages.end();
+        }
+    }
 }
 
 /// A run of dirty pages [`PageIndex::start_writeback`] put under writeback: its pages, and
@@ -365,9 +439,11 @@ impl<F> PageIndex<F> {
             entry.frame = Some(frame);
         }
         self.dirty += dirtied as usize;
+        self.stream.wrote(write.offset, write.len);
         Ok(Written {
             dirtied,
             first: first && dirtied > 0,
+            run: self.stream.run(self.writeback.is_none()),
         })
     }
 
@@ -396,19 +472,11 @@ impl<F> PageIndex<F> {
         if max == 0 {
             return Err(WritebackError::NoRoom);
         }
-        let mut run: Option<(u64, u32)> = None;
-        for (&page, entry) in self.pages.range(from..) {
-            match (entry.state == PageState::Dirty, run) {
-                (true, None) => run = Some((page, 1)),
-                (true, Some((first, count))) if first + u64::from(count) == page && count < max => {
-                    run = Some((first, count + 1));
-                }
-                (false, None) => {}
-                _ => break,
-            }
-        }
-        let Some(pages) = run.and_then(|(first, count)| RecordPages::from_parts(first, count))
-        else {
+        // Any writeback asked for answers the stream's signal, even one that finds nothing
+        // (an `fsync` got there first), so the stream never waits on a run nobody takes.
+        let found = self.next_dirty_run(from, max);
+        self.stream.taken(found.map(RecordPages::pages));
+        let Some(pages) = found else {
             return Ok(None);
         };
         let range = pages.pages();
@@ -427,6 +495,31 @@ impl<F> PageIndex<F> {
         }
         self.writeback = Some(pages);
         Ok(Some(TakenRun { pages, frames }))
+    }
+
+    /// The record for `run`, which [`PageIndex::write`] returned as [`Written::run`], could
+    /// not be sent: the stream may signal again. A later signal, for another run, is left
+    /// alone.
+    pub fn run_not_sent(&mut self, run: RecordPages) {
+        if self.stream.signalled == Some(run) {
+            self.stream.signalled = None;
+        }
+    }
+
+    /// The next run of `Dirty` pages at or after `from`, at most `max` pages.
+    fn next_dirty_run(&self, from: u64, max: u32) -> Option<RecordPages> {
+        let mut run: Option<(u64, u32)> = None;
+        for (&page, entry) in self.pages.range(from..) {
+            match (entry.state == PageState::Dirty, run) {
+                (true, None) => run = Some((page, 1)),
+                (true, Some((first, count))) if first + u64::from(count) == page && count < max => {
+                    run = Some((first, count + 1));
+                }
+                (false, None) => {}
+                _ => break,
+            }
+        }
+        run.and_then(|(first, count)| RecordPages::from_parts(first, count))
     }
 
     /// Applies the file system's answer to the writeback of `pages`: done, its pages are
@@ -560,6 +653,116 @@ mod tests {
             .collect()
     }
 
+    /// Writes `pages` pages from page `at` in 128 KiB (32-page) writes, as a sequential
+    /// writer would, and returns the runs signalled, with the write each came after.
+    fn stream(index: &mut PageIndex<u64>, at: u64, pages: u64) -> Vec<(u64, RecordPages)> {
+        let chunk = 32;
+        (0..pages / chunk)
+            .filter_map(|k| {
+                let page = at + k * chunk;
+                let w = write(index, page * PAGE_SIZE, (chunk * PAGE_SIZE) as usize);
+                w.run.map(|run| (k, run))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sequential_writer_signals_a_run_once() {
+        let mut index = filled(4096);
+        // The run is due once 256 whole pages are dirty: after the eighth write.
+        assert_eq!(stream(&mut index, 0, 512), [(7, record(0, 256))]);
+        // Taken: every dirty page in a row from the start, up to a record's worth.
+        let taken = index.start_writeback(0, MAX_RECORD_PAGES).expect("idle");
+        assert_eq!(taken.map(|t| t.pages), Some(record(0, 512)));
+        // Under writeback: the stream goes on, but asks for nothing until the answer.
+        assert_eq!(stream(&mut index, 512, 512), []);
+        index
+            .complete_writeback(record(0, 512), Outcome::Done)
+            .expect("in flight");
+        // The pages written meanwhile count: due at once, from where the run ended.
+        assert_eq!(stream(&mut index, 1024, 32), [(0, record(512, 544))]);
+    }
+
+    #[test]
+    fn a_run_leaves_the_page_the_stream_ends_in() {
+        let mut index = filled(1024);
+        // 300 whole pages and half of the next.
+        let w = write(&mut index, 0, 300 * PAGE + PAGE / 2);
+        assert_eq!(w.run, Some(record(0, 300)));
+        assert!(w.first);
+    }
+
+    #[test]
+    fn a_new_stream_signals_while_the_old_run_waits() {
+        let mut index = filled(4096);
+        assert_eq!(stream(&mut index, 0, 256), [(7, record(0, 256))]);
+        // Elsewhere before the old run is taken: the new stream has its own run.
+        assert_eq!(stream(&mut index, 1024, 256), [(7, record(1024, 256))]);
+    }
+
+    #[test]
+    fn a_run_not_sent_can_be_signalled_again() {
+        let mut index = filled(4096);
+        assert_eq!(stream(&mut index, 0, 256), [(7, record(0, 256))]);
+        // The record never reached the file system: the next write asks again.
+        index.run_not_sent(record(0, 256));
+        assert_eq!(stream(&mut index, 256, 32), [(0, record(0, 288))]);
+        // A stale "not sent" for an older run leaves the newer signal alone.
+        index.run_not_sent(record(0, 256));
+        assert_eq!(stream(&mut index, 288, 32), []);
+    }
+
+    #[test]
+    fn pages_redirtied_under_writeback_are_left_to_the_next_pass() {
+        let mut index = filled(4096);
+        assert_eq!(stream(&mut index, 0, 256), [(7, record(0, 256))]);
+        let taken = index.start_writeback(0, MAX_RECORD_PAGES).expect("idle");
+        assert_eq!(taken.map(|t| t.pages), Some(record(0, 256)));
+        // The writer goes back over pages under writeback: a new stream, from page 0.
+        assert_eq!(stream(&mut index, 0, 64), []);
+        index
+            .complete_writeback(record(0, 256), Outcome::Done)
+            .expect("in flight");
+        // Pages 0..64 are dirty again, for the age limit or fsync; the stream counts
+        // only the pages it wrote since it began, and asks once it has a run of them.
+        assert_eq!(index.dirty_pages(), 64);
+        assert_eq!(stream(&mut index, 64, 192), [(5, record(0, 256))]);
+    }
+
+    #[test]
+    fn random_writes_never_signal() {
+        let mut index = filled(4096);
+        for k in 0..2000_u64 {
+            let page = (k * 2_654_435_761) % 4096;
+            let w = write(&mut index, page * PAGE_SIZE, PAGE);
+            assert_eq!(w.run, None, "write {k} at page {page}");
+        }
+    }
+
+    #[test]
+    fn a_write_elsewhere_starts_a_new_stream() {
+        let mut index = filled(4096);
+        assert_eq!(stream(&mut index, 0, 224), []);
+        // Not where the stream ended: the 224 pages before do not count.
+        assert_eq!(stream(&mut index, 1000, 224), []);
+        assert_eq!(stream(&mut index, 1224, 32), [(0, record(1000, 256))]);
+    }
+
+    #[test]
+    fn any_writeback_answers_the_signal() {
+        let mut index = filled(4096);
+        assert_eq!(stream(&mut index, 0, 256), [(7, record(0, 256))]);
+        // An fsync's pass takes the pages and the record's own take finds nothing: the
+        // stream asks again once it has another run.
+        let taken = index.start_writeback(0, MAX_RECORD_PAGES).expect("idle");
+        let pages = taken.expect("dirty").pages;
+        index
+            .complete_writeback(pages, Outcome::Done)
+            .expect("in flight");
+        assert_eq!(index.start_writeback(0, MAX_RECORD_PAGES), Ok(None));
+        assert_eq!(stream(&mut index, 256, 256), [(7, record(256, 256))]);
+    }
+
     #[test]
     fn only_writes_inside_the_file_are_served() {
         let index = filled(4);
@@ -653,7 +856,8 @@ mod tests {
             index.write(&plan, vec![10, 11, 12, 13]),
             Ok(Written {
                 dirtied: 4,
-                first: true
+                first: true,
+                run: None,
             })
         );
         assert_eq!(dirty(&index), [0, 1, 2, 3]);

@@ -15,9 +15,12 @@
 //!   to an object whose writes the file system holds, and every write while the queue holds
 //!   twice its dirty limit, goes to the file system's scheme as before.
 //! - When an object's first page becomes dirty, a `Writeback` record tells the file system;
-//!   when a write takes the queue past its dirty limit, an urgent one does (once, until the
-//!   count falls below half the limit). The file system pulls the dirty pages with
-//!   [`take_dirty`], writes them to the file and answers with [`written_back`].
+//!   when a sequential writer has dirtied a run of pages, a run record asks it to write
+//!   that run back now, so the writeback of a large write overlaps the writer (the index
+//!   decides, `ferric_pcache::object::Written::run`); when a write takes the queue past its
+//!   dirty limit, an urgent one does (once, until the count falls below half the limit).
+//!   The file system pulls the dirty pages with [`take_dirty`], writes them to the file and
+//!   answers with [`written_back`].
 //! - A file system holds an object's writes ([`hold`]) while it changes the file itself, so a
 //!   cached write never lands between its writeback and its own change.
 //!
@@ -31,8 +34,8 @@ use core::{
 };
 
 use ferric_pcache::{
-    abi::{encode_taken, Outcome, Record, RecordPages},
-    object::{Attempt, Read, Write, WritebackError},
+    abi::{encode_taken, Outcome, Record, RecordPages, WritebackReason},
+    object::{Attempt, Read, Write, WritebackError, Written},
 };
 use syscall::{
     error::{Error, Result, EBADF, EBUSY, EINTR, EINVAL, EIO, EOVERFLOW},
@@ -174,7 +177,7 @@ fn write(
                 drop(state);
                 // Unreachable once the pages were ready: the file system serves the write.
                 let written = written.ok()?;
-                notify_dirty(object, &plan, written.first, token);
+                notify_dirty(object, &plan, written, token);
                 return Some(Ok(plan.len()));
             }
             Read::Wait if step.fills.is_empty() => {
@@ -262,32 +265,45 @@ fn merge_edges(
     }
 }
 
-/// Tells the file system about a write that dirtied `plan`'s pages: a record when they are
-/// the object's first dirty pages, and an urgent one when the queue is past its limit.
-fn notify_dirty(object: &Object, plan: &Write, first: bool, token: &mut CleanLockToken) {
+/// Tells the file system about a write that dirtied `plan`'s pages: an urgent record when
+/// the queue is past its limit, a run record when the write completed a sequential writer's
+/// run (`written.run`), and otherwise a record when they are the object's first dirty pages.
+fn notify_dirty(object: &Object, plan: &Write, written: Written, token: &mut CleanLockToken) {
     let queue = &object.queue;
     let past = queue
         .writeback
         .max()
         .is_some_and(|max| queue.dirty.load(Ordering::Relaxed) > max);
     let urgent = past && !queue.writeback.urgent_sent.swap(true, Ordering::Relaxed);
-    if !first && !urgent {
-        return;
-    }
+    // An urgent pass writes every dirty object, the run too; a run record also tells the
+    // file system the object is dirty.
+    let (reason, pages) = match (urgent, written.run) {
+        (true, _) => (WritebackReason::Urgent, RecordPages::new(plan.pages())),
+        (false, Some(run)) => (WritebackReason::Run, Some(run)),
+        (false, None) if written.first => {
+            (WritebackReason::Dirtied, RecordPages::new(plan.pages()))
+        }
+        (false, None) => return,
+    };
     // A write spans at most a record's worth of pages.
-    let Some(pages) = RecordPages::new(plan.pages()) else {
+    let Some(pages) = pages else {
         return;
     };
     let record = Record::Writeback {
         object: object.id,
         generation: object.generation,
         pages,
-        urgent,
+        reason,
     };
     // A queue that closed has failed the object; one out of memory gets the next record,
     // or the file system's own writeback before it reads or changes the file.
-    if queue.push_records(core::iter::once(record), token).is_err() && urgent {
-        queue.writeback.urgent_sent.store(false, Ordering::Relaxed);
+    if queue.push_records(core::iter::once(record), token).is_err() {
+        match reason {
+            WritebackReason::Urgent => queue.writeback.urgent_sent.store(false, Ordering::Relaxed),
+            // Let the stream ask again; a newer signal it made meanwhile stays.
+            WritebackReason::Run => object.state.lock().index.run_not_sent(pages),
+            _ => {}
+        }
     }
 }
 

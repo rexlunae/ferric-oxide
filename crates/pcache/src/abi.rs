@@ -78,10 +78,12 @@
 //! writeback at a time. A page written to meanwhile stays dirty after the answer, and a
 //! failed writeback leaves its pages dirty, so data the file system does not have is never
 //! dropped, by reclaim or anything else, except by a truncation of the file. The kernel tells
-//! the file system when to: a [`Record::Writeback`] when an object's first page becomes
-//! dirty, and an urgent one when the queue holds more dirty pages than
-//! [`Request::SetWriteback`]'s limit (at twice the limit, writes go to the file system's
-//! scheme, which slows writers down to the speed of writeback). The file system flushes an
+//! the file system when to, with a [`Record::Writeback`] and its [`WritebackReason`]: when an
+//! object's first page becomes dirty; at once for a run of a sequential writer's pages, so
+//! writeback of a large write overlaps the writer instead of all of it waiting for `fsync`;
+//! and urgently when the queue holds more dirty pages than [`Request::SetWriteback`]'s limit
+//! (at twice the limit, writes go to the file system's scheme, which slows writers down to
+//! the speed of writeback). The file system flushes an
 //! object before it reads or changes the file itself, and holds the object's cached writes
 //! ([`Request::HoldWrites`]) from before that flush until it has finished, so a cached write
 //! never races one it serves.
@@ -111,6 +113,12 @@ pub const PAGE_SIZE: u64 = 4096;
 
 /// The most pages one fill or writeback record may name (4 MiB), so one answer is bounded.
 pub const MAX_RECORD_PAGES: u32 = 1024;
+
+/// The fewest whole pages a sequential writer must have dirtied, and not yet put under
+/// writeback, before the kernel posts a [`WritebackReason::Run`] record (1 MiB): enough that
+/// one run is worth a writeback round trip, and few enough that writeback starts early in a
+/// large write.
+pub const STREAM_RUN_PAGES: u32 = 256;
 
 /// A cache object's identifier on its queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -328,6 +336,43 @@ impl ReadaheadMax {
     /// The number of pages.
     pub const fn get(self) -> u32 {
         self.0
+    }
+}
+
+/// Why the kernel posted a [`Record::Writeback`], and so how soon the file system should
+/// write the object's dirty pages back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WritebackReason {
+    /// The object's first page became dirty: write it back within the file system's age
+    /// limit.
+    Dirtied,
+    /// The queue is past its dirty limit: write every dirty object back at once.
+    Urgent,
+    /// A sequential writer has dirtied a run of the object's pages, the record's pages
+    /// ([`STREAM_RUN_PAGES`] or more): write one run back now, from the record's first page
+    /// (`writeback::flush_run`), while the writer goes on.
+    /// Its page range is a starting hint: the consumer may take one later dirty run
+    /// when an intervening flush already cleaned the originally named pages.
+    Run,
+}
+
+impl WritebackReason {
+    const fn to_word(self) -> u64 {
+        match self {
+            Self::Dirtied => 0,
+            Self::Urgent => 1,
+            Self::Run => 2,
+        }
+    }
+
+    const fn from_word(word: u64) -> Option<Self> {
+        Some(match word {
+            0 => Self::Dirtied,
+            1 => Self::Urgent,
+            2 => Self::Run,
+            _ => return None,
+        })
     }
 }
 
@@ -838,18 +883,19 @@ pub enum Record {
         pages: RecordPages,
     },
     /// The object has dirty pages: write them back ([`Request::TakeDirty`] and
-    /// [`Request::WrittenBack`]), within the file system's age limit, or at once when
-    /// `urgent`. Posted when the object's first page becomes dirty, and (urgent) when a write
+    /// [`Request::WrittenBack`]) as `reason` says. Posted when the object's first page
+    /// becomes dirty, when a sequential writer has dirtied a run, and (urgent) when a write
     /// takes the queue past its dirty limit ([`Request::SetWriteback`]).
     Writeback {
         /// The object.
         object: ObjectId,
         /// The object instance's generation.
         generation: Generation,
-        /// The pages the write that posted it dirtied (at most a record's worth).
+        /// The pages the write that posted it dirtied (at most a record's worth), or for
+        /// [`WritebackReason::Run`] the run to write back.
         pages: RecordPages,
-        /// The queue is past its dirty limit.
-        urgent: bool,
+        /// Why it was posted.
+        reason: WritebackReason,
     },
     /// The kernel needs memory: close the object if it is only retained (no client has the
     /// file open).
@@ -924,8 +970,9 @@ impl Record {
 
     /// The record's bytes: `kind: u16`, `count: u16`, a reserved zero `u32`, `object: u64`,
     /// `first: u64`, `generation: u64`, `fill: u64`, all little-endian. Records without pages
-    /// have `first` and `count` zero; a writeback record has its `urgent` flag (0 or 1) in the
-    /// `fill` word, and the other records other than fills have it zero.
+    /// have `first` and `count` zero; a writeback record has its [`WritebackReason`] in the
+    /// `fill` word (0 dirtied, 1 urgent, 2 run), and the other records other than fills have
+    /// it zero.
     pub fn to_bytes(self) -> [u8; Self::BYTES] {
         let pages = match self {
             Self::Fill { pages, .. } | Self::Writeback { pages, .. } => Some(pages),
@@ -948,7 +995,7 @@ impl Record {
         bytes[24..32].copy_from_slice(&self.generation().0.to_le_bytes());
         let word = match self {
             Self::Fill { fill, .. } => fill.0,
-            Self::Writeback { urgent, .. } => u64::from(urgent),
+            Self::Writeback { reason, .. } => reason.to_word(),
             Self::Release { .. } | Self::Accessed { .. } => 0,
         };
         bytes[32..40].copy_from_slice(&word.to_le_bytes());
@@ -1000,14 +1047,14 @@ impl Record {
                 fill: FillId(fill),
                 pages: pages()?,
             }),
-            Self::KIND_WRITEBACK => match fill {
-                0 | 1 => Ok(Self::Writeback {
+            Self::KIND_WRITEBACK => match WritebackReason::from_word(fill) {
+                Some(reason) => Ok(Self::Writeback {
                     object,
                     generation,
                     pages: pages()?,
-                    urgent: fill == 1,
+                    reason,
                 }),
-                _ => Err(RecordError::Reserved),
+                None => Err(RecordError::Reserved),
             },
             Self::KIND_RELEASE => no_pages()
                 .and_then(|()| no_fill())
@@ -1484,13 +1531,19 @@ mod tests {
                 object,
                 generation,
                 pages: record(u64::MAX - 8, 8),
-                urgent: false,
+                reason: WritebackReason::Dirtied,
             },
             Record::Writeback {
                 object,
                 generation,
                 pages: record(0, MAX_RECORD_PAGES),
-                urgent: true,
+                reason: WritebackReason::Urgent,
+            },
+            Record::Writeback {
+                object,
+                generation,
+                pages: record(256, 512),
+                reason: WritebackReason::Run,
             },
             Record::Release { object, generation },
             Record::Accessed { object, generation },
@@ -1535,16 +1588,19 @@ mod tests {
         // Only a fill has a fill ID.
         with_fill[32] = 1;
         assert_eq!(Record::from_bytes(&with_fill), Err(RecordError::Reserved));
-        // A writeback record's urgent flag is 0 or 1.
+        // A writeback record's reason is 0, 1 or 2.
         let mut writeback = Record::Writeback {
             object: ObjectId::new(1),
             generation: Generation::default(),
             pages: record(4, 1),
-            urgent: true,
+            reason: WritebackReason::Run,
         }
         .to_bytes();
-        assert_eq!(writeback[32..40], [1, 0, 0, 0, 0, 0, 0, 0]);
-        writeback[32] = 2;
+        assert_eq!(writeback[32..40], [2, 0, 0, 0, 0, 0, 0, 0]);
+        writeback[32] = 3;
+        assert_eq!(Record::from_bytes(&writeback), Err(RecordError::Reserved));
+        writeback[32] = 0;
+        writeback[39] = 1;
         assert_eq!(Record::from_bytes(&writeback), Err(RecordError::Reserved));
     }
 

@@ -13,6 +13,15 @@
 //! - at once, every object oldest first, on an urgent record: the queue is past its dirty
 //!   limit ([`DEFAULT_MAX_DIRTY_PAGES`]).
 //!
+//! A run record ([`crate::abi::WritebackReason::Run`]) asks for less: a sequential writer has
+//! dirtied a run of pages, and [`flush_run`] writes that one run back at once, from the
+//! record's first page, while the writer goes on filling the cache. The range is a hint:
+//! if another pass already cleaned it, the next dirty run at or after that start may be
+//! written, including later pages outside the record. One take still bounds the work to
+//! [`FLUSH_PAGES`]; a concurrent rewrite stays dirty for another pass. The kernel posts the next
+//! once the writer has dirtied another run, so writeback of a large write overlaps the write
+//! and `fsync` finds little left; the object stays on [`DirtyObjects`] for the rest.
+//!
 //! A [`flush`] pass walks the object from page 0 in page order, one run of dirty pages at a
 //! time ([`crate::abi::Request::TakeDirty`]), each from the end of the one before, and writes
 //! each run before it takes the next. It ends when no dirty page is left ahead of it, so it
@@ -189,23 +198,53 @@ pub struct Flushed {
 pub fn flush<F: Flush>(target: &mut F) -> Result<Flushed, F::Error> {
     let mut done = Flushed::default();
     let mut from = 0;
-    while let Some(pages) = target.take(from)? {
-        done.runs += 1;
-        let outcome = match target.write(pages) {
-            Ok(()) => {
-                done.pages += u64::from(pages.pages().count());
-                Outcome::Done
-            }
-            Err(errno) => {
-                done.failed.get_or_insert(errno);
-                Outcome::Failed(errno)
-            }
-        };
-        done.dirty_left = target.answer(pages, outcome)?;
+    while let Some(pages) = flush_one(target, from, &mut done)? {
         // Runs end at a page before `u64::MAX`, the end of the last possible run.
         from = pages.pages().end();
     }
     Ok(done)
+}
+
+/// Writes back one run of dirty pages, the next at or after page `from`: what a run record
+/// asks for (see the module docs). The record is a starting hint, not an exact range:
+/// a delayed record may write a later run if its original pages are already clean.
+/// Nothing is written when no page at or after `from` is dirty any more.
+/// [`Flushed::dirty_left`] is the object's dirty pages after it, so the caller knows whether
+/// the object is still dirty; it is 0 when nothing was taken, though pages before `from`
+/// may still be dirty.
+///
+/// # Errors
+///
+/// The error of a call on the object ([`Flush::take`], [`Flush::answer`]).
+pub fn flush_run<F: Flush>(target: &mut F, from: u64) -> Result<Flushed, F::Error> {
+    let mut done = Flushed::default();
+    flush_one(target, from, &mut done)?;
+    Ok(done)
+}
+
+/// Takes, writes and answers the next run at or after `from`, adding it to `done`; returns
+/// its pages, or `None` when nothing there was dirty.
+fn flush_one<F: Flush>(
+    target: &mut F,
+    from: u64,
+    done: &mut Flushed,
+) -> Result<Option<RecordPages>, F::Error> {
+    let Some(pages) = target.take(from)? else {
+        return Ok(None);
+    };
+    done.runs += 1;
+    let outcome = match target.write(pages) {
+        Ok(()) => {
+            done.pages += u64::from(pages.pages().count());
+            Outcome::Done
+        }
+        Err(errno) => {
+            done.failed.get_or_insert(errno);
+            Outcome::Failed(errno)
+        }
+    };
+    done.dirty_left = target.answer(pages, outcome)?;
+    Ok(Some(pages))
 }
 
 #[cfg(test)]
@@ -420,6 +459,58 @@ mod tests {
         let again = flush(&mut model).expect("no call fails");
         assert_eq!((again.pages, again.failed, again.dirty_left), (2, None, 0));
         assert_eq!(model.order, [8, 9, 1, 2]);
+    }
+
+    #[test]
+    fn a_run_writes_one_run_from_its_page() {
+        let mut model = Model::new(16);
+        for page in [1, 5, 6, 7, 8, 12] {
+            dirty(&mut model.index, page, 100 + page);
+        }
+        // From page 4: the next run there, 5..8 (three at most in the model), and no more.
+        let flushed = flush_run(&mut model, 4).expect("no call fails");
+        assert_eq!(
+            flushed,
+            Flushed {
+                pages: 3,
+                runs: 1,
+                failed: None,
+                dirty_left: 3,
+            }
+        );
+        assert_eq!(model.order, [5, 6, 7]);
+        // Past every dirty page: nothing taken or written.
+        assert_eq!(flush_run(&mut model, 13), Ok(Flushed::default()));
+        // A failed run stays dirty and says why.
+        model.failing.insert(8);
+        let failed = flush_run(&mut model, 8).expect("no call fails");
+        assert_eq!(
+            (failed.failed, failed.pages, failed.dirty_left),
+            (NonZeroU16::new(28), 0, 3)
+        );
+    }
+
+    #[test]
+    fn a_delayed_run_hint_writes_one_later_run_and_keeps_concurrent_rewrites_dirty() {
+        let mut model = Model::new(32);
+        for page in [4, 5] {
+            dirty(&mut model.index, page, page);
+        }
+        // Another pass consumes the two pages named by the queued hint.
+        assert_eq!(flush_run(&mut model, 4).unwrap().pages, 2);
+        for page in 20..24 {
+            dirty(&mut model.index, page, 100 + page);
+        }
+        model.meanwhile = |index, _| dirty(index, 20, 999);
+        let flushed = flush_run(&mut model, 4).unwrap();
+        // The model's three-page take limit, rather than the hint's two pages,
+        // bounds this pass. The later fourth page and a rewrite stay dirty.
+        assert_eq!((flushed.runs, flushed.pages, flushed.dirty_left), (1, 3, 2));
+        assert_eq!(model.order, [4, 5, 20, 21, 22]);
+        assert_eq!(model.file.get(&20), Some(&120));
+        assert_eq!(model.index.frame(20), Some(&999));
+        assert!(!model.index.evictable(20));
+        assert!(!model.index.evictable(23));
     }
 
     #[test]
