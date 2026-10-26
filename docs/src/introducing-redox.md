@@ -1,14 +1,17 @@
-# Introducing Redox OS
+# Introducing Ferric Oxide
 
-Redox OS is microkernel-based operating system, with a large number of supported programs and components, to create a full-featured user and application environment. In this chapter, we will discuss the goals, philosophy and scope of Redox.
+Ferric Oxide is a microkernel operating system written in Rust, aimed at high
+performance on modern hardware while keeping the isolation a microkernel
+provides. This chapter covers its goals, philosophy and scope, and where it
+comes from.
 
 1. [Our Goals](our-goals.md)
 2. [Our Philosophy](philosophy.md)
-3. [Why a New OS?](why-a-new-os.md)
-4. [Redox Use Cases](redox-use-cases.md)
-5. [Comparing Redox to Other OSes](how-redox-compares.md)
-6. [Why Rust?](why-rust.md)
-7. [Side Projects](side-projects.md)
-8. [Influences](influences.md)
-9. [Hardware Support](hardware-support.md)
-10. [Important Programs](important-programs.md)
+3. [Why Ferric Oxide?](why-a-new-os.md)
+4. [Why Rust?](why-rust.md)
+5. [Use Cases](redox-use-cases.md)
+6. [Comparing Ferric Oxide to Other OSes](how-redox-compares.md)
+7. [Influences](influences.md)
+8. [Hardware Support](hardware-support.md)
+9. [Important Programs](important-programs.md)
+10. [Related Projects](side-projects.md)

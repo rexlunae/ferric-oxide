@@ -1,5 +1,9 @@
 # Libraries and APIs
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 This page covers the context of the libraries and APIs on Redox.
 
 - [Versions](#versions)
@@ -64,7 +68,7 @@ Redox uses different mechanisms, compared to Linux, to implement system capabili
 
 ### relibc
 
-[relibc](https://gitlab.redox-os.org/redox-os/relibc) is an implementation of the [C Standard Library](https://en.wikipedia.org/wiki/C_standard_library) (libc) and POSIX in Rust.
+[relibc](https://github.com/rexlunae/ferric-oxide/tree/main/crates/relibc) is an implementation of the [C Standard Library](https://en.wikipedia.org/wiki/C_standard_library) (libc) and POSIX in Rust.
 
 relibc knows if it's compiled for Linux or Redox ahead-of-time (if the target is Redox relibc calls functions in libredox), the goal is to organize platform-specific functionality into clean modules.
 
@@ -82,7 +86,7 @@ You can see Rust crates using it on the [Reverse Dependencies](https://crates.io
 
 ### redox_syscall
 
-[redox_syscall](https://gitlab.redox-os.org/redox-os/syscall) contains the system call numbers and Rust API wrappers for the inline Assembly code of system calls to be used with low-level components and libraries.
+[redox_syscall](https://docs.rs/redox_syscall/) (the kernel builds its own copy, in `crates/kernel/syscall/`) contains the system call numbers and Rust API wrappers for the inline Assembly code of system calls to be used with low-level components and libraries.
 
 (redox_syscall should not be used directly by programs, use libredox instead)
 
