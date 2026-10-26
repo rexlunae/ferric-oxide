@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{Crashing, e2fsck, le32, load, reseal};
+use common::{Crashing, e2fsck, inode_at, le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Fs, OpenMode};
 use ext4d::journal::{self, JournalError, Outcome};
@@ -111,18 +111,6 @@ fn sets_an_inodes_times_through_the_journal() {
         let checked = e2fsck(name, after.clone());
         assert_eq!(times_of(checked, "hello.txt"), NEW, "{name}: after e2fsck");
     }
-}
-
-/// The byte offset of inode `number` in a volume whose inode is in group 0, from the
-/// superblock and the first group descriptor ("Finding an Inode" in "Ext4 Disk Layout").
-fn inode_at(image: &[u8], number: u32) -> usize {
-    let sb = &image[1024..2048];
-    let block_size = 1024usize << le32(sb, 0x18);
-    let first_data_block = le32(sb, 0x14) as usize;
-    let inode_size = usize::from(u16::from_le_bytes([sb[0x58], sb[0x59]]));
-    let descriptor = (first_data_block + 1) * block_size;
-    let table = le32(image, descriptor + 0x8) as usize;
-    table * block_size + (number as usize - 1) * inode_size
 }
 
 #[test]
