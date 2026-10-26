@@ -1,0 +1,20 @@
+[package]
+name = "ferric-fat-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "On-target test for fatd, the read-only FAT file system daemon"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+# Unpacks the gzipped fixture; the pure-Rust backend, so it cross-compiles.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+thiserror = "2.0.17"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = false
