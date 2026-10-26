@@ -39,6 +39,29 @@ pub mod id {
         if id == UNCHANGED { None } else { Some(id) }
     }
 
+    /// The owner and group a file has after `fchown(uid, gid)`, from its `current` owner
+    /// and group: each [`UNCHANGED`] argument keeps that ID. The caller's permission to
+    /// make the change is not checked here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_abi::id::{UNCHANGED, owner_after};
+    ///
+    /// assert_eq!(owner_after((1000, 100), UNCHANGED, 5), (1000, 5));
+    /// ```
+    pub const fn owner_after(current: (u32, u32), uid: u32, gid: u32) -> (u32, u32) {
+        let uid = match requested(uid) {
+            Some(uid) => uid,
+            None => current.0,
+        };
+        let gid = match requested(gid) {
+            Some(gid) => gid,
+            None => current.1,
+        };
+        (uid, gid)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -49,6 +72,19 @@ pub mod id {
             assert_eq!(requested(UNCHANGED), None);
             for id in [0, 1, 65535, 65536, u32::MAX - 1] {
                 assert_eq!(requested(id), Some(id));
+            }
+        }
+
+        #[test]
+        fn minus_one_in_either_position_keeps_that_id() {
+            for (uid, gid, expected) in [
+                (UNCHANGED, UNCHANGED, (1000, 100)),
+                (UNCHANGED, 5, (1000, 5)),
+                (7, UNCHANGED, (7, 100)),
+                (7, 5, (7, 5)),
+                (0, 0, (0, 0)),
+            ] {
+                assert_eq!(owner_after((1000, 100), uid, gid), expected, "{uid} {gid}");
             }
         }
     }

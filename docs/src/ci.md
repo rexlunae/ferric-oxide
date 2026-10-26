@@ -1,12 +1,49 @@
 # Continuous Integration
 
-The [Continuous Integration](https://en.wikipedia.org/wiki/Continuous_integration) helps developers to automate the software testing as the code evolves, it detects build failures, bugs and regressions.
+[Continuous integration](https://en.wikipedia.org/wiki/Continuous_integration)
+builds and tests every change automatically, to catch build failures, bugs and
+regressions before they land. This page covers Ferric Oxide's own CI on GitHub
+Actions, and Redoxer, a tool for testing a single program in a virtual machine.
 
-In Redox, we use the [Redoxer](https://gitlab.redox-os.org/redox-os/redoxer) program to set up our GitLab CI configuration file. It downloads our toolchain, builds the program or library for the Redox target using Cargo, and runs the program inside a Redox virtual machine. Redoxer helps developers to test software for Redox OS without having to bootstrap the full build system.
+## Ferric Oxide's workflows
 
-Refer to the repository [README](https://gitlab.redox-os.org/redox-os/redoxer#user-content-redoxer) for command line instructions. This page assumes you have read them.
+The workflows are in `.github/workflows/`. Every pull request runs the ones
+that apply to it.
 
-## Installing Redoxer
+| Workflow | Runs on | What it does |
+| --- | --- | --- |
+| `host-tools.yml` | Pushes and pull requests | `cargo fmt --check`, the host workspace tests (including feature-enabled shared crates), strict Clippy and Rustdoc for the Ferric tools and libraries, and host RedoxFS tests |
+| `kernel-lints.yml` | Pushes and pull requests | Keeps the kernel's Clippy warning counts and `unsafe` uses at or below `ci/kernel-lints.json`, and checks kernel relocations and IBT entry points |
+| `image.yml` | Pushes to `main` and `ci/**`, pull requests, nightly | Builds the `ferric-smoke` image and boots it in QEMU several times, running the tests under `recipes/tests/`; also a crash-dump boot and the tracing overhead budget. The nightly run boots `ferric-fuzz` for a long system call fuzzing run |
+| `cet-image.yml` | Pull requests, by hand | Builds and boots an image with supervisor CET enforcement |
+| `profile-image.yml` | Pull requests that touch the profiler, by hand | Boots an image with the sampling profiler and draws a flamegraph |
+
+[Validation and debugging](./ferric-testing.md) explains each check, the
+image tests, and how to reproduce a CI boot locally. To try a CI change
+without opening a pull request, push it to a branch named `ci/<something>`.
+
+The image builds currently start from Redox's CI container and its prebuilt
+packages, and build only the parts marked `source` in
+`config/ferric-smoke.toml` from this repository. Replacing those prebuilts
+with packages built by [`fox`](./ferric-packaging.md) is in progress.
+
+## Testing a program with Redoxer
+
+[Redoxer](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer)
+builds a program for the `redox` target with Cargo and runs it inside a virtual
+machine, without the full build system. Its source is in `tools/redoxer/`.
+
+> ⚠️ **Warning:** Redoxer still downloads its toolchain, test image and
+> libraries from the Redox project (`static.redox-os.org`) and its Docker
+> image, so what it tests is a Redox system, not a Ferric Oxide one. Use it to
+> check that a program builds and runs on the shared target; use the image
+> tests above for anything that depends on Ferric Oxide's kernel. Moving
+> Redoxer's downloads to `fox` builds is planned.
+
+Refer to Redoxer's [README](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer#readme)
+for its command line. This section assumes you have read it.
+
+### Installing Redoxer
 
 We provide two options to install Redoxer: Docker container or Cargo. To install via `redoxer` crate in `crates.io` :
 
@@ -26,7 +63,7 @@ To install and run Redoxer via [the official Docker container](https://hub.docke
 docker run -ti --rm docker.io/redoxos/redoxer redoxer exec true
 ```
 
-Compared to Redoxer via Cargo,  the Docker variant is very recommended for use in CI since it's **guaranteed to boot**, because the Redox toolchain and QEMU image for testing is already inside it and tested before being published. The Docker variant is only available for `x86_64` Linux at this time.
+Compared to Redoxer via Cargo, the Docker variant is recommended for use in CI since it's **guaranteed to boot**, because the toolchain and QEMU image for testing is already inside it and tested before being published. The Docker variant is only available for `x86_64` Linux at this time.
 
 All commands below will refer `redoxer` as the command to run Redoxer. For installations via Docker you need to prefix it using the `docker run` command or alias it in `.bashrc`:
 
@@ -34,9 +71,9 @@ All commands below will refer `redoxer` as the command to run Redoxer. For insta
 alias redoxer='docker run -ti --rm -v ".:/mnt" -w /mnt -e REDOXER_SYSROOT --device /dev/kvm docker.io/redoxos/redoxer redoxer'
 ```
 
-## Build and test a Rust project with Redoxer
+### Build and test a Rust project
 
-Redoxer has a first-class integration with Cargo. Here's how to check and build a Rust project targeting Redox OS:
+Redoxer has a first-class integration with Cargo. Here's how to check and build a Rust project for the `redox` target:
 
 ```sh
 redoxer check
@@ -46,7 +83,7 @@ redoxer check
 redoxer build
 ```
 
-Here's how to test a Rust project in Redox OS, which will run an actual test inside QEMU:
+Here's how to test a Rust project in a VM, which will run an actual test inside QEMU:
 
 ```sh
 redoxer test
@@ -54,15 +91,15 @@ redoxer test
 
 All Cargo commands are shorthanded; the complete list can be seen in the README or just run `redoxer`.
 
-## Build and test a C or C++ project with Redoxer
+### Build and test a C or C++ project
 
-Redoxer has a shorthand for `ar`, `cc`, `cxx` for the AR/GCC/G++ compiler. Here's how to build a single `main.c` file targeting Redox OS:
+Redoxer has a shorthand for `ar`, `cc`, `cxx` for the AR/GCC/G++ compiler. Here's how to build a single `main.c` file for the `redox` target:
 
 ```sh
 redoxer cc main.c -o main
 ```
 
-Here's how to test that single executable on Redox OS, which will run an actual test inside QEMU:
+Here's how to test that single executable in a VM, which will run an actual test inside QEMU:
 
 ```sh
 redoxer exec ./main
@@ -76,7 +113,7 @@ export CC="redoxer cc"
 export CXX="redoxer cxx"
 ```
 
-## Building with native libraries
+### Building with native libraries
 
 Sometimes a project needs native libraries such as OpenSSL or zlib. To have them included for compilation, run:
 
@@ -97,7 +134,7 @@ This is free software; see the source for copying conditions.  There is NO
 warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 ```
 
-## Testing with additional files
+### Testing with additional files
 
 To add files inside Redoxer use the `--folder` option, which will copy the contents of the specified directory path into `/root`:
 
@@ -126,7 +163,7 @@ You can copy files from the QEMU image to the specified directory path with the 
 redoxer exec --folder . --artifact . touch file
 ```
 
-## CI templates
+### CI templates for your own project
 
 - GitHub CI template:
 

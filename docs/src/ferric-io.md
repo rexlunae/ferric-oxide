@@ -1114,7 +1114,9 @@ read-only medium) is also served read-only, with the reason logged
   not give it to another owner, and may set its group only to its own or the
   caller's GID (`EPERM` otherwise), and then the set-user-ID and set-group-ID
   bits of a regular file are cleared. A symbolic link opened itself gets its
-  own owner and group.
+  own owner and group. The kernel checks first, before the scheme sees the
+  call: a caller other than root may name only its own effective UID and GID,
+  or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
 - **`write`** (`Fs::write`, `ext4d::write::write_data`) writes into the
   blocks a regular file already has, as ext4's default ordered mode does: the
   data is written home and flushed without going through the journal, then
