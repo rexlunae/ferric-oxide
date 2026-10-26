@@ -504,6 +504,26 @@ Move call. The groundwork for per-core NVMe and NIC queues. Off by default; with
 it, irq: counts interrupts by vector number alone, as upstream."""
 
 [[option]]
+id = "kernel.oneshot_timer"
+menu = "kernel"
+type = "bool"
+title = "Calibrated TSC and per-CPU one-shot timers (tickless step 1)"
+default = false
+depends = "target.arch == 'x86_64' && kernel.acpi"
+kernel_feature = "oneshot_timer"
+rebuild = ["kernel"]
+help = """
+The first step of tickless scheduling (issue #186). At boot the kernel measures
+the TSC's rate against the HPET (or the PIT), picks each CPU's one-shot timer
+(the local APIC in TSC-deadline mode when the CPU has it, otherwise a countdown
+it calibrates against the TSC) and runs a short self-test of one-shot deadlines
+on every CPU, logging how late they fired ("oneshot: cpu N: ..."). With
+kernel.trace_sched, the sched.timer_calibrate, sched.timer_arm and
+sched.timer_fire tracepoints record each step. Nothing uses the timers yet: the
+PIT still drives time, timeouts and the scheduler tick. Adds about 40 ms to
+boot. Off by default; without it the local APIC timer is unused, as upstream."""
+
+[[option]]
 id = "kernel.regbuf"
 menu = "kernel"
 type = "bool"
@@ -1734,6 +1754,11 @@ message = "With kernel.cpu.kpti = \"auto\" (on for Meltdown-affected Intel CPUs)
 level = "error"
 when = "target.arch == 'x86_64' && cpu.x86_64_level == 'v4' && (kernel.cpu.avx512 == 'never' || (kernel.cpu.avx512 == 'auto' && !kernel.self_modifying))"
 message = "Level v4 userspace uses AVX-512, which faults unless the kernel enables its state; kernel.cpu.avx512 cannot be \"never\", or \"auto\" without kernel.self_modifying."
+
+[[rule]]
+level = "error"
+when = "kernel.oneshot_timer && kernel.profiling"
+message = "kernel.oneshot_timer cannot be combined with kernel.profiling yet: the profiler's CPU takes over every interrupt vector, the local APIC timer's included, so its one-shot self-test never completes."
 
 [[rule]]
 level = "error"

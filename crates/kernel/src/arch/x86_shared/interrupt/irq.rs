@@ -308,8 +308,17 @@ crate::interrupt!(ata2, || {
 });
 
 crate::interrupt!(lapic_timer, || {
-    crate::println!("Local apic timer interrupt");
-    lapic_eoi();
+    // Ferric Oxide (`kernel.oneshot_timer`): this CPU's one-shot timer.
+    #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+    {
+        lapic_eoi();
+        crate::arch::device::oneshot::interrupt();
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "oneshot_timer")))]
+    {
+        crate::println!("Local apic timer interrupt");
+        lapic_eoi();
+    }
 });
 #[cfg(feature = "profiling")]
 crate::interrupt!(aux_timer, || {

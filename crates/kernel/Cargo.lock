@@ -123,6 +123,10 @@ name = "ferric-cet"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-clock"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-devicetree"
 version = "0.1.0"
 dependencies = [
@@ -242,6 +246,7 @@ dependencies = [
  "ferric-amdvi",
  "ferric-boot-time",
  "ferric-cet",
+ "ferric-clock",
  "ferric-devicetree",
  "ferric-hwrand",
  "ferric-iommu",

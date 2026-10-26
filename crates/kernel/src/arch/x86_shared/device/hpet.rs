@@ -126,14 +126,33 @@ unsafe fn debug_config(hpet: &mut Hpet) {
 
 /// Ferric Oxide: bit 13 of the capabilities register, COUNT_SIZE_CAP: the main counter is 64
 /// bits wide.
-#[cfg(feature = "trace")]
+#[cfg(any(feature = "trace", feature = "oneshot_timer"))]
 const COUNT_SIZE_CAP: u64 = 1 << 13;
 
-/// Ferric Oxide: the HPET's main counter as `kernel.trace`'s fallback clock (`trace::clock`):
-/// its address in the kernel's linear map and its tick length in femtoseconds, when the HPET
-/// is enabled and the counter is 64 bits wide (a 32-bit one wraps within minutes).
-#[cfg(all(feature = "trace", target_arch = "x86_64"))]
-pub(crate) fn trace_counter(hpet: &Hpet) -> Option<(*const u64, u64)> {
+/// Ferric Oxide: the HPET's main counter, where both `kernel.trace`'s fallback clock
+/// (`trace::clock`, through [`trace_counter`]) and the TSC calibration
+/// (`kernel.oneshot_timer`, `device::oneshot`) read it without the ACPI table's lock.
+#[cfg(all(
+    any(feature = "trace", feature = "oneshot_timer"),
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MainCounter {
+    /// The main counter in the kernel's linear map, which stays mapped for the kernel's life.
+    pub(crate) counter: *const u64,
+    /// The counter's tick in femtoseconds.
+    pub(crate) period_fs: u64,
+    /// The counter is 64 bits wide; otherwise only the low 32 bits count, and they wrap
+    /// within minutes.
+    pub(crate) wide: bool,
+}
+
+/// Ferric Oxide: the HPET's main counter, when the HPET is enabled and reports a period.
+#[cfg(all(
+    any(feature = "trace", feature = "oneshot_timer"),
+    target_arch = "x86_64"
+))]
+pub(crate) fn main_counter(hpet: &Hpet) -> Option<MainCounter> {
     // SAFETY: the ACPI code mapped the HPET's registers when it found the table; reading the
     // capabilities and configuration registers has no side effects.
     let (capability, config) = unsafe {
@@ -143,10 +162,23 @@ pub(crate) fn trace_counter(hpet: &Hpet) -> Option<(*const u64, u64)> {
         )
     };
     let period_fs = capability >> 32;
-    let usable = capability & COUNT_SIZE_CAP != 0 && config & ENABLE_CNF != 0 && period_fs != 0;
     let address = hpet.base_address.address as usize + MAIN_COUNTER_OFFSET;
     let counter = <crate::memory::RmmA as crate::memory::RmmArch>::phys_to_virt(
         crate::memory::PhysicalAddress::new(address),
     );
-    usable.then_some((counter.data() as *const u64, period_fs))
+    (config & ENABLE_CNF != 0 && period_fs != 0).then_some(MainCounter {
+        counter: counter.data() as *const u64,
+        period_fs,
+        wide: capability & COUNT_SIZE_CAP != 0,
+    })
+}
+
+/// Ferric Oxide: the HPET's main counter as `kernel.trace`'s fallback clock (`trace::clock`):
+/// its address in the kernel's linear map and its tick length in femtoseconds, when the HPET
+/// is enabled and the counter is 64 bits wide (a 32-bit one wraps within minutes).
+#[cfg(all(feature = "trace", target_arch = "x86_64"))]
+pub(crate) fn trace_counter(hpet: &Hpet) -> Option<(*const u64, u64)> {
+    main_counter(hpet)
+        .filter(|main| main.wide)
+        .map(|main| (main.counter, main.period_fs))
 }

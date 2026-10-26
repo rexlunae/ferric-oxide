@@ -162,6 +162,15 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
     // released into their own context initialization.
     BSP_READY.store(true, Ordering::Release);
 
+    // Ferric Oxide (`kernel.oneshot_timer`): the BSP's one-shot timer and its self-test,
+    // which needs the idle context above and runs before any other context exists here.
+    #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+    // SAFETY: once, on the BSP, with interrupts off, after its local APIC, its idle context
+    // and the TSC calibration in `device::init_noncore`.
+    unsafe {
+        crate::arch::device::oneshot::init_cpu();
+    }
+
     #[cfg(target_arch = "aarch64")]
     {
         crate::info!("SECONDARY CPU INIT");
@@ -242,6 +251,14 @@ pub(crate) fn kmain_ap(cpu_id: crate::cpu_set::LogicalCpuId, kmain_kstack: Kstac
     }
 
     context::init(&mut token, kmain_kstack);
+
+    // Ferric Oxide (`kernel.oneshot_timer`): this AP's one-shot timer and its self-test.
+    #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+    // SAFETY: once, on this AP, with interrupts off, after its local APIC and idle context;
+    // the BSP calibrated the TSC before setting `BSP_READY`.
+    unsafe {
+        crate::arch::device::oneshot::init_cpu();
+    }
 
     crate::debug!("AP {}", cpu_id);
 

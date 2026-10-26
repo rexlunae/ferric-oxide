@@ -138,6 +138,13 @@ The events are:
 | `sched.proc_exec` | `pid` (from `procmgr`) |
 | `sched.proc_exit` | `pid`, `status`, `signal` (from `procmgr`) |
 | `sched.proc_wait` | `waiter`, `pid`, `status` (from `procmgr`) |
+| `sched.tick` | none (one per periodic PIT interrupt, on the BSP) |
+| `sched.ipi_pit` | none (one per periodic `Pit` broadcast IPI received) |
+| `sched.ipi_wake` | `drained` (contexts on the cross-CPU wake-up list when the `Wakeup` IPI arrived) |
+| `sched.timer_calibrate` | `counter`, `hz`, `reference`, `spread_ppm` (see [One-shot timers](#one-shot-timers-and-wake-latency)) |
+| `sched.timer_arm` | `deadline`, `backend`, `value`, `flags` |
+| `sched.timer_fire` | `deadline`, `late_ns`, `early` |
+| `sched.wake_run` | `pid`, `id`, `wait` (wake-to-run latency in trace clock units) |
 
 ### Mapping-operation results
 
@@ -342,6 +349,40 @@ Enable all four with:
 ```text
 enable sched.proc_fork sched.proc_exec sched.proc_exit sched.proc_wait
 ```
+
+### One-shot timers and wake latency
+
+With `kernel.oneshot_timer` (the first tickless step, issue #186), the kernel
+calibrates the TSC at boot and every CPU tests its one-shot local APIC timer
+(`crates/kernel/src/arch/x86_shared/device/oneshot.rs`, arithmetic in
+`crates/clock`). Their events:
+
+- `sched.timer_calibrate`: a counter's measured rate. `counter` is 1 for the
+  TSC (once, on the BSP) and 2 for a CPU's local APIC countdown; `reference` is
+  1 for the HPET, 2 for the PIT and 3 for the TSC; `spread_ppm` is how far the
+  calibration windows disagreed.
+- `sched.timer_arm`: a CPU armed its timer. `deadline` is a TSC reading,
+  `backend` 1 for TSC-deadline mode and 2 for a countdown, `value` what was
+  written (the deadline or the initial count), and `flags` bit 0 a deadline
+  already past (fired as soon as possible), bit 1 a countdown too long for the
+  32-bit counter (it ends early and is re-armed).
+- `sched.timer_fire`: the timer interrupted. `late_ns` is how long after
+  `deadline` the handler ran; with `early` 1 the interrupt came before the
+  deadline, `late_ns` is the time left, and the timer is re-armed.
+
+`sched.wake_run` is recorded whenever `trace_sched` is compiled in, with or
+without the option: when a context that `unblock` made runnable is switched in,
+`wait` is the time in between, in the trace clock's units (the `clock` file).
+It is the wake-to-run latency the tickless scheduler and the per-CPU driver
+workers are measured by. Contexts made runnable another way (a scheme's mmap
+answer, a signal to a stopped context) have no record.
+
+```text
+enable sched.timer_calibrate sched.timer_arm sched.timer_fire sched.wake_run
+```
+
+The boot log also has one line per CPU with its self-test result, which CI
+checks (`scripts/ferric-ci/check-oneshot-log.sh`).
 
 ### Futex waits and wakes
 

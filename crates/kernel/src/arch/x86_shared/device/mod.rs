@@ -9,6 +9,9 @@ pub mod cpu;
 pub mod hpet;
 pub mod ioapic;
 pub mod local_apic;
+// Ferric Oxide: the calibrated TSC and per-CPU one-shot timers (`kernel.oneshot_timer`).
+#[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+pub mod oneshot;
 pub mod pic;
 pub mod pit;
 pub mod serial;
@@ -70,6 +73,9 @@ pub unsafe fn init_noncore() {
             crate::debug!("PIT used as system timer");
         }
 
+        #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+        oneshot::init_bsp();
+
         crate::debug!("Finished initializing devices");
     }
 }
@@ -88,6 +94,9 @@ pub struct ArchPercpuMisc {
     #[cfg(feature = "x86_kvm_pv")]
     pub tsc_info: tsc::TscPercpu,
     pub idt: Mutex<Option<&'static mut crate::arch::idt::Idt>>,
+    /// Ferric Oxide: this CPU's one-shot timer (`kernel.oneshot_timer`).
+    #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+    pub oneshot: oneshot::OneShotPercpu,
 }
 
 impl ArchPercpuMisc {
@@ -97,6 +106,8 @@ impl ArchPercpuMisc {
             #[cfg(feature = "x86_kvm_pv")]
             tsc_info: tsc::TscPercpu::default(),
             idt: Mutex::new(None),
+            #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+            oneshot: oneshot::OneShotPercpu::default(),
         }
     }
 }

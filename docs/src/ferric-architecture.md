@@ -139,6 +139,17 @@ at that CPU's next switch rather than waiting for a later wake-up. The IPI does
 not preempt a busy CPU: the woken context waits for that CPU's next switch,
 which today is at most one scheduler tick away.
 
+Time, timeouts and preemption are still driven by the periodic PIT (or HPET)
+interrupt: the BSP's handler advances `time::OFFSET`, broadcasts the `Pit`
+IPI and runs `timeout::trigger` and `switch::tick`. Tickless scheduling
+(issue #177) replaces that in steps. The first, `kernel.oneshot_timer`
+(off by default), adds the parts without using them yet: the TSC calibrated
+against the HPET or PIT (`device::oneshot::tsc_scale`) and a one-shot local
+APIC timer on every CPU, in TSC-deadline mode or as a calibrated countdown,
+which a boot self-test exercises. The portable arithmetic (tick and nanosecond
+conversion, calibration, deadline programming) is the host-tested
+`ferric-clock` crate in `crates/clock`.
+
 Address-space mappings, sharing and copy-on-write live under
 `crates/kernel/src/context/`; physical allocation and page tables are in
 `src/memory/` and the kernel's `rmm/`. Registered buffers and DMA retain frame

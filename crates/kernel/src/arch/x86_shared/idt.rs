@@ -258,6 +258,13 @@ fn init_generic(cpu_id: LogicalCpuId, idt: &mut Idt) {
 
         // reserve bit 49
         current_reservations[1] |= 1 << 17;
+
+        // Ferric Oxide (`kernel.oneshot_timer`): every CPU has its own one-shot timer.
+        #[cfg(all(target_arch = "x86_64", feature = "oneshot_timer"))]
+        {
+            current_idt[48].set_func(irq::lapic_timer);
+            current_reservations[1] |= 1 << 16;
+        }
     }
 
     // Set IPI handlers

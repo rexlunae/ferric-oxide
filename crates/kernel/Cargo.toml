@@ -20,6 +20,7 @@ ferric-aligned-buffer = { path = "../aligned-buffer" }
 ferric-devicetree = { path = "../devicetree" }
 ferric-amdvi = { path = "../amdvi" }
 ferric-cet = { path = "../cet" }
+ferric-clock = { path = "../clock", optional = true }
 ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
@@ -148,6 +149,10 @@ trace_level_info = ["trace_level_warn"]
 trace_level_debug = ["trace_level_info"]
 trace_level_trace = ["trace_level_debug"]
 lpss_debug = []
+# Ferric Oxide: calibrate the TSC and run a per-CPU one-shot local APIC timer self-test at boot
+# (x86_64, issue #186). Periodic scheduling is unchanged. ferric-trace supplies the invariant
+# TSC check.
+oneshot_timer = ["acpi", "dep:ferric-clock", "dep:ferric-trace"]
 multi_core = ["acpi"]
 numa = ["multi_core"]
 # Ferric Oxide: the ctl-profiling read of the kernel text address uses ferric-trace's

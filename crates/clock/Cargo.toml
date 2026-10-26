@@ -1,0 +1,8 @@
+[package]
+name = "ferric-clock"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Clocksource calibration, tick/nanosecond conversion and one-shot timer arithmetic for the tickless kernel"
+
+[dependencies]

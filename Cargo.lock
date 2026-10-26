@@ -1338,6 +1338,10 @@ name = "ferric-cet"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-clock"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-codecache"
 version = "0.1.0"
 dependencies = [
