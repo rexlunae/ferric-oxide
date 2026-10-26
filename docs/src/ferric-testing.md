@@ -672,3 +672,11 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### Lazy file-mapping reply protocol
+
+The kernel helper suite includes `context/fmap_reply.rs` directly. It covers
+reply-before-park, park-before-reply, exactly-once consumption, stale/duplicate
+responses and failed-dispatch cleanup. Normal `fmap` still creates eager
+mappings, and no scheme responds to `RequestMmap`; this protocol coverage is
+not an end-to-end lazy-fault test. Run the helper host and Miri commands above.

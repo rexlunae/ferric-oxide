@@ -10,6 +10,8 @@ extern crate alloc;
 
 #[path = "../src/cpu_set.rs"]
 mod cpu_set;
+#[path = "../src/context/fmap_reply.rs"]
+mod fmap_reply;
 #[path = "../src/sync/records.rs"]
 mod records;
 #[path = "../src/sync/spin_wait.rs"]
