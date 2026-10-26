@@ -374,13 +374,22 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                             return Err(Error::new(EACCES));
                         }
 
+                        // Ferric Oxide: write another description's cached writes back and
+                        // hold them first, so the truncation never drops acknowledged writes.
+                        let mut pcache = self.pcache.as_mut();
+                        let before = match pcache.as_deref_mut() {
+                            Some(c) => c.begin_change(&mut self.fs, &mut self.fmap, node_ptr)?,
+                            None => None,
+                        };
                         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                        self.fs.tx(|tx| {
+                        let truncated = self.fs.tx(|tx| {
                             tx.truncate_node(node_ptr, 0, mtime.as_secs(), mtime.subsec_nanos())
-                        })?;
-                        if let Some(pcache) = &mut self.pcache {
-                            pcache.changed(&mut self.fs, node_ptr, node.data().size(), 0, 0);
+                        });
+                        // Also on failure, which releases the hold.
+                        if let (Some(pcache), Some(before)) = (pcache, before) {
+                            pcache.changed(&mut self.fs, node_ptr, before, 0, 0);
                         }
+                        truncated?;
                     }
 
                     Handle::ResourceFile((

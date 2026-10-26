@@ -50,7 +50,10 @@
 //! - `pcache-redoxfs-writeback-mmap`: a mapping made over cached writes sees them, writes are
 //!   not cached while a shared writable mapping lasts, and those of a description opened
 //!   once it goes are again.
-//!   The last two pass at once when writes are not cached.
+//! - `pcache-redoxfs-writeback-trunc`: an `O_TRUNC` open through another description
+//!   writes cached writes back before truncating, and the writer's later cached writes
+//!   reach the file with zeros before them.
+//!   The `-age` and `-mmap` steps pass at once when writes are not cached.
 //! - `pcache-redoxfs-bench`: warm 4 KiB `pread`s and 1 MiB sequential reads of one file,
 //!   through a read-only description (cached) against an `O_FSYNC` one (served by RedoxFS,
 //!   as with the option off), in the same boot with `ferric_blkqueue::ab`'s paired rule.

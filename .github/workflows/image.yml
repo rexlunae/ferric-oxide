@@ -501,7 +501,7 @@ jobs:
         run: |
           steps="miss hit readahead eio bad-answer restore owner exec invalidate generation close
             redoxfs redoxfs-mmap redoxfs-writeback redoxfs-writeback-age redoxfs-writeback-mmap
-            redoxfs-bench"
+            redoxfs-writeback-trunc redoxfs-bench"
           for step in $steps; do
             grep -aF "FERRIC_TEST_PASS pcache-$step" "$LOG"
           done

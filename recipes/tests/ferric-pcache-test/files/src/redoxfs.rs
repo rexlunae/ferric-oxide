@@ -5,8 +5,8 @@
 //! (`kernel.page_cache_writeback`), every description but an `O_FSYNC` one is served from the
 //! cache, writes too; the steps that need RedoxFS to serve a description open it `O_FSYNC`,
 //! so they test the same thing either way, and the writeback steps check that cached writes
-//! reach the file: on `fsync`, at the last close, after a while on their own, and before a
-//! mapping.
+//! reach the file: on `fsync`, at the last close, after a while on their own, before a
+//! mapping, and across an `O_TRUNC` open through another description.
 //!
 //! Whether a write was cached shows in the modification time: RedoxFS moves it when it
 //! writes the file, and a cached write does not until it is written back.
@@ -511,6 +511,50 @@ pub fn age() -> Result<(), Failure> {
         expect(&open_fs(false)?, &want, "writeback on its own")?;
     }
     drop(writer);
+    io("remove the test file", fs::remove_file(PATH))
+}
+
+/// `pcache-redoxfs-writeback-trunc`: opening a file `O_TRUNC` while another description
+/// has cached writes in it truncates the file to nothing and keeps every write made after:
+/// RedoxFS writes the cached writes back and holds the file's writes during the truncation
+/// (as for `ftruncate`), so none is dropped by it or slips in between. The writer's writes
+/// after the truncation, from the cache, reach the file with zeros before them, and none of
+/// its earlier cached bytes comes back. Passes either way when writes are not cached.
+pub fn writeback_truncate() -> Result<(), Failure> {
+    io("create the test file", fs::write(PATH, bytes(15, 0, LEN)))?;
+    let writer = open_writer()?;
+    let reader = io("open the test file", File::open(PATH))?;
+    // Inside the file, and past its end: the second grows it in the cache only.
+    write_cached(&writer, &bytes(16, 4096, 2 * 4096), 4096)?;
+    write_cached(&writer, &bytes(17, LEN, 3000), LEN)?;
+    let truncating = io(
+        "open the test file O_TRUNC",
+        OpenOptions::new().write(true).truncate(true).open(PATH),
+    )?;
+    expect(&reader, &[], "an O_TRUNC open, from the cache")?;
+    expect(&open_fs(false)?, &[], "an O_TRUNC open, through RedoxFS")?;
+    // A write after the truncation, through the first writer: zeros before it.
+    let at = 2 * 4096 + 100;
+    let patch = bytes(18, at, 5000);
+    let cached = write_cached(&writer, &patch, at)?;
+    let mut want = vec![0; at];
+    want.extend_from_slice(&patch);
+    expect(
+        &reader,
+        &want,
+        "a write after the O_TRUNC open, from the cache",
+    )?;
+    io("fsync", writer.sync_all())?;
+    check(!cached || !unwritten(&writer)?, || {
+        "fsync did not write the cached write after the O_TRUNC open".into()
+    })?;
+    expect(&open_fs(false)?, &want, "fsync after the O_TRUNC open")?;
+    drop((writer, reader, truncating));
+    expect(
+        &open_fs(false)?,
+        &want,
+        "closing and reopening after the O_TRUNC open",
+    )?;
     io("remove the test file", fs::remove_file(PATH))
 }
 
