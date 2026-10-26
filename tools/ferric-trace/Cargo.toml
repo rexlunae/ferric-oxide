@@ -14,8 +14,6 @@ path = "src/main.rs"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ferric-trace = { path = "../../crates/trace" }
-# The fio-style latency histogram the `counts` view reports gaps with, as the benchmark jobs do.
-ferric-iobench = { path = "../../crates/iobench" }
 # Maps the rings for `ferric-trace capture` on Redox; empty elsewhere.
 ferric-trace-map = { path = "../../crates/trace-map" }
 # To decode the hardware reports in `iommu.fault` records, as the kernel does.

@@ -29,6 +29,8 @@ pub mod start;
 pub mod stop;
 
 pub mod time;
+#[cfg(feature = "time_one_shot")]
+pub mod timer;
 
 #[cfg(target_arch = "x86")]
 pub use ::rmm::x86::X86Arch as CurrentRmmArch;

@@ -1,91 +1,106 @@
-# Why a New OS?
+# Why Ferric Oxide?
 
-The essential goal of the Redox project is to build a robust, reliable and safe general-purpose operating system. To that end, the following key design choices have been made.
+Ferric Oxide exists to build a Rust operating system people can actually use
+for real work: secure because of its design, and fast because the design is
+measured and tuned. It starts from Redox OS, which already showed that a
+complete microkernel system can be written in Rust, and takes it in a
+direction Redox has not chosen.
+
+## Why start from Redox
+
+Writing an operating system from scratch takes many years before it can run
+real programs. Redox has spent a decade building a working kernel, bootloader,
+file system, C library, display server, drivers and a large set of ported
+programs, all in Rust and all MIT licensed. Forking it lets Ferric Oxide spend
+its effort on the parts it wants to change rather than reinventing the parts
+that already work. The kernel, relibc, bootloader, base services and RedoxFS
+were imported with their history; since then they have been maintained here,
+independently of Redox.
+
+## Why a fork rather than contributions
+
+Two differences make a separate project necessary.
+
+**Development process.** Redox does not accept contributions written with AI
+tools. Ferric Oxide does, with a human accountable for every change and the
+same review, testing and documentation requirements as any other contribution.
+This lets the project attempt changes larger than its maintainers could write
+by hand, such as a new I/O architecture, clean-room Linux file systems and a
+hypervisor. Redox's choice is respected: AI-assisted work is never sent
+upstream.
+
+**Technical direction.** Ferric Oxide makes choices that suit its goals but
+would not suit an upstream with broader ones:
+
+- **Modern hardware only.** x86-64-v3 and UEFI as the floor, ARM64 as the
+  second architecture, and no i586 or BIOS paths. The kernel can rely on
+  features such as an IOMMU and XSAVE instead of carrying fallbacks.
+- **Performance as a requirement.** Structural kernel changes (an IOMMU-fenced
+  shared-memory data plane, per-core queues, a page cache, and a scheduler
+  being reworked toward an event-driven design) land when benchmarks justify
+  them.
+- **Configuration over divergence.** Optional work is a feature toggle, so
+  experiments live in the main tree without being forced on every image.
+- **Supply-chain verifiability.** The `fox` package manager replaces `pkg`
+  with signed git sources, build attestations and SBOMs.
+- **Linux interoperability without GPL code.** Clean-room ext4, LVM, LUKS and
+  (planned) XFS, and planned microVM enclaves for software that expects
+  another OS's security model.
 
 ## Written in Rust
 
-Wherever possible, Redox code is written in [Rust](https://www.rust-lang.org/). Rust enforces a set of rules and checks on the use, sharing and deallocation of memory references. This almost entirely eliminates the potential for memory leaks, buffer overruns, use after free, and other [memory errors](https://en.wikipedia.org/wiki/Memory_safety#Types_of_memory_errors) that arise during development. The vast majority of security vulnerabilities in operating systems originate from memory errors. The Rust compiler prevents this type of error before the developer attempts to add it to the code base.
+Wherever possible, Ferric Oxide is written in [Rust](https://www.rust-lang.org/).
+Rust's ownership and type rules rule out buffer overruns, use-after-free,
+data races and the other [memory errors](https://en.wikipedia.org/wiki/Memory_safety#Types_of_memory_errors)
+that cause most security vulnerabilities in operating systems, and the
+compiler catches them before the code runs. [Why Rust?](./why-rust.md) goes
+into more detail.
 
-It allows us to unlock the full Rust potential by dropping legacy C and C++ code.
+## Microkernel architecture
 
-### Benefits
+A [microkernel](https://en.wikipedia.org/wiki/Microkernel) moves as much of
+the operating system as possible out of the kernel. Drivers, file systems and
+the network stack run as separate user-space processes ("daemons"), each with
+only the resources it needs. The kernel manages memory, scheduling and
+communication between them.
 
-The following items summarize the Rust benefits:
+In a [monolithic kernel](https://en.wikipedia.org/wiki/Monolithic_kernel), all
+of that code shares one address space with full privileges, so one bug in a
+driver can crash or compromise the whole machine. In Ferric Oxide a failing
+driver or service can be restarted, and a compromised one is confined to what
+it was given. With an IOMMU domain per driver (implemented, off by default),
+that confinement extends to the device's DMA as well.
 
-- Memory-Safety
+The benefits:
 
-  All memory allocations are verified by the compiler to prevent bugs, like buffer overflows and dangling pointers.
+- **Fault isolation.** A crash in a driver or service doesn't take down the
+  kernel or other services.
+- **Smaller attack surface.** Less code runs with kernel privileges, and
+  services hold only the capabilities they need.
+- **Restartable, updatable components.** Services can be restarted or
+  replaced without rebooting.
+- **Independent development and testing.** Services and drivers are ordinary
+  programs that can be built and tested separately.
 
-- Type-safety
+The traditional cost is performance: each request crosses the kernel several
+times and data is copied between processes. Removing that cost without giving
+up the isolation is Ferric Oxide's central design work. See
+[Our Goals](./our-goals.md#a-microkernel-without-the-ipc-tax) and
+[Microkernels](./microkernels.md).
 
-  Invalid type usage is verified at compile-time (NULLs can't cause undefined behavior, for example) and new types can be created to invalidate logic states that aren't allowed, which prevent/fix some logic bugs and reduce the formal verification effort
+## File systems
 
-- Thread-Safety
+The default file system is [RedoxFS](./redoxfs.md), a copy-on-write file
+system with checksums and optional encryption. Ferric Oxide adds read-only
+ext4, LVM2 and LUKS support so it can share disks with Linux, with writable
+ext4 and XFS planned. Choosing the default root file system is still an open
+decision.
 
-  Concurrent code in userspace programs is immune to data races.
+## Unix-like tools and API
 
-## Microkernel Architecture
-
-The [Microkernel Architecture](https://en.wikipedia.org/wiki/Microkernel) moves as much system components as possible out of the operating system kernel. Drivers, subsystems and other operating system functionality are executed as independent processes on user-space (daemons). The kernel's main responsibility is the coordination of these processes, and the management of system resources to the processes.
-
-Most kernels, other than some real-time operating systems, use an event-handler design. Hardware interrupts and application system calls, each one triggers an event invoking the appropriate handler. The kernel runs in supervisor-mode, with access to all system's resources. In [Monolithic Kernels](https://en.wikipedia.org/wiki/Monolithic_kernel), the operating system's entire response to an event must be completed in supervisor mode. A bug in the kernel, drivers or hardware, can cause the system to enter a state where it can't to respond to *any* event. And because of the large amount of code in the kernel, the potential for vulnerabilities while in supervisor mode is vastly greater than for a microkernel design.
-
-Beyond monolithic kernels being much more vulnerable to bugs there's also the much higher complexity of post-Internet modern hardware and drivers that didn't exist when monolithic kernels were adopted, but since the adoption of Internet and the implementation of the [TCP/IP](https://en.wikipedia.org/wiki/Internet_protocol_suite) network stack in [BSD Unix](https://en.wikipedia.org/wiki/Berkeley_Software_Distribution) the complexity grew fast. This growth has caused an epidemic of bugs that are hard or invisible to debug due to all monolithic kernel components sharing the same memory address space.
-
-In Redox, drivers and many system services can run in user-mode, similar to user programs, and the system can restrict them so they can only access the resources that they require for their designated purpose. If a driver fails or panics, it could be ignored or restarted with no impact on the rest of the system. A misbehaving piece of hardware might impact system performance or cause the loss of a service with a small chance of data corruption, but the kernel and maybe the essential system components will continue to function and to provide whatever services remain available.
-
-Thus Redox has an unique opportunity to show the microkernel potential for the mainstream operating systems universe with the features and convenience that you would expect from them.
-
-### Benefits
-
-The following items summarize the microkernel benefits:
-
-- More stable and secure
-
-  The very small size of the kernel allow the system to be more stable and secure because most system components are isolated in user-space, reducing the chance of a [kernel panic](https://en.wikipedia.org/wiki/Kernel_panic) and the severity of security bugs.
-
-- Bug isolation
-
-  Most system components run in user-space on a microkernel system. Because of this some types of bugs in most system components and drivers can't spread to other system components or drivers.
-
-- More stable long execution
-
-  When an operating system is left running for a long time (days, months or even years) it will activate many bugs and it's hard to know when they were activated, at some point these bugs can cause security issues, data corruption or crash the system.
-
-  In a microkernel most system components are isolated and some bug types can't spread to other system components, thus the long execution tend to enable less bugs reducing the security issues, data corruption and downtime on servers.
-
-  Also some system components can be restarted on-the-fly (without a full system restart) to disable the bugs of a long execution.
-
-- Restartless design
-
-  A mature microkernel changes very little (except for bug fixes), so you won't need to restart your system very often to update it.
-
-  Since most system components are in userspace they can be restarted/updated on-the-fly, reducing the downtime of servers a lot.
-
-- Easier to develop and test
-
-  As most system components are separated daemons in userspace and the kernel is small, they can be developed and tested independently before integration.
-
-- Easy and quick to expand
-
-  New drivers or system components can be easily and quickly added as userspace daemons using the scheme protocol.
-
-- True modularity
-
-  You can enable/disable/update most system components without a system restart, similar to but safer than some modules on monolithic kernels and [livepatching](https://en.wikipedia.org/wiki/Kpatch).
-
-- Less maintenance cost
-
-Subsystems, system components and drivers can use different versions of the scheme protocol to stay working without source code modification after possible system API/ABI changes on updates
-
-You can read more about the above benefits on the [Microkernels](./microkernels.md) page.
-
-## Advanced Filesystem
-
-Redox provides an advanced filesystem, [RedoxFS](https://gitlab.redox-os.org/redox-os/redoxfs). It includes many of the features in [ZFS](https://en.wikipedia.org/wiki/OpenZFS), but in a more modular design.
-
-More details on RedoxFS can be found on the [RedoxFS](./redoxfs.md) page.
-
-## Unix-like Tools and API
-
-Redox provides a Unix-like command interface, with many everyday tools written in Rust but with familiar names and options. As well, Redox system services include a programming interface that is a subset of the [POSIX](https://en.wikipedia.org/wiki/POSIX) API, via [relibc](https://gitlab.redox-os.org/redox-os/relibc). This means that many Linux/POSIX programs can run on Redox with only recompilation. While the Redox team has a strong preference for having essential programs written in Rust, we are agnostic about the programming language for programs of the user's choice. This means an easy migration path for systems and programs previously developed for a Unix-like platform.
+Ferric Oxide provides a Unix-like command line with familiar tools, many of
+them written in Rust, and a POSIX-like programming interface through relibc.
+Many Linux and BSD programs run after recompilation, and Rust programs that
+use the standard library generally work unchanged. The project prefers Rust
+for system components, but is agnostic about the languages of the programs
+users choose to run.

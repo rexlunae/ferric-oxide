@@ -12,7 +12,6 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
-use ferric_trace_cli::counts;
 use ferric_trace_cli::crash::CrashReport;
 use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
 use ferric_trace_cli::profile::{self, Run};
@@ -91,23 +90,6 @@ enum Cmd {
         #[arg(long)]
         partial: bool,
     },
-    /// Print one summary line per event: record counts and rates, and, with `--gap`, the
-    /// gaps between a CPU's consecutive records of an event, as `key=value` fields
-    Counts {
-        /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
-        #[arg(required = true)]
-        inputs: Vec<PathBuf>,
-        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
-        #[arg(long)]
-        partial: bool,
-        /// Also report the gaps between a CPU's consecutive records of this event, in
-        /// nanoseconds; repeat to ask for more events
-        #[arg(long = "gap")]
-        gap: Vec<String>,
-        /// The TSC frequency of the traced machine in MHz, as for `perfetto`
-        #[arg(long, default_value = "1000")]
-        tsc_mhz: perfetto::TscMhz,
-    },
     /// Print the panic message and the records of a crash dump (`/scheme/kernel.trace/crash`
     /// after a panic, or a copy of it), and optionally save the records as a capture
     Crash {
@@ -173,8 +155,6 @@ enum CliError {
     Seconds(f64),
     #[error(transparent)]
     Crash(#[from] ferric_trace_cli::crash::CrashDumpError),
-    #[error("no event named {0} in the catalog (--gap)")]
-    UnknownEvent(String),
     #[error("cannot write {}", path.display())]
     Write {
         path: PathBuf,
@@ -254,29 +234,6 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
             text::write(&capture, &mut out)
-                .and_then(|()| out.flush())
-                .map_err(|source| CliError::Write {
-                    path: PathBuf::from("<stdout>"),
-                    source,
-                })
-        }
-        Cmd::Counts {
-            inputs,
-            partial,
-            gap,
-            tsc_mhz,
-        } => {
-            let capture = loader(partial)(&inputs)?;
-            for name in &gap {
-                if ferric_trace::kernel::CATALOG.find(name).is_none() {
-                    return Err(CliError::UnknownEvent(name.clone()));
-                }
-            }
-            let gap: Vec<&str> = gap.iter().map(String::as_str).collect();
-            let losses = counts::losses(&inputs);
-            let stdout = io::stdout();
-            let mut out = BufWriter::new(stdout.lock());
-            counts::write(&capture, &gap, &losses, tsc_mhz, &mut out)
                 .and_then(|()| out.flush())
                 .map_err(|source| CliError::Write {
                     path: PathBuf::from("<stdout>"),

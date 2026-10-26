@@ -16,9 +16,6 @@
 //! - [`flamegraph`] symbolizes a profile's stacks and folds them; [`svg`] draws the result
 //!   (the `ferric-trace flamegraph` command).
 //! - [`text`] prints one line per record, like the kernel's `ftrace` text output.
-//! - [`counts`] prints how many records each event produced and their rates, and, with
-//!   `--gap`, the gaps between a CPU's consecutive records of an event, as `key=value`
-//!   lines the scheduler baseline protocol reads (`ferric-trace counts`).
 //! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
 //!   sources, IOMMU fault reports) into words, for both views.
 //! - [`perfetto`] converts a capture to the Chrome trace event JSON format, which the Perfetto
@@ -51,7 +48,6 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
-pub mod counts;
 pub mod crash;
 pub mod describe;
 pub mod drain;

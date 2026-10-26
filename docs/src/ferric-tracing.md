@@ -138,6 +138,13 @@ The events are:
 | `sched.proc_exec` | `pid` (from `procmgr`) |
 | `sched.proc_exit` | `pid`, `status`, `signal` (from `procmgr`) |
 | `sched.proc_wait` | `waiter`, `pid`, `status` (from `procmgr`) |
+| `sched.tick` | none (one per periodic PIT interrupt, on the BSP) |
+| `sched.ipi_pit` | none (one per periodic `Pit` broadcast IPI received) |
+| `sched.ipi_wake` | `drained` (contexts on the cross-CPU wake-up list when the `Wakeup` IPI arrived) |
+| `sched.timer_calibrate` | `counter`, `hz`, `reference`, `spread_ppm` (see [One-shot timers](#one-shot-timers-and-wake-latency)) |
+| `sched.timer_arm` | `deadline`, `backend`, `value`, `flags` |
+| `sched.timer_fire` | `deadline`, `late_ns`, `early` |
+| `sched.wake_run` | `pid`, `id`, `wait` (wake-to-run latency in trace clock units) |
 | `mm.tlb_flush` | `targets`, `pages`, `local`, `wait_cycles` (debug level; see [TLB maintenance](#tlb-maintenance)) |
 | `mm.tlb_ipi` | `handled` (debug level) |
 | `mm.cr3_switch` | `kind`, `space` (debug level) |
@@ -347,6 +354,42 @@ Enable all four with:
 enable sched.proc_fork sched.proc_exec sched.proc_exit sched.proc_wait
 ```
 
+### One-shot timers and wake latency
+
+With `kernel.time.one_shot` (the first tickless step, issue #186), the kernel
+calibrates the TSC at boot (`crates/kernel/src/arch/x86_shared/time/continuous.rs`)
+and every CPU tests its one-shot local APIC timer
+(`crates/kernel/src/arch/x86_shared/timer.rs`; the arithmetic is in
+`crates/timed`). Their events:
+
+- `sched.timer_calibrate`: a counter's measured rate. `counter` is 1 for the
+  TSC (once, on the BSP) and 2 for a CPU's local APIC countdown; `reference` is
+  1 for the HPET, 2 for the PIT, 3 for the TSC and 4 for the KVM clock;
+  `spread_ppm` is how far the calibration windows disagreed.
+- `sched.timer_arm`: a CPU armed its timer. `deadline` is in monotonic
+  nanoseconds (the `time::monotonic` scale),
+  `backend` 1 for TSC-deadline mode and 2 for a countdown, `value` what was
+  written (the deadline or the initial count), and `flags` bit 0 a deadline
+  already past (fired as soon as possible), bit 1 a countdown too long for the
+  32-bit counter (it ends early and is re-armed).
+- `sched.timer_fire`: the timer interrupted. `late_ns` is how long after
+  `deadline` the handler ran; with `early` 1 the interrupt came before the
+  deadline, `late_ns` is the time left, and the timer is re-armed.
+
+`sched.wake_run` is recorded whenever `trace_sched` is compiled in, with or
+without the option: when a context that `unblock` made runnable is switched in,
+`wait` is the time in between, in the trace clock's units (the `clock` file).
+It is the wake-to-run latency the tickless scheduler and the per-CPU driver
+workers are measured by. Contexts made runnable another way (a scheme's mmap
+answer, a signal to a stopped context) have no record.
+
+```text
+enable sched.timer_calibrate sched.timer_arm sched.timer_fire sched.wake_run
+```
+
+The boot log also has one line per CPU with its lateness series and the BSP's
+selftest rounds, which CI checks (`scripts/ferric-ci/check-oneshot-log.sh`).
+
 ### Futex waits and wakes
 
 The futex events cover the kernel's queued waits and wake calls
@@ -526,8 +569,7 @@ capture. The kernel writes them in `crates/kernel/src/tlb_stats.rs`,
   and the TSC ticks the invalidations took. A map on VT-d units outside
   caching mode invalidates nothing and has no record.
 
-`ferric-trace text` names a `mm.cr3_switch` record's kind, and `ferric-trace
-counts` gives the events' rates (`--gap mm.tlb_flush` their spacing).
+`ferric-trace text` names a `mm.cr3_switch` record's kind.
 
 ## Records and rings
 
@@ -934,117 +976,6 @@ and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), 
 captures sent to one backend keep separate traces. The mapping is described in
 `tools/ferric-trace/src/otlp.rs`.
 
-## Scheduler and timer baseline
-
-The tickless scheduler work ([#177] and its issue track) needs a measured
-picture of today's periodic behavior before it changes anything: how many
-timer interrupts the periodic PIT path produces per second, when the `Pit`
-broadcast IPI reaches the other CPUs, how often the scheduler switches, what a
-cross-CPU wakeup costs, and what a waiting ring's per-ring worker costs. The
-reproducible protocol for that picture is the scheduler and timer baseline
-(issue [#179], extended by the tickless sections of [#185]). It is a
-measurement protocol, not a benchmark of a candidate: it pins a commit and a
-configuration, collects raw captures and machine-readable lines, and states
-the machine and boot it measured. Success thresholds for later work are frozen
-from these numbers before candidate tuning.
-
-The scheduler event IDs are `sched.tick=33`, `sched.ipi_pit=34` and
-`sched.ipi_wake=35`. Build and decode baseline captures with the same pinned
-commit/catalog. Captures from early development catalogs using IDs 22–24 need
-regeneration; those IDs now describe process lifecycle events and cannot be
-silently interpreted using the current catalog.
-
-The baseline image is `config/ferric-sched-bench.toml` (`make all
-CONFIG_NAME=ferric-sched-bench`), built with the CI `ferric.toml` (image.yml
-writes it), which turns `kernel.trace` and the `trace_sched` events on. The
-image's console script, `/usr/lib/ferric-sched-bench.ion`, runs four windows:
-
-1. **Idle.** Ten seconds with no runnable user workload. The capture counts
-   the periodic `sched.tick` records on the PIT owner and `sched.ipi_pit`
-   records on every other CPU: the timer interrupt rate the tickless work
-   must stop, and its jitter.
-2. **One busy context.** `ferric-sched-burn --seconds 10` runs a syscall-free
-   spin. The periodic tick is the only thing that can preempt it, so the
-   window shows the periodic preemption of a greedy best-effort context.
-3. **Waiting rings.** `ferric-ring-test --scale N --quiet-seconds 8` for
-   `N` in 1, 16, 64, 256: each ring submits one asynchronous 1-byte read of an
-   empty pipe, so its worker blocks in the read (the legacy one-context-per-
-   ring model). The window covers the setup (each ring's `sched.context_create`
-   and `sched.context_start`), the quiet hold, and the wake of every ring; the
-   run prints the wake latency (write to completion, per ring, with
-   fio-style percentiles) as a `FERRIC_BENCH ring-scale` line. Timing starts
-   immediately before the releasing pipe write. The workload validates each
-   actual CQE's request id, successful one-byte result and count, then checks
-   for extra completions; a local loop counter is not completion evidence.
-4. **Benchmarks with tracing on.** `ferric-ring-test`, `ferric-trace-bench`
-   and `ferric-iobench` run and print their usual `FERRIC_BENCH` lines; the
-   trace-bench lines also report the tracing overhead and lost records.
-
-Between and after the windows, the script captures the rings with
-`ferric-trace capture` and prints one `counts` line per event (per CPU and
-merged) with `ferric-trace counts`, the `counts` view:
-
-```text
-counts sched.tick cpu=0 count=2440 rate_per_s=243
-counts sched.tick cpu=all count=2440 rate_per_s=243 gap_ns_min=4050000 gap_ns_mean=4053000
-        gap_ns_p50=4052000 gap_ns_p99=4073000 gap_ns_p999=4100000 gap_ns_max=12340000
-```
-
-A `counts` line has the event, the CPU (`cpu=all` for the merged line), the
-record count, that CPU's rate over the capture (first to last record), and, with
-`--gap <event>`, the gaps between a CPU's consecutive records of that event as
-fio-style percentiles in nanoseconds. The merged rate uses the total count
-over the same capture duration. A capture directory's `stats.start` and
-`stats.end` snapshots add `lost_before` and `lost_during` to the CPU lines, so
-a window that overflowed its ring reports the loss instead of silently
-undercounting. The tool takes the same inputs as `text`:
-
-```sh
-cargo run -p ferric-trace-cli -- counts capture/ --tsc-mhz 4292 --gap sched.tick --gap sched.switch
-```
-
-The kernel's trace clock is the invariant TSC and does not know its own
-frequency, so a TSC capture's `counts` lines are in real nanoseconds only
-with the traced machine's TSC rate in `--tsc-mhz` (perfetto's `--tsc-mhz`
-is the same value). Under KVM with `host,migratable=off` the guest TSC runs
-at the host's rate; measure it on the host and record it with the results:
-
-```sh
-gcc -O2 -x c -o /tmp/tscrate - <<'C'
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdint.h>
-#include <time.h>
-#include <x86intrin.h>
-int main(void) {
-    struct timespec a, b;
-    uint64_t t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &a);
-    t0 = __rdtsc();
-    struct timespec s = { .tv_sec = 0, .tv_nsec = 500000000 };
-    nanosleep(&s, 0);
-    t1 = __rdtsc();
-    clock_gettime(CLOCK_MONOTONIC, &b);
-    double ns = (double)((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec));
-    printf("tsc_rate=%.2f MHz\n", (double)(t1 - t0) / ns * 1000.0);
-    return 0;
-}
-C
-/tmp/tscrate
-```
-
-The host runs the image with `scripts/ferric-ci/boot-smoke.sh` on KVM
-(`host,migratable=off`; software QEMU's PIT and LAPIC timing is not
-representative), `BOOT_SMP=1` and the default 4 vCPUs, once each, and checks
-the serial log with `scripts/ferric-ci/check-sched-bench-log.sh`. The
-protocol's report records the exact commit and image configuration, the
-machine and QEMU version, the raw serial log and captures, and the `counts`
-and `FERRIC_BENCH` lines; QEMU/KVM's 5–15% noise is not evidence of a
-speedup, only baseline evidence. The same windows and counts are the
-before/after harness for the tickless work: a tickless kernel's idle window
-must show no `sched.tick` or `sched.ipi_pit` records at all, while `sched.switch`
-rates, wake counts and the ring-scale lines keep their meaning.
-
 ## TLB and address-space switch counters
 
 `kernel.tlb_stats` (Kernel menu, off by default; kernel feature `tlb_stats`)
@@ -1107,8 +1038,8 @@ FERRIC_BENCH iobench-randread-4k-qd32 tlb_policy=adaptive kpti=on pcid=on tlb_op
 counters are system-wide, so the daemons serving the reads (the file system,
 `nvmed`) are included, as they should be. The key is `tlb_policy`, not
 `policy`, so `check-iobench-log.sh` does not take these lines for results.
-The TSC ticks are not calibrated; divide by the TSC rate (see the protocol
-above) for time.
+The TSC ticks are not calibrated; divide by the traced machine's TSC rate
+for time.
 
 The counters are plain per-CPU words in the per-CPU block, written only by
 their CPU with a relaxed load and store, as `sys:stat`'s are, on paths that
@@ -1119,10 +1050,6 @@ nothing is compiled in. KPTI's own CR3 switches on entry and exit are not
 counted (they are in the entry assembly); `syscalls`, `irqs` and the mode line
 bound them. Boot-time and kernel-text page invalidations (the static-key and
 alternatives patching) are not counted either.
-
-[#177]: https://github.com/rexlunae/ferric-oxide/issues/177
-[#179]: https://github.com/rexlunae/ferric-oxide/issues/179
-[#185]: https://github.com/rexlunae/ferric-oxide/issues/185
 
 ## Sampling profiles
 

@@ -56,11 +56,11 @@ Its MMIO translation follows every ancestor bus and rejects range crossings and
 overflow. The kernel retains its independent reservation-map and reserved-memory
 policy checks. This does not replace drivers or validate every device binding.
 
-The six imported subtrees are `crates/kernel/`, `crates/bootloader/`,
-`crates/relibc/`, `userspace/base/`, `userspace/redoxfs/` and `docs/`.
-`.github/workflows/subtree-sync.yml` pulls their upstream changes into this
-fork and proposes local pull requests. Installer and Redoxer are local snapshots
-and are not in that workflow's sync matrix. relibc's `openlibm` and
+`crates/kernel/`, `crates/bootloader/`, `crates/relibc/`, `userspace/base/`,
+`userspace/redoxfs/` and `docs/` were imported from Redox OS as git subtrees,
+so their history is preserved, and Installer and Redoxer as snapshots. None of
+them is synced from Redox: they are maintained here, and a Redox change is
+ported by hand when it is wanted. relibc's `openlibm` and
 `dlmalloc-rs` remain nested submodules, registered in the root `.gitmodules`.
 
 ## From firmware to user programs
@@ -138,6 +138,43 @@ delivered (the target's APIC ID not yet recorded, or a port without IPIs) runs
 at that CPU's next switch rather than waiting for a later wake-up. The IPI does
 not preempt a busy CPU: the woken context waits for that CPU's next switch,
 which today is at most one scheduler tick away.
+
+### Timers and timekeeping
+
+Without `kernel.time.one_shot` (the default), time, timeouts and preemption
+are driven by the periodic PIT (or HPET) interrupt as upstream: the BSP's
+handler advances `time::OFFSET`, broadcasts the `Pit` IPI and runs
+`timeout::trigger` and `switch::tick`, and the monotonic clock is `OFFSET`
+plus an interpolation of the current period. Tickless scheduling (issue #177)
+replaces that in steps; the first is `kernel.time.one_shot` (off by default).
+
+With the option, the BSP calibrates the TSC at boot against the KVM clock, the
+HPET main counter (32- or 64-bit) or PIT channel 0, over five short windows
+whose median it takes, refusing windows that disagree. The monotonic clock
+(`time::monotonic`) then comes from a *continuous* source selected at the same
+point (`arch/x86_shared/time/continuous.rs`): the KVM paravirtual clock when
+built in and available, else the calibrated invariant TSC, else the HPET
+counter, else the previous OFFSET-plus-interpolation path (reported, and the
+only case where the clock depends on the periodic PIT interrupt). The clock
+keeps advancing while the periodic interrupt is masked, and the realtime
+offset contract is unchanged.
+
+The per-CPU one-shot scheduler timer (`arch/x86_shared/timer.rs`) uses the
+LAPIC timer in TSC-deadline mode (Intel SDM) when CPUID reports it: a deadline
+in TSC ticks is written to IA32_TSC_DEADLINE, and one MSR write is the whole
+reprogram, so the rearm protocol is "recheck the clock after programming".
+Without TSC-deadline mode, the CPU measures its LAPIC countdown against the
+TSC and arms one-shot countdowns, re-arming one that its 32-bit count ended
+early. Deadlines are monotonic nanoseconds, turned into a TSC deadline relative
+to the current time when programmed, so they hold whichever clock source was
+chosen. The portable arithmetic (ordered `Nanos`/`Duration`/`Deadline` types,
+rate conversions, calibration, the backend's programming and the
+`ArmedDeadline` rearm cell) lives in the host-tested `ferric-timed` crate.
+With the feature on, every CPU arms a series of 24 deadlines from 50 µs to
+5 ms and logs how late they fired, and the BSP arms the timer for a second,
+arms an already-due deadline and checks a disarmed timer stays quiet. The
+periodic PIT path remains the scheduler's event source until the event-driven
+scheduler (#187) takes over.
 
 Address-space mappings, sharing and copy-on-write live under
 `crates/kernel/src/context/`; physical allocation and page tables are in

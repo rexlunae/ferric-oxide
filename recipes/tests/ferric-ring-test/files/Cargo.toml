@@ -10,9 +10,6 @@ description = "Submission/completion ring test for Ferric Oxide"
 
 [dependencies]
 ferric-ring = { path = "../../../../crates/ring" }
-# The fio-style latency histogram the `--scale` waiting-ring baseline reports its wake
-# latencies with, as the disk benchmark jobs do.
-ferric-iobench = { path = "../../../../crates/iobench" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libc = "0.2"

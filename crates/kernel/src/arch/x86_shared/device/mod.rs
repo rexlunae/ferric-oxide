@@ -70,6 +70,11 @@ pub unsafe fn init_noncore() {
             crate::debug!("PIT used as system timer");
         }
 
+        // Ferric Oxide (`kernel.time.one_shot`): calibrate the TSC and pick the continuous
+        // clock source now that the HPET or PIT is running, before anything reads the clock.
+        #[cfg(feature = "time_one_shot")]
+        crate::arch::time::init();
+
         crate::debug!("Finished initializing devices");
     }
 }

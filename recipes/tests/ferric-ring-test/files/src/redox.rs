@@ -1,8 +1,4 @@
 //! The test on Redox: a small ring client over the `kernel.ring` scheme, and the steps.
-//!
-//! `--async-only` runs the asynchronous chain and close steps without the other tests or
-//! benchmarks; the trace lifecycle test uses it to exercise worker identity restoration.
-//! `--scale N [--quiet-seconds S]` runs only the waiting-ring baseline (see [`scale`]).
 
 use std::ffi::c_int;
 use std::fmt;
@@ -31,11 +27,6 @@ const PAGE: usize = 4096;
 /// Why a step failed.
 #[derive(Debug)]
 enum Failure {
-    /// A completion batch failed its count, identity or result check.
-    Completion {
-        what: &'static str,
-        source: crate::completions::Mismatch,
-    },
     /// A call failed with an errno.
     Errno { what: &'static str, errno: i32 },
     /// A call that must fail with `expected` returned `got` (minus an errno, or a result).
@@ -46,14 +37,11 @@ enum Failure {
     },
     /// Something read back is not what was written.
     Mismatch { what: &'static str },
-    /// A completion did not arrive within the waiting-ring workload's deadline.
-    Timeout { what: &'static str },
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Completion { what, source } => write!(f, "{what}: {source}"),
             Self::Errno { what, errno } => write!(f, "{what}: errno {errno}"),
             Self::Expected {
                 what,
@@ -61,7 +49,6 @@ impl fmt::Display for Failure {
                 got,
             } => write!(f, "{what}: expected {expected}, got {got}"),
             Self::Mismatch { what } => write!(f, "{what}: the bytes differ"),
-            Self::Timeout { what } => write!(f, "{what}: no completion in time"),
         }
     }
 }
@@ -291,7 +278,12 @@ fn enter_on(fd: &Fd, n: u32, min_complete: u32) -> i64 {
 
 /// Checks `cqes` are, in order, the `(user_data, result)` pairs of `expected`.
 fn check_cqes(what: &'static str, cqes: &[Cqe], expected: &[(u64, i64)]) -> Result<(), Failure> {
-    crate::completions::check(cqes, expected).map_err(|source| Failure::Completion { what, source })
+    expect(what, expected.len() as i64, cqes.len() as i64)?;
+    for (cqe, &(user_data, result)) in cqes.iter().zip(expected) {
+        expect(what, user_data as i64, cqe.user_data as i64)?;
+        expect(what, result, cqe.result)?;
+    }
+    Ok(())
 }
 
 /// A RedoxFS file of `len` bytes of a pattern, opened read-write.
@@ -1197,108 +1189,6 @@ fn ns_per_op(start: Instant, ops: usize) -> f64 {
     start.elapsed().as_nanos() as f64 / ops as f64
 }
 
-/// How long a worker may take to answer a wake before [`scale`] gives up.
-const SCALE_WAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long `scale` waits for the workers to block on their reads.
-const SCALE_SETTLE: Duration = Duration::from_millis(250);
-/// How hard `scale` polls a ring for a completion after waking it.
-const SCALE_POLL: Duration = Duration::from_micros(50);
-/// The byte each waiting read waits for.
-const SCALE_BYTE: u8 = b'x';
-
-/// The waiting-ring baseline (`ferric-ring-test --scale N [--quiet-seconds S]`): how many
-/// kernel contexts and how much scheduler work `N` rings with a genuinely pending read
-/// cost, and how long an individual wake takes to reach its completion. The
-/// scheduler-baseline image (config/ferric-sched-bench.toml) captures the kernel trace
-/// around the whole run; this step only drives the workload and prints the markers a
-/// capture can be matched to, and the wake-latency `FERRIC_BENCH` line.
-///
-/// Every ring submits one asynchronous 1-byte read of an empty pipe, so its worker blocks
-/// in the read. After a short settle, the step stays quiet for `S` seconds (the window the
-/// harness's capture attributes to the waiting rings), then wakes each ring with one byte
-/// and times write to completion, checks exactly one completion with the byte, and closes
-/// everything.
-fn scale(rings_n: usize, quiet_seconds: u64) -> Result<(), Failure> {
-    let mut rings: Vec<Ring> = Vec::with_capacity(rings_n);
-    let mut writers: Vec<c_int> = Vec::with_capacity(rings_n);
-    let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(rings_n);
-    let started = Instant::now();
-    for i in 0..rings_n {
-        let mut ring = Ring::new(8, 8)?;
-        let [rd, wr] = pipe()?;
-        let mut buf = vec![0u8; 1];
-        ring.submit(&[Sqe::read(
-            rd as u32,
-            CURRENT_POSITION,
-            buf.as_mut_ptr() as u64,
-            1,
-            i as u64,
-        )
-        .run_async()])?;
-        expect("Enter of an asynchronous read", 1, ring.enter(1))?;
-        // The read names the descriptor at submission; the worker's reference keeps it
-        // alive, so the submitter can close it, as `ring-async` does.
-        close_fd(rd);
-        rings.push(ring);
-        writers.push(wr);
-        buffers.push(buf);
-    }
-    let setup_ms = started.elapsed().as_millis();
-    println!("FERRIC_SCALE_SETUP rings={rings_n} setup_ms={setup_ms}");
-    std::thread::sleep(SCALE_SETTLE);
-    // The quiet window: nothing runs but the workers' blocked reads (and, on the harness,
-    // whatever the scheduler does around them). The harness's capture that ends with this
-    // step is the run's window.
-    std::thread::sleep(Duration::from_secs(quiet_seconds));
-    println!("FERRIC_SCALE_WAKE rings={rings_n}");
-    let mut latencies = ferric_iobench::latency::Histogram::new();
-    for (i, (ring, &wr)) in rings.iter_mut().zip(&writers).enumerate() {
-        let wake = Instant::now();
-        // SAFETY: the pipe's write end with one byte to write.
-        let n = unsafe { libc::write(wr, [SCALE_BYTE].as_ptr().cast(), 1) };
-        expect("write to the pipe", 1, n as i64)?;
-        let completions = loop {
-            let cqes = ring.reap()?;
-            if !cqes.is_empty() {
-                break cqes;
-            }
-            if wake.elapsed() > SCALE_WAKE_TIMEOUT {
-                return Err(Failure::Timeout {
-                    what: "a wake to reach its completion",
-                });
-            }
-            std::thread::sleep(SCALE_POLL);
-        };
-        latencies.record(wake.elapsed().as_nanos() as u64);
-        check_cqes(
-            "one successful waiting-ring read",
-            &completions,
-            &[(i as u64, 1)],
-        )?;
-    }
-    for (ring, buf) in rings.iter_mut().zip(&buffers) {
-        check_cqes("no duplicate waiting-ring completion", &ring.reap()?, &[])?;
-        if buf != &[SCALE_BYTE] {
-            return Err(Failure::Mismatch {
-                what: "the byte a waiting read got",
-            });
-        }
-    }
-    println!(
-        "FERRIC_BENCH ring-scale rings={rings_n} setup_ms={setup_ms} wake_ns_mean={} \
-         wake_ns_p50={} wake_ns_p99={} wake_ns_p999={} wake_ns_max={}",
-        latencies.mean(),
-        latencies.percentile(500_000),
-        latencies.percentile(990_000),
-        latencies.percentile(999_000),
-        latencies.max(),
-    );
-    for wr in writers {
-        close_fd(wr);
-    }
-    Ok(())
-}
-
 /// Runs `BENCH_OPS` copies of `sqe` through `ring` in batches, checking each result.
 fn bench_ring(ring: &mut Ring, sqe: Sqe, result: i64) -> Result<f64, Failure> {
     let batch = vec![sqe; BENCH_BATCH];
@@ -1406,49 +1296,7 @@ type Step = fn() -> Result<(), Failure>;
 
 /// Runs the test.
 pub fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let async_only = args.get(1).map(String::as_str) == Some("--async-only");
-    // `--scale N [--hold PATH]` runs only the waiting-ring baseline.
-    if let Some(position) = args.iter().position(|arg| arg == "--scale") {
-        let count = args.get(position + 1).and_then(|n| n.parse::<usize>().ok());
-        let quiet = args
-            .iter()
-            .position(|arg| arg == "--quiet-seconds")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        let result = match open_ring() {
-            Ok(_) => match count {
-                Some(count) => scale(count, quiet),
-                None => Err(Failure::Expected {
-                    what: "--scale to name a number of rings",
-                    expected: 1,
-                    got: -1,
-                }),
-            },
-            Err(err) if matches!(err.errno(), ENODEV | ENOENT) => {
-                println!("FERRIC_TEST_SKIP ring: the kernel has no {SCHEME_NAME} scheme");
-                return ExitCode::SUCCESS;
-            }
-            Err(err) => {
-                println!(
-                    "FERRIC_TEST_FAIL ring-scale: open a ring: errno {}",
-                    err.errno()
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-        return match result {
-            Ok(()) => {
-                println!("FERRIC_TEST_PASS ring-scale");
-                ExitCode::SUCCESS
-            }
-            Err(why) => {
-                println!("FERRIC_TEST_FAIL ring-scale: {why}");
-                ExitCode::FAILURE
-            }
-        };
-    }
+    let async_only = std::env::args().nth(1).as_deref() == Some("--async-only");
     match open_ring() {
         Ok(_) => {}
         Err(err) if matches!(err.errno(), ENODEV | ENOENT) => {

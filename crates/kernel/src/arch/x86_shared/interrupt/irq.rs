@@ -178,10 +178,6 @@ crate::interrupt_stack!(pit_stack, |_stack| {
         *time::OFFSET.write(token.token()) += pit::RATE;
     }
 
-    // Ferric Oxide: the sched.tick tracepoint (`kernel.trace`): one record per
-    // periodic PIT interrupt, counting the ticks the tickless work must stop.
-    crate::trace::trace_event!(ferric_trace::kernel::SCHED_TICK);
-
     unsafe { eoi(0) };
 
     // Wake up other CPUs
@@ -312,6 +308,11 @@ crate::interrupt!(ata2, || {
 });
 
 crate::interrupt!(lapic_timer, || {
+    // The one-shot scheduler timer (kernel.time.one_shot): the handler marks
+    // the armed deadline fired; the periodic path kept the log before.
+    #[cfg(feature = "time_one_shot")]
+    crate::arch::timer::handle_fire();
+    #[cfg(not(feature = "time_one_shot"))]
     crate::println!("Local apic timer interrupt");
     lapic_eoi();
 });

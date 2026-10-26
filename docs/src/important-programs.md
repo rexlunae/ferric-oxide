@@ -1,14 +1,12 @@
 # Important Programs
 
-This page covers important programs and libraries supported by Redox as of August 2026. <!-- don't forget to update this date -->
+> ⚠️ **Warning:** The status below was inherited from the Redox OS book (August 2026) and describes Redox images. It has not been re-tested on Ferric Oxide, whose x86-64-v3 baseline, kernel changes and package tooling can change the results. Report what you find, with the commit you tested, in an issue.
 
-Redox is designed to be source-compatible with POSIX and Linux applications, only requiring compilation or small patches.
+This page lists important programs and libraries known to work on the system and how well they were tested. The system is designed to be source-compatible with POSIX and Linux applications, usually needing only recompilation or small patches.
 
-This page contains programs that are known to work well on Redox and documents how well they were tested. All programs are compiled through our package cross-compilation system called Cookbook, which includes the configuration of all kinds of patches and forks that are required to make them run on Redox.
+Programs are cross-compiled by the recipe engine (the cookbook, in `tools/cookbook/`), whose recipes in `recipes/` hold the patches and forks each program needs. The `native` build profile currently installs most applications as prebuilt packages downloaded from Redox's package server, built for Redox's baseline rather than x86-64-v3. Replacing those downloads with packages built and distributed through [`fox`](./ferric-packaging.md) is in progress.
 
-Everything on the following lists are tested on the x86_64 (Intel/AMD) CPU architecture, other CPU architectures may not have been tested yet.
-
-(The broken or bad status may be outdated, consider to verify yourself to confirm and possibly report regressions to us)
+Everything on the following lists was tested on x86-64; other architectures may not have been tested yet.
 
 ## Compilers
 
@@ -36,7 +34,7 @@ The following interpreters have been tested to build on Redox, but the runtime s
 
 ## GUI Libraries
 
-Most GUI applications are running through Orbital (Redox display server and window manager), it supports the following GUI libraries:
+Most GUI applications run on Orbital (the display server and window manager), which supports the following GUI libraries:
 
 - Mesa3D (OpenGL and EGL, via liborbital)
 - SDL1 and SDL2 (via Mesa3D)
@@ -169,4 +167,4 @@ The following CLI tools are known to be working. Programs listed below may not i
 
 ## Other Programs
 
-You can see all Redox components and ported programs on the [package server list](https://static.redox-os.org/pkg/x86_64-unknown-redox/).
+The recipes under `recipes/` list every component and ported program the build knows about; `recipes/wip/` holds ports that are not finished.

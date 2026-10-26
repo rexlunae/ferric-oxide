@@ -1350,6 +1350,19 @@ unsafe fn switch_to(
         prev_context.debug_id,
         next_context.debug_id,
     );
+    // Ferric Oxide: the sched.wake_run tracepoint: how long the next context waited between
+    // `unblock_no_ipi` making it runnable and running here.
+    #[cfg(feature = "trace_sched")]
+    if next_context.woken_at != 0 {
+        let wait = crate::trace::clock::now().saturating_sub(next_context.woken_at);
+        next_context.woken_at = 0;
+        crate::trace::trace_event!(
+            ferric_trace::kernel::SCHED_WAKE_RUN,
+            next_context.pid,
+            next_context.debug_id,
+            wait,
+        );
+    }
 
     // Set the previous context as "not running"
     prev_context.running = false;

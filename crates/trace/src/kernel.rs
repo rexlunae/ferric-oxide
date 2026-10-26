@@ -445,6 +445,7 @@ crate::events! {
         level: Debug,
         args: ["scheme", "count", "bytes"],
     }
+
     /// The periodic scheduler tick advanced time on this CPU: the x86 PIT interrupt
     /// handler just added one `pit::RATE` to `time::OFFSET`, and will broadcast the
     /// `Pit` IPI, trigger time-scheme timeouts and call the scheduler's tick
@@ -480,6 +481,53 @@ crate::events! {
         args: ["drained"],
     }
 
+    /// A counter's rate was measured at boot (`kernel.time.one_shot`): which counter
+    /// (1 the TSC, once on the BSP; 2 this CPU's local APIC countdown timer), its rate in
+    /// Hz, the reference it was measured against (1 the HPET, 2 the PIT, 3 the TSC, 4 the
+    /// KVM clock) and how far the calibration windows disagreed, in parts per million.
+    pub const SCHED_TIMER_CALIBRATE = 36 {
+        name: "sched.timer_calibrate",
+        subsystem: Sched,
+        level: Info,
+        args: ["counter", "hz", "reference", "spread_ppm"],
+    }
+
+    /// This CPU armed its one-shot timer (`kernel.time.one_shot`): the deadline in
+    /// monotonic nanoseconds, the backend (1 TSC-deadline, 2 local APIC countdown), the value written
+    /// (the TSC deadline or the initial count) and flags: bit 0 the deadline was already
+    /// past or closer than the minimum lead, so the timer fires as soon as it can; bit 1
+    /// the interval did not fit a countdown, which will end early and be re-armed.
+    pub const SCHED_TIMER_ARM = 37 {
+        name: "sched.timer_arm",
+        subsystem: Sched,
+        level: Info,
+        args: ["deadline", "backend", "value", "flags"],
+    }
+
+    /// This CPU's one-shot timer interrupted (`kernel.time.one_shot`): the deadline it was
+    /// armed for (monotonic nanoseconds), how many nanoseconds after it the handler ran, and
+    /// `early` 1 when it came before the deadline instead (`late_ns` is then the time left
+    /// and the timer is re-armed for the same deadline). Lateness covers interrupt delivery
+    /// and the time interrupts were disabled on this CPU.
+    pub const SCHED_TIMER_FIRE = 38 {
+        name: "sched.timer_fire",
+        subsystem: Sched,
+        level: Info,
+        args: ["deadline", "late_ns", "early"],
+    }
+
+    /// A context woken from a blocked state was switched in on this CPU: its process id and
+    /// debug id, and how long it waited between being made runnable and running, in the
+    /// trace clock's units (the `clock` file says which). This is the wake-to-run latency the
+    /// tickless work and the per-CPU driver workers are judged by. A context woken while
+    /// still running (a wake-up before its block took effect) has no record.
+    pub const SCHED_WAKE_RUN = 39 {
+        name: "sched.wake_run",
+        subsystem: Sched,
+        level: Info,
+        args: ["pid", "id", "wait"],
+    }
+
     /// A `Flusher` batch finished: a change to a user address space's mappings (or 32
     /// queued pages of one) has been made visible to every CPU. The arguments are the other
     /// CPUs that had the address space loaded and were made to flush (0 when none was: no
@@ -489,7 +537,7 @@ crate::events! {
     /// The kernel flushes whole TLBs for a batch, never single pages, so `pages` is the
     /// batch's size, not the number of `invlpg`s. A debug-level event for TLB cost work; the
     /// `/scheme/sys/tlb` counters (`kernel.tlb_stats`) count the same without a capture.
-    pub const MM_TLB_FLUSH = 36 {
+    pub const MM_TLB_FLUSH = 40 {
         name: "mm.tlb_flush",
         subsystem: Mm,
         level: Debug,
@@ -499,7 +547,7 @@ crate::events! {
     /// This CPU took a TLB shootdown IPI: whether a request was still pending (1, answered
     /// with a full flush now) or the CPU had already answered it by polling (0), while
     /// waiting on a shootdown of its own or at a context switch. Debug level.
-    pub const MM_TLB_IPI = 37 {
+    pub const MM_TLB_IPI = 41 {
         name: "mm.tlb_ipi",
         subsystem: Mm,
         level: Debug,
@@ -511,7 +559,7 @@ crate::events! {
     /// `space` of `mm.map` records; 0 for the empty table). Switches that keep the address
     /// space load nothing and are not recorded: they are the `sched.switch` records without
     /// one of these. Debug level.
-    pub const MM_CR3_SWITCH = 38 {
+    pub const MM_CR3_SWITCH = 42 {
         name: "mm.cr3_switch",
         subsystem: Mm,
         level: Debug,
@@ -522,7 +570,7 @@ crate::events! {
     /// units and waited for them: domain ID, IOVA, byte length, the number of units
     /// invalidated, and the TSC ticks the invalidations took. Operations that invalidated
     /// no unit (VT-d units outside caching mode, on a map) are not recorded. Debug level.
-    pub const IOMMU_IOTLB_FLUSH = 39 {
+    pub const IOMMU_IOTLB_FLUSH = 43 {
         name: "iommu.iotlb_flush",
         subsystem: Iommu,
         level: Debug,
@@ -846,10 +894,14 @@ mod tests {
         assert_eq!(SCHED_TICK.id().get(), 33);
         assert_eq!(SCHED_IPI_PIT.id().get(), 34);
         assert_eq!(SCHED_IPI_WAKE.id().get(), 35);
-        assert_eq!(MM_TLB_FLUSH.id().get(), 36);
-        assert_eq!(MM_TLB_IPI.id().get(), 37);
-        assert_eq!(MM_CR3_SWITCH.id().get(), 38);
-        assert_eq!(IOMMU_IOTLB_FLUSH.id().get(), 39);
+        assert_eq!(SCHED_TIMER_CALIBRATE.id().get(), 36);
+        assert_eq!(SCHED_TIMER_ARM.id().get(), 37);
+        assert_eq!(SCHED_TIMER_FIRE.id().get(), 38);
+        assert_eq!(SCHED_WAKE_RUN.id().get(), 39);
+        assert_eq!(MM_TLB_FLUSH.id().get(), 40);
+        assert_eq!(MM_TLB_IPI.id().get(), 41);
+        assert_eq!(MM_CR3_SWITCH.id().get(), 42);
+        assert_eq!(IOMMU_IOTLB_FLUSH.id().get(), 43);
         assert_eq!(SCHEME_SQE_DELIVER.id().get(), 31);
         assert_eq!(SCHEME_SQE_DELIVER.subsystem(), Subsystem::Scheme);
         assert_eq!(SCHEME_CQE_RECEIVE.id().get(), 32);

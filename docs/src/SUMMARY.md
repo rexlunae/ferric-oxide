@@ -1,4 +1,4 @@
-# Ferric Oxide System
+# The Ferric Oxide Book
 
 [Introduction](./introduction.md)
 
@@ -10,6 +10,7 @@
   - [Memory and CPU Protection](./ferric-memory.md)
   - [Registered Buffers, IOMMUs and Rings](./ferric-io.md)
   - [Kernel Tracing](./ferric-tracing.md)
+  - [Kernel Async Executor (design)](./ferric-async.md)
   - [Virtualization (prepared)](./ferric-virt.md)
   - [Package Tooling: fox](./ferric-packaging.md)
   - [WebAssembly Interfaces](./ferric-wasm.md)
@@ -19,17 +20,17 @@
 
 # Introduction
 
-- [Introducing Redox](./introducing-redox.md)
+- [Introducing Ferric Oxide](./introducing-redox.md)
   - [Our Goals](./our-goals.md)
   - [Our Philosophy](./philosophy.md)
-  - [Why a New OS?](./why-a-new-os.md)
+  - [Why Ferric Oxide?](./why-a-new-os.md)
   - [Why Rust?](./why-rust.md)
   - [Use Cases](./redox-use-cases.md)
-  - [Comparing Redox to Other OSes](./how-redox-compares.md)
+  - [Comparing Ferric Oxide to Other OSes](./how-redox-compares.md)
   - [Influences](./influences.md)
   - [Hardware Support](./hardware-support.md)
   - [Important Programs](./important-programs.md)
-  - [Side Projects](./side-projects.md)
+  - [Related Projects](./side-projects.md)
 
 # Architecture and Design
 
@@ -114,7 +115,7 @@
   - [References](./references.md)
   - [Libraries and APIs](./libraries-apis.md)
   - [Coding and Building](./coding-and-building.md)
-  - [Including Programs in Redox](./including-programs.md)
+  - [Including Programs](./including-programs.md)
   - [Application Porting](./porting-applications.md)
   - [Porting Case Study](./porting-case-study.md)
   - [Continuous Integration](./ci.md)

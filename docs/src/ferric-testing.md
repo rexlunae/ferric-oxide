@@ -232,6 +232,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
+| `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -321,11 +322,18 @@ futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
 posts the benchmark as a notice, and `check-iobench-log.sh` checks the disk
-benchmark's lines and A/B and writes its figures to the job summary. Read those
-scripts for the exact required marker set.
+benchmark's lines and A/B and writes its figures to the job summary.
+`check-oneshot-log.sh` checks that the BSP calibrated the TSC and chose a
+clock source, that each of the four CPUs fired every deadline of its one-shot
+timer lateness series, and that the BSP's selftest rounds passed
+(`kernel.time.one_shot`, on in the CI image), and posts the clock source and
+lateness as a notice. Read those scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
-(see [Kernel tracing](ferric-tracing.md#overhead-budget)).
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)). It discards each
+boot's output, so when a boot fails it runs `print-test-fails.sh` on the boot's
+console log, and a test that failed early in the boot can be read from the job
+log.
 
 The workflow caches `~/.cargo/git/db` and `~/.cargo/registry/cache` under a
 `cargo-git-` key derived from the tracked `Cargo.lock` files. Cargo fetches a
@@ -461,6 +469,13 @@ the runner adds both HDA controllers. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.
+
+`scripts/ferric-ci/test-print-test-fails.sh` checks `print-test-fails.sh`
+against fixture console logs: a log with no failed test prints nothing; with two
+failures it prints exactly the 40 lines before the first and everything up to
+the second, inside a log group; and a console line that looks like a workflow
+command (`::error::`) is printed only while workflow commands are stopped. The
+host-tools workflow runs it after `test-boot-smoke.sh`.
 
 ### CET image and Kleya rerun
 
@@ -693,14 +708,15 @@ unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
 
-### Scheduler baseline accounting
+### Portable executor core
 
-The trace CLI's `counts::tests` includes a multi-CPU capture with unequal rates
-and a merged rate over the same interval. The ring-test recipe's host tests
-(`cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml`)
-exercise the same CQE validator used by the target workload, rejecting missing,
-duplicate, wrong-request, failed and short completions. The scheduler benchmark
-image/boot remains the check for measured wake latency and real completions.
+`cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
+races, detached cancellation, live-only deadlines, stale and invalid ids, and
+bounded notification storage. Paused producers are coordinated by channels,
+without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib`
+runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
+The crate is not linked into the kernel yet; these tests do not exercise actual
+interrupts, scheduler wait registration or timer hardware.
 
 ### NVMe phase accounting
 

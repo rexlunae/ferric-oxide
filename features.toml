@@ -777,6 +777,26 @@ rebuild = ["kernel"]
 help = "Log system calls. Very noisy; for debugging only."
 
 [[option]]
+id = "kernel.time.one_shot"
+menu = "kernel"
+type = "bool"
+title = "Continuous clock and per-CPU one-shot scheduler timers"
+default = false
+depends = "target.arch == 'x86_64'"
+kernel_feature = "time_one_shot"
+rebuild = ["kernel"]
+help = """
+Ferric Oxide (tickless scheduling, #186): calibrate the TSC at boot against
+the KVM clock, the HPET or the PIT; take the monotonic clock from a continuous
+source (KVM clock, invariant TSC, HPET) so it keeps advancing without the
+periodic interrupt; and build the per-CPU one-shot timer, the local APIC in
+TSC-deadline mode when the CPU has it and otherwise a one-shot countdown
+calibrated against the TSC. Every CPU runs a boot selftest of its timer and
+logs how late its deadlines fired. Nothing schedules from the one-shot timer
+yet: the periodic PIT still drives the scheduler. Off by default; without it
+the kernel behaves exactly as before."""
+
+[[option]]
 id = "kernel.profiling"
 menu = "kernel"
 type = "bool"
@@ -1744,6 +1764,11 @@ message = "Kernel CPU features set to \"auto\" act as \"never\" without self-mod
 level = "warn"
 when = "target.arch == 'x86_64' && kernel.cpu.pcid == 'always' && kernel.cpu.kpti == 'never'"
 message = "kernel.cpu.pcid only affects KPTI; with kernel.cpu.kpti = \"never\" it does nothing."
+
+[[rule]]
+level = "error"
+when = "kernel.time.one_shot && kernel.profiling"
+message = "kernel.time.one_shot cannot be combined with kernel.profiling yet: the profiler's CPU takes over every interrupt vector, the local APIC timer's included, so its one-shot selftest never completes."
 
 [[rule]]
 level = "error"
