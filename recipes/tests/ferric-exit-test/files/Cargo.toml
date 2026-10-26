@@ -1,0 +1,12 @@
+[package]
+name = "ferric-exit-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Process exit with a busy thread, regression test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[profile.release]
+debug = false

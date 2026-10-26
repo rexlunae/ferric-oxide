@@ -27,6 +27,7 @@ mod futex;
 mod journal;
 mod lifecycle;
 mod mapping;
+mod proc;
 
 /// A file descriptor no process has open: the `write` to it fails with `EBADF` at once.
 const BAD_FD: usize = 0x7e57;
@@ -903,6 +904,7 @@ fn run() -> Result<(), Failure> {
     journal::check_journal(&cpus)?;
     futex::check_futex(&cpus)?;
     lifecycle::check_lifecycle(&cpus)?;
+    proc::check_proc(&cpus)?;
     check_filter(&cpus)?;
     check_clock(&cpus)?;
     cap::check_cap()

@@ -64,6 +64,13 @@ crate::interrupt_stack!(non_maskable, @paranoid, |stack| {
             stack.instr_pointer().wrapping_sub(crate::kernel_image_slide())
         );
         stack.trace();
+        // Ferric Oxide: and what every context is waiting for, so an NMI also names the
+        // context a hang with every CPU idle is stuck on (boot-smoke.sh sends one at its
+        // timeout).
+        // SAFETY: the dump takes only `try_` locks, so the token cannot deadlock on a lock
+        // the interrupted code holds, and it is dropped before the handler returns.
+        let mut token = unsafe { crate::sync::CleanLockToken::new() };
+        crate::context::dump_for_nmi(token.downgrade());
     }
 });
 
@@ -159,12 +166,7 @@ crate::interrupt_stack!(device_not_available, |stack| {
 crate::interrupt_error!(double_fault, |stack, _code| {
     crate::println!("Double fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_error!(invalid_tss, |stack, code| {
@@ -315,12 +317,7 @@ crate::interrupt_error!(alignment_check, |stack, code| {
 crate::interrupt_stack!(machine_check, @paranoid, |stack| {
     crate::println!("Machine check fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_stack!(simd, |stack| {
@@ -338,23 +335,13 @@ crate::interrupt_stack!(simd, |stack| {
 crate::interrupt_stack!(virtualization, |stack| {
     crate::println!("Virtualization fault");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 crate::interrupt_error!(security, |stack, _code| {
     crate::println!("Security exception");
     stack.trace();
-    unsafe {
-        loop {
-            interrupt::disable();
-            interrupt::halt();
-        }
-    }
+    interrupt::halt_forever();
 });
 
 // Ferric Oxide (CET, see arch/x86_64/ibt.rs and shstk.rs): with kernel indirect branch tracking

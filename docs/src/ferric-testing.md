@@ -255,6 +255,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
+| `ferric-exit-test` | Process exit while a second thread is busy reading a pipe or parking on a futex: the force-killed thread must not block in its next wait, so every child exits ([#200](https://github.com/rexlunae/ferric-oxide/issues/200)) |
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
@@ -262,7 +263,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
-| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), the mapping journal (fixed replacement, kernel-placed and fixed `mremap`, a fork's clone and its teardown, and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), disable, and read-only mapping of the rings with `commit` checks |
+| `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), the mapping journal (fixed replacement, kernel-placed and fixed `mremap`, a fork's clone and its teardown, and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), `procmgr`'s fork/exec/exit/wait records for a child with its exit status and the refusal of forged `emit` records, and read-only mapping of the rings with `commit` checks |
 | `ferric-ext4-test` | Mounts the `ext4d` fixture image (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) completed DMA map/protect/unmap records, cached translations and live disable (`iommu-mapping-trace`), and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
@@ -373,6 +374,31 @@ This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
 
+When the marker does not arrive within the timeout, the script first samples
+every CPU's registers through the QEMU monitor (several times, with the
+frame-pointer chain of each CPU spinning in the kernel), then sends an NMI to
+CPU 0. The NMI handler prints its stack trace and then one line per context:
+
+```text
+NMI: 41 contexts
+  pid 21 "/scheme/initfs/bin/redoxfs" Blocked "pcache::records" running=false queued=false cpu=Some(1) syscall=Some([22000003, ...])
+  0xffffff7f8013bb60: busy
+```
+
+Each row gives the process, the context's name, its status and block reason,
+whether it is running or queued to run, the CPU it last ran on and the system
+call it is in. With every CPU idle (a lost wake-up, as in
+[#200](https://github.com/rexlunae/ferric-oxide/issues/200)), the stuck
+context is the one blocked on something that will never come. The handler takes
+only `try_` locks, so it cannot deadlock on a lock the interrupted code holds:
+a context whose lock is held prints as `<address>: busy`, and `NMI: context
+list busy` means the context list itself was locked and no rows follow. Writing
+to the console still takes the console lock, so an NMI that interrupts a
+console writer stalls there, as its stack trace always has. After QEMU is
+stopped the script copies the context rows to stderr, so they reach the job log
+even where a workflow discards the script's stdout or keeps only the console's
+tail (trace-overhead does both).
+
 The two HDA controllers exercise the audio scheme naming in `ihdad` and
 `audiod`. The smoke script waits up to 30 seconds for the second controller's
 `audiohw.<pci-address>` scheme and reports `audio-second-controller`: the
@@ -385,8 +411,9 @@ failure, a crash after the marker, a missing test result, a missing marker, a
 smoke shell that could not be linked (which must fail with that message rather
 than a generic timeout), a link failure after the marker and a marker that
 arrives while the runner waits after that line (both of which must still pass), a
-program the script starts that fails to link (which must not fail the run), and
-that the runner adds both HDA controllers. Its fake QEMU stays alive for a
+program the script starts that fails to link (which must not fail the run), a
+timeout whose NMI context rows (and only those) must reach stderr, and that
+the runner adds both HDA controllers. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.

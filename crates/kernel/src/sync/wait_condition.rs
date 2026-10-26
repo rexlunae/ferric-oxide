@@ -107,6 +107,10 @@ impl WaitCondition {
                 if context.cancelled {
                     return false;
                 }
+                // Ferric Oxide: nor does a context being killed (#200).
+                if context.killed_before_wait() {
+                    return false;
+                }
                 context.upgrade().block(reason);
             }
 

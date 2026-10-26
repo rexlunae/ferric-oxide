@@ -43,6 +43,10 @@ pub fn nanosleep(
         {
             return Err(Error::new(EINTR));
         }
+        // Ferric Oxide: a thread killed on its way here does not sleep (#200).
+        if context.killed_before_wait() {
+            return Err(Error::new(EINTR));
+        }
         let mut context = context.upgrade();
         context.wake = Some(end);
         context.block("nanosleep");

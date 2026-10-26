@@ -42,3 +42,16 @@ pub unsafe fn halt() {
         core::arch::asm!("hlt", options(nomem, nostack));
     }
 }
+
+/// Ferric Oxide: stops this CPU for good, after a fault it cannot recover from: interrupts
+/// off, then `hlt` in a loop (an NMI still wakes it, and it halts again).
+pub fn halt_forever() -> ! {
+    loop {
+        // SAFETY: with interrupts off and the CPU halted nothing more runs here, so no state
+        // the caller relies on can be disturbed.
+        unsafe {
+            disable();
+            halt();
+        }
+    }
+}

@@ -309,6 +309,27 @@ impl Context {
         }
     }
 
+    /// Ferric Oxide: whether this context, which must be the one running on this CPU, has
+    /// been force-killed, for a wait to check just before it blocks (#200).
+    ///
+    /// `ForceKill` marks a context and wakes it under its lock. A context that was running
+    /// then (in user space, or in the kernel on its way to a wait) has no wait to be woken
+    /// from, and a wait that starts after the mark would block for good: process exit then
+    /// never finishes. So a wait checks this under the same lock and does not block when it
+    /// is true. This CPU's copy of the mark, which the system call's return checks, is only
+    /// refreshed when a context is switched to, so it is set here too: the call then ends the
+    /// context instead of returning `EINTR` to a loop that retries it.
+    pub fn killed_before_wait(&self) -> bool {
+        if !self.being_sigkilled {
+            return false;
+        }
+        PercpuBlock::current()
+            .switch_internals
+            .being_sigkilled
+            .set(true);
+        true
+    }
+
     pub fn hard_block(&mut self, reason: HardBlockedReason) -> bool {
         if self.status.is_runnable() {
             self.status = Status::HardBlocked { reason };

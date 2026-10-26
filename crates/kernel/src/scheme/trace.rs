@@ -39,6 +39,12 @@
 //!   writing `events` or `crash` needs control access. A capability can be narrowed by
 //!   `dup(cap, "cap/read")`, never widened.
 //!
+//! - `emit`: user space writes one `ferric_trace::abi::UserRecord` per write, for one of the
+//!   events only user space reports (`ferric_trace::kernel::USER_EVENTS`: the process
+//!   manager's fork, exec, exit and wait). Opening it needs control access. The kernel checks
+//!   the event and its argument count, and stores the record if the event is on
+//!   (`trace::emit_user`); it vouches for the record's time and CPU, not its arguments.
+//!
 //! `events`, `stats`, `clock`, `filters` and `crash` are read from a snapshot taken at the first read of each open, as in
 //! the `sys` scheme. Opening by path is for root only (with control access): traces leak
 //! timing and kernel addresses.
@@ -52,7 +58,7 @@ use core::{
 use ferric_trace::{
     abi::{
         Access, Command, CpuCommand, EventLine, FilterBusyLine, FilterLine, Path, StatsLine,
-        CPU_MAP_BYTES,
+        UserRecord, CPU_MAP_BYTES,
     },
     filter::Loaded,
 };
@@ -71,7 +77,7 @@ use crate::{
         data::Map,
         usercopy::{UserSliceRo, UserSliceWo},
     },
-    trace::{self, ControlError, FilterControlError, Mode},
+    trace::{self, ControlError, FilterControlError, Mode, UserEmitError},
 };
 
 /// The number of the scheme root.
@@ -110,6 +116,8 @@ enum Handle {
     Cpu(LogicalCpuId),
     /// `cap/<access>`: opens other paths through `dup`.
     Cap(Access),
+    /// `emit`: user-space records, opened with control access.
+    Emit,
 }
 
 /// Every open handle but the root, by number.
@@ -234,6 +242,10 @@ fn open(path: &str, access: Access) -> Result<OpenResult> {
             return Ok(insert(Handle::Cap(wanted), InternalFlags::empty()));
         }
         Path::Cap(_) => return Err(Error::new(EACCES)),
+        Path::Emit => {
+            require_control(access)?;
+            return Ok(insert(Handle::Emit, InternalFlags::empty()));
+        }
     };
     let handle = Handle::Text {
         text: handle,
@@ -315,6 +327,22 @@ fn cpu_command(cpu: LogicalCpuId, buf: UserSliceRo) -> Result<usize> {
     Ok(len)
 }
 
+/// Stores the user-space record written to `emit` (`trace::emit_user`).
+fn emit_command(buf: UserSliceRo) -> Result<usize> {
+    if buf.len() > UserRecord::MAX_BYTES {
+        return Err(Error::new(EINVAL));
+    }
+    let mut bytes = [0u8; UserRecord::MAX_BYTES];
+    let len = buf.copy_common_bytes_to_slice(&mut bytes)?;
+    let record =
+        UserRecord::decode(bytes.get(..len).unwrap_or(&[])).map_err(|_| Error::new(EINVAL))?;
+    match trace::emit_user(&record) {
+        Ok(_) => Ok(len),
+        Err(UserEmitError::NotCompiled(_)) => Err(Error::new(EOPNOTSUPP)),
+        Err(UserEmitError::NotUserEvent | UserEmitError::ArgCount) => Err(Error::new(EINVAL)),
+    }
+}
+
 /// The errno for a failed `enable` or `disable`.
 fn control_errno(err: &ControlError<'_>) -> Error {
     Error::new(match err {
@@ -384,7 +412,7 @@ impl KernelScheme for TraceScheme {
     ) -> Result<usize> {
         let handle = HANDLES.lock().get(&id).cloned().ok_or(Error::new(EBADF))?;
         match handle {
-            Handle::Cap(_) => Err(Error::new(EBADF)),
+            Handle::Cap(_) | Handle::Emit => Err(Error::new(EBADF)),
             Handle::Text { text, snapshot, .. } => {
                 let data = match snapshot {
                     Some(data) => data,
@@ -432,6 +460,7 @@ impl KernelScheme for TraceScheme {
                 ..
             } => require_control(access).and_then(|()| events_command(buf)),
             Handle::Cpu(cpu) => cpu_command(cpu, buf),
+            Handle::Emit => emit_command(buf),
             Handle::Text {
                 text: Text::Crash,
                 access,
@@ -525,6 +554,7 @@ impl KernelScheme for TraceScheme {
                 cpu.get()
             ),
             Handle::Cap(access) => alloc::format!("/scheme/kernel.trace/{access}"),
+            Handle::Emit => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::EMIT_PATH),
         };
         buf.copy_common_bytes_from_slice(path.as_bytes())
     }
