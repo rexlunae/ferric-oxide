@@ -46,6 +46,9 @@
 //!   file is ([`PageCache::flush_due`]);
 //! - at once, every dirty file oldest first, on an urgent record (the cache is past its dirty
 //!   limit);
+//! - one run at once, with `ferric_pcache::writeback::flush_run`, on a run record: a
+//!   sequential writer has dirtied a run of pages, so writing it now overlaps the rest of
+//!   the write and leaves `fsync` less to do;
 //! - at unmount ([`PageCache::flush_all`]).
 //!
 //! A mapped file's cached writes are held while it has any mapping, so the mapped pages,
@@ -59,7 +62,9 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use ferric_pcache::abi::{Access, ObjectId, Outcome, Record, RecordPages, PAGE_SIZE};
+use ferric_pcache::abi::{
+    Access, ObjectId, Outcome, Record, RecordPages, WritebackReason, PAGE_SIZE,
+};
 use ferric_pcache::client::{
     self, Answered, Call, ClientError, FlushTimer, Object, Pump, Queue, FLUSH_DUE,
     FORWARDED_RECORDS,
@@ -531,6 +536,18 @@ impl PageCache {
         fmaps: &mut Fmaps,
         node_id: u32,
     ) -> Result<(), FlushError> {
+        self.write_back(fs, fmaps, node_id, Pass::All)
+    }
+
+    /// Writes back `node_id`'s dirty pages, or the one run `pass` names, and notes whether it
+    /// is still dirty after.
+    fn write_back<D: Disk>(
+        &mut self,
+        fs: &mut FileSystem<D>,
+        fmaps: &mut Fmaps,
+        node_id: u32,
+        pass: Pass,
+    ) -> Result<(), FlushError> {
         let (Some(wb), Some(cached)) = (self.writeback.as_mut(), self.files.get(&node_id)) else {
             return Ok(());
         };
@@ -541,8 +558,13 @@ impl PageCache {
             node_id,
             buf: &mut wb.buf,
         };
-        let flushed = writeback::flush(&mut target);
+        let flushed = match pass {
+            Pass::All => writeback::flush(&mut target),
+            Pass::Run(from) => writeback::flush_run(&mut target, from),
+        };
         match &flushed {
+            // A run pass that took nothing says nothing of the pages before it.
+            Ok(Flushed { runs: 0, .. }) if matches!(pass, Pass::Run(_)) => {}
             Ok(Flushed { dirty_left: 0, .. }) => {
                 wb.dirty.cleaned(node_id);
             }
@@ -668,17 +690,24 @@ impl PageCache {
 
     /// Handles the records in `records` (forwarded by the pump): answers fills with the
     /// files' bytes, and notes the files writeback records say are dirty, writing every
-    /// dirty file back at once after an urgent one.
+    /// dirty file back at once after an urgent one, and the run a run record names.
     pub fn fill<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, records: &[u8]) {
         let mut urgent = false;
+        let mut runs = Vec::new();
         for record in Record::decode_all(records) {
             if let Ok(Record::Writeback {
                 object,
-                urgent: now,
+                pages,
+                reason,
                 ..
             }) = record
             {
-                urgent |= now;
+                match reason {
+                    WritebackReason::Urgent => urgent = true,
+                    WritebackReason::Run => runs.push((object, pages.pages().first())),
+                    // Dirtied, and any reason a newer kernel adds: the age limit applies.
+                    _ => {}
+                }
                 self.dirtied(object);
                 continue;
             }
@@ -720,8 +749,21 @@ impl PageCache {
                 Err(err) => log::error!("page cache: bad record from the kernel: {err}"),
             }
         }
+        // An urgent pass writes the runs too.
         if urgent {
             self.flush_all(fs, fmaps);
+            return;
+        }
+        for (object, from) in runs {
+            let Ok(node_id) = u32::try_from(object.get()) else {
+                continue;
+            };
+            if let Err(err) = self.write_back(fs, fmaps, node_id, Pass::Run(from)) {
+                log::warn!(
+                    "page cache: writeback of a run of node {node_id}: {}",
+                    Chain(&err)
+                );
+            }
         }
     }
 
@@ -736,6 +778,15 @@ impl PageCache {
             wb.timer.arm();
         }
     }
+}
+
+/// How much of a file [`PageCache::write_back`] writes.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// Every dirty page, in page order ([`writeback::flush`]).
+    All,
+    /// One run, the next at or after this page ([`writeback::flush_run`]): a run record.
+    Run(u64),
 }
 
 /// Turns cached writes on for `queue`, with a timer thread that makes the [`FLUSH_DUE`] call
