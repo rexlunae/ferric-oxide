@@ -1132,8 +1132,11 @@ read-only medium) is also served read-only, with the reason logged
   are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
   permission (and read permission unless `O_WRONLY`); `O_CREAT` and `O_TRUNC`
-  are refused (`EOPNOTSUPP`), and `O_APPEND` writes at the end. Every open
-  file is opened again in `ext4-view` after a write, so reads see it.
+  are refused (`EOPNOTSUPP`). `O_APPEND` opens and writes also fail with
+  `EOPNOTSUPP`, including a flag enabled after open through `F_SETFL`: the
+  current scheme response cannot return an append's actual ending position
+  to the kernel ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)).
+  Every open file is opened again in `ext4-view` after a write, so reads see it.
 
 A crash at any write leaves the old inode or a journal whose replay gives the
 new one. The tests crash a change before each of its eight writes and check
@@ -1156,7 +1159,9 @@ FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 and past the end inside the last block, checks the permission rules, that
 other open handles read the new bytes, that holes, unwritten extents and
 missing blocks are refused with nothing written (the `write-data` fixture,
-which also has immutable and append-only files), and crashes a write before
+which also has immutable and append-only files). It checks that append opens
+and writes at an earlier cursor or EOF fail without changing any image bytes,
+size or timestamps, and that ordinary offset writes still work. It crashes a write before
 each of its nine writes.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with

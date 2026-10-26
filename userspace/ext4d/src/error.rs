@@ -37,6 +37,9 @@ pub enum Error {
     /// files are not supported yet.
     #[error("creating and truncating files is not supported yet")]
     CreateOrTruncate,
+    /// Append positioning cannot be reported through the current scheme write response.
+    #[error("O_APPEND is not supported until the kernel can accept the actual write position")]
+    AppendUnsupported,
     /// The caller cannot search a directory or read the final inode.
     #[error("permission denied")]
     PermissionDenied,
@@ -93,7 +96,7 @@ impl Error {
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
             Self::NotOwner | Self::ChownRestricted => EPERM,
-            Self::SymlinkMode | Self::CreateOrTruncate => EOPNOTSUPP,
+            Self::SymlinkMode | Self::CreateOrTruncate | Self::AppendUnsupported => EOPNOTSUPP,
             Self::InvalidTime => EINVAL,
             #[cfg(feature = "write")]
             Self::Lookup(err) => lookup_errno(err),

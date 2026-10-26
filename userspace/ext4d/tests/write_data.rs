@@ -327,3 +327,46 @@ fn a_crash_at_any_write_leaves_the_old_size_or_the_new_one() {
         );
     }
 }
+
+#[test]
+fn append_opens_and_writes_are_refused_without_changing_the_file() {
+    use syscall::flag::{O_APPEND, O_RDWR, O_WRONLY};
+    let (mut fs, shared) = mount_writable(basic());
+    let untouched = shared.bytes();
+    for access in [O_WRONLY, O_RDWR] {
+        let mode = OpenMode::from_flags(access | O_APPEND);
+        assert!(mode.append);
+        let error = fs
+            .open(None, "/hello.txt", mode)
+            .expect_err("append is unsupported");
+        assert!(matches!(error, Error::AppendUnsupported));
+        assert_eq!(error.errno(), syscall::error::EOPNOTSUPP);
+    }
+    let file = open(&mut fs, "/hello.txt", READ_WRITE);
+    let before = fs.attributes(file).unwrap();
+    assert_eq!(before.size, 16);
+    // Cover an append flag enabled after open. The old scheme implementation
+    // appended at EOF and returned 4, which advanced the kernel's cursor 0 -> 4.
+    for offset in [0, 5, before.size] {
+        let error = fs
+            .write_with_flags(file, offset, b"more", O_APPEND as u32)
+            .expect_err("cannot return a correct append cursor");
+        assert!(matches!(error, Error::AppendUnsupported));
+        assert_eq!(error.errno(), syscall::error::EOPNOTSUPP);
+        assert_eq!(fs.attributes(file).unwrap(), before);
+        assert_eq!(shared.bytes(), untouched);
+    }
+    // Explicit-offset writes still use the supplied position and return their count.
+    assert_eq!(fs.write_with_flags(file, 6, b"FROM", 0).unwrap(), 4);
+    assert_eq!(read_all(&mut fs, file), b"hello FROM ext4\n");
+    e2fsck("append-refused", shared.bytes());
+    let mut ro = Fs::new(Window::whole(basic()).unwrap()).unwrap();
+    assert!(matches!(
+        ro.open(
+            None,
+            "/hello.txt",
+            OpenMode::from_flags(O_WRONLY | O_APPEND)
+        ),
+        Err(Error::ReadOnly)
+    ));
+}

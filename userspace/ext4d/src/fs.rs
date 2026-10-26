@@ -42,6 +42,8 @@ pub struct OpenMode {
     pub write_only: bool,
     /// Creation or truncation (`O_CREAT`, `O_TRUNC`).
     pub create_or_truncate: bool,
+    /// Append positioning (`O_APPEND`), currently refused with `EOPNOTSUPP`.
+    pub append: bool,
     /// The path must be a directory (`O_DIRECTORY`).
     pub directory: bool,
     /// Open a final symbolic link itself, to read its target (`O_SYMLINK`).
@@ -59,6 +61,7 @@ impl OpenMode {
             write: false,
             write_only: false,
             create_or_truncate: false,
+            append: false,
             directory: false,
             symlink: false,
             no_follow: false,
@@ -69,14 +72,15 @@ impl OpenMode {
     /// Reads the mode from Redox `openat` flags.
     pub const fn from_flags(flags: usize) -> Self {
         use syscall::flag::{
-            O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK, O_TRUNC,
-            O_WRONLY,
+            O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK,
+            O_TRUNC, O_WRONLY,
         };
         let access = flags & O_ACCMODE;
         Self {
             write: access != O_RDONLY && access != 0,
             write_only: access == O_WRONLY,
             create_or_truncate: flags & (O_CREAT | O_TRUNC) != 0,
+            append: flags & O_APPEND != 0,
             directory: flags & O_DIRECTORY != 0,
             symlink: flags & O_SYMLINK != 0,
             no_follow: flags & O_NOFOLLOW != 0,
@@ -620,15 +624,17 @@ impl Fs {
     /// is restricted to the inode's owner/group/other mode bits.
     ///
     /// Opens for writing need a volume mounted with `Fs::new_writable`; the file can then
-    /// be written in place with [`Self::write`]. Creating and truncating are not supported
-    /// yet.
+    /// be written in place with [`Self::write`]. Creating, truncating and append positioning
+    /// are not supported yet; the scheme cannot report an append's actual ending cursor
+    /// to the kernel (issue #244).
     ///
     /// # Errors
     /// Returns the errors of [`Self::open`], [`Error::PermissionDenied`] for denied access,
     /// [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file, [`Error::ReadOnly`] for
     /// an open for writing, creating or truncating on a read-only mount,
     /// [`Error::CreateOrTruncate`] for `O_CREAT` or `O_TRUNC` on a writable one, and
-    /// [`Error::IsADirectory`] for a directory opened for writing.
+    /// [`Error::AppendUnsupported`] for `O_APPEND`, and [`Error::IsADirectory`] for a
+    /// directory opened for writing.
     pub fn open_as(
         &mut self,
         base: Option<usize>,
@@ -642,6 +648,9 @@ impl Fs {
         }
         if mode.create_or_truncate {
             return Err(Error::CreateOrTruncate);
+        }
+        if mode.append {
+            return Err(Error::AppendUnsupported);
         }
         let start = match base {
             Some(base) if !path.starts_with('/') => {
@@ -994,11 +1003,35 @@ impl Fs {
     /// `write::WriteError::NotAllocated` when it would need a block allocated, which is not
     /// supported yet (`EOPNOTSUPP`).
     pub fn write(&mut self, id: usize, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        self.write_with_flags(id, offset, buf, 0)
+    }
+
+    /// Writes at an explicit offset with the current scheme-call flags.
+    ///
+    /// `O_APPEND` is refused even if enabled after open through `F_SETFL`: the current
+    /// scheme response carries only a byte count, so the kernel cannot update its cursor
+    /// to the actual end of an append. No size, data or timestamp changes on refusal.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::write`], plus [`Error::AppendUnsupported`] (`EOPNOTSUPP`) for
+    /// `O_APPEND` on a handle opened for writing. Unknown and read-only handles still
+    /// return [`Error::BadHandle`].
+    pub fn write_with_flags(
+        &mut self,
+        id: usize,
+        offset: u64,
+        buf: &[u8],
+        flags: u32,
+    ) -> Result<usize, Error> {
         let handle = self.handle(id)?;
         match handle.open {
             Open::File(_) if handle.writable => {}
             Open::Directory { .. } => return Err(Error::IsADirectory),
             _ => return Err(Error::BadHandle { handle: id }),
+        }
+        if flags as usize & syscall::flag::O_APPEND != 0 {
+            return Err(Error::AppendUnsupported);
         }
         #[cfg(not(feature = "write"))]
         {
