@@ -198,17 +198,18 @@ pub fn selftest(token: &mut CleanLockToken) {
             return;
         }
     }
-    let mut spins = 0u64;
-    while !fired() {
+    // Bound the wait by the clock, not a spin count, so a wedged timer is
+    // reported after three seconds on any CPU.
+    let give_up = start + 3_000_000_000;
+    while !fired() && time::monotonic(token) <= give_up {
         // SAFETY: interrupts on so the timer interrupt arrives; the spin is a
         // bounded wait for a boot selftest.
         unsafe { arch::interrupt::enable_and_nop() };
-        spins += 1;
-        if spins > 10_000_000_000 {
-            crate::info!("timer: one-shot selftest round 1: no fire (wedged)");
-            disarm();
-            return;
-        }
+    }
+    if !fired() {
+        crate::info!("timer: one-shot selftest round 1: no fire (wedged)");
+        disarm();
+        return;
     }
     take_fired();
     let end = time::monotonic(token);
