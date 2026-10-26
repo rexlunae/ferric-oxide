@@ -1,6 +1,6 @@
 # Microkernels
 
-The Redox kernel is a microkernel. Microkernels stand out in their design by providing minimal abstractions in kernel-space. Microkernels focus on user-space, unlike Monolithic kernels which focus on kernel-space.
+The Ferric Oxide kernel, like the Redox kernel it comes from, is a microkernel. Microkernels stand out in their design by providing minimal abstractions in kernel-space. Microkernels focus on user-space, unlike Monolithic kernels which focus on kernel-space.
 
 The basic philosophy of microkernels is that any component which *can* run in user-space *should* run in user-space. Kernel-space should only be utilized for the most essential components (e.g., system calls, process separation, resource management, IPC, thread management, etc).
 
@@ -80,7 +80,23 @@ The performance difference between monolithic and microkernels has shrunk over t
 - [Context Switch Documentation](https://wiki.osdev.org/Context_Switching)
 - [Microkernels Performance Paper](https://os.inf.tu-dresden.de/pubs/sosp97/)
 
-We are working on exciting performance optimizations to minimize the overhead of extra context switches.
+Ferric Oxide's I/O work aims at this overhead (see
+[Registered buffers, IOMMUs and rings](./ferric-io.md)):
+
+- **Direct switches.** A request to a user-space scheme switches straight to
+  the daemon serving it and back, without a trip through the run queue.
+- **Rings.** Shared submission and completion queues let a program submit many
+  operations with one system call, or none while the kernel is already
+  working through the queue.
+- **Registered buffers and DMA grants.** Data can move between a program, a
+  service and a device without being copied at each step; file descriptors
+  still control access, and only the bytes skip the copies.
+- **PCID.** Tagged TLB entries mean a switch between address spaces does not
+  have to flush the TLB.
+- **A kernel-colocated driver tier** (planned) would let a few hot drivers run
+  in the kernel's address space without kernel privileges, isolated by Rust's
+  type system, protection keys and the IOMMU. See
+  [Drivers](./drivers.md).
 
 ## Versus monolithic kernels
 
@@ -111,8 +127,12 @@ The above illustration from [Wikimedia](https://commons.wikimedia.org/wiki/File:
 
 ## A Note On The Current State
 
-Redox has less than 40,000 Rust lines of kernel code. For comparison Minix has around 6,000 C lines of kernel code.
+The kernel in `crates/kernel/src/` has roughly 47,000 non-blank, non-comment
+lines of Rust (October 2026), across all architectures; Ferric Oxide's
+additions (IOMMU, rings, page cache, tracing) account for part of that growth.
+For comparison, MINIX has around 6,000 lines of C in its kernel. Line counts
+are only a rough guide, since the two kernels do different amounts of work.
 
-(The above comparison can't be used to argue that Minix is more stable or safe than Redox due to a less amount of source code lines, because Redox is more advanced than Minix in features, thus more lines of code are expected and a 1:1 comparison can't be made)
-
-We would like to move more parts of Redox to user-space to get an even more stable and secure kernel.
+Ferric Oxide keeps new kernel code behind feature options, puts portable logic
+in host-tested `no_std` crates under `crates/`, and moves work to user space
+where performance allows.

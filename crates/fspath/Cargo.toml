@@ -1,0 +1,11 @@
+[package]
+name = "ferric-fspath"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Path normalization and path-derived inode numbers for scheme file system daemons, no_std"
+publish = false
+
+# No dependencies: the file system daemons (userspace/fatd, each its own workspace) build this
+# crate by path through a symlink, as with ferric-blocklayer.
+[dependencies]
