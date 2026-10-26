@@ -265,19 +265,23 @@ struct ObjectState {
 /// the change `f` made to the object's: every change to an index that can drop or dirty a
 /// page goes through here, so the count follows writes, writebacks, truncations and
 /// invalidations.
+///
+/// The count moves before the lock is released, as on every path that changes it: changes
+/// to one object then reach the count in the order they were made, so a write's increment
+/// can never land after the writeback that cleans its pages and leave the count above the
+/// pages really dirty. [`Queue::account`] only touches atomics, so it takes no lock under
+/// the object's.
 fn with_index<R>(object: &Object, f: impl FnOnce(&mut ObjectState) -> R) -> R {
-    let (result, before, after) = {
-        let mut state = object.state.lock();
-        let before = state.index.dirty_pages();
-        let result = f(&mut state);
-        (result, before, state.index.dirty_pages())
-    };
-    object.queue.account(before, after);
+    let mut state = object.state.lock();
+    let before = state.index.dirty_pages();
+    let result = f(&mut state);
+    object.queue.account(before, state.index.dirty_pages());
     result
 }
 
 impl Queue {
-    /// One of the queue's objects went from `before` dirty pages to `after`.
+    /// One of the queue's objects went from `before` dirty pages to `after`. Called with
+    /// that object's state locked, so its changes reach the count in order.
     fn account(&self, before: usize, after: usize) {
         if let Some(more) = after.checked_sub(before) {
             self.dirty.fetch_add(more, Ordering::Relaxed);
@@ -580,9 +584,12 @@ fn end_object(object: &Arc<Object>, token: &mut CleanLockToken) {
     let (failed, dirty) = {
         let mut state = object.state.lock();
         state.gone = true;
-        (state.index.fail_all(), state.index.dirty_pages())
+        let failed = state.index.fail_all();
+        let dirty = state.index.dirty_pages();
+        // Under the lock, like every change to the count ([`with_index`]).
+        object.queue.account(dirty, 0);
+        (failed, dirty)
     };
-    object.queue.account(dirty, 0);
     if failed != 0 {
         crate::info!(
             "pcache: object {} went with {failed} page(s) being filled",

@@ -168,9 +168,10 @@ fn write(
                 let frames = frames.into_iter().map(Arc::new).collect();
                 let before = state.index.dirty_pages();
                 let written = state.index.write(&plan, frames);
-                let after = state.index.dirty_pages();
+                // Under the lock, so it reaches the count before any writeback of these
+                // pages does (`with_index`).
+                object.queue.account(before, state.index.dirty_pages());
                 drop(state);
-                object.queue.account(before, after);
                 // Unreachable once the pages were ready: the file system serves the write.
                 let written = written.ok()?;
                 notify_dirty(object, &plan, written.first, token);
