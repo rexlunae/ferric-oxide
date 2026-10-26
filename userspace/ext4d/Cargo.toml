@@ -28,6 +28,7 @@ journal-replay = ["dep:ferric-jbd2"]
 write = ["journal-replay"]
 
 [dependencies]
+ferric-fspath = { path = "../../crates/fspath" }
 ext4-view = { version = "1.0.0", features = ["std"] }
 ferric-jbd2 = { path = "../../crates/jbd2", optional = true }
 log = "0.4.27"
