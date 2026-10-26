@@ -64,15 +64,37 @@ impl Disk for NvmeDisk {
         Ok(())
     }
 
-    /// With per-CPU workers and a policy that serves requests concurrently
-    /// ([`QueuePolicy::serves_concurrently`](ferric_blkqueue::QueuePolicy::serves_concurrently)).
-    /// The main thread's queue pair serves one request at a time either way (see
-    /// `percore::Dispatcher::claim_inline`).
+    /// With per-CPU workers, whether a request that arrives while another is in flight is
+    /// handed to a worker that answers it itself ([`PendingIo`], `Work::Answer`), so the
+    /// scheme's thread does not wait for it.
+    ///
+    /// [`Workers`](ferric_blkqueue::QueuePolicy::Workers) always serves concurrently.
+    /// With the `overlap` feature (`drivers.nvme_overlap`, off by default),
+    /// [`Adaptive`](ferric_blkqueue::QueuePolicy::Adaptive) keeps the first request of a
+    /// burst on the main thread's queue pair (its thread context serves one request at a
+    /// time) and overlaps the rest on the workers, so a single thread never pays a
+    /// hand-off. Without the feature, Adaptive serves one call at a time as before:
+    /// measured on QEMU/KVM (Kleya, same-boot A/B), the adaptive overlap loses about
+    /// 1-3% of qd32 IOPS because each hand-off costs more than the emulated controller
+    /// saves, so the default stays serial until real NVMe hardware shows the overlap
+    /// paying.
     #[cfg(feature = "percore")]
     fn concurrent(&self) -> bool {
-        self.workers
-            .as_ref()
-            .is_some_and(|workers| workers.policy().serves_concurrently())
+        self.workers.as_ref().is_some_and(|workers| match workers.policy() {
+            ferric_blkqueue::QueuePolicy::Workers => true,
+            ferric_blkqueue::QueuePolicy::MainQueue => false,
+            ferric_blkqueue::QueuePolicy::Adaptive => {
+                #[cfg(feature = "overlap")]
+                {
+                    workers.busy()
+                }
+                #[cfg(not(feature = "overlap"))]
+                {
+                    false
+                }
+            }
+            _ => false,
+        })
     }
 
     /// With per-CPU workers, a concurrent read or write goes to a worker, which writes the

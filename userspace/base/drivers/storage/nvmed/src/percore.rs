@@ -171,6 +171,14 @@ impl Dispatcher {
         self.policy.set(policy);
     }
 
+    /// Whether any request is in flight on any queue pair: the main thread's inline one, or
+    /// a job a worker is running. The Adaptive overlap option (`drivers.nvme_overlap`) uses
+    /// this to decide whether a request that arrives now may be handed to a worker.
+    #[cfg(feature = "overlap")]
+    pub fn busy(&self) -> bool {
+        self.in_flight.get() > 0
+    }
+
     /// How requests are placed now.
     pub fn policy(&self) -> QueuePolicy {
         self.policy.get()

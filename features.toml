@@ -573,6 +573,30 @@ when = "value"
 make_append = { FERRIC_INITFS_FEATURES = "nvmed/percore" }
 
 [[option]]
+id = "drivers.nvme_overlap"
+menu = "drivers"
+type = "bool"
+title = "Overlap Adaptive queue-policy requests on the per-CPU workers"
+default = false
+depends = "drivers.nvme_percore"
+rebuild = ["base"]
+help = """
+Let the Adaptive queue policy hand a request that arrives while another is in
+flight to a per-CPU worker that answers it itself, instead of serving one call
+at a time on the receiving thread's queue pair. The first request of a burst
+still runs inline, so a single thread pays no hand-off. Off by default: the
+same-boot QEMU/KVM measurement (Kleya, iobench qd32) loses about 1-3% of IOPS
+with the overlap on, because each hand-off costs more than the emulated
+controller saves; the Phase 2 exit criterion needs the overlap on real NVMe
+hardware, where the controller is far faster than the per-request hand-off.
+Builds nvmed with its overlap Cargo feature. Off by default; without it nvmed
+serves one call at a time, as upstream."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_INITFS_FEATURES = "nvmed/overlap" }
+
+[[option]]
 id = "drivers.nvmed_perf"
 menu = "drivers"
 type = "bool"

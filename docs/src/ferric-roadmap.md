@@ -115,6 +115,18 @@ The aim is driver-in-kernel performance (no address-space switch, no IPC) withou
 
 **Exit:** with IOMMU enforcement on, fio 4K random read at QD32 on NVMe reaches at least 80% of Linux io_uring on the same disk, and a driver crash or rogue DMA can't corrupt the kernel or other processes (tested by fault injection).
 
+> **QEMU measurement note (phase 2 perf instrumentation, #206):** the emulated
+> NVMe controller processes every queue's commands on one thread, about
+> 52-67 us per 4 KiB command, walling random reads at roughly 15-19k IOPS
+> whatever the driver does. The QD32 latency on QEMU (about 1.5-2.1 ms) is
+> queue and dispatch wait, not device time: the scheme serves requests one at
+> a time (~63-86 us each) while the controller floor is ~52 us. The
+> Workers-style overlap option (`drivers.nvme_overlap`) cuts qd32 p50 to
+> ~1.2-1.3 ms when requests reach the controller, but its hand-offs cost more
+> than the emulated controller saves (same-boot A/B loses ~1-3% at qd32), so
+> it stays off by default; the exit criterion itself cannot be met under
+> emulation, and the next gate is the reference-hardware fio comparison.
+
 ## Phase V: Hardware virtualization and enclaves
 
 **Why it comes this early:** the project wants isolated enclaves for bringing over C/C++ code written for operating systems with different security models. Instead of porting everything to relibc and the capability model first, the code can run unmodified inside a lightweight VM, and the VM gets exactly the capabilities the host chooses to give it. That makes the hypervisor a porting tool, not just a server feature, so it now comes right after the I/O groundwork. It runs in parallel with Phase 3 and ahead of the hardware and graphics work.
