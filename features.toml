@@ -643,7 +643,8 @@ whole-request service time and summed command time (SQ-slot acceptance through
 observed completion). A separate thread logs and resets summaries once a second,
 even when I/O is idle. Command time includes doorbell batching and wakeup latency,
 but excludes waiting for a free SQ slot; it is not pure controller service time.
-Windows are not benchmark-round boundaries. x86 uses CPU counter reads; other
+A queue-policy change also ends a window, and each line names its policy; with
+drivers.nvme_percore it also times the hand-offs to and from the workers. x86 uses CPU counter reads; other
 architectures use the monotonic clock. Reporting adds timer/logging system calls
 on its own thread. Off by default; without it nvmed's timing path is absent."""
 

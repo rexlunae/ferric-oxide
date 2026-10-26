@@ -372,8 +372,8 @@ each I/O request's phases with the CPU cycle counter and logs a summary about
 once a second:
 
 ```text
-nvmed: perf: read.service n=2048 mean=196.633 min=176.044 max=227.512 us
-nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
+nvmed: perf: policy=MainQueue read.service n=2048 mean=196.633 min=176.044 max=227.512 us
+nvmed: perf: policy=MainQueue read.device n=2048 mean=151.790 min=139.812 max=179.145 us
 ```
 
 - `read.service`/`write.service` cover request entry through return, including
@@ -387,6 +387,16 @@ nvmed: perf: read.device n=2048 mean=151.790 min=139.812 max=179.145 us
   phase together, so the counts and interval boundaries match.
 - Service minus command time measures the remaining driver work, including
   buffer preparation, free-slot waits and copies.
+- With per-CPU queue pairs (`drivers.nvme_percore`), `handoff` is the time from
+  the scheme's thread queueing a request for a worker until that worker starts
+  it, which is mostly the worker's (usually cross-CPU) wake-up, and `return` is
+  the time from a worker settling a job until the scheme's thread resumes the
+  job's future (the report pipe's wake-up; `Workers` requests answer the scheme
+  themselves and have none). A request on the main thread's queue pair has
+  neither.
+- `policy=` names the queue policy the window measured. Changing the policy
+  (the same-boot benchmark does, between rounds) ends the window, so a window
+  never mixes two policies.
 
 A separate reporting thread takes and resets the counters once a second, so
 samples are reported even after an I/O burst goes idle. Logging happens outside
