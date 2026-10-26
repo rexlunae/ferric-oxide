@@ -1,5 +1,6 @@
 //! Finding the journal inode's blocks: the superblock fields, its group descriptor, the
-//! inode, and its extent tree or (ext3) indirect block map.
+//! inode, and its extent tree or (ext3) indirect block map. `crate::lookup` maps
+//! directories the same way ([`BlockMap::of_inode`]), with holes allowed.
 //!
 //! Written from "Ext4 Disk Layout": "The Super Block", "Block Group Descriptors", "Finding
 //! an Inode", "Inode Table", "The Contents of inode.i_block" ("Direct/Indirect Block
@@ -231,7 +232,7 @@ impl Volume {
     }
 
     /// Reads inode `number` (the whole on-disk inode, `inode_size` bytes).
-    fn read_inode<R: ReadAt>(
+    pub(crate) fn read_inode<R: ReadAt>(
         &self,
         window: &Window<R>,
         number: u32,
@@ -285,12 +286,18 @@ struct Run {
     physical: u64,
 }
 
-/// Where each block of the journal inode is on the volume.
+/// Where each block of the journal inode (or, with [`BlockMap::of_inode`], of another
+/// inode) is on the volume.
 #[derive(Debug)]
 pub(crate) struct BlockMap {
     runs: Vec<Run>,
-    /// The journal's length in blocks, from the inode's size.
+    /// The inode's length in blocks, from its size.
     pub(crate) len: u32,
+    /// The inode mapped, for errors.
+    number: u32,
+    /// Whether holes are allowed (and left out of the map): not in a journal, which has
+    /// none, but in an ordinary file or directory.
+    holes: bool,
 }
 
 impl BlockMap {
@@ -316,15 +323,53 @@ impl BlockMap {
         let mut map = Self {
             runs: Vec::new(),
             len,
+            number,
+            holes: false,
         };
-        if le32(&inode, 0x20) & EXTENTS_FL != 0 {
-            map.extents(volume, window, i_block, MAX_DEPTH)?;
-        } else {
-            map.indirect(volume, window, i_block)?;
-        }
-        map.runs.sort_by_key(|run| run.logical);
+        map.walk(volume, window, &inode)?;
         map.validate(volume, window)?;
         Ok(map)
+    }
+
+    /// Maps inode `number`, whose on-disk bytes are `inode`, for reading its blocks (a
+    /// directory, for a path lookup). Unlike the journal's map, holes are allowed and left
+    /// out, and so are unwritten extents, which read as zeros. Nothing is checked beyond
+    /// what reading needs: each block is checked to be inside the volume when it is read.
+    #[cfg(feature = "write")]
+    pub(crate) fn of_inode<R: ReadAt>(
+        volume: &Volume,
+        window: &Window<R>,
+        inode: &[u8],
+        number: u32,
+    ) -> Result<Self, JournalError> {
+        let size = u64::from(le32(inode, 0x6C)) << 32 | u64::from(le32(inode, 0x4));
+        let len = u32::try_from(size.div_ceil(u64::from(volume.block_size)))
+            .map_err(|_| JournalError::BadInode { number })?;
+        let mut map = Self {
+            runs: Vec::new(),
+            len,
+            number,
+            holes: true,
+        };
+        map.walk(volume, window, inode)?;
+        Ok(map)
+    }
+
+    /// Fills the map from the inode's extent tree or block map, sorted by logical block.
+    fn walk<R: ReadAt>(
+        &mut self,
+        volume: &Volume,
+        window: &Window<R>,
+        inode: &[u8],
+    ) -> Result<(), JournalError> {
+        let i_block = &inode[0x28..0x64];
+        if le32(inode, 0x20) & EXTENTS_FL != 0 {
+            self.extents(volume, window, i_block, MAX_DEPTH)?;
+        } else {
+            self.indirect(volume, window, i_block)?;
+        }
+        self.runs.sort_by_key(|run| run.logical);
+        Ok(())
     }
 
     /// Whether volume block `block` belongs to the journal.
@@ -382,11 +427,16 @@ impl BlockMap {
         (into < run.len).then(|| run.physical + u64::from(into))
     }
 
-    /// Adds journal block `logical` at volume block `physical`, which must not be 0 (a hole:
-    /// a journal has none).
-    fn push(&mut self, logical: u32, physical: u64, number: u32) -> Result<(), JournalError> {
+    /// Adds block `logical` at volume block `physical`. Block 0 is a hole: skipped where
+    /// holes are allowed, an error in a journal, which has none.
+    fn push(&mut self, logical: u32, physical: u64) -> Result<(), JournalError> {
         if physical == 0 {
-            return Err(JournalError::BadInode { number });
+            if self.holes {
+                return Ok(());
+            }
+            return Err(JournalError::BadInode {
+                number: self.number,
+            });
         }
         if let Some(last) = self.runs.last_mut()
             && last.logical + last.len == logical
@@ -425,8 +475,11 @@ impl BlockMap {
                 let logical = le32(entry, 0);
                 let mut len = u32::from(le16(entry, 4));
                 // Over 32768 marks an unwritten extent; the journal never has one, but the
-                // length is the same either way.
+                // length is the same either way. Elsewhere it reads as zeros, as a hole does.
                 if len > 32768 {
+                    if self.holes {
+                        continue;
+                    }
                     len -= 32768;
                 }
                 let physical = u64::from(le16(entry, 6)) << 32 | u64::from(le32(entry, 8));
@@ -459,7 +512,7 @@ impl BlockMap {
                 return Ok(());
             }
             let block = le32(i_block, slot * 4);
-            self.push(next, u64::from(block), volume.journal_inode)?;
+            self.push(next, u64::from(block))?;
             next += 1;
         }
         for (slot, levels) in [(12, 1), (13, 2), (14, 3)] {
@@ -471,7 +524,7 @@ impl BlockMap {
         }
         if next < self.len {
             return Err(JournalError::BadInode {
-                number: volume.journal_inode,
+                number: self.number,
             });
         }
         Ok(())
@@ -485,6 +538,13 @@ impl BlockMap {
         levels: u32,
         next: &mut u32,
     ) -> Result<(), JournalError> {
+        if block == 0 && self.holes {
+            // A hole covers every block the indirect block would have mapped.
+            let per_block = u64::from(volume.block_size / 4);
+            let covered = per_block.saturating_pow(levels);
+            *next = u32::try_from(u64::from(*next).saturating_add(covered)).unwrap_or(u32::MAX);
+            return Ok(());
+        }
         let mut buf = vec![0; volume.block_size as usize];
         volume.read_block(window, block, &mut buf)?;
         for entry in buf.chunks_exact(4) {
@@ -493,7 +553,7 @@ impl BlockMap {
             }
             let child = u64::from(le32(entry, 0));
             if levels == 1 {
-                self.push(*next, child, volume.journal_inode)?;
+                self.push(*next, child)?;
                 *next += 1;
             } else {
                 self.indirect_level(volume, window, child, levels - 1, next)?;
@@ -542,17 +602,36 @@ mod tests {
         let mut map = BlockMap {
             runs: Vec::new(),
             len: 10,
+            number: 8,
+            holes: false,
         };
         for (logical, physical) in [(0, 100), (1, 101), (2, 200), (3, 201)] {
-            map.push(logical, physical, 8).expect("not a hole");
+            map.push(logical, physical).expect("not a hole");
         }
         assert!(matches!(
-            map.push(4, 0, 8),
+            map.push(4, 0),
             Err(JournalError::BadInode { number: 8 })
         ));
         assert_eq!(map.runs.len(), 2);
         assert_eq!(map.physical(1), Some(101));
         assert_eq!(map.physical(3), Some(201));
         assert_eq!(map.physical(4), None);
+    }
+
+    #[test]
+    fn holes_are_left_out_where_they_are_allowed() {
+        let mut map = BlockMap {
+            runs: Vec::new(),
+            len: 4,
+            number: 12,
+            holes: true,
+        };
+        for (logical, physical) in [(0, 100), (1, 0), (2, 0), (3, 103)] {
+            map.push(logical, physical).expect("a hole is allowed");
+        }
+        assert_eq!(map.physical(0), Some(100));
+        assert_eq!(map.physical(1), None);
+        assert_eq!(map.physical(2), None);
+        assert_eq!(map.physical(3), Some(103));
     }
 }

@@ -12,9 +12,7 @@
 
 mod common;
 
-use std::process::Command;
-
-use common::{Crashing, le32, load, reseal};
+use common::{Crashing, e2fsck, le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Fs, OpenMode};
 use ext4d::journal::{self, JournalError, Outcome};
@@ -85,40 +83,6 @@ fn hello_contents(image: Vec<u8>) -> Vec<u8> {
 }
 
 const NEW: ((i64, u32), (i64, u32)) = ((0x7000_0000, 123_456_789), (0x7000_0001, 5));
-
-/// Has `e2fsck` (named by `EXT4D_E2FSCK`) replay and then check `image`, and returns the
-/// volume it leaves. Without `EXT4D_E2FSCK` the image comes back as it is.
-fn e2fsck(name: &str, image: Vec<u8>) -> Vec<u8> {
-    let Some(e2fsck) = std::env::var_os("EXT4D_E2FSCK") else {
-        return image;
-    };
-    let path = std::env::temp_dir().join(format!("ext4d-write-{}-{name}.ext4", std::process::id()));
-    std::fs::write(&path, &image).expect("a temporary file");
-    // The first run replays a journal that needs it (exit status 0, or 1 when it says it
-    // changed the volume); the second must find nothing at all to fix.
-    let replay = Command::new(&e2fsck)
-        .args(["-f", "-y"])
-        .arg(&path)
-        .output()
-        .expect("e2fsck runs");
-    assert!(
-        matches!(replay.status.code(), Some(0 | 1)),
-        "{name}: e2fsck -fy: {replay:?}"
-    );
-    let check = Command::new(&e2fsck)
-        .args(["-f", "-n"])
-        .arg(&path)
-        .output()
-        .expect("e2fsck runs");
-    assert_eq!(
-        check.status.code(),
-        Some(0),
-        "{name}: e2fsck -fn: {check:?}"
-    );
-    let after = std::fs::read(&path).expect("the checked image");
-    std::fs::remove_file(&path).expect("removed");
-    after
-}
 
 /// The 1 KiB blocks of the two images that differ.
 fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {

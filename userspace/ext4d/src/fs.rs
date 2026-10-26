@@ -7,13 +7,21 @@
 //! or processing `..`. Symbolic links are expanded with the same checks, except where
 //! `O_SYMLINK` or `O_STAT | O_NOFOLLOW` asks for the final link itself.
 //!
-//! Nothing here changes the volume. [`OpenMode::wants_write`] opens and every changing call
-//! fail with [`Error::ReadOnly`].
+//! [`OpenMode::wants_write`] opens and every changing call fail with [`Error::ReadOnly`],
+//! with one exception: on a volume mounted with `Fs::new_writable` (Cargo feature
+//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`] sets a file's times through
+//! the journal (`crate::write`). The inode to change is found from the handle's path by
+//! `crate::lookup`. After each change the `ext4-view` reader is loaded again, since it keeps
+//! the blocks it has read, and every handle's metadata is read again from it.
 //!
 //! Limitation: `ext4-view` does not expose inode numbers. [`Attributes::ino`] is a stable
 //! number made from the path instead, so hard links to one inode get different numbers.
 
+#[cfg(feature = "write")]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "write")]
+use std::rc::Rc;
 
 use ext4_view::{Ext4, Ext4Read, File, FileType, Metadata};
 
@@ -190,6 +198,48 @@ impl Kind {
     }
 }
 
+/// `tv_nsec` for "the current time" in a `futimens` time (relibc's `sys/stat.h`).
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+/// `tv_nsec` for "leave this time as it is" in a `futimens` time (relibc's `sys/stat.h`).
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// What a `futimens` call asks for one of a file's times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeChange {
+    /// Set it to the current time (`UTIME_NOW`).
+    Now,
+    /// Leave it as it is (`UTIME_OMIT`).
+    Omit,
+    /// Set it to this time.
+    At {
+        /// Seconds since 1970-01-01 00:00:00 UTC; negative before it.
+        seconds: i64,
+        /// Nanoseconds, below 1 000 000 000.
+        nanoseconds: u32,
+    },
+}
+
+impl TimeChange {
+    /// Reads a `futimens` time: `tv_nsec` is [`UTIME_NOW`], [`UTIME_OMIT`] or the
+    /// nanoseconds of `tv_sec`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTime`] when `nanoseconds` is none of those.
+    pub fn from_timespec(seconds: i64, nanoseconds: i64) -> Result<Self, Error> {
+        match nanoseconds {
+            UTIME_NOW => Ok(Self::Now),
+            UTIME_OMIT => Ok(Self::Omit),
+            0..1_000_000_000 => Ok(Self::At {
+                seconds,
+                // In range, so it fits.
+                nanoseconds: nanoseconds as u32,
+            }),
+            _ => Err(Error::InvalidTime),
+        }
+    }
+}
+
 /// One directory entry, for `getdents`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -222,6 +272,59 @@ pub struct Fs {
     needs_recovery: bool,
     handles: BTreeMap<usize, Handle>,
     next: usize,
+    /// The device, for changes, on a volume mounted with [`Fs::new_writable`].
+    #[cfg(feature = "write")]
+    writer: Option<Box<dyn Writable>>,
+}
+
+/// The writable device of a volume mounted with [`Fs::new_writable`], with its type erased.
+#[cfg(feature = "write")]
+trait Writable {
+    /// A reader of the device for `ext4-view`, which sees every change made through this.
+    fn reader(&self) -> Box<dyn Ext4Read>;
+    /// The inode `path` names.
+    fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError>;
+    /// Sets inode `number`'s times through the journal.
+    fn set_times(
+        &self,
+        number: u32,
+        times: &crate::write::Times,
+    ) -> Result<(), crate::write::WriteError>;
+}
+
+/// The device, shared by `ext4-view`'s reader and the writer. Fs is single-threaded and
+/// `ext4-view` reads only inside an `Fs` call, so no borrow is held across another.
+#[cfg(feature = "write")]
+struct Shared<W>(Rc<RefCell<crate::device::Window<W>>>);
+
+#[cfg(feature = "write")]
+impl<W: crate::device::ReadAt> Ext4Read for Shared<W> {
+    fn read(
+        &mut self,
+        start_byte: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Box<dyn core::error::Error + Send + Sync + 'static>> {
+        Ok(self.0.try_borrow()?.read_exact_at(dst, start_byte)?)
+    }
+}
+
+#[cfg(feature = "write")]
+impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device::Window<W>>> {
+    fn reader(&self) -> Box<dyn Ext4Read> {
+        Box::new(Shared(Rc::clone(self)))
+    }
+
+    fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError> {
+        crate::lookup::inode_of(&self.borrow(), path)
+    }
+
+    fn set_times(
+        &self,
+        number: u32,
+        times: &crate::write::Times,
+    ) -> Result<(), crate::write::WriteError> {
+        crate::write::set_times(&mut self.borrow_mut(), number, times)
+    }
 }
 
 impl Fs {
@@ -235,20 +338,56 @@ impl Fs {
     pub fn new<R: crate::device::ReadAt + 'static>(
         device: crate::device::Window<R>,
     ) -> Result<Self, Error> {
-        let mut sb = [0; superblock::SIZE];
-        device
-            .read_exact_at(&mut sb, superblock::OFFSET)
-            .map_err(Error::Device)?;
-        let geometry = Geometry::parse(&sb)?;
-        let needs_recovery = superblock::needs_recovery(&sb);
-        let ext4 = Ext4::load(Box::new(device) as Box<dyn Ext4Read>)?;
+        let sb = read_superblock(&device)?;
+        Self::load(&sb, Box::new(device))
+    }
+
+    /// The volume whose superblock is `sb`, read through `reader`.
+    fn load(sb: &[u8; superblock::SIZE], reader: Box<dyn Ext4Read>) -> Result<Self, Error> {
+        let geometry = Geometry::parse(sb)?;
+        let needs_recovery = superblock::needs_recovery(sb);
+        let ext4 = Ext4::load(reader)?;
         Ok(Self {
             ext4,
             geometry,
             needs_recovery,
             handles: BTreeMap::new(),
             next: 1,
+            #[cfg(feature = "write")]
+            writer: None,
         })
+    }
+
+    /// Loads the volume `device` holds for reading and for the changes `crate::write`
+    /// makes: so far, setting times ([`Self::set_times`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Write`] when the volume cannot be written ([`crate::write::check_writable`]:
+    /// it needs replaying, has no journal or has a feature `crate::write` does not write
+    /// under); mount it with [`Self::new`] then. Otherwise the errors of [`Self::new`].
+    #[cfg(feature = "write")]
+    pub fn new_writable<W: crate::device::WriteAt + 'static>(
+        device: crate::device::Window<W>,
+    ) -> Result<Self, Error> {
+        crate::write::check_writable(&device)?;
+        let sb = read_superblock(&device)?;
+        let device = Rc::new(RefCell::new(device));
+        let mut fs = Self::load(&sb, device.reader())?;
+        fs.writer = Some(Box::new(device));
+        Ok(fs)
+    }
+
+    /// Whether the volume was mounted for changes (`Fs::new_writable`, Cargo feature `write`).
+    pub fn is_writable(&self) -> bool {
+        #[cfg(feature = "write")]
+        {
+            self.writer.is_some()
+        }
+        #[cfg(not(feature = "write"))]
+        {
+            false
+        }
     }
 
     /// The volume's size and free space.
@@ -464,6 +603,96 @@ impl Fs {
         Err(Error::ReadOnly)
     }
 
+    /// Sets the access and modification times of the file `id` names, as `futimens` does,
+    /// and its change time to now, in one journal transaction.
+    ///
+    /// Following POSIX `futimens`: two [`TimeChange::Omit`]s change nothing and need no
+    /// permission; [`TimeChange::Now`] for both needs the caller (`uid`, `gid`) to own the
+    /// file or be able to write it; anything else needs the caller to own it. UID zero may
+    /// do all of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadHandle`], [`Error::ReadOnly`] on a volume not mounted with
+    /// `Fs::new_writable` (and always without the `write` feature),
+    /// [`Error::PermissionDenied`] and [`Error::NotOwner`] as above, `Error::Lookup` when
+    /// the file's inode cannot be found, and `Error::Write` when the change fails (see
+    /// `write::set_times`).
+    pub fn set_times(
+        &mut self,
+        id: usize,
+        accessed: TimeChange,
+        modified: TimeChange,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), Error> {
+        let handle = self.handle(id)?;
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = (handle, accessed, modified, uid, gid);
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            use crate::write::{Times, Timestamp};
+
+            let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
+            if (accessed, modified) == (TimeChange::Omit, TimeChange::Omit) {
+                return Ok(());
+            }
+            let metadata = &handle.metadata;
+            if uid != 0 && metadata.uid() != uid {
+                if (accessed, modified) != (TimeChange::Now, TimeChange::Now) {
+                    return Err(Error::NotOwner);
+                }
+                require_access(metadata, uid, gid, 0o2)?;
+            }
+            let now = Timestamp::now();
+            let time = |change| match change {
+                TimeChange::Now => Some(now),
+                TimeChange::Omit => None,
+                TimeChange::At {
+                    seconds,
+                    nanoseconds,
+                } => Some(Timestamp {
+                    seconds,
+                    nanoseconds,
+                }),
+            };
+            let times = Times {
+                accessed: time(accessed),
+                modified: time(modified),
+                changed: now,
+            };
+            let number = writer.inode_of(&handle.path)?;
+            let result = writer.set_times(number, &times);
+            // Even a failed change may have written part of the transaction.
+            self.reload();
+            Ok(result?)
+        }
+    }
+
+    /// Loads `ext4-view`'s reader again after a change, as it keeps the blocks it has read,
+    /// and reads every handle's metadata again from it. If the volume cannot be loaded, the
+    /// old reader is kept, and the change is still on the disk.
+    #[cfg(feature = "write")]
+    fn reload(&mut self) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        match Ext4::load(writer.reader()) {
+            Ok(ext4) => {
+                for handle in self.handles.values_mut() {
+                    if let Ok(metadata) = ext4.symlink_metadata(handle.path.as_str()) {
+                        handle.metadata = metadata;
+                    }
+                }
+                self.ext4 = ext4;
+            }
+            Err(err) => log::warn!("cannot load the volume again after a change: {err}"),
+        }
+    }
+
     fn resolve(
         &self,
         start: &str,
@@ -538,6 +767,17 @@ impl Fs {
             .get_mut(&id)
             .ok_or(Error::BadHandle { handle: id })
     }
+}
+
+/// The volume superblock's bytes.
+fn read_superblock<R: crate::device::ReadAt>(
+    device: &crate::device::Window<R>,
+) -> Result<[u8; superblock::SIZE], Error> {
+    let mut sb = [0; superblock::SIZE];
+    device
+        .read_exact_at(&mut sb, superblock::OFFSET)
+        .map_err(Error::Device)?;
+    Ok(sb)
 }
 
 /// Apply one inode's owner, primary group or other permission class.
@@ -626,6 +866,26 @@ mod tests {
         assert_eq!(normalize("/a/b", "/x/./y"), "/x/y");
         assert_eq!(normalize("/", "../../.."), "/");
         assert_eq!(normalize("/a", "..//b/"), "/b");
+    }
+
+    #[test]
+    fn futimens_times_are_read() {
+        let read = |seconds, nanoseconds| TimeChange::from_timespec(seconds, nanoseconds).ok();
+        assert_eq!(read(5, UTIME_NOW), Some(TimeChange::Now));
+        assert_eq!(read(5, UTIME_OMIT), Some(TimeChange::Omit));
+        assert_eq!(
+            read(-5, 999_999_999),
+            Some(TimeChange::At {
+                seconds: -5,
+                nanoseconds: 999_999_999
+            })
+        );
+        for bad in [-1, 1_000_000_000, UTIME_NOW + 1, i64::MIN] {
+            assert!(matches!(
+                TimeChange::from_timespec(0, bad),
+                Err(Error::InvalidTime)
+            ));
+        }
     }
 
     #[test]

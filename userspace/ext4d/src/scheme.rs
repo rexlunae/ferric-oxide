@@ -1,10 +1,12 @@
 //! The `ext4d` scheme: Redox scheme calls on top of [`Fs`].
 //!
 //! The scheme's handles are [`Fs`] handles. Reads, directory listings, `fstat`, `fstatvfs`
-//! and `fpath` are served. Everything that would change the volume (opens for writing or
-//! creating, `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename`, `flink`) fails
-//! with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through
-//! [`Error::errno`]. Opens enforce the caller's UID/GID through [`Fs::open_as`].
+//! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
+//! `fs.ext4_write`), `futimens` sets times through the journal ([`Fs::set_times`]).
+//! Everything else that would change the volume (opens for writing or creating,
+//! `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `frename`, `flink`, and `futimens` on a
+//! read-only mount) fails with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos
+//! only through [`Error::errno`]. Opens and `futimens` enforce the caller's UID/GID.
 
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
@@ -15,7 +17,7 @@ use syscall::schemev2::NewFdFlags;
 use thiserror::Error;
 
 use crate::Error;
-use crate::fs::{Fs, OpenMode};
+use crate::fs::{Fs, OpenMode, TimeChange};
 
 /// Why the scheme could not be set up or stopped serving.
 #[derive(Debug, Error)]
@@ -248,13 +250,18 @@ impl SchemeSync for Ext4Scheme {
         self.fs.refuse_change(id).map_err(|e| errno(&e))
     }
 
-    fn futimens(
-        &mut self,
-        id: usize,
-        _times: &[TimeSpec],
-        _ctx: &CallerCtx,
-    ) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn futimens(&mut self, id: usize, times: &[TimeSpec], ctx: &CallerCtx) -> syscall::Result<()> {
+        // relibc sends both times, with UTIME_NOW for a null pointer.
+        let &[accessed, modified] = times else {
+            return Err(errno(&Error::InvalidTime));
+        };
+        let change = |time: TimeSpec| TimeChange::from_timespec(time.tv_sec, time.tv_nsec.into());
+        let (accessed, modified) = change(accessed)
+            .and_then(|a| Ok((a, change(modified)?)))
+            .map_err(|e| errno(&e))?;
+        self.fs
+            .set_times(id, accessed, modified, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
     fn getdents<'buf>(

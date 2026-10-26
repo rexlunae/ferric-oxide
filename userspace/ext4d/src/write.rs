@@ -19,9 +19,9 @@
 //! replay and check what is left.
 //!
 //! The one operation so far is [`set_times`], which sets an existing inode's access,
-//! modification and change times. It is not yet reachable through the scheme: `ext4-view`
-//! does not say which inode a path names, so the scheme's `futimens` still fails with
-//! `EROFS`.
+//! modification and change times. The scheme's `futimens` reaches it through
+//! [`crate::fs::Fs::set_times`], which finds the inode with [`crate::lookup`].
+//! [`check_writable`] tells, at mount time, whether a volume can be served read-write.
 //!
 //! # Specification
 //!
@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
 use thiserror::Error;
 
-use crate::device::{Window, WindowError, WriteAt};
+use crate::device::{ReadAt, Window, WindowError, WriteAt};
 use crate::journal::map::{BlockMap, RO_COMPAT_METADATA_CSUM, Volume, le32};
 use crate::journal::{
     self, BlockError, Journal, JournalError, open_journal, read_volume_superblock,
@@ -159,6 +159,19 @@ pub struct Timestamp {
     pub nanoseconds: u32,
 }
 
+impl Timestamp {
+    /// The current time, or the epoch if the clock is before it.
+    pub fn now() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            seconds: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+            nanoseconds: now.subsec_nanos(),
+        }
+    }
+}
+
 /// The times [`set_times`] writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Times {
@@ -261,10 +274,28 @@ pub fn set_times<R: WriteAt>(
     Ok(())
 }
 
+/// Checks that this module can write to the volume `window` holds, without writing: what
+/// every change checks first, for deciding at mount time whether to serve the volume
+/// read-write.
+///
+/// # Errors
+///
+/// The refusals of [`set_times`] that depend on the volume, not the inode:
+/// [`WriteError::NeedsReplay`], [`WriteError::NoJournal`], [`WriteError::UnsupportedFeature`]
+/// and [`WriteError::Journal`]; and [`WriteError::Open`] for a journal the writer refuses
+/// (one that is aborted or has version 1 checksums).
+pub fn check_writable<R: ReadAt>(window: &Window<R>) -> Result<(), WriteError> {
+    let (volume, _) = writable_volume(window)?;
+    let map = BlockMap::load(&volume, window)?;
+    let (_, raw, _) = open_journal(window, &map, &volume)?;
+    Writer::new(&raw)?;
+    Ok(())
+}
+
 /// The volume's superblock fields, once it is known that this module may write to it, and
 /// what its metadata checksums start from (with `metadata_csum`): `s_checksum_seed`, or the
 /// CRC32C of the UUID.
-fn writable_volume<R: WriteAt>(window: &Window<R>) -> Result<(Volume, Option<u32>), WriteError> {
+fn writable_volume<R: ReadAt>(window: &Window<R>) -> Result<(Volume, Option<u32>), WriteError> {
     let sb = read_volume_superblock(window)?;
     let volume = Volume::parse(&sb)?;
     if volume.needs_replay()? {

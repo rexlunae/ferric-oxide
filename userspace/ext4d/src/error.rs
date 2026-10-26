@@ -4,7 +4,7 @@
 use ext4_view::Ext4Error;
 use syscall::error::{
     EACCES, EBADF, EFBIG, EILSEQ, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR,
-    EOPNOTSUPP, EROFS,
+    EOPNOTSUPP, EPERM, EROFS,
 };
 use thiserror::Error;
 
@@ -48,6 +48,22 @@ pub enum Error {
     /// The ext4 reader failed.
     #[error("ext4")]
     Ext4(#[from] Ext4Error),
+    /// Setting explicit times on a file the caller does not own (POSIX `futimens`: only
+    /// `UTIME_NOW` for both times is allowed with write permission alone).
+    #[error("only the owner can set a file's times")]
+    NotOwner,
+    /// A `futimens` time whose nanoseconds are out of range and not `UTIME_NOW` or
+    /// `UTIME_OMIT`, or a call without exactly two times.
+    #[error("invalid time")]
+    InvalidTime,
+    /// The path's inode could not be found for a change (`write`).
+    #[cfg(feature = "write")]
+    #[error("cannot find the inode to change")]
+    Lookup(#[from] crate::lookup::LookupError),
+    /// Changing the volume through its journal failed (`write`).
+    #[cfg(feature = "write")]
+    #[error("cannot change the volume")]
+    Write(#[from] crate::write::WriteError),
 }
 
 impl Error {
@@ -64,7 +80,39 @@ impl Error {
             Self::Device(_) => EIO,
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
+            Self::NotOwner => EPERM,
+            Self::InvalidTime => EINVAL,
+            #[cfg(feature = "write")]
+            Self::Lookup(err) => lookup_errno(err),
+            #[cfg(feature = "write")]
+            Self::Write(err) => write_errno(err),
         }
+    }
+}
+
+#[cfg(feature = "write")]
+fn lookup_errno(err: &crate::lookup::LookupError) -> i32 {
+    use crate::lookup::LookupError;
+    match err {
+        LookupError::NotFound { .. } => ENOENT,
+        LookupError::NotADirectory { .. } => ENOTDIR,
+        LookupError::Unsupported { .. } => EOPNOTSUPP,
+        // Malformed volumes and device failures, and anything added later.
+        _ => EIO,
+    }
+}
+
+#[cfg(feature = "write")]
+fn write_errno(err: &crate::write::WriteError) -> i32 {
+    use crate::write::WriteError;
+    match err {
+        // The volume cannot be written as it is (checked at mount, but it can change).
+        WriteError::NeedsReplay | WriteError::NoJournal | WriteError::UnsupportedFeature { .. } => {
+            EROFS
+        }
+        WriteError::TimeOutOfRange { .. } => EINVAL,
+        // Damaged inodes, journals and devices, and anything added later.
+        _ => EIO,
     }
 }
 
@@ -102,6 +150,41 @@ mod tests {
         assert_eq!(Error::from(Ext4Error::PathTooLong).errno(), ENAMETOOLONG);
         assert_eq!(Error::BadHandle { handle: 3 }.errno(), EBADF);
         assert_eq!(Error::IsADirectory.errno(), EISDIR);
+    }
+
+    #[test]
+    fn times_errors_map_to_their_errno() {
+        assert_eq!(Error::NotOwner.errno(), EPERM);
+        assert_eq!(Error::InvalidTime.errno(), EINVAL);
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn write_errors_map_to_their_errno() {
+        use crate::lookup::LookupError;
+        use crate::write::WriteError;
+        let not_found = LookupError::NotFound {
+            directory: 2,
+            name: "x".to_owned(),
+        };
+        assert_eq!(Error::from(not_found).errno(), ENOENT);
+        let unsupported = LookupError::Unsupported {
+            number: 2,
+            what: "inline-data directories",
+        };
+        assert_eq!(Error::from(unsupported).errno(), EOPNOTSUPP);
+        assert_eq!(Error::from(WriteError::NoJournal).errno(), EROFS);
+        assert_eq!(Error::from(WriteError::NeedsReplay).errno(), EROFS);
+        let late = WriteError::TimeOutOfRange {
+            number: 12,
+            seconds: 1 << 40,
+            nanoseconds: 0,
+        };
+        assert_eq!(Error::from(late).errno(), EINVAL);
+        assert_eq!(
+            Error::from(WriteError::FreeInode { number: 12 }).errno(),
+            EIO
+        );
     }
 
     #[test]

@@ -962,10 +962,12 @@ e2fsprogs and runs the same tests on them.
 
 `fs.ext4_write` (default off, needs `fs.ext4_journal_replay`; Cargo feature
 `write`) is the first step towards writable ext4: changing a volume through its
-journal. The scheme still serves volumes read-only; the one change so far,
-setting an existing inode's access, modification and change times
-(`ext4d::write::set_times`), is a library call that the scheme's `futimens`
-does not reach yet, because `ext4-view` does not say which inode a path names.
+journal. The one change so far sets an existing inode's access, modification
+and change times (`ext4d::write::set_times`), and the scheme's `futimens` makes
+it; every other change still fails with `EROFS`. At mount, ext4d opens the
+device for writing and serves the volume read-write (times only) when
+`ext4d::write::check_writable` accepts it, and otherwise serves it read-only
+and says why.
 
 - **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
   changed block) into an empty journal from `s_first`: descriptor blocks with
@@ -985,6 +987,23 @@ does not reach yet, because `ext4-view` does not say which inode a path names.
   volumes that need recovery (replay them first), have no journal, or have a
   feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
   bits), and inodes that are free or already fail their checksum.
+- **The path's inode** (`userspace/ext4d/src/lookup.rs`): `ext4-view` resolves
+  paths but does not say which inode one ends at, so ext4d walks the handle's
+  normalized path itself from the root (inode 2), mapping each directory's
+  blocks with the journal code's extent and indirect block map (holes allowed)
+  and scanning their entries. Every directory is read as a linear one, which
+  covers hashed ones too: their index blocks read as unused entries, and their
+  leaves are linear blocks ("Directory Entries" in "Ext4 Disk Layout").
+  Inline-data and encrypted directories are refused (`EOPNOTSUPP`); names match
+  byte for byte, also in case-insensitive directories.
+- **`futimens`** (`Fs::set_times`) follows POSIX: `UTIME_OMIT` for both times
+  changes nothing; `UTIME_NOW` for both (or a null pointer, which relibc sends
+  as that) needs the caller to own the file or have write permission on it;
+  any other times need the caller to own it (`EPERM` otherwise); UID 0 may do
+  all of them. The change time is set to now. `ext4-view` keeps the blocks it
+  has read, so after each change it is loaded again and every open handle's
+  metadata is read again; open files keep reading their contents, which a time
+  change does not touch.
 
 A crash at any write leaves the old times or a journal whose replay gives the
 new ones. The tests crash a change before each of its eight writes and check
@@ -994,6 +1013,11 @@ must then find nothing to fix, on every volume the tests leave. The format
 comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
 "Inode Timestamps" and "Checksums" in "Ext4 Disk Layout", and experiments with
 e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
+`tests/futimens.rs` checks each lookup by its effect (times set on the inode it
+finds are the ones `ext4-view` then reads at that path, and nowhere else),
+including all 200 entries of `basic.ext4`'s hashed `many/` directory and ext3's
+indirect-mapped directories, and checks the permission rules, `UTIME_NOW` and
+`UTIME_OMIT`, a symbolic link's own times, and `e2fsck` on what is left.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;

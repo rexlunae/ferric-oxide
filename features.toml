@@ -1418,7 +1418,7 @@ make_append = { FERRIC_EXT4D_FEATURES = "journal-replay" }
 id = "fs.ext4_write"
 menu = "fs"
 type = "bool"
-title = "Write to ext4 through the journal (first step)"
+title = "Write to ext4 through the journal (times only, so far)"
 default = false
 depends = "fs.ext4_journal_replay"
 rebuild = ["ext4d"]
@@ -1428,14 +1428,16 @@ transaction, logged with descriptor and commit blocks and their checksums,
 committed, then written home and the journal emptied (the checkpoint), so a
 crash at any point leaves the change made in full by a replay, or not at all.
 The only change so far sets an existing inode's access, modification and
-change times, and the scheme does not call it yet: volumes are still served
-read-only. Volumes that need recovery are replayed first, and volumes with a
-feature the writer does not know (mmp, meta_bg, readonly and others) are refused.
+change times, which the scheme's futimens does (with POSIX's owner and
+write-permission rules), finding the inode from the path itself; every other
+change still fails with EROFS. Volumes that need recovery are replayed first;
+volumes with a feature the writer does not know (mmp, meta_bg, readonly and
+others), or with no journal, are served read-only, and ext4d says why.
 
 The writer is checked against e2fsprogs: e2fsck replays and checks what it
 leaves, including volumes crashed part-way through a change. Off, ext4d writes
 only to replay a journal. Source: crates/jbd2 (writer) and
-userspace/ext4d/src/write.rs."""
+userspace/ext4d/src/{write,lookup}.rs."""
 
 [[option.effect]]
 when = "value"
