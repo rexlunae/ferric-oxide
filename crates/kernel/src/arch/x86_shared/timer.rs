@@ -186,6 +186,7 @@ pub fn take_fired() -> bool {
 /// on the BSP, after the APs are up, with interrupts enabled; the PIT keeps
 /// ticking underneath.
 pub fn selftest(token: &mut CleanLockToken) {
+    crate::info!("timer: one-shot selftest entered");
     if !tsc_deadline_supported() {
         crate::info!("timer: one-shot selftest skipped (no TSC-deadline timer)");
         return;
@@ -196,9 +197,11 @@ pub fn selftest(token: &mut CleanLockToken) {
             .map(|rate| rate.get())
             .unwrap_or(0)
     );
+    crate::info!("timer: one-shot selftest: rate ready");
 
     // Round 1: arm for one second, wait for the fire, measure the elapsed
     // monotonic time against the requested deadline.
+    crate::info!("timer: one-shot selftest: arming round 1");
     let start = time::monotonic(token);
     let deadline = Nanos::new(start as u64 + 1_000_000_000);
     match arm(deadline) {

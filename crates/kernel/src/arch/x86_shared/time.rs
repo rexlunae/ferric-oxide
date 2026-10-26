@@ -70,6 +70,7 @@ pub fn tsc_rate() -> Option<TicksPerSecond> {
 /// Measures the invariant TSC's rate against the KVM clock when available,
 /// else the HPET, logging the calibration and a cross-check in ppm.
 fn calibrate_tsc() -> Option<TicksPerSecond> {
+    crate::info!("time: calibrating the invariant tsc against the pvclock");
     if !tsc_invariant() {
         return None;
     }
