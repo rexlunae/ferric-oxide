@@ -17,13 +17,15 @@ crate::interrupt!(wakeup, || {
     // idle (tickless) system nothing may interrupt the halt again: the woken contexts stay
     // `Runnable` in no run queue, requests are never served, and every CPU idles forever
     // (the boot-smoke hang). If this CPU is idling, do the switch right here instead of
-    // returning into the halt. An AP still starting up has no idle context yet, and is not
-    // idling.
-    let internals = &PercpuBlock::current().switch_internals;
-    let idling = internals.has_idle_context()
-        && context::is_current(&internals.idle_context())
-        && !internals.local_wakeup_list.borrow().is_empty();
-    if idling {
+    // returning into the halt.
+    let idle = PercpuBlock::current().switch_internals.idle_context();
+    if context::is_current(&idle)
+        && !PercpuBlock::current()
+            .switch_internals
+            .local_wakeup_list
+            .borrow()
+            .is_empty()
+    {
         let _ = context::switch(&mut token);
     }
 });

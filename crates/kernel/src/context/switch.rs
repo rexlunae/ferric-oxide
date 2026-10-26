@@ -1542,12 +1542,6 @@ impl ContextSwitchPercpu {
         *self.idle_ctxt.borrow_mut() = Some(new);
     }
 
-    /// Ferric Oxide: whether this CPU has its idle context yet. An AP takes interrupts (a
-    /// wake-up IPI among them) during start-up, before `set_idle_context`.
-    pub fn has_idle_context(&self) -> bool {
-        self.idle_ctxt.borrow().is_some()
-    }
-
     /// Retrieves the current idle context.
     pub fn idle_context(&self) -> Ref<'_, Arc<ContextLock>> {
         Ref::map(self.idle_ctxt.borrow(), |opt| {
