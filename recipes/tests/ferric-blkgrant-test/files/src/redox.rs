@@ -505,6 +505,11 @@ fn bench_threads(read: &Disk) -> Result<(), Failure> {
     ];
     let percore = set_policy(read, QueuePolicy::Adaptive)?;
     for threads in BENCH_THREADS {
+        // Diagnostic: the host's counters over 400 ms of idle, the floor under each round's.
+        println!("FERRIC_DIAG round-start policy=idle threads={threads} round=0");
+        std::thread::sleep(Duration::from_millis(400));
+        println!("FERRIC_DIAG round-end policy=idle threads={threads} round=0 iops=0");
+        std::thread::sleep(Duration::from_millis(400));
         // Per policy in POLICIES order, per round.
         let mut samples = [[0_u32; ab::MAX_ROUNDS]; POLICIES.len()];
         let mut rounds = 0;
@@ -564,7 +569,16 @@ fn bench_round_policies(
         if percore {
             set_policy(read, policies[k])?;
         }
+        // Diagnostic markers: the host snapshots KVM and QEMU counters at each.
+        let name = policies[k].name();
+        println!("FERRIC_DIAG round-start policy={name} threads={threads} round={round}");
+        std::thread::sleep(Duration::from_millis(400));
         samples[k][round] = bench_round(read, threads)?;
+        println!(
+            "FERRIC_DIAG round-end policy={name} threads={threads} round={round} iops={}",
+            samples[k][round]
+        );
+        std::thread::sleep(Duration::from_millis(400));
     }
     Ok(())
 }

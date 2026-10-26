@@ -72,7 +72,7 @@ edu=(-device edu,addr=10.0,dma_mask=0xffffffffffffffff)
 
 # The disk and network controllers sit at fixed slots too, so check-iommu-log.sh can
 # find the DMA domains of their drivers by requester ID.
-disk_dev=(-device nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0)
+disk_dev=(-device "nvme,drive=drv0,serial=NVME_SERIAL,addr=4.0${BOOT_NVME_OPTS:+,$BOOT_NVME_OPTS}")
 case "${BOOT_NIC:-e1000}" in
     e1000) net_dev=(-device e1000,netdev=net0,addr=5.0) ;;
     virtio) net_dev=(-device virtio-net-pci,netdev=net0,addr=5.0) ;;
@@ -115,10 +115,10 @@ trap 'rm -f "$disk" "$monitor"' EXIT
 # ends the run at once instead of waiting for the timeout.
 : > "$log"
 qemu-system-x86_64 \
-    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp 4 -m 2048 \
+    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp "${BOOT_SMP:-4}" -m 2048 \
     -bios "$firmware" \
     "${iommu[@]}" \
-    -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
+    -drive file="$disk",format=raw,if=none,id=drv0${BOOT_DRIVE_OPTS:+,$BOOT_DRIVE_OPTS} "${disk_dev[@]}" \
     -netdev user,id=net0 "${net_dev[@]}" \
     "${edu[@]}" \
     "${hda_dev[@]}" \
