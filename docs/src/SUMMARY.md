@@ -1,4 +1,4 @@
-# Ferric Oxide System
+# The Ferric Oxide Book
 
 [Introduction](./introduction.md)
 
@@ -19,17 +19,17 @@
 
 # Introduction
 
-- [Introducing Redox](./introducing-redox.md)
+- [Introducing Ferric Oxide](./introducing-redox.md)
   - [Our Goals](./our-goals.md)
   - [Our Philosophy](./philosophy.md)
-  - [Why a New OS?](./why-a-new-os.md)
+  - [Why Ferric Oxide?](./why-a-new-os.md)
   - [Why Rust?](./why-rust.md)
   - [Use Cases](./redox-use-cases.md)
-  - [Comparing Redox to Other OSes](./how-redox-compares.md)
+  - [Comparing Ferric Oxide to Other OSes](./how-redox-compares.md)
   - [Influences](./influences.md)
   - [Hardware Support](./hardware-support.md)
   - [Important Programs](./important-programs.md)
-  - [Side Projects](./side-projects.md)
+  - [Related Projects](./side-projects.md)
 
 # Architecture and Design
 
