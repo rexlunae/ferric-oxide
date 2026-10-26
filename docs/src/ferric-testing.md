@@ -689,20 +689,7 @@ execution/FUSE feature. On macOS that optional tool requires a libfuse setup;
 the native build and the targeted commands above require neither FUSE nor
 macFUSE.
 
-## Documentation checks
-
-The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
-From `docs/`, run:
-
-```sh
-./unused_pages.sh
-mdbook build
-```
-
-`lychee src` is the book's optional link-checking command. If those tools are
-unavailable, report that limitation and at least check local page links,
-anchors, source paths and table-of-contents coverage. Do not report an unrun
-render or OS boot as successful.
+## Focused regression checks
 
 ### Portable executor core
 
@@ -724,6 +711,14 @@ nvmed's plain, timing-only and timing+percore+DMA configurations for Redox.
 This checks accounting and feature integration; controller timing and idle-burst
 reporting still need an instrumented target boot.
 
+### NVMe request lifetime accounting
+
+`ferric-blkqueue`'s activity tests cover claims surviving inline completion,
+cross-thread worker completion and failed delivery. The existing Redox driver
+builds cover percore, perf and grant-DMA integration. Smoke CI retains the
+serial Adaptive default and its enforced same-boot queue performance gates.
+
+
 ### Profiler CPU wakeup acknowledgements
 
 The host kernel helper suite includes `context/idle.rs`, used by the real
@@ -733,3 +728,18 @@ EOI without reading current-context state. Ordinary idle/running CPU decisions
 and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
+
+## Documentation checks
+
+The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
+From `docs/`, run:
+
+```sh
+./unused_pages.sh
+mdbook build
+```
+
+`lychee src` is the book's optional link-checking command. If those tools are
+unavailable, report that limitation and at least check local page links,
+anchors, source paths and table-of-contents coverage. Do not report an unrun
+render or OS boot as successful.
