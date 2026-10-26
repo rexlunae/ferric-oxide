@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "fatfs",
  "ferric-blocklayer",
+ "ferric-exfat",
  "ferric-fspath",
  "flate2",
  "libredox",
@@ -71,6 +72,14 @@ dependencies = [
 name = "ferric-blocklayer"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "ferric-exfat"
+version = "0.1.0"
+dependencies = [
+ "ferric-blocklayer",
  "thiserror",
 ]
 

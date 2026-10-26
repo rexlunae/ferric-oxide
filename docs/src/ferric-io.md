@@ -1112,7 +1112,7 @@ enters the null namespace and serves in the foreground until it is stopped.
 - **Limits:** FAT has no inode numbers, so `st_ino` is a hash of the stored
   path (`ferric-fspath`, shared with the other daemons); FAT times have no time
   zone and are read as UTC; `st_atime` has only a date; `st_ctime` is the
-  modification time; exFAT is not supported yet.
+  modification time.
 
 The host tests (`userspace/fatd/tests/`) read FAT12, FAT16 and FAT32 images
 that `tests/fixtures/make-fixtures.sh` builds with `mkfs.fat` and `mtools`:
@@ -1121,6 +1121,45 @@ another, a directory over several clusters, deleted entries and a partition
 inside a larger disk. CI also runs them on images the runner's dosfstools and
 mtools make (`FATD_FIXTURES`). `ferric-fat-test` mounts the FAT32 image on the
 target.
+
+### exFAT
+
+With `fs.exfat` (off by default; it needs `fs.fat`), fatd is built with its
+`exfat` Cargo feature and also serves exFAT volumes, the format of SD cards and
+USB sticks over 32 GiB. It looks at the boot sector's file system name: an
+`EXFAT` volume goes to the exFAT reader, everything else to `fatfs`. Without the
+option, fatd refuses an exFAT volume with `EOPNOTSUPP` ("built without exFAT
+support") rather than as a damaged FAT volume.
+
+The reader is `ferric-exfat` (`crates/exfat/`), a `no_std` crate written from
+Microsoft's published "exFAT file system specification" (revision 1.00 of the
+format). No suitable maintained crate existed, and no code comes from Linux or
+other exFAT implementations. It reads through the same `BlockDevice`, so exFAT
+on a partition, on LUKS or on LVM works as FAT does.
+
+- **Checks:** the boot sector's fields and layout, the boot region's checksum
+  (sector 11), the up-case table's checksum, and every directory entry set's
+  checksum. A critical entry type it does not know is an error; benign ones
+  are skipped.
+- **Names** are compared through the volume's own up-case table, as the
+  specification asks; exFAT has no short names. `fpath` gives the names as
+  stored.
+- **Data:** cluster chains are followed through the active FAT, or not at all
+  for files marked `NoFatChain` (one contiguous run). Each open file keeps
+  where its last read ended in the chain, so sequential reads do not walk it
+  from the start. Bytes past a file's valid data length read as zeros.
+- **Times** are kept to 10 ms and converted to UTC with the zone offset exFAT
+  records (as UTC when it records none); unlike FAT, `st_atime` has the time
+  of day.
+- **Free space** for `statvfs` is counted from the allocation bitmap.
+
+`crates/exfat/tests/fixtures/make-fixtures.sh` builds two images (4 KiB and
+512-byte clusters) with `mkfs.exfat` and fills them through a loop mount, with
+the same tree as the FAT images plus a `big.bin` whose clusters are a real FAT
+chain; it checks them with `fsck.exfat`. The crate's own tests and fatd's
+(`tests/exfat.rs`, with `--features exfat`) read them, and CI also runs both on
+fresh images. `ferric-fat-test` mounts the 4 KiB image on the target too, and
+prints `FERRIC_TEST_SKIP exfat` when fatd was built without it.
 
 ## Block layers: LUKS and LVM, read-only
 

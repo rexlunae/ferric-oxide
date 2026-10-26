@@ -5,36 +5,19 @@
 //! date as years since 1980, month and day, and a time as hours, minutes and two-second
 //! units, with an optional count of hundredths of a second for creation times. `fatfs`
 //! decodes the fields into [`fatfs::Date`] and [`fatfs::Time`]; this module turns them into
-//! seconds and nanoseconds since 1970.
+//! seconds and nanoseconds since 1970, with the calendar arithmetic `ferric-exfat` uses for
+//! exFAT's timestamps, which keep FAT's format.
 //!
 //! The specification does not say which time zone the fields are in, and FAT records none.
 //! `fatd` reads them as UTC, as the UEFI firmware and most other readers do.
 
-/// Seconds and nanoseconds since 1970-01-01 00:00 UTC.
-pub type UnixTime = (i64, u32);
-
-/// Days from 1970-01-01 to the given proleptic Gregorian date (negative before it), for a
-/// month in 1..=12. The count of days before each era of 400 years, then of the years,
-/// months and days inside it, with the year starting in March so that leap days fall last.
-const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_from_march = (month + 9) % 12;
-    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
+pub use ferric_exfat::time::UnixTime;
 
 /// The start of `date`, or `None` for a date the fields cannot hold (month 0 or above 12,
 /// day 0): FAT writes zero for "no date", which decodes to 1980-00-00.
 pub fn date(date: fatfs::Date) -> Option<UnixTime> {
-    let (month, day) = (i64::from(date.month), i64::from(date.day));
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let days = days_from_civil(i64::from(date.year), month, day);
-    Some((days * 86_400, 0))
+    let seconds = ferric_exfat::time::from_fields(date.year, date.month, date.day, 0, 0, 0)?;
+    Some((seconds, 0))
 }
 
 /// `date_time` as a Unix time, or `None` when its date is not one ([`date`]). Times past

@@ -1,6 +1,8 @@
 //! `fatd`: a read-only FAT12, FAT16 and FAT32 file system for Ferric Oxide, served as a scheme
 //! the way RedoxFS serves its own (features.toml option `fs.fat`, off by default). It is for
-//! the EFI system partition and for removable media.
+//! the EFI system partition and for removable media. With the Cargo feature `exfat`
+//! (features.toml `fs.exfat`, off by default) it serves exFAT volumes too, read by
+//! [`ferric_exfat`].
 //!
 //! The pieces, from the disk up:
 //!
@@ -11,14 +13,15 @@
 //!   refuses every write, and keeps one chunk so that the allocation table and directories,
 //!   which `fatfs` reads a few bytes at a time, do not cost a disk read each.
 //! - [`fs`]: the open-file table on top of the `fatfs` crate, which reads the format (boot
-//!   sector, allocation tables, cluster chains, long file names). Every call that would change
+//!   sector, allocation tables, cluster chains, long file names), or of `ferric-exfat`. Every call that would change
 //!   the file system fails with [`Error::ReadOnly`] (`EROFS`).
 //! - [`time`]: FAT dates and times as Unix times.
 //! - [`error`]: [`Error`], and the one place it becomes an errno.
 //! - `scheme` (Redox only): the scheme handler, a thin layer from scheme calls to [`fs`].
 //!
 //! Everything but `scheme` runs on the host, so `cargo test` covers it against FAT images
-//! made by `mkfs.fat` and `mtools` (`tests/fixtures/`).
+//! made by `mkfs.fat` and `mtools` (`tests/fixtures/`), and `cargo test --features exfat`
+//! against the exFAT images of `crates/exfat/tests/fixtures/`.
 //!
 //! # Specification
 //!
@@ -26,8 +29,9 @@
 //! Initiative FAT32 File System Specification: FAT: General Overview of On-Disk Format",
 //! version 1.03 (December 2000). [`time`] is written from its "Date and Time Formats"
 //! section, and the case-insensitive name lookup in [`fs`] from its rules for short and long
-//! names. Everything else is read by the `fatfs` crate (MIT). No code here comes from the
-//! Linux kernel.
+//! names. Everything else is read by the `fatfs` crate (MIT). exFAT is read by
+//! `ferric-exfat`, written from Microsoft's "exFAT file system specification". No code here
+//! comes from the Linux kernel.
 //!
 //! # Examples
 //!

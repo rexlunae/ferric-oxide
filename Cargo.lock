@@ -1373,6 +1373,15 @@ name = "ferric-elfreloc"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-exfat"
+version = "0.1.0"
+dependencies = [
+ "ferric-blocklayer",
+ "flate2",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-fspath"
 version = "0.1.0"
 
