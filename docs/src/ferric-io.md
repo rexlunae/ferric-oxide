@@ -1138,18 +1138,15 @@ device) and serves in the foreground until it is stopped.
 - **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
   serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
   [Block layers](#block-layers-luks-and-lvm-read-only)).
-- **Times:** `ext4-view` exposes neither inode numbers nor change times, so
-  ext4d finds each handle's inode at open itself (`ext4d::lookup`, below) and
-  `fstat` reads `st_atime`, `st_mtime` and `st_ctime` from one read of it
-  (`i_atime`, `i_mtime`, `i_ctime`, each with its `_extra` field's epoch bits
-  and nanoseconds). Where the inode cannot be found (a path through an
-  inline-data or encrypted directory) it reports `ext4-view`'s times, with the
-  modification time as the change time. On a volume that needs recovery the
-  lookup and the inode read go through the committed journal blocks in place
-  of their home blocks (`ext4d::journal::committed_blocks`). `ext4-view` reads
-  through its own in-memory view of the journal, which as of 1.0.0 does not
-  follow a log that wraps round and then serves the older inode; taking all
-  three times from ext4d's read keeps `fstat` from mixing the two versions.
+- **Change times:** `ext4-view` exposes neither inode numbers nor change
+  times, so ext4d finds each handle's inode at open itself (`ext4d::lookup`,
+  below) and `fstat` reads `st_ctime` from it (`i_ctime` with
+  `i_ctime_extra`'s epoch bits and nanoseconds). Where the inode cannot be
+  found (a path through an inline-data or encrypted directory) it reports the
+  modification time instead. Both read the same device, which on a volume
+  that needs recovery is the volume as its replay would leave it (see
+  [Journal replay](#journal-replay)), so they always read the same copy of
+  the inode.
 - **Limits:** `st_ino` is a hash of the path (hard links get different
   numbers); `mmap` is not served; encrypted files and devices are refused
   (`EOPNOTSUPP`).
@@ -1158,12 +1155,28 @@ device) and serves in the foreground until it is stopped.
 
 A volume that was not cleanly unmounted has `needs_recovery` set: its journal
 holds committed transactions that may not have reached their home blocks.
-Without help, ext4d reads it through `ext4-view`'s view of the journal in
-memory, which is enough for most volumes but not all: as of `ext4-view` 1.0.0
-it refuses a journal that holds an escaped block (one whose data starts with
-the JBD2 magic number), and on a log that wraps round from the end of the
-journal to its start it ignores the committed transactions and serves the old
-contents. The tests pin both behaviours down.
+Without `fs.ext4_journal_replay`, ext4d reads it as the replay would leave
+it, without writing: `ext4d::journal::replayed_blocks` works out in memory
+every block the replay would write (each committed block, checked as the
+replay checks it, and the volume superblock with `needs_recovery` cleared),
+and every read, `ext4-view`'s and ext4d's own, sees those blocks in place of
+their home blocks. Free-space and inode counts reported by `statvfs`
+come from this same overlaid superblock; the recovery diagnostic still
+reports the physical device's original flag, since a read-only mount does
+not replay onto disk. Recovery-flag edits and their checksum use a generated
+`simple_endian` superblock wire layout, checked against a known-good fixture.
+Even an empty journal needs the superblock overlay when
+`needs_recovery` is set; `tests/unreplayed.rs` checks this for 1 KiB and 4 KiB
+blocks and verifies that the underlying image stays unchanged. `ext4-view`
+then finds a clean volume and does not use its
+own view of the journal, which as of 1.0.0 refuses a journal that holds an
+escaped block (one whose data starts with the JBD2 magic number) and, on a
+log that wraps round from the end of the journal to its start, ignores the
+committed transactions and serves the old contents. `tests/unreplayed.rs`
+pins `ext4-view`'s behaviour down, and checks that every file, its contents
+and its metadata on each journal fixture match `e2fsck`'s replay of it. If
+the journal cannot be read (a damaged block, an external journal), the
+volume is given to `ext4-view` as it is and the reason is logged.
 
 `fs.ext4_journal_replay` (default off, needs `fs.ext4`; Cargo feature
 `journal-replay`) has ext4d replay the journal onto the disk before it serves

@@ -365,26 +365,56 @@ impl<W: crate::device::ReadAt> Ext4Read for Shared<W> {
     }
 }
 
-/// The device read as `ext4-view` reads it: on a volume that needs recovery, with the
-/// committed journal blocks in place of their home blocks (`journal::committed_blocks`),
-/// since `ext4-view` overlays them too and its metadata would otherwise disagree with what
-/// is read here.
+/// `ext4-view`'s reader of a volume that needs recovery: the device with [`Raw`]'s replayed
+/// blocks in place of their home blocks.
+struct Replayed<R> {
+    device: Rc<RefCell<crate::device::Window<R>>>,
+    blocks: Rc<BTreeMap<u64, Vec<u8>>>,
+    block_size: u64,
+}
+
+impl<R: crate::device::ReadAt> Ext4Read for Replayed<R> {
+    fn read(
+        &mut self,
+        start_byte: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Box<dyn core::error::Error + Send + Sync + 'static>> {
+        use crate::device::ReadAt;
+
+        let device = self.device.try_borrow()?;
+        let overlaid = crate::journal::Overlaid {
+            window: &device,
+            blocks: &self.blocks,
+            block_size: self.block_size,
+        };
+        Ok(overlaid.read_exact_at(dst, start_byte)?)
+    }
+}
+
+/// The device as a replay would leave it. On a volume that needs recovery, the blocks the
+/// replay would write (`journal::replayed_blocks`: the committed journal blocks, and the
+/// superblock with `needs_recovery` cleared) are read in place of their home blocks, by
+/// `ext4-view` and by ext4d's own reads alike, so they agree. `ext4-view` then sees a clean
+/// volume and leaves its own view of the journal alone, which as of 1.0.0 refuses a journal
+/// with an escaped block and does not follow a log that wraps round.
 struct Raw<R> {
     device: Rc<RefCell<crate::device::Window<R>>>,
-    /// The committed journal blocks, or `None` when they could not be read; each read then
-    /// tries again, to return the error.
-    overlay: Option<BTreeMap<u64, Vec<u8>>>,
+    /// The replayed blocks (shared with `ext4-view`'s reader), or `None` when they could not
+    /// be read: `ext4-view` then reads the device as it is, with its own view of the
+    /// journal, and each of ext4d's reads tries again, to return the error.
+    overlay: Option<Rc<BTreeMap<u64, Vec<u8>>>>,
     block_size: u64,
 }
 
 impl<R: crate::device::ReadAt> Raw<R> {
     /// The device, with its overlay read now.
     fn new(device: Rc<RefCell<crate::device::Window<R>>>, block_size: u32) -> Self {
-        let overlay = crate::journal::committed_blocks(&device.borrow())
+        let overlay = crate::journal::replayed_blocks(&device.borrow())
             .inspect_err(|err| {
                 log::warn!("cannot read the journal's committed blocks: {err}");
             })
-            .ok();
+            .ok()
+            .map(Rc::new);
         Self {
             device,
             overlay,
@@ -404,7 +434,7 @@ impl<R: crate::device::ReadAt> Raw<R> {
         let blocks = match &self.overlay {
             Some(blocks) => blocks,
             None => {
-                fresh = crate::journal::committed_blocks(&device)?;
+                fresh = crate::journal::replayed_blocks(&device)?;
                 &fresh
             }
         };
@@ -421,7 +451,14 @@ impl<R: crate::device::ReadAt> Raw<R> {
 
 impl<R: crate::device::ReadAt + 'static> Device for Raw<R> {
     fn reader(&self) -> Box<dyn Ext4Read> {
-        Box::new(Shared(Rc::clone(&self.device)))
+        match &self.overlay {
+            Some(blocks) if !blocks.is_empty() => Box::new(Replayed {
+                device: Rc::clone(&self.device),
+                blocks: Rc::clone(blocks),
+                block_size: self.block_size,
+            }),
+            _ => Box::new(Shared(Rc::clone(&self.device))),
+        }
     }
 
     fn inode_of(&self, path: &str) -> Result<u32, crate::lookup::LookupError> {
@@ -462,19 +499,33 @@ impl Fs {
     /// [`Error::Device`] when the superblock cannot be read, [`Error::Superblock`] when it is
     /// not an ext4 one, and [`Error::Ext4`] when the reader refuses the volume (an
     /// incompatible feature, a bad checksum, a journal it cannot replay).
+    /// [`Error::Lookup`] reports a failure reading the recovered superblock.
     pub fn new<R: crate::device::ReadAt + 'static>(
         device: crate::device::Window<R>,
     ) -> Result<Self, Error> {
         let sb = read_superblock(&device)?;
         let block_size = Geometry::parse(&sb)?.block_size;
         let raw = Raw::new(Rc::new(RefCell::new(device)), block_size);
-        Self::load(&sb, Box::new(raw))
+        let visible_sb = if raw
+            .overlay
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+        {
+            raw.read(|window| Ok(crate::journal::read_volume_superblock(window)?))?
+        } else {
+            sb
+        };
+        Self::load(&visible_sb, superblock::needs_recovery(&sb), Box::new(raw))
     }
 
-    /// The volume whose superblock is `sb`, read through `device`.
-    fn load(sb: &[u8; superblock::SIZE], device: Box<dyn Device>) -> Result<Self, Error> {
+    /// Use the reader-visible superblock for geometry, and the physical device's
+    /// recovery flag for diagnostics: a read-only overlay does not clean the device.
+    fn load(
+        sb: &[u8; superblock::SIZE],
+        needs_recovery: bool,
+        device: Box<dyn Device>,
+    ) -> Result<Self, Error> {
         let geometry = Geometry::parse(sb)?;
-        let needs_recovery = superblock::needs_recovery(sb);
         let ext4 = Ext4::load(device.reader())?;
         Ok(Self {
             ext4,
@@ -508,7 +559,7 @@ impl Fs {
         let block_size = Geometry::parse(&sb)?.block_size;
         // A writable volume never needs recovery (check_writable), so its overlay is empty.
         let raw = Raw::new(Rc::clone(&device), block_size);
-        let mut fs = Self::load(&sb, Box::new(raw))?;
+        let mut fs = Self::load(&sb, superblock::needs_recovery(&sb), Box::new(raw))?;
         fs.writer = Some(Box::new(device));
         Ok(fs)
     }
@@ -580,8 +631,8 @@ impl Fs {
     }
 
     /// Whether the volume's journal still needed replaying when it was mounted: it is then
-    /// read through `ext4-view`'s in-memory view of the journal, which does not handle every
-    /// journal (see `journal`, features.toml `fs.ext4_journal_replay`).
+    /// read as the replay would leave it, without writing (`crate::journal::replayed_blocks`;
+    /// features.toml `fs.ext4_journal_replay` replays it onto the disk instead).
     pub const fn needs_recovery(&self) -> bool {
         self.needs_recovery
     }
@@ -778,12 +829,11 @@ impl Fs {
         Ok(entries.as_deref().unwrap_or_default())
     }
 
-    /// The attributes of the file `id` names. Most come from `ext4-view`. The times are read
-    /// from the inode itself, all three from one read, because `ext4-view` does not expose
-    /// the change time and, on a volume whose journal it does not follow (a wrapped log), can
-    /// serve an older copy of the inode than the one the journal holds; taking some times from
-    /// each would mix two versions. When the inode could not be found or read (logged), the
-    /// times are `ext4-view`'s, with the modification time as the change time.
+    /// The attributes of the file `id` names. They come from `ext4-view`, except the change
+    /// time, which it does not expose: that is read from the inode itself, and is the
+    /// modification time instead when the inode could not be found or read (logged). Both
+    /// read the same device, with a volume that needs recovery seen as its replay would
+    /// leave it (`crate::journal::replayed_blocks`), so they agree on which copy of the inode they read.
     ///
     /// # Errors
     ///
@@ -793,7 +843,6 @@ impl Fs {
         let m = &handle.metadata;
         let time = |t: ext4_view::Timestamp| (t.seconds(), t.nanoseconds());
         let kind = Kind::from(m.file_type());
-        let times = self.inode_times(handle);
         Ok(Attributes {
             ino: path_ino(&handle.path),
             mode: kind.mode_bits() | m.mode(),
@@ -802,9 +851,11 @@ impl Fs {
             gid: m.gid(),
             size: m.len(),
             block_size: self.geometry.block_size,
-            accessed: times.map_or(time(m.accessed()), |t| t.accessed),
-            modified: times.map_or(time(m.modified()), |t| t.modified),
-            changed: times.map_or(time(m.modified()), |t| t.changed),
+            accessed: time(m.accessed()),
+            modified: time(m.modified()),
+            changed: self
+                .inode_times(handle)
+                .map_or(time(m.modified()), |t| t.changed),
         })
     }
 

@@ -118,6 +118,10 @@ gzip -9 -n -c "$img" > "$out/dir-64k.ext4.gz"
 # so that the commit block wraps round. ext4-view does not follow it, so a read-only mount
 # must read all of the inode's times one way.
 #
+# journal-wrap-space: a wrapped version 3 journal that allocates allocated.txt. Every
+# changed block from debugfs's allocation is logged, including the volume superblock's
+# free-block and free-inode counts. The physical superblock retains the old counts.
+#
 # The jbd2 crate's tests use the journal inodes of journal-v3, journal-v2 and journal-ext3
 # (crates/jbd2/tests/fixtures/*.jbd2.gz, written here too when that directory is given as $2).
 journal_image() {
@@ -239,8 +243,32 @@ printf 'jo -c -v 3\njw -b %s %s\njc\n' "$itable" "$work/itable" > "$work/journal
 E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -f "$work/journal.cmd" "$img" >/dev/null 2>&1
 wrap_log "$img" 2
 
+# Log a real file allocation, including all of its data and metadata changes, while
+# leaving their original home blocks in place until the reference replay.
+img=$work/journal-wrap-space.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a60 -E root_owner=0:0 -d "$jroot" "$img" 2M
+cp "$img" "$work/space.changed.ext4"
+printf 'recovered allocation\n' > "$work/space.txt"
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -R \
+    "write $work/space.txt /allocated.txt" "$work/space.changed.ext4" >/dev/null 2>&1
+python3 - "$img" "$work/space.changed.ext4" "$work" <<'EOPY'
+import pathlib, sys
+before, after = [pathlib.Path(p).read_bytes() for p in sys.argv[1:3]]
+work = pathlib.Path(sys.argv[3])
+blocks = [i for i in range(len(before) // 1024)
+          if before[i * 1024:(i + 1) * 1024] != after[i * 1024:(i + 1) * 1024]]
+assert 1 in blocks, "allocation must change the volume superblock"
+(work / "space.blocks").write_text(",".join(map(str, blocks)))
+(work / "space.payload").write_bytes(b"".join(after[i * 1024:(i + 1) * 1024] for i in blocks))
+EOPY
+blocks=$(cat "$work/space.blocks")
+printf 'jo -c -v 3\njw -b %s %s\njc\n' "$blocks" "$work/space.payload" > "$work/journal.cmd"
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -f "$work/journal.cmd" "$img" >/dev/null 2>&1
+wrap_log "$img" 2
+
 for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-wrap \
-    journal-wrap-inode; do
+    journal-wrap-inode journal-wrap-space; do
     replayed "$name"
 done
 

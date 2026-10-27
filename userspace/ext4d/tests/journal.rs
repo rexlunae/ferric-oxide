@@ -96,23 +96,6 @@ fn the_replayed_volume_mounts_with_the_journaled_contents() {
     }
 }
 
-/// What ext4-view's in-memory view of the journal (all a read-only mount has) makes of
-/// these volumes, as of ext4-view 1.0.0: it refuses a journal with an escaped block, which
-/// every volume here logs, and does not follow a log that wraps round, so it serves
-/// journal-wrap's hello.txt as it was before the journal. The replay serves both right.
-#[test]
-fn without_the_replay_the_reader_cannot_serve_these_volumes() {
-    for name in NAMES {
-        let image = load(&format!("{name}.ext4.gz"));
-        if name == "journal-wrap" {
-            assert_eq!(hello(image), b"hello from ext4\n", "{name}: stale");
-            continue;
-        }
-        let result = Fs::new(Window::whole(image).expect("its length"));
-        assert!(matches!(result, Err(ext4d::Error::Ext4(_))), "{name}");
-    }
-}
-
 /// journal-wrap-inode's one transaction logs an inode table block, with its commit block
 /// wrapped round to the start of the log.
 #[test]
@@ -128,6 +111,46 @@ fn a_wrapped_inode_table_block_replays_like_e2fsck() {
         }
     );
     assert_same_blocks(name, &ours, &load(&format!("{name}.replayed.ext4.gz")));
+}
+
+/// `replayed_blocks`, the read-only mount's view, is the replay without its writes: laid
+/// over the volume, it gives what the replay writes, except the journal superblock (the
+/// replay empties the journal; the view leaves it, as a clean volume superblock means no
+/// reader looks at it).
+#[test]
+fn the_replayed_blocks_are_what_the_replay_writes() {
+    for name in NAMES.into_iter().chain(["journal-wrap-inode"]) {
+        let image = load(&format!("{name}.ext4.gz"));
+        let window = Window::whole(image.clone()).expect("its length");
+        let blocks = journal::replayed_blocks(&window).expect("readable");
+        let block_size = 1024usize << le32(&image, 1024 + 0x18);
+        let mut view = image.clone();
+        for (block, contents) in &blocks {
+            let at = usize::try_from(*block).expect("fits") * block_size;
+            view[at..at + block_size].copy_from_slice(contents);
+        }
+        let (outcome, ours) = replay(image);
+        outcome.expect("replayed");
+        let differ: Vec<&[u8]> = view
+            .chunks(block_size)
+            .zip(ours.chunks(block_size))
+            .filter(|(a, b)| a != b)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(differ.len(), 1, "{name}");
+        assert_eq!(
+            differ[0][..4],
+            0xC03B_3998_u32.to_be_bytes(),
+            "{name}: the journal superblock"
+        );
+        let clean = Window::whole(load(&format!("{name}.replayed.ext4.gz"))).expect("its length");
+        assert!(
+            journal::replayed_blocks(&clean)
+                .expect("readable")
+                .is_empty(),
+            "{name}"
+        );
+    }
 }
 
 #[test]
