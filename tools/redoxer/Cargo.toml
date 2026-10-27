@@ -40,3 +40,6 @@ cli-exec = [
 [dev-dependencies]
 fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
 tempfile.workspace = true
+# Lays out sysroots the way an earlier, pkg-based redoxer did.
+pkgar.workspace = true
+pkgar-keys.workspace = true

@@ -22,26 +22,32 @@ enum PkgCommand {
     Remove,
 }
 
-/// A repository over the cookbook's built packages, trusting its key.
-fn cookbook_repository(cookbook: &Path) -> anyhow::Result<LocalRepository> {
+/// The cookbook's signing key, the one its packages are trusted under.
+fn cookbook_keys(cookbook: &Path) -> anyhow::Result<fox_core::TrustedKeys> {
     let key_path = cookbook.join(fox_core::cookbook::PUBLIC_KEY);
     let key = fox_core::keys::load_key_file(&key_path)?;
     let mut keys = fox_core::TrustedKeys::new();
     keys.insert(fox_core::keys::COOKBOOK_LABEL, key.key);
+    Ok(keys)
+}
+
+/// A repository over the cookbook's built packages, trusting its key.
+fn cookbook_repository(cookbook: &Path) -> anyhow::Result<LocalRepository> {
     Ok(LocalRepository::new(
         cookbook.join("repo").join(target()),
-        keys,
+        cookbook_keys(cookbook)?,
     ))
 }
 
 fn pkg_inner(
     sysroot: &Path,
-    cookbook: impl FnOnce() -> anyhow::Result<PathBuf>,
+    cookbook: impl Fn() -> anyhow::Result<PathBuf>,
     cmd: PkgCommand,
     pkgs: Vec<PackageName>,
 ) -> anyhow::Result<()> {
     pkg_dir_init(sysroot).context("Initializing package sysroot")?;
     let store = fox_store::Store::open(sysroot)?;
+    adopt_pkg_sysroot(&store, &pkgs, &cookbook)?;
     match cmd {
         PkgCommand::Install => {
             let mut repository = cookbook_repository(&cookbook()?)?;
@@ -80,6 +86,43 @@ fn pkg_inner(
             Ok(())
         }
     }
+}
+
+/// Adopts the packages an earlier redoxer installed with `pkg`, so that fox
+/// can update and remove them. Only runs while one of `pkgs` is listed in
+/// `pkg`'s state but not recorded by fox, so other sysroots need no cookbook
+/// to remove packages.
+fn adopt_pkg_sysroot(
+    store: &fox_store::Store,
+    pkgs: &[PackageName],
+    cookbook: &impl Fn() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<()> {
+    if !store.root().join(fox_store::PKG_STATE).is_file() {
+        return Ok(());
+    }
+    let mut unrecorded = false;
+    for name in pkgs {
+        unrecorded |= store.get(name)?.is_none();
+    }
+    if !unrecorded {
+        return Ok(());
+    }
+    let keys = cookbook_keys(&cookbook()?)?;
+    let options = fox_store::AdoptOptions {
+        allow_unsigned_metadata: true,
+        ..fox_store::AdoptOptions::default()
+    };
+    let report = store.adopt_pkg(&keys, options)?;
+    for package in &report.adopted {
+        println!("redoxer pkg: adopted {} {}", package.name, package.version);
+    }
+    for skipped in &report.skipped {
+        eprintln!(
+            "redoxer pkg: not adopting {}: {}",
+            skipped.name, skipped.reason
+        );
+    }
+    Ok(())
 }
 
 /// Installs `requested` and the dependencies they lack from `repository`.
@@ -288,6 +331,51 @@ mod tests {
         run(root, cookbook.path(), PkgCommand::Update, &["lib"]).unwrap();
         assert!(root.join("usr/lib/libnew.a").is_file());
         assert_eq!(installed(root), names(&["lib", "libnew"]));
+    }
+
+    /// Installs `name` from the cookbook the way `pkg` did: extract it, keep
+    /// its head and list it in `pkg`'s state, with no fox record.
+    fn pkg_install(root: &Path, cookbook: &Path, key: &FixtureKey, name: &str) {
+        let archive = cookbook
+            .join("repo")
+            .join(target())
+            .join(format!("{name}.pkgar"));
+        pkgar::extract(&key.public_path, &archive, root).unwrap();
+        let pkey = pkgar_keys::PublicKeyFile::open(&key.public_path)
+            .unwrap()
+            .pkey;
+        let heads = root.join(fox_store::PKG_HEADS_DIR);
+        fs::create_dir_all(&heads).unwrap();
+        pkgar::PackageFile::new(&archive, &pkey)
+            .unwrap()
+            .split(heads.join(format!("{name}.pkgar_head")), None::<&Path>)
+            .unwrap();
+        let state = root.join(fox_store::PKG_STATE);
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        let mut text = fs::read_to_string(&state).unwrap_or_default();
+        text.push_str(&format!(
+            "[installed.{name:?}]\nremote = \"local\"\nblake3 = \"\"\nmanual = true\ndependencies = []\n"
+        ));
+        fs::write(state, text).unwrap();
+    }
+
+    #[test]
+    fn sysroots_populated_by_pkg_are_adopted() {
+        let (cookbook, key) = cookbook();
+        let sysroot = tempfile::tempdir().unwrap();
+        let root = sysroot.path();
+        pkg_dir_init(root).unwrap();
+        pkg_install(root, cookbook.path(), &key, "lib");
+        pkg_install(root, cookbook.path(), &key, "app");
+
+        run(root, cookbook.path(), PkgCommand::Update, &["lib"]).unwrap();
+        assert_eq!(installed(root), names(&["app", "lib"]));
+        run(root, cookbook.path(), PkgCommand::Remove, &["app"]).unwrap();
+        assert!(!root.join("usr/include/app.h").exists());
+
+        let no_cookbook = || anyhow::bail!("no cookbook");
+        pkg_inner(root, no_cookbook, PkgCommand::Remove, names(&["lib"])).unwrap();
+        assert!(installed(root).is_empty(), "adoption runs once");
     }
 
     #[test]

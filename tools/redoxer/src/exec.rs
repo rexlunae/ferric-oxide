@@ -256,11 +256,13 @@ fn base(
     let has_orbital = config.packages.contains_key("orbital");
 
     // The image depends on its configuration and on the packages it is
-    // built from, so either changing rebuilds it.
-    let stamp =
-        cookbook_stamp(cookbook, |_| true).context("unable to read the cookbook's repository")?;
+    // built from, so either changing rebuilds it. The repository index is
+    // rewritten on every publish, so it is left out. A FUSE build starts
+    // from an existing tar image, so a stale one goes too.
+    let stamp = cookbook_stamp(cookbook, |name| name != "repo.toml")
+        .context("unable to read the cookbook's repository")?;
     let stamp = format!("{config_str}\n# {stamp}");
-    clear_stale(name, &base_toml, &stamp, &[&base_file])?;
+    clear_stale(name, &base_toml, &stamp, &[&base_file, &base_tar])?;
     if !base_file.is_file() {
         eprintln!("redoxer: building {name}");
 

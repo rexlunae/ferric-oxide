@@ -4453,6 +4453,8 @@ dependencies = [
  "fox-store",
  "fuser",
  "libc",
+ "pkgar 0.2.4",
+ "pkgar-keys 0.2.4",
  "proc-mounts",
  "redox_installer",
  "redox_syscall 0.9.4",
