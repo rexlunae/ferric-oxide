@@ -1,5 +1,6 @@
 # Ferric Oxide: ferric-blockd, the read-only block-layer daemon that serves LUKS volumes and
-# LVM logical volumes as a scheme (features.toml fs.luks and fs.lvm, off by default). It
+# LVM logical volumes as a scheme (features.toml fs.luks and fs.lvm, off by default), and with
+# fs.unlock_at_boot ferric-unlock and its init unit, which unlock /etc/ferric/crypttab at boot. It
 # lives in this repository at userspace/blockd/; as a path source (relative to the
 # repository root), edits there rebuild it.
 [source]
@@ -14,5 +15,13 @@ script = """
 ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
 # fs.luks and fs.lvm each add their layer to FERRIC_BLOCKD_FEATURES; built by name without a
 # ferric.toml (as the smoke image is), the daemon has both.
-cookbook_cargo --no-default-features --features "${FERRIC_BLOCKD_FEATURES:-luks lvm}"
+features="${FERRIC_BLOCKD_FEATURES:-luks lvm}"
+cookbook_cargo --no-default-features --features "${features}"
+# fs.unlock_at_boot adds "unlock", which builds ferric-unlock; init runs it from this unit.
+case " ${features} " in
+*" unlock "*)
+    mkdir -p "${COOKBOOK_STAGE}/usr/lib/init.d"
+    cp "${COOKBOOK_RECIPE}/05_ferric-unlock.service" "${COOKBOOK_STAGE}/usr/lib/init.d/"
+    ;;
+esac
 """

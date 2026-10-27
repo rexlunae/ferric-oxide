@@ -117,9 +117,11 @@ jobs:
           # default) is in, so ferric-ext4-test mounts its ext4 image, with the journal replay
           # (fs.ext4_journal_replay, also off by default), so it also mounts one that needs
           # recovery, and so is ferric-blockd with both its layers (fs.luks and fs.lvm, off by
-          # default), so ferric-blocklayer-test serves its LUKS and LVM images, and so is fatd
-          # (fs.fat, off by default), so ferric-fat-test mounts its FAT32 image.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nfat = true\n' > "$out/ferric.toml"
+          # default), so ferric-blocklayer-test serves its LUKS and LVM images, and with
+          # ferric-unlock (fs.unlock_at_boot, also off by default), so that test also reads back
+          # the volumes its crypttab had unlocked and mounted at boot.
+          # fatd (fs.fat) also mounts its FAT32 fixture.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nunlock_at_boot = true\nfat = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc, initfs and ext4d features,
@@ -582,14 +584,15 @@ jobs:
           echo "::notice::ferric-fat-test passed all 6 steps"
 
       # fs.luks and fs.lvm are on, so ferric-blocklayer-test serves LVM on LUKS (4 KiB
-      # sectors), LUKS on LVM and LUKS1 with ferric-blockd and runs every step.
+      # sectors), LUKS on LVM and LUKS1 with ferric-blockd and runs every step; fs.unlock_at_boot
+      # is on too, so ferric-unlock has served the test's crypttab at boot (unlock-boot).
       - name: Check the block layer
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: |
-          for step in image lvm-on-luks luks-on-lvm luks1 erofs access refuse; do
+          for step in image lvm-on-luks luks-on-lvm luks1 erofs access refuse unlock-boot; do
             grep -aF "FERRIC_TEST_PASS blocklayer-$step" "$LOG"
           done
-          echo "::notice::ferric-blocklayer-test passed all 7 steps"
+          echo "::notice::ferric-blocklayer-test passed all 8 steps"
 
       - name: Check the IOMMU
         # The kernel's attach, bind, fault and release lines, the test driver's results, and

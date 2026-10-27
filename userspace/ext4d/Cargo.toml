@@ -44,6 +44,8 @@ thiserror = "2.0.17"
 flate2 = "1"
 
 [target.'cfg(target_os = "redox")'.dependencies]
+# The readiness handshake with ferric-unlock (fs.unlock_at_boot).
+ferric-ready = { path = "../../crates/ready" }
 libredox = "0.1.25"
 redox-scheme = "0.11.4"
 

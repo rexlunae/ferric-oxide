@@ -1435,6 +1435,30 @@ source_packages = ["ferric-blockd"]
 make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
 
 [[option]]
+id = "fs.unlock_at_boot"
+menu = "fs"
+type = "bool"
+title = "Unlock LUKS and LVM volumes at boot (ferric-unlock)"
+default = false
+depends = "fs.luks || fs.lvm"
+rebuild = ["ferric-blockd"]
+help = """
+Add ferric-unlock to ferric-blockd's package, and the init unit
+05_ferric-unlock.service that runs it once at boot, before the services
+numbered 10 and up. It reads /etc/ferric/crypttab, one volume per line:
+`NAME STEP... [ext4:SCHEME]`, with the steps ferric-blockd takes (dev:,
+slice:, luks:KEYFILE, lvm:NAME). For each line it starts ferric-blockd to
+serve /scheme/NAME, waits for it, and with `ext4:SCHEME` has ext4d (fs.ext4)
+mount the volume at /scheme/SCHEME. LUKS passphrases come from key files; there
+is no prompt. RedoxFS cannot be mounted this way, because ferric-blockd serves
+volumes read-only. With no crypttab it does nothing. Source:
+userspace/blockd (crypttab.rs, unlock.rs)."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BLOCKD_FEATURES = "unlock" }
+
+[[option]]
 id = "fs.ext4_journal_replay"
 menu = "fs"
 type = "bool"
