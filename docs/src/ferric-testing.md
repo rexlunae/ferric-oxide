@@ -288,7 +288,7 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
 | `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
-| `ferric-aslr-test` | Address variation between program executions |
+| `ferric-aslr-test` | Sparse 32 GiB virtual reservation after exec, and address variation between executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
@@ -452,8 +452,14 @@ This turns the intermittent boot in
 labelled failure. The investigation in
 [#300](https://github.com/rexlunae/ferric-oxide/issues/300) connects a reproduced
 empty audio-scheme capture to a loader `ENOMEM`, and the original #222 `/tmp`
-failures to `mkdir` failing in the loader. Their underlying loader failure
-remains open.
+failures to `mkdir` failing in the loader. The reproduced mapping failure comes
+from exec raising its mmap floor to the argument/environment buffer above the
+randomized stack. Exec now keeps the floor
+at the ELF image spans; `ferric-aslr-test` rejects this failure deterministically
+with an uncommitted 32 GiB reservation. Repeated Linux KVM boot validation remains
+required; the earlier opaque `NotFound` and executor-interruption reports are not
+assumed to share this cause.
+
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
 `fstat`, or `mmap`, including the requested mapping length), or the search paths
@@ -463,7 +469,8 @@ occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
 or TLS failure cannot reuse an earlier search diagnostic. The host check
 `bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual object search,
-mapping ownership, error, fatal-message formatter and errno modules. It checks candidate order,
+mapping ownership, error, fatal-message formatter and errno modules. It checks
+candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
 output, isolation from a later parse/TLS failure, stable `dlerror` messages,
 and descriptor cleanup after failed stat/map operations. File descriptors are
