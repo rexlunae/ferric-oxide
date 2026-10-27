@@ -1,5 +1,13 @@
 # Testing
 
+Ferric Oxide's checks are described in [Validation and Debugging](./ferric-testing.md):
+host unit and integration tests, Miri, the kernel lint ratchet, image boots
+with the smoke-test profile, syscall fuzzing, tracing overhead budgets and the
+documentation checks, along with how to reproduce each CI job locally. Start
+there. This page covers the general habits and the in-guest test suites
+inherited from Redox (`acid`, `relibc-tests`, `os-test`), which are still
+built through the Make recipe commands shown below.
+
 - [Manual Test Suite Execution](#manual-test-suite-execution)
 - [Test Images](#test-images)
 
@@ -11,15 +19,15 @@
 
 - The real hardware testing is bigger than QEMU testing and thus detect more bugs.
 
-- The test suites can be executed in an automated way by running the `make rp.auto-test,--with-package-deps qemu` command from the build system and running the `auto-test` command inside of Redox (testing on real hardware is more rich and thus can have different results compared to QEMU).
+- The test suites can be executed in an automated way by running the `make rp.auto-test,--with-package-deps qemu` command from the build system and running the `auto-test` command inside the guest (testing on real hardware is more rich and thus can have different results compared to QEMU).
 
 ## Manual Test Suite Execution
 
 ### acid
 
-[acid](https://gitlab.redox-os.org/redox-os/acid) is the smallest test suite on Redox (quickest way to test), to use it run the following commands:
+[acid](https://gitlab.redox-os.org/redox-os/acid) is the smallest test suite (quickest way to test), to use it run the following commands:
 
-- Install the `acid` source to the Redox image, launch QEMU and go to `acid` directory
+- Install the `acid` source to the image, launch QEMU and go to `acid` directory
 
 ```
 make rp.acid qemu
@@ -55,7 +63,7 @@ cargo bench benchmark-name
 
 Or if you don't want to install Cargo:
 
-- Install the `acid` binary to the Redox image and launch QEMU
+- Install the `acid` binary to the image and launch QEMU
 
 ```
 make crp.acid-bins qemu
@@ -69,9 +77,9 @@ acid test-name
 
 ### relibc-tests
 
-[relibc-tests](https://gitlab.redox-os.org/redox-os/relibc/-/tree/master/tests) is the second most rich test suite in Redox and is used to complement the `acid` test suite (test faster than the `os-test` test suite), to use it run the following commands:
+[relibc-tests](https://gitlab.redox-os.org/redox-os/relibc/-/tree/master/tests) is the second most complete test suite and is used to complement the `acid` test suite (test faster than the `os-test` test suite), to use it run the following commands:
 
-- Install the `relibc-tests` binaries to the Redox image, launch QEMU and go to `relibc-tests` directory
+- Install the `relibc-tests` binaries to the image, launch QEMU and go to `relibc-tests` directory
 
 ```
 make rp.relibc-tests-bins qemu
@@ -95,7 +103,7 @@ make run-once TESTBIN=test-name
 
 Or if you also want to build from source for more testing:
 
-- Install the `relibc-tests` binaries to the Redox image, launch QEMU and go to `relibc-tests` directory
+- Install the `relibc-tests` binaries to the image, launch QEMU and go to `relibc-tests` directory
 
 ```
 make rp.relibc-tests qemu
@@ -115,7 +123,7 @@ relibc-tests/check.sh --host --test=test-dir/test-name
 
 The [os-test](https://sortix.org/os-test/) test suite has the largest number of tests and is the recommended method to test the system (but take more time to test), to use it run the following commands:
 
-- Install the `os-test` binaries to the Redox image, launch QEMU and go to `os-test` directory
+- Install the `os-test` binaries to the image, launch QEMU and go to `os-test` directory
 
 ```
 make crp.os-test-bins qemu
@@ -141,7 +149,7 @@ make test
 
 Or if you also want to build from source for more testing:
 
-- Install the `os-test` sources to the Redox image, launch QEMU and go to `os-test` directory
+- Install the `os-test` sources to the image, launch QEMU and go to `os-test` directory
 
 ```
 make rp.os-test qemu
@@ -175,7 +183,7 @@ make test
 
 ## Test Images
 
-There are Redox filesystem configurations for automated testing which shutdown the system if successful, to use these images run one of the following commands from the build system:
+There are image configurations for automated testing which shutdown the system if successful, to use these images run one of the following commands from the build system:
 
 - Automated test suite execution
 
@@ -195,7 +203,7 @@ make CONFIG_NAME=os-test all qemu
 
 - Automated system compilation
 
-This image build Redox.
+This image builds the system from source inside the guest (self-hosting).
 
 ```
 make CONFIG_NAME=sys-build all qemu

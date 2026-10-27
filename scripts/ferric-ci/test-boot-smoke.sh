@@ -9,6 +9,11 @@ touch "$work/image" "$work/firmware"
 cat > "$work/bin/qemu-system-x86_64" <<'QEMU'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_QEMU_ARGS"
+# The timeout fixture serves a real monitor socket, so the runner's Python probe
+# exercises register parsing, CPU selection and memory reads end to end.
+if [ -n "${FAKE_QEMU_MONITOR:-}" ]; then
+    exec python3 "$FAKE_QEMU_MONITOR" "$@"
+fi
 # FAKE_QEMU_SPLIT prints that many lines, pauses FAKE_QEMU_SPLIT_DELAY seconds,
 # and prints the rest, so a test can put a line after the runner has already read
 # an earlier one. The delay stays under the runner's one-second marker watch,
@@ -83,8 +88,43 @@ printf '%s\n' $'FERRIC_TEST_PASS xstate\r' 'NMI: 3 contexts' \
     '  0xffffff7f8013bb60: busy' \
     $'  pid 40 "/usr/bin/ferric-ext4-test" Runnable "" running=false queued=false cpu=Some(2) syscall=None\r' \
     'not a context row' > "$FAKE_QEMU_LOG"
+cat > "$work/monitor.py" <<'PYMONITOR'
+import os
+import socket
+import sys
+
+args = sys.argv[1:]
+address = args[args.index("-monitor") + 1].removeprefix("unix:").split(",")[0]
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(address)
+    server.listen(1)
+    # Printing serial output only after listen makes readiness deterministic.
+    with open(os.environ["FAKE_QEMU_LOG"]) as log:
+        print(log.read(), end="", flush=True)
+    connection, _ = server.accept()
+    with connection, connection.makefile("rb") as commands, open(os.environ["FAKE_MONITOR_COMMANDS"], "w") as trace:
+        connection.sendall(b"QEMU monitor\n(qemu) ")
+        for line in commands:
+            command = line.decode().strip()
+            trace.write(command + "\n")
+            trace.flush()
+            reply = ""
+            if command == "info registers -a":
+                reply = (
+                    "CPU#0\nRIP=0000000000400100 RBP=0000000000007000 RFL=00000202 CPL=3 HLT=0\n"
+                    "CPU#1\nRIP=0000000000400200 RBP=0000000000007001 RFL=00000202 CPL=3 HLT=0\n"
+                    "CPU#2\nRIP=0000000000400300 RBP=ffff800000007000 RFL=00000202 CPL=3 HLT=0\n"
+                    "CPU#3\nRIP=0000000000400400 RBP=0000000000009000 RFL=00000202 CPL=3 HLT=1\n"
+                )
+            elif command == "x /2gx 0x7000":
+                reply = "0000000000007000: 0x0000800000000000 0x0000000000401234\n"
+            elif command.startswith("x /2gx"):
+                raise AssertionError("probe followed an invalid, unaligned or halted frame: " + command)
+            connection.sendall((reply + "(qemu) ").encode())
+PYMONITOR
 status=0
-BOOT_TIMEOUT=2 FAKE_QEMU_SLEEP=6 bash "$runner" "$work/image" "$work/serial" host \
+FAKE_QEMU_MONITOR="$work/monitor.py" FAKE_MONITOR_COMMANDS="$work/monitor-commands" \
+BOOT_TIMEOUT=2 bash "$runner" "$work/image" "$work/serial" host \
     > "$work/stdout" 2> "$work/stderr" || status=$?
 [ "$status" -eq 1 ] || { echo "timeout-contexts: expected 1, got $status" >&2; cat "$work/stderr" >&2; exit 1; }
 grep -qF 'timed out after 2s' "$work/stderr" \
@@ -98,6 +138,17 @@ expected_rows=$(tr -d '\r' < "$FAKE_QEMU_LOG" | grep -v -e '^FERRIC_' -e '^not a
     exit 1
 }
 echo "PASS: timeout-contexts"
+grep -qF 'boot-smoke-cpu: cpu 0 user frame 0 ret=0x401234' "$work/stderr" \
+    || { echo "timeout-user-frames: missing CPL3 frame" >&2; cat "$work/stderr" >&2; exit 1; }
+[ "$(grep -c '^x /2gx' "$work/monitor-commands")" -eq 1 ] \
+    || { echo "timeout-user-frames: invalid frame dereferenced" >&2; cat "$work/monitor-commands" >&2; exit 1; }
+grep -qx nmi "$work/monitor-commands" \
+    || { echo "timeout-user-frames: no NMI after sampling" >&2; exit 1; }
+if grep -q 'Traceback' "$work/stderr"; then
+    cat "$work/stderr" >&2
+    exit 1
+fi
+echo "PASS: timeout-user-frames"
 
 # The smoke image's audio check needs both controllers on the QEMU command line.
 grep -q -- '-device ich9-intel-hda,id=hda0' "$FAKE_QEMU_ARGS" \
