@@ -258,3 +258,14 @@ Pinned grants cannot be re-shared as ordinary mappings, private copy-on-write
 pages must be allocator-owned, and frames cannot be reused while a CPU or DMA
 mapping may still reach them. [Registered buffers and IOMMUs](ferric-io.md)
 describes the strict teardown and retry behavior that enforces those lifetimes.
+
+The same ordering applies to CPU translations. When a scheme shares a page
+it holds copy-on-write with a client (`Grant::borrow_fmap`), the kernel first
+gives the scheme a private copy, then remaps the scheme's page to it. The old
+translation stays in other CPUs' TLBs until a shootdown, so the remap is queued
+on the scheme address space's flusher, and that flusher runs once all pages
+are borrowed, while the address-space lock is still held. The old frame is
+released only after every CPU using that address space has acknowledged the
+shootdown. One limitation remains: if a later page in the same call fails with
+`ENOMEM`, the call returns early, and the remaps already queued are not
+flushed or their frames released.
