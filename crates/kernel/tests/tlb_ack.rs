@@ -55,9 +55,13 @@ impl System {
         me.mailbox.receive(
             |page| me.pages.lock().unwrap().push(page),
             || {
-                if self.global.take(cpu) {
-                    me.global_flushes.fetch_add(1, Ordering::SeqCst);
-                }
+                self.global.flush(
+                    cpu,
+                    || {
+                        me.global_flushes.fetch_add(1, Ordering::SeqCst);
+                    },
+                    || {},
+                );
                 me.full_flushes.fetch_add(1, Ordering::SeqCst);
             },
         );

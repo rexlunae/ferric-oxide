@@ -216,11 +216,11 @@ impl PercpuBlock {
         // mailbox's request counter was loaded, so it sees the generation of every broadcast
         // whose request this handling acknowledges.
         self.tlb_mailbox.receive(invalidate_tlb_page, || {
-            if GLOBAL_FLUSH.take(self.cpu_id.get() as usize) {
-                crate::memory::RmmA::invalidate_all_global();
-            } else {
-                crate::memory::RmmA::invalidate_all();
-            }
+            GLOBAL_FLUSH.flush(
+                self.cpu_id.get() as usize,
+                crate::memory::RmmA::invalidate_all_global,
+                crate::memory::RmmA::invalidate_all,
+            );
         });
     }
 }
