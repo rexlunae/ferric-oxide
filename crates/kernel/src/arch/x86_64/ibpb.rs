@@ -5,20 +5,22 @@
 //! speculatively running gadgets of the attacker's choosing (Spectre v2 user-to-user,
 //! CVE-2017-5715). Writing bit 0 of `IA32_PRED_CMD` (MSR 0x49) discards those predictions.
 //!
-//! The kernel issues one, through [`before_switch`], when a CPU switches to a context that runs
-//! user code in an address space other than the last one whose user code it ran: in
-//! `context::arch::switch_to` for context switches and in `Context::set_addr_space` for a context
-//! that changes address space (exec). Switches to kernel and idle contexts, to kernel contexts that
-//! borrow a process's address space (ring workers), and between threads of one process issue
-//! none. [`policy`](crate::arch::ibpb::policy) holds the decision as pure functions; this module
-//! adds the boot-time choice, the per-CPU state and a count.
+//! The kernel issues one, through [`before_switch`](crate::arch::ibpb::before_switch), when a
+//! CPU switches to a context that runs user code in an address space other than the last one
+//! whose user code it ran: in `context::arch::switch_to` for context switches and in
+//! `Context::set_addr_space` for a context that changes address space (exec). Switches to kernel
+//! and idle contexts, to kernel contexts that borrow a process's address space (ring workers),
+//! and between threads of one process issue none. [`policy`](crate::arch::ibpb::policy) holds
+//! the decision as pure functions; this module adds the boot-time choice, the per-CPU state and
+//! a count.
 //!
 //! The `ibpb` CPU feature (`arch.x86_64.features.ibpb` in the kernel config, `kernel.cpu.ibpb`
 //! in `ferric.toml`) chooses: `never` builds it out, `auto` turns it on when the CPU reports
 //! IBPB support ([`Cpuid::supports_ibpb`](crate::arch::ibpb::policy::Cpuid::supports_ibpb)), and
 //! `always` also panics at boot on CPUs without it. Like KPTI the choice is made once, on the
-//! bootstrap processor, and every other CPU checks its own support as it starts ([`init_cpu`]):
-//! under `always` a CPU without IBPB panics, under `auto` it runs without barriers and says so.
+//! bootstrap processor, and every other CPU checks its own support as it starts
+//! ([`init_cpu`](crate::arch::ibpb::init_cpu)): under `always` a CPU without IBPB panics, under
+//! `auto` it runs without barriers and says so.
 
 pub mod policy;
 
