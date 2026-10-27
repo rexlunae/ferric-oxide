@@ -330,7 +330,7 @@ and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
 a third without kernel tracing. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer and tracing result markers, the trace boot log line,
-KASLR/KPTI logs, shadow-stack detection and
+KASLR/KPTI logs, the IBPB decision, shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and

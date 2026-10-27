@@ -235,6 +235,8 @@ fn continue_after_kmain_stack(
             crate::arch::alternative::early_init(true);
             #[cfg(target_arch = "x86_64")]
             crate::arch::kpti::init_bsp();
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::ibpb::decide();
 
             // Set up syscall instruction
             interrupt::syscall::init();

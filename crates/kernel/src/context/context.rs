@@ -476,6 +476,20 @@ impl Context {
                     let new_addrsp = new.acquire_read(token);
                     unsafe {
                         new_addrsp.table.utable.make_current();
+                        // Ferric Oxide: as in `switch_arch_hook`, for a context that changes
+                        // address space (exec).
+                        #[cfg(target_arch = "x86_64")]
+                        if crate::arch::ibpb::needed_for_switch(
+                            &this_percpu.last_user_addrsp,
+                            Some(new),
+                        ) {
+                            // SAFETY: true only when the CPU reports IBPB, so the MSR exists;
+                            // the write only discards branch predictions.
+                            x86::msr::wrmsr(
+                                crate::arch::ibpb::IA32_PRED_CMD,
+                                crate::arch::ibpb::PRED_CMD_IBPB,
+                            );
+                        }
                     }
                 }
                 _ => unsafe {

@@ -269,3 +269,41 @@ released only after every CPU using that address space has acknowledged the
 shootdown. One limitation remains: if a later page in the same call fails with
 `ENOMEM`, the call returns early, and the remaps already queued are not
 flushed or their frames released.
+
+### Branch predictor barriers between processes
+
+`kernel.cpu.ibpb` defaults to `auto`. On CPUs that report IBPB support
+(Intel CPUID.(7,0):EDX\[26\], AMD CPUID.80000008h:EBX\[12\]) the kernel
+writes `IA32_PRED_CMD` bit 0 (MSR 0x49) when a CPU is about to run a user
+address space other than the last one it ran. This discards indirect branch
+predictions one process trained before another runs (Spectre v2 user-to-user,
+CVE-2017-5715). The choice is made once on the bootstrap processor, like KPTI;
+`always` panics at boot on a CPU without support and `never` builds the code
+out. Without a `ferric.toml` the kernel config example keeps it `never`, as
+upstream Redox has no barrier.
+
+Each CPU remembers the last user address space it ran through a weak
+reference, which keeps that address space's allocation alive so a new address
+space cannot reuse its address and be mistaken for it. Switches to kernel and
+idle contexts, which have no address space of their own, keep that record and
+issue nothing, so a process that yields to the idle loop and resumes pays no
+barrier; neither do switches between threads of one process. The check runs in
+`percpu::switch_arch_hook` and in `Context::set_addr_space`, which covers a
+context that gets a new address space through exec. The decision and the
+CPUID decoding are pure functions in `arch/x86_64/ibpb/policy.rs`, covered by
+the kernel helper tests; `sys:stat` reports the number of barriers issued as
+`ibpb_barriers`.
+
+The default follows KPTI: on where the CPU provides the mitigation. An IBPB
+costs thousands of cycles, but it is paid only on switches between processes,
+not on system calls, interrupts or switches through the idle loop. Linux makes
+the barrier conditional by default, issuing it only for tasks that opt in
+through `prctl`; Ferric has no such per-process opt-in yet, so the
+choice is all switches or none. Systems running only mutually trusted
+processes can select `never`. The kernel does not yet use IBRS, STIBP or
+retpolines, so this covers user-to-user attacks only, not user-to-kernel
+branch target injection or attacks from a sibling hyperthread. `auto`
+looks only at IBPB support, not at vulnerability bits. Image CI boots under KVM with
+`-cpu host` and requires the boot-time decision in the log; whether barriers
+are on there depends on the runner exposing IBPB to the guest.
+>>>>>>> aa0f1541e (kernel: IBPB on context switch between user address spaces)

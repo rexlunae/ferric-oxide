@@ -38,6 +38,10 @@ pub struct PercpuBlock {
     pub new_addrsp_tmp: Cell<Option<Arc<AddrSpaceWrapper>>>,
     pub new_addrsp_guard: Cell<Option<AddrSpaceSwitchReadGuard>>,
     pub wants_tlb_shootdown: AtomicBool,
+    /// Ferric Oxide: the last user address space this CPU ran, kept across kernel and idle
+    /// contexts so switching back to it needs no IBPB (see `arch/x86_64/ibpb.rs`).
+    #[cfg(target_arch = "x86_64")]
+    pub last_user_addrsp: Cell<Option<Weak<AddrSpaceWrapper>>>,
 
     // TODO: Put mailbox queues here, e.g. for TLB shootdown? Just be sure to 128-byte align it
     // first to avoid cache invalidation.
@@ -268,6 +272,19 @@ pub unsafe fn switch_arch_hook() {
         if let Some(next_addrsp) = &*percpu.current_addrsp.borrow() {
             next_addrsp.used_by.atomic_set(percpu.cpu_id);
         }
+        // Ferric Oxide: Spectre v2 user-to-user isolation.
+        #[cfg(target_arch = "x86_64")]
+        if crate::arch::ibpb::needed_for_switch(
+            &percpu.last_user_addrsp,
+            percpu.current_addrsp.borrow().as_ref(),
+        ) {
+            // SAFETY: `needed_for_switch` is true only when the CPU reports IBPB, so the MSR
+            // exists; the write only discards branch predictions.
+            x86::msr::wrmsr(
+                crate::arch::ibpb::IA32_PRED_CMD,
+                crate::arch::ibpb::PRED_CMD_IBPB,
+            );
+        }
         match next_addrsp_guard {
             Some(next_addrsp) => {
                 next_addrsp.table.utable.make_current();
@@ -300,6 +317,8 @@ impl PercpuBlock {
             new_addrsp_tmp: Cell::new(None),
             new_addrsp_guard: Cell::new(None),
             wants_tlb_shootdown: AtomicBool::new(false),
+            #[cfg(target_arch = "x86_64")]
+            last_user_addrsp: Cell::new(None),
             ptrace_flags: Cell::new(PtraceFlags::empty()),
             ptrace_session: RefCell::new(None),
             inside_syscall: Cell::new(false),
