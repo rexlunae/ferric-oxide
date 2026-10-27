@@ -28,9 +28,11 @@ architecture: `aarch64` on Apple Silicon and `x86_64` on Intel/AMD. Setup adds
 the prebuilt Redox standard library for x86-64. For ARM64, the generated Cargo
 adapter builds std from rust-src; rustup does not distribute that target. Setup
 selects `image.config = "native"` and binary application packages.
-`config/native.toml` rebuilds the
-local kernel, UEFI bootloader, relibc, base services/drivers and RedoxFS, even
-with `build.repo_binary = true`. The selected package manager is added by the
+The cookbook always builds recipes whose
+source is in this repository (a `path` source, or `same_as` one: the kernel,
+UEFI bootloader, relibc, base services/drivers, RedoxFS, fox and the test
+recipes) from source, even with `build.repo_binary = true` and in every image
+configuration, because a package server cannot have this checkout's build. The selected package manager is added by the
 catalog. Existing configurations are preserved, so their image choice and
 package policy still apply. The first build downloads Rust components, target
 runtime data, Cargo dependencies and application packages.

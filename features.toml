@@ -1760,7 +1760,10 @@ make_false = ""
 help = """
 Fetch packages from the upstream package server instead of building them.
 Much faster, but those packages ignore every compile-time option here
-(processor baseline, kernel features). Sets REPO_BINARY."""
+(processor baseline, kernel features). Recipes kept in this repository
+(kernel, relibc, base, bootloader, RedoxFS, fox, tests) are always built
+from source. With build.offline, a package whose prebuilt archive was never
+downloaded is built from its fetched sources. Sets REPO_BINARY."""
 
 [[option]]
 id = "build.debug"

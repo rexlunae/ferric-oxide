@@ -728,6 +728,21 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
             CookRecipe::from_list(binary_recipe_names.clone())?
         };
 
+        // In-tree recipes build from source under every rule (see
+        // CookRecipe::is_in_tree), so they get their build and dev
+        // dependencies like any source recipe.
+        let (in_tree, binary_recipes): (Vec<_>, Vec<_>) =
+            binary_recipes.into_iter().partition(CookRecipe::is_in_tree);
+        if command.is_building() || command.is_pushing() {
+            let in_tree_names: Vec<_> = in_tree.into_iter().map(|r| r.name).collect();
+            recipes.extend(CookRecipe::get_build_deps_recursive(
+                &in_tree_names,
+                command.is_building(),
+            )?);
+        } else {
+            recipes.extend(in_tree);
+        }
+
         let ignore_recipes = CookRecipe::from_list(ignore_recipe_names.clone())?;
 
         recipes.extend(binary_recipes);
@@ -806,6 +821,24 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
                 recipe.rule = "source".into();
                 recipe.reload_recipe()?;
             }
+        }
+    }
+
+    if command.is_building() && config.cook.offline {
+        // Offline, a prebuilt package that was never downloaded cannot be
+        // used, so its recipe builds from the sources already fetched.
+        for recipe in recipes
+            .iter_mut()
+            .filter(|r| r.rule == "binary" && !r.has_downloaded_binaries())
+        {
+            if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
+                println!(
+                    "DEBUG: Recipe {:?} has no downloaded binary package, building it from source",
+                    recipe.name.as_str()
+                );
+            }
+            recipe.rule = "source".into();
+            recipe.reload_recipe()?;
         }
     }
 
