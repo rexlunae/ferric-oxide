@@ -170,7 +170,10 @@ impl Volume {
     /// The volume's fixed metadata as block ranges (`start..end`): the boot block and every
     /// superblock and descriptor table copy with the reserved GDT blocks, then each group's
     /// bitmaps and inode table, read from its descriptor.
-    fn metadata<R: ReadAt>(&self, window: &Window<R>) -> Result<Vec<(u64, u64)>, JournalError> {
+    pub(crate) fn metadata<R: ReadAt>(
+        &self,
+        window: &Window<R>,
+    ) -> Result<Vec<(u64, u64)>, JournalError> {
         if self.incompat & INCOMPAT_META_BG != 0 {
             return Err(JournalError::Unsupported {
                 what: "replaying the journal of a meta_bg volume",

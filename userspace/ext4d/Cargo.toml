@@ -39,6 +39,7 @@ log = "0.4.27"
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
 thiserror = "2.0.17"
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "both_endian", "byte_impls", "io-std"] }
 
 [dev-dependencies]
 flate2 = "1"

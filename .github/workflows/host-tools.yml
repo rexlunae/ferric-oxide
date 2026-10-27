@@ -31,6 +31,7 @@ on:
       - "recipes/core/fatd/**"
       - "recipes/tests/ferric-fat-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
+      - "userspace/base/drivers/executor/**"
       - "userspace/base/drivers/storage/nvmed/**"
       - "recipes/tests/ferric-iobench/**"
       - "recipes/tests/ferric-ring-test/**"
@@ -279,7 +280,7 @@ jobs:
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test times
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
-            cargo test --locked --features write --test write --test futimens --test chmod_chown
+            cargo test --locked --features write --test write --test futimens --test chmod_chown --test write_data
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
@@ -426,7 +427,7 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p driver-block -p netstack -p rtl8125d
+        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d
       - name: Compile NVMe timing with buffered and DMA paths
         run: |
           rustup target add x86_64-unknown-redox
