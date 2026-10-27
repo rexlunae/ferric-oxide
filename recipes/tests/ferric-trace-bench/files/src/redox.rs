@@ -160,7 +160,7 @@ impl Trace {
 struct Samples {
     /// Compiled out: no trace scheme.
     out: Vec<f64>,
-    /// Compiled in, all off, in back-to-back rounds like `out`'s.
+    /// Compiled in, all off, in untoggled rounds like `out`'s.
     off: Vec<f64>,
     /// Compiled in, all off, each round right before an `on` round.
     pairoff: Vec<f64>,
@@ -168,32 +168,46 @@ struct Samples {
     on: Vec<f64>,
 }
 
-/// Runs `workload` for [`ROUNDS`] rounds in each state.
+/// Runs every workload for [`ROUNDS`] rounds in each state, and returns their samples in
+/// `workloads` order.
 ///
-/// Without a trace scheme every round is `out`. With one, a block of back-to-back `off` rounds
-/// comes first, run exactly as the `out` rounds are, because toggling tracepoints (live
-/// patching, its IPIs) and draining the rings disturb the caches and would add their cost to
-/// any round that follows. Then `pairoff` and `on` rounds alternate, so both sides of that
-/// comparison see the same disturbance and the same drift.
-fn measure(workload: &mut Workload<'_>, trace: Option<&Trace>) -> Result<Samples, Failure> {
-    let mut samples = Samples::default();
-    // A warm-up round, so the first timed one does not pay for cold caches.
-    (workload.round)()?;
-    let Some(trace) = trace else {
-        for _ in 0..ROUNDS {
-            samples.out.push((workload.round)()?);
-        }
-        return Ok(samples);
-    };
-    for _ in 0..ROUNDS {
-        samples.off.push((workload.round)()?);
+/// The untoggled rounds come first, for every workload: `out` without a trace scheme, `off`
+/// with one, run the same way on both kernels, because toggling tracepoints (live patching, its
+/// IPIs) and draining the rings disturb the caches and would add their cost to any round that
+/// follows. The workloads take turns, one round each, so each workload's rounds are spread over
+/// the whole phase instead of a burst of a few milliseconds that one stall of the runner can
+/// cover from end to end. (Issue #280: with each workload's `off` block run after the previous
+/// workload's toggling rounds, the null system call's `off` rounds were up to 30% slower than
+/// the `pairoff` rounds of the same boot, and `out` never followed any toggling.)
+///
+/// Then, with a trace scheme, each workload alternates `pairoff` and `on` rounds, so both sides
+/// of that comparison see the same disturbance and the same drift.
+fn measure(workloads: &mut [Workload<'_>], trace: Option<&Trace>) -> Result<Vec<Samples>, Failure> {
+    let mut samples: Vec<Samples> = workloads.iter().map(|_| Samples::default()).collect();
+    // A warm-up round each, so the first timed one does not pay for cold caches.
+    for workload in workloads.iter_mut() {
+        (workload.round)()?;
     }
     for _ in 0..ROUNDS {
-        samples.pairoff.push((workload.round)()?);
-        trace.command("enable all")?;
-        samples.on.push((workload.round)()?);
-        trace.command("disable all")?;
-        trace.drain()?;
+        for (workload, samples) in workloads.iter_mut().zip(&mut samples) {
+            let ns = (workload.round)()?;
+            match trace {
+                None => samples.out.push(ns),
+                Some(_) => samples.off.push(ns),
+            }
+        }
+    }
+    let Some(trace) = trace else {
+        return Ok(samples);
+    };
+    for (workload, samples) in workloads.iter_mut().zip(&mut samples) {
+        for _ in 0..ROUNDS {
+            samples.pairoff.push((workload.round)()?);
+            trace.command("enable all")?;
+            samples.on.push((workload.round)()?);
+            trace.command("disable all")?;
+            trace.drain()?;
+        }
     }
     Ok(samples)
 }
@@ -243,8 +257,8 @@ fn run() -> Result<(), Failure> {
             round: Box::new(syscall_round),
         },
     ];
-    for workload in &mut workloads {
-        let mut samples = measure(workload, trace.as_ref())?;
+    let samples = measure(&mut workloads, trace.as_ref())?;
+    for (workload, mut samples) in workloads.iter().zip(samples) {
         report(workload.name, "out", &mut samples.out);
         report(workload.name, "off", &mut samples.off);
         report(workload.name, "pairoff", &mut samples.pairoff);

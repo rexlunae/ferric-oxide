@@ -52,7 +52,7 @@ use crate::journal::{JournalError, read_volume_superblock};
 pub const ROOT_INODE: u32 = 2;
 /// `s_feature_incompat`: directory entries record the file type, and `name_len` is one
 /// byte.
-const INCOMPAT_FILETYPE: u32 = 0x2;
+pub(crate) const INCOMPAT_FILETYPE: u32 = 0x2;
 /// Where an inode keeps `i_mode`.
 const I_MODE: usize = 0x0;
 /// Where an inode keeps `i_flags`.
@@ -65,7 +65,7 @@ const ENCRYPT_FL: u32 = 0x800;
 /// `i_flags`: the inode keeps its contents in itself (`inline_data`).
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 /// The fixed part of a directory entry: inode, `rec_len`, `name_len` (and file type).
-const ENTRY_HEADER: usize = 8;
+pub(crate) const ENTRY_HEADER: usize = 8;
 
 /// Why a path's inode could not be found.
 #[derive(Debug, Error)]
@@ -185,7 +185,7 @@ pub fn times<R: ReadAt>(window: &Window<R>, number: u32) -> Result<InodeTimes, L
 }
 
 /// The inode the entry `name` of directory `directory` names, if it has one.
-fn find<R: ReadAt>(
+pub(crate) fn find<R: ReadAt>(
     volume: &Volume,
     window: &Window<R>,
     directory: u32,
@@ -277,7 +277,7 @@ const BLOCK_64K: usize = 1 << 16;
 /// stored, except in 64 KiB blocks, where `0xFFFF` and 0 stand for 65536 (an entry over the
 /// whole block), which 16 bits cannot hold. No other length in such a block can be 0xFFFF
 /// (lengths are multiples of 4) or 0 (no entry is empty).
-fn rec_len(stored: u16, block_len: usize) -> usize {
+pub(crate) fn rec_len(stored: u16, block_len: usize) -> usize {
     if block_len == BLOCK_64K && matches!(stored, 0 | u16::MAX) {
         BLOCK_64K
     } else {

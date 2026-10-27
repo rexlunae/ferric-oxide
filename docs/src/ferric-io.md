@@ -293,6 +293,21 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
   thread's queue pair still serves one request at a time (its thread context
   and bounce buffer are shared): `MainQueue` requests queue for it on an
   async lock.
+- A client's submissions reach driver-block through its disk ring
+  (`redox-rings` shared queues; redoxfs is the main client). When the ring
+  worker finds the submission queue empty it sets its waiting bit in the
+  queue's head, re-checks the tail and waits for an event on the ring's pipe;
+  a client that sees the bit after pushing writes one byte to the pipe. The
+  pipe bytes do not pair up with pops: a submission that arrives while the
+  worker is still spinning or re-checking is popped with no byte written,
+  and a client can write several bytes before the worker wakes. So the worker
+  opens the pipe non-blocking and drains it after each event
+  (`RingEventSource`), instead of a blocking one-byte read after every pop,
+  which could stop the whole executor on an empty pipe with the request
+  unserved. Both sides fence between storing their own index and reading the
+  other's (the waiting-bit handshake in
+  [rexlunae/redox-rings#1](https://github.com/rexlunae/redox-rings/pull/1),
+  with stress tests and loom models there).
 - On QEMU, spilling overlapping requests to per-CPU workers cannot beat one
   queue. The emulated controller serves all its queues from one thread, and
   each hand-off costs cross-CPU wake-ups. With `Adaptive` served
@@ -1124,8 +1139,9 @@ device) and serves in the foreground until it is stopped.
   kernel.org. No code comes from Linux.
 - **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
   `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
-  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod`, `fchown`, opens for
-  writing and `write` into existing blocks are served: see
+  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod`, `fchown`, `ftruncate`,
+  opens for writing, creating (regular files) and truncating, and `write` are
+  served: see
   [Writing through the journal](#writing-through-the-journal)).
 - **Access:** the scheme uses the caller's UID and primary GID. It checks
   directory search permissions at each path component, including expanded
@@ -1245,9 +1261,12 @@ e2fsprogs and runs the same tests on them.
 `write`) is the first step towards writable ext4: changing a volume through its
 journal. The changes so far rewrite one existing inode (`ext4d::write::change`):
 its access, modification and change times (`futimens`), its permission bits
-(`fchmod`) or its owner and group (`fchown`), each with a new change time; every
-other change still fails with `EROFS`. At mount, ext4d opens the device for
-writing and serves the volume read-write (those three calls) when
+(`fchmod`) or its owner and group (`fchown`), each with a new change time; write
+a file's data, allocating blocks past its end and in its holes (`write`); set its
+size, freeing or zeroing what is past the new end (`ftruncate`, `O_TRUNC`); and
+create an empty regular file (`O_CREAT`). Every other change (removal, renames,
+links, directories, symbolic links) still fails with `EROFS`. At mount, ext4d
+opens the device for writing and serves the volume read-write (those calls) when
 `ext4d::write::check_writable` accepts it, and otherwise serves it read-only
 and says why; a device that does not open for writing (no write permission, a
 read-only medium) is also served read-only, with the reason logged
@@ -1324,26 +1343,71 @@ read-only medium) is also served read-only, with the reason logged
   After a crash the inode therefore never claims data that is not on the
   disk; a crash before the commit leaves the new bytes with the old size and
   times. Every block the write touches is mapped first (extents or indirect
-  blocks) and must be an initialized block of the file inside the volume and
-  outside the journal and the fixed metadata (boot and superblock copies,
-  descriptor tables, bitmaps and inode tables). When growing past EOF, the
-  interval from the old size to the write offset is zeroed before the new
-  size is committed. Its mappings are validated too: a hole, an unwritten
-  extent or a block past the file's needs allocation, which is not done yet,
-  so the write is refused
-  (`EOPNOTSUPP`) before anything is written. Immutable and append-only files
-  are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
+  blocks); a mapped one must be an initialized block of the file inside the
+  volume and outside the journal and the fixed metadata (boot and superblock
+  copies, descriptor tables, bitmaps and inode tables). Holes and blocks past
+  the end are allocated (below). Between the old end and the write, the rest of
+  the old last block and every block the file kept past its end (after a
+  shrink) are zeroed, and holes are left as they are, so the gap reads as
+  zeroes. An unwritten extent is not converted yet, so a write into one is
+  refused (`EOPNOTSUPP`) before anything is written. Immutable and append-only
+  files are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
-  permission (and read permission unless `O_WRONLY`); `O_CREAT` and `O_TRUNC`
-  are refused (`EOPNOTSUPP`). `O_APPEND` opens and writes also fail with
-  `EOPNOTSUPP`, including a flag enabled after open through `F_SETFL`: the
-  current scheme response cannot return an append's actual ending position
-  to the kernel ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)).
-  Mapping validation retains the extent map and the volume's metadata ranges,
-  without allocating another mapping entry for every block in the write.
-  The inode's size and flags use a generated `simple_endian` native/wire
-  layout, with a byte fixture protecting unchanged fields. Every open file
-  is opened again in `ext4-view` after a write, so reads see it.
+  permission (and read permission unless `O_WRONLY`). `O_APPEND` opens and
+  writes fail with `EOPNOTSUPP`, including a flag enabled after open through
+  `F_SETFL`: the current scheme response cannot return an append's actual
+  ending position to the kernel
+  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)). The inode's
+  size and flags use a generated `simple_endian` native/wire layout, with a byte
+  fixture protecting unchanged fields. Every open file is opened again in
+  `ext4-view` after a write, so reads see it.
+- **Allocation** (`userspace/ext4d/src/write/txn.rs`) reads and changes the
+  block and inode bitmaps, the group descriptors' free counts, `bg_flags`,
+  `bg_itable_unused` and checksums, and the superblock's free counts, all inside
+  the change's one transaction ("Block Group Descriptors", "Block and inode
+  Bitmaps" and "Checksums" in "Ext4 Disk Layout"). Both descriptor checksum
+  kinds are written: CRC32C with `metadata_csum` (with the bitmaps' own
+  checksums) and CRC16 with `gdt_csum`. A descriptor or bitmap whose checksum
+  is wrong is not changed (`EIO`). A block goes to the first free one at or
+  after a goal (the block after the file's previous one, so a file grows in
+  place, or the inode's group), wrapping round the volume; an inode to the
+  parent's group or the first one after it with room. Groups still marked
+  `BLOCK_UNINIT` or `INODE_UNINIT` are skipped, and the superblock, descriptors,
+  bitmaps, inode tables and journal are never handed out or freed. No space
+  gives `ENOSPC` before anything is written; the reserved blocks
+  (`s_r_blocks_count`) are not held back from other users yet. The group
+  descriptor, extent and directory records are each declared once, with
+  `simple_endian`'s `#[derive(Endianize)]` (`userspace/ext4d/src/write/ondisk.rs`),
+  rather than assembled from bytes by hand.
+- **The extent tree** (`userspace/ext4d/src/write/extents.rs`) maps a new block
+  by lengthening the extent before it when the block follows on, and otherwise
+  by inserting an extent in the root or in the leaf under it, fixing the index
+  keys and the leaf's checksum tail ("Extent Tree" in "Ext4 Disk Layout"). The
+  tree does not grow yet: a leaf with no room refuses the write (`EOPNOTSUPP`),
+  and a file without extents (an ext3 block map) cannot be allocated to or
+  freed from. Truncating cuts the extents past the new end, frees their blocks
+  and any leaf or index block left empty, and resets an emptied tree to an
+  empty root.
+- **`ftruncate` and `O_TRUNC`** (`Fs::truncate`, `ext4d::write::truncate`) need
+  a handle open for writing (`EBADF` otherwise) or, at open, write permission.
+  A shrink commits the new size and the freed blocks in one transaction and
+  then zeroes the rest of the new last block, so a crash leaves the old size or
+  the new one; a growth zeroes that tail first and then commits the size, leaving
+  a hole. Directories give `EISDIR`.
+- **`O_CREAT`** (`Fs::open_as`, `ext4d::write::create`) needs write and search
+  permission on the parent directory; `O_EXCL` gives `EEXIST` when the name is
+  taken. The new inode is a regular file with an empty extent root, one link,
+  the caller's UID, its GID or the directory's when the directory is
+  set-group-ID, the open's permission bits, all four times set to now, a
+  generation and `i_extra_isize` 32, and the directory's project with `project`.
+  The entry (`userspace/ext4d/src/write/dir.rs`, "Linear (Classic) Directories"
+  in "Ext4 Disk Layout") goes into the slack of an entry or an unused entry with
+  room in the first block that has some, or into a new block added to the
+  directory, with the checksum tail with `metadata_csum`. Hashed (htree),
+  encrypted, inline-data, case-insensitive and block-mapped directories are
+  refused (`EOPNOTSUPP`), as are directories, symbolic links and device files
+  (`O_DIRECTORY`, `O_SYMLINK`), and creating on a volume with `quota` (whose
+  usage would change). Names of more than 255 bytes give `ENAMETOOLONG`.
 
 A crash at any write leaves the old inode or a journal whose replay gives the
 new one. The tests crash a change before each of its eight writes and check
@@ -1355,7 +1419,7 @@ comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
 e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
 `tests/futimens.rs` checks each lookup by its effect (times set on the inode it
 finds are the ones `ext4-view` then reads at that path, and nowhere else),
-including all 200 entries of `basic.ext4`'s hashed `many/` directory and ext3's
+including all 200 entries of `basic.ext4`'s `many/` directory (three blocks) and ext3's
 indirect-mapped directories, and checks the permission rules, `UTIME_NOW` and
 `UTIME_OMIT`, a symbolic link's own times, and `e2fsck` on what is left.
 `tests/chmod_chown.rs` checks the mode, owner and group bytes in the inode
@@ -1364,12 +1428,20 @@ bits, symbolic links, the `quota` fixture (`quota.ext4.gz`), a volume made for
 FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 `tests/write_data.rs` writes inside a block, across blocks and whole blocks,
 and past the end inside the last block, checks the permission rules, that
-other open handles read the new bytes, that holes, unwritten extents and
-missing blocks are refused with nothing written (the `write-data` fixture,
-which also has immutable and append-only files). It checks that append opens
-and writes at an earlier cursor or EOF fail without changing any image bytes,
-size or timestamps, and that ordinary offset writes still work. It crashes a write before
-each of its nine writes.
+other open handles read the new bytes, that unwritten extents are refused with
+nothing written (the `write-data` fixture, which also has immutable and
+append-only files), that append opens and writes at an earlier cursor or EOF
+fail without changing any image bytes, size or timestamps, and that ordinary
+offset writes still work, and crashes a write before each of its nine writes.
+`tests/alloc.rs` runs on `alloc.ext4.gz` (`metadata_csum`) and
+`alloc-gdt.ext4.gz` (`gdt_csum`, 32-byte descriptors): writes past the end and
+into holes, extents that grow in place, a full root and a leaf under the root,
+`ENOSPC`, truncation down, to zero and up, creation in a block with room and in
+a full directory, the refusals, `O_CREAT`, `O_EXCL`, `O_TRUNC` and `ftruncate`
+through `Fs`, and the free counts each leaves. Every volume is then checked
+with `e2fsck -fn` as it is, without a replay; and a write past the end, a
+truncate and a create are each crashed before every one of their writes, with
+ext4d's replay and `e2fsck`'s both giving the old state or the new one.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;

@@ -34,6 +34,12 @@ impl Data {
         self.size_high = (size >> 32) as u32;
         write_native::<_, DataWire, Self>(&mut &mut *inode, self)
     }
+
+    /// Store `flags` in `i_flags` and preserve every other field.
+    pub(crate) fn put_flags(mut self, inode: &mut [u8], flags: u32) -> std::io::Result<()> {
+        self.flags = flags;
+        write_native::<_, DataWire, Self>(&mut &mut *inode, self)
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +71,13 @@ mod tests {
         expected[0x6C..0x70].copy_from_slice(&[2, 0, 0, 0]);
         native.put_size(&mut inode, 0x2_0102_0304).unwrap();
         assert_eq!(inode, expected);
+        let mut flagged = inode.clone();
+        flagged[0x20..0x24].copy_from_slice(&[0, 0, 8, 0]);
+        Data::read(&inode)
+            .unwrap()
+            .put_flags(&mut inode, 0x8_0000)
+            .unwrap();
+        assert_eq!(inode, flagged);
         assert_eq!(size_of::<DataWire>(), 128);
     }
 }

@@ -1123,37 +1123,31 @@ cargo run -p ferric-trace-cli -- counts capture/ --tsc-mhz 4292 --gap sched.tick
 The kernel's trace clock is the invariant TSC and does not know its own
 frequency, so a TSC capture's `counts` lines are in real nanoseconds only
 with the traced machine's TSC rate in `--tsc-mhz` (perfetto's `--tsc-mhz`
-is the same value). Under KVM with `host,migratable=off` the guest TSC runs
-at the host's rate; measure it on the host and record it with the results:
+is the same value). A capture whose `clock` line gives the tick length (the
+KVM clock, the HPET) is converted with that instead. `ferric-trace tsc-mhz`
+measures the rate: it reads the TSC on both sides of a one-second sleep
+(`--seconds`), inside two readings of the monotonic clock, which the kernel
+keeps from the KVM clock, the HPET or the PIT, and prints the cycles per
+microsecond. The baseline image runs it in the guest before the windows,
+passes the result to every `counts` run, and prints it as
+`FERRIC_SCHED_BENCH_TSC tsc_mhz=<n>`, so the log records the rate its counts
+were converted with; a fixed rate in the image would be wrong on any other
+host. On the host, the same command measures a capture's machine for
+`perfetto` or `counts` there:
 
 ```sh
-gcc -O2 -x c -o /tmp/tscrate - <<'C'
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdint.h>
-#include <time.h>
-#include <x86intrin.h>
-int main(void) {
-    struct timespec a, b;
-    uint64_t t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &a);
-    t0 = __rdtsc();
-    struct timespec s = { .tv_sec = 0, .tv_nsec = 500000000 };
-    nanosleep(&s, 0);
-    t1 = __rdtsc();
-    clock_gettime(CLOCK_MONOTONIC, &b);
-    double ns = (double)((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec));
-    printf("tsc_rate=%.2f MHz\n", (double)(t1 - t0) / ns * 1000.0);
-    return 0;
-}
-C
-/tmp/tscrate
+cargo run -p ferric-trace-cli -- tsc-mhz
 ```
 
 The host runs the image with `scripts/ferric-ci/boot-smoke.sh` on KVM
 (`host,migratable=off`; software QEMU's PIT and LAPIC timing is not
 representative), `BOOT_SMP=1` and the default 4 vCPUs, once each, and checks
-the serial log with `scripts/ferric-ci/check-sched-bench-log.sh`. The
+the serial log with `scripts/ferric-ci/check-sched-bench-log.sh LOG CPUS`,
+which needs the measured TSC rate, six `sched.tick` lines with every gap
+field `counts` prints, and, with more than one CPU, the `sched.ipi_pit` and
+`sched.ipi_wake` lines (one CPU has no cross-CPU interrupts);
+`scripts/ferric-ci/test-check-sched-bench-log.sh` checks it against fixture
+logs of both configurations. The
 protocol's report records the exact commit and image configuration, the
 machine and QEMU version, the raw serial log and captures, and the `counts`
 and `FERRIC_BENCH` lines; QEMU/KVM's 5–15% noise is not evidence of a
@@ -1165,6 +1159,7 @@ rates, wake counts and the ring-scale lines keep their meaning.
 [#177]: https://github.com/rexlunae/ferric-oxide/issues/177
 [#179]: https://github.com/rexlunae/ferric-oxide/issues/179
 [#185]: https://github.com/rexlunae/ferric-oxide/issues/185
+[#280]: https://github.com/rexlunae/ferric-oxide/issues/280
 
 ## Sampling profiles
 
@@ -1512,25 +1507,39 @@ rounds:
   is far more than 5% of a call that does nothing else.
 
 On a kernel without `kernel.trace` every round runs as state `out`. With it,
-the program runs a block of back-to-back rounds with all events off (`off`),
-exactly as the `out` rounds run. Then it alternates rounds with all off
-(`pairoff`) and with `enable all` (`on`), draining the rings after each `on`
-round. Toggling tracepoints (live patching and its IPIs) and draining disturb
-the caches of the round that follows. So `off` is compared with `out`, and `on`
-with `pairoff`, and the two are never compared across. The program prints
+the program runs the same rounds with all events off (`off`), exactly as the
+`out` rounds run: before any toggling, with the two workloads taking turns one
+round at a time, so each workload's rounds spread over the whole phase rather
+than a burst of a few milliseconds that one stall of the runner covers. Then,
+workload by workload, it alternates rounds with all off (`pairoff`) and with
+`enable all` (`on`), draining the rings after each `on` round. Toggling
+tracepoints (live patching and its IPIs) and draining disturb the caches of
+the round that follows. So `off` is compared with `out`, and `on` with
+`pairoff`, and the two are never compared across. (Until issue [#280] the
+`syscall` workload's `off` block ran right after the `io` workload's toggling
+rounds, which no `out` round follows; in one recorded job it was up to 30%
+slower than the `pairoff` rounds of the same boot.) The program prints
 `FERRIC_BENCH <workload> <state> min_ns=<n> median_ns=<n> rounds=<n>` for each
 workload and state, and `FERRIC_BENCH lost records=<n>` for records dropped
 during the `on` rounds.
 
 The image workflow builds a second smoke image whose kernel differs only in
 leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
-image ten times each, interleaved (a boot takes about 20 seconds).
+image ten times each (a boot takes about 20 seconds), as ten runs of two
+back-to-back boots, one of each image, alternating which goes first.
 `scripts/ferric-ci/check-trace-overhead.sh` takes each boot's fastest round of
-each workload and state, and compares the medians of those over the boots.
-The fastest round keeps scheduling noise within a boot out. The median over
-boots handles the variation between boots: kernel image KASLR moves the code
-and runner load changes, and the first runs showed a spread of about 3%,
-three times the budget.
+each workload and state, and judges paired differences: `off` against `out`
+for the two boots of each run, and `on` against `pairoff` within each traced
+boot. The median of the pairs' differences is what the budget applies to. The
+fastest round keeps scheduling noise within a boot out. Pairing handles the
+variation between boots that comes from the runner: its load changes over the
+job (nested-KVM runners spread 3% to 20% between boots), and the two boots of
+a run see about the same load, so each pair's difference cancels it, where a
+difference of two medians over all boots does not. The median of the pairs
+keeps one stalled boot from deciding. The script's regression test,
+`scripts/ferric-ci/test-check-trace-overhead.sh`, replays the per-boot results
+of a recorded noisy job, with stalls and a change of load added, and a real
+regression on the same noise.
 
 Every boot's bench and trace result lines go into a few workflow annotations
 per image (GitHub keeps ten notices per step and 4 KiB of each). A boot that
@@ -1538,7 +1547,8 @@ fails, or lacks `FERRIC_TEST_PASS trace-bench`, fails the job, with an
 annotation that puts its test results and crash lines ahead of the serial
 tail, so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
 `ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
-medians. The script fails, naming the logs, when a boot lacks a result or a
+median paired differences; the notice also lists each pair's difference and
+each state's median over the boots. The script fails, naming the logs, when a boot lacks a result or a
 traced boot lacks its `lost records` line. It warns when records were dropped,
 since a dropped record costs less than a written one, and prints every result
 as a notice on the run.

@@ -209,6 +209,7 @@ fn dotconfig_shadowing(root: &Path) -> Vec<Diag> {
         "PREFIX_BINARY",
         "REPO_BINARY",
         "REPO_DEBUG",
+        "REPO_DEBUGINFO",
         "REPO_OFFLINE",
         "REPO_NONSTOP",
         "FILESYSTEM_CONFIG",

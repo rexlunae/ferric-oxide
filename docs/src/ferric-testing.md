@@ -243,7 +243,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
-| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from boots without and with `kernel.trace` against the tracing overhead budget |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences |
 | `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
@@ -342,8 +342,17 @@ timer lateness series, and that the BSP's selftest rounds passed
 (`kernel.time.one_shot`, on in the CI image), and posts the clock source and
 lateness as a notice. Read those scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
-each, interleaved, and runs `check-trace-overhead.sh` on the twenty serial logs
-(see [Kernel tracing](ferric-tracing.md#overhead-budget)). It discards each
+each, as ten back-to-back pairs that alternate which image boots first, and
+runs `check-trace-overhead.sh` on the twenty serial logs (see
+[Kernel tracing](ferric-tracing.md#overhead-budget)). The gate judges paired
+differences, never medians taken over two separate sets of boots: each run's
+compiled-out boot against its compiled-in-but-off boot, and each traced boot's
+`on` rounds against its own interleaved `pairoff` rounds, with the budget on
+the median of those differences, so runner load that drifts during the job
+cancels within each pair and a stall in one boot is outvoted (issue #280). The
+notice lists every pair's difference, so a failure shows whether most pairs
+agree. `scripts/ferric-ci/test-check-trace-overhead.sh` (host-tools CI) runs
+the gate on fixture logs built from a recorded noisy job. It discards each
 boot's output, so when a boot fails it runs `print-test-fails.sh` on the boot's
 console log, and a test that failed early in the boot can be read from the job
 log.
@@ -514,6 +523,14 @@ failures it prints exactly the 40 lines before the first and everything up to
 the second, inside a log group; and a console line that looks like a workflow
 command (`::error::`) is printed only while workflow commands are stopped. The
 host-tools workflow runs it after `test-boot-smoke.sh`.
+
+`scripts/ferric-ci/test-check-sched-bench-log.sh` checks
+`check-sched-bench-log.sh` (the [scheduler baseline](ferric-tracing.md#scheduler-and-timer-baseline)'s log
+check) against fixture logs whose `counts` lines carry every gap field
+`ferric-trace counts` prints: complete 1- and 4-vCPU baselines pass, and a log
+missing a tick window, a gap field, the measured TSC rate or, with more than
+one CPU, the cross-CPU interrupt lines fails with a message. The host-tools
+workflow runs it with the trace-overhead gate's test.
 
 ### CET image and Kleya rerun
 
