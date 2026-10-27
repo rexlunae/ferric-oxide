@@ -1,55 +1,89 @@
-# Build Process
+# What the Build Does
 
-This page explains what each build system command does in detail.
+This page explains what each build command does, from `cargo xtask` down to
+the Make targets it runs. (Read the [Build System Reference](./build-system-reference.md)
+for the context of each Make command.)
 
-(Read the [Build System](./build-system-reference.md) to know the context of each command)
-
-- [Bootstrap Scripts](#bootstrap-scripts)
+- [cargo xtask](#cargo-xtask)
+- [Configuration](#configuration)
 - [Toolchain](#toolchain)
 - [Build System](#build-system)
 - [Recipes](#recipes)
 - [QEMU](#qemu)
 
-## Bootstrap Scripts
+## cargo xtask
 
-### podman_bootstrap.sh
+### cargo xtask setup
 
-- Install Podman, GNU Make, Rust, FUSE and QEMU if it's not installed in the host system.
-- Download the build system sources (if you run without the `-d` option: `./podman_bootstrap.sh -d`)
-- Show a message with the commands to build the Redox system.
+- Check for rustup, Cargo, Clang, Git, curl, tar, Make (and NASM for x86-64).
+- Add `rust-src` and `llvm-tools-preview` to the pinned toolchain, and the
+  prebuilt Redox-target standard library for x86-64.
+- Install or update `cbindgen` and `just` with Cargo.
+- Initialize the source submodules.
+- Write a starting `ferric.toml` (the `native` image, native LLVM toolchain,
+  no Podman, no FUSE) if there isn't one.
 
-### native_bootstrap.sh
+`./native_bootstrap.sh` runs the same thing. The older
+`./podman_bootstrap.sh` installs Podman and other host packages instead; see
+[Building with Podman](./podman-build.md).
 
-- Install the Rust toolchain (using [rustup.rs](https://rustup.rs/)).
-- Install the recipe build tools from your Linux or Unix-like distribution.
-- Download the build system sources (if you run without the `-d` option: `./native_bootstrap.sh -d`)
-- Show a message with the commands to build the Redox system.
+### cargo xtask build
+
+- Select the guest architecture (`--arch`, or the host's) and run
+  `make qemu-image` for it, with the native toolchain and rootless image
+  writing unless `--podman` is given.
+- Make then does everything below: generates the configuration, prepares the
+  toolchain, builds the recipes and writes the image.
+
+### cargo xtask run
+
+- The same as `build`, then boot the image in QEMU (`make qemu`).
+  `--no-build` skips straight to booting (`make qemu-run`).
+
+## Configuration
+
+On every Make invocation, `mk/ferric.mk` runs `ferric-config` to resolve
+`ferric.toml` against the catalog in `features.toml` and any overrides on the
+command line. It writes `build/ferric/config.mk` (Make settings),
+`build/ferric/filesystem.toml` (image contents) and
+`build/ferric/kernel-config.toml` (kernel CPU policy), and touches the recipes
+whose settings changed so they rebuild. See [Build and Configuration](./ferric-build.md#how-settings-reach-components).
 
 ## Toolchain
 
 ### make prefix
 
-- Download our Rust and GCC forks from the [Redox build server](https://static.redox-os.org/toolchain/) (if it's not present or you if you executed `rm -rf prefix` to fix issues).
-- Build the `relibc` submodule.
+- With the native toolchain (the default), assemble the target sysroot under
+  `prefix/llvm/<arch>-unknown-redox/`: target headers, libraries and startup
+  objects extracted from the prebuilt GCC toolchain archive (its Linux compiler
+  binaries are never run), a Clang driver adapter for the Redox target, and
+  relibc built from `crates/relibc/`.
+- With the inherited recipe toolchain (`build.toolchain = "recipe"`, the
+  default with Podman), download the prebuilt Rust and GCC cross compilers.
+- The toolchain archive is still downloaded from Redox's server; replacing it
+  is in progress.
 
-### make prefix (after "touch relibc" command)
+### make prefix (after relibc changes)
 
-- Build the new relibc changes
+- The sysroot tracks relibc's sources, so changes to relibc are rebuilt into
+  it automatically before recipes that depend on it.
 
 ## Build System
 
 ### make pull
 
-- Update the build system source and submodules
-- Checkout submodules to the latest pinned commit
+- Run `git pull` and remove the filesystem-tools tag so the host tools are
+  rebuilt. It doesn't update submodules; run
+  `git submodule update --init --recursive` for that.
 
 ### make all (first execution)
 
-- Download the binaries of the Redox toolchain from the build server (if `make prefix` was not executed before).
-- Download the sources of the recipes specified on your filesystem configuration.
-- Cross-compile recipes to Redox.
-- Package recipe binaries as `pkgar` files.
-- Install packages in the QEMU virtual disk formatted with RedoxFS.
+- Prepare the toolchain (if `make prefix` was not executed before).
+- Fetch the sources of the recipes in your image configuration. Core components (kernel, bootloader, relibc, base, RedoxFS, installer, `fox`) come from this repository.
+- Cross-compile recipes for the target, or download prebuilt packages when `build.repo_binary` is on.
+- Package each recipe as a signed `pkgar` archive, with a signed `fox` manifest when `packages.signed_manifests` is on.
+- Install the packages into a RedoxFS disk image, without FUSE in the native build.
+- With `packages.manager = "fox"` (the default), adopt the installed packages with the host `fox`, sync the optional package set, and write the image SBOM to `image.cdx.json`.
 
 ### make all (second execution and next)
 
@@ -57,25 +91,25 @@ If the `build/$ARCH/$CONFIG/repo.tag` file is up to date, it won't do anything. 
 
 ### make all (Podman environment, first execution)
 
-- Download the Redox container image.
-- Install the Rust and Redox toolchains (inside the container).
+- Build the Debian-based build container.
+- Install the Rust and cross toolchains (inside the container).
 - Install the recipe build tools (inside the container).
 - Download the sources of the recipes specified on your filesystem configuration.
-- Cross-compile recipes to Redox (inside the container).
+- Cross-compile recipes for the target (inside the container).
 - Package recipe binaries as `pkgar` files.
 - Install recipe packages in the QEMU virtual disk formatted with RedoxFS.
 
 ### make rebuild
 
 - Verify source changes on recipes (if available, download them) or if a new recipe was added to the filesystem configuration.
-- Cross-compile recipes with changes to Redox.
+- Cross-compile recipes with changes.
 - Package recipe binaries with changes as `pkgar` files.
 - Install recipe packages with changes in the QEMU virtual disk formatted with RedoxFS.
 
 ### make image
 
 - Verify source changes on recipes (if the build system was updated or has changes)
-- Create a new Redox image with new recipe changes or recipes
+- Create a new image with new recipe changes or recipes
 
 ## Recipes
 
@@ -95,7 +129,7 @@ If the `build/$ARCH/$CONFIG/repo.tag` file is up to date, it won't do anything. 
 
 - It checks for pending changes, if found, it will trigger `make rebuild`.
 - It checks the existence of the QEMU image, if not available, it will works like `make image`.
-- A command with custom arguments is passed to QEMU to boot Redox without problems.
+- QEMU starts with the UEFI firmware, the image and the options from `ferric.toml` and the command line.
 - The QEMU window is shown with a menu to choose the resolution.
 - The bootloader does a bootstrap of the kernel, the kernel starts the init, the init starts the user-space daemons and Orbital.
 - The Orbital login screen appears.

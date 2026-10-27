@@ -19,7 +19,7 @@ name = "ferric-blockd"
 path = "src/main.rs"
 
 [dependencies]
-ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["alloc"] }
+ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["std"] }
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
 thiserror = "2.0.17"

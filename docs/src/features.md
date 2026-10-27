@@ -1,42 +1,35 @@
 # Features
 
-- [Desktop](#desktop)
-- [Mobile](#mobile)
-- [External References](#external-references)
+This page compares Ferric Oxide with other operating systems on common
+features. "Off by default" means the feature is implemented but has to be
+turned on in `ferric.toml`; see [Implemented System](./ferric-oxide.md) for the
+limits of each one.
 
-This page contains an operating system comparison table for common/important features.
+| **Feature** | **Ferric Oxide** | **Linux** | **FreeBSD** | **Plan 9** |
+|---|---|---|---|---|
+| [SMP](https://en.wikipedia.org/wiki/Symmetric_multiprocessing) | Yes | Yes | Yes | Yes |
+| [NUMA](https://en.wikipedia.org/wiki/Non-uniform_memory_access) | Partial: firmware tables parsed (`kernel.numa`, experimental); NUMA-aware placement planned | Yes | Yes | No |
+| Full disk encryption | Yes (RedoxFS); LUKS1/LUKS2 volumes read-only | Yes | Yes | No |
+| Exploit mitigations | Yes: KASLR, ASLR, KPTI, SMEP/SMAP; supervisor CET optional | Yes | Yes | No |
+| [IOMMU](https://en.wikipedia.org/wiki/Input%E2%80%93output_memory_management_unit) DMA isolation | Yes, Intel VT-d and AMD-Vi (off by default) | Yes | Yes | No |
+| Asynchronous I/O rings | Yes, `kernel.ring` (off by default) | Yes (io_uring) | No (POSIX AIO, kqueue) | No |
+| Kernel tracing | Yes, x86-64 (off by default) | Yes | Yes (DTrace) | No |
+| Hardware virtualization host | Planned | Yes (KVM) | Yes (bhyve) | No |
+| OpenGL/Vulkan | Only OpenGL with CPU emulation | Yes | Yes | No |
+| [UEFI](https://en.wikipedia.org/wiki/UEFI) boot loader | Yes | Yes | Yes | No |
+| [IDE](https://en.wikipedia.org/wiki/Parallel_ATA) | Yes | Yes | Yes | Yes |
+| [SATA](https://en.wikipedia.org/wiki/SATA) | Yes | Yes | Yes | Yes |
+| [NVMe](https://en.wikipedia.org/wiki/NVM_Express) | Yes | Yes | Yes | No |
+| [PCI](https://en.wikipedia.org/wiki/Peripheral_Component_Interconnect) and [PCIe](https://en.wikipedia.org/wiki/PCI_Express) | Yes | Yes | Yes | No |
+| [USB](https://en.wikipedia.org/wiki/USB) | Yes (incomplete) | Yes | Yes | Yes |
+| [Ethernet](https://en.wikipedia.org/wiki/Ethernet) | Yes | Yes | Yes | Yes |
+| [Wi-Fi](https://en.wikipedia.org/wiki/Wi-Fi) | No (planned) | Yes | Yes | No |
+| [Bluetooth](https://en.wikipedia.org/wiki/Bluetooth) | No (planned) | Yes | Yes | No |
+| ext4 | Read-only (off by default) | Yes | Yes | No |
+| LVM | Read-only (off by default) | Yes | No | No |
 
-## Desktop
-
-| **Feature**                                                            | **Redox**                      | **Linux (GNU/Linux)**  | **FreeBSD** | **Plan 9** |
-|------------------------------------------------------------------------|--------------------------------|------------------------|-------------|------------|
-| [SMP](https://en.wikipedia.org/wiki/Symmetric_multiprocessing)         | Yes                            | Yes                    | Yes         | Yes        |
-| [NUMA](https://en.wikipedia.org/wiki/Non-uniform_memory_access)        | No (planned)                   | Yes                    | Yes         | No         |
-| Full Disk Encryption                                                   | Yes                            | Yes                    | Yes         | No         |
-| Exploit Mitigations                                                    | No (planned)                   | Yes                    | Yes         | No         |
-| OpenGL/Vulkan                                                          | Only OpenGL with CPU emulation | Yes                    | Yes         | No         |
-| [UEFI](https://en.wikipedia.org/wiki/UEFI) Boot Loader                 | Yes                            | Yes                    | Yes         | No         |
-| [IDE](https://en.wikipedia.org/wiki/Parallel_ATA)                      | Yes                            | Yes                    | Yes         | Yes        |
-| [SATA](https://en.wikipedia.org/wiki/SATA)                             | Yes                            | Yes                    | Yes         | Yes        |
-| [NVMe](https://en.wikipedia.org/wiki/NVM_Express)                      | Yes                            | Yes                    | Yes         | No         |
-| [PCI](https://en.wikipedia.org/wiki/Peripheral_Component_Interconnect) | Yes                            | Yes                    | Yes         | No         |
-| [PCIe](https://en.wikipedia.org/wiki/PCI_Express)                      | Yes                            | Yes                    | Yes         | No         |
-| [USB](https://en.wikipedia.org/wiki/USB)                               | Yes (incomplete)               | Yes                    | Yes         | Yes        |
-| [Ethernet](https://en.wikipedia.org/wiki/Ethernet)                     | Yes                            | Yes                    | Yes         | Yes        |
-| [Wi-Fi](https://en.wikipedia.org/wiki/Wi-Fi)                           | No (planned)                   | Yes                    | Yes         | No         |
-| [Bluetooth](https://en.wikipedia.org/wiki/Bluetooth)                   | No (planned)                   | Yes                    | Yes         | No         |
-
-## Mobile
-
-| **Feature**                                                                                      | **Redox**    | **Android** | **iOS**        |
-|--------------------------------------------------------------------------------------------------|--------------|-------------|----------------|
-| [File-based Encryption](https://source.android.com/docs/security/features/encryption/file-based) | No           | Yes         | Not documented |
-| [Sandboxing](https://en.wikipedia.org/wiki/Sandbox_(computer_security))                          | Yes          | Yes         | Yes            |
-| [USB Tethering](https://en.wikipedia.org/wiki/Tethering)                                         | No (planned) | Yes         | Yes            |
-| [NFC](https://en.wikipedia.org/wiki/Near-field_communication)                                    | No (planned) | Yes         | Yes            |
-| [GPS](https://en.wikipedia.org/wiki/Global_Positioning_System)                                   | No (planned) | Yes         | Yes            |
-| Sensors                                                                                          | No (planned) | Yes         | Yes            |
-| Factory Reset                                                                                    | No (planned) | Yes         | Yes            |
+Phones and tablets are not a Ferric Oxide target. The
+[roadmap](./ferric-roadmap.md) covers desktops, servers and real hardware.
 
 ## External References
 

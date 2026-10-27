@@ -3,13 +3,10 @@ extern crate redox_installer;
 extern crate serde;
 extern crate toml;
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::rc::Rc;
 use std::{env, fs, process};
 
 use arg_parser::ArgParser;
-use pkg::net_backend::DownloadBackend;
 
 use redox_installer::{Config, PackageConfig};
 
@@ -27,10 +24,10 @@ Using redox_installer as an installer:
                           Use this only if you plan to use other partition tool
     --live                Use bootloader configured for live disk
     --no-mount            Use RedoxFS AR instead of FUSE to write files
-    --cookbook            Use local Redox OS build system rather than downloading packages
+    --cookbook            Build system checkout whose repo/<target>/ holds the packages to install
     --config-name         Name of the filesystem configuration used for os-release VARIANT
-    --fox                 Host fox binary: adopt the installed packages into fox's
-                          database (fox adopt-pkg) once the image root is complete
+    --fox                 Host fox binary to finish the image root with: sync a
+                          package set and write the image SBOM
     --fox-packages        With --fox: fox package set to sync into the image
                           (fox sync --target <image target>, fox.lock beside it)
     --fox-locked          With --fox-packages: fail unless fox.lock pins every package
@@ -69,21 +66,6 @@ fn local_repo_build_id(cookbook: &str) -> Option<String> {
         .join(redox_installer::get_target())
         .join("repo.toml");
     let repo_toml = fs::read_to_string(repo_toml).ok()?;
-    build_id_from_repo_toml(&repo_toml)
-}
-
-fn remote_repo_build_id() -> Option<String> {
-    let callback = Rc::new(RefCell::new(pkg::callback::SilentCallback::new()));
-    let download_backend = pkg::net_backend::DefaultNetBackend::new().ok()?;
-    let mut repo = pkg::RepoManager::new(callback, Box::new(download_backend));
-    repo.add_remote(
-        "https://static.redox-os.org/pkg",
-        &redox_installer::get_target(),
-    )
-    .ok()?;
-
-    let package = pkg::PackageName::new("repo").ok()?;
-    let (repo_toml, _) = repo.get_package_toml(&package).ok()?;
     build_id_from_repo_toml(&repo_toml)
 }
 
@@ -234,11 +216,7 @@ fn main() {
             None
         };
 
-        let build_id = if let Some(cookbook) = cookbook.as_deref() {
-            local_repo_build_id(cookbook)
-        } else {
-            remote_repo_build_id()
-        };
+        let build_id = cookbook.as_deref().and_then(local_repo_build_id);
         append_os_release_metadata(
             &mut config,
             parser.get_opt("config-name").as_deref(),

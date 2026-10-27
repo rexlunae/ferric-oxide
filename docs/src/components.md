@@ -1,6 +1,8 @@
-# Components of Redox
+# Components
 
-Redox is made up of several discrete components.
+Ferric Oxide is made up of several discrete components. The core ones are in
+this repository; [Architecture and component boundaries](./ferric-architecture.md)
+says where each one lives.
 
 ## Core
 
@@ -14,11 +16,12 @@ Redox is made up of several discrete components.
 - audiod - Audio daemon
 - netstack - TCP/UDP stack
 - ps2d - PS/2 driver
-- relibc - Redox C library
+- relibc - C library
 - randd
 - zerod
-- ion - Terminal shell
-- orbital - Desktop environment
+- ion - Terminal shell (recipe)
+- fox - Package manager
+- orbital - Desktop environment (recipe)
 
 ## Orbital
 

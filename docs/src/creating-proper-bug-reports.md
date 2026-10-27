@@ -1,72 +1,62 @@
 # Creating Proper Bug Reports
 
-If you identify a problem with the system that has not been identified previously, please create a GitLab Issue. In general, we prefer that you are able to reproduce your problem with the latest build of the system.
+If you find a problem that hasn't been reported, open a
+[GitHub issue](https://github.com/rexlunae/ferric-oxide/issues/new/choose)
+with the bug report template. A good report lets someone else reproduce the
+problem without asking you anything.
 
-- Make sure the code you are seeing the issue with is up to date with `upstream/master`. This helps to weed out reports for bugs that have already been addressed.
-- Search Redox Issues to see if a similar problem has been reported before. Then search outstanding merge requests to see if a fix is pending.
-- Make sure the issue is reproducible (trigger it several times). Try to identify the minimum number of steps to reproduce it. If the issue happens inconsistently, it may still be worth filing a bug report for it, but indicate approximately how often the bug occurs.
-- Explain if your problem happens in a virtual machine, real hardware or both. Also say your configuration (default options or customized), if you had the problem on real hardware say your computer model.
-- If it is a significant problem, join us on the [chat](./chat.md) and ask if it is a known problem, or if someone plans to address it in the short term.
-- Identify the recipe that is causing the issue. If a particular command is the source of the problem, look for a repository on Redox GitLab with the same name. Or, for certain programs such as `games` or command line utilities, you can search for the package containing the command with `grep -rnw COMMAND --include Cargo.toml`, where `COMMAND` is the name of the command causing the problem. The location of the `Cargo.toml` file can help indicate which recipe contains the command. This is where you should expect to report the issue.
-- If the problem involves multiple recipes, kernel interactions with other programs, or general build problems, then you should plan to log the issue against the `redox` repository.
-- If the problem occurs during build, record the build log using `script` or `tee`, e.g.
+## Before you file
 
-```sh
-make r.recipe-name 2>&1 | tee recipe-name.log
-```
+- **Reproduce it on current `main`.** Pull the latest changes and rebuild; the
+  bug may already be fixed.
+- **Search** open and closed issues, and open pull requests, for the same
+  problem.
+- **Narrow it down.** Find the smallest set of steps that triggers it, and say
+  how often it happens if it is intermittent.
+- **Find the component.** A command usually comes from a recipe of the same
+  name under `recipes/`. For Rust programs,
+  `grep -rnw COMMAND --include Cargo.toml` in the source tree shows which crate
+  provides a command. Problems in the kernel, drivers, base services, RedoxFS,
+  the build or the package tools belong in this repository's issues. Problems
+  in a ported program that also occur on other systems belong with that
+  program's own project.
 
-If the problem occurs while using the Redox command line, use `script` in combination with your Terminal window.
+## What to include
 
-```sh
-tee qemu.log
-```
+- **The commit:** `git rev-parse HEAD`.
+- **Your configuration:** your `ferric.toml` (or "none"), and the architecture
+  and CPU variant you built (`cargo xtask --arch ...`, `--cpu-variant ...`).
+- **The host:** operating system and version (`uname -a`), `rustc -V` and
+  `rustup show` from the repository root, and your C compiler.
+- **Where it runs:** QEMU (with `qemu-system-x86_64 --version` or the aarch64
+  equivalent, and whether acceleration was on) or real hardware (the exact
+  model).
+- **Logs.** For a build failure, capture the whole build:
 
-```sh
-make qemu
-```
+  ```sh
+  cargo xtask build 2>&1 | tee build.log
+  ```
 
-- Wait for Redox to start, then in this window:
+  For a single recipe, `make r.RECIPE 2>&1 | tee RECIPE.log`.
 
-```
-redox login: user
-```
+  For a problem in the running system, boot with the serial console and keep
+  its output:
 
-- Execute the commands to demonstrate the bug
-- Terminate QEMU
+  ```sh
+  cargo xtask run --no-build --headless 2>&1 | tee qemu.log
+  ```
 
-```sh
-sudo shutdown
-```
+  Log in, run the commands that show the bug, then shut down with `shutdown`
+  (or quit QEMU with `Ctrl-a x` if shutdown hangs).
 
-- If shutdown does not work (there are known bugs) then
-- Use the QEMU menu to quit
-- Then exit the shell created by script
+- **Traces, for kernel and performance problems.** If the image was built with
+  kernel tracing, a `ferric-trace` capture or crash dump of the failure is
+  often the fastest route to the cause. See [Kernel Tracing](./ferric-tracing.md).
 
-```sh
-exit
-```
+Put logs in fenced code blocks, or attach them as files when they are long.
 
-- Join us in the chat.
+## After you file
 
-- Record build information like:
-
-     - The rust toolchain you used to build Redox
-       - `rustc -V` and/or `rustup show` from your Redox project folder
-     - The commit hash of the code you used
-       - `git rev-parse HEAD`
-     - The environment you are running Redox in (the "target")
-       - `qemu-system-x86_64 -version` or your current hardware configuration, if applicable
-     - The operating system you used to build Redox
-       - `uname -a` or an alternative format
-
-- Format your log on the message in Markdown syntax to avoid a flood on the chat, you can see how to do it on the [GitHub documentation](https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#quoting-code).
-
-- Make sure that your bug doesn't already have an issue on GitLab. Feel free to ask in the Redox [Chat](./chat.md) if you're uncertain as to whether your issue is new.
-
-- Create a GitLab issue following the template. Non-bug report issues may ignore this template.
-
-- Once you create the issue don't forget to post the link on the Dev or Support rooms of the chat, because the GitLab email notifications have distractions (service messages or spam) and most developers don't leave their GitLab pages open to receive desktop notifications from the web browser (which require a custom setting to receive issue notifications).
-
-By doing this you help us to pay attention to your issues and avoid them being accidentally forgotten.
-
-- Watch the issue and be available for questions.
+Watch the issue and answer questions. If you find more information, such as a
+simpler reproduction or the commit that introduced the bug (`git bisect`),
+add it as a comment.
