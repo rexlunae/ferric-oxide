@@ -21,9 +21,15 @@ pub unsafe fn init(cpu_id: LogicalCpuId) {
         }
 
         // Ferric Oxide: `RmmA::invalidate_all_global` (broadcast TLB shootdowns) can then use
-        // INVPCID. The BSP decides for every CPU, as KPTI's PCID support does.
+        // INVPCID. The BSP enables it if it has the instruction, before any AP starts; each AP
+        // checks its own CPUID and withdraws it if it lacks the instruction, before it can handle
+        // a shootdown (issue #282). After the BSP, the flag only goes from available to not, and
+        // the fallback toggles CR4.PGE.
+        let has_invpcid = has_ext_feat(|feat| feat.has_invpcid());
         if cpu_id == LogicalCpuId::BSP {
-            crate::memory::RmmA::set_invpcid_available(has_ext_feat(|feat| feat.has_invpcid()));
+            crate::memory::RmmA::set_invpcid_available(has_invpcid);
+        } else if !has_invpcid {
+            crate::memory::RmmA::set_invpcid_available(false);
         }
 
         if let Some(feats) = cpuid().get_extended_processor_and_feature_identifiers()

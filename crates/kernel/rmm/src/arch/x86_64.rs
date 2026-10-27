@@ -180,7 +180,8 @@ impl X8664Arch {
     /// # Safety
     ///
     /// When `available`, every CPU that calls `invalidate_all_global` from now on must support
-    /// `INVPCID`.
+    /// `INVPCID`, or must itself call this with `false` before its first call. A CPU's own store
+    /// is visible to its later loads, so withdrawing needs no ordering with other CPUs.
     pub unsafe fn set_invpcid_available(available: bool) {
         INVPCID_AVAILABLE.store(available, Ordering::Relaxed);
     }

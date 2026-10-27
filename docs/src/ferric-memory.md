@@ -229,8 +229,10 @@ off, and a page-table reload does not drop global TLB entries. Freeing a shadow
 stack therefore broadcasts a shootdown (`shootdown_tlb_all`) that asks
 every CPU to drop global entries as well: each CPU that sees a new request,
 counted by a generation in `percpu/global_flush.rs`, invalidates with `INVPCID`
-type 2 when the CPU has it, or by toggling CR4.PGE (Intel SDM Volume 3A,
-4.10.4.1). Shootdowns for user address spaces still only reload the page table
+type 2 when every CPU has it, or by toggling CR4.PGE (Intel SDM Volume 3A,
+4.10.4.1). The BSP enables `INVPCID` for this if its CPUID reports it, and each
+AP that lacks it turns it off for all CPUs before it can handle a shootdown
+([#282](https://github.com/rexlunae/ferric-oxide/issues/282)). Shootdowns for user address spaces still only reload the page table
 ([#260](https://github.com/rexlunae/ferric-oxide/issues/260)). The broadcast
 waits, through the same per-CPU tickets as a targeted round, until every other
 CPU has flushed, and only then is the stack's frame returned to the pool
