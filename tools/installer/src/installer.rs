@@ -1033,6 +1033,47 @@ pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
     Ok(true)
 }
 
+/// Makes `output` ready to hold an image of `size`: creates a missing file
+/// at that size, grows a smaller file, resizes a different-sized file when
+/// the size is `exact` (a larger one otherwise only leaves more room), and
+/// checks that a device is large enough.
+///
+/// # Errors
+/// Returns I/O errors, or an error if a device is smaller than the image
+/// needs.
+fn prepare_image_output(output: &Path, size: &crate::ImageSize, exact: bool) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = u64::from(size.mib) * MIB;
+    if !output.exists() {
+        eprintln!(
+            "Creating a new file to {} with size {} MB",
+            output.display(),
+            size.mib
+        );
+        fs::File::create(output)?.set_len(bytes)?;
+    } else if fs::metadata(output)?.is_file() {
+        let file = fs::OpenOptions::new().write(true).open(output)?;
+        let len = file.metadata()?.len();
+        if len < bytes || (exact && len != bytes) {
+            eprintln!("Resizing {} to {} MB", output.display(), size.mib);
+            file.set_len(bytes)?;
+        } else {
+            eprintln!("Overwriting {}", output.display());
+        }
+    } else {
+        let disk_mib = DiskWrapper::open(output)?.size() / MIB;
+        if disk_mib < u64::from(size.required_mib) {
+            bail!(
+                "{} holds {disk_mib} MiB, but the image needs {} MiB",
+                output.display(),
+                size.required_mib
+            );
+        }
+        eprintln!("Overwriting {} ({disk_mib} MiB)", output.display());
+    }
+    Ok(())
+}
+
 fn install_inner(config: Config, output: &Path) -> Result<()> {
     println!("Installing to {}:\n{}", output.display(), config);
     let cookbook = config.general.cookbook.clone();
@@ -1052,43 +1093,16 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
         if fs_size < 32 {
             bail!("Refusing to create image disk less than 32 MB");
         }
-        let bytes = fs_size * 1024 * 1024;
-        if !output.exists() {
-            eprintln!(
-                "Creating a new file to {} with size {} MB",
-                output.display(),
-                fs_size
-            );
-            let file = fs::File::create(output)?;
-            file.set_len(bytes)?;
-        } else if fs::metadata(output)?.is_file() {
-            // An exact size is kept even when the file is larger; otherwise
-            // a larger file only leaves more room.
-            let exact = config.general.filesystem_size_exact.unwrap_or(false);
-            let file = fs::OpenOptions::new().write(true).open(output)?;
-            let len = file.metadata()?.len();
-            if len < bytes || (exact && len != bytes) {
-                eprintln!("Resizing {} to {} MB", output.display(), fs_size);
-                file.set_len(bytes)?;
-            } else {
-                eprintln!("Overwriting {}", output.display());
-            }
-        } else {
-            // A device: its size is what it is.
-            let disk_mib = DiskWrapper::open(output)?.size() / (1024 * 1024);
-            if disk_mib < u64::from(size.required_mib) {
-                bail!(
-                    "{} holds {disk_mib} MiB, but the image needs {} MiB",
-                    output.display(),
-                    size.required_mib
-                );
-            }
-            eprintln!("Overwriting {} ({disk_mib} MiB)", output.display());
-        }
         let live = config.general.live_disk.unwrap_or(false);
         let password_opt = config.general.encrypt_disk.clone();
         let password_opt = password_opt.as_ref().map(|p| p.as_bytes());
         let (bootloader_bios, bootloader_efi) = fetch_bootloaders(&config, cookbook, live)?;
+        // Only after everything that can fail without touching the output.
+        prepare_image_output(
+            output,
+            &size,
+            config.general.filesystem_size_exact.unwrap_or(false),
+        )?;
         let efi_partition_path = match config
             .general
             .write_bootloader
@@ -1240,6 +1254,38 @@ pub(crate) mod tests {
             error.downcast_ref(),
             Some(PackageInstallError::NotInRepository { .. })
         ));
+    }
+
+    #[test]
+    fn image_files_are_sized_for_the_image() {
+        const MIB: u64 = 1024 * 1024;
+        let size = crate::ImageSize {
+            packages: 0,
+            files: 0,
+            required_mib: 64,
+            mib: 128,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let len = |path: &Path| fs::metadata(path).unwrap().len();
+
+        let new = dir.path().join("new.img");
+        prepare_image_output(&new, &size, false).unwrap();
+        assert_eq!(len(&new), 128 * MIB);
+
+        let small = dir.path().join("small.img");
+        fs::File::create(&small).unwrap().set_len(MIB).unwrap();
+        prepare_image_output(&small, &size, false).unwrap();
+        assert_eq!(len(&small), 128 * MIB);
+
+        let large = dir.path().join("large.img");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(256 * MIB)
+            .unwrap();
+        prepare_image_output(&large, &size, false).unwrap();
+        assert_eq!(len(&large), 256 * MIB);
+        prepare_image_output(&large, &size, true).unwrap();
+        assert_eq!(len(&large), 128 * MIB);
     }
 
     #[test]
