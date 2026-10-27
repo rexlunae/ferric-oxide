@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use ferric_trace_cli::capture::{Capture, CaptureError};
@@ -108,6 +109,13 @@ enum Cmd {
         #[arg(long, default_value = "1000")]
         tsc_mhz: perfetto::TscMhz,
     },
+    /// Measure this machine's TSC frequency against the monotonic clock and print it in MHz,
+    /// the value `--tsc-mhz` takes
+    TscMhz {
+        /// How long to measure for, in seconds
+        #[arg(long, default_value = "1")]
+        seconds: f64,
+    },
     /// Print the panic message and the records of a crash dump (`/scheme/kernel.trace/crash`
     /// after a panic, or a copy of it), and optionally save the records as a capture
     Crash {
@@ -173,6 +181,10 @@ enum CliError {
     Seconds(f64),
     #[error(transparent)]
     Crash(#[from] ferric_trace_cli::crash::CrashDumpError),
+    #[error("cannot measure the TSC frequency")]
+    TscRate(#[from] ferric_trace_cli::tsc::TscRateError),
+    #[error("this CPU has no TSC to measure")]
+    NoTsc,
     #[error("no event named {0} in the catalog (--gap)")]
     UnknownEvent(String),
     #[error("cannot write {}", path.display())]
@@ -247,6 +259,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
                         source,
                     }),
             }
+        }
+        Cmd::TscMhz { seconds } => {
+            let window =
+                Duration::try_from_secs_f64(seconds).map_err(|_| CliError::Seconds(seconds))?;
+            let mhz = ferric_trace_cli::tsc::measure(cpu::tsc().ok_or(CliError::NoTsc)?, window)?;
+            println!("{:.3}", mhz.get());
+            Ok(())
         }
         Cmd::Crash { dump, out } => crash(&dump, out.as_deref()),
         Cmd::Text { inputs, partial } => {
@@ -420,6 +439,24 @@ fn loader(partial: bool) -> fn(&[PathBuf]) -> Result<Capture, CaptureError> {
         Capture::load_partial
     } else {
         Capture::load
+    }
+}
+
+/// The CPU's time-stamp counter, the counter the kernel's trace clock reads when it picks the
+/// TSC.
+mod cpu {
+    /// A reader of the TSC, or `None` on an architecture without one.
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc() -> Option<impl FnMut() -> u64> {
+        // SAFETY: RDTSC only reads a counter, has no side effects, and every x86-64 CPU has
+        // it; user space may run it unless the kernel sets CR4.TSD, which Redox does not.
+        Some(|| unsafe { core::arch::x86_64::_rdtsc() })
+    }
+
+    /// A reader of the TSC, or `None` on an architecture without one.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn tsc() -> Option<fn() -> u64> {
+        None
     }
 }
 

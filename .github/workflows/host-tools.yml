@@ -68,6 +68,10 @@ jobs:
         run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Perf A/B gate regression tests
         run: bash scripts/ferric-ci/test-perf-ab.sh
+      - name: Trace-overhead gate regression tests
+        run: bash scripts/ferric-ci/test-check-trace-overhead.sh
+      - name: Sched-bench log checker regression tests
+        run: bash scripts/ferric-ci/test-check-sched-bench-log.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test
