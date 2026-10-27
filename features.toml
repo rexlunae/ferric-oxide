@@ -1720,9 +1720,23 @@ menu = "build"
 type = "bool"
 title = "Debug info"
 default = false
+make_var = "REPO_DEBUGINFO"
+rebuild = ["*"]
+help = "Keep debug info and skip stripping in locally built packages, which stay optimized. Sets REPO_DEBUGINFO."
+
+[[option]]
+id = "build.unoptimized"
+menu = "build"
+type = "bool"
+title = "Unoptimized debug builds"
+default = false
 make_var = "REPO_DEBUG"
 rebuild = ["*"]
-help = "Keep debug info and skip stripping in locally built packages. Sets REPO_DEBUG."
+help = """
+Build local packages with Cargo's debug profile: no optimization, debug assertions
+and debug info. File systems, drivers and the C library run many times slower
+(under QEMU emulation, starting a large program can take seconds). Use it only to
+chase a bug that needs debug assertions. Sets REPO_DEBUG."""
 
 [[option]]
 id = "build.offline"
