@@ -768,6 +768,14 @@ and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
 
+### Lazy file-mapping reply protocol
+
+The kernel helper suite includes `context/fmap_reply.rs` directly. It covers
+reply-before-park, park-before-reply, exactly-once consumption, stale/duplicate
+responses and failed-dispatch cleanup. Normal `fmap` still creates eager
+mappings, and no scheme responds to `RequestMmap`; this protocol coverage is
+not an end-to-end lazy-fault test. Run the helper host and Miri commands above.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
