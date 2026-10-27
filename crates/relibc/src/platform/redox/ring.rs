@@ -12,7 +12,7 @@ use core::{
     num::NonZeroU32,
     ops::Deref,
     ptr::{self, NonNull},
-    sync::atomic::Ordering,
+    sync::atomic::{Ordering, fence},
 };
 
 use alloc::{boxed::Box, vec::Vec};
@@ -362,6 +362,9 @@ impl<'ring> redox_ring_cq<'ring> {
 
             match self.peek() {
                 Ok(item) => {
+                    // Pairs with the producer's fence after it sets the waiting bit, as in
+                    // redox-rings' `is_wait_tail`: without it this load can miss the bit.
+                    fence(Ordering::SeqCst);
                     let current_tail_raw = self.cq.header.tail.load(Ordering::Relaxed);
                     if current_tail_raw & WAITING_BIT != 0 {
                         self.notify_on_head();
@@ -391,6 +394,9 @@ impl<'ring> redox_ring_cq<'ring> {
                         core::hint::spin_loop();
                     }
                     self.cq.header.head.store(head_with_flag, Ordering::Release);
+                    // Orders the waiting-bit store before the tail re-read (store-buffer
+                    // pattern); the producer fences before checking the bit.
+                    fence(Ordering::SeqCst);
 
                     let fresh_tail = self.cq.header.tail.load(Ordering::Acquire) & INDEX_MASK;
                     if fresh_tail != current_tail {

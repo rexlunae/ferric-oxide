@@ -339,6 +339,22 @@ image overrides. CI's forced test features remain separate. See
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.
 
+## Debug info and unoptimized builds
+
+Two options control how locally built packages are compiled:
+
+| Option | Make variable | Effect |
+| --- | --- | --- |
+| `build.debug` | `REPO_DEBUGINFO` | Optimized release build with full debug info (`CARGO_PROFILE_RELEASE_DEBUG=true`, `CARGO_PROFILE_RELEASE_STRIP=false`, `-g` for C), not stripped when packaged. |
+| `build.unoptimized` | `REPO_DEBUG` | Cargo's debug profile: no optimization, debug assertions and debug info. |
+
+Use `build.debug` for symbolized backtraces and profiles. `build.unoptimized` makes file
+systems, drivers and the C library run many times slower: under QEMU emulation,
+starting a large program from RedoxFS took seconds ([#286](https://github.com/rexlunae/ferric-oxide/issues/286)).
+Keep it for bugs that need debug assertions. With both on, the debug profile wins.
+Both mark every recipe for rebuild, and the relibc recipe's build stamp includes the
+debug-info setting, so toggling `build.debug` rebuilds relibc too.
+
 ## Dependency sources
 
 Ferric Oxide keeps its build inputs independent of upstream Redox services.
@@ -355,7 +371,13 @@ fetches from upstream Redox at build time.
   `redox-rings`, `redox-buffer-pool`, `redox-log`, `rehid`, `acpi`, `uefi`,
   `ring` and relibc's `object` fork) come from full-history mirror repositories.
   Each `Cargo.lock` pins the exact revision; when updating a mirror, keep the
-  pinned revision so only the source moves.
+  pinned revision so only the source moves. `redox-rings` is pinned with `rev`
+  in `crates/relibc`, `userspace/base` and `userspace/redoxfs` to a Ferric
+  commit that adds the memory fences its wait protocol needs (a waiter could
+  otherwise sleep through a wake-up) and the stress tests and loom models
+  that check them (see
+  [rexlunae/redox-rings#1](https://github.com/rexlunae/redox-rings/pull/1));
+  all three use the same revision.
 - The relibc submodules (`openlibm`, `dlmalloc-rs`) use the same mirrors.
 - Nothing in this repository syncs from upstream Redox. Recipes that fetch
   their own component trees from upstream Redox, and the prebuilt toolchain

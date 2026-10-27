@@ -207,6 +207,13 @@ user stacks. Its scope and limits:
 - The kernel and bootloader are excluded, as for every flag in
   `cpu.flags_exclude`.
 
+## Debug info and unoptimized builds
+
+`build.debug = true` sets `REPO_DEBUGINFO=1`: locally built packages stay optimized and
+keep full debug info. `build.unoptimized = true` sets `REPO_DEBUG=1`, the inherited
+unoptimized Cargo debug profile, which runs many times slower. See
+[Debug info and unoptimized builds](../../docs/src/ferric-build.md#debug-info-and-unoptimized-builds).
+
 ## Adding an option
 
 Add an `[[option]]` to `features.toml`; no code changes are needed for the

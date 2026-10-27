@@ -16,10 +16,12 @@
 #
 # The trace timestamps are TSC cycles (the kernel's trace clock picks the
 # invariant TSC, whose period it does not know), so the counts runs must tell
-# ferric-trace the traced machine's TSC frequency. Set TSC_MHZ below to the
-# KVM guest's TSC rate (the host's, measured as documented in
-# docs/src/ferric-tracing.md). kleya's is 4292. The counts lines are in real
-# nanoseconds only with the right value.
+# ferric-trace the traced machine's TSC frequency. The script measures it in
+# the guest with `ferric-trace tsc-mhz` (the TSC against the kernel's
+# monotonic clock: the KVM clock, the HPET or the PIT, each with a known rate)
+# and prints it as FERRIC_SCHED_BENCH_TSC, so the log records the rate its
+# counts lines were converted with. A capture whose clock line carries its own
+# tick length overrides --tsc-mhz.
 
 include = ["minimal.toml"]
 
@@ -67,7 +69,8 @@ ls /scheme
 # turns both on: kernel.trace and kernel.trace_boot = "sched"). Without it the image
 # skips, as the smoke image's trace steps do.
 if contains "$(ls /scheme)" kernel.trace
-    let tsc_mhz = 4292
+    let tsc_mhz = "$(ferric-trace tsc-mhz)"
+    echo FERRIC_SCHED_BENCH_TSC tsc_mhz=$tsc_mhz
     echo enable sched > /scheme/kernel.trace/events
     # Let the boot services settle before the windows.
     sleep 10

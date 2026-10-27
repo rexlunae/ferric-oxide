@@ -2027,6 +2027,9 @@ impl Grant {
                 .map_err(|_| Error::new(ENOMEM));
             }
             let mut src_addrspace = &mut *guard;
+            let mut src_flusher_state =
+                Flusher::with_cpu_set(&src.addr_space_lock.used_by, &src.addr_space_lock.tlb_ack)
+                    .detach();
             for dst_page in span.pages() {
                 let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
@@ -2062,6 +2065,12 @@ impl Grant {
                 let frame = if let Some(page_info) = get_page_info(frame) {
                     match page_info.add_ref(RefKind::Shared) {
                         Ok(()) => frame,
+                        // SAFETY: `guard` holds the source address space's lock, so no other
+                        // thread can change its tables. Remapping the page to the private copy
+                        // leaves the old translation cached; `flush.ignore()` is sound because
+                        // the remap and the old frame are queued on the source flusher, which
+                        // is flushed after the loop, so the old frame is freed only after every
+                        // CPU using the source address space has dropped the old translation.
                         Err(AddRefError::CowToShared) => unsafe {
                             let CowResult {
                                 new_frame: new_cow_frame,
@@ -2069,31 +2078,31 @@ impl Grant {
                             } = cow(frame, page_info, RefKind::Shared)
                                 .map_err(|_| Error::new(ENOMEM))?;
 
-                            let (_, _, flush) = src_addrspace
+                            let (old_flags, _, flush) = src_addrspace
                                 .table
                                 .utable
                                 .remap_with_full(src_page.start_address(), |_, flags| {
                                     Some((new_cow_frame.base(), flags))
                                 })
                                 .expect("page did exist");
-                            // The source flusher below invalidates the whole TLB of every CPU
-                            // using the source address space.
+                            // The source flusher, flushed after the loop, invalidates this page
+                            // on every CPU using the source address space, this one included.
                             flush.ignore();
 
-                            // The source may be the running context (a process sharing its own
-                            // pages, as fork does), so its TLB still translates this page to the
-                            // old frame. Flush now, under the source lock: until then its stores
-                            // land in the old frame and later reads of the new one look rolled
-                            // back, and the old frame must not be freed while still reachable.
-                            let mut src_flusher = Flusher::with_cpu_set(
-                                &src.addr_space_lock.used_by,
-                                &src.addr_space_lock.tlb_ack,
+                            let mut src_flusher = Flusher {
+                                active_cpus: &src.addr_space_lock.used_by,
+                                state: src_flusher_state,
+                            };
+                            src_flusher.queue(
+                                frame,
+                                None,
+                                TlbShootdownActions::change_of_flags(old_flags, new_flags),
                             );
-                            src_flusher.queue(frame, None, TlbShootdownActions::MOVE);
+
                             if let Some(old_frame) = old_frame {
                                 src_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
                             }
-                            drop(src_flusher);
+                            src_flusher_state = src_flusher.detach();
 
                             // TODO: there used to be an additional remove_ref here, was that
                             // correct?
@@ -2127,6 +2136,15 @@ impl Grant {
                     flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
                 }
             }
+
+            // `FlusherState` has no `Drop`: without this the remaps above are never invalidated
+            // and the old CoW frames queued as FREE are never released. `guard` still holds the
+            // source address space's lock, as `Flusher::flush` requires.
+            Flusher {
+                active_cpus: &src.addr_space_lock.used_by,
+                state: src_flusher_state,
+            }
+            .flush();
         }
 
         Ok(Self {
@@ -3554,6 +3572,19 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 ackword,
             },
         }
+    }
+    fn detach(mut self) -> FlusherState<'addrsp> {
+        static DUMMY: AtomicU32 = AtomicU32::new(0);
+        let state = core::mem::replace(
+            &mut self.state,
+            FlusherState {
+                pagequeue: ArrayVec::new(),
+                ackword: &DUMMY,
+                dirty: false,
+            },
+        );
+        core::mem::forget(self);
+        state
     }
     // NOTE: Lock must be held, which must be guaranteed by the caller.
     pub fn flush(&mut self) {

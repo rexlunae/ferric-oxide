@@ -40,7 +40,19 @@ pub use concurrent::{CloseReady, PendingIo, SharedGate, Transfer};
 
 use crate::{EventSource, PhysAddr};
 
-struct RingEventSource<'a, Ev: EventSource>(Mutex<Pin<&'a mut Ev>>);
+/// Wakes the ring worker when a client has pushed submissions.
+///
+/// A client writes one byte to the ring's pipe when it sees the worker's waiting bit, and the
+/// event queue reports the pipe readable. The bytes do not pair up with pops: a pop can succeed
+/// without any byte written (the submission arrived while the worker was still spinning or
+/// re-checking the tail), and a client can write several bytes before the worker wakes. So the
+/// worker never reads the pipe per pop. It drains the non-blocking pipe after each event instead,
+/// which neither blocks the executor on an empty pipe nor lets the pipe fill up and block the
+/// client's write.
+struct RingEventSource<'a, Ev: EventSource> {
+    events: Mutex<Pin<&'a mut Ev>>,
+    pipe: &'a Fd,
+}
 
 impl<'a, Ev: EventSource> WaitNotifyAsync for RingEventSource<'a, Ev> {
     async fn wait_on_tail(
@@ -48,7 +60,10 @@ impl<'a, Ev: EventSource> WaitNotifyAsync for RingEventSource<'a, Ev> {
         _expected_tail: u32,
         _deadline_opt: Option<&TimeSpec>,
     ) -> FutexWaitResult {
-        self.0.lock().unwrap().as_mut().next().await;
+        self.events.lock().unwrap().as_mut().next().await;
+        if let Err(err) = drain_wakeups(|buf| self.pipe.read(buf)) {
+            log::error!("failed to drain the ring's wake-up pipe: {err}");
+        }
         FutexWaitResult::Waited
     }
 
@@ -66,6 +81,30 @@ impl<'a, Ev: EventSource> WaitNotifyAsync for RingEventSource<'a, Ev> {
 
     fn notify_on_head(&self) {
         unimplemented!("notify_on_head is not implemented for RingEventSource")
+    }
+}
+
+/// Read and discard every byte waiting in a non-blocking wake-up pipe, through `read`.
+///
+/// Returns how many bytes were discarded. The drain ends when the pipe is empty (`EAGAIN`) or
+/// its write end has closed; an interrupted read is retried.
+///
+/// # Errors
+///
+/// Returns any other error from `read`.
+fn drain_wakeups(
+    mut read: impl FnMut(&mut [u8]) -> libredox::error::Result<usize>,
+) -> libredox::error::Result<usize> {
+    let mut buf = [0_u8; 64];
+    let mut drained = 0;
+    loop {
+        match read(&mut buf) {
+            Ok(0) => return Ok(drained),
+            Ok(count) => drained += count,
+            Err(err) if err.errno() == libredox::errno::EAGAIN => return Ok(drained),
+            Err(err) if err.errno() == libredox::errno::EINTR => {}
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -789,7 +828,11 @@ impl<T: Disk + Clone + 'static, Hw: Hardware> SchemeAsync for RingDiskSchemeInne
 
                 let sq_fd = self.shm_dir.openat(&sq_name, queue_flags, 0)?;
                 let cq_fd = self.shm_dir.openat(&cq_name, queue_flags, 0)?;
-                let pipe_fd = self.pipe_root.openat("", flag::O_CLOEXEC, 0)?;
+                // Non-blocking: the worker drains this pipe after each wake-up event and must not
+                // block the executor when it is already empty (see `RingEventSource`).
+                let pipe_fd = self
+                    .pipe_root
+                    .openat("", flag::O_CLOEXEC | flag::O_NONBLOCK, 0)?;
                 let ring_fds = [sq_fd.raw(), cq_fd.raw(), pipe_fd.raw()];
 
                 let sq = BlockingConsumer::<DiskOpSqe>::from_fd(sq_fd, true, Some(nr_sq_entries))?;
@@ -1094,9 +1137,11 @@ async fn ring_worker_task<Hw: Hardware, D: Disk + Clone + 'static>(
     let mut queue = Vec::<DiskOpSqe>::with_capacity(BATCH_LIMIT);
     let cq = Rc::new(Mutex::new(cq));
     let ev_handle = pin!(executor.register_external_event(pipe_fd.raw(), EventFlags::READ));
-    let source = RingEventSource(Mutex::new(ev_handle));
+    let source = RingEventSource {
+        events: Mutex::new(ev_handle),
+        pipe: &pipe_fd,
+    };
     let wq = WorkQueue::<Hw>::new();
-    let mut tmp_buf = [0; 1];
 
     loop {
         let mut spun = false;
@@ -1165,15 +1210,9 @@ async fn ring_worker_task<Hw: Hardware, D: Disk + Clone + 'static>(
             continue;
         }
 
+        // `futex` (the default waiter) would block the whole executor and not just this task, so
+        // the worker waits on the pipe's events; `RingEventSource` drains the pipe.
         if let Ok(req) = sq.inner.inner.pop_async(&source, None).await {
-            // TODO: A write to the pipe is only done when the waiting bit is set in the ring
-            // header. So, reading once from the pipe per wakeup should be okay for now. This can't
-            // be avoided as eventually the pipe's buffer will fill up and any writes to the pipe
-            // from the producer will block indefinitely. We probably want to use some other event
-            // mechanism here in the future. `futex` (which is the default notification mechanism if
-            // a waiter is unspecified) is not feasible here as that would block the whole process
-            // and not just the current async task.
-            let _ = pipe_fd.read(&mut tmp_buf);
             queue.push(req);
         }
     }
@@ -1258,5 +1297,66 @@ impl<D: Disk> DiskWorker<D> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use libredox::errno::{EAGAIN, EBADF, EINTR};
+    use libredox::error::{Error, Result};
+
+    use super::drain_wakeups;
+
+    // `libredox::error::Error`'s `Debug` calls into relibc's `strerror`, which host tests do not
+    // link, so results are compared without it.
+    fn drained(reads: Vec<Result<usize>>) -> Option<usize> {
+        drain_wakeups(pipe(reads)).ok()
+    }
+
+    /// A pipe that returns `reads` in order, then reports itself empty.
+    fn pipe(reads: Vec<Result<usize>>) -> impl FnMut(&mut [u8]) -> Result<usize> {
+        let mut reads = VecDeque::from(reads);
+        move |buf| {
+            let read = reads.pop_front().unwrap_or(Err(Error::new(EAGAIN)));
+            if let Ok(count) = read {
+                assert!(count <= buf.len(), "the mock never returns more than asked");
+            }
+            read
+        }
+    }
+
+    #[test]
+    fn empty_pipe_returns_at_once() {
+        // The old worker did a blocking one-byte read after every pop; a pop that needed no
+        // wake-up then blocked the executor on an empty pipe.
+        assert_eq!(drained(vec![]), Some(0));
+    }
+
+    #[test]
+    fn drains_every_queued_byte() {
+        // Several notifications can arrive for one wake-up; leaving them would fill the pipe
+        // until the client's write blocks.
+        assert_eq!(drained(vec![Ok(64), Ok(64), Ok(3)]), Some(131));
+    }
+
+    #[test]
+    fn retries_an_interrupted_read() {
+        let reads = vec![Ok(1), Err(Error::new(EINTR)), Ok(2)];
+        assert_eq!(drained(reads), Some(3));
+    }
+
+    #[test]
+    fn stops_when_the_writer_has_closed() {
+        let reads = vec![Ok(5), Ok(0), Ok(7)];
+        assert_eq!(drained(reads), Some(5));
+    }
+
+    #[test]
+    fn reports_other_errors() {
+        let reads = vec![Ok(1), Err(Error::new(EBADF))];
+        let errno = drain_wakeups(pipe(reads)).err().map(|err| err.errno());
+        assert_eq!(errno, Some(EBADF));
     }
 }

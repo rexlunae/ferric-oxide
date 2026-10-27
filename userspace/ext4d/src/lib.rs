@@ -13,7 +13,7 @@
 //! - [`fs`]: the open-file table on top of the `ext4-view` crate, which does the real work
 //!   of reading ext4 (extents, hashed directories, checksums, the journal). Every call
 //!   that would change the file system fails with [`Error::ReadOnly`] (`EROFS`), except
-//!   setting times on a volume mounted with `write`.
+//!   what `write` does on a volume mounted with it.
 //! - `journal` (Cargo feature `journal-replay`, features.toml `fs.ext4_journal_replay`):
 //!   replays a volume's journal onto the disk before it is served, with the `ferric-jbd2`
 //!   crate. Without it, a volume that needs recovery is read as the replay would leave
@@ -21,7 +21,8 @@
 //!   written.
 //! - `write` (Cargo feature `write`, features.toml `fs.ext4_write`): changes the volume
 //!   through its journal, one JBD2 transaction per change, with `ferric-jbd2`'s writer. So
-//!   far it sets an inode's times, which the scheme's `futimens` does on a volume
+//!   far it sets an inode's times, mode and owner, writes file data (allocating blocks),
+//!   truncates files and creates regular ones, which the scheme does on a volume
 //!   `Fs::new_writable` mounted. `lookup` finds the inode a path names, which
 //!   `ext4-view` does not say.
 //! - [`error`]: [`Error`], and the one place it becomes an errno.

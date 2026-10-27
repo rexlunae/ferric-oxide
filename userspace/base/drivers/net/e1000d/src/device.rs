@@ -1,7 +1,8 @@
 use std::convert::TryInto;
-use std::{cmp, mem, ptr, slice, thread, time};
+use std::{cmp, mem, slice, thread, time};
 
 use common::dma::Dma;
+use common::io::{Io, MmioPtr};
 use driver_network::NetworkAdapter;
 use syscall::error::Result;
 
@@ -238,12 +239,13 @@ impl Intel8254x {
     }
 
     pub unsafe fn read_reg(&self, register: u32) -> u32 {
-        ptr::read_volatile((self.base + register as usize) as *mut u32)
+        MmioPtr::new((self.base + register as usize) as *mut u32).read()
     }
 
     pub unsafe fn write_reg(&self, register: u32, data: u32) -> u32 {
-        ptr::write_volatile((self.base + register as usize) as *mut u32, data);
-        ptr::read_volatile((self.base + register as usize) as *mut u32)
+        let mut reg = MmioPtr::new((self.base + register as usize) as *mut u32);
+        reg.write(data);
+        reg.read()
     }
 
     pub unsafe fn flag(&self, register: u32, flag: u32, value: bool) {

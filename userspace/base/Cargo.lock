@@ -2139,7 +2139,7 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 [[package]]
 name = "redox-rings"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
+source = "git+https://github.com/rexlunae/redox-rings.git?rev=8a83b108b58e05270c7ec00ddb77c194467f5920#8a83b108b58e05270c7ec00ddb77c194467f5920"
 dependencies = [
  "bitflags 2.13.1",
  "libredox",

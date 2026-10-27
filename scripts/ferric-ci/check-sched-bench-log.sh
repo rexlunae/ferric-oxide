@@ -7,7 +7,8 @@
 #
 # Usage: check-sched-bench-log.sh LOG [CPUS]
 #   CPUS (default 4) names the boot's vCPU count; a 1-vCPU boot has no Pit broadcast
-#   or cross-CPU wakeup IPIs, so those lines are not expected there.
+#   or cross-CPU wakeup IPIs (sched.ipi_pit, sched.ipi_wake), so those lines are not
+#   expected there.
 set -euo pipefail
 
 log="$1"
@@ -30,20 +31,29 @@ if grep -aE "FERRIC_TEST_FAIL" <<< "$clean"; then
     fail "a FERRIC_TEST_FAIL line is present"
 fi
 
+# The rate the guest measured its TSC at, which every counts line below was converted with.
+need '^FERRIC_SCHED_BENCH_TSC tsc_mhz=[0-9]+(\.[0-9]+)?$'
+
+# The merged gap fields of a `ferric-trace counts` line, in the order counts.rs prints them.
+gaps='gap_ns_min=[0-9]+ gap_ns_mean=[0-9]+ gap_ns_p50=[0-9]+ gap_ns_p99=[0-9]+ gap_ns_p999=[0-9]+ gap_ns_max=[0-9]+'
+
 # The six windows (idle, burn, four ring counts) each report the periodic tick and
 # its inter-tick gaps (the tick period and jitter the tickless work must stop).
-ticks="$(grep -acE '^counts sched\.tick cpu=all count=[0-9]+ rate_per_s=[0-9]+ gap_ns_p99=[0-9]+' <<< "$clean")"
+ticks="$(grep -acE "^counts sched\.tick cpu=all count=[0-9]+ rate_per_s=[0-9]+ $gaps\$" <<< "$clean" || true)"
 if [ "$ticks" -lt 6 ]; then
     fail "expected six per-window sched.tick count lines, saw $ticks"
 fi
+# The Pit broadcast and the wakeup IPIs go from one CPU to another, so a 1-vCPU boot
+# has none.
 if [ "$cpus" -gt 1 ]; then
-    need '^counts sched\.ipi_pit cpu=all count=[1-9][0-9]* rate_per_s=[0-9]+ gap_ns_p99=[0-9]+'
+    need "^counts sched\.ipi_pit cpu=all count=[1-9][0-9]* rate_per_s=[0-9]+ $gaps\$"
+    # The waiting-ring windows show the wake bursts.
+    need "^counts sched\.ipi_wake cpu=all count=[1-9][0-9]* rate_per_s=[0-9]+ $gaps\$"
 fi
 
 # The burn window shows the periodic preemption of a greedy context: switches.
-need '^counts sched\.switch cpu=all count=[1-9][0-9]* .*gap_ns_p99=[0-9]+'
-# The waiting-ring windows show the wake bursts and the ring worker churn.
-need '^counts sched\.ipi_wake cpu=all count=[1-9][0-9]* .*gap_ns_p99=[0-9]+'
+need "^counts sched\.switch cpu=all count=[1-9][0-9]* rate_per_s=[0-9]+ $gaps\$"
+# The waiting-ring windows show the ring worker churn.
 need '^counts sched\.context_create cpu=all count=[1-9][0-9]*'
 
 # The scale runs: setup and wake markers, the wake-latency line, and the pass, for
@@ -65,5 +75,5 @@ need "FERRIC_BENCH ring file-read-4k"
 need "FERRIC_BENCH trace-bench"
 need "FERRIC_BENCH iobench-"
 
-lines="$(grep -aoE "FERRIC_BENCH (ring-scale|iobench-|ring |trace-bench)|counts sched\.(tick|ipi_pit|ipi_wake|switch|context_create) cpu=all.*" <<< "$clean")"
+lines="$(grep -aoE "FERRIC_SCHED_BENCH_TSC .*|FERRIC_BENCH (ring-scale|iobench-|ring |trace-bench)|counts sched\.(tick|ipi_pit|ipi_wake|switch|context_create) cpu=all.*" <<< "$clean")"
 echo "::notice title=sched-bench::$lines"

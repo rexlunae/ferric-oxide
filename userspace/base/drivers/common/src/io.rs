@@ -1,6 +1,8 @@
 use core::cmp::PartialEq;
 use core::ops::{BitAnd, BitOr, Not};
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 mod mmio;
 mod mmio_ptr;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

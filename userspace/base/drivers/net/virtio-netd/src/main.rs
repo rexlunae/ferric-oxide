@@ -3,6 +3,7 @@ mod scheme;
 use std::fs::File;
 use std::io::{Read, Write};
 
+use common::io::{Io, MmioPtr};
 use driver_network::NetworkScheme;
 use pcid_interface::PciFunctionHandle;
 
@@ -59,16 +60,10 @@ fn daemon(
 
     // Negotiate device features:
     let mac_address = if device.transport.check_device_feature(VIRTIO_NET_F_MAC) {
-        let mac = unsafe {
-            [
-                core::ptr::read_volatile(device_space.add(0)),
-                core::ptr::read_volatile(device_space.add(1)),
-                core::ptr::read_volatile(device_space.add(2)),
-                core::ptr::read_volatile(device_space.add(3)),
-                core::ptr::read_volatile(device_space.add(4)),
-                core::ptr::read_volatile(device_space.add(5)),
-            ]
-        };
+        // SAFETY: with VIRTIO_NET_F_MAC the first six bytes of the device space hold the MAC.
+        let mac: [u8; 6] = core::array::from_fn(|i| {
+            unsafe { MmioPtr::new(device_space.add(i).cast_mut()) }.read()
+        });
 
         log::info!(
             "virtio-net: device MAC is {:>02X}:{:>02X}:{:>02X}:{:>02X}:{:>02X}:{:>02X}",

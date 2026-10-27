@@ -33,7 +33,7 @@ impl<T> Mmio<T> {
 }
 
 // Generic implementation (WARNING: requires aligned pointers!)
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 impl<T> Io for Mmio<T>
 where
     T: Copy
@@ -169,6 +169,57 @@ impl Io for Mmio<u64> {
                 in(reg) ptr,
                 in(reg) value,
             );
+        }
+    }
+}
+
+// AArch64 implementation: one syndrome-carrying load or store per access, see `io::aarch64`.
+#[cfg(target_arch = "aarch64")]
+impl<T> Io for Mmio<T>
+where
+    T: super::aarch64::MmioWord
+        + PartialEq
+        + core::ops::BitAnd<Output = T>
+        + core::ops::BitOr<Output = T>
+        + core::ops::Not<Output = T>,
+{
+    type Value = T;
+
+    fn read(&self) -> T {
+        // SAFETY: the wrapper points at device memory of type `T`, aligned as the generic
+        // implementation already requires.
+        unsafe { T::mmio_read(ptr::addr_of!(self.value).cast::<T>()) }
+    }
+
+    fn write(&mut self, value: T) {
+        // SAFETY: as for `read`.
+        unsafe { T::mmio_write(ptr::addr_of_mut!(self.value).cast::<T>(), value) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Io, Mmio};
+
+    #[test]
+    fn every_width_round_trips() {
+        let mut byte = Mmio::new(0u8);
+        byte.write(0xa5);
+        assert_eq!(byte.read(), 0xa5);
+
+        let mut half = Mmio::new(0u16);
+        half.writef(0x8000, true);
+        assert!(half.readf(0x8000));
+
+        let mut word = Mmio::new(0u32);
+        word.write(0xdead_beef);
+        assert_eq!(word.read(), 0xdead_beef);
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut double = Mmio::new(0u64);
+            double.write(u64::MAX - 1);
+            assert_eq!(double.read(), u64::MAX - 1);
         }
     }
 }

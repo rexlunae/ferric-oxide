@@ -178,6 +178,17 @@ them can continue; that was the boot-smoke hang in
 in `crates/kernel/tests` model the wait with threads and an acknowledgement
 flag; only the image boots exercise the real context-switch path.
 
+On ARM64 every user address space uses ASID 0 (`TCR_EL1.A1` is clear and
+`TTBR0_EL1` carries no ASID), so the TLB is not tagged by process. Switching
+address spaces (`set_table` in `rmm/src/arch/aarch64.rs`) writes the table
+base, runs `isb` so the new base is in effect, and then invalidates the whole
+TLB with `tlbi vmalle1is`. Without that `isb`, the CPU may still walk the old
+table speculatively after the invalidation, leaving the previous process's
+translations behind for the same virtual addresses. After `fork`, the parent
+and child map the same addresses to different frames, so one process then
+writes into the other's memory. TCG does not show this; Apple CPUs under HVF
+do, as a bootstrap panic right after its first fork.
+
 The old catalog option `kernel.pti` is separate from `kernel.cpu.kpti`. It
 describes an experimental inherited path and currently names a Cargo feature
 absent from the kernel manifest. Use `kernel.cpu.kpti` for the implemented
@@ -248,18 +259,25 @@ pages must be allocator-owned, and frames cannot be reused while a CPU or DMA
 mapping may still reach them. [Registered buffers and IOMMUs](ferric-io.md)
 describes the strict teardown and retry behavior that enforces those lifetimes.
 
-When a private copy-on-write page of one address space becomes shared with
-another (`Grant::borrow_fmap`, and the external-mapping fault path in
-`correct_inner`), the kernel copies the page to a new frame and remaps the
-source page to it. The source address space may be running on other CPUs, or
-be the current one (fork shares its own pages this way), so its TLBs still
-translate the page to the old frame. The kernel shoots down every CPU using the
-source address space under its lock, right after the remap, and queues the old
-frame's release on that same flush. The old frame is freed only after those
-CPUs acknowledge, so no store lands in a frame that is being reused. Before
-[#298](https://github.com/rexlunae/ferric-oxide/pull/298) both paths dropped
-that flush. They were found while chasing the aarch64 HVF bootstrap crash
-([#297](https://github.com/rexlunae/ferric-oxide/issues/297)), whose own cause
-was a missing `isb` after the page-table switch
+The same ordering applies to CPU translations. When a scheme shares a page
+it holds copy-on-write with a client (`Grant::borrow_fmap`), the kernel first
+gives the scheme a private copy, then remaps the scheme's page to it. The old
+translation stays in other CPUs' TLBs until a shootdown, so the remap is queued
+on the scheme address space's flusher, and that flusher runs once all pages
+are borrowed, while the address-space lock is still held. The old frame is
+released only after every CPU using that address space has acknowledged the
+shootdown. One limitation remains: if a later page in the same call fails with
+`ENOMEM`, the call returns early, and the remaps already queued are not
+flushed or their frames released.
+
+The external-mapping fault path in `correct_inner` makes the same CoW-to-shared
+change on behalf of another address space: it copies the foreign page, remaps it
+and queues the old frame's release on a flusher for the foreign address space,
+which runs before that address space's lock is released. Before
+[#298](https://github.com/rexlunae/ferric-oxide/pull/298) this path issued no
+shootdown at all and freed the old frame while foreign TLBs could still reach
+it. The gap was found while chasing the aarch64 HVF bootstrap
+crash ([#297](https://github.com/rexlunae/ferric-oxide/issues/297)), whose own
+cause was a missing `isb` after the page-table switch
 ([#299](https://github.com/rexlunae/ferric-oxide/pull/299)). TCG hides missing
 invalidations. CI boots cover x86_64 only, and no host test models the remap.

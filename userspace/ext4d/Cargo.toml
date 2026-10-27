@@ -10,6 +10,12 @@ publish = false
 # runs its host tests with --manifest-path).
 [workspace]
 
+[workspace.dependencies]
+# Endian-aware on-disk records (#[derive(Endianize)]). Only what the records need:
+# little-endian integers and bytes, the derive, and the std::io reads and writes the derive
+# generates.
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "io-std", "little_endian", "both_endian", "integer_impls", "byte_impls"] }
+
 [lib]
 name = "ext4d"
 path = "src/lib.rs"
@@ -24,10 +30,10 @@ path = "src/main.rs"
 # superblock and inode map are read in every build (ferric-jbd2), as the same map finds the
 # inodes whose change times `fstat` reports.
 journal-replay = []
-# Change the volume through its journal (features.toml fs.ext4_write): so far, setting a
-# file's times, which the scheme's futimens does. Off by default; needs the replay, since a
+# Change the volume through its journal (features.toml fs.ext4_write): so far, a file's
+# times, mode and owner, its data (allocating blocks), truncation and creating regular files. Off by default; needs the replay, since a
 # volume is replayed before it is written.
-write = ["journal-replay"]
+write = ["journal-replay", "dep:crc"]
 
 [dependencies]
 ferric-fspath = { path = "../../crates/fspath" }
@@ -35,11 +41,15 @@ ext4-view = { version = "1.0.0", features = ["std"] }
 # The futimens sentinels (UTIME_NOW, UTIME_OMIT), shared with relibc.
 ferric-abi = { path = "../../crates/abi" }
 ferric-jbd2 = { path = "../../crates/jbd2" }
+# The CRC16 of group descriptors on volumes with gdt_csum (write).
+crc = { version = "3.3", default-features = false, optional = true }
 log = "0.4.27"
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
 thiserror = "2.0.17"
-simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "both_endian", "byte_impls", "io-std"] }
+# The inode prefix, and the extent, directory and group descriptor records allocation
+# writes (write).
+simple_endian = { workspace = true }
 
 [dev-dependencies]
 flate2 = "1"
