@@ -35,6 +35,7 @@ use core::num::NonZeroU64;
 
 use ferric_timed::{
     calibrate::{self, estimate, CalibrationError, Sample, WrappingCounter},
+    monotonic,
     rate::TicksPerSecond,
 };
 use spin::Once;
@@ -352,16 +353,19 @@ fn hpet_ns() -> u128 {
     (ticks as u128 * period_fs as u128) / 1_000_000
 }
 
-/// The last continuous-clock value this source returned, so a source hiccup (the KVM
-/// clock briefly stepping backward while it re-bases its page, for example) can be
-/// clamped instead of panicking or jumping the clock back.
-static LAST_CONTINUOUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The latest continuous-clock value returned on any CPU. Every read publishes through it
+/// (`fetch_max`), so a source hiccup (the KVM clock briefly stepping backward while it
+/// re-bases its page, for example) or a CPU delayed between its reading and the publish is
+/// clamped instead of moving the clock back.
+static PUBLISHED: monotonic::Watermark = monotonic::Watermark::new();
 
-/// When the KVM clock hiccups (its page re-bases and every later read is behind the last
-/// value, so its scale is over), the handover offset bridges the last good pvclock value
-/// onto the fallback scale: after the handover, `time = fallback_time + KVM_HANDOVER`
-/// continues without freezing or jumping backward. 0 means no handover happened yet.
-static KVM_HANDOVER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the KVM clock was handed over to the fallback sources. Once its page re-bases
+/// (a reading behind the previous one), its scale is over: the handover offset bridges the
+/// last published value onto the fallback scale, and every later read uses
+/// `fallback_time + offset`, even when the KVM clock reads valid values again on its new,
+/// lower epoch.
+#[cfg(feature = "x86_kvm_pv")]
+static KVM_HANDOVER: monotonic::Handover = monotonic::Handover::new();
 
 /// The continuous sources without the KVM clock: the calibrated invariant TSC, else the
 /// HPET, else the `OFFSET + interpolation` fallback. Used as the KVM clock's degradation
@@ -384,39 +388,20 @@ fn continuous_without_kvm(token: &mut CleanLockToken) -> u128 {
 pub fn monotonic_absolute(token: &mut CleanLockToken) -> u128 {
     let ns = match source() {
         #[cfg(feature = "x86_kvm_pv")]
-        Source::Kvm => match super::super::device::tsc::monotonic_absolute() {
-            Some(ns) => ns,
-            None => {
-                // The pvclock stepped backward (its page re-based): its scale is over. The
-                // first failure bridges the scales, then the fallback clock carries on with
-                // the offset; the clamped value frozen here is exactly the last good pvclock
-                // value.
-                let offset = KVM_HANDOVER.load(core::sync::atomic::Ordering::Relaxed);
-                if offset == 0 {
-                    let fallback_now = continuous_without_kvm(token);
-                    let last = LAST_CONTINUOUS.load(core::sync::atomic::Ordering::Relaxed);
-                    KVM_HANDOVER.store(
-                        last.saturating_sub(fallback_now as u64),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                    u128::from(last)
-                } else {
-                    continuous_without_kvm(token).saturating_add(u128::from(offset))
-                }
-            }
-        },
-        _ => continuous_without_kvm(token).saturating_add(u128::from(
-            KVM_HANDOVER.load(core::sync::atomic::Ordering::Relaxed),
-        )),
+        Source::Kvm => monotonic::read(
+            &PUBLISHED,
+            &KVM_HANDOVER,
+            || super::super::device::tsc::monotonic_absolute().map(saturating_u64),
+            || saturating_u64(continuous_without_kvm(token)),
+        ),
+        _ => PUBLISHED.publish(saturating_u64(continuous_without_kvm(token))),
     };
-    // Clamp against the last returned value: the sources are continuous, but their
-    // handover and the KVM clock's page re-basing can produce a brief backward step, which
-    // would turn wake timers into long sleeps. Clamping freezes the clock for that step
-    // instead (bounded by it).
-    let last = LAST_CONTINUOUS.load(core::sync::atomic::Ordering::Relaxed);
-    let ns = ns.max(u128::from(last));
-    LAST_CONTINUOUS.store(ns as u64, core::sync::atomic::Ordering::Relaxed);
-    ns
+    u128::from(ns)
+}
+
+/// A nanosecond count as the published clock's `u64` (which lasts 584 years).
+fn saturating_u64(ns: u128) -> u64 {
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// The resolution of [`monotonic_absolute`], in nanoseconds.

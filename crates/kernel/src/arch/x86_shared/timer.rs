@@ -418,14 +418,18 @@ unsafe fn run_series() -> Verdict {
                 timed_out = true;
                 break;
             }
-            // SAFETY: the caller allows interrupts here; any interrupt (the
-            // timer, the PIT, an IPI) ends the halt, and the handlers only
+            // Spin with interrupts open rather than halt: a halted CPU only
+            // reaches the timeout check when some interrupt arrives, and on a
+            // CPU whose one-shot timer never fires (with no periodic tick or
+            // IPI to fall back on) the boot would stall.
+            // SAFETY: the caller allows interrupts here, and the handlers only
             // touch their own state. Interrupts are off again before the
             // fired flag is read.
             unsafe {
-                arch::interrupt::enable_and_halt();
+                arch::interrupt::enable_and_nop();
                 arch::interrupt::disable();
             }
+            core::hint::spin_loop();
         }
         if timed_out {
             break;

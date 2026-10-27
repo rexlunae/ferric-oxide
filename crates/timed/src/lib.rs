@@ -25,6 +25,9 @@
 //!   with (a TSC-deadline value, or a one-shot countdown at a calibrated rate) and
 //!   classifies a timer interrupt as due or early.
 //! - [`selftest`] is the per-CPU lateness series of the boot selftest.
+//! - [`monotonic`] publishes the clock across CPUs without regressing
+//!   ([`monotonic::Watermark`]) and hands the KVM clock over to a fallback for
+//!   good once it steps backward ([`monotonic::Handover`]).
 //!
 //! The shared deadline service (#187) and the async executor binding (#181)
 //! build their earliest-deadline queues on the same types.
@@ -44,6 +47,7 @@
 extern crate std;
 
 pub mod calibrate;
+pub mod monotonic;
 pub mod oneshot;
 pub mod rate;
 pub mod selftest;

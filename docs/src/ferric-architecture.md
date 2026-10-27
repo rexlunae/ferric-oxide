@@ -157,7 +157,13 @@ built in and available, else the calibrated invariant TSC, else the HPET
 counter, else the previous OFFSET-plus-interpolation path (reported, and the
 only case where the clock depends on the periodic PIT interrupt). The clock
 keeps advancing while the periodic interrupt is masked, and the realtime
-offset contract is unchanged.
+offset contract is unchanged. Every read publishes its value with one atomic
+`fetch_max` on a shared watermark, so a CPU delayed between reading the source
+and publishing cannot move the clock back. If the KVM clock steps backward (its
+page re-bases), the clock hands over for good to the next continuous source,
+offset so it continues from the last published time; later KVM readings on the
+new, lower epoch are ignored rather than freezing the clock until they catch
+up (`ferric_timed::monotonic`).
 
 The per-CPU one-shot scheduler timer (`arch/x86_shared/timer.rs`) uses the
 LAPIC timer in TSC-deadline mode (Intel SDM) when CPUID reports it: a deadline
