@@ -532,7 +532,11 @@ marker, an exit during the final timeout poll, a missing test result and a missi
 marker. A smoke shell that cannot be linked fails early with that message. Any
 loader failure before a later marker, including a child failure followed by SKIP,
 must fail the run; a link failure first printed after completion may pass with a
-clean QEMU exit. The fixtures also require timeout NMI context rows (and only
+clean QEMU exit. This ordering is also checked when the error and marker share
+a line. A large UTF-8/ANSI console fixture has a ten-second host deadline: the
+final loader-failure check scans records once, avoiding Bash glob removal over
+the entire log, which took minutes on a repeated-launch console. NUL padding
+and carriage returns are removed before matching. The fixtures also require timeout NMI context rows (and only
 those) on stderr and both HDA controllers in QEMU's arguments. A Unix monitor
 socket fixture supplies CPL 3 registers and a user frame; it checks the emitted
 return address and that unaligned, out-of-range and halted-CPU frame pointers are

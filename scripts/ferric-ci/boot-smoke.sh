@@ -303,12 +303,21 @@ if slide is not None:
 fi
 kill "$tail_pid" 2>/dev/null || true
 
-# The console mixes in CRs and escape sequences; normalize before matching.
-clean="$(tr -d '\r' < "$log")"
+# The console mixes in CRs, NUL padding and escape sequences.
+clean="$(tr -d '\000\r' < "$log")"
 # A failed command substitution can turn an enabled test into a SKIP. Preserve
 # loader failures before completion even when the script reaches its marker.
-before_marker="${clean%%FERRIC_SMOKE_OK*}"
-if grep -qF '[ld.so]: failed to link ' <<< "$before_marker"; then
+# Shell glob removal over a large UTF-8 string can take minutes. Scan records
+# once, preserving order even when a marker shares a line with another message.
+if LC_ALL=C awk '
+    !finished {
+        marker = index($0, "FERRIC_SMOKE_OK")
+        prefix = marker ? substr($0, 1, marker - 1) : $0
+        if (index(prefix, "[ld.so]: failed to link ")) failed = 1
+        if (marker) finished = 1
+    }
+    END { exit !failed }
+' <<< "$clean"; then
     echo "boot-smoke: FAIL, a program failed to link before the smoke marker" >&2
     exit 1
 fi
