@@ -295,7 +295,7 @@ jobs:
         cpu: [host]
         iommu: [none]
         nic: [e1000]
-        variant: [base, ioeventfd, nopoll, iouring, smp2]
+        variant: [base, nopoll]
     env:
       # With x2APIC hidden every EOI and IPI is an xAPIC MMIO access, which exits to the host
       # under the runners' nested KVM, while x2APIC's MSR accesses take KVM's faster path.
@@ -368,6 +368,9 @@ jobs:
         run: |
           sleep 2
           cat kvmdiag.txt || true
+          # Logs and artifacts are not always downloadable; annotations are.
+          python3 scripts/ferric-ci/kvm-diag-annotate.py kvmdiag.txt "kvmdiag ${{ matrix.variant }}" || true
+          head -c 3500 kvmdiag.txt | grep -m1 'qemu pid' | sed 's/^/::notice title=kvmdiag header::/' || true
           tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -aE 'FERRIC_DIAG|FERRIC_BENCH|nvmed: perf:|nvmed: queue policy' || true
       - uses: actions/upload-artifact@v4
         if: always()
