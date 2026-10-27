@@ -1,0 +1,162 @@
+//! Ferric Oxide: the closed files whose page-cache objects RedoxFS keeps (#286).
+//!
+//! Without this, a file's cached pages went with its last description, so every run of a
+//! program read the whole executable through RedoxFS again. [`IdleFiles`] holds the files
+//! no description has open, least recently closed first, within a file count and byte
+//! budget. Each entry carries a stamp of the node as it was at close; a file whose node no
+//! longer matches (its ID was freed and reused, or it changed without going through the
+//! cache) is not reused.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+/// What happened to a file [`IdleFiles::take`] looked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// It was idle with the same stamp: its object can serve the new description.
+    Reused,
+    /// It was idle with a different stamp: its object must be closed.
+    Stale,
+    /// It was not idle.
+    Absent,
+}
+
+/// Closed files kept for reuse, by node ID, evicted oldest first.
+#[derive(Debug)]
+pub struct IdleFiles<S> {
+    by_node: BTreeMap<u32, Entry<S>>,
+    by_age: BTreeMap<u64, u32>,
+    bytes: u64,
+    next_age: u64,
+    max_files: usize,
+    max_bytes: u64,
+}
+
+#[derive(Debug)]
+struct Entry<S> {
+    age: u64,
+    bytes: u64,
+    stamp: S,
+}
+
+impl<S: PartialEq> IdleFiles<S> {
+    /// An empty set that keeps at most `max_files` files of at most `max_bytes` in all.
+    pub fn new(max_files: usize, max_bytes: u64) -> Self {
+        Self {
+            by_node: BTreeMap::new(),
+            by_age: BTreeMap::new(),
+            bytes: 0,
+            next_age: 0,
+            max_files,
+            max_bytes,
+        }
+    }
+
+    /// Keeps `node`, `bytes` long and stamped `stamp`, as the most recently closed file, and
+    /// returns the files evicted to stay within budget, oldest first. A file larger than the
+    /// whole byte budget is evicted at once, so the result can name `node` itself.
+    pub fn insert(&mut self, node: u32, bytes: u64, stamp: S) -> Vec<u32> {
+        self.remove(node);
+        let age = self.next_age;
+        self.next_age += 1;
+        self.by_age.insert(age, node);
+        self.by_node.insert(node, Entry { age, bytes, stamp });
+        self.bytes += bytes;
+        let mut evicted = Vec::new();
+        while self.by_node.len() > self.max_files || self.bytes > self.max_bytes {
+            let Some((_, oldest)) = self.by_age.first_key_value() else {
+                break;
+            };
+            let oldest = *oldest;
+            self.remove(oldest);
+            evicted.push(oldest);
+        }
+        evicted
+    }
+
+    /// Takes `node` out of the set because a description opened it, comparing its stamp now
+    /// with the one it was kept with.
+    pub fn take(&mut self, node: u32, stamp: &S) -> Taken {
+        match self.remove_entry(node) {
+            Some(entry) if entry.stamp == *stamp => Taken::Reused,
+            Some(_) => Taken::Stale,
+            None => Taken::Absent,
+        }
+    }
+
+    /// Takes `node` out of the set; whether it was there.
+    pub fn remove(&mut self, node: u32) -> bool {
+        self.remove_entry(node).is_some()
+    }
+
+    /// Whether `node` is in the set.
+    pub fn contains(&self, node: u32) -> bool {
+        self.by_node.contains_key(&node)
+    }
+
+    fn remove_entry(&mut self, node: u32) -> Option<Entry<S>> {
+        let entry = self.by_node.remove(&node)?;
+        self.by_age.remove(&entry.age);
+        self.bytes -= entry.bytes;
+        Some(entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_oldest_file_goes_first_when_the_count_is_full() {
+        let mut idle = IdleFiles::new(2, u64::MAX);
+        assert!(idle.insert(1, 10, ()).is_empty());
+        assert!(idle.insert(2, 10, ()).is_empty());
+        assert_eq!(idle.insert(3, 10, ()), [1]);
+        assert!(!idle.contains(1));
+        assert!(idle.contains(2) && idle.contains(3));
+    }
+
+    #[test]
+    fn files_are_evicted_until_the_bytes_fit() {
+        let mut idle = IdleFiles::new(10, 100);
+        idle.insert(1, 40, ());
+        idle.insert(2, 40, ());
+        assert_eq!(idle.insert(3, 70, ()), [1, 2]);
+        assert!(idle.contains(3));
+    }
+
+    #[test]
+    fn a_file_larger_than_the_budget_is_not_kept() {
+        let mut idle = IdleFiles::new(10, 100);
+        idle.insert(1, 40, ());
+        assert_eq!(idle.insert(2, 101, ()), [1, 2]);
+        assert!(!idle.contains(2));
+    }
+
+    #[test]
+    fn reclosing_a_file_makes_it_the_newest() {
+        let mut idle = IdleFiles::new(2, u64::MAX);
+        idle.insert(1, 10, ());
+        idle.insert(2, 10, ());
+        assert_eq!(idle.take(1, &()), Taken::Reused);
+        idle.insert(1, 10, ());
+        assert_eq!(idle.insert(3, 10, ()), [2]);
+    }
+
+    #[test]
+    fn a_changed_stamp_is_stale_and_leaves_the_set() {
+        let mut idle = IdleFiles::new(4, u64::MAX);
+        idle.insert(7, 10, (1, 2));
+        assert_eq!(idle.take(7, &(1, 3)), Taken::Stale);
+        assert_eq!(idle.take(7, &(1, 3)), Taken::Absent);
+    }
+
+    #[test]
+    fn removal_returns_the_bytes_to_the_budget() {
+        let mut idle = IdleFiles::new(10, 100);
+        idle.insert(1, 60, ());
+        assert!(idle.remove(1));
+        assert!(!idle.remove(1));
+        assert!(idle.insert(2, 100, ()).is_empty());
+    }
+}

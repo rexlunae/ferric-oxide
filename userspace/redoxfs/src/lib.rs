@@ -54,6 +54,9 @@ mod disk;
 mod filesystem;
 mod header;
 mod htree;
+// Used by the page cache, which only Redox builds; tested on the host.
+#[cfg_attr(not(target_os = "redox"), allow(dead_code))]
+mod idle_files;
 mod key;
 #[cfg(all(feature = "std", not(fuzzing)))]
 mod mount;

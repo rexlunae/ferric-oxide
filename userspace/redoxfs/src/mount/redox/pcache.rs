@@ -80,6 +80,7 @@ use syscall::flag::{O_ACCMODE, O_FSYNC, O_RDONLY, O_RDWR, O_WRONLY};
 use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
+use crate::idle_files::{IdleFiles, Taken};
 use crate::{Disk, FileSystem, Node, TreePtr};
 
 /// The handle number of the description the pump forwards records through. RedoxFS numbers
@@ -123,6 +124,9 @@ impl std::error::Error for StartError {
 struct Cached {
     object: Arc<Object>,
     handles: usize,
+    /// RedoxFS removed the file's last link while it was open: its object goes with its
+    /// last description instead of being kept idle, since the node is freed.
+    removed: bool,
 }
 
 /// The objects of the cached files by node ID, shared with the pump so it can fail the fills
@@ -174,6 +178,31 @@ fn flush_errno(_err: &FlushError) -> syscall::Error {
     syscall::Error::new(EIO)
 }
 
+/// How many closed files keep their objects, and the most bytes (by file size) they may
+/// hold in all: enough for the programs a shell session runs over and over.
+const IDLE_FILES: usize = 64;
+const IDLE_BYTES: u64 = 256 << 20;
+
+/// A node as it was when its last description closed. A file opened again with a different
+/// stamp is not served from the pages kept for it: its node ID may have been freed and
+/// reused, or the file changed some way the cache did not see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    ctime: (u64, u32),
+    mtime: (u64, u32),
+    size: u64,
+}
+
+impl Stamp {
+    fn of(node: &Node) -> Self {
+        Self {
+            ctime: node.ctime(),
+            mtime: node.mtime(),
+            size: node.size(),
+        }
+    }
+}
+
 /// RedoxFS's queue and the objects of its cached files.
 pub struct PageCache {
     queue: Arc<Queue>,
@@ -188,6 +217,8 @@ pub struct PageCache {
     writable: BTreeMap<u32, usize>,
     /// The buffer fills are read into.
     buf: Vec<u8>,
+    /// Cached files no description has open, kept so the next open finds their pages.
+    idle: IdleFiles<Stamp>,
     /// Cached writes, when the kernel has them.
     writeback: Option<Writeback>,
 }
@@ -289,6 +320,7 @@ impl PageCache {
             attached: BTreeMap::new(),
             writable: BTreeMap::new(),
             buf: Vec::new(),
+            idle: IdleFiles::new(IDLE_FILES, IDLE_BYTES),
             writeback,
         }))
     }
@@ -337,6 +369,9 @@ impl PageCache {
         if !node.data().is_file() {
             return;
         }
+        if self.idle.take(node_id, &Stamp::of(node.data())) == Taken::Stale {
+            self.forget(node_id);
+        }
         if let Err(err) = self.try_attach(handle, node.data().size(), node_id, access) {
             log::warn!("page cache: not caching node {node_id}: {}", Chain(&err));
         }
@@ -361,7 +396,14 @@ impl PageCache {
                 object.hold_writes(true)?;
             }
             self.objects_mut().insert(node_id, Arc::downgrade(&object));
-            self.files.insert(node_id, Cached { object, handles: 0 });
+            self.files.insert(
+                node_id,
+                Cached {
+                    object,
+                    handles: 0,
+                    removed: false,
+                },
+            );
         }
         let cached = self
             .files
@@ -377,9 +419,10 @@ impl PageCache {
         Ok(())
     }
 
-    /// Forgets `handle`, which its client closed (the kernel has detached it); the file's
-    /// object goes with its last attached description, once its dirty pages are written
-    /// back. If they cannot be, they are lost with the object (logged), as a failed
+    /// Forgets `handle`, which its client closed (the kernel has detached it). After the
+    /// file's last attached description its dirty pages are written back and the object is
+    /// kept idle ([`IdleFiles`]), so the next open of the file finds its pages. If they
+    /// cannot be written back, they are lost with the object (logged), as a failed
     /// writeback at `close` loses them on any system: the node may be freed now.
     pub fn closed<D: Disk>(&mut self, fs: &mut FileSystem<D>, fmaps: &mut Fmaps, handle: usize) {
         let Some(node_id) = self.attached.remove(&handle) else {
@@ -390,13 +433,41 @@ impl PageCache {
         };
         cached.handles -= 1;
         if cached.handles == 0 {
-            if let Err(err) = self.flush(fs, fmaps, node_id) {
-                log::error!(
-                    "page cache: node {node_id} closed with dirty pages not written: {}",
-                    Chain(&err)
-                );
+            let removed = cached.removed;
+            match self.flush(fs, fmaps, node_id) {
+                Ok(()) if !removed => self.keep_idle(fs, node_id),
+                Ok(()) => self.forget(node_id),
+                Err(err) => {
+                    log::error!(
+                        "page cache: node {node_id} closed with dirty pages not written: {}",
+                        Chain(&err)
+                    );
+                    self.forget(node_id);
+                }
             }
+        }
+    }
+
+    /// Keeps the object of `node_id`, which no description has open now, for the next open;
+    /// closes the objects of the files that pushes out of the idle budget.
+    fn keep_idle<D: Disk>(&mut self, fs: &mut FileSystem<D>, node_id: u32) {
+        let Ok(node) = fs.tx(|tx| tx.read_tree(TreePtr::<Node>::new(node_id))) else {
             self.forget(node_id);
+            return;
+        };
+        let stamp = Stamp::of(node.data());
+        for evicted in self.idle.insert(node_id, stamp.size, stamp) {
+            self.forget(evicted);
+        }
+    }
+
+    /// RedoxFS removed the last link to `node_id`, freeing the node: closes its object now
+    /// if no description has it open, or marks it to go with its last description.
+    pub fn removed(&mut self, node_id: u32) {
+        if self.idle.contains(node_id) {
+            self.forget(node_id);
+        } else if let Some(cached) = self.files.get_mut(&node_id) {
+            cached.removed = true;
         }
     }
 
@@ -674,6 +745,7 @@ impl PageCache {
     /// Closes `node_id`'s object, failing its outstanding fills and dropping its pages; its
     /// descriptions go back to RedoxFS.
     fn forget(&mut self, node_id: u32) {
+        self.idle.remove(node_id);
         self.objects_mut().remove(&node_id);
         if self.files.remove(&node_id).is_some() {
             self.attached.retain(|_, node| *node != node_id);

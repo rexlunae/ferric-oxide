@@ -576,6 +576,9 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
         };
 
         let _ = self.other_scheme_fd_map.remove(&node_id);
+        if let Some(pcache) = &mut self.pcache {
+            pcache.removed(node_id);
+        }
 
         Ok(())
     }
