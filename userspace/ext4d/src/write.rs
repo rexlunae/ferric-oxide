@@ -21,13 +21,26 @@
 //! The operations so far change one existing inode in place ([`change`]): its access,
 //! modification and change times ([`set_times`], `futimens`), its permission bits
 //! (`fchmod`), or its owner and group (`fchown`), each with a new change time; and
-//! [`write_data`] writes into the blocks a regular file already has (`write`), as ext4's
-//! ordered mode does: the data goes home first, unjournaled, and the inode's new size and
-//! times then follow in one transaction. Nothing is allocated or freed yet, so a write
-//! that would need a new block is refused. The scheme reaches them through
-//! [`crate::fs::Fs::set_times`], [`crate::fs::Fs::set_mode`], [`crate::fs::Fs::set_owner`]
-//! and [`crate::fs::Fs::write`], which check the caller's permission as POSIX says and find
-//! the inode with [`crate::lookup`]. [`check_writable`] tells, at mount time, whether a
+//! [`write_data`] writes a regular file's data (`write`), as ext4's ordered mode does: the
+//! data goes home first, unjournaled, and the inode's new size, times and any blocks
+//! allocated for holes or past the end then follow in one transaction. [`truncate`] sets a
+//! file's size, freeing the blocks past the new end (`ftruncate`, `O_TRUNC`), and [`create`]
+//! makes an empty regular file in a directory (`O_CREAT`). The scheme reaches them through
+//! [`crate::fs::Fs::set_times`], [`crate::fs::Fs::set_mode`], [`crate::fs::Fs::set_owner`],
+//! [`crate::fs::Fs::write`], [`crate::fs::Fs::truncate`] and [`crate::fs::Fs::open_as`],
+//! which check the caller's permission as POSIX says and find the inode with
+//! [`crate::lookup`].
+//!
+//! Allocation is split into three private modules: `txn` reads and changes the block and
+//! inode bitmaps, the group descriptors and the superblock's free counts inside the one
+//! transaction, with every checksum; `extents` maps and unmaps blocks in an inode's extent
+//! tree (lengthening an extent, inserting one in a root or leaf with room, cutting the tree
+//! back); and `dir` adds an entry to a linear directory, growing it by a block when no block
+//! has room. The group descriptor, extent and directory records they read and write are
+//! declared in `ondisk`, with `simple_endian`'s `#[derive(Endianize)]`. Not done yet: growing an extent tree by a level or splitting a leaf, converting
+//! unwritten extents, block-mapped (ext3) files, hashed directories, holding the reserved
+//! blocks back, and quota updates (so allocation and creation on a `quota` volume are
+//! refused). [`check_writable`] tells, at mount time, whether a
 //! volume can be served read-write.
 //!
 //! An owner or group above 65535 needs the high halves the inode keeps for Linux and Hurd
@@ -42,13 +55,17 @@
 //! (feature flags, `s_checksum_seed`, `s_creator_os`), "Inode Table" (the fields,
 //! `i_extra_isize`, and the per-OS `osd2` union holding the high halves of the owner and
 //! group),
-//! "Inode Timestamps" (the epoch bits and nanoseconds in the `_extra` fields) and
-//! "Checksums" (the inode checksum: CRC32C over the inode number, `i_generation` and the
-//! whole inode with its checksum fields zero, from the volume's checksum seed). The journal
+//! "Inode Timestamps" (the epoch bits and nanoseconds in the `_extra` fields),
+//! "Block Group Descriptors", "Block and inode Bitmaps", "Extent Tree", "Linear (Classic)
+//! Directories" and "Checksums" (the inode checksum: CRC32C over the inode number,
+//! `i_generation` and the whole inode with its checksum fields zero, from the volume's
+//! checksum seed; and those of the descriptors, bitmaps, extent blocks and directory
+//! blocks). The journal
 //! format is `ferric-jbd2`'s. The inode checksum was checked against volumes made by
 //! e2fsprogs 1.47's `mke2fs`, and what this module writes is checked with its `e2fsck`. No
 //! code here comes from the Linux kernel or from e2fsprogs.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
@@ -57,13 +74,21 @@ use thiserror::Error;
 use crate::device::{ReadAt, Window, WindowError, WriteAt};
 use crate::inode::data::Data;
 use crate::inode::{
-    I_ATIME, I_ATIME_EXTRA, I_CTIME, I_CTIME_EXTRA, I_MTIME, I_MTIME_EXTRA, has_extra, le16,
+    GOOD_OLD_INODE_SIZE, I_ATIME, I_ATIME_EXTRA, I_CTIME, I_CTIME_EXTRA, I_EXTRA_ISIZE, I_MTIME,
+    I_MTIME_EXTRA, has_extra, le16,
 };
 use crate::journal::map::{BlockMap, RO_COMPAT_METADATA_CSUM, Volume, le32};
 use crate::journal::{
     self, BlockError, Journal, JournalError, open_journal, read_volume_superblock,
 };
 use crate::superblock::COMPAT_HAS_JOURNAL;
+
+mod dir;
+mod extents;
+mod ondisk;
+mod txn;
+
+use txn::Txn;
 
 /// `s_feature_incompat` bits that writing an inode's times, mode, owner or data in place is
 /// safe under: `filetype`,
@@ -117,6 +142,38 @@ const VERITY_FL: u32 = 0x10_0000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 /// `s_feature_ro_compat`: files may be 2^31 bytes or longer.
 const RO_COMPAT_LARGE_FILE: u32 = 0x2;
+/// `s_feature_ro_compat`: group descriptors have a CRC16 (without `metadata_csum`).
+const RO_COMPAT_GDT_CSUM: u32 = 0x10;
+/// `s_feature_ro_compat`: blocks are allocated in clusters, which this module does not do.
+const RO_COMPAT_BIGALLOC: u32 = 0x200;
+/// `s_feature_ro_compat`: inodes have a project ID (`i_projid`).
+const RO_COMPAT_PROJECT: u32 = 0x2000;
+/// `s_feature_incompat`: files may have extent trees, as every file this module makes does.
+const INCOMPAT_EXTENTS: u32 = 0x40;
+/// Where the superblock keeps `s_min_extra_isize`.
+const S_MIN_EXTRA_ISIZE: usize = 0x15C;
+/// `i_flags`: `i_block` holds an extent tree.
+const EXTENTS_FL: u32 = 0x8_0000;
+/// `i_flags`: `i_blocks` counts file-system blocks, not 512-byte sectors.
+const HUGE_FILE_FL: u32 = 0x4_0000;
+/// `i_blocks_lo` and `l_i_blocks_high`: the blocks the inode uses.
+const I_BLOCKS_LO: usize = 0x1C;
+const I_BLOCKS_HIGH: usize = 0x74;
+/// `i_links_count`.
+const I_LINKS_COUNT: usize = 0x1A;
+/// `i_crtime` and `i_crtime_extra`: the creation time.
+const I_CRTIME: usize = 0x90;
+const I_CRTIME_EXTRA: usize = 0x94;
+/// `i_projid`.
+const I_PROJID: usize = 0x9C;
+/// `i_extra_isize` for new inodes: the fields up to `i_projid`.
+const NEW_EXTRA_ISIZE: u16 = 32;
+/// The file type bits of a directory.
+const S_IFDIR: u16 = 0x4000;
+/// `ext4_dir_entry_2.file_type` of a regular file.
+const FT_REG_FILE: u8 = 1;
+/// The longest name a directory entry holds.
+const NAME_MAX: usize = 255;
 
 /// Where an inode keeps `i_mode`.
 const I_MODE: usize = 0x0;
@@ -223,9 +280,8 @@ pub enum WriteError {
         /// The flags that say how.
         flags: u32,
     },
-    /// A data write to a block of the file that has no initialized block on the volume (a
-    /// hole, an unwritten extent, or past the blocks it has): it would need a block
-    /// allocated, which this module does not do yet.
+    /// A data write to a block of the file that is in an unwritten extent, which this
+    /// module does not convert yet.
     #[error("block {block} of inode {number} is not allocated")]
     NotAllocated {
         /// The inode number.
@@ -250,6 +306,108 @@ pub enum WriteError {
         /// The size the write would leave.
         size: u64,
     },
+    /// A block would have to be allocated for, or freed from, a file whose blocks are not
+    /// mapped by an extent tree (an ext2 or ext3 block map), which this module does not do.
+    #[error("inode {number} has no extent tree")]
+    NoExtents {
+        /// The inode number.
+        number: u32,
+    },
+    /// A new extent is needed in a tree leaf that is full: the tree would have to grow,
+    /// which this module does not do yet.
+    #[error("inode {number}'s extent tree has no room for another extent")]
+    ExtentTreeFull {
+        /// The inode number.
+        number: u32,
+    },
+    /// The inode's extent tree is malformed.
+    #[error("inode {number} has a malformed extent tree")]
+    BadExtentTree {
+        /// The inode number.
+        number: u32,
+    },
+    /// No initialized block group has a free block or inode.
+    #[error("no space left on the volume")]
+    NoSpace,
+    /// A block to read, allocate or free is outside the volume's groups, part of its fixed
+    /// metadata or journal, or (to free) already free.
+    #[error("block {block} cannot be used or freed")]
+    BadBlock {
+        /// The volume block.
+        block: u64,
+    },
+    /// A group descriptor fails its checksum, so its group is not changed.
+    #[error("group {group}'s descriptor has checksum {stored:#06x}, expected {computed:#06x}")]
+    GroupChecksum {
+        /// The group.
+        group: u32,
+        /// The value stored.
+        stored: u32,
+        /// The value computed.
+        computed: u32,
+    },
+    /// A block or inode bitmap fails its checksum, so its group is not changed.
+    #[error("group {group}'s bitmap has checksum {stored:#010x}, expected {computed:#010x}")]
+    BitmapChecksum {
+        /// The group.
+        group: u32,
+        /// The value stored.
+        stored: u32,
+        /// The value computed.
+        computed: u32,
+    },
+    /// An extent tree or directory block fails its checksum, so it is not changed.
+    #[error("block {block} has checksum {stored:#010x}, expected {computed:#010x}")]
+    BlockChecksum {
+        /// The volume block.
+        block: u64,
+        /// The value stored.
+        stored: u32,
+        /// The value computed.
+        computed: u32,
+    },
+    /// A directory block holds an entry whose lengths do not fit it, or lacks its checksum
+    /// tail.
+    #[error("directory inode {number} is malformed at byte {offset} of block {block}")]
+    BadDirectory {
+        /// The directory's inode number.
+        number: u32,
+        /// The directory's logical block.
+        block: u64,
+        /// Where in the block.
+        offset: usize,
+    },
+    /// A file would be created in a directory kept in a way this module does not add entries
+    /// to: hashed, encrypted, inline-data, case-insensitive or without an extent tree.
+    #[error("directory inode {number} is kept in a way ext4d does not add to (flags {flags:#x})")]
+    UnsupportedDirectory {
+        /// The directory's inode number.
+        number: u32,
+        /// The flags that say how (`0x80000`, the extent flag, when it is missing).
+        flags: u32,
+    },
+    /// A file would be created in an inode that is not a directory.
+    #[error("inode {number} is not a directory")]
+    NotADirectory {
+        /// The inode number.
+        number: u32,
+    },
+    /// A file would be created under a name its directory already has.
+    #[error("directory inode {directory} already has the name")]
+    Exists {
+        /// The directory's inode number.
+        directory: u32,
+    },
+    /// A name that cannot be a directory entry: empty, `.`, `..`, or holding a `/` or a
+    /// NUL.
+    #[error("not a valid file name")]
+    InvalidName,
+    /// A name longer than the 255 bytes a directory entry holds.
+    #[error("the name is longer than 255 bytes")]
+    NameTooLong,
+    /// The directory a file would be created in could not be searched.
+    #[error("cannot search the directory")]
+    Directory(#[from] crate::lookup::LookupError),
     /// The journal cannot be written to.
     #[error("cannot write to the journal")]
     Open(#[from] OpenError),
@@ -416,9 +574,6 @@ pub fn change<R: WriteAt>(
     let target = writable_volume(window)?;
     let volume = &target.volume;
     let map = BlockMap::load(volume, window)?;
-    let (_, raw, _) = open_journal(&*window, &map, volume)?;
-    let mut writer = Writer::new(&raw)?;
-
     let block_size = u64::from(volume.block_size);
     let at = volume.inode_offset(window, number)?;
     let (home, within) = (at / block_size, (at % block_size) as usize);
@@ -427,23 +582,44 @@ pub fn change<R: WriteAt>(
     let inode = &mut block[within..within + volume.inode_size as usize];
     check_inode(&target, number, inode)?;
     apply(&target, number, inode, change)?;
-    if let Some(seed) = target.checksum_seed {
-        let checksum = inode_checksum(seed, number, inode);
-        put_checksum(inode, checksum);
-    }
+    seal(&target, number, inode);
+    commit(window, &target, &map, BTreeMap::from([(home, block)]))
+}
 
+/// Writes `blocks` (volume block number to new contents) through the journal in one
+/// transaction: `INCOMPAT_RECOVER` is set, the transaction logged and committed, the blocks
+/// written home and the journal emptied, and `INCOMPAT_RECOVER` cleared.
+fn commit<R: WriteAt>(
+    window: &mut Window<R>,
+    target: &Target,
+    map: &BlockMap,
+    blocks: BTreeMap<u64, Vec<u8>>,
+) -> Result<(), WriteError> {
+    let volume = &target.volume;
+    let (_, raw, _) = open_journal(&*window, map, volume)?;
+    let mut writer = Writer::new(&raw)?;
     let mut transaction = writer.transaction();
-    transaction.log(home, &block)?;
+    for (home, block) in &blocks {
+        transaction.log(*home, block)?;
+    }
     journal::set_recover_flag(window, true)?;
     let mut journal = Journal {
         window: &mut *window,
-        map: &map,
+        map,
         volume,
     };
     let committed = writer.commit(&mut journal, transaction, commit_time())?;
     writer.checkpoint(&mut journal, committed)?;
     journal::set_recover_flag(window, false)?;
     Ok(())
+}
+
+/// Stores inode `number`'s checksum in `inode`, on a volume with `metadata_csum`.
+fn seal(target: &Target, number: u32, inode: &mut [u8]) {
+    if let Some(seed) = target.checksum_seed {
+        let checksum = inode_checksum(seed, number, inode);
+        put_checksum(inode, checksum);
+    }
 }
 
 /// Checks that inode `number`, whose bytes are `inode`, is in use and passes its checksum,
@@ -552,14 +728,7 @@ fn put_owner(
     if new != old && target.volume.ro_compat & RO_COMPAT_QUOTA != 0 {
         return Err(WriteError::QuotaTracked { number });
     }
-    for (id, low, high) in [(new.0, I_UID, I_UID_HIGH), (new.1, I_GID, I_GID_HIGH)] {
-        if target.high_ids {
-            inode[high..high + 2].copy_from_slice(&((id >> 16) as u16).to_le_bytes());
-        } else if id > 0xFFFF {
-            return Err(WriteError::IdOutOfRange { number, id });
-        }
-        inode[low..low + 2].copy_from_slice(&(id as u16).to_le_bytes());
-    }
+    put_ids(target, number, inode, new)?;
     let mode = le16(inode, I_MODE);
     if owner.drop_set_id && mode & S_IFMT == S_IFREG {
         let mode = mode & !(S_ISUID | S_ISGID);
@@ -568,26 +737,58 @@ fn put_owner(
     Ok(())
 }
 
-/// Writes `data` at byte `offset` of the regular file inode `number`, into the blocks it
-/// already has, then records the write in its inode (a new size if it grew, and `changed`
-/// as its modification and change time) in one journal transaction ([`Change::Written`]).
+/// Stores the owner and group `ids` in the inode, with their high halves where the volume's
+/// inodes have them.
+fn put_ids(
+    target: &Target,
+    number: u32,
+    inode: &mut [u8],
+    ids: (u32, u32),
+) -> Result<(), WriteError> {
+    for (id, low, high) in [(ids.0, I_UID, I_UID_HIGH), (ids.1, I_GID, I_GID_HIGH)] {
+        if target.high_ids {
+            inode[high..high + 2].copy_from_slice(&((id >> 16) as u16).to_le_bytes());
+        } else if id > 0xFFFF {
+            return Err(WriteError::IdOutOfRange { number, id });
+        }
+        inode[low..low + 2].copy_from_slice(&(id as u16).to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Writes `data` at byte `offset` of the regular file inode `number`, then records the write
+/// in its inode (a new size if it grew, and `changed` as its modification and change time),
+/// in one journal transaction.
 ///
 /// As in ext4's default ordered mode, the data is not journaled: it is written to its
 /// blocks and flushed before the inode's transaction is logged, so after a crash the inode
-/// never claims a size whose data is not on the disk. A crash before the commit leaves the
-/// new data in place with the old size and times. Nothing is allocated: every block the
-/// write touches must already be an initialized block of the file, and the new size and
-/// times must fit in the inode, or nothing is written. An empty `data` writes nothing.
+/// never claims a size or a block whose data is not on the disk. A crash before the commit
+/// leaves the old size, blocks and times; new data may then sit in blocks that are still
+/// free, or past the old end of the file, where nothing reads it.
+///
+/// Blocks of the file that the write touches and that it does not have yet (past its end or
+/// in a hole) are allocated, as close after the file's last block as there is room, and
+/// mapped in its extent tree, in the same transaction as the bitmaps, group descriptors,
+/// superblock counts and inode that record them. The bytes of a newly allocated block that
+/// the write does not cover are zero, and so are the bytes between the old end of the file
+/// and `offset` in the block the old end is in. Blocks between that block and the write are
+/// left as a hole. Everything is checked, and every block allocated, before any data is
+/// written: a write that cannot be made writes nothing. An empty `data` writes nothing.
 ///
 /// # Errors
 ///
 /// Those of [`change`]; [`WriteError::NotAFile`] for anything but a regular file;
 /// [`WriteError::FileFlags`] for an immutable or append-only file;
-/// [`WriteError::UnsupportedFile`] for inline data, encryption, verity or journaled data;
-/// [`WriteError::NotAllocated`] when a block the write touches is a hole, an unwritten
-/// extent or past the file's blocks; [`WriteError::BadDataBlock`] for a block mapped
-/// outside the volume, into the journal or into fixed metadata; and
-/// [`WriteError::FileTooLarge`].
+/// [`WriteError::UnsupportedFile`] for inline data, encryption, verity, journaled data or
+/// (when blocks are allocated) huge-file block counts; [`WriteError::NotAllocated`] for a
+/// block in an unwritten extent; [`WriteError::BadDataBlock`] for a block mapped outside
+/// the volume, into the journal or into fixed metadata; [`WriteError::FileTooLarge`]. When blocks are allocated:
+/// [`WriteError::NoExtents`] for a file without an extent tree,
+/// [`WriteError::ExtentTreeFull`] when its leaf has no room for a new extent,
+/// [`WriteError::NoSpace`], [`WriteError::QuotaTracked`] on a volume with `quota`,
+/// [`WriteError::UnsupportedFeature`] on one with `bigalloc`, and
+/// [`WriteError::BadExtentTree`], [`WriteError::BadBlock`], [`WriteError::GroupChecksum`],
+/// [`WriteError::BitmapChecksum`] and [`WriteError::BlockChecksum`] for damaged metadata.
 ///
 /// # Examples
 ///
@@ -623,7 +824,7 @@ pub fn write_data<R: WriteAt>(
             number,
             size: u64::MAX,
         })?;
-    let size = Data::read(&inode)?.size();
+    let size = size_of(&inode)?;
     let written = Written {
         size: (end > size).then_some(end),
         changed,
@@ -636,44 +837,658 @@ pub fn write_data<R: WriteAt>(
         &mut inode.clone(),
         &Change::Written(written),
     )?;
-    // Growth must initialize the entire gap, including previously allocated stale bytes.
-    // Validate all mappings before the first write, using a map bounded by the extent
-    // tree rather than allocating a second entry for each block in a large write.
-    let first = offset.min(size);
-    let map = data_blocks(&target.volume, window, number, &inode, first, end)?;
+    let journal = BlockMap::load(&target.volume, window)?;
+    let span = Span { offset, end, size };
+    let plan = plan_write(&*window, &target, &journal, number, &inode, span, written)?;
+    put_data(window, &target, &plan.blocks, span, data)?;
+    zero_gap(window, &target, &plan.gap, size)?;
+    window.flush()?;
+    match plan.transaction {
+        None => change(window, number, &Change::Written(written)),
+        Some(transaction) => commit(window, &target, &journal, transaction),
+    }
+}
+
+/// The bytes a write covers (`offset..end`) and the file's size before it.
+#[derive(Clone, Copy)]
+struct Span {
+    offset: u64,
+    end: u64,
+    size: u64,
+}
+
+/// The blocks one transaction writes: each volume block's new contents.
+type Blocks = BTreeMap<u64, Vec<u8>>;
+
+/// Where a block the write touches goes: a block the file has, or one allocated for it.
+#[derive(Clone, Copy)]
+struct Placed {
+    logical: u64,
+    physical: u64,
+    new: bool,
+}
+
+/// What a write does, all of it checked before anything is written.
+struct Plan {
+    /// Every block the write touches.
+    blocks: Vec<Placed>,
+    /// The blocks the file keeps between its old end and the first block the write
+    /// touches, whose bytes past the old end must be zeroed.
+    gap: Vec<Placed>,
+    /// The transaction, when blocks are allocated.
+    transaction: Option<Blocks>,
+}
+
+/// Finds or allocates every block the write touches, and finds the blocks between the old
+/// end and the write. When any is allocated, the inode's whole transaction (the extent
+/// tree, bitmaps, descriptors, superblock and the inode with `written` applied) comes back
+/// with them; otherwise the caller makes the inode change.
+fn plan_write<R: ReadAt>(
+    window: &Window<R>,
+    target: &Target,
+    journal: &BlockMap,
+    number: u32,
+    inode: &[u8],
+    span: Span,
+    written: Written,
+) -> Result<Plan, WriteError> {
+    let block_size = u64::from(target.volume.block_size);
+    let range = span.offset / block_size..span.end.div_ceil(block_size);
+    let mut txn = Txn::new(window, target, journal);
+    let gap = gap_blocks(&mut txn, target, number, inode, span)?;
+    let found = find_blocks(&mut txn, target, number, inode, range)?;
+    if found.iter().all(|(_, physical)| physical.is_some()) {
+        let blocks = found
+            .into_iter()
+            .map(|(logical, physical)| Placed {
+                logical,
+                physical: physical.unwrap_or_default(),
+                new: false,
+            })
+            .collect();
+        return Ok(Plan {
+            blocks,
+            gap,
+            transaction: None,
+        });
+    }
+    check_allocatable(target, number, inode)?;
+    let mut inode = txn.inode(number)?;
+    let mut goal = goal_for(&mut txn, target, number, &inode, found[0].0)?;
+    let mut placed = Vec::with_capacity(found.len());
+    let mut allocated = 0;
+    for (logical, physical) in found {
+        let (physical, new) = match physical {
+            Some(physical) => (physical, false),
+            None => {
+                let physical = txn.allocate_block(goal)?;
+                let block = u32::try_from(logical).map_err(|_| WriteError::FileTooLarge {
+                    number,
+                    size: span.end,
+                })?;
+                extents::map(&mut txn, number, &mut inode, block, physical)?;
+                allocated += 1;
+                (physical, true)
+            }
+        };
+        goal = physical + 1;
+        placed.push(Placed {
+            logical,
+            physical,
+            new,
+        });
+    }
+    apply(target, number, &mut inode, &Change::Written(written))?;
+    add_blocks(&mut inode, block_size, allocated);
+    seal(target, number, &mut inode);
+    txn.put_inode(number, &inode)?;
+    Ok(Plan {
+        blocks: placed,
+        gap,
+        transaction: Some(txn.finish()?),
+    })
+}
+
+/// Checks that file data of inode `number` may go to volume block `physical`: inside the
+/// volume, and outside the journal and the fixed metadata.
+fn data_block<R: ReadAt>(
+    txn: &mut Txn<'_, R>,
+    target: &Target,
+    number: u32,
+    physical: u64,
+) -> Result<u64, WriteError> {
+    if physical >= target.volume.blocks || txn.reserved(physical)? {
+        return Err(WriteError::BadDataBlock { number, physical });
+    }
+    Ok(physical)
+}
+
+/// The blocks inode `number` has from the one holding its old end up to (not including)
+/// the first block the write touches. A file can keep blocks past its end (after a
+/// shrink), and their old bytes must read as zeros once the new size covers them; holes
+/// and unwritten extents already do.
+fn gap_blocks<R: ReadAt>(
+    txn: &mut Txn<'_, R>,
+    target: &Target,
+    number: u32,
+    inode: &[u8],
+    span: Span,
+) -> Result<Vec<Placed>, WriteError> {
+    let block_size = u64::from(target.volume.block_size);
+    let range = span.size / block_size..span.offset / block_size;
+    if range.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut mapped = Vec::new();
+    if flags_of(inode)? & EXTENTS_FL == 0 {
+        // A block map is read only up to the old size: of the gap, it can have just the
+        // block holding the old end.
+        let map = txn.block_map(number, inode)?;
+        if let Some(physical) = u32::try_from(range.start)
+            .ok()
+            .and_then(|block| map.physical(block))
+        {
+            mapped.push((range.start, physical));
+        }
+    } else {
+        for extent in extents::leaves(txn, number, inode)? {
+            let start = u64::from(extent.logical);
+            let first = start.max(range.start);
+            let last = (start + u64::from(extent.len)).min(range.end);
+            if extent.unwritten || first >= last {
+                continue;
+            }
+            mapped
+                .extend((first..last).map(|logical| (logical, extent.physical + logical - start)));
+        }
+    }
+    mapped
+        .into_iter()
+        .map(|(logical, physical)| {
+            Ok(Placed {
+                logical,
+                physical: data_block(txn, target, number, physical)?,
+                new: false,
+            })
+        })
+        .collect()
+}
+
+/// The volume block of each block in `range` of inode `number`, or `None` for one it does
+/// not have yet (a hole or past its end).
+fn find_blocks<R: ReadAt>(
+    txn: &mut Txn<'_, R>,
+    target: &Target,
+    number: u32,
+    inode: &[u8],
+    range: std::ops::Range<u64>,
+) -> Result<Vec<(u64, Option<u64>)>, WriteError> {
+    if flags_of(inode)? & EXTENTS_FL == 0 {
+        // A block map: what it has is written, and a block it lacks needs an extent tree.
+        let window_map = txn.block_map(number, inode)?;
+        return range
+            .map(|logical| {
+                let physical = u32::try_from(logical)
+                    .ok()
+                    .and_then(|block| window_map.physical(block))
+                    .ok_or(WriteError::NoExtents { number })?;
+                Ok((logical, Some(data_block(txn, target, number, physical)?)))
+            })
+            .collect();
+    }
+    let extents = extents::leaves(txn, number, inode)?;
+    range
+        .map(|logical| {
+            let covering = extents.iter().find(|extent| {
+                let start = u64::from(extent.logical);
+                (start..start + u64::from(extent.len)).contains(&logical)
+            });
+            match covering {
+                None => Ok((logical, None)),
+                Some(extent) if extent.unwritten => Err(WriteError::NotAllocated {
+                    number,
+                    block: logical,
+                }),
+                Some(extent) => {
+                    let physical = extent.physical + (logical - u64::from(extent.logical));
+                    Ok((logical, Some(data_block(txn, target, number, physical)?)))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Checks that blocks can be allocated for inode `number` on this volume.
+fn check_allocatable(target: &Target, number: u32, inode: &[u8]) -> Result<(), WriteError> {
+    let volume = &target.volume;
+    if volume.ro_compat & RO_COMPAT_QUOTA != 0 {
+        return Err(WriteError::QuotaTracked { number });
+    }
+    if volume.ro_compat & RO_COMPAT_BIGALLOC != 0 {
+        return Err(WriteError::UnsupportedFeature {
+            field: "ro_compat",
+            flags: RO_COMPAT_BIGALLOC,
+        });
+    }
+    if flags_of(inode)? & HUGE_FILE_FL != 0 {
+        return Err(WriteError::UnsupportedFile {
+            number,
+            flags: HUGE_FILE_FL,
+        });
+    }
+    Ok(())
+}
+
+/// Where to look for the first new block of inode `number`, the one for block `logical`:
+/// after the extent before it, or at the start of the inode's group.
+fn goal_for<R: ReadAt>(
+    txn: &mut Txn<'_, R>,
+    target: &Target,
+    number: u32,
+    inode: &[u8],
+    logical: u64,
+) -> Result<u64, WriteError> {
+    let extents = extents::leaves(txn, number, inode)?;
+    let before = extents
+        .iter()
+        .rev()
+        .find(|extent| u64::from(extent.logical) < logical);
+    Ok(match before {
+        Some(extent) => extent.physical + u64::from(extent.len),
+        None => {
+            let volume = &target.volume;
+            let group = u64::from((number - 1) / volume.inodes_per_group);
+            u64::from(volume.first_data_block) + group * u64::from(volume.blocks_per_group)
+        }
+    })
+}
+
+/// Writes the data into its blocks: whole new blocks as they are, others read first, with
+/// the bytes of a new block the write does not cover, and those between the old end of the
+/// file and the write, zero.
+fn put_data<R: WriteAt>(
+    window: &mut Window<R>,
+    target: &Target,
+    blocks: &[Placed],
+    span: Span,
+    data: &[u8],
+) -> Result<(), WriteError> {
     let block_size = u64::from(target.volume.block_size);
     let mut buf = vec![0; target.volume.block_size as usize];
-    for logical in first / block_size..end.div_ceil(block_size) {
-        let physical = map
-            .physical(logical as u32)
-            .ok_or(WriteError::NotAllocated {
-                number,
-                block: logical,
-            })?;
-        let start = (logical * block_size).max(first);
-        let stop = ((logical + 1) * block_size).min(end);
-        let within = (start - logical * block_size) as usize;
-        let len = (stop - start) as usize;
-        if len == buf.len() && start >= offset {
-            let from = (start - offset) as usize;
-            window.write_all_at(&data[from..from + len], physical * block_size)?;
+    for block in blocks {
+        let base = block.logical * block_size;
+        // The part of this block the write covers, and where it is in `data`.
+        let start = base.max(span.offset);
+        let stop = (base + block_size).min(span.end);
+        let (within, len) = ((start - base) as usize, (stop - start) as usize);
+        let from = (start - span.offset) as usize;
+        let piece = &data[from..from + len];
+        let at = block.physical * block_size;
+        if len == buf.len() {
+            window.write_all_at(piece, at)?;
             continue;
         }
-        if len != buf.len() {
-            window.read_exact_at(&mut buf, physical * block_size)?;
+        if block.new {
+            buf.fill(0);
+        } else {
+            window.read_exact_at(&mut buf, at)?;
+            // Bytes past the old end that the write skips over must read as zeros.
+            let gap_start = base.max(span.size);
+            let gap_end = (base + block_size).min(span.offset);
+            if gap_start < gap_end {
+                buf[(gap_start - base) as usize..(gap_end - base) as usize].fill(0);
+            }
         }
-        buf[within..within + len].fill(0);
-        let data_start = start.max(offset);
-        if data_start < stop {
-            let from = (data_start - offset) as usize;
-            let into = (data_start - logical * block_size) as usize;
-            let count = (stop - data_start) as usize;
-            buf[into..into + count].copy_from_slice(&data[from..from + count]);
-        }
-        window.write_all_at(&buf, physical * block_size)?;
+        buf[within..within + len].copy_from_slice(piece);
+        window.write_all_at(&buf, at)?;
     }
-    window.flush()?;
-    change(window, number, &Change::Written(written))
+    Ok(())
+}
+
+/// Zeroes the bytes of each gap block past the old end of the file, `size`.
+fn zero_gap<R: WriteAt>(
+    window: &mut Window<R>,
+    target: &Target,
+    gap: &[Placed],
+    size: u64,
+) -> Result<(), WriteError> {
+    let block_size = u64::from(target.volume.block_size);
+    let mut buf = vec![0; target.volume.block_size as usize];
+    for block in gap {
+        let base = block.logical * block_size;
+        let at = block.physical * block_size;
+        let within = (size.max(base) - base) as usize;
+        if within > 0 {
+            window.read_exact_at(&mut buf, at)?;
+        }
+        buf[within..].fill(0);
+        window.write_all_at(&buf, at)?;
+    }
+    Ok(())
+}
+
+/// Zeroes the bytes of volume block `physical` past byte `size % block_size`: the end of a
+/// file whose last block it is.
+fn zero_tail<R: WriteAt>(
+    window: &mut Window<R>,
+    target: &Target,
+    physical: u64,
+    size: u64,
+) -> Result<(), WriteError> {
+    let block_size = u64::from(target.volume.block_size);
+    let within = (size % block_size) as usize;
+    let mut buf = vec![0; target.volume.block_size as usize];
+    window.read_exact_at(&mut buf, physical * block_size)?;
+    buf[within..].fill(0);
+    window.write_all_at(&buf, physical * block_size)?;
+    Ok(())
+}
+
+/// Sets the size of the regular file inode `number` to `size` (`ftruncate`, and `O_TRUNC`
+/// with a size of 0), with `changed` as its modification and change time, in one journal
+/// transaction.
+///
+/// A smaller size frees the blocks past the new end, and the extent tree nodes left empty;
+/// the bytes past the new end in its last block are zeroed once the transaction is
+/// committed. A larger size allocates nothing: the file reads as zeros up to it, and the
+/// bytes past the old end in its last block are zeroed first, before the transaction.
+///
+/// # Errors
+///
+/// Those of [`write_data`] that do not concern data: the volume's and the inode's,
+/// [`WriteError::NotAFile`], [`WriteError::FileFlags`], [`WriteError::UnsupportedFile`],
+/// [`WriteError::FileTooLarge`] and [`WriteError::TimeOutOfRange`]; and, when blocks are
+/// freed, [`WriteError::NoExtents`] for a file without an extent tree,
+/// [`WriteError::QuotaTracked`] on a volume with `quota`, and the damaged-metadata errors.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ext4d::device::Window;
+/// use ext4d::write::{self, Timestamp};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let image = std::fs::OpenOptions::new().read(true).write(true).open("disk.ext4")?;
+/// let mut window = Window::whole(image)?;
+/// // Empty inode 12, as O_TRUNC does.
+/// write::truncate(&mut window, 12, 0, Timestamp::now())?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn truncate<R: WriteAt>(
+    window: &mut Window<R>,
+    number: u32,
+    size: u64,
+    changed: Timestamp,
+) -> Result<(), WriteError> {
+    let target = writable_volume(window)?;
+    let inode = target.volume.read_inode(window, number)?;
+    check_inode(&target, number, &inode)?;
+    check_data_writable(number, &inode)?;
+    let written = Written {
+        size: Some(size),
+        changed,
+    };
+    apply(
+        &target,
+        number,
+        &mut inode.clone(),
+        &Change::Written(written),
+    )?;
+    let old = size_of(&inode)?;
+    let journal = BlockMap::load(&target.volume, window)?;
+    let map = BlockMap::of_inode(&target.volume, window, &inode, number)?;
+    let block_size = u64::from(target.volume.block_size);
+    // The block holding the end of the shorter of the two sizes, if it is not full.
+    let short = old.min(size);
+    let tail = (!short.is_multiple_of(block_size))
+        .then(|| u32::try_from(short / block_size).ok())
+        .flatten()
+        .and_then(|block| map.physical(block));
+    let transaction = {
+        let mut txn = Txn::new(&*window, &target, &journal);
+        let mut inode = txn.inode(number)?;
+        if size < old {
+            let keep = u32::try_from(size.div_ceil(block_size))
+                .map_err(|_| WriteError::FileTooLarge { number, size })?;
+            let freed = free_from(&mut txn, &target, number, &mut inode, &map, keep)?;
+            remove_blocks(&mut inode, block_size, freed);
+        }
+        apply(&target, number, &mut inode, &Change::Written(written))?;
+        seal(&target, number, &mut inode);
+        txn.put_inode(number, &inode)?;
+        txn.finish()?
+    };
+    if let Some(tail) = tail
+        && size > old
+    {
+        zero_tail(window, &target, tail, old)?;
+        window.flush()?;
+    }
+    commit(window, &target, &journal, transaction)?;
+    if let Some(tail) = tail
+        && size < old
+    {
+        zero_tail(window, &target, tail, size)?;
+        window.flush()?;
+    }
+    Ok(())
+}
+
+/// Frees inode `number`'s blocks from block `keep` on; how many volume blocks were freed.
+fn free_from<R: ReadAt>(
+    txn: &mut Txn<'_, R>,
+    target: &Target,
+    number: u32,
+    inode: &mut [u8],
+    map: &BlockMap,
+    keep: u32,
+) -> Result<u64, WriteError> {
+    if flags_of(inode)? & EXTENTS_FL == 0 {
+        // Nothing to free from a block map is fine; anything else needs an extent tree.
+        let any = (keep..map.len.max(keep)).any(|block| map.physical(block).is_some());
+        return if any {
+            Err(WriteError::NoExtents { number })
+        } else {
+            Ok(0)
+        };
+    }
+    let extents = extents::leaves(txn, number, inode)?;
+    if extents.iter().all(|extent| extent.end() <= u64::from(keep)) {
+        return Ok(0);
+    }
+    check_allocatable(target, number, inode)?;
+    extents::truncate(txn, number, inode, keep)
+}
+
+/// What a file [`create`] makes has: its permission bits, owner, group and times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewFile {
+    /// The permission bits (`0o7777`), with the caller's umask already applied.
+    pub permissions: u16,
+    /// The owner.
+    pub uid: u32,
+    /// The group.
+    pub gid: u32,
+    /// The access, modification, change and creation time, which the directory also takes
+    /// as its modification and change time.
+    pub created: Timestamp,
+}
+
+/// Creates an empty regular file named `name` in directory `parent`, in one journal
+/// transaction, and returns its inode number.
+///
+/// An inode is allocated, in the directory's group or the first one after it with a free
+/// inode, and written as an empty file with an extent tree, one link, `file`'s mode, owner,
+/// group and times, and (with `project`) the directory's project. The entry goes into the
+/// first directory block with room for it; when none has, a block is allocated and added to
+/// the directory. The directory's modification and change times become `file.created`.
+///
+/// # Errors
+///
+/// [`WriteError::InvalidName`], [`WriteError::NameTooLong`], [`WriteError::InvalidPermissions`],
+/// [`WriteError::IdOutOfRange`] and [`WriteError::TimeOutOfRange`] for what cannot be
+/// stored; [`WriteError::NotADirectory`] when `parent` is not one;
+/// [`WriteError::Exists`] when it has the name already; [`WriteError::UnsupportedDirectory`]
+/// for a hashed, encrypted, inline-data, case-insensitive or block-mapped directory;
+/// [`WriteError::QuotaTracked`] on a volume with `quota`; [`WriteError::NoExtents`] on one
+/// without extents; [`WriteError::NoSpace`]; [`WriteError::Directory`] when the directory
+/// cannot be searched; and those of [`change`] for the volume and the directory's inode.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ext4d::device::Window;
+/// use ext4d::lookup::ROOT_INODE;
+/// use ext4d::write::{self, NewFile, Timestamp};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let image = std::fs::OpenOptions::new().read(true).write(true).open("disk.ext4")?;
+/// let mut window = Window::whole(image)?;
+/// let file = NewFile { permissions: 0o644, uid: 1000, gid: 100, created: Timestamp::now() };
+/// let number = write::create(&mut window, ROOT_INODE, b"new.txt", &file)?;
+/// # let _ = number;
+/// # Ok(())
+/// # }
+/// ```
+pub fn create<R: WriteAt>(
+    window: &mut Window<R>,
+    parent: u32,
+    name: &[u8],
+    file: &NewFile,
+) -> Result<u32, WriteError> {
+    if name.len() > NAME_MAX {
+        return Err(WriteError::NameTooLong);
+    }
+    let valid = !name.is_empty()
+        && name != b"."
+        && name != b".."
+        && !name.iter().any(|&b| b == b'/' || b == 0);
+    if !valid {
+        return Err(WriteError::InvalidName);
+    }
+    if file.permissions & !PERMISSION_BITS != 0 {
+        return Err(WriteError::InvalidPermissions {
+            bits: file.permissions,
+        });
+    }
+    let target = writable_volume(window)?;
+    let volume = &target.volume;
+    if volume.ro_compat & RO_COMPAT_QUOTA != 0 {
+        return Err(WriteError::QuotaTracked { number: parent });
+    }
+    if volume.incompat & INCOMPAT_EXTENTS == 0 {
+        return Err(WriteError::NoExtents { number: parent });
+    }
+    let dir = volume.read_inode(window, parent)?;
+    check_inode(&target, parent, &dir)?;
+    if le16(&dir, I_MODE) & S_IFMT != S_IFDIR {
+        return Err(WriteError::NotADirectory { number: parent });
+    }
+    let filetype = volume.incompat & crate::lookup::INCOMPAT_FILETYPE != 0;
+    if crate::lookup::find(volume, window, parent, name, filetype)?.is_some() {
+        return Err(WriteError::Exists { directory: parent });
+    }
+    let journal = BlockMap::load(volume, window)?;
+    let (number, transaction) = {
+        let mut txn = Txn::new(&*window, &target, &journal);
+        let mut dir = txn.inode(parent)?;
+        let number = txn.allocate_inode((parent - 1) / volume.inodes_per_group)?;
+        let mut inode = new_inode(&target, number, &dir, file)?;
+        let entry = dir::NewEntry {
+            name,
+            inode: number,
+            file_type: if filetype { FT_REG_FILE } else { 0 },
+            filetype,
+        };
+        dir::add_entry(&mut txn, parent, &mut dir, &entry)?;
+        for field in [(I_MTIME, I_MTIME_EXTRA), (I_CTIME, I_CTIME_EXTRA)] {
+            put_time_of(&mut dir, parent, field.0, field.1, Some(file.created))?;
+        }
+        seal(&target, parent, &mut dir);
+        txn.put_inode(parent, &dir)?;
+        seal(&target, number, &mut inode);
+        txn.put_inode(number, &inode)?;
+        (number, txn.finish()?)
+    };
+    commit(window, &target, &journal, transaction)?;
+    Ok(number)
+}
+
+/// The bytes of new inode `number`: an empty regular file with `file`'s attributes, in
+/// directory `dir`. Its checksum is left for the caller.
+fn new_inode(
+    target: &Target,
+    number: u32,
+    dir: &[u8],
+    file: &NewFile,
+) -> Result<Vec<u8>, WriteError> {
+    let size = target.volume.inode_size as usize;
+    let mut inode = vec![0; size];
+    if size > GOOD_OLD_INODE_SIZE {
+        let room = (size - GOOD_OLD_INODE_SIZE) as u16;
+        let extra = NEW_EXTRA_ISIZE.max(target.min_extra_isize).min(room);
+        inode[I_EXTRA_ISIZE..I_EXTRA_ISIZE + 2].copy_from_slice(&extra.to_le_bytes());
+    }
+    let mode = S_IFREG | file.permissions;
+    inode[I_MODE..I_MODE + 2].copy_from_slice(&mode.to_le_bytes());
+    put_ids(target, number, &mut inode, (file.uid, file.gid))?;
+    for (field, extra) in [
+        (I_ATIME, I_ATIME_EXTRA),
+        (I_MTIME, I_MTIME_EXTRA),
+        (I_CTIME, I_CTIME_EXTRA),
+        (I_CRTIME, I_CRTIME_EXTRA),
+    ] {
+        if field == I_CRTIME && !has_extra(&inode, I_CRTIME_EXTRA + 4) {
+            continue;
+        }
+        put_time_of(&mut inode, number, field, extra, Some(file.created))?;
+    }
+    inode[I_LINKS_COUNT..I_LINKS_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+    Data::read(&inode)?.put_flags(&mut inode, EXTENTS_FL)?;
+    extents::init_root(&mut inode);
+    let generation =
+        (file.created.nanoseconds ^ (file.created.seconds as u32)).rotate_left(7) ^ number;
+    inode[I_GENERATION..I_GENERATION + 4].copy_from_slice(&generation.to_le_bytes());
+    let projects = target.volume.ro_compat & RO_COMPAT_PROJECT != 0;
+    if projects && has_extra(&inode, I_PROJID + 4) && has_extra(dir, I_PROJID + 4) {
+        inode[I_PROJID..I_PROJID + 4].copy_from_slice(&dir[I_PROJID..I_PROJID + 4]);
+    }
+    Ok(inode)
+}
+
+/// The size in `i_size_lo` and `i_size_high`.
+fn size_of(inode: &[u8]) -> Result<u64, WriteError> {
+    Ok(Data::read(inode)?.size())
+}
+
+/// The flags in `i_flags`.
+fn flags_of(inode: &[u8]) -> Result<u32, WriteError> {
+    Ok(Data::read(inode)?.flags)
+}
+
+/// The blocks counted in `i_blocks_lo` and `l_i_blocks_high`, in 512-byte units.
+fn blocks_of(inode: &[u8]) -> u64 {
+    u64::from(le16(inode, I_BLOCKS_HIGH)) << 32 | u64::from(le32(inode, I_BLOCKS_LO))
+}
+
+fn put_blocks(inode: &mut [u8], blocks: u64) {
+    inode[I_BLOCKS_LO..I_BLOCKS_LO + 4].copy_from_slice(&(blocks as u32).to_le_bytes());
+    let high = (blocks >> 32) as u16;
+    inode[I_BLOCKS_HIGH..I_BLOCKS_HIGH + 2].copy_from_slice(&high.to_le_bytes());
+}
+
+/// Counts `count` more volume blocks of `block_size` bytes in the inode's `i_blocks`.
+fn add_blocks(inode: &mut [u8], block_size: u64, count: u64) {
+    put_blocks(inode, blocks_of(inode) + count * (block_size / 512));
+}
+
+/// Counts `count` fewer volume blocks in the inode's `i_blocks`.
+fn remove_blocks(inode: &mut [u8], block_size: u64, count: u64) {
+    put_blocks(
+        inode,
+        blocks_of(inode).saturating_sub(count * (block_size / 512)),
+    );
 }
 
 /// Checks that the data of inode `number` (`inode`) is one this module can write in place.
@@ -699,45 +1514,17 @@ fn check_data_writable(number: u32, inode: &[u8]) -> Result<(), WriteError> {
     Ok(())
 }
 
-/// The volume block of each block of inode `number` that bytes `offset..end` touch, by
-/// block within the file, all checked before anything is written.
-fn data_blocks<R: ReadAt>(
-    volume: &Volume,
-    window: &Window<R>,
-    number: u32,
-    inode: &[u8],
-    offset: u64,
-    end: u64,
-) -> Result<BlockMap, WriteError> {
-    let block_size = u64::from(volume.block_size);
-    let map = BlockMap::of_inode(volume, window, inode, number)?;
-    let journal = BlockMap::load(volume, window)?;
-    let metadata = volume.metadata(window)?;
-    for logical in offset / block_size..end.div_ceil(block_size) {
-        let physical = u32::try_from(logical)
-            .ok()
-            .and_then(|block| map.physical(block))
-            .ok_or(WriteError::NotAllocated {
-                number,
-                block: logical,
-            })?;
-        if physical >= volume.blocks
-            || journal.contains(physical)
-            || metadata
-                .iter()
-                .any(|&(start, end)| (start..end).contains(&physical))
-        {
-            return Err(WriteError::BadDataBlock { number, physical });
-        }
-    }
-    Ok(map)
-}
-
 /// Stores `size` in `i_size_lo` and `i_size_high`.
 fn put_size(target: &Target, number: u32, inode: &mut [u8], size: u64) -> Result<(), WriteError> {
     if size > i32::MAX as u64 && target.volume.ro_compat & RO_COMPAT_LARGE_FILE == 0 {
         return Err(WriteError::FileTooLarge { number, size });
     }
+    store_size(inode, size)
+}
+
+/// Stores `size` in `i_size_lo` and `i_size_high`, unchecked: a directory's, which may use
+/// both halves without `large_file`.
+fn store_size(inode: &mut [u8], size: u64) -> Result<(), WriteError> {
     Data::read(inode)?.put_size(inode, size)?;
     Ok(())
 }
@@ -771,6 +1558,12 @@ struct Target {
     /// `l_i_gid_high` (`s_creator_os` Linux) or `h_i_uid_high` and `h_i_gid_high` (Hurd), at
     /// the same offsets. Other creators keep other fields there.
     high_ids: bool,
+    /// Whether group descriptors have a CRC16 (`gdt_csum`, without `metadata_csum`).
+    gdt_csum: bool,
+    /// `s_uuid`, which the CRC16 starts with.
+    uuid: [u8; 16],
+    /// `s_min_extra_isize`: the least `i_extra_isize` a new inode may have.
+    min_extra_isize: u16,
 }
 
 /// The volume's [`Target`], once it is known that this module may write to it.
@@ -803,10 +1596,16 @@ fn writable_volume<R: ReadAt>(window: &Window<R>) -> Result<Target, WriteError> 
         }
     });
     let high_ids = matches!(le32(&sb, S_CREATOR_OS), CREATOR_LINUX | CREATOR_HURD);
+    let gdt_csum = seed.is_none() && volume.ro_compat & RO_COMPAT_GDT_CSUM != 0;
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&sb[S_UUID..S_UUID + 16]);
     Ok(Target {
         volume,
         checksum_seed: seed,
         high_ids,
+        gdt_csum,
+        uuid,
+        min_extra_isize: le16(&sb, S_MIN_EXTRA_ISIZE),
     })
 }
 

@@ -58,6 +58,7 @@ dependencies = [
 name = "ext4d"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "ext4-view",
  "ferric-abi",
  "ferric-fspath",

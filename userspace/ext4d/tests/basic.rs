@@ -245,7 +245,11 @@ fn every_change_is_erofs() {
             ..OpenMode::read()
         },
         OpenMode {
-            create_or_truncate: true,
+            create: true,
+            ..OpenMode::read()
+        },
+        OpenMode {
+            truncate: true,
             ..OpenMode::read()
         },
     ];

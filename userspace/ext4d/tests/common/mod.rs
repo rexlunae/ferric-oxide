@@ -156,6 +156,29 @@ pub fn e2fsck(name: &str, image: Vec<u8>) -> Vec<u8> {
     after
 }
 
+/// Has `e2fsck -fn` (named by `EXT4D_E2FSCK`) check `image` as it is, without letting it
+/// replay or fix anything first: it must find nothing wrong. Without `EXT4D_E2FSCK`, nothing
+/// is checked.
+pub fn e2fsck_clean(name: &str, image: &[u8]) {
+    let Some(e2fsck) = std::env::var_os("EXT4D_E2FSCK") else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!("ext4d-{}-{name}.ext4", std::process::id()));
+    std::fs::write(&path, image).expect("a temporary file");
+    let check = Command::new(&e2fsck)
+        .args(["-f", "-n"])
+        .arg(&path)
+        .output()
+        .expect("e2fsck runs");
+    std::fs::remove_file(&path).expect("removed");
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "{name}: e2fsck -fn: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+}
+
 /// A volume in memory that stays reachable after it is handed to a [`ext4d::fs::Fs`], so a
 /// test can look at the bytes it was left with.
 #[derive(Clone, Default)]

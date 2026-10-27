@@ -59,14 +59,14 @@ pub(crate) struct Volume {
     pub(crate) blocks: u64,
     needs_recovery: bool,
     pub(crate) incompat: u32,
-    first_data_block: u32,
-    blocks_per_group: u32,
-    inodes_per_group: u32,
+    pub(crate) first_data_block: u32,
+    pub(crate) blocks_per_group: u32,
+    pub(crate) inodes_per_group: u32,
     /// `s_inodes_count`.
     pub(crate) inodes: u32,
     /// The size of an on-disk inode in bytes.
     pub(crate) inode_size: u32,
-    desc_size: u32,
+    pub(crate) desc_size: u32,
     first_meta_bg: u32,
     reserved_gdt_blocks: u32,
     pub(crate) compat: u32,
@@ -145,7 +145,7 @@ impl Volume {
     }
 
     /// The number of block groups.
-    fn groups(&self) -> u64 {
+    pub(crate) fn groups(&self) -> u64 {
         let data = self.blocks.saturating_sub(u64::from(self.first_data_block));
         data.div_ceil(u64::from(self.blocks_per_group))
     }
@@ -224,7 +224,7 @@ impl Volume {
         Ok(block * u64::from(self.block_size))
     }
 
-    fn read_block<R: ReadAt>(
+    pub(crate) fn read_block<R: ReadAt>(
         &self,
         window: &Window<R>,
         block: u64,
@@ -577,7 +577,7 @@ fn is_power_of(mut n: u64, base: u64) -> bool {
 }
 
 /// The little-endian `u16` at `at`; every caller's buffer is long enough.
-fn le16(raw: &[u8], at: usize) -> u16 {
+pub(crate) fn le16(raw: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([raw[at], raw[at + 1]])
 }
 
