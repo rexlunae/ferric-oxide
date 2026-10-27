@@ -542,7 +542,31 @@ enum InterruptVectorKind {
     MsiX { table_entry: *mut MsixTableEntry },
 }
 
+/// Ferric Oxide: how an [`InterruptVector`] is delivered, for drivers whose device registers
+/// depend on it (an NVMe controller's INTMS and INTMC serve pin-based and MSI interrupts only).
+///
+/// Deliberately exhaustive: a driver that matches on it must decide what a new mechanism means
+/// for its device rather than fall into a wildcard arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptMechanism {
+    /// The INTx# pin, through the I/O APIC.
+    Pin,
+    /// An MSI message.
+    Msi,
+    /// An MSI-X table entry, which the driver masks through its Vector Control word.
+    MsiX,
+}
+
 impl InterruptVector {
+    /// Ferric Oxide: how this vector is delivered.
+    pub fn mechanism(&self) -> InterruptMechanism {
+        match self.kind {
+            InterruptVectorKind::Legacy => InterruptMechanism::Pin,
+            InterruptVectorKind::Msi => InterruptMechanism::Msi,
+            InterruptVectorKind::MsiX { .. } => InterruptMechanism::MsiX,
+        }
+    }
+
     pub fn irq_handle(&self) -> &File {
         &self.irq_handle
     }

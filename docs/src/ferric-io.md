@@ -365,6 +365,32 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### NVMe interrupt masking
+
+nvmed's executor masks a queue pair's interrupt vector while it drains that
+pair's completion queues, then unmasks it. Which register it writes is decided
+once, when the driver starts, from the vector's delivery mechanism
+(`pcid_interface::irq_helpers::InterruptVector::mechanism`), and kept as
+`nvme::intmask::InterruptMask`:
+
+- Pin-based and MSI interrupts use the controller's INTMS (offset 0Ch) and
+  INTMC (offset 10h) registers, one bit per vector. At start nvmed masks every
+  vector and unmasks vector 0.
+- MSI-X uses the Mask bit of the vector's table entry (its Vector Control
+  word). nvmed never reads or writes INTMS or INTMC then: the NVM Express Base
+  Specification 1.4 (sections 3.1.3 and 3.1.4) says host software shall not
+  access them when the controller is configured for MSI-X. Each per-CPU queue
+  pair masks its own entry.
+
+The driver has preferred MSI-X since it was imported, and its MSI-X path never
+wrote INTMS or INTMC; this rule makes that a typed, tested decision rather than
+a side effect of `set_masked_if_fast`. Setting the Mask bit is a
+read-modify-write of Vector Control (the PCI specification has software keep
+its reserved bits), so a mask and unmask cost two reads and two writes of the
+MSI-X table on every interrupt, besides the doorbell writes. Under emulation
+each of those is an MMIO exit. `cargo test -p nvmed` (in `userspace/base`)
+covers the choice for each mechanism and the INTMS/INTMC bit values.
+
 ### NVMe request lifetime accounting
 
 The dispatcher counts inline requests, awaited worker jobs and requests that
