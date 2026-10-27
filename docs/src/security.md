@@ -1,35 +1,77 @@
 # Security
 
-This page covers the security design.
+This page describes the security model as it stands on `main`, and the parts
+that are still planned. [Memory and CPU protection](./ferric-memory.md) has
+the details of the hardware mitigations.
 
-## Unsafe Rust
+## Isolation by design
 
-Some parts of the system code use unsafe Rust code which has less compiler verification than safe Rust, thus still safer than C or C++
+Drivers, file systems, the network stack and most other services run as
+separate user-space processes. A bug in one of them is contained to that
+process instead of running with kernel privileges, and the kernel itself
+stays small enough to review.
 
-Unsafe Rust code is replaced with safe Rust code where possible, where it's not possible the security focus relies on boundaries.
+The system is written in Rust. `unsafe` code is kept to small, commented
+blocks behind safe interfaces (see [Rusting Properly](./rusting-properly.md)),
+and CI fails if the number of `unsafe` uses in the kernel goes up
+(`scripts/ferric-ci/kernel-lint-ratchet.sh`).
 
-Some unsafe Rust code is using safe Rust code in some parts, we are looking more unsafe Rust code than can use safe Rust code.
+## Namespaces and file descriptors
 
-## Applications and Libraries
+Every resource is reached through a scheme, and every process has a
+**namespace**: the set of schemes it can open by name. A process can be
+started with a smaller namespace, or none, so it cannot open new resources
+and can only use the file descriptors it was given. In bootstrap, the initial
+namespace manager (`initnsmgr`) serves these namespaces.
 
-The POSIX and Linux source code compatibility don't reduce the system security, `relibc` translate POSIX APIs and try to improve the compatibility security where possible:
+A file descriptor works as a capability: holding it grants the operations it
+was opened for, and it can be passed to another process. Ferric Oxide's new
+interfaces rely on this. A registered-buffer region controls its grants, a
+grant gives bounded and revocable access to memory, a DMA-domain descriptor
+allows operations on one device's IOMMU domain, and `kernel.trace` hands out
+`cap/read` and `cap/control` descriptors so a non-root collector can read
+traces without becoming root.
 
-- The microkernel architecture greatly reduce the potential to use system bugs to get application or library sensitive data or inject malicious code
-- POSIX and Linux functions are written in Rust, which prevent many bugs
-- Input sanitization is done where possible, like strings
+## Users and root
 
-The POSIX/Linux applications or libraries is who decide if they use safer APIs, while Redox provide the compatibility.
+Alongside namespaces, services check the caller's user and group IDs, in the
+Unix way. Some kernel schemes still decide access with a plain "is this
+root" check: IRQs, physical memory mappings, port I/O and opening the IOMMU
+attach capability all require root today.
 
-## Capabilities and Sandbox
+## Hardware mitigations
 
-- The namespaces and [capability-based](https://en.wikipedia.org/wiki/Capability-based_security) system are implemented by the kernel but some parts can be moved to user-space.
-- A namespace is a list of schemes, if you run `ls :`, it will show the schemes on the current namespace.
-- Each process has a namespace.
-- [Capabilities](https://en.wikipedia.org/wiki/File_descriptor#File_descriptors_as_capabilities) are customized file descriptors that carry specific actions.
+| Mitigation | Status | Option |
+| --- | --- | --- |
+| Kernel image and physical-map KASLR | Implemented, on by default | `kernel.kaslr_image`, `kernel.kaslr` |
+| User ASLR, stack guards, faulting `PROT_NONE` | Implemented, on by default | `kernel.aslr`, `kernel.prot_none` |
+| SMEP, SMAP, NX, UMIP | Used where the CPU has them | |
+| KPTI with PCID | Implemented; on automatically for Intel CPUs affected by Meltdown | `kernel.cpu.kpti`, `kernel.cpu.pcid` |
+| Supervisor CET (IBT and shadow stacks) | Implemented, off by default; shadow stacks need KPTI off | see [CET](./ferric-memory.md#cet-enforcement-versus-preparation) |
+| User-mode CET | Not implemented | |
+| IOMMU DMA isolation | Implemented, off by default | `kernel.iommu` |
+| Bounds-check hardening against Spectre v1 at kernel trust boundaries | Implemented in the paths `crates/nospec/` covers | |
 
-The sandbox system duplicates the system resources for each program, it allows them to be completely isolated from the main system. Flatpak and Snap use a sandbox security system on Linux, Redox will do the same.
+## Planned: the capability model
 
-Redox allows sandbox by limiting a program's capabilities:
+Phase 4 of the [roadmap](./ferric-roadmap.md#phase-4-finish-the-capability-security-model)
+finishes the move from root checks to capabilities:
 
-- Only a certain number of schemes in the program's namespace is allowed, or no scheme at all. That way new file descriptors can't be opened.
-- All functionality is forced to occur via file descriptors (WIP).
+- The remaining root checks in kernel schemes become explicit capabilities: a
+  device manager hands out IRQ, physical-memory, IOMMU-domain and port I/O
+  descriptors.
+- Every system service starts sandboxed, with a manifest of the schemes it
+  needs, through the namespace manager and `contain`.
+- Desktop applications get per-application sandbox profiles.
+- The boot chain uses UEFI Secure Boot with Ferric Oxide keys and TPM measured
+  boot, and full-disk encryption can be unlocked by a key sealed to the TPM.
+- A written threat model and an external review follow.
+
+`fox` packages already carry signatures and SBOMs; capability manifests checked
+at install time are planned with Phase 4 (see [the roadmap](./ferric-roadmap.md)).
+
+## POSIX programs
+
+relibc provides the POSIX and Linux interfaces in Rust on top of schemes, so
+ported C programs get the same process isolation. Whether a program uses
+safer interfaces is still up to the program.

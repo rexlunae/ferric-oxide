@@ -1,8 +1,9 @@
 use std::convert::TryInto;
 use std::time::{Duration, Instant};
-use std::{cmp, mem, ptr, slice, thread};
+use std::{cmp, mem, slice, thread};
 
 use common::dma::Dma;
+use common::io::{Io, MmioPtr};
 use driver_network::NetworkAdapter;
 use syscall::error::Result;
 
@@ -215,7 +216,8 @@ impl Intel8259x {
             "MMIO access out of bounds"
         );
 
-        unsafe { ptr::read_volatile((self.base + register as usize) as *mut u32) }
+        // SAFETY: the bounds check above keeps the access inside the mapped BAR.
+        unsafe { MmioPtr::new((self.base + register as usize) as *mut u32) }.read()
     }
 
     /// Sets the register at `self.base` + `register`.
@@ -229,10 +231,10 @@ impl Intel8259x {
             "MMIO access out of bounds"
         );
 
-        unsafe {
-            ptr::write_volatile((self.base + register as usize) as *mut u32, data);
-            ptr::read_volatile((self.base + register as usize) as *mut u32)
-        }
+        // SAFETY: the bounds check above keeps the access inside the mapped BAR.
+        let mut reg = unsafe { MmioPtr::new((self.base + register as usize) as *mut u32) };
+        reg.write(data);
+        reg.read()
     }
 
     fn write_flag(&self, register: u32, flags: u32) {

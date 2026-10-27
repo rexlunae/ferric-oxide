@@ -502,6 +502,12 @@ impl FileMmapInfo {
         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
     }
 
+    /// Ferric Oxide: the references to mapped ranges, of any kind; the page cache holds the
+    /// file's cached writes while there are any, so the mapped pages see every write.
+    pub fn mappings(&self) -> usize {
+        self.ranges.iter().map(|(_, fmap)| fmap.rc).sum()
+    }
+
     /// Ferric Oxide: the references to mapped ranges that `Fmap::sync` writes back to the
     /// file, those of shared writable mappings; the page cache leaves the file alone while
     /// there are any.

@@ -48,11 +48,18 @@ ferric-ext4-test = "source"
 # image is built by name (CONFIG_NAME=ferric-smoke), so ferric-config's generated package
 # list does not apply to it and the package has to be named here, as fox is below.
 ext4d = "source"
+# Mounts a FAT32 image and an exFAT image with fatd (fs.fat and fs.exfat, which CI turns on);
+# skips without them.
+ferric-fat-test = "source"
+# fatd, as features.toml fs.fat = true adds it; named here for the same reason as ext4d above.
+fatd = "source"
 # Serves the LUKS and LVM images of crates/blocklayer with ferric-blockd (fs.luks and fs.lvm,
 # which CI turns on) and reads them back; skips without it.
 ferric-blocklayer-test = "source"
 # ferric-blockd, as features.toml fs.luks or fs.lvm adds it; named here for the same reason as
-# ext4d above. Built by name, it has both layers.
+# ext4d above. Built by name, it has both layers; CI passes FERRIC_BLOCKD_FEATURES from its
+# ferric.toml, whose fs.unlock_at_boot adds ferric-unlock and its 05_ferric-unlock.service, so
+# the test's /etc/ferric/crypttab is unlocked at boot.
 ferric-blockd = "source"
 # Reads and writes the NVMe disk through a registered-buffer grant (drivers.grant_dma,
 # which CI turns on) and times it against ordinary reads.
@@ -65,8 +72,8 @@ ferric-iobench = "source"
 # Opens a queue socket on e1000d and exchanges ARP and ICMP with QEMU's gateway through its
 # own rings, in copy mode (drivers.net_bypass and kernel.regbuf, which CI turns on).
 ferric-netq-test = "source"
-# fox replaces pkg, as features.toml packages.manager = "fox" does: it adopts
-# the image's packages on first boot (05_fox-adopt.service) and the script
+# fox replaces pkg, as features.toml packages.manager = "fox" does: the
+# installer records the image's packages in fox's database, and the script
 # below checks them against their signatures.
 fox = "source"
 pkgutils = "ignore"
@@ -141,6 +148,7 @@ end
 ferric-ring-test || echo FERRIC_TEST_FAIL ring exited with an error
 ferric-pcache-test || echo FERRIC_TEST_FAIL pcache exited with an error
 ferric-ext4-test || echo FERRIC_TEST_FAIL ext4 exited with an error
+ferric-fat-test || echo FERRIC_TEST_FAIL fat exited with an error
 ferric-blocklayer-test || echo FERRIC_TEST_FAIL blocklayer exited with an error
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error

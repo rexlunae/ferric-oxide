@@ -1,6 +1,16 @@
+# Host and target installer share the in-tree source. The path source makes
+# the cookbook rebuild the installer when tools/installer changes; changes
+# only under crates/fox-* need `make cr.installer`, as for recipes/core/fox.
 [source]
-# Host and target installer share the in-tree source.
 path = "tools/installer"
 
 [build]
-template = "cargo"
+template = "custom"
+script = """
+# The installer is a member of the host workspace at the repository root:
+# it takes its dependency versions and lockfile from there, and places
+# packages with ../../crates/fox-store. The cookbook's copy in source/ has
+# neither, so build the in-tree crate instead, as recipes/core/fox does.
+export CARGO_TARGET_DIR="${COOKBOOK_BUILD}/target"
+COOKBOOK_SOURCE="${COOKBOOK_ROOT}/tools/installer" cookbook_cargo
+"""

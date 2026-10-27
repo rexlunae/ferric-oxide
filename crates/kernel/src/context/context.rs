@@ -170,7 +170,8 @@ pub struct Context {
     /// ring worker is cancelled when its ring closes; such a context has no signal state, so
     /// this is how an interruption that comes before the wait is not lost.
     pub cancelled: bool,
-    pub fmap_ret: Option<Frame>,
+    /// Lazy file-map reply and wait registration, serialized by this context lock.
+    pub(crate) fmap_ret: super::fmap_reply::FmapReply<Frame>,
     /// Priority
     pub prio: usize,
     /// Virtual Run Time
@@ -249,7 +250,7 @@ impl Context {
             name: ArrayString::new(),
             files: Arc::new(RwLock::new(FdTbl::new())),
             userspace: false,
-            fmap_ret: None,
+            fmap_ret: super::fmap_reply::FmapReply::new(),
             prio: 20,
             vtime: 0,
             vd: 0,
@@ -651,7 +652,15 @@ impl Kstack {
         let must_be_zero = true;
         #[cfg_attr(not(shstk_compiled), expect(unused_mut))]
         let mut this = Self {
-            base: allocate_p2frame(4, must_be_zero).ok_or(Enomem)?,
+            // Ferric Oxide: say so when a context cannot get its stack, so a thread or process
+            // creation that fails now and then (ENOMEM in user space) shows why in the boot log.
+            base: allocate_p2frame(4, must_be_zero).ok_or_else(|| {
+                crate::warn!(
+                    "no 64 KiB kernel stack for a new context: {} frames free",
+                    crate::memory::free_frames()
+                );
+                Enomem
+            })?,
             #[cfg(shstk_compiled)]
             shadow: None,
         };

@@ -7,8 +7,8 @@ path = "userspace/ext4d"
 [build]
 template = "custom"
 script = """
-# The journal replay (features.toml fs.ext4_journal_replay) is crates/jbd2, a path
-# dependency at ../../crates from userspace/ext4d/. The cookbook builds a copy of
+# The journal replay (features.toml fs.ext4_journal_replay) is crates/jbd2, and the futimens
+# and fchown sentinels are crates/abi: path dependencies at ../../crates from userspace/ext4d/. The cookbook builds a copy of
 # userspace/ext4d/ in this recipe's source/, so give that copy the same relative path to it.
 ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
 # fs.ext4_journal_replay adds journal-replay to FERRIC_EXT4D_FEATURES (and fs.ext4_write adds

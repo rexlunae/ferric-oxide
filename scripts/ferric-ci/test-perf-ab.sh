@@ -32,6 +32,12 @@ iobench_log() {
         [ "$job" = randread-4k-qd32 ] && ab="$1"
         echo "FERRIC_BENCH iobench-$job ab_baseline_iops=1000 ab_candidate_iops=800 ab_ratio=800 ab_tolerance=900 ab_rounds=5 ab=$ab"
     done
+    for job in file-randwrite-4k-qd1 file-write-128k-qd1; do
+        for path in fs cache; do
+            echo "FERRIC_BENCH iobench-$job path=$path rounds=3 $fields"
+        done
+        echo "FERRIC_BENCH iobench-$job ab_baseline_iops=1000 ab_candidate_iops=1000 ab_ratio=1000 ab_tolerance=50 ab_rounds=3 ab=pass"
+    done
     echo "FERRIC_TEST_PASS iobench"
 }
 
@@ -68,6 +74,18 @@ for check in blkgrant iobench; do
     expect 0 "$script" "$work/$check-fail.log" report
     expect 1 "$script" "$work/$check-fail.log" warn
 done
+
+# File jobs are reported rather than gated, but their records remain mandatory.
+sed '/iobench-file-.*ab=pass/s/ab=pass/ab=fail/' "$work/iobench-pass.log" > "$work/file-fail.log"
+if ! env -u GITHUB_STEP_SUMMARY -u PERF_AB "$dir/check-iobench-log.sh" none "$work/file-fail.log" > "$work/out" 2>&1; then
+    echo "FAIL: file A/B should be reported without failing disk gates"
+    failures=$((failures + 1))
+fi
+sed '/iobench-file-/d' "$work/iobench-pass.log" > "$work/file-missing.log"
+if env -u GITHUB_STEP_SUMMARY PERF_AB=report "$dir/check-iobench-log.sh" none "$work/file-missing.log" > "$work/out" 2>&1; then
+    echo "FAIL: report mode must still reject missing file benchmark records"
+    failures=$((failures + 1))
+fi
 
 [ "$failures" = 0 ] || { echo "test-perf-ab: $failures failed"; exit 1; }
 echo "test-perf-ab: OK"

@@ -104,15 +104,30 @@ pub struct FileScheme<'sock, D: Disk> {
 }
 
 impl<'sock, D: Disk> FileScheme<'sock, D> {
-    /// Ferric Oxide: tells the page cache how many writable mapped ranges of `node_ptr`
-    /// RedoxFS writes back now, after a mapping changed.
+    /// Drop state for a node whose last link disappeared in a committed transaction.
+    fn removed(&mut self, node_id: u32) {
+        self.other_scheme_fd_map.remove(&node_id);
+        if let Some(pcache) = &mut self.pcache {
+            pcache.removed(node_id);
+        }
+    }
+
+    /// Ferric Oxide: tells the page cache how many mapped ranges of `node_ptr` there are now,
+    /// and how many of them RedoxFS writes back, after a mapping changed.
     fn mappings_changed(&mut self, node_ptr: TreePtr<Node>) {
         if let Some(pcache) = &mut self.pcache {
-            let writable = self
+            let (mapped, writable) = self
                 .fmap
                 .get(&node_ptr.id())
-                .map_or(0, |info| info.writable_mappings());
-            pcache.mappings_changed(node_ptr, writable);
+                .map_or((0, 0), |info| (info.mappings(), info.writable_mappings()));
+            pcache.mappings_changed(node_ptr, mapped, writable);
+        }
+    }
+
+    /// Ferric Oxide: writes the page cache's dirty pages back, at unmount.
+    pub fn flush_page_cache(&mut self) {
+        if let Some(pcache) = &mut self.pcache {
+            pcache.flush_all(&mut self.fs, &mut self.fmap);
         }
     }
 
@@ -367,13 +382,22 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
                             return Err(Error::new(EACCES));
                         }
 
+                        // Ferric Oxide: write another description's cached writes back and
+                        // hold them first, so the truncation never drops acknowledged writes.
+                        let mut pcache = self.pcache.as_mut();
+                        let before = match pcache.as_deref_mut() {
+                            Some(c) => c.begin_change(&mut self.fs, &mut self.fmap, node_ptr)?,
+                            None => None,
+                        };
                         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                        self.fs.tx(|tx| {
+                        let truncated = self.fs.tx(|tx| {
                             tx.truncate_node(node_ptr, 0, mtime.as_secs(), mtime.subsec_nanos())
-                        })?;
-                        if let Some(pcache) = &mut self.pcache {
-                            pcache.changed(&mut self.fs, node_ptr, node.data().size(), 0, 0);
+                        });
+                        // Also on failure, which releases the hold.
+                        if let (Some(pcache), Some(before)) = (pcache, before) {
+                            pcache.changed(&mut self.fs, node_ptr, before, 0, 0);
                         }
+                        truncated?;
                     }
 
                     Handle::ResourceFile((
@@ -462,10 +486,11 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.handles.insert(id, handle);
 
-        // Ferric Oxide: the kernel serves reads of files opened read-only from its page cache.
+        // Ferric Oxide: the kernel serves reads of files opened read-only from its page cache,
+        // and with cached writes, reads and writes of the others too (`pcache`).
         if let Some(pcache) = &mut self.pcache {
-            if flags & O_ACCMODE == O_RDONLY && flags & (O_STAT | O_SYMLINK) == 0 {
-                pcache.attach(&mut self.fs, id, node_ptr);
+            if flags & (O_STAT | O_SYMLINK) == 0 {
+                pcache.attach(&mut self.fs, id, node_ptr, flags);
             }
         }
 
@@ -558,7 +583,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
             return Ok(());
         };
 
-        let _ = self.other_scheme_fd_map.remove(&node_id);
+        self.removed(node_id);
 
         Ok(())
     }
@@ -788,6 +813,10 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     ) -> Result<usize> {
         // println!("Read {}, {:X} {}", id, buf.as_ptr() as usize, buf.len());
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
+        // Ferric Oxide: the page cache's dirty pages of the file go back first.
+        if let Some(pcache) = &mut self.pcache {
+            pcache.before_read(&mut self.fs, &mut self.fmap, file.node_ptr())?;
+        }
         self.fs.tx(|tx| file.read(&mut self.fmap, buf, offset, tx))
     }
 
@@ -801,12 +830,14 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     ) -> Result<usize> {
         // println!("Write {}, {:X} {}", id, buf.as_ptr() as usize, buf.len());
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
-        // Ferric Oxide: drop the pages the write changes from the page cache before replying.
+        // Ferric Oxide: drop the pages the write changes from the page cache before replying,
+        // after writing its dirty pages back and holding its cached writes.
         let node_ptr = file.node_ptr();
-        let pcache = self.pcache.as_mut();
-        let before = pcache
-            .as_ref()
-            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let mut pcache = self.pcache.as_mut();
+        let before = match pcache.as_deref_mut() {
+            Some(c) => c.begin_change(&mut self.fs, &mut self.fmap, node_ptr)?,
+            None => None,
+        };
         let written = self.fs.tx(|tx| file.write(&mut self.fmap, buf, offset, tx));
         if let (Some(pcache), Some(before)) = (pcache, before) {
             // An append writes at the old end, whatever offset it was given.
@@ -918,21 +949,22 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
 
         let scheme_name = &self.scheme_name;
         let old_name = old_name.as_ref();
-        self.fs.tx(|tx| {
+        let replaced = self.fs.tx(|tx| {
             let (orig_parent_ptr, _, new_parent, new_name) =
                 Self::validate_new_link(scheme_name, file, &new_path, ctx, tx)?;
 
-            tx.rename_node(
+            tx.rename_node_replaced(
                 orig_parent_ptr,
                 old_name,
                 new_parent.ptr(),
                 new_name.as_ref(),
-            )?;
-
-            Ok(())
+            )
         })?;
 
         file.set_path(new_path.as_ref());
+        if let Some(node_id) = replaced {
+            self.removed(node_id);
+        }
         Ok(0)
     }
 
@@ -955,6 +987,10 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
     fn fsync(&mut self, id: usize, _ctx: &CallerCtx) -> Result<()> {
         // println!("Fsync {}", id);
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
+        // Ferric Oxide: the page cache's dirty pages of the file go back first.
+        if let Some(pcache) = &mut self.pcache {
+            pcache.fsync(&mut self.fs, &mut self.fmap, file.node_ptr())?;
+        }
         let fmaps = &mut self.fmap;
 
         self.fs.tx(|tx| file.sync(fmaps, tx))
@@ -964,10 +1000,11 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         // println!("Ftruncate {}, {}", id, len);
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
         let node_ptr = file.node_ptr();
-        let pcache = self.pcache.as_mut();
-        let before = pcache
-            .as_ref()
-            .and_then(|c| c.size_before(&mut self.fs, node_ptr));
+        let mut pcache = self.pcache.as_mut();
+        let before = match pcache.as_deref_mut() {
+            Some(c) => c.begin_change(&mut self.fs, &mut self.fmap, node_ptr)?,
+            None => None,
+        };
         let truncated = self.fs.tx(|tx| file.truncate(len, tx));
         // Ferric Oxide: drop the pages between the old and the new end from the page cache.
         if let (Some(pcache), Some(before)) = (pcache, before) {
@@ -1001,9 +1038,14 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
         _ctx: &CallerCtx,
     ) -> Result<usize> {
         let file = Handle::get_resource_mut(self.handles.get_mut(&id))?;
+        let node_ptr = file.node_ptr();
+        // Ferric Oxide: the mapping shows the newest bytes, and the page cache holds the
+        // file's cached writes until `mappings_changed` sees whether it is still mapped.
+        if let Some(pcache) = &mut self.pcache {
+            pcache.before_map(&mut self.fs, &mut self.fmap, node_ptr)?;
+        }
         let fmaps = &mut self.fmap;
 
-        let node_ptr = file.node_ptr();
         let mapped = self.fs.tx(|tx| file.fmap(fmaps, flags, size, offset, tx));
         // Ferric Oxide: a shared writable mapping ends the file's page caching while it lasts.
         self.mappings_changed(node_ptr);
@@ -1037,7 +1079,7 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             return;
         };
         if let Some(pcache) = &mut self.pcache {
-            pcache.closed(id);
+            pcache.closed(&mut self.fs, &mut self.fmap, id);
         }
         let Ok(resource) = file.resource() else {
             return;
@@ -1183,6 +1225,16 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             }
             if let Some(pcache) = &mut self.pcache {
                 pcache.fill(&mut self.fs, &mut self.fmap, payload);
+            }
+            return Ok(0);
+        }
+        // Ferric Oxide: the page cache's writeback timer, through the same description.
+        if metadata.first() == Some(&ferric_pcache::client::FLUSH_DUE) {
+            if id != super::pcache::PUMP_HANDLE || ctx.uid != 0 {
+                return Err(Error::new(EPERM));
+            }
+            if let Some(pcache) = &mut self.pcache {
+                pcache.flush_due(&mut self.fs, &mut self.fmap);
             }
             return Ok(0);
         }

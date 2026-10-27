@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ferric_blkqueue::QueuePolicy;
 use ferric_blkqueue::ab::{self, Comparison, Verdict};
-use ferric_iobench::job::{BlockSizeMismatch, Job, JobError};
+use ferric_iobench::job::{BlockSizeMismatch, Job, JobError, Spec};
 use ferric_iobench::latency::Histogram;
 use ferric_iobench::offsets::Order;
 use ferric_iobench::report::Summary;
@@ -20,6 +20,7 @@ use syscall::CallFlags;
 use syscall::error::{EIO, EOPNOTSUPP};
 
 use crate::DEFAULT_JOBS;
+use crate::file;
 use crate::round::{SpawnError, run_together};
 
 /// The queue policies a round runs, with their names in the output. The first is the A/B
@@ -32,15 +33,20 @@ const POLICIES: [(QueuePolicy, &str); 3] = [
 
 /// Why the benchmark could not run.
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     /// A call failed with an errno.
     Errno { what: &'static str, errno: i32 },
     /// The disk has no partitions.
     NoPartition,
     /// The largest partition is smaller than a job's `io_size`.
     TooSmall { need: u64, have: u64 },
-    /// A read returned fewer bytes than asked for.
-    ShortRead { at: u64, len: usize, got: usize },
+    /// A read or write moved fewer bytes than asked for.
+    Short {
+        what: &'static str,
+        at: u64,
+        len: usize,
+        got: usize,
+    },
     /// A submitter thread panicked.
     Thread,
     /// The job's block size does not suit the disk.
@@ -58,8 +64,8 @@ impl fmt::Display for Failure {
                 f,
                 "the largest partition has {have} bytes, the job reads {need}"
             ),
-            Self::ShortRead { at, len, got } => {
-                write!(f, "a read of {len} bytes at {at} returned {got}")
+            Self::Short { what, at, len, got } => {
+                write!(f, "a {what} of {len} bytes at {at} returned {got}")
             }
             Self::Thread => f.write_str("a submitter thread panicked"),
             Self::BlockSize(_) => f.write_str("the job does not suit the disk"),
@@ -79,7 +85,7 @@ impl std::error::Error for Failure {
 }
 
 /// Wraps a `std::io` result with what it was doing.
-fn io<T>(what: &'static str, r: std::io::Result<T>) -> Result<T, Failure> {
+pub(crate) fn io<T>(what: &'static str, r: std::io::Result<T>) -> Result<T, Failure> {
     r.map_err(|e| Failure::Errno {
         what,
         errno: e.raw_os_error().unwrap_or(EIO),
@@ -95,11 +101,30 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some(scheme) = nvme_scheme() else {
+    let disk_jobs: Vec<Job> = jobs
+        .iter()
+        .filter(|spec| spec.filename.is_none())
+        .map(|spec| spec.job)
+        .collect();
+    let file_jobs: Vec<(Job, &str)> = jobs
+        .iter()
+        .filter_map(|spec| Some((spec.job, spec.filename?)))
+        .collect();
+    let scheme = nvme_scheme();
+    if scheme.is_none() && file_jobs.is_empty() {
         println!("FERRIC_TEST_SKIP iobench: no NVMe disk scheme");
         return ExitCode::SUCCESS;
-    };
-    match run(&scheme, &jobs) {
+    }
+    let result = match &scheme {
+        Some(scheme) if !disk_jobs.is_empty() => run(scheme, &disk_jobs),
+        _ => Ok(()),
+    }
+    .and_then(|()| {
+        file_jobs
+            .iter()
+            .try_for_each(|(job, path)| file::bench_job(job, path))
+    });
+    match result {
         Ok(()) => {
             println!("FERRIC_TEST_PASS iobench");
             ExitCode::SUCCESS
@@ -127,14 +152,14 @@ impl fmt::Display for Chain<'_> {
 }
 
 /// The jobs to run: the one `args` describe, or [`DEFAULT_JOBS`] without arguments.
-fn parse_jobs(args: &[String]) -> Result<Vec<Job>, JobError<'_>> {
+fn parse_jobs(args: &[String]) -> Result<Vec<Spec<'_>>, JobError<'_>> {
     if args.is_empty() {
         DEFAULT_JOBS
             .iter()
-            .map(|job| Job::parse(job.split_whitespace()))
+            .map(|job| Spec::parse(job.split_whitespace()))
             .collect()
     } else {
-        Ok(vec![Job::parse(args.iter().map(String::as_str))?])
+        Ok(vec![Spec::parse(args.iter().map(String::as_str))?])
     }
 }
 
@@ -218,8 +243,8 @@ fn run(scheme: &str, jobs: &[Job]) -> Result<(), Failure> {
     result
 }
 
-/// Every round of one policy, together.
-struct Totals {
+/// Every round of one variant (a queue policy, or a file's path), together.
+pub(crate) struct Totals {
     /// Each round's IOPS, for the A/B.
     iops: [u32; ab::MAX_ROUNDS],
     elapsed_ns: u64,
@@ -227,7 +252,7 @@ struct Totals {
 }
 
 impl Totals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             iops: [0; ab::MAX_ROUNDS],
             elapsed_ns: 0,
@@ -251,15 +276,51 @@ fn bench_job(disk: &Disk, job: &Job, percore: bool) -> Result<(), Failure> {
     } else {
         &POLICIES[..1]
     };
-    let mut totals: Vec<Totals> = policies.iter().map(|_| Totals::new()).collect();
+    let names: Vec<&str> = if percore {
+        policies.iter().map(|&(_, name)| name).collect()
+    } else {
+        vec!["single"]
+    };
+    let rounds = run_rounds(job, "policy", &names, percore, |k| {
+        if percore {
+            set_policy(disk, policies[k].0)?;
+        }
+        run_round(disk, job)
+    })?;
+    rounds.print(job);
+    Ok(())
+}
+
+/// A job's rounds, run by [`run_rounds`].
+pub(crate) struct Rounds<'a> {
+    /// What the variants are (`policy`, `path`), the key of their names in the output.
+    key: &'a str,
+    names: &'a [&'a str],
+    totals: Vec<Totals>,
+    rounds: usize,
+    /// The A/B of the second variant against the first, when one was asked for.
+    cmp: Option<Comparison>,
+}
+
+/// Runs rounds of `job` in each of its variants (`names`, called `key` in the output) with
+/// `round(k)` timing one run of variant `k`, until the A/B of variant 1 against variant 0 is
+/// settled (`ab`), or for [`ab::ROUNDS`] rounds without one.
+pub(crate) fn run_rounds<'a>(
+    job: &Job,
+    key: &'a str,
+    names: &'a [&'a str],
+    ab: bool,
+    mut round: impl FnMut(usize) -> Result<(u64, Box<Histogram>), Failure>,
+) -> Result<Rounds<'a>, Failure> {
+    let mut totals: Vec<Totals> = names.iter().map(|_| Totals::new()).collect();
     let mut rounds = 0;
     let mut batch = ab::ROUNDS;
     let cmp = loop {
-        for round in rounds..rounds + batch {
-            run_policies(disk, job, policies, percore, round, &mut totals)?;
+        for r in rounds..rounds + batch {
+            run_variants(job, r, &mut totals, &mut round)?;
         }
         rounds += batch;
-        if !percore {
+        if !ab {
             break None;
         }
         let cmp = Comparison::new(&totals[0].iops[..rounds], &totals[1].iops[..rounds]);
@@ -268,31 +329,32 @@ fn bench_job(disk: &Disk, job: &Job, percore: bool) -> Result<(), Failure> {
         }
         batch = ab::CONFIRM_ROUNDS;
     };
-    print_job(job, policies, &totals, rounds, cmp, percore);
-    Ok(())
+    Ok(Rounds {
+        key,
+        names,
+        totals,
+        rounds,
+        cmp,
+    })
 }
 
-/// Runs round `round` of `job` with every policy in `policies`, adding each one's results
-/// to `totals[policy]`. Odd rounds run the policies in reverse order, so drift during the run
+/// Runs round `round` of `job` in every variant, adding each one's results to
+/// `totals[variant]`. Odd rounds run the variants in reverse order, so drift during the run
 /// does not favour one.
-fn run_policies(
-    disk: &Disk,
+fn run_variants(
     job: &Job,
-    policies: &[(QueuePolicy, &str)],
-    percore: bool,
     round: usize,
     totals: &mut [Totals],
+    run: &mut impl FnMut(usize) -> Result<(u64, Box<Histogram>), Failure>,
 ) -> Result<(), Failure> {
-    for step in 0..policies.len() {
+    let variants = totals.len();
+    for step in 0..variants {
         let k = if round.is_multiple_of(2) {
             step
         } else {
-            policies.len() - 1 - step
+            variants - 1 - step
         };
-        if percore {
-            set_policy(disk, policies[k].0)?;
-        }
-        let (elapsed_ns, latency) = run_round(disk, job)?;
+        let (elapsed_ns, latency) = run(k)?;
         let summary = Summary {
             bs: job.bs,
             elapsed_ns,
@@ -306,24 +368,24 @@ fn run_policies(
     Ok(())
 }
 
-fn print_job(
-    job: &Job,
-    policies: &[(QueuePolicy, &str)],
-    totals: &[Totals],
-    rounds: usize,
-    cmp: Option<Comparison>,
-    percore: bool,
-) {
-    let label = job.label();
-    for (&(_, name), total) in policies.iter().zip(totals) {
-        let name = if percore { name } else { "single" };
-        let summary = Summary {
-            bs: job.bs,
-            elapsed_ns: total.elapsed_ns,
-            latency: &total.latency,
-        };
-        println!("FERRIC_BENCH iobench-{label} policy={name} rounds={rounds} {summary}");
+impl Rounds<'_> {
+    /// Prints the job's `FERRIC_BENCH` lines: one per variant, then the A/B.
+    pub(crate) fn print(&self, job: &Job) {
+        let (label, key, rounds) = (job.label(), self.key, self.rounds);
+        for (name, total) in self.names.iter().zip(&self.totals) {
+            let summary = Summary {
+                bs: job.bs,
+                elapsed_ns: total.elapsed_ns,
+                latency: &total.latency,
+            };
+            println!("FERRIC_BENCH iobench-{label} {key}={name} rounds={rounds} {summary}");
+        }
+        print_ab(job, self.cmp, rounds);
     }
+}
+
+fn print_ab(job: &Job, cmp: Option<Comparison>, rounds: usize) {
+    let label = job.label();
     match cmp {
         Some(cmp) => {
             let verdict = if cmp.verdict() == Verdict::Pass {
@@ -372,12 +434,17 @@ fn submit(
         let got = io("pread", disk.file.read_at(&mut buf, at))?;
         latency.record(nanos(issued.elapsed()));
         if got != bs {
-            return Err(Failure::ShortRead { at, len: bs, got });
+            return Err(Failure::Short {
+                what: "read",
+                at,
+                len: bs,
+                got,
+            });
         }
     }
     Ok(latency)
 }
 
-fn nanos(time: Duration) -> u64 {
+pub(crate) fn nanos(time: Duration) -> u64 {
     u64::try_from(time.as_nanos()).unwrap_or(u64::MAX)
 }

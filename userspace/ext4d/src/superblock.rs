@@ -24,6 +24,8 @@
 
 use thiserror::Error;
 
+pub(crate) mod recovery;
+
 /// Where the superblock starts on the volume.
 pub const OFFSET: u64 = 1024;
 /// The superblock's size in bytes.

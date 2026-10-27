@@ -111,6 +111,8 @@ redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", default-fea
 redox-buffer-pool = { git = "https://github.com/rexlunae/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]} # Ferric mirror of redox-os/redox-buffer-pool
 
 zerocopy = { version = "0.8.55", features = ["derive"] }
+# Ferric Oxide: the futimens sentinels' one definition (sys_stat checks its literals against it).
+ferric-abi = { path = "../abi" }
 
 [dependencies.dlmalloc]
 path = "dlmalloc-rs"

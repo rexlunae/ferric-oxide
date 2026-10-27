@@ -1,6 +1,6 @@
 # GUI
 
-The desktop environment of Redox (Orbital) is provided by a set of programs that run in user-space.
+The desktop environment (Orbital) is provided by a set of programs that run in user-space.
 
 - Orbital - The display server and window manager sets up the `orbital:` scheme, manages the display, and handles requests for window creation, redraws, and event polling.
 - Launcher - The launcher multi-purpose program that scans the applications in the `/apps/` directory and provides the following services:

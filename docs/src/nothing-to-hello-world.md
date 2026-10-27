@@ -1,127 +1,87 @@
 # From Nothing To Hello World
 
-This page explain the quickest way to test a program on Redox. This tutorial doesn't build Redox from source.
+This page shows the quickest way to get your own program running in the guest.
+
+> ⚠️ **Warning:** These steps come from the Redox OS book and have only been partly updated for Ferric Oxide's native build. Step 9 uses `make rp.*`, which builds the recipe and copies it into the existing image through FUSE, so it needs FUSE (or the [Podman build](./podman-build.md)). To include a program in every build instead, add it to `image.packages_add` in `ferric.toml` (see [Including Programs](./including-programs.md)). They have not been re-verified on the native build.
 
 In this example we will use a "Hello World" program written in Rust.
 
- 1. Create the `tryredox` folder.
+ 1. Get the source and set up the toolchain (see [Building Ferric Oxide](./building-redox.md) for the prerequisites).
 
     ```sh
-    mkdir -p ~/tryredox
+    git clone https://github.com/rexlunae/ferric-oxide ~/ferric-oxide
+    cd ~/ferric-oxide
+    cargo xtask setup
     ```
 
- 2. Navigate to the `tryredox` folder.
+ 2. Build the image once, so there is an image to add the program to.
 
     ```sh
-    cd ~/tryredox
+    cargo xtask build
     ```
 
- 3. Download the script to configure Podman and download the Redox build system.
-
-    ```sh
-    curl -sf https://gitlab.redox-os.org/redox-os/redox/raw/master/podman_bootstrap.sh -o podman_bootstrap.sh
-    ```
-
- 4. Execute the downloaded script.
-
-    ```sh
-    time bash -e podman_bootstrap.sh
-    ```
-
- 5. Enable the Rust toolchain in the current shell.
-
-    ```sh
-    source ~/.cargo/env
-    ```
-
- 6. Navigate to the Redox build system directory.
-
-    ```sh
-    cd ~/tryredox/redox
-    ```
-
- 7. Create the `.config` file and add the `REPO_BINARY` environment variable to download the pre-compiled packages.
-
-    ```sh
-    echo "REPO_BINARY?=1 \n CONFIG_NAME?=my-config" >> .config
-    ```
-
- 8. Create the `hello-world` recipe folder.
+ 3. Create the `hello-world` recipe folder.
 
     ```sh
     mkdir recipes/other/hello-world
     ```
 
- 9. Create the `source` folder for the recipe.
+ 4. Create the `source` folder for the recipe.
 
     ```sh
     mkdir recipes/other/hello-world/source
     ```
 
-10. Navigate to the recipe's `source` folder.
+ 5. Navigate to the recipe's `source` folder.
 
     ```sh
     cd recipes/other/hello-world/source
     ```
 
-11. Initialize a Cargo project with the "Hello World" string.
+ 6. Initialize a Cargo project with the "Hello World" string.
 
     ```sh
     cargo init --name="hello-world"
     ```
 
-12. Create the `hello-world` recipe configuration.
+ 7. Create the `hello-world` recipe configuration.
 
     ```sh
-    cd ~/tryredox/redox
+    cd ~/ferric-oxide
     ```
 
     ```sh
     nano recipes/other/hello-world/recipe.toml
     ```
 
-13. Add the following to the recipe configuration:
+ 8. Add the following to the recipe configuration:
 
     ```toml
     [build]
     template = "cargo"
     ```
 
-14. Create the `my-config` filesystem configuration.
+ 9. Build the Hello World program and add it to the image.
 
     ```sh
-    cp config/x86_64/desktop.toml config/x86_64/my-config.toml
+    make prefix rp.hello-world
     ```
 
-15. Open the `my-config` filesystem configuration file (i.e., `config/x86_64/my-config.toml`) and add the `hello-world` package to it.
-
-    ```toml
-    [packages]
-    # Add the item below
-    hello-world = "source"
-    ```
-
-16. Build the Hello World program and update the Redox image.
+10. Start the virtual machine without a GUI.
 
     ```sh
-    time make prefix rp.hello-world
+    cargo xtask run --no-build --headless
     ```
 
-17. Start the Redox virtual machine without a GUI.
+11. At the login prompt, write "user" for the user name and press Enter.
+
+12. Run the "Hello World" program.
 
     ```sh
-    make qemu gpu=no
+    hello-world
     ```
 
-18. At the Redox login screen, write "user" for the user name and press Enter.
-
-19. Run the "Hello World" program.
-
-    ```sh
-    helloworld
-    ```
-
-20. Shut down the Redox virtual machine.
+13. Shut down the virtual machine.
 
     ```sh
     sudo shutdown

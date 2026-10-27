@@ -18,15 +18,30 @@
 //! change; the tests crash a volume after every write and check both, and CI has `e2fsck`
 //! replay and check what is left.
 //!
-//! The one operation so far is [`set_times`], which sets an existing inode's access,
-//! modification and change times. It is not yet reachable through the scheme: `ext4-view`
-//! does not say which inode a path names, so the scheme's `futimens` still fails with
-//! `EROFS`.
+//! The operations so far change one existing inode in place ([`change`]): its access,
+//! modification and change times ([`set_times`], `futimens`), its permission bits
+//! (`fchmod`), or its owner and group (`fchown`), each with a new change time; and
+//! [`write_data`] writes into the blocks a regular file already has (`write`), as ext4's
+//! ordered mode does: the data goes home first, unjournaled, and the inode's new size and
+//! times then follow in one transaction. Nothing is allocated or freed yet, so a write
+//! that would need a new block is refused. The scheme reaches them through
+//! [`crate::fs::Fs::set_times`], [`crate::fs::Fs::set_mode`], [`crate::fs::Fs::set_owner`]
+//! and [`crate::fs::Fs::write`], which check the caller's permission as POSIX says and find
+//! the inode with [`crate::lookup`]. [`check_writable`] tells, at mount time, whether a
+//! volume can be served read-write.
+//!
+//! An owner or group above 65535 needs the high halves the inode keeps for Linux and Hurd
+//! volumes (`s_creator_os`); other creators keep different fields there, so such IDs are
+//! refused on their volumes. On a volume with `quota`, a new owner or group would have to
+//! move the inode's usage between quota records, which this module does not do yet, so it is
+//! refused; a new mode is not counted and is written.
 //!
 //! # Specification
 //!
 //! Written from "Ext4 Disk Layout" on the ext4 wiki at kernel.org: "The Super Block"
-//! (feature flags, `s_checksum_seed`), "Inode Table" (the fields and `i_extra_isize`),
+//! (feature flags, `s_checksum_seed`, `s_creator_os`), "Inode Table" (the fields,
+//! `i_extra_isize`, and the per-OS `osd2` union holding the high halves of the owner and
+//! group),
 //! "Inode Timestamps" (the epoch bits and nanoseconds in the `_extra` fields) and
 //! "Checksums" (the inode checksum: CRC32C over the inode number, `i_generation` and the
 //! whole inode with its checksum fields zero, from the volume's checksum seed). The journal
@@ -39,14 +54,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
 use thiserror::Error;
 
-use crate::device::{Window, WindowError, WriteAt};
+use crate::device::{ReadAt, Window, WindowError, WriteAt};
+use crate::inode::data::Data;
+use crate::inode::{
+    I_ATIME, I_ATIME_EXTRA, I_CTIME, I_CTIME_EXTRA, I_MTIME, I_MTIME_EXTRA, has_extra, le16,
+};
 use crate::journal::map::{BlockMap, RO_COMPAT_METADATA_CSUM, Volume, le32};
 use crate::journal::{
     self, BlockError, Journal, JournalError, open_journal, read_volume_superblock,
 };
 use crate::superblock::COMPAT_HAS_JOURNAL;
 
-/// `s_feature_incompat` bits that writing an inode's times is safe under: `filetype`,
+/// `s_feature_incompat` bits that writing an inode's times, mode, owner or data in place is
+/// safe under: `filetype`,
 /// `recover`, `extents`, `64bit`, `flex_bg`, `ea_inode`, `csum_seed`, `largedir`,
 /// `inline_data`, `encrypt` and `casefold`. Not `compression`, `journal_dev`, `mmp` (another
 /// host may have the volume), `dirdata` or `meta_bg` (whose journal map the replay code
@@ -66,32 +86,54 @@ const INCOMPAT_CSUM_SEED: u32 = 0x2000;
 const S_UUID: usize = 0x68;
 /// Where the superblock keeps `s_checksum_seed`.
 const S_CHECKSUM_SEED: usize = 0x270;
+/// Where the superblock keeps `s_creator_os`, and the values whose inodes keep the high
+/// halves of the owner and group at `0x78` and `0x7A`.
+const S_CREATOR_OS: usize = 0x48;
+const CREATOR_LINUX: u32 = 0;
+const CREATOR_HURD: u32 = 1;
+/// `s_feature_ro_compat`: quota files count each owner's and group's blocks and inodes.
+const RO_COMPAT_QUOTA: u32 = 0x100;
+
+/// `i_uid` and `i_gid`: the low 16 bits of the owner and group.
+const I_UID: usize = 0x2;
+const I_GID: usize = 0x18;
+/// `l_i_uid_high` and `l_i_gid_high` (Linux; Hurd's are at the same offsets).
+const I_UID_HIGH: usize = 0x78;
+const I_GID_HIGH: usize = 0x7A;
+/// `i_mode`'s file type bits and a regular file's value of them.
+const S_IFMT: u16 = 0xF000;
+const S_IFREG: u16 = 0x8000;
+/// `i_mode`'s permission bits, and the set-ID bits among them.
+const PERMISSION_BITS: u16 = 0o7777;
+const S_ISUID: u16 = 0o4000;
+const S_ISGID: u16 = 0o2000;
+
+/// `i_flags`, and the flags a data write checks.
+const IMMUTABLE_FL: u32 = 0x10;
+const APPEND_FL: u32 = 0x20;
+const ENCRYPT_FL: u32 = 0x800;
+const JOURNAL_DATA_FL: u32 = 0x4000;
+const VERITY_FL: u32 = 0x10_0000;
+const INLINE_DATA_FL: u32 = 0x1000_0000;
+/// `s_feature_ro_compat`: files may be 2^31 bytes or longer.
+const RO_COMPAT_LARGE_FILE: u32 = 0x2;
 
 /// Where an inode keeps `i_mode`.
 const I_MODE: usize = 0x0;
-/// `i_atime`, `i_ctime`, `i_mtime`: the low 32 bits of the seconds, signed.
-const I_ATIME: usize = 0x8;
-const I_CTIME: usize = 0xC;
-const I_MTIME: usize = 0x10;
 /// `i_generation`, which the inode checksum covers first.
 const I_GENERATION: usize = 0x64;
 /// `l_i_checksum_lo`: the low 16 bits of the inode checksum.
 const I_CHECKSUM_LO: usize = 0x7C;
-/// `i_extra_isize`: how many bytes past the first 128 the fields below take.
-const I_EXTRA_ISIZE: usize = 0x80;
 /// `i_checksum_hi`: the high 16 bits of the inode checksum.
 const I_CHECKSUM_HI: usize = 0x82;
-/// `i_ctime_extra`, `i_mtime_extra`, `i_atime_extra`: epoch bits and nanoseconds.
-const I_CTIME_EXTRA: usize = 0x84;
-const I_MTIME_EXTRA: usize = 0x88;
-const I_ATIME_EXTRA: usize = 0x8C;
-/// The size of the original (revision 0) inode, before the extra fields.
-const GOOD_OLD_INODE_SIZE: usize = 128;
 
 /// Why the volume could not be changed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WriteError {
+    /// An inode prefix could not be decoded or encoded.
+    #[error("cannot encode or decode the inode data fields")]
+    InodeEncoding(#[from] std::io::Error),
     /// The volume or its journal could not be read, or is malformed.
     #[error("cannot open the journal")]
     Journal(#[from] JournalError),
@@ -136,6 +178,78 @@ pub enum WriteError {
         /// The nanoseconds.
         nanoseconds: u32,
     },
+    /// Mode bits outside the permission bits (`0o7777`).
+    #[error("{bits:#o} is not a set of permission bits")]
+    InvalidPermissions {
+        /// The bits given.
+        bits: u16,
+    },
+    /// An owner or group above 65535 on a volume whose inodes keep only the low 16 bits
+    /// (`s_creator_os` other than Linux or Hurd).
+    #[error("inode {number} cannot hold the owner or group {id}")]
+    IdOutOfRange {
+        /// The inode number.
+        number: u32,
+        /// The ID that does not fit.
+        id: u32,
+    },
+    /// A new owner or group on a volume with `quota`, whose quota files would have to move
+    /// the inode's usage from one ID to another, which this module does not do.
+    #[error("inode {number} is counted in the volume's quotas, which ext4d does not update")]
+    QuotaTracked {
+        /// The inode number.
+        number: u32,
+    },
+    /// A data write to a file that is not a regular one.
+    #[error("inode {number} is not a regular file")]
+    NotAFile {
+        /// The inode number.
+        number: u32,
+    },
+    /// A data write to a file whose flags (`i_flags`) forbid it: immutable or append-only.
+    #[error("inode {number} is immutable or append-only (flags {flags:#x})")]
+    FileFlags {
+        /// The inode number.
+        number: u32,
+        /// The flags that forbid the write.
+        flags: u32,
+    },
+    /// A data write to a file kept in a way this module does not write: inline data,
+    /// encrypted, verity-protected or with its data journaled.
+    #[error("inode {number}'s data is kept in a way ext4d does not write yet (flags {flags:#x})")]
+    UnsupportedFile {
+        /// The inode number.
+        number: u32,
+        /// The flags that say how.
+        flags: u32,
+    },
+    /// A data write to a block of the file that has no initialized block on the volume (a
+    /// hole, an unwritten extent, or past the blocks it has): it would need a block
+    /// allocated, which this module does not do yet.
+    #[error("block {block} of inode {number} is not allocated")]
+    NotAllocated {
+        /// The inode number.
+        number: u32,
+        /// The block within the file.
+        block: u64,
+    },
+    /// The inode maps file data outside the volume, into the journal or into fixed metadata.
+    #[error("inode {number} maps a block to {physical}, outside its data")]
+    BadDataBlock {
+        /// The inode number.
+        number: u32,
+        /// The volume block it maps to.
+        physical: u64,
+    },
+    /// A write ending past the largest size the inode can hold (2^31 - 1 bytes without
+    /// `large_file`).
+    #[error("inode {number} cannot be {size} bytes long")]
+    FileTooLarge {
+        /// The inode number.
+        number: u32,
+        /// The size the write would leave.
+        size: u64,
+    },
     /// The journal cannot be written to.
     #[error("cannot write to the journal")]
     Open(#[from] OpenError),
@@ -157,6 +271,66 @@ pub struct Timestamp {
     pub seconds: i64,
     /// Nanoseconds, below 1 000 000 000.
     pub nanoseconds: u32,
+}
+
+impl Timestamp {
+    /// The current time, or the epoch if the clock is before it.
+    pub fn now() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            seconds: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+            nanoseconds: now.subsec_nanos(),
+        }
+    }
+}
+
+/// A change [`change`] makes to an inode. Each also sets the change time (`i_ctime`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Change {
+    /// The access, modification and change times (`futimens`).
+    Times(Times),
+    /// The permission bits (`fchmod`).
+    Mode(Mode),
+    /// The owner and group (`fchown`).
+    Owner(Owner),
+    /// What a data write leaves in the inode (`write`): a new size if the file grew, and
+    /// the modification and change times.
+    Written(Written),
+}
+
+/// What a [`Change::Written`] writes, after [`write_data`] has written the data itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// The new size (`i_size_lo`, `i_size_high`), when the write ended past the old one.
+    pub size: Option<u64>,
+    /// The new modification and change time.
+    pub changed: Timestamp,
+}
+
+/// The permission bits a [`Change::Mode`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mode {
+    /// The new permission bits, within `0o7777`; the file type is kept.
+    pub permissions: u16,
+    /// The new change time.
+    pub changed: Timestamp,
+}
+
+/// The owner and group a [`Change::Owner`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    /// The new owner (`i_uid`), or `None` to keep it.
+    pub uid: Option<u32>,
+    /// The new group (`i_gid`), or `None` to keep it.
+    pub gid: Option<u32>,
+    /// Whether to clear the set-user-ID and set-group-ID bits of a regular file, as POSIX
+    /// `chown` does for callers without privilege.
+    pub drop_set_id: bool,
+    /// The new change time.
+    pub changed: Timestamp,
 }
 
 /// The times [`set_times`] writes.
@@ -204,21 +378,81 @@ pub fn set_times<R: WriteAt>(
     number: u32,
     times: &Times,
 ) -> Result<(), WriteError> {
-    let (volume, checksum_seed) = writable_volume(window)?;
-    let map = BlockMap::load(&volume, window)?;
-    let (_, raw, _) = open_journal(&*window, &map, &volume)?;
+    change(window, number, &Change::Times(*times))
+}
+
+/// Makes `change` to inode `number` in one journal transaction: the inode is read, checked
+/// (in use, and passing its checksum), changed in memory with its checksum updated, logged,
+/// committed and written home.
+///
+/// # Errors
+///
+/// Those of [`set_times`], and for the change itself: [`WriteError::TimeOutOfRange`] for a
+/// time or change time that does not fit, [`WriteError::InvalidPermissions`] for mode bits
+/// outside `0o7777`, [`WriteError::IdOutOfRange`] for an owner or group above 65535 on a
+/// volume whose inodes have no high halves for them, and [`WriteError::QuotaTracked`] for a
+/// new owner or group on a volume with `quota`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ext4d::device::Window;
+/// use ext4d::write::{self, Change, Mode, Timestamp};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let image = std::fs::OpenOptions::new().read(true).write(true).open("disk.ext4")?;
+/// let mut window = Window::whole(image)?;
+/// // chmod 0640 on inode 12, the first file mke2fs makes.
+/// let mode = Mode { permissions: 0o640, changed: Timestamp::now() };
+/// write::change(&mut window, 12, &Change::Mode(mode))?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn change<R: WriteAt>(
+    window: &mut Window<R>,
+    number: u32,
+    change: &Change,
+) -> Result<(), WriteError> {
+    let target = writable_volume(window)?;
+    let volume = &target.volume;
+    let map = BlockMap::load(volume, window)?;
+    let (_, raw, _) = open_journal(&*window, &map, volume)?;
     let mut writer = Writer::new(&raw)?;
 
     let block_size = u64::from(volume.block_size);
     let at = volume.inode_offset(window, number)?;
-    let (target, within) = (at / block_size, (at % block_size) as usize);
+    let (home, within) = (at / block_size, (at % block_size) as usize);
     let mut block = vec![0; volume.block_size as usize];
-    window.read_exact_at(&mut block, target * block_size)?;
+    window.read_exact_at(&mut block, home * block_size)?;
     let inode = &mut block[within..within + volume.inode_size as usize];
+    check_inode(&target, number, inode)?;
+    apply(&target, number, inode, change)?;
+    if let Some(seed) = target.checksum_seed {
+        let checksum = inode_checksum(seed, number, inode);
+        put_checksum(inode, checksum);
+    }
+
+    let mut transaction = writer.transaction();
+    transaction.log(home, &block)?;
+    journal::set_recover_flag(window, true)?;
+    let mut journal = Journal {
+        window: &mut *window,
+        map: &map,
+        volume,
+    };
+    let committed = writer.commit(&mut journal, transaction, commit_time())?;
+    writer.checkpoint(&mut journal, committed)?;
+    journal::set_recover_flag(window, false)?;
+    Ok(())
+}
+
+/// Checks that inode `number`, whose bytes are `inode`, is in use and passes its checksum,
+/// before anything is written for it.
+fn check_inode(target: &Target, number: u32, inode: &[u8]) -> Result<(), WriteError> {
     if le16(inode, I_MODE) == 0 {
         return Err(WriteError::FreeInode { number });
     }
-    if let Some(seed) = checksum_seed {
+    if let Some(seed) = target.checksum_seed {
         let (stored, computed) = (stored_checksum(inode), inode_checksum(seed, number, inode));
         if stored != computed {
             return Err(WriteError::InodeChecksum {
@@ -228,43 +462,319 @@ pub fn set_times<R: WriteAt>(
             });
         }
     }
-    let changes = [
-        (I_ATIME, I_ATIME_EXTRA, times.accessed),
-        (I_MTIME, I_MTIME_EXTRA, times.modified),
-        (I_CTIME, I_CTIME_EXTRA, Some(times.changed)),
-    ];
-    for (field, extra, time) in changes {
-        if let Some(time) = time {
-            put_time(inode, field, extra, time).ok_or(WriteError::TimeOutOfRange {
-                number,
-                seconds: time.seconds,
-                nanoseconds: time.nanoseconds,
-            })?;
-        }
-    }
-    if let Some(seed) = checksum_seed {
-        let checksum = inode_checksum(seed, number, inode);
-        put_checksum(inode, checksum);
-    }
-
-    let mut transaction = writer.transaction();
-    transaction.log(target, &block)?;
-    journal::set_recover_flag(window, true)?;
-    let mut journal = Journal {
-        window: &mut *window,
-        map: &map,
-        volume: &volume,
-    };
-    let committed = writer.commit(&mut journal, transaction, commit_time())?;
-    writer.checkpoint(&mut journal, committed)?;
-    journal::set_recover_flag(window, false)?;
     Ok(())
 }
 
-/// The volume's superblock fields, once it is known that this module may write to it, and
-/// what its metadata checksums start from (with `metadata_csum`): `s_checksum_seed`, or the
-/// CRC32C of the UUID.
-fn writable_volume<R: WriteAt>(window: &Window<R>) -> Result<(Volume, Option<u32>), WriteError> {
+/// Makes `change` to the bytes of inode `number`, in memory.
+fn apply(
+    target: &Target,
+    number: u32,
+    inode: &mut [u8],
+    change: &Change,
+) -> Result<(), WriteError> {
+    let changed = match change {
+        Change::Times(times) => {
+            put_time_of(inode, number, I_ATIME, I_ATIME_EXTRA, times.accessed)?;
+            put_time_of(inode, number, I_MTIME, I_MTIME_EXTRA, times.modified)?;
+            times.changed
+        }
+        Change::Mode(mode) => {
+            put_permissions(inode, mode.permissions)?;
+            mode.changed
+        }
+        Change::Owner(owner) => {
+            put_owner(target, number, inode, owner)?;
+            owner.changed
+        }
+        Change::Written(written) => {
+            if let Some(size) = written.size {
+                put_size(target, number, inode, size)?;
+            }
+            put_time_of(inode, number, I_MTIME, I_MTIME_EXTRA, Some(written.changed))?;
+            written.changed
+        }
+    };
+    put_time_of(inode, number, I_CTIME, I_CTIME_EXTRA, Some(changed))
+}
+
+/// Stores `time`, if there is one, as [`put_time`] does.
+fn put_time_of(
+    inode: &mut [u8],
+    number: u32,
+    field: usize,
+    extra: usize,
+    time: Option<Timestamp>,
+) -> Result<(), WriteError> {
+    let Some(time) = time else {
+        return Ok(());
+    };
+    put_time(inode, field, extra, time).ok_or(WriteError::TimeOutOfRange {
+        number,
+        seconds: time.seconds,
+        nanoseconds: time.nanoseconds,
+    })
+}
+
+/// Replaces the permission bits of `i_mode` (`0o7777`: the set-ID and sticky bits and
+/// read, write and execute for owner, group and others), keeping its file type.
+fn put_permissions(inode: &mut [u8], permissions: u16) -> Result<(), WriteError> {
+    if permissions & !PERMISSION_BITS != 0 {
+        return Err(WriteError::InvalidPermissions { bits: permissions });
+    }
+    let mode = le16(inode, I_MODE) & !PERMISSION_BITS | permissions;
+    inode[I_MODE..I_MODE + 2].copy_from_slice(&mode.to_le_bytes());
+    Ok(())
+}
+
+/// The owner and group stored in the inode: the low halves, with the high halves when the
+/// volume's inodes have them.
+fn owner_of(target: &Target, inode: &[u8]) -> (u32, u32) {
+    let id = |low, high| {
+        let low = u32::from(le16(inode, low));
+        if target.high_ids {
+            u32::from(le16(inode, high)) << 16 | low
+        } else {
+            low
+        }
+    };
+    (id(I_UID, I_UID_HIGH), id(I_GID, I_GID_HIGH))
+}
+
+/// Stores `owner`'s owner and group in the inode, and drops its set-ID bits if it asks.
+fn put_owner(
+    target: &Target,
+    number: u32,
+    inode: &mut [u8],
+    owner: &Owner,
+) -> Result<(), WriteError> {
+    let old = owner_of(target, inode);
+    let new = (owner.uid.unwrap_or(old.0), owner.gid.unwrap_or(old.1));
+    if new != old && target.volume.ro_compat & RO_COMPAT_QUOTA != 0 {
+        return Err(WriteError::QuotaTracked { number });
+    }
+    for (id, low, high) in [(new.0, I_UID, I_UID_HIGH), (new.1, I_GID, I_GID_HIGH)] {
+        if target.high_ids {
+            inode[high..high + 2].copy_from_slice(&((id >> 16) as u16).to_le_bytes());
+        } else if id > 0xFFFF {
+            return Err(WriteError::IdOutOfRange { number, id });
+        }
+        inode[low..low + 2].copy_from_slice(&(id as u16).to_le_bytes());
+    }
+    let mode = le16(inode, I_MODE);
+    if owner.drop_set_id && mode & S_IFMT == S_IFREG {
+        let mode = mode & !(S_ISUID | S_ISGID);
+        inode[I_MODE..I_MODE + 2].copy_from_slice(&mode.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Writes `data` at byte `offset` of the regular file inode `number`, into the blocks it
+/// already has, then records the write in its inode (a new size if it grew, and `changed`
+/// as its modification and change time) in one journal transaction ([`Change::Written`]).
+///
+/// As in ext4's default ordered mode, the data is not journaled: it is written to its
+/// blocks and flushed before the inode's transaction is logged, so after a crash the inode
+/// never claims a size whose data is not on the disk. A crash before the commit leaves the
+/// new data in place with the old size and times. Nothing is allocated: every block the
+/// write touches must already be an initialized block of the file, and the new size and
+/// times must fit in the inode, or nothing is written. An empty `data` writes nothing.
+///
+/// # Errors
+///
+/// Those of [`change`]; [`WriteError::NotAFile`] for anything but a regular file;
+/// [`WriteError::FileFlags`] for an immutable or append-only file;
+/// [`WriteError::UnsupportedFile`] for inline data, encryption, verity or journaled data;
+/// [`WriteError::NotAllocated`] when a block the write touches is a hole, an unwritten
+/// extent or past the file's blocks; [`WriteError::BadDataBlock`] for a block mapped
+/// outside the volume, into the journal or into fixed metadata; and
+/// [`WriteError::FileTooLarge`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use ext4d::device::Window;
+/// use ext4d::write::{self, Timestamp};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let image = std::fs::OpenOptions::new().read(true).write(true).open("disk.ext4")?;
+/// let mut window = Window::whole(image)?;
+/// // Overwrite the first bytes of inode 12, the first file mke2fs makes.
+/// write::write_data(&mut window, 12, 0, b"HELLO", Timestamp::now())?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn write_data<R: WriteAt>(
+    window: &mut Window<R>,
+    number: u32,
+    offset: u64,
+    data: &[u8],
+    changed: Timestamp,
+) -> Result<(), WriteError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let target = writable_volume(window)?;
+    let inode = target.volume.read_inode(window, number)?;
+    check_inode(&target, number, &inode)?;
+    check_data_writable(number, &inode)?;
+    let end = offset
+        .checked_add(data.len() as u64)
+        .ok_or(WriteError::FileTooLarge {
+            number,
+            size: u64::MAX,
+        })?;
+    let size = Data::read(&inode)?.size();
+    let written = Written {
+        size: (end > size).then_some(end),
+        changed,
+    };
+    // A size or time the inode cannot hold must be refused before any data is written,
+    // not after: the change that records them is made on a copy first.
+    apply(
+        &target,
+        number,
+        &mut inode.clone(),
+        &Change::Written(written),
+    )?;
+    // Growth must initialize the entire gap, including previously allocated stale bytes.
+    // Validate all mappings before the first write, using a map bounded by the extent
+    // tree rather than allocating a second entry for each block in a large write.
+    let first = offset.min(size);
+    let map = data_blocks(&target.volume, window, number, &inode, first, end)?;
+    let block_size = u64::from(target.volume.block_size);
+    let mut buf = vec![0; target.volume.block_size as usize];
+    for logical in first / block_size..end.div_ceil(block_size) {
+        let physical = map
+            .physical(logical as u32)
+            .ok_or(WriteError::NotAllocated {
+                number,
+                block: logical,
+            })?;
+        let start = (logical * block_size).max(first);
+        let stop = ((logical + 1) * block_size).min(end);
+        let within = (start - logical * block_size) as usize;
+        let len = (stop - start) as usize;
+        if len == buf.len() && start >= offset {
+            let from = (start - offset) as usize;
+            window.write_all_at(&data[from..from + len], physical * block_size)?;
+            continue;
+        }
+        if len != buf.len() {
+            window.read_exact_at(&mut buf, physical * block_size)?;
+        }
+        buf[within..within + len].fill(0);
+        let data_start = start.max(offset);
+        if data_start < stop {
+            let from = (data_start - offset) as usize;
+            let into = (data_start - logical * block_size) as usize;
+            let count = (stop - data_start) as usize;
+            buf[into..into + count].copy_from_slice(&data[from..from + count]);
+        }
+        window.write_all_at(&buf, physical * block_size)?;
+    }
+    window.flush()?;
+    change(window, number, &Change::Written(written))
+}
+
+/// Checks that the data of inode `number` (`inode`) is one this module can write in place.
+fn check_data_writable(number: u32, inode: &[u8]) -> Result<(), WriteError> {
+    if le16(inode, I_MODE) & S_IFMT != S_IFREG {
+        return Err(WriteError::NotAFile { number });
+    }
+    let flags = Data::read(inode)?.flags;
+    let forbidden = flags & (IMMUTABLE_FL | APPEND_FL);
+    if forbidden != 0 {
+        return Err(WriteError::FileFlags {
+            number,
+            flags: forbidden,
+        });
+    }
+    let unsupported = flags & (ENCRYPT_FL | JOURNAL_DATA_FL | VERITY_FL | INLINE_DATA_FL);
+    if unsupported != 0 {
+        return Err(WriteError::UnsupportedFile {
+            number,
+            flags: unsupported,
+        });
+    }
+    Ok(())
+}
+
+/// The volume block of each block of inode `number` that bytes `offset..end` touch, by
+/// block within the file, all checked before anything is written.
+fn data_blocks<R: ReadAt>(
+    volume: &Volume,
+    window: &Window<R>,
+    number: u32,
+    inode: &[u8],
+    offset: u64,
+    end: u64,
+) -> Result<BlockMap, WriteError> {
+    let block_size = u64::from(volume.block_size);
+    let map = BlockMap::of_inode(volume, window, inode, number)?;
+    let journal = BlockMap::load(volume, window)?;
+    let metadata = volume.metadata(window)?;
+    for logical in offset / block_size..end.div_ceil(block_size) {
+        let physical = u32::try_from(logical)
+            .ok()
+            .and_then(|block| map.physical(block))
+            .ok_or(WriteError::NotAllocated {
+                number,
+                block: logical,
+            })?;
+        if physical >= volume.blocks
+            || journal.contains(physical)
+            || metadata
+                .iter()
+                .any(|&(start, end)| (start..end).contains(&physical))
+        {
+            return Err(WriteError::BadDataBlock { number, physical });
+        }
+    }
+    Ok(map)
+}
+
+/// Stores `size` in `i_size_lo` and `i_size_high`.
+fn put_size(target: &Target, number: u32, inode: &mut [u8], size: u64) -> Result<(), WriteError> {
+    if size > i32::MAX as u64 && target.volume.ro_compat & RO_COMPAT_LARGE_FILE == 0 {
+        return Err(WriteError::FileTooLarge { number, size });
+    }
+    Data::read(inode)?.put_size(inode, size)?;
+    Ok(())
+}
+
+/// Checks that this module can write to the volume `window` holds, without writing: what
+/// every change checks first, for deciding at mount time whether to serve the volume
+/// read-write.
+///
+/// # Errors
+///
+/// The refusals of [`set_times`] that depend on the volume, not the inode:
+/// [`WriteError::NeedsReplay`], [`WriteError::NoJournal`], [`WriteError::UnsupportedFeature`]
+/// and [`WriteError::Journal`]; and [`WriteError::Open`] for a journal the writer refuses
+/// (one that is aborted or has version 1 checksums).
+pub fn check_writable<R: ReadAt>(window: &Window<R>) -> Result<(), WriteError> {
+    let target = writable_volume(window)?;
+    let map = BlockMap::load(&target.volume, window)?;
+    let (_, raw, _) = open_journal(window, &map, &target.volume)?;
+    Writer::new(&raw)?;
+    Ok(())
+}
+
+/// What a change needs to know about the volume.
+struct Target {
+    /// The superblock fields.
+    volume: Volume,
+    /// What metadata checksums start from (with `metadata_csum`): `s_checksum_seed`, or the
+    /// CRC32C of the UUID.
+    checksum_seed: Option<u32>,
+    /// Whether inodes keep the high 16 bits of the owner and group, at `l_i_uid_high` and
+    /// `l_i_gid_high` (`s_creator_os` Linux) or `h_i_uid_high` and `h_i_gid_high` (Hurd), at
+    /// the same offsets. Other creators keep other fields there.
+    high_ids: bool,
+}
+
+/// The volume's [`Target`], once it is known that this module may write to it.
+fn writable_volume<R: ReadAt>(window: &Window<R>) -> Result<Target, WriteError> {
     let sb = read_volume_superblock(window)?;
     let volume = Volume::parse(&sb)?;
     if volume.needs_replay()? {
@@ -292,7 +802,12 @@ fn writable_volume<R: WriteAt>(window: &Window<R>) -> Result<(Volume, Option<u32
             ferric_jbd2::crc32c(&[&sb[S_UUID..S_UUID + 16]])
         }
     });
-    Ok((volume, seed))
+    let high_ids = matches!(le32(&sb, S_CREATOR_OS), CREATOR_LINUX | CREATOR_HURD);
+    Ok(Target {
+        volume,
+        checksum_seed: seed,
+        high_ids,
+    })
 }
 
 /// The commit block's time: now, or the epoch if the clock is before it.
@@ -304,13 +819,6 @@ fn commit_time() -> CommitTime {
         seconds: now.as_secs(),
         nanoseconds: now.subsec_nanos(),
     }
-}
-
-/// Whether the inode's extra fields reach past byte `end`.
-fn has_extra(inode: &[u8], end: usize) -> bool {
-    inode.len() > GOOD_OLD_INODE_SIZE
-        && GOOD_OLD_INODE_SIZE + usize::from(le16(inode, I_EXTRA_ISIZE)) >= end
-        && inode.len() >= end
 }
 
 /// Stores `time` in the seconds field at `field` and, if the inode has it, the extra field
@@ -378,14 +886,12 @@ fn put_checksum(inode: &mut [u8], checksum: u32) {
     }
 }
 
-/// The little-endian `u16` at `at`; every caller's buffer is long enough.
-fn le16(raw: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([raw[at], raw[at + 1]])
-}
-
 #[cfg(test)]
 mod tests {
+    const I_FLAGS: usize = 0x20;
+
     use super::*;
+    use crate::inode::{I_EXTRA_ISIZE, time as read_time};
 
     fn inode(extra_isize: u16) -> Vec<u8> {
         let mut inode = vec![0; 256];
@@ -398,6 +904,52 @@ mod tests {
             seconds,
             nanoseconds,
         }
+    }
+
+    #[test]
+    fn only_plain_regular_files_take_data() {
+        let mut inode = vec![0; 256];
+        inode[I_MODE..I_MODE + 2].copy_from_slice(&(S_IFREG | 0o644).to_le_bytes());
+        check_data_writable(12, &inode).expect("a regular file");
+        for (flags, refused) in [
+            (IMMUTABLE_FL, true),
+            (APPEND_FL, true),
+            (ENCRYPT_FL, false),
+            (JOURNAL_DATA_FL, false),
+            (VERITY_FL, false),
+            (INLINE_DATA_FL, false),
+        ] {
+            inode[I_FLAGS..I_FLAGS + 4].copy_from_slice(&(0x8_0000 | flags).to_le_bytes());
+            let err = check_data_writable(12, &inode).expect_err("refused");
+            if refused {
+                assert!(matches!(err, WriteError::FileFlags { flags: f, .. } if f == flags));
+            } else {
+                assert!(matches!(err, WriteError::UnsupportedFile { flags: f, .. } if f == flags));
+            }
+        }
+        inode[I_FLAGS..I_FLAGS + 4].fill(0);
+        inode[I_MODE..I_MODE + 2].copy_from_slice(&0o40_755u16.to_le_bytes());
+        assert!(matches!(
+            check_data_writable(2, &inode),
+            Err(WriteError::NotAFile { number: 2 })
+        ));
+    }
+
+    #[test]
+    fn put_permissions_keeps_the_file_type() {
+        let mut inode = vec![0; 256];
+        inode[I_MODE..I_MODE + 2].copy_from_slice(&(S_IFREG | 0o644).to_le_bytes());
+        put_permissions(&mut inode, 0o4750).expect("permission bits");
+        assert_eq!(le16(&inode, I_MODE), S_IFREG | 0o4750);
+        assert!(matches!(
+            put_permissions(&mut inode, S_IFREG | 0o644),
+            Err(WriteError::InvalidPermissions { bits }) if bits == S_IFREG | 0o644
+        ));
+        assert_eq!(
+            le16(&inode, I_MODE),
+            S_IFREG | 0o4750,
+            "a refused mode writes nothing"
+        );
     }
 
     #[test]
@@ -424,6 +976,11 @@ mod tests {
             assert_eq!((extra & 3, extra >> 2), (epoch, 999_999_999), "{seconds}");
             let decoded = i64::from(low) + (i64::from(extra & 3) << 32);
             assert_eq!(decoded, seconds);
+            // What crate::inode reads back, for fstat's change time.
+            assert_eq!(
+                read_time(&inode, I_MTIME, I_MTIME_EXTRA),
+                (seconds, 999_999_999)
+            );
         }
         assert!(put_time(&mut inode, I_MTIME, I_MTIME_EXTRA, time(1 << 34, 0)).is_none());
         assert!(

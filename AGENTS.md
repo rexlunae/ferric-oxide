@@ -63,7 +63,7 @@ The implemented layout is below. Put new code in the appropriate component direc
 | `features.toml` | Catalog of build-time feature options | — |
 | `docs/` | The book: Ferric system chapters, plus chapters revised from the Redox book it was imported from | — |
 
-Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` and a general `ferric-abi` crate do not exist yet. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
+Host, kernel, UEFI and Redox user-space builds retain separate workspace or standalone-package boundaries so their targets, lockfiles and profiles remain independent. Code shared between workspaces goes in `crates/` and is depended on by path (from `crates/kernel/` a shared crate is `../<name>`). Host RedoxFS tools currently build from `userspace/redoxfs/`; `tools/redoxfs-host/` does not exist yet. `ferric-abi` (`crates/abi`) holds interface constants shared by relibc and daemons, so far the `futimens` sentinels; relibc keeps literal copies for its cbindgen headers and asserts at build time that they match. Keep Rust crates out of the repository root: new crates go in `crates/`, `tools/` or `userspace/`. Do not merge the workspaces into one.
 
 ## Non-negotiable project rules
 
@@ -73,6 +73,7 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
+- **Fix crashes; do not route around them.** When something crashes, hangs or traps (a kernel panic, a daemon abort, a QEMU accelerator exit, a failing boot test), find and fix the root cause. Turning off the feature, accelerator or code path that exposes it, catching or ignoring the failure, adding a retry, or defaulting to a slower path to avoid it is not a fix. If the root cause cannot be fixed in the same change, open an issue that describes it, and keep any temporary workaround visible: an opt-in with a comment and documentation that link the issue, never a silent default.
 
 ## Rust conventions
 

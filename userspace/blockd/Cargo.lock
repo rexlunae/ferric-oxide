@@ -113,6 +113,7 @@ name = "ferric-blockd"
 version = "0.1.0"
 dependencies = [
  "ferric-blocklayer",
+ "ferric-ready",
  "libredox",
  "redox-scheme",
  "redox_syscall",
@@ -152,6 +153,10 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
+
+[[package]]
+name = "ferric-ready"
+version = "0.1.0"
 
 [[package]]
 name = "generic-array"

@@ -1,5 +1,9 @@
 # Build System Reference
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 The build system downloads and creates several files that you may want to know about. There are also several `make` commands mentioned below, and a few extras that you may find useful. Here's a quick summary. All file paths are relative to your `redox` base directory.
 
 - [Build System Organization](#build-system-organization)
@@ -83,10 +87,10 @@ The build system downloads and creates several files that you may want to know a
 ### Build System Files
 
 - `build` - The directory where the build system will place the final image. Usually `build/$(ARCH)/$(CONFIG_NAME)`, e.g. `build/x86_64/desktop`
-- `build/$ARCH/your-config/harddrive.img` - The Redox image file, to be used by QEMU or VirtualBox for virtual machine execution on a Unix-like host.
+- `build/$ARCH/your-config/harddrive.img` - The image file, to be used by QEMU or VirtualBox for virtual machine execution on a Unix-like host.
 - `build/$ARCH/your-config/redox-live.iso` - The Redox bootable image file, to be used on real hardware for testing and possible installation.
 - `build/$ARCH/your-config/fetch.tag` - An empty file that, if present, tells the build system that the downloading of recipe sources is done.
-- `build/$ARCH/your-config/repo.tag` - An empty file that, if present, tells the build system that all recipes required for the Redox image have been successfully built. **The build system will not check for changes to your code when this file is present.** Use `make rebuild` to force the build system to check for changes.
+- `build/$ARCH/your-config/repo.tag` - An empty file that, if present, tells the build system that all recipes required for the image have been successfully built. **The build system will not check for changes to your code when this file is present.** Use `make rebuild` to force the build system to check for changes.
 - `build/podman` - The directory where Podman Build places the container user's home directory, including the container's Rust installation. Use `make container_clean` to remove it. In some situations, you may need to remove this directory manually, possibly with root privileges.
 - `build/container.tag` - An empty file, created during the first Podman build, so a Podman build knows when a reusable Podman image is available. Use `make container_clean` to force a rebuild of the Podman image on your next `make rebuild` run.
 - `build/logs/$TARGET/recipe.log` - Where recipe build logs are stored.
@@ -115,7 +119,7 @@ The build system downloads and creates several files that you may want to know a
 
 ## GNU Make Commands
 
-You can combine `make` commands, but order is significant. For example, `make r.games image` will build the `games` recipe and create a new Redox image, but `make image r.games` will make the Redox image before the recipe building, thus the new recipe binary will not be included on your Redox filesystem.
+You can combine `make` commands, but order is significant. For example, `make r.games image` will build the `games` recipe and create a new image, but `make image r.games` will make the image before the recipe building, thus the new recipe binary will not be included on your Redox filesystem.
 
 ### Build System
 
@@ -123,9 +127,9 @@ You can combine `make` commands, but order is significant. For example, `make r.
 - `make cookbook` - Update Cookbook binaries with local changes (when `make pull` is not used)
 - `make all` - Builds the entire system, checking for changes and only building as required. Only use this for the first build. If the system was successfully built previously, this command may report `Nothing to be done for 'all'`, even if some recipes have changed. Use `make rebuild` instead.
 - `make rebuild` - Update all binaries from recipes with source code changes (it doesn't detect changes on the Redox toolchain). This should be your normal `make` target.
-- `make rebuild-push` - Similar to `make rebuild` but push updated recipes instead of a image rebuild, use this to preserve your changes on the Redox image after a full update (it will update downloaded packages if `REPO_BINARY` is enabled)
+- `make rebuild-push` - Similar to `make rebuild` but push updated recipes instead of a image rebuild, use this to preserve your changes on the image after a full update (it will update downloaded packages if `REPO_BINARY` is enabled)
 - `make prefix` - Download the Rust/GCC forks and build relibc.
-- `make fstools` - Build the Redox image builder (installer), Cookbook and RedoxFS.
+- `make fstools` - Build the image builder (installer), Cookbook and RedoxFS.
 - `make fstools_clean` - Clean the image builder, Cookbook and RedoxFS binaries.
 - `make fetch` - Update recipe sources, according to each recipe, without building them. Only the recipes that are included in your `(CONFIG_NAME).toml` are downloaded. Does nothing if `$(BUILD)/fetch.tag` is present. You won't need this.
 - `make unfetch` - Clean all recipe sources.
@@ -142,12 +146,12 @@ You can combine `make` commands, but order is significant. For example, `make r.
 - `make find` - Show the recipe packages location
 - `make tree` - Show all recipe and package dependencies from the current filesystem configuration that will be built and pushed
 - `make repo-tree` - Show all recipe dependencies (`build.dependencies` data type) that will be built, also check what dependencies were built or not
-- `make image-tree` - Show the package dependencies (`package.dependencies` data type) that will be pushed into the Redox image
+- `make image-tree` - Show the package dependencies (`package.dependencies` data type) that will be pushed into the image
 - `make image` - Builds a new QEMU image, `build/harddrive.img`, without checking if any recipes have changed. It can save you some time if you are just updating one recipe with `make r.recipe`
-- `make push` - Only install recipes with new changes in an existing Redox image (it can still be used after `make c.--all` or `make u.--all` execution)
+- `make push` - Only install recipes with new changes in an existing image (it can still be used after `make c.--all` or `make u.--all` execution)
 - `make install` - Install the recipe binaries in the system for self-hosted development testing
-- `make mount` - Mounts the Redox image as a filesystem at `$(BUILD)/filesystem`. **Do not use this if QEMU is running**, and remember to use `make unmount` as soon as you are done. This is not recommended, but if you need to get a large file onto or off of your Redox image, this is available as a workaround.
-- `make unmount` - Unmounts the Redox image filesystem. Use this as soon as you are done with `make mount`, and **do not start QEMU** until this is done.
+- `make mount` - Mounts the image as a filesystem at `$(BUILD)/filesystem`. **Do not use this if QEMU is running**, and remember to use `make unmount` as soon as you are done. This is not recommended, but if you need to get a large file onto or off of your image, this is available as a workaround.
+- `make unmount` - Unmounts the image filesystem. Use this as soon as you are done with `make mount`, and **do not start QEMU** until this is done.
 - `make live` - Creates a bootable image, `build/livedisk.iso`. Recipes are not usually rebuilt.
 - `make popsicle` - Flash the Redox bootable image on your USB device using the [Popsicle](https://github.com/pop-os/popsicle) tool (the program executable must be present on your shell `$PATH` environment variable, you can get the executable by extracting the AppImage, installing from the package manager or building from source)
 - `make mount_live` - Mount the live disk ISO
@@ -181,20 +185,20 @@ You can combine `make` commands, but order is significant. For example, `make r.
   - This command will continue where you stopped the build process, it's useful to save time if you had a compilation error and patched a crate
 
 - `make ri.recipe` - Build or rebuild and install the recipe to Redox
-- `make p.recipe` (abbreviation of `push`) - Install one or multiple recipe packages to an existing Redox image (it can still be used after `make c.recipe` or `make u.recipe` execution)
-- `make p.--all-compiled` - Install all compiled recipes to Redox image
+- `make p.recipe` (abbreviation of `push`) - Install one or multiple recipe packages to an existing image (it can still be used after `make c.recipe` or `make u.recipe` execution)
+- `make p.--all-compiled` - Install all compiled recipes to image
 - `make i.recipe` (abbreviation of `install`) - Install a recipe to Redox for self-hosted development testing
 - `make bc.recipe` - Set the recipe rule to `binary` (pre-built package) and clean existing recipe binaries
 - `make sc.recipe` - Set the recipe rule to `source` (enable compilation) and clean existing recipe binaries
-- `make nc.recipe` - Set the recipe rule to `ignore` (disable installation on Redox image) and clean existing recipe binaries
+- `make nc.recipe` - Set the recipe rule to `ignore` (disable installation on image) and clean existing recipe binaries
 - `make cc.recipe` - Reset recipe rule to default (`source`) and clean existing recipe binaries
 - `make c.recipe` (abbreviation of `clean`) - Clean one or multiple recipe binaries, while preserving packages.
 - `make u.recipe` (abbreviation of `unfetch`) - Clean one or multiple recipe source code and binaries, while preserving packages (**please backup or submit your source changes before the execution of this command**)
 - `make u.--all` - Remove all previously downloaded source/binaries and preserve recipe packages
 - `make rt.recipe` (abbreviation of `repo-tree`) - Show the recipe dependencies that will be built, also check what dependencies were built or not
-- `make pt.recipe` (abbreviation of `push-tree`) - Show the package dependencies that will be pushed into the Redox image
+- `make pt.recipe` (abbreviation of `push-tree`) - Show the package dependencies that will be pushed into the image
 - `make rp.recipe` - A shortcut for `make r.recipe p.recipe`
-- `make rp.--all-binaries` - Install all downloaded recipe packages to Redox image
+- `make rp.--all-binaries` - Install all downloaded recipe packages to image
 - `make cr.recipe` - A shortcut for `make c.recipe r.recipe`
 - `make crp.recipe` - A shortcut for `make c.recipe r.recipe p.recipe`
 - `make cri.recipe` - A shortcut for `make c.recipe r.recipe i.recipe`
@@ -221,13 +225,13 @@ All recipe targets also support multiple recipe entries by separating each recip
 - `make qemu audio=no` - Disable all sound drivers.
 - `make qemu usb=no` - Disable all USB drivers.
 - `make qemu uefi=yes` - Enable the UEFI boot loader (it supports more screen resolutions).
-- `make qemu live=yes` - Fully load the Redox image to RAM.
+- `make qemu live=yes` - Fully load the image to RAM.
 - `make qemu disk=nvme` - Boot Redox from a NVMe interface (high-performance SSD emulation).
 - `make qemu disk=usb` - Boot Redox from a virtual USB device.
 - `make qemu disk=cdrom` - Boot Redox from a virtual CD-ROM disk.
 - `make qemu kvm=no` - Start QEMU without the [Linux KVM](https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine) acceleration if it's not supported.
 - `make qemu iommu=yes` - Start QEMU with [IOMMU](https://en.wikipedia.org/wiki/Input-output_memory_management_unit) enabled.
-- `make qemu gdb=yes` - Start QEMU with the GDB configuration enabled, you need to run the `make rp.gdbserver` command before to install the GDB server in the Redox image (persist until the next image creation) or add the `gdbserver` recipe on your filesystem configuration (`gdbserver = {}`) to persist in new images, then run the `make gdb` command in another shell to connect the GDB processes.
+- `make qemu gdb=yes` - Start QEMU with the GDB configuration enabled, you need to run the `make rp.gdbserver` command before to install the GDB server in the image (persist until the next image creation) or add the `gdbserver` recipe on your filesystem configuration (`gdbserver = {}`) to persist in new images, then run the `make gdb` command in another shell to connect the GDB processes.
 - `make gdb` - Connects the host system GDB to the GDB server (`gdbserver` recipe) running inside of Redox in QEMU.
 - `make qemu option1=value option2=value` - Cumulative QEMU options are supported.
 - `make virtualbox` - Boot Redox in VirtualBox, it requires the VirtualBox service to be running, run `systemctl status vboxdrv.service` to verify or `akmods; systemctl restart vboxdrv.service` to enable on systems using systemd.
@@ -288,7 +292,7 @@ This is the recommended way to update the system and applications sources and bi
 make rebuild-push
 ```
 
-(If you need a new Redox image, run the `make rebuild` command)
+(If you need a new image, run the `make rebuild` command)
 
 Or (if you enabled the `REPO_BINARY` environment variable)
 
@@ -296,7 +300,7 @@ Or (if you enabled the `REPO_BINARY` environment variable)
 make fetch push
 ```
 
-(If you need a new Redox image, run the `make fetch push` command)
+(If you need a new image, run the `make fetch push` command)
 
 If you want to just update the system without non-essential programs, run the following command:
 
@@ -364,7 +368,7 @@ Read the [Filesystem Customization](./configuration-settings.md#filesystem-custo
 
 ## Cross-Compilation
 
-The Redox build system is an example of [cross-compilation](https://en.wikipedia.org/wiki/Cross_compiler). The Redox [toolchain](https://static.redox-os.org/toolchain/) runs on Linux, and produces Redox executables. Anything that is installed with your package manager is just part of the toolchain and does not go on Redox.
+The build system is an example of [cross-compilation](https://en.wikipedia.org/wiki/Cross_compiler). The Redox [toolchain](https://static.redox-os.org/toolchain/) runs on Linux, and produces Redox executables. Anything that is installed with your package manager is just part of the toolchain and does not go on Redox.
 
 In the background, the `make all` command downloads the Redox toolchain to build all recipes (patched forks of rustc, GCC and LLVM).
 

@@ -129,6 +129,25 @@ that found these bugs on every run: `mremap` and an anonymous `fmap` with
 `MAP_FIXED` whose end leaves user space, and a `funmap` length with no aligned
 value.
 
+### Prepared lazy borrowed mapping faults
+
+The fault handler for `Provider::FmapBorrowed` begins a fresh reply slot before
+sending `RequestMmap`. Under the context write lock it registers a wait only
+if no reply is ready. `ProvideMmap` uses that same lock to publish the frame
+and make a registered waiter runnable. A reply before registration therefore
+requires neither blocking nor a scheduler switch; a reply after registration
+has a waiter to wake. Responses are consumed once, and each new request
+clears stale state. If request dispatch fails (currently, for example, request
+tag allocation), the fault becomes `PfError::Segv` rather than a kernel panic.
+An unavailable user scheme also produces that fault.
+
+This remains a prepared path: `fmap_inner` hardcodes `mapping_is_lazy=false`,
+and no current scheme answers `RequestMmap`. Ordinary `fmap` cannot exercise
+it. Enabling it needs both lazy mapping creation and a responder. The actual
+reply-slot state machine is included in host/Miri helper tests for both
+reply/park orders, stale replies, duplicates and failed dispatch cleanup;
+those tests do not emulate a user-copy fault or a hardware context switch.
+
 ## KPTI and PCID
 
 `kernel.cpu.kpti` defaults to `auto`. It enables kernel page-table isolation

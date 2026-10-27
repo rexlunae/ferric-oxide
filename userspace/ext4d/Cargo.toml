@@ -20,25 +20,33 @@ path = "src/main.rs"
 
 [features]
 # Replay a volume's journal onto the disk before serving it (features.toml
-# fs.ext4_journal_replay). Off by default: without it ext4d never writes.
-journal-replay = ["dep:ferric-jbd2"]
-# Change the volume through its journal (features.toml fs.ext4_write): so far, setting an
-# inode's times. Off by default; needs the replay, since a volume is replayed before it is
-# written.
+# fs.ext4_journal_replay). Off by default: without it ext4d never writes. The journal
+# superblock and inode map are read in every build (ferric-jbd2), as the same map finds the
+# inodes whose change times `fstat` reports.
+journal-replay = []
+# Change the volume through its journal (features.toml fs.ext4_write): so far, setting a
+# file's times, which the scheme's futimens does. Off by default; needs the replay, since a
+# volume is replayed before it is written.
 write = ["journal-replay"]
 
 [dependencies]
+ferric-fspath = { path = "../../crates/fspath" }
 ext4-view = { version = "1.0.0", features = ["std"] }
-ferric-jbd2 = { path = "../../crates/jbd2", optional = true }
+# The futimens sentinels (UTIME_NOW, UTIME_OMIT), shared with relibc.
+ferric-abi = { path = "../../crates/abi" }
+ferric-jbd2 = { path = "../../crates/jbd2" }
 log = "0.4.27"
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
 thiserror = "2.0.17"
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "both_endian", "byte_impls", "io-std"] }
 
 [dev-dependencies]
 flate2 = "1"
 
 [target.'cfg(target_os = "redox")'.dependencies]
+# The readiness handshake with ferric-unlock (fs.unlock_at_boot).
+ferric-ready = { path = "../../crates/ready" }
 libredox = "0.1.25"
 redox-scheme = "0.11.4"
 

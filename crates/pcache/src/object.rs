@@ -39,6 +39,19 @@
 //! fill may hold the old bytes, so it is not taken. The page goes back to
 //! [`PageState::Absent`] and the fill ends without failing, so the readers that waited for it
 //! fill it again on their retry.
+//!
+//! Writes the kernel serves and their writeback are in [`PageIndex::start_write`],
+//! [`PageIndex::write`], [`PageIndex::start_writeback`] and
+//! [`PageIndex::complete_writeback`]; reclaim takes a page with [`PageIndex::evict`], which
+//! refuses a page whose data the file system does not have. The index counts its dirty pages
+//! ([`PageIndex::dirty_pages`]): `Dirty` ones and those under writeback, whose writeback can
+//! still fail. A page under writeback that a truncation cuts is dropped once its writeback
+//! ends; until then readers and writers of it wait, so the bytes past the cut never come
+//! back.
+
+mod write;
+
+pub use write::{EvictError, TakenRun, Write, WriteError, WritebackError, Written, WrittenBack};
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -202,6 +215,16 @@ impl<F> Entry<F> {
             stale: false,
         }
     }
+
+    /// Whether a reader or writer of the page waits for it: it is being filled, or it is
+    /// under writeback and was truncated away meanwhile (it goes when the writeback ends).
+    const fn waits(&self) -> bool {
+        match self.state {
+            PageState::Filling => true,
+            PageState::Writeback { .. } => self.stale,
+            _ => false,
+        }
+    }
 }
 
 /// The pages of one cache object.
@@ -212,6 +235,12 @@ pub struct PageIndex<F> {
     pages: BTreeMap<u64, Entry<F>>,
     /// The ID the next fill gets; `None` once every ID has been used. IDs are never reused.
     next_fill: Option<FillId>,
+    /// Pages holding data the file system does not have: `Dirty` or under writeback.
+    dirty: usize,
+    /// The run of pages under writeback, if any: one at a time.
+    writeback: Option<RecordPages>,
+    /// The sequential writer it follows, for early writeback.
+    stream: write::Stream,
 }
 
 impl<F> Default for PageIndex<F> {
@@ -227,6 +256,9 @@ impl<F> PageIndex<F> {
             size: 0,
             pages: BTreeMap::new(),
             next_fill: Some(FillId::new(1)),
+            dirty: 0,
+            writeback: None,
+            stream: write::Stream::new(),
         }
     }
 
@@ -255,14 +287,33 @@ impl<F> PageIndex<F> {
     /// Sets the file's size. When the file shrinks, the pages from the one the new end falls
     /// in are invalidated ([`PageIndex::invalidate`]): the page holding the new end has bytes
     /// past it that must not come back if the file grows again, and fills outstanding past
-    /// the end become stale. Returns how many cached pages were dropped.
+    /// the end become stale. Dirty pages there are dropped too (the truncation discards
+    /// them), and pages under writeback are dropped when it ends. Returns how many cached
+    /// pages were dropped.
     pub fn set_size(&mut self, size: u64) -> usize {
         let shrunk = size < self.size;
         self.size = size;
         if shrunk {
-            self.invalidate_from(size / PAGE_SIZE, u64::MAX).dropped
+            self.invalidate_from(size / PAGE_SIZE, u64::MAX, true)
+                .dropped
         } else {
             0
+        }
+    }
+
+    /// The number of pages holding data the file system does not have yet: dirty, or under
+    /// a writeback that has not ended.
+    pub const fn dirty_pages(&self) -> usize {
+        self.dirty
+    }
+
+    /// The frame of `page`, when it holds the file's data.
+    pub fn frame(&self, page: u64) -> Option<&F> {
+        let entry = self.pages.get(&page)?;
+        if entry.state.readable() && !entry.waits() {
+            entry.frame.as_ref()
+        } else {
+            None
         }
     }
 
@@ -301,7 +352,7 @@ impl<F> PageIndex<F> {
                 };
             }
         };
-        let read = if fills.is_empty() && !self.busy(pages) {
+        let read = if fills.is_empty() && !self.waits(pages) {
             Read::Ready
         } else {
             Read::Wait
@@ -312,11 +363,12 @@ impl<F> PageIndex<F> {
         ReadStep { read, fills }
     }
 
-    /// Whether any of `pages` is being filled or written back.
-    fn busy(&self, pages: PageRange) -> bool {
+    /// Whether any of `pages` must be waited for before it is read or written
+    /// ([`Entry::waits`]).
+    fn waits(&self, pages: PageRange) -> bool {
         self.pages
             .range(pages.first()..pages.end())
-            .any(|(_, entry)| entry.state.busy())
+            .any(|(_, entry)| entry.waits())
     }
 
     /// The read's own part of [`PageIndex::start_read`]: the fills it started, or why it
@@ -406,9 +458,7 @@ impl<F> PageIndex<F> {
         (pages.first()..pages.end())
             .map(|page| {
                 let entry = self.pages.get(&page)?;
-                entry
-                    .state
-                    .readable()
+                (entry.state.readable() && !entry.waits())
                     .then(|| entry.frame.clone())
                     .flatten()
             })
@@ -486,15 +536,18 @@ impl<F> PageIndex<F> {
     }
 
     /// Drops the cached copies of `pages`, whose bytes changed outside the cache, and marks
-    /// those being filled stale (see the module docs). Pages under writeback are left as they
-    /// are: they hold data newer than the file system's, which only the write path (PR 5)
-    /// creates.
+    /// those being filled stale (see the module docs). Dirty pages are dropped too, and
+    /// counted ([`Invalidated::dirty`]): a file system that has the kernel serve writes
+    /// writes them back and holds writes before it changes the file itself, so there are
+    /// none. Pages under writeback are left as they are: they hold data newer than the file
+    /// system's.
     pub fn invalidate(&mut self, pages: PageRange) -> Invalidated {
-        self.invalidate_from(pages.first(), pages.end())
+        self.invalidate_from(pages.first(), pages.end(), false)
     }
 
-    /// [`PageIndex::invalidate`] of the pages `first..end`.
-    fn invalidate_from(&mut self, first: u64, end: u64) -> Invalidated {
+    /// [`PageIndex::invalidate`] of the pages `first..end`; a `truncation` also marks the
+    /// pages under writeback stale, to drop when it ends.
+    fn invalidate_from(&mut self, first: u64, end: u64, truncation: bool) -> Invalidated {
         let mut done = Invalidated::default();
         let touched: Vec<u64> = self
             .pages
@@ -510,8 +563,12 @@ impl<F> PageIndex<F> {
                     entry.stale = true;
                     done.stale += 1;
                 }
-                PageState::Writeback { .. } | PageState::Absent => {}
-                _ => {
+                PageState::Writeback { .. } => entry.stale |= truncation,
+                PageState::Absent => {}
+                state => {
+                    if state.dirty() {
+                        done.dirty += 1;
+                    }
                     if self.drop_page(page) {
                         done.dropped += 1;
                     }
@@ -537,9 +594,13 @@ impl<F> PageIndex<F> {
 
     /// Forgets `page`, which is absent from now on; returns whether it had a frame.
     fn drop_page(&mut self, page: u64) -> bool {
-        self.pages
-            .remove(&page)
-            .is_some_and(|entry| entry.frame.is_some())
+        let Some(entry) = self.pages.remove(&page) else {
+            return false;
+        };
+        if entry.state.dirty() {
+            self.dirty = self.dirty.saturating_sub(1);
+        }
+        entry.frame.is_some()
     }
 
     /// Fails every outstanding fill (the file system's queue closed), and returns how many
@@ -598,6 +659,8 @@ pub struct Invalidated {
     pub dropped: usize,
     /// Pages being filled, whose fills are now stale.
     pub stale: usize,
+    /// Of the dropped pages, those that were dirty.
+    pub dirty: usize,
 }
 
 /// Why a fill answer was not applied.
@@ -1249,7 +1312,7 @@ mod tests {
             index.invalidate(range(1, 2)),
             Invalidated {
                 dropped: 2,
-                stale: 0
+                ..Invalidated::default()
             }
         );
         assert_eq!(index.resident(), 2);
@@ -1277,8 +1340,8 @@ mod tests {
         assert_eq!(
             index.invalidate(range(1, 1)),
             Invalidated {
-                dropped: 0,
-                stale: 1
+                stale: 1,
+                ..Invalidated::default()
             }
         );
         // The answer may hold the old bytes of page 1: pages 0 and 2 are taken, page 1 is

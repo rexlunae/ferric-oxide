@@ -10,8 +10,12 @@ extern crate alloc;
 
 #[path = "../src/arch/x86_shared/device/apic_id.rs"]
 mod apic_id;
+#[path = "../src/scheme/chown.rs"]
+mod chown;
 #[path = "../src/cpu_set.rs"]
 mod cpu_set;
+#[path = "../src/context/fmap_reply.rs"]
+mod fmap_reply;
 #[path = "../src/percpu/global_flush.rs"]
 mod global_flush;
 #[path = "../src/context/idle.rs"]

@@ -1,0 +1,49 @@
+[package]
+name = "fatd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only FAT12/FAT16/FAT32 and exFAT file system daemon for Ferric Oxide (features.toml fs.fat, fs.exfat)"
+publish = false
+
+# Builds on its own, outside any workspace above it (the cookbook builds it for Redox; CI
+# runs its host tests with --manifest-path).
+[workspace]
+
+[lib]
+name = "fatd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fatd"
+path = "src/main.rs"
+
+[dependencies]
+# The FAT reader the image installer (tools/installer) already uses to write the EFI
+# partition. Without its default features: no chrono (fatd converts FAT times itself) and
+# nothing that reads the clock, which only writes would need.
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["std"] }
+ferric-fat-types = { path = "../../crates/fat-types" }
+# Build the parser only when fs.exfat enables this daemon's exfat feature.
+ferric-exfat = { path = "../../crates/exfat", optional = true }
+ferric-fspath = { path = "../../crates/fspath" }
+log = "0.4.27"
+# Errno values and the Stat layout of the scheme ABI; usable on the host too.
+redox_syscall = { version = "0.9.5", features = ["std"] }
+thiserror = "2.0.17"
+
+[features]
+default = []
+# Mount exFAT volumes too (features.toml fs.exfat, off by default).
+exfat = ["dep:ferric-exfat"]
+
+[dev-dependencies]
+flate2 = "1"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "0.1.25"
+redox-scheme = "0.11.4"
+
+[profile.release]
+debug = false

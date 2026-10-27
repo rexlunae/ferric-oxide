@@ -8,13 +8,17 @@
 //! `DEVICE` is a disk, a partition or an image file. `--offset` and `--length` pick the
 //! volume's bytes out of it, for a partition on a whole disk. The volume appears at
 //! `/scheme/SCHEME` once it is mounted, and the daemon serves it in the foreground until
-//! the scheme is closed. Only Redox has schemes; elsewhere the program says so and exits.
+//! the scheme is closed. Started with `FERRIC_READY=stdout` (as `ferric-unlock` does), it
+//! writes `ready` to stdout once the scheme is registered (`ferric_ready`). Only Redox has
+//! schemes; elsewhere the program says so and exits.
 //!
 //! Built with `journal-replay` (features.toml `fs.ext4_journal_replay`), it first replays the
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
 //! for that. Without it the device is only ever opened for reading. `write` (features.toml
-//! `fs.ext4_write`) adds the library's journaled writes, which the scheme does not call yet.
-//! `ext4d --features`
+//! `fs.ext4_write`) opens the device for writing and serves the volume read-write when the
+//! library can write to it (`ext4d::write::check_writable`), so far for `futimens` only;
+//! when it cannot, or the device does not open for writing, it says why and serves the
+//! volume read-only (`ext4d::fs::Fs::mount_preferring_write`). `ext4d --features`
 //! prints the optional features it was built with, one per line, so tests can tell.
 
 #![forbid(unsafe_code)]
@@ -49,7 +53,6 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "redox")]
 mod daemon {
-    use std::error::Error as _;
     use std::fs::File;
     use std::process::ExitCode;
 
@@ -93,6 +96,8 @@ mod daemon {
         Mount(#[from] ext4d::Error),
         #[error("serving the scheme failed")]
         Serve(#[from] ServeError),
+        #[error("cannot tell the starter the volume is mounted")]
+        Notify(#[source] std::io::Error),
     }
 
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, DaemonError> {
@@ -170,22 +175,58 @@ mod daemon {
         Ok(())
     }
 
+    /// Loads the volume: without `write`, read-only.
+    #[cfg(not(feature = "write"))]
+    fn mount(_args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
+        Ok(ext4d::fs::Fs::new(window)?)
+    }
+
+    /// Loads the volume: with `write`, for changes when the library can write to it and the
+    /// device opens for writing; otherwise read-only, saying why.
+    #[cfg(feature = "write")]
+    fn mount(args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
+        let (fs, read_only) = ext4d::fs::Fs::mount_preferring_write(window, || open(args, true))?;
+        if let Some(reason) = read_only {
+            eprint!("ext4d: {}: serving read-only: {reason}", args.device);
+            print_sources(&reason);
+        }
+        Ok(fs)
+    }
+
+    /// Prints `err`'s sources after it, then ends the line.
+    fn print_sources(err: &dyn std::error::Error) {
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprint!(": {cause}");
+            source = cause.source();
+        }
+        eprintln!();
+    }
+
     fn run() -> Result<(), DaemonError> {
         let args = parse(std::env::args().skip(1))?;
         let window = open(&args, false)?;
         #[cfg(feature = "journal-replay")]
         replay(&args, &window)?;
-        let fs = ext4d::fs::Fs::new(window)?;
+        let fs = mount(&args, window)?;
         if fs.needs_recovery() {
             eprintln!(
-                "ext4d: {}: the volume needs journal recovery; serving ext4-view's in-memory \
-                 view of the journal (fs.ext4_journal_replay replays it onto the disk)",
+                "ext4d: {}: the volume needs journal recovery; serving it as the replay would \
+                 leave it, with the journal's committed blocks read in memory over the volume \
+                 (the disk is not changed; fs.ext4_journal_replay replays it onto the disk)",
                 args.device
             );
         }
+        let mode = if fs.is_writable() {
+            "read-write (times, mode, owner and in-place data only)"
+        } else {
+            "read-only"
+        };
         let mount = Mount::new(fs, &args.scheme)?;
+        // Only now is the name ours; a starter waiting for it may rely on that.
+        ferric_ready::notify().map_err(DaemonError::Notify)?;
         eprintln!(
-            "ext4d: {} mounted read-only at /scheme/{}",
+            "ext4d: {} mounted {mode} at /scheme/{}",
             args.device, args.scheme
         );
         mount.serve()?;
@@ -197,12 +238,7 @@ mod daemon {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprint!("ext4d: {err}");
-                let mut source = err.source();
-                while let Some(cause) = source {
-                    eprint!(": {cause}");
-                    source = cause.source();
-                }
-                eprintln!();
+                print_sources(&err);
                 ExitCode::FAILURE
             }
         }
