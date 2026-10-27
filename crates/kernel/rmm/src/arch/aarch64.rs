@@ -89,6 +89,14 @@ impl Arch for AArch64Arch {
     /// speculatively after the invalidation, leaving the previous process's
     /// translations (same VAs, other frames) in the TLB. TCG never does that;
     /// Apple cores under HVF do, and a forked child then wrote into its parent.
+    ///
+    /// # Safety
+    ///
+    /// The caller must run at EL1 and pass the physical address of a
+    /// page-aligned top-level table of the kind given by `table_kind`. That
+    /// table must stay allocated and valid for as long as it is installed. A
+    /// kernel table must map the code and stack in use at the switch, or the
+    /// next instruction fetch faults.
     #[inline(always)]
     unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress) {
         unsafe {
