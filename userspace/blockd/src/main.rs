@@ -6,8 +6,10 @@
 //! ```
 //!
 //! See `ferric_blockd::spec` for the steps. The volume appears at `/scheme/SCHEME` once it is
-//! built, and the daemon serves it in the foreground until the scheme is closed. Only Redox
-//! has schemes; elsewhere the program says so and exits.
+//! built, and the daemon serves it in the foreground until the scheme is closed. Started
+//! with `FERRIC_READY=stdout` (as `ferric-unlock` does), it writes `ready` to stdout once the
+//! scheme is registered (`ferric_ready`). Only Redox has schemes; elsewhere the program says
+//! so and exits.
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +48,8 @@ mod daemon {
         Assemble(#[from] AssembleError<io::Error>),
         #[error("serving the scheme failed")]
         Serve(#[from] ServeError),
+        #[error("cannot tell the starter the volume is served")]
+        Notify(#[source] io::Error),
     }
 
     fn run() -> Result<(), DaemonError> {
@@ -53,6 +57,8 @@ mod daemon {
         let volume = assemble(&spec.steps, &mut Files)?;
         let size = ferric_blocklayer::BlockDevice::size(&volume);
         let mount = Mount::new(Volume::new(volume), &spec.scheme)?;
+        // Only now is the name ours; a starter waiting for it may rely on that.
+        ferric_ready::notify().map_err(DaemonError::Notify)?;
         eprintln!(
             "ferric-blockd: {size}-byte volume served read-only at /scheme/{}",
             spec.scheme
