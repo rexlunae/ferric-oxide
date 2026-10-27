@@ -413,7 +413,7 @@ jobs:
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-fat-test/files/Cargo.toml -- -D warnings
 
-  # driver-block's concurrent-request and close-ordering tests run on the host.
+  # driver-block's concurrent-request, close-ordering and ring wake-up pipe tests run on the host.
   driver-block:
     runs-on: ubuntu-24.04
     defaults:

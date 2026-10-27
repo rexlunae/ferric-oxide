@@ -107,7 +107,7 @@ libm = "0.2"
 log = "0.4"
 spin = "0.9.8"
 argon2 = "0.5.3"
-redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", default-features = false, features = ["sync"] } # Ferric mirror of redox-os/redox-rings
+redox-rings = { git = "https://github.com/rexlunae/redox-rings.git", rev = "8a83b108b58e05270c7ec00ddb77c194467f5920", default-features = false, features = ["sync"] } # Ferric mirror of redox-os/redox-rings
 redox-buffer-pool = { git = "https://github.com/rexlunae/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]} # Ferric mirror of redox-os/redox-buffer-pool
 
 zerocopy = { version = "0.8.55", features = ["derive"] }
