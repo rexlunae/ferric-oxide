@@ -1879,6 +1879,11 @@ make = { QEMU_CPU = "{value}" }
 
 [[rule]]
 level = "warn"
+when = "build.offline"
+message = "Offline builds use only sources and prebuilt packages already downloaded; anything missing fails until you run make fetch or turn build.offline off."
+
+[[rule]]
+level = "warn"
 when = "build.repo_binary && target.arch == 'x86_64' && cpu.x86_64_level != 'v1'"
 message = "Prebuilt packages are compiled for baseline x86-64; only packages you build locally use the selected level."
 
