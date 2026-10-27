@@ -85,6 +85,13 @@ redoxer pkg install xz
 redoxer build
 ```
 
+`redoxer pkg` installs and records packages with fox. A sysroot an earlier,
+`pkg`-based redoxer populated has no fox records yet: the first command that
+names one of its packages adopts every package in `etc/pkg/packages.toml`
+whose signed head verifies against the cookbook's key, so that command needs
+`REDOXER_COOKBOOK` even for `remove`. Packages that cannot be adopted are
+listed and left in place; remove the sysroot and install them again.
+
 
 - Run the Rust program on Redox
 
