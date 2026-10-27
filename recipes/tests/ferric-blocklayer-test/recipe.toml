@@ -2,8 +2,10 @@
 # (features.toml fs.luks and fs.lvm). It serves the LUKS and LVM images from
 # crates/blocklayer/tests/fixtures/ (built into the test) with ferric-blockd, reads them back
 # through the scheme, and checks that changes fail with EROFS, that only root may open a
-# volume and that a wrong passphrase is refused. It prints FERRIC_TEST_SKIP when the image has
-# no ferric-blockd. Only for test images. Source lives in files/; as a path source (relative
+# volume and that a wrong passphrase is refused. With ferric-unlock (fs.unlock_at_boot) it also
+# reads back the volumes the crypttab here had unlocked and mounted at boot; the recipe installs
+# that table as /etc/ferric/crypttab, with its images and key file. It prints FERRIC_TEST_SKIP
+# when the image has no ferric-blockd. Only for test images. Source lives in files/; as a path source (relative
 # to the repository root) edits there rebuild it.
 [source]
 path = "recipes/tests/ferric-blocklayer-test/files"
@@ -17,4 +19,13 @@ script = """
 # there too.
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
 cookbook_cargo
+# What /etc/ferric/crypttab names, for ferric-unlock to serve at boot (fs.unlock_at_boot).
+share="${COOKBOOK_STAGE}/usr/share/ferric-blocklayer-test"
+mkdir -p "${share}" "${COOKBOOK_STAGE}/etc/ferric"
+cp "${COOKBOOK_ROOT}/crates/blocklayer/tests/fixtures/lvm-on-luks.img" "${share}/"
+cp "${COOKBOOK_ROOT}/userspace/ext4d/tests/fixtures/basic.ext4" "${share}/"
+# No trailing newline: the whole file is the passphrase.
+printf '%s' 'correct horse' > "${share}/key"
+chmod 600 "${share}/key"
+cp "${COOKBOOK_RECIPE}/crypttab" "${COOKBOOK_STAGE}/etc/ferric/crypttab"
 """

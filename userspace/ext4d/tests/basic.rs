@@ -418,3 +418,11 @@ fn unprivileged_opens_check_directory_search_and_final_read_permissions() {
             .is_ok()
     );
 }
+#[test]
+fn metadata_only_directories_cannot_list_entries() {
+    let mut fs = mount();
+    let mode = OpenMode::from_flags(syscall::flag::O_STAT | syscall::flag::O_DIRECTORY);
+    let id = fs.open_as(None, "/dir", mode, 1001, 1001).unwrap();
+    assert!(fs.attributes(id).is_ok());
+    assert!(matches!(fs.entries(id), Err(ext4d::Error::NotADirectory)));
+}

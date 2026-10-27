@@ -365,6 +365,17 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### NVMe request lifetime accounting
+
+The dispatcher counts inline requests, awaited worker jobs and requests that
+workers answer directly through one `ferric-blkqueue::activity::Claim` per
+request. A direct job carries its claim from enqueue until its response or
+drop, including failed delivery and worker exit. Completing another inline
+request cannot hide a worker that is still active when the queue policy changes.
+The shared counter uses atomics because direct jobs finish on worker threads.
+Adaptive and MainQueue continue serving requests serially; explicit Workers
+continues to use concurrent direct responses.
+
 ### Where a request's time goes (drivers.nvmed_perf)
 
 `drivers.nvmed_perf` builds nvmed with its `perf` Cargo feature, which times
@@ -402,7 +413,6 @@ thread identity and socket/request timing (`scheme.request`/`scheme.response`,
 `scheme.cqe_receive`). Historical measurements from before these accounting
 fixes need remeasurement before deriving per-request phase differences. The
 phase figures compare one boot; they are not a documented time source.
-
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
@@ -1130,16 +1140,23 @@ read-only medium) is also served read-only, with the reason logged
   disk; a crash before the commit leaves the new bytes with the old size and
   times. Every block the write touches is mapped first (extents or indirect
   blocks); a mapped one must be an initialized block of the file inside the
-  volume and outside the journal. Holes and blocks past the end are allocated
-  (below), and the blocks between the old end and the write are left as a hole,
-  with the rest of the old last block zeroed, so they read as zeroes. An
-  unwritten extent is not converted yet, so a write into one is refused
-  (`EOPNOTSUPP`) before anything is written. Immutable and append-only files
-  are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
+  volume and outside the journal and the fixed metadata (boot and superblock
+  copies, descriptor tables, bitmaps and inode tables). Holes and blocks past
+  the end are allocated (below). Between the old end and the write, the rest of
+  the old last block and every block the file kept past its end (after a
+  shrink) are zeroed, and holes are left as they are, so the gap reads as
+  zeroes. An unwritten extent is not converted yet, so a write into one is
+  refused (`EOPNOTSUPP`) before anything is written. Immutable and append-only
+  files are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
-  permission (and read permission unless `O_WRONLY`), and `O_APPEND` writes at
-  the end. Every open file is opened again in `ext4-view` after a write, so
-  reads see it.
+  permission (and read permission unless `O_WRONLY`). `O_APPEND` opens and
+  writes fail with `EOPNOTSUPP`, including a flag enabled after open through
+  `F_SETFL`: the current scheme response cannot return an append's actual
+  ending position to the kernel
+  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)). The inode's
+  size and flags use a generated `simple_endian` native/wire layout, with a byte
+  fixture protecting unchanged fields. Every open file is opened again in
+  `ext4-view` after a write, so reads see it.
 - **Allocation** (`userspace/ext4d/src/write/txn.rs`) reads and changes the
   block and inode bitmaps, the group descriptors' free counts, `bg_flags`,
   `bg_itable_unused` and checksums, and the superblock's free counts, all inside
@@ -1209,16 +1226,18 @@ FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 and past the end inside the last block, checks the permission rules, that
 other open handles read the new bytes, that unwritten extents are refused with
 nothing written (the `write-data` fixture, which also has immutable and
-append-only files), and crashes a write before each of its nine writes.
+append-only files), that append opens and writes at an earlier cursor or EOF
+fail without changing any image bytes, size or timestamps, and that ordinary
+offset writes still work, and crashes a write before each of its nine writes.
 `tests/alloc.rs` runs on `alloc.ext4.gz` (`metadata_csum`) and
-`alloc-gdt.ext4.gz` (`gdt_csum`, 32-byte descriptors): appends, writes past the
-end and into holes, extents that grow in place, a full root and a leaf under the
-root, `ENOSPC`, truncation down, to zero and up, creation in a block with room
-and in a full directory, the refusals, `O_CREAT`, `O_EXCL`, `O_TRUNC` and
-`ftruncate` through `Fs`, and the free counts each leaves. Every volume is then
-checked with `e2fsck -fn` as it is, without a replay; and an append, a truncate
-and a create are each crashed before every one of their writes, with ext4d's
-replay and `e2fsck`'s both giving the old state or the new one.
+`alloc-gdt.ext4.gz` (`gdt_csum`, 32-byte descriptors): writes past the end and
+into holes, extents that grow in place, a full root and a leaf under the root,
+`ENOSPC`, truncation down, to zero and up, creation in a block with room and in
+a full directory, the refusals, `O_CREAT`, `O_EXCL`, `O_TRUNC` and `ftruncate`
+through `Fs`, and the free counts each leaves. Every volume is then checked
+with `e2fsck -fn` as it is, without a replay; and a write past the end, a
+truncate and a create are each crashed before every one of their writes, with
+ext4d's replay and `e2fsck`'s both giving the old state or the new one.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
@@ -1229,6 +1248,60 @@ protected files, directories and symlink targets. Host fixtures additionally
 cover owner and primary-group access.
 The image workflow checks the ext4 markers only for smoke boots, since the
 nightly fuzz script runs only the fuzzer and package verification.
+
+## FAT, read-only
+
+FAT and ext4 daemons both use `ferric-fspath` for text path normalization and
+stable path-derived inode numbers. ext4d re-exports its existing `normalize`
+entry point from the shared crate. Each daemon still walks and validates
+components against its own filesystem; the text helper does no lookup or
+symlink resolution.
+
+`fatd` (`userspace/fatd/`, features.toml `fs.fat`, off by default) serves a
+FAT12, FAT16 or FAT32 volume read-only as a scheme: the EFI system partition, a
+USB stick or an SD card. It takes the same arguments as ext4d:
+
+```text
+fatd [--offset BYTES] [--length BYTES] DEVICE SCHEME
+```
+
+The device is only ever opened for reading. The daemon registers the scheme,
+enters the null namespace and serves in the foreground until it is stopped.
+
+- **Reading** is done by the `fatfs` crate (MIT), which the image installer
+  already uses to write the EFI partition: the boot sector, FAT type by
+  cluster count, the allocation tables, cluster chains and long file names.
+  fatd adds the time conversion and the name lookup, written from Microsoft's
+  "FAT: General Overview of On-Disk Format" (the FAT32 File System
+  Specification, version 1.03). No code comes from Linux.
+- **Device:** reads go through `ferric-blocklayer`'s `BlockDevice`, so a
+  partition is a `Slice` and FAT on LUKS or LVM is fatd over a volume
+  `ferric-blockd` serves. `fatfs` reads the allocation table and directories a
+  few bytes at a time; fatd keeps the last 4 KiB it read and serves those
+  reads from it, so they do not each cost a whole-block disk read.
+- **Names:** directories list each entry's long name, or its 8.3 short name
+  when it has none (in lower case when the entry's case flags say so). Lookups
+  ignore case and match the short name too, as the specification asks, so
+  `/efi/boot/bootx64.efi` and `/EFI/BOOT/BOOTX64.EFI` open the same file, and
+  `fpath` gives the names as the directories store them.
+- **Owners:** FAT has none. Every file is root's and mode `0444`, every
+  directory `0555`, and no caller is refused a read.
+- **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
+  `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
+  `EROFS`. The device below refuses writes too, so nothing `fatfs` does can
+  change the volume, and access dates are not updated.
+- **Limits:** FAT has no inode numbers, so `st_ino` is a hash of the stored
+  path (`ferric-fspath`, shared with the other daemons); FAT times have no time
+  zone and are read as UTC; `st_atime` has only a date; `st_ctime` is the
+  modification time; exFAT is not supported yet.
+
+The host tests (`userspace/fatd/tests/`) read FAT12, FAT16 and FAT32 images
+that `tests/fixtures/make-fixtures.sh` builds with `mkfs.fat` and `mtools`:
+long, short and non-ASCII names, a file whose cluster chain is split around
+another, a directory over several clusters, deleted entries and a partition
+inside a larger disk. CI also runs them on images the runner's dosfstools and
+mtools make (`FATD_FIXTURES`). `ferric-fat-test` mounts the FAT32 image on the
+target.
 
 ## Block layers: LUKS and LVM, read-only
 
@@ -1304,7 +1377,8 @@ ext4d /scheme/root rootfs
   with `EROFS`. Reads stop at the end of the volume.
 - **Limits:** read-only; no keyslot management, tokens, detached headers or
   reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
-  started by hand, not by init, the installer or the bootloader.
+  started by hand or at boot by `ferric-unlock` (below), not by the installer
+  or the bootloader.
 
 The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
 as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
@@ -1313,6 +1387,55 @@ split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
 data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
 Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
 serves the same images through `ferric-blockd` on the target.
+
+### Unlocking at boot
+
+With `fs.unlock_at_boot` (File systems menu, default `false`, needs `fs.luks`
+or `fs.lvm`), the `ferric-blockd` package also holds `ferric-unlock` and the
+init unit `05_ferric-unlock.service`. Init runs it once, as a oneshot, after
+the base services (`00_*`) and before the network and console (`10_*` and up),
+so the volumes are served before the services that use them start; a service
+can also name the unit in `requires_weak`. It reads `/etc/ferric/crypttab`:
+
+```text
+# NAME   STEP...                                               [FILESYSTEM:SCHEME]
+home     dev:/scheme/disk.nvme/0p2 luks:/etc/keys/home lvm:home ext4:home-fs
+scratch  dev:/scheme/disk.nvme/0p3 luks:/etc/keys/scratch
+```
+
+Each line is a `ferric-blockd` command line (the scheme name, then the steps),
+with an optional last field `ext4:SCHEME` that has `ext4d` (`fs.ext4`) mount
+the volume at `/scheme/SCHEME`. `#` starts a comment, and every scheme name in
+the table must be unique. For each line in order, `ferric-unlock` refuses the
+line if `/scheme/NAME` is already served, starts `ferric-blockd`, and waits up
+to 60 seconds (LUKS key derivation is slow on purpose) for the daemon's
+readiness line (`crates/ready`, `ferric-ready`): started with
+`FERRIC_READY=stdout`, `ferric-blockd` and `ext4d` write `ready` to stdout once
+they have registered their scheme themselves, so another process's scheme of
+the same name is never taken for the volume. A daemon that exits, says
+anything else or misses the deadline has failed, and one still running is
+killed, so a volume cannot appear after its failure was logged. Then it does
+the same for the file system daemon. The daemons keep serving after it exits. A line that fails
+is logged with its whole error chain and does not stop the others; a table
+that does not parse starts nothing; with no table it does nothing. The table
+is Ferric Oxide's own format (`userspace/blockd/src/crypttab.rs`), shaped like
+a crypttab line.
+
+- **Passphrases** come from key files only (`luks:KEYFILE`); there is no prompt
+  on the console yet, and the key files must be readable at boot, so put them
+  on the root file system or an already-unlocked volume.
+- **RedoxFS** cannot be mounted this way: it opens its disk for writing, and
+  `ferric-blockd` serves volumes read-only. `redoxfs:SCHEME` is refused with
+  its own error.
+- **ext4 journals:** a volume that needs recovery is served from ext4-view's
+  in-memory view of the journal. With `fs.ext4_journal_replay`, `ext4d` tries
+  to replay it onto the disk instead, cannot open the read-only volume for
+  writing, and does not mount it.
+- **Root:** this unlocks volumes after the root file system is mounted; an
+  encrypted root (unlocked by the bootloader or initfs) is not covered.
+
+`ferric-blocklayer-test` installs a table with LVM on LUKS from a key file and
+an ext4 volume, and its `blocklayer-unlock-boot` step reads both back.
 
 ## Kernel-bypass network queues
 

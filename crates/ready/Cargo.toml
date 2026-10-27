@@ -1,0 +1,11 @@
+[package]
+name = "ferric-ready"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Readiness handshake between a Ferric Oxide daemon and the process that started it: one line on the daemon's stdout once its scheme is registered"
+publish = false
+
+# No dependencies: ferric-blockd's and ext4d's recipes build this crate through a symlink
+# outside the host workspace.
+[dependencies]

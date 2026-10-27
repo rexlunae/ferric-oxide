@@ -40,6 +40,9 @@ pub enum Error {
     /// `O_CREAT` and `O_EXCL` for a path that exists.
     #[error("the file exists")]
     Exists,
+    /// Append positioning cannot be reported through the current scheme write response.
+    #[error("O_APPEND is not supported until the kernel can accept the actual write position")]
+    AppendUnsupported,
     /// The caller cannot search a directory or read the final inode.
     #[error("permission denied")]
     PermissionDenied,
@@ -96,7 +99,7 @@ impl Error {
             Self::Superblock(_) => EINVAL,
             Self::Ext4(err) => ext4_errno(err),
             Self::NotOwner | Self::ChownRestricted => EPERM,
-            Self::SymlinkMode | Self::CreateKind => EOPNOTSUPP,
+            Self::SymlinkMode | Self::CreateKind | Self::AppendUnsupported => EOPNOTSUPP,
             Self::Exists => EEXIST,
             Self::InvalidTime => EINVAL,
             #[cfg(feature = "write")]

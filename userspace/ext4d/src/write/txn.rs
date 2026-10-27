@@ -284,7 +284,7 @@ impl<'a, R: ReadAt> Txn<'a, R> {
     }
 
     /// Whether `block` is part of the fixed metadata or the journal.
-    fn reserved(&mut self, block: u64) -> Result<bool, WriteError> {
+    pub(super) fn reserved(&mut self, block: u64) -> Result<bool, WriteError> {
         if self.metadata.is_none() {
             self.metadata = Some(self.target.volume.metadata(self.window)?);
         }

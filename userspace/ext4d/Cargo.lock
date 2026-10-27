@@ -61,7 +61,9 @@ dependencies = [
  "crc",
  "ext4-view",
  "ferric-abi",
+ "ferric-fspath",
  "ferric-jbd2",
+ "ferric-ready",
  "flate2",
  "libredox",
  "log",
@@ -76,12 +78,20 @@ name = "ferric-abi"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-fspath"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-jbd2"
 version = "0.1.0"
 dependencies = [
  "crc",
  "thiserror",
 ]
+
+[[package]]
+name = "ferric-ready"
+version = "0.1.0"
 
 [[package]]
 name = "flate2"

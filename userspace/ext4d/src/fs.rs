@@ -26,6 +26,10 @@
 //! Limitation: [`Attributes::ino`] is a stable number made from the path, so hard links to
 //! one inode get different numbers.
 
+/// Text path normalization shared with the other filesystem daemons.
+pub use ferric_fspath::normalize;
+use ferric_fspath::path_ino;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -52,6 +56,8 @@ pub struct OpenMode {
     /// The permission bits a created file gets (the low 12 bits of the flags, with the
     /// caller's umask applied by the C library).
     pub permissions: u16,
+    /// Append positioning (`O_APPEND`), currently refused with `EOPNOTSUPP`.
+    pub append: bool,
     /// The path must be a directory (`O_DIRECTORY`).
     pub directory: bool,
     /// Open a final symbolic link itself, to read its target (`O_SYMLINK`).
@@ -72,6 +78,7 @@ impl OpenMode {
             exclusive: false,
             truncate: false,
             permissions: 0,
+            append: false,
             directory: false,
             symlink: false,
             no_follow: false,
@@ -82,8 +89,8 @@ impl OpenMode {
     /// Reads the mode from Redox `openat` flags.
     pub const fn from_flags(flags: usize) -> Self {
         use syscall::flag::{
-            O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK,
-            O_TRUNC, O_WRONLY,
+            O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_STAT,
+            O_SYMLINK, O_TRUNC, O_WRONLY,
         };
         let access = flags & O_ACCMODE;
         Self {
@@ -93,6 +100,7 @@ impl OpenMode {
             exclusive: flags & O_EXCL != 0,
             truncate: flags & O_TRUNC != 0,
             permissions: (flags & 0o7777) as u16,
+            append: flags & O_APPEND != 0,
             directory: flags & O_DIRECTORY != 0,
             symlink: flags & O_SYMLINK != 0,
             no_follow: flags & O_NOFOLLOW != 0,
@@ -678,6 +686,9 @@ impl Fs {
     /// POSIX says. With `O_TRUNC`, an existing regular file is emptied, which needs write
     /// permission.
     ///
+    /// Append positioning is not supported yet: the scheme cannot report an append's actual
+    /// ending cursor to the kernel (issue #244).
+    ///
     /// # Errors
     /// Returns the errors of [`Self::open`], [`Error::PermissionDenied`] for denied access,
     /// [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file, [`Error::ReadOnly`] for
@@ -686,7 +697,7 @@ impl Fs {
     /// [`Error::CreateKind`] for `O_CREAT` with `O_DIRECTORY` or `O_SYMLINK` on one that does
     /// not, [`Error::IsADirectory`] for a directory opened for writing or truncating (or a
     /// path to create that ends in `/`), and `Error::Write` and `Error::Lookup` when
-    /// creating or truncating fails.
+    /// creating or truncating fails, and [`Error::AppendUnsupported`] for `O_APPEND`.
     pub fn open_as(
         &mut self,
         base: Option<usize>,
@@ -697,6 +708,9 @@ impl Fs {
     ) -> Result<usize, Error> {
         if mode.wants_write() && !self.is_writable() {
             return Err(Error::ReadOnly);
+        }
+        if mode.append {
+            return Err(Error::AppendUnsupported);
         }
         let start = match base {
             Some(base) if !path.starts_with('/') => {
@@ -1206,11 +1220,35 @@ impl Fs {
     /// extent tree would have to grow, and `write::WriteError::NotAllocated` for an
     /// unwritten extent, which are not supported yet (`EOPNOTSUPP`).
     pub fn write(&mut self, id: usize, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        self.write_with_flags(id, offset, buf, 0)
+    }
+
+    /// Writes at an explicit offset with the current scheme-call flags.
+    ///
+    /// `O_APPEND` is refused even if enabled after open through `F_SETFL`: the current
+    /// scheme response carries only a byte count, so the kernel cannot update its cursor
+    /// to the actual end of an append. No size, data or timestamp changes on refusal.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::write`], plus [`Error::AppendUnsupported`] (`EOPNOTSUPP`) for
+    /// `O_APPEND` on a handle opened for writing. Unknown and read-only handles still
+    /// return [`Error::BadHandle`].
+    pub fn write_with_flags(
+        &mut self,
+        id: usize,
+        offset: u64,
+        buf: &[u8],
+        flags: u32,
+    ) -> Result<usize, Error> {
         let handle = self.handle(id)?;
         match handle.open {
             Open::File(_) if handle.writable => {}
             Open::Directory { .. } => return Err(Error::IsADirectory),
             _ => return Err(Error::BadHandle { handle: id }),
+        }
+        if flags as usize & syscall::flag::O_APPEND != 0 {
+            return Err(Error::AppendUnsupported);
         }
         #[cfg(not(feature = "write"))]
         {
@@ -1419,42 +1457,6 @@ fn read_entries(ext4: &Ext4, path: &str) -> Result<Vec<Entry>, Error> {
         });
     }
     Ok(entries)
-}
-
-/// `path` resolved against the directory `start` (both from the root), with `.` and `..`
-/// resolved as text and no empty components. The result starts with `/`; `..` at the root
-/// stays at the root.
-pub fn normalize(start: &str, path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    let full = if path.starts_with('/') {
-        [path, ""]
-    } else {
-        [start, path]
-    };
-    for component in full.iter().flat_map(|p| p.split('/')) {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            name => parts.push(name),
-        }
-    }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
-    out
-}
-
-/// A stable number for the file at `path`: 2 for the root, as in ext4, and a 64-bit FNV-1a
-/// hash of the path, kept clear of the small numbers ext4 reserves, for the rest.
-fn path_ino(path: &str) -> u64 {
-    if path == "/" {
-        return 2;
-    }
-    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    hash | 1 << 63
 }
 
 #[cfg(test)]

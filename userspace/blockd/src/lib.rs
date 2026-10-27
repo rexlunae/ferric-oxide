@@ -10,7 +10,10 @@
 //! - [`device`]: disks, partitions and image files as block devices;
 //! - [`volume`]: the open handles of the served volume, and the one place an error becomes
 //!   an errno;
-//! - `scheme` (Redox only): the scheme handler, a thin layer from scheme calls to [`volume`].
+//! - `scheme` (Redox only): the scheme handler, a thin layer from scheme calls to [`volume`];
+//! - `crypttab` and `unlock` (Cargo feature `unlock`, features.toml `fs.unlock_at_boot`): the
+//!   boot-time table of volumes to unlock and mount, and the `ferric-unlock` step that starts
+//!   one `ferric-blockd` (and file system daemon) per line.
 //!
 //! Everything but `scheme` runs on the host, so `cargo test` covers it against the images in
 //! `crates/blocklayer/tests/fixtures/`. A file system daemon reads the volume like a disk:
@@ -36,10 +39,14 @@
 compile_error!("ferric-blockd needs the luks or lvm feature (features.toml fs.luks or fs.lvm)");
 
 pub mod assemble;
+#[cfg(feature = "unlock")]
+pub mod crypttab;
 pub mod device;
 #[cfg(target_os = "redox")]
 pub mod scheme;
 pub mod spec;
+#[cfg(feature = "unlock")]
+pub mod unlock;
 pub mod volume;
 
 use std::io;

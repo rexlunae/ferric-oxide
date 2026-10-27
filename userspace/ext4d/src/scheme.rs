@@ -4,13 +4,14 @@
 //! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
 //! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
 //! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
-//! is written ([`Fs::write`], allocating the blocks it does not have yet; with `O_APPEND`,
-//! at its end, as RedoxFS does; the kernel still moves the cursor from where it was, issue
-//! #244). `O_CREAT` creates a regular file, `O_TRUNC` and `ftruncate` resize one
-//! ([`Fs::truncate`]). Everything else that would change the volume (`unlinkat`,
-//! `frename`, `flink`, creating directories and links, and all of the above on a read-only
-//! mount) fails with `EROFS` or `EOPNOTSUPP`, as [`Error::ReadOnly`] and
-//! [`Error::CreateKind`] say. Errors become errnos only through [`Error::errno`]. Opens and
+//! is written ([`Fs::write_with_flags`], allocating the blocks it does not have yet).
+//! `O_APPEND` opens and writes fail with `EOPNOTSUPP`: the current write response cannot
+//! report an append's actual position to the kernel (issue #244). `O_CREAT` creates a
+//! regular file, `O_TRUNC` and `ftruncate` resize one ([`Fs::truncate`]). Everything else
+//! that would change the volume (`unlinkat`, `frename`, `flink`, creating directories and
+//! links, and all of the above on a read-only mount) fails with `EROFS` or `EOPNOTSUPP`, as
+//! [`Error::ReadOnly`] and [`Error::CreateKind`] say. Errors become errnos only through
+//! [`Error::errno`]. Opens and
 //! every change enforce the caller's UID/GID.
 
 use ferric_abi::id::requested;
@@ -195,12 +196,9 @@ impl SchemeSync for Ext4Scheme {
         _ctx: &CallerCtx,
     ) -> syscall::Result<usize> {
         // The caller's permission was checked when the file was opened for writing.
-        let offset = if fcntl_flags as usize & syscall::flag::O_APPEND != 0 {
-            self.fs.attributes(id).map_err(|e| errno(&e))?.size
-        } else {
-            offset
-        };
-        self.fs.write(id, offset, buf).map_err(|e| errno(&e))
+        self.fs
+            .write_with_flags(id, offset, buf, fcntl_flags)
+            .map_err(|e| errno(&e))
     }
 
     fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> syscall::Result<u64> {

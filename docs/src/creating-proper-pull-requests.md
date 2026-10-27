@@ -1,136 +1,96 @@
-# Creating Proper Merge Requests
+# Creating Proper Pull Requests
 
-In order for changes you have made to be added to Redox, or other related projects, it is necessary to have someone review your changes, and merge them into the official repository.
+Changes reach Ferric Oxide through GitHub pull requests, which are reviewed and
+merged into `main`.
 
-This is done by preparing a feature branch, and submitting a merge request.
-
-For small changes, it is sufficient to just submit a merge request. For larger changes, which may require planning or more extensive review, it is better to start by creating an [issue](./filing-issues.md). This provides a shared reference for proposed changes, and a place to collect discussion and feedback related to it.
-
-The steps given below are for the main Redox project repository - other projects may vary, though most of the approach is the same.
-
-### Please note:
-
-- **Once you have marked your MR as ready, don't add new commits.**
-- **If you need to add new commits mark the MR as draft again.**
-- Sometimes you need to rebase your MR to fix the CI testing
+For small changes, open a pull request directly. For larger ones, such as a
+change to a kernel interface, a scheme, the file system format or the build
+system layout, start with an issue labelled `proposal` so the approach can be
+agreed before you write the code (see [Filing Issues](./filing-issues.md)).
 
 ## Preparing your branch
 
-1. In an appropriate directory, e.g. `~/tryredox`, clone the Redox repository to your computer using the following command:
+1. Fork [rexlunae/ferric-oxide](https://github.com/rexlunae/ferric-oxide) on
+   GitHub, then clone your fork and add the main repository as `upstream`:
 
     ```sh
-    git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream --recursive
+    git clone https://github.com/YOUR_USERNAME/ferric-oxide.git
+    cd ferric-oxide
+    git remote add upstream https://github.com/rexlunae/ferric-oxide.git
     ```
 
-  - If you used `podman_bootstrap.sh` or `native_bootstrap.sh` scripts (see the [Building Redox](./podman-build.md) page), the `git clone` was done for you and you can skip this step.
-  - You need to create a [Personal Access Token](./signing-in-to-gitlab.md#setting-up-pat) for pushing your code into your repository fork later.
-
-2. Change to the newly created redox directory and rebase to ensure you're using the latest changes:
+2. Set up the build, if you haven't already (see [Build and Configuration](./ferric-build.md)):
 
     ```sh
-    cd redox
+    cargo xtask setup
     ```
+
+3. Start a branch from the latest `main`:
 
     ```sh
-    git rebase upstream master
+    git fetch upstream main
+    git checkout -b MY_BRANCH upstream/main
     ```
-3. You should have a fork of the repository on GitLab and a local copy on your computer. The local copy should have two remotes; `upstream` and `origin`, `upstream` should be set to the main repository and `origin` should be your fork. Log into Redox Gitlab and fork the [build system repository](https://gitlab.redox-os.org/redox-os/redox) - look for the button in the upper right.
 
-4. Add your fork to your list of Git remotes with:
+4. Make your changes, and update the documentation they affect in the same
+   branch (see [Writing Documentation Correctly](./writing-docs-correctly.md)).
+
+5. Check and test them. At least:
 
     ```sh
-    git remote add origin https://gitlab.redox-os.org/MY_USERNAME/redox.git
+    cargo fmt --all --check
+    cargo test --locked --workspace
+    cargo xtask build
+    cargo xtask run --headless
     ```
 
-  - Note: If you made an error in your `git remote` command, use `git remote remove origin` and try again.
+   Changes to the kernel, drivers or boot path need an image boot. Changes
+   that claim a speedup need before-and-after numbers. [Validation and
+   Debugging](./ferric-testing.md) lists the checks CI runs and how to run
+   them locally.
 
-5. Alternatively, if you already have a fork and copy of the repo, you can simply check to make sure you're up-to-date. Fetch the upstream, rebase with local commits, and update the submodules:
+6. Commit with a sign-off, which certifies your contribution under the
+   [Developer Certificate of Origin](https://developercertificate.org/):
 
     ```sh
-    git fetch upstream master
+    git commit -s
     ```
+
+   Write commit messages in the imperative ("Add stuff to file.ext", not
+   "added stuff to file.ext"), with a body that explains why.
+
+7. Rebase onto the latest `main` before you push, rather than merging `main`
+   into your branch:
 
     ```sh
-    git rebase upstream/master
+    git fetch upstream main
+    git rebase upstream/main
+    git push -u origin MY_BRANCH
     ```
 
-    ```sh
-    git submodule update --recursive --init
-    ```
+## Submitting the pull request
 
-    Usually, when syncing your local copy with the master branch, you will want to rebase instead of merge. This is because otherwise it will create duplicate commits that don't actually do anything when merged into the master branch.
+Open a pull request from your branch against `main` and fill in the template:
 
-6. Before you start to make changes, you will want to create a separate branch, and keep the `master` branch of your fork identical to the main repository, so that you can compare your changes with the main branch and test out a more stable build if you need to. Create a separate branch:
+- **Problem:** what the change solves, with a link to the issue if there is one.
+- **Solution:** what you changed and why this way.
+- **Testing:** the commands you ran, the targets you built and booted, and
+  benchmark numbers for performance work.
+- **AI assistance:** which tools did a meaningful share of the work, if any.
+  See the [AI Contribution Policy](https://github.com/rexlunae/ferric-oxide/blob/main/AI_POLICY.md).
 
-    ```sh
-    git checkout -b MY_BRANCH
-    ```
-
-7. Make your changes and test them.
-8. Commit:
-
-    ```sh
-    git add . --all
-    ```
-
-    ```sh
-    git commit -m "COMMIT MESSAGE"
-    ```
-
-    Commit messages should describe their changes in present-tense, e.g. "`Add stuff to file.ext`" instead of "`added stuff to file.ext`".
-    Try to remove duplicate/merge commits from PRs as these clutter up history, and may make it hard to read.
-9.  Optionally run [rustfmt](https://github.com/rust-lang/rustfmt) on the files you changed and commit again if it did anything (check with `git diff` first).
-
-10. Test your changes with `make qemu` or `make virtualbox`
-11. merge from upstream:
-
-    ```sh
-    git fetch upstream
-    ```
-
-    ```sh
-    git rebase upstream/master
-    ```
-
-  - Note: try not to use `git merge`, it is equivalent to doing `git fetch upstream; git merge master upstream/master`
-
-12. Repeat step 10 to make sure the rebase still builds and starts.
-13. Push your changes to your fork:
-
-    ```sh
-    git push origin MY_BRANCH
-    ```
-
-## Submitting a merge request
-
-1. On [Redox GitLab](https://gitlab.redox-os.org/), create a Merge Request, following the template. Add a short title and explain your changes on description (if long enough to be necessary) in a easy way and what they fixed or/and improved, use a bullet item list if you did multiple changes that aren't explained in commit titles. **Submit!**
-2. Once your merge request is ready, notify reviewers by sending the link to the [Redox Merge Requests](https://matrix.to/#/#redox-mrs:matrix.org) room.
+Keep each pull request to one change. Open it as a draft while it is still in
+progress, and mark it ready for review when CI is green and you've finished.
+GitHub notifies reviewers; there's nothing else to post.
 
 ## Incorporating feedback
 
-Sometimes a reviewer will request modifications. If changes are required:
+When a reviewer asks for changes, push new commits to the same branch and
+reply to each comment, either with the fix or with why you disagree. If you
+need to make large changes after review has started, mark the pull request as
+a draft again until they are done, so reviewers don't spend time on code that
+is still moving.
 
-1. Reply or add a thread to the original merge request notification in the [Redox Merge Requests](https://matrix.to/#/#redox-mrs:matrix.org) room indicating that you intend to make additional changes.
-
-   **Note**: It's best to avoid making large changes or additions to a merge request branch, but if necessary, please indicate in chat that you will be making significant changes.
-
-2. Mark the merge request as "Draft" before pushing any changes to the branch being reviewed.
-3. Make any necessary changes.
-4. Reply on the same thread in the [Redox Merge Requests](https://matrix.to/#/#redox-mrs:matrix.org) room that your merge request is now ready.
-5. Mark the merge request as "Ready"
-
-This process communicates that the branch may be changing, and prevents reviewers from expending time and effort reviewing changes that are still in progress.
-
-## Using GitLab web interface
-
-- Update your fork before new changes (click on the button to update the branch in the fork page)
-
-1. Fork the repository that you want and click in the "Web IDE" button inside the "Code" blue button.
-1. If you have many changes and prefer a faster review create a branch for each part of the changes by clicking in the button named as "master" or "main" in the bottom left position
-2. Make your changes in the files and click in the "Source Control" button on the left side.
-3. Explain your commits and apply
-4. After the first commit creation a pop-up window will appear suggesting to create a MR, if your changes are ready click on the "Create MR" button.
-5. If you want to make more changes continue in the IDE, once you finish to create commits return to the fork page and reload it
-6. Click on the "Create merge request" button that will appear
-7. Explain your changes and create the MR (you can squash your commits if their names don't contain relevant information)
-8. If your merge request is ready send the link in the [Redox Merge Requests](https://matrix.to/#/#redox-mrs:matrix.org) room.
+If your change is also useful to Redox OS and you wrote it entirely yourself,
+you may send it to Redox under their rules. Never send AI-assisted work there:
+Redox does not accept it.

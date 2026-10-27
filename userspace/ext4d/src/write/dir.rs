@@ -22,9 +22,8 @@
 use super::extents::{self, Extent};
 use super::ondisk::{DirEntry, DirTail, Record};
 use super::txn::Txn;
-use super::{EXTENTS_FL, I_FLAGS, I_GENERATION, WriteError, add_blocks, size_of, store_size};
+use super::{EXTENTS_FL, I_GENERATION, WriteError, add_blocks, flags_of, size_of, store_size};
 use crate::device::ReadAt;
-use crate::journal::map::le32;
 use crate::lookup::{ENTRY_HEADER, rec_len};
 
 /// `i_flags` that make a directory one this module does not add to: hashed, encrypted,
@@ -64,7 +63,7 @@ pub(super) fn add_entry<R: ReadAt>(
     dir: &mut [u8],
     entry: &NewEntry<'_>,
 ) -> Result<(), WriteError> {
-    let flags = le32(dir, I_FLAGS);
+    let flags = flags_of(dir)?;
     let unsupported = flags & (INDEX_FL | ENCRYPT_FL | INLINE_DATA_FL | CASEFOLD_FL);
     if unsupported != 0 || flags & EXTENTS_FL == 0 {
         return Err(WriteError::UnsupportedDirectory {
@@ -80,7 +79,7 @@ pub(super) fn add_entry<R: ReadAt>(
         block_size
     };
     let extents = extents::leaves(txn, number, dir)?;
-    let blocks = size_of(dir).div_ceil(block_size as u64);
+    let blocks = size_of(dir)?.div_ceil(block_size as u64);
     for logical in 0..blocks {
         let Some(physical) = physical_of(&extents, logical) else {
             continue;
@@ -132,7 +131,7 @@ fn add_block<R: ReadAt>(
         put_tail(&mut block, seed, number, dir);
     }
     txn.put_block(physical, block);
-    store_size(dir, (blocks + 1) * txn.block_size());
+    store_size(dir, (blocks + 1) * txn.block_size())?;
     add_blocks(dir, txn.block_size(), 1);
     Ok(())
 }

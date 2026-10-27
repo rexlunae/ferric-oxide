@@ -1411,6 +1411,30 @@ source_packages = ["ferric-blockd"]
 make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
 
 [[option]]
+id = "fs.unlock_at_boot"
+menu = "fs"
+type = "bool"
+title = "Unlock LUKS and LVM volumes at boot (ferric-unlock)"
+default = false
+depends = "fs.luks || fs.lvm"
+rebuild = ["ferric-blockd"]
+help = """
+Add ferric-unlock to ferric-blockd's package, and the init unit
+05_ferric-unlock.service that runs it once at boot, before the services
+numbered 10 and up. It reads /etc/ferric/crypttab, one volume per line:
+`NAME STEP... [ext4:SCHEME]`, with the steps ferric-blockd takes (dev:,
+slice:, luks:KEYFILE, lvm:NAME). For each line it starts ferric-blockd to
+serve /scheme/NAME, waits for it, and with `ext4:SCHEME` has ext4d (fs.ext4)
+mount the volume at /scheme/SCHEME. LUKS passphrases come from key files; there
+is no prompt. RedoxFS cannot be mounted this way, because ferric-blockd serves
+volumes read-only. With no crypttab it does nothing. Source:
+userspace/blockd (crypttab.rs, unlock.rs)."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BLOCKD_FEATURES = "unlock" }
+
+[[option]]
 id = "fs.ext4_journal_replay"
 menu = "fs"
 type = "bool"
@@ -1474,6 +1498,27 @@ userspace/ext4d/src/{write,lookup}.rs."""
 [[option.effect]]
 when = "value"
 make_append = { FERRIC_EXT4D_FEATURES = "write" }
+
+[[option]]
+id = "fs.fat"
+menu = "fs"
+type = "bool"
+title = "Read-only FAT12/FAT16/FAT32 (fatd)"
+default = false
+help = """
+Add fatd to the image: a daemon that serves a FAT12, FAT16 or FAT32 volume,
+such as the EFI system partition or a USB stick, read-only as a scheme. Run it
+as `fatd [--offset BYTES] [--length BYTES] DEVICE SCHEME`, with a disk, a
+partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
+Long file names are listed, and names are looked up without regard to case
+and by their 8.3 short names too, as FAT specifies. FAT has no owners: every
+file is shown as root's and readable by everyone. Every change fails with
+EROFS, and the device is only ever opened for reading. Reading is done by the
+fatfs crate; exFAT is not supported yet. Source: userspace/fatd."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["fatd"]
 
 
 # ---------------------------------------------------------------- packages
