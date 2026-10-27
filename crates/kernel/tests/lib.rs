@@ -16,10 +16,15 @@ mod chown;
 mod cpu_set;
 #[path = "../src/context/fmap_reply.rs"]
 mod fmap_reply;
+<<<<<<< HEAD
 #[path = "../src/percpu/global_flush.rs"]
 mod global_flush;
 #[path = "../src/arch/x86_64/ibpb/policy.rs"]
 mod ibpb_policy;
+=======
+#[path = "../src/context/handoff.rs"]
+mod handoff;
+>>>>>>> 769a98b5a (Restore a retained timeslice owner when its scheme handler parks)
 #[path = "../src/context/idle.rs"]
 mod idle;
 #[path = "../src/sync/records.rs"]

@@ -1,13 +1,18 @@
-//! This module provides a context-switching mechanism that utilizes a simple round-robin scheduler.
-//! The scheduler iterates over available contexts, selecting the next context to run, while
-//! handling process states and synchronization.
+//! EEVDF timeslice selection and physical context switching.
+//!
+//! Direct scheme calls can run a handler on a client's timeslice. Scheduler
+//! selection retains locked owners until the physical handoff is decided;
+//! retaining an owner can still require switching away from a parked handler.
 
 // TODO(refactor): split this module into a scheduler and a switch module
 
 use crate::{
     context::{
-        self, arch, memory::AddrSpaceSwitchReadGuard, ArcContextLockWriteGuard, Context,
-        ContextLock, ContextQueueKey, ContextQueueValue, RunContextData, WeakContextRef,
+        self, arch,
+        handoff::{Handoff, Scheduled},
+        memory::AddrSpaceSwitchReadGuard,
+        ArcContextLockWriteGuard, Context, ContextLock, ContextQueueKey, ContextQueueValue,
+        RunContextData, WeakContextRef,
     },
     cpu_set::{LogicalCpuId, LogicalCpuSet},
     cpu_stats::{self, CpuState},
@@ -207,50 +212,53 @@ fn switch_inner(
         return SwitchResult::Switched;
     }
 
-    let (prev_sched_guard, next_sched_guard, next_addrsp_guard, schedule_time) =
-        match schedule(percpu, schedule_time, token) {
-            ScheduleResult::Picked {
-                prev_sched_context,
-                next_sched_context,
-                next_address_space,
-                schedule_time,
-            } => (
-                prev_sched_context,
-                next_sched_context,
-                next_address_space,
-                schedule_time,
-            ),
-            // didn't change sched context, so will not change current context
-            ScheduleResult::AllContextsIdle => {
-                percpu.stats.set_state(cpu_stats::CpuState::Idle);
-
-                if percpu.switch_internals.passed_over.get() {
-                    return SwitchResult::Contended;
-                }
-                return SwitchResult::AllContextsIdle;
-            }
-        };
-
+    let selection = schedule(percpu, schedule_time, token);
     let current_context_lock_ref = percpu.switch_internals.current_context();
+    let (previous, next_sched_guard, next_addrsp_guard) = match selection.handoff(|owner| {
+        Arc::ptr_eq(
+            &*current_context_lock_ref,
+            ArcContextLockWriteGuard::rwlock(owner),
+        )
+    }) {
+        Handoff::RetainedCurrent => {
+            // A retained user context is still working. Only the actual idle
+            // context may report idleness or use the idle loop's contention path.
+            if !Arc::ptr_eq(
+                &*current_context_lock_ref,
+                &*percpu.switch_internals.idle_context(),
+            ) {
+                return SwitchResult::Switched;
+            }
+            percpu.stats.set_state(cpu_stats::CpuState::Idle);
+            return if percpu.switch_internals.passed_over.get() {
+                SwitchResult::Contended
+            } else {
+                SwitchResult::AllContextsIdle
+            };
+        }
+        Handoff::SelectedCurrent => return SwitchResult::Switched,
+        Handoff::Switch {
+            previous,
+            next,
+            address_space,
+        } => (previous, next, address_space),
+    };
 
-    if Arc::ptr_eq(
-        &*current_context_lock_ref,
-        ArcContextLockWriteGuard::rwlock(&next_sched_guard),
-    ) {
-        // We had already switched the current context to the one now picked by the scheduler, so
-        // no switch needs to be done.
-        return SwitchResult::Switched;
-    }
-    let current_context_guard = if Arc::ptr_eq(
-        &*current_context_lock_ref,
-        ArcContextLockWriteGuard::rwlock(&prev_sched_guard),
-    ) {
-        // The previous sched and previous current contexts coincided.
-        // TODO: s/current/real/g
-        prev_sched_guard
-    } else {
-        drop(prev_sched_guard);
-        unsafe { current_context_lock_ref.write_arc() }
+    let current_context_guard = match previous {
+        Some(previous)
+            if Arc::ptr_eq(
+                &*current_context_lock_ref,
+                ArcContextLockWriteGuard::rwlock(&previous),
+            ) =>
+        {
+            previous
+        }
+        previous => {
+            drop(previous);
+            // SAFETY: Selection holds only the distinct next context now. No
+            // current-context guard or run-queue lock remains held.
+            unsafe { current_context_lock_ref.write_arc() }
+        }
     };
 
     let was_idle = Arc::ptr_eq(
@@ -261,6 +269,8 @@ fn switch_inner(
 
     let switch_time = schedule_time;
 
+    // SAFETY: Both distinct contexts are locked, percpu is this CPU, and the
+    // selected address-space guard is retained until switch_finish_hook.
     unsafe {
         switch_to(
             percpu,
@@ -269,20 +279,13 @@ fn switch_inner(
             next_addrsp_guard,
             switch_time,
             was_idle,
+            token,
         );
     }
 
     SwitchResult::Switched
 }
-enum ScheduleResult {
-    Picked {
-        prev_sched_context: ArcContextLockWriteGuard,
-        next_sched_context: ArcContextLockWriteGuard,
-        next_address_space: Option<AddrSpaceSwitchReadGuard>,
-        schedule_time: u128,
-    },
-    AllContextsIdle,
-}
+type ScheduleResult = Scheduled<ArcContextLockWriteGuard, Option<AddrSpaceSwitchReadGuard>>;
 
 // There's a separation between the sched context and current context: the former context is the
 // owner of the current timeslice, and may be blocked or even Dead, whereas the latter is the
@@ -517,7 +520,10 @@ fn schedule(
     );
     forward_contexts(&mut forward, token);
     let Some((mut next_sched_context, next_address_space)) = next else {
-        return ScheduleResult::AllContextsIdle;
+        // A client may have become runnable since try_direct_switch_back.
+        // Keep its lock until the caller decides the physical handoff: leaving
+        // a borrowed handler running here would return from its blocked wait.
+        return ScheduleResult::Retained(prev_context_guard);
     };
 
     *percpu.switch_internals.sched_ctxt.borrow_mut() = Some(Arc::clone(
@@ -533,11 +539,10 @@ fn schedule(
     }
     next_sched_context.schedule_time = schedule_time;
 
-    ScheduleResult::Picked {
-        prev_sched_context: prev_context_guard,
-        next_sched_context,
-        next_address_space,
-        schedule_time,
+    ScheduleResult::Replaced {
+        previous: prev_context_guard,
+        next: next_sched_context,
+        address_space: next_address_space,
     }
 }
 
@@ -1198,11 +1203,6 @@ fn try_direct_switch_back(
         return false;
     }
 
-    let addr_space = next_guard
-        .addr_space()
-        .ok()
-        .map(|addrsp| unsafe { AddrSpaceSwitchReadGuard::new(addrsp.inner.read(token.token())) });
-
     let was_idle = Arc::ptr_eq(
         ArcContextLockWriteGuard::rwlock(&prev_guard),
         percpu.switch_internals.idle_ctxt.borrow().as_ref().unwrap(),
@@ -1213,9 +1213,10 @@ fn try_direct_switch_back(
             percpu,
             prev_guard,
             next_guard,
-            addr_space,
+            None,
             schedule_time,
             was_idle,
+            token,
         );
     }
 
@@ -1280,38 +1281,51 @@ pub fn direct_switch_to(
         return switch_inner(percpu, schedule_time, token);
     }
 
-    let addr_space = next_context_guard
-        .addr_space()
-        .ok()
-        .map(|addrsp| unsafe { AddrSpaceSwitchReadGuard::new(addrsp.inner.read(token.token())) });
-
     unsafe {
         switch_to(
             percpu,
             prev_context_guard,
             next_context_guard,
-            addr_space,
+            None,
             schedule_time,
             was_idle,
+            token,
         );
     }
 
     SwitchResult::Switched
 }
 
-// SAFETY:
-//
-// - percpu must be the current hardware thread's
-// - prev_context_guard must be a write guard of the current context
-// - addr_space_guard must be a guard of the next context's addrsp
+/// Installs a selected context, acquiring its address space if not supplied.
+///
+/// The outer `None` requests acquisition; `Some(None)` is an already selected
+/// kernel context without an address space.
+///
+/// # Safety
+///
+/// `percpu` must belong to this hardware thread. The distinct context guards
+/// must lock the current and selected contexts, respectively. Any supplied
+/// address-space guard must protect the selected context's address space.
+/// The caller may hold only these guards; the switch releases them through
+/// `switch_finish_hook` and retains the installed address-space read guard.
 unsafe fn switch_to(
     percpu: &PercpuBlock,
     mut prev_context_guard: ArcRwLockWriteGuard<L4, Context>,
     mut next_context_guard: ArcRwLockWriteGuard<L4, Context>,
-    addr_space_guard: Option<AddrSpaceSwitchReadGuard>,
+    selected_addr_space_guard: Option<Option<AddrSpaceSwitchReadGuard>>,
     switch_time: u128,
     was_idle: bool,
+    token: &mut CleanLockToken,
 ) {
+    let addr_space_guard = selected_addr_space_guard.unwrap_or_else(|| {
+        next_context_guard.addr_space().ok().map(|addrsp| {
+            // SAFETY: The selected context guard owns the address space and
+            // stays locked until switch_finish_hook. The installed read guard
+            // then protects the active space until the next context switch.
+            unsafe { AddrSpaceSwitchReadGuard::new(addrsp.inner.read(token.token())) }
+        })
+    });
+
     // When direct-switching to contexts present on a different CPU's runqueue, the current context
     // can get removed from that runqueue (as it was already running) and hence *all* runqueues. We
     // thus check if it has been removed, and if so reinsert it to the fast wakeup queue.

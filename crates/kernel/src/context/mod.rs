@@ -53,6 +53,9 @@ pub mod context;
 /// Optional idle-context access and interrupt acknowledgement.
 pub(crate) mod idle;
 
+/// Timeslice selection versus physical context handoff.
+pub(crate) mod handoff;
+
 /// Context switch function
 pub mod switch;
 
