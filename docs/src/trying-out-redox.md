@@ -1,8 +1,17 @@
-# Trying Out Redox
+# Trying Out the System
 
-There are several programs, games, demos and other things to try on Redox. Most of these are not included in the regular Redox build, so you will need to run the `demo` variant from the list of available Redox images. Currently, Redox does not have Wi-Fi support, so if you need Internet access for some of the things you want to do, you are best to use an Ethernet cable or [run Redox in a virtual machine](./running-vm.md). Most of the suggestions below do not require Internet access.
+There are several programs, games, demos and other things to try. Most of these are not included in the default images, so build the `demo` image first:
 
-On the `demo` variant, click on the Redox symbol in the bottom left corner of the screen. This brings up a menu, which, for the `demo` variant, includes some games. Feel free to give them a try!
+```sh
+cargo run -q -p ferric-config -- set image.config=demo
+cargo xtask run
+```
+
+There is no Wi-Fi support yet, so if you need Internet access, use an Ethernet cable or [run in a virtual machine](./running-vm.md). Most of the suggestions below do not require Internet access.
+
+> 📝 **Note:** This list comes from the Redox OS book. The programs are built from the same recipes, but they haven't all been re-tested on Ferric Oxide.
+
+In the `demo` image, click on the menu button in the bottom left corner of the screen. This brings up a menu, which, for the `demo` variant, includes some games. Feel free to give them a try!
 
 Many of the available commands are in the folders `/usr/bin` and `/ui/bin`, which are included in your command path. Open a Terminal window and type `ls /usr/bin` (or `ls /scheme/file/usr/bin`) to see some of the available commands.
 
@@ -72,7 +81,7 @@ Kibi is the default terminal text editor inspired on GNU Nano but with more feat
 
 ### Rusthello
 
-Rusthello is an advanced Reversi AI, made by [HenryTheCat](https://github.com/HenryTheCat). It is highly concurrent, so this acts as a demonstration of Redox's multithreading capabilities. It supports various AIs, such as brute force, minimax, local optimizations, and hybrid AIs.
+Rusthello is an advanced Reversi AI, made by [HenryTheCat](https://github.com/HenryTheCat). It is highly concurrent, so this acts as a demonstration of the system's multithreading capabilities. It supports various AIs, such as brute force, minimax, local optimizations, and hybrid AIs.
 
 In a Terminal window, type `rusthello`.
 
@@ -82,7 +91,7 @@ Then you will get prompted for various things, such as difficulty, AI setup, and
 
 ### Freedoom
 
-Freedoom is a first-person shooter in the form of content for a Doom engine. For Redox, we have included the PrBoom engine to run Freedoom. You can read more about Freedoom on the [Freedoom website](https://freedoom.github.io/). PrBoom can be found on the [PrBoom website](https://prboom.sourceforge.net/).
+Freedoom is a first-person shooter in the form of content for a Doom engine. The PrBoom engine is included to run Freedoom. You can read more about Freedoom on the [Freedoom website](https://freedoom.github.io/). PrBoom can be found on the [PrBoom website](https://prboom.sourceforge.net/).
 
 Freedoom can be run by selecting its entry from the "Games" section of the Orbital system menu, or by running either `/usr/games/freedoom1` or `/usr/games/freedoom2` from a terminal.
 

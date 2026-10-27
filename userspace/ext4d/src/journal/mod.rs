@@ -1,5 +1,10 @@
-//! Replaying the journal onto the volume before it is served (features.toml
-//! `fs.ext4_journal_replay`, Cargo feature `journal-replay`, off by default).
+//! Reading an ext4 volume's journal, and replaying it onto the volume before it is served
+//! (features.toml `fs.ext4_journal_replay`, Cargo feature `journal-replay`, off by default).
+//!
+//! The module is in every build: `crate::lookup` uses its volume superblock and inode block
+//! map (`map`) to find the inodes whose change times `fstat` reports. Only the daemon built
+//! with `journal-replay` calls [`replay`]; without it the device is never opened for
+//! writing.
 //!
 //! A volume that was not cleanly unmounted has `INCOMPAT_RECOVER` set: its journal holds
 //! committed transactions whose blocks may not have reached their home locations. The
@@ -36,6 +41,7 @@
 pub(crate) mod map;
 
 use core::ops::{Deref, DerefMut};
+use std::collections::BTreeMap;
 
 use ferric_jbd2::{JournalRead, Recovery, RecoveryError, Superblock, SuperblockError};
 use thiserror::Error;
@@ -261,6 +267,90 @@ pub fn replay<R: WriteAt>(window: &mut Window<R>) -> Result<Outcome, JournalErro
     })
 }
 
+/// The blocks a replay of the volume in `window` would write, by block number, with the
+/// contents it would write: the committed journal transactions, read and checked as
+/// [`replay`] reads them, but kept in memory. Empty for a volume that does not need
+/// recovery. Reading through [`Overlaid`] then sees the volume as a replay would leave it,
+/// as `ext4-view`'s own in-memory view of the journal does, without writing anything.
+///
+/// # Errors
+///
+/// A [`JournalError`] for a volume or journal that cannot be read or is malformed, an
+/// external journal, or a block that fails its checksum.
+pub fn committed_blocks<R: ReadAt>(
+    window: &Window<R>,
+) -> Result<BTreeMap<u64, Vec<u8>>, JournalError> {
+    let sb = read_volume_superblock(window)?;
+    let volume = Volume::parse(&sb)?;
+    let mut blocks = BTreeMap::new();
+    if !volume.needs_replay()? {
+        return Ok(blocks);
+    }
+    let map = BlockMap::load(&volume, window)?;
+    let (_, _, jsb) = open_journal(window, &map, &volume)?;
+    let journal = Journal {
+        window,
+        map: &map,
+        volume: &volume,
+    };
+    let recovery = Recovery::scan(&journal, &jsb)?;
+    for write in recovery.writes() {
+        if write.target >= volume.blocks {
+            return Err(JournalError::BlockOutOfRange {
+                block: write.target,
+            });
+        }
+        let mut buf = vec![0; volume.block_size as usize];
+        recovery.read(&journal, &jsb, write, &mut buf)?;
+        blocks.insert(write.target, buf);
+    }
+    Ok(blocks)
+}
+
+/// A volume read with some of its blocks replaced, by [`committed_blocks`]: what a replay
+/// would leave, read without one. A failed read of the volume comes back as an
+/// [`std::io::Error`] whose source is the [`WindowError`].
+pub struct Overlaid<'a, R> {
+    /// The volume.
+    pub window: &'a Window<R>,
+    /// The blocks to read instead of the volume's, by block number.
+    pub blocks: &'a BTreeMap<u64, Vec<u8>>,
+    /// The volume's block size in bytes: the length of every block in `blocks`.
+    pub block_size: u64,
+}
+
+impl<R: ReadAt> ReadAt for Overlaid<'_, R> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        if self.blocks.is_empty() {
+            return self
+                .window
+                .read_exact_at(buf, offset)
+                .map_err(std::io::Error::other);
+        }
+        // Block by block: each piece comes from the overlay or the volume.
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let (block, within) = (at / self.block_size, (at % self.block_size) as usize);
+            let len = (buf.len() - done).min(self.block_size as usize - within);
+            let piece = &mut buf[done..done + len];
+            match self.blocks.get(&block) {
+                Some(contents) => piece.copy_from_slice(&contents[within..within + len]),
+                None => self
+                    .window
+                    .read_exact_at(piece, at)
+                    .map_err(std::io::Error::other)?,
+            }
+            done += len;
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.window.len())
+    }
+}
+
 /// Reads and checks the journal superblock: returns where it is on the volume, journal block
 /// 0's bytes and the parsed superblock.
 pub(crate) fn open_journal<R: ReadAt>(
@@ -399,5 +489,33 @@ impl<R: WriteAt, W: DerefMut<Target = Window<R>>> ferric_jbd2::JournalWrite for 
 
     fn flush(&mut self) -> Result<(), BlockError> {
         Ok(self.window.flush()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_overlay_replaces_whole_blocks_and_reads_across_them() {
+        let volume = Window::whole((0..64u8).collect::<Vec<u8>>()).expect("its length");
+        let blocks = BTreeMap::from([(1, vec![0xAA; 16]), (3, vec![0xBB; 16])]);
+        let overlaid = Overlaid {
+            window: &volume,
+            blocks: &blocks,
+            block_size: 16,
+        };
+        let mut buf = [0; 40];
+        overlaid
+            .read_exact_at(&mut buf, 10)
+            .expect("inside the volume");
+        let mut expected: Vec<u8> = (10..16).collect();
+        expected.extend([0xAA; 16]);
+        expected.extend(32..48);
+        expected.extend([0xBB; 2]);
+        assert_eq!(buf.as_slice(), expected.as_slice());
+        assert_eq!(overlaid.size().expect("its size"), 64);
+        // Past the end of the volume, the volume's error comes back.
+        assert!(overlaid.read_exact_at(&mut [0; 8], 60).is_err());
     }
 }

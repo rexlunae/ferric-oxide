@@ -1,13 +1,41 @@
 # ARM64
 
+ARM64 (aarch64) is Ferric Oxide's second architecture. On an Apple Silicon or
+other ARM64 host, `cargo xtask` builds for it by default; on an x86-64 host,
+pass `--arch aarch64` to every command:
+
+```sh
+cargo xtask --arch aarch64 setup
+cargo xtask --arch aarch64 build
+cargo xtask --arch aarch64 run --headless
+```
+
+Current status, from [Build and Configuration](./ferric-build.md#native-build-and-qemu):
+
+- The default image is a RAM-backed live image (`redox-live.iso`) run under
+  software emulation. Changes are lost when QEMU exits.
+- Persistent storage is not yet working: NVMe initialization times out and
+  virtio lacks MSI-X support. Hardware acceleration with HVF reaches the
+  kernel but traps early in user space, so it is off by default
+  (`qemu.kvm = "yes"` turns it on experimentally).
+- The standard library for the ARM64 Redox target is built from `rust-src`,
+  because rustup doesn't distribute one.
+- Some prebuilt ARM64 applications fail at runtime.
+- Wall-clock time comes from the UEFI firmware at boot.
+- The CPU baseline is ARMv8.0-A, with ARMv8.2-A and ARMv9 variants
+  (`cargo xtask --arch aarch64 build --cpu-variant armv8.2-a`).
+
+The rest of this page comes from the Redox OS book and covers boards.
+
 - [Boards](#boards)
   - [Raspberry Pi](#raspberry-pi)
 
-The build system support cross-compilation for multiple CPU architectures in the same directory. Building for `aarch64` only requires that you set the `ARCH` environment variable to the correct value. Normally, you would do this in [.config](./configuration-settings.md#config), but you can also do this temporarily with the `make ARCH=aarch64` command, in the shell environment (`export ARCH=aarch64`) or with the [build.sh](./configuration-settings.md#buildsh) script.
-
-(ARM64 has limited support)
-
 # Boards
+
+> ⚠️ **Warning:** The board instructions below come from the Redox OS book and
+> have not been tested with Ferric Oxide. They use the Make interface
+> (`make ARCH=aarch64 BOARD=raspi3bp ...`) and firmware downloaded from a
+> Redox developer's repository.
 
 ## Raspberry Pi
 

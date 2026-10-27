@@ -948,7 +948,8 @@ device) and serves in the foreground until it is stopped.
   kernel.org. No code comes from Linux.
 - **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
   `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
-  `EROFS`.
+  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod` and `fchown` are served:
+  see [Writing through the journal](#writing-through-the-journal)).
 - **Access:** the scheme uses the caller's UID and primary GID. It checks
   directory search permissions at each path component, including expanded
   symlink targets, and read permission on the final inode. UID zero bypasses
@@ -960,10 +961,21 @@ device) and serves in the foreground until it is stopped.
 - **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
   serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
   [Block layers](#block-layers-luks-and-lvm-read-only)).
-- **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
-  hash of the path (hard links get different numbers) and `st_ctime` is the
-  modification time; `mmap` is not served; encrypted files and devices are
-  refused (`EOPNOTSUPP`).
+- **Times:** `ext4-view` exposes neither inode numbers nor change times, so
+  ext4d finds each handle's inode at open itself (`ext4d::lookup`, below) and
+  `fstat` reads `st_atime`, `st_mtime` and `st_ctime` from one read of it
+  (`i_atime`, `i_mtime`, `i_ctime`, each with its `_extra` field's epoch bits
+  and nanoseconds). Where the inode cannot be found (a path through an
+  inline-data or encrypted directory) it reports `ext4-view`'s times, with the
+  modification time as the change time. On a volume that needs recovery the
+  lookup and the inode read go through the committed journal blocks in place
+  of their home blocks (`ext4d::journal::committed_blocks`). `ext4-view` reads
+  through its own in-memory view of the journal, which as of 1.0.0 does not
+  follow a log that wraps round and then serves the older inode; taking all
+  three times from ext4d's read keeps `fstat` from mixing the two versions.
+- **Limits:** `st_ino` is a hash of the path (hard links get different
+  numbers); `mmap` is not served; encrypted files and devices are refused
+  (`EOPNOTSUPP`).
 
 ### Journal replay
 
@@ -1041,10 +1053,15 @@ e2fsprogs and runs the same tests on them.
 
 `fs.ext4_write` (default off, needs `fs.ext4_journal_replay`; Cargo feature
 `write`) is the first step towards writable ext4: changing a volume through its
-journal. The scheme still serves volumes read-only; the one change so far,
-setting an existing inode's access, modification and change times
-(`ext4d::write::set_times`), is a library call that the scheme's `futimens`
-does not reach yet, because `ext4-view` does not say which inode a path names.
+journal. The changes so far rewrite one existing inode (`ext4d::write::change`):
+its access, modification and change times (`futimens`), its permission bits
+(`fchmod`) or its owner and group (`fchown`), each with a new change time; every
+other change still fails with `EROFS`. At mount, ext4d opens the device for
+writing and serves the volume read-write (those three calls) when
+`ext4d::write::check_writable` accepts it, and otherwise serves it read-only
+and says why; a device that does not open for writing (no write permission, a
+read-only medium) is also served read-only, with the reason logged
+(`Fs::mount_preferring_write`).
 
 - **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
   changed block) into an empty journal from `s_first`: descriptor blocks with
@@ -1058,21 +1075,75 @@ does not reach yet, because `ext4-view` does not say which inode a path names.
   empties the journal again with the next sequence number.
 - **ext4d** (`userspace/ext4d/src/write.rs`) builds the new inode table block
   (the times, with the epoch bits and nanoseconds in the `_extra` fields when
-  the inode has them, and the inode checksum from the volume's checksum seed,
+  the inode has them; `i_mode`'s permission bits, keeping its file type; or
+  `i_uid` and `i_gid`, with their high halves at `0x78` and `0x7A` when
+  `s_creator_os` is Linux or Hurd, whose `osd2` keeps them there, and IDs above
+  65535 refused (`EINVAL`) on other creators' volumes; and the inode checksum
+  from the volume's checksum seed,
   `s_checksum_seed` with `metadata_csum_seed`), sets `needs_recovery`, commits
   and checkpoints the transaction, and clears `needs_recovery`. It refuses
   volumes that need recovery (replay them first), have no journal, or have a
   feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
-  bits), and inodes that are free or already fail their checksum.
+  bits), and inodes that are free or already fail their checksum. On a volume
+  with `quota`, a new owner or group is refused (`EOPNOTSUPP`): its quota files
+  would have to move the inode's usage from one ID to another, which ext4d does
+  not do yet. A new mode is not counted and is written.
+- **The path's inode** (`userspace/ext4d/src/lookup.rs`): `ext4-view` resolves
+  paths but does not say which inode one ends at, so ext4d walks the handle's
+  normalized path itself from the root (inode 2), mapping each directory's
+  blocks with the journal code's extent and indirect block map (holes allowed)
+  and scanning their entries. Every directory is read as a linear one, which
+  covers hashed ones too: their index blocks read as unused entries, and their
+  leaves are linear blocks ("Directory Entries" in "Ext4 Disk Layout").
+  Inline-data and encrypted directories are refused (`EOPNOTSUPP`); names match
+  byte for byte, also in case-insensitive directories. With 64 KiB blocks, an
+  entry that spans a whole block (length 65536, which `rec_len`'s 16 bits cannot
+  hold) is stored as `0xFFFF`, or 0, which `e2fsck` also accepts; both are read
+  as 65536 (found from `mke2fs`'s output and `e2fsck`'s verdicts, and covered by
+  the `dir-64k` fixture). The lookup is in every build, as `fstat` uses it too.
+- **`futimens`** (`Fs::set_times`) reads `tv_nsec`'s `UTIME_NOW` and
+  `UTIME_OMIT` from `ferric-abi` (`crates/abi`), the one definition relibc's
+  `sys/stat.h` constants are checked against when relibc builds, and follows
+  POSIX: `UTIME_OMIT` for both times
+  changes nothing; `UTIME_NOW` for both (or a null pointer, which relibc sends
+  as that) needs the caller to own the file or have write permission on it;
+  any other times need the caller to own it (`EPERM` otherwise); UID 0 may do
+  all of them. The change time is set to now. `ext4-view` keeps the blocks it
+  has read, so after each change it is loaded again and every open handle's
+  metadata is read again; open files keep reading their contents, which a time
+  change does not touch.
+- **`fchmod`** (`Fs::set_mode`) follows POSIX `chmod`: the caller must own the
+  file or be UID 0 (`EPERM` otherwise); the file type bits of the argument are
+  ignored; a caller other than UID 0 whose GID is not the file's group loses
+  the set-group-ID bit on a regular file. A symbolic link opened itself
+  (`O_SYMLINK`) is refused with `EOPNOTSUPP`, as its mode is not used.
+- **`fchown`** (`Fs::set_owner`) follows POSIX `chown` with
+  `_POSIX_CHOWN_RESTRICTED`: `-1` (`ferric_abi::id::UNCHANGED`) keeps an ID;
+  UID 0 may set any owner and group; any other caller must own the file, may
+  not give it to another owner, and may set its group only to its own or the
+  caller's GID (`EPERM` otherwise), and then the set-user-ID and set-group-ID
+  bits of a regular file are cleared. A symbolic link opened itself gets its
+  own owner and group. The kernel checks first, before the scheme sees the
+  call: a caller other than root may name only its own effective UID and GID,
+  or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
 
-A crash at any write leaves the old times or a journal whose replay gives the
-new ones. The tests crash a change before each of its eight writes and check
+A crash at any write leaves the old inode or a journal whose replay gives the
+new one. The tests crash a change before each of its eight writes and check
 that both ext4d's replay and `e2fsck`'s give one or the other, never a mix;
 with `EXT4D_E2FSCK` set (CI sets it) `e2fsck -fy` replays and `e2fsck -fn`
 must then find nothing to fix, on every volume the tests leave. The format
 comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
 "Inode Timestamps" and "Checksums" in "Ext4 Disk Layout", and experiments with
 e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
+`tests/futimens.rs` checks each lookup by its effect (times set on the inode it
+finds are the ones `ext4-view` then reads at that path, and nowhere else),
+including all 200 entries of `basic.ext4`'s hashed `many/` directory and ext3's
+indirect-mapped directories, and checks the permission rules, `UTIME_NOW` and
+`UTIME_OMIT`, a symbolic link's own times, and `e2fsck` on what is left.
+`tests/chmod_chown.rs` checks the mode, owner and group bytes in the inode
+(32-bit IDs in both halves), the permission rules of both calls, the set-ID
+bits, symbolic links, the `quota` fixture (`quota.ext4.gz`), a volume made for
+FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;

@@ -1725,7 +1725,8 @@ impl KernelScheme for UserScheme {
         {
             let ctx = context::current();
             let cx = &ctx.read(token.token());
-            if cx.euid != 0 && (uid != cx.euid || gid != cx.egid) {
+            // Ferric Oxide: allow UNCHANGED (-1) for either ID (`super::chown`).
+            if !super::chown::chown_allowed(cx.euid, cx.egid, uid, gid) {
                 return Err(Error::new(EPERM));
             }
         }

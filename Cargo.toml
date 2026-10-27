@@ -5,6 +5,7 @@
 resolver = "3"
 # Keep default builds on the build-system tools and shared host-testable crates.
 default-members = [
+    "crates/abi",
     "crates/aligned-buffer",
     "crates/amdvi",
     "crates/blkgrant",
@@ -53,6 +54,7 @@ default-members = [
     "tools/fox-registry",
 ]
 members = [
+    "crates/abi",
     "crates/aligned-buffer",
     "crates/exec-core",
     "crates/amdvi",

@@ -37,45 +37,13 @@ use crate::{ld_so::dso::resolve_sym, platform::types::c_uint};
 #[cfg(not(target_arch = "x86"))]
 use super::dso::Rela;
 use super::{
-    PATH_SEP,
     access::accessible,
     debug::{_dl_debug_state, _r_debug, RTLDState},
     dso::{DSO, ProgramHeader},
     tcb::{Master, Tcb},
 };
 
-#[derive(Debug, Copy, Clone)]
-pub enum DlError {
-    /// Failed to locate the requested DSO.
-    NotFound,
-    /// The DSO is malformed somehow.
-    Malformed,
-    /// Invalid DSO handle.
-    InvalidHandle,
-    /// Out of memory.
-    Oom,
-}
-
-impl DlError {
-    /// Returns a human-readable, null-terminated C string describing the error.
-    pub const fn repr(&self) -> &'static core::ffi::CStr {
-        match self {
-            DlError::NotFound => {
-                c"Failed to locate the requested DSO. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::Malformed => {
-                c"The DSO is malformed somehow. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::InvalidHandle => {
-                c"Invalid DSO handle. Set `LD_DEBUG=all` for more information."
-            }
-
-            DlError::Oom => c"Out of memory.",
-        }
-    }
-}
+pub use super::load_error::DlError;
 
 pub type Result<T> = core::result::Result<T, DlError>;
 
@@ -932,39 +900,24 @@ impl Linker {
             eprintln!("[ld.so]: looking for '{}'", name);
         }
 
-        if name.contains('/') && accessible(name, F_OK).is_ok() {
-            if debug {
-                eprintln!("[ld.so]: found at '{}'!", name);
-            }
-            return Ok(name.into());
-        } else {
-            let mut search_paths = Vec::new();
-            if let Some(runpath) = parent_runpath {
-                search_paths.extend(runpath.split(PATH_SEP));
-            }
-            if let Some(ld_path) = self.config.library_path.as_ref() {
-                search_paths.extend(ld_path.split(PATH_SEP));
-            }
-            search_paths.push("/lib");
-            for part in search_paths.iter() {
-                let full_path = format!("{}/{}", part, name);
+        let result = super::object_search::find(
+            name,
+            parent_runpath,
+            self.config.library_path.as_deref(),
+            |path| {
                 if debug {
-                    eprintln!("[ld.so]: trying path '{}'", full_path);
+                    eprintln!("[ld.so]: trying path '{path}'");
                 }
-                if accessible(&full_path, F_OK).is_ok() {
-                    if debug {
-                        eprintln!("[ld.so]: found at '{}'!", full_path);
-                    }
-                    return Ok(full_path.into());
-                }
+                accessible(path, F_OK)
+            },
+        );
+        if debug {
+            match &result {
+                Ok(path) => eprintln!("[ld.so]: found at '{path}'!"),
+                Err(_) => eprintln!("[ld.so]: failed to locate '{name}'"),
             }
         }
-
-        if debug {
-            eprintln!("[ld.so]: failed to locate '{}'", name);
-        }
-
-        Err(DlError::NotFound)
+        result
     }
 
     fn read_file(&self, path: &str) -> Result<MmapFile> {
@@ -984,8 +937,10 @@ impl Linker {
                 if debug {
                     eprintln!("[ld.so]: failed to open '{}': {}", path, err)
                 }
-
-                DlError::NotFound
+                DlError::Open {
+                    path: path.to_string(),
+                    source: err,
+                }
             })?
         };
 

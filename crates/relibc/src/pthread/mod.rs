@@ -173,11 +173,19 @@ pub(crate) unsafe fn create(
         };
         if ret as isize == -1 {
             // "Insufficient resources"
+            log::warn!(
+                "pthread_create: mmap of a {total_size}-byte stack failed: errno {}",
+                crate::platform::ERRNO.get()
+            );
             return Err(Errno(EAGAIN));
         }
         if guard_size > 0
             && unsafe { sys_mman::mprotect(ret, guard_size, sys_mman::PROT_NONE) } != 0
         {
+            log::warn!(
+                "pthread_create: mprotect of the stack guard failed: errno {}",
+                crate::platform::ERRNO.get()
+            );
             let _ = unsafe { Sys::munmap(ret, total_size) };
             return Err(Errno(EAGAIN));
         }
@@ -198,7 +206,10 @@ pub(crate) unsafe fn create(
     };
 
     let current_tcb = unsafe { Tcb::current() }.expect("no TCB!");
-    let new_tcb = unsafe { Tcb::new(current_tcb.tls_len) }.map_err(|_| Errno(ENOMEM))?;
+    let new_tcb = unsafe { Tcb::new(current_tcb.tls_len) }.map_err(|err| {
+        log::warn!("pthread_create: allocating the thread's TCB failed: {err:?}");
+        Errno(ENOMEM)
+    })?;
     new_tcb.pthread.flags = flags.bits().into();
     new_tcb.pthread.stack_base = stack_base;
     new_tcb.pthread.stack_size = stack_size;
@@ -234,8 +245,15 @@ pub(crate) unsafe fn create(
         push(new_thread_shim as *const () as usize);
     }
 
-    let Ok(os_tid) = (unsafe { Sys::rlct_clone(stack, &mut new_tcb.os_specific) }) else {
-        return Err(Errno(EAGAIN));
+    // Ferric Oxide: every failure here reaches the caller as EAGAIN, which says nothing about
+    // which step failed, so the underlying errno goes to the log (stderr by default). Thread
+    // creation that fails only now and then is otherwise impossible to diagnose from a boot log.
+    let os_tid = match unsafe { Sys::rlct_clone(stack, &mut new_tcb.os_specific) } {
+        Ok(os_tid) => os_tid,
+        Err(Errno(errno)) => {
+            log::warn!("pthread_create: creating the thread failed: errno {errno}");
+            return Err(Errno(EAGAIN));
+        }
     };
     core::mem::forget(stack_raii);
 

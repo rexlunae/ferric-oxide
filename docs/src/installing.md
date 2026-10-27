@@ -1,10 +1,12 @@
-# Installing Redox
+# Installing
 
-Redox OS provides an installer to facilitate installation from Redox OS itself or Linux. **Please back up your system** before attempting to install. Note that at this time (Release 0.9.0), you can't install onto a USB device or use a USB device for your Redox filesystem, but you can install from it.
+The installer can install the system onto a disk from a running live image, or from Linux. **Please back up your system** before attempting to install. You can't install onto a USB device or use a USB device for the root file system yet, but you can install from one.
 
-## Starting the Installer from Redox OS Livedisk
+> 📝 **Note:** This page describes the installer inherited from Redox OS. The command-line installer is built from `tools/installer/` in this repository; the GUI installer is still built from Redox's installer source. Installation has not yet been validated on real hardware for Ferric Oxide; see [Running on Real Hardware](./real-hardware.md).
 
-The installer is usually pre-installed on Redox OS. After starting your Redox OS *livedisk* system from a USB device or CD/DVD, log in as the user named `user` with an empty password, click on the Redox OS icon in the Orbital bottom bar to open the app menu, then open the "System" app category and click on the "Redox Installer" app. 
+## Starting the Installer from a Live Image
+
+Desktop images usually include the installer. After starting the live image from a USB device, log in as the user named `user` with an empty password, open the app menu from the Orbital bottom bar, then open the "System" app category and click on the installer.
 
 Or, if you want to launch it from the terminal, run the following command:
 
@@ -20,45 +22,41 @@ sudo redox_installer_tui
 
 At the moment, the GUI installer is more capable than the TUI version, but the TUI one will be updated.
 
-In the TUI version, if Redox recognizes your device, it will prompt you to select a device to install on. Choose carefully, as it will erase all the data on that device. Note that if your device is not recognized, it may offer you the option to install on `disk/live` (the in-memory *livedisk*). Don't do this, as it will crash Redox.
+In the TUI version, if the system recognizes your device, it will prompt you to select a device to install on. Choose carefully, as it will erase all the data on that device. Note that if your device is not recognized, it may offer you the option to install on `disk/live` (the in-memory *livedisk*). Don't do this, as it will crash the system.
 
 The TUI version also prompts for a `redoxfs password`. This is for an encrypted filesystem. Leave the password empty and press Enter if you don't need filesystem encryption.
 
 ## Starting the Installer from Linux
 
-At the moment, the GUI installer is capable of installation from Linux. However, the binary is not distributed; you need to compile and install it using `cargo`:
+From Linux, the command-line installer in this repository can write a configuration's packages to a disk or image file. Build it from the repository root:
 
 ```sh
-cargo install --git https://gitlab.redox-os.org/redox-os/installer redox_installer_gui --locked
+cargo build --release -p redox_installer --features installer
 ```
 
-The GUI installer is using `libcosmic`, so it will only work using Wayland. After compiling it, launch it from terminal:
+The GUI installer is not part of this repository yet. Its recipe (`installer-gui`) builds it from Redox's installer source for the target system. It uses `libcosmic`, so on Linux it only works under Wayland.
 
-```sh
-redox_installer_gui
-```
-
-Depending on how you will install Redox OS, you might want to run it with `sudo`.
+Depending on where you install, you may need to run the installer with `sudo`.
 
 ### GUI Installer Options
 
 The GUI installer is capable of many installation modes. This section explains each step option and its implications in detail:
 
-#### 1. Where do you want to install Redox OS?
+#### 1. Where do you want to install Ferric Oxide?
 
-This section asks about the general scenario where you want to install Redox OS:
+This section asks about the general scenario where you want to install Ferric Oxide:
 
 - **Whole Drive**
 
-  Use the whole storage device for Redox OS. It will erase all data on that device. The next section is [#2](#2-choose-a-drive).
+  Use the whole storage device for Ferric Oxide. It will erase all data on that device. The next section is [#2](#2-choose-a-drive).
 
 - **Specific Partition**
 
-  Use a storage device partition for Redox OS. It will erase all data in that partition, but leave every other partition intact. It is the option that you should use if you want to dual-boot with your current Linux installation. The next section is [#3](#3-choose-a-main-partition).
+  Use a storage device partition for Ferric Oxide. It will erase all data in that partition, but leave every other partition intact. It is the option that you should use if you want to dual-boot with your current Linux installation. The next section is [#3](#3-choose-a-main-partition).
 
 - **Image File**
 
-  Write to a new image file. This option will create an image disk file similar to the one that's hosted on the Redox OS download page. The next section is [#4](#4-configure-image-file).
+  Write to a new image file. This option will create an image disk file similar to the one that's hosted on the Ferric Oxide download page. The next section is [#4](#4-configure-image-file).
 
 
 #### 2. Choose a drive
@@ -75,7 +73,7 @@ This layout is not configurable. If you wish to do so, format your disk using `G
 
 #### 3. Choose a main partition
 
-This section lets you choose which partition you want to use as the main RedoxFS partition for Redox OS. This will erase the data for that partition but leave everything else untouched.
+This section lets you choose which partition you want to use as the main RedoxFS partition for Ferric Oxide. This will erase the data for that partition but leave everything else untouched.
 
 The installer is not capable of doing partitioning. If you want to do so, use another tool such as `GParted` and set up an empty partition for RedoxFS, then click **Reload** on this page after you're done partitioning.
 
@@ -83,7 +81,7 @@ Note that installing just for RedoxFS partition will not make it bootable; hence
 
 - **Do not write**
 
-  This will not write any bootloader and leave the installed Redox OS in that partition unbootable, because Redox OS requires a custom bootloader and cannot be loaded by common bootloaders such as `GRUB`, `systemd-boot`, etc.
+  This will not write any bootloader and leave the installed Ferric Oxide in that partition unbootable, because Ferric Oxide requires a custom bootloader and cannot be loaded by common bootloaders such as `GRUB`, `systemd-boot`, etc.
 
 - **Dual-boot (systemd-boot)**
 
@@ -100,7 +98,7 @@ If you choose any partition, make sure it's not mounted. **Never choose the part
 
 - **Any partition in /dev/\***
 
-This option will format the partition with the FAT filesystem containing UEFI bootloader for Redox OS. The bootloader does not have to be on the same disk as RedoxFS, as the bootloader will look to all drives that contain a RedoxFS partition with the help of UEFI services.
+This option will format the partition with the FAT filesystem containing UEFI bootloader for Ferric Oxide. The bootloader does not have to be on the same disk as RedoxFS, as the bootloader will look to all drives that contain a RedoxFS partition with the help of UEFI services.
 
 This option is meant for installation to an external storage device, or for chainloading to any bootloader that supports it, such as `GRUB`. In some machines, the bootloader can also be directly bootable from BIOS boot device menu or boot priority on firmware setup.
 
@@ -112,17 +110,17 @@ If you do not see the `Next` button, try to maximize the window.
 
 #### 4. Configure Image File
 
-This section contain options for installing Redox OS into a image file. This section is particularly useful for emulating Redox in a virtual machine, or for advanced installation methods later on.
+This section contain options for installing Ferric Oxide into a image file. This section is particularly useful for emulating the system in a virtual machine, or for advanced installation methods later on.
 
 - **Image Path**
 
 This asks where to install the image file. In Linux, the `Browse` button is visible to open a file dialog where the file will be saved.
 
-You can also specify a path to a directory, and it will just install Redox OS files in that directory, but this behavior is not recommended to be used.
+You can also specify a path to a directory, and it will just install Ferric Oxide files in that directory, but this behavior is not recommended to be used.
 
 - **Image Size**
 
-Specify the image file size, which will also be the size of the main RedoxFS partition for Redox OS.
+Specify the image file size, which will also be the size of the main RedoxFS partition for Ferric Oxide.
 
 - **Skip Partition?**
 
@@ -130,7 +128,7 @@ Checking this box will prevent the image file from being formatted as GPT device
 
 - **Write Bootloader EFI**
 
-This asks where to install the bootloader file. The EFI file is needed to boot the Redox OS disk later on. It is a PE executable that is usually placed in `/EFI/BOOT/*.EFI` of a boot partition.
+This asks where to install the bootloader file. The EFI file is needed to boot the Ferric Oxide disk later on. It is a PE executable that is usually placed in `/EFI/BOOT/*.EFI` of a boot partition.
 
 
 #### 5. Select System Profile
@@ -139,15 +137,15 @@ After entering options from either Section 2, 3, or 4, this is the last section 
 
 - **Desktop**
 
-  This option chooses the Redox OS to be installed with desktop and server components. The installation usually takes around 3 minutes (200 seconds).
+  This option chooses the Ferric Oxide to be installed with desktop and server components. The installation usually takes around 3 minutes (200 seconds).
 
 - **Server**
 
-  This option chooses the Redox OS to be installed with only server components. Its installation usually takes around 1 minute and half (90 seconds).
+  This option chooses the Ferric Oxide to be installed with only server components. Its installation usually takes around 1 minute and half (90 seconds).
 
 - **Clone**
 
-  This option is only visible if you boot Redox OS to a live disk. It will install an identical copy from the current Redox OS live disk memory.
+  This option is only visible if you boot Ferric Oxide to a live disk. It will install an identical copy from the current Ferric Oxide live disk memory.
 
 - **Install as Live Disk**
 
@@ -155,11 +153,11 @@ This option will make the bootloader install with live disk mode being chosen as
 
 - **Enable disk encryption password**
 
-You can enter a password for main RedoxFS partition encryption. It is whole-disk encryption; the bootloader will ask for the password later to boot Redox.
+You can enter a password for main RedoxFS partition encryption. It is whole-disk encryption; the bootloader will ask for the password at boot.
 
 
 #### 6. Installation Progress
 
 The installation is then performed and usually will finish within minutes. Unfortunately, for the GUI installer, the progress is in the terminal where it was launched, instead of being reported in the GUI.
 
-Once the installation completes, you can restart your computer to boot into Redox!
+Once the installation completes, you can restart your computer to boot into Ferric Oxide!

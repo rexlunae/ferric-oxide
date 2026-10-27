@@ -48,15 +48,15 @@ components and Cargo utilities. QEMU is needed for `run`. Existing
 `cargo xtask --podman build`; the inherited recipe toolchain remains available
 for recipes that need GCC-specific tools.
 
-The upstream [Redox Book](https://doc.redox-os.org/book/) is still the reference for the build system. These pages are the most useful:
+The book in `docs/` covers the rest of the build. These pages are the most useful:
 
-- [Build System Reference](https://doc.redox-os.org/book/build-system-reference.html)
-- [Configuration Settings](https://doc.redox-os.org/book/configuration-settings.html), including how to keep local recipe changes from being overwritten
-- [Coding and Building](https://doc.redox-os.org/book/coding-and-building.html), including how to update initfs after changing system components or drivers
-- [Porting Applications](https://doc.redox-os.org/book/porting-applications.html)
-- [Developer FAQ](https://doc.redox-os.org/book/developer-faq.html)
+- [Configuration Settings](docs/src/configuration-settings.md), including how to keep local recipe changes from being overwritten
+- [Build System Reference](docs/src/build-system-reference.md)
+- [Coding and Building](docs/src/coding-and-building.md), including how to update initfs after changing system components or drivers
+- [Porting Applications](docs/src/porting-applications.md)
+- [Developer FAQ](docs/src/developer-faq.md)
 
-To work on a single component without the full build system, use [Redoxer](https://gitlab.redox-os.org/redox-os/redoxer).
+To work on a single component without the full build system, use [Redoxer](tools/redoxer/README.md).
 
 ## What a good pull request looks like
 
