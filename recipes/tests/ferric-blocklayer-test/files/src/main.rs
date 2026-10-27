@@ -12,7 +12,12 @@
 //! - `blocklayer-luks1`: a LUKS1 volume;
 //! - `blocklayer-erofs`: opening a volume for writing fails with `EROFS`;
 //! - `blocklayer-access`: a process that is not root gets `EACCES`;
-//! - `blocklayer-refuse`: with a wrong passphrase the daemon exits without serving.
+//! - `blocklayer-refuse`: with a wrong passphrase the daemon exits without serving;
+//! - `blocklayer-unlock-boot` (with `/usr/bin/ferric-unlock`, features.toml
+//!   `fs.unlock_at_boot`): the volumes of the recipe's `/etc/ferric/crypttab` were unlocked at
+//!   boot, so LVM on LUKS reads back its pattern at `/scheme/ferric-boot-lol`, and (with ext4d)
+//!   `hello.txt` reads back from the ext4 volume mounted through `ferric-blockd`. Without
+//!   ferric-unlock this step prints `FERRIC_TEST_SKIP blocklayer-unlock-boot`.
 //!
 //! Without `/usr/bin/ferric-blockd` (fs.luks and fs.lvm off) it prints
 //! `FERRIC_TEST_SKIP blocklayer`. The images are those of
