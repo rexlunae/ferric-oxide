@@ -10,8 +10,11 @@
 # Every default job must print a line per queue policy (main: the one-queue path; adaptive:
 # the per-CPU default; workers) and an A/B line. drivers.nvme_percore is on in every CI image,
 # so the A/B must have run (ab=pass or ab=fail, not ab=none), and the per-CPU default must
-# reach the single queue's IOPS within the same-boot noise (ferric_blkqueue::ab). The figures
-# go out as a notice and, when GITHUB_STEP_SUMMARY is set, as a table in the job summary.
+# reach the single queue's IOPS within the same-boot noise (ferric_blkqueue::ab). Every default
+# file job must print a line per path (fs: RedoxFS alone; cache: through the page cache) and
+# an A/B line; that A/B is reported, not gated, since with kernel.page_cache_writeback off a
+# write job's two paths are the same path. The figures go out as a notice and, when
+# GITHUB_STEP_SUMMARY is set, as a table in the job summary.
 set -euo pipefail
 # shellcheck source=perf-ab.sh
 . "$(dirname "$0")/perf-ab.sh"
@@ -20,6 +23,7 @@ mode="$1"
 log="$2"
 clean="$(tr -d '\r\000' < "$log")"
 jobs="randread-4k-qd1 randread-4k-qd32 read-128k-qd1"
+file_jobs="file-randwrite-4k-qd1 file-write-128k-qd1"
 
 fail() {
     echo "::error title=iobench ($mode)::$*" >&2
@@ -42,6 +46,12 @@ for job in $jobs; do
     done
     need "FERRIC_BENCH iobench-$job ab_baseline_iops=[0-9]+ ab_candidate_iops=[0-9]+ ab_ratio=[0-9]+ ab_tolerance=[0-9]+ ab_rounds=[0-9]+ ab=(pass|fail)"
 done
+for job in $file_jobs; do
+    for path in fs cache; do
+        need "FERRIC_BENCH iobench-$job path=$path rounds=[0-9]+ $fields"
+    done
+    need "FERRIC_BENCH iobench-$job ab_baseline_iops=[0-9]+ ab_candidate_iops=[0-9]+ ab_ratio=[0-9]+ ab_tolerance=[0-9]+ ab_rounds=[0-9]+ ab=(pass|fail)"
+done
 
 lines="$(grep -aoE "FERRIC_BENCH iobench-.*" <<< "$clean" | sed 's/^FERRIC_BENCH //')"
 echo "::notice title=iobench ($mode)::$(paste -sd ';' - <<< "$lines")"
@@ -57,16 +67,18 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
         echo "### ferric-iobench ($mode)"
         echo
-        echo "| Job | Policy | IOPS | MiB/s | p50 µs | p99 µs | p99.9 µs | max µs | A/B |"
+        echo "| Job | Policy or path | IOPS | MiB/s | p50 µs | p99 µs | p99.9 µs | max µs | A/B |"
         echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
-        # One row per job and policy; the A/B lines have no policy.
+        # One row per job and policy (disk jobs) or path (file jobs); the A/B lines have
+        # neither. The A/B goes on the candidate's row.
         while read -r line; do
             job="${line%% *}"
             policy="$(field policy "$line")"
+            [ -n "$policy" ] || policy="$(field path "$line")"
             [ -n "$policy" ] || continue
             ab="$(grep -aE "^$job ab_" <<< "$lines" | head -n 1 || true)"
             verdict=""
-            if [ "$policy" = adaptive ]; then
+            if [ "$policy" = adaptive ] || [ "$policy" = cache ]; then
                 verdict="$(field ab "$ab") (ratio $(field ab_ratio "$ab")‰, tolerance $(field ab_tolerance "$ab")‰)"
             fi
             echo "| ${job#iobench-} | $policy | $(field iops "$line") | $(field mib_s "$line") | $(us "$(field lat_p50_ns "$line")") | $(us "$(field lat_p99_ns "$line")") | $(us "$(field lat_p999_ns "$line")") | $(us "$(field lat_max_ns "$line")") | $verdict |"
@@ -75,7 +87,8 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     } >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if grep -aE "^iobench-[^ ]+ ab_.* ab=fail" <<< "$lines"; then
+# Only the disk jobs' A/B is a gate; the file jobs' is reported above.
+if grep -aE "^iobench-[^ ]+ ab_.* ab=fail" <<< "$lines" | grep -avE "^iobench-file-"; then
     perf_ab_failed "iobench ($mode)" "nvmed's per-CPU default policy is slower than its single queue in the same boot"
 fi
 echo "check-iobench-log: $mode OK"

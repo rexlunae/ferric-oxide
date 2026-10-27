@@ -740,6 +740,34 @@ runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
 
+### Delayed page-cache writeback notifications
+
+RedoxFS's host library tests (`cargo test --locked --manifest-path
+userspace/redoxfs/Cargo.toml --lib --no-default-features --features std`)
+also exercise closed-file cache count/byte limits, extreme sizes, zero budgets,
+stale stamps and unsuccessful reopen attempts. Transaction tests identify
+rename targets losing their last link with and without an open description,
+and distinguish surviving hard links, same-node renames and absent targets.
+These test the shared lifetime decisions; image tests remain necessary for
+actual kernel cache-object attachment and page reuse.
+
+`ferric-pcache` also checks its 40-byte queue record against literal little-endian
+fixtures, including every writeback reason and unaligned input. The generated
+wire layout is shared by kernel and file-system consumers.
+
+`cargo test --locked -p ferric-pcache --all-features` includes the delayed
+notification regression: fsync cleans a file before its record is delivered,
+writes race on either side of the current-count query, duplicate records keep
+the first dirty time, and another dirty file keeps its timer. ABI tests cover
+the `DirtyPages` request and reject extra metadata/packed flags. CI compiles
+the RedoxFS client and kernel query together; the writeback-enabled image's
+fsync, age, mapping and truncation smoke checks cover target integration.
+
+The shared page-cache writeback tests also cover delayed sequential-run hints:
+an intervening flush cleans the recorded pages, then the hint writes just one
+later dirty run while a concurrent rewrite remains dirty. This pins the
+intentional start-hint semantics and the take-size work bound.
+
 ### Driver executor event reads
 
 `cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`
