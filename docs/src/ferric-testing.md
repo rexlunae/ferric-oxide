@@ -742,6 +742,15 @@ interrupts, scheduler wait registration or timer hardware.
 
 ### Delayed page-cache writeback notifications
 
+RedoxFS's host library tests (`cargo test --locked --manifest-path
+userspace/redoxfs/Cargo.toml --lib --no-default-features --features std`)
+also exercise closed-file cache count/byte limits, extreme sizes, zero budgets,
+stale stamps and unsuccessful reopen attempts. Transaction tests identify
+rename targets losing their last link with and without an open description,
+and distinguish surviving hard links, same-node renames and absent targets.
+These test the shared lifetime decisions; image tests remain necessary for
+actual kernel cache-object attachment and page reuse.
+
 `ferric-pcache` also checks its 40-byte queue record against literal little-endian
 fixtures, including every writeback reason and unaligned input. The generated
 wire layout is shared by kernel and file-system consumers.

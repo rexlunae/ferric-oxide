@@ -7,14 +7,16 @@
 //! longer matches (its ID was freed and reused, or it changed without going through the
 //! cache) is not reused.
 
+#![forbid(unsafe_code)]
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-/// What happened to a file [`IdleFiles::take`] looked for.
+/// Whether a file's idle object can serve an attachment being attempted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Taken {
+pub enum IdleMatch {
     /// It was idle with the same stamp: its object can serve the new description.
-    Reused,
+    Reusable,
     /// It was idle with a different stamp: its object must be closed.
     Stale,
     /// It was not idle.
@@ -57,13 +59,12 @@ impl<S: PartialEq> IdleFiles<S> {
     /// whole byte budget is evicted at once, so the result can name `node` itself.
     pub fn insert(&mut self, node: u32, bytes: u64, stamp: S) -> Vec<u32> {
         self.remove(node);
-        let age = self.next_age;
-        self.next_age += 1;
-        self.by_age.insert(age, node);
-        self.by_node.insert(node, Entry { age, bytes, stamp });
-        self.bytes += bytes;
         let mut evicted = Vec::new();
-        while self.by_node.len() > self.max_files || self.bytes > self.max_bytes {
+        // Make room before adding the weight, so even an extreme file size cannot
+        // overflow the accounting and bypass the byte limit in a release build.
+        while self.by_node.len() >= self.max_files
+            || bytes > self.max_bytes.saturating_sub(self.bytes)
+        {
             let Some((_, oldest)) = self.by_age.first_key_value() else {
                 break;
             };
@@ -71,16 +72,26 @@ impl<S: PartialEq> IdleFiles<S> {
             self.remove(oldest);
             evicted.push(oldest);
         }
+        if self.max_files == 0 || bytes > self.max_bytes {
+            evicted.push(node);
+            return evicted;
+        }
+        let age = self.next_age;
+        self.next_age += 1;
+        self.by_age.insert(age, node);
+        self.by_node.insert(node, Entry { age, bytes, stamp });
+        self.bytes += bytes;
         evicted
     }
 
-    /// Takes `node` out of the set because a description opened it, comparing its stamp now
-    /// with the one it was kept with.
-    pub fn take(&mut self, node: u32, stamp: &S) -> Taken {
-        match self.remove_entry(node) {
-            Some(entry) if entry.stamp == *stamp => Taken::Reused,
-            Some(_) => Taken::Stale,
-            None => Taken::Absent,
+    /// Compare stamps without removing the idle entry or changing eviction order.
+    /// Remove a reusable entry only after the attachment succeeds; a failed attempt
+    /// must leave its object within the idle budget. Discard a stale object explicitly.
+    pub fn check(&self, node: u32, stamp: &S) -> IdleMatch {
+        match self.by_node.get(&node) {
+            Some(entry) if entry.stamp == *stamp => IdleMatch::Reusable,
+            Some(_) => IdleMatch::Stale,
+            None => IdleMatch::Absent,
         }
     }
 
@@ -138,17 +149,19 @@ mod tests {
         let mut idle = IdleFiles::new(2, u64::MAX);
         idle.insert(1, 10, ());
         idle.insert(2, 10, ());
-        assert_eq!(idle.take(1, &()), Taken::Reused);
+        assert_eq!(idle.check(1, &()), IdleMatch::Reusable);
+        assert!(idle.remove(1));
         idle.insert(1, 10, ());
         assert_eq!(idle.insert(3, 10, ()), [2]);
     }
 
     #[test]
-    fn a_changed_stamp_is_stale_and_leaves_the_set() {
+    fn a_changed_stamp_is_stale_until_discarded() {
         let mut idle = IdleFiles::new(4, u64::MAX);
         idle.insert(7, 10, (1, 2));
-        assert_eq!(idle.take(7, &(1, 3)), Taken::Stale);
-        assert_eq!(idle.take(7, &(1, 3)), Taken::Absent);
+        assert_eq!(idle.check(7, &(1, 3)), IdleMatch::Stale);
+        assert!(idle.remove(7));
+        assert_eq!(idle.check(7, &(1, 3)), IdleMatch::Absent);
     }
 
     #[test]
@@ -158,5 +171,35 @@ mod tests {
         assert!(idle.remove(1));
         assert!(!idle.remove(1));
         assert!(idle.insert(2, 100, ()).is_empty());
+    }
+
+    #[test]
+    fn an_extreme_file_size_cannot_wrap_the_byte_budget() {
+        let mut idle = IdleFiles::new(64, 256 << 20);
+        idle.insert(1, 4096, ());
+        assert_eq!(idle.insert(2, u64::MAX, ()), [1, 2]);
+        assert!(!idle.contains(1) && !idle.contains(2));
+        assert!(idle.insert(3, 4096, ()).is_empty());
+    }
+
+    #[test]
+    fn zero_limits_keep_no_files() {
+        for (files, bytes) in [(0, 100), (1, 0), (0, 0)] {
+            let mut idle = IdleFiles::new(files, bytes);
+            assert_eq!(idle.insert(1, 1, ()), [1]);
+            assert!(!idle.contains(1));
+        }
+    }
+
+    #[test]
+    fn an_unfinished_reopen_keeps_its_budget_and_eviction_order() {
+        let mut idle = IdleFiles::new(2, 100);
+        idle.insert(1, 40, 11);
+        idle.insert(2, 40, 22);
+        assert_eq!(idle.check(1, &11), IdleMatch::Reusable);
+        // The attachment failed, so it never committed remove(1).
+        assert!(idle.contains(1));
+        assert_eq!(idle.insert(3, 60, 33), [1]);
+        assert!(idle.contains(2) && idle.contains(3));
     }
 }

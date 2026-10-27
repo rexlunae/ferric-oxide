@@ -104,6 +104,14 @@ pub struct FileScheme<'sock, D: Disk> {
 }
 
 impl<'sock, D: Disk> FileScheme<'sock, D> {
+    /// Drop state for a node whose last link disappeared in a committed transaction.
+    fn removed(&mut self, node_id: u32) {
+        self.other_scheme_fd_map.remove(&node_id);
+        if let Some(pcache) = &mut self.pcache {
+            pcache.removed(node_id);
+        }
+    }
+
     /// Ferric Oxide: tells the page cache how many mapped ranges of `node_ptr` there are now,
     /// and how many of them RedoxFS writes back, after a mapping changed.
     fn mappings_changed(&mut self, node_ptr: TreePtr<Node>) {
@@ -575,10 +583,7 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
             return Ok(());
         };
 
-        let _ = self.other_scheme_fd_map.remove(&node_id);
-        if let Some(pcache) = &mut self.pcache {
-            pcache.removed(node_id);
-        }
+        self.removed(node_id);
 
         Ok(())
     }
@@ -944,21 +949,22 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
 
         let scheme_name = &self.scheme_name;
         let old_name = old_name.as_ref();
-        self.fs.tx(|tx| {
+        let replaced = self.fs.tx(|tx| {
             let (orig_parent_ptr, _, new_parent, new_name) =
                 Self::validate_new_link(scheme_name, file, &new_path, ctx, tx)?;
 
-            tx.rename_node(
+            tx.rename_node_replaced(
                 orig_parent_ptr,
                 old_name,
                 new_parent.ptr(),
                 new_name.as_ref(),
-            )?;
-
-            Ok(())
+            )
         })?;
 
         file.set_path(new_path.as_ref());
+        if let Some(node_id) = replaced {
+            self.removed(node_id);
+        }
         Ok(0)
     }
 

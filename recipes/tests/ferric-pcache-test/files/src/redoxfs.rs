@@ -150,6 +150,13 @@ pub fn coherence() -> Result<(), Failure> {
     // Twice: the second read is served from the pages the first filled.
     expect(&reader, &want, "creating the file")?;
     expect(&reader, &want, "reading it again")?;
+    set_old_times(&reader)?;
+    drop(reader);
+    let reader = io("reopen the test file", File::open(PATH))?;
+    check(served_from_cache(&reader, 0)?, || {
+        "closing the last description discarded the clean file's cached pages".into()
+    })?;
+    expect(&reader, &want, "reopening the retained object")?;
     let writer = io(
         "open the test file to write",
         OpenOptions::new().write(true).open(PATH),
@@ -462,7 +469,7 @@ pub fn writeback() -> Result<(), Failure> {
     expect(&open_fs(false)?, &want, "fsync, through RedoxFS")?;
     expect(&reader, &want, "fsync, from the cache")?;
     drop((writer, reader));
-    // Every description closed: the cache forgot the file, so this reads what RedoxFS has.
+    // Every description closed. O_FSYNC bypasses the retained object and reads RedoxFS.
     expect(&open_fs(false)?, &want, "closing and reopening")?;
 
     // A write left dirty at the last close.

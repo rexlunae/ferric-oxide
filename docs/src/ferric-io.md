@@ -927,6 +927,20 @@ again. A private mapping never changes RedoxFS's buffer (the kernel copies a
 page on its first store), so RedoxFS no longer writes it back, nor ranges
 nothing maps any more, whose retained buffers can be older than later writes.
 
+After the last attached description closes, RedoxFS flushes dirty pages and
+keeps clean objects for reuse by later opens. The idle cache keeps at most
+64 files and 256 MiB by logical file size, evicting the least recently closed
+files first. Reopening compares the node's size, modification time and change
+time with their values at close; a different stamp discards the old object.
+Failed attachments leave reusable objects in the idle budget. A failed
+last-close flush discards the object, and removing a file's last link, by
+unlink or rename replacement, discards an idle object immediately or prevents
+an open one from entering the idle cache when its last description closes.
+The rename transaction reports the replaced node only when its last link
+disappears (`Transaction::rename_node_replaced`), so surviving hard links
+keep their objects. Successful fills overwrite their complete buffer,
+including zeroing any tail past EOF; later fills reuse the allocation.
+
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
@@ -943,7 +957,9 @@ file out of the cache exactly while it lasts, even after its descriptor closes
 or beside a read-only mapping, and a private one changes neither the file nor
 its caching (the
 access time shows whether a read was served from the cache: RedoxFS moves it
-when it reads a file, the cache does not), and benchmarks warm 4 KiB
+when it reads a file, the cache does not). It also closes the last description
+and reopens the file, requiring a retained-page hit rather than another fill,
+and benchmarks warm 4 KiB
 `pread`s and 1 MiB sequential reads of one file through a read-only
 description (cached) against an `O_FSYNC` one (served by RedoxFS, as with the
 option off) in the same boot, with the paired A/B rule of
@@ -1039,7 +1055,7 @@ RedoxFS attaches every regular-file description except `O_FSYNC` ones, as
 opened (read-only, write-only or read-write), and writes back an object:
 
 - on `fsync`, before it serves a read itself, and at the last close of the
-  file, before it forgets the object;
+  file, before the clean object enters the bounded idle cache described above;
 - before it serves a write, an `ftruncate` or an `mmap` itself, after holding
   the object's writes; the hold lasts while the file has any mapping, since
   RedoxFS's mapped buffers are written back without a write call (a shared

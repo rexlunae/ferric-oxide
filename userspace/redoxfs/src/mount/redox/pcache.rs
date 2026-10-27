@@ -80,7 +80,7 @@ use syscall::flag::{O_ACCMODE, O_FSYNC, O_RDONLY, O_RDWR, O_WRONLY};
 use syscall::CallFlags;
 
 use super::resource::{FileResource, Fmaps, Resource};
-use crate::idle_files::{IdleFiles, Taken};
+use crate::idle_files::{IdleFiles, IdleMatch};
 use crate::{Disk, FileSystem, Node, TreePtr};
 
 /// The handle number of the description the pump forwards records through. RedoxFS numbers
@@ -369,11 +369,13 @@ impl PageCache {
         if !node.data().is_file() {
             return;
         }
-        if self.idle.take(node_id, &Stamp::of(node.data())) == Taken::Stale {
+        if self.idle.check(node_id, &Stamp::of(node.data())) == IdleMatch::Stale {
             self.forget(node_id);
         }
         if let Err(err) = self.try_attach(handle, node.data().size(), node_id, access) {
             log::warn!("page cache: not caching node {node_id}: {}", Chain(&err));
+        } else {
+            self.idle.remove(node_id);
         }
     }
 

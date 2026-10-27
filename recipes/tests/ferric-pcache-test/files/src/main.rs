@@ -31,7 +31,8 @@
 //!
 //! - `pcache-redoxfs`: a read-only description of a file in `/tmp` reads the new bytes after
 //!   writes, a write past the end, a truncation and a growing truncation made through another
-//!   description, and an append at the end leaves the pages before it cached.
+//!   description, and an append at the end leaves the pages before it cached. Closing the
+//!   last description and reopening reuses clean pages, checked through the access time.
 //! - `pcache-redoxfs-mmap`: a file with a shared writable mapping is not cached while the
 //!   mapping lasts, even after the descriptor it was made through closes or with a read-only
 //!   mapping beside it, and is cached again once unmapped; a reader cached before the mapping
