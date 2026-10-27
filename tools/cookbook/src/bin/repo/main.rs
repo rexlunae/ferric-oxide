@@ -729,18 +729,20 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         };
 
         // In-tree recipes build from source under every rule (see
-        // CookRecipe::is_in_tree), so they get their build and dev
-        // dependencies like any source recipe.
-        let (in_tree, binary_recipes): (Vec<_>, Vec<_>) =
-            binary_recipes.into_iter().partition(CookRecipe::is_in_tree);
+        // CookRecipe::is_in_tree), and so do prebuilts an offline cook
+        // cannot download, so they get their build and dev dependencies
+        // like any source recipe.
+        let (from_source, binary_recipes): (Vec<_>, Vec<_>) = binary_recipes
+            .into_iter()
+            .partition(|r| r.is_in_tree() || offline_cook_without_binaries(&config, &command, r));
         if command.is_building() || command.is_pushing() {
-            let in_tree_names: Vec<_> = in_tree.into_iter().map(|r| r.name).collect();
+            let names: Vec<_> = from_source.into_iter().map(|r| r.name).collect();
             recipes.extend(CookRecipe::get_build_deps_recursive(
-                &in_tree_names,
+                &names,
                 command.is_building(),
             )?);
         } else {
-            recipes.extend(in_tree);
+            recipes.extend(from_source);
         }
 
         let ignore_recipes = CookRecipe::from_list(ignore_recipe_names.clone())?;
@@ -824,14 +826,12 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         }
     }
 
-    if command.is_building() && config.cook.offline {
-        // Offline, a prebuilt package that was never downloaded cannot be
-        // used, so its recipe builds from the sources already fetched.
+    if command == CliCommand::Cook && config.cook.offline {
         for recipe in recipes
             .iter_mut()
-            .filter(|r| r.rule == "binary" && !r.has_downloaded_binaries())
+            .filter(|r| r.rule == "binary" && offline_cook_without_binaries(&config, &command, r))
         {
-            if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
+            if config.cook.verbose && !config.cook.tui {
                 println!(
                     "DEBUG: Recipe {:?} has no downloaded binary package, building it from source",
                     recipe.name.as_str()
@@ -848,6 +848,17 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     }
 
     Ok((config, command, recipes))
+}
+
+/// Whether `recipe` is a prebuilt that this offline cook cannot use because
+/// its archives were never downloaded, so it builds from the sources already
+/// fetched. `fetch` still downloads prebuilts, so it never falls back.
+fn offline_cook_without_binaries(
+    config: &CliConfig,
+    command: &CliCommand,
+    recipe: &CookRecipe,
+) -> bool {
+    *command == CliCommand::Cook && config.cook.offline && !recipe.has_downloaded_binaries()
 }
 
 fn handle_fetch(
