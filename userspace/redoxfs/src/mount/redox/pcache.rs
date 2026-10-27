@@ -722,7 +722,8 @@ impl PageCache {
                     };
                     let range = fill.pages.pages();
                     let len = range.count() as usize * PAGE_SIZE as usize;
-                    self.buf.clear();
+                    // `read_pages` writes or zeroes every byte, so only growth is zeroed here:
+                    // zeroing the whole buffer per fill cost as much as the read (#286).
                     self.buf.resize(len, 0);
                     let offset = range.first() * PAGE_SIZE;
                     let read = read_pages(fs, fmaps, node_id, offset, &mut self.buf);
@@ -908,8 +909,8 @@ fn write_pages<D: Disk>(
     Ok(())
 }
 
-/// Reads `buf.len()` bytes of `node_id` from `offset` as a client `read` would, zero past the
-/// end of the file.
+/// Reads `buf.len()` bytes of `node_id` from `offset` as a client `read` would, and zeroes the
+/// bytes past the end of the file, so every byte of `buf` is written.
 fn read_pages<D: Disk>(
     fs: &mut FileSystem<D>,
     fmaps: &mut Fmaps,
@@ -933,6 +934,7 @@ fn read_pages<D: Disk>(
         }
         done += n;
     }
+    buf[done..].fill(0);
     Ok(())
 }
 
