@@ -37,6 +37,20 @@ fn redoxer_dir() -> path::PathBuf {
         .join(target())
 }
 
+/// The cookbook checkout `REDOXER_COOKBOOK` names. Its built repository
+/// (`repo/<target>/`) has the packages `redoxer pkg` installs and the
+/// `redoxer exec` images are made from; Ferric Oxide downloads none.
+#[cfg(any(feature = "cli-pkg", feature = "cli-exec"))]
+fn cookbook_dir() -> anyhow::Result<path::PathBuf> {
+    match std::env::var_os("REDOXER_COOKBOOK") {
+        Some(dir) if !dir.is_empty() => Ok(path::PathBuf::from(dir)),
+        _ => anyhow::bail!(
+            "set REDOXER_COOKBOOK to a Ferric Oxide checkout whose repo/{} holds built packages",
+            target()
+        ),
+    }
+}
+
 fn status_error(status: process::ExitStatus) -> io::Result<()> {
     if status.success() {
         Ok(())

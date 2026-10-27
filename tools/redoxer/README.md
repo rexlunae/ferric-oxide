@@ -24,10 +24,13 @@ redoxer <ar | cc | cxx> [arguments]
 
 redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui] [-h|--help] [-i|--install-config] [-o|--output file] [--] <command> [arguments]...
     Run a command inside QEMU, using a "base" or "gui" redox image, or provide custom one with --install-config
-    The redox image will be initialized if not exist or different with the specified --install-config
+    The redox image will be initialized if not exist or different with the specified --install-config,
+    and rebuilt when the cookbook or its built packages change
     Specify a folder to copy it into /root inside redox image, or more generic one with folder:path
     If folder for /root is not specified but <command> is a file, the file will be copied
     Environment flags:
+        REDOXER_COOKBOOK      Ferric Oxide checkout whose built repo/$TARGET the image is made from
+                              (required unless the install config sets general.cookbook)
         REDOXER_QEMU_BINARY   Override qemu binary
         REDOXER_QEMU_ARGS     Override qemu args
         REDOXER_USE_FUSE      [true|false] Override use fuse (default is automatically detected)
@@ -39,7 +42,8 @@ redoxer pkg [install|remove|update] pkg-1 pkg-2 ...
     Install additional native packages for Cargo
     Environment flags:
         REDOXER_SYSROOT     Where to install sysroot (default is target/$TARGET/sysroot on Cargo projects)
-        REDOXER_PKG_SOURCE  Override source of packages (default is https://static.redox-os.org/pkg)
+        REDOXER_COOKBOOK    Ferric Oxide checkout whose repo/$TARGET has the built packages
+                            (required to install or update; update also installs new dependencies)
 
 redoxer toolchain [--update] [--url PATH]
     Install or manage toolchain

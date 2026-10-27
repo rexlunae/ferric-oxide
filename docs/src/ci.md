@@ -33,39 +33,41 @@ with packages built by [`fox`](./ferric-packaging.md) is in progress.
 builds a program for the `redox` target with Cargo and runs it inside a virtual
 machine, without the full build system. Its source is in `tools/redoxer/`.
 
-> ⚠️ **Warning:** Redoxer still downloads its toolchain, test image and
-> libraries from the Redox project (`static.redox-os.org`) and its Docker
-> image, so what it tests is a Redox system, not a Ferric Oxide one. Use it to
-> check that a program builds and runs on the shared target; use the image
-> tests above for anything that depends on Ferric Oxide's kernel. Moving
-> Redoxer's downloads to `fox` builds is planned.
+> ⚠️ **Warning:** Ferric Oxide's Redoxer builds its test image and sysroot
+> packages from a cookbook checkout, but `redoxer toolchain` still downloads
+> its toolchain from the Redox project (`static.redox-os.org`). Moving the
+> toolchain to `fox` builds is planned.
 
 Refer to Redoxer's [README](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer#readme)
 for its command line. This section assumes you have read it.
 
 ### Installing Redoxer
 
-We provide two options to install Redoxer: Docker container or Cargo. To install via `redoxer` crate in `crates.io` :
+Install Ferric Oxide's Redoxer from a checkout of this repository:
 
 ```sh
-cargo install redoxer
+cargo install --path tools/redoxer
 ```
 
-Then download the toolchain, QEMU image and test if installation works with `true` from `uutils` :
+It downloads no packages: set `REDOXER_COOKBOOK` to a checkout whose `repo/$TARGET/` holds built packages (for example after `make all`), and `redoxer exec` builds its image from those, as `redoxer pkg` does below. The image and the bootloader are rebuilt when the cookbook or its built packages change. Then check that it works by running `true` from `uutils`:
 
 ```sh
+export REDOXER_COOKBOOK=/path/to/ferric-oxide
 redoxer exec true
 ```
 
-To install and run Redoxer via [the official Docker container](https://hub.docker.com/r/redoxos/redoxer):
+#### Upstream Redoxer
+
+The `redoxer` crate on crates.io and [the Docker container](https://hub.docker.com/r/redoxos/redoxer) are upstream's builds. They ignore `REDOXER_COOKBOOK` and download a Redox image and packages from Redox's server, so they test a Redox system rather than a Ferric Oxide one:
 
 ```sh
+cargo install redoxer
 docker run -ti --rm docker.io/redoxos/redoxer redoxer exec true
 ```
 
-Compared to Redoxer via Cargo, the Docker variant is recommended for use in CI since it's **guaranteed to boot**, because the toolchain and QEMU image for testing is already inside it and tested before being published. The Docker variant is only available for `x86_64` Linux at this time.
+The Docker variant ships its toolchain and QEMU image already tested, and is only available for `x86_64` Linux.
 
-All commands below will refer `redoxer` as the command to run Redoxer. For installations via Docker you need to prefix it using the `docker run` command or alias it in `.bashrc`:
+All commands below will refer `redoxer` as the command to run Redoxer. For upstream's Docker image you need to prefix it using the `docker run` command or alias it in `.bashrc`:
 
 ```sh
 alias redoxer='docker run -ti --rm -v ".:/mnt" -w /mnt -e REDOXER_SYSROOT --device /dev/kvm docker.io/redoxos/redoxer redoxer'
@@ -121,7 +123,7 @@ Sometimes a project needs native libraries such as OpenSSL or zlib. To have them
 redoxer pkg openssl3 zlib
 ```
 
-It will download and extract the compiled library to `target/$TARGET/sysroot` or configured from `REDOXER_SYSROOT`. After it does, all subsequent Redoxer calls will automatically be linked to them via `RUSTFLAGS`, `LDFLAGS`, etc.
+It will install the built packages, and the packages they depend on, from `$REDOXER_COOKBOOK/repo/$TARGET/` into `target/$TARGET/sysroot` or configured from `REDOXER_SYSROOT`, with fox's store, so `redoxer pkg remove` can take them out again. After it does, all subsequent Redoxer calls will automatically be linked to them via `RUSTFLAGS`, `LDFLAGS`, etc.
 
 To verify how the build works run the `redoxer env` command and examine how environment variables are produced. You can also debug it with a interactive GNU Bash using `redoxer env bash` :
 

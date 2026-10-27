@@ -155,8 +155,59 @@ pub fn qemu_default_args() -> Vec<&'static str> {
 static BASE_TOML: &str = include_str!("../res/base.toml");
 static GUI_TOML: &str = include_str!("../res/gui.toml");
 
-fn bootloader() -> anyhow::Result<PathBuf> {
+/// Identifies what an image built from `cookbook` contains: the checkout
+/// and the name, size and modification time of each built archive whose
+/// file name passes `filter`. A rebuilt package changes it.
+fn cookbook_stamp(cookbook: &Path, filter: impl Fn(&str) -> bool) -> io::Result<String> {
+    let repo = cookbook.join("repo").join(target());
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&repo)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !filter(&name) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        entries.push(format!("{name} {} {modified}", metadata.len()));
+    }
+    entries.sort();
+    let cookbook = cookbook.canonicalize()?;
+    Ok(format!(
+        "cookbook {}\n{}\n",
+        cookbook.display(),
+        entries.join("\n")
+    ))
+}
+
+/// Removes `files` if `stamp_file` does not hold `stamp`, so they are built
+/// again from the current inputs.
+fn clear_stale(name: &str, stamp_file: &Path, stamp: &str, files: &[&Path]) -> io::Result<()> {
+    if fs::read_to_string(stamp_file).is_ok_and(|old| old == stamp) {
+        return Ok(());
+    }
+    if files.iter().any(|file| file.exists()) {
+        eprintln!("redoxer: clearing old {name}");
+    }
+    for file in files.iter().copied().chain([stamp_file]) {
+        match fs::remove_file(file) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn bootloader(cookbook: &Path) -> anyhow::Result<PathBuf> {
     let bootloader_bin = redoxer_dir().join("bootloader.bin");
+    let stamp_file = redoxer_dir().join("bootloader.stamp");
+    let stamp = cookbook_stamp(cookbook, |name| name.starts_with("bootloader."))
+        .context("unable to read the cookbook's repository")?;
+    clear_stale("bootloader", &stamp_file, &stamp, &[&bootloader_bin])?;
     if !bootloader_bin.is_file() {
         eprintln!("redoxer: building bootloader");
 
@@ -167,11 +218,7 @@ fn bootloader() -> anyhow::Result<PathBuf> {
         fs::create_dir_all(&bootloader_dir)?;
 
         let mut config = redox_installer::Config::default();
-        config.files.push(redox_installer::FileConfig {
-            path: "/etc/pkg.d/50_redox".to_string(),
-            data: "https://static.redox-os.org/pkg".to_string(),
-            ..Default::default()
-        });
+        config.general.cookbook = Some(cookbook.display().to_string());
         config
             .packages
             .insert("bootloader".to_string(), Default::default());
@@ -186,6 +233,7 @@ fn bootloader() -> anyhow::Result<PathBuf> {
             }),
             &bootloader_bin,
         )?;
+        fs::write(&stamp_file, stamp)?;
     }
     Ok(bootloader_bin)
 }
@@ -194,7 +242,9 @@ fn bootloader() -> anyhow::Result<PathBuf> {
 fn base(
     bootloader_bin: &Path,
     name: &str,
+    mut config: redox_installer::Config,
     config_str: &str,
+    cookbook: &Path,
     fuse: bool,
 ) -> anyhow::Result<(PathBuf, bool)> {
     let ext = if fuse { "bin" } else { "tar" };
@@ -203,18 +253,14 @@ fn base(
     let base_tar = redoxer_dir().join(format!("{}.{}", name, "tar"));
     let base_toml = redoxer_dir().join(format!("{}.{}", name, "toml"));
 
-    let mut config: redox_installer::Config =
-        toml::from_str(config_str).context("Unable to parse install-config")?;
     let has_orbital = config.packages.contains_key("orbital");
 
-    if base_toml.is_file() && base_file.is_file() {
-        let r = fs::read_to_string(&base_toml).context("Unable to read base toml")?;
-        if r != config_str {
-            eprintln!("redoxer: clearing old {name}");
-            fs::remove_file(&base_toml).context("Unable to delete base toml")?;
-            fs::remove_file(&base_file).context("Unable to delete base bin/tar")?;
-        }
-    }
+    // The image depends on its configuration and on the packages it is
+    // built from, so either changing rebuilds it.
+    let stamp =
+        cookbook_stamp(cookbook, |_| true).context("unable to read the cookbook's repository")?;
+    let stamp = format!("{config_str}\n# {stamp}");
+    clear_stale(name, &base_toml, &stamp, &[&base_file])?;
     if !base_file.is_file() {
         eprintln!("redoxer: building {name}");
 
@@ -230,6 +276,7 @@ fn base(
         }
 
         config.general.live_disk = Some(qemu_use_live_disk());
+        config.general.cookbook = Some(cookbook.display().to_string());
 
         if fuse {
             run_install_mount(
@@ -270,7 +317,7 @@ fn base(
         if base_dir.is_dir() {
             fs::remove_dir_all(&base_dir)?;
         }
-        fs::write(base_toml, config_str)?;
+        fs::write(base_toml, stamp)?;
     }
     Ok((base_file, has_orbital))
 }
@@ -349,11 +396,21 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
         process::exit(1);
     }
 
-    let bootloader_bin = bootloader().context("unable to init bootloader")?;
+    let install_config: redox_installer::Config =
+        toml::from_str(&config.config_toml).context("Unable to parse install-config")?;
+    // The bootloader and the image come from the same cookbook: the install
+    // config's, or else REDOXER_COOKBOOK's.
+    let cookbook = match &install_config.general.cookbook {
+        Some(cookbook) => PathBuf::from(cookbook),
+        None => crate::cookbook_dir()?,
+    };
+    let bootloader_bin = bootloader(&cookbook).context("unable to init bootloader")?;
     let (base_file, gui) = base(
         &bootloader_bin,
         &config.config_name,
+        install_config,
         &config.config_toml,
+        &cookbook,
         fuse,
     )
     .context("unable to init base")?;
@@ -757,5 +814,47 @@ mod tests {
             RedoxerExecConfig::new(["--folder".into(), "src:/etc/./data".into()].into_iter())
                 .unwrap();
         assert_eq!(config.folders.get("etc/data"), Some(&"src".to_string()));
+    }
+
+    #[test]
+    fn stale_images_are_cleared_when_the_cookbook_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_cookbook = |name: &str| {
+            let cookbook = dir.path().join(name);
+            let repo = cookbook.join("repo").join(target());
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join("bootloader.pkgar"), name).unwrap();
+            fs::write(repo.join("kernel.pkgar"), name).unwrap();
+            cookbook
+        };
+        let first = make_cookbook("first");
+        let second = make_cookbook("second");
+        let image = dir.path().join("base.tar");
+        let stamp_file = dir.path().join("base.toml");
+
+        let stamp = cookbook_stamp(&first, |_| true).unwrap();
+        fs::write(&image, "image").unwrap();
+        fs::write(&stamp_file, &stamp).unwrap();
+        clear_stale("base", &stamp_file, &stamp, &[&image]).unwrap();
+        assert!(image.is_file(), "an unchanged cookbook keeps the image");
+
+        let other = cookbook_stamp(&second, |_| true).unwrap();
+        clear_stale("base", &stamp_file, &other, &[&image]).unwrap();
+        assert!(!image.exists() && !stamp_file.exists());
+
+        let kernel_only = |name: &str| name.starts_with("kernel.");
+        let before = cookbook_stamp(&first, |name| name.starts_with("bootloader.")).unwrap();
+        let kernel = cookbook_stamp(&first, kernel_only).unwrap();
+        fs::write(
+            first.join("repo").join(target()).join("kernel.pkgar"),
+            "rebuilt",
+        )
+        .unwrap();
+        assert_ne!(cookbook_stamp(&first, kernel_only).unwrap(), kernel);
+        assert_eq!(
+            cookbook_stamp(&first, |name| name.starts_with("bootloader.")).unwrap(),
+            before,
+            "the bootloader ignores other packages"
+        );
     }
 }
