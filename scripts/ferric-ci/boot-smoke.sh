@@ -133,10 +133,15 @@ tail_pid=$!
 status=""
 crash=""
 deadend=""
+collect_qemu_exit() {
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        return 1
+    fi
+    status=0
+    wait "$qemu_pid" || status=$?
+}
 for ((i = 0; i < timeout_secs; i++)); do
-    if ! kill -0 "$qemu_pid" 2>/dev/null; then
-        status=0
-        wait "$qemu_pid" || status=$?
+    if collect_qemu_exit; then
         break
     fi
     if grep -qaE "$crash_pattern" "$log"; then
@@ -157,14 +162,17 @@ for ((i = 0; i < timeout_secs; i++)); do
             fi
             sleep 0.1
         done
-        if [ -n "$marker" ]; then
-            continue
+        if [ -z "$marker" ]; then
+            deadend=1
+            break
         fi
-        deadend=1
-        break
     fi
     sleep 1
 done
+# QEMU may have exited during the final sleep, before the timeout elapsed.
+if [ -z "$status" ]; then
+    collect_qemu_exit || true
+fi
 # The same check after the loop covers a guest that exited before the watch saw it,
 # and only applies while no marker has been printed: a link failure after the smoke
 # test finished is not a reason to fail a boot that passed.
@@ -316,13 +324,19 @@ if ! grep -q '^FERRIC_TEST_\(PASS\|SKIP\)' <<< "$markers"; then
     echo "boot-smoke: FAIL, no test reported a result" >&2
     exit 1
 fi
+# A completed test script does not establish that the guest shut down cleanly.
+# In particular, never hide an accelerator failure or a hang after its marker.
+if [ "$status" = 124 ]; then
+    echo "boot-smoke: FAIL, timed out after ${timeout_secs}s" >&2
+    exit 1
+fi
+if [ "$status" != 0 ]; then
+    echo "boot-smoke: FAIL, QEMU exited with $status" >&2
+    exit 1
+fi
 if grep -q '^FERRIC_SMOKE_OK' <<< "$markers"; then
     echo "boot-smoke: PASS (cpu=$cpu, iommu=${BOOT_IOMMU:-none}, nic=${BOOT_NIC:-e1000}, qemu exit $status)"
     exit 0
 fi
-if [ "$status" = 124 ]; then
-    echo "boot-smoke: FAIL, timed out after ${timeout_secs}s without the marker" >&2
-else
-    echo "boot-smoke: FAIL, QEMU exited with $status without the marker" >&2
-fi
+echo "boot-smoke: FAIL, QEMU exited with $status without the marker" >&2
 exit 1

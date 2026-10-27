@@ -440,25 +440,37 @@ failed, ends the run with that console error and `boot-smoke: FAIL, the smoke
 shell could not start`. The linker line counts only for the shell: every program
 reports the same prefix, so a program the script starts that fails to link stays
 that program's test result instead of killing the guest. A boot that prints the
-marker first still passes, including one that prints it while the runner watches
-for the marker in the second after it saw such a line, so a link failure during
-shutdown does not fail a green run. `scripts/ferric-ci/test-boot-smoke.sh`
+marker first still passes if QEMU exits successfully, including one that prints
+it while the runner watches for the marker in the second after it saw such a
+line, so a link failure during
+shutdown does not fail a green run. A timeout or nonzero QEMU exit still fails,
+even after the marker: finishing the test script does not establish that the
+guest shut down cleanly. `scripts/ferric-ci/test-boot-smoke.sh`
 exercises these cases against a fake QEMU, without firmware or virtualization.
 This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
-labelled failure; the underlying `NotFound` during early boot is still open.
+labelled failure. The investigation in
+[#300](https://github.com/rexlunae/ferric-oxide/issues/300) connects a reproduced
+empty audio-scheme capture to a loader `ENOMEM`, and the original #222 `/tmp`
+failures to `mkdir` failing in the loader. Their underlying loader failure
+remains open.
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
-for the failing attempt's search or open (the path whose `access` or open failed and
-its errno, or the search paths a library is in none of), so the next
+for the failing attempt: the path, original errno and exact operation (`open`,
+`fstat`, or `mmap`, including the requested mapping length), or the search paths
+a library is in none of. Thus an `ENOMEM` while loading a library does not by
+itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
 or TLS failure cannot reuse an earlier search diagnostic. The host check
 `bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual object search,
-error, fatal-message formatter and errno modules. It checks candidate order,
+mapping ownership, error, fatal-message formatter and errno modules. It checks candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
-output, isolation from a later parse/TLS failure, and stable `dlerror` messages.
-Only platform access checks, errno storage and its message table use host
-adapters; this is not an end-to-end dynamic-link or guest-boot test.
+output, isolation from a later parse/TLS failure, stable `dlerror` messages,
+and descriptor cleanup after failed stat/map operations. File descriptors are
+owned immediately after open, including on error paths; a successful mapping
+retains its descriptor until after unmap. Platform I/O, file guards, errno storage
+and its message table use host adapters; this is not an end-to-end dynamic-link
+or guest-boot test.
 
 relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
 failure as `EAGAIN`. It logs the step that failed and the underlying errno at
@@ -502,8 +514,9 @@ audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
 QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a missing test result, a missing marker, a
-smoke shell that could not be linked (which must fail with that message rather
+failure, a crash after the marker, a nonzero QEMU exit or timeout after the
+marker, an exit during the final timeout poll, a missing test result, a missing
+marker, a smoke shell that could not be linked (which must fail with that message rather
 than a generic timeout), a link failure after the marker and a marker that
 arrives while the runner waits after that line (both of which must still pass), a
 program the script starts that fails to link (which must not fail the run), a

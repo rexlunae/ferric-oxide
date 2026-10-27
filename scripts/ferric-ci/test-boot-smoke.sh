@@ -29,6 +29,7 @@ fi
 # Stay alive for a moment like a guest that is still shutting down, so the
 # runner's watch loop reads the log instead of finding QEMU already gone.
 sleep "${FAKE_QEMU_SLEEP:-1.2}"
+exit "${FAKE_QEMU_STATUS:-0}"
 QEMU
 chmod +x "$work/bin/qemu-system-x86_64"
 export PATH="$work/bin:$PATH" OVMF_FIRMWARE="$work/firmware" BOOT_TIMEOUT=5
@@ -51,6 +52,12 @@ check() {
     echo "PASS: $name"
 }
 check pass 0 $'FERRIC_TEST_PASS xstate\r\nFERRIC_SMOKE_OK\r'
+FAKE_QEMU_STATUS=1 check qemu-error-after-marker 1 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'QEMU exited with 1'
+FAKE_QEMU_SLEEP=10 BOOT_TIMEOUT=1 check timeout-after-marker 1 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'timed out after 1s'
+FAKE_QEMU_SLEEP=0.5 BOOT_TIMEOUT=1 check exit-during-final-poll 0 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'qemu exit 0'
 check skip 0 $'FERRIC_TEST_SKIP xstate\nFERRIC_SMOKE_OK'
 check missing-result 1 'FERRIC_SMOKE_OK'
 check failure 1 $'FERRIC_TEST_FAIL xstate\nFERRIC_SMOKE_OK'
@@ -68,11 +75,12 @@ check smoke-shell-unlinked-bare-path 1 \
     'the smoke shell could not start'
 # The same message after the smoke test passed says nothing about the run.
 check link-failure-after-marker 0 \
-    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound'
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound' \
+    'qemu exit 0'
 # Nor does one that reaches the log while the runner is watching for the marker
 # after it saw the line: the guest printed the marker during that watch.
 check marker-during-wait 0 \
-    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' '' 1
+    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'qemu exit 0' 1
 # A program the smoke script starts can fail to link too; that is the script's
 # test result, and the run must not be killed for it.
 check child-link-failure 0 \
