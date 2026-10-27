@@ -178,6 +178,10 @@ crate::interrupt_stack!(pit_stack, |_stack| {
         *time::OFFSET.write(token.token()) += pit::RATE;
     }
 
+    // Ferric Oxide: the sched.tick tracepoint (`kernel.trace`): one record per
+    // periodic PIT interrupt, counting the ticks the tickless work must stop.
+    crate::trace::trace_event!(ferric_trace::kernel::SCHED_TICK);
+
     unsafe { eoi(0) };
 
     // Wake up other CPUs

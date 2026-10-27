@@ -52,18 +52,17 @@ use ferric_jbd2::{JournalRead, Recovery, RecoveryError, Superblock, SuperblockEr
 use thiserror::Error;
 
 use crate::device::{ReadAt, Window, WindowError, WriteAt};
-use crate::superblock::{self, INCOMPAT_RECOVER, SuperblockError as VolumeSuperblockError};
-use map::{BlockMap, CHECKSUM_AT, RO_COMPAT_METADATA_CSUM, Volume};
-
-/// Where the volume superblock keeps `s_feature_incompat`.
-const INCOMPAT_AT: usize = 0x60;
-/// Where the volume superblock keeps `s_feature_ro_compat`.
-const RO_COMPAT_AT: usize = 0x64;
+use crate::superblock::recovery::put_recover_flag;
+use crate::superblock::{self, SuperblockError as VolumeSuperblockError};
+use map::{BlockMap, Volume};
 
 /// Why the journal could not be replayed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum JournalError {
+    /// The recovery fields could not be decoded or encoded.
+    #[error("cannot encode or decode the superblock recovery fields")]
+    SuperblockEncoding(#[from] std::io::Error),
     /// The volume superblock was refused.
     #[error("bad superblock")]
     Superblock(#[from] VolumeSuperblockError),
@@ -346,7 +345,7 @@ pub fn replayed_blocks<R: ReadAt>(
             block
         }
     };
-    put_recover_flag(&mut block[within..within + superblock::SIZE], false);
+    put_recover_flag(&mut block[within..within + superblock::SIZE], false)?;
     blocks.insert(home, block);
     Ok(blocks)
 }
@@ -466,24 +465,10 @@ pub(crate) fn set_recover_flag<R: WriteAt>(
     recover: bool,
 ) -> Result<(), JournalError> {
     let mut sb = read_volume_superblock(window)?;
-    put_recover_flag(&mut sb, recover);
+    put_recover_flag(&mut sb, recover)?;
     window.write_all_at(&sb, superblock::OFFSET)?;
     window.flush()?;
     Ok(())
-}
-
-/// Sets or clears `INCOMPAT_RECOVER` in the volume superblock `sb`, in memory, and updates
-/// its checksum when the volume has `metadata_csum`.
-fn put_recover_flag(sb: &mut [u8], recover: bool) {
-    let mut incompat = map::le32(sb, INCOMPAT_AT) & !INCOMPAT_RECOVER;
-    if recover {
-        incompat |= INCOMPAT_RECOVER;
-    }
-    sb[INCOMPAT_AT..INCOMPAT_AT + 4].copy_from_slice(&incompat.to_le_bytes());
-    if map::le32(sb, RO_COMPAT_AT) & RO_COMPAT_METADATA_CSUM != 0 {
-        let crc = ferric_jbd2::crc32c(&[&sb[..CHECKSUM_AT]]);
-        sb[CHECKSUM_AT..CHECKSUM_AT + 4].copy_from_slice(&crc.to_le_bytes());
-    }
 }
 
 pub(crate) fn read_volume_superblock<R: ReadAt>(

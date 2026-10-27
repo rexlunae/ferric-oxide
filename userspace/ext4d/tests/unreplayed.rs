@@ -14,7 +14,7 @@ use ext4d::device::Window;
 use ext4d::fs::{Attributes, Fs, Kind, OpenMode};
 use ext4d::journal;
 
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 8] = [
     "journal-v3",
     "journal-v2",
     "journal-v2-64",
@@ -22,6 +22,7 @@ const NAMES: [&str; 7] = [
     "journal-4k",
     "journal-wrap",
     "journal-wrap-inode",
+    "journal-wrap-space",
 ];
 
 fn mount(image: Vec<u8>) -> Fs {
@@ -81,10 +82,38 @@ fn a_read_only_mount_serves_what_a_replay_leaves() {
         assert!(ours.needs_recovery(), "{name}");
         let mut theirs = mount(load(&format!("{name}.replayed.ext4.gz")));
         assert!(!theirs.needs_recovery(), "{name}");
+        assert_eq!(
+            ours.geometry(),
+            theirs.geometry(),
+            "{name}: recovered geometry"
+        );
         let (ours, theirs) = (tree(&mut ours), tree(&mut theirs));
         assert!(!theirs.is_empty(), "{name}");
         assert_eq!(ours, theirs, "{name}");
     }
+}
+
+#[test]
+fn wrapped_recovery_uses_journaled_free_space_and_keeps_the_device_dirty() {
+    let image = load("journal-wrap-space.ext4.gz");
+    let physical =
+        ext4d::superblock::Geometry::parse(image[1024..2048].try_into().unwrap()).unwrap();
+    let expected_image = load("journal-wrap-space.replayed.ext4.gz");
+    let expected =
+        ext4d::superblock::Geometry::parse(expected_image[1024..2048].try_into().unwrap()).unwrap();
+    assert_ne!(
+        physical.free_blocks, expected.free_blocks,
+        "fixture logs changed counts"
+    );
+    assert_ne!(
+        physical.free_inodes, expected.free_inodes,
+        "fixture logs an inode allocation"
+    );
+    let shared = common::SharedImage::new(image.clone());
+    let fs = Fs::new(Window::whole(shared.clone()).unwrap()).unwrap();
+    assert_eq!(fs.geometry(), expected);
+    assert!(fs.needs_recovery());
+    assert_eq!(shared.bytes(), image);
 }
 
 #[test]
@@ -120,6 +149,10 @@ fn ext4_view_alone_cannot_serve_these_volumes() {
                 let ext4 = result.expect("loads");
                 let modified = ext4.metadata("/hello.txt").expect("hello.txt").modified();
                 assert_eq!(modified.seconds(), 0x6955_B900, "{name}: stale");
+            }
+            "journal-wrap-space" => {
+                let ext4 = result.expect("loads");
+                assert!(ext4.metadata("/allocated.txt").is_err(), "stale file tree");
             }
             _ => assert!(result.is_err(), "{name}"),
         }

@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 use anyhow::{Result, bail};
-use pkg::Library;
+use fox_store::deps::{LocalRepository, PlanError, Request};
 use rand::{TryRngCore, rngs::OsRng};
 use redoxfs::{BLOCK_SIZE, Disk, DiskIo, FileSystem, unmount_path};
 use termion::input::TermRead;
@@ -13,13 +13,11 @@ use crate::config::package::PackageConfig;
 use crate::disk_wrapper::DiskWrapper;
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     env, fs,
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
-    rc::Rc,
     sync::mpsc::channel,
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -111,53 +109,77 @@ pub fn prompt_password(prompt: &str, confirm_prompt: &str) -> Result<Option<Stri
     bail!("passwords do not match, giving up");
 }
 
-fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> anyhow::Result<()> {
-    let target = &get_target();
+/// Why the configured packages could not be installed.
+#[derive(Debug, thiserror::Error)]
+pub enum PackageInstallError {
+    /// Packages are configured but no cookbook was given to take them from.
+    #[error("packages are configured, but there is no cookbook to install them from")]
+    NoRepository,
+    /// A configured package is not in the cookbook's repository.
+    #[error("package {name} is not in {}", repository.display())]
+    NotInRepository {
+        /// The package.
+        name: fox_core::PackageName,
+        /// The repository directory.
+        repository: PathBuf,
+    },
+    /// Dependencies of the configured packages are not in the repository.
+    #[error("missing dependencies: {}", missing_list(.0))]
+    MissingDependencies(Vec<fox_store::deps::MissingDependency>),
+}
 
-    let packages: Vec<&String> = config
+fn missing_list(missing: &[fox_store::deps::MissingDependency]) -> String {
+    missing
+        .iter()
+        .map(|entry| format!("{} (needed by {})", entry.dependency, entry.package))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Installs the configured packages and their dependencies from the
+/// cookbook's repository (`<cookbook>/repo/<target>/`) with fox's store, so
+/// the image's packages are recorded in fox's database (`var/lib/fox/`) as
+/// they are placed. The cookbook's signing key becomes a key the image
+/// trusts.
+fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> anyhow::Result<()> {
+    let names = config
         .packages
         .iter()
-        .filter_map(|(packagename, package)| match package {
-            PackageConfig::Build(rule) if rule == "ignore" => None,
-            _ => Some(packagename),
-        })
-        .collect();
-
-    let mut library = if let Some(cookbook) = cookbook {
-        let callback = pkg::callback::PlainCallback::new();
-        let repo = Path::new(cookbook).join("repo");
-        let pubkey = Path::new(cookbook).join("build");
-        Library::new_local(
-            repo,
-            pubkey,
-            dest.to_path_buf(),
-            target,
-            Rc::new(RefCell::new(callback)),
-        )
-    } else {
-        let callback = pkg::callback::IndicatifCallback::new();
-        Library::new_remote(
-            &vec!["https://static.redox-os.org/pkg"],
-            dest,
-            target,
-            Rc::new(RefCell::new(callback)),
-        )
-    }?;
-
-    let packages = pkg::PackageName::from_list(packages)?;
-    library.install(packages)?;
-    library.apply()?;
-
-    // Ferric Oxide: an image that ships fox (features.toml packages.manager)
-    // must trust the key that signed its packages, or fox cannot verify or
-    // adopt them on first boot.
-    if let Some(cookbook) = cookbook {
-        let fox = pkg::PackageName::new("fox")?;
-        if library.get_installed_packages()?.contains(&fox) {
-            install_fox_key(Path::new(cookbook), dest)?;
-        }
+        .filter(|(_, package)| !matches!(package, PackageConfig::Build(rule) if rule == "ignore"))
+        .map(|(name, _)| fox_core::PackageName::new(name.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.is_empty() {
+        return Ok(());
     }
+    let cookbook = Path::new(cookbook.ok_or(PackageInstallError::NoRepository)?);
 
+    let key = install_fox_key(cookbook, dest)?;
+    let mut keys = fox_core::TrustedKeys::new();
+    keys.insert(FOX_COOKBOOK_LABEL, key.key);
+    let repository = cookbook.join("repo").join(get_target());
+    let mut source = LocalRepository::new(&repository, keys);
+    let store = fox_store::Store::open(dest)?;
+    let requested = names.into_iter().map(Request::Name).collect();
+    let plan = match fox_store::deps::plan(&store, requested, &mut source) {
+        Err(PlanError::NotFound(name)) => {
+            return Err(PackageInstallError::NotInRepository { name, repository }.into());
+        }
+        plan => plan?,
+    };
+    if !plan.missing.is_empty() {
+        return Err(PackageInstallError::MissingDependencies(plan.missing).into());
+    }
+    // Without features.toml packages.signed_manifests, cookbook archives
+    // carry only the unsigned metadata file the cookbook wrote beside them.
+    let options = fox_store::InstallOptions {
+        force: false,
+        allow_unsigned_metadata: true,
+    };
+    for (archive, _) in &plan.install {
+        let manifest = archive.manifest();
+        println!("installing {} {}", manifest.name, manifest.version);
+    }
+    store.install_plan(&plan, options)?;
     Ok(())
 }
 
@@ -165,9 +187,13 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
 /// image root. fox trusts every key file in `etc/fox/keys/`, by file name.
 const FOX_COOKBOOK_KEY: &str = "etc/fox/keys/cookbook.toml";
 
+/// The label fox gives that key, from its file name.
+const FOX_COOKBOOK_LABEL: &str = "cookbook";
+
 /// Copies the public key the cookbook signs packages with
-/// (`build/id_ed25519.pub.toml`) into the image as a key fox trusts.
-fn install_fox_key(cookbook: &Path, dest: &Path) -> anyhow::Result<()> {
+/// (`build/id_ed25519.pub.toml`) into the image as a key fox trusts, and
+/// returns it.
+fn install_fox_key(cookbook: &Path, dest: &Path) -> anyhow::Result<fox_core::TrustedKey> {
     let key = cookbook.join("build/id_ed25519.pub.toml");
     let target = dest.join(FOX_COOKBOOK_KEY);
     if let Some(dir) = target.parent() {
@@ -175,7 +201,7 @@ fn install_fox_key(cookbook: &Path, dest: &Path) -> anyhow::Result<()> {
     }
     fs::copy(&key, &target)
         .with_context(|| format!("copying {} to {}", key.display(), target.display()))?;
-    Ok(())
+    Ok(fox_core::keys::load_key_file(&target)?)
 }
 
 /// Install configured files, packages and accounts, creating the output directory if needed.
@@ -1094,36 +1120,106 @@ pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A fresh directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
+    /// A cookbook checkout with a signing key and a repository holding
+    /// `app` (which needs `lib`) and `lib`.
+    fn cookbook() -> (tempfile::TempDir, fox_core::fixtures::FixtureKey) {
+        use fox_core::fixtures::{FixtureEntry, FixtureKey, build_package};
+        use fox_core::{Manifest, PackageName};
 
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = env::temp_dir().join(format!("installer-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
+        let cookbook = tempfile::tempdir().unwrap();
+        let build = cookbook.path().join("build");
+        fs::create_dir_all(&build).unwrap();
+        let key = FixtureKey::generate(&build, "id_ed25519").unwrap();
+        let repo = cookbook.path().join("repo").join(get_target());
+        fs::create_dir_all(&repo).unwrap();
+        let lib = Manifest::new(PackageName::new("lib").unwrap(), "1.0");
+        let lib_file = [FixtureEntry::file("usr/lib/liblib.so", b"lib", 0o644)];
+        build_package(&repo, &key, Some(&lib), &lib_file, false).unwrap();
+        let mut app = Manifest::new(PackageName::new("app").unwrap(), "2.0");
+        app.depends = vec![lib.name.clone()];
+        let app_file = [FixtureEntry::file("usr/bin/app", b"app", 0o755)];
+        build_package(&repo, &key, Some(&app), &app_file, false).unwrap();
+        (cookbook, key)
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+    fn config(packages: &[&str]) -> Config {
+        let mut config = Config::default();
+        for name in packages {
+            config
+                .packages
+                .insert((*name).to_string(), PackageConfig::default());
         }
+        config
     }
 
     #[test]
-    fn fox_key_comes_from_the_cookbook() {
-        let cookbook = TempDir::new("fox-cookbook");
-        let dest = TempDir::new("fox-dest");
-        fs::create_dir_all(cookbook.0.join("build")).unwrap();
-        fs::write(cookbook.0.join("build/id_ed25519.pub.toml"), "pkey = []\n").unwrap();
-        install_fox_key(&cookbook.0, &dest.0).unwrap();
-        let installed = fs::read_to_string(dest.0.join(FOX_COOKBOOK_KEY)).unwrap();
-        assert_eq!(installed, "pkey = []\n");
+    fn packages_and_dependencies_are_installed_with_fox() {
+        let (cookbook, key) = cookbook();
+        let dest = tempfile::tempdir().unwrap();
+        let cookbook_path = cookbook.path().to_str().unwrap();
+        install_packages(&config(&["app"]), dest.path(), Some(cookbook_path)).unwrap();
 
-        // Without a cookbook key there is nothing to trust: that is an error.
-        let empty = TempDir::new("fox-empty");
-        assert!(install_fox_key(&empty.0, &dest.0).is_err());
+        assert!(dest.path().join("usr/bin/app").is_file());
+        assert!(dest.path().join("usr/lib/liblib.so").is_file());
+        let installed = fs::read(dest.path().join(FOX_COOKBOOK_KEY)).unwrap();
+        assert_eq!(installed, fs::read(&key.public_path).unwrap());
+        let store = fox_store::Store::open(dest.path()).unwrap();
+        let names: Vec<_> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|package| (package.name.to_string(), package.signer_label))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("app".to_string(), FOX_COOKBOOK_LABEL.to_string()),
+                ("lib".to_string(), FOX_COOKBOOK_LABEL.to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn ignored_and_absent_packages() {
+        let (cookbook, _) = cookbook();
+        let dest = tempfile::tempdir().unwrap();
+        let cookbook_path = cookbook.path().to_str().unwrap();
+        let mut ignored = config(&[]);
+        ignored
+            .packages
+            .insert("app".into(), PackageConfig::Build("ignore".into()));
+        install_packages(&ignored, dest.path(), None).unwrap();
+        assert!(!dest.path().join("usr/bin/app").exists());
+
+        let error = install_packages(&config(&["app"]), dest.path(), None).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PackageInstallError::NoRepository)
+        ));
+        let error =
+            install_packages(&config(&["absent"]), dest.path(), Some(cookbook_path)).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PackageInstallError::NotInRepository { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_dependencies_fail_the_install() {
+        let (cookbook, _) = cookbook();
+        let repo = cookbook.path().join("repo").join(get_target());
+        fs::remove_file(repo.join("lib.pkgar")).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let error = install_packages(
+            &config(&["app"]),
+            dest.path(),
+            Some(cookbook.path().to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PackageInstallError::MissingDependencies(missing)) if missing.len() == 1
+        ));
+        assert!(!dest.path().join("usr/bin/app").exists());
     }
 }

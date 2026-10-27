@@ -984,7 +984,12 @@ it, without writing: `ext4d::journal::replayed_blocks` works out in memory
 every block the replay would write (each committed block, checked as the
 replay checks it, and the volume superblock with `needs_recovery` cleared),
 and every read, `ext4-view`'s and ext4d's own, sees those blocks in place of
-their home blocks. Even an empty journal needs the superblock overlay when
+their home blocks. Free-space and inode counts reported by `statvfs`
+come from this same overlaid superblock; the recovery diagnostic still
+reports the physical device's original flag, since a read-only mount does
+not replay onto disk. Recovery-flag edits and their checksum use a generated
+`simple_endian` superblock wire layout, checked against a known-good fixture.
+Even an empty journal needs the superblock overlay when
 `needs_recovery` is set; `tests/unreplayed.rs` checks this for 1 KiB and 4 KiB
 blocks and verifies that the underlying image stays unchanged. `ext4-view`
 then finds a clean volume and does not use its

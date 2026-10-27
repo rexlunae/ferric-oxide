@@ -64,9 +64,8 @@ pub enum Error {
     /// `UTIME_OMIT`, or a call without exactly two times.
     #[error("invalid time")]
     InvalidTime,
-    /// The path's inode could not be found for a change (`write`).
-    #[cfg(feature = "write")]
-    #[error("cannot find the inode to change")]
+    /// Recovered metadata could not be read, or a path's inode could not be found.
+    #[error("cannot read recovered metadata or find the inode")]
     Lookup(#[from] crate::lookup::LookupError),
     /// Changing the volume through its journal failed (`write`).
     #[cfg(feature = "write")]
@@ -91,7 +90,6 @@ impl Error {
             Self::NotOwner | Self::ChownRestricted => EPERM,
             Self::SymlinkMode => EOPNOTSUPP,
             Self::InvalidTime => EINVAL,
-            #[cfg(feature = "write")]
             Self::Lookup(err) => lookup_errno(err),
             #[cfg(feature = "write")]
             Self::Write(err) => write_errno(err),
@@ -99,7 +97,6 @@ impl Error {
     }
 }
 
-#[cfg(feature = "write")]
 fn lookup_errno(err: &crate::lookup::LookupError) -> i32 {
     use crate::lookup::LookupError;
     match err {

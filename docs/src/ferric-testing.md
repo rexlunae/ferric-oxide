@@ -426,11 +426,32 @@ exercises these cases against a fake QEMU, without firmware or virtualization.
 This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
 labelled failure; the underlying `NotFound` during early boot is still open.
+ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
+for the failing attempt's search or open (the path whose `access` or open failed and
+its errno, or the search paths a library is in none of), so the next
+occurrence names the file and error without `LD_DEBUG`. Context is carried
+by the typed load error, with its original errno, so a later malformed object
+or TLS failure cannot reuse an earlier search diagnostic. The host check
+`bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual object search,
+error, fatal-message formatter and errno modules. It checks candidate order,
+successful fallback, missing and inaccessible libraries reaching the fatal
+output, isolation from a later parse/TLS failure, and stable `dlerror` messages.
+Only platform access checks, errno storage and its message table use host
+adapters; this is not an end-to-end dynamic-link or guest-boot test.
+
+relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
+failure as `EAGAIN`. It logs the step that failed and the underlying errno at
+`warn` level, which relibc writes to stderr by default (`RELIBC_LOG_LEVEL`
+changes the level): the stack `mmap`, the guard `mprotect`, the TCB, or
+creating the thread itself. When creating the thread fails because the kernel
+cannot allocate a context's 64 KiB kernel stack, the kernel logs that with the
+number of free frames.
 
 When the marker does not arrive within the timeout, the script first samples
 every CPU's registers through the QEMU monitor (several times, with the
-frame-pointer chain of each CPU spinning in the kernel), then sends an NMI to
-CPU 0. The NMI handler prints its stack trace and then one line per context:
+frame-pointer chain of each CPU spinning in the kernel, or in user space for a
+CPU at CPL 3, as `user frame` lines), then sends an NMI to CPU 0. The NMI
+handler prints its stack trace and then one line per context:
 
 ```text
 NMI: 41 contexts
@@ -466,7 +487,11 @@ than a generic timeout), a link failure after the marker and a marker that
 arrives while the runner waits after that line (both of which must still pass), a
 program the script starts that fails to link (which must not fail the run), a
 timeout whose NMI context rows (and only those) must reach stderr, and that
-the runner adds both HDA controllers. Its fake QEMU stays alive for a
+the runner adds both HDA controllers. A Unix monitor socket fixture supplies
+CPL 3 registers and a user frame; it checks the emitted return address and
+that unaligned, out-of-range and halted-CPU frame pointers are not read.
+The probe consumes the monitor greeting before sending commands, keeping
+register and memory responses aligned with their requests. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
 reads the log instead of finding QEMU already gone. The host-tools workflow
 runs it before the Rust checks.
@@ -696,6 +721,15 @@ macFUSE.
 
 ## Focused regression checks
 
+### Scheduler baseline accounting
+
+The trace CLI's `counts::tests` includes a multi-CPU capture with unequal rates
+and a merged rate over the same interval. The ring-test recipe's host tests
+(`cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml`)
+exercise the same CQE validator used by the target workload, rejecting missing,
+duplicate, wrong-request, failed and short completions. The scheduler benchmark
+image/boot remains the check for measured wake latency and real completions.
+
 ### Portable executor core
 
 `cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
@@ -733,6 +767,14 @@ EOI without reading current-context state. Ordinary idle/running CPU decisions
 and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
+
+### Lazy file-mapping reply protocol
+
+The kernel helper suite includes `context/fmap_reply.rs` directly. It covers
+reply-before-park, park-before-reply, exactly-once consumption, stale/duplicate
+responses and failed-dispatch cleanup. Normal `fmap` still creates eager
+mappings, and no scheme responds to `RequestMmap`; this protocol coverage is
+not an end-to-end lazy-fault test. Run the helper host and Miri commands above.
 
 ## Documentation checks
 

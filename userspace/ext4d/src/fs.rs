@@ -465,19 +465,33 @@ impl Fs {
     /// [`Error::Device`] when the superblock cannot be read, [`Error::Superblock`] when it is
     /// not an ext4 one, and [`Error::Ext4`] when the reader refuses the volume (an
     /// incompatible feature, a bad checksum, a journal it cannot replay).
+    /// [`Error::Lookup`] reports a failure reading the recovered superblock.
     pub fn new<R: crate::device::ReadAt + 'static>(
         device: crate::device::Window<R>,
     ) -> Result<Self, Error> {
         let sb = read_superblock(&device)?;
         let block_size = Geometry::parse(&sb)?.block_size;
         let raw = Raw::new(Rc::new(RefCell::new(device)), block_size);
-        Self::load(&sb, Box::new(raw))
+        let visible_sb = if raw
+            .overlay
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+        {
+            raw.read(|window| Ok(crate::journal::read_volume_superblock(window)?))?
+        } else {
+            sb
+        };
+        Self::load(&visible_sb, superblock::needs_recovery(&sb), Box::new(raw))
     }
 
-    /// The volume whose superblock is `sb`, read through `device`.
-    fn load(sb: &[u8; superblock::SIZE], device: Box<dyn Device>) -> Result<Self, Error> {
+    /// Use the reader-visible superblock for geometry, and the physical device's
+    /// recovery flag for diagnostics: a read-only overlay does not clean the device.
+    fn load(
+        sb: &[u8; superblock::SIZE],
+        needs_recovery: bool,
+        device: Box<dyn Device>,
+    ) -> Result<Self, Error> {
         let geometry = Geometry::parse(sb)?;
-        let needs_recovery = superblock::needs_recovery(sb);
         let ext4 = Ext4::load(device.reader())?;
         Ok(Self {
             ext4,
@@ -510,7 +524,7 @@ impl Fs {
         let block_size = Geometry::parse(&sb)?.block_size;
         // A writable volume never needs recovery (check_writable), so its overlay is empty.
         let raw = Raw::new(Rc::clone(&device), block_size);
-        let mut fs = Self::load(&sb, Box::new(raw))?;
+        let mut fs = Self::load(&sb, superblock::needs_recovery(&sb), Box::new(raw))?;
         fs.writer = Some(Box::new(device));
         Ok(fs)
     }

@@ -5,7 +5,7 @@ fstools: $(FSTOOLS_TAG) $(FSTOOLS)
 GOING_TO_PODMAN_AGAIN?=0
 
 # These tools run inside Podman if it is used, or on the host if Podman is not used
-$(FSTOOLS): $(shell find tools/installer -type f -o -type d) Cargo.lock
+$(FSTOOLS): $(shell find tools/installer crates/fox-core crates/fox-store -type f -o -type d) Cargo.lock
 $(FSTOOLS): | prefix $(CONTAINER_TAG) $(FSTOOLS_TAG)
 ifeq ($(PODMAN_BUILD),1)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
