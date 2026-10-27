@@ -18,12 +18,15 @@ use crate::{
     start::Stack,
 };
 
-pub const PATH_SEP: char = ':';
+/// Separator between dynamic-loader library search directories.
+pub use object_search::PATH_SEP;
 
 mod access;
 pub mod debug;
 pub mod dso;
 pub mod linker;
+mod load_error;
+mod object_search;
 pub mod start;
 pub mod tcb;
 

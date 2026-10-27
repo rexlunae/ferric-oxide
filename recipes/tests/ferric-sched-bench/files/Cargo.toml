@@ -1,0 +1,16 @@
+[package]
+name = "ferric-sched-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Scheduler baseline workload helpers for the ferric-sched-bench image"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[[bin]]
+name = "ferric-sched-burn"
+path = "src/main.rs"
+
+[profile.release]
+debug = false

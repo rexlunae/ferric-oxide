@@ -1,33 +1,48 @@
 # Repository Structure
 
-The [Redox GitLab](https://gitlab.redox-os.org/) consists of a large number of **Projects**, you will find the projects organized as a very large, flat alphabetical list. This is not indicative of the role or importance of the various projects.
+Ferric Oxide is a monorepo: one repository holds the build system and the core
+operating system. Applications are still built from recipes that fetch their
+own source.
 
-## The Redox Project
+| Path | Contents |
+| --- | --- |
+| `crates/kernel/`, `crates/bootloader/`, `crates/relibc/` | The kernel, the UEFI bootloader and the C library, each with its own Cargo workspace |
+| `crates/` (others) | Shared libraries, `no_std` where possible: IOMMU, registered buffers, rings, tracing, page cache, LUKS, LVM, `fox` and more |
+| `userspace/base/` | Essential services and drivers (`init`, `pcid`, `netstack`, storage, network, USB, input, audio, graphics) |
+| `userspace/redoxfs/` | RedoxFS, the default file system, and its host tools |
+| `tools/` | Host tools: `cargo xtask` (`ferric-build`), `ferric-config`, the cookbook recipe engine, the installer, Redoxer, `fox`, `cargo fox`, `fox-registry` and `ferric-trace` |
+| `recipes/` | Package recipes, one directory per package; `recipes/wip/` holds unfinished ports |
+| `config/` | Image configurations: which packages and files go into each image |
+| `features.toml` | The catalog of build-time feature options |
+| `mk/`, `Makefile` | The Make layer that the recipe engine and image build still use |
+| `docs/` | This book |
+| `.github/` | CI workflows, issue and pull request templates |
 
-The `redox` project is actually just the root of the build system. It does not contain any of the code that the final Redox image will include. It includes the Makefiles, configuration files, package system and a few scripts to simplify setup and building. The `redox` project can be found at the [GitLab repository](https://gitlab.redox-os.org/redox-os/redox).
+[AGENTS.md](https://github.com/rexlunae/ferric-oxide/blob/main/AGENTS.md#repository-layout)
+has the authoritative layout, and [Architecture and Components](./ferric-architecture.md)
+explains how the pieces fit together.
 
-## Recipes
+## Separate workspaces
 
-The many **recipes** that are added into the Redox image are built from the corresponding software sources. The name of a Redox package almost always matches the name of its program or library, although this is not enforced.
+The host tools, kernel, bootloader, relibc and user space build for different
+targets with different profiles, so they keep separate Cargo workspaces and
+lockfiles. Code shared between them goes in `crates/` and is used by path.
+Don't merge the workspaces into one.
 
-The **recipe** contains the instructions to download and build a program, for its inclusion in the Redox image.
+## Origins
 
-## Cookbook
+The kernel, bootloader, relibc, base services, RedoxFS and this book were
+imported from Redox OS with their git history, and are now maintained here.
+Nothing is synced from Redox; a Redox change that is worth having is ported by
+hand in an ordinary pull request. Internal names such as the `redox` target
+triple, `relibc` and `RedoxFS` are kept because the Rust targets and existing
+tools depend on them.
 
-The `cookbook` system contains the infrastructure for building the Redox recipes, you can find its source code in the `src` folder and recipes under the `recipes` folder.
+## Recipes and their sources
 
-## Crates
-
-Some Redox projects are built as Rust crates, and included in Redox recipes using Cargo's dependency management system. Updates to a crate must be pushed to the crate repository in order for it to be included in your build.
-
-## Forks, Tarballs and Other Sources
-
-Some recipes obtain their source code from places other than Redox GitLab. The Cookbook system can pull in source from any Git repository URL. It can also obtain tarballs which is most used by C/C++ programs.
-
-In some cases, the Redox GitLab has a fork of another repository, in order to add Redox-specific patches. Where possible, we try to push these changes upstream, but there are some reasons why this might not be feasible.
-
-## Personal Forks
-
-When you are contributing to Redox, you are expected to make your changes in a personal fork of the relevant project, then create a Merge Request (PR) to have your changes pulled from your fork into the `master` or `main` branches. Note that your personal fork is required to have public visibility.
-
-In some rare situations, e.g. for experimental features or projects with licensing that is not compatible with Redox, a recipe may download sources located in a personal repository. Before using one of these recipes, please check with us on the [chat](./chat.md) to understand why the project is set up this way, and do not commit a Redox configuration file containing such a recipe without permission.
+A recipe (`recipes/<category>/<name>/recipe.toml`) says where a package's
+source comes from and how to build it. Core components point at paths in this
+repository. Many other recipes still fetch from Redox's GitLab, from other
+upstream projects' repositories, or as tarballs; moving those away from live
+Redox sources is in progress, as is distributing prebuilt packages through
+[`fox`](./ferric-packaging.md) instead of Redox's package server.

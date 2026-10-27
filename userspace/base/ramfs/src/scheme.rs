@@ -833,8 +833,7 @@ impl SchemeSync for Scheme<'_> {
 
         // TODO: validate ctx
 
-        file.uid = uid;
-        file.gid = gid;
+        file.set_owner(uid, gid);
 
         Ok(())
     }

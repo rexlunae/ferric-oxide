@@ -399,15 +399,14 @@ jobs:
             exit 1
           fi
 
-      # fox replaced pkg (config/ferric-smoke.toml): on first boot it adopted every
-      # package the installer put in the image, each with a signed manifest the
-      # cookbook packed into it (FERRIC_FOX_MANIFEST), and re-checked them all.
+      # fox replaced pkg (config/ferric-smoke.toml): the installer placed every
+      # package with fox's store, each with a signed manifest the cookbook packed
+      # into it (FERRIC_FOX_MANIFEST), and the boot script re-checked them all.
       - name: Check fox package management
         run: |
-          grep -aE "adopted ([0-9]+) of \1 packages" "$LOG"
           grep -aE "fox 0\.1\.0 \([0-9]+ files, signed by cookbook\)" "$LOG"
           if grep -aF "unsigned name" "$LOG"; then
-            echo "::error::packages were adopted without a signed manifest"
+            echo "::error::packages were installed without a signed manifest"
             exit 1
           fi
           grep -aF "FERRIC_TEST_PASS fox-verify" "$LOG"

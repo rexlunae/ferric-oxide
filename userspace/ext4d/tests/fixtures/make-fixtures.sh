@@ -18,6 +18,12 @@
 #   link               a symbolic link to hello.txt
 #   big.bin            200 KiB, byte i is (i * 7 + i / 4096) mod 251, over several blocks
 #   many/f000..f199    200 small files, so the directory is hashed (an htree)
+#
+# dir-64k.ext4.gz: 4 MiB, 64 KiB blocks, no journal, metadata_csum or dir_index, with
+# d/a ("linked from a whole 64 KiB block\n") and d/b, a second link to it whose entry is
+# alone in d's second block. That entry spans the whole block, a length of 65536 that
+# rec_len's 16 bits cannot hold: mke2fs stores it as 0xFFFF in the empty block debugfs's
+# expand_dir adds, and only the entry's inode, name and type are written over it here.
 set -eu
 out=${1:-$(dirname "$0")}
 work=$(mktemp -d)
@@ -58,6 +64,30 @@ for name in /dir/private.txt /dir/private-dir; do
     debugfs -w -R "set_inode_field $name gid 100" "$out/basic.ext4" >/dev/null 2>&1
 done
 
+root64=$work/root64
+mkdir -p "$root64/d"
+printf 'linked from a whole 64 KiB block\n' > "$root64/d/a"
+find "$root64" -exec touch -h -d '2026-01-01 00:00:00 UTC' {} +
+img=$work/dir-64k.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 65536 \
+    -O ^has_journal,^metadata_csum,^dir_index \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a30 -E root_owner=0:0 -d "$root64" "$img" 4M 2>/dev/null
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -R "expand_dir /d" "$img" >/dev/null 2>&1
+a=$(debugfs -R "stat /d/a" "$img" 2>/dev/null | sed -n 's/^Inode: *\([0-9]*\).*/\1/p')
+python3 - "$img" "$(debugfs -R "bmap /d 1" "$img" 2>/dev/null)" "$a" <<'EOPY'
+import struct, sys
+image, block, inode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+f = open(image, "r+b")
+f.seek(block * 65536)
+entry = f.read(8)
+assert entry == struct.pack("<IHBB", 0, 0xFFFF, 0, 0), entry
+f.seek(block * 65536)
+f.write(struct.pack("<IHBB", inode, 0xFFFF, 1, 1) + b"b")
+EOPY
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -R "sif /d/a links_count 2" "$img" >/dev/null 2>&1
+e2fsck -fn "$img" >/dev/null 2>&1
+gzip -9 -n -c "$img" > "$out/dir-64k.ext4.gz"
+
 # Journal replay (features.toml fs.ext4_journal_replay). Each NAME.ext4.gz is a volume that
 # needs recovery: debugfs's journal_write logs transactions into its journal without
 # writing them home, the state a crash leaves. NAME.replayed.ext4.gz is the same volume after
@@ -80,6 +110,13 @@ done
 #   journal-4k     ext4 with 4 KiB blocks (16 MiB, a 4 MiB journal), version 3 checksums
 #   journal-wrap   journal-v3 with its log moved to start three blocks before the end of
 #                  the journal, so it wraps round to the first log block
+#
+# journal-wrap-inode: ext4 defaults with a version 3 journal whose one committed
+# transaction logs hello.txt's inode table block with new times (atime 0x70000000, mtime
+# 0x70000001, ctime 0x70000002, over 0x6955B900 for all three in the inode table; the copy
+# is made by debugfs's set_inode_field, which also updates the inode checksum), its log moved to start two blocks before the journal's end
+# so that the commit block wraps round. ext4-view does not follow it, so a read-only mount
+# must read all of the inode's times one way.
 #
 # The jbd2 crate's tests use the journal inodes of journal-v3, journal-v2 and journal-ext3
 # (crates/jbd2/tests/fixtures/*.jbd2.gz, written here too when that directory is given as $2).
@@ -138,12 +175,13 @@ journal_image journal-v2-64 1024 2M "jo -c -v 2" -t ext4
 journal_image journal-ext3 1024 2M "jo" -t ext3
 journal_image journal-4k 4096 16M "jo -c -v 3" -t ext4 -J size=4
 
-# journal-wrap: move journal-v3's log so it starts three blocks before the journal's end.
-cp "$work/journal-v3.ext4" "$work/journal-wrap.ext4"
-debugfs -R "blocks <8>" "$work/journal-wrap.ext4" 2>/dev/null > "$work/journal-blocks"
-python3 - "$work/journal-wrap.ext4" "$work/journal-blocks" <<'EOPY'
+# wrap_log IMAGE BACK: move IMAGE's journal log so it starts BACK blocks before the
+# journal's end and wraps round to the first log block.
+wrap_log() {
+    debugfs -R "blocks <8>" "$1" 2>/dev/null > "$work/journal-blocks"
+    python3 - "$1" "$work/journal-blocks" "$2" <<'EOPY'
 import struct, sys
-image, blocks = sys.argv[1], sys.argv[2]
+image, blocks, back = sys.argv[1], sys.argv[2], int(sys.argv[3])
 bs = 1024
 phys = [int(b) for b in open(blocks).read().split()]
 f = open(image, "r+b")
@@ -168,7 +206,7 @@ while any(rd(first + used)):
 log = [rd(first + i) for i in range(used)]
 for i in range(used):
     wr(first + i, bytes(bs))
-new_start = maxlen - 3
+new_start = maxlen - back
 for i, block in enumerate(log):
     wr(first + (new_start - first + i) % (maxlen - first), block)
 sb[0x1C:0x20] = struct.pack(">I", new_start)
@@ -176,10 +214,47 @@ sb[0xFC:0x100] = bytes(4)
 sb[0xFC:0x100] = struct.pack(">I", crc32c(bytes(sb[:1024])))
 wr(0, sb)
 EOPY
+}
 
-for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-wrap; do
+# journal-wrap: journal-v3's log, starting three blocks before the journal's end.
+cp "$work/journal-v3.ext4" "$work/journal-wrap.ext4"
+wrap_log "$work/journal-wrap.ext4" 3
+
+img=$work/journal-wrap-inode.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a40 -E root_owner=0:0 -d "$jroot" "$img" 2M
+# mke2fs -d takes ctime (and atime) from the clock, so pin all three before and after.
+set_times() {
+    for field in "atime @$2" "mtime @$3" "ctime @$4" "atime_extra 0" "mtime_extra 0" \
+        "ctime_extra 0"; do
+        debugfs -w -R "set_inode_field /hello.txt $field" "$1" >/dev/null 2>&1
+    done
+}
+set_times "$img" 1767225600 1767225600 1767225600
+cp "$img" "$work/times.ext4"
+set_times "$work/times.ext4" 1879048192 1879048193 1879048194
+itable=$(debugfs -R "imap /hello.txt" "$img" 2>/dev/null | sed -n 's/.*located at block \([0-9]*\),.*/\1/p')
+dd if="$work/times.ext4" of="$work/itable" bs=1024 skip="$itable" count=1 2>/dev/null
+printf 'jo -c -v 3\njw -b %s %s\njc\n' "$itable" "$work/itable" > "$work/journal.cmd"
+E2FSPROGS_FAKE_TIME=1767225600 debugfs -w -f "$work/journal.cmd" "$img" >/dev/null 2>&1
+wrap_log "$img" 2
+
+for name in journal-v3 journal-v2 journal-v2-64 journal-ext3 journal-4k journal-wrap \
+    journal-wrap-inode; do
     replayed "$name"
 done
+
+# quota.ext4.gz: ext4 defaults with quota (user and group quota inodes, 3 and 4), 2 MiB,
+# 1 KiB blocks, with hello.txt. Giving hello.txt a new owner or group would move its usage
+# from one quota record to another.
+img=$work/quota.ext4
+E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 -O quota \
+    -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a50 -E root_owner=0:0 -d "$jroot" "$img" 2M
+# mke2fs -d leaves the quota files without the usage of what it copies in; e2fsck -fy
+# counts it (and exits 1, having changed the volume).
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fy "$img" >/dev/null || [ $? -eq 1 ]
+E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
+gzip -9 -n -c "$img" > "$out/quota.ext4.gz"
 
 if [ -n "${2:-}" ]; then
     for name in journal-v3 journal-v2 journal-ext3; do

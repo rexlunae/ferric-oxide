@@ -13,6 +13,7 @@
 #   BOOT_REBOOT=1 lets the guest reset and boot again (no -no-reboot), and does not
 #   treat a kernel panic as a failure: for the crash-dump image, whose first boot
 #   panics on purpose and resets (see image.yml's crash job, which checks the log).
+#   BOOT_SMP=N boots N vCPUs instead of the default 4 (the scheduler baseline runs 1).
 set -euo pipefail
 
 image="$1"
@@ -115,7 +116,7 @@ trap 'rm -f "$disk" "$monitor"' EXIT
 # ends the run at once instead of waiting for the timeout.
 : > "$log"
 qemu-system-x86_64 \
-    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp 4 -m 2048 \
+    "${accel[@]}" -cpu "$cpu" -machine "$machine" -smp "${BOOT_SMP:-4}" -m 2048 \
     -bios "$firmware" \
     "${iommu[@]}" \
     -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
@@ -183,10 +184,10 @@ if [ -z "$status" ]; then
     # addresses (and IF clear when it spins with interrupts off).
     echo "boot-smoke: CPU state at the timeout" >&2
     # Before anything disturbs the guest: every CPU's registers, sampled a few times, and for
-    # each CPU spinning in the kernel (CPL 0, not halted) its frame-pointer chain, read through
-    # the monitor. Only then an NMI, whose dump on the serial log gives the kernel image's
-    # KASLR slide (its RIP against the link address it prints), so the raw addresses can be
-    # named below.
+    # each CPU spinning (not halted, in the kernel or in user space) its frame-pointer chain,
+    # read through the monitor. Only then an NMI, whose dump on the serial log gives the
+    # kernel image's KASLR slide (its RIP against the link address it prints), so the raw
+    # addresses can be named below.
     probe_log="$(mktemp)"
     python3 - "$monitor" <<'PY' | tee "$probe_log" >&2 || true
 import re, socket, sys, time
@@ -194,8 +195,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.settimeout(2)
 
-def cmd(line):
-    s.sendall(line.encode() + b"\n")
+def receive():
     out = b""
     deadline = time.time() + 5
     while not out.endswith(b"(qemu) ") and time.time() < deadline:
@@ -208,7 +208,13 @@ def cmd(line):
         out += chunk
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace"))
 
-cmd("")
+def cmd(line):
+    s.sendall(line.encode() + b"\n")
+    return receive()
+
+# Consume the unsolicited greeting before sending a command; an extra blank
+# command would leave a second prompt and shift every response by one request.
+receive()
 def cpus(text):
     found = {}
     for block in re.split(r"(?m)^CPU#", text)[1:]:
@@ -225,19 +231,23 @@ for sample in range(5):
               f"rbp=0x{r.get('RBP', '0')} rfl={r.get('RFL', '?')} cpl={r.get('CPL', '?')} "
               f"hlt={r.get('HLT', '?')}")
     time.sleep(0.2)
+# A CPU spinning in user space (CPL 3) gets its user frame-pointer chain too: the NMI's
+# context list names the program running there, and the return addresses name the loop.
 for n, r in sorted(last.items()):
-    if r.get("CPL") != "0" or r.get("HLT") != "0":
+    if r.get("CPL") not in ("0", "3") or r.get("HLT") != "0":
         continue
+    user = r.get("CPL") == "3"
     cmd(f"cpu {n}")
     rbp = int(r.get("RBP", "0"), 16)
     for depth in range(24):
-        if rbp < 0xffff800000000000 or rbp % 8:
+        in_range = (0 < rbp < 0x0000800000000000) if user else rbp >= 0xffff800000000000
+        if not in_range or rbp % 8:
             break
         m = re.search(r":\s*0x([0-9a-f]+)\s+0x([0-9a-f]+)", cmd(f"x /2gx {rbp:#x}"))
         if not m:
             break
         rbp, ret = int(m.group(1), 16), int(m.group(2), 16)
-        print(f"boot-smoke-cpu: cpu {n} frame {depth} ret=0x{ret:x}")
+        print(f"boot-smoke-cpu: cpu {n} {'user ' if user else ''}frame {depth} ret=0x{ret:x}")
 cmd("cpu 0")
 cmd("nmi")
 time.sleep(3)
