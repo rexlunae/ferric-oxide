@@ -1062,9 +1062,13 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
             let file = fs::File::create(output)?;
             file.set_len(bytes)?;
         } else if fs::metadata(output)?.is_file() {
+            // An exact size is kept even when the file is larger; otherwise
+            // a larger file only leaves more room.
+            let exact = config.general.filesystem_size_exact.unwrap_or(false);
             let file = fs::OpenOptions::new().write(true).open(output)?;
-            if file.metadata()?.len() < bytes {
-                eprintln!("Growing {} to {} MB", output.display(), fs_size);
+            let len = file.metadata()?.len();
+            if len < bytes || (exact && len != bytes) {
+                eprintln!("Resizing {} to {} MB", output.display(), fs_size);
                 file.set_len(bytes)?;
             } else {
                 eprintln!("Overwriting {}", output.display());

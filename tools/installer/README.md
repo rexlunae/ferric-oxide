@@ -28,6 +28,24 @@ Unsuplied configuration will use the default. You can use the `general.prompt`
 setting to prompt when configuration is not set. Multiple configurations can
 be specified, they will be built in order.
 
+## Image size
+
+When the output is an image file, the installer sizes it before writing
+anything. It adds up what the configured packages and their dependencies take
+on RedoxFS (from the archives in `<cookbook>/repo/<target>/`), the
+configuration's own files, and headroom (a quarter more, plus 64 MiB and the
+partitions), and builds the image at `general.filesystem_size` or that size,
+whichever is larger. Packages a fox package set adds later (`--fox-packages`)
+are not counted; they use the headroom.
+
+`--size=<MiB>`, or `filesystem_size_exact = true` in the configuration, makes
+the size exact instead: the installer fails before writing if the contents do
+not fit, and resizes an existing image file to that size. A block-device output
+keeps its size and must hold what the image needs.
+`--filesystem-size --cookbook=<dir>` prints the size an image would be built at
+(and fails the same way); without `--cookbook` it prints the configured value.
+The [`image_size`](src/size.rs) function is the library entry point.
+
 ## Images without FUSE or root privileges
 
 `--no-mount` builds a staging tree and writes it through the Rust RedoxFS API.

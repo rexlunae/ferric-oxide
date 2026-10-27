@@ -8,7 +8,8 @@
 # The installer creates harddrive.img and redox-live.iso itself, at the
 # configuration's filesystem_size grown to fit the packages it installs.
 # FILESYSTEM_SIZE=<MiB> makes the size exact: the installer stops before
-# writing if the packages do not fit.
+# writing if the packages do not fit. filesystem.img is formatted before the
+# installer runs, so it asks the installer for the size (and that check) first.
 INSTALLER_SIZE_OPTS=$(if $(FILESYSTEM_SIZE),--size=$(FILESYSTEM_SIZE))
 FERRIC_FOX_LOCK=$(if $(FERRIC_FOX_PACKAGES),$(wildcard $(dir $(FERRIC_FOX_PACKAGES))fox.lock))
 
@@ -46,10 +47,7 @@ else
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	rm -rf $@  $@.partial $(MOUNT_DIR)
 	-$(FUMOUNT) /tmp/redox_installer || true
-	FILESYSTEM_SIZE=$(FILESYSTEM_SIZE) && \
-	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
-	FILESYSTEM_SIZE=$$($(INSTALLER) $(INSTALLER_OPTS) --filesystem-size -c $(FILESYSTEM_CONFIG)) || exit 1; \
-	fi && \
+	FILESYSTEM_SIZE=$$($(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) --filesystem-size -c $(FILESYSTEM_CONFIG)) && \
 	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
 	$(REDOXFS_MKFS) $(REDOXFS_MKFS_FLAGS) $@.partial
 	mkdir -p $(MOUNT_DIR)
