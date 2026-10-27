@@ -6,27 +6,36 @@
 # Usage: check-trace-overhead.sh --out LOG... --in LOG...
 #   --out  logs of boots of a kernel built without kernel.trace (state "out")
 #   --in   logs of boots of a kernel with kernel.trace (states "off", "pairoff" and "on")
+# Give as many --in logs as --out logs: the Nth of each is a pair, two boots
+# run back to back on the same runner (image.yml's trace-overhead job boots
+# the two images in turn).
 #
-# Each boot's fastest round of a workload and state is its result, and the
-# median of those over all given boots counts: boot-to-boot variation (kernel
-# image KASLR moves the code, the runner's neighbours come and go) is several
-# times the budget, and the median of many boots keeps one lucky or unlucky
-# boot from deciding. The budgets:
+# Each boot's fastest round of a workload and state is its result. Every
+# comparison is paired, and the median of the pairs' differences counts:
+#   "off" vs "out" pairs the two boots of a run, because the two kernels can
+#   only run in separate boots. A runner's load changes over the job (the
+#   neighbours on a nested-KVM host come and go), and two adjacent boots see
+#   about the same load, so each pair's difference cancels it where the
+#   difference of two medians over all boots does not.
+#   "on" vs "pairoff" pairs the two states of one boot, whose rounds alternate.
+# The median of the paired differences keeps one unlucky pair (a stall that
+# hit one boot of it) from deciding. The budgets:
 #   compiled in, all off ("off") at most OFF_BUDGET_PCT (default 1) percent
 #   slower than compiled out ("out"), on the "syscall" workload, a null system
 #   call;
 #   every compiled-in event on ("on") at most ON_BUDGET_PCT (default 5)
 #   percent slower than all off in the rounds paired with it ("pairoff"), on
 #   the "io" workload, requests to RedoxFS.
-# Every result is reported. "off" and "out" run on two kernels built
-# separately, so their comparison also measures where the linker put the hot
-# code, and which runner the job got. On the null system call that is small
-# and repeatable (+0.53% and +0.54% in two runs), and the tracepoints are the
-# largest share of the work, so a disabled tracepoint that costs anything
-# shows there first. On "io", which runs through far more kernel code, the
-# same comparison went from -4.25% to +1.12% between those two runs with no
-# tracepoint changed. It is reported, not judged, because judging it would
-# judge the layout. "on" and "pairoff" run on the same kernel.
+# Every result is reported, with each state's median over the boots for
+# reference. "off" and "out" run on two kernels built separately, so their
+# comparison also measures where the linker put the hot code. On the null
+# system call that is small and repeatable (+0.53% and +0.54% in two runs),
+# and the tracepoints are the largest share of the work, so a disabled
+# tracepoint that costs anything shows there first. On "io", which runs
+# through far more kernel code, the same comparison went from -4.25% to +1.12%
+# between those two runs with no tracepoint changed, and to -10.9% in a
+# third. It is reported, not judged, because judging it would judge the
+# layout.
 set -euo pipefail
 
 off_budget="${OFF_BUDGET_PCT:-1}"
@@ -52,14 +61,19 @@ if [ "${#out_logs[@]}" -eq 0 ] || [ "${#in_logs[@]}" -eq 0 ]; then
     echo "usage: check-trace-overhead.sh --out LOG... --in LOG..." >&2
     exit 2
 fi
+if [ "${#out_logs[@]}" -ne "${#in_logs[@]}" ]; then
+    echo "check-trace-overhead: ${#out_logs[@]} --out logs but ${#in_logs[@]} --in logs; the comparison pairs them" >&2
+    exit 2
+fi
+pairs="${#out_logs[@]}"
 
-# Sets `result` to the median over LOGS of each log's first min_ns for WORKLOAD
-# in STATE, and `missing` to the logs that have no such line. `result` is empty
-# when any log is missing one, so a workload is never judged on fewer boots
-# than the job ran. It runs in the current shell, not in a command
+# Sets `result` to each log's first min_ns for WORKLOAD in STATE, one per line
+# in LOGS order, and `missing` to the logs that have no such line. `result` is
+# empty when any log is missing one, so a workload is never judged on fewer
+# boots than the job ran. It runs in the current shell, not in a command
 # substitution, so a log without a match is reported instead of ending the
 # script under `set -e` and `pipefail`.
-best() {
+results() {
     local workload="$1" state="$2" log value values=()
     shift 2
     missing=()
@@ -75,17 +89,36 @@ best() {
     done
     result=""
     if [ "${#missing[@]}" -eq 0 ]; then
-        result="$(printf '%s\n' "${values[@]}" | sort -g | awk '{ v[NR] = $1 } END {
-            if (NR % 2) print v[(NR + 1) / 2]; else printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
-        }')"
+        result="$(printf '%s\n' "${values[@]}")"
     fi
 }
 
-# True when MEASURED is more than BUDGET percent above BASE. It compares the
-# unrounded values: the percentages printed in the summary are rounded to three
-# places, and an increase just over a budget must not pass once rounded.
+# The median of the numbers on standard input, one per line, printed with
+# FORMAT (default three decimal places).
+median() {
+    sort -g | awk -v fmt="${1:-%.3f}\n" '{ v[NR] = $1 } END {
+        if (NR % 2) printf fmt, v[(NR + 1) / 2]; else printf fmt, (v[NR / 2] + v[NR / 2 + 1]) / 2
+    }'
+}
+
+# Each pair's percent difference of the MEASURED list from the BASE list (one
+# value per line, in pair order), unrounded, one per line.
+paired_pct() {
+    paste -d ' ' <(printf '%s\n' "$1") <(printf '%s\n' "$2") \
+        | awk '{ printf "%.9f\n", ($1 / $2 - 1) * 100 }'
+}
+
+# True when the median paired difference PCT is more than BUDGET percent. It
+# compares the unrounded value: the percentages printed in the summary are
+# rounded to three places, and an increase just over a budget must not pass
+# once rounded.
 over_budget() {
-    awk -v m="$1" -v base="$2" -v b="$3" 'BEGIN { exit !(m > base * (1 + b / 100)) }'
+    awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
+}
+
+# The paired differences, rounded for the summary: "+0.123 -0.456 ...".
+listed() {
+    awk '{ printf "%s%+.2f", (NR > 1 ? " " : ""), $1 } END { print "" }' <<< "$1"
 }
 
 status=0
@@ -93,9 +126,9 @@ for workload in io syscall; do
     complete=1
     for state in out off pairoff on; do
         if [ "$state" = out ]; then
-            best "$workload" "$state" "${out_logs[@]}"
+            results "$workload" "$state" "${out_logs[@]}"
         else
-            best "$workload" "$state" "${in_logs[@]}"
+            results "$workload" "$state" "${in_logs[@]}"
         fi
         printf -v "$state" '%s' "$result"
         if [ "${#missing[@]}" -gt 0 ]; then
@@ -107,20 +140,20 @@ for workload in io syscall; do
         status=1
         continue
     fi
-    read -r off_pct on_pct < <(awk -v out="$out" -v off="$off" -v pairoff="$pairoff" -v on="$on" \
-        'BEGIN { printf "%.3f %.3f\n", (off / out - 1) * 100, (on / pairoff - 1) * 100 }')
-    summary="$workload (median of ${#out_logs[@]}+${#in_logs[@]} boots' fastest rounds): out ${out} ns, off ${off} ns (${off_pct}% vs out), pairoff ${pairoff} ns, on ${on} ns (${on_pct}% vs pairoff)"
+    off_pairs="$(paired_pct "$off" "$out")"
+    on_pairs="$(paired_pct "$on" "$pairoff")"
+    off_pct="$(median <<< "$off_pairs")"
+    on_pct="$(median <<< "$on_pairs")"
+    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs; each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs; each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
-    if [ "$workload" = syscall ] && over_budget "$off" "$out" "$off_budget"; then
-        echo "::error title=trace overhead::a system call with tracing compiled in but off is ${off_pct}% slower than compiled out (budget ${off_budget}%): $summary"
+    if [ "$workload" = syscall ] && over_budget "$(median %.9f <<< "$off_pairs")" "$off_budget"; then
+        echo "::error title=trace overhead::a system call with tracing compiled in but off is ${off_pct}% slower than compiled out, as the median of paired boots (budget ${off_budget}%): $summary"
         status=1
     fi
-    if [ "$workload" = io ]; then
-        if over_budget "$on" "$pairoff" "$on_budget"; then
-            echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
-            status=1
-        fi
+    if [ "$workload" = io ] && over_budget "$(median %.9f <<< "$on_pairs")" "$on_budget"; then
+        echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
+        status=1
     fi
 done
 # A full ring drops records, which is cheaper than writing them, so losses make "on" look

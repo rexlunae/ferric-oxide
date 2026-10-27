@@ -152,6 +152,42 @@ fn refuses_a_bad_tsc_frequency() {
     }
 }
 
+/// The sched-bench image passes `tsc-mhz`'s output straight to `counts --tsc-mhz`, so the
+/// printed value must be one that option accepts.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn measures_a_tsc_frequency_counts_accepts() {
+    let output = ferric_trace()
+        .args(["tsc-mhz", "--seconds", "0.05"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let mhz = String::from_utf8(output.stdout).expect("utf-8");
+    let mhz = mhz.trim_end();
+    assert!(mhz.parse::<f64>().expect("a number") >= 1.0, "{mhz}");
+    let dir = capture();
+    let counts = ferric_trace()
+        .arg("counts")
+        .arg(dir.path())
+        .arg(format!("--tsc-mhz={mhz}"))
+        .output()
+        .expect("runs");
+    assert!(counts.status.success(), "{counts:?}");
+}
+
+#[test]
+fn refuses_a_bad_measurement_window() {
+    for bad in ["-1", "NaN", "inf"] {
+        let output = ferric_trace()
+            .arg("tsc-mhz")
+            .arg(format!("--seconds={bad}"))
+            .output()
+            .expect("runs");
+        assert!(!output.status.success(), "{bad}");
+        assert!(output.stdout.is_empty(), "{bad}: wrote output");
+    }
+}
+
 #[test]
 fn captures_a_scheme_directory() {
     let scheme = tempfile::tempdir().expect("temp dir");

@@ -753,8 +753,9 @@ jobs:
       # Log downloads are not always readable, so every result and failure is an annotation.
       - name: Boot both images ten times
         env:
-          # A boot takes about 20 seconds. The check takes the median over boots, and the
-          # spread between boots (about 3% here) is larger than the 1% budget.
+          # A boot takes about 20 seconds. The spread between boots (3% to 20% on a loaded
+          # runner) is larger than the 1% budget, so the check pairs each run's two boots and
+          # takes the median of the pairs' differences.
           BENCH_BOOTS: "10"
         run: |
           for image in notrace trace; do
@@ -762,8 +763,13 @@ jobs:
           done
           failed=0
           for run in $(seq 1 "$BENCH_BOOTS"); do
-            for image in notrace trace; do
-              log="bench-$image-$run.log"
+            # The two boots of a run are a pair. Alternating which goes first keeps a
+            # steady drift in the runner's load from always landing on the same image.
+            if [ $((run % 2)) -eq 1 ]; then order="notrace trace"; else order="trace notrace"; fi
+            for image in $order; do
+              # Two-digit run numbers, so the two images' log globs list the pairs in the
+              # same order.
+              log="bench-$image-$(printf '%02d' "$run").log"
               status=0
               scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "$log" host > /dev/null || status=$?
               tr -d '\r' < "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$log.clean" || true
@@ -805,6 +811,7 @@ jobs:
 
       - name: Check the overhead budget
         run: |
+          # The Nth notrace and trace logs are the two boots of run N.
           scripts/ferric-ci/check-trace-overhead.sh --out bench-notrace-*.log --in bench-trace-*.log
 
       - uses: actions/upload-artifact@v4
