@@ -684,6 +684,40 @@ fn o_creat_needs_write_and_search_permission_on_the_directory() {
 }
 
 #[test]
+fn a_refused_o_trunc_open_leaves_the_file_whole() {
+    // A file its owner may write but not read: O_RDWR | O_TRUNC is refused for the read,
+    // and the truncation must not have happened first.
+    let (mut fs, shared) = mount_writable(load("alloc.ext4.gz"));
+    let id = fs.open_as(None, "/locked", CREATE, 0, 0).expect("created");
+    fs.write(id, 0, b"keep me\n").expect("written");
+    fs.set_owner(id, Some(1000), Some(100), 0, 0)
+        .expect("chowned");
+    fs.set_mode(id, 0o200, 0, 0).expect("chmodded");
+    let untouched = shared.bytes();
+    let mode = OpenMode {
+        truncate: true,
+        ..READ_WRITE
+    };
+    let err = fs
+        .open_as(None, "/locked", mode, 1000, 100)
+        .expect_err("not readable");
+    assert_eq!(err.errno(), 13, "{err:?}");
+    assert!(shared.bytes() == untouched);
+    assert_eq!(contents(&shared.bytes(), "/locked"), b"keep me\n");
+}
+
+#[test]
+fn geometry_follows_allocation() {
+    let (mut fs, shared) = mount_writable(load("alloc.ext4.gz"));
+    let id = fs.open_as(None, "/counted", CREATE, 0, 0).expect("created");
+    fs.write(id, 0, &[7; 3 * 1024]).expect("written");
+    let on_disk = free(&shared.bytes());
+    let geometry = fs.geometry();
+    assert_eq!(geometry.free_blocks, on_disk.blocks);
+    assert_eq!(geometry.free_inodes, on_disk.inodes);
+}
+
+#[test]
 fn o_trunc_empties_the_file_and_ftruncate_sets_its_size() {
     let (mut fs, shared) = mount_writable(load("alloc.ext4.gz"));
     let before = free(&shared.bytes());

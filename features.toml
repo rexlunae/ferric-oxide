@@ -1492,7 +1492,7 @@ make_append = { FERRIC_EXT4D_FEATURES = "journal-replay" }
 id = "fs.ext4_write"
 menu = "fs"
 type = "bool"
-title = "Write to ext4 through the journal (times, mode, owner, data, truncation and file creation, so far)"
+title = "Write to ext4 through the journal (times, mode, owner, data, allocation, truncation and file creation, so far)"
 default = false
 depends = "fs.ext4_journal_replay"
 rebuild = ["ext4d"]
@@ -1501,16 +1501,18 @@ Build ext4d with its journaled writer: each change to a volume is one JBD2
 transaction, logged with descriptor and commit blocks and their checksums,
 committed, then written home and the journal emptied (the checkpoint), so a
 crash at any point leaves the change made in full by a replay, or not at all.
-The changes so far rewrite one existing inode: its access and modification
-times (futimens), its permission bits (fchmod) or its owner and group (fchown),
-each with a new change time, following POSIX's owner, write-permission and
-restricted-chown rules, and finding the inode from the path itself; every other
-change still fails with EROFS. A new owner or group is refused on volumes with
-quota, and IDs above 65535 on volumes not made for Linux or Hurd. Files opened
-for writing are written in place, into the blocks they already have, as ext4's
-ordered mode does (the data first, then the new size and times in one
-transaction); a write that would need a new block, and opens that create or
-truncate, fail with EOPNOTSUPP until allocation is done. Volumes that need recovery are replayed first;
+The changes so far: an inode's access and modification times (futimens), its
+permission bits (fchmod) or its owner and group (fchown), each with a new change
+time, following POSIX's owner, write-permission and restricted-chown rules;
+file data, as ext4's ordered mode writes it (the data first, then the new size
+and times in one transaction), allocating blocks for writes past the end and
+into holes; truncation (ftruncate, O_TRUNC), which frees the blocks past the new
+end; and new regular files (O_CREAT, O_EXCL). Allocation updates the block and
+inode bitmaps, group descriptors and superblock counts in the same transaction.
+Every other change (removal, renames, directories, links, O_APPEND, growing an
+splitting a full extent leaf) fails with EROFS or EOPNOTSUPP. A new owner or
+group, and any allocation, is refused on volumes with quota, and IDs above 65535
+on volumes not made for Linux or Hurd. Volumes that need recovery are replayed first;
 volumes with a feature the writer does not know (mmp, meta_bg, readonly and
 others), or with no journal, are served read-only, and ext4d says why, as are
 volumes whose device cannot be opened for writing.

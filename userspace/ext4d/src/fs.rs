@@ -783,37 +783,38 @@ impl Fs {
             }
             Err(err) => return Err(err),
         };
-        if mode.truncate && !mode.stat && !created {
-            self.truncate_at_open(&path, &metadata, uid, gid)?;
-        }
-        // The metadata again, after a truncation.
-        let metadata = if mode.truncate && !created {
-            self.ext4.symlink_metadata(path.as_str())?
-        } else {
-            metadata
-        };
         if mode.directory && !metadata.is_dir() {
             return Err(Error::NotADirectory);
         }
         if mode.symlink && !metadata.is_symlink() {
             return Err(Error::NotASymlink);
         }
+        if !mode.stat && !metadata.is_symlink() && !created {
+            if mode.write {
+                if metadata.is_dir() {
+                    return Err(Error::IsADirectory);
+                }
+                require_access(&metadata, uid, gid, 0o2)?;
+            }
+            if !mode.write_only {
+                require_access(&metadata, uid, gid, 0o4)?;
+            }
+        }
+        // Truncate only once every other check has passed, so a refused open changes nothing.
+        let metadata = if mode.truncate && !mode.stat && !created {
+            self.truncate_at_open(&path, &metadata, uid, gid)?;
+            self.ext4.symlink_metadata(path.as_str())?
+        } else {
+            metadata
+        };
         let open = if mode.stat {
             Open::Metadata
         } else if metadata.is_symlink() {
             let target = self.ext4.read_link(path.as_str())?.as_ref().to_vec();
             Open::Symlink { target }
         } else {
-            if mode.write {
-                if metadata.is_dir() {
-                    return Err(Error::IsADirectory);
-                }
-                if !created {
-                    require_access(&metadata, uid, gid, 0o2)?;
-                }
-            }
-            if !mode.write_only && !created {
-                require_access(&metadata, uid, gid, 0o4)?;
+            if mode.write && metadata.is_dir() {
+                return Err(Error::IsADirectory);
             }
             if metadata.is_dir() {
                 Open::Directory { entries: None }
@@ -1350,6 +1351,13 @@ impl Fs {
     fn reload(&mut self) {
         match Ext4::load(self.device.reader()) {
             Ok(ext4) => {
+                // The free counts change with every allocation; fstatvfs reports them.
+                match read_geometry(&mut *self.device.reader()) {
+                    Ok(geometry) => self.geometry = geometry,
+                    Err(err) => {
+                        log::warn!("cannot read the superblock again after a change: {err}")
+                    }
+                }
                 for handle in self.handles.values_mut() {
                     if let Ok(metadata) = ext4.symlink_metadata(handle.path.as_str()) {
                         handle.metadata = metadata;
@@ -1462,6 +1470,28 @@ impl Fs {
 }
 
 /// The volume superblock's bytes.
+/// Why [`read_geometry`] failed.
+#[cfg(feature = "write")]
+#[derive(Debug, thiserror::Error)]
+enum GeometryReadError {
+    /// The superblock could not be read.
+    #[error("cannot read the superblock")]
+    Read(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// The bytes read are not an ext4 superblock.
+    #[error(transparent)]
+    Superblock(#[from] superblock::SuperblockError),
+}
+
+/// The volume's current geometry, from the superblock `reader` sees.
+#[cfg(feature = "write")]
+fn read_geometry(reader: &mut dyn Ext4Read) -> Result<Geometry, GeometryReadError> {
+    let mut sb = [0; superblock::SIZE];
+    reader
+        .read(superblock::OFFSET, &mut sb)
+        .map_err(GeometryReadError::Read)?;
+    Ok(Geometry::parse(&sb)?)
+}
+
 fn read_superblock<R: crate::device::ReadAt>(
     device: &crate::device::Window<R>,
 ) -> Result<[u8; superblock::SIZE], Error> {
