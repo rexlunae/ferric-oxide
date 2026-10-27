@@ -3703,7 +3703,12 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             core::hint::spin_loop();
         }
         let wait_cycles = waited.map_or(0, crate::tlb_stats::Stopwatch::elapsed);
-        crate::tlb_stats::flush_batch(affected_cpu_count, pages.len(), local, wait_cycles);
+        let local_flush = match (local, invalidation.is_all()) {
+            (false, _) => crate::tlb_stats::LocalFlush::None,
+            (true, false) => crate::tlb_stats::LocalFlush::Pages,
+            (true, true) => crate::tlb_stats::LocalFlush::Full,
+        };
+        crate::tlb_stats::flush_batch(affected_cpu_count, pages.len(), local_flush, wait_cycles);
 
         for entry in pages {
             match entry {

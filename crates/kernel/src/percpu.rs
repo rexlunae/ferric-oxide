@@ -204,6 +204,7 @@ pub fn invalidate_tlb_page(page: usize) {
     crate::memory::RmmA::invalidate(rmm::VirtualAddress::new(
         page.wrapping_mul(crate::memory::PAGE_SIZE),
     ));
+    crate::tlb_stats::tlb_count!(FlushPage);
 }
 
 impl PercpuBlock {
@@ -214,9 +215,12 @@ impl PercpuBlock {
             return;
         }
 
-        self.tlb_mailbox
-            .receive(invalidate_tlb_page, crate::memory::RmmA::invalidate_all);
-        crate::tlb_stats::shootdown_handled();
+        let full = Cell::new(false);
+        self.tlb_mailbox.receive(invalidate_tlb_page, || {
+            full.set(true);
+            crate::memory::RmmA::invalidate_all();
+        });
+        crate::tlb_stats::shootdown_handled(full.get());
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {
             addrsp.tlb_ack.fetch_add(1, Ordering::Release);
