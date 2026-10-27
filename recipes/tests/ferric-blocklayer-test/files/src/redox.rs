@@ -25,6 +25,12 @@ const KEPT: usize = 8192;
 const BLOCKD: &str = "/usr/bin/ferric-blockd";
 const KEY: &str = "/tmp/ferric-blocklayer-test.key";
 const WRONG_KEY: &str = "/tmp/ferric-blocklayer-test.wrong";
+/// ferric-unlock, which serves the recipe's /etc/ferric/crypttab at boot (fs.unlock_at_boot).
+const UNLOCK: &str = "/usr/bin/ferric-unlock";
+const EXT4D: &str = "/usr/bin/ext4d";
+/// The volumes that table names: LVM on LUKS, and ext4 on a plain volume.
+const BOOT_LOL: &str = "/scheme/ferric-boot-lol";
+const BOOT_EXT4: &str = "/scheme/ferric-boot-ext4";
 /// How long the daemon may take to serve.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -135,8 +141,7 @@ fn serve(scheme: &str, steps: &[String]) -> Result<Served, Failure> {
 
 /// Checks the volume's size and that its first `KEPT` bytes, and a run that crosses a
 /// 4096-byte boundary, hold the pattern for `seed`.
-fn check(served: &Served, size: u64, seed: u64) -> Result<(), Failure> {
-    let root = &served.root;
+fn check(root: &str, size: u64, seed: u64) -> Result<(), Failure> {
     let meta = io(format!("stat {root}"), fs::metadata(root))?;
     same(format!("{root}'s size"), meta.len(), size)?;
     let file = io(format!("open {root}"), File::open(root))?;
@@ -182,7 +187,7 @@ fn lvm_on_luks() -> Result<Served, Failure> {
             "lvm:inner",
         ]),
     )?;
-    check(&served, 64 * 1024, 6)?;
+    check(&served.root, 64 * 1024, 6)?;
     Ok(served)
 }
 
@@ -195,7 +200,7 @@ fn luks_on_lvm() -> Result<Served, Failure> {
             &format!("luks:{KEY}"),
         ]),
     )?;
-    check(&served, 128 * 1024, 5)?;
+    check(&served.root, 128 * 1024, 5)?;
     // The LV jumps from PE 6 to PE 9 at 64 KiB into the decrypted data.
     let file = io("open /scheme/ferric-blk-lul", File::open(&served.root))?;
     let mut run = vec![0; 8192];
@@ -219,8 +224,24 @@ fn luks1() -> Result<Served, Failure> {
             &format!("luks:{KEY}"),
         ]),
     )?;
-    check(&served, KEPT as u64, 3)?;
+    check(&served.root, KEPT as u64, 3)?;
     Ok(served)
+}
+
+/// The volumes ferric-unlock unlocked and mounted at boot, before this test started, must be
+/// served: LVM on LUKS from a key file, and with ext4d an ext4 volume through ferric-blockd.
+fn unlock_boot() -> Result<(), Failure> {
+    check(BOOT_LOL, 64 * 1024, 6)?;
+    if !Path::new(EXT4D).exists() {
+        println!("ferric-blocklayer-test: no {EXT4D} (fs.ext4 is off), so no file system to read");
+        return Ok(());
+    }
+    let hello = format!("{BOOT_EXT4}/hello.txt");
+    same(
+        format!("{hello} on the volume unlocked at boot"),
+        io(format!("read {hello}"), fs::read(&hello))?,
+        b"hello from ext4\n".to_vec(),
+    )
 }
 
 /// `result` must have failed with `errno`.
@@ -346,6 +367,11 @@ pub fn main() -> ExitCode {
         None => ok = false,
     }
     ok &= report("refuse", refuse()).is_some();
+    if Path::new(UNLOCK).exists() {
+        ok &= report("unlock-boot", unlock_boot()).is_some();
+    } else {
+        println!("FERRIC_TEST_SKIP blocklayer-unlock-boot: no {UNLOCK} (fs.unlock_at_boot is off)");
+    }
     drop(lol);
     for path in [
         "/tmp/ferric-blocklayer-lvm-on-luks.img",

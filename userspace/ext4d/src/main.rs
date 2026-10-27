@@ -8,7 +8,9 @@
 //! `DEVICE` is a disk, a partition or an image file. `--offset` and `--length` pick the
 //! volume's bytes out of it, for a partition on a whole disk. The volume appears at
 //! `/scheme/SCHEME` once it is mounted, and the daemon serves it in the foreground until
-//! the scheme is closed. Only Redox has schemes; elsewhere the program says so and exits.
+//! the scheme is closed. Started with `FERRIC_READY=stdout` (as `ferric-unlock` does), it
+//! writes `ready` to stdout once the scheme is registered (`ferric_ready`). Only Redox has
+//! schemes; elsewhere the program says so and exits.
 //!
 //! Built with `journal-replay` (features.toml `fs.ext4_journal_replay`), it first replays the
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
@@ -94,6 +96,8 @@ mod daemon {
         Mount(#[from] ext4d::Error),
         #[error("serving the scheme failed")]
         Serve(#[from] ServeError),
+        #[error("cannot tell the starter the volume is mounted")]
+        Notify(#[source] std::io::Error),
     }
 
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, DaemonError> {
@@ -219,6 +223,8 @@ mod daemon {
             "read-only"
         };
         let mount = Mount::new(fs, &args.scheme)?;
+        // Only now is the name ours; a starter waiting for it may rely on that.
+        ferric_ready::notify().map_err(DaemonError::Notify)?;
         eprintln!(
             "ext4d: {} mounted {mode} at /scheme/{}",
             args.device, args.scheme

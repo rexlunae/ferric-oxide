@@ -18,7 +18,15 @@ path = "src/lib.rs"
 name = "ferric-blockd"
 path = "src/main.rs"
 
+# Unlocks the volumes of /etc/ferric/crypttab at boot (features.toml fs.unlock_at_boot).
+[[bin]]
+name = "ferric-unlock"
+path = "src/unlock_main.rs"
+required-features = ["unlock"]
+
 [dependencies]
+# The readiness handshake with ferric-unlock, on both sides.
+ferric-ready = { path = "../../crates/ready" }
 ferric-blocklayer = { path = "../../crates/blocklayer", default-features = false, features = ["std"] }
 # Errno values and the Stat layout of the scheme ABI; usable on the host too.
 redox_syscall = { version = "0.9.5", features = ["std"] }
@@ -37,6 +45,9 @@ default = ["luks", "lvm"]
 luks = ["ferric-blocklayer/luks"]
 ## The LVM2 logical-volume layer (`lvm:NAME`), features.toml fs.lvm.
 lvm = ["ferric-blocklayer/lvm"]
+## The `ferric-unlock` boot step that reads /etc/ferric/crypttab, features.toml
+## fs.unlock_at_boot.
+unlock = []
 
 [profile.release]
 debug = false

@@ -413,7 +413,6 @@ thread identity and socket/request timing (`scheme.request`/`scheme.response`,
 `scheme.cqe_receive`). Historical measurements from before these accounting
 fixes need remeasurement before deriving per-request phase differences. The
 phase figures compare one boot; they are not a documented time source.
-
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
@@ -1297,7 +1296,8 @@ ext4d /scheme/root rootfs
   with `EROFS`. Reads stop at the end of the volume.
 - **Limits:** read-only; no keyslot management, tokens, detached headers or
   reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
-  started by hand, not by init, the installer or the bootloader.
+  started by hand or at boot by `ferric-unlock` (below), not by the installer
+  or the bootloader.
 
 The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
 as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
@@ -1306,6 +1306,55 @@ split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
 data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
 Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
 serves the same images through `ferric-blockd` on the target.
+
+### Unlocking at boot
+
+With `fs.unlock_at_boot` (File systems menu, default `false`, needs `fs.luks`
+or `fs.lvm`), the `ferric-blockd` package also holds `ferric-unlock` and the
+init unit `05_ferric-unlock.service`. Init runs it once, as a oneshot, after
+the base services (`00_*`) and before the network and console (`10_*` and up),
+so the volumes are served before the services that use them start; a service
+can also name the unit in `requires_weak`. It reads `/etc/ferric/crypttab`:
+
+```text
+# NAME   STEP...                                               [FILESYSTEM:SCHEME]
+home     dev:/scheme/disk.nvme/0p2 luks:/etc/keys/home lvm:home ext4:home-fs
+scratch  dev:/scheme/disk.nvme/0p3 luks:/etc/keys/scratch
+```
+
+Each line is a `ferric-blockd` command line (the scheme name, then the steps),
+with an optional last field `ext4:SCHEME` that has `ext4d` (`fs.ext4`) mount
+the volume at `/scheme/SCHEME`. `#` starts a comment, and every scheme name in
+the table must be unique. For each line in order, `ferric-unlock` refuses the
+line if `/scheme/NAME` is already served, starts `ferric-blockd`, and waits up
+to 60 seconds (LUKS key derivation is slow on purpose) for the daemon's
+readiness line (`crates/ready`, `ferric-ready`): started with
+`FERRIC_READY=stdout`, `ferric-blockd` and `ext4d` write `ready` to stdout once
+they have registered their scheme themselves, so another process's scheme of
+the same name is never taken for the volume. A daemon that exits, says
+anything else or misses the deadline has failed, and one still running is
+killed, so a volume cannot appear after its failure was logged. Then it does
+the same for the file system daemon. The daemons keep serving after it exits. A line that fails
+is logged with its whole error chain and does not stop the others; a table
+that does not parse starts nothing; with no table it does nothing. The table
+is Ferric Oxide's own format (`userspace/blockd/src/crypttab.rs`), shaped like
+a crypttab line.
+
+- **Passphrases** come from key files only (`luks:KEYFILE`); there is no prompt
+  on the console yet, and the key files must be readable at boot, so put them
+  on the root file system or an already-unlocked volume.
+- **RedoxFS** cannot be mounted this way: it opens its disk for writing, and
+  `ferric-blockd` serves volumes read-only. `redoxfs:SCHEME` is refused with
+  its own error.
+- **ext4 journals:** a volume that needs recovery is served from ext4-view's
+  in-memory view of the journal. With `fs.ext4_journal_replay`, `ext4d` tries
+  to replay it onto the disk instead, cannot open the read-only volume for
+  writing, and does not mount it.
+- **Root:** this unlocks volumes after the root file system is mounted; an
+  encrypted root (unlocked by the bootloader or initfs) is not covered.
+
+`ferric-blocklayer-test` installs a table with LVM on LUKS from a key file and
+an ext4 volume, and its `blocklayer-unlock-boot` step reads both back.
 
 ## Kernel-bypass network queues
 
