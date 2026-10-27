@@ -1,5 +1,6 @@
 #![feature(negative_impls)]
 
+mod event_read;
 mod task;
 
 use std::cell::{Cell, RefCell};
@@ -287,8 +288,18 @@ impl<Hw: Hardware> LocalExecutor<Hw> {
         let o = retval.borrow_mut().take().unwrap();
         o
     }
+    /// Wait for and dispatch an event, retrying interrupted queue reads.
+    ///
+    /// # Panics
+    /// Panics if the event queue returns an error other than an interruption.
     fn react(&self) {
-        let event = self.queue.next_event().expect("failed to get next event");
+        let event = match event_read::next_event(
+            || self.queue.next_event(),
+            |error| error.is_interrupt(),
+        ) {
+            Ok(event) => event,
+            Err(error) => panic!("failed to get next event: {error}"),
+        };
 
         if event.user_data != 0 {
             let Some((task, flags_ptr)) = self.external_event.borrow_mut().remove(&event.user_data)

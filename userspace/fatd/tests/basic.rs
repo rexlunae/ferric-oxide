@@ -5,16 +5,16 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use fatd::Error;
-use fatd::fs::{Fs, Kind, OpenMode, Volume, mount};
+use fatd::fs::{Format, Fs, Kind, OpenMode, Volume, mount};
 use ferric_blocklayer::{BlockDevice, Memory, Slice};
 use syscall::error::{EBADF, EISDIR, ENOENT, ENOTDIR, EROFS};
 
 type Image = Memory<Vec<u8>>;
 
-const IMAGES: [(&str, u8); 3] = [
-    ("fat12.img.gz", 12),
-    ("fat16.img.gz", 16),
-    ("fat32.img.gz", 32),
+const IMAGES: [(&str, Format); 3] = [
+    ("fat12.img.gz", Format::Fat12),
+    ("fat16.img.gz", Format::Fat16),
+    ("fat32.img.gz", Format::Fat32),
 ];
 
 /// 2026-01-01 12:34:56 UTC, when every fixture file was last written.
@@ -35,10 +35,10 @@ fn load(file: &str) -> Vec<u8> {
     bytes
 }
 
-fn volumes() -> impl Iterator<Item = (u8, Volume<Image>)> {
-    IMAGES.into_iter().map(|(file, bits)| {
+fn volumes() -> impl Iterator<Item = (Format, Volume<Image>)> {
+    IMAGES.into_iter().map(|(file, format)| {
         let volume = mount(Memory::new(load(file))).expect("a FAT volume");
-        (bits, volume)
+        (format, volume)
     })
 }
 
@@ -81,16 +81,16 @@ fn big() -> Vec<u8> {
 
 #[test]
 fn each_fat_type_is_recognized() {
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let fs = Fs::new(&volume);
-        assert_eq!(fs.fat_bits(), bits);
+        assert_eq!(fs.format(), format);
         assert_eq!(fs.label(), "FERRIC");
     }
 }
 
 #[test]
 fn the_root_lists_long_and_short_names() {
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let mut fs = Fs::new(&volume);
         assert_eq!(
             names(&mut fs, "/"),
@@ -104,7 +104,7 @@ fn the_root_lists_long_and_short_names() {
                 "many",
                 "Ünïcødé.txt",
             ],
-            "FAT{bits}"
+            "{format:?}"
         );
         assert!(names(&mut fs, "/empty").is_empty());
     }
@@ -112,7 +112,7 @@ fn the_root_lists_long_and_short_names() {
 
 #[test]
 fn files_read_back() {
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let mut fs = Fs::new(&volume);
         assert_eq!(read_all(&mut fs, "/hello.txt"), b"hello from FAT\n");
         assert_eq!(read_all(&mut fs, "/A Long File Name.txt"), b"long\n");
@@ -120,14 +120,14 @@ fn files_read_back() {
         assert_eq!(read_all(&mut fs, "/dir/nested.txt"), b"nested\n");
         let efi = read_all(&mut fs, "/EFI/BOOT/BOOTX64.EFI");
         assert_eq!((efi.len(), &efi[..2]), (512, &b"MZ"[..]));
-        assert_eq!(read_all(&mut fs, "/big.bin"), big(), "FAT{bits}");
+        assert_eq!(read_all(&mut fs, "/big.bin"), big(), "{format:?}");
     }
 }
 
 #[test]
 fn reads_at_offsets_follow_the_cluster_chain() {
     let want = big();
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let mut fs = Fs::new(&volume);
         let id = fs.open(None, "big.bin", OpenMode::read()).unwrap();
         // Backwards, across clusters, and past the end.
@@ -136,7 +136,7 @@ fn reads_at_offsets_follow_the_cluster_chain() {
             let n = fs.read(id, offset, &mut buf).unwrap();
             let start = offset as usize;
             let end = (start + 777).min(want.len());
-            assert_eq!(&buf[..n], &want[start..end], "FAT{bits} at {offset}");
+            assert_eq!(&buf[..n], &want[start..end], "{format:?} at {offset}");
         }
         assert_eq!(fs.read(id, 300_000, &mut [0; 8]).unwrap(), 0);
     }
@@ -204,16 +204,16 @@ fn relative_opens_and_dot_dot_resolve() {
 
 #[test]
 fn attributes_describe_files_and_directories() {
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let mut fs = Fs::new(&volume);
-        let cluster = if bits == 12 { 1024 } else { 512 };
+        let cluster = if format == Format::Fat12 { 1024 } else { 512 };
         let file = fs.open(None, "/big.bin", OpenMode::read()).unwrap();
         let a = fs.attributes(file).unwrap();
         assert_eq!(
             (a.kind, a.size, a.cluster_size),
             (Kind::File, 204_800, cluster)
         );
-        assert_eq!(a.modified, Some((STAMP, 0)), "FAT{bits}");
+        assert_eq!(a.modified, Some((STAMP, 0)), "{format:?}");
         let st = a.to_stat();
         assert_eq!((st.st_mode, st.st_uid, st.st_gid), (0o100_444, 0, 0));
         assert_eq!(st.st_mtime, STAMP as u64);
@@ -234,13 +234,13 @@ fn attributes_describe_files_and_directories() {
 
 #[test]
 fn geometry_counts_clusters() {
-    for (bits, volume) in volumes() {
+    for (format, volume) in volumes() {
         let fs = Fs::new(&volume);
         let g = fs.geometry().unwrap();
         let used = g.clusters - g.free_clusters;
         // big.bin alone takes 200 or 400 clusters; the rest take a few dozen more.
         let big = 204_800 / u64::from(g.cluster_size);
-        assert!(used > big && used < big + 300, "FAT{bits}: {g:?}");
+        assert!(used > big && used < big + 300, "{format:?}: {g:?}");
         assert_eq!(g.to_statvfs().f_bavail, g.free_clusters);
     }
 }

@@ -22,7 +22,7 @@ $(PREFIX)/sysroot: $(PREFIX)/ready
 # Track the complete installation inputs, including headers, Cargo/build config,
 # submodules and relibc's shared path dependencies. Directory mtimes also catch
 # removals. Keep generated outputs and Git internals outside the dependency set.
-RELIBC_SOURCE_INPUTS:=$(shell find crates/relibc crates/hwrand crates/procinfo crates/kernel/syscall \
+RELIBC_SOURCE_INPUTS:=$(shell find crates/relibc crates/abi crates/hwrand crates/procinfo crates/kernel/syscall \
 	\( -name .git -o -name target -o -path crates/relibc/build \
 	-o -path crates/relibc/sysroot -o -path crates/relibc/prefix \) -prune \
 	-o \( -type f -o -type d -o -type l \) -print)

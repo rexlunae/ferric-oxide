@@ -557,10 +557,36 @@ and pread of those files from them, copying from memory with no round trip to
 the file system once the pages are there. A miss becomes a fill request on the
 file system's queue, with readahead past it; a failed fill fails its readers
 with EIO and the next read tries again. RedoxFS caches the files its clients
-open read-only; writes still go to RedoxFS, which drops the pages they change.
-Mappings, cached writes and reclaim come later, so an object keeps every page
-read until the file system closes it. Off by default; without it the kernel
-has no such scheme and every read goes to the file system, as upstream."""
+open read-only; writes still go to RedoxFS, which drops the pages they change
+(kernel.page_cache_writeback caches them too). Mappings and reclaim come later,
+so an object keeps every page read until the file system closes it. Off by
+default; without it the kernel has no such scheme and every read goes to the
+file system, as upstream."""
+
+[[option]]
+id = "kernel.page_cache_writeback"
+menu = "kernel"
+type = "bool"
+title = "Shared page cache: cached writes with writeback"
+default = false
+depends = "kernel.page_cache"
+kernel_feature = "page_cache_writeback"
+rebuild = ["kernel"]
+help = """
+Let the page cache take writes too (Phase 2.6). A positioned write or pwrite
+inside a cached file's size is copied into its pages, which become dirty, and
+returns without a round trip to the file system; writes that extend the file,
+appends and O_SYNC descriptions still go to it. The file system writes dirty
+pages back: on fsync (which returns once they are on disk), before it reads or
+changes the file itself, when the file has been dirty for 5 seconds, and at
+once when the cache holds more than 32 MiB of dirty pages (at 64 MiB writes go
+to the file system, which slows writers down to the disk). A failed writeback
+keeps the pages dirty, and nothing drops a dirty page but a truncation.
+RedoxFS then caches every regular file it opens, not only read-only ones,
+except while the file is mapped. Dirty data not yet written back is lost if
+the system stops without unmounting, as with any write-back cache: use fsync.
+Off by default; without it RedoxFS's page cache serves reads only, as with
+kernel.page_cache alone."""
 
 [[option]]
 id = "drivers.rtl8125"
@@ -1398,9 +1424,12 @@ Add ext4d to the image: a daemon that serves an ext4 volume read-only as a
 scheme, the way RedoxFS serves its own. Run it as
 `ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME`, with a disk, a
 partition or an image file as DEVICE; the volume appears at /scheme/SCHEME.
-Every change (writing, creating, removing, renaming) fails with EROFS.
-Reading is done by the ext4-view crate, and handles extents, hashed
-directories, checksums and the journal. Source: userspace/ext4d."""
+Every change (writing, creating, removing, renaming) fails with EROFS,
+unless fs.ext4_write is on: it adds a journaled writer, which so far sets a
+file's times, mode and owner (futimens, fchmod, fchown) and writes into a
+file's existing blocks. Reading is done by the ext4-view crate, and handles
+extents, hashed directories, checksums and the journal; fstat's change time
+is read from the inode by ext4d. Source: userspace/ext4d."""
 
 [[option.effect]]
 when = "value"
@@ -1452,6 +1481,30 @@ source_packages = ["ferric-blockd"]
 make_append = { FERRIC_BLOCKD_FEATURES = "lvm" }
 
 [[option]]
+id = "fs.unlock_at_boot"
+menu = "fs"
+type = "bool"
+title = "Unlock LUKS and LVM volumes at boot (ferric-unlock)"
+default = false
+depends = "fs.luks || fs.lvm"
+rebuild = ["ferric-blockd"]
+help = """
+Add ferric-unlock to ferric-blockd's package, and the init unit
+05_ferric-unlock.service that runs it once at boot, before the services
+numbered 10 and up. It reads /etc/ferric/crypttab, one volume per line:
+`NAME STEP... [ext4:SCHEME]`, with the steps ferric-blockd takes (dev:,
+slice:, luks:KEYFILE, lvm:NAME). For each line it starts ferric-blockd to
+serve /scheme/NAME, waits for it, and with `ext4:SCHEME` has ext4d (fs.ext4)
+mount the volume at /scheme/SCHEME. LUKS passphrases come from key files; there
+is no prompt. RedoxFS cannot be mounted this way, because ferric-blockd serves
+volumes read-only. With no crypttab it does nothing. Source:
+userspace/blockd (crypttab.rs, unlock.rs)."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BLOCKD_FEATURES = "unlock" }
+
+[[option]]
 id = "fs.ext4_journal_replay"
 menu = "fs"
 type = "bool"
@@ -1471,9 +1524,8 @@ commits it ends the log at its transaction instead). The journal's location is
 checked against the volume and its metadata, and an interrupted replay can be
 run again.
 
-Off, ext4d never writes, and reads such a volume through ext4-view's view of
-the journal in memory, which refuses journals with escaped blocks and does
-not follow a log that wraps round. This is the first step towards writable
+Off, ext4d never writes: it reads such a volume as the replay would leave it,
+with the committed journal blocks laid over it in memory. This is the first step towards writable
 ext4. Source: crates/jbd2 and userspace/ext4d/src/journal."""
 
 [[option.effect]]
@@ -1484,7 +1536,7 @@ make_append = { FERRIC_EXT4D_FEATURES = "journal-replay" }
 id = "fs.ext4_write"
 menu = "fs"
 type = "bool"
-title = "Write to ext4 through the journal (first step)"
+title = "Write to ext4 through the journal (times, mode, owner and in-place data, so far)"
 default = false
 depends = "fs.ext4_journal_replay"
 rebuild = ["ext4d"]
@@ -1493,15 +1545,24 @@ Build ext4d with its journaled writer: each change to a volume is one JBD2
 transaction, logged with descriptor and commit blocks and their checksums,
 committed, then written home and the journal emptied (the checkpoint), so a
 crash at any point leaves the change made in full by a replay, or not at all.
-The only change so far sets an existing inode's access, modification and
-change times, and the scheme does not call it yet: volumes are still served
-read-only. Volumes that need recovery are replayed first, and volumes with a
-feature the writer does not know (mmp, meta_bg, readonly and others) are refused.
+The changes so far rewrite one existing inode: its access and modification
+times (futimens), its permission bits (fchmod) or its owner and group (fchown),
+each with a new change time, following POSIX's owner, write-permission and
+restricted-chown rules, and finding the inode from the path itself; every other
+change still fails with EROFS. A new owner or group is refused on volumes with
+quota, and IDs above 65535 on volumes not made for Linux or Hurd. Files opened
+for writing are written in place, into the blocks they already have, as ext4's
+ordered mode does (the data first, then the new size and times in one
+transaction); a write that would need a new block, and opens that create or
+truncate, fail with EOPNOTSUPP until allocation is done. Volumes that need recovery are replayed first;
+volumes with a feature the writer does not know (mmp, meta_bg, readonly and
+others), or with no journal, are served read-only, and ext4d says why, as are
+volumes whose device cannot be opened for writing.
 
 The writer is checked against e2fsprogs: e2fsck replays and checks what it
 leaves, including volumes crashed part-way through a change. Off, ext4d writes
 only to replay a journal. Source: crates/jbd2 (writer) and
-userspace/ext4d/src/write.rs."""
+userspace/ext4d/src/{write,lookup}.rs."""
 
 [[option.effect]]
 when = "value"
@@ -1522,11 +1583,36 @@ Long file names are listed, and names are looked up without regard to case
 and by their 8.3 short names too, as FAT specifies. FAT has no owners: every
 file is shown as root's and readable by everyone. Every change fails with
 EROFS, and the device is only ever opened for reading. Reading is done by the
-fatfs crate; exFAT is not supported yet. Source: userspace/fatd."""
+fatfs crate; for exFAT, turn on fs.exfat too. Source: userspace/fatd."""
 
 [[option.effect]]
 when = "value"
 source_packages = ["fatd"]
+
+[[option]]
+id = "fs.exfat"
+menu = "fs"
+type = "bool"
+title = "Read-only exFAT in fatd"
+default = false
+depends = "fs.fat"
+rebuild = ["fatd"]
+help = """
+Build fatd with its exFAT reader, so it also serves exFAT volumes (SD cards
+and USB sticks over 32 GiB), read-only, the same way: fatd tells the formats
+apart by the boot sector. The boot region's checksum, the up-case table's
+checksum and every directory entry set's checksum are checked; names are
+compared through the volume's up-case table; cluster chains are followed
+through the FAT, or not at all for files stored contiguously; and bytes past
+a file's valid data length read as zeros. Times keep exFAT's 10 ms and the
+time of day of the last access, converted to UTC by the zone offset it records.
+Every change fails with EROFS. Off, fatd refuses exFAT volumes with
+EOPNOTSUPP. The reader is written from Microsoft's published exFAT
+specification. Source: crates/exfat."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_FATD_FEATURES = "exfat" }
 
 
 # ---------------------------------------------------------------- packages

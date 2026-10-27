@@ -12,9 +12,7 @@
 
 mod common;
 
-use std::process::Command;
-
-use common::{Crashing, le32, load, reseal};
+use common::{Crashing, e2fsck, inode_at, le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Fs, OpenMode};
 use ext4d::journal::{self, JournalError, Outcome};
@@ -86,40 +84,6 @@ fn hello_contents(image: Vec<u8>) -> Vec<u8> {
 
 const NEW: ((i64, u32), (i64, u32)) = ((0x7000_0000, 123_456_789), (0x7000_0001, 5));
 
-/// Has `e2fsck` (named by `EXT4D_E2FSCK`) replay and then check `image`, and returns the
-/// volume it leaves. Without `EXT4D_E2FSCK` the image comes back as it is.
-fn e2fsck(name: &str, image: Vec<u8>) -> Vec<u8> {
-    let Some(e2fsck) = std::env::var_os("EXT4D_E2FSCK") else {
-        return image;
-    };
-    let path = std::env::temp_dir().join(format!("ext4d-write-{}-{name}.ext4", std::process::id()));
-    std::fs::write(&path, &image).expect("a temporary file");
-    // The first run replays a journal that needs it (exit status 0, or 1 when it says it
-    // changed the volume); the second must find nothing at all to fix.
-    let replay = Command::new(&e2fsck)
-        .args(["-f", "-y"])
-        .arg(&path)
-        .output()
-        .expect("e2fsck runs");
-    assert!(
-        matches!(replay.status.code(), Some(0 | 1)),
-        "{name}: e2fsck -fy: {replay:?}"
-    );
-    let check = Command::new(&e2fsck)
-        .args(["-f", "-n"])
-        .arg(&path)
-        .output()
-        .expect("e2fsck runs");
-    assert_eq!(
-        check.status.code(),
-        Some(0),
-        "{name}: e2fsck -fn: {check:?}"
-    );
-    let after = std::fs::read(&path).expect("the checked image");
-    std::fs::remove_file(&path).expect("removed");
-    after
-}
-
 /// The 1 KiB blocks of the two images that differ.
 fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {
     a.chunks(1024)
@@ -147,18 +111,6 @@ fn sets_an_inodes_times_through_the_journal() {
         let checked = e2fsck(name, after.clone());
         assert_eq!(times_of(checked, "hello.txt"), NEW, "{name}: after e2fsck");
     }
-}
-
-/// The byte offset of inode `number` in a volume whose inode is in group 0, from the
-/// superblock and the first group descriptor ("Finding an Inode" in "Ext4 Disk Layout").
-fn inode_at(image: &[u8], number: u32) -> usize {
-    let sb = &image[1024..2048];
-    let block_size = 1024usize << le32(sb, 0x18);
-    let first_data_block = le32(sb, 0x14) as usize;
-    let inode_size = usize::from(u16::from_le_bytes([sb[0x58], sb[0x59]]));
-    let descriptor = (first_data_block + 1) * block_size;
-    let table = le32(image, descriptor + 0x8) as usize;
-    table * block_size + (number as usize - 1) * inode_size
 }
 
 #[test]
@@ -287,6 +239,40 @@ fn a_crash_at_any_write_leaves_the_change_made_or_not() {
         result.expect("written after the replay");
         assert_eq!(times_of(again, "hello.txt"), NEW, "{writes_left}");
     }
+}
+
+/// On a volume whose journal holds a committed change that is not home yet, a read-only
+/// mount reads the change time as `ext4-view` reads the other times: with the journal's
+/// blocks in place of their home blocks, not from the device as it is.
+#[test]
+fn an_unreplayed_change_time_is_read_through_the_journal() {
+    let before = clean("journal-v3");
+    // After five writes the transaction is committed and the journal points at it, but the
+    // inode table block is not home yet.
+    let mut window = Window::whole(Crashing {
+        bytes: before.clone(),
+        writes_left: 5,
+    })
+    .expect("its length");
+    write::set_times(&mut window, HELLO, &TIMES).expect_err("the device stops");
+    let crashed = window.into_inner().bytes;
+    assert!(
+        journal::needs_replay(&Window::whole(crashed.clone()).expect("its length"))
+            .expect("readable")
+    );
+    // The device still holds the old inode.
+    let at = inode_at(&crashed, HELLO);
+    assert_eq!(crashed[at..at + 256], before[at..at + 256]);
+
+    let mut fs = Fs::new(Window::whole(crashed).expect("its length")).expect("an ext4 volume");
+    assert!(fs.needs_recovery());
+    let root = fs.root().expect("the root");
+    let hello = fs
+        .open_as(Some(root), "hello.txt", OpenMode::read(), 0, 0)
+        .expect("hello.txt");
+    let attributes = fs.attributes(hello).expect("open");
+    assert_eq!((attributes.accessed, attributes.modified), NEW);
+    assert_eq!(attributes.changed, (CHANGED.seconds, CHANGED.nanoseconds));
 }
 
 #[test]

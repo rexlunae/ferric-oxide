@@ -74,6 +74,12 @@ pub const S_ISVTX: mode_t = 0o1_000;
 
 pub const UTIME_NOW: c_long = (1 << 30) - 1;
 pub const UTIME_OMIT: c_long = (1 << 30) - 2;
+// Ferric Oxide: ferric_abi::time holds the one definition, which schemes such as ext4d use;
+// cbindgen needs the literals above for the C header, so the build checks they agree.
+const _: () = assert!(
+    UTIME_NOW as i64 == ferric_abi::time::UTIME_NOW
+        && UTIME_OMIT as i64 == ferric_abi::time::UTIME_OMIT
+);
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_stat.h.html>.
 #[repr(C)]

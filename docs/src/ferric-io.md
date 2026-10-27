@@ -413,7 +413,6 @@ thread identity and socket/request timing (`scheme.request`/`scheme.response`,
 `scheme.cqe_receive`). Historical measurements from before these accounting
 fixes need remeasurement before deriving per-request phase differences. The
 phase figures compare one boot; they are not a documented time source.
-
 ## Disk benchmark (ferric-iobench)
 
 Phase 2's exit benchmark measures the NVMe paths with fio-style jobs.
@@ -423,9 +422,13 @@ benchmark is its own MIT code, in two parts:
 
 - `crates/iobench` (`ferric-iobench`, `no_std`, host-tested) holds the logic.
   It parses fio's options (`--rw`, `--bs`, `--iodepth`, `--numjobs`,
-  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct=1`) and
-  refuses by name what the runner does not do: writes, engines other than
-  `psync`, and buffered I/O (`--direct=0`). Before a job runs, its block size
+  `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct`,
+  `--filename`, `--end_fsync`) and refuses by name what the runner does not
+  do: engines other than `psync`, and on the disk writes, `--end_fsync=1` and
+  buffered I/O (`--direct=0`). A job with `--filename` is a file job: it runs
+  on a file through the file system, buffered (`--direct=0`; Redox has no
+  `O_DIRECT`), may write, and with `--end_fsync=1` ends with one `fsync`
+  inside its timed part, as fio does. Before a disk job runs, its block size
   is checked against the partition's logical block size (`st_blksize`), since
   the disk scheme refuses reads that are not whole blocks. A job with fewer
   blocks than reads in flight is refused too: some threads would have nothing
@@ -435,9 +438,12 @@ benchmark is its own MIT code, in two parts:
   Linux.
 - `recipes/tests/ferric-iobench` is the on-target runner. It reads the
   largest partition of the NVMe disk scheme. Without arguments it runs three
-  jobs: `randread-4k-qd1` (latency), `randread-4k-qd32` (IOPS) and
-  `read-128k-qd1` (bandwidth). With arguments it runs the one job they
-  describe, for example `ferric-iobench --rw=randread --bs=4k --iodepth=8`.
+  disk jobs, `randread-4k-qd1` (latency), `randread-4k-qd32` (IOPS) and
+  `read-128k-qd1` (bandwidth), and two file jobs on `/tmp/ferric-iobench`,
+  `file-randwrite-4k-qd1` (4 MiB of 4 KiB random overwrites, then `fsync`) and
+  `file-write-128k-qd1` (32 MiB of 128 KiB sequential overwrites, then
+  `fsync`). With arguments it runs the one job they describe, for example
+  `ferric-iobench --rw=randread --bs=4k --iodepth=8`.
 
 When nvmed has per-CPU queue pairs, every round runs the job once with each
 queue policy: `MainQueue` (the one-queue path), `Adaptive` (the default) and
@@ -459,6 +465,24 @@ five CI boots, fails on `ab=fail`, and puts the numbers in a notice and in a
 table in the job summary. CI runs on emulated NVMe under KVM on shared
 runners, so its numbers are only good for the same-boot comparison, not as
 absolute figures.
+
+A file job fills its file before the first round, outside the timed part, so
+its writes overwrite data in place, and runs one untimed round through each
+path before the timed ones. Each round runs it once through each of two
+paths: `path=fs`, a descriptor opened `O_FSYNC`, which RedoxFS always serves
+itself, so every read and write is a request to RedoxFS as without the page
+cache; and `path=cache`, a plain descriptor, which the page cache serves where
+it can (reads with `kernel.page_cache`, writes too with
+`kernel.page_cache_writeback`). Every round ends with an `fsync`, so the next
+starts with no dirty pages. The A/B line compares `cache` against `fs` and is
+reported, not gated: with the cached writes off, a write job's two paths are
+the same path.
+
+```text
+FERRIC_BENCH iobench-file-randwrite-4k-qd1 path=fs rounds=3 ios=3072 iops=… mib_s=… lat_…_ns=…
+FERRIC_BENCH iobench-file-randwrite-4k-qd1 path=cache rounds=3 ios=3072 iops=… mib_s=… lat_…_ns=…
+FERRIC_BENCH iobench-file-randwrite-4k-qd1 ab_baseline_iops=… ab_candidate_iops=… ab_ratio=… ab_tolerance=… ab_rounds=3 ab=pass
+```
 
 ### Comparing with fio on Linux
 
@@ -772,18 +796,25 @@ table, `Fstat`, asynchronous chains and waits, closing a ring with a chain
 blocked, the refusals, back-pressure and a corrupt tail, and prints ring
 versus system call timings, by descriptor, by slot and on the worker.
 
-## Page cache (read path)
+## Page cache
+
+The fill queue's fixed 40-byte little-endian records use a native `Endianize`
+layout and its generated `simple_endian` wire type. Serialization and parsing
+use safe slice I/O without allocation or alignment requirements. Literal-byte
+regressions cover fills, releases, accesses and all writeback reasons (dirtied,
+urgent and run), retaining their existing encoding and reserved-field checks.
+
 
 With `kernel.page_cache = true` in `ferric.toml` (Kernel menu, off by
 default), the kernel has a `kernel.pcache` scheme that caches file contents in
 kernel memory and serves `read` and `pread` from it, without a round trip to
 the file system once the pages are there (roadmap Phase 2.6, design in
-`io/pagecache-design.md` in the project files). This step is the read path:
-RedoxFS serves the files its clients open read-only from it, and writes stay
-with RedoxFS, which drops the pages they change. Mappings, cached writes,
-writeback and reclaim are later steps, so an object keeps every page it was
-given until it closes. Without the option the kernel has no such scheme and
-every read goes to the file system, as upstream.
+`io/pagecache-design.md` in the project files). RedoxFS serves the files its
+clients open read-only from it, and writes stay with RedoxFS, which drops the
+pages they change; with `kernel.page_cache_writeback` too (below), writes go
+into the cache as well. Mappings and reclaim are later steps, so an object
+keeps every page it was given until it closes. Without the option the kernel
+has no such scheme and every read goes to the file system, as upstream.
 
 How a file system uses it:
 
@@ -875,8 +906,8 @@ holds the policies, host-tested:
 RedoxFS (`userspace/redoxfs/src/mount/redox/pcache.rs`) binds a queue when it
 mounts and the kernel has the scheme. Each regular file with a description
 opened `O_RDONLY` gets an object (the node ID is the object ID), and those
-descriptions are attached; writers, directories, `mmap` and `fstat` stay with
-RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
+descriptions are attached, except `O_FSYNC` ones; writers, directories, `mmap`
+and `fstat` stay with RedoxFS. Its pump thread forwards fill records to RedoxFS's own scheme (through a
 description it makes from the scheme socket, since RedoxFS runs in the null
 namespace once mounted and cannot open its own path) as a
 call, so the main loop answers them in order with the writes it serves,
@@ -895,6 +926,20 @@ again. A private mapping never changes RedoxFS's buffer (the kernel copies a
 page on its first store), so RedoxFS no longer writes it back, nor ranges
 nothing maps any more, whose retained buffers can be older than later writes.
 
+After the last attached description closes, RedoxFS flushes dirty pages and
+keeps clean objects for reuse by later opens. The idle cache keeps at most
+64 files and 256 MiB by logical file size, evicting the least recently closed
+files first. Reopening compares the node's size, modification time and change
+time with their values at close; a different stamp discards the old object.
+Failed attachments leave reusable objects in the idle budget. A failed
+last-close flush discards the object, and removing a file's last link, by
+unlink or rename replacement, discards an idle object immediately or prevents
+an open one from entering the idle cache when its last description closes.
+The rename transaction reports the replaced node only when its last link
+disappears (`Transaction::rename_node_replaced`), so surviving hard links
+keep their objects. Successful fills overwrite their complete buffer,
+including zeroing any tail past EOF; later fills reuse the allocation.
+
 The host-tools workflow runs its tests, Clippy and Rustdoc with and without
 `alloc`. `ferric-pcache-test` runs in the smoke image, which CI builds with
 the option on: it serves a small file system scheme of its own and checks a
@@ -911,11 +956,141 @@ file out of the cache exactly while it lasts, even after its descriptor closes
 or beside a read-only mapping, and a private one changes neither the file nor
 its caching (the
 access time shows whether a read was served from the cache: RedoxFS moves it
-when it reads a file, the cache does not), and benchmarks warm 4 KiB
+when it reads a file, the cache does not). It also closes the last description
+and reopens the file, requiring a retained-page hit rather than another fill,
+and benchmarks warm 4 KiB
 `pread`s and 1 MiB sequential reads of one file through a read-only
-description (cached) against a read-write one (served by RedoxFS, as with the
+description (cached) against an `O_FSYNC` one (served by RedoxFS, as with the
 option off) in the same boot, with the paired A/B rule of
 `ferric_blkqueue::ab`; it fails if the cache is slower.
+
+### Cached writes and writeback
+
+With `kernel.page_cache_writeback = true` as well (Kernel menu, off by
+default; it needs `kernel.page_cache`), a `write` or `pwrite` inside the file
+goes into the cache: the kernel copies the bytes into new frames, swaps them
+into the object's index (pages are copy-on-write, never changed in place
+under a reader), and returns, with no round trip to the file system. The pages
+are *dirty* until the file system writes them back. Without the option the
+kernel refuses every writeback request with `EOPNOTSUPP`, RedoxFS attaches
+only read-only descriptions, and the cache behaves as above.
+
+The kernel serves a write from the cache only when all of these hold, and
+otherwise sends it to the file system as before: the description is attached
+for writing, the write is positioned (not `O_APPEND`), the description is not
+`O_FSYNC`, the write lies inside the file's current size and spans at most
+1024 pages, the file system is not holding the object's writes, and the queue
+has fewer than twice its dirty limit dirty. The edges of a write that covers
+only part of a page need the page's old bytes: the kernel fills those pages
+first, as a read would, then merges them under the object's lock. A write that
+grows the file always goes to the file system, which owns the size.
+
+Writeback is pulled by the file system, so the kernel never waits on it:
+
+1. `SetWriteback` on the queue turns cached writes on and sets the dirty limit
+   in pages. `AttachAccess` attaches a description for reading, writing or
+   both (`Attach` stays read-only).
+2. When an object gets its first dirty page, the kernel puts a `Writeback`
+   record on the queue. When the queue goes past its dirty limit, it puts an
+   *urgent* one, once, until the count is back under half the limit. When a
+   sequential writer (each write starting where the last ended) has dirtied
+   256 whole pages (1 MiB, `abi::STREAM_RUN_PAGES`) that no writeback has
+   taken, and no run of the object is in flight, it puts a *run* record
+   naming them, once, until the file system next takes dirty pages of the
+   object. The record's reason (`WritebackReason`) is in its last word.
+3. `TakeDirty { from }` on an object marks the next run of dirty pages at or
+   after page `from` (up to 1024 pages, and as many as the payload holds) as
+   under writeback, copies them into the payload, and returns the run's first
+   page and length (`abi::encode_taken`), or nothing when no page is dirty
+   there. One run per object is in flight at a time (`EBUSY` otherwise). A
+   writer may dirty a page again while its run is in flight; the new bytes
+   are in a new frame, so the run's copy is unaffected.
+4. The file system writes the run to the file and answers `WrittenBack` with
+   the run and an errno (0 for success). Pages written and not dirtied again
+   become clean; failed pages become dirty again, so the data is not lost. The
+   answer returns how many dirty pages the object has left.
+5. `HoldWrites` on an object makes cached writes fall back to the file system
+   until it is released. The file system holds and writes back before it
+   changes a file itself, so its own writes, truncations and mappings never
+   race the cache.
+
+A truncation drops the dirty pages past the new end; a page under writeback
+that it cuts is dropped when its writeback completes, and readers and writers
+wait for it meanwhile. Reclaim (`PageIndex::evict`, and so `Clock`) takes only
+clean pages that are in the file: a dirty page or one under writeback is never
+evicted. When an object or its queue closes with dirty pages still in it, the
+kernel drops them and logs a warning: the file system writes back before it
+closes an object.
+
+`ferric_pcache::writeback` holds the file system's side, host-tested:
+`DirtyObjects` keeps the dirty objects and since when (the earliest dirtying
+since they were last clean) and says which are due, oldest first, and `flush`
+writes one object back, run by run in page order from page 0, each run
+starting where the last one ended, so a writer dirtying pages behind the pass
+does not keep it going; a run that fails is answered as failed and the pass
+goes on, and the failures are counted. `flush_run` writes the next dirty run at or after the
+record's starting page. `client` has the calls and
+`spawn_flush_timer`, a thread that wakes the file system once a second while
+some object is dirty.
+
+A page-cache sequential-write run notification is a starting hint, rather than
+an exact range restriction. If fsync or another pass cleaned its pages while
+the record waited in the pump, `flush_run` may take the next dirty run at or
+after that start, including newer pages beyond the recorded range. It still
+performs only one take, bounded to 1024 pages, and concurrent rewrites remain
+dirty. The host writeback regression covers this delayed-record ordering.
+
+Before arming the age timer for a writeback record, RedoxFS queries the object's
+current dirty-page count (`Request::DirtyPages`, verb 13, no payload). A record
+can wait in the pump until after fsync has cleaned the object; a zero count
+then removes it from the dirty set and leaves the timer disarmed if nothing
+else is dirty. The main loop serializes this check with its flush completions.
+A write after a zero answer posts another first-dirty record; a write before
+the answer is included in the count. Query errors retain the timer for retry.
+The kernel reads the count under only the object lock, without nesting a queue
+lock or altering the ordering used by writers and writeback.
+
+RedoxFS attaches every regular-file description except `O_FSYNC` ones, as
+opened (read-only, write-only or read-write), and writes back an object:
+
+- on `fsync`, before it serves a read itself, and at the last close of the
+  file, before the clean object enters the bounded idle cache described above;
+- before it serves a write, an `ftruncate` or an `mmap` itself, after holding
+  the object's writes; the hold lasts while the file has any mapping, since
+  RedoxFS's mapped buffers are written back without a write call (a shared
+  writable mapping closes the object altogether, as on the read path, so
+  descriptions opened after it goes are cached again);
+- when the object has been dirty for 5 s (`DEFAULT_AGE_MS`), checked by its
+  timer once a second;
+- every dirty object at once on an urgent record (the default limit is 8192
+  pages, 32 MiB, per mount), and every one at unmount;
+- one run at once on a run record. The writer keeps filling the cache while
+  RedoxFS writes the run, and the kernel posts the next record once it has
+  dirtied another run, so a large sequential write is mostly on disk by the
+  time `fsync` comes, instead of all of it being written then. Random writes
+  never form a run, so they still coalesce in the cache until the age or
+  `fsync`.
+
+It writes a run through its usual write path, clipped at the file's size, so
+the run is stored (compressed or encrypted where the file system is) as any
+write is. Cached writes
+are durable only after `fsync` or writeback, as on other systems with a page
+cache: a crash loses up to the writeback age of them. A file's modification
+time moves when its writes are written back, not when they are made.
+
+`ferric-pcache-test` checks the cached writes in the smoke image, which has the
+option on: data written through a plain description is seen at once by a
+cached reader and by one RedoxFS serves (which writes the dirty pages back
+first), and survives `fsync`, close and reopen; a write left dirty at the last
+close reaches the file; a write nobody syncs is written back on its own within
+the age; and a mapping made over dirty pages sees them, writes are not cached
+while a shared writable mapping lasts, and a description opened once it goes
+is cached again. The
+modification time shows whether a write was cached (`cached=yes`), since a
+cached write does not move it until it is written back. The steps that need
+RedoxFS to serve a description open it `O_FSYNC`, so the read-path steps hold
+with the option on or off. `ferric-iobench`'s file jobs compare writes through
+the cache against writes RedoxFS serves in the same boot.
 
 The kernel fix this test turned up is not specific to the page cache. When a
 request is sent to a user scheme, the caller switches straight to the context
@@ -949,7 +1124,9 @@ device) and serves in the foreground until it is stopped.
   kernel.org. No code comes from Linux.
 - **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
   `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
-  `EROFS`.
+  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod`, `fchown`, opens for
+  writing and `write` into existing blocks are served: see
+  [Writing through the journal](#writing-through-the-journal)).
 - **Access:** the scheme uses the caller's UID and primary GID. It checks
   directory search permissions at each path component, including expanded
   symlink targets, and read permission on the final inode. UID zero bypasses
@@ -961,21 +1138,45 @@ device) and serves in the foreground until it is stopped.
 - **Layers:** ext4 on LUKS or LVM is ext4d over a volume `ferric-blockd`
   serves: `ext4d /scheme/NAME SCHEME` reads it like any disk (see
   [Block layers](#block-layers-luks-and-lvm-read-only)).
-- **Limits:** `ext4-view` does not expose inode numbers, so `st_ino` is a
-  hash of the path (hard links get different numbers) and `st_ctime` is the
-  modification time; `mmap` is not served; encrypted files and devices are
-  refused (`EOPNOTSUPP`).
+- **Change times:** `ext4-view` exposes neither inode numbers nor change
+  times, so ext4d finds each handle's inode at open itself (`ext4d::lookup`,
+  below) and `fstat` reads `st_ctime` from it (`i_ctime` with
+  `i_ctime_extra`'s epoch bits and nanoseconds). Where the inode cannot be
+  found (a path through an inline-data or encrypted directory) it reports the
+  modification time instead. Both read the same device, which on a volume
+  that needs recovery is the volume as its replay would leave it (see
+  [Journal replay](#journal-replay)), so they always read the same copy of
+  the inode.
+- **Limits:** `st_ino` is a hash of the path (hard links get different
+  numbers); `mmap` is not served; encrypted files and devices are refused
+  (`EOPNOTSUPP`).
 
 ### Journal replay
 
 A volume that was not cleanly unmounted has `needs_recovery` set: its journal
 holds committed transactions that may not have reached their home blocks.
-Without help, ext4d reads it through `ext4-view`'s view of the journal in
-memory, which is enough for most volumes but not all: as of `ext4-view` 1.0.0
-it refuses a journal that holds an escaped block (one whose data starts with
-the JBD2 magic number), and on a log that wraps round from the end of the
-journal to its start it ignores the committed transactions and serves the old
-contents. The tests pin both behaviours down.
+Without `fs.ext4_journal_replay`, ext4d reads it as the replay would leave
+it, without writing: `ext4d::journal::replayed_blocks` works out in memory
+every block the replay would write (each committed block, checked as the
+replay checks it, and the volume superblock with `needs_recovery` cleared),
+and every read, `ext4-view`'s and ext4d's own, sees those blocks in place of
+their home blocks. Free-space and inode counts reported by `statvfs`
+come from this same overlaid superblock; the recovery diagnostic still
+reports the physical device's original flag, since a read-only mount does
+not replay onto disk. Recovery-flag edits and their checksum use a generated
+`simple_endian` superblock wire layout, checked against a known-good fixture.
+Even an empty journal needs the superblock overlay when
+`needs_recovery` is set; `tests/unreplayed.rs` checks this for 1 KiB and 4 KiB
+blocks and verifies that the underlying image stays unchanged. `ext4-view`
+then finds a clean volume and does not use its
+own view of the journal, which as of 1.0.0 refuses a journal that holds an
+escaped block (one whose data starts with the JBD2 magic number) and, on a
+log that wraps round from the end of the journal to its start, ignores the
+committed transactions and serves the old contents. `tests/unreplayed.rs`
+pins `ext4-view`'s behaviour down, and checks that every file, its contents
+and its metadata on each journal fixture match `e2fsck`'s replay of it. If
+the journal cannot be read (a damaged block, an external journal), the
+volume is given to `ext4-view` as it is and the reason is logged.
 
 `fs.ext4_journal_replay` (default off, needs `fs.ext4`; Cargo feature
 `journal-replay`) has ext4d replay the journal onto the disk before it serves
@@ -1042,10 +1243,15 @@ e2fsprogs and runs the same tests on them.
 
 `fs.ext4_write` (default off, needs `fs.ext4_journal_replay`; Cargo feature
 `write`) is the first step towards writable ext4: changing a volume through its
-journal. The scheme still serves volumes read-only; the one change so far,
-setting an existing inode's access, modification and change times
-(`ext4d::write::set_times`), is a library call that the scheme's `futimens`
-does not reach yet, because `ext4-view` does not say which inode a path names.
+journal. The changes so far rewrite one existing inode (`ext4d::write::change`):
+its access, modification and change times (`futimens`), its permission bits
+(`fchmod`) or its owner and group (`fchown`), each with a new change time; every
+other change still fails with `EROFS`. At mount, ext4d opens the device for
+writing and serves the volume read-write (those three calls) when
+`ext4d::write::check_writable` accepts it, and otherwise serves it read-only
+and says why; a device that does not open for writing (no write permission, a
+read-only medium) is also served read-only, with the reason logged
+(`Fs::mount_preferring_write`).
 
 - **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
   changed block) into an empty journal from `s_first`: descriptor blocks with
@@ -1059,21 +1265,111 @@ does not reach yet, because `ext4-view` does not say which inode a path names.
   empties the journal again with the next sequence number.
 - **ext4d** (`userspace/ext4d/src/write.rs`) builds the new inode table block
   (the times, with the epoch bits and nanoseconds in the `_extra` fields when
-  the inode has them, and the inode checksum from the volume's checksum seed,
+  the inode has them; `i_mode`'s permission bits, keeping its file type; or
+  `i_uid` and `i_gid`, with their high halves at `0x78` and `0x7A` when
+  `s_creator_os` is Linux or Hurd, whose `osd2` keeps them there, and IDs above
+  65535 refused (`EINVAL`) on other creators' volumes; and the inode checksum
+  from the volume's checksum seed,
   `s_checksum_seed` with `metadata_csum_seed`), sets `needs_recovery`, commits
   and checkpoints the transaction, and clears `needs_recovery`. It refuses
   volumes that need recovery (replay them first), have no journal, or have a
   feature it does not know it can write under (`mmp`, `meta_bg`, `readonly`, unknown
-  bits), and inodes that are free or already fail their checksum.
+  bits), and inodes that are free or already fail their checksum. On a volume
+  with `quota`, a new owner or group is refused (`EOPNOTSUPP`): its quota files
+  would have to move the inode's usage from one ID to another, which ext4d does
+  not do yet. A new mode is not counted and is written.
+- **The path's inode** (`userspace/ext4d/src/lookup.rs`): `ext4-view` resolves
+  paths but does not say which inode one ends at, so ext4d walks the handle's
+  normalized path itself from the root (inode 2), mapping each directory's
+  blocks with the journal code's extent and indirect block map (holes allowed)
+  and scanning their entries. Every directory is read as a linear one, which
+  covers hashed ones too: their index blocks read as unused entries, and their
+  leaves are linear blocks ("Directory Entries" in "Ext4 Disk Layout").
+  Inline-data and encrypted directories are refused (`EOPNOTSUPP`); names match
+  byte for byte, also in case-insensitive directories. With 64 KiB blocks, an
+  entry that spans a whole block (length 65536, which `rec_len`'s 16 bits cannot
+  hold) is stored as `0xFFFF`, or 0, which `e2fsck` also accepts; both are read
+  as 65536 (found from `mke2fs`'s output and `e2fsck`'s verdicts, and covered by
+  the `dir-64k` fixture). The lookup is in every build, as `fstat` uses it too.
+- **`futimens`** (`Fs::set_times`) reads `tv_nsec`'s `UTIME_NOW` and
+  `UTIME_OMIT` from `ferric-abi` (`crates/abi`), the one definition relibc's
+  `sys/stat.h` constants are checked against when relibc builds, and follows
+  POSIX: `UTIME_OMIT` for both times
+  changes nothing; `UTIME_NOW` for both (or a null pointer, which relibc sends
+  as that) needs the caller to own the file or have write permission on it;
+  any other times need the caller to own it (`EPERM` otherwise); UID 0 may do
+  all of them. The change time is set to now. `ext4-view` keeps the blocks it
+  has read, so after each change it is loaded again and every open handle's
+  metadata is read again; open files keep reading their contents, which a time
+  change does not touch.
+- **`fchmod`** (`Fs::set_mode`) follows POSIX `chmod`: the caller must own the
+  file or be UID 0 (`EPERM` otherwise); the file type bits of the argument are
+  ignored; a caller other than UID 0 whose GID is not the file's group loses
+  the set-group-ID bit on a regular file. A symbolic link opened itself
+  (`O_SYMLINK`) is refused with `EOPNOTSUPP`, as its mode is not used.
+- **`fchown`** (`Fs::set_owner`) follows POSIX `chown` with
+  `_POSIX_CHOWN_RESTRICTED`: `-1` (`ferric_abi::id::UNCHANGED`) keeps an ID;
+  UID 0 may set any owner and group; any other caller must own the file, may
+  not give it to another owner, and may set its group only to its own or the
+  caller's GID (`EPERM` otherwise), and then the set-user-ID and set-group-ID
+  bits of a regular file are cleared. A symbolic link opened itself gets its
+  own owner and group. The kernel checks first, before the scheme sees the
+  call: a caller other than root may name only its own effective UID and GID,
+  or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
+- **`write`** (`Fs::write`, `ext4d::write::write_data`) writes into the
+  blocks a regular file already has, as ext4's default ordered mode does: the
+  data is written home and flushed without going through the journal, then
+  one transaction records the new modification and change times and, when the
+  write ends past the old size, the new size (`i_size_lo`, `i_size_high`).
+  After a crash the inode therefore never claims data that is not on the
+  disk; a crash before the commit leaves the new bytes with the old size and
+  times. Every block the write touches is mapped first (extents or indirect
+  blocks) and must be an initialized block of the file inside the volume and
+  outside the journal and the fixed metadata (boot and superblock copies,
+  descriptor tables, bitmaps and inode tables). When growing past EOF, the
+  interval from the old size to the write offset is zeroed before the new
+  size is committed. Its mappings are validated too: a hole, an unwritten
+  extent or a block past the file's needs allocation, which is not done yet,
+  so the write is refused
+  (`EOPNOTSUPP`) before anything is written. Immutable and append-only files
+  are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
+  files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
+  permission (and read permission unless `O_WRONLY`); `O_CREAT` and `O_TRUNC`
+  are refused (`EOPNOTSUPP`). `O_APPEND` opens and writes also fail with
+  `EOPNOTSUPP`, including a flag enabled after open through `F_SETFL`: the
+  current scheme response cannot return an append's actual ending position
+  to the kernel ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)).
+  Mapping validation retains the extent map and the volume's metadata ranges,
+  without allocating another mapping entry for every block in the write.
+  The inode's size and flags use a generated `simple_endian` native/wire
+  layout, with a byte fixture protecting unchanged fields. Every open file
+  is opened again in `ext4-view` after a write, so reads see it.
 
-A crash at any write leaves the old times or a journal whose replay gives the
-new ones. The tests crash a change before each of its eight writes and check
+A crash at any write leaves the old inode or a journal whose replay gives the
+new one. The tests crash a change before each of its eight writes and check
 that both ext4d's replay and `e2fsck`'s give one or the other, never a mix;
 with `EXT4D_E2FSCK` set (CI sets it) `e2fsck -fy` replays and `e2fsck -fn`
 must then find nothing to fix, on every volume the tests leave. The format
 comes from the same sources as the replay ("Journal (jbd2)", "Inode Table",
 "Inode Timestamps" and "Checksums" in "Ext4 Disk Layout", and experiments with
 e2fsprogs 1.47); nothing comes from the Linux kernel or e2fsprogs code.
+`tests/futimens.rs` checks each lookup by its effect (times set on the inode it
+finds are the ones `ext4-view` then reads at that path, and nowhere else),
+including all 200 entries of `basic.ext4`'s hashed `many/` directory and ext3's
+indirect-mapped directories, and checks the permission rules, `UTIME_NOW` and
+`UTIME_OMIT`, a symbolic link's own times, and `e2fsck` on what is left.
+`tests/chmod_chown.rs` checks the mode, owner and group bytes in the inode
+(32-bit IDs in both halves), the permission rules of both calls, the set-ID
+bits, symbolic links, the `quota` fixture (`quota.ext4.gz`), a volume made for
+FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
+`tests/write_data.rs` writes inside a block, across blocks and whole blocks,
+and past the end inside the last block, checks the permission rules, that
+other open handles read the new bytes, that holes, unwritten extents and
+missing blocks are refused with nothing written (the `write-data` fixture,
+which also has immutable and append-only files). It checks that append opens
+and writes at an earlier cursor or EOF fail without changing any image bytes,
+size or timestamps, and that ordinary offset writes still work. It crashes a write before
+each of its nine writes.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;
@@ -1129,7 +1425,7 @@ enters the null namespace and serves in the foreground until it is stopped.
 - **Limits:** FAT has no inode numbers, so `st_ino` is a hash of the stored
   path (`ferric-fspath`, shared with the other daemons); FAT times have no time
   zone and are read as UTC; `st_atime` has only a date; `st_ctime` is the
-  modification time; exFAT is not supported yet.
+  modification time.
 
 The host tests (`userspace/fatd/tests/`) read FAT12, FAT16 and FAT32 images
 that `tests/fixtures/make-fixtures.sh` builds with `mkfs.fat` and `mtools`:
@@ -1138,6 +1434,56 @@ another, a directory over several clusters, deleted entries and a partition
 inside a larger disk. CI also runs them on images the runner's dosfstools and
 mtools make (`FATD_FIXTURES`). `ferric-fat-test` mounts the FAT32 image on the
 target.
+
+### exFAT
+
+With `fs.exfat` (off by default; it needs `fs.fat`), fatd is built with its
+`exfat` Cargo feature and also serves exFAT volumes, the format of SD cards and
+USB sticks over 32 GiB. It looks at the boot sector's file system name: an
+`EXFAT` volume goes to the exFAT reader, everything else to `fatfs`. Without the
+option, fatd refuses an exFAT volume with `EOPNOTSUPP` ("built without exFAT
+support") rather than as a damaged FAT volume. The parser dependency is optional:
+without this feature, fatd compiles only the shared identification constants and
+timestamp arithmetic in `ferric-fat-types` (`crates/fat-types/`), not `ferric-exfat`.
+
+The reader is `ferric-exfat` (`crates/exfat/`), a `no_std` crate written from
+Microsoft's published "exFAT file system specification" (revision 1.00 of the
+format). No suitable maintained crate existed, and no code comes from Linux or
+other exFAT implementations. It reads through the same `BlockDevice`, so exFAT
+on a partition, on LUKS or on LVM works as FAT does. Its disk records use native
+`Endianize` layouts and generated `simple_endian` wire types. A safe slice
+adapter reads those fields without casts, including from unaligned buffers;
+the crate forbids unsafe code.
+
+- **Checks:** the boot sector's fields and layout, the boot region's checksum
+  (sector 11), the up-case table's checksum, and every directory entry set's
+  checksum. The up-case table's declared length must be even and at most
+  128 KiB before its buffer is allocated or its payload read; compressed tables
+  cannot expand beyond 65536 UTF-16 entries. A critical entry type it does not know is an error; benign ones
+  are skipped. The allocation bitmap must cover every cluster, the root
+  directory's chain is refused once it passes the 256 MiB a directory may be
+  (before anything is read into memory), and each file's FAT chain is checked
+  on its first read to end exactly where the file's length says, so a chain
+  that loops or ends early is an error rather than repeated or missing data.
+- **Names** are compared through the volume's own up-case table, as the
+  specification asks; exFAT has no short names. `fpath` gives the names as
+  stored.
+- **Data:** cluster chains are followed through the active FAT, or not at all
+  for files marked `NoFatChain` (one contiguous run). Each open file keeps
+  where its last read ended in the chain, so sequential reads do not walk it
+  from the start. Bytes past a file's valid data length read as zeros.
+- **Times** are kept to 10 ms and converted to UTC with the zone offset exFAT
+  records (as UTC when it records none); unlike FAT, `st_atime` has the time
+  of day.
+- **Free space** for `statvfs` is counted from the allocation bitmap.
+
+`crates/exfat/tests/fixtures/make-fixtures.sh` builds two images (4 KiB and
+512-byte clusters) with `mkfs.exfat` and fills them through a loop mount, with
+the same tree as the FAT images plus a `big.bin` whose clusters are a real FAT
+chain; it checks them with `fsck.exfat`. The crate's own tests and fatd's
+(`tests/exfat.rs`, with `--features exfat`) read them, and CI also runs both on
+fresh images. `ferric-fat-test` mounts the 4 KiB image on the target too, and
+prints `FERRIC_TEST_SKIP exfat` when fatd was built without it.
 
 ## Block layers: LUKS and LVM, read-only
 
@@ -1213,7 +1559,8 @@ ext4d /scheme/root rootfs
   with `EROFS`. Reads stop at the end of the volume.
 - **Limits:** read-only; no keyslot management, tokens, detached headers or
   reencryption; ciphers other than AES-XTS (`plain`/`plain64`) are refused;
-  started by hand, not by init, the installer or the bootloader.
+  started by hand or at boot by `ferric-unlock` (below), not by the installer
+  or the bootloader.
 
 The fixtures (`crates/blocklayer/tests/fixtures/`, made by `make-fixtures.sh`
 as root with cryptsetup, lvm2 and Python's `cryptography`, no device-mapper)
@@ -1222,6 +1569,55 @@ split over two extent runs, an LV on LUKS2 with 4096-byte sectors, and LUKS1
 data OpenSSL encrypted with the key of `crates/luks/tests/fixtures/luks1.img`.
 Bytes no test reads are zeroed to keep them small. `ferric-blocklayer-test`
 serves the same images through `ferric-blockd` on the target.
+
+### Unlocking at boot
+
+With `fs.unlock_at_boot` (File systems menu, default `false`, needs `fs.luks`
+or `fs.lvm`), the `ferric-blockd` package also holds `ferric-unlock` and the
+init unit `05_ferric-unlock.service`. Init runs it once, as a oneshot, after
+the base services (`00_*`) and before the network and console (`10_*` and up),
+so the volumes are served before the services that use them start; a service
+can also name the unit in `requires_weak`. It reads `/etc/ferric/crypttab`:
+
+```text
+# NAME   STEP...                                               [FILESYSTEM:SCHEME]
+home     dev:/scheme/disk.nvme/0p2 luks:/etc/keys/home lvm:home ext4:home-fs
+scratch  dev:/scheme/disk.nvme/0p3 luks:/etc/keys/scratch
+```
+
+Each line is a `ferric-blockd` command line (the scheme name, then the steps),
+with an optional last field `ext4:SCHEME` that has `ext4d` (`fs.ext4`) mount
+the volume at `/scheme/SCHEME`. `#` starts a comment, and every scheme name in
+the table must be unique. For each line in order, `ferric-unlock` refuses the
+line if `/scheme/NAME` is already served, starts `ferric-blockd`, and waits up
+to 60 seconds (LUKS key derivation is slow on purpose) for the daemon's
+readiness line (`crates/ready`, `ferric-ready`): started with
+`FERRIC_READY=stdout`, `ferric-blockd` and `ext4d` write `ready` to stdout once
+they have registered their scheme themselves, so another process's scheme of
+the same name is never taken for the volume. A daemon that exits, says
+anything else or misses the deadline has failed, and one still running is
+killed, so a volume cannot appear after its failure was logged. Then it does
+the same for the file system daemon. The daemons keep serving after it exits. A line that fails
+is logged with its whole error chain and does not stop the others; a table
+that does not parse starts nothing; with no table it does nothing. The table
+is Ferric Oxide's own format (`userspace/blockd/src/crypttab.rs`), shaped like
+a crypttab line.
+
+- **Passphrases** come from key files only (`luks:KEYFILE`); there is no prompt
+  on the console yet, and the key files must be readable at boot, so put them
+  on the root file system or an already-unlocked volume.
+- **RedoxFS** cannot be mounted this way: it opens its disk for writing, and
+  `ferric-blockd` serves volumes read-only. `redoxfs:SCHEME` is refused with
+  its own error.
+- **ext4 journals:** a volume that needs recovery is served from ext4-view's
+  in-memory view of the journal. With `fs.ext4_journal_replay`, `ext4d` tries
+  to replay it onto the disk instead, cannot open the read-only volume for
+  writing, and does not mount it.
+- **Root:** this unlocks volumes after the root file system is mounted; an
+  encrypted root (unlocked by the bootloader or initfs) is not covered.
+
+`ferric-blocklayer-test` installs a table with LVM on LUKS from a key file and
+an ext4 volume, and its `blocklayer-unlock-boot` step reads both back.
 
 ## Kernel-bypass network queues
 

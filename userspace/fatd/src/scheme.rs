@@ -4,7 +4,7 @@
 //! and `fpath` are served. Everything that would change the volume (opens for writing or
 //! creating, `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename`, `flink`) fails
 //! with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through
-//! [`Error::errno`]. FAT has no owners, so every caller may read everything (see [`Fs`]).
+//! [`Error::errno`]. FAT and exFAT have no owners, so every caller may read everything (see [`Fs`]).
 
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
@@ -42,7 +42,7 @@ pub enum ServeError {
     Request(#[source] syscall::Error),
 }
 
-/// The scheme handler for one FAT volume.
+/// The scheme handler for one FAT or exFAT volume.
 pub struct FatScheme<'v, D: Device> {
     fs: Fs<'v, D>,
     /// `/scheme/NAME`, which `fpath` puts before paths.

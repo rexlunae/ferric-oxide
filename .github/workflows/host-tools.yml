@@ -31,6 +31,7 @@ on:
       - "recipes/core/fatd/**"
       - "recipes/tests/ferric-fat-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
+      - "userspace/base/drivers/executor/**"
       - "userspace/base/drivers/storage/nvmed/**"
       - "recipes/tests/ferric-iobench/**"
       - "recipes/tests/ferric-ring-test/**"
@@ -80,7 +81,7 @@ jobs:
           rustup component add miri
           cargo miri test --locked -p ferric-exec-core -p ferric-devicetree
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-build -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-build -p ferric-abi -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -88,7 +89,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-abi -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)
@@ -183,6 +184,16 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-fspath
           rustup target add x86_64-unknown-none
           cargo build --locked -p ferric-fspath --target x86_64-unknown-none
+      # ferric-exfat: the read-only exFAT reader fatd uses (fs.exfat); no_std, so check it
+      # builds for a bare-metal target too. Its fixture tests on fresh images run in the fatd
+      # job.
+      - name: ferric-exfat
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-exfat -p ferric-fat-types -- -D warnings
+          cargo test --locked -p ferric-exfat -p ferric-fat-types
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-exfat -p ferric-fat-types
+          rustup target add x86_64-unknown-none
+          cargo build --locked -p ferric-exfat -p ferric-fat-types --target x86_64-unknown-none
       # ferric-lvm: read-only LVM2 labels, metadata and LV mapping; no_std, so check it
       # builds for a bare-metal target as the kernel and the bootloader would use it.
       - name: ferric-lvm
@@ -268,10 +279,10 @@ jobs:
           mke2fs -V
           mkdir -p "$RUNNER_TEMP/ext4"
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
-          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test unreplayed
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
-            cargo test --locked --features write --test write
+            cargo test --locked --features write --test write --test futimens --test chmod_chown --test write_data
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
@@ -284,7 +295,7 @@ jobs:
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-ext4-test/files/Cargo.toml -- -D warnings
 
-  # ferric-blockd (fs.luks, fs.lvm): its tests, lints and docs for the host and for Redox, the
+  # ferric-blockd (fs.luks, fs.lvm, fs.unlock_at_boot): its tests, lints and docs for the host and for Redox, the
   # on-target test's lints, and the block-layer tests on images cryptsetup and lvm2 make now.
   blockd:
     runs-on: ubuntu-24.04
@@ -312,6 +323,9 @@ jobs:
           cargo test --locked
           cargo test --locked --no-default-features --features luks
           cargo test --locked --no-default-features --features lvm
+          # ferric-unlock and its crypttab (fs.unlock_at_boot), with both layers and with one.
+          cargo test --locked --features unlock
+          cargo test --locked --no-default-features --features luks,unlock
       - name: Test the layers on fresh images
         run: |
           sudo apt-get update
@@ -325,15 +339,17 @@ jobs:
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --target x86_64-unknown-redox -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
+          # The unlock feature only adds code, so building with it lints and documents all of it.
+          cargo clippy --locked --all-targets --features unlock -- -D warnings
+          cargo clippy --locked --all-targets --features unlock --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features unlock
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features unlock --target x86_64-unknown-redox
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-blocklayer-test/files/Cargo.toml -- -D warnings
 
-  # fatd (fs.fat): its tests on the committed FAT images and on ones dosfstools and mtools make
-  # now, its lints and docs for the host and for Redox, and the on-target test's lints.
+  # fatd (fs.fat, fs.exfat): its tests on the committed FAT and exFAT images and on ones
+  # dosfstools, mtools and exfatprogs make now, with and without its exfat feature, its lints
+  # and docs for the host and for Redox, and the on-target test's lints.
   fatd:
     runs-on: ubuntu-24.04
     defaults:
@@ -352,8 +368,18 @@ jobs:
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path ../../recipes/tests/ferric-fat-test/files/Cargo.toml
+      - name: Check optional parser dependency
+        run: |
+          cargo tree --locked --no-default-features -e normal > "$RUNNER_TEMP/fatd-base-tree.txt"
+          if grep -q 'ferric-exfat' "$RUNNER_TEMP/fatd-base-tree.txt"; then
+            echo "fatd without exfat must not compile the exFAT parser" >&2
+            exit 1
+          fi
+          cargo tree --locked --features exfat -e normal | grep 'ferric-exfat'
       - name: Test (committed images)
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          cargo test --locked --features exfat
       - name: Test (fresh images from dosfstools and mtools)
         run: |
           sudo apt-get update
@@ -362,13 +388,26 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fat"
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/fat"
           FATD_FIXTURES="$RUNNER_TEMP/fat" cargo test --locked --test basic
+      # make-fixtures.sh mounts each image through a loop device (the kernel's exfat driver,
+      # or exfat-fuse), so it runs as root.
+      - name: Test (fresh images from exfatprogs)
+        run: |
+          sudo apt-get install -y exfatprogs exfat-fuse
+          dpkg-query -W exfatprogs exfat-fuse
+          mkdir -p "$RUNNER_TEMP/exfat"
+          sudo ../../crates/exfat/tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/exfat"
+          EXFAT_FIXTURES="$RUNNER_TEMP/exfat" cargo test --locked --features exfat --test exfat
+          EXFAT_FIXTURES="$RUNNER_TEMP/exfat" CARGO_TARGET_DIR=target \
+            cargo test --locked --manifest-path ../../crates/exfat/Cargo.toml --test fixtures
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --target x86_64-unknown-redox -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --target x86_64-unknown-redox
+          for features in "" exfat; do
+            cargo clippy --locked --all-targets --features "$features" -- -D warnings
+            cargo clippy --locked --all-targets --features "$features" --target x86_64-unknown-redox -- -D warnings
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features "$features"
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features "$features" --target x86_64-unknown-redox
+          done
           CARGO_TARGET_DIR=target cargo clippy --locked --all-targets --target x86_64-unknown-redox \
             --manifest-path ../../recipes/tests/ferric-fat-test/files/Cargo.toml -- -D warnings
 
@@ -390,7 +429,7 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p driver-block -p netstack -p rtl8125d
+        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d
       - name: Compile NVMe timing with buffered and DMA paths
         run: |
           rustup target add x86_64-unknown-redox

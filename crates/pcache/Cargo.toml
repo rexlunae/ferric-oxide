@@ -6,6 +6,10 @@ license = "MIT"
 description = "The kernel page cache's interface and policies: cache objects, fill and writeback records, page states, readahead, reclaim and the reverse map"
 
 [dependencies]
+# Shared across the kernel, host and standalone userspace builds. These consumers
+# also build through recipe symlinks outside the host workspace, so inheritance
+# cannot be used here; keep this version aligned with workspace.dependencies.
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "both_endian", "byte_impls", "io-core"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libredox = { version = "0.1.20", optional = true }

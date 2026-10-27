@@ -1,4 +1,5 @@
-//! `ferric-fat-test`: mounts a FAT32 image with `fatd` and checks it on the running system.
+//! `ferric-fat-test`: mounts a FAT32 image and an exFAT image with `fatd` and checks them on
+//! the running system.
 //!
 //! Prints one `FERRIC_TEST_PASS fat-<step>` or `FERRIC_TEST_FAIL fat-<step>: <why>` line for
 //! each step, and exits with an error if any failed:
@@ -13,8 +14,13 @@
 //! - `fat-erofs`: writing, creating, removing, renaming and making a directory fail with
 //!   `EROFS`, and the file is unchanged afterwards.
 //!
-//! Without `/usr/bin/fatd` (fs.fat off) it prints `FERRIC_TEST_SKIP fat`. The image is
-//! `fat32.img.gz` from `userspace/fatd/tests/fixtures/`, whose script lists its contents.
+//! The same steps then run on the exFAT image, prefixed `exfat-` instead (`exfat-read` skips
+//! the short names, which exFAT does not have); when `fatd` was built without exFAT
+//! (fs.exfat off) and says so, they are one `FERRIC_TEST_SKIP exfat` line instead.
+//!
+//! Without `/usr/bin/fatd` (fs.fat off) it prints `FERRIC_TEST_SKIP fat`. The images are
+//! `fat32.img.gz` from `userspace/fatd/tests/fixtures/` and `exfat-4k.img.gz` from
+//! `crates/exfat/tests/fixtures/`, whose scripts list their contents.
 
 #![forbid(unsafe_code)]
 

@@ -1,5 +1,5 @@
 # Ferric Oxide: fatd, the read-only FAT12/FAT16/FAT32 file system daemon (features.toml fs.fat,
-# off by default). It lives in this repository at userspace/fatd/; as a path source (relative
+# off by default), and exFAT with fs.exfat (also off by default). It lives in this repository at userspace/fatd/; as a path source (relative
 # to the repository root), edits there rebuild it.
 [source]
 path = "userspace/fatd"
@@ -7,9 +7,11 @@ path = "userspace/fatd"
 [build]
 template = "custom"
 script = """
-# ferric-blocklayer and ferric-fspath are path dependencies at ../../crates from
+# ferric-blocklayer, ferric-fat-types, optional ferric-exfat and ferric-fspath are path dependencies at ../../crates from
 # userspace/fatd/. The cookbook builds a copy of userspace/fatd/ in this recipe's source/, so
 # give that copy the same relative path to them, as ext4d's recipe does.
 ln -sfn "${COOKBOOK_ROOT}/crates" "${COOKBOOK_SOURCE}/../../crates"
-cookbook_cargo
+# fs.exfat adds exfat to FERRIC_FATD_FEATURES; without it (and without a ferric.toml) fatd
+# reads FAT only.
+cookbook_cargo ${FERRIC_FATD_FEATURES:+--features "${FERRIC_FATD_FEATURES}"}
 """

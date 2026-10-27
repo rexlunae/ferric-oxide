@@ -1055,14 +1055,18 @@ impl UserInner {
 
                 {
                     let mut context = context_lock.write(token.token());
-                    if let Status::HardBlocked {
-                        reason: HardBlockedReason::AwaitingMmap { .. },
-                    } = context.status
+                    let waiting = context.fmap_ret.provide(Frame::containing(frame));
+                    if waiting
+                        && matches!(
+                            context.status,
+                            Status::HardBlocked {
+                                reason: HardBlockedReason::AwaitingMmap { .. },
+                            }
+                        )
                     {
                         context.status = Status::Runnable;
                         wake = (true, context.cpu_id);
                     }
-                    context.fmap_ret = Some(Frame::containing(frame));
                 }
                 if wake.0 {
                     wakeup_context(&context_lock, wake.1, &mut token.downgrade());
@@ -1725,7 +1729,8 @@ impl KernelScheme for UserScheme {
         {
             let ctx = context::current();
             let cx = &ctx.read(token.token());
-            if cx.euid != 0 && (uid != cx.euid || gid != cx.egid) {
+            // Ferric Oxide: allow UNCHANGED (-1) for either ID (`super::chown`).
+            if !super::chown::chown_allowed(cx.euid, cx.egid, uid, gid) {
                 return Err(Error::new(EPERM));
             }
         }
@@ -2011,6 +2016,14 @@ impl KernelScheme for UserScheme {
         _stored_flags: u32,
         token: &mut CleanLockToken,
     ) -> Result<usize> {
+        // Ferric Oxide: a description the file system attached to a page cache object for
+        // writing may be written into the cache (`kernel.pcache`, `page_cache_writeback`).
+        #[cfg(feature = "page_cache_writeback")]
+        if let Some(result) =
+            super::pcache::write_attached(&self.inner, file, buf, offset, call_flags, token)
+        {
+            return result;
+        }
         let ctx = { context::current().read(token.token()).caller_ctx() };
 
         let mut address = self.inner.capture_user(buf, token)?;

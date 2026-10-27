@@ -41,13 +41,21 @@ including ones crashed part-way through a change, to `e2fsck` through
 `x86_64-unknown-redox` with each of those feature sets. The `ferric-jbd2` step tests, lints and documents the
 journal crate, and builds it for `x86_64-unknown-none` to keep it `no_std`.
 Its `blockd` job does the same for `userspace/blockd/` (with each
-of its layers alone and both), and runs `ferric-blocklayer`'s fixture tests
+of its layers alone and both, and with `ferric-unlock`'s `unlock` feature), and runs `ferric-blocklayer`'s fixture tests
 again on images `crates/blocklayer/tests/fixtures/make-fixtures.sh` makes as
 root with the runner's cryptsetup and lvm2 (`BLOCKLAYER_FIXTURES`). Its `fatd`
 job tests `userspace/fatd/` on the committed FAT12, FAT16 and FAT32 images and on
 ones `make-fixtures.sh` builds with the runner's dosfstools and mtools
-(`FATD_FIXTURES`), and lints and documents it for the host and for
-`x86_64-unknown-redox`.
+(`FATD_FIXTURES`), with and without its `exfat` feature, then fatd's exFAT tests
+and `ferric-exfat`'s fixture tests on exFAT images
+`crates/exfat/tests/fixtures/make-fixtures.sh` makes as root with the runner's
+exfatprogs (`EXFAT_FIXTURES`), and lints and documents fatd both ways for the
+host and for `x86_64-unknown-redox`.
+
+The exFAT regressions reject oversized and odd-length up-case streams before
+reading their payload, and check generated wire layouts against literal byte
+fixtures. CI also checks `ferric-fat-types` on the host and bare metal and verifies
+that fatd's default dependency graph excludes `ferric-exfat`.
 
 Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
 running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
@@ -295,8 +303,8 @@ even when the surrounding build uses prebuilt packages. Its init script emits
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), the mapping journal (fixed replacement, kernel-placed and fixed `mremap`, a fork's clone and its teardown, and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), `procmgr`'s fork/exec/exit/wait records for a child with its exit status and the refusal of forged `emit` records, and read-only mapping of the rings with `commit` checks |
 | `ferric-ext4-test` | Mounts the `ext4d` fixture image (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS`. `ext4-journal` mounts a volume that needs recovery: ext4d must replay its journal (`fs.ext4_journal_replay`), serve the journaled contents and leave the image clean. The step is skipped only when `ext4d --features` does not list `journal-replay`; once it does, a replay error fails the step |
-| `ferric-fat-test` | Mounts the `fatd` FAT32 fixture image (`fs.fat`), lists the root, an empty directory and one over several clusters, reads files whole and at an offset by their long names, their 8.3 short names and in another case, checks sizes, kinds, modes and modification times from `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
-| `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving |
+| `ferric-fat-test` | Mounts the `fatd` FAT32 fixture image (`fs.fat`), then the exFAT one (`fs.exfat`, a skip without it), and on each lists the root, an empty directory and one over several clusters, reads files whole and at an offset by their long names, their 8.3 short names (FAT only) and in another case, checks sizes, kinds, modes and modification times from `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
+| `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving. With `ferric-unlock` (`fs.unlock_at_boot`), `blocklayer-unlock-boot` reads back the volumes its `/etc/ferric/crypttab` had unlocked at boot: LVM on LUKS from a key file, and ext4 mounted by `ext4d` through `ferric-blockd` |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) completed DMA map/protect/unmap records, cached translations and live disable (`iommu-mapping-trace`), and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
@@ -744,6 +752,47 @@ runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
 
+### Delayed page-cache writeback notifications
+
+RedoxFS's host library tests (`cargo test --locked --manifest-path
+userspace/redoxfs/Cargo.toml --lib --no-default-features --features std`)
+also exercise closed-file cache count/byte limits, extreme sizes, zero budgets,
+stale stamps and unsuccessful reopen attempts. Transaction tests identify
+rename targets losing their last link with and without an open description,
+and distinguish surviving hard links, same-node renames and absent targets.
+These test the shared lifetime decisions; image tests remain necessary for
+actual kernel cache-object attachment and page reuse.
+
+`ferric-pcache` also checks its 40-byte queue record against literal little-endian
+fixtures, including every writeback reason and unaligned input. The generated
+wire layout is shared by kernel and file-system consumers.
+
+`cargo test --locked -p ferric-pcache --all-features` includes the delayed
+notification regression: fsync cleans a file before its record is delivered,
+writes race on either side of the current-count query, duplicate records keep
+the first dirty time, and another dirty file keeps its timer. ABI tests cover
+the `DirtyPages` request and reject extra metadata/packed flags. CI compiles
+the RedoxFS client and kernel query together; the writeback-enabled image's
+fsync, age, mapping and truncation smoke checks cover target integration.
+
+The shared page-cache writeback tests also cover delayed sequential-run hints:
+an intervening flush cleans the recorded pages, then the hint writes just one
+later dirty run while a concurrent rewrite remains dirty. This pins the
+intentional start-hint semantics and the take-size work bound.
+
+### Driver executor event reads
+
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`
+tests the event-read adapter used by queue-based drivers, including NVMe.
+An interrupted event read (`EINTR`) is retried without dispatching an event;
+other queue errors remain fatal. Regressions cover repeated interruptions,
+the eventual event's complete payload, immediate success and terminal errors
+before or after an interruption. `cargo test --locked -p ferric-exec-core
+--test driver_event_read` includes the same driver module, so its portable tests
+also run on hosts without libredox event support. The host-tools driver job runs
+the executor package tests and compiles the NVMe configurations below. Host mocks do not establish why
+a guest read was interrupted; repeat image boots remain the target check.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual
@@ -771,6 +820,14 @@ EOI without reading current-context state. Ordinary idle/running CPU decisions
 and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
+
+### Lazy file-mapping reply protocol
+
+The kernel helper suite includes `context/fmap_reply.rs` directly. It covers
+reply-before-park, park-before-reply, exactly-once consumption, stale/duplicate
+responses and failed-dispatch cleanup. Normal `fmap` still creates eager
+mappings, and no scheme responds to `RequestMmap`; this protocol coverage is
+not an end-to-end lazy-fault test. Run the helper host and Miri commands above.
 
 ## Documentation checks
 

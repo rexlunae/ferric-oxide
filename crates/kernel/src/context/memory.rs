@@ -3363,18 +3363,32 @@ fn correct_inner<'l>(
                 .ok_or(PfError::Segv)?;
 
             let offset = file_ref.base_offset as u64 + (pages_from_grant_start * PAGE_SIZE) as u64;
-            user_inner
+            let context_lock = Arc::clone(&crate::context::current());
+            // Request dispatch and the provider may race; both park and reply
+            // transitions are serialized by the context write lock (#202).
+            context_lock.write(token.token()).fmap_ret.begin();
+            if user_inner
                 .request_fmap(scheme_number, offset, 1, flags, &mut token)
-                .unwrap();
+                .is_err()
+            {
+                let _ = context_lock.write(token.token()).fmap_ret.take();
+                return Err(PfError::Segv);
+            }
 
             // The fault blocks on the scheme: release the per-CPU current-context borrow
             // before switching, while keeping this context alive until the reply arrives.
-            let context_lock = Arc::clone(&crate::context::current());
-            context_lock
-                .write(token.token())
-                .hard_block(HardBlockedReason::AwaitingMmap { file_ref });
-
-            super::switch(&mut token);
+            let blocked = {
+                let mut context = context_lock.write(token.token());
+                if context.fmap_ret.park() {
+                    context.hard_block(HardBlockedReason::AwaitingMmap { file_ref });
+                    true
+                } else {
+                    false
+                }
+            };
+            if blocked {
+                super::switch(&mut token);
+            }
 
             let frame = context_lock
                 .write(token.token())

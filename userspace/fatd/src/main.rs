@@ -1,4 +1,5 @@
-//! `fatd`: serves a FAT12, FAT16 or FAT32 volume, read-only, as a scheme.
+//! `fatd`: serves a FAT12, FAT16, FAT32 or (with the `exfat` feature) exFAT volume,
+//! read-only, as a scheme.
 //!
 //! ```text
 //! fatd [--offset BYTES] [--length BYTES] DEVICE SCHEME
@@ -64,7 +65,7 @@ mod daemon {
         },
         #[error("the volume's bytes do not fit the device")]
         Window(#[from] OutOfRange),
-        #[error("cannot mount the FAT volume")]
+        #[error("cannot mount the volume")]
         Mount(#[from] fatd::Error),
         #[error("serving the scheme failed")]
         Serve(#[from] ServeError),
@@ -122,10 +123,10 @@ mod daemon {
         let size = window.size();
         let volume = fatd::fs::mount(window)?;
         let fs = Fs::new(&volume);
-        let (bits, label) = (fs.fat_bits(), fs.label());
+        let (format, label) = (fs.format().name(), fs.label());
         let mount = Mount::new(fs, &args.scheme)?;
         eprintln!(
-            "fatd: {} ({size} bytes, FAT{bits}, label {label:?}) mounted read-only at /scheme/{}",
+            "fatd: {} ({size} bytes, {format}, label {label:?}) mounted read-only at /scheme/{}",
             args.device, args.scheme
         );
         mount.serve()?;

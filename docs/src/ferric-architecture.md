@@ -212,3 +212,12 @@ with filesystem access behind `std`; the store, SBOM, git, build and registry
 layers use `std`.
 Hardware access stays in kernel integration modules while portable rules can
 be exercised on the host.
+
+User-space drivers reach device registers through `common::io::Mmio` and
+`common::io::MmioPtr` in `userspace/base/drivers/common/`. On x86 and ARM64 each
+access is one inline-assembly load or store of the register's width. On ARM64
+that is an `ldr`/`str` with a plain base-register operand, because KVM and
+QEMU's HVF backend can only emulate a trapped access whose exception syndrome is
+valid. `read_volatile` lets the compiler choose writeback, pair or SIMD
+encodings, and HVF aborts the VM on those. Do not access a mapped BAR or ECAM
+window with `read_volatile`/`write_volatile` directly.

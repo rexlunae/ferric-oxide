@@ -1,0 +1,9 @@
+# Ferric Oxide: the volumes ferric-unlock (features.toml fs.unlock_at_boot) serves at boot on
+# test images, for ferric-blocklayer-test's blocklayer-unlock-boot step to read back. The
+# recipe installs the images and the key file under /usr/share/ferric-blocklayer-test/.
+# NAME              STEP...                                                  [FILESYSTEM:SCHEME]
+
+# LVM on LUKS2 (4096-byte sectors): LV "inner" of innervg, pattern seed 6.
+ferric-boot-lol    dev:/usr/share/ferric-blocklayer-test/lvm-on-luks.img luks:/usr/share/ferric-blocklayer-test/key lvm:inner
+# ext4d (fs.ext4) mounting a volume ferric-blockd serves: ext4d's basic image, whole.
+ferric-boot-ext4blk dev:/usr/share/ferric-blocklayer-test/basic.ext4 ext4:ferric-boot-ext4

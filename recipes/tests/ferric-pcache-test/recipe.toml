@@ -1,7 +1,9 @@
 # Ferric Oxide: the on-target test of the shared page cache's read path
 # (kernel.page_cache). It serves a small file system scheme of its own, binds a
 # kernel.pcache queue to it, attaches the descriptions its clients open, and
-# checks misses, hits, readahead, failed fills and a closed queue. It prints
+# checks misses, hits, readahead, failed fills and a closed queue; then on RedoxFS
+# it checks coherence, mappings and, with kernel.page_cache_writeback, that cached
+# writes reach the file (fsync, last close, age, mmap). It prints
 # FERRIC_TEST_SKIP when the kernel has no kernel.pcache scheme. Only for test
 # images. Source lives in files/; as a path source (relative to the repository
 # root) edits there rebuild it.

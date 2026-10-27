@@ -32,6 +32,85 @@ where
 }
 
 #[test]
+fn rename_reports_targets_losing_their_last_link_before_release() {
+    for open in [false, true] {
+        with_redoxfs(move |mut fs| {
+            let root = TreePtr::root();
+            let source = fs
+                .tx(|tx| tx.create_node(root, "source", Node::MODE_FILE, 0, 0))
+                .unwrap();
+            let target = fs
+                .tx(|tx| tx.create_node(root, "target", Node::MODE_FILE, 0, 0))
+                .unwrap();
+            if open {
+                fs.tx(|tx| tx.on_open_node(target.ptr())).unwrap();
+            }
+            let removed = fs
+                .tx(|tx| tx.rename_node_replaced(root, "source", root, "target"))
+                .unwrap();
+            assert_eq!(removed, Some(target.id()), "open: {open}");
+            assert_eq!(
+                fs.tx(|tx| tx.find_node(root, "target")).unwrap().id(),
+                source.id()
+            );
+            if open {
+                // A replaced node stays readable while its description is open.
+                assert!(fs.tx(|tx| tx.read_tree(target.ptr())).is_ok());
+                assert_eq!(fs.node_usages.get(&target.id()), Some(&1));
+                fs.tx(|tx| tx.on_close_node(target.ptr())).unwrap();
+            }
+            fs.tx(|tx| tx.release_unused_nodes()).unwrap();
+            assert!(fs.tx(|tx| tx.read_tree(target.ptr())).is_err());
+        });
+    }
+}
+
+#[test]
+fn rename_keeps_surviving_hardlinks_and_same_node_targets() {
+    with_redoxfs(|mut fs| {
+        let root = TreePtr::root();
+        let source = fs
+            .tx(|tx| tx.create_node(root, "source", Node::MODE_FILE, 0, 0))
+            .unwrap();
+        let target = fs
+            .tx(|tx| tx.create_node(root, "target", Node::MODE_FILE, 0, 0))
+            .unwrap();
+        fs.tx(|tx| tx.link_node(root, "alias", target.ptr()))
+            .unwrap();
+        assert_eq!(
+            fs.tx(|tx| tx.rename_node_replaced(root, "source", root, "target"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs.tx(|tx| tx.find_node(root, "alias")).unwrap().id(),
+            target.id()
+        );
+        assert_eq!(
+            fs.tx(|tx| tx.read_tree(target.ptr()))
+                .unwrap()
+                .data()
+                .links(),
+            1
+        );
+        assert_eq!(
+            fs.tx(|tx| tx.rename_node_replaced(root, "target", root, "target"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs.tx(|tx| tx.rename_node_replaced(root, "target", root, "new"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs.tx(|tx| tx.find_node(root, "new")).unwrap().id(),
+            source.id()
+        );
+    });
+}
+
+#[test]
 fn many_create_remove_should_not_increase_size() {
     with_redoxfs(|mut fs| {
         let initially_free = fs.allocator().free();

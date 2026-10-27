@@ -1,11 +1,18 @@
 //! The `ext4d` scheme: Redox scheme calls on top of [`Fs`].
 //!
 //! The scheme's handles are [`Fs`] handles. Reads, directory listings, `fstat`, `fstatvfs`
-//! and `fpath` are served. Everything that would change the volume (opens for writing or
-//! creating, `unlinkat`, `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename`, `flink`) fails
-//! with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through
-//! [`Error::errno`]. Opens enforce the caller's UID/GID through [`Fs::open_as`].
+//! and `fpath` are served. On a volume mounted with `Fs::new_writable` (features.toml
+//! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
+//! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
+//! is written in place, into the blocks it has ([`Fs::write_with_flags`]). `O_APPEND`
+//! opens and writes fail with `EOPNOTSUPP`: the current write response cannot report an
+//! append's actual position to the kernel (issue #244). Opens that create or truncate
+//! also fail with `EOPNOTSUPP` there. Everything else that would
+//! change the volume (`unlinkat`, `ftruncate`, `frename`, `flink`, and all of the above on
+//! a read-only mount) fails with `EROFS`, as [`Error::ReadOnly`] says. Errors become errnos only through [`Error::errno`]. Opens and
+//! every change enforce the caller's UID/GID.
 
+use ferric_abi::id::requested;
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use syscall::data::{Stat, StatVfs, TimeSpec};
@@ -15,7 +22,7 @@ use syscall::schemev2::NewFdFlags;
 use thiserror::Error;
 
 use crate::Error;
-use crate::fs::{Fs, OpenMode};
+use crate::fs::{Fs, OpenMode, TimeChange};
 
 /// Why the scheme could not be set up or stopped serving.
 #[derive(Debug, Error)]
@@ -181,24 +188,32 @@ impl SchemeSync for Ext4Scheme {
     fn write(
         &mut self,
         id: usize,
-        _buf: &[u8],
-        _offset: u64,
-        _fcntl_flags: u32,
+        buf: &[u8],
+        offset: u64,
+        fcntl_flags: u32,
         _ctx: &CallerCtx,
     ) -> syscall::Result<usize> {
-        self.fs.refuse_change(id).map(|()| 0).map_err(|e| errno(&e))
+        // The caller's permission was checked when the file was opened for writing.
+        self.fs
+            .write_with_flags(id, offset, buf, fcntl_flags)
+            .map_err(|e| errno(&e))
     }
 
     fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> syscall::Result<u64> {
         Ok(self.fs.attributes(id).map_err(|e| errno(&e))?.size)
     }
 
-    fn fchmod(&mut self, id: usize, _mode: u16, _ctx: &CallerCtx) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn fchmod(&mut self, id: usize, mode: u16, ctx: &CallerCtx) -> syscall::Result<()> {
+        self.fs
+            .set_mode(id, mode, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
-    fn fchown(&mut self, id: usize, _uid: u32, _gid: u32, _ctx: &CallerCtx) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn fchown(&mut self, id: usize, uid: u32, gid: u32, ctx: &CallerCtx) -> syscall::Result<()> {
+        let (uid, gid) = (requested(uid), requested(gid));
+        self.fs
+            .set_owner(id, uid, gid, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
     fn fcntl(
@@ -248,13 +263,18 @@ impl SchemeSync for Ext4Scheme {
         self.fs.refuse_change(id).map_err(|e| errno(&e))
     }
 
-    fn futimens(
-        &mut self,
-        id: usize,
-        _times: &[TimeSpec],
-        _ctx: &CallerCtx,
-    ) -> syscall::Result<()> {
-        self.fs.refuse_change(id).map_err(|e| errno(&e))
+    fn futimens(&mut self, id: usize, times: &[TimeSpec], ctx: &CallerCtx) -> syscall::Result<()> {
+        // relibc sends both times, with UTIME_NOW for a null pointer.
+        let &[accessed, modified] = times else {
+            return Err(errno(&Error::InvalidTime));
+        };
+        let change = |time: TimeSpec| TimeChange::from_timespec(time.tv_sec, time.tv_nsec.into());
+        let (accessed, modified) = change(accessed)
+            .and_then(|a| Ok((a, change(modified)?)))
+            .map_err(|e| errno(&e))?;
+        self.fs
+            .set_times(id, accessed, modified, ctx.uid, ctx.gid)
+            .map_err(|e| errno(&e))
     }
 
     fn getdents<'buf>(

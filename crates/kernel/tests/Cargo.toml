@@ -11,6 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 redox_syscall = { path = "../syscall", default-features = false }
+ferric-abi = { path = "../../abi" }
 ferric-irq = { path = "../../irq", optional = true }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
 

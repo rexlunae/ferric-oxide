@@ -1,7 +1,9 @@
-# Ferric Oxide: the on-target test for fatd (features.toml fs.fat). It mounts the FAT32
-# fixture image from userspace/fatd/tests/fixtures/ (built into the test) with fatd, lists
-# directories, reads files by their long, short and differently cased names, and checks that
-# every change fails with EROFS. It prints FERRIC_TEST_SKIP when the image has no fatd. Only
+# Ferric Oxide: the on-target test for fatd (features.toml fs.fat, fs.exfat). It mounts the
+# FAT32 fixture image from userspace/fatd/tests/fixtures/ and the exFAT one from
+# crates/exfat/tests/fixtures/ (both built into the test) with fatd, lists directories, reads
+# files by their long, short and differently cased names, and checks that every change fails
+# with EROFS. It prints FERRIC_TEST_SKIP when the image has no fatd, or (for exFAT) when fatd
+# was built without exFAT. Only
 # for test images. Source lives in files/; as a path source (relative to the repository root)
 # edits there rebuild it.
 [source]
@@ -11,7 +13,8 @@ path = "recipes/tests/ferric-fat-test/files"
 template = "custom"
 dev-dependencies = ["relibc"]
 script = """
-# The fixture is included from ../../../../../userspace/fatd/tests/fixtures/ (from src/).
+# The fixtures are included from ../../../../../userspace/fatd/tests/fixtures/ and
+# ../../../../../crates/exfat/tests/fixtures/ (from src/).
 # The cookbook builds a copy of files/ in this recipe's source/, at the same depth, so the
 # relative path holds there too.
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"

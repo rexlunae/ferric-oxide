@@ -174,7 +174,8 @@ pub struct Context {
     /// ring worker is cancelled when its ring closes; such a context has no signal state, so
     /// this is how an interruption that comes before the wait is not lost.
     pub cancelled: bool,
-    pub fmap_ret: Option<Frame>,
+    /// Lazy file-map reply and wait registration, serialized by this context lock.
+    pub(crate) fmap_ret: super::fmap_reply::FmapReply<Frame>,
     /// Priority
     pub prio: usize,
     /// Virtual Run Time
@@ -255,7 +256,7 @@ impl Context {
             name: ArrayString::new(),
             files: Arc::new(RwLock::new(FdTbl::new())),
             userspace: false,
-            fmap_ret: None,
+            fmap_ret: super::fmap_reply::FmapReply::new(),
             prio: 20,
             vtime: 0,
             vd: 0,
