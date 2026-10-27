@@ -148,6 +148,16 @@ then
     export CPPFLAGS="${CPPFLAGS} -g"
 fi
 
+# Ferric Oxide: COOKBOOK_DEBUGINFO=true (build.debug in ferric.toml) keeps the optimized
+# release build and adds full debug info to it, so debugging a local image does not also
+# make it run unoptimized.
+if [ ! -z "${COOKBOOK_DEBUGINFO}" ]
+then
+    export CARGO_PROFILE_RELEASE_DEBUG=true
+    export CARGO_PROFILE_RELEASE_STRIP=false
+    export CPPFLAGS="${CPPFLAGS} -g"
+fi
+
 if [ ! -z "${COOKBOOK_OFFLINE}" ]
 then
 build_flags+=" --offline"

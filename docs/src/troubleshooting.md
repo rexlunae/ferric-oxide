@@ -557,7 +557,8 @@ You will see the available debug methods for recipes on this section.
 
 - If you change the recipe build mode (`release` to `debug` or the opposite) while debugging, don't forget to rebuild with `make cr.recipe-name` because the build system may not detect the changes.
 
-- `REPO_DEBUG` - This environment variable will build the recipe binaries with assertions, checking and symbols.
+- `REPO_DEBUG` - This environment variable will build the recipe binaries unoptimized, with assertions, checking and symbols. Unoptimized file systems, drivers and C library run many times slower, so whole images built this way are slow to use (`build.unoptimized` in `ferric.toml`).
+- `REPO_DEBUGINFO` - This environment variable keeps the recipe binaries optimized and adds full debug info without stripping them (`build.debug` in `ferric.toml`). Prefer it unless you need debug assertions.
 
 (Debugging with symbols inside of Redox is not supported yet)
 
