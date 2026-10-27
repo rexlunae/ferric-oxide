@@ -3683,7 +3683,6 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 rmm::PageFlushAll::<RmmA>::new().flush()
             });
         }
-        }
         // Ferric Oxide: the shootdown's wait for acknowledgements (`tlb_stats`, mm.tlb_flush).
         let waited = (affected_cpu_count > 0).then(crate::tlb_stats::Stopwatch::start);
 
