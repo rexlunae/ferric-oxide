@@ -732,9 +732,10 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         // CookRecipe::is_in_tree), and so do prebuilts an offline cook
         // cannot download, so they get their build and dev dependencies
         // like any source recipe.
-        let (from_source, binary_recipes): (Vec<_>, Vec<_>) = binary_recipes
-            .into_iter()
-            .partition(|r| r.is_in_tree() || offline_cook_without_binaries(&config, &command, r));
+        let (from_source, binary_recipes): (Vec<_>, Vec<_>) =
+            binary_recipes.into_iter().partition(|r| {
+                r.is_in_tree() || offline_cook_without_binaries(config.cook.offline, &command, r)
+            });
         if command.is_building() || command.is_pushing() {
             let names: Vec<_> = from_source.into_iter().map(|r| r.name).collect();
             recipes.extend(CookRecipe::get_build_deps_recursive(
@@ -826,12 +827,11 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         }
     }
 
-    if command == CliCommand::Cook && config.cook.offline {
-        for recipe in recipes
-            .iter_mut()
-            .filter(|r| r.rule == "binary" && offline_cook_without_binaries(&config, &command, r))
-        {
-            if config.cook.verbose && !config.cook.tui {
+    if config.cook.offline {
+        for recipe in recipes.iter_mut().filter(|r| {
+            r.rule == "binary" && offline_cook_without_binaries(config.cook.offline, &command, r)
+        }) {
+            if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
                 println!(
                     "DEBUG: Recipe {:?} has no downloaded binary package, building it from source",
                     recipe.name.as_str()
@@ -850,15 +850,14 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     Ok((config, command, recipes))
 }
 
-/// Whether `recipe` is a prebuilt that this offline cook cannot use because
-/// its archives were never downloaded, so it builds from the sources already
-/// fetched. `fetch` still downloads prebuilts, so it never falls back.
-fn offline_cook_without_binaries(
-    config: &CliConfig,
-    command: &CliCommand,
-    recipe: &CookRecipe,
-) -> bool {
-    *command == CliCommand::Cook && config.cook.offline && !recipe.has_downloaded_binaries()
+/// Whether `recipe` is a prebuilt that an offline cook, or its `cook-list`
+/// preview, cannot use because its archives were never downloaded, so it
+/// builds from the sources already fetched. `fetch` still downloads
+/// prebuilts, so it never falls back.
+fn offline_cook_without_binaries(offline: bool, command: &CliCommand, recipe: &CookRecipe) -> bool {
+    offline
+        && matches!(command, CliCommand::Cook | CliCommand::CookList)
+        && !recipe.has_downloaded_binaries()
 }
 
 fn handle_fetch(
@@ -1187,3 +1186,53 @@ macro_rules! bail_options_err {
 }
 
 use bail_options_err;
+
+#[cfg(test)]
+mod tests {
+    use super::{CliCommand, offline_cook_without_binaries};
+    use cookbook::recipe::CookRecipe;
+
+    #[test]
+    fn only_offline_cooks_fall_back_from_undownloaded_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("curl");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recipe.toml"),
+            "[source]\ntar = \"https://example.org/curl.tar.xz\"\n\n[build]\ntemplate = \"custom\"\nscript = \"make\"\n",
+        )
+        .unwrap();
+        let recipe = CookRecipe::from_path(&dir, true, false).unwrap();
+
+        assert!(offline_cook_without_binaries(
+            true,
+            &CliCommand::Cook,
+            &recipe
+        ));
+        assert!(offline_cook_without_binaries(
+            true,
+            &CliCommand::CookList,
+            &recipe
+        ));
+        assert!(!offline_cook_without_binaries(
+            true,
+            &CliCommand::Fetch,
+            &recipe
+        ));
+        assert!(!offline_cook_without_binaries(
+            false,
+            &CliCommand::Cook,
+            &recipe
+        ));
+
+        let target_dir = dir.join("target").join(recipe.target);
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("source.pkgar"), b"").unwrap();
+        std::fs::write(target_dir.join("source.toml"), b"").unwrap();
+        assert!(!offline_cook_without_binaries(
+            true,
+            &CliCommand::Cook,
+            &recipe
+        ));
+    }
+}
