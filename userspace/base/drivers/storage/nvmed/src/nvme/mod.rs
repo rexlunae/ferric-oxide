@@ -16,12 +16,15 @@ use syscall::error::{Error, Result, EIO};
 pub mod cmd;
 pub mod executor;
 pub mod identify;
+// Ferric Oxide: INTMS/INTMC or the MSI-X Vector Control word, decided once at start.
+pub mod intmask;
 // Ferric Oxide: one I/O queue pair per CPU (features.toml: drivers.nvme_percore).
 #[cfg(feature = "percore")]
 pub mod percore;
 pub mod queues;
 
 use self::executor::NvmeExecutor;
+use self::intmask::{InterruptMask, MaskRegister, MaskWrite};
 pub use self::queues::{NvmeCmd, NvmeCmdQueue, NvmeComp, NvmeCompQueue};
 
 #[repr(C, packed)]
@@ -92,6 +95,8 @@ impl Caps {
 
 pub struct Nvme {
     interrupt_vector: Mutex<InterruptVector>,
+    /// Ferric Oxide: how `interrupt_vector` is masked, from its delivery mechanism.
+    interrupt_mask: InterruptMask,
     pcid_interface: Mutex<PciFunctionHandle>,
     regs: RwLock<&'static mut NvmeRegs>,
 
@@ -213,6 +218,7 @@ impl Nvme {
             cq_ivs: RwLock::new(iter::once((0, 0)).collect()),
             sq_ivs: RwLock::new(iter::once((0, 0)).collect()),
 
+            interrupt_mask: InterruptMask::new(interrupt_vector.mechanism()),
             interrupt_vector: Mutex::new(interrupt_vector),
             pcid_interface: Mutex::new(pcid_interface),
 
@@ -274,9 +280,25 @@ impl Nvme {
             }
         }
 
-        if !self.interrupt_vector.get_mut().set_masked_if_fast(false) {
-            self.regs.get_mut().intms.write(0xFFFF_FFFF);
-            self.regs.get_mut().intmc.write(0x0000_0001);
+        match self.interrupt_mask {
+            InterruptMask::MsixVectorControl => {
+                let fast = self.interrupt_vector.get_mut().set_masked_if_fast(false);
+                debug_assert!(fast, "nvmed: MSI-X vector without a table entry");
+            }
+            InterruptMask::IntmsIntmc => {
+                // Mask every vector, then unmask the one the admin queue interrupts on.
+                let regs = self.regs.get_mut();
+                Self::write_mask(
+                    regs,
+                    MaskWrite {
+                        register: MaskRegister::Set,
+                        value: u32::MAX,
+                    },
+                );
+                if let Some(write) = self.interrupt_mask.register_write(0, false) {
+                    Self::write_mask(regs, write);
+                }
+            }
         }
 
         {
@@ -333,7 +355,11 @@ impl Nvme {
         Ok(())
     }
 
-    pub fn set_vector_masked(&self, vector: u16, masked: bool) {
+    /// Masks (`masked`) or unmasks interrupt `vector` while its completion queues drain.
+    ///
+    /// Under MSI-X this writes the vector's table entry and never INTMS or INTMC, which the
+    /// NVMe specification forbids host software to access then (see [`intmask`]).
+    pub fn set_vector_masked(&self, vector: Iv, masked: bool) {
         // Ferric Oxide: a per-CPU queue pair's own MSI-X entry.
         #[cfg(feature = "percore")]
         if let Some(own) = self.percore_vectors.lock().get_mut(&vector) {
@@ -341,36 +367,23 @@ impl Nvme {
                 return;
             }
         }
-        let mut interrupt_vector_guard = (&self).interrupt_vector.lock();
-
-        if !interrupt_vector_guard.set_masked_if_fast(masked) {
-            let mut to_mask = 0x0000_0000;
-            let mut to_clear = 0x0000_0000;
-
-            let vector = vector as u8;
-
-            if masked {
-                assert_ne!(
-                    to_clear & (1 << vector),
-                    (1 << vector),
-                    "nvmed: internal error: cannot both mask and set"
-                );
-                to_mask |= 1 << vector;
-            } else {
-                assert_ne!(
-                    to_mask & (1 << vector),
-                    (1 << vector),
-                    "nvmed: internal error: cannot both mask and set"
-                );
-                to_clear |= 1 << vector;
+        match self.interrupt_mask {
+            InterruptMask::MsixVectorControl => {
+                let fast = self.interrupt_vector.lock().set_masked_if_fast(masked);
+                debug_assert!(fast, "nvmed: MSI-X vector without a table entry");
             }
+            InterruptMask::IntmsIntmc => match self.interrupt_mask.register_write(vector, masked) {
+                Some(write) => Self::write_mask(&mut self.regs.write(), write),
+                None => log::error!("nvmed: interrupt vector {vector} has no INTMS/INTMC bit"),
+            },
+        }
+    }
 
-            if to_mask != 0 {
-                (&self).regs.write().intms.write(to_mask);
-            }
-            if to_clear != 0 {
-                (&self).regs.write().intmc.write(to_clear);
-            }
+    /// Writes INTMS or INTMC.
+    fn write_mask(regs: &mut NvmeRegs, write: MaskWrite) {
+        match write.register {
+            MaskRegister::Set => regs.intms.write(write.value),
+            MaskRegister::Clear => regs.intmc.write(write.value),
         }
     }
 

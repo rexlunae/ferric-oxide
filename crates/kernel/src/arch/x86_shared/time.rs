@@ -1,6 +1,18 @@
 use super::device::{hpet, pit};
+#[cfg(not(feature = "time_one_shot"))]
 use crate::sync::CleanLockToken;
 
+// Ferric Oxide (`kernel.time.one_shot`, tickless scheduling #186): a calibrated TSC and a
+// continuous clock source replace the OFFSET-plus-interpolation clock below. Without the
+// option the clock is upstream's.
+#[cfg(feature = "time_one_shot")]
+mod continuous;
+#[cfg(feature = "time_one_shot")]
+pub(crate) use continuous::MAX_SPREAD_PPM;
+#[cfg(feature = "time_one_shot")]
+pub use continuous::{init, monotonic_absolute, monotonic_resolution, tsc_rate};
+
+#[cfg(not(feature = "time_one_shot"))]
 pub fn monotonic_absolute(token: &mut CleanLockToken) -> u128 {
     // The paravirtualized TSC is already guaranteed to be monotonic, and thus doesn't need to be
     // readjusted.
@@ -54,6 +66,7 @@ fn hpet_or_pit() -> u128 {
     (elapsed as u128 * pit::PERIOD_FS) / 1_000_000
 }
 
+#[cfg(not(feature = "time_one_shot"))]
 pub fn monotonic_resolution() -> u128 {
     #[cfg(feature = "x86_kvm_pv")]
     if super::device::tsc::monotonic_absolute().is_some() {

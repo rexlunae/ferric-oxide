@@ -40,6 +40,17 @@
 //! exits zero when there is no NVMe disk and no file job, `FERRIC_TEST_FAIL iobench: <why>`
 //! and exits non-zero when a job cannot run, and `FERRIC_TEST_PASS iobench` when every job
 //! ran.
+//!
+//! On a kernel with `kernel.tlb_stats` (`/scheme/sys/tlb`), it also prints, per policy, how
+//! much TLB maintenance each read cost, from the counters' growth over the rounds' timed
+//! parts (`ferric_trace::tlb::PerOp`): local flushes, shootdowns, shootdown IPIs, CR3
+//! loads, system calls and IOTLB flushes per read, and targets, pages and acknowledgement
+//! wait per shootdown. The counters are system-wide, so whatever else runs meanwhile
+//! (nvmed, the file system daemons) is included, which for disk reads is the point:
+//!
+//! ```text
+//! FERRIC_BENCH iobench-randread-4k-qd32 tlb_policy=main kpti=on pcid=on tlb_ops=… flushes_per_op=…
+//! ```
 
 #[cfg(target_os = "redox")]
 mod file;

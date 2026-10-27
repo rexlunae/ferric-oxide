@@ -312,6 +312,11 @@ crate::interrupt!(ata2, || {
 });
 
 crate::interrupt!(lapic_timer, || {
+    // The one-shot scheduler timer (kernel.time.one_shot): the handler marks
+    // the armed deadline fired; the periodic path kept the log before.
+    #[cfg(feature = "time_one_shot")]
+    crate::arch::timer::handle_fire();
+    #[cfg(not(feature = "time_one_shot"))]
     crate::println!("Local apic timer interrupt");
     lapic_eoi();
 });

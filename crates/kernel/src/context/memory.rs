@@ -906,7 +906,7 @@ impl AddrSpaceWrapper {
         } else {
             let (frame, flush, new_guard) = correct_inner(self, guard, page, AccessMode::Write, 0)
                 .map_err(|_| Error::new(ENOMEM))?;
-            flush.flush();
+            crate::tlb_stats::flush_page(flush);
             guard_lock = Some(new_guard);
 
             frame
@@ -1998,7 +1998,7 @@ impl Grant {
                         let (_, flush, new_guard) =
                             correct_inner(src.addr_space_lock, guard, page, AccessMode::Read, 0)
                                 .map_err(|_| Error::new(EIO))?;
-                        flush.flush();
+                        crate::tlb_stats::flush_page(flush);
                         guard = new_guard;
                     }
                     let (phys, _) = guard
@@ -2417,7 +2417,7 @@ impl Grant {
                                 // userspace race condition
                                 //
                                 //flush.ignore();
-                                flush.flush();
+                                crate::tlb_stats::flush_page(flush);
 
                                 // FIXME: Is MOVE correct?
                                 src_flusher.queue(
@@ -3165,7 +3165,7 @@ pub fn try_correcting_page_tables(
 
     let (_, flush, _) = correct_inner(&addr_space, addr_space_lock, faulting_page, access, 0)?;
 
-    flush.flush();
+    crate::tlb_stats::flush_page(flush);
 
     Ok(())
 }
@@ -3653,6 +3653,7 @@ impl<'a> Flusher<'a> {
         // request, and for nothing else. A CPU that leaves the address space meanwhile still
         // has to take its mailbox and invalidate before its acknowledgement counts.
         let mut acks = TlbAcks::new();
+        let mut affected_cpu_count: u32 = 0;
         let current_cpu_id = crate::cpu_id();
 
         for cpu_id in self.active_cpus.iter() {
@@ -3663,15 +3664,26 @@ impl<'a> Flusher<'a> {
                 continue;
             };
             crate::percpu::expect_tlb_ack(&mut acks, cpu_id, ack);
+            affected_cpu_count = affected_cpu_count.saturating_add(1);
         }
 
-        if self.active_cpus.contains(current_cpu_id) {
+        let local = self.active_cpus.contains(current_cpu_id);
+        if local {
             invalidation.invalidate(crate::percpu::invalidate_tlb_page, || {
                 rmm::PageFlushAll::<RmmA>::new().flush()
             });
         }
+        // Ferric Oxide: the shootdown's wait for acknowledgements (`tlb_stats`, mm.tlb_flush).
+        let waited = (affected_cpu_count > 0).then(crate::tlb_stats::Stopwatch::start);
 
         crate::percpu::wait_for_tlb_acks(&mut acks);
+        let wait_cycles = waited.map_or(0, crate::tlb_stats::Stopwatch::elapsed);
+        crate::tlb_stats::flush_batch(
+            affected_cpu_count,
+            pages.len(),
+            local && invalidation.is_all(),
+            wait_cycles,
+        );
 
         for entry in pages {
             match entry {

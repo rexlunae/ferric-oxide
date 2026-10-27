@@ -122,6 +122,10 @@ pub struct Context {
     // scheduler additionally were to use this information for decision-making, it's primarily a
     // statistic where RDTSC does add some overhead.
     pub switch_time: u128,
+    /// Ferric Oxide: the trace clock when [`Self::unblock_no_ipi`] made this context runnable,
+    /// for the `sched.wake_run` tracepoint's wake-to-run latency; 0 when not measuring.
+    #[cfg(feature = "trace_sched")]
+    pub woken_at: u64,
     /// Amount of CPU time while being the current context (see `running`)
     pub active_cpu_time: u128,
     /// Amount of CPU time while being the sched context (see `currently_scheduled`)
@@ -236,6 +240,8 @@ impl Context {
             cpu_id: None,
             schedule_time: 0,
             switch_time: 0,
+            #[cfg(feature = "trace_sched")]
+            woken_at: 0,
             active_cpu_time: 0,
             sched_cpu_time: 0,
             sched_affinity: LogicalCpuSet::all(),
@@ -346,6 +352,12 @@ impl Context {
         if self.status.is_soft_blocked() {
             self.status = Status::Runnable;
             self.status_reason = "";
+            #[cfg(feature = "trace_sched")]
+            if const { crate::trace::compiled_in(&ferric_trace::kernel::SCHED_WAKE_RUN) }
+                && crate::trace::enabled::<{ ferric_trace::kernel::SCHED_WAKE_RUN.id().get() }>()
+            {
+                self.woken_at = crate::trace::clock::now();
+            }
 
             true
         } else {

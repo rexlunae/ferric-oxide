@@ -1,0 +1,14 @@
+[package]
+name = "ferric-timed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Monotonic nanosecond time and deadline arithmetic for the scheduler"
+
+[dependencies]
+
+[features]
+default = []
+
+# Host tests use std.
+[dev-dependencies]

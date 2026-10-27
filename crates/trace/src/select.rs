@@ -203,6 +203,10 @@ mod tests {
                 crate::kernel::SCHED_TICK.id(),
                 crate::kernel::SCHED_IPI_PIT.id(),
                 crate::kernel::SCHED_IPI_WAKE.id(),
+                crate::kernel::SCHED_TIMER_CALIBRATE.id(),
+                crate::kernel::SCHED_TIMER_ARM.id(),
+                crate::kernel::SCHED_TIMER_FIRE.id(),
+                crate::kernel::SCHED_WAKE_RUN.id(),
             ]
         );
     }
