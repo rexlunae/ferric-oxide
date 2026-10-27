@@ -120,14 +120,14 @@ jobs:
           # default), so ferric-blocklayer-test serves its LUKS and LVM images, and with
           # ferric-unlock (fs.unlock_at_boot, also off by default), so that test also reads back
           # the volumes its crypttab had unlocked and mounted at boot.
-          # fatd (fs.fat) also mounts its FAT32 fixture.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nunlock_at_boot = true\nfat = true\n' > "$out/ferric.toml"
+          # fatd (fs.fat, fs.exfat) also mounts its FAT32 and exFAT fixtures.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nunlock_at_boot = true\nfat = true\nexfat = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
-          # Pass the recipe-facing settings (kernel, relibc, initfs and ext4d features,
+          # Pass the recipe-facing settings (kernel, relibc, initfs, ext4d and fatd features,
           # kernel link arguments, bootloader features, signed fox manifests)
           # on to the build.
-          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_BASE_DRIVERS FERRIC_BLOCKD_FEATURES FERRIC_EXT4D_FEATURES FERRIC_FOX_MANIFEST; do
+          for var in FERRIC_KERNEL_FEATURES FERRIC_RELIBC_FEATURES FERRIC_KERNEL_LINK_ARGS FERRIC_BOOTLOADER_FEATURES FERRIC_INITFS_FEATURES FERRIC_BASE_FEATURES FERRIC_BASE_DRIVERS FERRIC_BLOCKD_FEATURES FERRIC_EXT4D_FEATURES FERRIC_FATD_FEATURES FERRIC_FOX_MANIFEST; do
             value="$(sed -n "s/^export $var:=//p" "$out/config.mk")"
             echo "$var=$value" | tee -a "$GITHUB_ENV"
           done
@@ -574,14 +574,17 @@ jobs:
           done
           echo "::notice::ferric-ext4-test passed all 7 steps"
 
-      # fs.fat is on, so ferric-fat-test mounts its FAT32 image with fatd and runs every step.
+      # fs.fat and fs.exfat are on, so ferric-fat-test mounts its FAT32 and exFAT images with
+      # fatd and runs every step on each.
       - name: Check FAT
         if: env.CONFIG_NAME == 'ferric-smoke'
         run: |
-          for step in image mount list read stat erofs; do
-            grep -aF "FERRIC_TEST_PASS fat-$step" "$LOG"
+          for format in fat exfat; do
+            for step in image mount list read stat erofs; do
+              grep -aF "FERRIC_TEST_PASS $format-$step" "$LOG"
+            done
           done
-          echo "::notice::ferric-fat-test passed all 6 steps"
+          echo "::notice::ferric-fat-test passed all 6 steps on FAT32 and on exFAT"
 
       # fs.luks and fs.lvm are on, so ferric-blocklayer-test serves LVM on LUKS (4 KiB
       # sectors), LUKS on LVM and LUKS1 with ferric-blockd and runs every step; fs.unlock_at_boot

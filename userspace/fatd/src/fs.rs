@@ -1,24 +1,26 @@
 //! The open-file table: what a scheme's `openat`, `read`, `getdents`, `fstat` and `close`
-//! do, on a FAT volume read by `fatfs`.
+//! do, on a FAT volume read by `fatfs` or, with the `exfat` feature, an exFAT volume read by
+//! `ferric-exfat`. [`mount`] tells the two apart by the boot sector's file system name.
 //!
 //! Handles are numbers the scheme gives its clients. Each names an open file or directory
 //! with its path from the volume's root, so relative opens and `fpath` work. A path is
 //! resolved one component at a time, in order: each name is looked up in its directory the
-//! way the FAT specification asks, ignoring case and matching either the long name or the
-//! 8.3 short name, and the handle keeps the names as the directory stores them. So
-//! `/efi/boot/bootx64.efi` opens `/EFI/BOOT/BOOTX64.EFI`, and both get the same inode number.
+//! way the format asks, ignoring case (on FAT matching either the long name or the 8.3
+//! short name; on exFAT comparing through the volume's up-case table), and the handle keeps
+//! the names as the directory stores them. So `/efi/boot/bootx64.efi` opens
+//! `/EFI/BOOT/BOOTX64.EFI`, and both get the same inode number.
 //!
-//! FAT records no owner and no permissions. Every file is presented as owned by root and
+//! Neither format records an owner or permissions. Every file is presented as owned by root and
 //! readable by everyone (`0444`), every directory as searchable by everyone (`0555`), and no
 //! caller is refused a read. Nothing here changes the volume: [`OpenMode::wants_write`] opens
 //! and every changing call fail with [`Error::ReadOnly`].
 //!
-//! Limitations: FAT has no inode numbers, so [`Attributes::ino`] is made from the path
-//! ([`ferric_fspath::path_ino`]); and FAT times carry no time zone, so they are read as UTC
-//! (see [`crate::time`]).
+//! Limitations: neither format has inode numbers, so [`Attributes::ino`] is made from the
+//! path ([`ferric_fspath::path_ino`]); and FAT times carry no time zone, so they are read as
+//! UTC (see [`crate::time`]).
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use ferric_fspath::{normalize, path_ino};
 
@@ -26,8 +28,51 @@ use crate::Error;
 use crate::disk::{Device, Disk};
 use crate::time::{self, UnixTime};
 
-/// A mounted FAT volume on the device `D`: the `fatfs` file system the handles borrow.
-pub type Volume<D> = fatfs::FileSystem<Disk<D>>;
+/// A mounted volume on the device `D`, which the handles borrow.
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "exfat",
+    expect(
+        clippy::large_enum_variant,
+        reason = "a daemon mounts one volume, once, and never moves it"
+    )
+)]
+pub enum Volume<D: Device> {
+    /// FAT12, FAT16 or FAT32, read by `fatfs`.
+    Fat(fatfs::FileSystem<Disk<D>>),
+    /// exFAT, read by `ferric-exfat` (feature `exfat`, features.toml `fs.exfat`).
+    #[cfg(feature = "exfat")]
+    ExFat(ferric_exfat::ExFat<D>),
+}
+
+/// The format of a mounted volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Format {
+    /// FAT12.
+    Fat12,
+    /// FAT16.
+    Fat16,
+    /// FAT32.
+    Fat32,
+    /// exFAT.
+    ExFat,
+}
+
+impl Format {
+    /// The format's usual name: `FAT12`, `FAT16`, `FAT32` or `exFAT`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fat12 => "FAT12",
+            Self::Fat16 => "FAT16",
+            Self::Fat32 => "FAT32",
+            Self::ExFat => "exFAT",
+        }
+    }
+}
+
+#[cfg(feature = "exfat")]
+type ExFat<D> = ferric_exfat::ExFat<D>;
 
 type Dir<'v, D> = fatfs::Dir<'v, Disk<D>>;
 type DirEntry<'v, D> = fatfs::DirEntry<'v, Disk<D>>;
@@ -41,16 +86,38 @@ const DIRECTORY_MODE: u16 = 0o555;
 /// The mode bits of every file: readable by everyone.
 const FILE_MODE: u16 = 0o444;
 
-/// Reads the FAT boot sector (and, on FAT32, the FSInfo sector) of `device` and mounts the
-/// volume, read-only.
+/// Reads the boot sector of `device` and mounts the volume, read-only: as exFAT when its
+/// file system name is `EXFAT`, otherwise as FAT (reading, on FAT32, the FSInfo sector too).
 ///
 /// # Errors
 ///
-/// [`Error::Mount`] when `device` does not start with a FAT boot sector `fatfs` accepts, or
-/// cannot be read.
+/// [`Error::Mount`] when `device` cannot be read or does not start with a FAT boot sector
+/// `fatfs` accepts, [`Error::ExFatDisabled`] for an exFAT volume when the `exfat` feature
+/// is off, and `Error::ExFat` (with the `exfat` feature) when the exFAT reader refuses the volume.
 pub fn mount<D: Device>(device: D) -> Result<Volume<D>, Error> {
+    let mut first = [0; ferric_fat_types::BOOT_SECTOR_PREFIX];
+    device
+        .read_at(0, &mut first)
+        .map_err(|e| Error::Mount(io::Error::other(e)))?;
+    if &first[3..11] == ferric_fat_types::EXFAT_NAME {
+        return mount_exfat(device);
+    }
     // The default options leave access dates alone, so reading a file writes nothing.
-    fatfs::FileSystem::new(Disk::new(device), fatfs::FsOptions::new()).map_err(Error::Mount)
+    fatfs::FileSystem::new(Disk::new(device), fatfs::FsOptions::new())
+        .map(Volume::Fat)
+        .map_err(Error::Mount)
+}
+
+#[cfg(feature = "exfat")]
+fn mount_exfat<D: Device>(device: D) -> Result<Volume<D>, Error> {
+    ExFat::open(device)
+        .map(Volume::ExFat)
+        .map_err(Error::from_exfat)
+}
+
+#[cfg(not(feature = "exfat"))]
+fn mount_exfat<D: Device>(_device: D) -> Result<Volume<D>, Error> {
+    Err(Error::ExFatDisabled)
 }
 
 /// What an `openat` asks for, from its flags.
@@ -101,7 +168,7 @@ impl OpenMode {
     }
 }
 
-/// The kind of file a handle or directory entry names: FAT has only these two.
+/// The kind of file a handle or directory entry names: FAT and exFAT have only these two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Kind {
@@ -112,13 +179,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The kind of a directory entry: a directory when its `ATTR_DIRECTORY` bit is set.
-    fn of<D: Device>(entry: &DirEntry<'_, D>) -> Self {
-        if entry.is_dir() {
-            Self::Directory
-        } else {
-            Self::File
-        }
+    /// A directory when `is_dir` (the entry's `ATTR_DIRECTORY` bit is set), else a file.
+    const fn of(is_dir: bool) -> Self {
+        if is_dir { Self::Directory } else { Self::File }
     }
 
     /// The file type and permission bits of `st_mode` for this kind (see the module docs).
@@ -145,11 +208,12 @@ pub struct Attributes {
     pub ino: u64,
     /// The kind of file.
     pub kind: Kind,
-    /// The size in bytes; 0 for a directory, as FAT records.
+    /// The size in bytes, as the directory entry records it: 0 for a FAT directory, the
+    /// allocated length of an exFAT one.
     pub size: u64,
     /// The volume's cluster size, the unit it allocates in.
     pub cluster_size: u32,
-    /// The last access: FAT keeps only the date, so this is its start.
+    /// The last access: FAT keeps only the date, so this is its start; exFAT keeps the time.
     pub accessed: Option<UnixTime>,
     /// The last write.
     pub modified: Option<UnixTime>,
@@ -168,10 +232,10 @@ impl Attributes {
         }
     }
 
-    fn of<D: Device>(entry: &DirEntry<'_, D>, path: &str, cluster_size: u32) -> Self {
+    fn of_fat<D: Device>(entry: &DirEntry<'_, D>, path: &str, cluster_size: u32) -> Self {
         Self {
             ino: path_ino(path),
-            kind: Kind::of(entry),
+            kind: Kind::of(entry.is_dir()),
             size: entry.len(),
             cluster_size,
             accessed: time::date(entry.accessed()),
@@ -179,9 +243,21 @@ impl Attributes {
         }
     }
 
+    #[cfg(feature = "exfat")]
+    fn of_exfat(entry: &ferric_exfat::Entry, path: &str, cluster_size: u32) -> Self {
+        Self {
+            ino: path_ino(path),
+            kind: Kind::of(entry.is_dir()),
+            size: entry.stream.length,
+            cluster_size,
+            accessed: entry.accessed.to_unix(),
+            modified: entry.modified.to_unix(),
+        }
+    }
+
     /// The attributes as the scheme ABI's `Stat`. Owner and group are root, `st_blocks`
-    /// counts 512-byte units of the size, and missing times read as 1970. FAT has no change
-    /// time; the last write stands in for it.
+    /// counts 512-byte units of the size, and missing times read as 1970. Neither format has
+    /// a change time; the last write stands in for it.
     pub fn to_stat(&self) -> syscall::data::Stat {
         let (mtime, mtime_nsec) = self.modified.unwrap_or_default();
         let (atime, atime_nsec) = self.accessed.unwrap_or_default();
@@ -213,12 +289,12 @@ pub struct Geometry {
     pub cluster_size: u32,
     /// The clusters of the data region.
     pub clusters: u64,
-    /// The clusters the allocation table marks free.
+    /// The clusters the allocation table (on exFAT, the allocation bitmap) marks free.
     pub free_clusters: u64,
 }
 
 impl Geometry {
-    /// The geometry as the scheme ABI's `StatVfs`. FAT reserves nothing for the superuser,
+    /// The geometry as the scheme ABI's `StatVfs`. Neither format reserves space for the superuser,
     /// so every free cluster is available.
     pub const fn to_statvfs(&self) -> syscall::data::StatVfs {
         syscall::data::StatVfs {
@@ -233,7 +309,7 @@ impl Geometry {
 /// One directory entry, for `getdents`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// The entry's name: its long name, or its 8.3 short name when it has none.
+    /// The entry's name: on FAT its long name, or its 8.3 short name when it has none.
     pub name: String,
     /// The kind of file it names.
     pub kind: Kind,
@@ -243,10 +319,31 @@ pub struct Entry {
 
 enum Open<'v, D: Device> {
     Metadata,
-    File(File<'v, D>),
+    File(Data<'v, D>),
     Directory {
-        dir: Dir<'v, D>,
+        dir: Directory<'v, D>,
         entries: Option<Vec<Entry>>,
+    },
+}
+
+/// An open file's data.
+enum Data<'v, D: Device> {
+    Fat(File<'v, D>),
+    #[cfg(feature = "exfat")]
+    ExFat {
+        volume: &'v ExFat<D>,
+        stream: ferric_exfat::Stream,
+        cursor: ferric_exfat::Cursor,
+    },
+}
+
+/// An open directory, before its entries are read.
+enum Directory<'v, D: Device> {
+    Fat(Dir<'v, D>),
+    #[cfg(feature = "exfat")]
+    ExFat {
+        volume: &'v ExFat<D>,
+        stream: ferric_exfat::Stream,
     },
 }
 
@@ -261,10 +358,12 @@ struct Handle<'v, D: Device> {
 /// What a path names: the root directory, which has no entry, or a directory entry.
 enum Found<'v, D: Device> {
     Root,
-    Entry(DirEntry<'v, D>),
+    Fat(DirEntry<'v, D>),
+    #[cfg(feature = "exfat")]
+    ExFat(&'v ExFat<D>, ferric_exfat::Entry),
 }
 
-/// The open handles of a mounted FAT volume.
+/// The open handles of a mounted volume.
 pub struct Fs<'v, D: Device> {
     volume: &'v Volume<D>,
     cluster_size: u32,
@@ -275,48 +374,76 @@ pub struct Fs<'v, D: Device> {
 impl<'v, D: Device> Fs<'v, D> {
     /// The handle table of `volume`, with nothing open.
     pub fn new(volume: &'v Volume<D>) -> Self {
+        let cluster_size = match volume {
+            Volume::Fat(fat) => fat.cluster_size(),
+            // At most 32 MiB, which the boot sector check ensures.
+            #[cfg(feature = "exfat")]
+            Volume::ExFat(exfat) => exfat.boot_sector().cluster_size() as u32,
+        };
         Self {
             volume,
-            cluster_size: volume.cluster_size(),
+            cluster_size,
             handles: BTreeMap::new(),
             next: 1,
         }
     }
 
-    /// The volume's label from its boot sector, without the padding; empty when it has none.
+    /// The volume's label, without the padding; empty when it has none. FAT keeps it in the
+    /// boot sector, exFAT in a root directory entry.
     pub fn label(&self) -> String {
-        let label = self.volume.volume_label();
-        let label = label.trim_end_matches(' ');
-        if label == "NO NAME" {
-            String::new()
-        } else {
-            label.to_owned()
+        match self.volume {
+            Volume::Fat(fat) => {
+                let label = fat.volume_label();
+                let label = label.trim_end_matches(' ');
+                if label == "NO NAME" {
+                    String::new()
+                } else {
+                    label.to_owned()
+                }
+            }
+            #[cfg(feature = "exfat")]
+            Volume::ExFat(exfat) => exfat.label().to_owned(),
         }
     }
 
-    /// Which FAT the volume uses: 12, 16 or 32, chosen by its cluster count as the
-    /// specification's "FAT Type Determination" section says.
-    pub fn fat_bits(&self) -> u8 {
-        match self.volume.fat_type() {
-            fatfs::FatType::Fat12 => 12,
-            fatfs::FatType::Fat16 => 16,
-            fatfs::FatType::Fat32 => 32,
+    /// The volume's format. Which FAT a FAT volume uses is chosen by its cluster count, as
+    /// the FAT specification's "FAT Type Determination" section says.
+    pub fn format(&self) -> Format {
+        match self.volume {
+            Volume::Fat(fat) => match fat.fat_type() {
+                fatfs::FatType::Fat12 => Format::Fat12,
+                fatfs::FatType::Fat16 => Format::Fat16,
+                fatfs::FatType::Fat32 => Format::Fat32,
+            },
+            #[cfg(feature = "exfat")]
+            Volume::ExFat(_) => Format::ExFat,
         }
     }
 
     /// The volume's size and free space. On FAT12 and FAT16, and on FAT32 without a
-    /// trustworthy FSInfo sector, this reads the whole allocation table.
+    /// trustworthy FSInfo sector, this reads the whole allocation table; on exFAT, the
+    /// allocation bitmap.
     ///
     /// # Errors
     ///
-    /// [`Error::Read`] when the allocation table cannot be read.
+    /// [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when the table or bitmap cannot be read.
     pub fn geometry(&self) -> Result<Geometry, Error> {
-        let stats = self.volume.stats().map_err(Error::Read)?;
-        Ok(Geometry {
-            cluster_size: stats.cluster_size(),
-            clusters: u64::from(stats.total_clusters()),
-            free_clusters: u64::from(stats.free_clusters()),
-        })
+        match self.volume {
+            Volume::Fat(fat) => {
+                let stats = fat.stats().map_err(Error::Read)?;
+                Ok(Geometry {
+                    cluster_size: stats.cluster_size(),
+                    clusters: u64::from(stats.total_clusters()),
+                    free_clusters: u64::from(stats.free_clusters()),
+                })
+            }
+            #[cfg(feature = "exfat")]
+            Volume::ExFat(exfat) => Ok(Geometry {
+                cluster_size: self.cluster_size,
+                clusters: u64::from(exfat.boot_sector().cluster_count),
+                free_clusters: exfat.free_clusters().map_err(Error::from_exfat)?,
+            }),
+        }
     }
 
     /// Opens the root directory, as the scheme's root handle.
@@ -337,7 +464,7 @@ impl<'v, D: Device> Fs<'v, D> {
     /// for an unknown `base`, [`Error::NotADirectory`] when `base` or a component on the way
     /// is not a directory or `mode.directory` is set and the path is not one,
     /// [`Error::NotASymlink`] for `O_SYMLINK`, [`Error::PathTooLong`], [`Error::NotFound`],
-    /// and [`Error::Read`] when a directory cannot be read.
+    /// and [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when a directory cannot be read.
     pub fn open(
         &mut self,
         base: Option<usize>,
@@ -370,7 +497,9 @@ impl<'v, D: Device> Fs<'v, D> {
         let (path, found) = self.resolve(start, path)?;
         let attributes = match &found {
             Found::Root => Attributes::root(self.cluster_size),
-            Found::Entry(entry) => Attributes::of(entry, &path, self.cluster_size),
+            Found::Fat(entry) => Attributes::of_fat(entry, &path, self.cluster_size),
+            #[cfg(feature = "exfat")]
+            Found::ExFat(_, entry) => Attributes::of_exfat(entry, &path, self.cluster_size),
         };
         if mode.symlink {
             return Err(Error::NotASymlink);
@@ -378,17 +507,10 @@ impl<'v, D: Device> Fs<'v, D> {
         if mode.directory && attributes.kind != Kind::Directory {
             return Err(Error::NotADirectory);
         }
-        let open = match found {
-            _ if mode.stat => Open::Metadata,
-            Found::Root => Open::Directory {
-                dir: self.volume.root_dir(),
-                entries: None,
-            },
-            Found::Entry(entry) if entry.is_dir() => Open::Directory {
-                dir: entry.to_dir(),
-                entries: None,
-            },
-            Found::Entry(entry) => Open::File(entry.to_file()),
+        let open = if mode.stat {
+            Open::Metadata
+        } else {
+            self.open_found(found)
         };
         let id = self.next;
         self.next += 1;
@@ -414,29 +536,27 @@ impl<'v, D: Device> Fs<'v, D> {
     /// # Errors
     ///
     /// [`Error::BadHandle`] (also for a handle opened with `O_STAT`), [`Error::IsADirectory`]
-    /// for a directory, and [`Error::Read`] when the file's clusters cannot be read.
+    /// for a directory, and [`Error::Read`] or `Error::ExFat` (with the `exfat` feature) when the file's clusters
+    /// cannot be read.
     pub fn read(&mut self, id: usize, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let handle = self.handle_mut(id)?;
         let size = handle.attributes.size;
-        let file = match &mut handle.open {
+        let data = match &mut handle.open {
             Open::Metadata => return Err(Error::BadHandle { handle: id }),
             Open::Directory { .. } => return Err(Error::IsADirectory),
-            Open::File(file) => file,
+            Open::File(data) => data,
         };
-        // `fatfs` follows the cluster chain from the start on a seek to another cluster,
-        // and not at all for the position the last read left, so sequential reads stay
-        // cheap.
-        file.seek(SeekFrom::Start(offset.min(size)))
-            .map_err(Error::Read)?;
-        let mut done = 0;
-        while done < buf.len() {
-            let n = file.read(&mut buf[done..]).map_err(Error::Read)?;
-            if n == 0 {
-                break;
-            }
-            done += n;
+        match data {
+            Data::Fat(file) => read_fat(file, size, offset, buf),
+            #[cfg(feature = "exfat")]
+            Data::ExFat {
+                volume,
+                stream,
+                cursor,
+            } => volume
+                .read(stream, cursor, offset, buf)
+                .map_err(Error::from_exfat),
         }
-        Ok(done)
     }
 
     /// The entries of the directory `id` names, without `.` and `..` and the volume label,
@@ -446,7 +566,7 @@ impl<'v, D: Device> Fs<'v, D> {
     /// # Errors
     ///
     /// [`Error::BadHandle`], [`Error::NotADirectory`] for anything else, and [`Error::Read`]
-    /// when the directory cannot be read.
+    /// or `Error::ExFat` (with the `exfat` feature) when the directory cannot be read.
     pub fn entries(&mut self, id: usize) -> Result<&[Entry], Error> {
         let handle = self
             .handles
@@ -456,7 +576,13 @@ impl<'v, D: Device> Fs<'v, D> {
             return Err(Error::NotADirectory);
         };
         if entries.is_none() {
-            *entries = Some(read_entries(dir, &handle.path)?);
+            *entries = Some(match dir {
+                Directory::Fat(dir) => read_fat_entries(dir, &handle.path)?,
+                #[cfg(feature = "exfat")]
+                Directory::ExFat { volume, stream } => {
+                    read_exfat_entries(volume, stream, &handle.path)?
+                }
+            });
         }
         Ok(entries.as_deref().unwrap_or_default())
     }
@@ -492,45 +618,72 @@ impl<'v, D: Device> Fs<'v, D> {
     }
 
     /// Resolves `path` from the directory `start` (from the root when `path` is absolute),
-    /// one component at a time and in order, as POSIX does: each name is looked up in the
-    /// directory reached so far, `..` goes back to that directory's parent, and any component
-    /// after a file (`..` and `.` included) fails with [`Error::NotADirectory`]. So
-    /// `/hello.txt/../EFI` is `ENOTDIR` and `/missing/../EFI` is `ENOENT`, not `/EFI`.
-    /// Returns the path with the names as stored, and what it names.
+    /// one component at a time and in order (see [`walk`]). Returns the path with the names
+    /// as stored, and what it names.
     fn resolve(&self, start: &str, path: &str) -> Result<(String, Found<'v, D>), Error> {
-        let start = if path.starts_with('/') { "" } else { start };
-        let components = start.split('/').chain(path.split('/'));
-        // The entries from the root to where the walk is; empty at the root.
-        let mut walked: Vec<(String, DirEntry<'v, D>)> = Vec::new();
-        for component in components {
-            let dir = match walked.last() {
-                None => self.volume.root_dir(),
-                Some((_, entry)) if entry.is_dir() => entry.to_dir(),
-                Some(_) => return Err(Error::NotADirectory),
-            };
-            match component {
-                "" | "." => {}
-                ".." => {
-                    walked.pop();
-                }
-                name => {
-                    let entry = lookup(&dir, name)?;
-                    walked.push((entry.file_name(), entry));
-                }
+        match self.volume {
+            Volume::Fat(fat) => {
+                let (stored, entry) = walk(
+                    start,
+                    path,
+                    |parent: Option<&DirEntry<'v, D>>, name| {
+                        let dir = parent.map_or_else(|| fat.root_dir(), DirEntry::to_dir);
+                        let entry = lookup(&dir, name)?;
+                        Ok((entry.file_name(), entry))
+                    },
+                    DirEntry::is_dir,
+                )?;
+                Ok((stored, entry.map_or(Found::Root, Found::Fat)))
+            }
+            #[cfg(feature = "exfat")]
+            Volume::ExFat(exfat) => {
+                let (stored, entry) = walk(
+                    start,
+                    path,
+                    |parent: Option<&ferric_exfat::Entry>, name| {
+                        let dir = parent.map_or_else(|| exfat.root(), |entry| entry.stream);
+                        let entry = exfat
+                            .find(&dir, name)
+                            .map_err(Error::from_exfat)?
+                            .ok_or(Error::NotFound)?;
+                        Ok((entry.name_lossy(), entry))
+                    },
+                    ferric_exfat::Entry::is_dir,
+                )?;
+                Ok((
+                    stored,
+                    entry.map_or(Found::Root, |e| Found::ExFat(exfat, e)),
+                ))
             }
         }
-        let mut stored = String::new();
-        for (name, _) in &walked {
-            stored.push('/');
-            stored.push_str(name);
+    }
+
+    /// What a handle to `found` reads from.
+    fn open_found(&self, found: Found<'v, D>) -> Open<'v, D> {
+        let dir = |dir| Open::Directory { dir, entries: None };
+        match found {
+            Found::Root => match self.volume {
+                Volume::Fat(fat) => dir(Directory::Fat(fat.root_dir())),
+                #[cfg(feature = "exfat")]
+                Volume::ExFat(volume) => dir(Directory::ExFat {
+                    volume,
+                    stream: volume.root(),
+                }),
+            },
+            Found::Fat(entry) if entry.is_dir() => dir(Directory::Fat(entry.to_dir())),
+            Found::Fat(entry) => Open::File(Data::Fat(entry.to_file())),
+            #[cfg(feature = "exfat")]
+            Found::ExFat(volume, entry) if entry.is_dir() => dir(Directory::ExFat {
+                volume,
+                stream: entry.stream,
+            }),
+            #[cfg(feature = "exfat")]
+            Found::ExFat(volume, entry) => Open::File(Data::ExFat {
+                volume,
+                stream: entry.stream,
+                cursor: ferric_exfat::Cursor::default(),
+            }),
         }
-        if stored.is_empty() {
-            stored.push('/');
-        }
-        let found = walked
-            .pop()
-            .map_or(Found::Root, |(_, entry)| Found::Entry(entry));
-        Ok((stored, found))
     }
 
     fn handle(&self, id: usize) -> Result<&Handle<'v, D>, Error> {
@@ -542,6 +695,70 @@ impl<'v, D: Device> Fs<'v, D> {
             .get_mut(&id)
             .ok_or(Error::BadHandle { handle: id })
     }
+}
+
+/// Walks `path` from the directory `start` (from the root when `path` is absolute), one
+/// component at a time and in order, as POSIX does: each name is looked up with `lookup` in
+/// the directory reached so far (`None` for the root), which returns the entry and its name
+/// as stored; `..` goes back to that directory's parent; and any component after a file
+/// (`..` and `.` included) fails with [`Error::NotADirectory`]. So `/hello.txt/../EFI` is
+/// `ENOTDIR` and `/missing/../EFI` is `ENOENT`, not `/EFI`. Returns the path with the names as
+/// stored, and the entry it names (`None` for the root).
+fn walk<E>(
+    start: &str,
+    path: &str,
+    mut lookup: impl FnMut(Option<&E>, &str) -> Result<(String, E), Error>,
+    is_dir: impl Fn(&E) -> bool,
+) -> Result<(String, Option<E>), Error> {
+    let start = if path.starts_with('/') { "" } else { start };
+    // The entries from the root to where the walk is; empty at the root.
+    let mut walked: Vec<(String, E)> = Vec::new();
+    for component in start.split('/').chain(path.split('/')) {
+        if walked.last().is_some_and(|(_, entry)| !is_dir(entry)) {
+            return Err(Error::NotADirectory);
+        }
+        match component {
+            "" | "." => {}
+            ".." => {
+                walked.pop();
+            }
+            name => {
+                let next = lookup(walked.last().map(|(_, entry)| entry), name)?;
+                walked.push(next);
+            }
+        }
+    }
+    let mut stored = String::new();
+    for (name, _) in &walked {
+        stored.push('/');
+        stored.push_str(name);
+    }
+    if stored.is_empty() {
+        stored.push('/');
+    }
+    Ok((stored, walked.pop().map(|(_, entry)| entry)))
+}
+
+/// Reads into `buf` from byte `offset` of a FAT file of `size` bytes.
+fn read_fat<D: Device>(
+    file: &mut File<'_, D>,
+    size: u64,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, Error> {
+    // `fatfs` follows the cluster chain from the start on a seek to another cluster, and not
+    // at all for the position the last read left, so sequential reads stay cheap.
+    file.seek(SeekFrom::Start(offset.min(size)))
+        .map_err(Error::Read)?;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = file.read(&mut buf[done..]).map_err(Error::Read)?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    Ok(done)
 }
 
 /// Whether two names are equal ignoring case, as FAT compares names: by their upper-case
@@ -571,7 +788,7 @@ fn lookup<'v, D: Device>(dir: &Dir<'v, D>, name: &str) -> Result<DirEntry<'v, D>
     Err(Error::NotFound)
 }
 
-fn read_entries<D: Device>(dir: &Dir<'_, D>, path: &str) -> Result<Vec<Entry>, Error> {
+fn read_fat_entries<D: Device>(dir: &Dir<'_, D>, path: &str) -> Result<Vec<Entry>, Error> {
     let mut entries = Vec::new();
     for entry in dir.iter() {
         let entry = entry.map_err(Error::Read)?;
@@ -581,11 +798,31 @@ fn read_entries<D: Device>(dir: &Dir<'_, D>, path: &str) -> Result<Vec<Entry>, E
         let name = entry.file_name();
         entries.push(Entry {
             ino: path_ino(&normalize(path, &name)),
-            kind: Kind::of(&entry),
+            kind: Kind::of(entry.is_dir()),
             name,
         });
     }
     Ok(entries)
+}
+
+#[cfg(feature = "exfat")]
+fn read_exfat_entries<D: Device>(
+    volume: &ExFat<D>,
+    dir: &ferric_exfat::Stream,
+    path: &str,
+) -> Result<Vec<Entry>, Error> {
+    let listing = volume.list(dir).map_err(Error::from_exfat)?;
+    Ok(listing
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name_lossy();
+            Entry {
+                ino: path_ino(&normalize(path, &name)),
+                kind: Kind::of(entry.is_dir()),
+                name,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

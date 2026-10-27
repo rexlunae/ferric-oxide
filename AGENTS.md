@@ -73,6 +73,7 @@ Host, kernel, UEFI and Redox user-space builds retain separate workspace or stan
 - **Never send AI-generated work upstream.** Redox bans LLM-generated contributions. Do not open merge requests, issues or comments on gitlab.redox-os.org or the redox-os GitHub mirrors with AI-written content.
 - **Optional behaviour is a feature toggle.** Anything a user might want on or off (a driver tier, tracing, a CPU level, a file system) is an option in `features.toml`, chosen in `ferric.toml` through `tools/ferric-config`. Prefer adding an entry there over custom Makefile or environment-variable logic. Without a `ferric.toml` the build must behave like upstream.
 - **CPU baseline.** User space targets x86-64-v3 by default; x86-64-v4 is an optional build. Do not add code paths for older CPUs, i586 or BIOS boot. Runtime-detected faster paths (AVX-512 and the like) are welcome behind feature detection.
+- **Fix crashes; do not route around them.** When something crashes, hangs or traps (a kernel panic, a daemon abort, a QEMU accelerator exit, a failing boot test), find and fix the root cause. Turning off the feature, accelerator or code path that exposes it, catching or ignoring the failure, adding a retry, or defaulting to a slower path to avoid it is not a fix. If the root cause cannot be fixed in the same change, open an issue that describes it, and keep any temporary workaround visible: an opt-in with a comment and documentation that link the issue, never a silent default.
 
 ## Rust conventions
 

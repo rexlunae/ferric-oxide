@@ -1381,6 +1381,21 @@ name = "ferric-exec-core"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-exfat"
+version = "0.1.0"
+dependencies = [
+ "ferric-blocklayer",
+ "ferric-fat-types",
+ "flate2",
+ "simple_endian",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ferric-fat-types"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-fspath"
 version = "0.1.0"
 

@@ -1,0 +1,19 @@
+[package]
+name = "ferric-exfat"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only exFAT reader, no_std, written from Microsoft's published exFAT specification"
+publish = false
+
+[dependencies]
+ferric-fat-types = { path = "../fat-types" }
+ferric-blocklayer = { path = "../blocklayer", default-features = false }
+# Not inherited from the host workspace: fatd builds this crate through a symlink outside
+# that workspace, where `workspace = true` cannot be resolved. Keep the version in step with
+# the root Cargo.toml's [workspace.dependencies].
+thiserror = { version = "2", default-features = false }
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "both_endian", "byte_impls", "io-core"] }
+
+[dev-dependencies]
+flate2 = "1"
