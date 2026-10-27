@@ -48,6 +48,19 @@ The target package system is Cargo-based: packages come from git URLs, prebuilt 
 
 **Exit:** a Phase 0 image is built entirely from registry packages listed in `ferric.toml`/`fox.lock`. Every installed artifact has passed author-tag, registry and builder signature checks. A system SBOM is produced, and `fox audit` flags a seeded test advisory. A package also installs straight from a git URL by building from source. P5 is required for M1.
 
+## Phase B: Bash-compatible shell (`brush`)
+
+High priority, near term. Replace ion with [brush](https://github.com/reubeno/brush), a bash-compatible shell written in Rust under the MIT license, as the default login shell and the shell that runs system scripts (decided 27 October 2026). Ion has its own non-POSIX syntax, so every script in the tree is ion-only and nothing written for sh or bash runs unchanged; its recipe also comes from the Redox GitLab. Ion stays available as an optional package. Tracking issue: [#302](https://github.com/rexlunae/ferric-oxide/issues/302), which lists every place that depends on ion today.
+
+1. **Build.** Pin a brush revision, move the recipe out of `recipes/wip`, and cross-compile `brush-shell` for x86_64 and aarch64 as a fox package. Patch crates that leave Redox out (`nix`, `uzers`, `rlimit`, `command-fds`, tokio's process and signal drivers) upstream where possible. The line editor (`reedline`, `crossterm`) already works for nushell.
+2. **relibc and kernel gaps, fixed at the root.** `waitid` (missing), `getrusage` (stubbed to zeros), and process-group signals and terminal ownership on ptys (`tcsetpgrp`, `killpg`, `SIGTSTP`/`SIGTTOU`/`SIGCONT`), each with a relibc test.
+3. **Switch.** Rewrite the boot-time and test scripts from ion to POSIX sh, update the CI boot-smoke patterns, and point the user database in `config/` and the installer at `/usr/bin/brush`. Decide whether `/usr/bin/sh` is dash or brush in POSIX mode.
+4. **Docs.** Replace the ion internals page with a brush page and update the `ion -c` examples.
+
+Phase B depends only on Phase 0 and can run alongside everything else.
+
+**Exit:** a default image boots to a brush login shell on x86_64 and aarch64, CI boot smoke runs its scripts through brush, job control (Ctrl-C, Ctrl-Z, `fg`, `bg`, `jobs`) works on the console and on a pty, and no default configuration or recipe depends on ion.
+
 ## Phase T: Kernel tracing and introspection
 
 This runs alongside Phases 1–2 because every later benchmark depends on it. Before this phase the kernel had only a small `log` module, a time-sampling profiler behind the `profiling` Cargo feature, `syscall_debug` printing, and ptrace; what Phase T has added so far is in [Kernel tracing](ferric-tracing.md). The goal is Linux-class introspection (ftrace, perf, bpftrace, `/proc`) with overhead you choose.
@@ -269,7 +282,7 @@ rate. Verify GPU use separately from software fallback.
 ## Phase 8: The "usable" bar and releases
 
 There are two release milestones:
-- **M1 "Server/VM usable":** Phases 0–4, Phase P (through P5), Phase T and Phase V (hypervisor and enclaves), plus guest virtualization. An installable image runs real services in a VM with hardening and sandboxing on by default.
+- **M1 "Server/VM usable":** Phases 0–4, Phase P (through P5), Phase B, Phase T and Phase V (hypervisor and enclaves), plus guest virtualization. An installable image runs real services in a VM with hardening and sandboxing on by default.
 - **M2 "Workstation usable":** M1 plus Phases 5–6. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering and Xwayland compatibility described in Phase 6, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
 
 Both milestones need versioned releases with signed images, a signed package repository with an update channel, release notes and an upstream-sync policy.
@@ -340,6 +353,7 @@ Compiled native code is kept in a system-wide, persistent cache that sits beside
 
 ```
 Phase 0 ─┬─ Phase P (packages: P1–P3 part of Phase 0 exit, P4 after W2/W3 + v4, P5 after Phase 4 → M1)
+         ├─ Phase B (brush shell replaces ion, high priority)
          ├─ Phase T (tracing, feeds all benchmarks)
          ├─ Phase 1 (hardening) ──────────────────────┐
          ├─ Phase 2.1 IOMMU ─ 2.2–2.3 ─┬─ Phase V (hypervisor, enclaves) ─┐
