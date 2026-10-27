@@ -27,6 +27,10 @@ pub const LOCAL_BUILDER_KEY: &str = "var/lib/fox/local-builder.pub.toml";
 /// The label of the local builder key.
 pub const LOCAL_BUILDER_LABEL: &str = "local-builder";
 
+/// The label under which a system image trusts the cookbook key that
+/// signed the packages it was built from.
+pub const COOKBOOK_LABEL: &str = "cookbook";
+
 /// Why trusted keys could not be loaded.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -49,6 +53,17 @@ pub enum KeyError {
         #[source]
         source: io::Error,
     },
+    /// A key file could not be copied into a system's trusted keys.
+    #[error("cannot install public key file {} as {}", from.display(), to.display())]
+    Install {
+        /// The key file.
+        from: PathBuf,
+        /// Where it was going.
+        to: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Reads one public key file. Its label is the file name without the
@@ -66,6 +81,31 @@ pub fn load_key_file(path: &Path) -> Result<TrustedKey, KeyError> {
     Ok(TrustedKey {
         label: key_label(path),
         key: KeyId::from_bytes(file.pkey),
+    })
+}
+
+/// Makes the system at `root` trust the public key file `path` under
+/// `label`, by copying it to `<root>/etc/fox/keys/<label>.toml`, and
+/// returns the key.
+///
+/// # Errors
+///
+/// [`KeyError::File`] if `path` is not a public key file and
+/// [`KeyError::Install`] if it cannot be copied.
+pub fn install_key_file(path: &Path, root: &Path, label: &str) -> Result<TrustedKey, KeyError> {
+    let key = load_key_file(path)?;
+    let dir = root.join(TRUSTED_KEYS_DIR);
+    let target = dir.join(format!("{label}.toml"));
+    let install_error = |source| KeyError::Install {
+        from: path.to_path_buf(),
+        to: target.clone(),
+        source,
+    };
+    fs::create_dir_all(&dir).map_err(install_error)?;
+    fs::copy(path, &target).map_err(install_error)?;
+    Ok(TrustedKey {
+        label: label.to_string(),
+        key: key.key,
     })
 }
 
@@ -154,6 +194,26 @@ mod tests {
             0
         );
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn installed_key_is_trusted_by_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (public, _) = pkgar_keys::SecretKeyFile::new();
+        let source = dir.path().join("id_ed25519.pub.toml");
+        public.save(&source).unwrap();
+        let root = dir.path().join("root");
+
+        let key = install_key_file(&source, &root, COOKBOOK_LABEL).unwrap();
+        assert_eq!(key.label, COOKBOOK_LABEL);
+        let trusted = trusted_keys_for_root(&root).unwrap();
+        let found = trusted.get(&KeyId::from_bytes(public.pkey)).unwrap();
+        assert_eq!(found.label, COOKBOOK_LABEL);
+
+        assert!(matches!(
+            install_key_file(&dir.path().join("nope.toml"), &root, "x"),
+            Err(KeyError::File { .. })
+        ));
     }
 
     #[test]

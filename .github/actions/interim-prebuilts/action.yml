@@ -1,0 +1,18 @@
+name: Interim prebuilt packages
+description: >
+  Points the cookbook at Redox's prebuilt packages for REPO_BINARY=1 image
+  builds. The cookbook has no default remote; this is the one place CI
+  still names Redox's package server, and it goes away when the packages
+  workflow publishes Ferric Oxide's own fox-signed prebuilt channel.
+runs:
+  using: composite
+  steps:
+    - name: Configure the interim prebuilt remote
+      shell: bash
+      run: |
+        key="$PWD/build/remote-keys/interim.pub.toml"
+        mkdir -p "$(dirname "$key")"
+        curl --fail --silent --show-error --location --retry 5 \
+          --output "$key" https://static.redox-os.org/pkg/id_ed25519.pub.toml
+        echo "COOKBOOK_REMOTE=https://static.redox-os.org/pkg/{target}" >> "$GITHUB_ENV"
+        echo "COOKBOOK_REMOTE_KEY=$key" >> "$GITHUB_ENV"

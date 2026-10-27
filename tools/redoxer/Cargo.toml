@@ -15,7 +15,9 @@ fuser = { version = "0.16", optional = true }
 libc = { version = "0.2", optional = true }
 proc-mounts = { version = "0.3", optional = true }
 redox_installer = { workspace = true, optional = true, features = ["installer", "fuse"] }
-redox-pkg = { version = "0.3.1", features = ["indicatif"], optional = true }
+# Ferric Oxide: `redoxer pkg` installs a cookbook's packages with fox.
+fox-core = { path = "../../crates/fox-core", features = ["std"], optional = true }
+fox-store = { path = "../../crates/fox-store", optional = true }
 redox_syscall = { version = "0.9", optional = true }
 redoxfs = { version = "0.9", optional = true }
 tempfile = { workspace = true, optional = true }
@@ -23,7 +25,7 @@ toml = { version = "0.8", optional = true }
 
 [features]
 default = ["cli-pkg", "cli-exec"]
-cli-pkg = ["redox-pkg"]
+cli-pkg = ["fox-core", "fox-store"]
 cli-exec = [
     "libc",
     "fuser",
@@ -34,3 +36,10 @@ cli-exec = [
     "proc-mounts",
     "toml",
 ]
+
+[dev-dependencies]
+fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
+tempfile.workspace = true
+# Lays out sysroots the way an earlier, pkg-based redoxer did.
+pkgar.workspace = true
+pkgar-keys.workspace = true

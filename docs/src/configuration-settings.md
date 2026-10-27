@@ -383,7 +383,7 @@ Done! The `acid` package is now included in your image.
 
 ### Binary Recipe Mode
 
-Without `ferric.toml`, the build system builds all packages from source (i.e., recipes). The `native` profile that `cargo xtask setup` selects turns on `build.repo_binary` instead, which installs prebuilt packages for applications. Those packages currently come from Redox's package server and are built for Redox's CPU baseline, not x86-64-v3; replacing them with packages built and distributed through `fox` is in progress. There's also a recipe rule and filesystem configuration option to choose per package.
+Without `ferric.toml`, the build system builds all packages from source (i.e., recipes). The `native` profile that `cargo xtask setup` selects turns on `build.repo_binary` instead, which installs prebuilt packages for applications, and there's also a recipe rule and filesystem configuration option to choose per package. Ferric Oxide's cookbook has no default remote: set `remote` and its signing key `remote_key` in the `[cook]` table of `cookbook.toml` (or `COOKBOOK_REMOTE` and `COOKBOOK_REMOTE_KEY`), as described in [Prebuilt packages](./ferric-packaging.md#prebuilt-packages-repo_binary). Without them, binary recipes are built from source.
 
 This is useful for some purposes, such as producing development builds, confirming package status from the package server, and reducing image build time with large programs.
 

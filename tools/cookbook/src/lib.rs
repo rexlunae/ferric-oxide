@@ -7,10 +7,6 @@ pub mod web;
 /// Default for maximum number of levels to descend down dependencies tree.
 pub const WALK_DEPTH: usize = 16;
 
-/// Default remote package source, for recipes with build type = "remote".
-/// This is overridable with mirrors config (via `cookbook.toml`).
-pub const REMOTE_PKG_SOURCE: &str = "https://static.redox-os.org/pkg";
-
 pub fn is_redox() -> bool {
     cfg!(target_os = "redox")
 }
@@ -45,8 +41,7 @@ pub enum Error {
         context: &'static str,
     },
     Command(Command, ExitStatus),
-    Package(pkg::PackageError),
-    PackageBackend(pkg::backend::Error),
+    Package(PackageError),
     Pkgar(pkgar::Error),
     Options(String),
     Other(String),
@@ -57,6 +52,61 @@ pub enum Error {
     },
     /// Ferric Oxide: a `fox` manifest could not be serialized.
     FoxManifest(fox_core::ManifestError),
+    /// Ferric Oxide: a signing key could not be read or installed.
+    FoxKey(fox_core::keys::KeyError),
+    /// Ferric Oxide: a package archive failed fox's checks.
+    FoxArchive(Box<fox_core::archive::ArchiveError>),
+    /// Ferric Oxide: fox could not install a package into the sysroot.
+    FoxStore(Box<fox_store::StoreError>),
+}
+
+/// Why a recipe or one of its packages could not be found or read.
+#[derive(Debug, thiserror::Error)]
+pub enum PackageError {
+    /// A metadata or recipe file is not there.
+    #[error("missing package file {}", .0.display())]
+    FileMissing(PathBuf),
+    /// A metadata or recipe file could not be read.
+    #[error("cannot read package file {}", .path.display())]
+    FileError {
+        /// The file.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+    /// A file is not valid TOML of the expected shape.
+    #[error("cannot parse {}", .path.display())]
+    Parse {
+        /// The file.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// Package metadata or a package name is invalid.
+    #[error(transparent)]
+    Metadata(#[from] fox_core::cookbook::CookbookError),
+    /// No recipe has this name.
+    #[error("package {0} not found")]
+    PackageNotFound(fox_core::cookbook::RecipeName),
+    /// Dependencies nest deeper than the walk allows; the names are the
+    /// path down to where it stopped.
+    #[error("recursion limit reached while processing dependencies; tree: {0:?}")]
+    Recursion(std::collections::VecDeque<fox_core::cookbook::RecipeName>),
+    /// One or more of the package's dependencies failed.
+    #[error("package {0} is missing one or more dependencies")]
+    DependencyInvalid(fox_core::cookbook::RecipeName),
+}
+
+impl PackageError {
+    /// Adds `name` to the front of a [`PackageError::Recursion`] path, so
+    /// the path can be built up while unwinding.
+    pub fn append_recursion(&mut self, name: &fox_core::cookbook::RecipeName) {
+        if let PackageError::Recursion(packages) = self {
+            packages.push_front(name.clone());
+        }
+    }
 }
 
 impl Error {
@@ -104,9 +154,6 @@ impl Display for Error {
                 )
             }
             Error::Package(package_error) => write!(f, "Package error: {}", package_error),
-            Error::PackageBackend(package_error) => {
-                write!(f, "Package backend error: {}", package_error)
-            }
             Error::Pkgar(error) => write!(f, "Package archive error: {}", error),
             Error::Other(context) | Error::Options(context) => {
                 write!(f, "{context}")
@@ -115,6 +162,9 @@ impl Display for Error {
                 write!(f, "Package name {name:?} is not valid for fox: {source}")
             }
             Error::FoxManifest(error) => write!(f, "Cannot write fox manifest: {error}"),
+            Error::FoxKey(error) => write!(f, "{error}"),
+            Error::FoxArchive(error) => write!(f, "Package archive error: {error}"),
+            Error::FoxStore(error) => write!(f, "Cannot install package: {error}"),
         }
     }
 }
@@ -173,29 +223,33 @@ impl From<Error> for String {
     }
 }
 
-impl From<pkg::PackageError> for Error {
-    fn from(value: pkg::PackageError) -> Self {
+impl From<PackageError> for Error {
+    fn from(value: PackageError) -> Self {
         Error::Package(value)
     }
 }
 
-impl From<pkg::backend::Error> for Error {
-    fn from(value: pkg::backend::Error) -> Self {
-        match value {
-            pkg::backend::Error::IO(source, path, context) => Error::Io {
-                source,
-                path: Some(path),
-                context,
-            },
-            pkg::backend::Error::Download(pkg::net_backend::DownloadError::IO(error)) => {
-                Error::Io {
-                    source: error,
-                    path: None,
-                    context: "Package network I/O",
-                }
-            }
-            error => Error::PackageBackend(error),
-        }
+impl From<fox_core::cookbook::CookbookError> for Error {
+    fn from(value: fox_core::cookbook::CookbookError) -> Self {
+        Error::Package(PackageError::Metadata(value))
+    }
+}
+
+impl From<fox_core::keys::KeyError> for Error {
+    fn from(value: fox_core::keys::KeyError) -> Self {
+        Error::FoxKey(value)
+    }
+}
+
+impl From<fox_core::archive::ArchiveError> for Error {
+    fn from(value: fox_core::archive::ArchiveError) -> Self {
+        Error::FoxArchive(Box::new(value))
+    }
+}
+
+impl From<fox_store::StoreError> for Error {
+    fn from(value: fox_store::StoreError) -> Self {
+        Error::FoxStore(Box::new(value))
     }
 }
 

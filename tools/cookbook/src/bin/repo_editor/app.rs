@@ -59,8 +59,8 @@ pub struct App {
     pub all_recipes: Vec<CookRecipe>,
     pub all_compiled_recipes: Vec<CookRecipe>,
     pub all_config_recipes: Vec<CookRecipe>,
-    pub filtered_recipes: Vec<PackageName>,
-    pub pinned_recipes: BTreeSet<PackageName>,
+    pub filtered_recipes: Vec<RecipeName>,
+    pub pinned_recipes: BTreeSet<RecipeName>,
     pub filter_source: FilterSource,
     pub list_state: ListState,
     pub focus: Focus,
@@ -149,7 +149,7 @@ impl App {
             .map(|s| {
                 s.packages
                     .keys()
-                    .filter_map(|p| PackageName::new(p).ok())
+                    .filter_map(|p| RecipeName::new(p).ok())
                     .filter_map(|p| CookRecipe::from_name(p).ok())
                     .collect()
             })
@@ -195,13 +195,13 @@ impl App {
         self.right_tab_active = RightPanelTab::MainActions;
     }
 
-    pub fn highlighted_recipe(&self) -> Option<&PackageName> {
+    pub fn highlighted_recipe(&self) -> Option<&RecipeName> {
         self.list_state
             .selected()
             .and_then(|idx| self.filtered_recipes.get(idx))
     }
 
-    pub fn selected_recipes(&self) -> Vec<PackageName> {
+    pub fn selected_recipes(&self) -> Vec<RecipeName> {
         if !self.pinned_recipes.is_empty() {
             let mut targets: Vec<_> = self.pinned_recipes.iter().cloned().collect();
             targets.sort();

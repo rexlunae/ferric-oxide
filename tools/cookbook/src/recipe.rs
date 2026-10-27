@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeSet,
-    convert::TryInto,
     fs,
     path::{Path, PathBuf},
 };
 
-use pkg::{PackageError, PackageName};
+use fox_core::cookbook::RecipeName;
+
+use crate::PackageError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -141,16 +142,16 @@ pub enum BuildKind {
 pub struct BuildRecipe {
     #[serde(flatten)]
     pub kind: BuildKind,
-    pub dependencies: Vec<PackageName>,
+    pub dependencies: Vec<RecipeName>,
     pub compiler: Option<BuildCompiler>,
     #[serde(rename = "dev-dependencies")]
-    pub dev_dependencies: Vec<PackageName>,
+    pub dev_dependencies: Vec<RecipeName>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct PackageRecipe {
-    pub dependencies: Vec<PackageName>,
+    pub dependencies: Vec<RecipeName>,
     pub version: Option<String>,
     pub description: Option<String>,
 }
@@ -159,7 +160,7 @@ pub struct PackageRecipe {
 #[serde(default)]
 pub struct OptionalPackageRecipe {
     pub name: String,
-    pub dependencies: Vec<PackageName>,
+    pub dependencies: Vec<RecipeName>,
     pub files: Vec<String>,
 }
 
@@ -217,7 +218,7 @@ impl BuildRecipe {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CookRecipe {
-    pub name: PackageName,
+    pub name: RecipeName,
     pub dir: PathBuf,
     pub recipe: Recipe,
     pub target: &'static str,
@@ -233,10 +234,14 @@ impl Recipe {
         if !file.is_file() {
             return Err(PackageError::FileMissing(file.clone()));
         }
-        let toml = fs::read_to_string(file)
-            .map_err(|err| PackageError::FileError(err.raw_os_error(), file.clone()))?;
-        let recipe: Recipe =
-            toml::from_str(&toml).map_err(|err| PackageError::Parse(err, Some(file.clone())))?;
+        let toml = fs::read_to_string(file).map_err(|source| PackageError::FileError {
+            path: file.clone(),
+            source,
+        })?;
+        let recipe: Recipe = toml::from_str(&toml).map_err(|source| PackageError::Parse {
+            path: file.clone(),
+            source,
+        })?;
         Ok(recipe)
     }
 
@@ -250,13 +255,17 @@ impl Recipe {
 }
 
 impl CookRecipe {
-    pub fn new(name: PackageName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
+    pub fn new(name: RecipeName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
         let target = cook_package::package_target(&name);
         if name.is_host() {
-            let thisname = name.without_host();
-            let fn_map = |p: PackageName| {
+            let thisname = name.without_prefix();
+            let fn_map = |p: RecipeName| {
                 if p.is_host() {
-                    if p.name() == thisname { None } else { Some(p) }
+                    if p.recipe() == thisname {
+                        None
+                    } else {
+                        Some(p)
+                    }
                 } else if p.is_target() {
                     None
                 } else {
@@ -287,7 +296,7 @@ impl CookRecipe {
         })
     }
 
-    pub fn dummy(name: &PackageName) -> Self {
+    pub fn dummy(name: &RecipeName) -> Self {
         Self {
             dir: PathBuf::new(),
             is_deps: false,
@@ -299,15 +308,15 @@ impl CookRecipe {
         }
     }
 
-    pub fn from_name(name: PackageName) -> Result<Self, PackageError> {
-        let dir = staged_pkg::find(name.name())
+    pub fn from_name(name: RecipeName) -> Result<Self, PackageError> {
+        let dir = staged_pkg::find(name.recipe())
             .ok_or_else(|| PackageError::PackageNotFound(name.clone()))?;
         let file = dir.join("recipe.toml");
         let recipe = Recipe::new(&file)?;
         Self::new(name, dir.to_path_buf(), recipe)
     }
 
-    pub fn from_list(names: Vec<PackageName>) -> Result<Vec<Self>, PackageError> {
+    pub fn from_list(names: Vec<RecipeName>) -> Result<Vec<Self>, PackageError> {
         let mut packages = Vec::new();
         for name in names {
             packages.push(Self::from_name(name)?);
@@ -317,7 +326,7 @@ impl CookRecipe {
 
     pub fn from_path(dir: &Path, read_recipe: bool, is_host: bool) -> Result<Self, PackageError> {
         let file = dir.join("recipe.toml");
-        let mut name: PackageName = dir.file_name().unwrap().try_into()?;
+        let mut name = RecipeName::new(dir.file_name().unwrap().to_string_lossy())?;
         if is_host {
             name = name.with_host();
         }
@@ -331,7 +340,7 @@ impl CookRecipe {
     }
 
     fn new_recursive(
-        names: &[PackageName],
+        names: &[RecipeName],
         recurse_build_deps: bool,
         recurse_dev_build_deps: bool,
         recurse_package_deps: bool,
@@ -431,7 +440,7 @@ impl CookRecipe {
     }
 
     pub fn get_build_deps_recursive(
-        names: &[PackageName],
+        names: &[RecipeName],
         include_dev: bool,
     ) -> Result<Vec<Self>, PackageError> {
         let packages = Self::new_recursive(
@@ -449,9 +458,9 @@ impl CookRecipe {
     }
 
     pub fn get_package_deps_recursive(
-        names: &[PackageName],
+        names: &[RecipeName],
         include_names: bool,
-    ) -> Result<Vec<PackageName>, PackageError> {
+    ) -> Result<Vec<RecipeName>, PackageError> {
         // recurse_build_deps == true here as libraries (build deps) can have runtime files (package deps)
         let packages = Self::new_recursive(
             names,
@@ -468,9 +477,9 @@ impl CookRecipe {
     }
 
     pub fn get_all_deps_names_recursive(
-        names: &[PackageName],
+        names: &[RecipeName],
         include_dev: bool,
-    ) -> Result<Vec<PackageName>, PackageError> {
+    ) -> Result<Vec<RecipeName>, PackageError> {
         let packages =
             Self::new_recursive(names, true, include_dev, true, true, true, true, WALK_DEPTH)?;
 
@@ -590,13 +599,13 @@ impl CookRecipe {
     }
 
     /// Get the name for recipe that is used as the build source
-    pub fn canon_recipe_name(&self) -> PackageName {
+    pub fn canon_recipe_name(&self) -> RecipeName {
         // TODO: I hope nobody is nesting same_as...
         if let Some(SourceRecipe::SameAs { same_as }) = &self.recipe.source {
             if let Some(name) = Path::new(&same_as)
                 .file_name()
                 .and_then(|p| p.to_str())
-                .and_then(|p| PackageName::new(p).ok())
+                .and_then(|p| RecipeName::new(p).ok())
             {
                 return name;
             } else {
@@ -613,7 +622,7 @@ impl CookRecipe {
 
 // TODO: Wrap these vectors in a struct
 
-pub fn recipes_mark_as_deps(names: &[PackageName], packages: &mut Vec<CookRecipe>) {
+pub fn recipes_mark_as_deps(names: &[RecipeName], packages: &mut Vec<CookRecipe>) {
     for package in packages.iter_mut() {
         package.is_deps = !names.contains(&package.name);
     }
@@ -684,7 +693,7 @@ pub fn validate_filesystem_rules(recipes: &[CookRecipe]) -> crate::Result<()> {
 
 #[derive(Serialize, Deserialize)]
 pub struct AutoDeps {
-    pub packages: BTreeSet<PackageName>,
+    pub packages: BTreeSet<RecipeName>,
 }
 
 pub struct VersionExtractor {
@@ -736,7 +745,7 @@ impl VersionExtractor {
 
 #[cfg(test)]
 mod tests {
-    use pkg::PackageName;
+    use fox_core::cookbook::RecipeName;
 
     #[test]
     fn git_cargo_recipe() {
@@ -837,7 +846,7 @@ mod tests {
                 source: None,
                 build: BuildRecipe::new(BuildKind::None),
                 package: PackageRecipe {
-                    dependencies: vec![PackageName::new("gcc13").unwrap()],
+                    dependencies: vec![RecipeName::new("gcc13").unwrap()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -849,14 +858,14 @@ mod tests {
     fn ignore_required_by_build_dep_is_rejected() {
         use crate::recipe::{BuildKind, BuildRecipe, CookRecipe, validate_filesystem_rules};
 
-        let mut ignored = CookRecipe::dummy(&PackageName::new("libogg").unwrap());
+        let mut ignored = CookRecipe::dummy(&RecipeName::new("libogg").unwrap());
         ignored.rule = "ignore".into();
 
-        let mut dependent = CookRecipe::dummy(&PackageName::new("libvorbis").unwrap());
+        let mut dependent = CookRecipe::dummy(&RecipeName::new("libvorbis").unwrap());
         dependent.recipe.build = BuildRecipe::new(BuildKind::Custom {
             script: "make".to_string(),
         });
-        dependent.recipe.build.dependencies = vec![PackageName::new("libogg").unwrap()];
+        dependent.recipe.build.dependencies = vec![RecipeName::new("libogg").unwrap()];
 
         let err = validate_filesystem_rules(&[ignored, dependent]).unwrap_err();
         let msg = format!("{}", err);
@@ -869,21 +878,21 @@ mod tests {
     fn ignore_multiple_required_by_build_dep_are_rejected() {
         use crate::recipe::{BuildKind, BuildRecipe, CookRecipe, validate_filesystem_rules};
 
-        let mut ignored_ogg = CookRecipe::dummy(&PackageName::new("libogg").unwrap());
+        let mut ignored_ogg = CookRecipe::dummy(&RecipeName::new("libogg").unwrap());
         ignored_ogg.rule = "ignore".into();
 
-        let mut ignored_foo = CookRecipe::dummy(&PackageName::new("libfoo").unwrap());
+        let mut ignored_foo = CookRecipe::dummy(&RecipeName::new("libfoo").unwrap());
         ignored_foo.rule = "ignore".into();
 
-        let mut dependent = CookRecipe::dummy(&PackageName::new("libvorbis").unwrap());
+        let mut dependent = CookRecipe::dummy(&RecipeName::new("libvorbis").unwrap());
 
         dependent.recipe.build = BuildRecipe::new(BuildKind::Custom {
             script: "make".to_string(),
         });
 
         dependent.recipe.build.dependencies = vec![
-            PackageName::new("libogg").unwrap(),
-            PackageName::new("libfoo").unwrap(),
+            RecipeName::new("libogg").unwrap(),
+            RecipeName::new("libfoo").unwrap(),
         ];
 
         let err = validate_filesystem_rules(&[ignored_ogg, ignored_foo, dependent]).unwrap_err();
@@ -898,14 +907,14 @@ mod tests {
     fn ignore_required_by_dev_dep_is_rejected() {
         use crate::recipe::{BuildKind, BuildRecipe, CookRecipe, validate_filesystem_rules};
 
-        let mut ignored = CookRecipe::dummy(&PackageName::new("libogg").unwrap());
+        let mut ignored = CookRecipe::dummy(&RecipeName::new("libogg").unwrap());
         ignored.rule = "ignore".into();
 
-        let mut dependent = CookRecipe::dummy(&PackageName::new("libvorbis").unwrap());
+        let mut dependent = CookRecipe::dummy(&RecipeName::new("libvorbis").unwrap());
         dependent.recipe.build = BuildRecipe::new(BuildKind::Custom {
             script: "make".to_string(),
         });
-        dependent.recipe.build.dev_dependencies = vec![PackageName::new("libogg").unwrap()];
+        dependent.recipe.build.dev_dependencies = vec![RecipeName::new("libogg").unwrap()];
 
         let err = validate_filesystem_rules(&[ignored, dependent]).unwrap_err();
         assert!(format!("{}", err).contains("libogg"));
@@ -916,12 +925,12 @@ mod tests {
         use crate::recipe::{BuildKind, BuildRecipe, CookRecipe, validate_filesystem_rules};
 
         // e.g. pruning `orbterm` from a metapackage: nothing references it.
-        let mut ignored = CookRecipe::dummy(&PackageName::new("orbterm").unwrap());
+        let mut ignored = CookRecipe::dummy(&RecipeName::new("orbterm").unwrap());
         ignored.rule = "ignore".into();
 
-        let mut meta = CookRecipe::dummy(&PackageName::new("desktop-minimal").unwrap());
+        let mut meta = CookRecipe::dummy(&RecipeName::new("desktop-minimal").unwrap());
         meta.recipe.build = BuildRecipe::new(BuildKind::None);
-        meta.recipe.package.dependencies = vec![PackageName::new("orbital").unwrap()];
+        meta.recipe.package.dependencies = vec![RecipeName::new("orbital").unwrap()];
 
         assert!(validate_filesystem_rules(&[ignored, meta]).is_ok());
         assert!(validate_filesystem_rules(&[]).is_ok());

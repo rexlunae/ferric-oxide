@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pkg::{Package, PackageName};
+use fox_core::cookbook::{PackageInfo, RecipeName};
 
 use crate::{
     recipe::CookRecipe,
@@ -63,10 +63,10 @@ pub fn generate_web(all_packages: &Vec<String>, config: &CliWebConfig) {
     let mut files_map: BTreeMap<String, String> = BTreeMap::new();
 
     for package_name in all_packages {
-        let Ok(package_name) = PackageName::new(package_name) else {
+        let Ok(package_name) = RecipeName::new(package_name) else {
             continue;
         };
-        let Some(recipe_path) = staged_pkg::find(package_name.name()) else {
+        let Some(recipe_path) = staged_pkg::find(package_name.recipe()) else {
             continue;
         };
         let Ok(mut package) = staged_pkg::from_path(recipe_path, package_name.suffix()) else {
@@ -117,7 +117,7 @@ pub fn generate_web(all_packages: &Vec<String>, config: &CliWebConfig) {
         }
     }
 
-    let mut grouped_packages: BTreeMap<String, Vec<&(Package, CookRecipe)>> = BTreeMap::new();
+    let mut grouped_packages: BTreeMap<String, Vec<&(PackageInfo, CookRecipe)>> = BTreeMap::new();
 
     for item in &valid_packages {
         let category = get_category(&item.1.dir);
