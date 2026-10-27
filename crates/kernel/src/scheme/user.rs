@@ -1055,14 +1055,18 @@ impl UserInner {
 
                 {
                     let mut context = context_lock.write(token.token());
-                    if let Status::HardBlocked {
-                        reason: HardBlockedReason::AwaitingMmap { .. },
-                    } = context.status
+                    let waiting = context.fmap_ret.provide(Frame::containing(frame));
+                    if waiting
+                        && matches!(
+                            context.status,
+                            Status::HardBlocked {
+                                reason: HardBlockedReason::AwaitingMmap { .. },
+                            }
+                        )
                     {
                         context.status = Status::Runnable;
                         wake = (true, context.cpu_id);
                     }
-                    context.fmap_ret = Some(Frame::containing(frame));
                 }
                 if wake.0 {
                     wakeup_context(&context_lock, wake.1, &mut token.downgrade());
