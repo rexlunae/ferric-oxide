@@ -3,7 +3,7 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -219,11 +219,16 @@ fn run() -> Result<(), Failure> {
         trace.drain()?;
     }
     let lost_before = trace.as_ref().map(Trace::lost).transpose()?;
+    // O_FSYNC keeps the workload's requests going to RedoxFS: with the page cache's cached
+    // writes (kernel.page_cache_writeback) a plain descriptor's writes and reads would be
+    // served by the kernel, and the workload would no longer be the scheme round trips the
+    // budget is set for.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
+        .custom_flags(syscall::flag::O_FSYNC as i32)
         .open(IO_PATH)
         .map_err(io_failure(IO_PATH))?;
     file.write_all_at(&vec![0u8; IO_LEN], 0)

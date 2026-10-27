@@ -60,12 +60,13 @@ jobs:
     strategy:
       matrix:
         # Two configurations, so doc links break neither with optional modules compiled
-        # out nor with them in: `never` without rings or the page cache, `auto` with them.
+        # out nor with them in: `never` without rings or the page cache, `auto` with them
+        # (page_cache_writeback brings in page_cache).
         include:
           - iommu: never
             features: regbuf,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info
           - iommu: auto
-            features: regbuf,rings,page_cache,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info
+            features: regbuf,rings,page_cache_writeback,trace_syscall,trace_sched,trace_scheme,trace_mm,trace_irq,trace_iommu,trace_level_info
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/prepare-cargo-git

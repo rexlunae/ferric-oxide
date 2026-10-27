@@ -267,7 +267,7 @@ jobs:
           mke2fs -V
           mkdir -p "$RUNNER_TEMP/ext4"
           tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
-          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test times
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test unreplayed
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
             cargo test --locked --features write --test write --test futimens --test chmod_chown --test write_data --test alloc

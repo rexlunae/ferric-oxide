@@ -1281,10 +1281,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferric-aligned-buffer"
-version = "0.1.0"
-
-[[package]]
 name = "fdt"
 version = "0.2.0-alpha3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1292,6 +1288,10 @@ checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
 
 [[package]]
 name = "ferric-abi"
+version = "0.1.0"
+
+[[package]]
+name = "ferric-aligned-buffer"
 version = "0.1.0"
 
 [[package]]
@@ -1456,6 +1456,7 @@ version = "0.1.0"
 dependencies = [
  "libredox",
  "redox_syscall 0.9.4",
+ "simple_endian",
 ]
 
 [[package]]
@@ -5108,6 +5109,26 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "simple_endian"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fefb7154bf9471272770ebfc50bc8ce4c52b8394ac189288655966948ad611fa"
+dependencies = [
+ "simple_endian_derive",
+]
+
+[[package]]
+name = "simple_endian_derive"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eff6284c89365acc991ef7104aba51708740641a71296c933b7be99e17a5663"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
 
 [[package]]
 name = "siphasher"

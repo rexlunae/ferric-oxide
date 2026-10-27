@@ -1454,6 +1454,11 @@ impl<'a, D: Disk> Transaction<'a, D> {
         Err(Error::new(ENOENT))
     }
 
+    /// Rename a node, discarding the identity of any target losing its last link.
+    ///
+    /// # Errors
+    /// Returns the lookup, name-validation, link and removal errors of
+    /// [`Self::rename_node_replaced`].
     pub fn rename_node(
         &mut self,
         orig_parent_ptr: TreePtr<Node>,
@@ -1461,13 +1466,33 @@ impl<'a, D: Disk> Transaction<'a, D> {
         new_parent_ptr: TreePtr<Node>,
         new_name: &str,
     ) -> Result<()> {
+        self.rename_node_replaced(orig_parent_ptr, orig_name, new_parent_ptr, new_name)
+            .map(|_| ())
+    }
+
+    /// Rename a node and report a replaced target whose last link was removed.
+    ///
+    /// A reported node may remain allocated until its open descriptions close. No node
+    /// is reported when another hard link survives, the target is absent, or both names
+    /// already refer to the same node. Notify caches only after the transaction commits.
+    ///
+    /// # Errors
+    /// Returns errors from source lookup, target removal and creating the new link,
+    /// including `ENOENT` for a missing source and `EINVAL` for an invalid name.
+    pub fn rename_node_replaced(
+        &mut self,
+        orig_parent_ptr: TreePtr<Node>,
+        orig_name: &str,
+        new_parent_ptr: TreePtr<Node>,
+        new_name: &str,
+    ) -> Result<Option<u32>> {
         let orig = self.find_node(orig_parent_ptr, orig_name)?;
 
         // TODO: only allow ENOENT as an error?
-        if let Ok(new) = self.find_node(new_parent_ptr, new_name) {
+        let replaced = if let Ok(new) = self.find_node(new_parent_ptr, new_name) {
             // Move to same name, return
             if new.id() == orig.id() {
-                return Ok(());
+                return Ok(None);
             }
 
             // Remove new name
@@ -1476,8 +1501,10 @@ impl<'a, D: Disk> Transaction<'a, D> {
                 new_parent_ptr,
                 new_name,
                 new.data().mode() & Node::MODE_TYPE,
-            )?;
-        }
+            )?
+        } else {
+            None
+        };
 
         // Link original file to new name
         self.check_name(&new_parent_ptr, new_name)?;
@@ -1490,7 +1517,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
             orig.data().mode() & Node::MODE_TYPE,
         )?;
 
-        Ok(())
+        Ok(replaced)
     }
 
     pub fn rename_node_no_replace(

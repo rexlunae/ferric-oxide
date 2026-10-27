@@ -211,8 +211,9 @@ mod daemon {
         let fs = mount(&args, window)?;
         if fs.needs_recovery() {
             eprintln!(
-                "ext4d: {}: the volume needs journal recovery; serving ext4-view's in-memory \
-                 view of the journal (fs.ext4_journal_replay replays it onto the disk)",
+                "ext4d: {}: the volume needs journal recovery; serving it as the replay would \
+                 leave it, with the journal's committed blocks read in memory over the volume \
+                 (the disk is not changed; fs.ext4_journal_replay replays it onto the disk)",
                 args.device
             );
         }

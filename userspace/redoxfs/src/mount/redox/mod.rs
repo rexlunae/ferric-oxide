@@ -83,6 +83,8 @@ where
         }
     }
 
+    // Ferric Oxide: write back what the kernel's page cache holds dirty first.
+    scheme.flush_page_cache();
     // Cleanup on unmount
     scheme.fs.cleanup()?;
 
