@@ -96,6 +96,14 @@ pub trait Arch: Clone + Copy {
     fn invalidate(address: VirtualAddress);
     fn invalidate_all();
 
+    /// Ferric Oxide: like [`Self::invalidate_all`], but also drops global translations and those
+    /// of every address-space tag (PCID, ASID), as needed after removing a global kernel mapping.
+    /// The default is `invalidate_all`, for architectures where that already does both.
+    #[inline(always)]
+    fn invalidate_all_global() {
+        Self::invalidate_all();
+    }
+
     fn table(table_kind: TableKind) -> PhysicalAddress;
     unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress);
 
