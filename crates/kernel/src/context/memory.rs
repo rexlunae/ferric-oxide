@@ -2027,9 +2027,6 @@ impl Grant {
                 .map_err(|_| Error::new(ENOMEM));
             }
             let mut src_addrspace = &mut *guard;
-            let mut src_flusher_state =
-                Flusher::with_cpu_set(&src.addr_space_lock.used_by, &src.addr_space_lock.tlb_ack)
-                    .detach();
             for dst_page in span.pages() {
                 let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
@@ -2072,33 +2069,31 @@ impl Grant {
                             } = cow(frame, page_info, RefKind::Shared)
                                 .map_err(|_| Error::new(ENOMEM))?;
 
-                            let (old_flags, _, _flush) = src_addrspace
+                            let (_, _, flush) = src_addrspace
                                 .table
                                 .utable
                                 .remap_with_full(src_page.start_address(), |_, flags| {
                                     Some((new_cow_frame.base(), flags))
                                 })
                                 .expect("page did exist");
+                            // The source flusher below invalidates the whole TLB of every CPU
+                            // using the source address space.
+                            flush.ignore();
 
-                            // TODO: flush.ignore() is correct, but seems to be amplifying a
-                            // userspace race condition
-                            //
-                            //flush.ignore();
-
-                            let mut src_flusher = Flusher {
-                                active_cpus: &src.addr_space_lock.used_by,
-                                state: src_flusher_state,
-                            };
-                            src_flusher.queue(
-                                frame,
-                                None,
-                                TlbShootdownActions::change_of_flags(old_flags, new_flags),
+                            // The source may be the running context (a process sharing its own
+                            // pages, as fork does), so its TLB still translates this page to the
+                            // old frame. Flush now, under the source lock: until then its stores
+                            // land in the old frame and later reads of the new one look rolled
+                            // back, and the old frame must not be freed while still reachable.
+                            let mut src_flusher = Flusher::with_cpu_set(
+                                &src.addr_space_lock.used_by,
+                                &src.addr_space_lock.tlb_ack,
                             );
-
+                            src_flusher.queue(frame, None, TlbShootdownActions::MOVE);
                             if let Some(old_frame) = old_frame {
                                 src_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
                             }
-                            src_flusher_state = src_flusher.detach();
+                            drop(src_flusher);
 
                             // TODO: there used to be an additional remove_ref here, was that
                             // correct?
@@ -3296,22 +3291,37 @@ fn correct_inner<'l>(
                                 old_frame,
                             } = cow(src_frame, info, RefKind::Shared)?;
 
-                            if let Some(old_frame) = old_frame {
-                                flusher.queue(old_frame, None, TlbShootdownActions::FREE);
-                                flusher.flush();
-                            }
-
                             let mut guard = RwLockUpgradableGuard::upgrade(guard);
 
-                            // TODO: flusher
-                            unsafe {
+                            // SAFETY: The foreign address space is write-locked and the new
+                            // frame holds a copy of the old one. The single-page flush is
+                            // replaced by `foreign_flusher` below, which invalidates every TLB
+                            // entry of the foreign address space before this lock is released.
+                            let remapped = unsafe {
                                 guard
                                     .table
                                     .utable
                                     .remap_with_full(src_page.start_address(), |_, f| {
                                         Some((new_frame.base(), f))
-                                    });
+                                    })
+                                    .map(|(_, _, flush)| flush.ignore())
+                                    .is_some()
+                            };
+
+                            // The foreign address space's TLBs, not this one's, still translate
+                            // the page to the old frame. Invalidate them before that frame can
+                            // be freed, or their stores are lost and its next owner is written.
+                            let mut foreign_flusher = Flusher::with_cpu_set(
+                                &foreign_address_space.used_by,
+                                &foreign_address_space.tlb_ack,
+                            );
+                            if remapped {
+                                foreign_flusher.queue(src_frame, None, TlbShootdownActions::MOVE);
                             }
+                            if let Some(old_frame) = old_frame {
+                                foreign_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                            }
+                            drop(foreign_flusher);
 
                             new_frame
                         }
@@ -3544,19 +3554,6 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 ackword,
             },
         }
-    }
-    fn detach(mut self) -> FlusherState<'addrsp> {
-        static DUMMY: AtomicU32 = AtomicU32::new(0);
-        let state = core::mem::replace(
-            &mut self.state,
-            FlusherState {
-                pagequeue: ArrayVec::new(),
-                ackword: &DUMMY,
-                dirty: false,
-            },
-        );
-        core::mem::forget(self);
-        state
     }
     // NOTE: Lock must be held, which must be guaranteed by the caller.
     pub fn flush(&mut self) {
