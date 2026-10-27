@@ -2065,6 +2065,12 @@ impl Grant {
                 let frame = if let Some(page_info) = get_page_info(frame) {
                     match page_info.add_ref(RefKind::Shared) {
                         Ok(()) => frame,
+                        // SAFETY: `guard` holds the source address space's lock, so no other
+                        // thread can change its tables. Remapping the page to the private copy
+                        // leaves the old translation cached; `flush.ignore()` is sound because
+                        // the remap and the old frame are queued on the source flusher, which
+                        // is flushed after the loop, so the old frame is freed only after every
+                        // CPU using the source address space has dropped the old translation.
                         Err(AddRefError::CowToShared) => unsafe {
                             let CowResult {
                                 new_frame: new_cow_frame,
@@ -2072,18 +2078,16 @@ impl Grant {
                             } = cow(frame, page_info, RefKind::Shared)
                                 .map_err(|_| Error::new(ENOMEM))?;
 
-                            let (old_flags, _, _flush) = src_addrspace
+                            let (old_flags, _, flush) = src_addrspace
                                 .table
                                 .utable
                                 .remap_with_full(src_page.start_address(), |_, flags| {
                                     Some((new_cow_frame.base(), flags))
                                 })
                                 .expect("page did exist");
-
-                            // TODO: flush.ignore() is correct, but seems to be amplifying a
-                            // userspace race condition
-                            //
-                            //flush.ignore();
+                            // The source flusher, flushed after the loop, invalidates this page
+                            // on every CPU using the source address space, this one included.
+                            flush.ignore();
 
                             let mut src_flusher = Flusher {
                                 active_cpus: &src.addr_space_lock.used_by,
@@ -2143,6 +2147,15 @@ impl Grant {
                     );
                 }
             }
+
+            // `FlusherState` has no `Drop`: without this the remaps above are never invalidated
+            // and the old CoW frames queued as FREE are never released. `guard` still holds the
+            // source address space's lock, as `Flusher::flush` requires.
+            Flusher {
+                active_cpus: &src.addr_space_lock.used_by,
+                state: src_flusher_state,
+            }
+            .flush();
         }
 
         Ok(Self {
