@@ -305,6 +305,13 @@ kill "$tail_pid" 2>/dev/null || true
 
 # The console mixes in CRs and escape sequences; normalize before matching.
 clean="$(tr -d '\r' < "$log")"
+# A failed command substitution can turn an enabled test into a SKIP. Preserve
+# loader failures before completion even when the script reaches its marker.
+before_marker="${clean%%FERRIC_SMOKE_OK*}"
+if grep -qF '[ld.so]: failed to link ' <<< "$before_marker"; then
+    echo "boot-smoke: FAIL, a program failed to link before the smoke marker" >&2
+    exit 1
+fi
 # Markers can share a line with other console output (the login prompt, say),
 # so match them wherever they start, one per line.
 markers="$(grep -ao 'FERRIC_\(TEST_[A-Z]*\|SMOKE_[A-Z]*\).*' <<< "$clean" || true)"

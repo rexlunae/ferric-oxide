@@ -437,15 +437,15 @@ The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
 quoted path it prints), or init reporting that `ion /usr/lib/ferric-smoke.ion`
 failed, ends the run with that console error and `boot-smoke: FAIL, the smoke
-shell could not start`. The linker line counts only for the shell: every program
-reports the same prefix, so a program the script starts that fails to link stays
-that program's test result instead of killing the guest. A boot that prints the
-marker first still passes if QEMU exits successfully, including one that prints
-it while the runner watches for the marker in the second after it saw such a
-line, so a link failure during
-shutdown does not fail a green run. A timeout or nonzero QEMU exit still fails,
-even after the marker: finishing the test script does not establish that the
-guest shut down cleanly. `scripts/ferric-ci/test-boot-smoke.sh`
+shell could not start`. A loader failure in any
+program before `FERRIC_SMOKE_OK` fails the run even if the shell later prints a
+PASS or SKIP: a helper that failed to load can otherwise look like an absent
+optional feature. The shell-specific watch ends an impossible boot early; child
+failures are checked in the final log so the other tests can finish. A link
+failure first printed after the marker does not invalidate completed tests if
+QEMU exits successfully. A timeout or nonzero QEMU exit still fails, even after
+the marker: finishing the test script does not establish that the guest shut
+down cleanly. `scripts/ferric-ci/test-boot-smoke.sh`
 exercises these cases against a fake QEMU, without firmware or virtualization.
 This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
@@ -517,8 +517,8 @@ QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
 failure, a crash after the marker, a nonzero QEMU exit or timeout after the
 marker, an exit during the final timeout poll, a missing test result, a missing
 marker, a smoke shell that could not be linked (which must fail with that message rather
-than a generic timeout), a link failure after the marker and a marker that
-arrives while the runner waits after that line (both of which must still pass), a
+than a generic timeout), a link failure after the marker (which may pass with a clean exit), a loader
+failure before a later marker (which must fail), a
 program the script starts that fails to link (which must not fail the run), a
 timeout whose NMI context rows (and only those) must reach stderr, and that
 the runner adds both HDA controllers. A Unix monitor socket fixture supplies

@@ -77,14 +77,12 @@ check smoke-shell-unlinked-bare-path 1 \
 check link-failure-after-marker 0 \
     $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound' \
     'qemu exit 0'
-# Nor does one that reaches the log while the runner is watching for the marker
-# after it saw the line: the guest printed the marker during that watch.
-check marker-during-wait 0 \
-    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'qemu exit 0' 1
-# A program the smoke script starts can fail to link too; that is the script's
-# test result, and the run must not be killed for it.
-check child-link-failure 0 \
-    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK'
+# A later marker cannot erase a loader failure observed before completion.
+check marker-during-wait 1 \
+    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'a program failed to link before the smoke marker' 1
+# In particular, a failed helper can make a feature check falsely report SKIP.
+check child-link-failure 1 \
+    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK' 'a program failed to link before the smoke marker'
 
 # A boot that never prints the marker times out. The NMI the runner sends then makes the
 # kernel list every context. The runner copies those rows, and only those, to stderr,
