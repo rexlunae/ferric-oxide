@@ -24,6 +24,8 @@ mod spin_wait;
 mod tlb;
 
 #[cfg(test)]
+mod tlb_ack;
+#[cfg(test)]
 mod wait_support;
 #[cfg(test)]
 use wait_support::{context, percpu};

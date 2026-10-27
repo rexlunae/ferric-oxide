@@ -560,7 +560,8 @@ mod stacks {
                 }
             }
             drop(mapper);
-            crate::percpu::shootdown_tlb_ipi(None, &crate::memory::tlb::TlbInvalidation::ALL);
+            // Waits for every CPU: `drop` frees the frame only once no TLB can hold it.
+            crate::percpu::shootdown_tlb_all();
         }
     }
 

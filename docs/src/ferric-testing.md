@@ -164,9 +164,12 @@ CI checks each feature combination and a bare-metal build.
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set`, `sync/records`, TLB shootdown mailbox
-(`memory/tlb.rs`) and local APIC ID decoding
-(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
+It includes the actual `cpu_set`, `sync/records`, TLB shootdown mailbox and
+acknowledgements (`memory/tlb.rs`), broadcast global-flush generation
+(`percpu/global_flush.rs`) and local APIC ID decoding
+(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations.
+`tests/tlb_ack.rs` wires the mailbox and the generation together as `percpu.rs`
+does and races broadcasts against targeted rounds on threads. Run from the root:
 
 ```sh
 cargo test --locked -p ferric-aligned-buffer
