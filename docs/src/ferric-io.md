@@ -384,12 +384,26 @@ once, when the driver starts, from the vector's delivery mechanism
 
 The driver has preferred MSI-X since it was imported, and its MSI-X path never
 wrote INTMS or INTMC; this rule makes that a typed, tested decision rather than
-a side effect of `set_masked_if_fast`. Setting the Mask bit is a
-read-modify-write of Vector Control (the PCI specification has software keep
-its reserved bits), so a mask and unmask cost two reads and two writes of the
-MSI-X table on every interrupt, besides the doorbell writes. Under emulation
-each of those is an MMIO exit. `cargo test -p nvmed` (in `userspace/base`)
-covers the choice for each mechanism and the INTMS/INTMC bit values.
+a side effect of `set_masked_if_fast`.
+
+The Mask bit shares the Vector Control word with reserved bits that the PCI
+Express specification has software preserve, so upstream sets it with a
+read-modify-write: a mask and an unmask were two reads and two writes of the
+MSI-X table on every interrupt, besides the two doorbell writes, and under
+emulation each is an MMIO exit. That accounts for the six exits per request
+that #271 measured on CI's QEMU. pcid now caches the word in the
+`InterruptVector` (`pcid_interface::msi::VectorControl`), read once when the
+entry is programmed, so each mask or unmask is one write, which should leave
+four exits per request. That figure follows from the code and the host tests;
+no CI job counts MMIO exits, so it has not been measured. The cache holds
+because only the driver that owns the table writes it, and `Msix::retarget`,
+the one other writer, restores the Mask bit it found.
+
+`cargo test -p nvmed` (in `userspace/base`) covers the masking choice for each
+mechanism and the INTMS/INTMC bit values. `cargo test -p pcid` counts register
+accesses on a mock Vector Control word: one read for the cache, then one write
+per mask or unmask with the reserved bits kept, against two accesses each for
+the read-modify-write.
 
 ### NVMe request lifetime accounting
 

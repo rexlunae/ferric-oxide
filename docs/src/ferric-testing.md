@@ -779,7 +779,8 @@ before or after an interruption. `cargo test --locked -p ferric-exec-core
 --test driver_event_read` includes the same driver module, so its portable tests
 also run on hosts without libredox event support. The host-tools driver job runs
 the executor package tests, nvmed's host tests (the interrupt masking choice for
-pin-based, MSI and MSI-X vectors) and compiles the NVMe configurations below. Host mocks do not establish why
+pin-based, MSI and MSI-X vectors), pcid's host tests (one MMIO write per MSI-X
+mask or unmask, counted on a mock register) and compiles the NVMe configurations below. Host mocks do not establish why
 a guest read was interrupted; repeat image boots remain the target check.
 
 ### NVMe phase accounting

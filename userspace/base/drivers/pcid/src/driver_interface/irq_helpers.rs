@@ -11,7 +11,7 @@ use std::num::NonZeroU8;
 
 use ferric_vtd::interrupt::MsiFormat;
 
-use crate::msi::{MsiAddrAndData, MsixTableEntry};
+use crate::msi::{MsiAddrAndData, MsixTableEntry, VectorControl};
 // Ferric Oxide: vectors on a chosen CPU.
 use crate::percpu::{self, CpuEntry, CpuId, VectorError};
 use crate::PciFunctionHandle;
@@ -308,10 +308,14 @@ impl Msix {
                 .try_clone()
                 .expect("failed to clone MSI-X IRQ handle");
             let entry = self.mapped.table_entry_pointer(0);
+            let vec_ctl = entry.vector_control();
             InterruptVector {
                 irq_handle,
                 vector: 0,
-                kind: InterruptVectorKind::MsiX { table_entry: entry },
+                kind: InterruptVectorKind::MsiX {
+                    table_entry: entry,
+                    vec_ctl,
+                },
                 cpu: *cpu,
             }
         }
@@ -485,14 +489,18 @@ impl Msix {
         self.next += 1;
         let entry = self.mapped.table_entry_pointer(index as usize);
         entry.write_addr_and_data(msg_addr_and_data);
-        entry.unmask();
+        let mut vec_ctl = entry.vector_control();
+        entry.set_masked_cached(&mut vec_ctl, false);
 
         self.handles.push((kept, cpu));
 
         Ok(InterruptVector {
             irq_handle,
             vector: index,
-            kind: InterruptVectorKind::MsiX { table_entry: entry },
+            kind: InterruptVectorKind::MsiX {
+                table_entry: entry,
+                vec_ctl,
+            },
             cpu,
         })
     }
@@ -539,7 +547,11 @@ impl Msix {
 enum InterruptVectorKind {
     Legacy,
     Msi,
-    MsiX { table_entry: *mut MsixTableEntry },
+    MsiX {
+        table_entry: *mut MsixTableEntry,
+        // Ferric Oxide: the entry's Vector Control word, so masking is one write.
+        vec_ctl: VectorControl,
+    },
 }
 
 /// Ferric Oxide: how an [`InterruptVector`] is delivered, for drivers whose device registers
@@ -580,11 +592,23 @@ impl InterruptVector {
         self.cpu
     }
 
+    /// Masks (`masked`) or unmasks an MSI-X vector through its table entry and returns `true`,
+    /// or returns `false` for a pin-based or MSI vector, which the caller masks through the
+    /// device's own registers.
+    ///
+    /// Ferric Oxide: the entry's Vector Control word is cached from one read when the entry is
+    /// programmed, so each call is a single MMIO write ([`VectorControl`]).
     pub fn set_masked_if_fast(&mut self, masked: bool) -> bool {
-        match self.kind {
+        match &mut self.kind {
             InterruptVectorKind::Legacy | InterruptVectorKind::Msi => false,
-            InterruptVectorKind::MsiX { table_entry } => {
-                unsafe { (*table_entry).set_masked(masked) };
+            InterruptVectorKind::MsiX {
+                table_entry,
+                vec_ctl,
+            } => {
+                // SAFETY: `table_entry` points into the MSI-X table that `Msix::enable` mapped,
+                // which stays mapped for the life of the process; `Mmio` accesses the entry
+                // with volatile operations.
+                unsafe { (**table_entry).set_masked_cached(vec_ctl, masked) };
                 true
             }
         }
