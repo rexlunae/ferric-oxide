@@ -110,8 +110,8 @@ pub fn fetch_offline(recipe: &CookRecipe, logger: &PtyOut) -> Result<FetchResult
             let cached = source_dir.is_dir();
             if !cached {
                 let source_tar = recipe_dir.join("source.tar");
-                let source_tar_blake3 = get_file_blake3(&source_tar)?;
                 if source_tar.exists() {
+                    let source_tar_blake3 = get_file_blake3(&source_tar)?;
                     if let Some(blake3) = blake3 {
                         if source_tar_blake3 != *blake3 {
                             bail_other_err!(
@@ -943,6 +943,29 @@ mod tests {
         assert!(snapshot.join("src/bin/deleted.rs").exists());
         assert!(!refresh_path_source(&original, &snapshot, "source").unwrap());
         assert!(!snapshot.join("src/bin/deleted.rs").exists());
+    }
+
+    #[test]
+    fn offline_tar_source_that_was_never_downloaded_says_how_to_fetch_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("glib");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("recipe.toml"),
+            "[source]\ntar = \"https://example.org/glib.tar.xz\"\nblake3 = \"00\"\n\n[build]\ntemplate = \"custom\"\nscript = \"make\"\n",
+        )
+        .unwrap();
+        let recipe = CookRecipe::from_path(&dir, true, false).unwrap();
+
+        let Err(err) = fetch_offline(&recipe, &None) else {
+            panic!("offline fetch without a downloaded tar must fail");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("offline mode cannot download"),
+            "{message}"
+        );
+        assert!(message.contains("make fetch"), "{message}");
     }
 
     #[test]
