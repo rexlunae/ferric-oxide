@@ -233,6 +233,14 @@ impl MsixTableEntry {
     pub fn set_masked(&mut self, masked: bool) {
         self.vec_ctl.writef(Self::VEC_CTL_MASK_BIT, masked)
     }
+    /// Ferric Oxide: reads the Vector Control word once, for [`Self::set_masked_cached`].
+    pub fn vector_control(&self) -> VectorControl {
+        VectorControl::read(&self.vec_ctl)
+    }
+    /// Ferric Oxide: [`Self::set_masked`] with one write and no read (see [`VectorControl`]).
+    pub fn set_masked_cached(&mut self, cache: &mut VectorControl, masked: bool) {
+        cache.set_masked(&mut self.vec_ctl, masked);
+    }
     pub fn mask(&mut self) {
         self.set_masked(true);
     }
@@ -247,6 +255,44 @@ impl MsixTableEntry {
     }
 }
 
+/// Ferric Oxide: an MSI-X table entry's Vector Control word as last read or written, so that
+/// masking or unmasking the entry is one MMIO write instead of a read-modify-write.
+///
+/// The PCI Express Base Specification (MSI-X Table, Vector Control for MSI-X Table Entries)
+/// defines bit 0 as the Mask bit and bits 31:1 as reserved, which software must preserve when
+/// it changes the Mask bit. The reserved bits are taken from one read
+/// ([`MsixTableEntry::vector_control`]); after that, only the Mask bit changes. The cache is
+/// valid while every other write to the word restores the Mask bit it found, as
+/// `Msix::retarget` does; nothing outside the driver that owns the table writes it.
+///
+/// Under emulation each MMIO access is a VM exit, and a driver that masks its vector while it
+/// drains a completion queue does so on every interrupt, so this halves those exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VectorControl(u32);
+
+impl VectorControl {
+    /// Reads the word from `reg`: the only read this cache makes.
+    pub fn read(reg: &impl Io<Value = u32>) -> Self {
+        Self(reg.read())
+    }
+
+    /// Whether the Mask bit is set, as last read or written.
+    pub fn is_masked(self) -> bool {
+        self.0 & MsixTableEntry::VEC_CTL_MASK_BIT != 0
+    }
+
+    /// Sets (`masked`) or clears the Mask bit with one write of `reg`, keeping the other bits
+    /// as they were read.
+    pub fn set_masked(&mut self, reg: &mut impl Io<Value = u32>, masked: bool) {
+        self.0 = if masked {
+            self.0 | MsixTableEntry::VEC_CTL_MASK_BIT
+        } else {
+            self.0 & !MsixTableEntry::VEC_CTL_MASK_BIT
+        };
+        reg.write(self.0);
+    }
+}
+
 impl fmt::Debug for MsixTableEntry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MsixTableEntry")
@@ -254,5 +300,79 @@ impl fmt::Debug for MsixTableEntry {
             .field("msg_data", &self.msg_data())
             .field("vec_ctl", &self.vec_ctl())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A register that counts its reads and writes.
+    struct CountingReg {
+        value: Cell<u32>,
+        reads: Cell<usize>,
+        writes: usize,
+    }
+
+    impl CountingReg {
+        fn new(value: u32) -> Self {
+            Self {
+                value: Cell::new(value),
+                reads: Cell::new(0),
+                writes: 0,
+            }
+        }
+    }
+
+    impl Io for CountingReg {
+        type Value = u32;
+
+        fn read(&self) -> u32 {
+            self.reads.set(self.reads.get() + 1);
+            self.value.get()
+        }
+
+        fn write(&mut self, value: u32) {
+            self.writes += 1;
+            self.value.set(value);
+        }
+    }
+
+    #[test]
+    fn the_cache_reads_once_and_masks_with_one_write_each() {
+        let mut reg = CountingReg::new(0);
+        let mut cache = VectorControl::read(&reg);
+        for _ in 0..3 {
+            cache.set_masked(&mut reg, true);
+            assert_eq!(reg.value.get(), 1);
+            assert!(cache.is_masked());
+            cache.set_masked(&mut reg, false);
+            assert_eq!(reg.value.get(), 0);
+            assert!(!cache.is_masked());
+        }
+        assert_eq!(reg.reads.get(), 1);
+        assert_eq!(reg.writes, 6);
+    }
+
+    #[test]
+    fn the_read_modify_write_costs_two_accesses_each() {
+        let mut reg = CountingReg::new(0);
+        reg.writef(MsixTableEntry::VEC_CTL_MASK_BIT, true);
+        reg.writef(MsixTableEntry::VEC_CTL_MASK_BIT, false);
+        assert_eq!((reg.reads.get(), reg.writes), (2, 2));
+    }
+
+    #[test]
+    fn reserved_bits_are_kept() {
+        let reserved = 0xABCD_0000;
+        let mut reg = CountingReg::new(reserved | MsixTableEntry::VEC_CTL_MASK_BIT);
+        let mut cache = VectorControl::read(&reg);
+        assert!(cache.is_masked());
+        cache.set_masked(&mut reg, false);
+        assert_eq!(reg.value.get(), reserved);
+        cache.set_masked(&mut reg, true);
+        assert_eq!(reg.value.get(), reserved | MsixTableEntry::VEC_CTL_MASK_BIT);
     }
 }

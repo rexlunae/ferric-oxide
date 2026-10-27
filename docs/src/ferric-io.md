@@ -380,6 +380,61 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### NVMe interrupt masking
+
+nvmed's executor masks a queue pair's interrupt vector while it drains that
+pair's completion queues, then unmasks it. Which register it writes is decided
+once, when the driver starts, from the vector's delivery mechanism
+(`pcid_interface::irq_helpers::InterruptVector::mechanism`), and kept as
+`nvme::intmask::InterruptMask`:
+
+- Pin-based and MSI interrupts use the controller's INTMS (offset 0Ch) and
+  INTMC (offset 10h) registers, one bit per vector. At start nvmed masks every
+  vector and unmasks vector 0.
+- MSI-X uses the Mask bit of the vector's table entry (its Vector Control
+  word). nvmed never reads or writes INTMS or INTMC then: the NVM Express Base
+  Specification 1.4 (sections 3.1.3 and 3.1.4) says host software shall not
+  access them when the controller is configured for MSI-X. Each per-CPU queue
+  pair masks its own entry.
+
+The driver has preferred MSI-X since it was imported, and its MSI-X path never
+wrote INTMS or INTMC; this rule makes that a typed, tested decision rather than
+a side effect of `set_masked_if_fast`.
+
+The Mask bit shares the Vector Control word with reserved bits that the PCI
+Express specification has software preserve, so upstream sets it with a
+read-modify-write: a mask and an unmask were two reads and two writes of the
+MSI-X table on every interrupt, besides the two doorbell writes, and under
+emulation each is an MMIO exit. That accounts for the six exits per request
+that #271 measured on CI's QEMU. pcid now caches the word in the
+`InterruptVector` (`pcid_interface::msi::VectorControl`), read once when the
+entry is programmed, so each mask or unmask is one write, and a request costs
+four exits. The cache holds because only the driver that owns the table writes
+it, and `Msix::retarget`, the one other writer, restores the Mask bit it found.
+
+Measured on CI's QEMU/KVM (MSI-X, x2APIC, 4 vCPUs), with the same diagnostic
+image before and after the change: 6.00 MMIO exits per request before and 4.00
+after, in every single-thread round of every queue policy and with KVM halt
+polling on or off. Multi-thread rounds on the per-CPU workers come out
+slightly lower in both (5.8 before, 3.8 to 3.9 after), since one interrupt can
+complete more than one request there. The method: a throwaway diagnostic
+branch prints a marker around each `ferric-blkgrant-test` threaded-read round
+(1024 4 KiB `pread`s), and a host-side monitor snapshots the QEMU process's
+KVM debugfs counters (`mmio_exits`, `exits`) at each marker; per-request exits
+are the round's delta, less the same window's idle delta (zero MMIO exits),
+divided by 1024. The runs are
+[40472544866](https://github.com/rexlunae/ferric-oxide/actions/runs/40472544866)
+(main at 232069712) and
+[40472602252](https://github.com/rexlunae/ferric-oxide/actions/runs/40472602252)
+(this change at d78c3fc6a). No regular CI job counts exits; the host tests below are what
+keeps the one-write mask from regressing.
+
+`cargo test -p nvmed` (in `userspace/base`) covers the masking choice for each
+mechanism and the INTMS/INTMC bit values. `cargo test -p pcid` counts register
+accesses on a mock Vector Control word: one read for the cache, then one write
+per mask or unmask with the reserved bits kept, against two accesses each for
+the read-modify-write.
+
 ### NVMe request lifetime accounting
 
 The dispatcher counts inline requests, awaited worker jobs and requests that
