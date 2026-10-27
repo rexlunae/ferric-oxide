@@ -493,6 +493,8 @@ Example:
 
 ### Ignored Recipes
 
+Included files are loaded depth first, each before the file that includes it, and each file only once: when two includes share a base (`desktop.toml` includes `desktop-minimal.toml` and `server.toml`, which both include `minimal.toml`), the base is loaded the first time and skipped the second, so it cannot undo the overrides loaded after it.
+
 You can disable the installation of some recipes in the image by ignoring, this is commonly used to disable recipes imported from other filesystem configurations to yours using the `include` data type.
 
 To quickly ignore them use the following command:
