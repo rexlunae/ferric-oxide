@@ -81,15 +81,31 @@ impl Arch for AArch64Arch {
         PhysicalAddress::new(address)
     }
 
+    /// Switches a translation table base and drops every cached translation.
+    ///
+    /// All user address spaces share ASID 0, so cross-process isolation rests on
+    /// this flush. The `isb` after the `msr` makes the new base take effect
+    /// before the `tlbi`: without it the CPU may still walk the old table
+    /// speculatively after the invalidation, leaving the previous process's
+    /// translations (same VAs, other frames) in the TLB. TCG never does that;
+    /// Apple cores under HVF do, and a forked child then wrote into its parent.
+    ///
+    /// # Safety
+    ///
+    /// The caller must run at EL1 and pass the physical address of a
+    /// page-aligned top-level table of the kind given by `table_kind`. That
+    /// table must stay allocated and valid for as long as it is installed. A
+    /// kernel table must map the code and stack in use at the switch, or the
+    /// next instruction fetch faults.
     #[inline(always)]
     unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress) {
         unsafe {
             match table_kind {
                 TableKind::User => {
-                    asm!("msr ttbr0_el1, {0}", in(reg) address.data());
+                    asm!("msr ttbr0_el1, {0}", "isb", in(reg) address.data());
                 }
                 TableKind::Kernel => {
-                    asm!("msr ttbr1_el1, {0}", in(reg) address.data());
+                    asm!("msr ttbr1_el1, {0}", "isb", in(reg) address.data());
                 }
             }
             Self::invalidate_all();
