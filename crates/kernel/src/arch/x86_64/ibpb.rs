@@ -5,17 +5,20 @@
 //! speculatively running gadgets of the attacker's choosing (Spectre v2 user-to-user,
 //! CVE-2017-5715). Writing bit 0 of `IA32_PRED_CMD` (MSR 0x49) discards those predictions.
 //!
-//! The kernel issues one when a CPU switches to a user address space other than the last one it
-//! ran: in `percpu::switch_arch_hook` for context switches and in `Context::set_addr_space` for a
-//! context that changes address space (exec). Switches to kernel and idle contexts, and between
-//! threads of one process, issue none. [`policy`](crate::arch::ibpb::policy) holds the decision
-//! as pure functions; this module adds the boot-time choice, the per-CPU record and a count.
+//! The kernel issues one, through [`before_switch`], when a CPU switches to a context that runs
+//! user code in an address space other than the last one whose user code it ran: in
+//! `context::arch::switch_to` for context switches and in `Context::set_addr_space` for a context
+//! that changes address space (exec). Switches to kernel and idle contexts, to kernel contexts that
+//! borrow a process's address space (ring workers), and between threads of one process issue
+//! none. [`policy`](crate::arch::ibpb::policy) holds the decision as pure functions; this module
+//! adds the boot-time choice, the per-CPU state and a count.
 //!
 //! The `ibpb` CPU feature (`arch.x86_64.features.ibpb` in the kernel config, `kernel.cpu.ibpb`
 //! in `ferric.toml`) chooses: `never` builds it out, `auto` turns it on when the CPU reports
 //! IBPB support ([`Cpuid::supports_ibpb`](crate::arch::ibpb::policy::Cpuid::supports_ibpb)), and
 //! `always` also panics at boot on CPUs without it. Like KPTI the choice is made once, on the
-//! bootstrap processor.
+//! bootstrap processor, and every other CPU checks its own support as it starts ([`init_cpu`]):
+//! under `always` a CPU without IBPB panics, under `auto` it runs without barriers and says so.
 
 pub mod policy;
 
@@ -71,8 +74,35 @@ fn read_cpuid() -> policy::Cpuid {
     }
 }
 
+/// Per-CPU IBPB state, kept in the CPU's [`PercpuBlock`](crate::percpu::PercpuBlock).
+pub struct PerCpu {
+    /// Whether this CPU issues barriers: they are on and this CPU reports IBPB support.
+    active: Cell<bool>,
+    /// The last address space whose user code this CPU ran, kept across kernel and idle contexts
+    /// so switching back to it needs no barrier. The weak reference keeps the address space's
+    /// allocation alive, so a new address space can never reuse its address and be mistaken for
+    /// it.
+    last_user: Cell<Option<Weak<AddrSpaceWrapper>>>,
+}
+
+impl PerCpu {
+    /// State for a CPU that has not yet run [`init_cpu`]: it issues no barriers.
+    pub const fn new() -> Self {
+        Self {
+            active: Cell::new(false),
+            last_user: Cell::new(None),
+        }
+    }
+}
+
+impl Default for PerCpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Decides whether context switches issue barriers, on the bootstrap processor before any user
-/// code runs. Returns the decision.
+/// code runs, and sets up the bootstrap processor's state. Returns the decision.
 ///
 /// # Panics
 ///
@@ -93,33 +123,57 @@ pub fn decide() -> bool {
     } else {
         crate::info!("IBPB: not supported by this CPU, switches issue no barrier");
     }
+    init_cpu(&crate::percpu::PercpuBlock::current().ibpb);
     supported
 }
 
-/// Decides whether switching this CPU to `next` (`None` for a kernel or idle context) needs a
-/// barrier, given `last_user`, the CPU's record of the last user address space it ran. When it
-/// does, records `next` and counts the barrier; the caller must then write [`PRED_CMD_IBPB`] to
-/// [`IA32_PRED_CMD`] before `next` runs user code. Always false while barriers are off.
+/// Sets up `state`, the current CPU's IBPB state, after [`decide`] and before the CPU runs any
+/// user code. The bootstrap processor's decision is global, but `IA32_PRED_CMD` is written by
+/// whichever CPU switches, so each CPU must check that it implements the MSR itself.
 ///
-/// `last_user` holds a weak reference, which keeps the address space's allocation alive, so a
-/// new address space can never reuse the address of the recorded one and be mistaken for it.
-pub fn needed_for_switch(
-    last_user: &Cell<Option<Weak<AddrSpaceWrapper>>>,
-    next: Option<&Arc<AddrSpaceWrapper>>,
-) -> bool {
+/// # Panics
+///
+/// When the `ibpb` feature is `always`, barriers are on and this CPU, unlike the bootstrap
+/// processor, does not report IBPB support.
+pub fn init_cpu(state: &PerCpu) {
     if !enabled() {
-        return false;
+        return;
     }
-    let last = last_user.take();
-    let needed = policy::needs_barrier(last.as_ref().map(Weak::as_ptr), next.map(Arc::as_ptr));
-    match next {
-        Some(next) if needed => {
-            last_user.set(Some(Arc::downgrade(next)));
+    let supported = read_cpuid().supports_ibpb();
+    if !supported {
+        if cfg!(cpu_feature_always = "ibpb") {
+            panic!("IBPB: this CPU does not report IBPB support, unlike the bootstrap processor");
+        }
+        crate::warn!(
+            "IBPB: this CPU does not report IBPB support, unlike the bootstrap processor; it issues no barriers"
+        );
+    }
+    state.active.set(supported);
+}
+
+/// Issues a barrier when switching the current CPU, whose IBPB state is `state`, to a context
+/// whose user code runs in `next` needs one, and records `next` as the last user address space.
+/// `next` is `None` for a context that runs no user code: kernel and idle contexts, and ring
+/// workers, which borrow a submitter's address space to reach its buffers but never enter user
+/// mode. Call it before `next`'s user code runs; it does nothing while barriers are off.
+pub fn before_switch(state: &PerCpu, next: Option<&Arc<AddrSpaceWrapper>>) {
+    if !compiled() || !state.active.get() {
+        return;
+    }
+    let last = state.last_user.take();
+    if !policy::needs_barrier(last.as_ref().map(Weak::as_ptr), next.map(Arc::as_ptr)) {
+        state.last_user.set(last);
+        return;
+    }
+    state.last_user.set(next.map(Arc::downgrade));
+    // `init_cpu` activated this CPU only if it reports IBPB, so the write should not fault; if
+    // the CPU disagrees with its CPUID anyway, it stops issuing barriers rather than crashing.
+    match crate::arch::misc::wrmsr_safe(IA32_PRED_CMD, PRED_CMD_IBPB) {
+        Ok(()) => {
             BARRIERS.fetch_add(1, Ordering::Relaxed);
         }
-        _ => last_user.set(last),
+        Err(_) => state.active.set(false),
     }
-    needed
 }
 
 /// The number of barriers issued on all CPUs since boot, shown in `sys:stat`.

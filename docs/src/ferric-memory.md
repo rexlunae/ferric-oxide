@@ -279,17 +279,25 @@ address space other than the last one it ran. This discards indirect branch
 predictions one process trained before another runs (Spectre v2 user-to-user,
 CVE-2017-5715). The choice is made once on the bootstrap processor, like KPTI;
 `always` panics at boot on a CPU without support and `never` builds the code
-out. Without a `ferric.toml` the kernel config example keeps it `never`, as
+out. Every other CPU checks its own CPUID as it starts, since the MSR is
+written by whichever CPU switches: under `always` a CPU without IBPB panics,
+and under `auto` it runs without barriers and logs a warning. A CPU whose
+barrier write faults despite its CPUID stops issuing barriers instead of
+crashing. Without a `ferric.toml` the kernel config example keeps it `never`, as
 upstream Redox has no barrier.
 
-Each CPU remembers the last user address space it ran through a weak
-reference, which keeps that address space's allocation alive so a new address
-space cannot reuse its address and be mistaken for it. Switches to kernel and
-idle contexts, which have no address space of their own, keep that record and
-issue nothing, so a process that yields to the idle loop and resumes pays no
-barrier; neither do switches between threads of one process. The check runs in
-`percpu::switch_arch_hook` and in `Context::set_addr_space`, which covers a
-context that gets a new address space through exec. The decision and the
+Each CPU remembers the last address space whose user code it ran through a
+weak reference, which keeps that address space's allocation alive so a new
+address space cannot reuse its address and be mistaken for it. Switches to
+contexts that run no user code keep that record and issue nothing: kernel and
+idle contexts, and ring workers, which install a submitter's address space to
+reach its buffers but never enter user mode (`Context::runs_user_code` tells
+them apart, since workers also set `userspace` to be scheduled). A process that
+yields to the idle loop or to a ring worker and resumes pays no barrier;
+neither do switches between threads of one process. `ibpb::before_switch`
+makes the check and the MSR write, called from the x86_64 `switch_to` and from
+`Context::set_addr_space`, which covers a context that gets a new address space
+through exec. The decision and the
 CPUID decoding are pure functions in `arch/x86_64/ibpb/policy.rs`, covered by
 the kernel helper tests; `sys:stat` reports the number of barriers issued as
 `ibpb_barriers`.
@@ -305,5 +313,6 @@ retpolines, so this covers user-to-user attacks only, not user-to-kernel
 branch target injection or attacks from a sibling hyperthread. `auto`
 looks only at IBPB support, not at vulnerability bits. Image CI boots under KVM with
 `-cpu host` and requires the boot-time decision in the log; whether barriers
-are on there depends on the runner exposing IBPB to the guest.
->>>>>>> aa0f1541e (kernel: IBPB on context switch between user address spaces)
+are on there depends on the runner exposing IBPB to the guest. When they are,
+it also requires a non-zero `ibpb_barriers` count, which the smoke script
+prints from `sys:stat` after its tests have run.

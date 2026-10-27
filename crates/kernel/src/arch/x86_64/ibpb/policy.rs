@@ -108,6 +108,23 @@ mod tests {
     }
 
     #[test]
+    fn ring_worker_borrowing_an_address_space_needs_no_barrier() {
+        // A runs, a ring worker borrows B's address space (it runs no user code, so the switch
+        // passes None), then A resumes: no barrier. B's own user code then needs one.
+        let mut last = None;
+        let mut barriers = 0;
+        for next in [Some(1), None, Some(1), Some(2)] {
+            if needs_barrier(last, next) {
+                barriers += 1;
+            }
+            if next.is_some() {
+                last = next;
+            }
+        }
+        assert_eq!(barriers, 2);
+    }
+
+    #[test]
     fn no_cpuid_bits_means_no_support() {
         assert!(!Cpuid::default().supports_ibpb());
         let cpuid = Cpuid {

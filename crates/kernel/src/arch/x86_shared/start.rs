@@ -357,6 +357,8 @@ unsafe extern "C" fn start_ap(args_ptr: *mut KernelArgsAp) -> ! {
             // PCID every invalidation also uses INVPCID, which faults until CR4.PCIDE is set.
             #[cfg(target_arch = "x86_64")]
             crate::arch::kpti::init_cpu();
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::ibpb::init_cpu(&crate::percpu::PercpuBlock::current().ibpb);
 
             // Initialize paging
             paging::init();
