@@ -393,11 +393,26 @@ MSI-X table on every interrupt, besides the two doorbell writes, and under
 emulation each is an MMIO exit. That accounts for the six exits per request
 that #271 measured on CI's QEMU. pcid now caches the word in the
 `InterruptVector` (`pcid_interface::msi::VectorControl`), read once when the
-entry is programmed, so each mask or unmask is one write, which should leave
-four exits per request. That figure follows from the code and the host tests;
-no CI job counts MMIO exits, so it has not been measured. The cache holds
-because only the driver that owns the table writes it, and `Msix::retarget`,
-the one other writer, restores the Mask bit it found.
+entry is programmed, so each mask or unmask is one write, and a request costs
+four exits. The cache holds because only the driver that owns the table writes
+it, and `Msix::retarget`, the one other writer, restores the Mask bit it found.
+
+Measured on CI's QEMU/KVM (MSI-X, x2APIC, 4 vCPUs), with the same diagnostic
+image before and after the change: 6.00 MMIO exits per request before and 4.00
+after, in every single-thread round of every queue policy and with KVM halt
+polling on or off. Multi-thread rounds on the per-CPU workers come out
+slightly lower in both (5.8 before, 3.8 to 3.9 after), since one interrupt can
+complete more than one request there. The method: a throwaway diagnostic
+branch prints a marker around each `ferric-blkgrant-test` threaded-read round
+(1024 4 KiB `pread`s), and a host-side monitor snapshots the QEMU process's
+KVM debugfs counters (`mmio_exits`, `exits`) at each marker; per-request exits
+are the round's delta, less the same window's idle delta (zero MMIO exits),
+divided by 1024. The runs are
+[40472544866](https://github.com/rexlunae/ferric-oxide/actions/runs/40472544866)
+(main at 232069712) and
+[40472602252](https://github.com/rexlunae/ferric-oxide/actions/runs/40472602252)
+(this change at d78c3fc6a). No regular CI job counts exits; the host tests below are what
+keeps the one-write mask from regressing.
 
 `cargo test -p nvmed` (in `userspace/base`) covers the masking choice for each
 mechanism and the INTMS/INTMC bit values. `cargo test -p pcid` counts register
