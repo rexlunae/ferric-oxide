@@ -258,7 +258,8 @@ source address space under its lock, right after the remap, and queues the old
 frame's release on that same flush. The old frame is freed only after those
 CPUs acknowledge, so no store lands in a frame that is being reused. Before
 [#298](https://github.com/rexlunae/ferric-oxide/pull/298) both paths dropped
-that flush ([#297](https://github.com/rexlunae/ferric-oxide/issues/297)). TCG
-hides the bug; it showed up as bootstrap memory rolling back on aarch64 under
-HVF. The fix was validated by an HVF boot on Apple Silicon. CI boots cover
-x86_64 only, and no host test models the remap.
+that flush. They were found while chasing the aarch64 HVF bootstrap crash
+([#297](https://github.com/rexlunae/ferric-oxide/issues/297)), whose own cause
+was a missing `isb` after the page-table switch
+([#299](https://github.com/rexlunae/ferric-oxide/pull/299)). TCG hides missing
+invalidations. CI boots cover x86_64 only, and no host test models the remap.
