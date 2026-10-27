@@ -873,6 +873,62 @@ mod tests {
         );
     }
 
+    /// The destination runs out of frames while mapping the first page, before any page is
+    /// mapped: there is no page to undo, but the tables linked for it are handed back.
+    #[test]
+    fn map_span_out_of_frames_on_the_first_page() {
+        let _machine = fresh_machine();
+        let mut src_alloc = RecordingAllocator::new(crate::MEGABYTE, 64);
+        // The top-level table, then the PDPT and PD for page 0. Its PT does not fit.
+        let mut dst_alloc = RecordingAllocator::new(crate::MEGABYTE + 64 * PAGE, 3);
+        // SAFETY: `init` loaded a valid table.
+        let mut src = unsafe { PageMapper::current(TableKind::User, &mut src_alloc) };
+        // SAFETY: the new table is only used through this mapper.
+        let mut dst = unsafe { PageMapper::create(TableKind::User, &mut dst_alloc) }
+            .expect("allocate the destination table");
+
+        let src_base = VirtualAddress::new(0x1_0000_0000);
+        let dst_base = VirtualAddress::new(0x2_0000_0000);
+        for i in 0..2 {
+            map_frame(&mut src, page_at(src_base, i), frame(i));
+        }
+
+        let mut unmapped = Vec::new();
+        // SAFETY: the destination span is unmapped and nothing else uses the table.
+        let result = unsafe {
+            dst.map_span_or_none(
+                dst_base,
+                2,
+                user_flags(),
+                |_, i| src.translate(page_at(src_base, i)).map(|(phys, _)| phys),
+                &mut |u| unmapped.push(u),
+            )
+        };
+
+        assert_eq!(result, Err(MapSpanError { page: 0 }));
+        for i in 0..2 {
+            assert!(dst.translate(page_at(dst_base, i)).is_none());
+            assert_eq!(
+                src.translate(page_at(src_base, i)).map(|m| m.0),
+                Some(frame(i)),
+                "source page {i} untouched"
+            );
+        }
+        let mut tables: Vec<_> = unmapped
+            .iter()
+            .map(|u| match u {
+                Unmapped::Table(t) => *t,
+                Unmapped::Page(p) => panic!("no page was mapped, but {p:?} was undone"),
+            })
+            .collect();
+        tables.sort();
+        let expected: Vec<_> = (1..3)
+            .map(|i| PhysicalAddress::new(crate::MEGABYTE + (64 + i) * PAGE))
+            .collect();
+        assert_eq!(tables, expected);
+        assert!(dst.allocator().freed.is_empty());
+    }
+
     /// Moving a page within one table, the way `Grant::transfer` does it: the destination is
     /// mapped before the source is unmapped, so a page table both share is never left empty
     /// (and handed back) in between, and the move needs no frame once the mapping succeeded.
