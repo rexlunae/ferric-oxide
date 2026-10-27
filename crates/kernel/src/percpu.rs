@@ -210,11 +210,11 @@ impl PercpuBlock {
         }
 
         // TODO: Finer-grained flush
-        if GLOBAL_FLUSH.take(self.cpu_id.get() as usize) {
-            crate::memory::RmmA::invalidate_all_global();
-        } else {
-            crate::memory::RmmA::invalidate_all();
-        }
+        GLOBAL_FLUSH.flush(
+            self.cpu_id.get() as usize,
+            crate::memory::RmmA::invalidate_all_global,
+            crate::memory::RmmA::invalidate_all,
+        );
         crate::tlb_stats::shootdown_handled();
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {
