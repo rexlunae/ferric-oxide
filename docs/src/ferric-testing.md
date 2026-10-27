@@ -285,6 +285,12 @@ builds of kernel, relibc, bootloader, RedoxFS, base and Ferric test packages,
 even when the surrounding build uses prebuilt packages. Its init script emits
 `FERRIC_SMOKE_BEGIN`, runs the tests, emits `FERRIC_SMOKE_OK` and shuts down.
 
+The ASLR test links dynamically against the image's in-tree relibc so it exercises
+the interpreter exec path, which installs the mmap floor. A static executable
+would bypass that path and miss the sparse-address-space regression. Its host
+protocol tests run with `cargo test --locked --manifest-path
+recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
+
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
 | `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
