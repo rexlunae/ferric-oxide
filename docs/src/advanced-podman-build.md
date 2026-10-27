@@ -1,5 +1,9 @@
 # Advanced Podman Build
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 To make the Redox build process more consistent across platforms, we are using **Rootless Podman** for major parts of the build.
 
 Before reading through this section, make sure you have already read:
@@ -267,7 +271,7 @@ If you just want to install the packages temporarily, run `make env`, open a new
 
 If you are interested in how we are able to use your working directory for builds in **Podman**, the following configuration details may be interesting.
 
-The build process is performed in your normal working directory, e.g., `~/tryredox/redox`. Compilation of the Redox components is performed in the container, but the final Redox image (`build/$ARCH/$CONFIG/harddrive.img` or `build/$ARCH/$CONFIG/livedisk.iso`) is constructed using [FUSE](https://github.com/libfuse/libfuse) running directly on your host machine.
+The build process is performed in your normal working directory, e.g., `~/tryredox/redox`. Compilation of the Redox components is performed in the container, but the final image (`build/$ARCH/$CONFIG/harddrive.img` or `build/$ARCH/$CONFIG/livedisk.iso`) is constructed using [FUSE](https://github.com/libfuse/libfuse) running directly on your host machine.
 
 Setting `PODMAN_BUILD?` to 1 in [.config](./configuration-settings.md#config), on the `make` command line (e.g., `make PODMAN_BUILD=1 all`) or in the environment (e.g., `export PODMAN_BUILD=1; make all`) will enable Podman.
 

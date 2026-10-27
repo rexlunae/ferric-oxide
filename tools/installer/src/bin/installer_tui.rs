@@ -1,7 +1,4 @@
 use anyhow::{Result, anyhow, bail};
-use pkgar::{PackageHead, ext::EntryExt};
-use pkgar_core::PackageSrc;
-use pkgar_keys::PublicKeyFile;
 use redox_installer::{Config, DiskOption, try_fast_install, with_redoxfs_mount, with_whole_disk};
 use std::{
     ffi::OsStr,
@@ -158,6 +155,8 @@ fn copy_file(src: &Path, dest: &Path, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Lists every file of the packages installed on the running system, from
+/// fox's database, and fox's own state, so the copy keeps them installed.
 fn package_files(
     root_path: &Path,
     config: &mut Config,
@@ -166,29 +165,50 @@ fn package_files(
     //TODO: Remove packages from config where all files are located (and have valid shasum?)
     config.packages.clear();
 
-    let pkey_path = "pkg/id_ed25519.pub.toml";
-    let pkey = PublicKeyFile::open(&root_path.join(pkey_path))?.pkey;
-    files.push(pkey_path.to_string());
-
-    for item_res in fs::read_dir(&root_path.join("pkg"))? {
-        let item = item_res?;
-        let pkg_path = item.path();
-        if pkg_path.extension() == Some(OsStr::new("pkgar_head")) {
-            let mut pkg = PackageHead::new(&pkg_path, &root_path, &pkey)?;
-            for entry in pkg.read_entries()? {
-                files.push(entry.check_path()?.to_str().unwrap().to_string());
-            }
-            files.push(
-                pkg_path
-                    .strip_prefix(root_path)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-            );
+    let store = fox_store::Store::open(root_path)?;
+    for package in store.list()? {
+        files.extend(package.files.into_iter().map(|file| file.path));
+    }
+    for dir in [fox_store::STATE_DIR, fox_core::keys::TRUSTED_KEYS_DIR] {
+        state_files(root_path, &root_path.join(dir), files)?;
+    }
+    // fox's configuration is reserved rather than owned by a package.
+    for file in [
+        fox_core::registries::REGISTRIES_FILE,
+        fox_core::policy::POLICY_FILE,
+        fox_core::trust::TRUST_FILE,
+    ] {
+        if root_path.join(file).is_file() {
+            files.push(file.to_string());
         }
     }
+    Ok(())
+}
 
+/// Adds the regular files under `dir`, relative to `root_path`, skipping
+/// fox's registry checkouts and source caches, which are rebuilt on demand.
+fn state_files(root_path: &Path, dir: &Path, files: &mut Vec<String>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let relative = path
+            .strip_prefix(root_path)?
+            .to_str()
+            .ok_or_else(|| anyhow!("{} is not UTF-8", path.display()))?
+            .to_string();
+        if path.is_symlink() || path.is_file() {
+            files.push(relative);
+        } else if path.is_dir()
+            && !matches!(
+                path.file_name().and_then(OsStr::to_str),
+                Some("registries" | "git")
+            )
+        {
+            state_files(root_path, &path, files)?;
+        }
+    }
     Ok(())
 }
 
@@ -372,5 +392,43 @@ fn main() {
             eprintln!("redox_installer_tui: failed to install: {:?}", err);
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_files_keep_fox_state_and_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path();
+        let kept = [
+            fox_core::registries::REGISTRIES_FILE,
+            fox_core::policy::POLICY_FILE,
+            fox_core::trust::TRUST_FILE,
+            "etc/fox/keys/cookbook.pub.toml",
+        ];
+        for file in kept
+            .into_iter()
+            .chain(["var/lib/fox/registries/main/index.toml"])
+        {
+            let path = root_path.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        fox_store::Store::open(root_path).unwrap();
+
+        let mut files = Vec::new();
+        package_files(root_path, &mut Config::default(), &mut files).unwrap();
+        for file in kept {
+            assert!(files.iter().any(|f| f == file), "{file} is copied");
+        }
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.starts_with("var/lib/fox/registries")),
+            "registry checkouts are rebuilt, not copied"
+        );
     }
 }

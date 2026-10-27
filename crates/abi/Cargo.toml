@@ -1,0 +1,8 @@
+[package]
+name = "ferric-abi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Constants of the interfaces between Ferric Oxide's C library, schemes and kernel that are defined once for every consumer"
+
+[dependencies]

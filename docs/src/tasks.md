@@ -1,6 +1,6 @@
 # Tasks
 
-This page contain commands used for common and specific tasks on Redox.
+This page contains commands for common tasks on a running Ferric Oxide system.
 
 - [Hardware](#hardware)
 - [System](#system)

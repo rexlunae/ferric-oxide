@@ -13,8 +13,10 @@
 //! Built with `journal-replay` (features.toml `fs.ext4_journal_replay`), it first replays the
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
 //! for that. Without it the device is only ever opened for reading. `write` (features.toml
-//! `fs.ext4_write`) adds the library's journaled writes, which the scheme does not call yet.
-//! `ext4d --features`
+//! `fs.ext4_write`) opens the device for writing and serves the volume read-write when the
+//! library can write to it (`ext4d::write::check_writable`), so far for `futimens` only;
+//! when it cannot, or the device does not open for writing, it says why and serves the
+//! volume read-only (`ext4d::fs::Fs::mount_preferring_write`). `ext4d --features`
 //! prints the optional features it was built with, one per line, so tests can tell.
 
 #![forbid(unsafe_code)]
@@ -49,7 +51,6 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "redox")]
 mod daemon {
-    use std::error::Error as _;
     use std::fs::File;
     use std::process::ExitCode;
 
@@ -170,12 +171,40 @@ mod daemon {
         Ok(())
     }
 
+    /// Loads the volume: without `write`, read-only.
+    #[cfg(not(feature = "write"))]
+    fn mount(_args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
+        Ok(ext4d::fs::Fs::new(window)?)
+    }
+
+    /// Loads the volume: with `write`, for changes when the library can write to it and the
+    /// device opens for writing; otherwise read-only, saying why.
+    #[cfg(feature = "write")]
+    fn mount(args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
+        let (fs, read_only) = ext4d::fs::Fs::mount_preferring_write(window, || open(args, true))?;
+        if let Some(reason) = read_only {
+            eprint!("ext4d: {}: serving read-only: {reason}", args.device);
+            print_sources(&reason);
+        }
+        Ok(fs)
+    }
+
+    /// Prints `err`'s sources after it, then ends the line.
+    fn print_sources(err: &dyn std::error::Error) {
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprint!(": {cause}");
+            source = cause.source();
+        }
+        eprintln!();
+    }
+
     fn run() -> Result<(), DaemonError> {
         let args = parse(std::env::args().skip(1))?;
         let window = open(&args, false)?;
         #[cfg(feature = "journal-replay")]
         replay(&args, &window)?;
-        let fs = ext4d::fs::Fs::new(window)?;
+        let fs = mount(&args, window)?;
         if fs.needs_recovery() {
             eprintln!(
                 "ext4d: {}: the volume needs journal recovery; serving ext4-view's in-memory \
@@ -183,9 +212,14 @@ mod daemon {
                 args.device
             );
         }
+        let mode = if fs.is_writable() {
+            "read-write (times, mode and owner only)"
+        } else {
+            "read-only"
+        };
         let mount = Mount::new(fs, &args.scheme)?;
         eprintln!(
-            "ext4d: {} mounted read-only at /scheme/{}",
+            "ext4d: {} mounted {mode} at /scheme/{}",
             args.device, args.scheme
         );
         mount.serve()?;
@@ -197,12 +231,7 @@ mod daemon {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprint!("ext4d: {err}");
-                let mut source = err.source();
-                while let Some(cause) = source {
-                    eprint!(": {cause}");
-                    source = cause.source();
-                }
-                eprintln!();
+                print_sources(&err);
                 ExitCode::FAILURE
             }
         }

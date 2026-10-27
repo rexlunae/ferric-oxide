@@ -84,12 +84,12 @@ for the native build. Existing Make targets remain available.
 
 Where the project is heading, phase by phase, is in the [roadmap](ROADMAP.md).
 
-The in-tree [system documentation](docs/src/ferric-oxide.md) describes the implemented architecture, configuration, memory and CPU protection, registered buffers and DMA isolation, package tooling, and validation. See [docs/README.md](docs/README.md) to build or serve the book. The inherited Redox chapters remain useful background, alongside the upstream build guides:
+The in-tree [system documentation](docs/src/ferric-oxide.md) describes the implemented architecture, configuration, memory and CPU protection, registered buffers and DMA isolation, package tooling, and validation. See [docs/README.md](docs/README.md) to build or serve the book. Other useful pages in the book:
 
-- [Building with Podman](https://doc.redox-os.org/book/podman-build.html)
-- [Build System Reference](https://doc.redox-os.org/book/build-system-reference.html)
-- [Running in a Virtual Machine](https://doc.redox-os.org/book/running-vm.html) and on [Real Hardware](https://doc.redox-os.org/book/real-hardware.html)
-- [Developer FAQ](https://doc.redox-os.org/book/developer-faq.html)
+- [Building Ferric Oxide](docs/src/building-redox.md) and [Building with Podman](docs/src/podman-build.md)
+- [Configuration Settings](docs/src/configuration-settings.md) and the [Build System Reference](docs/src/build-system-reference.md)
+- [Running in a Virtual Machine](docs/src/running-vm.md) and on [Real Hardware](docs/src/real-hardware.md)
+- [Developer FAQ](docs/src/developer-faq.md)
 
 Internal names such as the `x86_64-unknown-redox` target, `relibc`, `RedoxFS` and the `redox` paths in the build system are unchanged, because the Rust targets, existing tools and imported code depend on them.
 

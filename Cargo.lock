@@ -1287,6 +1287,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "addf728870aa3321a3a3a5d564ddf72b8ebb4dfbfd608a1befd43e8710b2a2b5"
 
 [[package]]
+name = "ferric-abi"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-aligned-buffer"
 version = "0.1.0"
 
@@ -1513,6 +1517,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ferric-amdvi",
+ "ferric-iobench",
  "ferric-procinfo",
  "ferric-trace",
  "ferric-trace-map",
@@ -4462,6 +4467,8 @@ dependencies = [
  "anyhow",
  "arg_parser",
  "fatfs",
+ "fox-core",
+ "fox-store",
  "fscommon",
  "gpt",
  "libc",
@@ -4470,15 +4477,14 @@ dependencies = [
  "pkgar-core 0.2.4",
  "pkgar-keys 0.2.4",
  "rand 0.9.5",
- "redox-pkg 0.3.3",
  "redox_syscall 0.9.4",
  "redoxfs",
- "ring",
  "rust-argon2",
  "serde",
  "serde_derive",
  "tempfile",
  "termion",
+ "thiserror 2.0.17",
  "toml 0.8.23",
  "uuid",
 ]
