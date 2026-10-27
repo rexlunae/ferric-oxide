@@ -31,8 +31,10 @@ on:
       - "recipes/core/fatd/**"
       - "recipes/tests/ferric-fat-test/**"
       - "userspace/base/drivers/storage/driver-block/**"
+      - "userspace/base/drivers/executor/**"
       - "userspace/base/drivers/storage/nvmed/**"
       - "recipes/tests/ferric-iobench/**"
+      - "recipes/tests/ferric-ring-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
@@ -58,6 +60,8 @@ jobs:
           restore-keys: host-
       - name: Smoke runner regression tests
         run: bash scripts/ferric-ci/test-boot-smoke.sh
+      - name: Loader diagnostic regression tests
+        run: bash scripts/ferric-ci/test-ld-so-errors.sh
       - name: Failed-test log printer tests
         run: bash scripts/ferric-ci/test-print-test-fails.sh
       - name: Native toolchain regression tests
@@ -67,7 +71,9 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Test
-        run: cargo test --locked --workspace
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml
       - name: Device-tree memory safety
         run: |
           rustup component add miri
@@ -383,7 +389,7 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p driver-block -p netstack -p rtl8125d
+        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d
       - name: Compile NVMe timing with buffered and DMA paths
         run: |
           rustup target add x86_64-unknown-redox

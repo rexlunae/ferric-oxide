@@ -59,6 +59,9 @@ pub mod switch;
 /// File struct - defines a scheme and a file number
 pub mod file;
 
+/// Lazy file-mapping reply/park protocol, shared with host regression tests.
+pub(crate) mod fmap_reply;
+
 /// Memory struct - contains a set of pages for a context
 pub mod memory;
 

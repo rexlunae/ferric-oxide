@@ -1137,8 +1137,12 @@ read-only medium) is also served read-only, with the reason logged
   disk; a crash before the commit leaves the new bytes with the old size and
   times. Every block the write touches is mapped first (extents or indirect
   blocks) and must be an initialized block of the file inside the volume and
-  outside the journal; a hole, an unwritten extent or a block past the file's
-  needs allocation, which is not done yet, so the write is refused
+  outside the journal and the fixed metadata (boot and superblock copies,
+  descriptor tables, bitmaps and inode tables). When growing past EOF, the
+  interval from the old size to the write offset is zeroed before the new
+  size is committed. Its mappings are validated too: a hole, an unwritten
+  extent or a block past the file's needs allocation, which is not done yet,
+  so the write is refused
   (`EOPNOTSUPP`) before anything is written. Immutable and append-only files
   are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
@@ -1147,7 +1151,11 @@ read-only medium) is also served read-only, with the reason logged
   `EOPNOTSUPP`, including a flag enabled after open through `F_SETFL`: the
   current scheme response cannot return an append's actual ending position
   to the kernel ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)).
-  Every open file is opened again in `ext4-view` after a write, so reads see it.
+  Mapping validation retains the extent map and the volume's metadata ranges,
+  without allocating another mapping entry for every block in the write.
+  The inode's size and flags use a generated `simple_endian` native/wire
+  layout, with a byte fixture protecting unchanged fields. Every open file
+  is opened again in `ext4-view` after a write, so reads see it.
 
 A crash at any write leaves the old inode or a journal whose replay gives the
 new one. The tests crash a change before each of its eight writes and check

@@ -1,6 +1,22 @@
 # Troubleshooting the Build
 
-This page covers all troubleshooting methods and tips for our build system.
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
+For the native `cargo xtask` build, start with these:
+
+- `cargo xtask doctor` lists the host tools the build found and stops at the
+  first missing one.
+- `cargo xtask --dry-run build` prints the Make command the build would run.
+- `cargo run -q -p ferric-config -- check` validates `ferric.toml` and warns
+  when a `.config` file shadows a setting.
+- Build logs: run `cargo xtask build 2>&1 | tee build.log`. Without a terminal,
+  the cookbook's TUI is disabled so the log stays readable.
+- [Build and Configuration](./ferric-build.md) lists the native build's known
+  limits, such as the ARM64 live image and recipes that still need GNU tools.
+
+The rest of this page covers the inherited Make, Podman and recipe workflows.
 
 (You must read the [Build System](./build-system-reference.md) page before)
 
@@ -47,15 +63,15 @@ Read the [Debug Methods](#debug-methods) and [Boot](#boot) sections for more det
 
 ### Virtual Machine
 
-- CPU acceleration (Linux KVM or Windows Hyper-V) may hide or trigger bugs because accelerated and emulated CPU virtualization have different timings that may change bug behavior, disable/enable them to verify if the bug still happen or is easier to reproduce (you can use the `kvm=no` option to disable Linux KVM in Redox build system, for example: `make qemu kvm=no` )
+- CPU acceleration (Linux KVM or Windows Hyper-V) may hide or trigger bugs because accelerated and emulated CPU virtualization have different timings that may change bug behavior, disable/enable them to verify if the bug still happen or is easier to reproduce (you can use the `kvm=no` option to disable Linux KVM in build system, for example: `make qemu kvm=no` )
 
 ### Real Hardware
 
 - Test if your boot problem happens with live mode enabled and disabled, press the `L` key in the boot screen resolution menu to toggle
 - If possible verify if your boot problem happens in UEFI and BIOS (UEFI has BIOS emulation which is called "CSM mode" and can be enabled in the UEFI settings)
 - Photos are safer and faster to send boot logs than boot log text written by hand, which is error-prone and time consuming
-- Verify if your computer has enough RAM to load the whole Redox image because data streaming from USB is not supported yet, if it has 1GB or less of RAM we recommend the `server`, `desktop-minimal` or `desktop` image variants to avoid OOM panics
-- If you have a very weak 64 bits Intel or AMD CPU (single core and L cache smaller than 1MB, like Intel Atom CPUs released before 2010) and 1GB or less of RAM we recommended the [Intel/AMD 32 bits Redox images](https://static.redox-os.org/img/i586/) and the `server`, `desktop-minimal` or `desktop` variants to avoid OOM panics and have better performance
+- Verify if your computer has enough RAM to load the whole image because data streaming from USB is not supported yet, if it has 1GB or less of RAM we recommend the `server`, `desktop-minimal` or `desktop` image variants to avoid OOM panics
+- If you have a very weak 64 bits Intel or AMD CPU (single core and L cache smaller than 1MB, like Intel Atom CPUs released before 2010) and 1GB or less of RAM we recommended the [Intel/AMD 32 bits images](https://static.redox-os.org/img/i586/) and the `server`, `desktop-minimal` or `desktop` variants to avoid OOM panics and have better performance
 
 Read the [Debug Methods](#debug-methods) and [Boot](#boot) sections for more details.
 
@@ -119,9 +135,9 @@ Let us know if you have improvements for Podman troubleshooting on the [chat](./
 
 Not all Linux distributions are supported by `native_bootstrap.sh`, so if you have frequent compilation problems try the `podman_bootstrap.sh` script for [Podman](https://podman.io/) builds.
 
-If you want to support your Unix-like system without Podman, you can try to install the Debian/Ubuntu package equivalents for your system from your package manager/software store, you can see them on the `ubuntu()` function of the [native_bootstrap.sh](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/native_bootstrap.sh) script.
+If you want to support your Unix-like system without Podman, you can try to install the Debian/Ubuntu package equivalents for your system from your package manager/software store, you can see them on the `ubuntu()` function of the [native_bootstrap.sh](https://github.com/rexlunae/ferric-oxide/blob/main/native_bootstrap.sh) script.
 
-The `native_bootstrap.sh` script and `redox-base-containerfile` covers the build system packages needed by the recipes at the [demo.toml](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/config/x86_64/demo.toml) filesystem configuration.
+The `native_bootstrap.sh` script and `redox-base-containerfile` covers the build system packages needed by the recipes at the [demo.toml](https://github.com/rexlunae/ferric-oxide/blob/main/config/x86_64/demo.toml) filesystem configuration.
 
 (Note that some systems may have build environment problems hard and time consuming to fix, on these systems Podman will fix most headaches)
 
@@ -130,7 +146,7 @@ The `native_bootstrap.sh` script and `redox-base-containerfile` covers the build
 If you did not use `podman_bootstrap.sh` or `native_bootstrap.sh` to setup your environment, you can download the sources with:
 
 ```sh
-git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream
+git clone https://github.com/rexlunae/ferric-oxide.git
 ```
 
 - Ensure that all the libraries and packages required by Redox are installed by running `./podman_bootstrap.sh -d` or, if you will be using the Podman build run the `./podman_bootstrap.sh -d` command.
@@ -173,7 +189,7 @@ After all recipes are cooked, a tag file is created as `build/$ARCH/$CONFIG_NAME
 
 ### Create the Image with FUSE
 
-To build the final Redox image, `redox_installer` uses [FUSE](https://github.com/libfuse/libfuse), creating a virtual filesystem and copying the recipe packages into it. This is done outside of Podman, even if you are using Podman Build.
+To build the final image, `redox_installer` uses [FUSE](https://github.com/libfuse/libfuse), creating a virtual filesystem and copying the recipe packages into it. This is done outside of Podman, even if you are using Podman Build.
 
 On some Linux distributions, FUSE may not be permitted for some users, or `podman_bootstrap.sh` and `native_bootstrap.sh` might not install it correctly. Investigate whether you can address your FUSE issues, or join the [chat](./chat.md) if you need advice.
 
@@ -213,9 +229,9 @@ git branch -v
 
 Environment leakage is when some program or library is not fully cross-compiled to Redox, thus its dependency chain has Linux references that don't work on Redox.
 
-It usually happens when the program or library get objects from outside the Redox build system PATH.
+It usually happens when the program or library get objects from outside the build system PATH.
 
-- The Redox build system PATH only reads at `/usr/bin` and `/bin` to use the host system build tools
+- The build system PATH only reads at `/usr/bin` and `/bin` to use the host system build tools
 - The program build system must use the host system build tools and the Cookbook recipe dependencies, not the host system libraries.
 - The most common way to detect this is to install the `*-dev` dependency package equivalent to the program recipe dependency, for example:
 
@@ -384,7 +400,7 @@ Check if the compilation or runtime error continues after this command, if the e
 If the methods above doesn't work you need to download a new copy of the build system by running the `podman_bootstrap.sh` or `native_bootstrap.sh` scripts or using the following commands:
 
 ```sh
-git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream
+git clone https://github.com/rexlunae/ferric-oxide.git
 ```
 
 ```sh
@@ -553,13 +569,13 @@ To enable them you can use the following commands or scripts:
 REPO_DEBUG?=1
 ```
 
-- Enable the `REPO_DEBUG` environment variable for one command, rebuild/package a recipe and add to the Redox image:
+- Enable the `REPO_DEBUG` environment variable for one command, rebuild/package a recipe and add to the image:
 
 ```sh
 REPO_DEBUG=1 make crp.recipe-name
 ```
 
-- Enable the `REPO_DEBUG` environment variable for multiple commands, rebuild/package a recipe and add to the Redox image:
+- Enable the `REPO_DEBUG` environment variable for multiple commands, rebuild/package a recipe and add to the image:
 
 ```sh
 export REPO_DEBUG=1
@@ -615,7 +631,7 @@ It will print the file and line number for each entry in the backtrace.
 
 Use the following instructions to debug a recipe with GDB:
 
-- Build or rebuild the recipe with assertions/checking/symbols and install into the Redox image:
+- Build or rebuild the recipe with assertions/checking/symbols and install into the image:
 
 ```sh
 make crp.recipe-name REPO_DEBUG=1
@@ -627,7 +643,7 @@ If you want to permanently enable debug binaries add the following environment v
 REPO_DEBUG?=1
 ```
 
-- Build and install the GDB server into the Redox image
+- Build and install the GDB server into the image
 
 ```sh
 make rp.gdbserver

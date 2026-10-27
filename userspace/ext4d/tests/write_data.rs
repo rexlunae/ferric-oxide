@@ -99,6 +99,76 @@ fn a_write_past_the_end_inside_the_last_block_grows_the_file() {
 }
 
 #[test]
+fn growing_past_eof_zeros_stale_bytes_in_the_gap() {
+    for (path, offset) in [("/hello.txt", 50), ("/big.bin", 200 * 1024 - 1)] {
+        let mut image = basic();
+        let window = Window::whole(image.clone()).unwrap();
+        let number = lookup::inode_of(&window, path).unwrap();
+        let at = inode_at(&image, number);
+        let old = contents(image.clone(), path);
+        image[at + 4..at + 8].copy_from_slice(&10u32.to_le_bytes());
+        common::reseal_inode(&mut image, number);
+        let (mut fs, shared) = mount_writable(image);
+        let file = open(&mut fs, path, READ_WRITE);
+        assert_eq!(fs.write(file, offset, b"Z").unwrap(), 1);
+        let mut expected = old[..10].to_vec();
+        expected.resize(offset as usize, 0);
+        expected.push(b'Z');
+        assert_eq!(read_all(&mut fs, file), expected);
+        let checked = e2fsck("zero-gap", shared.bytes());
+        assert_eq!(contents(checked, path), expected);
+    }
+}
+
+#[test]
+fn a_mapping_into_fixed_metadata_is_refused_before_any_write() {
+    let original = basic();
+    let window = Window::whole(original.clone()).unwrap();
+    let number = lookup::inode_of(&window, "/hello.txt").unwrap();
+    let at = inode_at(&original, number);
+    let block_size = 1024usize << le32(&original, 1024 + 0x18);
+    let first = le32(&original, 1024 + 0x14) as usize;
+    let gdt = (first + 1) * block_size;
+    // Boot block, volume superblock, descriptors, bitmaps and inode table.
+    let forbidden = [
+        0,
+        first as u32,
+        first as u32 + 1,
+        le32(&original, gdt),
+        le32(&original, gdt + 4),
+        le32(&original, gdt + 8),
+    ];
+    for physical in forbidden {
+        let mut image = original.clone();
+        // hello.txt's first extent, one block long; preserve the rest of the inode.
+        image[at + 0x3C..at + 0x40].copy_from_slice(&physical.to_le_bytes());
+        common::reseal_inode(&mut image, number);
+        let before = image.clone();
+        let mut window = Window::whole(image).unwrap();
+        let error =
+            write::write_data(&mut window, number, 0, b"BAD", Timestamp::now()).unwrap_err();
+        assert!(
+            matches!(error, WriteError::BadDataBlock { physical: bad, .. } if bad == u64::from(physical)),
+            "{physical}: {error:?}"
+        );
+        assert_eq!(window.into_inner(), before, "{physical}: no writes");
+    }
+}
+
+#[test]
+fn missing_gap_blocks_refuse_growth_without_zeroing_the_old_tail() {
+    let image = basic();
+    let window = Window::whole(image.clone()).unwrap();
+    let number = lookup::inode_of(&window, "/hello.txt").unwrap();
+    let mut window = Window::whole(image.clone()).unwrap();
+    assert!(matches!(
+        write::write_data(&mut window, number, 2048, b"Z", Timestamp::now()),
+        Err(WriteError::NotAllocated { block: 1, .. })
+    ));
+    assert_eq!(window.into_inner(), image);
+}
+
+#[test]
 fn a_write_across_blocks_changes_only_its_bytes() {
     // big.bin: 200 KiB in 1 KiB blocks. 3000 bytes from 1000 touch blocks 0 to 3, the
     // first and last of them in part; 2048..3072 is one whole block.
@@ -292,39 +362,42 @@ fn a_crash_at_any_write_leaves_the_old_size_or_the_new_one() {
     let window = Window::whole(before.clone()).expect("its length");
     let number = lookup::inode_of(&window, "/hello.txt").expect("hello.txt");
     let old = contents(before.clone(), "/hello.txt");
-    let mut new = old.clone();
-    new.extend_from_slice(b"grown\n");
-    let offset = u64::try_from(old.len()).expect("fits");
-    let changed = Timestamp {
-        seconds: 0x7000_0002,
-        nanoseconds: 0,
-    };
-    // The data block, then the eight writes of the inode's transaction (tests/write.rs).
-    for writes_left in 0..9 {
-        let mut window = Window::whole(Crashing {
-            bytes: before.clone(),
-            writes_left,
-        })
-        .expect("its length");
-        write::write_data(&mut window, number, offset, b"grown\n", changed)
-            .expect_err("the device stops");
-        let crashed = window.into_inner().bytes;
-        // The data is home from the first write on, but past the old size until the
-        // transaction is committed (from the sixth write on).
-        let expected = if writes_left < 6 { &old } else { &new };
-        let theirs = e2fsck(&format!("data-crash-{writes_left}"), crashed.clone());
-        assert_eq!(
-            &contents(theirs, "/hello.txt"),
-            expected,
-            "{writes_left}: e2fsck"
-        );
-        let mut window = Window::whole(crashed).expect("its length");
-        journal::replay(&mut window).expect("replayed");
-        assert_eq!(
-            &contents(window.into_inner(), "/hello.txt"),
-            expected,
-            "{writes_left}"
-        );
+    for gap in [0, 40] {
+        let mut new = old.clone();
+        new.resize(old.len() + gap, 0);
+        new.extend_from_slice(b"grown\n");
+        let offset = u64::try_from(old.len() + gap).expect("fits");
+        let changed = Timestamp {
+            seconds: 0x7000_0002,
+            nanoseconds: 0,
+        };
+        // The data block, then the eight writes of the inode's transaction (tests/write.rs).
+        for writes_left in 0..9 {
+            let mut window = Window::whole(Crashing {
+                bytes: before.clone(),
+                writes_left,
+            })
+            .expect("its length");
+            write::write_data(&mut window, number, offset, b"grown\n", changed)
+                .expect_err("the device stops");
+            let crashed = window.into_inner().bytes;
+            // The data is home from the first write on, but past the old size until the
+            // transaction is committed (from the sixth write on).
+            let expected = if writes_left < 6 { &old } else { &new };
+            let theirs = e2fsck(&format!("data-crash-{writes_left}"), crashed.clone());
+            assert_eq!(
+                &contents(theirs, "/hello.txt"),
+                expected,
+                "{writes_left}: e2fsck"
+            );
+            let mut window = Window::whole(crashed).expect("its length");
+            journal::replay(&mut window).expect("replayed");
+            assert_eq!(
+                &contents(window.into_inner(), "/hello.txt"),
+                expected,
+                "{writes_left}"
+            );
+        }
     }
 }
 

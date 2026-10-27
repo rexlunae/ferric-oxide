@@ -68,17 +68,18 @@
 # Getting Started
 
 - [Getting started](./getting-started.md)
-  - [Running Redox in a Virtual Machine](./running-vm.md)
-  - [Running Redox on Real Hardware](./real-hardware.md)
-  - [Installing Redox](./installing.md)
-  - [Trying Out Redox](./trying-out-redox.md)
+  - [Building Ferric Oxide](./building-redox.md)
+  - [Running in a Virtual Machine](./running-vm.md)
+  - [Running on Real Hardware](./real-hardware.md)
+  - [Installing](./installing.md)
+  - [Trying Out the System](./trying-out-redox.md)
   - [Tasks](./tasks.md)
   - [Package Manager](./pkg.md)
 
 # Contributing
 
 - [Contributing](./contributing.md)
-  - [Chat](./chat.md)
+  - [Getting in Touch](./chat.md)
 
 - [Best practices and guidelines](./best-practices.md)
   - [Literate programming](./literate-programming.md)
@@ -88,18 +89,16 @@
   - [Avoiding Panics](./avoiding-panics.md)
   - [Testing](./testing-practices.md)
 
-- [Using Redox GitLab](./using-redox-gitlab.md)
-  - [Signing in to GitLab](./signing-in-to-gitlab.md)
+- [Working on GitHub](./using-redox-gitlab.md)
   - [Repository Structure](./repository-structure.md)
   - [Creating Proper Bug Reports](./creating-proper-bug-reports.md)
-  - [Creating Proper Merge Requests](./creating-proper-pull-requests.md)
+  - [Creating Proper Pull Requests](./creating-proper-pull-requests.md)
   - [Filing Issues](./filing-issues.md)
 
-# Developing with and for Redox
+# Building and Developing
 
-- [The Redox Build Process](./build-process.md)
-  - [Building Redox](./podman-build.md)
-  - [Native Build](./building-redox.md)
+- [The Build Process](./build-process.md)
+  - [Building with Podman](./podman-build.md)
   - [Self-hosted Development](./self-hosted.md)
   - [From Nothing To Hello World](./nothing-to-hello-world.md)
   - [Configuration Settings](./configuration-settings.md)
@@ -108,7 +107,7 @@
   - [Advanced Native Build](./advanced-build.md)
   - [Working with ARM64](./aarch64.md)
   - [Troubleshooting the Build](./troubleshooting.md)
-  - [Build Process](./build-phases.md)
+  - [What the Build Does](./build-phases.md)
 
 - [Developing for Redox](./developing-for-redox.md)
   - [Developer FAQ](./developer-faq.md)

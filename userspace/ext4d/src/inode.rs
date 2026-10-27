@@ -8,6 +8,9 @@
 //! offsets and `i_extra_isize`) and "Inode Timestamps" (the epoch bits and nanoseconds in the
 //! `_extra` fields). No code here comes from the Linux kernel or from e2fsprogs.
 
+#[cfg(feature = "write")]
+pub(crate) mod data;
+
 /// `i_atime`, `i_ctime`, `i_mtime`: the low 32 bits of the seconds, signed.
 pub(crate) const I_ATIME: usize = 0x8;
 pub(crate) const I_CTIME: usize = 0xC;

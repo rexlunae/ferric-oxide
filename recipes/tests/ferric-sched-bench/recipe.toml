@@ -1,0 +1,15 @@
+# Ferric Oxide: the scheduler and timer baseline (roadmap: tickless scheduling). The image
+# config/ferric-sched-bench.toml runs it; it provides the busy workload of the baseline
+# (ferric-sched-burn). It prints FERRIC_BURN_BEGIN/END markers. Only for test images.
+# Source lives in files/; as a path source (relative to the repository root) edits there
+# rebuild it.
+[source]
+path = "recipes/tests/ferric-sched-bench/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

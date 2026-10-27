@@ -55,6 +55,7 @@ use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
 use thiserror::Error;
 
 use crate::device::{ReadAt, Window, WindowError, WriteAt};
+use crate::inode::data::Data;
 use crate::inode::{
     I_ATIME, I_ATIME_EXTRA, I_CTIME, I_CTIME_EXTRA, I_MTIME, I_MTIME_EXTRA, has_extra, le16,
 };
@@ -107,11 +108,7 @@ const PERMISSION_BITS: u16 = 0o7777;
 const S_ISUID: u16 = 0o4000;
 const S_ISGID: u16 = 0o2000;
 
-/// `i_size_lo` and `i_size_high`.
-const I_SIZE_LO: usize = 0x4;
-const I_SIZE_HIGH: usize = 0x6C;
 /// `i_flags`, and the flags a data write checks.
-const I_FLAGS: usize = 0x20;
 const IMMUTABLE_FL: u32 = 0x10;
 const APPEND_FL: u32 = 0x20;
 const ENCRYPT_FL: u32 = 0x800;
@@ -134,6 +131,9 @@ const I_CHECKSUM_HI: usize = 0x82;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WriteError {
+    /// An inode prefix could not be decoded or encoded.
+    #[error("cannot encode or decode the inode data fields")]
+    InodeEncoding(#[from] std::io::Error),
     /// The volume or its journal could not be read, or is malformed.
     #[error("cannot open the journal")]
     Journal(#[from] JournalError),
@@ -233,7 +233,7 @@ pub enum WriteError {
         /// The block within the file.
         block: u64,
     },
-    /// The inode maps a block of the file to one outside the volume or inside the journal.
+    /// The inode maps file data outside the volume, into the journal or into fixed metadata.
     #[error("inode {number} maps a block to {physical}, outside its data")]
     BadDataBlock {
         /// The inode number.
@@ -586,7 +586,8 @@ fn put_owner(
 /// [`WriteError::UnsupportedFile`] for inline data, encryption, verity or journaled data;
 /// [`WriteError::NotAllocated`] when a block the write touches is a hole, an unwritten
 /// extent or past the file's blocks; [`WriteError::BadDataBlock`] for a block mapped
-/// outside the volume or into the journal; and [`WriteError::FileTooLarge`].
+/// outside the volume, into the journal or into fixed metadata; and
+/// [`WriteError::FileTooLarge`].
 ///
 /// # Examples
 ///
@@ -622,7 +623,7 @@ pub fn write_data<R: WriteAt>(
             number,
             size: u64::MAX,
         })?;
-    let size = u64::from(le32(&inode, I_SIZE_HIGH)) << 32 | u64::from(le32(&inode, I_SIZE_LO));
+    let size = Data::read(&inode)?.size();
     let written = Written {
         size: (end > size).then_some(end),
         changed,
@@ -635,24 +636,41 @@ pub fn write_data<R: WriteAt>(
         &mut inode.clone(),
         &Change::Written(written),
     )?;
-    let blocks = data_blocks(&target.volume, window, number, &inode, offset, end)?;
+    // Growth must initialize the entire gap, including previously allocated stale bytes.
+    // Validate all mappings before the first write, using a map bounded by the extent
+    // tree rather than allocating a second entry for each block in a large write.
+    let first = offset.min(size);
+    let map = data_blocks(&target.volume, window, number, &inode, first, end)?;
     let block_size = u64::from(target.volume.block_size);
     let mut buf = vec![0; target.volume.block_size as usize];
-    for (logical, physical) in blocks {
-        // The part of this block the write covers, and where it is in `data`.
-        let start = (logical * block_size).max(offset);
+    for logical in first / block_size..end.div_ceil(block_size) {
+        let physical = map
+            .physical(logical as u32)
+            .ok_or(WriteError::NotAllocated {
+                number,
+                block: logical,
+            })?;
+        let start = (logical * block_size).max(first);
         let stop = ((logical + 1) * block_size).min(end);
         let within = (start - logical * block_size) as usize;
         let len = (stop - start) as usize;
-        let from = (start - offset) as usize;
-        let piece = &data[from..from + len];
-        if len == buf.len() {
-            window.write_all_at(piece, physical * block_size)?;
-        } else {
-            window.read_exact_at(&mut buf, physical * block_size)?;
-            buf[within..within + len].copy_from_slice(piece);
-            window.write_all_at(&buf, physical * block_size)?;
+        if len == buf.len() && start >= offset {
+            let from = (start - offset) as usize;
+            window.write_all_at(&data[from..from + len], physical * block_size)?;
+            continue;
         }
+        if len != buf.len() {
+            window.read_exact_at(&mut buf, physical * block_size)?;
+        }
+        buf[within..within + len].fill(0);
+        let data_start = start.max(offset);
+        if data_start < stop {
+            let from = (data_start - offset) as usize;
+            let into = (data_start - logical * block_size) as usize;
+            let count = (stop - data_start) as usize;
+            buf[into..into + count].copy_from_slice(&data[from..from + count]);
+        }
+        window.write_all_at(&buf, physical * block_size)?;
     }
     window.flush()?;
     change(window, number, &Change::Written(written))
@@ -663,7 +681,7 @@ fn check_data_writable(number: u32, inode: &[u8]) -> Result<(), WriteError> {
     if le16(inode, I_MODE) & S_IFMT != S_IFREG {
         return Err(WriteError::NotAFile { number });
     }
-    let flags = le32(inode, I_FLAGS);
+    let flags = Data::read(inode)?.flags;
     let forbidden = flags & (IMMUTABLE_FL | APPEND_FL);
     if forbidden != 0 {
         return Err(WriteError::FileFlags {
@@ -690,25 +708,29 @@ fn data_blocks<R: ReadAt>(
     inode: &[u8],
     offset: u64,
     end: u64,
-) -> Result<Vec<(u64, u64)>, WriteError> {
+) -> Result<BlockMap, WriteError> {
     let block_size = u64::from(volume.block_size);
     let map = BlockMap::of_inode(volume, window, inode, number)?;
     let journal = BlockMap::load(volume, window)?;
-    (offset / block_size..end.div_ceil(block_size))
-        .map(|logical| {
-            let physical = u32::try_from(logical)
-                .ok()
-                .and_then(|block| map.physical(block))
-                .ok_or(WriteError::NotAllocated {
-                    number,
-                    block: logical,
-                })?;
-            if physical >= volume.blocks || journal.contains(physical) {
-                return Err(WriteError::BadDataBlock { number, physical });
-            }
-            Ok((logical, physical))
-        })
-        .collect()
+    let metadata = volume.metadata(window)?;
+    for logical in offset / block_size..end.div_ceil(block_size) {
+        let physical = u32::try_from(logical)
+            .ok()
+            .and_then(|block| map.physical(block))
+            .ok_or(WriteError::NotAllocated {
+                number,
+                block: logical,
+            })?;
+        if physical >= volume.blocks
+            || journal.contains(physical)
+            || metadata
+                .iter()
+                .any(|&(start, end)| (start..end).contains(&physical))
+        {
+            return Err(WriteError::BadDataBlock { number, physical });
+        }
+    }
+    Ok(map)
 }
 
 /// Stores `size` in `i_size_lo` and `i_size_high`.
@@ -716,8 +738,7 @@ fn put_size(target: &Target, number: u32, inode: &mut [u8], size: u64) -> Result
     if size > i32::MAX as u64 && target.volume.ro_compat & RO_COMPAT_LARGE_FILE == 0 {
         return Err(WriteError::FileTooLarge { number, size });
     }
-    inode[I_SIZE_LO..I_SIZE_LO + 4].copy_from_slice(&(size as u32).to_le_bytes());
-    inode[I_SIZE_HIGH..I_SIZE_HIGH + 4].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+    Data::read(inode)?.put_size(inode, size)?;
     Ok(())
 }
 
@@ -867,6 +888,8 @@ fn put_checksum(inode: &mut [u8], checksum: u32) {
 
 #[cfg(test)]
 mod tests {
+    const I_FLAGS: usize = 0x20;
+
     use super::*;
     use crate::inode::{I_EXTRA_ISIZE, time as read_time};
 

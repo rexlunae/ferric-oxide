@@ -91,6 +91,32 @@ pub fn inode_at(image: &[u8], number: u32) -> usize {
     table * block_size + (number as usize - 1) * inode_size
 }
 
+/// Recompute an inode checksum after deliberately changing an on-disk test fixture.
+pub fn reseal_inode(image: &mut [u8], number: u32) {
+    if le32(image, 1024 + 0x64) & 0x400 == 0 {
+        return;
+    }
+    let seed = if le32(image, 1024 + 0x60) & 0x2000 != 0 {
+        le32(image, 1024 + 0x270)
+    } else {
+        ferric_jbd2::crc32c(&[&image[1024 + 0x68..1024 + 0x78]])
+    };
+    let at = inode_at(image, number);
+    let size = usize::from(le16(image, 1024 + 0x58));
+    let inode = &mut image[at..at + size];
+    let high = size >= 0x84 && le16(inode, 0x80) >= 4;
+    inode[0x7C..0x7E].fill(0);
+    if high {
+        inode[0x82..0x84].fill(0);
+    }
+    let checksum =
+        ferric_jbd2::crc32c_seeded(seed, &[&number.to_le_bytes(), &inode[0x64..0x68], inode]);
+    inode[0x7C..0x7E].copy_from_slice(&(checksum as u16).to_le_bytes());
+    if high {
+        inode[0x82..0x84].copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+    }
+}
+
 /// The little-endian `u16` at `at`.
 pub fn le16(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])

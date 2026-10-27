@@ -69,8 +69,8 @@ ferric-iobench = "source"
 # Opens a queue socket on e1000d and exchanges ARP and ICMP with QEMU's gateway through its
 # own rings, in copy mode (drivers.net_bypass and kernel.regbuf, which CI turns on).
 ferric-netq-test = "source"
-# fox replaces pkg, as features.toml packages.manager = "fox" does: it adopts
-# the image's packages on first boot (05_fox-adopt.service) and the script
+# fox replaces pkg, as features.toml packages.manager = "fox" does: the
+# installer records the image's packages in fox's database, and the script
 # below checks them against their signatures.
 fox = "source"
 pkgutils = "ignore"

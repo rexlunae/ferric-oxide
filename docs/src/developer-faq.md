@@ -604,7 +604,7 @@ Verify if you have `curl` installed or download the script from your web browser
 
 - Verify if you have the GNU Bash shell installed on your system.
 - Verify if Podman is supported on your operating system.
-- Verify if your operating system is [supported](./building-redox.md#supported-unix-like-distributions-and-podman-build) on the `native_bootstrap.sh` script
+- Verify if your operating system is [supported](./building-redox.md#prerequisites) on the `native_bootstrap.sh` script
 
 ### Build System
 
