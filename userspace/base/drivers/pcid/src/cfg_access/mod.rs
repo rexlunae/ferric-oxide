@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use std::{fs, io};
 
+use common::io::{Io, MmioPtr};
 use common::{MemoryType, PhysBorrowed, Prot};
 use fdt::Fdt;
 use pci_types::{ConfigRegionAccess, PciAddress};
@@ -355,7 +356,7 @@ impl ConfigRegionAccess for Pcie {
         let _guard = self.lock.lock().unwrap();
 
         match self.mmio_addr(address, offset) {
-            Some(addr) => addr.read_volatile(),
+            Some(addr) => MmioPtr::new(addr).read(),
             None => self.fallback.read(address, offset),
         }
     }
@@ -364,7 +365,7 @@ impl ConfigRegionAccess for Pcie {
         let _guard = self.lock.lock().unwrap();
 
         match self.mmio_addr(address, offset) {
-            Some(addr) => addr.write_volatile(value),
+            Some(addr) => MmioPtr::new(addr).write(value),
             None => self.fallback.write(address, offset, value),
         }
     }

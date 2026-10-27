@@ -24,7 +24,7 @@ impl<T> MmioPtr<T> {
 }
 
 // Generic implementation (WARNING: requires aligned pointers!)
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 impl<T> Io for MmioPtr<T>
 where
     T: Copy
@@ -153,5 +153,29 @@ impl Io for MmioPtr<u64> {
                 in(reg) value,
             );
         }
+    }
+}
+
+// AArch64 implementation: one syndrome-carrying load or store per access, see `io::aarch64`.
+#[cfg(target_arch = "aarch64")]
+impl<T> Io for MmioPtr<T>
+where
+    T: super::aarch64::MmioWord
+        + PartialEq
+        + core::ops::BitAnd<Output = T>
+        + core::ops::BitOr<Output = T>
+        + core::ops::Not<Output = T>,
+{
+    type Value = T;
+
+    fn read(&self) -> T {
+        // SAFETY: the wrapper points at device memory of type `T`, aligned as the generic
+        // implementation already requires.
+        unsafe { T::mmio_read(self.ptr) }
+    }
+
+    fn write(&mut self, value: T) {
+        // SAFETY: as for `read`.
+        unsafe { T::mmio_write(self.ptr, value) }
     }
 }
