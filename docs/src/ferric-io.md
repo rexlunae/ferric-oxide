@@ -1124,8 +1124,9 @@ device) and serves in the foreground until it is stopped.
   kernel.org. No code comes from Linux.
 - **Read-only:** opens for writing, creating or truncating, and `unlinkat`,
   `ftruncate`, `fchmod`, `fchown`, `futimens`, `frename` and `flink`, fail with
-  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod` and `fchown` are served:
-  see [Writing through the journal](#writing-through-the-journal)).
+  `EROFS` (with `fs.ext4_write`, `futimens`, `fchmod`, `fchown`, opens for
+  writing and `write` into existing blocks are served: see
+  [Writing through the journal](#writing-through-the-journal)).
 - **Access:** the scheme uses the caller's UID and primary GID. It checks
   directory search permissions at each path component, including expanded
   symlink targets, and read permission on the final inode. UID zero bypasses
@@ -1302,6 +1303,34 @@ read-only medium) is also served read-only, with the reason logged
   own owner and group. The kernel checks first, before the scheme sees the
   call: a caller other than root may name only its own effective UID and GID,
   or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
+- **`write`** (`Fs::write`, `ext4d::write::write_data`) writes into the
+  blocks a regular file already has, as ext4's default ordered mode does: the
+  data is written home and flushed without going through the journal, then
+  one transaction records the new modification and change times and, when the
+  write ends past the old size, the new size (`i_size_lo`, `i_size_high`).
+  After a crash the inode therefore never claims data that is not on the
+  disk; a crash before the commit leaves the new bytes with the old size and
+  times. Every block the write touches is mapped first (extents or indirect
+  blocks) and must be an initialized block of the file inside the volume and
+  outside the journal and the fixed metadata (boot and superblock copies,
+  descriptor tables, bitmaps and inode tables). When growing past EOF, the
+  interval from the old size to the write offset is zeroed before the new
+  size is committed. Its mappings are validated too: a hole, an unwritten
+  extent or a block past the file's needs allocation, which is not done yet,
+  so the write is refused
+  (`EOPNOTSUPP`) before anything is written. Immutable and append-only files
+  are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
+  files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
+  permission (and read permission unless `O_WRONLY`); `O_CREAT` and `O_TRUNC`
+  are refused (`EOPNOTSUPP`). `O_APPEND` opens and writes also fail with
+  `EOPNOTSUPP`, including a flag enabled after open through `F_SETFL`: the
+  current scheme response cannot return an append's actual ending position
+  to the kernel ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)).
+  Mapping validation retains the extent map and the volume's metadata ranges,
+  without allocating another mapping entry for every block in the write.
+  The inode's size and flags use a generated `simple_endian` native/wire
+  layout, with a byte fixture protecting unchanged fields. Every open file
+  is opened again in `ext4-view` after a write, so reads see it.
 
 A crash at any write leaves the old inode or a journal whose replay gives the
 new one. The tests crash a change before each of its eight writes and check
@@ -1320,6 +1349,14 @@ indirect-mapped directories, and checks the permission rules, `UTIME_NOW` and
 (32-bit IDs in both halves), the permission rules of both calls, the set-ID
 bits, symbolic links, the `quota` fixture (`quota.ext4.gz`), a volume made for
 FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
+`tests/write_data.rs` writes inside a block, across blocks and whole blocks,
+and past the end inside the last block, checks the permission rules, that
+other open handles read the new bytes, that holes, unwritten extents and
+missing blocks are refused with nothing written (the `write-data` fixture,
+which also has immutable and append-only files). It checks that append opens
+and writes at an earlier cursor or EOF fail without changing any image bytes,
+size or timestamps, and that ordinary offset writes still work. It crashes a write before
+each of its nine writes.
 
 Host tests run against `tests/fixtures/basic.ext4`, made by `mke2fs` with
 `tests/fixtures/make-fixtures.sh`, and the journal fixtures above;

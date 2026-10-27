@@ -8,12 +8,14 @@
 //! `O_SYMLINK` or `O_STAT | O_NOFOLLOW` asks for the final link itself.
 //!
 //! [`OpenMode::wants_write`] opens and every changing call fail with [`Error::ReadOnly`],
-//! with three exceptions: on a volume mounted with `Fs::new_writable` (Cargo feature
-//! `write`, features.toml `fs.ext4_write`), [`Fs::set_times`], [`Fs::set_mode`] and
-//! [`Fs::set_owner`] set a file's times, permission bits, and owner and group through the
-//! journal (`crate::write`), each checking the caller's permission as POSIX says. The inode to change is found from the handle's path by
-//! `crate::lookup`. After each change the `ext4-view` reader is loaded again, since it keeps
-//! the blocks it has read, and every handle's metadata is read again from it.
+//! except on a volume mounted with `Fs::new_writable` (Cargo feature `write`, features.toml
+//! `fs.ext4_write`): there [`Fs::set_times`], [`Fs::set_mode`] and [`Fs::set_owner`] set a
+//! file's times, permission bits, and owner and group through the journal
+//! (`crate::write`), each checking the caller's permission as POSIX says, and a file opened
+//! for writing (with write permission) is written into the blocks it has ([`Fs::write`]).
+//! The inode to change is found from the handle's path by `crate::lookup`. After each
+//! change the `ext4-view` reader is loaded again, since it keeps the blocks it has read,
+//! and every handle's metadata is read again from it, and every open file opened again.
 //!
 //! `ext4-view` exposes neither inode numbers nor change times. Each handle's inode is found
 //! at open by `crate::lookup`, and [`Fs::attributes`] reads the change time from it.
@@ -40,8 +42,12 @@ use crate::superblock::{self, Geometry};
 pub struct OpenMode {
     /// Write access (`O_WRONLY` or `O_RDWR`).
     pub write: bool,
+    /// Write access without read access (`O_WRONLY`): only write permission is needed.
+    pub write_only: bool,
     /// Creation or truncation (`O_CREAT`, `O_TRUNC`).
     pub create_or_truncate: bool,
+    /// Append positioning (`O_APPEND`), currently refused with `EOPNOTSUPP`.
+    pub append: bool,
     /// The path must be a directory (`O_DIRECTORY`).
     pub directory: bool,
     /// Open a final symbolic link itself, to read its target (`O_SYMLINK`).
@@ -57,7 +63,9 @@ impl OpenMode {
     pub const fn read() -> Self {
         Self {
             write: false,
+            write_only: false,
             create_or_truncate: false,
+            append: false,
             directory: false,
             symlink: false,
             no_follow: false,
@@ -68,12 +76,15 @@ impl OpenMode {
     /// Reads the mode from Redox `openat` flags.
     pub const fn from_flags(flags: usize) -> Self {
         use syscall::flag::{
-            O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK, O_TRUNC,
+            O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT, O_SYMLINK,
+            O_TRUNC, O_WRONLY,
         };
         let access = flags & O_ACCMODE;
         Self {
             write: access != O_RDONLY && access != 0,
+            write_only: access == O_WRONLY,
             create_or_truncate: flags & (O_CREAT | O_TRUNC) != 0,
+            append: flags & O_APPEND != 0,
             directory: flags & O_DIRECTORY != 0,
             symlink: flags & O_SYMLINK != 0,
             no_follow: flags & O_NOFOLLOW != 0,
@@ -270,6 +281,11 @@ struct Handle {
     inode: Option<u32>,
     metadata: Metadata,
     open: Open,
+    /// Opened for writing, on a volume mounted for changes: [`Fs::write`] may write to it.
+    writable: bool,
+    /// Opened for reading (not `O_WRONLY`, whose open does not check read permission):
+    /// [`Fs::read`] may read from it.
+    readable: bool,
 }
 
 /// Why [`Fs::mount_preferring_write`] mounted a volume read-only.
@@ -323,6 +339,14 @@ trait Writable {
         &self,
         number: u32,
         change: &crate::write::Change,
+    ) -> Result<(), crate::write::WriteError>;
+    /// Writes `data` at `offset` of inode `number`'s blocks (`write::write_data`).
+    fn write_data(
+        &self,
+        number: u32,
+        offset: u64,
+        data: &[u8],
+        changed: crate::write::Timestamp,
     ) -> Result<(), crate::write::WriteError>;
 }
 
@@ -418,6 +442,16 @@ impl<W: crate::device::WriteAt + 'static> Writable for Rc<RefCell<crate::device:
     ) -> Result<(), crate::write::WriteError> {
         crate::write::change(&mut self.borrow_mut(), number, change)
     }
+
+    fn write_data(
+        &self,
+        number: u32,
+        offset: u64,
+        data: &[u8],
+        changed: crate::write::Timestamp,
+    ) -> Result<(), crate::write::WriteError> {
+        crate::write::write_data(&mut self.borrow_mut(), number, offset, data, changed)
+    }
 }
 
 impl Fs {
@@ -456,7 +490,8 @@ impl Fs {
 
     /// Loads the volume `device` holds for reading and for the changes `crate::write`
     /// makes: so far, setting times, mode and owner ([`Self::set_times`],
-    /// [`Self::set_mode`], [`Self::set_owner`]).
+    /// [`Self::set_mode`], [`Self::set_owner`]) and writing into a file's blocks
+    /// ([`Self::write`]).
     ///
     /// # Errors
     ///
@@ -587,13 +622,23 @@ impl Fs {
     /// Opens a path using the caller's user and primary group IDs.
     ///
     /// Checks search permission on every traversed directory, including symlink targets,
-    /// and read permission on the final object unless `mode.stat` requests metadata only.
-    /// UID zero bypasses permission checks. Supplementary groups and ACLs are not supported;
-    /// access is restricted to the inode's owner/group/other mode bits.
+    /// and, unless `mode.stat` requests metadata only, read permission on the final object
+    /// (not for `O_WRONLY`) and write permission when it is opened for writing. UID zero
+    /// bypasses permission checks. Supplementary groups and ACLs are not supported; access
+    /// is restricted to the inode's owner/group/other mode bits.
+    ///
+    /// Opens for writing need a volume mounted with `Fs::new_writable`; the file can then
+    /// be written in place with [`Self::write`]. Creating, truncating and append positioning
+    /// are not supported yet; the scheme cannot report an append's actual ending cursor
+    /// to the kernel (issue #244).
     ///
     /// # Errors
     /// Returns the errors of [`Self::open`], [`Error::PermissionDenied`] for denied access,
-    /// and [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file.
+    /// [`Error::NotASymlink`] for `O_SYMLINK` on an ordinary file, [`Error::ReadOnly`] for
+    /// an open for writing, creating or truncating on a read-only mount,
+    /// [`Error::CreateOrTruncate`] for `O_CREAT` or `O_TRUNC` on a writable one, and
+    /// [`Error::AppendUnsupported`] for `O_APPEND`, and [`Error::IsADirectory`] for a
+    /// directory opened for writing.
     pub fn open_as(
         &mut self,
         base: Option<usize>,
@@ -602,8 +647,14 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<usize, Error> {
-        if mode.wants_write() {
+        if mode.wants_write() && !self.is_writable() {
             return Err(Error::ReadOnly);
+        }
+        if mode.create_or_truncate {
+            return Err(Error::CreateOrTruncate);
+        }
+        if mode.append {
+            return Err(Error::AppendUnsupported);
         }
         let start = match base {
             Some(base) if !path.starts_with('/') => {
@@ -628,7 +679,15 @@ impl Fs {
             let target = self.ext4.read_link(path.as_str())?.as_ref().to_vec();
             Open::Symlink { target }
         } else {
-            require_access(&metadata, uid, gid, 0o4)?;
+            if mode.write {
+                if metadata.is_dir() {
+                    return Err(Error::IsADirectory);
+                }
+                require_access(&metadata, uid, gid, 0o2)?;
+            }
+            if !mode.write_only {
+                require_access(&metadata, uid, gid, 0o4)?;
+            }
             if metadata.is_dir() {
                 Open::Directory { entries: None }
             } else {
@@ -640,6 +699,8 @@ impl Fs {
             path,
             inode,
             metadata,
+            writable: mode.write && !mode.stat,
+            readable: !mode.write_only,
             open,
         };
         let id = self.next;
@@ -659,10 +720,16 @@ impl Fs {
     ///
     /// # Errors
     ///
-    /// [`Error::BadHandle`], [`Error::IsADirectory`] for a directory, and [`Error::Ext4`]
+    /// [`Error::BadHandle`] for an unknown handle, one opened with `O_STAT` or one opened
+    /// write-only (`O_WRONLY`), [`Error::IsADirectory`] for a directory, and [`Error::Ext4`]
     /// when the reader fails.
     pub fn read(&mut self, id: usize, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        match &mut self.handle_mut(id)?.open {
+        let handle = self.handle_mut(id)?;
+        // A write-only open did not check read permission, so it must not read.
+        if !handle.readable {
+            return Err(Error::BadHandle { handle: id });
+        }
+        match &mut handle.open {
             Open::Metadata => Err(Error::BadHandle { handle: id }),
             Open::Directory { .. } => Err(Error::IsADirectory),
             Open::Symlink { target } => {
@@ -822,7 +889,7 @@ impl Fs {
                 modified: time(modified),
                 changed: now,
             };
-            self.commit(id, &Change::Times(times))
+            self.change(id, &Change::Times(times))
         }
     }
 
@@ -867,7 +934,7 @@ impl Fs {
                 permissions,
                 changed: Timestamp::now(),
             };
-            self.commit(id, &Change::Mode(mode))
+            self.change(id, &Change::Mode(mode))
         }
     }
 
@@ -923,27 +990,97 @@ impl Fs {
                 drop_set_id: uid != 0,
                 changed: Timestamp::now(),
             };
-            self.commit(id, &Change::Owner(owner))
+            self.change(id, &Change::Owner(owner))
+        }
+    }
+
+    /// Writes `buf` at byte `offset` of the file `id` names, which must be a regular file
+    /// opened for writing, into the blocks it already has (`write::write_data`), and sets
+    /// its modification and change times to now (and its size, if the write ends past it).
+    /// Returns how many bytes were written: all of `buf`, or none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadHandle`] for an unknown handle or one not opened for writing,
+    /// [`Error::IsADirectory`] for a directory, `Error::Lookup` when the file's inode cannot
+    /// be found, and `Error::Write` when the write fails: notably
+    /// `write::WriteError::NotAllocated` when it would need a block allocated, which is not
+    /// supported yet (`EOPNOTSUPP`).
+    pub fn write(&mut self, id: usize, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        self.write_with_flags(id, offset, buf, 0)
+    }
+
+    /// Writes at an explicit offset with the current scheme-call flags.
+    ///
+    /// `O_APPEND` is refused even if enabled after open through `F_SETFL`: the current
+    /// scheme response carries only a byte count, so the kernel cannot update its cursor
+    /// to the actual end of an append. No size, data or timestamp changes on refusal.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::write`], plus [`Error::AppendUnsupported`] (`EOPNOTSUPP`) for
+    /// `O_APPEND` on a handle opened for writing. Unknown and read-only handles still
+    /// return [`Error::BadHandle`].
+    pub fn write_with_flags(
+        &mut self,
+        id: usize,
+        offset: u64,
+        buf: &[u8],
+        flags: u32,
+    ) -> Result<usize, Error> {
+        let handle = self.handle(id)?;
+        match handle.open {
+            Open::File(_) if handle.writable => {}
+            Open::Directory { .. } => return Err(Error::IsADirectory),
+            _ => return Err(Error::BadHandle { handle: id }),
+        }
+        if flags as usize & syscall::flag::O_APPEND != 0 {
+            return Err(Error::AppendUnsupported);
+        }
+        #[cfg(not(feature = "write"))]
+        {
+            let _ = (offset, buf);
+            Err(Error::ReadOnly)
+        }
+        #[cfg(feature = "write")]
+        {
+            let changed = crate::write::Timestamp::now();
+            self.commit(id, |writer, number| {
+                writer.write_data(number, offset, buf, changed)
+            })?;
+            Ok(buf.len())
         }
     }
 
     /// Makes `change` to the inode of the file `id` names, then loads the volume again.
     #[cfg(feature = "write")]
-    fn commit(&mut self, id: usize, change: &crate::write::Change) -> Result<(), Error> {
+    fn change(&mut self, id: usize, change: &crate::write::Change) -> Result<(), Error> {
+        self.commit(id, |writer, number| writer.change(number, change))
+    }
+
+    /// Runs `make` with the writer and the inode number of the file `id` names, then loads
+    /// the volume again.
+    #[cfg(feature = "write")]
+    fn commit(
+        &mut self,
+        id: usize,
+        make: impl FnOnce(&dyn Writable, u32) -> Result<(), crate::write::WriteError>,
+    ) -> Result<(), Error> {
         let handle = self.handle(id)?;
         let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?;
         let number = match handle.inode {
             Some(number) => number,
             None => self.device.inode_of(&handle.path)?,
         };
-        let result = writer.change(number, change);
+        let result = make(writer.as_ref(), number);
         // Even a failed change may have written part of the transaction.
         self.reload();
         Ok(result?)
     }
 
     /// Loads `ext4-view`'s reader again after a change, as it keeps the blocks it has read,
-    /// and reads every handle's metadata again from it. If the volume cannot be loaded, the
+    /// and reads every handle's metadata again from it, and opens every open file again, so
+    /// that reads see what was written. If the volume cannot be loaded, the
     /// old reader is kept, and the change is still on the disk.
     #[cfg(feature = "write")]
     fn reload(&mut self) {
@@ -952,6 +1089,11 @@ impl Fs {
                 for handle in self.handles.values_mut() {
                     if let Ok(metadata) = ext4.symlink_metadata(handle.path.as_str()) {
                         handle.metadata = metadata;
+                    }
+                    if let Open::File(file) = &mut handle.open
+                        && let Ok(fresh) = ext4.open(handle.path.as_str())
+                    {
+                        **file = fresh;
                     }
                 }
                 self.ext4 = ext4;
@@ -1147,6 +1289,9 @@ mod tests {
         assert!(OpenMode::from_flags(O_RDONLY | O_DIRECTORY).directory);
         assert!(OpenMode::from_flags(O_WRONLY).wants_write());
         assert!(OpenMode::from_flags(O_RDWR).wants_write());
+        assert!(OpenMode::from_flags(O_WRONLY).write_only);
+        assert!(!OpenMode::from_flags(O_RDWR).write_only);
+        assert!(!OpenMode::from_flags(O_RDONLY).write_only);
         assert!(OpenMode::from_flags(O_RDONLY | O_CREAT).wants_write());
         assert!(OpenMode::from_flags(O_RDONLY | O_TRUNC).wants_write());
     }
