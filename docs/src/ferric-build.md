@@ -339,6 +339,22 @@ image overrides. CI's forced test features remain separate. See
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.
 
+## Debug info and unoptimized builds
+
+Two options control how locally built packages are compiled:
+
+| Option | Make variable | Effect |
+| --- | --- | --- |
+| `build.debug` | `REPO_DEBUGINFO` | Optimized release build with full debug info (`CARGO_PROFILE_RELEASE_DEBUG=true`, `CARGO_PROFILE_RELEASE_STRIP=false`, `-g` for C), not stripped when packaged. |
+| `build.unoptimized` | `REPO_DEBUG` | Cargo's debug profile: no optimization, debug assertions and debug info. |
+
+Use `build.debug` for symbolized backtraces and profiles. `build.unoptimized` makes file
+systems, drivers and the C library run many times slower: under QEMU emulation,
+starting a large program from RedoxFS took seconds ([#286](https://github.com/rexlunae/ferric-oxide/issues/286)).
+Keep it for bugs that need debug assertions. With both on, the debug profile wins.
+Both mark every recipe for rebuild, and the relibc recipe's build stamp includes the
+debug-info setting, so toggling `build.debug` rebuilds relibc too.
+
 ## Dependency sources
 
 Ferric Oxide keeps its build inputs independent of upstream Redox services.
