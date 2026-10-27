@@ -10,7 +10,8 @@ description = "Shared page cache read path: on-target test for Ferric Oxide"
 
 [dependencies]
 ferric-blkqueue = { path = "../../../../crates/blkqueue" }
-ferric-pcache = { path = "../../../../crates/pcache" }
+# `alloc` for `writeback::DEFAULT_AGE_MS`, which the writeback-age step waits on.
+ferric-pcache = { path = "../../../../crates/pcache", features = ["alloc"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libc = "0.2"

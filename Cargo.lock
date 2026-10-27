@@ -1471,6 +1471,7 @@ version = "0.1.0"
 dependencies = [
  "libredox",
  "redox_syscall 0.9.4",
+ "simple_endian",
 ]
 
 [[package]]

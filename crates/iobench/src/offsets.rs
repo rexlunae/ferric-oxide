@@ -21,12 +21,13 @@ pub struct Order {
 }
 
 impl Order {
-    /// The order of `blocks` blocks: in sequence for [`Rw::Read`], a permutation seeded with
-    /// `seed` for [`Rw::RandRead`].
+    /// The order of `blocks` blocks: in sequence for [`Rw::Read`] and [`Rw::Write`], a
+    /// permutation seeded with `seed` for [`Rw::RandRead`] and [`Rw::RandWrite`].
     pub const fn new(rw: Rw, blocks: u64, seed: u64) -> Self {
-        let random = match rw {
-            Rw::Read => None,
-            Rw::RandRead => Some(Mix::new(blocks, seed)),
+        let random = if rw.random() {
+            Some(Mix::new(blocks, seed))
+        } else {
+            None
         };
         Self { blocks, random }
     }
@@ -156,6 +157,18 @@ mod tests {
         let order = Order::new(Rw::Read, 5, 1);
         assert_eq!(all(&order), [0, 1, 2, 3, 4]);
         assert_eq!(order.block(5), None);
+    }
+
+    #[test]
+    fn writes_take_the_same_orders_as_reads() {
+        assert_eq!(
+            all(&Order::new(Rw::Write, 64, 3)),
+            all(&Order::new(Rw::Read, 64, 3))
+        );
+        assert_eq!(
+            all(&Order::new(Rw::RandWrite, 1000, 3)),
+            all(&Order::new(Rw::RandRead, 1000, 3))
+        );
     }
 
     #[test]

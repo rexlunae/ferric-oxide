@@ -9,8 +9,13 @@
 //! | [`Request::Attach`] | an object | metadata `[verb, handle]` |
 //! | [`Request::Detach`] | an object | metadata `[verb, handle]` |
 //! | [`Request::Filled`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page, generation, fill]`, payload the pages |
-//! | [`Request::WrittenBack`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page, generation]` |
+//! | [`Request::WrittenBack`] | an object | metadata `[verb \| count << 16 \| errno << 32, first page]` |
 //! | [`Request::SetReadaheadMax`] | a queue | metadata `[verb, pages]` |
+//! | [`Request::SetWriteback`] | a queue | metadata `[verb, pages]` |
+//! | [`Request::AttachAccess`] | an object | metadata `[verb, handle, access]` |
+//! | [`Request::HoldWrites`] | an object | metadata `[verb, 0 or 1]` |
+//! | [`Request::TakeDirty`] | an object | `SYS_CALL` with `READ`, metadata `[verb, first page]`, payload room for the pages; returns [`decode_taken`]'s word |
+//! | [`Request::DirtyPages`] | an object | metadata `[verb]`; returns its current dirty page count |
 //! | read records | a queue | `read(queue, buf)`: whole [`Record::BYTES`]-byte records |
 //!
 //! Every call fits the four metadata words the kernel passes a kernel scheme
@@ -19,8 +24,8 @@
 //! A file system opens one queue and binds it to its own scheme with [`Request::Bind`],
 //! passing its scheme socket, so the queue can only ever serve that scheme's descriptions.
 //! Each object it creates belongs to that queue: the kernel puts the object's [`Record`]s
-//! there, and the file system answers each record with [`Request::Filled`] or
-//! [`Request::WrittenBack`] on the object's descriptor, which only it holds. The file system
+//! there, and the file system answers each fill record with [`Request::Filled`] on the
+//! object's descriptor, which only it holds. The file system
 //! picks each object's ID ([`ObjectId`], unique on its queue, for example the file's node
 //! number) when it creates the object, so records name objects in its own terms and need no
 //! lookup. Opening an ID the queue already has fails with `EEXIST`. An ID may be reused once
@@ -51,14 +56,43 @@
 //! number the file system's scheme gave the client's description. The kernel then serves that
 //! description's positioned `read` and `pread` from the object, until the file system
 //! detaches it, the client closes it, or the object or its queue closes. Everything else
-//! (unpositioned reads, `mmap`, writes, `fstat`) still goes to the file system's scheme;
-//! serving shared mappings from objects is a later step of the design.
+//! (unpositioned reads, `mmap`, writes unless they are cached (below), `fstat`) still goes to
+//! the file system's scheme; serving shared mappings from objects is a later step of the
+//! design.
+//!
+//! # Cached writes
+//!
+//! With the kernel's `page_cache_writeback` feature a file system may also have the kernel
+//! serve writes. [`Request::SetWriteback`] on the queue turns it on (a kernel without the
+//! feature refuses it with `EOPNOTSUPP`, and the file system carries on as before), and
+//! [`Request::AttachAccess`] attaches a description for writing too. A positioned `write` or
+//! `pwrite` of such a description that lies inside the file's size, without `O_APPEND` or
+//! `O_FSYNC`, is then copied into the object's pages, which become dirty, and returns with no
+//! round trip. Anything else (a write that extends the file, an append, a synchronous
+//! description, an object whose writes are held) goes to the file system's scheme as
+//! before.
+//!
+//! The file system writes dirty pages back by pulling them: [`Request::TakeDirty`] marks the
+//! next run of dirty pages under writeback and copies their bytes to the caller, who writes
+//! them to the file and answers [`Request::WrittenBack`]. One run of an object is under
+//! writeback at a time. A page written to meanwhile stays dirty after the answer, and a
+//! failed writeback leaves its pages dirty, so data the file system does not have is never
+//! dropped, by reclaim or anything else, except by a truncation of the file. The kernel tells
+//! the file system when to, with a [`Record::Writeback`] and its [`WritebackReason`]: when an
+//! object's first page becomes dirty; at once for a run of a sequential writer's pages, so
+//! writeback of a large write overlaps the writer instead of all of it waiting for `fsync`;
+//! and urgently when the queue holds more dirty pages than [`Request::SetWriteback`]'s limit
+//! (at twice the limit, writes go to the file system's scheme, which slows writers down to
+//! the speed of writeback). The file system flushes an
+//! object before it reads or changes the file itself, and holds the object's cached writes
+//! ([`Request::HoldWrites`]) from before that flush until it has finished, so a cached write
+//! never races one it serves.
 //!
 //! [`Request::encode`] and [`Request::decode`] are the one place the metadata layout is written
 //! down; [`Record::to_bytes`] and [`Record::from_bytes`] the one place the record layout is.
 
 use core::fmt;
-use core::num::NonZeroU16;
+use core::num::{NonZeroU16, NonZeroU32};
 
 /// The scheme's number among the kernel's global schemes (`GlobalSchemes` in the kernel's
 /// `redox_syscall`), which bootstrap uses to find it among the kernel scheme capabilities it is
@@ -79,6 +113,12 @@ pub const PAGE_SIZE: u64 = 4096;
 
 /// The most pages one fill or writeback record may name (4 MiB), so one answer is bounded.
 pub const MAX_RECORD_PAGES: u32 = 1024;
+
+/// The fewest whole pages a sequential writer must have dirtied, and not yet put under
+/// writeback, before the kernel posts a [`WritebackReason::Run`] record (1 MiB): enough that
+/// one run is worth a writeback round trip, and few enough that writeback starts early in a
+/// large write.
+pub const STREAM_RUN_PAGES: u32 = 256;
 
 /// A cache object's identifier on its queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -299,6 +339,122 @@ impl ReadaheadMax {
     }
 }
 
+/// Why the kernel posted a [`Record::Writeback`], and so how soon the file system should
+/// write the object's dirty pages back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WritebackReason {
+    /// The object's first page became dirty: write it back within the file system's age
+    /// limit.
+    Dirtied,
+    /// The queue is past its dirty limit: write every dirty object back at once.
+    Urgent,
+    /// A sequential writer has dirtied a run of the object's pages, the record's pages
+    /// ([`STREAM_RUN_PAGES`] or more): write one run back now, from the record's first page
+    /// (`writeback::flush_run`), while the writer goes on.
+    /// Its page range is a starting hint: the consumer may take one later dirty run
+    /// when an intervening flush already cleaned the originally named pages.
+    Run,
+}
+
+impl WritebackReason {
+    const fn to_word(self) -> u64 {
+        match self {
+            Self::Dirtied => 0,
+            Self::Urgent => 1,
+            Self::Run => 2,
+        }
+    }
+
+    const fn from_word(word: u64) -> Option<Self> {
+        Some(match word {
+            0 => Self::Dirtied,
+            1 => Self::Urgent,
+            2 => Self::Run,
+            _ => return None,
+        })
+    }
+}
+
+/// What the kernel serves of an attached description ([`Request::AttachAccess`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// Reads only, as [`Request::Attach`].
+    Read,
+    /// Writes only (a description opened `O_WRONLY`).
+    Write,
+    /// Reads and writes.
+    ReadWrite,
+}
+
+impl Access {
+    /// Whether the kernel serves reads of the description.
+    pub const fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    /// Whether the kernel serves writes of the description.
+    pub const fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    const fn to_word(self) -> u64 {
+        match self {
+            Self::Read => 1,
+            Self::Write => 2,
+            Self::ReadWrite => 3,
+        }
+    }
+
+    const fn from_word(word: u64) -> Option<Self> {
+        Some(match word {
+            1 => Self::Read,
+            2 => Self::Write,
+            3 => Self::ReadWrite,
+            _ => return None,
+        })
+    }
+}
+
+/// The bits of [`Request::TakeDirty`]'s return value that hold the page count.
+const TAKEN_COUNT_BITS: u32 = 11;
+/// The first page a [`Request::TakeDirty`] return value can name: below 2^52, so the word
+/// stays below 2^63 and is never taken for an error return.
+const TAKEN_FIRST_LIMIT: u64 = 1 << 52;
+
+/// The return value of a [`Request::TakeDirty`] that took `pages` (`None`: no dirty page was
+/// left at or after the first page asked for), `first << 11 | count`, or 0. `None` when the
+/// first page is 2^52 or more, which no file of 2^64 bytes has.
+pub const fn encode_taken(pages: Option<RecordPages>) -> Option<u64> {
+    match pages {
+        None => Some(0),
+        Some(RecordPages(range)) if range.first < TAKEN_FIRST_LIMIT => {
+            Some(range.first << TAKEN_COUNT_BITS | range.count as u64)
+        }
+        Some(_) => None,
+    }
+}
+
+/// The pages a [`Request::TakeDirty`] return value names, `None` for 0.
+///
+/// # Errors
+///
+/// [`DecodeError::Value`] for a word [`encode_taken`] does not make: a count of 0 with a page,
+/// or above [`MAX_RECORD_PAGES`], or a first page of 2^52 or more.
+pub fn decode_taken(word: u64) -> Result<Option<RecordPages>, DecodeError> {
+    if word == 0 {
+        return Ok(None);
+    }
+    let count = word & ((1 << TAKEN_COUNT_BITS) - 1);
+    let first = word >> TAKEN_COUNT_BITS;
+    if first >= TAKEN_FIRST_LIMIT {
+        return Err(DecodeError::Value);
+    }
+    record_range(first, count)
+        .map(Some)
+        .ok_or(DecodeError::Value)
+}
+
 /// Which object instance a record is about. The kernel numbers each object it opens on a
 /// queue, from 0 up, never reusing a number, so an answer meant for a closed object with the
 /// same [`ObjectId`] is told apart from one for the object open now.
@@ -430,20 +586,67 @@ pub enum Request {
         /// The record's [`FillId`].
         fill: FillId,
     },
-    /// On the object a [`Record::Writeback`] named: the answer to it.
+    /// On an object: the answer to the [`Self::TakeDirty`] that took `pages`, once the file
+    /// system has written them to the file ([`Outcome::Done`]) or could not
+    /// ([`Outcome::Failed`], which leaves them dirty for a later writeback). A page written
+    /// to while it was under writeback stays dirty either way. Returns the number of the
+    /// object's pages still dirty, so the file system knows whether to come back. It needs
+    /// no generation: it is a call on the object [`Self::TakeDirty`] was, not an answer to a
+    /// record. An answer for pages that are not the object's writeback in flight is refused
+    /// with `EINVAL`.
     WrittenBack {
-        /// The pages the record named.
+        /// The pages [`Self::TakeDirty`] took.
         pages: RecordPages,
         /// How the writeback ended.
         outcome: Outcome,
-        /// The record's [`Generation`].
-        generation: Generation,
     },
     /// On a queue: read ahead at most `pages` pages for this file system's objects.
     SetReadaheadMax {
         /// The largest readahead window, in pages.
         pages: ReadaheadMax,
     },
+    /// On a queue: serve writes of descriptions attached with an [`Access`] that writes
+    /// (see the module docs), with `max_dirty` pages as the queue's dirty limit: past it the
+    /// kernel posts urgent [`Record::Writeback`]s, and at twice it sends writes to the file
+    /// system's scheme. A kernel without the `page_cache_writeback` feature refuses it with
+    /// `EOPNOTSUPP`. A later call changes the limit.
+    SetWriteback {
+        /// The dirty limit, in pages.
+        max_dirty: NonZeroU32,
+    },
+    /// On an object: serve `handle` of the file system's scheme from this object for
+    /// `access`. [`Access::Read`] is [`Self::Attach`]; the others need
+    /// [`Self::SetWriteback`] first, and refuse with `EOPNOTSUPP` without it.
+    AttachAccess {
+        /// The handle number of the client's description on the file system's scheme.
+        handle: u64,
+        /// What the kernel serves of it.
+        access: Access,
+    },
+    /// On an object: `hold` stops the kernel serving writes from it until a call with `hold`
+    /// false (they go to the file system's scheme meanwhile); holds do not nest. A write the
+    /// kernel was serving when the hold came has dirtied its pages by the time the call
+    /// returns, so a [`Self::TakeDirty`] pass after it sees every cached write.
+    HoldWrites {
+        /// Hold (true) or serve again (false).
+        hold: bool,
+    },
+    /// On an object: start writing back its next run of dirty pages at or after page `from`,
+    /// in page order: at most as many as the call's payload holds whole pages, and at most
+    /// [`MAX_RECORD_PAGES`]. Their bytes are copied to the payload (whole pages, zero past
+    /// the end of the file), and the call returns the pages ([`encode_taken`]), or 0 when no
+    /// page at or after `from` is dirty. The file system answers with
+    /// [`Self::WrittenBack`]. `EBUSY` while a run of the object is under writeback already,
+    /// and `EINVAL` for a payload smaller than a page.
+    TakeDirty {
+        /// The first page to look at.
+        from: u64,
+    },
+    /// On an object: returns its current dirty page count without starting writeback.
+    /// A delayed [`Record::Writeback`] can outlive fsync; recheck this count before
+    /// arming an age timer. A later write from a clean state posts a fresh record.
+    /// Refused with `EOPNOTSUPP` without `page_cache_writeback`.
+    DirtyPages,
     /// On an object: the file's bytes in `pages` changed outside the cache (the file system
     /// served a write of them itself). Their cached copies are dropped, and a fill of them in
     /// flight is stale: its answer is not taken, and the readers waiting for it fill again.
@@ -465,6 +668,11 @@ enum Verb {
     SetReadaheadMax = 6,
     Bind = 7,
     Invalidate = 8,
+    SetWriteback = 9,
+    AttachAccess = 10,
+    HoldWrites = 11,
+    TakeDirty = 12,
+    DirtyPages = 13,
 }
 
 impl Verb {
@@ -478,6 +686,11 @@ impl Verb {
             6 => Self::SetReadaheadMax,
             7 => Self::Bind,
             8 => Self::Invalidate,
+            9 => Self::SetWriteback,
+            10 => Self::AttachAccess,
+            11 => Self::HoldWrites,
+            12 => Self::TakeDirty,
+            13 => Self::DirtyPages,
             _ => return None,
         })
     }
@@ -489,15 +702,16 @@ impl Request {
 
     /// The metadata words, and how many of them are used.
     ///
-    /// [`Self::Filled`] and [`Self::WrittenBack`] are
-    /// `[verb | count << 16 | errno << 32, first page, generation]`: the verb in the low 16
-    /// bits of the first word, the page count in the 16 above it, the outcome's errno (0 for
-    /// [`Outcome::Done`]) in the 16 above that, the top 16 zero, and the record's whole
-    /// [`Generation`] in the third word. [`Self::Filled`] has the record's [`FillId`] in a
-    /// fourth. Every other request has the verb alone in its first word.
+    /// [`Self::Filled`] is `[verb | count << 16 | errno << 32, first page, generation, fill]`:
+    /// the verb in the low 16 bits of the first word, the page count in the 16 above it, the
+    /// outcome's errno (0 for [`Outcome::Done`]) in the 16 above that, the top 16 zero, the
+    /// record's whole [`Generation`] in the third word and its [`FillId`] in the fourth.
+    /// [`Self::WrittenBack`] has the same first two words and no more. Every other request
+    /// has the verb alone in its first word.
     pub const fn encode(self) -> ([u64; Self::MAX_WORDS], usize) {
         match self {
             Self::Bind => ([Verb::Bind as u64, 0, 0, 0], 1),
+            Self::DirtyPages => ([Verb::DirtyPages as u64, 0, 0, 0], 1),
             Self::SetSize { size } => ([Verb::SetSize as u64, size, 0, 0], 2),
             Self::Attach { handle } => ([Verb::Attach as u64, handle, 0, 0], 2),
             Self::Detach { handle } => ([Verb::Detach as u64, handle, 0, 0], 2),
@@ -515,18 +729,14 @@ impl Request {
                 ],
                 4,
             ),
-            Self::WrittenBack {
-                pages,
-                outcome,
-                generation,
-            } => (
+            Self::WrittenBack { pages, outcome } => (
                 [
                     answer_word(Verb::WrittenBack, pages, outcome),
                     pages.0.first,
-                    generation.0,
+                    0,
                     0,
                 ],
-                3,
+                2,
             ),
             Self::SetReadaheadMax { pages } => {
                 ([Verb::SetReadaheadMax as u64, pages.0 as u64, 0, 0], 2)
@@ -535,6 +745,14 @@ impl Request {
                 [Verb::Invalidate as u64, pages.first, pages.count as u64, 0],
                 3,
             ),
+            Self::SetWriteback { max_dirty } => {
+                ([Verb::SetWriteback as u64, max_dirty.get() as u64, 0, 0], 2)
+            }
+            Self::AttachAccess { handle, access } => {
+                ([Verb::AttachAccess as u64, handle, access.to_word(), 0], 3)
+            }
+            Self::HoldWrites { hold } => ([Verb::HoldWrites as u64, hold as u64, 0, 0], 2),
+            Self::TakeDirty { from } => ([Verb::TakeDirty as u64, from, 0, 0], 2),
         }
     }
 
@@ -545,7 +763,9 @@ impl Request {
     /// [`DecodeError::Verb`] for a missing or unknown verb, [`DecodeError::Length`] when the
     /// number of words does not match it, and [`DecodeError::Value`] for a page range that is
     /// empty, overflows or is longer than [`MAX_RECORD_PAGES`], a readahead maximum of 0 or
-    /// above [`MAX_RECORD_PAGES`], or bits above the verb that the request does not have.
+    /// above [`MAX_RECORD_PAGES`], a dirty limit of 0 or above `u32::MAX`, an unknown
+    /// [`Access`], a hold that is not 0 or 1, or bits above the verb that the request does
+    /// not have.
     pub fn decode(words: &[u64]) -> Result<Self, DecodeError> {
         let (&head, args) = words.split_first().ok_or(DecodeError::Verb)?;
         let verb = Verb::from_raw(head & VERB_MASK).ok_or(DecodeError::Verb)?;
@@ -555,6 +775,7 @@ impl Request {
         }
         match (verb, args) {
             (Verb::Bind, &[]) => Ok(Self::Bind),
+            (Verb::DirtyPages, &[]) => Ok(Self::DirtyPages),
             (Verb::SetSize, &[size]) => Ok(Self::SetSize { size }),
             (Verb::Attach, &[handle]) => Ok(Self::Attach { handle }),
             (Verb::Detach, &[handle]) => Ok(Self::Detach { handle }),
@@ -567,14 +788,9 @@ impl Request {
                     fill: FillId(fill),
                 })
             }
-            (Verb::WrittenBack, &[first, generation]) => {
+            (Verb::WrittenBack, &[first]) => {
                 let (pages, outcome) = answer(packed, first)?;
-                let generation = Generation(generation);
-                Ok(Self::WrittenBack {
-                    pages,
-                    outcome,
-                    generation,
-                })
+                Ok(Self::WrittenBack { pages, outcome })
             }
             (Verb::SetReadaheadMax, &[pages]) => u32::try_from(pages)
                 .ok()
@@ -586,6 +802,20 @@ impl Request {
                 .and_then(|count| PageRange::new(first, count))
                 .map(|pages| Self::Invalidate { pages })
                 .ok_or(DecodeError::Value),
+            (Verb::SetWriteback, &[pages]) => u32::try_from(pages)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .map(|max_dirty| Self::SetWriteback { max_dirty })
+                .ok_or(DecodeError::Value),
+            (Verb::AttachAccess, &[handle, access]) => Access::from_word(access)
+                .map(|access| Self::AttachAccess { handle, access })
+                .ok_or(DecodeError::Value),
+            (Verb::HoldWrites, &[hold]) => match hold {
+                0 => Ok(Self::HoldWrites { hold: false }),
+                1 => Ok(Self::HoldWrites { hold: true }),
+                _ => Err(DecodeError::Value),
+            },
+            (Verb::TakeDirty, &[from]) => Ok(Self::TakeDirty { from }),
             _ => Err(DecodeError::Length),
         }
     }
@@ -652,15 +882,20 @@ pub enum Record {
         /// The pages to fill.
         pages: RecordPages,
     },
-    /// Write these dirty pages of the object to the file, then answer
-    /// [`Request::WrittenBack`].
+    /// The object has dirty pages: write them back ([`Request::TakeDirty`] and
+    /// [`Request::WrittenBack`]) as `reason` says. Posted when the object's first page
+    /// becomes dirty, when a sequential writer has dirtied a run, and (urgent) when a write
+    /// takes the queue past its dirty limit ([`Request::SetWriteback`]).
     Writeback {
         /// The object.
         object: ObjectId,
-        /// The object instance's generation, for the answer.
+        /// The object instance's generation.
         generation: Generation,
-        /// The pages to write.
+        /// The pages the write that posted it dirtied (at most a record's worth), or for
+        /// [`WritebackReason::Run`] the run to write back.
         pages: RecordPages,
+        /// Why it was posted.
+        reason: WritebackReason,
     },
     /// The kernel needs memory: close the object if it is only retained (no client has the
     /// file open).
@@ -705,7 +940,7 @@ impl FillRef {
 
 impl Record {
     /// The size of a record on the queue, in bytes.
-    pub const BYTES: usize = 40;
+    pub const BYTES: usize = crate::wire::BYTES;
 
     /// The object a fill record is for, and what its answer repeats; `None` for other
     /// records.
@@ -735,7 +970,10 @@ impl Record {
 
     /// The record's bytes: `kind: u16`, `count: u16`, a reserved zero `u32`, `object: u64`,
     /// `first: u64`, `generation: u64`, `fill: u64`, all little-endian. Records without pages
-    /// have `first` and `count` zero, and records other than fills have `fill` zero.
+    /// have `first` and `count` zero; a writeback record has its [`WritebackReason`] in the
+    /// `fill` word (0 dirtied, 1 urgent, 2 run), and the other records other than fills have
+    /// it zero. Native fields are converted through a generated `Endianize` wire
+    /// layout; serialization needs neither allocation nor aligned input.
     pub fn to_bytes(self) -> [u8; Self::BYTES] {
         let pages = match self {
             Self::Fill { pages, .. } | Self::Writeback { pages, .. } => Some(pages),
@@ -750,16 +988,21 @@ impl Record {
         let object = self.object();
         // A record's count is at most `MAX_RECORD_PAGES`, which fits 16 bits.
         let (first, count) = pages.map_or((0, 0), |p| (p.0.first, p.0.count as u16));
-        let mut bytes = [0; Self::BYTES];
-        bytes[0..2].copy_from_slice(&kind.to_le_bytes());
-        bytes[2..4].copy_from_slice(&count.to_le_bytes());
-        bytes[8..16].copy_from_slice(&object.0.to_le_bytes());
-        bytes[16..24].copy_from_slice(&first.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.generation().0.to_le_bytes());
-        if let Self::Fill { fill, .. } = self {
-            bytes[32..40].copy_from_slice(&fill.0.to_le_bytes());
+        let word = match self {
+            Self::Fill { fill, .. } => fill.0,
+            Self::Writeback { reason, .. } => reason.to_word(),
+            Self::Release { .. } | Self::Accessed { .. } => 0,
+        };
+        crate::wire::QueueRecord {
+            kind,
+            count,
+            reserved: 0,
+            object: object.0,
+            first,
+            generation: self.generation().0,
+            fill: word,
         }
-        bytes
+        .bytes()
     }
 
     /// Decodes a record.
@@ -772,19 +1015,14 @@ impl Record {
     /// empty, overflowing or too long page range.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordError> {
         let bytes: &[u8; Self::BYTES] = bytes.try_into().map_err(|_| RecordError::Length)?;
-        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-        let u64_at = |at: usize| {
-            let mut word = [0; 8];
-            word.copy_from_slice(&bytes[at..at + 8]);
-            u64::from_le_bytes(word)
-        };
-        if bytes[4..8] != [0; 4] {
+        let record = crate::wire::QueueRecord::read(bytes).ok_or(RecordError::Length)?;
+        if record.reserved != 0 {
             return Err(RecordError::Reserved);
         }
-        let object = ObjectId(u64_at(8));
-        let (first, count) = (u64_at(16), u16_at(2));
-        let generation = Generation(u64_at(24));
-        let fill = u64_at(32);
+        let object = ObjectId(record.object);
+        let (first, count) = (record.first, record.count);
+        let generation = Generation(record.generation);
+        let fill = record.fill;
         let no_fill = || {
             if fill == 0 {
                 Ok(())
@@ -800,20 +1038,22 @@ impl Record {
                 Err(RecordError::Reserved)
             }
         };
-        match u16_at(0) {
+        match record.kind {
             Self::KIND_FILL => Ok(Self::Fill {
                 object,
                 generation,
                 fill: FillId(fill),
                 pages: pages()?,
             }),
-            Self::KIND_WRITEBACK => no_fill().and_then(|()| {
-                Ok(Self::Writeback {
+            Self::KIND_WRITEBACK => match WritebackReason::from_word(fill) {
+                Some(reason) => Ok(Self::Writeback {
                     object,
                     generation,
                     pages: pages()?,
-                })
-            }),
+                    reason,
+                }),
+                None => Err(RecordError::Reserved),
+            },
             Self::KIND_RELEASE => no_pages()
                 .and_then(|()| no_fill())
                 .map(|()| Self::Release { object, generation }),
@@ -1055,7 +1295,7 @@ mod tests {
         assert_eq!(Request::decode(&words[..len]), Ok(answer));
         // The errno field stays 16 bits: the top 16 bits of the first word are refused.
         assert_eq!(
-            Request::decode(&[5 | 1 << 16 | 1 << 48, 0, 0]),
+            Request::decode(&[5 | 1 << 16 | 1 << 48, 0]),
             Err(DecodeError::Value)
         );
     }
@@ -1162,6 +1402,7 @@ mod tests {
     fn requests_round_trip() {
         let all = [
             Request::Bind,
+            Request::DirtyPages,
             Request::SetSize { size: 12_345 },
             Request::Attach { handle: 9 },
             Request::Detach { handle: 9 },
@@ -1174,7 +1415,10 @@ mod tests {
             Request::WrittenBack {
                 pages: record(0, MAX_RECORD_PAGES),
                 outcome: Outcome::Failed(errno(5)),
-                generation: Generation::default(),
+            },
+            Request::WrittenBack {
+                pages: record(u64::MAX - 1, 1),
+                outcome: Outcome::Done,
             },
             Request::SetReadaheadMax {
                 pages: ReadaheadMax::new(64).expect("in range"),
@@ -1188,6 +1432,28 @@ mod tests {
             Request::Invalidate {
                 pages: PageRange::new(u64::MAX - u64::from(u32::MAX), u32::MAX).expect("valid"),
             },
+            Request::SetWriteback {
+                max_dirty: NonZeroU32::new(8192).expect("non-zero"),
+            },
+            Request::SetWriteback {
+                max_dirty: NonZeroU32::MAX,
+            },
+            Request::AttachAccess {
+                handle: 3,
+                access: Access::Read,
+            },
+            Request::AttachAccess {
+                handle: u64::MAX,
+                access: Access::Write,
+            },
+            Request::AttachAccess {
+                handle: 0,
+                access: Access::ReadWrite,
+            },
+            Request::HoldWrites { hold: true },
+            Request::HoldWrites { hold: false },
+            Request::TakeDirty { from: 0 },
+            Request::TakeDirty { from: u64::MAX },
         ];
         for request in all {
             let (words, len) = request.encode();
@@ -1197,18 +1463,20 @@ mod tests {
 
     #[test]
     fn bad_requests_are_refused() {
+        assert_eq!(Request::decode(&[13, 0]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[13 | (1 << 16)]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[99]), Err(DecodeError::Verb));
         assert_eq!(Request::decode(&[1]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[1, 2, 3]), Err(DecodeError::Length));
         assert_eq!(Request::decode(&[7, 0]), Err(DecodeError::Length));
-        // A fill answer without its fill ID, and a writeback answer with one.
+        // A fill answer without its fill ID, and a writeback answer with a generation.
         assert_eq!(
             Request::decode(&[4 | 1 << 16, 1, 0]),
             Err(DecodeError::Length)
         );
         assert_eq!(
-            Request::decode(&[5 | 1 << 16, 1, 0, 1]),
+            Request::decode(&[5 | 1 << 16, 1, 0]),
             Err(DecodeError::Length)
         );
         // An empty range, a too long one, a zero readahead maximum, bits above a plain verb.
@@ -1228,6 +1496,15 @@ mod tests {
         assert_eq!(Request::decode(&[8, 0, 1 << 32]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[8, u64::MAX, 2]), Err(DecodeError::Value));
         assert_eq!(Request::decode(&[8, 0]), Err(DecodeError::Length));
+        // A dirty limit of 0 or past 32 bits, an unknown access, a hold that is not a bool.
+        assert_eq!(Request::decode(&[9, 0]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[9, 1 << 32]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[10, 1, 0]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[10, 1, 4]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[10, 1]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[11, 2]), Err(DecodeError::Value));
+        assert_eq!(Request::decode(&[12]), Err(DecodeError::Length));
+        assert_eq!(Request::decode(&[12 | 1 << 16, 0]), Err(DecodeError::Value));
         // So the encoder cannot produce what the decoder refuses: 1024 is the largest maximum.
         assert_eq!(
             ReadaheadMax::new(MAX_RECORD_PAGES).map(ReadaheadMax::get),
@@ -1252,6 +1529,19 @@ mod tests {
                 object,
                 generation,
                 pages: record(u64::MAX - 8, 8),
+                reason: WritebackReason::Dirtied,
+            },
+            Record::Writeback {
+                object,
+                generation,
+                pages: record(0, MAX_RECORD_PAGES),
+                reason: WritebackReason::Urgent,
+            },
+            Record::Writeback {
+                object,
+                generation,
+                pages: record(256, 512),
+                reason: WritebackReason::Run,
             },
             Record::Release { object, generation },
             Record::Accessed { object, generation },
@@ -1260,6 +1550,56 @@ mod tests {
             assert_eq!(record.object(), object);
             assert_eq!(record.generation(), generation);
             assert_eq!(record.to_bytes()[24..32], [8, 7, 6, 5, 4, 3, 2, 1]);
+        }
+    }
+
+    #[test]
+    fn records_match_literal_little_endian_fixtures() {
+        let object = ObjectId::new(0x1122_3344_5566_7788);
+        let generation = Generation::new(0x0102_0304_0506_0708);
+        let pages = record(0x1234_5678_9abc_def0, 258);
+        let mut fixture = [
+            2, 0, 2, 1, 0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xf0, 0xde,
+            0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        for (reason, value) in [
+            (WritebackReason::Dirtied, 0),
+            (WritebackReason::Urgent, 1),
+            (WritebackReason::Run, 2),
+        ] {
+            fixture[32] = value;
+            let record = Record::Writeback {
+                object,
+                generation,
+                pages,
+                reason,
+            };
+            assert_eq!(record.to_bytes(), fixture);
+            assert_eq!(Record::from_bytes(&fixture), Ok(record));
+            let mut unaligned = [0; 41];
+            unaligned[1..].copy_from_slice(&fixture);
+            assert_eq!(Record::from_bytes(&unaligned[1..]), Ok(record));
+        }
+        fixture[0] = 1;
+        fixture[32..40].copy_from_slice(&[0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76]);
+        let fill = Record::Fill {
+            object,
+            generation,
+            pages,
+            fill: FillId::new(0x7654_3210_fedc_ba98),
+        };
+        assert_eq!(fill.to_bytes(), fixture);
+        assert_eq!(Record::from_bytes(&fixture), Ok(fill));
+        fixture[2..4].fill(0);
+        fixture[16..24].fill(0);
+        fixture[32..40].fill(0);
+        for (kind, record) in [
+            (3, Record::Release { object, generation }),
+            (4, Record::Accessed { object, generation }),
+        ] {
+            fixture[0] = kind;
+            assert_eq!(record.to_bytes(), fixture);
+            assert_eq!(Record::from_bytes(&fixture), Ok(record));
         }
     }
 
@@ -1280,10 +1620,10 @@ mod tests {
         bad[6] = 1;
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Reserved));
         let mut bad = fill;
-        bad[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        bad[2..4].copy_from_slice(&[0, 0]);
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
         let mut bad = fill;
-        bad[2..4].copy_from_slice(&(MAX_RECORD_PAGES as u16 + 1).to_le_bytes());
+        bad[2..4].copy_from_slice(&[1, 4]);
         assert_eq!(Record::from_bytes(&bad), Err(RecordError::Pages));
         let mut release = Record::Release {
             object: ObjectId::new(1),
@@ -1296,6 +1636,53 @@ mod tests {
         // Only a fill has a fill ID.
         with_fill[32] = 1;
         assert_eq!(Record::from_bytes(&with_fill), Err(RecordError::Reserved));
+        // A writeback record's reason is 0, 1 or 2.
+        let mut writeback = Record::Writeback {
+            object: ObjectId::new(1),
+            generation: Generation::default(),
+            pages: record(4, 1),
+            reason: WritebackReason::Run,
+        }
+        .to_bytes();
+        assert_eq!(writeback[32..40], [2, 0, 0, 0, 0, 0, 0, 0]);
+        writeback[32] = 3;
+        assert_eq!(Record::from_bytes(&writeback), Err(RecordError::Reserved));
+        writeback[32] = 0;
+        writeback[39] = 1;
+        assert_eq!(Record::from_bytes(&writeback), Err(RecordError::Reserved));
+    }
+
+    #[test]
+    fn taken_pages_round_trip_below_the_error_returns() {
+        assert_eq!(encode_taken(None), Some(0));
+        assert_eq!(decode_taken(0), Ok(None));
+        let last = TAKEN_FIRST_LIMIT - 1;
+        for pages in [
+            record(0, 1),
+            record(7, 3),
+            record(0, MAX_RECORD_PAGES),
+            record(last, 1),
+        ] {
+            let word = encode_taken(Some(pages)).expect("encodable");
+            // A kernel call's error returns are the top 4095 values; these stay below 2^63.
+            assert!(word < 1 << 63, "{word:#x}");
+            assert_eq!(decode_taken(word), Ok(Some(pages)));
+        }
+        assert_eq!(encode_taken(Some(record(TAKEN_FIRST_LIMIT, 1))), None);
+        // No count, too many pages, a page too far.
+        assert_eq!(decode_taken(5 << 11), Err(DecodeError::Value));
+        assert_eq!(decode_taken(1025), Err(DecodeError::Value));
+        assert_eq!(
+            decode_taken(TAKEN_FIRST_LIMIT << 11 | 1),
+            Err(DecodeError::Value)
+        );
+    }
+
+    #[test]
+    fn access_says_what_is_served() {
+        assert!(Access::Read.reads() && !Access::Read.writes());
+        assert!(!Access::Write.reads() && Access::Write.writes());
+        assert!(Access::ReadWrite.reads() && Access::ReadWrite.writes());
     }
 
     #[test]

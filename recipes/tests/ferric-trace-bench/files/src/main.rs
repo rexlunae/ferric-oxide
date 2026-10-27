@@ -4,7 +4,8 @@
 //!
 //! - `io`: a 4 KiB `pwrite` and `pread` of a file on the root file system, one operation per
 //!   pair. Each call is a request to RedoxFS through its scheme, so this is the storage path the
-//!   budget for every event on is judged on.
+//!   budget for every event on is judged on. The file is opened `O_FSYNC`, which the page cache
+//!   leaves to RedoxFS, so cached reads and writes do not take the requests away.
 //! - `syscall`: a one-byte `write` to a file descriptor that is not open, the cheapest system
 //!   call that reaches the kernel's dispatch. It shows the per-call cost of a tracepoint, and the
 //!   budget for tracing compiled in but off is judged on it.

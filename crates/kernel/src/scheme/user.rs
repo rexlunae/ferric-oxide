@@ -2016,6 +2016,14 @@ impl KernelScheme for UserScheme {
         _stored_flags: u32,
         token: &mut CleanLockToken,
     ) -> Result<usize> {
+        // Ferric Oxide: a description the file system attached to a page cache object for
+        // writing may be written into the cache (`kernel.pcache`, `page_cache_writeback`).
+        #[cfg(feature = "page_cache_writeback")]
+        if let Some(result) =
+            super::pcache::write_attached(&self.inner, file, buf, offset, call_flags, token)
+        {
+            return result;
+        }
         let ctx = { context::current().read(token.token()).caller_ctx() };
 
         let mut address = self.inner.capture_user(buf, token)?;
