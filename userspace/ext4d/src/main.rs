@@ -218,7 +218,7 @@ mod daemon {
             );
         }
         let mode = if fs.is_writable() {
-            "read-write (times, mode and owner only)"
+            "read-write (times, mode, owner and in-place data only)"
         } else {
             "read-only"
         };

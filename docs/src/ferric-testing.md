@@ -740,6 +740,19 @@ runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
 
+### Driver executor event reads
+
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`
+tests the event-read adapter used by queue-based drivers, including NVMe.
+An interrupted event read (`EINTR`) is retried without dispatching an event;
+other queue errors remain fatal. Regressions cover repeated interruptions,
+the eventual event's complete payload, immediate success and terminal errors
+before or after an interruption. `cargo test --locked -p ferric-exec-core
+--test driver_event_read` includes the same driver module, so its portable tests
+also run on hosts without libredox event support. The host-tools driver job runs
+the executor package tests and compiles the NVMe configurations below. Host mocks do not establish why
+a guest read was interrupted; repeat image boots remain the target check.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual
