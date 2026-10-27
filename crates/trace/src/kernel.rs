@@ -444,6 +444,40 @@ crate::events! {
         level: Debug,
         args: ["scheme", "count", "bytes"],
     }
+    /// The periodic scheduler tick advanced time on this CPU: the x86 PIT interrupt
+    /// handler just added one `pit::RATE` to `time::OFFSET`, and will broadcast the
+    /// `Pit` IPI, trigger time-scheme timeouts and call the scheduler's tick
+    /// accounting. One record per PIT interrupt, on the CPU that owns the PIT (the
+    /// BSP). Together with `sched.ipi_pit` it counts the periodic timer interrupts
+    /// the tickless work must stop.
+    pub const SCHED_TICK = 33 {
+        name: "sched.tick",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received the periodic `Pit` broadcast IPI the BSP sends after each
+    /// `sched.tick`, and is about to run the scheduler's tick accounting. One record
+    /// per pit IPI, on every non-BSP CPU.
+    pub const SCHED_IPI_PIT = 34 {
+        name: "sched.ipi_pit",
+        subsystem: Sched,
+        level: Info,
+        args: [],
+    }
+
+    /// This CPU received a `Wakeup` IPI and is about to drain the cross-CPU wakeup
+    /// list into its local wakeup list: the number of contexts that were on the
+    /// cross-CPU list. The scheduler can only consider these wakeups when an
+    /// interrupt arrives, so busy CPUs whose interrupts are disabled can run stale
+    /// run queues until the next periodic tick or targeted IPI.
+    pub const SCHED_IPI_WAKE = 35 {
+        name: "sched.ipi_wake",
+        subsystem: Sched,
+        level: Info,
+        args: ["drained"],
+    }
 }
 
 /// The events user space may write through [`crate::abi::EMIT_PATH`]: the process
@@ -719,6 +753,9 @@ mod tests {
         assert_eq!(MM_CLONE.id().get(), 28);
         assert_eq!(MM_DESTROY.id().get(), 29);
         assert_eq!(MM_CLONE_SKIP.id().get(), 30);
+        assert_eq!(SCHED_TICK.id().get(), 33);
+        assert_eq!(SCHED_IPI_PIT.id().get(), 34);
+        assert_eq!(SCHED_IPI_WAKE.id().get(), 35);
         assert_eq!(SCHEME_SQE_DELIVER.id().get(), 31);
         assert_eq!(SCHEME_SQE_DELIVER.subsystem(), Subsystem::Scheme);
         assert_eq!(SCHEME_CQE_RECEIVE.id().get(), 32);

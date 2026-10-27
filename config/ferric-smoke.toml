@@ -48,6 +48,10 @@ ferric-ext4-test = "source"
 # image is built by name (CONFIG_NAME=ferric-smoke), so ferric-config's generated package
 # list does not apply to it and the package has to be named here, as fox is below.
 ext4d = "source"
+# Mounts a FAT32 image with fatd (fs.fat, which CI turns on); skips without it.
+ferric-fat-test = "source"
+# fatd, as features.toml fs.fat = true adds it; named here for the same reason as ext4d above.
+fatd = "source"
 # Serves the LUKS and LVM images of crates/blocklayer with ferric-blockd (fs.luks and fs.lvm,
 # which CI turns on) and reads them back; skips without it.
 ferric-blocklayer-test = "source"
@@ -141,6 +145,7 @@ end
 ferric-ring-test || echo FERRIC_TEST_FAIL ring exited with an error
 ferric-pcache-test || echo FERRIC_TEST_FAIL pcache exited with an error
 ferric-ext4-test || echo FERRIC_TEST_FAIL ext4 exited with an error
+ferric-fat-test || echo FERRIC_TEST_FAIL fat exited with an error
 ferric-blocklayer-test || echo FERRIC_TEST_FAIL blocklayer exited with an error
 # A short, fixed-seed fuzz run; the nightly ferric-fuzz config runs a long one.
 ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited with an error

@@ -11,9 +11,16 @@ The complete source for this example can be found at
 
 > TODO: the example has not been saved to the repo.
 
+> ⚠️ **Warning:** This example uses the older scheme API (`SchemeMut` and
+> `File::create(":vec")`). Current daemons create a socket with
+> `Socket::create()` and register it with `register_sync_scheme`; see
+> [Providing a Scheme](./scheme-operation.md#providing-a-scheme) and
+> [`ptyd`](https://github.com/rexlunae/ferric-oxide/blob/main/userspace/base/ptyd/src/main.rs)
+> for the current flow.
+
 ## Setup
 
-In order to build and run this example in a Redox environment, you'll need to be set up to compile the OS from source. The process for getting a program included in a local Redox build is laid out in the [Including Programs in Redox](./including-programs.md) page. Pause here and follow the `helloworld` example in that guide if you want to get this example running.
+In order to build and run this example for Ferric Oxide, you'll need to be set up to compile the OS from source. The process for getting a program included in a local build is laid out in the [Including Programs](./including-programs.md) page. Pause here and follow the `helloworld` example in that guide if you want to get this example running.
 
 This example assumes that `vec` was used as the name of the crate instead of
 `helloworld`. The crate should therefore be located at
@@ -91,7 +98,7 @@ fn main() {
 ```
 
 When other programs open/read/write/etc against our scheme, the
-Redox kernel will make those requests available to our program via this
+The kernel will make those requests available to our program via this
 scheme handler. Our scheme will read that data, handle the requests, and send
 responses back to the kernel by writing to the scheme handler. The kernel will
 then pass the results of operations back to the caller.
@@ -127,7 +134,7 @@ Now let's deal with the specific operations on our scheme. The
 `scheme.handle(...)` call dispatches requests to these methods, so that we
 don't need to worry about the gory details of the `Packet` struct.
 
-In most Unix systems (Redox included!), a program needs to open a file before it
+In most Unix systems (Ferric Oxide included!), a program needs to open a file before it
 can do very much with it. Since our scheme is just a "virtual filesystem",
 programs call `open` with the path to the "file" they want to interact with
 when they want to start a conversation with our scheme.

@@ -1,7 +1,32 @@
 # Getting started
 
-Redox is still at experimental/alpha stage, but there are many things that you can do with it, and it's fun to try it out. You can start by downloading and running the latest release. Read the instructions for [running in a virtual machine](./running-vm.md) or [running on real hardware](./real-hardware.md).
+Ferric Oxide is under heavy development and has no releases yet, so there are
+no downloadable images. You build an image from source and run it in QEMU,
+which takes a few commands:
 
-The [Building Redox](./podman-build.md) page has information about configuring your system to build Redox, which is necessary if you want to contribute to the development. The [Advanced Podman Build](./advanced-podman-build.md) page gives a look under the hood of the build process to help you maintain your build environment.
+```sh
+git clone https://github.com/rexlunae/ferric-oxide
+cd ferric-oxide
+cargo xtask setup
+cargo xtask build
+cargo xtask run
+```
 
-By reading the [Build System](./build-system-reference.md) page you can have a complete understanding of the build system.
+The pages in this chapter cover:
+
+- [Building Ferric Oxide](./building-redox.md): the prerequisites and the
+  native Cargo build, which is the recommended path.
+- [Running in a Virtual Machine](./running-vm.md): running the image in QEMU,
+  with or without a display.
+- [Running on Real Hardware](./real-hardware.md): writing a live image to a USB
+  drive and booting it.
+- [Installing](./installing.md): installing onto a disk.
+- [Trying Out the System](./trying-out-redox.md) and [Tasks](./tasks.md):
+  things to do once it boots.
+
+[Build and Configuration](./ferric-build.md) is the full reference for the
+build, including cross-architecture builds, CPU variants and feature
+configuration.
+
+> ⚠️ **Warning:** Ferric Oxide is experimental software. Back up your data
+> before running it on real hardware, and expect bugs.

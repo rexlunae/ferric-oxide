@@ -119,8 +119,9 @@ jobs:
           # default) is in, so ferric-ext4-test mounts its ext4 image, with the journal replay
           # (fs.ext4_journal_replay, also off by default), so it also mounts one that needs
           # recovery, and so is ferric-blockd with both its layers (fs.luks and fs.lvm, off by
-          # default), so ferric-blocklayer-test serves its LUKS and LVM images.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\n' > "$out/ferric.toml"
+          # default), so ferric-blocklayer-test serves its LUKS and LVM images, and so is fatd
+          # (fs.fat, off by default), so ferric-fat-test mounts its FAT32 image.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nfat = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc, initfs and ext4d features,
@@ -566,6 +567,15 @@ jobs:
             grep -aF "FERRIC_TEST_PASS ext4-$step" "$LOG"
           done
           echo "::notice::ferric-ext4-test passed all 7 steps"
+
+      # fs.fat is on, so ferric-fat-test mounts its FAT32 image with fatd and runs every step.
+      - name: Check FAT
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          for step in image mount list read stat erofs; do
+            grep -aF "FERRIC_TEST_PASS fat-$step" "$LOG"
+          done
+          echo "::notice::ferric-fat-test passed all 6 steps"
 
       # fs.luks and fs.lvm are on, so ferric-blocklayer-test serves LVM on LUKS (4 KiB
       # sectors), LUKS on LVM and LUKS1 with ferric-blockd and runs every step.

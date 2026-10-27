@@ -4,7 +4,7 @@
 
 This page lists important programs and libraries known to work on the system and how well they were tested. The system is designed to be source-compatible with POSIX and Linux applications, usually needing only recompilation or small patches.
 
-Programs are cross-compiled by the recipe engine (the cookbook, in `tools/cookbook/`), whose recipes in `recipes/` hold the patches and forks each program needs. The `native` build profile currently installs most applications as prebuilt packages downloaded from Redox's package server, built for Redox's baseline rather than x86-64-v3. Replacing those downloads with packages built and distributed through [`fox`](./ferric-packaging.md) is in progress.
+Programs are cross-compiled by the recipe engine (the cookbook, in `tools/cookbook/`), whose recipes in `recipes/` hold the patches and forks each program needs. The `native` build profile installs most applications as prebuilt packages from the cookbook's configured remote (see [Prebuilt packages](./ferric-packaging.md#prebuilt-packages-repo_binary)); without one they are built from source. CI still points that remote at Redox's package server, whose packages are built for Redox's baseline rather than x86-64-v3, until packages built and distributed through [`fox`](./ferric-packaging.md) replace them.
 
 Everything on the following lists was tested on x86-64; other architectures may not have been tested yet.
 
