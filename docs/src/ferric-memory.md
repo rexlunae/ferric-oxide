@@ -213,6 +213,17 @@ an address space acknowledges only by handling its mailbox like any other
 target. A requester whose target's flag is already set sends no second
 interrupt, because the pending handling will see its post.
 
+On ARM64 every user address space uses ASID 0 (`TCR_EL1.A1` is clear and
+`TTBR0_EL1` carries no ASID), so the TLB is not tagged by process. Switching
+address spaces (`set_table` in `rmm/src/arch/aarch64.rs`) writes the table
+base, runs `isb` so the new base is in effect, and then invalidates the whole
+TLB with `tlbi vmalle1is`. Without that `isb`, the CPU may still walk the old
+table speculatively after the invalidation, leaving the previous process's
+translations behind for the same virtual addresses. After `fork`, the parent
+and child map the same addresses to different frames, so one process then
+writes into the other's memory. TCG does not show this; Apple CPUs under HVF
+do, as a bootstrap panic right after its first fork.
+
 The old catalog option `kernel.pti` is separate from `kernel.cpu.kpti`. It
 describes an experimental inherited path and currently names a Cargo feature
 absent from the kernel manifest. Use `kernel.cpu.kpti` for the implemented

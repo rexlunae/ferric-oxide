@@ -47,8 +47,9 @@ then
     fi
     RELIBC_MAKE_ARGS+=("FEATURE_MATH=--features ${relibc_features}")
 fi
-# The Makefile only tracks sources, so rebuild when the features change.
-ferric_stamp="${FERRIC_RELIBC_FEATURES-upstream}"
+# The Makefile only tracks sources, so rebuild when the features or the debug-info
+# setting (build.debug) change.
+ferric_stamp="${FERRIC_RELIBC_FEATURES-upstream} debuginfo=${COOKBOOK_DEBUGINFO-}"
 if [ "$(cat "${COOKBOOK_BUILD}/ferric.stamp" 2>/dev/null)" != "${ferric_stamp}" ]
 then
     touch "${COOKBOOK_SOURCE}/Cargo.toml"

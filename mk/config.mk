@@ -50,8 +50,10 @@ REPO_APPSTREAM?=0
 REPO_NONSTOP?=0
 ## Do not update source repos, attempt to build in offline condition
 REPO_OFFLINE?=0
-## Do not strip debug info for local build
+## Build local packages unoptimized, with debug assertions and debug info (slow at run time)
 REPO_DEBUG?=0
+## Ferric Oxide: keep debug info in optimized local builds and do not strip them
+REPO_DEBUGINFO?=0
 ## Old config value that need to be corrected
 ifeq ($(ARCH),i686)
 	ARCH=i586
@@ -133,6 +135,10 @@ ifeq ($(REPO_DEBUG),1)
 #TODO: https://gitlab.redox-os.org/redox-os/relibc/-/issues/226
 #	export PROFILE=debug
 #	export RUSTCFLAGS="-Cdebuginfo=2"
+endif
+ifeq ($(REPO_DEBUGINFO),1)
+	export COOKBOOK_NOSTRIP=true
+	export COOKBOOK_DEBUGINFO=true
 endif
 
 UNAME := $(shell uname)

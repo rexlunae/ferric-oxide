@@ -148,6 +148,16 @@ then
     export CPPFLAGS="${CPPFLAGS} -g"
 fi
 
+# Ferric Oxide: COOKBOOK_DEBUGINFO=true (build.debug in ferric.toml) keeps the optimized
+# release build and adds full debug info to it, so debugging a local image does not also
+# make it run unoptimized.
+if [ ! -z "${COOKBOOK_DEBUGINFO}" ]
+then
+    export CARGO_PROFILE_RELEASE_DEBUG=true
+    export CARGO_PROFILE_RELEASE_STRIP=false
+    export CPPFLAGS="${CPPFLAGS} -g"
+fi
+
 if [ ! -z "${COOKBOOK_OFFLINE}" ]
 then
 build_flags+=" --offline"
@@ -515,8 +525,52 @@ killall sccache
 
 #[cfg(test)]
 mod tests {
-    use super::SHARED_PRESCRIPT;
+    use super::{BUILD_PRESCRIPT, SHARED_PRESCRIPT};
     use std::process::Command;
+
+    /// Runs the build prescript with `env` and returns the Cargo flags and release-profile
+    /// overrides it leaves for `cookbook_cargo`.
+    fn cargo_settings(env: &[(&str, &str)]) -> String {
+        let script = format!(
+            "{BUILD_PRESCRIPT}\nprintf '%s|%s|%s|%s' \"$build_flags\" \"$build_type\" \
+             \"${{CARGO_PROFILE_RELEASE_DEBUG-}}\" \"${{CARGO_PROFILE_RELEASE_STRIP-}}\"\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir.path())
+            .env_remove("COOKBOOK_DEBUG")
+            .env_remove("COOKBOOK_DEBUGINFO")
+            .env_remove("COOKBOOK_OFFLINE")
+            .env_remove("CARGO_PROFILE_RELEASE_DEBUG")
+            .env_remove("CARGO_PROFILE_RELEASE_STRIP")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn debug_info_keeps_the_release_build() {
+        assert_eq!(cargo_settings(&[]), "--release|release||");
+        assert_eq!(
+            cargo_settings(&[("COOKBOOK_DEBUGINFO", "true")]),
+            "--release|release|true|false"
+        );
+    }
+
+    #[test]
+    fn unoptimized_builds_drop_release() {
+        assert_eq!(cargo_settings(&[("COOKBOOK_DEBUG", "true")]), "|debug||");
+        // With both set the debug profile wins; the release overrides go unused.
+        assert_eq!(
+            cargo_settings(&[("COOKBOOK_DEBUG", "true"), ("COOKBOOK_DEBUGINFO", "true")]),
+            "|debug|true|false"
+        );
+    }
 
     #[test]
     fn gnu_config_get_writes_the_vendored_config_sub() {

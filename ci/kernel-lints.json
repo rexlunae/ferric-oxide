@@ -2,7 +2,7 @@
   "clippy::arithmetic_side_effects": 359,
   "clippy::assertions_on_constants": 5,
   "clippy::indexing_slicing": 164,
-  "clippy::missing_safety_doc": 31,
+  "clippy::missing_safety_doc": 30,
   "clippy::undocumented_unsafe_blocks": 539,
   "clippy::unwrap_used": 73,
   "dead_code": 16,

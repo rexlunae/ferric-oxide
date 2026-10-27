@@ -19,6 +19,8 @@
 //! - [`counts`] prints how many records each event produced and their rates, and, with
 //!   `--gap`, the gaps between a CPU's consecutive records of an event, as `key=value`
 //!   lines the scheduler baseline protocol reads (`ferric-trace counts`).
+//! - [`tsc`] measures the TSC frequency against the monotonic clock, the value a TSC capture's
+//!   `--tsc-mhz` needs (the `ferric-trace tsc-mhz` command).
 //! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
 //!   sources, IOMMU fault reports) into words, for both views.
 //! - [`perfetto`] converts a capture to the Chrome trace event JSON format, which the Perfetto
@@ -62,3 +64,4 @@ pub mod profile;
 pub mod spans;
 pub mod svg;
 pub mod text;
+pub mod tsc;

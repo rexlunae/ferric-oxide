@@ -105,6 +105,16 @@ pub trait Arch: Clone + Copy {
     }
 
     fn table(table_kind: TableKind) -> PhysicalAddress;
+    /// Installs the top-level page table at `address` for `table_kind` and
+    /// drops every cached translation.
+    ///
+    /// # Safety
+    ///
+    /// `address` must be the physical address of a page-aligned top-level
+    /// table of the kind given by `table_kind` that stays allocated and valid
+    /// while installed. A kernel table must map the code and stack in use at
+    /// the switch. The caller must run with the privilege the architecture
+    /// requires to write the table base register.
     unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress);
 
     #[inline(always)]

@@ -678,6 +678,31 @@ mod tests {
     }
 
     #[test]
+    fn debug_info_and_unoptimized_builds_are_separate_make_variables() {
+        let schema = real_schema();
+        for (option, debuginfo, unoptimized) in [
+            (None, "0", "0"),
+            (Some("build.debug"), "1", "0"),
+            (Some("build.unoptimized"), "0", "1"),
+        ] {
+            let user = option
+                .map(|id| BTreeMap::from([(id.to_owned(), Value::Bool(true))]))
+                .unwrap_or_default();
+            let resolved = resolve(&schema, &user);
+            let output = plan(&schema, &resolved, &root(), Path::new("build/ferric")).unwrap();
+            let mk = file(&output, "config.mk");
+            assert!(
+                mk.contains(&format!("REPO_DEBUGINFO?={debuginfo}\n")),
+                "{option:?}: {mk}"
+            );
+            assert!(
+                mk.contains(&format!("REPO_DEBUG?={unoptimized}\n")),
+                "{option:?}: {mk}"
+            );
+        }
+    }
+
+    #[test]
     fn experimental_rtl8125_is_opt_in() {
         let schema = real_schema();
         for enabled in [false, true] {
