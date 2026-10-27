@@ -73,11 +73,12 @@ pub enum Counter {
     Cr3Same,
     /// Single-page invalidations (`invlpg`, plus `invpcid` for the user PCID with KPTI and
     /// PCID) on the paths that change user mappings: page faults (demand paging, copy on
-    /// write) and the grant code. Boot-time and kernel-text changes are not counted.
+    /// write), the grant code, the local flush of a small `Flusher` batch, and each page of a
+    /// small shootdown this CPU answered. Boot-time and kernel-text changes are not counted.
     FlushPage,
     /// Full flushes of this CPU's TLB other than address-space switches: the local flush of a
-    /// `Flusher` batch, and each shootdown request this CPU answered
-    /// ([`Counter::ShootdownsHandled`]). Each reloads CR3.
+    /// `Flusher` batch that needed a whole-TLB flush, and each such shootdown request this CPU
+    /// answered. Each reloads CR3.
     FlushFull,
     /// `Flusher` batches flushed by this CPU: one per change to a user address space's
     /// mappings (or per 32 queued pages of a larger one) that needed TLB maintenance.
@@ -100,8 +101,8 @@ pub enum Counter {
     /// TLB shootdown IPIs this CPU took. One can find its request already answered, by the
     /// CPU's own polling while it waited on a shootdown of its own or at a context switch.
     TlbIpiReceived,
-    /// Shootdown requests this CPU answered with a full flush, whether in the IPI handler,
-    /// while polling or at a context switch.
+    /// Shootdown requests this CPU answered, with a full flush or page by page, whether in
+    /// the IPI handler, while polling or at a context switch.
     ShootdownsHandled,
     /// IOMMU domain operations (DMA map, unmap, protect) on this CPU that invalidated the
     /// IOTLB of at least one unit.

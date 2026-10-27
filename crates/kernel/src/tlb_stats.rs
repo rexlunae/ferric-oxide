@@ -78,16 +78,27 @@ pub fn flush_page(flush: rmm::PageFlush<RmmA>) {
     tlb_count!(FlushPage);
 }
 
+/// What a finished `Flusher` batch did to this CPU's TLB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalFlush {
+    /// This CPU was not using the address space, so only other CPUs flushed.
+    None,
+    /// This CPU invalidated the batch's pages one by one (each counted as `FlushPage`).
+    Pages,
+    /// This CPU flushed its whole TLB (counted as `FlushFull`).
+    Full,
+}
+
 /// Accounts for a finished `Flusher` batch of `pages` queued entries: `targets` other CPUs
-/// made to flush and acknowledged after `wait_cycles` TSC ticks, and whether this CPU flushed
-/// its whole TLB (`local`; a per-page invalidation counts each page as `FlushPage` instead).
-/// Counts it, and records `mm.tlb_flush`.
+/// made to flush and acknowledged after `wait_cycles` TSC ticks, and what this CPU flushed
+/// (`local`). Counts it, and records `mm.tlb_flush` with `local` set whenever this CPU
+/// flushed anything.
 #[inline(always)]
-pub fn flush_batch(targets: u32, pages: usize, local: bool, wait_cycles: u64) {
+pub fn flush_batch(targets: u32, pages: usize, local: LocalFlush, wait_cycles: u64) {
     let pages = pages as u64;
     tlb_count!(FlushBatches);
     tlb_count!(FlushBatchPages, pages);
-    if local {
+    if local == LocalFlush::Full {
         tlb_count!(FlushFull);
     }
     if targets > 0 {
@@ -100,7 +111,7 @@ pub fn flush_batch(targets: u32, pages: usize, local: bool, wait_cycles: u64) {
         ferric_trace::kernel::MM_TLB_FLUSH,
         targets,
         pages,
-        local,
+        local != LocalFlush::None,
         wait_cycles
     );
 }
