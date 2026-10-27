@@ -5,6 +5,41 @@ use crate::{
     VirtualAddress,
 };
 
+/// A frame or page-table page that [`PageMapper::unmap_span_deferring_tables`],
+/// [`PageMapper::map_phys_or_unlink`] or the undo of [`PageMapper::map_span_or_none`] removed
+/// from a page table.
+///
+/// The mapper has unlinked it but not freed or invalidated anything: other CPUs may still cache
+/// the translation or walks through the table, so the caller must not reuse either kind until a
+/// TLB shootdown covering every CPU that may use the table has completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unmapped {
+    /// The frame that an unmapped 4 KiB page mapped.
+    Page(PhysicalAddress),
+    /// A page-table page left empty and unlinked from its parent. It came from the mapper's
+    /// frame allocator, and the caller now owns it.
+    Table(PhysicalAddress),
+}
+
+/// Why [`PageMapper::map_span_or_none`] mapped nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapSpanError {
+    /// The index of the page that could not be mapped.
+    pub page: usize,
+}
+
+impl core::fmt::Display for MapSpanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "page {} of the span needs a page table that could not be allocated",
+            self.page
+        )
+    }
+}
+
+impl core::error::Error for MapSpanError {}
+
 pub struct PageMapper<A, F> {
     table_kind: TableKind,
     table_addr: PhysicalAddress,
@@ -302,6 +337,85 @@ impl<A: Arch, F: FrameAllocator> PageMapper<A, F> {
             })
         }
     }
+
+    /// Maps the 4 KiB pages `base + i * PAGE_SIZE` for `i` in `0..page_count`, page `i` to the
+    /// frame `frame_for(self, i)` returns, skipping the pages it returns `None` for. `frame_for`
+    /// gets the mapper so that it can look frames up in this same table.
+    ///
+    /// Either every page is mapped or none is. If a page needs a page table that the allocator
+    /// cannot supply, the page tables allocated for that page and the pages already mapped are
+    /// removed again, each reported to `unmapped` as by
+    /// [`Self::unmap_span_deferring_tables`]. Nothing is freed, so this is safe on a table that
+    /// other CPUs use.
+    ///
+    /// New mappings need no local TLB flush on the supported architectures, so the flushes
+    /// [`Self::map_phys`] returns are dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`MapSpanError`] when a page table could not be allocated (or the span leaves the table).
+    ///
+    /// # Safety
+    ///
+    /// The usual requirements for changing the page table apply, and every frame `frame_for`
+    /// returns must be valid to map with `flags`. No page of the span may be mapped beforehand:
+    /// the undo unmaps whatever is mapped there. `frame_for` must return the same answers when
+    /// asked again, and `unmapped` must not access this mapper's table.
+    pub unsafe fn map_span_or_none(
+        &mut self,
+        base: VirtualAddress,
+        page_count: usize,
+        flags: PageFlags<A>,
+        mut frame_for: impl FnMut(&Self, usize) -> Option<PhysicalAddress>,
+        unmapped: &mut impl FnMut(Unmapped),
+    ) -> Result<(), MapSpanError> {
+        for page in 0..page_count {
+            let Some(phys) = frame_for(self, page) else {
+                continue;
+            };
+            let virt = base.add(page * A::PAGE_SIZE);
+            // SAFETY: forwarded from the caller.
+            match unsafe { self.map_phys_or_unlink(virt, phys, flags, unmapped) } {
+                // SAFETY: the page was not mapped, so no TLB holds a translation for it.
+                Some(flush) => unsafe { flush.ignore() },
+                None => {
+                    // SAFETY: forwarded from the caller; nothing is freed.
+                    unsafe { self.unmap_span_deferring_tables(base, page, unmapped) };
+                    return Err(MapSpanError { page });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Maps the 4 KiB page at `virt` to `phys` as [`Self::map_phys`] does. If a page table it
+    /// needs cannot be allocated, it unlinks the empty page tables on `virt`'s path, including
+    /// those it linked before the allocation failed, and reports each to `unmapped` as an
+    /// [`Unmapped::Table`] instead of leaving them in the table, where nothing would free them.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::map_phys`]; `unmapped` must not access this mapper's table, and the caller
+    /// must not reuse what it reports before the shootdown [`Unmapped`] describes.
+    pub unsafe fn map_phys_or_unlink(
+        &mut self,
+        virt: VirtualAddress,
+        phys: PhysicalAddress,
+        flags: PageFlags<A>,
+        unmapped: &mut impl FnMut(Unmapped),
+    ) -> Option<PageFlush<A>> {
+        // SAFETY: forwarded from the caller.
+        let flush = unsafe { self.map_phys(virt, phys, flags, 0) };
+        if flush.is_none() {
+            // SAFETY: forwarded from the caller; the tables are only handed over.
+            unsafe {
+                prune_empty_tables(self.table(), virt, &mut |table| {
+                    unmapped(Unmapped::Table(table))
+                })
+            };
+        }
+        flush
+    }
 }
 
 impl<A: Arch, F> PageMapper<A, F> {
@@ -325,6 +439,96 @@ impl<A: Arch, F> PageMapper<A, F> {
     ) -> Option<(PhysicalAddress, u8, PageFlags<A>, PageFlush<A>)> {
         // SAFETY: forwarded from the caller; the tables are only handed over, not freed.
         unsafe { unmap_phys_with(self.table(), virt, free_table) }
+    }
+
+    /// Unmaps the 4 KiB pages `base + i * PAGE_SIZE` for `i` in `0..page_count` that are mapped,
+    /// and reports each one's frame and each page-table page left empty to `unmapped`, as
+    /// [`Self::unmap_phys_deferring_tables`] does for one page. A page's tables are reported
+    /// before the page.
+    ///
+    /// # Safety
+    ///
+    /// The usual requirements for changing the page table apply. `unmapped` must not access this
+    /// mapper's page table, and the caller must not reuse what it reports before the shootdown
+    /// [`Unmapped`] describes.
+    pub unsafe fn unmap_span_deferring_tables(
+        &mut self,
+        base: VirtualAddress,
+        page_count: usize,
+        unmapped: &mut impl FnMut(Unmapped),
+    ) {
+        for page in 0..page_count {
+            let virt = base.add(page * A::PAGE_SIZE);
+            // SAFETY: forwarded from the caller; the tables are only handed over.
+            let Some((phys, _, _, flush)) = (unsafe {
+                self.unmap_phys_deferring_tables(virt, &mut |table| {
+                    unmapped(Unmapped::Table(table))
+                })
+            }) else {
+                continue;
+            };
+            // SAFETY: the shootdown the caller runs for `Unmapped::Page` covers this CPU too.
+            unsafe { flush.ignore() };
+            unmapped(Unmapped::Page(phys));
+        }
+    }
+}
+
+/// Unlinks the page tables on `virt`'s path below `table` that hold no present entry, deepest
+/// first, and hands each to `free_table`. Only the user half is pruned, as in
+/// [`unmap_phys_with`]; `table` itself is never unlinked.
+///
+/// # Safety
+///
+/// The usual requirements for changing the page table apply; `free_table` must not access the
+/// table.
+unsafe fn prune_empty_tables<A: Arch>(
+    mut table: PageTable<A>,
+    virt: VirtualAddress,
+    free_table: &mut impl FnMut(PhysicalAddress),
+) {
+    let Some(i) = table.index_of(virt) else {
+        return;
+    };
+    if A::KERNEL_SEPARATE_TABLE || i < A::PAGE_ENTRIES / 2 {
+        // SAFETY: forwarded from the caller.
+        unsafe { prune_below(&mut table, virt, free_table) };
+    }
+}
+
+/// [`prune_empty_tables`] without the user-half check: returns whether `table` is empty.
+///
+/// # Safety
+///
+/// As for [`prune_empty_tables`].
+unsafe fn prune_below<A: Arch>(
+    table: &mut PageTable<A>,
+    virt: VirtualAddress,
+    free_table: &mut impl FnMut(PhysicalAddress),
+) -> bool {
+    // SAFETY: `index_of` and `entry` stay within the table, and `next` follows only an entry
+    // that is a table (not a leaf or huge page), as `PageMapper::visit` does.
+    unsafe {
+        let Some(i) = table.index_of(virt) else {
+            return false;
+        };
+        let level = u8::try_from(table.level()).ok().and_then(NonZeroU8::new);
+        let subtable = match (level, table.entry(i)) {
+            (Some(lvl), Some(entry))
+                if !A::entry_flag_large(lvl).is_some_and(|f| f & entry.data() != 0) =>
+            {
+                table.next(i)
+            }
+            _ => None,
+        };
+        if let Some(mut subtable) = subtable
+            && prune_below(&mut subtable, virt, free_table)
+        {
+            // Unlink first, as `unmap_phys_inner` does.
+            table.set_entry(i, PageEntry::new(0, 0));
+            free_table(subtable.phys());
+        }
+        (0..A::PAGE_ENTRIES).all(|j| !table.entry(j).is_some_and(|e| e.present()))
     }
 }
 
@@ -409,26 +613,43 @@ mod tests {
 
     use crate::{
         emulate::{fresh_machine, EmulateArch},
-        Arch, FrameAllocator, FrameCount, FrameUsage, PageFlags, PageMapper, PhysicalAddress,
-        TableKind, VirtualAddress,
+        Arch, FrameAllocator, FrameCount, FrameUsage, MapSpanError, PageFlags, PageMapper,
+        PhysicalAddress, TableKind, Unmapped, VirtualAddress,
     };
 
-    /// Hands out never-reused frames inside the emulator's 2 MiB physical map, so the mapper can
-    /// reach every table it creates, and records every frame it gets back.
+    /// Hands out never-reused frames from `next` up to `end`, inside the emulator's 2 MiB
+    /// physical map so the mapper can reach every table it creates, and records every frame it
+    /// gets back. Past `end` it is out of memory.
     struct RecordingAllocator {
         next: usize,
+        end: usize,
         freed: Vec<PhysicalAddress>,
+    }
+
+    impl RecordingAllocator {
+        fn new(start: usize, frames: usize) -> Self {
+            let end = start + frames * EmulateArch::PAGE_SIZE;
+            assert!(
+                end <= 2 * crate::MEGABYTE,
+                "outside the emulator's physical map"
+            );
+            Self {
+                next: start,
+                end,
+                freed: Vec::new(),
+            }
+        }
     }
 
     // SAFETY: frames come from a bump pointer and are never handed out twice.
     unsafe impl FrameAllocator for RecordingAllocator {
         fn allocate(&mut self, count: FrameCount) -> Option<PhysicalAddress> {
             let base = self.next;
-            self.next += count.data() * EmulateArch::PAGE_SIZE;
-            assert!(
-                self.next <= 2 * crate::MEGABYTE,
-                "outside the emulator's physical map"
-            );
+            let next = base + count.data() * EmulateArch::PAGE_SIZE;
+            if next > self.end {
+                return None;
+            }
+            self.next = next;
             Some(PhysicalAddress::new(base))
         }
 
@@ -454,10 +675,7 @@ mod tests {
     #[test]
     fn emptied_tables_are_deferred_or_freed() {
         let _machine = fresh_machine();
-        let mut allocator = RecordingAllocator {
-            next: crate::MEGABYTE,
-            freed: Vec::new(),
-        };
+        let mut allocator = RecordingAllocator::new(crate::MEGABYTE, 256);
         // SAFETY: `init` loaded a valid table.
         let mut mapper = unsafe { PageMapper::current(TableKind::User, &mut allocator) };
 
@@ -504,5 +722,189 @@ mod tests {
             .freed
             .iter()
             .all(|f| !deferred.contains(f)));
+    }
+
+    const PAGE: usize = EmulateArch::PAGE_SIZE;
+
+    fn user_flags() -> PageFlags<EmulateArch> {
+        PageFlags::<EmulateArch>::new().user(true).write(true)
+    }
+
+    /// A data frame for page `i`. Below the allocators' ranges; nothing reads it.
+    fn frame(i: usize) -> PhysicalAddress {
+        PhysicalAddress::new(0x8_0000 + i * PAGE)
+    }
+
+    fn map_frame(
+        mapper: &mut PageMapper<EmulateArch, &mut RecordingAllocator>,
+        virt: VirtualAddress,
+        phys: PhysicalAddress,
+    ) {
+        // SAFETY: the emulated user half is otherwise unused.
+        let flush = unsafe { mapper.map_phys(virt, phys, user_flags(), 0) }.expect("map page");
+        // SAFETY: nothing reads through this mapping.
+        unsafe { flush.ignore() };
+    }
+
+    fn page_at(base: VirtualAddress, i: usize) -> VirtualAddress {
+        base.add(i * PAGE)
+    }
+
+    #[test]
+    fn map_span_maps_every_source_page_and_skips_holes() {
+        let _machine = fresh_machine();
+        let mut src_alloc = RecordingAllocator::new(crate::MEGABYTE, 64);
+        let mut dst_alloc = RecordingAllocator::new(crate::MEGABYTE + 64 * PAGE, 64);
+        // SAFETY: `init` loaded a valid table.
+        let mut src = unsafe { PageMapper::current(TableKind::User, &mut src_alloc) };
+        // SAFETY: the new table is only used through this mapper.
+        let mut dst = unsafe { PageMapper::create(TableKind::User, &mut dst_alloc) }
+            .expect("allocate the destination table");
+
+        let src_base = VirtualAddress::new(0x1_0000_0000);
+        let dst_base = VirtualAddress::new(0x2_0000_0000);
+        map_frame(&mut src, page_at(src_base, 0), frame(0));
+        map_frame(&mut src, page_at(src_base, 2), frame(2));
+
+        let mut unmapped = Vec::new();
+        // SAFETY: the destination span is unmapped and nothing else uses the table.
+        let result = unsafe {
+            dst.map_span_or_none(
+                dst_base,
+                3,
+                user_flags(),
+                |_, i| src.translate(page_at(src_base, i)).map(|(phys, _)| phys),
+                &mut |u| unmapped.push(u),
+            )
+        };
+
+        assert_eq!(result, Ok(()));
+        assert!(unmapped.is_empty());
+        assert_eq!(
+            dst.translate(page_at(dst_base, 0)).map(|m| m.0),
+            Some(frame(0))
+        );
+        assert!(
+            dst.translate(page_at(dst_base, 1)).is_none(),
+            "the hole stays unmapped"
+        );
+        assert_eq!(
+            dst.translate(page_at(dst_base, 2)).map(|m| m.0),
+            Some(frame(2))
+        );
+    }
+
+    /// `Grant::transfer` in the kernel: the destination runs out of frames for its page tables
+    /// part way through the span. Nothing may change in either address space, and every page
+    /// and table the undo removed must be handed back for the deferred shootdown, not freed.
+    #[test]
+    fn map_span_out_of_frames_leaves_both_tables_unchanged() {
+        let _machine = fresh_machine();
+        let mut src_alloc = RecordingAllocator::new(crate::MEGABYTE, 64);
+        // The top-level table, then PDPT, PD and PT for pages 0 and 1, then the PD for pages 2
+        // and 3, which sit past a 1 GiB boundary. Their PT does not fit.
+        let mut dst_alloc = RecordingAllocator::new(crate::MEGABYTE + 64 * PAGE, 5);
+        // SAFETY: `init` loaded a valid table.
+        let mut src = unsafe { PageMapper::current(TableKind::User, &mut src_alloc) };
+        // SAFETY: the new table is only used through this mapper.
+        let mut dst = unsafe { PageMapper::create(TableKind::User, &mut dst_alloc) }
+            .expect("allocate the destination table");
+
+        let src_base = VirtualAddress::new(0x1_0000_0000);
+        let dst_base = VirtualAddress::new(0x8000_0000 - 2 * PAGE);
+        for i in 0..4 {
+            map_frame(&mut src, page_at(src_base, i), frame(i));
+        }
+
+        let mut unmapped = Vec::new();
+        // SAFETY: the destination span is unmapped and nothing else uses the table.
+        let result = unsafe {
+            dst.map_span_or_none(
+                dst_base,
+                4,
+                user_flags(),
+                |_, i| src.translate(page_at(src_base, i)).map(|(phys, _)| phys),
+                &mut |u| unmapped.push(u),
+            )
+        };
+
+        assert_eq!(result, Err(MapSpanError { page: 2 }));
+        for i in 0..4 {
+            assert!(
+                dst.translate(page_at(dst_base, i)).is_none(),
+                "page {i} undone"
+            );
+            assert_eq!(
+                src.translate(page_at(src_base, i)).map(|m| m.0),
+                Some(frame(i)),
+                "source page {i} untouched"
+            );
+        }
+        // SAFETY: entry 0 of the top-level table is within bounds.
+        assert!(unsafe { dst.table().entry(0) }.is_some_and(|e| !e.present()));
+
+        let tables: Vec<_> = unmapped
+            .iter()
+            .filter_map(|u| match u {
+                Unmapped::Table(t) => Some(*t),
+                Unmapped::Page(_) => None,
+            })
+            .collect();
+        let pages: Vec<_> = unmapped
+            .iter()
+            .filter_map(|u| match u {
+                Unmapped::Page(p) => Some(*p),
+                Unmapped::Table(_) => None,
+            })
+            .collect();
+        assert_eq!(pages, [frame(0), frame(1)]);
+        // Every table but the top level, including the PD linked for page 2 before its PT
+        // failed, is handed back once.
+        let mut expected: Vec<_> = (1..5)
+            .map(|i| PhysicalAddress::new(crate::MEGABYTE + (64 + i) * PAGE))
+            .collect();
+        let mut tables_sorted = tables.clone();
+        tables_sorted.sort();
+        expected.sort();
+        assert_eq!(tables_sorted, expected);
+        assert!(
+            dst.allocator().freed.is_empty(),
+            "nothing freed before the shootdown"
+        );
+    }
+
+    /// Moving a page within one table, the way `Grant::transfer` does it: the destination is
+    /// mapped before the source is unmapped, so a page table both share is never left empty
+    /// (and handed back) in between, and the move needs no frame once the mapping succeeded.
+    #[test]
+    fn move_within_one_table_keeps_the_shared_page_table() {
+        let _machine = fresh_machine();
+        // Only the PDPT, PD and PT for the source page: the move itself may allocate nothing.
+        let mut allocator = RecordingAllocator::new(crate::MEGABYTE, 3);
+        // SAFETY: `init` loaded a valid table.
+        let mut mapper = unsafe { PageMapper::current(TableKind::User, &mut allocator) };
+
+        let src_page = VirtualAddress::new(0x1_0000_0000);
+        let dst_page = VirtualAddress::new(0x1_0000_1000);
+        map_frame(&mut mapper, src_page, frame(0));
+
+        let mut unmapped = Vec::new();
+        // SAFETY: the destination page is unmapped and nothing else uses the table.
+        let result = unsafe {
+            mapper.map_span_or_none(
+                dst_page,
+                1,
+                user_flags(),
+                |m, _| m.translate(src_page).map(|(phys, _)| phys),
+                &mut |u| unmapped.push(u),
+            )
+        };
+        assert_eq!(result, Ok(()));
+        // SAFETY: as above.
+        unsafe { mapper.unmap_span_deferring_tables(src_page, 1, &mut |u| unmapped.push(u)) };
+
+        assert_eq!(unmapped, [Unmapped::Page(frame(0))], "no table emptied");
+        assert_eq!(mapper.translate(dst_page).map(|m| m.0), Some(frame(0)));
+        assert!(mapper.translate(src_page).is_none());
     }
 }
