@@ -17,7 +17,8 @@
 //!
 //! - `EMPTY`: nothing pending. Only the target sets it, when it takes the content.
 //! - `WRITING`: one requester owns the slots and is filling them. A requester gets there only
-//!   from `EMPTY`, so `WRITING` never hides an earlier request that was not taken.
+//!   from `EMPTY` without the stale-writer bit (below), so `WRITING` never hides an earlier
+//!   request that was not taken, and no one else stores to the slots meanwhile.
 //! - `READY`: the slots hold a page list for the target.
 //! - `ALL`: the target must flush everything.
 //!
@@ -26,6 +27,13 @@
 //! then covers both requests. A requester whose own request is a full flush also posts `ALL`.
 //! So the content of the mailbox is always at least the union of every request posted since the
 //! last take, and a receiver never does less than any pending requester needs.
+//!
+//! The requester displaced from `WRITING` may still be storing to the slots. So the upgrade
+//! also sets a stale-writer bit, which the `ALL` keeps through its take (to `EMPTY`) and through
+//! later posts (an `EMPTY` with the bit becomes `ALL`, not `WRITING`), until the displaced
+//! requester clears it with a `Release` CAS after its last store. Without it, the displaced
+//! stores could land on top of the next owner's list, and the target would invalidate the
+//! wrong pages.
 //!
 //! A receiver that finds `EMPTY` or `WRITING` has nothing to take: every request posted before
 //! the flag it is answering was set has been taken already, by an earlier handling on this CPU
@@ -191,6 +199,12 @@ const LEN_MASK: usize = SLOT_COUNT_MASK;
 const SEQ_SHIFT: u32 = TAG_BITS + SLOT_COUNT_BITS;
 const _: () = assert!(TLB_SINGLE_PAGE_FLUSH_CEILING <= LEN_MASK);
 
+/// In an `EMPTY` or `ALL` state (which have no length), the length field's lowest bit: a
+/// requester displaced from `WRITING` may still be storing to the slots, so nobody may claim
+/// them. At most one such writer exists, because claiming needs this bit clear; it clears the
+/// bit itself when its stores are done.
+const STALE_WRITER: usize = 1 << LEN_SHIFT;
+
 const fn state(tag: usize, len: usize, seq: usize) -> usize {
     seq << SEQ_SHIFT | len << LEN_SHIFT | tag
 }
@@ -228,13 +242,19 @@ impl TlbMailbox {
         }
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
+            let stale = current & STALE_WRITER;
             let (tag, desired) = match current & TAG_MASK {
                 TAG_ALL => return,
-                TAG_EMPTY if !inv.is_all() => {
+                TAG_EMPTY if !inv.is_all() && stale == 0 => {
                     (TAG_WRITING, state(TAG_WRITING, 0, next_seq(current)))
                 }
-                // A full flush, or a request the target has not taken yet: one `ALL` covers it
-                // and this one.
+                // A full flush, or slots a displaced writer may still be storing to.
+                TAG_EMPTY => (TAG_ALL, state(TAG_ALL, 0, next_seq(current)) | stale),
+                // The owner of the slots has not published them yet: one `ALL` covers its
+                // request and this one, and the owner, displaced, must clear `STALE_WRITER`
+                // before anyone else may claim the slots.
+                TAG_WRITING => (TAG_ALL, state(TAG_ALL, 0, next_seq(current)) | STALE_WRITER),
+                // A request the target has not taken yet: one `ALL` covers it and this one.
                 _ => (TAG_ALL, state(TAG_ALL, 0, next_seq(current))),
             };
             match self.state.compare_exchange_weak(
@@ -251,17 +271,34 @@ impl TlbMailbox {
     }
 
     /// Fills the slots this requester owns since it moved the state to `writing`, and publishes
-    /// them.
+    /// them. If another requester displaced it meanwhile, clears `STALE_WRITER` instead, which
+    /// lets the next requester claim the slots after these stores.
     fn fill(&self, inv: &TlbInvalidation, writing: usize) {
         for (slot, &range) in self.slots.iter().zip(inv.slots.iter().take(inv.len)) {
             slot.store(range, Ordering::Relaxed);
         }
         let ready = state(TAG_READY, inv.len, writing >> SEQ_SHIFT);
-        // Fails only if another requester upgraded the mailbox to `ALL`, which covers this
-        // request too.
-        let _ = self
-            .state
-            .compare_exchange(writing, ready, Ordering::Release, Ordering::Relaxed);
+        let mut current = writing;
+        loop {
+            // `Release`: the next claimer's `Acquire` CAS orders these slot stores before its
+            // own, and a receiver that takes `ready` sees them.
+            let desired = if current == writing {
+                ready
+            } else {
+                // Displaced: the `ALL` that displaced this request covers it. `STALE_WRITER`
+                // stays set until here, through takes and later posts.
+                current & !STALE_WRITER
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                desired,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Takes what is pending, leaving the mailbox empty. Returns an empty invalidation if
@@ -282,7 +319,14 @@ impl TlbMailbox {
                     inv
                 }
             };
-            let empty = state(TAG_EMPTY, 0, current >> SEQ_SHIFT);
+            // A displaced writer may still be storing to the slots: keep it marked. (Only `ALL`
+            // can carry the mark; in `READY` the bit belongs to the length.)
+            let stale = if taken.is_all() {
+                current & STALE_WRITER
+            } else {
+                0
+            };
+            let empty = state(TAG_EMPTY, 0, current >> SEQ_SHIFT) | stale;
             match self
                 .state
                 .compare_exchange(current, empty, Ordering::AcqRel, Ordering::Acquire)
@@ -439,6 +483,44 @@ mod tests {
         mailbox.post(&of(&[(2, 1)]));
         mailbox.fill(&first, writing);
         assert_eq!(received(&mailbox), None);
+    }
+
+    /// A requester displaced from `WRITING` may still be storing its list. Until it is done,
+    /// nobody may claim the slots, or its late stores would overwrite the next owner's list and
+    /// the target would invalidate the wrong page (what made
+    /// `concurrent_requesters_are_all_covered` fail now and then).
+    #[test]
+    fn displaced_writer_keeps_the_slots_until_it_is_done() {
+        let mailbox = TlbMailbox::new();
+        let slow = of(&[(1, 1)]);
+        // The slow requester owns the slots but has not stored anything yet.
+        let writing = state(TAG_WRITING, 0, 1);
+        mailbox.state.store(writing, Ordering::Relaxed);
+        // A second requester displaces it, and the target takes the resulting `ALL`.
+        mailbox.post(&of(&[(2, 1)]));
+        assert_eq!(received(&mailbox), None);
+        // A third requester must not claim the slots while the slow one may still store.
+        mailbox.post(&of(&[(3, 1)]));
+        assert_eq!(mailbox.state.load(Ordering::Relaxed) & TAG_MASK, TAG_ALL);
+        // The slow requester's stores land now, then it lets go of the slots.
+        mailbox.fill(&slow, writing);
+        assert_eq!(mailbox.state.load(Ordering::Relaxed) & STALE_WRITER, 0);
+        assert_eq!(received(&mailbox), None, "page 3 needs a full flush");
+        // The slots are free again.
+        mailbox.post(&of(&[(4, 1)]));
+        assert_eq!(received(&mailbox).unwrap(), [4]);
+    }
+
+    #[test]
+    fn displaced_writer_finishing_before_the_take_clears_its_mark() {
+        let mailbox = TlbMailbox::new();
+        let writing = state(TAG_WRITING, 0, 1);
+        mailbox.state.store(writing, Ordering::Relaxed);
+        mailbox.post(&of(&[(2, 1)]));
+        mailbox.fill(&of(&[(1, 1)]), writing);
+        assert_eq!(received(&mailbox), None);
+        mailbox.post(&of(&[(5, 1)]));
+        assert_eq!(received(&mailbox).unwrap(), [5]);
     }
 
     #[test]
