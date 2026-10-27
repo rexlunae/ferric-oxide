@@ -522,15 +522,15 @@ audio controllers does not lose every controller to a failed registration.
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
 QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
 failure, a crash after the marker, a nonzero QEMU exit or timeout after the
-marker, an exit during the final timeout poll, a missing test result, a missing
-marker, a smoke shell that could not be linked (which must fail with that message rather
-than a generic timeout), a link failure after the marker (which may pass with a clean exit), a loader
-failure before a later marker (which must fail), a
-program the script starts that fails to link (which must not fail the run), a
-timeout whose NMI context rows (and only those) must reach stderr, and that
-the runner adds both HDA controllers. A Unix monitor socket fixture supplies
-CPL 3 registers and a user frame; it checks the emitted return address and
-that unaligned, out-of-range and halted-CPU frame pointers are not read.
+marker, an exit during the final timeout poll, a missing test result and a missing
+marker. A smoke shell that cannot be linked fails early with that message. Any
+loader failure before a later marker, including a child failure followed by SKIP,
+must fail the run; a link failure first printed after completion may pass with a
+clean QEMU exit. The fixtures also require timeout NMI context rows (and only
+those) on stderr and both HDA controllers in QEMU's arguments. A Unix monitor
+socket fixture supplies CPL 3 registers and a user frame; it checks the emitted
+return address and that unaligned, out-of-range and halted-CPU frame pointers are
+not read.
 The probe consumes the monitor greeting before sending commands, keeping
 register and memory responses aligned with their requests. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop
