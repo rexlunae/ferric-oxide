@@ -25,6 +25,8 @@ Using redox_installer as an installer:
     --live                Use bootloader configured for live disk
     --no-mount            Use RedoxFS AR instead of FUSE to write files
     --cookbook            Build system checkout whose repo/<target>/ holds the packages to install
+    --size                Exact image size in MiB; fail before writing if the packages do not fit
+                          (without it the image grows past filesystem_size to fit them)
     --config-name         Name of the filesystem configuration used for os-release VARIANT
     --fox                 Host fox binary to finish the image root with: sync a
                           package set and write the image SBOM
@@ -35,9 +37,9 @@ Using redox_installer as an installer:
     --fox-sbom            With --fox: write the image's CycloneDX SBOM to this path
 
 Using redox_installer as a configuration parser:
-  redox_installer --config=file.toml [--list-packages|--filesystem-size|--output-config path]
+  redox_installer --config=file.toml [--cookbook=dir] [--list-packages|--filesystem-size|--output-config path]
     --list-packages      List packages will be installed
-    --filesystem-size    Output filesystem size in MB
+    --filesystem-size    Output the image size in MiB: with --cookbook, grown to fit the packages
     --output-config      Path to write the parsed config as another TOML
 "#;
 
@@ -149,6 +151,7 @@ fn main() {
         .add_opt("c", "config")
         .add_opt("o", "output-config")
         .add_opt("", "write-bootloader")
+        .add_opt("", "size")
         .add_flag(&["skip-partition"])
         .add_flag(&["filesystem-size"])
         .add_flag(&["l", "list-packages"])
@@ -169,6 +172,15 @@ fn main() {
     } else {
         redox_installer::Config::default()
     };
+
+    if let Some(size) = parser.get_opt("size") {
+        let Ok(mib) = size.parse::<u32>() else {
+            eprintln!("installer: --size wants a size in MiB, not {size:?}");
+            process::exit(1);
+        };
+        config.general.filesystem_size = Some(mib);
+        config.general.filesystem_size_exact = Some(true);
+    }
 
     // Get toml of merged config
     let merged_toml = toml::to_string_pretty(&config).unwrap();
@@ -191,7 +203,16 @@ fn main() {
     }
 
     if parser.found("filesystem-size") {
-        println!("{}", config.general.filesystem_size.unwrap_or(0));
+        match parser.get_opt("cookbook") {
+            Some(cookbook) => match redox_installer::image_size(&config, Some(&cookbook)) {
+                Ok(size) => println!("{}", size.mib),
+                Err(err) => {
+                    eprintln!("installer: {err:#}");
+                    process::exit(1);
+                }
+            },
+            None => println!("{}", config.general.filesystem_size.unwrap_or(0)),
+        }
     } else if parser.found("list-packages") {
         // List the packages that should be fetched or built by the cookbook
         for (packagename, package) in &config.packages {

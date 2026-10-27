@@ -7,8 +7,14 @@ pub struct GeneralConfig {
     pub cookbook: Option<String>,
     /// Allow prompts for missing information such as user password
     pub prompt: Option<bool>,
-    /// Total filesystem size in MB
+    /// Total image size in MiB. The installer grows the image when the
+    /// packages and files it installs need more, unless
+    /// `filesystem_size_exact` is set.
     pub filesystem_size: Option<u32>,
+    /// Make `filesystem_size` the exact image size: the installer fails
+    /// before writing anything when the packages and files do not fit,
+    /// instead of growing the image.
+    pub filesystem_size_exact: Option<bool>,
     /// EFI partition size in MB, default to 2MB
     pub efi_partition_size: Option<u32>,
     /// Skip disk partitioning, assume whole disk is a partition
@@ -31,6 +37,7 @@ impl GeneralConfig {
             self.cookbook = Some(cookbook);
         }
         self.filesystem_size = other.filesystem_size.or(self.filesystem_size);
+        self.filesystem_size_exact = other.filesystem_size_exact.or(self.filesystem_size_exact);
         self.efi_partition_size = other.efi_partition_size.or(self.efi_partition_size);
         self.skip_partitions = other.skip_partitions.or(self.skip_partitions);
         if let Some(encrypt_disk) = other.encrypt_disk {

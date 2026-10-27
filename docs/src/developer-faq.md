@@ -250,7 +250,7 @@ Insert the `CONFIG_NAME?=your-config-name` environment variable to your `.config
 
 ### How can I increase the filesystem size of my QEMU image?
 
-Change the `filesystem_size` data type of your filesystem configuration at: `config/$ARCH/your-config.toml` and run the `make image` command, read the [Filesystem Size](./configuration-settings.md#filesystem-size) section for more details.
+The image already grows to fit its packages. For more free space, raise `filesystem_size` in your filesystem configuration at `config/$ARCH/your-config.toml` (or set `image.filesystem_size` in `ferric.toml`) and run the `make image` command, read the [Filesystem Size](./configuration-settings.md#filesystem-size) section for more details.
 
 ### How can I change the CPU architecture of my build system?
 

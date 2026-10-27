@@ -307,9 +307,9 @@ The filesystem configurations for a given CPU architecture can be found in the [
 
 ### Filesystem Size
 
-The filesystem size is the total amount of storage space allocated for the filesystem that is built into the image, including all programs. It is specified in Megabytes (MB). The typical size is 512MB, although some configs (e.g., `demo`) are larger. The filesystem must be large enough to accommodate the packages included in the filesystem. For a *livedisk* system, the filesystem must not exceed the size of your system's RAM, and must also leave room for the package's installation and system execution.
+The filesystem size is the total size of the image, in MiB, including all programs. For a *livedisk* system the whole image is loaded into RAM, so it must leave room in your system's (or QEMU's `QEMU_MEM`) memory to run.
 
-The filesystem size is normally set from the **filesystem configuration** file, e.g. `config/x86_64/demo.toml`.
+The size comes from the **filesystem configuration** file, e.g. `config/x86_64/demo.toml`:
 
 ```toml
 [general]
@@ -318,18 +318,19 @@ filesystem_size = 768
 ...
 ```
 
-To change this, it is recommended that you create your own filesystem configuration and apply changes there. However, this can be temporarily overridden on the `make` command line, e.g.:
+That value is where sizing starts. The installer adds up what the configured packages and their dependencies take once installed, reading the archives in `repo/<target>/`, adds the configuration's own files and headroom (a quarter more, plus 64 MiB), and grows the image when `filesystem_size` is smaller. It prints both numbers:
 
-```sh
-make FILESYSTEM_SIZE=512 image qemu
+```
+Image needs 940 MiB (700 MiB of packages); building it at 940 MiB
 ```
 
-> ⚠️ **Warning:** setting the `filesystem_size` value too low will produce an error resembling the following:
->
-> ```
-> thread 'main' panicked at src/lib.rs:94:53:
-> called `Result::unwrap()` on an `Err` value: Error(Path("/tmp/redox_installer_759506/include/openssl/.pkgar.srtp.h"), State { next_error: Some(Os { code: 28, kind: StorageFull, message: "No space left on device" }), backtrace: InternalBacktrace { backtrace: None } })
-> ```
+To fix the size instead, set `filesystem_size_exact = true` beside `filesystem_size`, set `image.filesystem_size` in `ferric.toml` (`make menuconfig`), or pass it on the `make` command line:
+
+```sh
+make FILESYSTEM_SIZE=2048 image qemu
+```
+
+A fixed size that is too small stops the build before anything is written, with the size the image needs.
 
 ### Filesystem Customization
 
