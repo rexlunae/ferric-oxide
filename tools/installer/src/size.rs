@@ -30,9 +30,6 @@ const FIXED_HEADROOM_MIB: u64 = 64;
 /// configured ones, logs, and whatever the running system writes.
 const HEADROOM_QUARTERS: u64 = 5;
 
-/// The cookbook's public signing key, relative to the cookbook.
-const COOKBOOK_PUBLIC_KEY: &str = "build/id_ed25519.pub.toml";
-
 /// The size an image is built at, and what it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageSize {
@@ -93,7 +90,7 @@ pub fn packages_size(config: &Config, cookbook: Option<&str>) -> anyhow::Result<
         return Ok(0);
     }
     let cookbook = Path::new(cookbook.ok_or(PackageInstallError::NoRepository)?);
-    let key = fox_core::keys::load_key_file(&cookbook.join(COOKBOOK_PUBLIC_KEY))?;
+    let key = fox_core::keys::load_key_file(&cookbook.join(fox_core::cookbook::PUBLIC_KEY))?;
     let mut keys = fox_core::TrustedKeys::new();
     keys.insert(key.label, key.key);
     // Planned against an empty root, every package is in the plan.

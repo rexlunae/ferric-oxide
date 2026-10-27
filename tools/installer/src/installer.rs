@@ -188,9 +188,13 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     }
     let cookbook = Path::new(cookbook.ok_or(PackageInstallError::NoRepository)?);
 
-    let key = install_fox_key(cookbook, dest)?;
+    let key = fox_core::keys::install_key_file(
+        &cookbook.join(fox_core::cookbook::PUBLIC_KEY),
+        dest,
+        fox_core::keys::COOKBOOK_LABEL,
+    )?;
     let mut keys = fox_core::TrustedKeys::new();
-    keys.insert(FOX_COOKBOOK_LABEL, key.key);
+    keys.insert(key.label, key.key);
     let store = fox_store::Store::open(dest)?;
     let plan = plan_cookbook_packages(names, cookbook, keys, &store)?;
     // Without features.toml packages.signed_manifests, cookbook archives
