@@ -200,6 +200,9 @@ mod tests {
                 crate::kernel::SCHED_PROC_EXEC.id(),
                 crate::kernel::SCHED_PROC_EXIT.id(),
                 crate::kernel::SCHED_PROC_WAIT.id(),
+                crate::kernel::SCHED_TICK.id(),
+                crate::kernel::SCHED_IPI_PIT.id(),
+                crate::kernel::SCHED_IPI_WAKE.id(),
             ]
         );
     }

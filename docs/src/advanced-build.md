@@ -1,5 +1,9 @@
 # Advanced Build
 
+> ⚠️ **Warning:** This page comes from the Redox OS book and has not been
+> revised for Ferric Oxide yet. Its commands, paths and hardware details may
+> not match this repository; see [Implemented System](./ferric-oxide.md).
+
 In this section, we provide the gory details that may be handy to know if you are contributing to or developing for **Redox**.
 
 Before reading through this section, make sure you have already read:
@@ -9,7 +13,7 @@ Before reading through this section, make sure you have already read:
 
 ## Setup Your Environment
 
-Advanced users may accomplish the same as the [**native_bootstrap.sh**](https://gitlab.redox-os.org/redox-os/redox/-/blob/master/native_bootstrap.sh) script with the following steps:
+The [**native_bootstrap.sh**](https://github.com/rexlunae/ferric-oxide/blob/main/native_bootstrap.sh) script now only runs `cargo xtask setup`, which installs Rust components and Cargo utilities and writes an initial configuration. It doesn't clone the repository or install system packages. A full manual setup has these steps:
 
 - [Clone The Repository](#clone-the-repository)
 - [Install The Necessary Packages](#install-the-necessary-packages-and-emulators)
@@ -30,11 +34,11 @@ cd ~/tryredox
 ```
 
 ```sh
-git clone https://gitlab.redox-os.org/redox-os/redox.git --origin upstream
+git clone https://github.com/rexlunae/ferric-oxide.git
 ```
 
 ```sh
-cd redox
+cd ferric-oxide
 ```
 
 ```sh
@@ -43,21 +47,19 @@ make pull
 
 Please be patient, this can take minutes to hours depending on the hardware and network you're using.
 
-In addition to installing the various packages needed for building Redox, **native_bootstrap.sh** and **podman_bootstrap.sh** both clone the repository, so if you used either script, you have completed Step 1.
-
 ## Install The Necessary Packages and Emulator
 
-If you cloned the sources *before* running **native_bootstrap.sh**, you can use:
+From the cloned repository, prepare the Rust side of the toolchain:
 
 ```sh
-cd ~/tryredox/redox
+cd ~/tryredox/ferric-oxide
 ```
 
 ```sh
-./native_bootstrap.sh -d
+cargo xtask setup
 ```
 
-If you can't use the `native_bootstrap.sh` script, you need to install at least:
+`cargo xtask setup` doesn't install operating-system packages, so you also need at least:
 
 - Essential compilers: GCC, Rust and Nasm
 - GNU search, text, and build tools: `find`, `grep`, `make`, `patch`, `pkg-config`, and `sed`
@@ -195,7 +197,7 @@ guix shell --pure --container --emulate-fhs --network --share=$HOME \
 ```
 
 Then you will be able to run the actual build except for the part that
-uses FUSE to build the root filesystem. Modify `tryredox/redox` in the
+uses FUSE to build the root filesystem. Modify `tryredox/ferric-oxide` in the
 command below to match where your sources are:
 
 ```sh
@@ -208,7 +210,7 @@ guix shell --pure --container --emulate-fhs --network --share=$HOME \
 export LD_LIBRARY_PATH="/lib64:/lib:$LD_LIBRARY_PATH"
 export CI=1
 source ~/.cargo/env
-cd ~/tryredox/redox
+cd ~/tryredox/ferric-oxide
 make all PODMAN_BUILD=0 REPO_BINARY=1
 '
 ```
@@ -422,7 +424,7 @@ Relibc is very active in development, so even with `PREFIX_BINARY=1` it will be 
 
 ## Cookbook
 
-The **Cookbook** system is an essential part of the Redox build system. Each Redox component package  is built and managed by the Cookbook toolset. The variable `REPO_BINARY` in `mk/config.mk` controls if the recipes are compiled from sources or use binary packages from Redox CI server, read the section [REPO_BINARY](./configuration-settings.md#repo_binary) for more details. See the [Including Programs in Redox](./including-programs.md) page for examples of using the Cookbook toolset. If you will be developing recipes to include in Redox.
+The **Cookbook** system is an essential part of the build system. Each Redox component package  is built and managed by the Cookbook toolset. The variable `REPO_BINARY` in `mk/config.mk` controls if the recipes are compiled from sources or use binary packages from Redox CI server, read the section [REPO_BINARY](./configuration-settings.md#repo_binary) for more details. See the [Including Programs in Redox](./including-programs.md) page for examples of using the Cookbook toolset. If you will be developing recipes to include in Redox.
 
 ## sccache
 
@@ -457,7 +459,7 @@ This command also works with a Podman Build, creating a shell in Podman and sett
 If you want to update the build system or if some of the recipes have changed, you can update those parts of the system with `make pull`. However, this will not update the sources of the recipes.
 
 ```sh
-cd ~/tryredox/redox
+cd ~/tryredox/ferric-oxide
 ```
 
 ```sh
@@ -472,4 +474,4 @@ You can modify the size and contents of the filesystem for emulation and *livedi
 
 ## Next Steps
 
-Once this is all set up, we can finally build! See the [Compiling Redox](./building-redox.md#compiling-redox) section.
+Once this is all set up, we can finally build! See the [Compiling Redox](./building-redox.md#build-the-image) section.

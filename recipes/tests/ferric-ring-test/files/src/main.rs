@@ -61,6 +61,8 @@
 //! `--async-only` runs the asynchronous chain and close steps without the other tests or
 //! benchmarks; the trace lifecycle test uses it to exercise worker identity restoration.
 
+#[cfg(any(target_os = "redox", test))]
+mod completions;
 #[cfg(target_os = "redox")]
 mod redox;
 

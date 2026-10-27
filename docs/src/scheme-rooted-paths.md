@@ -1,6 +1,6 @@
 # Scheme-rooted Paths
 
-Scheme-rooted paths are the way that resources are identified on Redox.
+Scheme-rooted paths are the way that resources are identified on Ferric Oxide.
 
 ## What is a Resource
 
@@ -20,7 +20,7 @@ _scheme-name_ is the name of the kind of resource,
 and it also identifies the name used by the manager **daemon** for that kind.
 
 _resource-name_ is the specific resource of that kind.
-Typically in Redox, the _resource-name_ is a path with elements separated by slashes,
+Typically, the _resource-name_ is a path with elements separated by slashes,
 but the resource manager is free to interpret the _resource-name_ how it chooses,
 allowing other formats to be used if required.
 
@@ -31,11 +31,11 @@ These special files use [major/minor](https://en.wikipedia.org/wiki/Device_file#
 to identify the driver and the specific resource within the driver.
 There are also pseudo-filesystems, for example [procfs](https://en.wikipedia.org/wiki/Procfs) that provide access to resources using paths.
 
-Redox's scheme-rooted paths provide a consistent approach to resource naming, compared with Unix.
+Scheme-rooted paths provide a consistent approach to resource naming, compared with Unix.
 
 ## Regular Files
 
-For Redox, a path that does not begin with `/scheme/` is a reference to the the root filesystem, which is managed by the `file` scheme.
+A path that does not begin with `/scheme/` is a reference to the the root filesystem, which is managed by the `file` scheme.
 Thus `/home/user/.bashrc` is interpreted as `/scheme/file/home/user/.bashrc`.
 
 In this case, the scheme is `file` and the resource is
