@@ -1,14 +1,10 @@
 //! Ferric Oxide: building an image root through `fox`.
 //!
-//! After the installer has placed the image's packages, a [`FoxImage`]
-//! runs the host `fox` binary against the image root:
+//! The installer places the image's packages with fox's store, so they
+//! are in fox's database already. A [`FoxImage`] then runs the host `fox`
+//! binary against the image root:
 //!
-//! 1. `fox --root <root> adopt-pkg --allow-unsigned-metadata` takes the
-//!    packages the installer placed into fox's database, so the image boots
-//!    with them already adopted (the first-boot `05_fox-adopt.service`
-//!    then finds nothing to do). Unsigned names are accepted because they
-//!    are the ones the installer took from the image configuration.
-//! 2. With a package set (`fox-packages/1`), `fox --root <root> sync
+//! 1. With a package set (`fox-packages/1`), `fox --root <root> sync
 //!    --config <set> --target <image target>` installs its packages from
 //!    their registries or git sources and writes `fox.lock` beside the set;
 //!    `--locked` makes the build fail unless the lock already pins every
@@ -16,7 +12,7 @@
 //!    picks the x86-64 variants the image's packages are built and
 //!    downloaded for; fox cannot see the image's CPU, so without one it
 //!    uses the set's policy, else the v3 baseline.
-//! 3. With an SBOM path, `fox --root <root> sbom --system --name <name>
+//! 2. With an SBOM path, `fox --root <root> sbom --system --name <name>
 //!    --output <path>` describes every package in the finished root.
 //!
 //! Each step is a separate `fox` process, so the installer depends on
@@ -51,8 +47,6 @@ pub struct FoxImage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FoxStep {
-    /// `fox adopt-pkg`.
-    Adopt,
     /// `fox sync`.
     Sync,
     /// `fox sbom --system`.
@@ -62,7 +56,6 @@ pub enum FoxStep {
 impl fmt::Display for FoxStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Adopt => "adopt-pkg",
             Self::Sync => "sync",
             Self::Sbom => "sbom",
         })
@@ -128,10 +121,7 @@ impl FoxImage {
 
     /// Each step and its arguments after `fox --root <root>`.
     fn steps(&self) -> Vec<(FoxStep, Vec<String>)> {
-        let mut steps = vec![(
-            FoxStep::Adopt,
-            vec!["adopt-pkg".into(), "--allow-unsigned-metadata".into()],
-        )];
+        let mut steps = Vec::new();
         if let Some(packages) = &self.packages {
             let mut args = vec![
                 "sync".into(),
@@ -235,15 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn without_a_package_set_the_image_is_only_adopted() {
+    fn without_a_package_set_or_sbom_nothing_runs() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let fox = image(fake_fox(dir.path(), "none"));
         fox.run(Path::new("/image")).unwrap();
-        assert_eq!(
-            log(dir.path()),
-            "--root /image adopt-pkg --allow-unsigned-metadata\n"
-        );
+        assert!(!dir.path().join("log").exists());
     }
 
     #[test]
@@ -260,8 +247,7 @@ mod tests {
         fox.run(Path::new("/image")).unwrap();
         assert_eq!(
             log(dir.path()),
-            "--root /image adopt-pkg --allow-unsigned-metadata\n\
-             --root /image sync --config config/packages.toml --target x86_64-unknown-redox --level v4 --locked\n\
+            "--root /image sync --config config/packages.toml --target x86_64-unknown-redox --level v4 --locked\n\
              --root /image sbom --system --name ferric-oxide-desktop --output build/image.cdx.json\n"
         );
     }
@@ -286,11 +272,14 @@ mod tests {
         // The SBOM is not written for a root that did not sync.
         assert!(!log(dir.path()).contains("sbom"));
 
-        let missing = image(dir.path().join("no-such-fox"));
+        let missing = FoxImage {
+            sbom: Some("image.cdx.json".into()),
+            ..image(dir.path().join("no-such-fox"))
+        };
         assert!(matches!(
             missing.run(Path::new("/image")),
             Err(FoxError::Spawn {
-                step: FoxStep::Adopt,
+                step: FoxStep::Sbom,
                 ..
             })
         ));
