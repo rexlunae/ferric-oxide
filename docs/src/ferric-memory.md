@@ -247,3 +247,18 @@ Pinned grants cannot be re-shared as ordinary mappings, private copy-on-write
 pages must be allocator-owned, and frames cannot be reused while a CPU or DMA
 mapping may still reach them. [Registered buffers and IOMMUs](ferric-io.md)
 describes the strict teardown and retry behavior that enforces those lifetimes.
+
+When a private copy-on-write page of one address space becomes shared with
+another (`Grant::borrow_fmap`, and the external-mapping fault path in
+`correct_inner`), the kernel copies the page to a new frame and remaps the
+source page to it. The source address space may be running on other CPUs, or
+be the current one (fork shares its own pages this way), so its TLBs still
+translate the page to the old frame. The kernel shoots down every CPU using the
+source address space under its lock, right after the remap, and queues the old
+frame's release on that same flush. The old frame is freed only after those
+CPUs acknowledge, so no store lands in a frame that is being reused. Before
+[#298](https://github.com/rexlunae/ferric-oxide/pull/298) both paths dropped
+that flush ([#297](https://github.com/rexlunae/ferric-oxide/issues/297)). TCG
+hides the bug; it showed up as bootstrap memory rolling back on aarch64 under
+HVF. The fix was validated by an HVF boot on Apple Silicon. CI boots cover
+x86_64 only, and no host test models the remap.
