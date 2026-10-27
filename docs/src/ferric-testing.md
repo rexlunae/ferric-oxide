@@ -335,8 +335,12 @@ futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and
 posts the benchmark as a notice, and `check-iobench-log.sh` checks the disk
-benchmark's lines and A/B and writes its figures to the job summary. Read those
-scripts for the exact required marker set.
+benchmark's lines and A/B and writes its figures to the job summary.
+`check-oneshot-log.sh` checks that the BSP calibrated the TSC and chose a
+clock source, that each of the four CPUs fired every deadline of its one-shot
+timer lateness series, and that the BSP's selftest rounds passed
+(`kernel.time.one_shot`, on in the CI image), and posts the clock source and
+lateness as a notice. Read those scripts for the exact required marker set.
 The `trace-overhead` job boots the images with and without tracing ten times
 each, as ten back-to-back pairs that alternate which image boots first, and
 runs `check-trace-overhead.sh` on the twenty serial logs (see
@@ -858,3 +862,16 @@ mdbook build
 unavailable, report that limitation and at least check local page links,
 anchors, source paths and table-of-contents coverage. Do not report an unrun
 render or OS boot as successful.
+
+### TLB counters
+
+`cargo test --locked -p ferric-trace` covers the `/scheme/sys/tlb` line format
+(`tlb::tests`: round trip, refused lines, wrapping deltas, the per-read
+figures `ferric-iobench` prints) and the catalog checks that keep the TLB
+events at debug level under `trace_mm` and `trace_iommu`. The iobench runner's
+host tests check that the round's start hook (where the first snapshot is
+taken) runs once, before any work. The kernel side is checked by building it:
+Clippy for the kernel target with `--features tlb_stats` and with the debug
+trace levels, and with `iommu = "auto"` so the IOTLB accounting compiles, plus
+the lint ratchet for the default build. The counts themselves need a boot
+(`kernel.tlb_stats = true`; read `/scheme/sys/tlb`, or run `ferric-iobench`).

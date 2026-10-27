@@ -27,6 +27,8 @@
 //!   format.
 //! - [`crash`] is the crash dump a panic writes to reserved memory for the next boot to
 //!   read: its layout, a writer that copies the newest records of each ring, and a parser.
+//! - [`tlb`] holds the kernel's per-CPU TLB, CR3 and shootdown counters (`kernel.tlb_stats`)
+//!   and the line format of `/scheme/sys/tlb`, which serves them.
 //! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
 //!   `init` starts.
 //!
@@ -74,6 +76,7 @@ pub mod profile;
 pub mod record;
 pub mod ring;
 mod select;
+pub mod tlb;
 
 pub use event::{Catalog, Event, EventId, MAX_ARGS, MAX_EVENTS, Subsystem};
 pub use level::{Level, ParseLevelError};

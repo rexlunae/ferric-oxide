@@ -5,6 +5,16 @@ use crate::{
     cpu_set::LogicalCpuId,
 };
 
+/// Ferric Oxide: the time stamp counter now, for trace timestamps (`trace`) and the TLB
+/// counters' wait times (`tlb_stats`). It is not calibrated and not serializing: reads on one
+/// CPU are ordered with each other, and are good for spans of hundreds of cycles or more.
+#[cfg(any(feature = "trace", feature = "tlb_stats"))]
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    // SAFETY: RDTSC reads a counter; it has no side effects and every x86_64 CPU has it.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 pub unsafe fn init(cpu_id: LogicalCpuId) {
     unsafe {
         if has_ext_feat(|feat| feat.has_umip()) {

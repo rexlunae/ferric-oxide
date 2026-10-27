@@ -561,6 +561,8 @@ impl Domain {
         filter: impl Fn(&Unit) -> bool,
     ) -> Result<(), DomainError> {
         let mut done: Vec<usize> = Vec::new();
+        // Ferric Oxide: IOTLB accounting (`tlb_stats`) and iommu.iotlb_flush (`kernel.trace`).
+        let watch = crate::tlb_stats::Stopwatch::start();
         if let Vendor::AmdVi(_) = self.vendor {
             for &(_, index) in &self.attached {
                 if !done.contains(&index) {
@@ -568,6 +570,7 @@ impl Domain {
                     done.push(index);
                 }
             }
+            crate::tlb_stats::iotlb_flush(self.did, iova, len, done.len(), watch.elapsed());
             return Ok(());
         }
         let units = units();
@@ -583,6 +586,7 @@ impl Domain {
             unit.invalidate(&mut state, &[request])?;
             done.push(index);
         }
+        crate::tlb_stats::iotlb_flush(self.did, iova, len, done.len(), watch.elapsed());
         Ok(())
     }
 }

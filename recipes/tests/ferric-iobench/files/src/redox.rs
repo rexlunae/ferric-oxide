@@ -14,6 +14,7 @@ use ferric_iobench::job::{BlockSizeMismatch, Job, JobError, Spec};
 use ferric_iobench::latency::Histogram;
 use ferric_iobench::offsets::Order;
 use ferric_iobench::report::Summary;
+use ferric_trace::tlb::{self, Counters, ModeLine, PerOp, Snapshot};
 use libredox::Fd;
 use libredox::flag::{O_CLOEXEC, O_DIRECTORY, O_RDONLY};
 use syscall::CallFlags;
@@ -21,7 +22,7 @@ use syscall::error::{EIO, EOPNOTSUPP};
 
 use crate::DEFAULT_JOBS;
 use crate::file;
-use crate::round::{SpawnError, run_together};
+use crate::round::{SpawnError, run_together_at};
 
 /// The queue policies a round runs, with their names in the output. The first is the A/B
 /// baseline (the one-queue path) and the second the candidate (the default).
@@ -53,6 +54,10 @@ pub(crate) enum Failure {
     BlockSize(BlockSizeMismatch),
     /// A submitter thread could not be started.
     Spawn(SpawnError),
+    /// `/scheme/sys/tlb` could not be read.
+    TlbRead(std::io::Error),
+    /// `/scheme/sys/tlb` did not parse.
+    TlbParse(tlb::ParseError),
 }
 
 impl fmt::Display for Failure {
@@ -70,6 +75,8 @@ impl fmt::Display for Failure {
             Self::Thread => f.write_str("a submitter thread panicked"),
             Self::BlockSize(_) => f.write_str("the job does not suit the disk"),
             Self::Spawn(_) => f.write_str("a round could not start its submitters"),
+            Self::TlbRead(_) => f.write_str("could not read the kernel's TLB counters"),
+            Self::TlbParse(_) => f.write_str("the kernel's TLB counters did not parse"),
         }
     }
 }
@@ -79,6 +86,8 @@ impl std::error::Error for Failure {
         match self {
             Self::BlockSize(err) => Some(err),
             Self::Spawn(err) => Some(err),
+            Self::TlbRead(err) => Some(err),
+            Self::TlbParse(err) => Some(err),
             _ => None,
         }
     }
@@ -230,12 +239,44 @@ fn set_policy(disk: &Disk, policy: QueuePolicy) -> Result<bool, Failure> {
     }
 }
 
+/// The kernel's TLB counters (`/scheme/sys/tlb`, `kernel.tlb_stats`), when it has them.
+struct TlbStats {
+    path: String,
+    mode: ModeLine,
+}
+
+impl TlbStats {
+    /// The counters' file, or `None` for a kernel built without them.
+    ///
+    /// # Errors
+    ///
+    /// [`Failure::TlbRead`] or [`Failure::TlbParse`] when the file exists but cannot be read.
+    fn probe() -> Result<Option<Self>, Failure> {
+        let path = format!("/scheme/sys/{}", tlb::SYS_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let mode = Snapshot::parse(&text).map_err(Failure::TlbParse)?.mode;
+                Ok(Some(Self { path, mode }))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(Failure::TlbRead(err)),
+        }
+    }
+
+    /// Every CPU's counters now, summed.
+    fn read(&self) -> Result<Counters, Failure> {
+        let text = std::fs::read_to_string(&self.path).map_err(Failure::TlbRead)?;
+        Ok(Snapshot::parse(&text).map_err(Failure::TlbParse)?.total)
+    }
+}
+
 fn run(scheme: &str, jobs: &[Job]) -> Result<(), Failure> {
     let disk = largest_partition(scheme)?;
     let percore = set_policy(&disk, QueuePolicy::Adaptive)?;
+    let tlb = TlbStats::probe()?;
     let result = jobs
         .iter()
-        .try_for_each(|job| bench_job(&disk, job, percore));
+        .try_for_each(|job| bench_job(&disk, job, percore, tlb.as_ref()));
     if percore {
         // Leave the default in place whatever happened.
         set_policy(&disk, QueuePolicy::Adaptive)?;
@@ -262,7 +303,7 @@ impl Totals {
 }
 
 /// Runs `job` with every policy, in rounds, and prints its `FERRIC_BENCH` lines.
-fn bench_job(disk: &Disk, job: &Job, percore: bool) -> Result<(), Failure> {
+fn bench_job(disk: &Disk, job: &Job, percore: bool, tlb: Option<&TlbStats>) -> Result<(), Failure> {
     job.check_block_size(disk.block)
         .map_err(Failure::BlockSize)?;
     if disk.len < job.io_size {
@@ -281,14 +322,41 @@ fn bench_job(disk: &Disk, job: &Job, percore: bool) -> Result<(), Failure> {
     } else {
         vec!["single"]
     };
+    // The TLB counters' growth over each policy's timed parts, when the kernel has them.
+    let mut tlb_totals: Vec<Counters> = names.iter().map(|_| Counters::new()).collect();
     let rounds = run_rounds(job, "policy", &names, percore, |k| {
         if percore {
             set_policy(disk, policies[k].0)?;
         }
-        run_round(disk, job)
+        let (elapsed_ns, latency, tlb_delta) = run_round(disk, job, tlb)?;
+        tlb_totals[k] = tlb_totals[k].sum(&tlb_delta);
+        Ok((elapsed_ns, latency))
     })?;
     rounds.print(job);
+    if let Some(tlb) = tlb {
+        print_tlb(job, &rounds, &tlb_totals, tlb.mode);
+    }
     Ok(())
+}
+
+/// Prints each policy's TLB counter deltas per read, as `FERRIC_BENCH iobench-<job>
+/// tlb_policy=<policy> kpti=<on|off> pcid=<on|off> tlb_ops=… flushes_per_op=…` lines
+/// (`ferric_trace::tlb::PerOp`). The key is `tlb_policy`, not `policy`, so tools that take a
+/// `policy=` line for a result line skip these.
+fn print_tlb(job: &Job, rounds: &Rounds<'_>, tlb_totals: &[Counters], mode: ModeLine) {
+    let label = job.label();
+    let on_off = |on| if on { "on" } else { "off" };
+    for ((name, total), delta) in rounds.names.iter().zip(&rounds.totals).zip(tlb_totals) {
+        let per_op = PerOp {
+            delta,
+            ops: total.latency.count(),
+        };
+        println!(
+            "FERRIC_BENCH iobench-{label} tlb_policy={name} kpti={} pcid={} {per_op}",
+            on_off(mode.kpti),
+            on_off(mode.pcid),
+        );
+    }
 }
 
 /// A job's rounds, run by [`run_rounds`].
@@ -404,19 +472,33 @@ fn print_ab(job: &Job, cmp: Option<Comparison>, rounds: usize) {
 }
 
 /// Reads every block of `job` once, with [`Job::submitters`] threads that share a counter
-/// of reads started, and returns the wall-clock time and the merged latencies. The clock
-/// starts once every thread is ready ([`run_together`]).
-fn run_round(disk: &Disk, job: &Job) -> Result<(u64, Box<Histogram>), Failure> {
+/// of reads started, and returns the wall-clock time, the merged latencies and, with `tlb`,
+/// how much the kernel's TLB counters grew. The clock starts once every thread is ready
+/// ([`run_together_at`]), and the first TLB snapshot is taken just before it.
+fn run_round(
+    disk: &Disk,
+    job: &Job,
+    tlb: Option<&TlbStats>,
+) -> Result<(u64, Box<Histogram>, Counters), Failure> {
     let order = Order::of(job);
     let next = AtomicU64::new(0);
     let bs = job.bs as usize;
-    let timed = run_together(job.submitters(), || submit(disk, &order, &next, bs))
-        .map_err(Failure::Spawn)?;
+    let mut before = None;
+    let timed = run_together_at(
+        job.submitters(),
+        || submit(disk, &order, &next, bs),
+        || before = tlb.map(TlbStats::read),
+    )
+    .map_err(Failure::Spawn)?;
+    let tlb_delta = match (tlb, before) {
+        (Some(tlb), Some(before)) => tlb.read()?.delta(&before?),
+        _ => Counters::new(),
+    };
     let mut latency = Box::new(Histogram::new());
     for result in timed.results {
         latency.merge(&*result.ok_or(Failure::Thread)??);
     }
-    Ok((nanos(timed.elapsed), latency))
+    Ok((nanos(timed.elapsed), latency, tlb_delta))
 }
 
 /// One submitter: takes the next read until the job has none left, one `pread` at a time.

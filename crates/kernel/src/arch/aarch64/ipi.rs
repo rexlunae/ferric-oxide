@@ -64,6 +64,8 @@ pub(crate) fn handle(hwirq: u32, raw_iar: u32) -> bool {
         }
         x if x == IpiKind::Tlb as u32 => {
             unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+            // Ferric Oxide: TLB accounting (`tlb_stats`).
+            crate::tlb_stats::tlb_count!(TlbIpiReceived);
             PercpuBlock::current().maybe_handle_tlb_shootdown();
             true
         }

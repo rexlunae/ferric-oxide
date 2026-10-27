@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 ferric-blkqueue = { path = "../../../../crates/blkqueue" }
 ferric-iobench = { path = "../../../../crates/iobench" }
+ferric-trace = { path = "../../../../crates/trace" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libredox = "0.1.25"
