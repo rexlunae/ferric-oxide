@@ -8,9 +8,6 @@ use spin::Mutex;
 use syscall::error::{Error, Result, EACCES, EBADF, ENODEV};
 use syscall::schemev2::NewFdFlags;
 
-const NUM_SUB_BUFFS: usize = 32;
-const SUB_BUFF_SIZE: usize = 2048;
-
 enum Handle {
     Todo,
     SchemeRoot,
@@ -55,11 +52,6 @@ impl Sb16 {
     fn mixer_read(&mut self, index: u8) -> u8 {
         self.mixer_addr.write(index);
         self.mixer_data.read()
-    }
-
-    fn mixer_write(&mut self, index: u8, value: u8) {
-        self.mixer_addr.write(index);
-        self.mixer_data.write(value);
     }
 
     fn dsp_read(&mut self) -> Result<u8> {

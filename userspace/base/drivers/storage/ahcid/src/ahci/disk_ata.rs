@@ -20,7 +20,6 @@ struct Request {
 }
 
 pub struct DiskATA {
-    id: usize,
     port: &'static mut HbaPort,
     size: u64,
     request_opt: Option<Request>,
@@ -31,7 +30,7 @@ pub struct DiskATA {
 }
 
 impl DiskATA {
-    pub fn new(id: usize, port: &'static mut HbaPort) -> Result<Self> {
+    pub fn new(port: &'static mut HbaPort) -> Result<Self> {
         let mut clb = unsafe { Dma::zeroed()?.assume_init() };
 
         let mut ctbas: [_; 32] = (0..32)
@@ -48,7 +47,6 @@ impl DiskATA {
         let size = unsafe { port.identify(&mut clb, &mut ctbas).unwrap_or(0) };
 
         Ok(DiskATA {
-            id: id,
             port: port,
             size: size,
             request_opt: None,

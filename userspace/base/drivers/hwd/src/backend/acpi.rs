@@ -8,21 +8,14 @@ use syscall::flag::{AcpiVerb, CallFlags};
 
 use super::Backend;
 
-pub struct AcpiBackend {
-    rxsdt: Vec<u8>,
-}
+pub struct AcpiBackend;
 
 impl Backend for AcpiBackend {
     fn new() -> Result<Self, Box<dyn Error>> {
+        // Fails when the kernel found no ACPI tables, so the caller falls back to another
+        // backend.
         let kernel_handle = Fd::open("/scheme/kernel.acpi", libredox::flag::O_CLOEXEC, 0)?;
-        let len =
-            kernel_handle.call_ro(&mut [], CallFlags::empty(), &[AcpiVerb::ReadRxsdt as u64])?;
-        let mut rxsdt = vec![0_u8; len];
-        kernel_handle.call_ro(
-            &mut rxsdt,
-            CallFlags::empty(),
-            &[AcpiVerb::ReadRxsdt as u64],
-        )?;
+        kernel_handle.call_ro(&mut [], CallFlags::empty(), &[AcpiVerb::ReadRxsdt as u64])?;
 
         // Spawn acpid
 
@@ -32,7 +25,7 @@ impl Backend for AcpiBackend {
         #[allow(deprecated, reason = "we can't yet move this to init")]
         daemon::Daemon::spawn(Command::new("acpid"));
 
-        Ok(Self { rxsdt })
+        Ok(Self)
     }
 
     fn probe(&mut self) -> Result<(), Box<dyn Error>> {

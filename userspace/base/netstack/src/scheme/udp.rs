@@ -51,12 +51,10 @@ impl<'a> SchemeSocket for UdpSocket<'a> {
                     let connected_addr = data.addr.unwrap(); // Safe because is_specified() checked it
 
                     // Allow Broadcast special case (DHCP)
-                    let is_broadcast = match connected_addr {
-                        smoltcp::wire::IpAddress::Ipv4(ip) => {
-                            ip == smoltcp::wire::Ipv4Address::BROADCAST
-                        }
-                        _ => false,
-                    };
+                    let is_broadcast = matches!(
+                        connected_addr,
+                        smoltcp::wire::IpAddress::Ipv4(ip) if ip == smoltcp::wire::Ipv4Address::BROADCAST
+                    );
 
                     if !is_broadcast && !connected_addr.is_unspecified() {
                         if source.addr != connected_addr || source.port != data.port {

@@ -1,9 +1,10 @@
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::cell::Cell;
-use std::convert::TryFrom;
 use std::sync::Mutex;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use common::io::{Io as _, Pio};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use log::info;
 use pci_types::{ConfigRegionAccess, PciAddress};
 
@@ -18,6 +19,7 @@ impl Pci {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn set_iopl() {
         // The IO privilege level is per-thread, so we need to do the initialization on every thread.
         thread_local! {
@@ -37,6 +39,7 @@ impl Pci {
         });
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn address(address: PciAddress, offset: u8) -> u32 {
         assert_eq!(
             address.segment(),
@@ -83,12 +86,12 @@ impl ConfigRegionAccess for Pci {
 }
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 impl ConfigRegionAccess for Pci {
-    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
+    unsafe fn read(&self, _addr: PciAddress, _offset: u16) -> u32 {
         let _guard = self.lock.lock().unwrap();
         todo!("Pci::CfgAccess::read on this architecture")
     }
 
-    unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
+    unsafe fn write(&self, _addr: PciAddress, _offset: u16, _value: u32) {
         let _guard = self.lock.lock().unwrap();
         todo!("Pci::CfgAccess::write on this architecture")
     }

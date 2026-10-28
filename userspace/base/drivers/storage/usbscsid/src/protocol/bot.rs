@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 use std::slice;
 
 use xhcid_interface::{
-    ConfDesc, DeviceReqData, EndpBinaryDirection, EndpDirection, EndpointStatus, IfDesc, Invalid,
+    DeviceReqData, EndpBinaryDirection, EndpDirection, EndpointStatus, IfDesc, Invalid,
     PortReqRecipient, PortReqTy, PortTransferStatus, PortTransferStatusKind, XhciClientHandle,
     XhciClientHandleError, XhciEndpHandle,
 };
@@ -88,7 +88,6 @@ pub struct BulkOnlyTransport<'a> {
     bulk_out: XhciEndpHandle,
     bulk_in_num: u8,
     bulk_out_num: u8,
-    max_lun: u8,
     current_tag: u32,
     interface_num: u8,
 }
@@ -96,11 +95,7 @@ pub struct BulkOnlyTransport<'a> {
 pub const FEATURE_ENDPOINT_HALT: u16 = 0;
 
 impl<'a> BulkOnlyTransport<'a> {
-    pub fn init(
-        handle: &'a XhciClientHandle,
-        config_desc: &ConfDesc,
-        if_desc: &IfDesc,
-    ) -> Result<Self, ProtocolError> {
+    pub fn init(handle: &'a XhciClientHandle, if_desc: &IfDesc) -> Result<Self, ProtocolError> {
         let endpoints = &if_desc.endpoints;
 
         let bulk_in_num = (endpoints
@@ -123,7 +118,6 @@ impl<'a> BulkOnlyTransport<'a> {
             bulk_in_num,
             bulk_out_num,
             handle,
-            max_lun,
             current_tag: 0,
             interface_num: if_desc.number,
         })

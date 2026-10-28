@@ -64,7 +64,7 @@ impl Ps2d {
         match ps2.init() {
             Ok(()) => {}
             Err(err) => {
-                log::error!("failed to initialize: {:?}", err);
+                log::error!("failed to initialize: {}", err);
                 process::exit(1);
             }
         }
@@ -75,8 +75,9 @@ impl Ps2d {
 
         // TODO: QEMU hack, maybe do this when Init timed out?
         if vmmouse {
-            // 3 = MouseId::Intellimouse1
-            MouseState::Bat.handle(3, &mut ps2);
+            // 3 = MouseId::Intellimouse1. Only the commands this sends to the mouse matter: with
+            // vmmouse, packets come from the hypervisor, not from this state machine.
+            let _ = MouseState::Bat.handle(3, &mut ps2);
         }
 
         let mut this = Ps2d {
@@ -103,12 +104,6 @@ impl Ps2d {
         }
 
         this
-    }
-
-    pub fn irq(&mut self) {
-        while let Some((keyboard, data)) = self.ps2.next() {
-            self.handle(keyboard, data);
-        }
     }
 
     pub fn time_event(&mut self) {

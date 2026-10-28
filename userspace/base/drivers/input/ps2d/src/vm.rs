@@ -23,8 +23,6 @@ pub const CMD_REQUEST_RELATIVE: u32 = 0x4c455252;
 
 const VERSION: u32 = 0x3442554a;
 
-pub const RELATIVE_PACKET: u32 = 0x00010000;
-
 pub const LEFT_BUTTON: u32 = 0x20;
 pub const RIGHT_BUTTON: u32 = 0x10;
 pub const MIDDLE_BUTTON: u32 = 0x08;

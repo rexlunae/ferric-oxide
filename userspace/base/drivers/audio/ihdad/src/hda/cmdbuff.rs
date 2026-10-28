@@ -95,23 +95,16 @@ impl Corb {
         let corbsize_reg = self.regs.corbsize.read();
         let corbszcap = (corbsize_reg >> 4) & 0xF;
 
-        let mut corbsize_bytes: usize = 0;
         let mut corbsize: u8 = 0;
 
         if (corbszcap & 4) == 4 {
             corbsize = 2;
-            corbsize_bytes = 1024;
-
             self.corb_count = 256;
         } else if (corbszcap & 2) == 2 {
             corbsize = 1;
-            corbsize_bytes = 64;
-
             self.corb_count = 16;
         } else if (corbszcap & 1) == 1 {
             corbsize = 0;
-            corbsize_bytes = 8;
-
             self.corb_count = 2;
         }
 
@@ -253,23 +246,17 @@ impl Rirb {
         let rirbsize_reg = self.regs.rirbsize.read();
         let rirbszcap = (rirbsize_reg >> 4) & 0xF;
 
-        let mut rirbsize_bytes: usize = 0;
         let mut rirbsize: u8 = 0;
 
+        // RIRBSIZE (HDA 1.0a, 3.3.31): 0b10 is 256 entries, 0b01 is 16, 0b00 is 2.
         if (rirbszcap & 4) == 4 {
             rirbsize = 2;
-            rirbsize_bytes = 2048;
-
             self.rirb_count = 256;
         } else if (rirbszcap & 2) == 2 {
             rirbsize = 1;
-            rirbsize_bytes = 128;
-
-            self.rirb_count = 8;
+            self.rirb_count = 16;
         } else if (rirbszcap & 1) == 1 {
             rirbsize = 0;
-            rirbsize_bytes = 16;
-
             self.rirb_count = 2;
         }
 
@@ -277,6 +264,7 @@ impl Rirb {
 
         let addr = self.rirb_base_phys;
         self.set_address(addr);
+        self.regs.rirbsize.write((rirbsize_reg & 0xFC) | rirbsize);
 
         self.reset_write_pointer();
         self.rirb_rp = 0;

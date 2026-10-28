@@ -243,6 +243,7 @@ pub fn move_vector(handle: &File, cpu: CpuId) -> Result<Moved, VectorError> {
 }
 
 /// `err` and its sources, for a log line or a panic message.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn report(err: &dyn std::error::Error) -> String {
     let mut text = err.to_string();
     let mut source = err.source();
