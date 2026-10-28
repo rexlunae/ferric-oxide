@@ -28,6 +28,8 @@ Using redox_installer as an installer:
     --size                Exact image size in MiB; fail before writing if the packages do not fit
                           (without it the image grows past filesystem_size to fit them)
     --config-name         Name of the filesystem configuration used for os-release VARIANT
+    --build-tools-list    File naming the recipes the image builds with, one per line;
+                          installed alongside the packages when general.build_tools is set
     --fox                 Host fox binary to finish the image root with: sync a
                           package set and write the image SBOM
     --fox-packages        With --fox: fox package set to sync into the image

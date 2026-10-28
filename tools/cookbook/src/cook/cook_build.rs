@@ -242,7 +242,13 @@ pub fn build(
     )?;
     for dependency in build_deps.iter() {
         let (_, pkgar, _) = dependency.stage_paths();
-        if dependency.name.is_host() && !tools_are_target {
+        if dependency.name.is_host() {
+            // A tool always joins the toolchain, which is what the recipe runs
+            // tools from and what the guest shims stand in for. Built for the
+            // target it is also a target package, so it joins the sysroot too.
+            if tools_are_target {
+                dep_pkgars.insert((dependency.name.clone(), pkgar.clone()));
+            }
             dep_host_pkgars.insert((dependency.name.clone(), pkgar));
         } else {
             dep_pkgars.insert((dependency.name.clone(), pkgar));
@@ -481,10 +487,19 @@ pub fn build(
             // shims that stand in for the toolchain's binaries on PATH.
             if let Some(guest_tools) = crate::guest_tools_dir() {
                 command.env("COOKBOOK_GUEST_TOOLS", &guest_tools);
+                // The shims run `repo` themselves, and the cookbook's working
+                // directory is the recipe's build dir, so it is named absolutely.
+                let repo = cookbook_root
+                    .join("target/release/repo")
+                    .canonicalize()
+                    .map_err(wrap_io_err!(
+                        "locating the repo binary for guest build tools"
+                    ))?;
+                command.env("COOKBOOK_REPO_BIN", &repo);
                 if let Some(toolchain) = &cookbook_toolchain {
                     command.env(
                         "COOKBOOK_GUEST_TOOLS_SHIMS",
-                        write_guest_tool_shims(&guest_tools, toolchain)?,
+                        write_guest_tool_shims(&guest_tools, toolchain, &repo)?,
                     );
                 }
             }
@@ -677,7 +692,7 @@ pub fn get_sub_target_dir(target_dir: &Path, sub_path: &str) -> PathBuf {
 /// `Error` is large, like every `Result` in this module; the error paths here
 /// are startup failures, not per-file ones, so boxing buys nothing.
 #[allow(clippy::result_large_err)]
-fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path) -> Result<PathBuf> {
+fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path, repo: &Path) -> Result<PathBuf> {
     let bin = toolchain.join("bin");
     let shims = toolchain.join("guest-shims");
     if shims.is_dir() {
@@ -698,8 +713,11 @@ fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path) -> Result<PathBuf
         let entry = entry.map_err(wrap_io_err!(bin.clone(), "reading the toolchain binaries"))?;
         let name = entry.file_name();
         let shim = shims.join(&name);
+        // `repo` sits beside the cookbook_redoxer shim the recipe runs under,
+        // so the shim finds it by the same path rather than guessing one.
         let script = format!(
-            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"${{COOKBOOK_ROOT}}/bin/repo\" guest-run --guest \"{}\" --silent \"${{COOKBOOK_SILENT:-0}}\" -- \"{}\" \"$@\"\n",
+            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"{}\" guest-run --guest \"{}\" --silent \"${{COOKBOOK_SILENT:-0}}\" -- \"{}\" \"$@\"\n",
+            shell_quote(&repo.display().to_string()),
             shell_quote(guest_tools),
             shell_quote(&entry.path().display().to_string()),
         );
@@ -958,9 +976,15 @@ mod tests {
         std::fs::write(bin.join("mdbook"), "").unwrap();
         std::fs::write(bin.join("gperf"), "").unwrap();
 
-        let shims =
-            super::write_guest_tool_shims("/guest/guest.img", &temp.path().join("toolchain"))
-                .unwrap();
+        let repo = temp.path().join("target/release/repo");
+        std::fs::create_dir_all(repo.parent().unwrap()).unwrap();
+        std::fs::write(&repo, "").unwrap();
+        let shims = super::write_guest_tool_shims(
+            "/guest/guest.img",
+            &temp.path().join("toolchain"),
+            &repo,
+        )
+        .unwrap();
 
         for tool in ["mdbook", "gperf"] {
             let shim = shims.join(tool);
@@ -968,6 +992,10 @@ mod tests {
             assert!(
                 script.contains("guest-run") && script.contains("/guest/guest.img"),
                 "the shim dispatches {tool} into the guest: {script}"
+            );
+            assert!(
+                script.contains(repo.to_str().unwrap()),
+                "the shim runs the repo beside this checkout: {script}"
             );
             // The shim stands in for the tool on PATH, so it must be executable.
             assert!(

@@ -1126,27 +1126,29 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
 
 /// Prints the build tools the selected recipes need, one recipe name per line.
 ///
-/// A recipe's `build.dev-dependencies` are the tools it runs while it builds
-/// (the `host:` ones are built for the host by default). `make` collects this
-/// list to install the guest build environment for `build.build_tools =
-/// "guest"`. Names are printed without their `host:`/`target:` selector and
-/// deduplicated, so a tool several recipes need appears once.
+/// A recipe's `build.dev-dependencies` are the tools it runs while it builds.
+/// `make` collects this list to install the guest build environment for
+/// `build.build_tools = "guest"`, so it names the tools themselves rather than
+/// their whole dependency graph: a tool's own dependencies are installed with
+/// it when the environment is built.
 ///
-/// The selected recipes arrive as a flat list for an informational command, so
-/// the recursion starts from their names rather than from the loaded recipes.
+/// Only tools that are recipes are listed: a `host:` name can also be a program
+/// the host provides, and nothing can be built for the guest from that.
 fn handle_build_tools_list(recipes: &[CookRecipe]) -> Result<()> {
-    let names: Vec<RecipeName> = recipes.iter().map(|r| r.name.clone()).collect();
     let mut seen = BTreeSet::new();
-    for tool in CookRecipe::get_all_deps_names_recursive(&names, true)?.iter() {
-        // The walk collects the roots too; only their dependencies are tools.
-        if names.contains(tool) {
-            continue;
+    for recipe in recipes {
+        for tool in &recipe.recipe.build.dev_dependencies {
+            let name = tool.without_prefix();
+            if name.is_empty() || seen.contains(name) {
+                continue;
+            }
+            if staged_pkg::find(name).is_none() {
+                eprintln!("build-tools: no recipe for {name}; it stays a host tool");
+                continue;
+            }
+            seen.insert(name.to_owned());
+            println!("{name}");
         }
-        let name = tool.without_prefix();
-        if name.is_empty() || !seen.insert(name.to_owned()) {
-            continue;
-        }
-        println!("{name}");
     }
     Ok(())
 }

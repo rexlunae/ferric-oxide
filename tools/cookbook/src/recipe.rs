@@ -257,11 +257,14 @@ impl Recipe {
 impl CookRecipe {
     pub fn new(name: RecipeName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
         let target = cook_package::package_target(&name);
-        // A tool built for the guest depends on target packages, so its
-        // dependencies stay unprefixed; only a host tool needs its dependency
-        // chain moved to the host.
-        if name.is_host() && !crate::build_tools_in_guest() {
+        if name.is_host() {
+            // A tool recipe may list itself: python312 builds with its own
+            // interpreter. Dropping that edge is what stops the dependency walk
+            // from descending forever, and it applies however the tool is built.
             let thisname = name.without_prefix();
+            // A tool built for the guest depends on target packages, so its
+            // dependency chain stays unprefixed; a host tool's moves to the host.
+            let tools_are_target = crate::build_tools_in_guest();
             let fn_map = |p: RecipeName| {
                 if p.is_host() {
                     if p.recipe() == thisname {
@@ -271,6 +274,8 @@ impl CookRecipe {
                     }
                 } else if p.is_target() {
                     None
+                } else if tools_are_target {
+                    Some(p)
                 } else {
                     Some(p.with_host())
                 }
@@ -778,6 +783,27 @@ impl VersionExtractor {
 #[cfg(test)]
 mod tests {
     use fox_core::cookbook::RecipeName;
+
+    /// `python312` lists itself as a build tool because it builds with its own
+    /// interpreter. Keeping that edge makes the dependency walk descend until
+    /// it hits the depth limit, which is what broke the tool list: it must be
+    /// dropped however the tool is built, not only for a host build.
+    #[test]
+    fn a_tool_that_lists_itself_drops_that_dependency() {
+        use crate::recipe::{BuildRecipe, Recipe};
+
+        let name = RecipeName::new("python312").unwrap().with_host();
+        let mut recipe = Recipe::default();
+        recipe.build = BuildRecipe {
+            dev_dependencies: vec![name.clone()],
+            ..Default::default()
+        };
+        let cooked = super::CookRecipe::new(name, std::path::PathBuf::from("."), recipe).unwrap();
+        assert!(
+            cooked.recipe.build.dev_dependencies.is_empty(),
+            "a tool's self-reference is dropped from its own dependencies"
+        );
+    }
 
     #[test]
     fn git_cargo_recipe() {

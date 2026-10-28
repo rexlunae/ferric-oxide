@@ -37,6 +37,9 @@ redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui]
     Notes:
     - Setting REDOXER_QEMU_BINARY will print qemu commands to terminal
     - Setting "-o -" will hide qemu serial output, only printing stdout/stderr from the command
+    - x86_64 boots through UEFI when the cookbook's bootloader recipe produced no
+      BIOS bootloader, which is what a Ferric Oxide build does (it is UEFI-only);
+      a checkout that still builds `bootloader.bios` boots through BIOS as before
 
 redoxer pkg [install|remove|update] pkg-1 pkg-2 ...
     Install additional native packages for Cargo

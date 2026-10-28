@@ -44,14 +44,42 @@ pub fn qemu_has_kvm() -> bool {
         }
 }
 
+/// Whether the guest boots through UEFI rather than legacy BIOS.
+///
+/// Ferric Oxide builds a UEFI-only x86_64 image: the bootloader recipe skips the
+/// BIOS binaries when `FERRIC_UEFI_ONLY` is set, which the native toolchain
+/// does, and the build errors instead of falling back to BIOS when firmware is
+/// missing. Upstream Redox still ships a BIOS bootloader for x86_64, so a
+/// checkout that has one keeps using it.
 pub fn qemu_use_uefi() -> bool {
     match target() {
-        "x86_64-unknown-redox" => false,
-        "i586-unknown-redox" | "i686-unknown-redox" => false,
+        // The BIOS bootloader is present only in an upstream-style build.
+        "x86_64-unknown-redox" | "i586-unknown-redox" | "i686-unknown-redox" => {
+            !bootloader_bios_available()
+        }
         "aarch64-unknown-redox" => true,
         "riscv64gc-unknown-redox" => true,
         _ => panic!("Unknown target architecture for QEMU"),
     }
+}
+
+/// Whether the cookbook can supply the BIOS bootloader.
+///
+/// Ferric Oxide builds a UEFI-only x86_64 image: the bootloader recipe skips its
+/// BIOS binaries when `FERRIC_UEFI_ONLY` is set, which the native toolchain
+/// does, and the build errors instead of falling back to BIOS when firmware is
+/// missing. Upstream Redox still builds them, so a checkout that has them boots
+/// the way it always did. The recipe's staged output is what the repository is
+/// published from, so it answers the question without unpacking a package.
+fn bootloader_bios_available() -> bool {
+    let Ok(cookbook) = crate::cookbook_dir() else {
+        return false;
+    };
+    cookbook
+        .join("recipes/core/bootloader/target")
+        .join(target())
+        .join("stage/usr/lib/boot/bootloader.bios")
+        .is_file()
 }
 
 pub fn qemu_use_live_disk() -> bool {
