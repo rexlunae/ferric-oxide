@@ -18,6 +18,8 @@ mod cpu_set;
 mod fmap_reply;
 #[path = "../src/percpu/global_flush.rs"]
 mod global_flush;
+#[path = "../src/context/handoff.rs"]
+mod handoff;
 #[path = "../src/arch/x86_64/ibpb/policy.rs"]
 mod ibpb_policy;
 #[path = "../src/context/idle.rs"]

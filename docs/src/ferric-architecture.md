@@ -121,6 +121,16 @@ eligibility and an existing time slice. It also supports direct context
 switches for scheme requests. [Scheduling](scheduling.md) describes it and
 the planned tickless, asynchronous and real-time work.
 
+A direct scheme handler can run on its client's timeslice. Keeping that
+timeslice does not mean keeping the handler running: a client that becomes
+runnable during selection must regain execution when the handler parks.
+`context/handoff.rs` carries the retained or replacement owner guard through
+this decision, including the address-space handoff. Discarding a retained
+owner used to let a still-blocked NVMe handler return from its event wait
+with a spurious `EINTR` ([#308](https://github.com/rexlunae/ferric-oxide/issues/308)).
+Only the actual idle context reports an idle or contended scheduler return;
+a retained running user context continues its work.
+
 Timed waits are tracked by `context/timeout.rs`; direct switches preserve
 their deadlines so blocked scheme handlers can still wake. Futex wait setup
 and wakeups synchronize through the futex table in `syscall/futex.rs` so a

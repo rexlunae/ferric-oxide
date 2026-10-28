@@ -54,6 +54,9 @@ pub mod context;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod idle;
 
+/// Timeslice selection versus physical context handoff.
+pub(crate) mod handoff;
+
 /// Context switch function
 pub mod switch;
 

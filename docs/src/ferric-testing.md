@@ -197,6 +197,13 @@ Miri requires the `miri` component for the declared nightly toolchain. The
 kernel-lints workflow runs these tests, including Miri; the shared buffer also
 receives the host workspace's strict Clippy and Rustdoc checks.
 
+The included `context/handoff.rs` tests distinguish a timeslice owner from
+the physically running scheme handler. They cover a client becoming runnable
+after the direct-switch check, retention of the running owner, selection of
+an already-running handler, and preservation of the previous/next context and
+address-space guards when a switch is needed. These are the actual handoff
+decisions used by the kernel; host tests do not execute the architecture switch.
+
 The helper package also compiles the actual ordered-lock and wait-condition
 code for empty-list destruction tests, including `drop_panic`. Its host-only
 context/shootdown stubs fail if those hardware paths are reached. The regression
@@ -844,7 +851,15 @@ also run on hosts without libredox event support. The host-tools driver job runs
 the executor package tests, nvmed's host tests (the interrupt masking choice for
 pin-based, MSI and MSI-X vectors), pcid's host tests (one MMIO write per MSI-X
 mask or unmask, counted on a mock register) and compiles the NVMe configurations below. Host mocks do not establish why
-a guest read was interrupted; repeat image boots remain the target check.
+a guest read was interrupted; repeat image boots remain the target check. The
+reproduced spurious interruption in
+[#308](https://github.com/rexlunae/ferric-oxide/issues/308) came from the
+scheduler returning into a blocked NVMe handler after retaining a client that
+had just become runnable. The scheduler now hands execution back to that
+locked client. The retry remains correct for legitimate signal interruptions.
+Repeat image boots and repeated `ferric-blkgrant-test` worker-policy runs
+exercise the real parking/handoff path; retain the first failure and its logs.
+Linux KVM/Kleya confirmation remains required.
 
 ### NVMe phase accounting
 
