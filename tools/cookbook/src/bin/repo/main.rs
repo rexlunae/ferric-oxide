@@ -732,12 +732,22 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
 
         // In-tree recipes build from source under every rule (see
         // CookRecipe::is_in_tree), and so do prebuilts an offline cook
-        // cannot download, so they get their build and dev dependencies
-        // like any source recipe.
-        let (from_source, binary_recipes): (Vec<_>, Vec<_>) =
-            binary_recipes.into_iter().partition(|r| {
-                r.is_in_tree() || offline_cook_without_binaries(config.cook.offline, &command, r)
-            });
+        // cannot download or the remote does not publish, so they get their
+        // build and dev dependencies like any source recipe.
+        // Only target prebuilts can come from the remote, so a host-only or
+        // in-tree list never waits on its index.
+        let remote = if fetches_artifacts(&command)
+            && binary_recipes
+                .iter()
+                .any(|r| !r.name.is_host() && !r.is_in_tree())
+        {
+            fetch_repo::binary_repo()
+        } else {
+            None
+        };
+        let (from_source, binary_recipes): (Vec<_>, Vec<_>) = binary_recipes
+            .into_iter()
+            .partition(|r| builds_from_source(config.cook.offline, &command, remote, r));
         if command.is_building() || command.is_pushing() {
             let names: Vec<_> = from_source.into_iter().map(|r| r.name).collect();
             recipes.extend(CookRecipe::get_build_deps_recursive(
@@ -813,9 +823,7 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     if command.is_building() && recipes.iter().any(|r| r.rule == "binary") {
         let remote = fetch_repo::binary_repo();
         for recipe in recipes.iter_mut() {
-            if recipe.rule == "binary"
-                && !remote.is_some_and(|r| r.index.packages.contains_key(recipe.name.as_str()))
-            {
+            if recipe.rule == "binary" && !remote_publishes(remote, recipe) {
                 if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
                     // TODO: this should be printed at fetch log, not here
                     println!(
@@ -850,6 +858,37 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     }
 
     Ok((config, command, recipes))
+}
+
+/// Whether a recipe the rules make a prebuilt is built from source instead:
+/// it is in the tree, an offline cook cannot download it, or a fetch or cook
+/// cannot get it because `remote` does not publish it. Rule and lock edits
+/// (`change-rule`, `capture-rev`) leave the recipe a prebuilt so they only
+/// touch the recipes they edited before.
+fn builds_from_source(
+    offline: bool,
+    command: &CliCommand,
+    remote: Option<&fetch_repo::BinaryRepo>,
+    recipe: &CookRecipe,
+) -> bool {
+    recipe.is_in_tree()
+        || offline_cook_without_binaries(offline, command, recipe)
+        || (fetches_artifacts(command) && !remote_publishes(remote, recipe))
+}
+
+/// Whether `command` downloads or builds packages, as opposed to only
+/// listing or editing recipe rules and locks.
+fn fetches_artifacts(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Fetch | CliCommand::Cook | CliCommand::CookList
+    )
+}
+
+/// Whether `remote`'s index lists a prebuilt `recipe`; without a remote,
+/// nothing is published.
+fn remote_publishes(remote: Option<&fetch_repo::BinaryRepo>, recipe: &CookRecipe) -> bool {
+    remote.is_some_and(|r| r.index.packages.contains_key(recipe.name.as_str()))
 }
 
 /// Whether `recipe` is a prebuilt that an offline cook, or its `cook-list`
@@ -1191,7 +1230,7 @@ use bail_options_err;
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCommand, offline_cook_without_binaries};
+    use super::{CliCommand, builds_from_source, offline_cook_without_binaries};
     use cookbook::recipe::CookRecipe;
 
     #[test]
@@ -1236,5 +1275,29 @@ mod tests {
             &CliCommand::Cook,
             &recipe
         ));
+    }
+
+    #[test]
+    fn prebuilts_without_a_remote_build_from_source() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("xcb-proto");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recipe.toml"),
+            "[source]\ntar = \"https://example.org/xcb-proto.tar.xz\"\n\n[build]\ntemplate = \"configure\"\ndev-dependencies = [\"host:python312\"]\n",
+        )
+        .unwrap();
+        let recipe = CookRecipe::from_path(&dir, true, false).unwrap();
+
+        for command in [CliCommand::Cook, CliCommand::CookList, CliCommand::Fetch] {
+            assert!(builds_from_source(false, &command, None, &recipe));
+        }
+        for command in [
+            CliCommand::Push,
+            CliCommand::ChangeRule,
+            CliCommand::CaptureRev,
+        ] {
+            assert!(!builds_from_source(false, &command, None, &recipe));
+        }
     }
 }
