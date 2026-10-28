@@ -19,6 +19,8 @@
 //!   netstack answers, so it is asked on a helper thread ([`OwnLookup`]) and the `Own` request
 //!   waits, parked, until the answer is in: netstack is a client of this scheme, and an `fpath`
 //!   made from the request loop while netstack waits in a read of the adapter deadlocks both.
+//!   The helper wakes the request loop through a pipe the driver's event loop watches
+//!   ([`crate::NetworkScheme::wake_handle`]).
 //!
 //! A socket whose rings turn out corrupt, or whose grant its owner revokes (checked on every
 //! tick and call), is stopped: its calls fail with `EIO` and it takes no more frames. A revoke
@@ -31,11 +33,14 @@
 //! socket may ask for raw TX), and per-core workers.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Arc;
 use std::{fmt, thread};
 
 use ferric_netq::call::{Bind, Mode, Request, Stats};
@@ -45,13 +50,13 @@ use ferric_netq::frame::{Headers, MacAddr};
 use ferric_netq::own::{OwnError, OwnedPort};
 use ferric_regbuf::abi::{GrantInfo, Request as RegbufRequest};
 use libredox::call::MmapArgs;
-use libredox::flag::{MAP_SHARED, O_RDONLY, PROT_READ, PROT_WRITE};
+use libredox::flag::{MAP_SHARED, PROT_READ, PROT_WRITE};
 use libredox::Fd;
 use redox_scheme::{CallerCtx, Id, SendFdRequest, Socket};
 use scheme_utils::{FpathWriter, ResourceSync};
 use syscall::{
     CallFlags, Error, EventFlags, FobtainFdFlags, Result, EACCES, EBUSY, ECANCELED, EINVAL, EIO,
-    ENOENT, ENOMEM, ENOSPC, ENOTCONN, EWOULDBLOCK,
+    ENOENT, ENOMEM, ENOSPC, ENOTCONN, EWOULDBLOCK, F_SETFL, O_NONBLOCK,
 };
 
 use crate::{NetworkAdapter, NetworkResource, NetworkSchemeData};
@@ -74,26 +79,59 @@ pub(crate) struct State {
     steering: bool,
     /// The `Own` requests whose socket path a helper thread is asking netstack for.
     lookups: HashMap<Id, OwnLookup>,
-    /// A path in this scheme that the helper threads open to wake the request loop.
-    wake_path: String,
+    /// The pipe the helper threads write a byte to once they have an answer. The driver's
+    /// event loop watches the read end, which is non-blocking, and ticks when it is readable.
+    /// It is a pipe made before the driver enters the null namespace because a helper cannot
+    /// open anything by path after that.
+    wake_reader: PipeReader,
+    wake_writer: Arc<PipeWriter>,
 }
 
 impl State {
-    /// The state of the scheme `scheme_name`, served on `socket`.
-    pub(crate) fn new(socket: Rc<Socket>, scheme_name: &str) -> Self {
-        Self {
+    /// The state of a scheme served on `socket`. Call it before the driver enters the null
+    /// namespace: it makes the wake pipe.
+    ///
+    /// # Errors
+    ///
+    /// The pipe could not be made or made non-blocking.
+    pub(crate) fn new(socket: Rc<Socket>) -> io::Result<Self> {
+        let (wake_reader, wake_writer) = io::pipe()?;
+        libredox::call::fcntl(wake_reader.as_raw_fd() as usize, F_SETFL, O_NONBLOCK)
+            .map_err(io::Error::from)?;
+        Ok(Self {
             socket,
             pending: VecDeque::new(),
             buf: vec![0; FRAME_MAX],
             steering: false,
             lookups: HashMap::new(),
-            wake_path: format!("/scheme/{scheme_name}/mac"),
-        }
+            wake_reader,
+            wake_writer: Arc::new(wake_writer),
+        })
     }
 
-    /// Runs before the parked requests are polled: notes which lookups have their answer, so
-    /// [`State::drop_unclaimed`] can tell those whose `Own` was cancelled.
+    /// The read end of the wake pipe, for the driver's event loop.
+    pub(crate) fn wake_handle(&self) -> Option<usize> {
+        Some(self.wake_reader.as_raw_fd() as usize)
+    }
+
+    /// Runs before the parked requests are polled: empties the wake pipe and notes which
+    /// lookups have their answer, so [`State::drop_unclaimed`] can tell those whose `Own` was
+    /// cancelled.
     pub(crate) fn note_answered(&mut self) {
+        let mut bytes = [0; 64];
+        loop {
+            match self.wake_reader.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    if err.kind() != io::ErrorKind::WouldBlock {
+                        log::warn!("driver-network: reading the wake pipe failed: {err}");
+                    }
+                    break;
+                }
+            }
+        }
         note_answered(&mut self.lookups);
     }
 
@@ -464,7 +502,7 @@ impl<T: NetworkAdapter> Queue<T> {
                 let mut fds = [usize::MAX; 1];
                 request.obtain_fd(&data.bypass.socket, FobtainFdFlags::empty(), &mut fds)?;
                 let [owner] = fds.map(Fd::new);
-                OwnLookup::start(owner, data.bypass.wake_path.clone())?
+                OwnLookup::start(owner, Arc::clone(&data.bypass.wake_writer))?
             }
         };
         lookup.poll();
@@ -519,8 +557,8 @@ impl<T: NetworkAdapter> Queue<T> {
 /// netstack serves `fpath` on its socket from the same loop that reads frames from this
 /// scheme, and those reads block until this scheme's request loop answers them. An `fpath`
 /// made from the request loop can therefore wait on a netstack that waits on it. The helper
-/// thread waits instead, then wakes the request loop by opening [`State`]'s `wake_path`, a
-/// request the loop answers, so the parked `Own` is polled again with the answer in.
+/// thread waits instead, then wakes the request loop through [`State`]'s wake pipe, so the
+/// parked `Own` is polled again with the answer in.
 ///
 /// `S` is the socket's descriptor, generic only so the tests need no Redox descriptors.
 pub(crate) struct OwnLookup<S = Fd> {
@@ -537,7 +575,7 @@ impl OwnLookup {
     /// # Errors
     ///
     /// `ENOMEM` when the thread cannot be started; `owner` is closed then.
-    fn start(owner: Fd, wake_path: String) -> Result<Self> {
+    fn start(owner: Fd, wake: Arc<PipeWriter>) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("netq-own".into())
@@ -549,7 +587,7 @@ impl OwnLookup {
                     .map_err(Error::from);
                 // The answer goes first, so the poll the wake causes finds it.
                 if sender.send(answer).is_ok() {
-                    if let Err(err) = Fd::open(&wake_path, O_RDONLY, 0) {
+                    if let Err(err) = (&*wake).write_all(&[0]) {
                         log::warn!("driver-network: waking the request loop failed: {err}");
                     }
                 }

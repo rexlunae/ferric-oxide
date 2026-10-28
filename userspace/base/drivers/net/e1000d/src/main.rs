@@ -71,6 +71,12 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
             event::EventFlags::READ,
         )
         .expect("e1000d: failed to subscribe to scheme fd");
+    // Ferric Oxide: the bypass wake pipe ticks the scheme too.
+    if let Some(wake) = scheme.wake_handle() {
+        event_queue
+            .subscribe(wake, Source::Scheme, event::EventFlags::READ)
+            .expect("e1000d: failed to subscribe to the wake pipe");
+    }
 
     libredox::call::setrens(0, 0).expect("e1000d: failed to enter null namespace");
 

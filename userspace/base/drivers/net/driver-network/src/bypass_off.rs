@@ -15,8 +15,12 @@ use crate::{NetworkAdapter, NetworkResource, NetworkSchemeData};
 pub(crate) struct State;
 
 impl State {
-    pub(crate) fn new(_socket: Rc<Socket>, _scheme_name: &str) -> Self {
-        Self
+    pub(crate) fn new(_socket: Rc<Socket>) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn wake_handle(&self) -> Option<usize> {
+        None
     }
 
     pub(crate) fn note_answered(&mut self) {}

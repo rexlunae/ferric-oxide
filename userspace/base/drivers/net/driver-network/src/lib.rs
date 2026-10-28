@@ -63,7 +63,7 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         let adapter = adapter_fn();
         let mut scheme = NetworkSchemeImpl::new(
             scheme_name.clone(),
-            NetworkSchemeData::new(adapter, Rc::clone(&socket), &scheme_name),
+            NetworkSchemeData::new(adapter, Rc::clone(&socket)),
             NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
         );
         redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme)
@@ -77,6 +77,14 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
 
     pub fn event_handle(&self) -> &Fd {
         self.handler.socket().inner()
+    }
+
+    /// Ferric Oxide: a second descriptor the driver's event loop watches for reads alongside
+    /// [`NetworkScheme::event_handle`], calling [`NetworkScheme::tick`] when it is readable.
+    /// With the `bypass` feature it is the pipe that a queue socket's `Own` lookup wakes the
+    /// request loop through; without it there is none.
+    pub fn wake_handle(&self) -> Option<usize> {
+        self.scheme.scheme_data().bypass.wake_handle()
     }
 
     pub fn adapter(&self) -> &T {
@@ -154,10 +162,11 @@ struct NetworkSchemeData<T: NetworkAdapter> {
 }
 
 impl<T: NetworkAdapter> NetworkSchemeData<T> {
-    pub fn new(adapter: T, socket: Rc<Socket>, scheme_name: &str) -> Self {
+    pub fn new(adapter: T, socket: Rc<Socket>) -> Self {
         Self {
             adapter,
-            bypass: bypass::State::new(socket, scheme_name),
+            bypass: bypass::State::new(socket)
+                .expect("driver-network: failed to create the bypass wake pipe"),
         }
     }
 }
