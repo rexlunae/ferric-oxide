@@ -347,6 +347,7 @@ pub fn spawn(
         .setup_initial_call(&context.kstack, func, userspace_allowed);
 
     context.userspace = userspace_allowed;
+    context.runs_user_code = userspace_allowed;
     context.queue_key = Some(ContextQueueKey {
         vd: context.vd,
         rem_slice: Reverse(context.rem_slice),

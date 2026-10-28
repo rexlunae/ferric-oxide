@@ -42,6 +42,13 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         get_contexts_count(),
     );
 
+    // Ferric Oxide: context switches that issued an IBPB (arch/x86_64/ibpb.rs).
+    #[cfg(target_arch = "x86_64")]
+    let res = alloc::format!(
+        "{res}ibpb_barriers: {}\n",
+        crate::arch::ibpb::barriers_issued()
+    );
+
     Ok(res.into_bytes())
 }
 

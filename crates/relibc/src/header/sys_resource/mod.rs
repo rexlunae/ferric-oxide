@@ -104,6 +104,9 @@ pub const RLIMIT_RTTIME: c_int = 15;
 ///
 /// Number of limit flavors.
 pub const RLIMIT_NLIMITS: c_int = 16;
+/// Non-POSIX: the BSD and glibc spelling of [`RLIMIT_NLIMITS`], used by
+/// ports such as CPython that also build on macOS.
+pub const RLIM_NLIMITS: c_int = RLIMIT_NLIMITS;
 
 /// Unsigned integer type used for limit values.
 pub type rlim_t = c_ulonglong;

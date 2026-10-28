@@ -274,20 +274,72 @@ impl<A: Arch, F: FrameAllocator> PageMapper<A, F> {
         }
     }
 
+    /// Unmaps the page or huge page containing `virt` and returns its frame, level, flags and a
+    /// flush for the local TLB.
+    ///
+    /// For user addresses (and every address where [`Arch::KERNEL_SEPARATE_TABLE`] is true), the
+    /// page-table pages that the unmap leaves empty are unlinked and returned to the allocator
+    /// immediately. Use [`Self::unmap_phys_deferring_tables`] when another CPU might still be
+    /// using this table.
+    ///
+    /// # Safety
+    ///
+    /// Besides the usual requirements for changing the page table, no CPU may hold
+    /// paging-structure-cache (page-walk cache) entries that point at a page-table page this call
+    /// frees: those let a CPU keep walking through the freed frame after it has been reused. This
+    /// holds when the table is not loaded on any other CPU, and for kernel-half addresses on
+    /// architectures that share the kernel half (no page-table page is freed there).
     pub unsafe fn unmap_phys(
         &mut self,
         virt: VirtualAddress,
     ) -> Option<(PhysicalAddress, u8, PageFlags<A>, PageFlush<A>)> {
-        //TODO: verify virt is aligned
-        let mut table = self.table();
-
-        let unmap_parents = A::KERNEL_SEPARATE_TABLE || table.index_of(virt)? < A::PAGE_ENTRIES / 2; // Is a userspace mapping
-
+        let table = self.table();
+        let allocator = &mut self.allocator;
+        // SAFETY: the caller guarantees that no CPU still caches walks through freed tables.
         unsafe {
-            unmap_phys_inner(virt, &mut table, unmap_parents, &mut self.allocator)
-                // FIXME: may need to construct multiple page flushes if the level is higher
-                .map(|(pa, lvl, pf)| (pa, lvl, pf, PageFlush::new(virt)))
+            unmap_phys_with(table, virt, &mut |table| {
+                allocator.free_one(table);
+            })
         }
+    }
+}
+
+impl<A: Arch, F> PageMapper<A, F> {
+    /// Like [`Self::unmap_phys`], but does not free the page-table pages that the unmap empties.
+    /// Each one is unlinked from its parent and then passed to `free_table`, which owns it from
+    /// then on.
+    ///
+    /// Other CPUs that run on this table may still hold paging-structure-cache entries pointing
+    /// at those pages until their TLBs are invalidated. The caller must therefore free them only
+    /// after a TLB shootdown that covers every such CPU has completed, the same as for the
+    /// unmapped frame itself.
+    ///
+    /// # Safety
+    ///
+    /// The usual requirements for changing the page table apply. `free_table` must not access
+    /// this mapper's page table.
+    pub unsafe fn unmap_phys_deferring_tables(
+        &mut self,
+        virt: VirtualAddress,
+        free_table: &mut impl FnMut(PhysicalAddress),
+    ) -> Option<(PhysicalAddress, u8, PageFlags<A>, PageFlush<A>)> {
+        // SAFETY: forwarded from the caller; the tables are only handed over, not freed.
+        unsafe { unmap_phys_with(self.table(), virt, free_table) }
+    }
+}
+
+unsafe fn unmap_phys_with<A: Arch>(
+    mut table: PageTable<A>,
+    virt: VirtualAddress,
+    free_table: &mut impl FnMut(PhysicalAddress),
+) -> Option<(PhysicalAddress, u8, PageFlags<A>, PageFlush<A>)> {
+    //TODO: verify virt is aligned
+    let unmap_parents = A::KERNEL_SEPARATE_TABLE || table.index_of(virt)? < A::PAGE_ENTRIES / 2; // Is a userspace mapping
+
+    unsafe {
+        unmap_phys_inner(virt, &mut table, unmap_parents, free_table)
+            // FIXME: may need to construct multiple page flushes if the level is higher
+            .map(|(pa, lvl, pf)| (pa, lvl, pf, PageFlush::new(virt)))
     }
 }
 
@@ -295,7 +347,7 @@ unsafe fn unmap_phys_inner<A: Arch>(
     virt: VirtualAddress,
     table: &mut PageTable<A>,
     unmap_parents: bool,
-    allocator: &mut impl FrameAllocator,
+    free_table: &mut impl FnMut(PhysicalAddress),
 ) -> Option<(PhysicalAddress, u8, PageFlags<A>)> {
     unsafe {
         let i = table.index_of(virt)?;
@@ -319,7 +371,7 @@ unsafe fn unmap_phys_inner<A: Arch>(
             (Some(_), _) => table.next(i)?,
         };
 
-        let res = unmap_phys_inner(virt, &mut subtable, unmap_parents, allocator)?;
+        let res = unmap_phys_inner(virt, &mut subtable, unmap_parents, free_table)?;
 
         if unmap_parents {
             // TODO: Use a counter? This would reduce the remaining number of available bits, but could be
@@ -329,8 +381,10 @@ unsafe fn unmap_phys_inner<A: Arch>(
                 .any(|e| e.present());
 
             if !is_still_populated {
-                allocator.free_one(subtable.phys());
+                // Unlink first, so the frame is unreachable from this table before it is handed
+                // over; `free_table` may run a TLB shootdown and free it right away.
                 table.set_entry(i, PageEntry::new(0, 0));
+                free_table(subtable.phys());
             }
         }
 
@@ -344,5 +398,111 @@ impl<A, F: core::fmt::Debug> core::fmt::Debug for PageMapper<A, F> {
             .field("frame", &self.table_addr)
             .field("allocator", &self.allocator)
             .finish()
+    }
+}
+
+#[cfg(all(test, feature = "std", target_pointer_width = "64"))]
+mod tests {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use crate::{
+        emulate::{fresh_machine, EmulateArch},
+        Arch, FrameAllocator, FrameCount, FrameUsage, PageFlags, PageMapper, PhysicalAddress,
+        TableKind, VirtualAddress,
+    };
+
+    /// Hands out never-reused frames inside the emulator's 2 MiB physical map, so the mapper can
+    /// reach every table it creates, and records every frame it gets back.
+    struct RecordingAllocator {
+        next: usize,
+        freed: Vec<PhysicalAddress>,
+    }
+
+    // SAFETY: frames come from a bump pointer and are never handed out twice.
+    unsafe impl FrameAllocator for RecordingAllocator {
+        fn allocate(&mut self, count: FrameCount) -> Option<PhysicalAddress> {
+            let base = self.next;
+            self.next += count.data() * EmulateArch::PAGE_SIZE;
+            assert!(
+                self.next <= 2 * crate::MEGABYTE,
+                "outside the emulator's physical map"
+            );
+            Some(PhysicalAddress::new(base))
+        }
+
+        unsafe fn free(&mut self, address: PhysicalAddress, count: FrameCount) {
+            assert_eq!(count.data(), 1);
+            self.freed.push(address);
+        }
+
+        fn usage(&self) -> FrameUsage {
+            FrameUsage::new(FrameCount::new(0), FrameCount::new(0))
+        }
+    }
+
+    fn map(mapper: &mut PageMapper<EmulateArch, &mut RecordingAllocator>, virt: VirtualAddress) {
+        let flags = PageFlags::<EmulateArch>::new().user(true).write(true);
+        // SAFETY: the emulated user half is otherwise unused.
+        let flush = unsafe { mapper.map_phys(virt, PhysicalAddress::new(0x1F_F000), flags, 0) }
+            .expect("map user page");
+        // SAFETY: nothing reads through this mapping.
+        unsafe { flush.ignore() };
+    }
+
+    #[test]
+    fn emptied_tables_are_deferred_or_freed() {
+        let _machine = fresh_machine();
+        let mut allocator = RecordingAllocator {
+            next: crate::MEGABYTE,
+            freed: Vec::new(),
+        };
+        // SAFETY: `init` loaded a valid table.
+        let mut mapper = unsafe { PageMapper::current(TableKind::User, &mut allocator) };
+
+        let a = VirtualAddress::new(0x1_0000_0000);
+        let b = VirtualAddress::new(0x1_0000_1000);
+        map(&mut mapper, a);
+        map(&mut mapper, b);
+
+        let mut deferred = Vec::new();
+        // SAFETY: the mappings were created above and nothing uses them.
+        let (phys, level, _, flush) =
+            unsafe { mapper.unmap_phys_deferring_tables(a, &mut |t| deferred.push(t)) }
+                .expect("a was mapped");
+        // SAFETY: nothing reads through the mapping.
+        unsafe { flush.ignore() };
+        assert_eq!((phys, level), (PhysicalAddress::new(0x1F_F000), 0));
+        assert!(deferred.is_empty(), "the PT still maps b");
+
+        // SAFETY: as above.
+        let (_, _, _, flush) =
+            unsafe { mapper.unmap_phys_deferring_tables(b, &mut |t| deferred.push(t)) }
+                .expect("b was mapped");
+        // SAFETY: nothing reads through the mapping.
+        unsafe { flush.ignore() };
+        // PT, then PD, then PDPT, each unlinked before it is handed over.
+        assert_eq!(deferred.len(), 3);
+        // SAFETY: entry 0 of the top-level table is within bounds.
+        assert!(unsafe { mapper.table().entry(0) }.is_some_and(|e| !e.present()));
+        assert!(mapper.translate(b).is_none());
+        assert!(mapper.allocator().freed.is_empty(), "nothing freed early");
+
+        map(&mut mapper, a);
+        // SAFETY: as above, and no other CPU exists.
+        let (_, _, _, flush) = unsafe { mapper.unmap_phys(a) }.expect("a was mapped");
+        // SAFETY: nothing reads through the mapping.
+        unsafe { flush.ignore() };
+        assert_eq!(
+            mapper.allocator().freed.len(),
+            3,
+            "unmap_phys frees at once"
+        );
+        assert!(mapper
+            .allocator()
+            .freed
+            .iter()
+            .all(|f| !deferred.contains(f)));
     }
 }

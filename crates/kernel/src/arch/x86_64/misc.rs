@@ -30,6 +30,18 @@ pub unsafe fn init(cpu_id: LogicalCpuId) {
             x86::controlregs::cr4_write(x86::controlregs::cr4() | Cr4::CR4_ENABLE_SMEP);
         }
 
+        // Ferric Oxide: `RmmA::invalidate_all_global` (broadcast TLB shootdowns) can then use
+        // INVPCID. The BSP enables it if it has the instruction, before any AP starts; each AP
+        // checks its own CPUID and withdraws it if it lacks the instruction, before it can handle
+        // a shootdown (issue #282). After the BSP, the flag only goes from available to not, and
+        // the fallback toggles CR4.PGE.
+        let has_invpcid = has_ext_feat(|feat| feat.has_invpcid());
+        if cpu_id == LogicalCpuId::BSP {
+            crate::memory::RmmA::set_invpcid_available(has_invpcid);
+        } else if !has_invpcid {
+            crate::memory::RmmA::set_invpcid_available(false);
+        }
+
         if let Some(feats) = cpuid().get_extended_processor_and_feature_identifiers()
             && feats.has_rdtscp()
         {
@@ -74,7 +86,11 @@ pub struct MsrFault;
 /// (more so for wrmsr), but which is outside Rust's safety model just like safe Rust can open
 /// `/dev/mem` on userspace Linux. Only privileged userspace processes should ever be granted a
 /// capability to read MSRs.
+///
+/// Never inlined: the global label must exist exactly once, since the #GP handler recognizes a
+/// faulting `rdmsr` by its address.
 #[allow(named_asm_labels)]
+#[inline(never)]
 pub fn rdmsr_safe(reg: u32) -> Result<u64, MsrFault> {
     let failed: u32;
     let lo: u32;
@@ -99,7 +115,10 @@ __the_wrapped_rdmsr_instr:
     Ok(u64::from(lo) | (u64::from(hi) << 32))
 }
 /// Writes an MSR "safely", handling #GP.
+///
+/// Never inlined, for the same reason as [`rdmsr_safe`].
 #[allow(named_asm_labels)]
+#[inline(never)]
 pub fn wrmsr_safe(reg: u32, value: u64) -> Result<(), MsrFault> {
     let failed: u32;
     unsafe {

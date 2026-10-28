@@ -232,8 +232,10 @@ default remote, and it uses one only when both settings are given, in the
 | `remote` | `COOKBOOK_REMOTE` | URL of the remote, with `{target}` for the target triple. The cookbook fetches `<url>/repo.toml`, `<url>/<name>.toml` and `<url>/<name>.pkgar` with `curl` |
 | `remote_key` | `COOKBOOK_REMOTE_KEY` | Public key file (`pkgar-keys` format) that must have signed every package from the remote |
 
-Without a remote, or when its index cannot be fetched, `binary` recipes
-are built from source and the cookbook says why once. A remote without a
+Without a remote, or when its index cannot be fetched, `binary` recipes,
+and those the index does not list, are built from source with their build
+and dev dependencies (such as `host:python312` for `xcb-proto`), and the
+cookbook says why once. A remote without a
 key is refused: nothing from a remote is unpacked unless a key pinned on
 this side signed it. The index is cached in `build/remotes/` for eight
 hours (indefinitely with `COOKBOOK_OFFLINE`). `[mirrors]` rewrites apply to

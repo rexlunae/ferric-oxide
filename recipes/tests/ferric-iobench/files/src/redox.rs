@@ -3,9 +3,9 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferric_blkqueue::QueuePolicy;
@@ -21,6 +21,7 @@ use syscall::CallFlags;
 use syscall::error::{EIO, EOPNOTSUPP};
 
 use crate::DEFAULT_JOBS;
+use crate::engine::{EngineError, Reader, Readers};
 use crate::file;
 use crate::round::{SpawnError, run_together_at};
 
@@ -58,6 +59,8 @@ pub(crate) enum Failure {
     TlbRead(std::io::Error),
     /// `/scheme/sys/tlb` did not parse.
     TlbParse(tlb::ParseError),
+    /// The job's request path could not be set up, or a read on it failed.
+    Engine(EngineError),
 }
 
 impl fmt::Display for Failure {
@@ -77,6 +80,7 @@ impl fmt::Display for Failure {
             Self::Spawn(_) => f.write_str("a round could not start its submitters"),
             Self::TlbRead(_) => f.write_str("could not read the kernel's TLB counters"),
             Self::TlbParse(_) => f.write_str("the kernel's TLB counters did not parse"),
+            Self::Engine(_) => f.write_str("the job's request path failed"),
         }
     }
 }
@@ -88,6 +92,7 @@ impl std::error::Error for Failure {
             Self::Spawn(err) => Some(err),
             Self::TlbRead(err) => Some(err),
             Self::TlbParse(err) => Some(err),
+            Self::Engine(err) => Some(err),
             _ => None,
         }
     }
@@ -312,6 +317,7 @@ fn bench_job(disk: &Disk, job: &Job, percore: bool, tlb: Option<&TlbStats>) -> R
             have: disk.len,
         });
     }
+    let readers = Readers::new(&disk.file, job, disk.block).map_err(Failure::Engine)?;
     let policies = if percore {
         &POLICIES[..]
     } else {
@@ -328,7 +334,7 @@ fn bench_job(disk: &Disk, job: &Job, percore: bool, tlb: Option<&TlbStats>) -> R
         if percore {
             set_policy(disk, policies[k].0)?;
         }
-        let (elapsed_ns, latency, tlb_delta) = run_round(disk, job, tlb)?;
+        let (elapsed_ns, latency, tlb_delta) = run_round(&readers, job, tlb)?;
         tlb_totals[k] = tlb_totals[k].sum(&tlb_delta);
         Ok((elapsed_ns, latency))
     })?;
@@ -472,21 +478,28 @@ fn print_ab(job: &Job, cmp: Option<Comparison>, rounds: usize) {
 }
 
 /// Reads every block of `job` once, with [`Job::submitters`] threads that share a counter
-/// of reads started, and returns the wall-clock time, the merged latencies and, with `tlb`,
-/// how much the kernel's TLB counters grew. The clock starts once every thread is ready
-/// ([`run_together_at`]), and the first TLB snapshot is taken just before it.
+/// of reads started, each with its own reader from `readers`, and returns the wall-clock
+/// time, the merged latencies and, with `tlb`, how much the kernel's TLB counters grew. The
+/// clock starts once every thread is ready ([`run_together_at`]), and the first TLB snapshot
+/// is taken just before it.
 fn run_round(
-    disk: &Disk,
+    readers: &Readers<'_>,
     job: &Job,
     tlb: Option<&TlbStats>,
 ) -> Result<(u64, Box<Histogram>, Counters), Failure> {
     let order = Order::of(job);
     let next = AtomicU64::new(0);
+    let thread = AtomicUsize::new(0);
     let bs = job.bs as usize;
     let mut before = None;
     let timed = run_together_at(
         job.submitters(),
-        || submit(disk, &order, &next, bs),
+        || {
+            let mut reader = readers
+                .get(thread.fetch_add(1, Ordering::Relaxed))
+                .ok_or(Failure::Thread)?;
+            submit(&mut reader, &order, &next, bs)
+        },
         || before = tlb.map(TlbStats::read),
     )
     .map_err(Failure::Spawn)?;
@@ -501,19 +514,18 @@ fn run_round(
     Ok((nanos(timed.elapsed), latency, tlb_delta))
 }
 
-/// One submitter: takes the next read until the job has none left, one `pread` at a time.
+/// One submitter: takes the next read until the job has none left, one read at a time.
 fn submit(
-    disk: &Disk,
+    reader: &mut Reader<'_>,
     order: &Order,
     next: &AtomicU64,
     bs: usize,
 ) -> Result<Box<Histogram>, Failure> {
     let mut latency = Box::new(Histogram::new());
-    let mut buf = vec![0; bs];
     while let Some(block) = order.block(next.fetch_add(1, Ordering::Relaxed)) {
         let at = block * bs as u64;
         let issued = Instant::now();
-        let got = io("pread", disk.file.read_at(&mut buf, at))?;
+        let got = reader.read(at).map_err(Failure::Engine)?;
         latency.record(nanos(issued.elapsed()));
         if got != bs {
             return Err(Failure::Short {

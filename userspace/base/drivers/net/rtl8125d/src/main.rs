@@ -158,6 +158,12 @@ fn serve(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> Result<(
             event::EventFlags::READ,
         )
         .map_err(DriverError::SubscribeScheme)?;
+    // Ferric Oxide: the bypass wake pipe ticks the scheme too.
+    if let Some(wake) = scheme.wake_handle() {
+        event_queue
+            .subscribe(wake, Source::Scheme, event::EventFlags::READ)
+            .map_err(DriverError::SubscribeScheme)?;
+    }
 
     libredox::call::setrens(0, 0).map_err(DriverError::Namespace)?;
 

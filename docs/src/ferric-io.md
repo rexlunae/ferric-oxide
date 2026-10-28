@@ -493,8 +493,11 @@ benchmark is its own MIT code, in two parts:
 - `crates/iobench` (`ferric-iobench`, `no_std`, host-tested) holds the logic.
   It parses fio's options (`--rw`, `--bs`, `--iodepth`, `--numjobs`,
   `--io_size`/`--size`, `--randseed`, `--ioengine=psync`, `--direct`,
-  `--filename`, `--end_fsync`) and refuses by name what the runner does not
-  do: engines other than `psync`, and on the disk writes, `--end_fsync=1` and
+  `--filename`, `--end_fsync`), plus Ferric's request-path options
+  `--ioengine=regbuf|ring` and `--align=heap|page`
+  ([Request paths](#request-paths)), and refuses by name what the runner does not
+  do: fio engines other than `psync`, Ferric's engines on a file job, and on
+  the disk writes, `--end_fsync=1` and
   buffered I/O (`--direct=0`). A job with `--filename` is a file job: it runs
   on a file through the file system, buffered (`--direct=0`; Redox has no
   `O_DIRECT`), may write, and with `--end_fsync=1` ends with one `fsync`
@@ -535,6 +538,68 @@ five CI boots, fails on `ab=fail`, and puts the numbers in a notice and in a
 table in the job summary. CI runs on emulated NVMe under KVM on shared
 runners, so its numbers are only good for the same-boot comparison, not as
 absolute figures.
+
+### Request paths
+
+By default each submitter reads with `pread` into a `vec![0; bs]` heap buffer.
+That buffer is rarely page-aligned, so for every read the kernel's capture of
+the client buffer (`scheme/user.rs`) copies the partial first and last pages
+into bounce pages, maps them (and any whole pages between, borrowed) into
+nvmed, and unmaps them when nvmed answers. Each map and unmap is a TLB
+shootdown round on the CPUs running nvmed. Two options measure that cost
+against paths that map less or nothing per read. They change only the buffer
+and the call: the submitters, blocks, order, rounds and policies stay the same,
+so the lines of one boot compare. File jobs take `--align`, which places
+their buffer the same way, but not the other engines.
+
+| Option | Path | Per-read mapping | Needs |
+| --- | --- | --- | --- |
+| (default) `--ioengine=psync --align=heap` | `pread` into a heap buffer | head and tail bounce pages, middle pages borrowed, then unmapped | nothing |
+| `--align=page` | `pread` into a page-aligned buffer (an over-allocated heap buffer, cut at a page boundary) | whole pages borrowed, no head or tail copy; still mapped and unmapped | nothing |
+| `--ioengine=regbuf` | A registered buffer, one page-aligned stride per submitter, attached once per job as a read-write grant to slot 0 of the partition descriptor; each read is a `ferric_blkgrant` `Read` call with no payload, and the controller DMAs into the buffer | none (one in-kernel grant `Info` call per read in the driver) | `kernel.regbuf`, `drivers.grant_dma` and an IOMMU |
+| `--ioengine=ring` | Each submitter has its own `kernel.ring` ring and runs each read as one `Read` entry and one `Enter` | the same as `pread` with the same `--align`: the kernel runs the entry as the system call it stands for | `kernel.rings` |
+
+`regbuf` buffers are always page-aligned, so `--align` does not change that
+path. The job name gets the path as a suffix, so the default name is
+unchanged: `randread-4k-qd1-page`, `randread-4k-qd1-regbuf`,
+`randread-4k-qd1-ring`, `randread-4k-qd1-ring-page`. A path that needs a
+feature the system was built without fails the run with
+`FERRIC_TEST_FAIL iobench: the job's request path failed: --ioengine=regbuf
+needs kernel.regbuf (there is no kernel.regbuf scheme), which this system was
+built without (errno …)`; for `regbuf` the failure names `drivers.grant_dma`
+when nvmed answers `EOPNOTSUPP` to the attach, or the IOMMU when it answers
+`ENODEV`. The registered buffer pins `iodepth × numjobs` strides of `bs`
+rounded up to a page, which counts against the `kernel.regbuf` pin budget for
+users other than root.
+
+```sh
+ferric-iobench --rw=randread --bs=4k --iodepth=1 --io_size=4m                 # heap buffer
+ferric-iobench --rw=randread --bs=4k --iodepth=1 --io_size=4m --align=page    # whole pages
+ferric-iobench --rw=randread --bs=4k --iodepth=1 --io_size=4m --ioengine=regbuf  # zero-copy ceiling
+ferric-iobench --rw=randread --bs=4k --iodepth=1 --io_size=4m --ioengine=ring --align=page
+```
+
+The ring path does not yet batch reads or keep several in flight per thread,
+and kernel rings refuse grant buffers (`SqeFlags::BUF_GRANT`, `EOPNOTSUPP`), so
+it measures a ring entry against a system call, not a zero-copy path.
+driver-block's own shared-memory disk ring (`dup(disk, "uring")`, the
+`redox-rings` and `redox-buffer-pool` crates; RedoxFS's `disk/ring.rs` is the
+client) also maps nothing per request and needs no IOMMU, but the runner has
+no path for it yet.
+
+The smoke image runs `ferric-iobench` without arguments, so CI runs only the
+default path. To add a run of another path to the smoke boot, add a line with
+the job's options after the existing one in `config/ferric-smoke.toml`'s
+`/usr/lib/ferric-smoke.ion`, for example
+`ferric-iobench --rw=randread --bs=4k --iodepth=1 --io_size=4m --ioengine=regbuf || echo FERRIC_TEST_FAIL iobench exited with an error`.
+The CI image (`.github/workflows/image.yml`) turns on `kernel.rings`,
+`kernel.regbuf` and `drivers.grant_dma`, so a `ring` or `--align=page` run
+works on every boot. Only the boots with an IOMMU (`vtd`, `enforce`, `amdvi`,
+`amdvi-enforce`) can attach a grant, and a run that fails on a missing
+feature prints `FERRIC_TEST_FAIL iobench`, which `check-iobench-log.sh` treats
+as a failure, so a `regbuf` run must be limited to those boots (the `none` boot
+has no DMA domain). The check script requires only the default jobs' lines, so
+it accepts the extra lines as they are.
 
 A file job fills its file before the first round, outside the timed part, so
 its writes overwrite data in place, and runs one untimed round through each
@@ -1787,7 +1852,16 @@ netstack.
   `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
   reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
   keeps the socket open, so netstack keeps the port reserved; an `Own` of a
-  port the socket already owns keeps no second descriptor. The netstack
+  port the socket already owns keeps no second descriptor. netstack is itself
+  a client of the driver's scheme, and its frame reads wait on the driver's
+  request loop, so the driver asks for the path on a helper thread and parks
+  the `Own` request until the answer is in (scheme-utils' `ReadinessBased`
+  re-polls an fd-passing request whose handler returns `EWOULDBLOCK`). The
+  helper wakes the request loop through a pipe made before the driver enters
+  the null namespace, which each network driver's event loop watches next to
+  the scheme socket (`NetworkScheme::wake_handle`). Asking
+  from the request loop deadlocked the two whenever netstack was in a read
+  (#323). The netstack
   socket must be bound to one address: one bound to `0.0.0.0` (or `::`) is
   refused with `EINVAL` (`OwnError::UnspecifiedAddress`), since owning a port
   on every address would let the socket send from any source address. So an

@@ -23,5 +23,10 @@ int main(void) {
     printf("RLIMIT_STACK: %d\n", RLIMIT_STACK);
     printf("RLIMIT_AS: %d\n", RLIMIT_AS);
 
+    // Non-POSIX limit count, under both its glibc and its BSD/macOS names.
+    _Static_assert(RLIM_NLIMITS == RLIMIT_NLIMITS, "RLIM_NLIMITS must alias RLIMIT_NLIMITS");
+    printf("RLIMIT_NLIMITS: %d\n", RLIMIT_NLIMITS);
+    printf("RLIM_NLIMITS: %d\n", RLIM_NLIMITS);
+
     return 0;
 }

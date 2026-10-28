@@ -761,7 +761,7 @@ pub fn mremap(
                         .ok_or(Error::new(ENOMEM))?
                         .ignore();
 
-                    flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+                    flusher.queue(Some(page), frame, None, TlbShootdownActions::NEW_MAPPING);
                 }
 
                 Ok(Grant::allocated_one_page_nomap(page, page_flags))

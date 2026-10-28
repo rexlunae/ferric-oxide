@@ -236,6 +236,7 @@ VARIED_NAMES=\
 	kill-waitpid \
 	limits \
 	limits_cpp \
+	math_long_double \
 	pthread/timedwait \
 	pty/forkpty \
 	psignal \
