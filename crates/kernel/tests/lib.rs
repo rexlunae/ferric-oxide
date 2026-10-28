@@ -16,6 +16,8 @@ mod chown;
 mod cpu_set;
 #[path = "../src/context/fmap_reply.rs"]
 mod fmap_reply;
+#[path = "../src/percpu/global_flush.rs"]
+mod global_flush;
 #[path = "../src/arch/x86_64/ibpb/policy.rs"]
 mod ibpb_policy;
 #[path = "../src/context/idle.rs"]
@@ -27,6 +29,8 @@ mod spin_wait;
 #[path = "../src/memory/tlb.rs"]
 mod tlb;
 
+#[cfg(test)]
+mod tlb_ack;
 #[cfg(test)]
 mod wait_support;
 #[cfg(test)]

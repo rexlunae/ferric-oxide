@@ -19,7 +19,7 @@ use crate::{
     },
     cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
     cpu_stats::{CpuStats, CpuStatsData},
-    memory::tlb::{TlbInvalidation, TlbMailbox},
+    memory::tlb::{TlbAck, TlbAcks, TlbInvalidation, TlbMailbox},
     numa::{NumaNode, NumaNodeID},
     ptrace::Session,
     syscall::debug::SyscallDebugInfo,
@@ -118,6 +118,12 @@ impl OneShotPercpu {
     }
 }
 
+mod global_flush;
+
+/// Ferric Oxide: global-flush requests from broadcast shootdowns (see [`global_flush`]).
+static GLOBAL_FLUSH: global_flush::GlobalFlushRequests<{ MAX_CPU_COUNT as usize }> =
+    global_flush::GlobalFlushRequests::new();
+
 pub static ALL_PERCPU_BLOCKS: [AtomicPtr<PercpuBlock>; MAX_CPU_COUNT as usize] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPU_COUNT as usize];
 
@@ -157,49 +163,96 @@ pub fn get_all_stats() -> Vec<(LogicalCpuId, CpuStatsData)> {
 
 // PercpuBlock::current() is implemented somewhere in the arch-specific modules
 
-/// Asks `target`, or every other CPU for `None`, to invalidate `inv` ([`TlbInvalidation::ALL`]
-/// for the whole TLB).
-pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>, inv: &TlbInvalidation) {
+/// Asks every other CPU to flush its whole TLB, global entries included, and waits until each
+/// has (issue #281). Meant for kernel mappings, which may be global; while it waits, this CPU
+/// keeps answering shootdowns, so two CPUs broadcasting at once do not wait on each other.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", shstk_compiled)),
+    expect(dead_code, reason = "only shadow-stack teardown broadcasts")
+)]
+pub fn shootdown_tlb_all() {
     if cfg!(not(feature = "multi_core")) {
         return;
     }
-
-    if let Some(target) = target {
-        let my_percpublock = PercpuBlock::current();
-        assert_ne!(target, my_percpublock.cpu_id);
-
-        let Some(percpublock) = get_percpu_block(target) else {
-            crate::warn!("Trying to TLB shootdown a CPU that doesn't exist or isn't initialized.");
-            return;
-        };
-        // Post before the flag below publishes it with `Release`.
-        percpublock.tlb_mailbox.post(inv);
-        #[expect(clippy::bool_comparison)]
-        while percpublock
-            .wants_tlb_shootdown
-            .swap(true, Ordering::Release)
-            == true
+    // Before any request is posted, so the handling that acknowledges one also sees this.
+    GLOBAL_FLUSH.request();
+    let current = crate::cpu_id();
+    let mut acks = TlbAcks::new();
+    for id in 0..crate::cpu_count() {
+        // TODO: Optimize: send the IPI using destination shorthand "all CPUs".
+        let id = LogicalCpuId::new(id);
+        if id != current
+            && let Some(ack) = request_tlb_shootdown(id, &TlbInvalidation::ALL)
         {
-            // Load is faster than CAS or on x86, LOCK BTS
-            while percpublock.wants_tlb_shootdown.load(Ordering::Relaxed) == true {
-                my_percpublock.maybe_handle_tlb_shootdown();
-                core::hint::spin_loop();
-            }
-        }
-
-        crate::ipi::ipi_single(crate::ipi::IpiKind::Tlb, percpublock);
-        crate::tlb_stats::tlb_count!(TlbIpiSent);
-    } else {
-        let current = crate::cpu_id();
-        for id in 0..crate::cpu_count() {
-            // TODO: Optimize: use global counter and percpu ack counters, send IPI using
-            // destination shorthand "all CPUs".
-            let id = LogicalCpuId::new(id);
-            if id != current {
-                shootdown_tlb_ipi(Some(id), inv);
-            }
+            expect_tlb_ack(&mut acks, id, ack);
         }
     }
+    wait_for_tlb_acks(&mut acks);
+}
+
+/// Ferric Oxide: adds `ack`, from a request to `cpu`, to what [`wait_for_tlb_acks`] waits for.
+pub fn expect_tlb_ack<'a>(acks: &mut TlbAcks<'a>, cpu: LogicalCpuId, ack: TlbAck<'a>) {
+    if let Err(ack) = acks.record(cpu, ack) {
+        // Not reached: no CPU with a per-CPU block is beyond `TlbAcks`'s capacity.
+        while !ack.is_handled() {
+            PercpuBlock::current().maybe_handle_tlb_shootdown();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Ferric Oxide: waits until every request in `acks` has been handled by its target, answering
+/// this CPU's own shootdowns meanwhile: a target may itself be waiting for this CPU.
+pub fn wait_for_tlb_acks(acks: &mut TlbAcks<'_>) {
+    #[cfg(target_arch = "aarch64")]
+    let mut stall_watch = crate::arch::misc::StallWatch::start(2);
+
+    #[allow(unused_variables, reason = "only aarch64 reports a stall")]
+    while let pending @ 1.. = acks.poll() {
+        PercpuBlock::current().maybe_handle_tlb_shootdown();
+        #[cfg(target_arch = "aarch64")]
+        if stall_watch.stalled() {
+            crate::error!(
+                "TLB shootdown stalled on CPU {}: {} CPUs have not acknowledged",
+                crate::cpu_id(),
+                pending
+            );
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Ferric Oxide: asks `target` to invalidate `inv`. Returns what tells when `target` has done
+/// it, or `None` if no request was sent (a single-core kernel, or a CPU without a per-CPU block).
+///
+/// # Panics
+///
+/// Panics if `target` is this CPU.
+pub fn request_tlb_shootdown(
+    target: LogicalCpuId,
+    inv: &TlbInvalidation,
+) -> Option<TlbAck<'static>> {
+    if cfg!(not(feature = "multi_core")) {
+        return None;
+    }
+    assert_ne!(target, PercpuBlock::current().cpu_id);
+
+    let Some(percpublock) = get_percpu_block(target) else {
+        crate::warn!("Trying to TLB shootdown a CPU that doesn't exist or isn't initialized.");
+        return None;
+    };
+    // Post before the flag below publishes it with `Release`.
+    let ack = percpublock.tlb_mailbox.post(inv);
+    // A flag that was already set has an interrupt on the way from the CPU that set it, and the
+    // handling that swaps it off comes after this swap, so it sees the post (`memory::tlb`).
+    if !percpublock
+        .wants_tlb_shootdown
+        .swap(true, Ordering::Release)
+    {
+        crate::ipi::ipi_single(crate::ipi::IpiKind::Tlb, percpublock);
+        crate::tlb_stats::tlb_count!(TlbIpiSent);
+    }
+    Some(ack)
 }
 /// Ferric Oxide: invalidates page number `page` in this CPU's TLB (with KPTI and PCID, for both
 /// PCIDs). The page number comes from an address, so the product does not wrap.
@@ -218,16 +271,20 @@ impl PercpuBlock {
             return;
         }
 
+        // Acknowledges, per request, once it has invalidated (issue #264). A full flush also
+        // drops global entries when a broadcast asked for that: the check runs after the
+        // mailbox's request counter was loaded, so it sees the generation of every broadcast
+        // whose request this handling acknowledges.
         let full = Cell::new(false);
         self.tlb_mailbox.receive(invalidate_tlb_page, || {
             full.set(true);
-            crate::memory::RmmA::invalidate_all();
+            GLOBAL_FLUSH.flush(
+                self.cpu_id.get() as usize,
+                crate::memory::RmmA::invalidate_all_global,
+                crate::memory::RmmA::invalidate_all,
+            );
         });
         crate::tlb_stats::shootdown_handled(full.get());
-
-        if let Some(addrsp) = &*self.current_addrsp.borrow() {
-            addrsp.tlb_ack.fetch_add(1, Ordering::Release);
-        }
     }
 }
 
@@ -272,12 +329,13 @@ pub unsafe fn switch_arch_hook() {
 
             // See [`Flusher::flush`].
             //
-            // Without the fence, `wants_tlb_shootdown` check *may* happen
-            // before the CPU is removed from the `used_by` set. Hence, if a
-            // shootdown request arises *after* the check and *before* removing
-            // the CPU from the set, it would be missed and the CPU who
-            // requested the shootdown would spin forever since the request was
-            // never ACKed.
+            // Without the fence, the `wants_tlb_shootdown` check *may* happen
+            // before the CPU is removed from the `used_by` set. A request that
+            // saw the CPU in the set and arrived in between would then wait for
+            // this CPU's next interrupt or spin point instead of being answered
+            // here, before the table changes. Either way the requester waits for
+            // this CPU to handle its own request (`memory::tlb`), so leaving the
+            // set never acknowledges anything by itself.
             core::sync::atomic::fence(Ordering::SeqCst);
 
             percpu.maybe_handle_tlb_shootdown();
