@@ -6,11 +6,11 @@ path = "recipes/tests/ferric-aslr-test/files"
 
 [build]
 template = "custom"
-# Link against this repository's relibc, not the toolchain's prebuilt copy:
-# what the test checks lives in relibc, and statically linked programs carry
-# their libc with them.
+# Exercise the interpreter exec path, which installs mmap-min-addr. A static
+# executable bypasses that path and cannot detect the #300 floor regression.
+# The image and this link sysroot use the in-tree relibc.
 dev-dependencies = ["relibc"]
 script = """
-export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+DYNAMIC_INIT
 cookbook_cargo
 """

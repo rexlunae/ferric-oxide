@@ -36,6 +36,7 @@ on:
       - "userspace/base/drivers/pcid/**"
       - "recipes/tests/ferric-iobench/**"
       - "recipes/tests/ferric-ring-test/**"
+      - "recipes/tests/ferric-aslr-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
@@ -81,6 +82,7 @@ jobs:
         run: |
           cargo test --locked --workspace
           cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml
+          cargo test --locked --manifest-path recipes/tests/ferric-aslr-test/files/Cargo.toml
       - name: Device-tree memory safety
         run: |
           rustup component add miri

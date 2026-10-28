@@ -442,6 +442,9 @@ jobs:
           fi
           grep -aF "FERRIC_TEST_PASS fox-verify" "$LOG"
 
+      - name: Check post-exec virtual address space
+        run: grep -aF "FERRIC_TEST_PASS aslr-address-space:" "$LOG"
+
       - name: Check futex wakeups
         run: grep -aF "FERRIC_TEST_PASS futex-wake-race" "$LOG"
 

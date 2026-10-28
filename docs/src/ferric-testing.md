@@ -296,10 +296,16 @@ builds of kernel, relibc, bootloader, RedoxFS, base and Ferric test packages,
 even when the surrounding build uses prebuilt packages. Its init script emits
 `FERRIC_SMOKE_BEGIN`, runs the tests, emits `FERRIC_SMOKE_OK` and shuts down.
 
+The ASLR test links dynamically against the image's in-tree relibc so it exercises
+the interpreter exec path, which installs the mmap floor. A static executable
+would bypass that path and miss the sparse-address-space regression. Its host
+protocol tests run with `cargo test --locked --manifest-path
+recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
+
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
 | `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
-| `ferric-aslr-test` | Address variation between program executions |
+| `ferric-aslr-test` | Sparse 32 GiB virtual reservation after exec, and address variation between executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
@@ -448,28 +454,47 @@ The script stops early instead of waiting out the timeout when the smoke shell
 cannot start: ld.so reporting that it could not link `'/usr/bin/ion'` (the
 quoted path it prints), or init reporting that `ion /usr/lib/ferric-smoke.ion`
 failed, ends the run with that console error and `boot-smoke: FAIL, the smoke
-shell could not start`. The linker line counts only for the shell: every program
-reports the same prefix, so a program the script starts that fails to link stays
-that program's test result instead of killing the guest. A boot that prints the
-marker first still passes, including one that prints it while the runner watches
-for the marker in the second after it saw such a line, so a link failure during
-shutdown does not fail a green run. `scripts/ferric-ci/test-boot-smoke.sh`
+shell could not start`. A loader failure in any
+program before `FERRIC_SMOKE_OK` fails the run even if the shell later prints a
+PASS or SKIP: a helper that failed to load can otherwise look like an absent
+optional feature. The shell-specific watch ends an impossible boot early; child
+failures are checked in the final log so the other tests can finish. A link
+failure first printed after the marker does not invalidate completed tests if
+QEMU exits successfully. A timeout or nonzero QEMU exit still fails, even after
+the marker: finishing the test script does not establish that the guest shut
+down cleanly. `scripts/ferric-ci/test-boot-smoke.sh`
 exercises these cases against a fake QEMU, without firmware or virtualization.
 This turns the intermittent boot in
 [#155](https://github.com/rexlunae/ferric-oxide/issues/155) into a fast,
-labelled failure; the underlying `NotFound` during early boot is still open.
+labelled failure. The investigation in
+[#300](https://github.com/rexlunae/ferric-oxide/issues/300) connects a reproduced
+empty audio-scheme capture to a loader `ENOMEM`, and the original #222 `/tmp`
+failures to `mkdir` failing in the loader. The reproduced mapping failure comes
+from exec raising its mmap floor to the argument/environment buffer above the
+randomized stack. Exec now keeps the floor
+at the ELF image spans; `ferric-aslr-test` rejects this failure deterministically
+with an uncommitted 32 GiB reservation. Repeated Linux KVM boot validation remains
+required; the earlier opaque `NotFound` and executor-interruption reports are not
+assumed to share this cause.
+
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
-for the failing attempt's search or open (the path whose `access` or open failed and
-its errno, or the search paths a library is in none of), so the next
+for the failing attempt: the path, original errno and exact operation (`open`,
+`fstat`, or `mmap`, including the requested mapping length), or the search paths
+a library is in none of. Thus an `ENOMEM` while loading a library does not by
+itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
 or TLS failure cannot reuse an earlier search diagnostic. The host check
 `bash scripts/ferric-ci/test-ld-so-errors.sh` compiles the actual object search,
-error, fatal-message formatter and errno modules. It checks candidate order,
+mapping ownership, error, fatal-message formatter and errno modules. It checks
+candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
-output, isolation from a later parse/TLS failure, and stable `dlerror` messages.
-Only platform access checks, errno storage and its message table use host
-adapters; this is not an end-to-end dynamic-link or guest-boot test.
+output, isolation from a later parse/TLS failure, stable `dlerror` messages,
+and descriptor cleanup after failed stat/map operations. File descriptors are
+owned immediately after open, including on error paths; a successful mapping
+retains its descriptor until after unmap. Platform I/O, file guards, errno storage
+and its message table use host adapters; this is not an end-to-end dynamic-link
+or guest-boot test.
 
 relibc's `pthread_create` (and so Rust's `thread::spawn`) reports every
 failure as `EAGAIN`. It logs the step that failed and the underlying errno at
@@ -513,15 +538,20 @@ audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
 QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a missing test result, a missing marker, a
-smoke shell that could not be linked (which must fail with that message rather
-than a generic timeout), a link failure after the marker and a marker that
-arrives while the runner waits after that line (both of which must still pass), a
-program the script starts that fails to link (which must not fail the run), a
-timeout whose NMI context rows (and only those) must reach stderr, and that
-the runner adds both HDA controllers. A Unix monitor socket fixture supplies
-CPL 3 registers and a user frame; it checks the emitted return address and
-that unaligned, out-of-range and halted-CPU frame pointers are not read.
+failure, a crash after the marker, a nonzero QEMU exit or timeout after the
+marker, an exit during the final timeout poll, a missing test result and a missing
+marker. A smoke shell that cannot be linked fails early with that message. Any
+loader failure before a later marker, including a child failure followed by SKIP,
+must fail the run; a link failure first printed after completion may pass with a
+clean QEMU exit. This ordering is also checked when the error and marker share
+a line. A large UTF-8/ANSI console fixture has a ten-second host deadline: the
+final loader-failure check scans records once, avoiding Bash glob removal over
+the entire log, which took minutes on a repeated-launch console. NUL padding
+and carriage returns are removed before matching. The fixtures also require timeout NMI context rows (and only
+those) on stderr and both HDA controllers in QEMU's arguments. A Unix monitor
+socket fixture supplies CPL 3 registers and a user frame; it checks the emitted
+return address and that unaligned, out-of-range and halted-CPU frame pointers are
+not read.
 The probe consumes the monitor greeting before sending commands, keeping
 register and memory responses aligned with their requests. Its fake QEMU stays alive for a
 moment after printing, like a guest still shutting down, so the watch loop

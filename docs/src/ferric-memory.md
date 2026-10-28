@@ -85,6 +85,17 @@ integer frame; the opaque ARM64 `ucontext_t` layout remains unchanged.
 layout entropy, not a general cryptographic key generator. Randomization
 therefore depends on available hardware and the selected build.
 
+Exec sets the minimum address for later non-fixed mappings from the ELF image
+spans, including the interpreter. It does not raise that minimum to an arbitrary
+argument/environment mapping: best-fit placement can put that buffer above the
+randomized stack. Making its end a hard minimum confined future library and heap
+mappings to the remaining stack-ASLR gap (at most 16 GiB), sometimes returning
+`ENOMEM` for ordinary library loads despite ample physical RAM
+([#300](https://github.com/rexlunae/ferric-oxide/issues/300)). The existing grant
+protects the argument/environment buffer from overlap. `ferric-aslr-test` reserves
+and releases 32 GiB of `PROT_NONE` virtual space to detect this limit without
+committing data pages, then checks address variation between executions.
+
 The ELF relocation helper validates every relevant relocation before applying
 any. It supports the absolute and PC-relative relocation forms needed by the
 linked kernel and ignores relocations for unloaded debug sections. Unsupported

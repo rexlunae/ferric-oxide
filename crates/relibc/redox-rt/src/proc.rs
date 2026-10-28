@@ -1,7 +1,9 @@
 //! Process handles, address-space setup and fork/exec handoffs.
 //!
 //! Fork materializes and retains its stack handoff through the address-space
-//! snapshot; architecture trampolines consume that snapshot in the child.
+//! snapshot; architecture trampolines consume that snapshot in the child. Exec
+//! derives the mmap floor from ELF image spans, leaving other free holes usable
+//! even when arguments and environment are placed above the randomized stack.
 
 use core::{cell::SyncUnsafeCell, cmp, fmt::Debug, ops::Range};
 
@@ -381,7 +383,10 @@ pub fn fexec_impl(
         args_envs_size_aligned,
         MapFlags::PROT_READ | MapFlags::PROT_WRITE,
     )?;
-    update_min_mmap_addr(target_args_env_address, args_envs_size_aligned);
+    // Only ELF images establish the mmap floor. Best-fit allocation can put this
+    // payload above the randomized stack; raising the floor to it would confine
+    // every later heap/library mapping to the small gap below the user-space end.
+    // Its grant already prevents later mappings from overwriting the payload.
 
     let mut offset = 0;
 

@@ -9,7 +9,7 @@ use cookbook::cook::package::{package, package_handle_push};
 use cookbook::cook::pty::{PtyOut, flush_pty, write_to_pty};
 use cookbook::cook::tree::{self, DisplayOptions, TreeData, TreeItem, TreeOptions, WalkTreeEntry};
 use cookbook::cook::tui::join_logs;
-use cookbook::cook::{fetch_repo, ident};
+use cookbook::cook::{fetch_repo, host_tools, ident};
 use cookbook::recipe::{
     CookRecipe, SourceRecipe, recipes_flatten_package_names, recipes_mark_as_deps,
     validate_filesystem_rules,
@@ -259,6 +259,9 @@ fn main_inner() -> Result<()> {
     let (config, command, recipes) = parse_args(args)?;
     if command.is_building() || matches!(command, CliCommand::ChangeRuleLocal) {
         ident::init_ident();
+    }
+    if command == CliCommand::Cook {
+        host_tools::check(&recipes)?;
     }
     if command == CliCommand::Cook && config.cook.tui {
         match run_tui_cook(config.clone(), recipes.clone()) {

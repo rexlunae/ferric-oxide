@@ -1,5 +1,5 @@
 # Native development image: rebuild the fork's OS components with Cargo,
-# while reusing binary application packages from the existing package server.
+# and build application packages from their upstream sources.
 include = ["minimal.toml"]
 
 [general]

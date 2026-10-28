@@ -10,11 +10,18 @@
 //! - the code address only moves for position-independent executables, so a
 //!   match there is reported but is not a failure.
 //!
-//! Prints one result line, `FERRIC_TEST_PASS aslr ...`, `FERRIC_TEST_SKIP aslr
+//! Also reserves and releases 32 GiB of inaccessible virtual address space,
+//! without committing data pages. Exec must not make the argument/environment
+//! mapping above the randomized stack a hard floor for later mmap calls (#300).
+//!
+//! Prints the address-space result and `FERRIC_TEST_PASS aslr ...`, `FERRIC_TEST_SKIP aslr
 //! ...` (no RDRAND, so the system keeps its fixed layout) or `FERRIC_TEST_FAIL
 //! aslr ...`, and exits non-zero on failure.
 
-use std::process::{Command, ExitCode};
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use std::io;
+use std::process::{Command, ExitCode, Output};
 
 /// What one run reports, in this order.
 const NAMES: [&str; 4] = ["stack", "heap", "mmap", "code"];
@@ -33,6 +40,7 @@ fn probe() -> [usize; 4] {
     ]
 }
 
+#[cfg(target_arch = "x86_64")]
 fn has_rdrand() -> bool {
     // CPUID.(EAX=1):ECX bit 30. Older toolchains declare the intrinsic unsafe.
     #[allow(unused_unsafe)]
@@ -40,20 +48,89 @@ fn has_rdrand() -> bool {
     leaf1.ecx & (1 << 30) != 0
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn has_rdrand() -> bool {
+    false
+}
+
+/// Exercise virtual space larger than the entire 16 GiB stack-ASLR range.
+fn sparse_address_space() -> io::Result<()> {
+    const SIZE: usize = 32 << 30;
+    // SAFETY: null requests a fresh reservation. PROT_NONE and no accesses leave
+    // its data pages uncommitted; no existing mapping or reference is replaced.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SIZE,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if address == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: this function owns the complete live reservation and created no references to it.
+    if unsafe { libc::munmap(address, SIZE) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A child failed to start, execute, or follow the address-report protocol.
+#[derive(Debug)]
+enum ChildError {
+    Spawn(io::Error),
+    Failed(Output),
+    InvalidOutput(Output),
+}
+
+impl std::fmt::Display for ChildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "could not start child: {error}"),
+            Self::Failed(output) | Self::InvalidOutput(output) => write!(
+                f,
+                "child status {} stdout {:?} stderr {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Runs a child and parses its four addresses.
-fn run_child(exe: &str) -> Result<[usize; 4], String> {
+fn run_child(exe: &str) -> Result<[usize; 4], ChildError> {
     let output = Command::new(exe)
         .arg("--child")
         .output()
-        .map_err(|e| format!("could not run {exe}: {e}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let values: Vec<usize> = text
+        .map_err(ChildError::Spawn)?;
+    read_child(output)
+}
+
+fn read_child(output: Output) -> Result<[usize; 4], ChildError> {
+    if !output.status.success() {
+        return Err(ChildError::Failed(output));
+    }
+    let values: Result<Vec<usize>, _> = String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
-        .filter_map(|word| usize::from_str_radix(word, 16).ok())
+        .map(|word| usize::from_str_radix(word, 16))
         .collect();
     values
+        .map_err(|_| ChildError::InvalidOutput(output.clone()))?
         .try_into()
-        .map_err(|_| format!("child printed {text:?}, not four addresses"))
+        .map_err(|_| ChildError::InvalidOutput(output))
 }
 
 fn main() -> ExitCode {
@@ -67,6 +144,12 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+
+    if let Err(error) = sparse_address_space() {
+        println!("FERRIC_TEST_FAIL aslr-address-space: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("FERRIC_TEST_PASS aslr-address-space: sparse 32 GiB reservation");
 
     if !has_rdrand() {
         println!("FERRIC_TEST_SKIP aslr no RDRAND, layout stays fixed");
@@ -103,5 +186,40 @@ fn main() -> ExitCode {
             same.join(",")
         );
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(status: i32, stdout: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"loader failure context".to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_failed_child_cannot_pass_with_four_addresses() {
+        let error = read_child(output(1 << 8, "10 20 30 40")).unwrap_err();
+        assert!(matches!(error, ChildError::Failed(_)));
+        assert!(error.to_string().contains("loader failure context"));
+    }
+
+    #[test]
+    fn reports_require_exactly_four_hexadecimal_addresses() {
+        assert_eq!(
+            read_child(output(0, "10 20 30 40\n")).unwrap(),
+            [16, 32, 48, 64]
+        );
+        for text in ["10 20 30", "10 20 30 40 50", "error 10 20 30 40"] {
+            assert!(matches!(
+                read_child(output(0, text)),
+                Err(ChildError::InvalidOutput(_))
+            ));
+        }
     }
 }

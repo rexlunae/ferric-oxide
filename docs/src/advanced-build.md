@@ -13,7 +13,7 @@ Before reading through this section, make sure you have already read:
 
 ## Setup Your Environment
 
-The [**native_bootstrap.sh**](https://github.com/rexlunae/ferric-oxide/blob/main/native_bootstrap.sh) script now only runs `cargo xtask setup`, which installs Rust components and Cargo utilities and writes an initial configuration. It doesn't clone the repository or install system packages. A full manual setup has these steps:
+The [**native_bootstrap.sh**](https://github.com/rexlunae/ferric-oxide/blob/main/native_bootstrap.sh) script installs the build machine's packages with Homebrew, `apt-get` or `dnf` (skip that with `--no-packages`), then runs `cargo xtask setup`, which installs Rust components and Cargo utilities and writes an initial configuration. It doesn't clone the repository. A full manual setup has these steps:
 
 - [Clone The Repository](#clone-the-repository)
 - [Install The Necessary Packages](#install-the-necessary-packages-and-emulators)
