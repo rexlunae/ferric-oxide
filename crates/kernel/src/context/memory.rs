@@ -27,8 +27,9 @@ use crate::{
     cpu_set::LogicalCpuSet,
     memory::{
         deallocate_contiguous, deallocate_frame, get_page_info, init_frame, the_zeroed_frame,
-        AddRefError, Enomem, Frame, Page, PageFlags, PageInfo, PageMapper, RaiiFrame, RefCount,
-        RefKind, RmmA, TableKind, TheFrameAllocator, VirtualAddress, PAGE_SIZE,
+        tlb::TlbInvalidation, AddRefError, Enomem, Frame, Page, PageFlags, PageInfo, PageMapper,
+        RaiiFrame, RefCount, RefKind, RmmA, TableKind, TheFrameAllocator, VirtualAddress,
+        PAGE_SIZE,
     },
     percpu::PercpuBlock,
     scheme::KernelSchemes,
@@ -1786,7 +1787,7 @@ impl Grant {
                 let _still_referenced = info.remove_ref();
                 break;
             }
-            flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+            flusher.queue(Some(page), frame, None, TlbShootdownActions::NEW_MAPPING);
             mapped = mapped.saturating_add(1);
         }
         if mapped == 0 {
@@ -1834,7 +1835,7 @@ impl Grant {
                 };
                 result.ignore();
 
-                flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+                flusher.queue(Some(page), frame, None, TlbShootdownActions::NEW_MAPPING);
             }
         }
 
@@ -1876,7 +1877,7 @@ impl Grant {
                     .expect("TODO: page table OOM");
                 result.ignore();
 
-                flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+                flusher.queue(Some(page), frame, None, TlbShootdownActions::NEW_MAPPING);
             }
         }
 
@@ -1923,7 +1924,12 @@ impl Grant {
                     break;
                 };
                 result.ignore();
-                flusher.queue(the_frame, None, TlbShootdownActions::NEW_MAPPING);
+                flusher.queue(
+                    Some(page),
+                    the_frame,
+                    None,
+                    TlbShootdownActions::NEW_MAPPING,
+                );
             }
         }
 
@@ -2094,13 +2100,19 @@ impl Grant {
                                 state: src_flusher_state,
                             };
                             src_flusher.queue(
+                                Some(src_page),
                                 frame,
                                 None,
                                 TlbShootdownActions::change_of_flags(old_flags, new_flags),
                             );
 
                             if let Some(old_frame) = old_frame {
-                                src_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                                src_flusher.queue(
+                                    Some(src_page),
+                                    old_frame,
+                                    None,
+                                    TlbShootdownActions::FREE,
+                                );
                             }
                             src_flusher_state = src_flusher.detach();
 
@@ -2133,7 +2145,12 @@ impl Grant {
                         .unwrap();
                     flush.ignore();
 
-                    flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+                    flusher.queue(
+                        Some(dst_page),
+                        frame,
+                        None,
+                        TlbShootdownActions::NEW_MAPPING,
+                    );
                 }
             }
 
@@ -2266,6 +2283,7 @@ impl Grant {
                     flush.ignore();
 
                     dst_flusher.queue(
+                        Some(dst_base.next_by(i)),
                         Frame::containing(phys),
                         None,
                         TlbShootdownActions::NEW_MAPPING,
@@ -2338,7 +2356,12 @@ impl Grant {
                         flush.ignore();
                     }
                     let frame = Frame::containing(phys);
-                    src_flusher.queue(frame, None, TlbShootdownActions::REVOKE_WRITE);
+                    src_flusher.queue(
+                        Some(src_page),
+                        frame,
+                        None,
+                        TlbShootdownActions::REVOKE_WRITE,
+                    );
                     frame
                 }
                 RefKind::Shared => {
@@ -2357,7 +2380,12 @@ impl Grant {
                         unsafe {
                             src_flush.ignore();
                         }
-                        src_flusher.queue(new_frame, None, TlbShootdownActions::NEW_MAPPING);
+                        src_flusher.queue(
+                            Some(src_page),
+                            new_frame,
+                            None,
+                            TlbShootdownActions::NEW_MAPPING,
+                        );
 
                         new_frame
                     }
@@ -2376,7 +2404,12 @@ impl Grant {
                             old_frame,
                         } = cow(src_frame, src_page_info, rk).map_err(|_| Enomem)?;
                         if let Some(old_frame) = old_frame {
-                            src_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                            src_flusher.queue(
+                                Some(src_page),
+                                old_frame,
+                                None,
+                                TlbShootdownActions::FREE,
+                            );
                         }
 
                         // TODO: Flusher
@@ -2394,6 +2427,7 @@ impl Grant {
 
                                 // FIXME: Is MOVE correct?
                                 src_flusher.queue(
+                                    Some(src_page),
                                     Frame::containing(phys),
                                     None,
                                     TlbShootdownActions::MOVE,
@@ -2417,7 +2451,12 @@ impl Grant {
                             old_frame,
                         } = cow(src_frame, src_page_info, rk).map_err(|_| Enomem)?;
                         if let Some(old_frame) = old_frame {
-                            src_flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                            src_flusher.queue(
+                                Some(src_page),
+                                old_frame,
+                                None,
+                                TlbShootdownActions::FREE,
+                            );
                         }
                         new_frame
                     }
@@ -2440,7 +2479,12 @@ impl Grant {
                 map_result.ignore();
             }
 
-            dst_flusher.queue(src_frame, None, TlbShootdownActions::NEW_MAPPING);
+            dst_flusher.queue(
+                Some(dst_base.next_by(page_idx)),
+                src_frame,
+                None,
+                TlbShootdownActions::NEW_MAPPING,
+            );
         }
 
         Ok(Grant {
@@ -2495,7 +2539,12 @@ impl Grant {
             // TODO: huge pages
             debug_assert_eq!(lvl, 0, "no userspace pages have huge mappings");
 
-            src_flusher.queue(Frame::containing(phys), None, TlbShootdownActions::MOVE);
+            src_flusher.queue(
+                Some(src_page),
+                Frame::containing(phys),
+                None,
+                TlbShootdownActions::MOVE,
+            );
 
             let dst_mapper = dst_mapper.as_deref_mut().unwrap_or(&mut *src_mapper);
 
@@ -2509,6 +2558,7 @@ impl Grant {
                 flush.ignore();
             }
             dst_flusher.queue(
+                Some(dst_page),
                 Frame::containing(phys),
                 None,
                 TlbShootdownActions::NEW_MAPPING,
@@ -2546,6 +2596,7 @@ impl Grant {
                 flush.ignore();
                 //crate::info!("Remapped page {:?} (frame {:?})", page, Frame::containing(mapper.translate(page.start_address()).unwrap().0));
                 flusher.queue(
+                    Some(page),
                     Frame::containing(phys),
                     None,
                     TlbShootdownActions::change_of_flags(old_flags, new_flags),
@@ -2630,6 +2681,7 @@ impl Grant {
             }
 
             flusher.queue(
+                Some(self.base),
                 base_frame,
                 Some(NonZeroUsize::new(self.info.page_count).unwrap()),
                 TlbShootdownActions::FREE,
@@ -2653,7 +2705,12 @@ impl Grant {
                     flush.ignore();
                 }
 
-                flusher.queue(Frame::containing(phys), None, TlbShootdownActions::FREE);
+                flusher.queue(
+                    Some(page),
+                    Frame::containing(phys),
+                    None,
+                    TlbShootdownActions::FREE,
+                );
             }
         }
 
@@ -3205,7 +3262,12 @@ fn correct_inner<'l>(
                     } else {
                         let result = cow(frame, info, RefKind::Cow)?;
                         if let Some(old_frame) = result.old_frame {
-                            flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                            flusher.queue(
+                                Some(faulting_page),
+                                old_frame,
+                                None,
+                                TlbShootdownActions::FREE,
+                            );
                         }
                         result.new_frame
                     }
@@ -3323,7 +3385,9 @@ fn correct_inner<'l>(
                             } = cow(src_frame, info, RefKind::Shared)?;
 
                             if let Some(old_frame) = old_frame {
-                                flusher.queue(old_frame, None, TlbShootdownActions::FREE);
+                                // The frame is mapped in the foreign address space, not this
+                                // one, so there is no page here to name: keep the full flush.
+                                flusher.queue(None, old_frame, None, TlbShootdownActions::FREE);
                                 flusher.flush();
                             }
 
@@ -3476,9 +3540,13 @@ pub enum CopyMappingsMode {
 // TODO: Check if polymorphism is worth it in terms of code size performance penalty vs optimized
 // away checks.
 pub trait GenericFlusher {
-    // TODO: Don't require a frame unless FREE, require Page otherwise
+    // TODO: Don't require a frame unless FREE
+    /// Queues `actions` for `page` (`phys_contiguous_count` pages from it, if given), which maps
+    /// `frame`. `page` is `None` when the caller cannot name the page in this address space; a
+    /// `Flusher` then flushes the whole TLB.
     fn queue(
         &mut self,
+        page: Option<Page>,
         frame: Frame,
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
@@ -3488,7 +3556,10 @@ pub trait GenericFlusher {
 /// emptied page-table frame on `flusher`, so it is freed only after the shootdown.
 fn queue_table_free(flusher: &mut impl GenericFlusher) -> impl FnMut(PhysicalAddress) + '_ {
     move |table| {
+        // No page: the round then flushes whole TLBs, paging-structure caches included, on
+        // every architecture, instead of relying on per-address invalidation to reach them.
         flusher.queue(
+            None,
             Frame::containing(table),
             None,
             TlbShootdownActions::FREE_TABLE,
@@ -3501,6 +3572,7 @@ pub struct NopFlusher;
 impl GenericFlusher for NopFlusher {
     fn queue(
         &mut self,
+        _page: Option<Page>,
         frame: Frame,
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
@@ -3562,6 +3634,8 @@ struct FlusherState<'addrsp> {
     // TODO: what capacity?
     pagequeue: ArrayVec<PageQueueEntry, 32>,
     dirty: bool,
+    /// The pages this round invalidates, locally and on every other CPU in `active_cpus`.
+    invalidation: TlbInvalidation,
 
     ackword: &'addrsp AtomicU32,
 }
@@ -3595,6 +3669,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             state: FlusherState {
                 pagequeue: ArrayVec::new(),
                 dirty: false,
+                invalidation: TlbInvalidation::new(),
                 ackword,
             },
         }
@@ -3607,6 +3682,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 pagequeue: ArrayVec::new(),
                 ackword: &DUMMY,
                 dirty: false,
+                invalidation: TlbInvalidation::new(),
             },
         );
         core::mem::forget(self);
@@ -3615,10 +3691,14 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
     // NOTE: Lock must be held, which must be guaranteed by the caller.
     pub fn flush(&mut self) {
         let pages = core::mem::take(&mut self.state.pagequeue);
+        let mut invalidation = core::mem::take(&mut self.state.invalidation);
 
         #[expect(clippy::bool_comparison)]
         if pages.is_empty() && core::mem::replace(&mut self.state.dirty, false) == false {
             return;
+        }
+        if invalidation.is_empty() {
+            invalidation.set_all();
         }
 
         self.state.ackword.store(0, Ordering::SeqCst);
@@ -3632,7 +3712,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 continue;
             }
 
-            crate::percpu::shootdown_tlb_ipi(Some(cpu_id));
+            crate::percpu::shootdown_tlb_ipi(Some(cpu_id), &invalidation);
 
             core::sync::atomic::fence(Ordering::SeqCst);
 
@@ -3643,7 +3723,9 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
 
         let local = self.active_cpus.contains(current_cpu_id);
         if local {
-            rmm::PageFlushAll::<RmmA>::new().flush();
+            invalidation.invalidate(crate::percpu::invalidate_tlb_page, || {
+                rmm::PageFlushAll::<RmmA>::new().flush()
+            });
         }
         // Ferric Oxide: the shootdown's wait for acknowledgements (`tlb_stats`, mm.tlb_flush).
         let waited = (affected_cpu_count > 0).then(crate::tlb_stats::Stopwatch::start);
@@ -3665,7 +3747,12 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             core::hint::spin_loop();
         }
         let wait_cycles = waited.map_or(0, crate::tlb_stats::Stopwatch::elapsed);
-        crate::tlb_stats::flush_batch(affected_cpu_count, pages.len(), local, wait_cycles);
+        let local_flush = match (local, invalidation.is_all()) {
+            (false, _) => crate::tlb_stats::LocalFlush::None,
+            (true, false) => crate::tlb_stats::LocalFlush::Pages,
+            (true, true) => crate::tlb_stats::LocalFlush::Full,
+        };
+        crate::tlb_stats::flush_batch(affected_cpu_count, pages.len(), local_flush, wait_cycles);
 
         for entry in pages {
             match entry {
@@ -3681,7 +3768,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                     free_table_frame(frame);
                 }
                 PageQueueEntry::Other { actions } => {
-                    // We currently invalidate everything on each flush
+                    // `invalidation` covered the page above.
                     let _ = actions;
                 }
             }
@@ -3691,11 +3778,35 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
 impl GenericFlusher for Flusher<'_, '_> {
     fn queue(
         &mut self,
+        page: Option<Page>,
         frame: Frame,
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
     ) {
+        // A mapping that only fills a previously non-present PTE needs no invalidation on x86:
+        // TLBs and paging-structure caches never hold entries built from a PTE whose P flag is 0
+        // (Intel SDM Vol. 3A 4.10.2.3, 4.10.3.1 and 4.10.4.3; AMD APM Vol. 2 5.5), so no CPU,
+        // local or remote, can hold a stale translation for the page. Skipping it here avoids a
+        // shootdown round per user-scheme capture and per anonymous mmap. Every NEW_MAPPING
+        // caller maps into a span with no present PTE (a fresh span from `AddrSpace::mmap`, after
+        // `MAP_FIXED` has unmapped and flushed the old one, or a page `translate` just found
+        // unmapped), and queues remaps and frees with their own actions.
+        //
+        // This matters because a spurious fault is not harmless everywhere: `correct_inner`
+        // remaps an already-present page idempotently for `Allocated`, `AllocatedShared` and
+        // `PhysBorrowed` grants, but takes an extra page reference for `External` and asks the
+        // scheme again for `FmapBorrowed`. AArch64 does not cache invalid descriptors either, but
+        // without a DSB and a context synchronization on the other PEs a walk can still see the
+        // old invalid entry; RISC-V lets harts cache invalid PTEs until an SFENCE.VMA. Both keep
+        // the shootdown.
+        let new_mapping = actions.contains(TlbShootdownActions::NEW_MAPPING);
         let actions = actions & !TlbShootdownActions::NEW_MAPPING;
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+            && new_mapping
+            && actions.is_empty()
+        {
+            return;
+        }
 
         let entry = if actions.contains(TlbShootdownActions::FREE_TABLE) {
             PageQueueEntry::FreeTable(frame)
@@ -3713,6 +3824,18 @@ impl GenericFlusher for Flusher<'_, '_> {
             self.flush();
         }
         self.state.pagequeue.push(entry);
+
+        // RISC-V: `sfence.vma` with an address orders only the leaf PTEs for it, and an unmap
+        // can free the page tables above them (`unmap_parents`), so it keeps the full flush. The
+        // x86 `invlpg` and `INVPCID` individual-address, and the AArch64 `TLBI VAAE1IS`, also
+        // drop the cached upper-level entries.
+        match page {
+            Some(page) if !cfg!(target_arch = "riscv64") => self.state.invalidation.add(
+                page.start_address().data() / PAGE_SIZE,
+                phys_contiguous_count.map_or(1, NonZeroUsize::get),
+            ),
+            _ => self.state.invalidation.set_all(),
+        }
     }
 }
 impl Drop for Flusher<'_, '_> {
@@ -3741,8 +3864,8 @@ bitflags::bitflags! {
         /// forces a shootdown round, which must also invalidate paging-structure caches.
         const FREE_TABLE = 1 << 5;
 
-        /// Add a new mapping to an address space.
-        /// Not really a TLB shootdown action on most architectures, so almost always a no-op.
+        /// Add a new mapping where no present PTE was. `Flusher` skips the shootdown for it on
+        /// x86, which never caches not-present entries; other architectures still flush.
         const NEW_MAPPING = 1 << 31;
     }
 }

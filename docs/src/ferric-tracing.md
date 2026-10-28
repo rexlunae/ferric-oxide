@@ -1004,14 +1004,14 @@ order:
 | `cr3_switch` | Context switches that loaded another address space's table |
 | `cr3_empty` | Context switches that loaded the empty table (to a kernel context) |
 | `cr3_same` | Context switches that kept the address space: no CR3 load |
-| `flush_page` | Single-page invalidations on the paths that change user mappings (page faults, grants) |
-| `flush_full` | Full flushes other than switches: each `Flusher` batch's local flush and each shootdown answered |
+| `flush_page` | Single-page invalidations on the paths that change user mappings (page faults, grants, small `Flusher` batches and the shootdowns answered for them) |
+| `flush_full` | Full flushes other than switches: each `Flusher` batch and answered shootdown that needed a whole-TLB flush |
 | `flush_batches`, `flush_batch_pages` | `Flusher` batches (one per mapping change, or per 32 pages), and their queued page entries |
 | `shootdowns` | Batches that also made other CPUs flush |
 | `shootdown_targets`, `shootdown_pages` | Their target CPUs and queued pages, summed |
 | `shootdown_wait_cycles` | TSC ticks spent spinning for the targets' acknowledgements |
 | `tlb_ipi_sent`, `tlb_ipi_received` | Shootdown IPIs sent and taken |
-| `shootdowns_handled` | Shootdown requests answered, in the IPI handler, by polling, or at a switch |
+| `shootdowns_handled` | Shootdown requests answered, page by page or with a full flush, in the IPI handler, by polling, or at a switch |
 | `iotlb_flushes`, `iotlb_unit_flushes`, `iotlb_bytes`, `iotlb_cycles` | IOMMU domain operations that invalidated IOTLBs, the unit invalidations, the IOVA bytes and the TSC ticks they took |
 
 The counters only grow, and a read is a snapshot taken when the read starts;
