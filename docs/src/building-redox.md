@@ -86,8 +86,9 @@ RAM-backed live image) for ARM64.
 
 The starting configuration selects the `native` image, which builds the
 kernel, UEFI bootloader, relibc, base services and drivers, RedoxFS and the
-package manager from this repository, and builds the other applications from
-their upstream sources. Images are written with Rust tools, without FUSE or `sudo`.
+package manager from this repository. It asks for prebuilt application
+packages (`build.repo_binary`), but no package server is configured, so the
+other applications are built from their upstream sources. Images are written with Rust tools, without FUSE or `sudo`.
 
 > 📝 **Note:** There is no Ferric package server yet, so application packages
 > are built locally. Prebuilt packages distributed through

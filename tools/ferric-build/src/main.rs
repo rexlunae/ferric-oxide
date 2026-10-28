@@ -250,15 +250,22 @@ const SOURCE_BUILD_PROGRAMS: [&str; 14] = [
     "python3",
 ];
 
-fn doctor(arch: Architecture) -> Result<()> {
+/// Checks the build machine. With `podman`, recipes run in the container,
+/// which has its own copies of [`SOURCE_BUILD_PROGRAMS`].
+fn doctor(arch: Architecture, podman: bool) -> Result<()> {
     eprintln!("Guest architecture: {}", arch.name());
     let nasm = (arch == Architecture::X86_64).then_some("nasm");
+    let source_build = if podman {
+        &[][..]
+    } else {
+        &SOURCE_BUILD_PROGRAMS[..]
+    };
     let required = [
         "rustup", "cargo", "clang", "clang++", "git", "curl", "tar", "make",
     ]
     .into_iter()
     .chain(nasm)
-    .chain(SOURCE_BUILD_PROGRAMS);
+    .chain(source_build.iter().copied());
     let mut missing = Vec::new();
     for tool in required {
         match find_tool(tool) {
@@ -327,8 +334,8 @@ fn utility_ready(tool: &str, minimum: &str) -> Result<bool> {
     Ok(output.status.success() && version_satisfies(&output.stdout, minimum))
 }
 
-fn setup(root: &Path, arch: Architecture, dry_run: bool) -> Result<()> {
-    doctor(arch)?;
+fn setup(root: &Path, arch: Architecture, podman: bool, dry_run: bool) -> Result<()> {
+    doctor(arch, podman)?;
     let mut rustup = Command::new("rustup");
     rustup
         .current_dir(root)
@@ -418,8 +425,13 @@ fn run(cli: Cli) -> Result<()> {
             file.set_len(u64::from(mib) * 1024 * 1024)
                 .map_err(|source| BuildError::Io { path, source })
         }
-        Task::Doctor => doctor(selected_architecture(cli.arch, &[])?),
-        Task::Setup => setup(&root, selected_architecture(cli.arch, &[])?, cli.dry_run),
+        Task::Doctor => doctor(selected_architecture(cli.arch, &[])?, cli.podman),
+        Task::Setup => setup(
+            &root,
+            selected_architecture(cli.arch, &[])?,
+            cli.podman,
+            cli.dry_run,
+        ),
         Task::Build {
             args,
             all_variants,
