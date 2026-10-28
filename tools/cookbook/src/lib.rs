@@ -58,6 +58,8 @@ pub enum Error {
     FoxArchive(Box<fox_core::archive::ArchiveError>),
     /// Ferric Oxide: fox could not install a package into the sysroot.
     FoxStore(Box<fox_store::StoreError>),
+    /// Ferric Oxide: recipes to build need programs the build machine lacks.
+    MissingHostTools(cook::host_tools::MissingHostTools),
 }
 
 /// Why a recipe or one of its packages could not be found or read.
@@ -165,6 +167,7 @@ impl Display for Error {
             Error::FoxKey(error) => write!(f, "{error}"),
             Error::FoxArchive(error) => write!(f, "Package archive error: {error}"),
             Error::FoxStore(error) => write!(f, "Cannot install package: {error}"),
+            Error::MissingHostTools(error) => write!(f, "{error}"),
         }
     }
 }
@@ -220,6 +223,12 @@ impl From<String> for Error {
 impl From<Error> for String {
     fn from(val: Error) -> Self {
         format!("{}", val)
+    }
+}
+
+impl From<cook::host_tools::MissingHostTools> for Error {
+    fn from(value: cook::host_tools::MissingHostTools) -> Self {
+        Error::MissingHostTools(value)
     }
 }
 

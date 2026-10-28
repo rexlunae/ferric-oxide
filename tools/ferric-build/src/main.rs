@@ -238,20 +238,24 @@ fn doctor(arch: Architecture) -> Result<()> {
     if arch == Architecture::X86_64 && find_tool("nasm").is_none() {
         return Err(BuildError::Missing("nasm"));
     }
-    for tool in ["cbindgen", "just", arch.qemu()] {
+    for tool in ["cbindgen", "just", arch.qemu(), "meson", "cmake", "ninja"] {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
-            None => eprintln!(
-                "{tool}: absent ({})",
-                if tool.starts_with("qemu") {
-                    "only needed to run the image"
-                } else {
-                    "cargo xtask setup installs this Cargo utility"
-                }
-            ),
+            None => eprintln!("{tool}: absent ({})", absent_tool_note(tool)),
         }
     }
     Ok(())
+}
+
+/// Why an optional tool may be missing, for `doctor`'s report.
+fn absent_tool_note(tool: &str) -> &'static str {
+    match tool {
+        "cbindgen" | "just" => "cargo xtask setup installs this Cargo utility",
+        "meson" | "cmake" | "ninja" => {
+            "needed only by recipes built from source with Meson or CMake; the cook stops before building if one needs it"
+        }
+        _ => "only needed to run the image",
+    }
 }
 
 fn initialize(root: &Path, arch: Architecture) -> Result<()> {

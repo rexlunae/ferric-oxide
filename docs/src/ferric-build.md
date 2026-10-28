@@ -18,6 +18,11 @@ cargo xtask run --headless
 Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK.
 On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
+Recipes built from source with Meson or CMake (most of the X11 and GTK stack,
+for example xkeyboard-config) also need the build machine's `meson`, `cmake`
+and `ninja`. `cargo xtask doctor` reports whether they are present, and
+`repo cook` checks every recipe it is about to build from source before
+building any of them, listing each missing program with the recipes that need it.
 Recipes that need the build-time Python (`host:python312`, for example libxcb
 through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
 Homebrew's `openssl@3` is found even though it is keg-only. OpenSSL 4 does not
