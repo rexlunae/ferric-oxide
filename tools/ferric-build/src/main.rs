@@ -148,6 +148,11 @@ enum BuildError {
         "missing required tool {0}; install it using your preferred method, then rerun cargo xtask setup"
     )]
     Missing(&'static str),
+    #[error(
+        "missing required build-machine programs: {}; install them (./native_bootstrap.sh installs everything but Podman; see Prerequisites in docs/src/building-redox.md)",
+        .0.join(", ")
+    )]
+    MissingPrograms(Vec<&'static str>),
     #[error("cannot decode ferric-config's CPU variant plan")]
     VariantPlan {
         #[source]
@@ -225,18 +230,52 @@ fn cargo(root: &Path) -> Command {
     command
 }
 
-fn doctor(arch: Architecture) -> Result<()> {
+/// Programs that recipes built from source run on the build machine. Without
+/// a package server every application recipe builds from source, so the
+/// documented build needs all of them.
+const SOURCE_BUILD_PROGRAMS: [&str; 14] = [
+    "autoconf",
+    "automake",
+    "autopoint",
+    "bison",
+    "cmake",
+    "flex",
+    "m4",
+    "makeinfo",
+    "meson",
+    "ninja",
+    "patch",
+    "perl",
+    "pkg-config",
+    "python3",
+];
+
+/// Checks the build machine. With `podman`, recipes run in the container,
+/// which has its own copies of [`SOURCE_BUILD_PROGRAMS`], so Podman itself is
+/// required instead.
+fn doctor(arch: Architecture, podman: bool) -> Result<()> {
     eprintln!("Guest architecture: {}", arch.name());
-    for tool in [
+    let nasm = (arch == Architecture::X86_64).then_some("nasm");
+    let source_build = if podman {
+        &["podman"][..]
+    } else {
+        &SOURCE_BUILD_PROGRAMS[..]
+    };
+    let required = [
         "rustup", "cargo", "clang", "clang++", "git", "curl", "tar", "make",
-    ] {
+    ]
+    .into_iter()
+    .chain(nasm)
+    .chain(source_build.iter().copied());
+    let mut missing = Vec::new();
+    for tool in required {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
-            None => return Err(BuildError::Missing(tool)),
+            None => {
+                eprintln!("{tool}: MISSING");
+                missing.push(tool);
+            }
         }
-    }
-    if arch == Architecture::X86_64 && find_tool("nasm").is_none() {
-        return Err(BuildError::Missing("nasm"));
     }
     for tool in ["cbindgen", "just", arch.qemu()] {
         match find_tool(tool) {
@@ -251,7 +290,11 @@ fn doctor(arch: Architecture) -> Result<()> {
             ),
         }
     }
-    Ok(())
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BuildError::MissingPrograms(missing))
+    }
 }
 
 fn initialize(root: &Path, arch: Architecture) -> Result<()> {
@@ -292,8 +335,8 @@ fn utility_ready(tool: &str, minimum: &str) -> Result<bool> {
     Ok(output.status.success() && version_satisfies(&output.stdout, minimum))
 }
 
-fn setup(root: &Path, arch: Architecture, dry_run: bool) -> Result<()> {
-    doctor(arch)?;
+fn setup(root: &Path, arch: Architecture, podman: bool, dry_run: bool) -> Result<()> {
+    doctor(arch, podman)?;
     let mut rustup = Command::new("rustup");
     rustup
         .current_dir(root)
@@ -383,8 +426,13 @@ fn run(cli: Cli) -> Result<()> {
             file.set_len(u64::from(mib) * 1024 * 1024)
                 .map_err(|source| BuildError::Io { path, source })
         }
-        Task::Doctor => doctor(selected_architecture(cli.arch, &[])?),
-        Task::Setup => setup(&root, selected_architecture(cli.arch, &[])?, cli.dry_run),
+        Task::Doctor => doctor(selected_architecture(cli.arch, &[])?, cli.podman),
+        Task::Setup => setup(
+            &root,
+            selected_architecture(cli.arch, &[])?,
+            cli.podman,
+            cli.dry_run,
+        ),
         Task::Build {
             args,
             all_variants,

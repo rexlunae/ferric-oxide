@@ -4,6 +4,7 @@ pub mod fetch;
 pub mod fetch_repo;
 pub mod fox_manifest;
 pub mod fs;
+pub mod host_tools;
 pub mod ident;
 pub mod package;
 pub mod pty;

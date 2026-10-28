@@ -6,8 +6,8 @@
 
 For the native `cargo xtask` build, start with these:
 
-- `cargo xtask doctor` lists the host tools the build found and stops at the
-  first missing one.
+- `cargo xtask doctor` lists the host tools the build found and fails naming
+  every missing one.
 - `cargo xtask --dry-run build` prints the Make command the build would run.
 - `cargo run -q -p ferric-config -- check` validates `ferric.toml` and warns
   when a `.config` file shadows a setting.

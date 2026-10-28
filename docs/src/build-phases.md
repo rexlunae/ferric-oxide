@@ -23,7 +23,8 @@ for the context of each Make command.)
 - Write a starting `ferric.toml` (the `native` image, native LLVM toolchain,
   no Podman, no FUSE) if there isn't one.
 
-`./native_bootstrap.sh` runs the same thing. The older
+`./native_bootstrap.sh` first installs the build machine's packages with
+Homebrew, `apt-get` or `dnf`, then runs the same thing. The older
 `./podman_bootstrap.sh` installs Podman and other host packages instead; see
 [Building with Podman](./podman-build.md).
 
