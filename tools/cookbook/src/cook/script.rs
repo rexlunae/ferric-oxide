@@ -35,8 +35,18 @@ function DYNAMIC_INIT {
     )
 
     # TODO: check paths for spaces
-    export LDFLAGS="${USER_LDFLAGS}-Wl,-rpath-link,${COOKBOOK_SYSROOT}/lib -L${COOKBOOK_SYSROOT}/lib -Wl,--export-dynamic"
-    export RUSTFLAGS="-C target-feature=-crt-static -L native=${COOKBOOK_SYSROOT}/lib -C link-arg=-Wl,-rpath-link,${COOKBOOK_SYSROOT}/lib"
+    case "${TARGET}" in
+        *-apple-darwin)
+            # host: recipes on macOS link with ld64, which has no
+            # -rpath-link or --export-dynamic; those are for ELF targets.
+            export LDFLAGS="${USER_LDFLAGS}-L${COOKBOOK_SYSROOT}/lib"
+            export RUSTFLAGS="-L native=${COOKBOOK_SYSROOT}/lib"
+            ;;
+        *)
+            export LDFLAGS="${USER_LDFLAGS}-Wl,-rpath-link,${COOKBOOK_SYSROOT}/lib -L${COOKBOOK_SYSROOT}/lib -Wl,--export-dynamic"
+            export RUSTFLAGS="-C target-feature=-crt-static -L native=${COOKBOOK_SYSROOT}/lib -C link-arg=-Wl,-rpath-link,${COOKBOOK_SYSROOT}/lib"
+            ;;
+    esac
     export COOKBOOK_DYNAMIC=1
 
     if [ "function" = "$(type -t ferric_target_rustflags)" ]; then
@@ -591,5 +601,34 @@ mod tests {
             std::fs::read(dir.path().join("config.sub")).unwrap(),
             include_bytes!("../../res/config.sub")
         );
+    }
+
+    /// Runs `DYNAMIC_INIT` for `target` and returns the linker flags it exports.
+    fn dynamic_link_flags(target: &str) -> String {
+        let script = format!(
+            "{SHARED_PRESCRIPT}\nDYNAMIC_INIT\nprintf '%s|%s' \"$LDFLAGS\" \"$RUSTFLAGS\"\n"
+        );
+        let output = Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(script)
+            .env("TARGET", target)
+            .env("COOKBOOK_SYSROOT", "/sysroot")
+            .env_remove("USER_LDFLAGS")
+            .env_remove("COOKBOOK_VERBOSE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn dynamic_init_uses_elf_linker_flags_only_for_elf_targets() {
+        let redox = dynamic_link_flags("aarch64-unknown-redox");
+        assert!(redox.contains("-Wl,-rpath-link,/sysroot/lib"), "{redox}");
+        assert!(redox.contains("-Wl,--export-dynamic"), "{redox}");
+
+        let macos = dynamic_link_flags("aarch64-apple-darwin");
+        assert_eq!(macos, "-L/sysroot/lib|-L native=/sysroot/lib");
     }
 }

@@ -16,7 +16,10 @@ cargo xtask run --headless
 ```
 
 Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK.
-On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
+On macOS, Xcode Command Line Tools supplies Clang and the SDK; `host:`
+recipes link with its ld64, so the cookbook's `DYNAMIC_INIT` gives them only
+`-L` for the dependency sysroot rather than the ELF `-rpath-link` and
+`--export-dynamic` flags it uses for Redox. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
 Use existing installations or install missing tools using your preferred
 method: setup never invokes Homebrew, a system package manager or sudo.
