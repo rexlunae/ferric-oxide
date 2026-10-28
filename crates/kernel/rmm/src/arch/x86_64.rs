@@ -65,6 +65,19 @@ impl Arch for X8664Arch {
         unsafe { Self::set_table(TableKind::User, Self::table(TableKind::User)) };
     }
 
+    /// Uses `INVPCID` type 2 when [`X8664Arch::set_invpcid_available`] says it exists, and
+    /// otherwise toggles CR4.PGE.
+    #[inline(always)]
+    fn invalidate_all_global() {
+        if INVPCID_AVAILABLE.load(Ordering::Relaxed) {
+            // SAFETY: `set_invpcid_available` guarantees the instruction; type 2 ignores the
+            // descriptor's PCID and is valid whether or not CR4.PCIDE is set.
+            unsafe { invpcid(INVPCID_ALL_INCLUDING_GLOBAL, 0, 0) };
+        } else if !super::x86_shared::toggle_global_pages() {
+            Self::invalidate_all();
+        }
+    }
+
     #[inline(always)]
     fn table(_table_kind: TableKind) -> PhysicalAddress {
         let address: usize;
@@ -122,12 +135,18 @@ static USER_PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
 const INVPCID_ADDRESS: usize = 0;
 /// `INVPCID` type 1: every non-global translation in one PCID.
 const INVPCID_SINGLE_CONTEXT: usize = 1;
+/// `INVPCID` type 2: every translation in every PCID, global ones included.
+const INVPCID_ALL_INCLUDING_GLOBAL: usize = 2;
+
+/// Ferric Oxide: whether every CPU supports `INVPCID`, for [`Arch::invalidate_all_global`].
+static INVPCID_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Invalidates TLB and paging-structure cache entries for `pcid` with `INVPCID`.
 ///
 /// # Safety
 ///
-/// The CPU must support `INVPCID` and, since `pcid` is not 0, have CR4.PCIDE set.
+/// The CPU must support `INVPCID` and, for types 0 and 1 with a `pcid` other than 0, have
+/// CR4.PCIDE set.
 #[inline(always)]
 unsafe fn invpcid(kind: usize, pcid: usize, address: usize) {
     let descriptor: [usize; 2] = [pcid, address];
@@ -153,6 +172,18 @@ impl X8664Arch {
     /// from now on must have CR4.PCIDE set before it does.
     pub unsafe fn set_user_pcid(active: bool) {
         USER_PCID_ACTIVE.store(active, Ordering::Relaxed);
+    }
+
+    /// Ferric Oxide: lets [`Arch::invalidate_all_global`] use `INVPCID` instead of toggling
+    /// CR4.PGE.
+    ///
+    /// # Safety
+    ///
+    /// When `available`, every CPU that calls `invalidate_all_global` from now on must support
+    /// `INVPCID`, or must itself call this with `false` before its first call. A CPU's own store
+    /// is visible to its later loads, so withdrawing needs no ordering with other CPUs.
+    pub unsafe fn set_invpcid_available(available: bool) {
+        INVPCID_AVAILABLE.store(available, Ordering::Relaxed);
     }
 }
 

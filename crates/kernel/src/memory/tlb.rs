@@ -6,9 +6,28 @@
 //!
 //! The pages reach the other CPUs through one [`TlbMailbox`] per target CPU, in its
 //! `PercpuBlock`, next to the `wants_tlb_shootdown` flag. A requester first [posts] its
-//! invalidation, then sets the flag (`Release`) and sends the IPI. The target swaps the flag off
-//! (`Acquire`), [receives] what the mailbox holds, invalidates, and acknowledges. So every flag
-//! set still gets exactly one handling and one acknowledgement, as before.
+//! invalidation, which gives it a [`TlbAck`], then sets the flag (`Release`) and sends the IPI
+//! unless the flag was already set. The target swaps the flag off (`Acquire`), [receives] what the
+//! mailbox holds, invalidates, and acknowledges.
+//!
+//! # Acknowledgements
+//!
+//! Each post takes a ticket from the mailbox's request counter, and the target acknowledges by
+//! advancing the mailbox's handled counter. A requester waits until every target it posted to
+//! has handled its own ticket ([`TlbAcks`]), so nothing but that target's handling of that
+//! request, or a later one, can end the wait: not a CPU that left the address space, not an
+//! answer to someone else's request, and not a CPU the requester never asked. A CPU that leaves
+//! an address space acknowledges like any other handling, by taking its mailbox and
+//! invalidating first.
+//!
+//! A receiver loads the request counter, with `Acquire`, before it takes the mailbox, and
+//! publishes that value as handled once it has invalidated. Tickets up to that value belong to
+//! posts that happened before the take, so the take covered them (or an earlier take on this CPU
+//! did, which has finished invalidating, or this handling is nested and flushed everything).
+//! Posts with later tickets are not acknowledged by this handling; their flag set is answered by
+//! the next one. A flag that is already set when a requester sets it has an interrupt on the way
+//! and a handling still to come that swaps it off after this requester's swap, so the requester
+//! need not send another interrupt or wait for the flag to clear.
 //!
 //! # The mailbox protocol
 //!
@@ -53,13 +72,18 @@
 //!   posted, the sequence number differs and the CAS fails, so the taker retries and never acts
 //!   on a stale list. The sequence number is `usize::BITS - 8` bits wide, and an interrupted
 //!   take would have to see that many posts wrap around for a false match.
-//! - The receiver acknowledges with `Release` after invalidating; the requester waits for the
-//!   acknowledgements before freeing any frame.
+//! - A requester takes its ticket with a `Release` increment after its post. The receiver's
+//!   `Acquire` load of the counter reads that increment or a later one, which continues its
+//!   release sequence, so the post happens before the take.
+//! - The receiver advances the handled counter with `Release` after invalidating; the requester's
+//!   `Acquire` load of it comes before it frees any frame.
 //!
 //! [posts]: TlbMailbox::post
 //! [receives]: TlbMailbox::receive
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+use crate::cpu_set::{LogicalCpuId, MAX_CPU_COUNT};
 
 /// The most pages one shootdown round invalidates one at a time. A round that changes more
 /// pages flushes the whole TLB instead, locally and on every target.
@@ -222,6 +246,10 @@ pub struct TlbMailbox {
     /// How many [`TlbMailbox::receive`] calls are running on the target CPU, which is the only
     /// one that changes it; interrupts nest them. `Relaxed` is enough for that.
     receiving: AtomicU32,
+    /// The last ticket handed to a requester.
+    requested: AtomicUsize,
+    /// The last ticket the target has handled: it invalidated what every post up to it asked for.
+    handled: AtomicUsize,
 }
 
 impl TlbMailbox {
@@ -231,12 +259,29 @@ impl TlbMailbox {
             state: AtomicUsize::new(state(TAG_EMPTY, 0, 0)),
             slots: [const { AtomicUsize::new(0) }; TLB_SINGLE_PAGE_FLUSH_CEILING],
             receiving: AtomicU32::new(0),
+            requested: AtomicUsize::new(0),
+            handled: AtomicUsize::new(0),
         }
     }
 
     /// Posts `inv` for the target CPU. Call it after the page-table changes, and before setting
     /// the target's request flag with `Release` ordering. Requesters on any CPU may post at once.
-    pub fn post(&self, inv: &TlbInvalidation) {
+    ///
+    /// The returned [`TlbAck`] tells when the target has handled this request.
+    pub fn post(&self, inv: &TlbInvalidation) -> TlbAck<'_> {
+        self.post_content(inv);
+        // `Release`: a receiver that reads this ticket, or a later one, sees the post above.
+        let ticket = self
+            .requested
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
+        TlbAck {
+            mailbox: self,
+            ticket,
+        }
+    }
+
+    fn post_content(&self, inv: &TlbInvalidation) {
         if inv.is_empty() {
             return;
         }
@@ -343,8 +388,12 @@ impl TlbMailbox {
     ///
     /// A call that interrupted another one on the same CPU always flushes everything: the outer
     /// call may have taken the request this one answers and not yet invalidated it.
+    ///
+    /// It then acknowledges every request whose ticket was handed out before it started.
     pub fn receive(&self, page: impl FnMut(usize), all: impl FnOnce()) {
         let nested = self.receiving.fetch_add(1, Ordering::Relaxed) > 0;
+        // Before the take: every ticket up to this one belongs to a post the take will see.
+        let requested = self.requested.load(Ordering::Acquire);
         let inv = self.take();
         if nested {
             all();
@@ -352,6 +401,103 @@ impl TlbMailbox {
             inv.invalidate(page, all);
         }
         self.receiving.fetch_sub(1, Ordering::Relaxed);
+        self.acknowledge(requested);
+    }
+
+    /// Records that every ticket up to `ticket` has been handled. A nested handling may have
+    /// published a later ticket already, so this never moves the counter back.
+    fn acknowledge(&self, ticket: usize) {
+        let mut current = self.handled.load(Ordering::Relaxed);
+        while ticket_after(ticket, current) {
+            match self.handled.compare_exchange_weak(
+                current,
+                ticket,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn has_handled(&self, ticket: usize) -> bool {
+        !ticket_after(ticket, self.handled.load(Ordering::Acquire))
+    }
+}
+
+/// Whether ticket `a` was handed out after ticket `b`. Tickets wrap; two that are compared are
+/// never `isize::MAX` requests apart.
+fn ticket_after(a: usize, b: usize) -> bool {
+    (a.wrapping_sub(b) as isize) > 0
+}
+
+/// One request posted to a [`TlbMailbox`]: done once the target has handled it.
+#[derive(Clone, Copy, Debug)]
+pub struct TlbAck<'a> {
+    mailbox: &'a TlbMailbox,
+    ticket: usize,
+}
+
+impl TlbAck<'_> {
+    /// Whether the target has invalidated what this request, and every earlier one to the same
+    /// target, asked for.
+    pub fn is_handled(&self) -> bool {
+        self.mailbox.has_handled(self.ticket)
+    }
+}
+
+/// The requests one shootdown round posted, at most one per target CPU, that the requester waits
+/// for before it frees frames.
+#[derive(Debug)]
+pub struct TlbAcks<'a> {
+    pending: [Option<TlbAck<'a>>; MAX_CPU_COUNT as usize],
+    count: usize,
+}
+
+impl<'a> TlbAcks<'a> {
+    /// No pending requests.
+    pub const fn new() -> Self {
+        Self {
+            pending: [None; MAX_CPU_COUNT as usize],
+            count: 0,
+        }
+    }
+
+    /// Waits for `ack`, the request posted to `cpu`, as well. A later request to the same CPU
+    /// replaces an earlier one, which it covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ack` back if `cpu` is not below [`MAX_CPU_COUNT`], which no CPU with a per-CPU
+    /// block is; the caller must then wait for it itself.
+    pub fn record(&mut self, cpu: LogicalCpuId, ack: TlbAck<'a>) -> Result<(), TlbAck<'a>> {
+        let Some(slot) = self.pending.get_mut(cpu.get() as usize) else {
+            return Err(ack);
+        };
+        if slot.replace(ack).is_none() {
+            self.count = self.count.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Forgets the requests that have been handled. Returns how many are left.
+    pub fn poll(&mut self) -> usize {
+        if self.count != 0 {
+            for slot in &mut self.pending {
+                if slot.is_some_and(|ack| ack.is_handled()) {
+                    *slot = None;
+                    self.count = self.count.saturating_sub(1);
+                }
+            }
+        }
+        self.count
+    }
+}
+
+impl Default for TlbAcks<'_> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -565,6 +711,262 @@ mod tests {
             .compare_exchange(stale, empty, Ordering::AcqRel, Ordering::Acquire)
             .is_err());
         assert_eq!(received(&mailbox).unwrap(), [2]);
+    }
+
+    fn cpu(id: u32) -> LogicalCpuId {
+        LogicalCpuId::new(id)
+    }
+
+    #[test]
+    fn ack_waits_for_the_targets_own_handling() {
+        let mailbox = TlbMailbox::new();
+        let ack = mailbox.post(&of(&[(3, 1)]));
+        assert!(!ack.is_handled());
+        assert_eq!(received(&mailbox).unwrap(), [3]);
+        assert!(ack.is_handled());
+        // Later requests are not covered by the earlier handling.
+        let later = mailbox.post(&of(&[(4, 1)]));
+        assert!(ack.is_handled());
+        assert!(!later.is_handled());
+    }
+
+    /// Issue #264: the requester asked a CPU that then left the address space (and answered in
+    /// its switch hook), and a CPU that stayed. Under the shared counter the leaver was not
+    /// counted but its answer was, so one answer ended the wait before the CPU that stayed had
+    /// invalidated anything.
+    #[test]
+    fn leaver_answer_does_not_end_the_wait_for_another_cpu() {
+        let leaver = TlbMailbox::new();
+        let stayer = TlbMailbox::new();
+        let inv = of(&[(9, 1)]);
+        let mut acks = TlbAcks::new();
+        acks.record(cpu(1), leaver.post(&inv)).unwrap();
+        acks.record(cpu(2), stayer.post(&inv)).unwrap();
+        assert_eq!(acks.poll(), 2);
+
+        // The leaver answers in `switch_arch_hook`, after it cleared its bit.
+        assert_eq!(received(&leaver).unwrap(), [9]);
+        assert_eq!(
+            acks.poll(),
+            1,
+            "the CPU that stayed has not invalidated yet"
+        );
+
+        assert_eq!(received(&stayer).unwrap(), [9]);
+        assert_eq!(acks.poll(), 0);
+    }
+
+    /// Issue #264: a CPU answering someone else's request (another address space's round, or
+    /// the shadow-stack broadcast) must not count for this round, whichever CPU it is.
+    #[test]
+    fn answers_to_unrelated_requests_do_not_count() {
+        let target = TlbMailbox::new();
+        let bystander = TlbMailbox::new();
+        let mut acks = TlbAcks::new();
+
+        // The target answered an unrelated request before this round posted.
+        let _ = target.post(&TlbInvalidation::ALL);
+        assert_eq!(received(&target), None);
+        acks.record(cpu(0), target.post(&of(&[(5, 1)]))).unwrap();
+        // Another CPU answers a broadcast, possibly while running this address space.
+        let _ = bystander.post(&TlbInvalidation::ALL);
+        assert_eq!(received(&bystander), None);
+        assert_eq!(acks.poll(), 1);
+
+        assert_eq!(received(&target).unwrap(), [5]);
+        assert_eq!(acks.poll(), 0);
+    }
+
+    /// A handling that loaded the request counter before a post may still take that post, but
+    /// must not acknowledge it: the next handling, the one its flag set asks for, does.
+    #[test]
+    fn handling_that_began_before_a_post_does_not_acknowledge_it() {
+        let mailbox = TlbMailbox::new();
+        let earlier = mailbox.post(&of(&[(1, 1)]));
+        // The handling starts: it loads the counter...
+        let requested = mailbox.requested.load(Ordering::Acquire);
+        // ...a new request arrives before its take...
+        let ack = mailbox.post(&of(&[(2, 1)]));
+        // ...and the take covers both.
+        assert!(mailbox.take().is_all());
+        mailbox.acknowledge(requested);
+        assert!(earlier.is_handled());
+        assert!(!ack.is_handled());
+        assert_eq!(received(&mailbox).unwrap(), []);
+        assert!(ack.is_handled());
+    }
+
+    #[test]
+    fn nested_acknowledgement_is_not_undone_by_the_outer_one() {
+        let mailbox = TlbMailbox::new();
+        let outer_ack = mailbox.post(&of(&[(4, 1)]));
+        let mut inner_ack = None;
+        mailbox.receive(
+            |_| {
+                let ack = mailbox.post(&of(&[(5, 1)]));
+                assert_eq!(received(&mailbox), None);
+                assert!(ack.is_handled());
+                inner_ack = Some(ack);
+            },
+            || panic!("the outer call has a page list"),
+        );
+        // The outer call loaded an older ticket and acknowledged it after the inner one.
+        assert!(outer_ack.is_handled());
+        assert!(inner_ack.unwrap().is_handled());
+    }
+
+    #[test]
+    fn tickets_wrap_around() {
+        let mailbox = TlbMailbox::new();
+        mailbox.requested.store(usize::MAX - 1, Ordering::Relaxed);
+        mailbox.handled.store(usize::MAX - 1, Ordering::Relaxed);
+        let before_wrap = mailbox.post(&of(&[(1, 1)]));
+        let after_wrap = mailbox.post(&of(&[(2, 1)]));
+        assert!(!before_wrap.is_handled() && !after_wrap.is_handled());
+        assert_eq!(received(&mailbox), None);
+        assert!(before_wrap.is_handled() && after_wrap.is_handled());
+        assert_eq!(mailbox.handled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn later_request_to_the_same_cpu_replaces_the_earlier() {
+        let mailbox = TlbMailbox::new();
+        let mut acks = TlbAcks::new();
+        acks.record(cpu(3), mailbox.post(&of(&[(1, 1)]))).unwrap();
+        acks.record(cpu(3), mailbox.post(&of(&[(2, 1)]))).unwrap();
+        assert_eq!(acks.poll(), 1);
+        let _ = received(&mailbox);
+        assert_eq!(acks.poll(), 0);
+        let out_of_range = mailbox.post(&of(&[(3, 1)]));
+        assert!(acks.record(cpu(MAX_CPU_COUNT), out_of_range).is_err());
+    }
+
+    /// Several requesters each run shootdown rounds to every target, as `Flusher::flush` does,
+    /// and wait for their own acknowledgements while serving their own mailboxes. Targets answer
+    /// at arbitrary times, as a CPU does when it leaves an address space or reaches a spin
+    /// point. When a round's wait ends, every target must have invalidated the round's page,
+    /// one by one or by a full flush that began after it was posted.
+    #[test]
+    fn rounds_end_only_after_every_target_invalidated() {
+        use std::sync::{atomic::AtomicBool, Mutex};
+
+        const CPUS: usize = 4;
+        const REQUESTERS: usize = 2;
+        const ROUNDS: usize = if cfg!(miri) { 6 } else { 1000 };
+
+        struct Cpu {
+            mailbox: TlbMailbox,
+            flag: AtomicBool,
+            /// Pages invalidated one by one.
+            pages: Mutex<std::collections::BTreeSet<usize>>,
+            /// Counts posts as they begin, before the page-table changes would be visible.
+            posts_begun: AtomicUsize,
+            /// `posts_begun` at every full flush, which covers every post begun before its take.
+            /// Read after the take, it may also include posts begun just after it, so this check
+            /// is exact for page lists and lenient for full flushes. (A full flush can cover a
+            /// post before that post's ticket exists, when another requester upgraded it.)
+            full_flush_from: Mutex<Vec<usize>>,
+        }
+        impl Cpu {
+            fn serve(&self) {
+                if self.flag.swap(false, Ordering::Acquire) {
+                    self.mailbox.receive(
+                        |page| {
+                            self.pages.lock().unwrap().insert(page);
+                        },
+                        || {
+                            let begun = self.posts_begun.load(Ordering::SeqCst);
+                            self.full_flush_from.lock().unwrap().push(begun);
+                        },
+                    );
+                }
+            }
+            fn covered(&self, page: usize, post: usize) -> bool {
+                self.pages.lock().unwrap().contains(&page)
+                    || self
+                        .full_flush_from
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|&begun| post < begun)
+            }
+        }
+
+        // CPUs 0..REQUESTERS are requesters; all CPUs are targets of the others.
+        let cpus: Arc<Vec<Cpu>> = Arc::new(
+            (0..CPUS)
+                .map(|_| Cpu {
+                    mailbox: TlbMailbox::new(),
+                    flag: AtomicBool::new(false),
+                    pages: Mutex::new(Default::default()),
+                    posts_begun: AtomicUsize::new(0),
+                    full_flush_from: Mutex::new(Vec::new()),
+                })
+                .collect(),
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let targets: Vec<_> = (REQUESTERS..CPUS)
+            .map(|me| {
+                let (cpus, done) = (cpus.clone(), done.clone());
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Acquire) {
+                        cpus[me].serve();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        let requesters: Vec<_> = (0..REQUESTERS)
+            .map(|me| {
+                let (cpus, finished) = (cpus.clone(), finished.clone());
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        let page = (me * ROUNDS + round) * 2;
+                        let mut posted = Vec::new();
+                        let mut acks = TlbAcks::new();
+                        for (id, target) in cpus.iter().enumerate() {
+                            if id == me {
+                                continue;
+                            }
+                            let post = target.posts_begun.fetch_add(1, Ordering::SeqCst);
+                            let ack = target.mailbox.post(&of(&[(page, 1)]));
+                            posted.push((id, post));
+                            acks.record(cpu(id as u32), ack).unwrap();
+                            // The interrupt is implicit: targets poll their flags.
+                            target.flag.swap(true, Ordering::Release);
+                        }
+                        while acks.poll() != 0 {
+                            // A requester is a target of the other requesters.
+                            cpus[me].serve();
+                            std::thread::yield_now();
+                        }
+                        for (id, post) in posted {
+                            assert!(
+                                cpus[id].covered(page, post),
+                                "requester {me} round {round}: CPU {id} acknowledged early"
+                            );
+                        }
+                    }
+                    // Keep answering the requesters that are not done yet.
+                    finished.fetch_add(1, Ordering::AcqRel);
+                    while finished.load(Ordering::Acquire) < REQUESTERS {
+                        cpus[me].serve();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for requester in requesters {
+            requester.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        for target in targets {
+            target.join().unwrap();
+        }
     }
 
     /// Requesters on several threads each post one page and set the flag, as

@@ -42,6 +42,13 @@ impl Arch for X86Arch {
     }
 
     #[inline(always)]
+    fn invalidate_all_global() {
+        if !super::x86_shared::toggle_global_pages() {
+            Self::invalidate_all();
+        }
+    }
+
+    #[inline(always)]
     fn table(_table_kind: TableKind) -> PhysicalAddress {
         let address: usize;
         unsafe { asm!("mov {0}, cr3", out(reg) address) };

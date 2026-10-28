@@ -196,7 +196,22 @@ target has not taken is upgraded to a full flush, so concurrent requesters never
 get less than they asked for; the module documentation describes the protocol
 and its memory ordering. RISC-V keeps the full flush, because `sfence.vma` with
 an address does not cover the page tables an unmap frees. Shadow-stack
-teardown and a queued page the caller cannot name also flush everything.
+teardown and a queued page the caller cannot name also flush everything. A
+requester displaced while it fills the mailbox marks the mailbox until its
+stores are done, so they cannot overwrite the next requester's list.
+
+The flushing CPU frees the round's frames only after every CPU it asked has
+handled that round's request. Each post to a mailbox returns a ticket, and the
+target publishes the last ticket it covered after invalidating. The requester
+waits for each target's own ticket (`TlbAcks` in `memory/tlb.rs`) and answers
+shootdowns sent to it while it waits. The earlier shared counter per address
+space could be satisfied by the wrong acknowledgements: from a CPU that left the
+address space during the round, or from a CPU answering an unrelated request.
+The wait could then end before a CPU that still held translations had flushed
+([#264](https://github.com/rexlunae/ferric-oxide/issues/264)). A CPU that leaves
+an address space acknowledges only by handling its mailbox like any other
+target. A requester whose target's flag is already set sends no second
+interrupt, because the pending handling will see its post.
 
 On ARM64 every user address space uses ASID 0 (`TCR_EL1.A1` is clear and
 `TTBR0_EL1` carries no ASID), so the TLB is not tagged by process. Switching
@@ -238,6 +253,22 @@ exhaustion returns an allocation failure, with no writable fallback. The kernel
 checks every reserved page after constructing its boot mappings and invalidates
 old bootloader translations before AP startup. Pool frames are mapped only with
 read-only shadow-stack PTEs and an unmapped guard below each stack.
+
+Shadow-stack PTEs are global, like the rest of the kernel half while KPTI is
+off, and a page-table reload does not drop global TLB entries. Freeing a shadow
+stack therefore broadcasts a shootdown (`shootdown_tlb_all`) that asks
+every CPU to drop global entries as well: each CPU that sees a new request,
+counted by a generation in `percpu/global_flush.rs`, invalidates with `INVPCID`
+type 2 when every CPU has it, or by toggling CR4.PGE (Intel SDM Volume 3A,
+4.10.4.1). The BSP enables `INVPCID` for this if its CPUID reports it, and each
+AP that lacks it turns it off for all CPUs before it can handle a shootdown
+([#282](https://github.com/rexlunae/ferric-oxide/issues/282)). Shootdowns for user address spaces still only reload the page table
+([#260](https://github.com/rexlunae/ferric-oxide/issues/260)). The broadcast
+waits, through the same per-CPU tickets as a targeted round, until every other
+CPU has flushed, and only then is the stack's frame returned to the pool
+([#281](https://github.com/rexlunae/ferric-oxide/issues/281)). A CPU checks
+for a pending global flush after it reads its mailbox's ticket counter, so the
+handling that acknowledges a broadcast always drops global entries.
 
 Live CPUs write entries with `WRSS`. Pre-enable initialization makes a bounded
 store through the same read-only mapping while interrupts are masked and the
