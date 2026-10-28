@@ -15,11 +15,11 @@ use cookbook::recipe::{
     validate_filesystem_rules,
 };
 use cookbook::{Error, Result, staged_pkg};
-use pkg::{PackageName, PackageState};
+use fox_core::cookbook::RecipeName;
 use redox_installer::PackageConfig;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Write, stderr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{OnceLock, mpsc};
@@ -340,7 +340,7 @@ fn main_inner() -> Result<()> {
     Ok(())
 }
 
-fn print_failed(command: &CliCommand, recipe: &PackageName) {
+fn print_failed(command: &CliCommand, recipe: &RecipeName) {
     eprintln!(
         "{}{}{} {} - failed {}{}",
         style::Bold,
@@ -352,7 +352,7 @@ fn print_failed(command: &CliCommand, recipe: &PackageName) {
     );
 }
 
-fn print_success(command: &CliCommand, recipe: &PackageName) {
+fn print_success(command: &CliCommand, recipe: &RecipeName) {
     eprintln!(
         "{}{}{} {} - successful{}{}",
         style::Bold,
@@ -364,7 +364,7 @@ fn print_success(command: &CliCommand, recipe: &PackageName) {
     );
 }
 
-fn print_cached(command: &CliCommand, recipe: &PackageName) {
+fn print_cached(command: &CliCommand, recipe: &RecipeName) {
     eprintln!(
         "{}{}{} {} - cached{}{}",
         style::Bold,
@@ -421,7 +421,7 @@ fn repo_inner(config: &CliConfig, command: &CliCommand, recipe: &CookRecipe) -> 
             if !matches!(result, Ok(true)) {
                 flush_pty(&mut logger);
                 let log_path =
-                    log_path.join(format!("{}/{}.log", recipe.target, recipe.name.name()));
+                    log_path.join(format!("{}/{}.log", recipe.target, recipe.name.recipe()));
                 status_tx
                     .send(StatusUpdate::FlushLog(recipe.name.clone(), log_path))
                     .unwrap_or_default();
@@ -467,7 +467,7 @@ fn publish_packages(recipe_names: &Vec<CookRecipe>, repo_path: &PathBuf) -> Resu
 fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecipe>)> {
     let mut config = CliConfig::new()?;
     let mut command: Option<String> = None;
-    let mut recipe_names: Vec<PackageName> = Vec::new();
+    let mut recipe_names: Vec<RecipeName> = Vec::new();
     let mut override_filesystem_repo_binary = false;
     for arg in args {
         if arg.starts_with("--") {
@@ -548,7 +548,7 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         config.cook.verbose = false;
     }
 
-    let mut preloaded_recipes: BTreeMap<PackageName, CookRecipe> = BTreeMap::new();
+    let mut preloaded_recipes: BTreeMap<RecipeName, CookRecipe> = BTreeMap::new();
 
     // TODO: Unindent
     {
@@ -595,7 +595,7 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
                 recipe_names = conf
                     .packages
                     .keys()
-                    .filter_map(|k| PackageName::new(k.to_string()).ok())
+                    .filter_map(|k| RecipeName::new(k.to_string()).ok())
                     .collect();
             } else {
                 bail_options_err!(
@@ -623,13 +623,13 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
 
         // Expand deps for "source" + "local" and "binary"
         // This is the complete map from filesystem config
-        let mut source_names: Vec<PackageName> = Vec::new();
-        let mut binary_names: Vec<PackageName> = Vec::new();
-        let mut special_rules: HashMap<PackageName, String> = HashMap::new();
+        let mut source_names: Vec<RecipeName> = Vec::new();
+        let mut binary_names: Vec<RecipeName> = Vec::new();
+        let mut special_rules: HashMap<RecipeName, String> = HashMap::new();
         let default_rule = if repo_binary { "binary" } else { "source" };
 
         for (recipe_name, recipe_lock) in lock.iter().filter(|(_, v)| v.fsrule.is_some()) {
-            let Ok(recipe_name) = PackageName::new(recipe_name) else {
+            let Ok(recipe_name) = RecipeName::new(recipe_name) else {
                 continue;
             };
             let rule = recipe_lock.fsrule.as_ref().unwrap();
@@ -638,7 +638,7 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         }
         if let Some(conf) = config.filesystem.as_ref() {
             for (recipe_name_str, recipe_config) in conf.packages.iter() {
-                let Ok(recipe_name) = PackageName::new(recipe_name_str) else {
+                let Ok(recipe_name) = RecipeName::new(recipe_name_str) else {
                     continue;
                 };
 
@@ -660,13 +660,13 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         }
         source_names = CookRecipe::get_all_deps_names_recursive(&source_names, true)?;
         binary_names = CookRecipe::get_all_deps_names_recursive(&binary_names, false)?;
-        let source_names: HashSet<PackageName> = source_names.into_iter().collect();
-        let binary_names: HashSet<PackageName> = binary_names.into_iter().collect();
+        let source_names: HashSet<RecipeName> = source_names.into_iter().collect();
+        let binary_names: HashSet<RecipeName> = binary_names.into_iter().collect();
 
         // These are list that derived from recipe_names
-        let mut source_recipe_names: Vec<PackageName> = Vec::new();
-        let mut binary_recipe_names: Vec<PackageName> = Vec::new();
-        let mut ignore_recipe_names: Vec<PackageName> = Vec::new();
+        let mut source_recipe_names: Vec<RecipeName> = Vec::new();
+        let mut binary_recipe_names: Vec<RecipeName> = Vec::new();
+        let mut ignore_recipe_names: Vec<RecipeName> = Vec::new();
         for recipe_name in recipe_names.iter() {
             if source_names.contains(recipe_name) {
                 source_recipe_names.push(recipe_name.clone());
@@ -791,9 +791,11 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     }
 
     if command.is_building() && recipes.iter().any(|r| r.rule == "binary") {
-        let (_, repository) = fetch_repo::get_binary_repo();
+        let remote = fetch_repo::binary_repo();
         for recipe in recipes.iter_mut() {
-            if recipe.rule == "binary" && !repository.packages.contains_key(recipe.name.as_str()) {
+            if recipe.rule == "binary"
+                && !remote.is_some_and(|r| r.index.packages.contains_key(recipe.name.as_str()))
+            {
                 if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
                     // TODO: this should be printed at fetch log, not here
                     println!(
@@ -926,7 +928,7 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
             config.sysroot_dir.display()
         )));
     }
-    let recipe_map: HashMap<&PackageName, &CookRecipe> =
+    let recipe_map: HashMap<&RecipeName, &CookRecipe> =
         recipes.iter().map(|r| (&r.name, r)).collect();
     PUSH_CONFIG
         .set(config.clone())
@@ -941,23 +943,21 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
                 let config = PUSH_CONFIG.get().unwrap();
                 let install_path = &config.sysroot_dir;
                 let archive_path = item.recipe.stage_paths().1;
-                let mut state = if !config.no_metadata {
-                    Some(PackageState::from_sysroot(install_path).map_err(Error::from)?)
+                let store = if !config.no_metadata {
+                    Some(fox_store::Store::open(install_path)?)
                 } else {
                     None
                 };
-                let r = package_handle_push(state.as_mut(), &archive_path, install_path);
-                if matches!(r, Ok(false)) && state.is_some() {
-                    state
-                        .unwrap()
-                        .to_sysroot(install_path)
-                        .map_err(|e| Error::from_io_error(e, "Extracting package"))?;
-                }
-                r
+                package_handle_push(
+                    store.as_ref(),
+                    Path::new(fox_core::cookbook::PUBLIC_KEY),
+                    &archive_path,
+                    install_path,
+                )
             }
             WalkTreeEntry::NotBuilt => Err(Error::Other(format!(
                 "Package {} has not been built",
-                package_name.name()
+                package_name.recipe()
             ))),
             WalkTreeEntry::Deduped | WalkTreeEntry::Missing => {
                 // does not matter
@@ -1016,9 +1016,9 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
 }
 
 fn handle_tree(recipes: &Vec<CookRecipe>, cmd: TreeOptions, config: &CliConfig) -> Result<()> {
-    let recipe_map: HashMap<&PackageName, &CookRecipe> =
+    let recipe_map: HashMap<&RecipeName, &CookRecipe> =
         recipes.iter().map(|r| (&r.name, r)).collect();
-    let roots: Vec<PackageName> = recipes.iter().map(|s| s.name.clone()).collect();
+    let roots: Vec<RecipeName> = recipes.iter().map(|s| s.name.clone()).collect();
     let data = tree::display_tree_entry(&roots[..], &recipe_map, cmd, config.display)?;
 
     if matches!(config.display, DisplayOptions::Tree) {

@@ -586,17 +586,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "console"
-version = "0.16.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e96a4956774c13c126a8b5af4daa79384f4d826534c95a02d76afb39e2ab64e3"
-dependencies = [
- "encode_unicode",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1156,12 +1145,6 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
-
-[[package]]
-name = "encode_unicode"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "encoding_rs"
@@ -3155,17 +3138,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indicatif"
-version = "0.18.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
-dependencies = [
- "console",
- "portable-atomic",
- "unit-prefix",
-]
-
-[[package]]
 name = "indoc"
 version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4403,35 +4375,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "436d45c2b6a5b159d43da708e62b25be3a4a3d5550d654b72216ade4c4bfd717"
 
 [[package]]
-name = "redox-pkg"
-version = "0.3.2"
-source = "git+https://github.com/rexlunae/pkgutils.git#5de8f295fdce141aa76ddba6f787b5589db18783"
-dependencies = [
- "hex",
- "serde",
- "serde_derive",
- "thiserror 2.0.17",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "redox-pkg"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960488345d8f83ba3a074c96ce43e01512086476c44447eabf215a9900285f5e"
-dependencies = [
- "hex",
- "indicatif",
- "pkgar 0.2.4",
- "pkgar-core 0.2.4",
- "serde",
- "serde_derive",
- "thiserror 2.0.17",
- "toml 1.1.8+spec-1.1.0",
- "ureq",
-]
-
-[[package]]
 name = "redox-scheme"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4448,6 +4391,7 @@ dependencies = [
  "ansi-to-tui",
  "blake3",
  "fox-core",
+ "fox-store",
  "globset",
  "ignore",
  "libc",
@@ -4456,7 +4400,6 @@ dependencies = [
  "pkgar-core 0.2.3",
  "pkgar-keys 0.2.3",
  "ratatui",
- "redox-pkg 0.3.2",
  "redox_installer",
  "redoxer",
  "regex",
@@ -4465,6 +4408,7 @@ dependencies = [
  "strip-ansi-escapes",
  "tempfile",
  "termion",
+ "thiserror 2.0.17",
  "toml 0.8.23",
  "walkdir",
 ]
@@ -4533,10 +4477,13 @@ version = "0.2.63"
 dependencies = [
  "anyhow",
  "dirs",
+ "fox-core",
+ "fox-store",
  "fuser",
  "libc",
+ "pkgar 0.2.4",
+ "pkgar-keys 0.2.4",
  "proc-mounts",
- "redox-pkg 0.3.3",
  "redox_installer",
  "redox_syscall 0.9.4",
  "redoxfs",
@@ -4755,7 +4702,6 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5833,44 +5779,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
 
 [[package]]
-name = "unit-prefix"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "ureq"
-version = "3.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
-dependencies = [
- "base64 0.23.1",
- "log",
- "percent-encoding",
- "rustls",
- "rustls-pki-types",
- "ureq-proto",
- "utf8-zero",
- "webpki-roots",
-]
-
-[[package]]
-name = "ureq-proto"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86fd172ccca569e458f61b6bdd6220965a9ef36e672a6852953b51a0e1583be"
-dependencies = [
- "base64 0.23.1",
- "http",
- "httparse",
- "log",
-]
 
 [[package]]
 name = "url"
@@ -5883,12 +5795,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "utf8-zero"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -6043,15 +5949,6 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

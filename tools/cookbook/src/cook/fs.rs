@@ -340,9 +340,12 @@ pub fn serialize_and_write<T: Serialize>(file_path: &Path, content: &T) -> Resul
 }
 
 pub fn read_toml<T: DeserializeOwned>(file_path: &Path) -> Result<T> {
-    // TODO: General error rather than from PackageError?
-    toml::from_str(&read_to_string(file_path)?)
-        .map_err(|e| Error::Package(pkg::PackageError::Parse(e, Some(file_path.to_path_buf()))))
+    toml::from_str(&read_to_string(file_path)?).map_err(|source| {
+        Error::Package(crate::PackageError::Parse {
+            path: file_path.to_path_buf(),
+            source,
+        })
+    })
 }
 
 pub fn offline_check_exists(path: &PathBuf) -> Result<()> {

@@ -153,9 +153,13 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     }
     let cookbook = Path::new(cookbook.ok_or(PackageInstallError::NoRepository)?);
 
-    let key = install_fox_key(cookbook, dest)?;
+    let key = fox_core::keys::install_key_file(
+        &cookbook.join(fox_core::cookbook::PUBLIC_KEY),
+        dest,
+        fox_core::keys::COOKBOOK_LABEL,
+    )?;
     let mut keys = fox_core::TrustedKeys::new();
-    keys.insert(FOX_COOKBOOK_LABEL, key.key);
+    keys.insert(key.label, key.key);
     let repository = cookbook.join("repo").join(get_target());
     let mut source = LocalRepository::new(&repository, keys);
     let store = fox_store::Store::open(dest)?;
@@ -181,27 +185,6 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     }
     store.install_plan(&plan, options)?;
     Ok(())
-}
-
-/// Where the trusted key for the cookbook's packages goes, relative to the
-/// image root. fox trusts every key file in `etc/fox/keys/`, by file name.
-const FOX_COOKBOOK_KEY: &str = "etc/fox/keys/cookbook.toml";
-
-/// The label fox gives that key, from its file name.
-const FOX_COOKBOOK_LABEL: &str = "cookbook";
-
-/// Copies the public key the cookbook signs packages with
-/// (`build/id_ed25519.pub.toml`) into the image as a key fox trusts, and
-/// returns it.
-fn install_fox_key(cookbook: &Path, dest: &Path) -> anyhow::Result<fox_core::TrustedKey> {
-    let key = cookbook.join("build/id_ed25519.pub.toml");
-    let target = dest.join(FOX_COOKBOOK_KEY);
-    if let Some(dir) = target.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    fs::copy(&key, &target)
-        .with_context(|| format!("copying {} to {}", key.display(), target.display()))?;
-    Ok(fox_core::keys::load_key_file(&target)?)
 }
 
 /// Install configured files, packages and accounts, creating the output directory if needed.
@@ -1161,7 +1144,7 @@ mod tests {
 
         assert!(dest.path().join("usr/bin/app").is_file());
         assert!(dest.path().join("usr/lib/liblib.so").is_file());
-        let installed = fs::read(dest.path().join(FOX_COOKBOOK_KEY)).unwrap();
+        let installed = fs::read(dest.path().join("etc/fox/keys/cookbook.toml")).unwrap();
         assert_eq!(installed, fs::read(&key.public_path).unwrap());
         let store = fox_store::Store::open(dest.path()).unwrap();
         let names: Vec<_> = store
@@ -1173,8 +1156,14 @@ mod tests {
         assert_eq!(
             names,
             [
-                ("app".to_string(), FOX_COOKBOOK_LABEL.to_string()),
-                ("lib".to_string(), FOX_COOKBOOK_LABEL.to_string())
+                (
+                    "app".to_string(),
+                    fox_core::keys::COOKBOOK_LABEL.to_string()
+                ),
+                (
+                    "lib".to_string(),
+                    fox_core::keys::COOKBOOK_LABEL.to_string()
+                )
             ]
         );
     }

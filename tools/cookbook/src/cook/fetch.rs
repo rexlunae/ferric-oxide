@@ -1,5 +1,5 @@
 use crate::cook::{
-    fetch_repo::{self, PlainPtyCallback},
+    fetch_repo,
     fs::*,
     package::{get_package_name, package_source_paths},
     pty::PtyOut,
@@ -12,15 +12,12 @@ use crate::{
     recipe::{BuildKind, CookRecipe, SourceRecipe},
     wrap_io_err, wrap_other_err,
 };
-use pkg::{SourceIdentifier, net_backend::DownloadBackendWriter};
+use fox_core::cookbook::{PackageInfo, SourceIdentifier};
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
-    fs::{self, File},
-    io::Read,
+    fs,
     path::{Path, PathBuf},
     process::Command,
-    rc::Rc,
 };
 
 pub struct FetchResult {
@@ -759,12 +756,10 @@ pub fn fetch_remote(
     source_dir: PathBuf,
     logger: &PtyOut,
 ) -> Result<FetchResult> {
-    let (mut manager, repository) = fetch_repo::get_binary_repo();
+    let Some(remote) = fetch_repo::binary_repo() else {
+        bail_other_err!("There is no prebuilt package remote to fetch from")
+    };
     let target_dir = create_target_dir(recipe_dir, recipe.target)?;
-    if logger.is_some() {
-        let writer = logger.as_ref().unwrap().1.try_clone().unwrap();
-        manager.set_callback(Rc::new(RefCell::new(PlainPtyCallback::new(writer))));
-    }
     let packages = recipe.recipe.get_packages_list();
 
     let name = recipe_dir
@@ -778,12 +773,9 @@ pub fn fetch_remote(
 
     for package in packages {
         let (_, source_pkgar, source_toml) = package_source_paths(package, &target_dir);
-        let (tmp_pkgar, tmp_toml) = (
-            source_pkgar.with_added_extension("tmp"),
-            source_toml.with_added_extension("tmp"),
-        );
+        let tmp_toml = source_toml.with_added_extension("download");
         let source_name = get_package_name(name, package);
-        let Some(repo_blake3) = repository.packages.get(&source_name) else {
+        let Some(repo_blake3) = remote.index.packages.get(&source_name) else {
             bail_other_err!("Package {source_name} does not exist in server repository")
         };
 
@@ -800,35 +792,13 @@ pub fn fetch_remote(
             }
 
             if !source_toml.is_file() {
-                let pkg_toml = {
-                    if tmp_toml.is_file() {
-                        remove_all(&tmp_toml)?;
-                    }
-                    let toml_file =
-                        File::create(&tmp_toml).map_err(wrap_io_err!(tmp_toml, "Creating file"))?;
-                    let mut writer = DownloadBackendWriter::ToFile(toml_file);
-                    manager.download(&format!("{}.toml", source_name), None, None, &mut writer)?;
-                    read_source_toml(&tmp_toml)?
-                };
-
-                if tmp_pkgar.is_file() {
-                    remove_all(&tmp_pkgar)?;
-                }
-                let pkgar_file =
-                    File::create(&tmp_pkgar).map_err(wrap_io_err!(tmp_pkgar, "Creating file"))?;
-                let mut writer = DownloadBackendWriter::ToFile(pkgar_file);
-                manager.download(
-                    &format!("{}.pkgar", source_name),
-                    Some(pkg_toml.network_size),
-                    None,
-                    &mut writer,
-                )?;
-                rename(&tmp_pkgar, &source_pkgar)?;
+                // The metadata goes in place last, so it is only there
+                // once the archive it describes is.
+                remote.download(&format!("{source_name}.toml"), &tmp_toml, logger)?;
+                remote.download(&format!("{source_name}.pkgar"), &source_pkgar, logger)?;
                 rename(&tmp_toml, &source_toml)?;
                 cached = false;
             }
-
-            // manager.download(file, 0, dest)
         } else {
             offline_check_exists(&source_pkgar)?;
             offline_check_exists(&source_toml)?;
@@ -838,7 +808,7 @@ pub fn fetch_remote(
         if package.is_none() {
             let pkg_toml = read_source_toml(&source_toml)?;
 
-            fetch_apply_source_info_from_remote(recipe, &pkg_toml.to_ident())?;
+            fetch_apply_source_info_from_remote(recipe, &pkg_toml.source())?;
 
             result = Some(FetchResult::new(
                 source_dir.clone(),
@@ -852,13 +822,8 @@ pub fn fetch_remote(
     result.ok_or_else(wrap_other_err!("There's no mandatory package in remote"))
 }
 
-fn read_source_toml(source_toml: &Path) -> Result<pkg::Package> {
-    let mut file = File::open(source_toml).map_err(wrap_io_err!(source_toml, "Opening file"))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(wrap_io_err!(source_toml, "Reading file"))?;
-    let pkg_toml = pkg::Package::from_toml(&contents)?;
-    Ok(pkg_toml)
+fn read_source_toml(source_toml: &Path) -> Result<PackageInfo> {
+    Ok(PackageInfo::from_file(source_toml)?)
 }
 
 pub(crate) fn fetch_apply_patches(

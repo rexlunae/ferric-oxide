@@ -3,8 +3,7 @@ use cookbook::cook::{fetch, fs, package as cook_package};
 use cookbook::recipe::CookRecipe;
 use cookbook::web::{CliWebConfig, generate_web};
 use cookbook::{Error, Result, WALK_DEPTH, staged_pkg};
-use pkg::PackageName;
-use pkg::{Repository, SourceIdentifier};
+use fox_core::cookbook::{RecipeName, RepositoryIndex, SourceIdentifier};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -53,7 +52,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
     let target_packages = &config
         .recipe_list
         .iter()
-        .filter_map(|n| match PackageName::new(n) {
+        .filter_map(|n| match RecipeName::new(n) {
             Ok(p) if p.is_host() => None,
             Ok(p) => Some(p),
             Err(_) => None,
@@ -88,7 +87,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
     // === 1. Push recipes in list ===
     for recipe_toml in &recipe_list {
         let recipe = &recipe_toml.name;
-        let Some(recipe_path) = staged_pkg::find(recipe.name()) else {
+        let Some(recipe_path) = staged_pkg::find(recipe.recipe()) else {
             eprintln!("recipe {} not found", recipe);
             continue;
         };
@@ -101,7 +100,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
         for package in cookbook_recipe.recipe.get_packages_list() {
             let (stage_dir, pkgar_src, toml_src) =
                 cook_package::package_stage_paths(package, &target_dir);
-            let recipe_name = cook_package::get_package_name(recipe.name(), package);
+            let recipe_name = cook_package::get_package_name(recipe.recipe(), package);
             let pkgar_dst = repo_path.join(format!("{}.pkgar", recipe_name));
             let toml_dst = repo_path.join(format!("{}.toml", recipe_name));
 
@@ -122,7 +121,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
 
             // TODO: Extract from pkgar instead to handle config.cook.clean_target == true
             if stage_dir.join("usr/share/metainfo").exists() {
-                appstream_sources.insert(recipe.name().to_string(), stage_dir.clone());
+                appstream_sources.insert(recipe.recipe().to_string(), stage_dir.clone());
             }
         }
     }
@@ -183,7 +182,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
             recipe
         );
 
-        let Some(recipe_path) = staged_pkg::find(recipe.name()) else {
+        let Some(recipe_path) = staged_pkg::find(recipe.recipe()) else {
             eprintln!("recipe {} not found", recipe);
             continue;
         };
@@ -194,7 +193,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
 
         match fetch::fetch_get_source_info(&cookbook_recipe) {
             Ok(source_ident) => {
-                outdated_packages.insert(recipe.name().to_string(), source_ident);
+                outdated_packages.insert(recipe.recipe().to_string(), source_ident);
             }
             Err(e) => {
                 eprintln!(
@@ -203,7 +202,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
                 );
                 let ident = get_ident();
                 outdated_packages.insert(
-                    recipe.name().to_string(),
+                    recipe.recipe().to_string(),
                     SourceIdentifier {
                         source_identifier: "missing_source".to_string(),
                         patch_identifier: "".into(),
@@ -220,14 +219,14 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
     // === 4. Read and update repo.toml ===
     let repo_toml_path = repo_path.join("repo.toml");
     if repo_toml_path.exists() {
-        let parsed: Repository = fs::read_toml(&repo_toml_path)?;
+        let parsed: RepositoryIndex = fs::read_toml(&repo_toml_path)?;
         for (k, v) in parsed.packages {
             packages.insert(k, v);
         }
         if parsed.outdated_packages.len() > 0 {
             let built_packages: BTreeSet<String> = recipe_list
                 .iter()
-                .map(|p| p.name.name().to_string())
+                .map(|p| p.name.recipe().to_string())
                 .collect();
             for (k, v) in parsed.outdated_packages {
                 if outdated_packages.contains_key(&k) || !built_packages.contains(&k) {
@@ -263,7 +262,7 @@ fn publish_packages(config: &CliConfig) -> Result<()> {
         packages.insert(package_name, version_str.to_string());
     }
 
-    let repository = Repository {
+    let repository = RepositoryIndex {
         build_id: get_ident().commit.clone(),
         packages,
         outdated_packages,

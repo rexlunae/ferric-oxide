@@ -2,12 +2,12 @@ use crate::cook::ident;
 use crate::recipe::SourceRecipe;
 use crate::web::get_category;
 use crate::{cook::tree::format_size, recipe::CookRecipe};
-use pkg::Package;
+use fox_core::cookbook::PackageInfo;
 use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
 pub fn generate_html_pkg(
-    package: &Package,
+    package: &PackageInfo,
     recipe: &CookRecipe,
     dependents: &Vec<String>,
     stage_files: &Option<String>,
@@ -108,7 +108,7 @@ pub fn generate_html_pkg(
             &config.this_repo,
             host,
             &package.commit_identifier,
-            Some(&format!("recipes/{category}/{}/recipe.toml", name.name())),
+            Some(&format!("recipes/{category}/{}/recipe.toml", name.recipe())),
         );
         let short_commit = get_short_commit(&package.commit_identifier);
         source_html += &format!(
@@ -204,7 +204,7 @@ pub fn generate_html_pkg(
 }
 
 pub fn generate_html_index(
-    grouped_packages: BTreeMap<String, Vec<&(Package, CookRecipe)>>,
+    grouped_packages: BTreeMap<String, Vec<&(PackageInfo, CookRecipe)>>,
     index_path: &Path,
     config: &crate::web::CliWebConfig,
 ) {

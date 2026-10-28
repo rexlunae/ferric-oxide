@@ -36,7 +36,9 @@ tui = ["ratatui", "ansi-to-tui", "strip-ansi-escapes"]
 [dependencies]
 blake3 = "1"
 # Ferric Oxide: signed package manifests (src/cook/fox_manifest.rs).
-fox-core = { path = "../../crates/fox-core" }
+fox-core = { path = "../../crates/fox-core", features = ["std"] }
+# Ferric Oxide: `repo push` installs into the sysroot with fox.
+fox-store = { path = "../../crates/fox-store" }
 globset = "0.4"
 libc = "0.2"
 ignore = "0.4"
@@ -44,12 +46,12 @@ object = { version = "0.38", features = ["build_core"] }
 pkgar = { git = "https://github.com/rexlunae/pkgar.git" } # Ferric mirror of redox-os/pkgar
 pkgar-core = { git = "https://github.com/rexlunae/pkgar.git" }
 pkgar-keys = { git = "https://github.com/rexlunae/pkgar.git" }
-redox-pkg = { git = "https://github.com/rexlunae/pkgutils.git", default-features = false } # Ferric mirror of redox-os/pkgutils
 redox_installer.workspace = true
 redoxer = { workspace = true, default-features = false }
 regex = "1.11"
 serde.workspace = true
 termion = "4"
+thiserror = { workspace = true, features = ["std"] }
 toml = "0.8"
 walkdir = "2.3.1"
 ansi-to-tui = { version = "8", optional = true }
@@ -63,4 +65,5 @@ features = ["termion"]
 optional = true
 
 [dev-dependencies]
+fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }
 tempfile.workspace = true

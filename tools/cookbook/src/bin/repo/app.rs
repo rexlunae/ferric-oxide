@@ -6,7 +6,7 @@ use cookbook::cook::pty::{UnixSlavePty, flush_pty, setup_pty, write_to_pty};
 use cookbook::cook::tui::{drain_buffer_to_lines, join_logs, kill_everything, render_build_log};
 use cookbook::recipe::CookRecipe;
 use cookbook::{Error, Result, staged_pkg};
-use pkg::PackageName;
+use fox_core::cookbook::RecipeName;
 use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::TermionBackend;
@@ -88,14 +88,14 @@ impl RecipeStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatusUpdate {
-    StartFetch(PackageName),
+    StartFetch(RecipeName),
     Fetched(CookRecipe),
     FailFetch(CookRecipe, String),
-    StartCook(PackageName),
+    StartCook(RecipeName),
     Cooked(CookRecipe, bool),
     FailCook(CookRecipe, String),
-    PushLog(PackageName, Vec<u8>),
-    FlushLog(PackageName, PathBuf),
+    PushLog(RecipeName, Vec<u8>),
+    FlushLog(RecipeName, PathBuf),
     FetchThreadFinished,
     CookThreadFinished,
 }
@@ -120,10 +120,10 @@ const PROMPT_WAIT: Duration = Duration::from_millis(101);
 
 pub struct TuiApp {
     pub recipes: Vec<(CookRecipe, RecipeStatus)>,
-    active_fetch: Option<PackageName>,
-    active_cook: Option<PackageName>,
-    logs: HashMap<PackageName, Vec<String>>,
-    log_byte_buffer: HashMap<PackageName, Vec<u8>>,
+    active_fetch: Option<RecipeName>,
+    active_cook: Option<RecipeName>,
+    logs: HashMap<RecipeName, Vec<String>>,
+    log_byte_buffer: HashMap<RecipeName, Vec<u8>>,
     log_scroll: usize,
     log_view_job: JobType,
     auto_scroll: bool,
@@ -133,7 +133,7 @@ pub struct TuiApp {
     cook_complete: bool,
     prompt: Option<FailurePrompt>,
     pub dump_logs_anyway: bool,
-    pub dump_logs_on_exit: Option<(PackageName, String)>,
+    pub dump_logs_on_exit: Option<(RecipeName, String)>,
     is_inspecting: bool,
     search_query: String,
     search_results: Option<Vec<usize>>,
@@ -169,7 +169,7 @@ impl TuiApp {
         }
     }
 
-    pub fn get_active_name(&self) -> Option<PackageName> {
+    pub fn get_active_name(&self) -> Option<RecipeName> {
         if self.log_view_job == JobType::Cook {
             self.active_cook.clone()
         } else {
@@ -180,7 +180,7 @@ impl TuiApp {
     pub fn get_active_log(
         &self,
     ) -> (
-        Option<PackageName>,
+        Option<RecipeName>,
         Option<&Vec<String>>,
         Option<Cow<'_, str>>,
     ) {
@@ -196,7 +196,7 @@ impl TuiApp {
 
     pub fn get_recipe_log(
         &self,
-        recipe_name: &PackageName,
+        recipe_name: &RecipeName,
     ) -> (Option<&Vec<String>>, Option<Cow<'_, str>>) {
         let log_text = self.logs.get(recipe_name);
         let log_line = self
@@ -206,7 +206,7 @@ impl TuiApp {
         (log_text, log_line)
     }
 
-    pub fn write_log(&self, recipe_name: &PackageName, log_path: &PathBuf) -> Result<()> {
+    pub fn write_log(&self, recipe_name: &RecipeName, log_path: &PathBuf) -> Result<()> {
         let (Some(logs), line) = self.get_recipe_log(recipe_name) else {
             return Ok(());
         };
@@ -326,7 +326,8 @@ pub fn run_tui_cook(config: CliConfig, recipes: Vec<CookRecipe>) -> Result<TuiAp
                         write_to_pty(&logger, &format!("\n{err_ctx}"));
                     }
                     flush_pty(&mut logger);
-                    let log_path = log_path.join(format!("{}/{}.log", recipe.target, name.name()));
+                    let log_path =
+                        log_path.join(format!("{}/{}.log", recipe.target, name.recipe()));
                     cooker_status_tx
                         .send(StatusUpdate::FlushLog(name.clone(), log_path))
                         .unwrap_or_default();
@@ -431,7 +432,8 @@ pub fn run_tui_cook(config: CliConfig, recipes: Vec<CookRecipe>) -> Result<TuiAp
                         write_to_pty(&logger, &format!("\n{err_ctx}"));
                     }
                     flush_pty(&mut logger);
-                    let log_path = log_path.join(format!("{}/{}.log", recipe.target, name.name()));
+                    let log_path =
+                        log_path.join(format!("{}/{}.log", recipe.target, name.recipe()));
                     fetcher_status_tx
                         .send(StatusUpdate::FlushLog(name.clone(), log_path))
                         .unwrap_or_default();
@@ -1016,7 +1018,7 @@ fn draw_prompt(f: &mut ratatui::Frame, prompt: &FailurePrompt, is_nonstop: bool)
 
 fn spawn_log_reader<R>(
     mut reader: R,
-    package_name: PackageName,
+    package_name: RecipeName,
     status_tx: mpsc::Sender<StatusUpdate>,
 ) where
     R: Read + Send + 'static,
@@ -1042,7 +1044,7 @@ fn spawn_log_reader<R>(
 
 pub fn setup_logger(
     status_tx: &mpsc::Sender<StatusUpdate>,
-    name: &PackageName,
+    name: &RecipeName,
 ) -> (UnixSlavePty, std::io::PipeWriter) {
     let (pty_reader, log_reader, pipes) = setup_pty();
 
