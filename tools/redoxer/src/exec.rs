@@ -420,13 +420,21 @@ fn machine_args(arch: &str) -> anyhow::Result<Vec<String>> {
     })
 }
 
+/// The memory the guest is given, in MiB.
+///
+/// The bootloader reads the whole image into RAM before the kernel runs, so the
+/// guest needs room for a disk-sized buffer plus the kernel, the firmware and
+/// the tables built while doing it. A working image is a gigabyte, which leaves
+/// too little at 2048.
+const GUEST_MEMORY_MIB: u32 = 4096;
+
 /// The arguments that do not depend on the architecture or on firmware.
 fn common_qemu_args() -> Vec<String> {
     [
         "-cpu",
         "max",
         "-m",
-        "2048",
+        &GUEST_MEMORY_MIB.to_string(),
         "-smp",
         "4",
         "-netdev",
