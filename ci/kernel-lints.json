@@ -1,13 +1,10 @@
 {
-  "clippy::arithmetic_side_effects": 359,
+  "clippy::arithmetic_side_effects": 358,
   "clippy::assertions_on_constants": 5,
   "clippy::indexing_slicing": 164,
   "clippy::missing_safety_doc": 29,
   "clippy::undocumented_unsafe_blocks": 533,
   "clippy::unwrap_used": 71,
-  "dead_code": 16,
-  "unsafe keyword": 1157,
-  "unused_imports": 5,
-  "unused_mut": 3,
-  "unused_variables": 1
+  "dead_code": 10,
+  "unsafe keyword": 1155
 }
