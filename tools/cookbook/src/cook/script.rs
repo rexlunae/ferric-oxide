@@ -83,6 +83,21 @@ function DYNAMIC_STATIC_INIT {
     fi
 }
 
+# Prints the first prefix among "$@" whose include/openssl/opensslv.h is
+# OpenSSL 3, for host: builds that must not pick up OpenSSL 4 (CPython 3.12,
+# for one, does not build against it). Returns 1 when none is.
+function HOST_OPENSSL3_PREFIX {
+    local candidate
+    for candidate in "$@"; do
+        if [ -n "${candidate}" ] && grep -Eq '^#[[:space:]]*define[[:space:]]+OPENSSL_VERSION_MAJOR[[:space:]]+3[[:space:]]*$' \
+            "${candidate}/include/openssl/opensslv.h" 2>/dev/null; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Writes GNU config.sub (vendored in tools/cookbook/res, upstream GNU config 2022-01-03) to $1.
 function GNU_CONFIG_GET {
   cat > "$1" <<'FERRIC_CONFIG_SUB_EOF'
@@ -591,5 +606,51 @@ mod tests {
             std::fs::read(dir.path().join("config.sub")).unwrap(),
             include_bytes!("../../res/config.sub")
         );
+    }
+
+    /// Runs `HOST_OPENSSL3_PREFIX` over `candidates` and returns its output, or
+    /// `None` when it reports that none is OpenSSL 3.
+    fn host_openssl3_prefix(candidates: &[&std::path::Path]) -> Option<String> {
+        let output = Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(format!("{SHARED_PRESCRIPT}\nHOST_OPENSSL3_PREFIX \"$@\""))
+            .arg("bash")
+            .arg("")
+            .args(candidates)
+            .output()
+            .unwrap();
+        output.status.success().then(|| {
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        })
+    }
+
+    fn openssl_prefix(root: &std::path::Path, name: &str, major: u32) -> std::path::PathBuf {
+        let prefix = root.join(name);
+        std::fs::create_dir_all(prefix.join("include/openssl")).unwrap();
+        std::fs::write(
+            prefix.join("include/openssl/opensslv.h"),
+            format!("# define OPENSSL_VERSION_MAJOR  {major}\n# define OPENSSL_VERSION_MINOR  0\n"),
+        )
+        .unwrap();
+        prefix
+    }
+
+    #[test]
+    fn host_openssl3_prefix_skips_other_versions_and_missing_headers() {
+        let root = tempfile::tempdir().unwrap();
+        let v4 = openssl_prefix(root.path(), "v4", 4);
+        let v30 = openssl_prefix(root.path(), "v30", 30);
+        let v3 = openssl_prefix(root.path(), "v3", 3);
+        let missing = root.path().join("missing");
+
+        assert_eq!(
+            host_openssl3_prefix(&[&v4, &missing, &v30, &v3]),
+            Some(v3.display().to_string())
+        );
+        assert_eq!(host_openssl3_prefix(&[&v4, &missing]), None);
     }
 }

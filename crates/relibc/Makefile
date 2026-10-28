@@ -221,7 +221,10 @@ $(BUILD)/openlibm: openlibm
 
 ifeq ($(USE_RUST_LIBM),)
 $(BUILD)/openlibm/libopenlibm.a: $(BUILD)/openlibm headers $(BUILD)/$(PROFILE)/librelibc.a
-	$(MAKE) -s AR=$(AR) CC="$(CC_WRAPPER) $(CC)" LD=$(LD) CPPFLAGS="$(CPPFLAGS) -fno-stack-protector -I$(shell pwd)/include -I$(TARGET_HEADERS)" -C $< libopenlibm.a
+	# openlibm reads OS from the build machine's uname. On a macOS host that
+	# drops -fPIC and, on aarch64, every long double function Redox needs
+	# (frexpl, sqrtl, ...), because Apple's long double is a double.
+	$(MAKE) -s OS=Redox AR=$(AR) CC="$(CC_WRAPPER) $(CC)" LD=$(LD) CPPFLAGS="$(CPPFLAGS) -fno-stack-protector -I$(shell pwd)/include -I$(TARGET_HEADERS)" -C $< libopenlibm.a
 	./renamesyms.sh "$@" "$(BUILD)/$(PROFILE)/deps/"
 else
 $(BUILD)/openlibm/libopenlibm.a:

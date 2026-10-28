@@ -20,6 +20,15 @@
 //! (`ferric-iobench --rw=randread --bs=4k --iodepth=8`; `ferric_iobench::job` lists the
 //! options).
 //!
+//! `--ioengine` and `--align` choose the request path (`engine`; "Request paths" in
+//! `ferric_iobench::job`): `pread` into a heap buffer (the default), `pread` into a
+//! page-aligned buffer (`--align=page`), reads through a registered-buffer grant with no
+//! per-request mapping (`--ioengine=regbuf`), or reads as entries on a kernel ring
+//! (`--ioengine=ring`). A path that needs a feature the system was built without
+//! (`kernel.regbuf`, `drivers.grant_dma` and an IOMMU, or `kernel.rings`) fails the run with
+//! a message naming the feature. Paths other than the default add a suffix to the job's name
+//! (`iobench-randread-4k-qd1-regbuf`).
+//!
 //! Each job reads its `io_size` bytes from the start of the largest partition of the NVMe
 //! disk scheme, each block once, with `iodepth × numjobs` threads that each keep one `pread`
 //! in flight. When nvmed has per-CPU queue pairs, every round runs the job once per queue
@@ -52,6 +61,8 @@
 //! FERRIC_BENCH iobench-randread-4k-qd32 tlb_policy=main kpti=on pcid=on tlb_ops=… flushes_per_op=…
 //! ```
 
+#[cfg(target_os = "redox")]
+mod engine;
 #[cfg(target_os = "redox")]
 mod file;
 #[cfg(target_os = "redox")]

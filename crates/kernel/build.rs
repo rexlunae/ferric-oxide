@@ -103,9 +103,9 @@ fn parse_kconfig(arch: &str) -> Option<()> {
         .keys()
         .map(|feat| format!(", {feat:?}"))
         .collect::<String>();
-    // Ferric Oxide: the code checks for "ibt", "pcid" and "shstk" even when an older config.toml
-    // does not list them.
-    for feat in ["ibt", "pcid", "shstk"] {
+    // Ferric Oxide: the code checks for "ibpb", "ibt", "pcid" and "shstk" even when an older
+    // config.toml does not list them.
+    for feat in ["ibpb", "ibt", "pcid", "shstk"] {
         if !altfeatures.contains_key(feat) {
             features_list.push_str(&format!(", {feat:?}"));
         }

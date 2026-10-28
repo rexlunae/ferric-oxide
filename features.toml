@@ -1285,6 +1285,29 @@ and the CPU lacks them. Has no effect while KPTI is off."""
 choices = ["always", "auto", "never"]
 
 [[option]]
+id = "kernel.cpu.ibpb"
+menu = "kernel.cpu"
+type = "choice"
+title = "Branch predictor barrier between processes (Spectre v2)"
+default = "auto"
+depends = "target.arch == 'x86_64'"
+kernel_config = "arch.x86_64.features.ibpb"
+rebuild = ["kernel"]
+help = """
+Issue an indirect branch prediction barrier (IBPB) when a CPU switches to a
+user address space other than the last one it ran, so branch predictions one
+process trains cannot steer another (Spectre v2 user-to-user, CVE-2017-5715).
+Switches between threads of one process and to kernel, idle or ring worker
+contexts issue none. "auto" uses it on CPUs that report IBPB (Intel
+CPUID.7:EDX[26], AMD CPUID.80000008h:EBX[12]); "always" panics at boot on
+CPUs without it. Each
+barrier costs thousands of cycles, paid only on switches between processes;
+choose "never" for single-tenant systems that need the switch throughput.
+Like the other "auto" CPU options it acts as "never" without
+kernel.self_modifying."""
+choices = ["always", "auto", "never"]
+
+[[option]]
 id = "kernel.cpu.ibt"
 menu = "kernel.cpu"
 type = "choice"
@@ -1760,7 +1783,10 @@ make_false = ""
 help = """
 Fetch packages from the upstream package server instead of building them.
 Much faster, but those packages ignore every compile-time option here
-(processor baseline, kernel features). Sets REPO_BINARY."""
+(processor baseline, kernel features). Recipes kept in this repository
+(kernel, relibc, base, bootloader, RedoxFS, fox, tests) are always built
+from source. With build.offline, a package whose prebuilt archive was never
+downloaded is built from its fetched sources. Sets REPO_BINARY."""
 
 [[option]]
 id = "build.debug"
@@ -1873,6 +1899,11 @@ override = true
 make = { QEMU_CPU = "{value}" }
 
 # ---------------------------------------------------------------- rules
+
+[[rule]]
+level = "warn"
+when = "build.offline"
+message = "Offline builds use only sources and prebuilt packages already downloaded; anything missing fails until you run make fetch or turn build.offline off."
 
 [[rule]]
 level = "warn"
