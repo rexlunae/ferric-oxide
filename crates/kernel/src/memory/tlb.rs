@@ -44,6 +44,9 @@
 //! A requester that finds the mailbox `WRITING` or `READY`, that is, occupied by a request the
 //! target has not taken yet, does not merge into it: it upgrades it to `ALL` with one CAS, which
 //! then covers both requests. A requester whose own request is a full flush also posts `ALL`.
+//! A requester that finds `ALL` already pending still writes it back with a CAS: only a
+//! read-modify-write is sure to see the latest state, and only a store publishes the requester's
+//! page-table writes to the take that clears that `ALL`.
 //! So the content of the mailbox is always at least the union of every request posted since the
 //! last take, and a receiver never does less than any pending requester needs.
 //!
@@ -62,7 +65,9 @@
 //! # Memory ordering
 //!
 //! - The requester's page-table writes and its slot stores come before its `Release` CAS that
-//!   publishes `READY` (or `ALL`), and before its `Release` swap that sets the flag.
+//!   publishes `READY` or `ALL` (or rewrites an `ALL` already pending), and before its `Release`
+//!   swap that sets the flag. Every post therefore writes the state, so the take that clears it
+//!   reads from the post or from a later read-modify-write in its release sequence.
 //! - The receiver's `Acquire` swap of the flag synchronizes with the requester that set it, so
 //!   its `Acquire` load of the state sees that requester's post or a later state.
 //! - A take reads the slots and then CASes `READY` to `EMPTY` with `AcqRel`. The slot loads cannot
@@ -289,7 +294,11 @@ impl TlbMailbox {
         loop {
             let stale = current & STALE_WRITER;
             let (tag, desired) = match current & TAG_MASK {
-                TAG_ALL => return,
+                // A pending `ALL` covers this request, but only if the target has not taken it
+                // yet. A plain load may return an `ALL` that was already taken, and it would not
+                // order this requester's page-table writes before the take; the CAS reads the
+                // latest state and joins the release sequence the take reads from.
+                TAG_ALL => (TAG_ALL, current),
                 TAG_EMPTY if !inv.is_all() && stale == 0 => {
                     (TAG_WRITING, state(TAG_WRITING, 0, next_seq(current)))
                 }
