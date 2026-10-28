@@ -377,6 +377,69 @@ image overrides. CI's forced test features remain separate. See
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.
 
+## Build tools in the guest
+
+A recipe names the tools it runs while building in `build.dev-dependencies`,
+and a tool whose name carries the `host:` selector is built for the host by
+default. Those tools are needed to build the image but not wanted in it, so
+building them on the host asks every contributor to install software the image
+never uses, and they are the one part of its software stack the build never
+exercises the way the image runs it.
+
+`build.build_tools` decides where they are built:
+
+| Value | Behaviour |
+| --- | --- |
+| `guest` | The tools are built for the target and run inside a guest. Default when `host.arch == target.arch`. |
+| `host` | The inherited behaviour: the tools are compiled for and run on the host. |
+
+With `guest`, `mk/fstools.mk` installs one guest build environment per
+configuration under `build/<arch>/<config>/build-tools/` and reuses it for the
+whole image build instead of booting a guest per tool. It is keyed on the tool
+list and the repository's `Cargo.lock`, so a later build reuses it until either
+changes. That list comes from `repo build-tools-list`, which prints the
+recursive `build.dev-dependencies` of the image's package set, one recipe per
+line. `build.guest_env` enables the reuse and is active whenever
+`build.build_tools = "guest"`.
+
+`build.keep_build_tools` leaves the tools in the finished image as the
+`build-tools` meta-package; without it they stay in the scratch environment and
+are thrown away with it. It implies `build.build_tools = "guest"`, and setting
+it together with `host` is a configuration error.
+
+Cross-compiling is the exception. A tool built for a foreign architecture cannot
+run inside a guest on this host, so a build whose `host.arch` differs from
+`target.arch` uses the host tools whatever `build.build_tools` says, and
+`cargo xtask build` warns about that rather than falling back silently.
+`host.arch` is a catalog expression identifier, not an option: it resolves to
+the architecture the build runs on, in `target.arch` names, so
+`host.arch == target.arch` means "this is a native build".
+
+Changing either option marks every recipe stale, because the tools a recipe
+builds with change.
+
+### How a recipe runs a guest tool
+
+A `host:` recipe builds to the target in guest mode, so its result is a Redox
+binary and the host cannot execute it. Two things keep recipe scripts unchanged:
+
+1. The toolchain directory is not put on `PATH`, because everything in it is a
+   Redox binary. Instead the cookbook writes a shim of the same name for each
+   binary in `toolchain/bin`, and puts the shim directory there first.
+2. A shim runs the real tool through `repo guest-run --guest <image> -- <tool>
+   <args>`, which executes it in the guest build environment and mirrors its
+   exit status. `repo guest-run` never rebuilds or reinstalls the environment —
+   it only boots it — so repeated calls in one build reuse it.
+
+A recipe therefore keeps writing `gperf`, `mdbook build` and so on. The
+`FERRIC_GUEST_TOOLS_DIR` variable names the environment image; it is empty when
+the tools come from the host, which is what leaves a host build's `PATH` and
+execution unchanged.
+
+A `host:` name with no recipe (for example `gperf`, which is also a host system
+package) has nothing to build for either target. Those entries are host-provided
+binaries and guest mode neither builds nor runs them.
+
 ## Debug info and unoptimized builds
 
 Two options control how locally built packages are compiled:

@@ -31,6 +31,13 @@ programs recipes run (Autoconf, Automake, Meson, CMake, Ninja and others; see
 [Prerequisites](../../docs/src/building-redox.md#prerequisites)). `doctor`, which
 `setup` runs first, fails listing every missing one.
 
+Tools that recipes need while building but that should not stay in the image
+(`build.dev-dependencies`, the `host:` recipes) are built for the guest and run
+there by default on a native build, in one guest environment reused for the
+whole build, so the host does not need them. Cross-compiled builds use the host
+tools instead and warn about it. See `build.build_tools` and
+`build.keep_build_tools` in the [build chapter](../../docs/src/ferric-build.md#build-tools-in-the-guest).
+
 The initial `native` image builds the local kernel, UEFI bootloader, relibc,
 base services/drivers and RedoxFS; applications use existing binary packages.
 The feature catalog also adds the selected package manager. ARM64 defaults to

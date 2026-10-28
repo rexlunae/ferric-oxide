@@ -17,7 +17,7 @@ use cookbook::recipe::{
 use cookbook::{Error, Result, staged_pkg};
 use fox_core::cookbook::RecipeName;
 use redox_installer::PackageConfig;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Write, stderr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +29,8 @@ use termion::{color, style};
 
 mod app;
 use app::*;
+
+mod guest_run;
 
 // A repo manager, to replace repo.sh
 
@@ -117,6 +119,7 @@ enum CliCommand {
     CaptureRev,
     ChangeRule,
     ChangeRuleLocal,
+    BuildToolsList,
 }
 
 #[derive(Clone)]
@@ -131,9 +134,14 @@ impl CliCommand {
         *self == CliCommand::PushList
             || *self == CliCommand::CookList
             || *self == CliCommand::RepoList
+            || *self == CliCommand::BuildToolsList
     }
+    /// Commands that print a dependency tree. `build-tools-list` is
+    /// informational but prints one tool per line, so it is not a tree.
     pub fn is_tree(&self) -> bool {
-        self.is_informational()
+        *self == CliCommand::PushList
+            || *self == CliCommand::CookList
+            || *self == CliCommand::RepoList
     }
     pub fn is_change_rule(&self) -> bool {
         *self == CliCommand::ChangeRuleLocal
@@ -186,6 +194,7 @@ impl FromStr for CliCommand {
             "capture-rev" => Ok(CliCommand::CaptureRev),
             "change-rule" => Ok(CliCommand::ChangeRule),
             "change-rule-local" => Ok(CliCommand::ChangeRuleLocal),
+            "build-tools-list" => Ok(CliCommand::BuildToolsList),
             _ => bail_options_err!("Unknown command {:?}", s),
         }
     }
@@ -206,6 +215,7 @@ impl ToString for CliCommand {
             CliCommand::CaptureRev => "capture-rev".to_string(),
             CliCommand::ChangeRule => "change-rule".to_string(),
             CliCommand::ChangeRuleLocal => "change-rule-local".to_string(),
+            CliCommand::BuildToolsList => "build-tools-list".to_string(),
         }
     }
 }
@@ -249,11 +259,20 @@ fn main() {
     };
 }
 
+// `Error` is large throughout this binary; these are top-level failures, not
+// per-file ones, so boxing the error would only hide it.
+#[allow(clippy::result_large_err)]
 fn main_inner() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.is_empty() || args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
         bail_options_err!("");
+    }
+
+    // guest-run names no recipe: it runs one command in the guest build
+    // environment, so it is handled before the recipe arguments are read.
+    if guest_run::GuestRun::matches(&args) {
+        return guest_run::GuestRun::parse(args.into_iter().skip(1))?.run();
     }
 
     let (config, command, recipes) = parse_args(args)?;
@@ -294,6 +313,9 @@ fn main_inner() -> Result<()> {
     }
     if command.is_tree() {
         return handle_tree(&recipes, command.to_tree(), &config);
+    }
+    if command == CliCommand::BuildToolsList {
+        return handle_build_tools_list(&recipes);
     }
     if command.is_change_rule() {
         return handle_change_rule(&recipes, &config, &command);
@@ -1099,6 +1121,33 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Prints the build tools the selected recipes need, one recipe name per line.
+///
+/// A recipe's `build.dev-dependencies` are the tools it runs while it builds
+/// (the `host:` ones are built for the host by default). `make` collects this
+/// list to install the guest build environment for `build.build_tools =
+/// "guest"`. Names are printed without their `host:`/`target:` selector and
+/// deduplicated, so a tool several recipes need appears once.
+///
+/// The selected recipes arrive as a flat list for an informational command, so
+/// the recursion starts from their names rather than from the loaded recipes.
+fn handle_build_tools_list(recipes: &[CookRecipe]) -> Result<()> {
+    let names: Vec<RecipeName> = recipes.iter().map(|r| r.name.clone()).collect();
+    let mut seen = BTreeSet::new();
+    for tool in CookRecipe::get_all_deps_names_recursive(&names, true)?.iter() {
+        // The walk collects the roots too; only their dependencies are tools.
+        if names.contains(tool) {
+            continue;
+        }
+        let name = tool.without_prefix();
+        if name.is_empty() || !seen.insert(name.to_owned()) {
+            continue;
+        }
+        println!("{name}");
+    }
     Ok(())
 }
 

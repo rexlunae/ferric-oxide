@@ -238,3 +238,79 @@ fn each_variant_checkbox_can_be_disabled_without_changing_the_other_cpu_type() {
     assert_eq!(variants.len(), 2);
     assert!(variants.iter().all(|v| v["arch"] == "aarch64"));
 }
+
+/// `host.arch` lets the catalog tell a native build from a cross-compiled one
+/// without a new option, so build.build_tools can default to the guest only
+/// where the guest can run what it builds.
+#[test]
+fn build_tools_default_to_the_guest_only_on_a_native_build() {
+    let fixture = Fixture::new("[image]\nconfig='native'\n");
+    let host = std::env::consts::ARCH;
+    let cross = if host == "x86_64" {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+
+    let native = fixture
+        .config(&["list"])
+        .stdout
+        .split(|b| *b == b'\n')
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect::<String>();
+    assert!(
+        native.contains("build.build_tools"),
+        "build.build_tools is in the catalog"
+    );
+
+    // Each generated configuration keeps the value its own architecture resolves
+    // to, so a cross build falls back to the host tools.
+    let value = |arch: &str| {
+        let output = fixture.config(&[
+            "generate",
+            "--no-touch",
+            "--override",
+            &format!("target.arch={arch}"),
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mk = std::fs::read_to_string(fixture.0.path().join("build/ferric/config.mk")).unwrap();
+        mk.lines()
+            .find_map(|line| line.strip_prefix("export FERRIC_BUILD_TOOLS:="))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(value(host), "guest");
+    assert_eq!(value(cross), "host");
+}
+
+#[test]
+fn keeping_build_tools_without_a_guest_environment_is_an_error() {
+    let fixture = Fixture::new("[build]\nbuild_tools='host'\nkeep_build_tools=true\n");
+    let output = fixture.config(&["check"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("build.keep_build_tools") && stderr.contains("build.build_tools"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_cross_build_warns_that_the_tools_come_from_the_host() {
+    let fixture = Fixture::new("[build]\nbuild_tools='guest'\n");
+    let cross = if std::env::consts::ARCH == "x86_64" {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let output = fixture.config(&["check", "--override", &format!("target.arch={cross}")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("uses host tools instead"),
+        "expected the cross-build warning, got {stderr}"
+    );
+}

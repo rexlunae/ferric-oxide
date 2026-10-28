@@ -13,7 +13,7 @@
 INSTALLER_SIZE_OPTS=$(if $(FILESYSTEM_SIZE),--size=$(FILESYSTEM_SIZE))
 FERRIC_FOX_LOCK=$(if $(FERRIC_FOX_PACKAGES),$(wildcard $(dir $(FERRIC_FOX_PACKAGES))fox.lock))
 
-$(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
+$(BUILD)/harddrive.img: build_tools $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -21,25 +21,25 @@ else
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	-$(FUMOUNT) /tmp/redox_installer || true
 	rm -rf $@  $@.partial $(MOUNT_DIR)
-	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) $@.partial
+	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) $(BUILD_TOOLS_INSTALLER_OPT) $@.partial
 	mv $@.partial $@
 	touch $@
 endif
 
-$(BUILD)/redox-live.iso: $(FSTOOLS) $(REPO_TAG) redox.ipxe $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
+$(BUILD)/redox-live.iso: build_tools $(REPO_TAG) redox.ipxe $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
 	mkdir -p $(BUILD)
 	rm -rf $@  $@.partial
 	-$(FUMOUNT) /tmp/redox_installer || true
-	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
+	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) $(BUILD_TOOLS_INSTALLER_OPT) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
 	mv $@.partial $@
 	touch $@
 	cp redox.ipxe $(BUILD)/redox.ipxe
 endif
 
-$(BUILD)/filesystem.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
+$(BUILD)/filesystem.img: build_tools $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
 else
@@ -54,7 +54,7 @@ else
 	$(REDOXFS) $@.partial $(MOUNT_DIR)
 	sleep 1
 	pgrep redoxfs
-	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) $(MOUNT_DIR)
+	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) $(BUILD_TOOLS_INSTALLER_OPT) $(MOUNT_DIR)
 	sync
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	rm -rf $(MOUNT_DIR)

@@ -126,6 +126,26 @@ pub enum PackageInstallError {
     /// Dependencies of the configured packages are not in the repository.
     #[error("missing dependencies: {}", missing_list(.0))]
     MissingDependencies(Vec<fox_store::deps::MissingDependency>),
+    /// The build-tool list named by `general.build_tools.list` cannot be read.
+    #[error("cannot read the build tool list {}", path.display())]
+    BuildToolList {
+        /// The list file.
+        path: PathBuf,
+        /// Why it could not be read.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A line of the build-tool list is not a package name.
+    #[error("build tool `{name}` in {} is not a valid package name", path.display())]
+    BuildToolName {
+        /// The list file.
+        path: PathBuf,
+        /// The offending line.
+        name: String,
+        /// Why it was rejected.
+        #[source]
+        source: fox_core::NameError,
+    },
 }
 
 fn missing_list(missing: &[fox_store::deps::MissingDependency]) -> String {
@@ -176,13 +196,52 @@ pub(crate) fn plan_cookbook_packages(
     Ok(plan)
 }
 
+/// The build tools an installation adds to its package set.
+///
+/// The tools are the recipes the image's packages run while they build
+/// (`build.dev-dependencies`, including the `host:` ones), which `make` lists
+/// with `repo build-tools-list`. Installing them makes the guest build
+/// environment; `general.build_tools.keep` leaves them in a finished image.
+/// An installation without `general.build_tools` adds nothing.
+fn build_tool_names(config: &Config) -> Result<Vec<fox_core::PackageName>> {
+    let Some(build_tools) = &config.general.build_tools else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = &build_tools.list else {
+        return Ok(Vec::new());
+    };
+    let path = PathBuf::from(list);
+    let text = fs::read_to_string(&path).map_err(|source| PackageInstallError::BuildToolList {
+        path: path.clone(),
+        source,
+    })?;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') {
+            continue;
+        }
+        names.push(fox_core::PackageName::new(name).map_err(|source| {
+            PackageInstallError::BuildToolName {
+                path: path.clone(),
+                name: name.to_owned(),
+                source,
+            }
+        })?);
+    }
+    Ok(names)
+}
+
 /// Installs the configured packages and their dependencies from the
 /// cookbook's repository (`<cookbook>/repo/<target>/`) with fox's store, so
 /// the image's packages are recorded in fox's database (`var/lib/fox/`) as
 /// they are placed. The cookbook's signing key becomes a key the image
 /// trusts.
 fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> anyhow::Result<()> {
-    let names = package_names(config)?;
+    let mut names = package_names(config)?;
+    names.extend(build_tool_names(config)?);
+    names.sort();
+    names.dedup();
     if names.is_empty() {
         return Ok(());
     }
@@ -1309,5 +1368,65 @@ pub(crate) mod tests {
             Some(PackageInstallError::MissingDependencies(missing)) if missing.len() == 1
         ));
         assert!(!dest.path().join("usr/bin/app").exists());
+    }
+
+    /// A configuration that installs the tools listed in `list`.
+    fn with_build_tools(list: &str, keep: bool) -> Config {
+        let mut config = Config::default();
+        config.general.build_tools = Some(crate::config::general::BuildToolsConfig {
+            keep: Some(keep),
+            list: Some(list.to_owned()),
+        });
+        config
+    }
+
+    #[test]
+    fn build_tools_are_installed_alongside_the_image_packages() {
+        let (cookbook, _) = cookbook();
+        let list = tempfile::NamedTempFile::new().unwrap();
+        fs::write(list.path(), "# tools the image builds with\nlib\n").unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        install_packages(
+            &with_build_tools(list.path().to_str().unwrap(), true),
+            dest.path(),
+            Some(cookbook.path().to_str().unwrap()),
+        )
+        .unwrap();
+        // The tool comes from the same repository and is recorded in the image.
+        assert!(dest.path().join("usr/lib/liblib.so").exists());
+    }
+
+    #[test]
+    fn an_unreadable_build_tool_list_fails_the_install() {
+        let (cookbook, _) = cookbook();
+        let dest = tempfile::tempdir().unwrap();
+        let error = install_packages(
+            &with_build_tools("/nonexistent/build-tools.txt", false),
+            dest.path(),
+            Some(cookbook.path().to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PackageInstallError::BuildToolList { .. })
+        ));
+    }
+
+    #[test]
+    fn a_build_tool_that_is_not_a_package_name_is_reported_with_its_line() {
+        let (cookbook, _) = cookbook();
+        let list = tempfile::NamedTempFile::new().unwrap();
+        fs::write(list.path(), "not/a/package\n").unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let error = install_packages(
+            &with_build_tools(list.path().to_str().unwrap(), false),
+            dest.path(),
+            Some(cookbook.path().to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PackageInstallError::BuildToolName { name, .. }) if name == "not/a/package"
+        ));
     }
 }

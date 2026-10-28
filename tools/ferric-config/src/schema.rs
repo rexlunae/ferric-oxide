@@ -531,7 +531,11 @@ impl Schema {
         let mut ids = Vec::new();
         e.idents(&mut ids);
         for id in ids {
-            if (allow_value && id == "value") || self.index.contains_key(&id) {
+            // `host.arch` is supplied by the resolver, not declared as an option.
+            if (allow_value && id == "value")
+                || id == crate::model::HOST_ARCH
+                || self.index.contains_key(&id)
+            {
                 continue;
             }
             return Err(format!("{ctx}: expression refers to unknown option `{id}`"));

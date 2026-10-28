@@ -257,7 +257,10 @@ impl Recipe {
 impl CookRecipe {
     pub fn new(name: RecipeName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
         let target = cook_package::package_target(&name);
-        if name.is_host() {
+        // A tool built for the guest depends on target packages, so its
+        // dependencies stay unprefixed; only a host tool needs its dependency
+        // chain moved to the host.
+        if name.is_host() && !crate::build_tools_in_guest() {
             let thisname = name.without_prefix();
             let fn_map = |p: RecipeName| {
                 if p.is_host() {

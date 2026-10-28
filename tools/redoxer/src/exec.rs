@@ -1,14 +1,16 @@
 use anyhow::{bail, Context};
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "fuse")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::{fs, io};
 
-use crate::redoxfs::{
-    archive_image, expand_disk, extract_tar, run_install_mount, run_install_to_dir, shrink_disk,
-    RedoxFs,
-};
+use crate::redoxfs::{archive_image, expand_disk, extract_tar};
+#[cfg(feature = "fuse")]
+use crate::redoxfs::{run_install_mount, RedoxFs};
+#[cfg(feature = "fuse")]
+use crate::redoxfs::{run_install_to_dir, shrink_disk};
 use crate::writer::write_redoxerd_config;
 use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
 
@@ -93,9 +95,20 @@ fn kvm_accessible() -> Result<(), io::Error> {
 #[allow(unused)]
 pub fn fuse_accessible() -> Result<(), io::Error> {
     // TODO: A faster way than actually try to mount?
-    let t = tempfile::tempdir()?;
-    fuser::Session::new(crate::redoxfs::DummyFS, t.path(), &[])?.unmount();
-    Ok(())
+    #[cfg(feature = "fuse")]
+    {
+        let t = tempfile::tempdir()?;
+        fuser::Session::new(crate::redoxfs::DummyFS, t.path(), &[])?.unmount();
+        Ok(())
+    }
+    // Without the probe this cannot tell whether FUSE works, so it reports the
+    // conservative answer: images are installed through the RedoxFS writer
+    // instead of a mount, which needs neither FUSE nor root.
+    #[cfg(not(feature = "fuse"))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "redoxer was built without the fuse-probe feature",
+    ))
 }
 
 #[rustfmt::skip]
@@ -240,7 +253,8 @@ fn bootloader(cookbook: &Path) -> anyhow::Result<PathBuf> {
 
 /// creating a base image, returns the base image, bool if orbital exists
 fn base(
-    bootloader_bin: &Path,
+    // Only the mounting path reads it; the archive path does not.
+    #[cfg_attr(not(feature = "fuse"), allow(unused_variables))] bootloader_bin: &Path,
     name: &str,
     mut config: redox_installer::Config,
     config_str: &str,
@@ -280,6 +294,7 @@ fn base(
         config.general.live_disk = Some(qemu_use_live_disk());
         config.general.cookbook = Some(cookbook.display().to_string());
 
+        #[cfg(feature = "fuse")]
         if fuse {
             run_install_mount(
                 config,
@@ -300,6 +315,8 @@ fn base(
                 }
             }
         } else {
+            #[cfg(not(feature = "fuse"))]
+            require_no_fuse(fuse)?;
             run_install_to_dir(config, &base_dir)?;
 
             eprintln!("redoxer: compressing {name}");
@@ -322,6 +339,62 @@ fn base(
         fs::write(base_toml, stamp)?;
     }
     Ok((base_file, has_orbital))
+}
+
+/// A mounted image, which unmounts when dropped.
+#[cfg(feature = "fuse")]
+type MountedImage = RedoxFs;
+
+/// A build without the `fuse` feature never mounts an image.
+#[cfg(not(feature = "fuse"))]
+type MountedImage = core::convert::Infallible;
+
+/// Puts the image's contents in `dest_dir`, mounting the image when FUSE is
+/// asked for and extracting the archive otherwise.
+///
+/// A build without the `fuse` feature has no mounting code, so asking for FUSE
+/// there is a configuration error rather than a silent fallback to the other
+/// path: the two produce different images, and quietly changing which one runs
+/// would hide the mistake.
+fn install_into_disk(
+    fuse: bool,
+    redoxer_bin: &Path,
+    dest_dir: &Path,
+    base_file: &Path,
+) -> anyhow::Result<Option<MountedImage>> {
+    #[cfg(feature = "fuse")]
+    {
+        if fuse {
+            return Ok(Some(
+                RedoxFs::new(redoxer_bin, dest_dir).context("unable to init redoxfs")?,
+            ));
+        }
+        let _ = redoxer_bin;
+        extract_tar(base_file, dest_dir)?;
+        Ok(None)
+    }
+    // Without FUSE the archive path is the only one; it needs no mount.
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = redoxer_bin;
+        if fuse {
+            return require_no_fuse(true);
+        }
+        extract_tar(base_file, dest_dir)?;
+        Ok(None)
+    }
+}
+
+/// Fails when a build without the `fuse` feature is asked to mount an image.
+#[cfg(not(feature = "fuse"))]
+fn require_no_fuse(fuse: bool) -> anyhow::Result<Option<MountedImage>> {
+    if fuse {
+        anyhow::bail!(
+            "redoxer was built without the fuse feature, so it cannot mount images; \
+             rebuild without REDOXER_USE_FUSE or with --features fuse"
+        );
+    }
+    Ok(None)
 }
 
 fn apply_qemu_args(cmd: &mut Command, default: Vec<&str>, args_opt: Option<Vec<&str>>) {
@@ -437,12 +510,7 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
         fs::create_dir_all(&dest_dir).context("unable to create redoxer dir")?;
 
         {
-            let redoxfs_opt = if fuse {
-                Some(RedoxFs::new(&redoxer_bin, &dest_dir).context("unable to init redoxfs")?)
-            } else {
-                extract_tar(&base_file, &dest_dir)?;
-                None
-            };
+            let redoxfs_opt = install_into_disk(fuse, &redoxer_bin, &dest_dir, &base_file)?;
 
             write_redoxerd_config(
                 &dest_dir,
@@ -467,9 +535,12 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                     .context("rsync failed")?;
             }
 
+            #[cfg(feature = "fuse")]
             if let Some(mut redoxfs) = redoxfs_opt {
                 redoxfs.unmount().context("unable to unmount")?;
             }
+            #[cfg(not(feature = "fuse"))]
+            let _ = redoxfs_opt;
         }
 
         if !fuse {
@@ -546,11 +617,7 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
     };
 
     if code == 0 && !config.artifacts.is_empty() {
-        let redoxfs_opt = if fuse {
-            Some(RedoxFs::new(&redoxer_bin, &dest_dir).context("unable to init redoxfs")?)
-        } else {
-            unimplemented!()
-        };
+        let redoxfs_opt = install_into_disk(fuse, &redoxer_bin, &dest_dir, &base_file)?;
 
         for (sysroot, folder) in config.artifacts.iter() {
             eprintln!("redoxer: copying '/{sysroot}' to '{folder}'");
@@ -571,9 +638,12 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                 .context("rsync failed")?;
         }
 
+        #[cfg(feature = "fuse")]
         if let Some(mut redoxfs) = redoxfs_opt {
             redoxfs.unmount().context("unable to unmount")?;
         }
+        #[cfg(not(feature = "fuse"))]
+        let _ = redoxfs_opt;
     }
 
     tempdir.close()?;

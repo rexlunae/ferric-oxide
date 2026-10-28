@@ -1,23 +1,37 @@
 use anyhow::{anyhow, bail, Context};
 use redoxfs::{BlockAddr, BlockMeta, DiskFile, FileSystem};
+use std::fs;
 use std::fs::File;
+#[cfg(feature = "fuse")]
+use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "fuse")]
+use std::path::PathBuf;
 use std::process::Command;
+#[cfg(feature = "fuse")]
 use std::sync::mpsc::{channel, TryRecvError};
-use std::{fs, io, thread, time};
+#[cfg(feature = "fuse")]
+use std::{thread, time};
 
 use crate::status_error;
 
+/// An image mounted through RedoxFS's FUSE support.
+///
+/// Only the mounting path needs this; the archive path installs through the
+/// Rust writer instead, so it is absent without the `fuse` feature.
+#[cfg(feature = "fuse")]
 pub struct RedoxFs {
     image: PathBuf,
     dir: PathBuf,
 }
 
+#[cfg(feature = "fuse")]
 pub(crate) fn syscall_error(err: syscall::Error) -> io::Error {
     io::Error::from_raw_os_error(err.errno)
 }
 
+#[cfg(feature = "fuse")]
 impl RedoxFs {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(image: P, dir: Q) -> io::Result<Self> {
         let image = image.as_ref().to_owned();
@@ -98,6 +112,7 @@ impl RedoxFs {
     }
 }
 
+#[cfg(feature = "fuse")]
 impl Drop for RedoxFs {
     fn drop(&mut self) {
         if let Err(err) = self.unmount() {
@@ -110,6 +125,7 @@ impl Drop for RedoxFs {
     }
 }
 
+#[cfg(feature = "fuse")]
 pub fn run_install_mount(
     config: redox_installer::Config,
     bootloader_bin: &Path,
@@ -171,6 +187,7 @@ pub fn archive_image(
     Ok(())
 }
 
+#[cfg(feature = "fuse")]
 pub fn run_install_to_dir(config: redox_installer::Config, base_dir: &Path) -> io::Result<()> {
     redox_installer::install(config, base_dir).map_err(|err| io::Error::other(format!("{err}")))?;
     Ok(())
@@ -215,6 +232,7 @@ pub(crate) fn extract_tar(tar_file: &Path, dest_dir: &Path) -> anyhow::Result<()
     Ok(())
 }
 
+#[cfg(feature = "fuse")]
 pub(crate) fn shrink_disk(disk_path: &Path) -> anyhow::Result<()> {
     let shrink_size = {
         let mut fs = open_fs(disk_path)?;
@@ -375,6 +393,9 @@ fn resize<D: redoxfs::Disk>(fs: &mut FileSystem<D>, shrink: bool) -> Result<(u64
     Ok((old_size, new_size))
 }
 
+/// A filesystem that does nothing, used only to check that a mount succeeds.
+#[cfg(feature = "fuse")]
 pub(crate) struct DummyFS;
 
+#[cfg(feature = "fuse")]
 impl fuser::Filesystem for DummyFS {}

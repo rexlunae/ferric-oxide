@@ -228,6 +228,10 @@ pub fn build(
 
     let mut dep_pkgars = BTreeSet::new();
     let mut dep_host_pkgars = BTreeSet::new();
+    // With build.build_tools = "guest" a build tool is a target package, so it
+    // joins the sysroot like any other dependency instead of the host
+    // toolchain the recipe would run from the host.
+    let tools_are_target = crate::build_tools_in_guest();
     let build_deps = CookRecipe::get_build_deps_recursive(
         &[
             &recipe.build.dependencies[..],
@@ -238,7 +242,7 @@ pub fn build(
     )?;
     for dependency in build_deps.iter() {
         let (_, pkgar, _) = dependency.stage_paths();
-        if dependency.name.is_host() {
+        if dependency.name.is_host() && !tools_are_target {
             dep_host_pkgars.insert((dependency.name.clone(), pkgar));
         } else {
             dep_pkgars.insert((dependency.name.clone(), pkgar));
@@ -471,6 +475,19 @@ pub fn build(
             } else if name.is_host() {
                 command.env("COOKBOOK_TOOLCHAIN", &cookbook_sysroot);
             }
+            // With tools built for the guest, the toolchain holds Redox
+            // binaries. Scripts reach them through the guest runner instead of
+            // running them directly, so it needs to know where it is, and the
+            // shims that stand in for the toolchain's binaries on PATH.
+            if let Some(guest_tools) = crate::guest_tools_dir() {
+                command.env("COOKBOOK_GUEST_TOOLS", &guest_tools);
+                if let Some(toolchain) = &cookbook_toolchain {
+                    command.env(
+                        "COOKBOOK_GUEST_TOOLS_SHIMS",
+                        write_guest_tool_shims(&guest_tools, toolchain)?,
+                    );
+                }
+            }
             if let Some(compiler) = recipe.build.compiler.as_ref() {
                 match compiler {
                     BuildCompiler::Gcc | BuildCompiler::GccNoLTO => {
@@ -648,6 +665,60 @@ pub fn get_sub_target_dir(target_dir: &Path, sub_path: &str) -> PathBuf {
         target_dir = target_dir.join(cross_target)
     }
     target_dir.join(sub_path)
+}
+
+/// Writes a shim per tool in `toolchain/bin` and returns the shim directory.
+///
+/// With `build.build_tools = "guest"` those binaries are built for the target,
+/// so the host cannot run them. A shim of the same name runs the real one in the
+/// guest environment (`repo guest-run`), which keeps a recipe script that calls
+/// a tool by name working unchanged. The directory is per build and shared by
+/// the recipes cooked from it.
+/// `Error` is large, like every `Result` in this module; the error paths here
+/// are startup failures, not per-file ones, so boxing buys nothing.
+#[allow(clippy::result_large_err)]
+fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path) -> Result<PathBuf> {
+    let bin = toolchain.join("bin");
+    let shims = toolchain.join("guest-shims");
+    if shims.is_dir() {
+        fs::remove_all(&shims)?;
+    }
+    fs::create_dir(&shims)?;
+    let entries = match std::fs::read_dir(&bin) {
+        Ok(entries) => entries,
+        // A recipe with no tools has no toolchain binaries to stand in for.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(shims),
+        Err(source) => {
+            return Err(wrap_io_err!(bin.clone(), "reading the toolchain binaries")(
+                source,
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(wrap_io_err!(bin.clone(), "reading the toolchain binaries"))?;
+        let name = entry.file_name();
+        let shim = shims.join(&name);
+        let script = format!(
+            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"${{COOKBOOK_ROOT}}/bin/repo\" guest-run --guest \"{}\" --silent \"${{COOKBOOK_SILENT:-0}}\" -- \"{}\" \"$@\"\n",
+            shell_quote(guest_tools),
+            shell_quote(&entry.path().display().to_string()),
+        );
+        std::fs::write(&shim, script)
+            .map_err(wrap_io_err!(shim.clone(), "writing a guest tool shim"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).map_err(
+                wrap_io_err!(shim.clone(), "setting a guest tool shim executable"),
+            )?;
+        }
+    }
+    Ok(shims)
+}
+
+/// Quotes a path for the `sh` shim, which sees it inside double quotes.
+fn shell_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn build_deps_dir(
@@ -874,6 +945,37 @@ fn hint_incorrect_pkey(logger: &PtyOut, source_pubkey: &Path, source_pkgar: &Pat
 #[cfg(test)]
 mod tests {
     use std::os::unix;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A tool built for the guest cannot run on the host, so each toolchain
+    /// binary gets a shim that dispatches it into the guest under the name the
+    /// recipe already calls.
+    #[test]
+    fn guest_tool_shims_are_written_for_every_toolchain_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("toolchain/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mdbook"), "").unwrap();
+        std::fs::write(bin.join("gperf"), "").unwrap();
+
+        let shims =
+            super::write_guest_tool_shims("/guest/guest.img", &temp.path().join("toolchain"))
+                .unwrap();
+
+        for tool in ["mdbook", "gperf"] {
+            let shim = shims.join(tool);
+            let script = std::fs::read_to_string(&shim).unwrap();
+            assert!(
+                script.contains("guest-run") && script.contains("/guest/guest.img"),
+                "the shim dispatches {tool} into the guest: {script}"
+            );
+            // The shim stands in for the tool on PATH, so it must be executable.
+            assert!(
+                std::fs::metadata(&shim).unwrap().permissions().mode() & 0o111 != 0,
+                "{tool}'s shim is executable"
+            );
+        }
+    }
 
     #[test]
     fn native_sysroot_checks_every_required_package_variant() {
