@@ -487,8 +487,9 @@ impl core::fmt::Display for SeriesLine {
 
 /// The boot selftest (`kernel.time.one_shot`): validates the one-shot timer
 /// and reports the measurements the tickless work compares against. Runs once
-/// on the BSP, after the APs are up, with interrupts enabled; the PIT keeps
-/// ticking underneath.
+/// on the BSP, after the APs are up and before the bootstrap context exists,
+/// with interrupts off; the waits open them for one instruction at a time, so
+/// the PIT keeps ticking underneath.
 pub fn selftest(token: &mut CleanLockToken) {
     let Some(backend) = backend() else {
         crate::info!("timer: one-shot selftest skipped: no one-shot timer on this cpu");
@@ -518,9 +519,16 @@ pub fn selftest(token: &mut CleanLockToken) {
     let give_up_ticks = rate.ticks_for_nanos(5_000_000_000).get();
     let mut spins = 0u64;
     while spins < 2_000_000_000 && !fired() {
-        // SAFETY: interrupts on so the timer interrupt arrives; the spin is a
-        // bounded wait for a boot selftest.
-        unsafe { arch::interrupt::enable_and_nop() };
+        // Open interrupts for one instruction only: the rest of the selftest
+        // takes the log and serial spinlocks, and a PIT tick that lands while
+        // one is held can switch this CPU away from the holder for good.
+        // SAFETY: the timer interrupt needs a window to arrive; its handler
+        // only touches this CPU's one-shot state, and interrupts are off again
+        // before the fired flag is read.
+        unsafe {
+            arch::interrupt::enable_and_nop();
+            arch::interrupt::disable();
+        }
         spins = spins.saturating_add(1);
         if rdtsc().wrapping_sub(start_ticks) >= give_up_ticks {
             break;
@@ -570,8 +578,11 @@ pub fn selftest(token: &mut CleanLockToken) {
                 .get(),
         );
         loop {
-            // SAFETY: interrupts on, bounded wait.
-            unsafe { arch::interrupt::enable_and_nop() };
+            // SAFETY: as in round 1, interrupts are open for one instruction.
+            unsafe {
+                arch::interrupt::enable_and_nop();
+                arch::interrupt::disable();
+            }
             core::hint::spin_loop();
             if rdtsc() >= quiet_until {
                 break;
