@@ -149,9 +149,22 @@ WRAPPER
     } > "$sysroot/bin/$target-$tool"
     chmod +x "$sysroot/bin/$target-$tool"
 done
-# C/C++ commands selected by redoxer must also load the target config.
-ln -s "$target-clang" "$sysroot/bin/clang"
-ln -s "$target-clang++" "$sysroot/bin/clang++"
+# redoxer and the cookbook's CMake files call plain clang/clang++ with
+# --target for Redox code and without it for host: recipes, and this
+# directory comes first on PATH, so dispatch on the target.
+for tool in clang clang++; do
+    compiler="$clang_path"
+    [ "$tool" = clang ] || compiler=$(command -v clang++)
+    {
+        printf '#!/usr/bin/env bash\nfor arg in "$@"; do\n'
+        printf '    case "$arg" in --target=*-unknown-redox) exec '
+        quote_sh "$sysroot/bin/$target-$tool"
+        printf ' "$@" ;; esac\ndone\nexec '
+        quote_sh "$compiler"
+        printf ' "$@"\n'
+    } > "$sysroot/bin/$tool"
+    chmod +x "$sysroot/bin/$tool"
+done
 # ELF shared-library startup code comes from relibc, not the Darwin SDK.
 mkdir -p "$sysroot/$target/usr"
 ln -s ../include "$sysroot/$target/usr/include"

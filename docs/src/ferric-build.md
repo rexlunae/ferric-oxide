@@ -60,7 +60,10 @@ its `*-unknown-redox` target. A small linker
 script exports the constructor-array symbols relibc needs in dynamic executables.
 Static links and shared libraries keep their normal layouts. Clang must support
 `--gcc-install-dir`; no separate Homebrew LLVM installation is needed when the
-host's Clang supports it. Native artifacts live under
+host's Clang supports it. The adapter is `<arch>-unknown-redox-clang` (and
+`clang++`); the sysroot's plain `clang` and `clang++` use it only when called
+with `--target=*-unknown-redox` and otherwise run host Clang, so `host:`
+recipes build programs for the build machine. Native artifacts live under
 `prefix/llvm/<arch>-unknown-redox/`, apart from the inherited toolchain.
 
 Configured builds default to native LLVM on x86-64 and ARM64, `build.podman = false`, and

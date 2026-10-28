@@ -98,6 +98,15 @@ for target in x86_64-unknown-redox aarch64-unknown-redox; do
         *--target="$driver"*--sysroot=*) ;;
         *) echo 'Missing ELF driver or target sysroot' >&2; exit 1 ;;
     esac
+    # Plain clang is the host compiler unless a Redox target is named.
+    for tool in clang clang++; do
+        "$prefix/sysroot/bin/$tool" -c host.c
+        if grep -q -- '--config=' "$FAKE_CLANG_ARGS"; then
+            echo "Plain $tool used the Redox target config" >&2; exit 1
+        fi
+        "$prefix/sysroot/bin/$tool" --target="$target" -c target.c
+        grep -q -- "--config=.*$target.cfg" "$FAKE_CLANG_ARGS"
+    done
     "$prefix/sysroot/bin/$target-clang" --target="$target" -c 'file with spaces.c'
     case "$(cat "$FAKE_CLANG_ARGS")" in
         *--target=*-unknown-redox*|*dynamic-linker*) exit 1 ;;
