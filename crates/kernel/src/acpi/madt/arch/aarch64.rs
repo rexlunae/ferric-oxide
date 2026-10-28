@@ -68,8 +68,9 @@ pub(super) fn init(madt: Madt) {
             }
         }
         3 => {
-            #[allow(clippy::never_loop)]
-            for gicc in giccs {
+            // GICv3 CPU interfaces are system registers; only the first GICC's presence matters.
+            //TODO: support more GICCs
+            if !giccs.is_empty() {
                 let mut gic_cpu_if = GicV3CpuIf;
                 unsafe { gic_cpu_if.init() };
                 crate::info!("{:#x?}", gic_cpu_if);
@@ -87,8 +88,6 @@ pub(super) fn init(madt: Madt) {
                     ic: Box::new(gic),
                 };
                 unsafe { IRQ_CHIP.irq_chip_list.chips.push(chip) };
-                //TODO: support more GICCs
-                break;
             }
         }
         _ => {

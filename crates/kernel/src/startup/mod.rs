@@ -13,6 +13,7 @@ use crate::{
     sync::CleanLockToken,
 };
 
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 use crate::numa;
 
 pub mod memory;

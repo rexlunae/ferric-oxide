@@ -951,8 +951,6 @@ impl AddrSpace {
         // Ferric Oxide: with KPTI, the table is a pair with a shadow loaded in user space.
         #[cfg(target_arch = "x86_64")]
         let kpti = crate::arch::kpti::enabled();
-        #[cfg(not(target_arch = "x86_64"))]
-        let kpti = false;
         #[cfg(target_arch = "x86_64")]
         let paired = kpti.then(crate::arch::kpti::new_user_table);
         #[cfg(not(target_arch = "x86_64"))]
@@ -970,7 +968,11 @@ impl AddrSpace {
 
         Ok(Self {
             grants: UserGrants::new(),
-            table: Table { utable, kpti },
+            table: Table {
+                utable,
+                #[cfg(target_arch = "x86_64")]
+                kpti,
+            },
             mmap_min: MMAP_MIN_DEFAULT,
             #[cfg(feature = "sys_proc")]
             images: Vec::new(),
@@ -3073,6 +3075,7 @@ pub const DANGLING: usize = 1 << (usize::BITS - 2);
 pub struct Table {
     pub utable: PageMapper,
     /// Ferric Oxide: the table is a KPTI pair (see `arch::x86_64::kpti`).
+    #[cfg(target_arch = "x86_64")]
     kpti: bool,
 }
 

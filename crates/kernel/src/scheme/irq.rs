@@ -310,8 +310,7 @@ impl IrqScheme {
                 if flags & O_CREAT == 0 && flags & O_STAT == 0 {
                     return Err(Error::new(EINVAL));
                 }
-                let mut ack = 0;
-                let reservation = if flags & O_STAT == 0 {
+                let (reservation, ack) = if flags & O_STAT == 0 {
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     {
                         let index = irq_to_vector(irq_number);
@@ -321,14 +320,14 @@ impl IrqScheme {
                         }
                         // Taken before the vector is published as reserved, so an interrupt
                         // that arrives for the new owner right after is reported to it.
-                        ack = fresh_ack(cpu_id, irq_number);
+                        let ack = fresh_ack(cpu_id, irq_number);
                         set_reserved(cpu_id, index, true);
-                        Some(IrqReservation { cpu_id, index })
+                        (Some(IrqReservation { cpu_id, index }), ack)
                     }
                     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-                    None
+                    (None, 0)
                 } else {
-                    None
+                    (None, 0)
                 };
                 (
                     Handle::Irq {
@@ -623,6 +622,7 @@ fn remap(from: LogicalCpuId, from_vector: u8, to: LogicalCpuId, to_vector: u8) -
 /// was steered elsewhere), and its row still holds the old owner's interrupts; the new handle
 /// starts acknowledged at that count, so it reports only interrupts that arrive for it. The
 /// caller reads it before marking the vector reserved. Without `irq_percpu`, 0, as upstream.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn fresh_ack(cpu: LogicalCpuId, irq: u8) -> usize {
     #[cfg(all(feature = "irq-percpu", target_arch = "x86_64"))]
     return interrupt_count(cpu, irq);
@@ -633,6 +633,7 @@ fn fresh_ack(cpu: LogicalCpuId, irq: u8) -> usize {
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const fn irq_to_vector(irq: u8) -> u8 {
     irq + 32
 }

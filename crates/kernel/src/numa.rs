@@ -1,20 +1,21 @@
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 use alloc::string::String;
-use core::{
-    ops::{Deref, DerefMut},
-    ptr::write_bytes,
-    slice,
-};
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
+use core::slice;
 
-use crate::{acpi, cpu_set::LogicalCpuSet, percpu};
+use crate::percpu;
 use bitfield::Bit;
-use rmm::{Arch, BumpAllocator, MemoryArea, PhysicalAddress};
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
+use rmm::{Arch, BumpAllocator};
+use rmm::{MemoryArea, PhysicalAddress};
 use spin::once::Once;
-use syscall::{Error, NumaMemoryPolicy};
+use syscall::NumaMemoryPolicy;
 
 pub const MAX_DOMAINS: usize = 128;
 pub const MAX_MEM_REGIONS: usize = MAX_DOMAINS;
 
 static DOMAIN_NODE_MAP: Once<&'static [Option<NumaNodeID>]> = Once::new();
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 static NUMA_CPUS: Once<&'static [Option<NumaNodeID>]> = Once::new();
 static NUMA_MEMORY: Once<&'static [Option<NumaMemory>]> = Once::new();
 static DISTANCES: Once<&'static [u8]> = Once::new();
@@ -33,6 +34,7 @@ pub fn is_supported() -> bool {
 pub struct NumaNodeID(u32);
 
 impl NumaNodeID {
+    #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     pub fn new(node_id: u32) -> Result<Self, String> {
         if node_id as usize >= MAX_DOMAINS {
             return Err(alloc::format!(
@@ -42,6 +44,7 @@ impl NumaNodeID {
         }
         Ok(NumaNodeID(node_id))
     }
+    #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     pub fn get(&self) -> u32 {
         self.0
     }
@@ -57,13 +60,9 @@ pub struct FreeListMask {
 }
 
 impl FreeListMask {
+    #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     pub fn enable_index(&mut self, i: usize) {
         self.mask.set_bit(i, true);
-    }
-
-    #[allow(unused)]
-    pub fn disable_index(&mut self, i: usize) {
-        self.mask.set_bit(i, false);
     }
 
     pub fn is_enabled(&self, i: usize) -> bool {
@@ -91,6 +90,7 @@ pub struct NumaMemory {
 }
 
 impl NumaMemory {
+    #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     pub fn new(start: usize, length: usize, node_id: NumaNodeID) -> Self {
         #[cfg(target_pointer_width = "64")]
         let _pad = [0u8; 4];
@@ -107,16 +107,15 @@ impl NumaMemory {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 pub fn init<A: Arch>(allocator: &mut BumpAllocator<A>) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        acpi::srat::init(allocator, &DOMAIN_NODE_MAP, &NUMA_CPUS, &NUMA_MEMORY);
-        acpi::slit::init(&DISTANCES);
-    }
+    crate::acpi::srat::init(allocator, &DOMAIN_NODE_MAP, &NUMA_CPUS, &NUMA_MEMORY);
+    crate::acpi::slit::init(&DISTANCES);
 }
 
 pub type RegionMask = [bool; MAX_MEM_REGIONS];
 
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 pub fn init_arch(mask: &Option<RegionMask>) {
     if let Some(cpus) = NUMA_CPUS.get()
         && let Some(memories) = NUMA_MEMORY.get()
@@ -187,6 +186,7 @@ pub fn init_arch(mask: &Option<RegionMask>) {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 /// A helper function that prints information about NUMA - available nodes, cpus and memory blocks in them
 /// their starts and lengths
 pub fn dump_info() {
