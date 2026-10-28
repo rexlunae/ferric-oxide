@@ -63,7 +63,7 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         let adapter = adapter_fn();
         let mut scheme = NetworkSchemeImpl::new(
             scheme_name.clone(),
-            NetworkSchemeData::new(adapter, Rc::clone(&socket)),
+            NetworkSchemeData::new(adapter, Rc::clone(&socket), &scheme_name),
             NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
         );
         redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme)
@@ -109,9 +109,11 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         self.handler
             .read_and_process_requests(&mut self.scheme)
             .expect("driver-network: failed to read from socket");
+        self.scheme.scheme_data_mut().bypass.note_answered();
         self.handler
             .poll_all_requests(&mut self.scheme)
             .expect("driver-network: failed to poll requests");
+        self.scheme.scheme_data_mut().bypass.drop_unclaimed();
         self.handler
             .write_responses()
             .expect("driver-network: failed to write to socket");
@@ -152,10 +154,10 @@ struct NetworkSchemeData<T: NetworkAdapter> {
 }
 
 impl<T: NetworkAdapter> NetworkSchemeData<T> {
-    pub fn new(adapter: T, socket: Rc<Socket>) -> Self {
+    pub fn new(adapter: T, socket: Rc<Socket>, scheme_name: &str) -> Self {
         Self {
             adapter,
-            bypass: bypass::State::new(socket),
+            bypass: bypass::State::new(socket, scheme_name),
         }
     }
 }

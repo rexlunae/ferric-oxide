@@ -15,9 +15,13 @@ use crate::{NetworkAdapter, NetworkResource, NetworkSchemeData};
 pub(crate) struct State;
 
 impl State {
-    pub(crate) fn new(_socket: Rc<Socket>) -> Self {
+    pub(crate) fn new(_socket: Rc<Socket>, _scheme_name: &str) -> Self {
         Self
     }
+
+    pub(crate) fn note_answered(&mut self) {}
+
+    pub(crate) fn drop_unclaimed(&mut self) {}
 
     pub(crate) fn pending(&self) -> usize {
         0
