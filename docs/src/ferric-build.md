@@ -123,8 +123,8 @@ make r.kernel
 ```
 
 Make assignments after `--` override the Cargo command's architecture,
-container and FUSE settings. Without a terminal, Cargo commands disable the
-cookbook TUI so builds can be logged. The native path currently supports
+container and FUSE settings. Without a terminal, the cookbook does not start
+its TUI, whether run through Cargo or Make, so builds can be logged. The native path currently supports
 x86-64 and ARM64 UEFI. Some third-party recipes still require GNU build utilities or
 explicit GCC compilers; dependencies for those recipes are installed only when
 needed. A full application rebuild has broader requirements than the initial

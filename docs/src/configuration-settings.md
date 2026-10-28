@@ -513,7 +513,7 @@ This section has details of the [Cookbook Environment Variables](#cookbook-envir
 
 ### Cookbook TUI Mode
 
-Cookbook has a TUI mode which is enabled by default. This mode speedup the build process because it allows the source fetch and compilation to be done in parallel. When the `CI` environment variable is set the TUI mode will be disabled, which is desired for builds under Continuous Integration (CI).
+Cookbook has a TUI mode which is enabled by default. This mode speedup the build process because it allows the source fetch and compilation to be done in parallel. When the `CI` environment variable is set, or when standard output is not a terminal (piped, redirected or run from a script), the TUI mode is disabled and the build prints plain logs, which is desired for builds under Continuous Integration (CI).
 
 ### Cookbook Offline Mode
 

@@ -154,7 +154,13 @@ pub fn init_config() {
 
     #[cfg(not(test))]
     if config.cook_opt.tui.is_none() {
-        config.cook_opt.tui = Some(!std::env::var("CI").is_ok_and(|s| !s.is_empty()));
+        // The TUI takes over the terminal, so it needs one: piped or
+        // redirected output (scripts, Remote Control, log capture) gets
+        // plain logs instead.
+        config.cook_opt.tui = Some(
+            !std::env::var("CI").is_ok_and(|s| !s.is_empty())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        );
     }
     #[cfg(test)]
     if config.cook_opt.tui.is_none() {
