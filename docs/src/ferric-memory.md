@@ -321,6 +321,21 @@ shootdown. One limitation remains: if a later page in the same call fails with
 `ENOMEM`, the call returns early, and the remaps already queued are not
 flushed or their frames released.
 
+The same holds for page-table pages. When unmapping a user page empties a page
+table, `rmm`'s `PageMapper::unmap_phys_deferring_tables` unlinks the table and
+hands its frame to the caller instead of freeing it. The kernel's user unmap
+paths (`Grant::unmap` and `Grant::transfer` in `context/memory.rs`) queue it on
+the address space's `Flusher` as a `FREE_TABLE` action, so it returns to the
+allocator only after every CPU running that address space has acknowledged the
+TLB shootdown, which also drops paging-structure (page-walk) cache entries that
+point at it. Before this, a CPU running another thread of the process could
+walk through a freed and reused table
+([#259](https://github.com/rexlunae/ferric-oxide/issues/259)). Address spaces
+that no CPU has loaded, such as one being dropped, use `NopFlusher` and free
+tables at once. `PageMapper::unmap_phys` still frees emptied tables
+immediately; it is used for kernel-half unmaps, which never free tables on
+x86_64 and RISC-V, and for the boot-time AP trampoline.
+
 ### Branch predictor barriers between processes
 
 `kernel.cpu.ibpb` defaults to `auto`. On CPUs that report IBPB support

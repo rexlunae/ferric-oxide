@@ -114,17 +114,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use crate::emulate::EmulateArch;
-    use std::sync::{Mutex, MutexGuard};
-
-    static MACHINE: Mutex<()> = Mutex::new(());
-
-    fn machine() -> MutexGuard<'static, ()> {
-        let guard = MACHINE.lock().unwrap();
-        // SAFETY: The guard serializes all tests using the global emulated machine.
-        unsafe { EmulateArch::init() };
-        guard
-    }
+    use crate::emulate::{fresh_machine as machine, EmulateArch};
 
     const PAGE: usize = EmulateArch::PAGE_SIZE;
     static AREAS: [MemoryArea; 2] = [
