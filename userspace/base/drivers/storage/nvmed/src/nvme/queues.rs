@@ -121,8 +121,10 @@ impl NvmeCmdQueue {
         })
     }
 
+    /// Whether every slot but one is in use, the most an NVMe submission queue may hold (NVMe
+    /// 2.0 base specification, section 3.3.1.5).
     pub fn is_full(&self) -> bool {
-        self.head == self.tail + 1
+        ring_is_full(self.head, self.tail, self.data.len())
     }
 
     /// Add a new submission command entry to the queue. The caller must ensure that the queue have free
@@ -135,5 +137,28 @@ impl NvmeCmdQueue {
 
     pub fn kick(&mut self) {
         self.doorbell.write(u32::from(self.tail));
+    }
+}
+
+/// Whether advancing `tail` in a power-of-two ring of `len` slots would make it equal `head`.
+fn ring_is_full(head: u16, tail: u16, len: usize) -> bool {
+    (usize::from(tail) + 1) & (len - 1) == usize::from(head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ring_is_full;
+
+    #[test]
+    fn full_when_tail_is_one_behind_head() {
+        assert!(ring_is_full(5, 4, 64));
+        assert!(!ring_is_full(5, 5, 64));
+        assert!(!ring_is_full(5, 3, 64));
+    }
+
+    #[test]
+    fn full_when_tail_wraps_to_head() {
+        assert!(ring_is_full(0, 63, 64));
+        assert!(!ring_is_full(1, 63, 64));
     }
 }
