@@ -437,6 +437,8 @@ When `REPO_BINARY` is enabled, the image is made to use pre-built binaries for a
 
 (This environment variable has the same source compilation behavior of `recipe = "binary"` seen above)
 
+Recipes whose source is in this repository (a `path` source, or a `same_as` source pointing at one, such as the kernel, relibc, base, the bootloader, RedoxFS and fox) are always built from source, even under `REPO_BINARY=1` or `"binary"`, because a package server cannot have this checkout's build of them.
+
 For example:
 
 ```toml
@@ -519,7 +521,7 @@ Cookbook has a TUI mode which is enabled by default. This mode speedup the build
 
 Cookbook also has a mode where it will reduce Internet activity by adding `REPO_OFFLINE=1` into `.config`. This mode is useful when you are in places where the Internet connection is slow or absent, or when you want a fixed build system state or faster incremental compilation.
 
-In this mode, Cookbook will not update the source of any recipe or a package binary if also set with `REPO_BINARY=1`. It also adds the `--offline` option to some Cargo build methods inside recipes where it is supported. When Cookbook or Cargo must access the Internet because sources do not exist locally it will throw an error instead.
+In this mode, Cookbook will not update the source of any recipe or a package binary if also set with `REPO_BINARY=1`. When cooking, a recipe set to use a package binary whose archive was never downloaded is built from its already fetched sources instead, with its build dependencies; `make fetch` still downloads package binaries. It also adds the `--offline` option to some Cargo build methods inside recipes where it is supported. When Cookbook or Cargo must access the Internet because sources do not exist locally it will throw an error instead.
 
 To temporarily allow Cookbook and Cargo to have Internet activity and update sources, run `make f.package-name` (single recipe source fetch) or `make fetch` (to fetch all enabled recipe sources), as these commands will ignore the `REPO_OFFLINE` environment variable.
 
