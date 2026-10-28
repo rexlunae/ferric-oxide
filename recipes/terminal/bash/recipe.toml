@@ -20,6 +20,11 @@ COOKBOOK_CONFIGURE_FLAGS+=(
     bash_cv_func_strchrnul_works=yes
     --with-bash-malloc=no
     --with-installed-readline=yes
+    # When cross-compiling, bash builds mkbuiltins, mksyntax and friends for
+    # the host from buildconf.h, which never defines HAVE_C_BOOL or
+    # HAVE_STDBOOL_H, so bashansi.h typedefs `bool`. That is an error under
+    # C23, the default from GCC 15. The helpers are C17 code; build them as such.
+    CFLAGS_FOR_BUILD="-g -O2 -std=gnu17"
 )
 cookbook_configure
 ln -s "bash" "${COOKBOOK_STAGE}/usr/bin/sh"
