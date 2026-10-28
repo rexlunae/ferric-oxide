@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::{fs, io};
 
+#[cfg(feature = "fuse")]
+use crate::redoxfs::shrink_disk;
 use crate::redoxfs::{archive_image, expand_disk, extract_tar};
 #[cfg(feature = "fuse")]
 use crate::redoxfs::{run_install_mount, RedoxFs};
-#[cfg(feature = "fuse")]
-use crate::redoxfs::{run_install_to_dir, shrink_disk};
 use crate::writer::write_redoxerd_config;
 use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
 
@@ -149,7 +149,6 @@ pub fn qemu_disk_device() -> &'static str {
 /// The bootloader reads the whole image into memory before the kernel runs, so
 /// it has to fit beside the kernel in the guest's RAM. `qemu_disk_size` is what
 /// a run expands its private copy to once the base is loaded.
-#[cfg(feature = "fuse")]
 pub fn qemu_base_disk_size() -> u64 {
     DISK_SIZE_LIVE
 }
@@ -441,19 +440,17 @@ fn base(
         } else {
             #[cfg(not(feature = "fuse"))]
             require_no_fuse(fuse)?;
-            run_install_to_dir(config, &base_dir)?;
-
-            eprintln!("redoxer: compressing {name}");
-            Command::new("tar")
-                .arg("-c")
-                .arg("-p")
-                .arg("-f")
-                .arg(&base_partial)
-                .arg("-C")
-                .arg(&base_dir)
-                .arg(".")
-                .status()
-                .and_then(status_error)?;
+            // Without FUSE the tree is installed into a directory and written
+            // into a whole-disk image here; that layout is the one QEMU runs.
+            redox_installer::install(config, &base_dir)
+                .map_err(|err| io::Error::other(format!("{err}")))?;
+            archive_image(
+                &base_partial,
+                &base_dir,
+                bootloader_bin,
+                qemu_use_uefi(),
+                qemu_base_disk_size(),
+            )?;
         }
 
         fs::rename(&base_partial, &base_file)?;
