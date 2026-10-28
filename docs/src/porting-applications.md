@@ -1447,6 +1447,13 @@ If you get an error read the log and determine if it is one of the following pro
 - Lack of Redox patches
 - Missing C, POSIX or Linux library functions in relibc
 
+Prefer adding a missing constant or function to relibc over patching an
+application to use a different name. Recipe patches apply to the shared source
+tree, so they also reach `host:` builds of the same recipe, which compile
+against the build machine's C library. For example, relibc defines both
+`RLIMIT_NLIMITS` (glibc) and `RLIM_NLIMITS` (BSD and macOS), so CPython builds
+its own `resource` module unchanged for Redox and for a macOS host.
+
 Use this command to log any possible errors on your terminal output:
 
 ```sh
