@@ -154,7 +154,8 @@ pub fn run_install_mount(
                 eprintln!("redoxer: extracting archive");
                 extract_tar(base_tar, base_dir)?;
             } else {
-                run_install_to_dir(config, base_dir)?;
+                redox_installer::install(config, base_dir)
+                    .map_err(|err| io::Error::other(format!("{err}")))?;
             }
 
             Ok(())
