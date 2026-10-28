@@ -60,7 +60,7 @@ rm -rf "$staging"
 # X.Org's autotools macros (xorg-macros.m4), which X11 recipes need to
 # regenerate their build files. Podman images get them from xutils-dev.
 util_macros=util-macros-1.20.2
-util_macros_sha256=UTIL_MACROS_SHA256
+util_macros_sha256=9ac269eba24f672d7d7b3574e4be5f333d13f04a7712303b1821b2a51ac82e8e
 util_macros_archive="$prefix/$util_macros.tar.xz"
 if [ ! -f "$util_macros_archive" ]; then
     curl --fail --location --retry 5 --output "$util_macros_archive.partial" \
