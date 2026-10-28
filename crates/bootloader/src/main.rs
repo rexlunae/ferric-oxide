@@ -23,8 +23,11 @@ mod os;
 
 mod arch;
 mod editor;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod kaslr;
 mod logger;
+// The BIOS build's COM ports; UEFI builds write through the firmware console.
+#[cfg(all(target_arch = "x86", target_os = "none", feature = "serial_debug"))]
 mod serial_16550;
 
 const KIBI: usize = 1024;
@@ -461,6 +464,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
     println!("Hardware descriptor: {:x?}", hwdesc);
     let (acpi_rsdp_base, acpi_rsdp_size) = match hwdesc {
         OsHwDesc::Acpi(base, size) => (base, size),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         OsHwDesc::DeviceTree(base, size) => (base, size),
         OsHwDesc::NotFound => (0, 0),
     };
@@ -540,7 +544,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
             KERNEL_64BIT = kernel_64bit;
         }
         // Ferric Oxide: kernel image KASLR moves the entry point with the image.
-        #[cfg(feature = "kaslr")]
+        #[cfg(all(feature = "kaslr", any(target_arch = "x86", target_arch = "x86_64")))]
         let kernel_entry = kernel_entry + kaslr::randomize(kernel, kernel_64bit);
         (kernel, kernel_entry)
     };
@@ -600,6 +604,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
                 writeln!(w, "RSDP_ADDR={addr:016x}").unwrap();
                 writeln!(w, "RSDP_SIZE={size:016x}").unwrap();
             }
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             OsHwDesc::DeviceTree(addr, size) => {
                 writeln!(w, "DTB_ADDR={addr:016x}").unwrap();
                 writeln!(w, "DTB_SIZE={size:016x}").unwrap();

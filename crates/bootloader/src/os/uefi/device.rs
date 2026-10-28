@@ -1,5 +1,5 @@
 use alloc::{string::String, vec, vec::Vec};
-use core::{fmt::Write, mem, ptr, slice};
+use core::{fmt::Write, marker::PhantomData, mem, ptr, slice};
 use uefi::{
     Handle,
     device::{
@@ -461,14 +461,15 @@ impl Protocol<DevicePath> for DevicePathProtocol {
 }
 
 pub struct DevicePathIter<'a> {
-    device_path: &'a DevicePath,
+    // The nodes are read through `node_ptr`, which stays inside the borrowed path.
+    path: PhantomData<&'a DevicePath>,
     node_ptr: *const DevicePath,
 }
 
 impl<'a> DevicePathIter<'a> {
     pub fn new(device_path: &'a DevicePath) -> Self {
         Self {
-            device_path,
+            path: PhantomData,
             node_ptr: device_path as *const DevicePath,
         }
     }

@@ -38,6 +38,7 @@ pub struct OsMemoryAttributeRange {
 #[derive(Clone, Copy, Debug)]
 pub enum OsHwDesc {
     Acpi(u64, u64),
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     DeviceTree(u64, u64),
     NotFound,
 }
