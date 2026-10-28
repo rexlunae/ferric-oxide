@@ -189,6 +189,41 @@ them can continue; that was the boot-smoke hang in
 in `crates/kernel/tests` model the wait with threads and an acknowledgement
 flag; only the image boots exercise the real context-switch path.
 
+On x86, adding a mapping where no present page-table entry was sends no TLB
+shootdown and does no local flush, because x86 never caches not-present
+entries. This covers each user-scheme request that maps a client buffer into
+the scheme daemon, and each anonymous `mmap`. AArch64 and RISC-V still flush
+after new mappings (`TlbShootdownActions::NEW_MAPPING` in
+`context/memory.rs`). Remaps, permission changes and unmaps flush on every
+architecture.
+
+A shootdown round invalidates only the pages it changed when there are at most
+32 of them (`TLB_SINGLE_PAGE_FLUSH_CEILING` in `memory/tlb.rs`); a larger round
+flushes the whole TLB. The flushing CPU invalidates the pages itself (`invlpg`,
+plus `INVPCID` for the user PCID under KPTI with PCID; `TLBI VAAE1IS` on
+AArch64) and posts the list to each target CPU's mailbox in its per-CPU block
+before setting its shootdown flag. A mailbox that already holds a request the
+target has not taken is upgraded to a full flush, so concurrent requesters never
+get less than they asked for; the module documentation describes the protocol
+and its memory ordering. RISC-V keeps the full flush, because `sfence.vma` with
+an address does not cover the page tables an unmap frees. Shadow-stack
+teardown and a queued page the caller cannot name also flush everything. A
+requester displaced while it fills the mailbox marks the mailbox until its
+stores are done, so they cannot overwrite the next requester's list.
+
+The flushing CPU frees the round's frames only after every CPU it asked has
+handled that round's request. Each post to a mailbox returns a ticket, and the
+target publishes the last ticket it covered after invalidating. The requester
+waits for each target's own ticket (`TlbAcks` in `memory/tlb.rs`) and answers
+shootdowns sent to it while it waits. The earlier shared counter per address
+space could be satisfied by the wrong acknowledgements: from a CPU that left the
+address space during the round, or from a CPU answering an unrelated request.
+The wait could then end before a CPU that still held translations had flushed
+([#264](https://github.com/rexlunae/ferric-oxide/issues/264)). A CPU that leaves
+an address space acknowledges only by handling its mailbox like any other
+target. A requester whose target's flag is already set sends no second
+interrupt, because the pending handling will see its post.
+
 On ARM64 every user address space uses ASID 0 (`TCR_EL1.A1` is clear and
 `TTBR0_EL1` carries no ASID), so the TLB is not tagged by process. Switching
 address spaces (`set_table` in `rmm/src/arch/aarch64.rs`) writes the table
@@ -229,6 +264,22 @@ exhaustion returns an allocation failure, with no writable fallback. The kernel
 checks every reserved page after constructing its boot mappings and invalidates
 old bootloader translations before AP startup. Pool frames are mapped only with
 read-only shadow-stack PTEs and an unmapped guard below each stack.
+
+Shadow-stack PTEs are global, like the rest of the kernel half while KPTI is
+off, and a page-table reload does not drop global TLB entries. Freeing a shadow
+stack therefore broadcasts a shootdown (`shootdown_tlb_all`) that asks
+every CPU to drop global entries as well: each CPU that sees a new request,
+counted by a generation in `percpu/global_flush.rs`, invalidates with `INVPCID`
+type 2 when every CPU has it, or by toggling CR4.PGE (Intel SDM Volume 3A,
+4.10.4.1). The BSP enables `INVPCID` for this if its CPUID reports it, and each
+AP that lacks it turns it off for all CPUs before it can handle a shootdown
+([#282](https://github.com/rexlunae/ferric-oxide/issues/282)). Shootdowns for user address spaces still only reload the page table
+([#260](https://github.com/rexlunae/ferric-oxide/issues/260)). The broadcast
+waits, through the same per-CPU tickets as a targeted round, until every other
+CPU has flushed, and only then is the stack's frame returned to the pool
+([#281](https://github.com/rexlunae/ferric-oxide/issues/281)). A CPU checks
+for a pending global flush after it reads its mailbox's ticket counter, so the
+handling that acknowledges a broadcast always drops global entries.
 
 Live CPUs write entries with `WRSS`. Pre-enable initialization makes a bounded
 store through the same read-only mapping while interrupts are masked and the
@@ -280,3 +331,65 @@ released only after every CPU using that address space has acknowledged the
 shootdown. One limitation remains: if a later page in the same call fails with
 `ENOMEM`, the call returns early, and the remaps already queued are not
 flushed or their frames released.
+
+The same holds for page-table pages. When unmapping a user page empties a page
+table, `rmm`'s `PageMapper::unmap_phys_deferring_tables` unlinks the table and
+hands its frame to the caller instead of freeing it. The kernel's user unmap
+paths (`Grant::unmap` and `Grant::transfer` in `context/memory.rs`) queue it on
+the address space's `Flusher` as a `FREE_TABLE` action, so it returns to the
+allocator only after every CPU running that address space has acknowledged the
+TLB shootdown, which also drops paging-structure (page-walk) cache entries that
+point at it. Before this, a CPU running another thread of the process could
+walk through a freed and reused table
+([#259](https://github.com/rexlunae/ferric-oxide/issues/259)). Address spaces
+that no CPU has loaded, such as one being dropped, use `NopFlusher` and free
+tables at once. `PageMapper::unmap_phys` still frees emptied tables
+immediately; it is used for kernel-half unmaps, which never free tables on
+x86_64 and RISC-V, and for the boot-time AP trampoline.
+
+### Branch predictor barriers between processes
+
+`kernel.cpu.ibpb` defaults to `auto`. On CPUs that report IBPB support
+(Intel CPUID.(7,0):EDX\[26\], AMD CPUID.80000008h:EBX\[12\]) the kernel
+writes `IA32_PRED_CMD` bit 0 (MSR 0x49) when a CPU is about to run a user
+address space other than the last one it ran. This discards indirect branch
+predictions one process trained before another runs (Spectre v2 user-to-user,
+CVE-2017-5715). The choice is made once on the bootstrap processor, like KPTI;
+`always` panics at boot on a CPU without support and `never` builds the code
+out. Every other CPU checks its own CPUID as it starts, since the MSR is
+written by whichever CPU switches: under `always` a CPU without IBPB panics,
+and under `auto` it runs without barriers and logs a warning. A CPU whose
+barrier write faults despite its CPUID stops issuing barriers instead of
+crashing. Without a `ferric.toml` the kernel config example keeps it `never`, as
+upstream Redox has no barrier.
+
+Each CPU remembers the last address space whose user code it ran through a
+weak reference, which keeps that address space's allocation alive so a new
+address space cannot reuse its address and be mistaken for it. Switches to
+contexts that run no user code keep that record and issue nothing: kernel and
+idle contexts, and ring workers, which install a submitter's address space to
+reach its buffers but never enter user mode (`Context::runs_user_code` tells
+them apart, since workers also set `userspace` to be scheduled). A process that
+yields to the idle loop or to a ring worker and resumes pays no barrier;
+neither do switches between threads of one process. `ibpb::before_switch`
+makes the check and the MSR write, called from the x86_64 `switch_to` and from
+`Context::set_addr_space`, which covers a context that gets a new address space
+through exec. The decision and the
+CPUID decoding are pure functions in `arch/x86_64/ibpb/policy.rs`, covered by
+the kernel helper tests; `sys:stat` reports the number of barriers issued as
+`ibpb_barriers`.
+
+The default follows KPTI: on where the CPU provides the mitigation. An IBPB
+costs thousands of cycles, but it is paid only on switches between processes,
+not on system calls, interrupts or switches through the idle loop. Linux makes
+the barrier conditional by default, issuing it only for tasks that opt in
+through `prctl`; Ferric has no such per-process opt-in yet, so the
+choice is all switches or none. Systems running only mutually trusted
+processes can select `never`. The kernel does not yet use IBRS, STIBP or
+retpolines, so this covers user-to-user attacks only, not user-to-kernel
+branch target injection or attacks from a sibling hyperthread. `auto`
+looks only at IBPB support, not at vulnerability bits. Image CI boots under KVM with
+`-cpu host` and requires the boot-time decision in the log; whether barriers
+are on there depends on the runner exposing IBPB to the guest. When they are,
+it also requires a non-zero `ibpb_barriers` count, which the smoke script
+prints from `sys:stat` after its tests have run.

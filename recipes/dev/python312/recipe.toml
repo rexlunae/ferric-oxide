@@ -43,6 +43,20 @@ if [ "$TARGET" != "$COOKBOOK_HOST_TARGET" ]; then
     )
 else
     COOKBOOK_CONFIGURE_FLAGS=(--prefix=/usr)
+    # The host interpreter's ssl module needs OpenSSL 3: CPython 3.12 does not
+    # build against OpenSSL 4, which made ASN1_STRING opaque. Use the build
+    # machine's OpenSSL 3, from pkg-config or a keg-only Homebrew or MacPorts
+    # install, and stop before configure if there is none.
+    if ! host_openssl=$(HOST_OPENSSL3_PREFIX "$(pkg-config --variable=prefix openssl 2>/dev/null)" \
+        /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3 /opt/local/libexec/openssl3 /usr); then
+        echo "host:python312 needs OpenSSL 3 headers on the build machine (for example Homebrew's openssl@3);" >&2
+        echo "put its pkgconfig directory on PKG_CONFIG_PATH if it is installed somewhere else" >&2
+        exit 1
+    fi
+    COOKBOOK_CONFIGURE_FLAGS+=(--with-openssl="$host_openssl")
+    if [ "$host_openssl" != /usr ]; then
+        COOKBOOK_CONFIGURE_FLAGS+=(--with-openssl-rpath=auto)
+    fi
 fi
 
 if [ "${COOKBOOK_DYNAMIC}" != "1" ]; then
@@ -52,9 +66,11 @@ fi
 
 cookbook_configure
 
-# A same file to save 60MB
-(cd "${COOKBOOK_STAGE}/usr/lib/python3.12/config-3.12-$ARCH-$OS" && \
-    rm -f libpython3.12.a && ln -s ../../libpython3.12.a)
+# A same file to save 60MB. CPython names this directory after its platform
+# triplet: "$ARCH-$OS" on Redox and Linux, but just "darwin" on macOS hosts.
+for config_dir in "${COOKBOOK_STAGE}"/usr/lib/python3.12/config-3.12-*/; do
+    (cd "$config_dir" && rm -f libpython3.12.a && ln -s ../../libpython3.12.a)
+done
 # monkey patching to make paths working in target system
 if [ "$TARGET" != "$COOKBOOK_HOST_TARGET" ]; then
     PYTHON_INIT

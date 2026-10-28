@@ -93,6 +93,12 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
             event::EventFlags::READ,
         )
         .unwrap();
+    // Ferric Oxide: the bypass wake pipe ticks the scheme too.
+    if let Some(wake) = scheme.wake_handle() {
+        event_queue
+            .subscribe(wake, Source::Scheme, event::EventFlags::READ)
+            .expect("rtl8139d: failed to subscribe to the wake pipe");
+    }
 
     libredox::call::setrens(0, 0).expect("rtl8139d: failed to enter null namespace");
 

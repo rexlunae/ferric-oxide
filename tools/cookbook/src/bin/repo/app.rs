@@ -291,6 +291,16 @@ impl TuiApp {
 }
 
 pub fn run_tui_cook(config: CliConfig, recipes: Vec<CookRecipe>) -> Result<TuiApp> {
+    // Set up the terminal before any worker starts, so `tui = true` without
+    // a terminal fails with an error instead of panicking mid-build.
+    let mstdout = stdout()
+        .into_raw_mode()
+        .and_then(|out| out.into_alternate_screen())
+        .map_err(|source| Error::Io {
+            source,
+            path: None,
+            context: "the TUI needs a terminal; set CI=1 or [cook] tui = false",
+        })?;
     let (work_tx, work_rx) = mpsc::channel::<(CookRecipe, FetchResult)>();
     let (status_tx, status_rx) = mpsc::channel::<StatusUpdate>();
 
@@ -390,11 +400,6 @@ pub fn run_tui_cook(config: CliConfig, recipes: Vec<CookRecipe>) -> Result<TuiAp
     });
 
     let mstdin = stdin();
-    let mstdout = stdout()
-        .into_raw_mode()
-        .unwrap()
-        .into_alternate_screen()
-        .unwrap();
 
     // ----- Input Thread -----
     let (input_tx, input_rx) = mpsc::channel::<Event>();

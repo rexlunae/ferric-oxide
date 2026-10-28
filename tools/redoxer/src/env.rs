@@ -209,19 +209,40 @@ pub fn command<S: AsRef<ffi::OsStr>>(program: S) -> anyhow::Result<process::Comm
     Ok(command)
 }
 
+/// Arguments plain `clang` (or `clang++` when `cxx`) needs to build for the
+/// selected target: none for the host, otherwise the target triple, plus
+/// libstdc++ for C++ because libc++ is not ready for Redox (see the
+/// llvm-rt21 recipe).
+fn clang_target_args(cxx: bool) -> Vec<String> {
+    let cross_target = (host_target() != target()).then(gnu_target);
+    clang_args_for(cross_target, cxx)
+}
+
+fn clang_args_for(cross_target: Option<&str>, cxx: bool) -> Vec<String> {
+    let Some(cross_target) = cross_target else {
+        return Vec::new();
+    };
+    let mut args = vec![format!("--target={cross_target}")];
+    if cxx {
+        args.push("-stdlib=libstdc++".to_string());
+    }
+    args
+}
+
 fn inner<I: Iterator<Item = String>>(program: &str, args: I) -> anyhow::Result<()> {
     let clang = crate::is_use_clang();
-    let program = match program {
-        "env" => "env".to_string(),
-        "ar" if clang => "llvm-ar".to_string(),
-        "cc" if clang => "clang".to_string(),
-        "cxx" if clang => "clang++".to_string(),
-        "ar" => format!("{}-ar", gnu_target()),
-        "cc" => format!("{}-gcc", gnu_target()),
-        "cxx" => format!("{}-g++", gnu_target()),
+    let (program, target_args) = match program {
+        "env" => ("env".to_string(), Vec::new()),
+        "ar" if clang => ("llvm-ar".to_string(), Vec::new()),
+        "cc" if clang => ("clang".to_string(), clang_target_args(false)),
+        "cxx" if clang => ("clang++".to_string(), clang_target_args(true)),
+        "ar" => (format!("{}-ar", gnu_target()), Vec::new()),
+        "cc" => (format!("{}-gcc", gnu_target()), Vec::new()),
+        "cxx" => (format!("{}-g++", gnu_target()), Vec::new()),
         _ => return Err(anyhow!("Unknown env program {program:?}")),
     };
     command(program)?
+        .args(target_args)
         .args(args)
         .status()
         .and_then(status_error)?;
@@ -251,17 +272,11 @@ fn generate_gnu_targets() -> HashMap<&'static str, String> {
         h.insert("READELF", format!("{target_prefix}readelf"));
         h.insert("STRIP", format!("{target_prefix}strip"));
     } else {
-        let target_flag = if is_host {
-            String::new()
-        } else {
-            format!(" --target={}", gnu_target())
-        };
-
-        let target_cxxflag = if is_host {
-            String::new()
-        } else {
-            // TODO: libcxx is not ready (see llvm-rt21 recipe)
-            " -stdlib=libstdc++".to_string()
+        let with_args = |tool: &str, cxx: bool| {
+            std::iter::once(tool.to_string())
+                .chain(clang_target_args(cxx))
+                .collect::<Vec<_>>()
+                .join(" ")
         };
 
         h.insert("AR", "llvm-ar".to_string());
@@ -272,9 +287,9 @@ fn generate_gnu_targets() -> HashMap<&'static str, String> {
         h.insert("RANLIB", "llvm-ranlib".to_string());
         h.insert("READELF", "llvm-readelf".to_string());
         h.insert("STRIP", "llvm-strip".to_string());
-        h.insert("AS", format!("clang{target_flag}"));
-        h.insert("CC", format!("clang{target_flag}"));
-        h.insert("CXX", format!("clang++{target_flag}{target_cxxflag}"));
+        h.insert("AS", with_args("clang", false));
+        h.insert("CC", with_args("clang", false));
+        h.insert("CXX", with_args("clang++", true));
         h.insert("PKG_CONFIG", format!("{target_prefix}pkg-config"));
     }
     if is_host {
@@ -298,5 +313,24 @@ pub fn main(args: &[String]) {
             eprintln!("redoxer env: {err:#}");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clang_args_for;
+
+    #[test]
+    fn clang_names_the_redox_target_only_when_cross_compiling() {
+        assert!(clang_args_for(None, false).is_empty());
+        assert!(clang_args_for(None, true).is_empty());
+        assert_eq!(
+            clang_args_for(Some("aarch64-unknown-redox"), false),
+            ["--target=aarch64-unknown-redox"]
+        );
+        assert_eq!(
+            clang_args_for(Some("x86_64-unknown-redox"), true),
+            ["--target=x86_64-unknown-redox", "-stdlib=libstdc++"]
+        );
     }
 }

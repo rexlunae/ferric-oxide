@@ -29,6 +29,7 @@ use rmm::{BumpAllocator, FrameAllocator, FrameCount, FrameUsage, MemoryArea};
 
 mod kernel_mapper;
 pub mod page;
+pub mod tlb;
 pub use page::*;
 
 pub type PageMapper = rmm::PageMapper<RmmA, crate::memory::TheFrameAllocator>;

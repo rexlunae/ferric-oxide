@@ -24,7 +24,7 @@ crate::interrupt!(wakeup, || {
     // Issue #214: `kernel.profiling`'s profiler CPU points every vector from 33 up at this
     // handler, the TLB shootdown vector included, and never sets up contexts, so it has no
     // idle context. Asking it for one panicked; and a shootdown it does not answer leaves its
-    // `wants_tlb_shootdown` set, so the next broadcast (`shootdown_tlb_ipi(None)`, used when
+    // `wants_tlb_shootdown` set, so the next broadcast (`shootdown_tlb_all`, used when
     // a shadow stack is freed) spins on it forever. Answer the shootdown, as the `tlb` handler
     // would, and switch nothing: such a CPU has nothing to switch to. The other vectors need
     // no answer here: the Wakeup, Switch and Pit broadcasts only ask a CPU with contexts to

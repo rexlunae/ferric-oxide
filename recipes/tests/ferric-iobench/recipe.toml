@@ -4,7 +4,10 @@
 # percentiles as FERRIC_BENCH iobench-... lines, and a same-boot A/B of the per-CPU queues
 # against the single queue (ferric_blkqueue::ab). It only reads the disk; its file jobs
 # (--filename) write a file in /tmp through RedoxFS alone and through the page cache, and
-# compare the two. It prints FERRIC_TEST_SKIP when there is no NVMe disk. Only for test images. Source lives in files/; as a path source
+# compare the two. It prints FERRIC_TEST_SKIP when there is no NVMe disk. --align=page,
+# --ioengine=regbuf (kernel.regbuf, drivers.grant_dma, an IOMMU) and --ioengine=ring
+# (kernel.rings) choose other request paths on the disk, to measure the cost of mapping each
+# read's buffer into nvmed. Only for test images. Source lives in files/; as a path source
 # (relative to the repository root) edits there rebuild it.
 [source]
 path = "recipes/tests/ferric-iobench/files"
