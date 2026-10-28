@@ -115,19 +115,10 @@ impl NvmeCmd {
             cdw15: 0,
         }
     }
-    // TODO: this function is not used
-    pub fn get_features(_cid: u16, ptr: usize, fid: u8) -> Self {
-        Self {
-            opcode: 0xA,
-            dptr: [ptr as u64, 0],
-            cdw10: u32::from(fid), // TODO: SEL
-            ..Default::default()
-        }
-    }
-
     /// Ferric Oxide: Set Features, Number of Queues (FID 07h, NVMe Base Specification 2.0,
     /// 5.27.1.5): asks for `sqs_1 + 1` I/O submission and `cqs_1 + 1` I/O completion queues.
     /// The completion's dword 0 holds what the controller allocated, also 0-based.
+    #[cfg(feature = "percore")]
     pub fn set_features_number_of_queues(cid: u16, sqs_1: u16, cqs_1: u16) -> Self {
         const FID_NUMBER_OF_QUEUES: u32 = 0x07;
         Self {

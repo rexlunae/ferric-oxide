@@ -71,33 +71,9 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let mut sdhci = sd::SdHostCtrl::new(addr);
     unsafe {
         sdhci.init();
-        /*
-        let mut buf1 = [0u32; 512];
-        sdhci.sd_readblock(1, &mut buf1, 1);
-        println!("readblock {:?}", buf1);
-        buf1[0] = 0xdead_0000;
-        buf1[1] = 0xdead_0000;
-        buf1[2] = 0x0000_dead;
-        buf1[3] = 0x0000_dead;
-        sdhci.sd_writeblock(1, &buf1, 1);
-        sdhci.sd_readblock(1, &mut buf1, 1);
-        println!("readblock {:?}", buf1);
-        */
-        /*
-        let mut buf1 = [0u8; 512];
-        sdhci.read(1, &mut buf1);
-        println!("readblock {:?}", buf1);
-        buf1[0] = 0xde;
-        buf1[1] = 0xad;
-        buf1[2] = 0xde;
-        buf1[3] = 0xad;
-        sdhci.write(1, &buf1);
-        sdhci.read(1, &mut buf1);
-        println!("readblock {:?}", buf1);
-        */
     }
 
-    let mut disks = vec![sdhci];
+    let disks = vec![sdhci];
     let mut scheme = DiskScheme::new(
         Some(daemon),
         "disk.mmc".to_string(),

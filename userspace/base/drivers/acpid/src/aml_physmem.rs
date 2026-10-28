@@ -132,11 +132,6 @@ impl AmlPageCache {
         );
         Ok(())
     }
-
-    pub fn clear(&mut self) {
-        log::trace!("Clear page cache");
-        self.page_cache.clear();
-    }
 }
 
 #[derive(Clone)]

@@ -93,18 +93,6 @@ impl NvmeCompQueue {
         ((entry.status & 1) == 1) == self.phase
     }
 
-    /// Get a new CQ entry, busy waiting until an entry appears.
-    pub fn complete_spin(&mut self) -> NvmeComp {
-        log::debug!("Waiting for new CQ entry");
-        loop {
-            if let Some(some) = self.complete() {
-                return some;
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
     pub fn kick(&mut self) {
         if self.last_doorbell != self.head {
             self.doorbell.write(u32::from(self.head));
@@ -133,9 +121,6 @@ impl NvmeCmdQueue {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
     pub fn is_full(&self) -> bool {
         self.head == self.tail + 1
     }
@@ -150,29 +135,5 @@ impl NvmeCmdQueue {
 
     pub fn kick(&mut self) {
         self.doorbell.write(u32::from(self.tail));
-    }
-}
-
-#[derive(Debug)]
-pub enum Status {
-    GenericCmdStatus(u8),
-    CommandSpecificStatus(u8),
-    IntegrityError(u8),
-    PathRelatedStatus(u8),
-    Rsvd(u8),
-    Vendor(u8),
-}
-impl Status {
-    pub fn parse(raw: u16) -> Self {
-        let code = (raw >> 1) as u8;
-        match (raw >> 9) & 0b111 {
-            0 => Self::GenericCmdStatus(code),
-            1 => Self::CommandSpecificStatus(code),
-            2 => Self::IntegrityError(code),
-            3 => Self::PathRelatedStatus(code),
-            4..=6 => Self::Rsvd(code),
-            7 => Self::Vendor(code),
-            _ => unreachable!(),
-        }
     }
 }

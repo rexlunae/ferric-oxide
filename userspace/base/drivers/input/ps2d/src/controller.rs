@@ -24,6 +24,23 @@ pub enum Error {
     KeyboardCommandDataFail(KeyboardCommandData),
 }
 
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::CommandRetry => write!(f, "device asked to resend"),
+            Error::NoMoreTries => write!(f, "out of retries"),
+            Error::ReadTimeout => write!(f, "read timed out"),
+            Error::WriteTimeout => write!(f, "write timed out"),
+            Error::CommandTimeout(command) => write!(f, "command {command:?} timed out"),
+            Error::WriteConfigTimeout(config) => write!(f, "writing config {config:?} timed out"),
+            Error::KeyboardCommandFail(command) => write!(f, "keyboard command {command:?} failed"),
+            Error::KeyboardCommandDataFail(command) => {
+                write!(f, "keyboard command {command:?} with data failed")
+            }
+        }
+    }
+}
+
 bitflags! {
     pub struct StatusFlags: u8 {
         const OUTPUT_FULL = 1;
@@ -58,7 +75,7 @@ bitflags! {
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 #[allow(dead_code)]
-enum Command {
+pub(crate) enum Command {
     ReadConfig = 0x20,
     WriteConfig = 0x60,
     DisableSecond = 0xA7,
@@ -75,7 +92,7 @@ enum Command {
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 #[allow(dead_code)]
-enum KeyboardCommand {
+pub(crate) enum KeyboardCommand {
     EnableReporting = 0xF4,
     SetDefaultsDisable = 0xF5,
     SetDefaults = 0xF6,
@@ -84,14 +101,12 @@ enum KeyboardCommand {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
-enum KeyboardCommandData {
+pub(crate) enum KeyboardCommandData {
     ScancodeSet = 0xF0,
 }
 
 // Default timeout in microseconds
 const DEFAULT_TIMEOUT: u64 = 50_000;
-// Reset timeout in microseconds
-const RESET_TIMEOUT: u64 = 1_000_000;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub struct Ps2 {
@@ -189,19 +204,11 @@ impl Ps2 {
                     return Ok(ok);
                 }
                 Err(ref err) => {
-                    debug!("{}: retry {}/{}: {:?}", name, retry + 1, retries, err);
+                    debug!("{}: retry {}/{}: {}", name, retry + 1, retries, err);
                 }
             }
         }
         res
-    }
-
-    fn config(&mut self) -> Result<ConfigFlags, Error> {
-        self.retry(format_args!("read config"), 4, |x| {
-            x.command(Command::ReadConfig)?;
-            x.read()
-        })
-        .map(ConfigFlags::from_bits_truncate)
     }
 
     fn set_config(&mut self, config: ConfigFlags) -> Result<(), Error> {
@@ -254,16 +261,6 @@ impl Ps2 {
     pub fn mouse_command_async(&mut self, command: u8) -> Result<(), Error> {
         self.command(Command::WriteSecond)?;
         self.write(command as u8)
-    }
-
-    pub fn next(&mut self) -> Option<(bool, u8)> {
-        let status = self.status();
-        if status.contains(StatusFlags::OUTPUT_FULL) {
-            let data = self.data.read();
-            Some((!status.contains(StatusFlags::SECOND_OUTPUT_FULL), data))
-        } else {
-            None
-        }
     }
 
     pub fn init_keyboard(&mut self) -> Result<(), Error> {
@@ -343,7 +340,7 @@ impl Ps2 {
 
         // Initialize keyboard
         if let Err(err) = self.init_keyboard() {
-            error!("failed to initialize keyboard: {:?}", err);
+            error!("failed to initialize keyboard: {}", err);
             return Err(err);
         }
 
@@ -351,7 +348,7 @@ impl Ps2 {
         let enable_mouse = match self.command(Command::EnableSecond) {
             Ok(()) => true,
             Err(err) => {
-                error!("failed to initialize mouse: {:?}", err);
+                error!("failed to initialize mouse: {}", err);
                 false
             }
         };
@@ -361,7 +358,7 @@ impl Ps2 {
             // Use inner function to prevent retries
             // Response is ignored since scanning is now on
             if let Err(err) = self.keyboard_command_inner(KeyboardCommand::EnableReporting as u8) {
-                error!("failed to initialize keyboard reporting: {:?}", err);
+                error!("failed to initialize keyboard reporting: {}", err);
                 //TODO: fix by using interrupts?
             }
         }

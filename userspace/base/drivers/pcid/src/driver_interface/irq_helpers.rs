@@ -9,15 +9,20 @@ use std::io::prelude::*;
 use std::io::{self};
 use std::num::NonZeroU8;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use ferric_vtd::interrupt::MsiFormat;
 
-use crate::msi::{MsiAddrAndData, MsixTableEntry, VectorControl};
 // Ferric Oxide: vectors on a chosen CPU.
-use crate::percpu::{self, CpuEntry, CpuId, VectorError};
+use crate::percpu::{CpuId, VectorError};
 use crate::PciFunctionHandle;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::{
     msi::MappedMsixRegs, MsiSetFeatureInfo, PciFeature, PciFeatureInfo, PcidChannel, SetFeatureInfo,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::{
+    msi::{MsiAddrAndData, MsixTableEntry, VectorControl},
+    percpu::{self, CpuEntry},
 };
 
 /// Read the local APIC ID of the bootstrap processor.
@@ -546,7 +551,9 @@ impl Msix {
 #[derive(Debug)]
 enum InterruptVectorKind {
     Legacy,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Msi,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     MsiX {
         table_entry: *mut MsixTableEntry,
         // Ferric Oxide: the entry's Vector Control word, so masking is one write.
@@ -574,7 +581,9 @@ impl InterruptVector {
     pub fn mechanism(&self) -> InterruptMechanism {
         match self.kind {
             InterruptVectorKind::Legacy => InterruptMechanism::Pin,
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             InterruptVectorKind::Msi => InterruptMechanism::Msi,
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             InterruptVectorKind::MsiX { .. } => InterruptMechanism::MsiX,
         }
     }
@@ -598,6 +607,7 @@ impl InterruptVector {
     ///
     /// Ferric Oxide: the entry's Vector Control word is cached from one read when the entry is
     /// programmed, so each call is a single MMIO write ([`VectorControl`]).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn set_masked_if_fast(&mut self, masked: bool) -> bool {
         match &mut self.kind {
             InterruptVectorKind::Legacy | InterruptVectorKind::Msi => false,
@@ -612,6 +622,13 @@ impl InterruptVector {
                 true
             }
         }
+    }
+
+    /// Returns `false`: without MSI or MSI-X on this architecture every vector is pin-based,
+    /// which the caller masks through the device's own registers.
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    pub fn set_masked_if_fast(&mut self, _masked: bool) -> bool {
+        false
     }
 }
 

@@ -42,7 +42,7 @@ mod imp {
         }
     }
 
-    pub fn write_debug(b: u8) -> syscall::Result<()> {
+    pub fn write_debug(_b: u8) -> syscall::Result<()> {
         // TODO
         Ok(())
     }

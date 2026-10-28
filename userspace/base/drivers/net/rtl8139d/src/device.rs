@@ -1,5 +1,4 @@
 use std::convert::TryInto;
-use std::mem;
 
 use common::dma::Dma;
 use common::io::{Io, Mmio, ReadOnly};
@@ -11,7 +10,6 @@ const RX_BUFFER_SIZE: usize = 64 * 1024;
 
 const RXSTS_ROK: u16 = 1 << 0;
 
-const TSD_TOK: u32 = 1 << 15;
 const TSD_OWN: u32 = 1 << 13;
 const TSD_SIZE_MASK: u32 = 0x1FFF;
 
@@ -23,13 +21,7 @@ const CR_BUFE: u8 = 1 << 0;
 const IMR_TOK: u16 = 1 << 2;
 const IMR_ROK: u16 = 1 << 0;
 
-const RCR_RBLEN_8K: u32 = 0b00 << 11;
-const RCR_RBLEN_16K: u32 = 0b01 << 11;
-const RCR_RBLEN_32K: u32 = 0b10 << 11;
 const RCR_RBLEN_64K: u32 = 0b11 << 11;
-const RCR_RBLEN_MASK: u32 = 0b11 << 11;
-const RCR_AER: u32 = 1 << 5;
-const RCR_AR: u32 = 1 << 4;
 const RCR_AB: u32 = 1 << 3;
 const RCR_AM: u32 = 1 << 2;
 const RCR_APM: u32 = 1 << 1;

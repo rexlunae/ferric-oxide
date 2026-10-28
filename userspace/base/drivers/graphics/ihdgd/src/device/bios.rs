@@ -141,92 +141,85 @@ impl BdbGeneralDefinitions {
     }
 }
 
-pub struct Bios {
-    region: MmioRegion,
-    header: &'static mut BiosHeader,
-}
+/// Validates the IGD OpRegion in `region` and logs its VBT and BIOS data blocks.
+pub fn dump_op_region(region: &MmioRegion) -> Result<()> {
+    let header = unsafe { &*(region.virt as *const BiosHeader) };
+    header.dump();
 
-impl Bios {
-    pub fn new(region: MmioRegion) -> Result<Self> {
-        let header = unsafe { &mut *(region.virt as *mut BiosHeader) };
-        header.dump();
-
-        {
-            let sig = read_bios_string(&header.signature);
-            if sig != "IntelGraphicsMem" {
-                log::warn!("invalid op region signature {:?}", sig);
-                return Err(Error::new(EIO));
-            }
-        }
-
-        let size = (header.size.read() as usize) * 1024;
-        if size != region.size {
-            log::warn!("invalid op region size {}", size);
+    {
+        let sig = read_bios_string(&header.signature);
+        if sig != "IntelGraphicsMem" {
+            log::warn!("invalid op region signature {:?}", sig);
             return Err(Error::new(EIO));
         }
-
-        //TODO: other mailboxes?
-
-        if header.mailboxes.read() & MBOX_VBT == 0 {
-            log::warn!("op region does not support VBT mailbox");
-            return Err(Error::new(EIO));
-        }
-
-        //TODO: read VBT from mailbox 3 RVDA (0x3BA) and RVDS (0x3C2) if missing in mailbox 4
-        let vbt_addr = region.virt + 1024;
-        let vbt_header = unsafe { &*(vbt_addr as *const VbtHeader) };
-        vbt_header.dump();
-
-        //TODO: check vbt checksum
-        {
-            let sig = read_bios_string(&vbt_header.signature);
-            if !sig.starts_with("$VBT") {
-                log::warn!("invalid VBT signature {:?}", sig);
-                return Err(Error::new(EIO));
-            }
-        }
-
-        let bdb_addr = vbt_addr + (vbt_header.bdb_offset.read() as usize);
-        let bdb_header = unsafe { &*(bdb_addr as *const BdbHeader) };
-        bdb_header.dump();
-        {
-            let sig = read_bios_string(&bdb_header.signature);
-            if sig != "BIOS_DATA_BLOCK " {
-                log::warn!("invalid BDB signature {:?}", sig);
-                bdb_header.dump();
-                return Err(Error::new(EIO));
-            }
-        }
-
-        let mut block_addr = bdb_addr + bdb_header.header_size.read() as usize;
-        let block_end = bdb_addr + bdb_header.bdb_size.read() as usize;
-        while block_addr + size_of::<BdbBlock>() <= block_end {
-            let block = unsafe { &*(block_addr as *const BdbBlock) };
-            //TODO: mipi sequence v3 has different size field
-            let id = block.id.read();
-            let size = block.size.read() as usize;
-            block_addr += size_of::<BdbBlock>();
-            if block_addr + size <= block_end {
-                match id {
-                    2 => {
-                        if size >= size_of::<BdbGeneralDefinitions>() {
-                            let gen_defs =
-                                unsafe { &*(block_addr as *const BdbGeneralDefinitions) };
-                            gen_defs.dump();
-                        } else {
-                            log::warn!("BDB general definitions too small");
-                            block.dump();
-                        }
-                    }
-                    _ => block.dump(),
-                }
-                block_addr += block.size.read() as usize;
-            } else {
-                log::warn!("truncated block id {} size {}", id, size);
-                break;
-            }
-        }
-
-        Ok(Self { region, header })
     }
+
+    let size = (header.size.read() as usize) * 1024;
+    if size != region.size {
+        log::warn!("invalid op region size {}", size);
+        return Err(Error::new(EIO));
+    }
+
+    //TODO: other mailboxes?
+
+    if header.mailboxes.read() & MBOX_VBT == 0 {
+        log::warn!("op region does not support VBT mailbox");
+        return Err(Error::new(EIO));
+    }
+
+    //TODO: read VBT from mailbox 3 RVDA (0x3BA) and RVDS (0x3C2) if missing in mailbox 4
+    let vbt_addr = region.virt + 1024;
+    let vbt_header = unsafe { &*(vbt_addr as *const VbtHeader) };
+    vbt_header.dump();
+
+    //TODO: check vbt checksum
+    {
+        let sig = read_bios_string(&vbt_header.signature);
+        if !sig.starts_with("$VBT") {
+            log::warn!("invalid VBT signature {:?}", sig);
+            return Err(Error::new(EIO));
+        }
+    }
+
+    let bdb_addr = vbt_addr + (vbt_header.bdb_offset.read() as usize);
+    let bdb_header = unsafe { &*(bdb_addr as *const BdbHeader) };
+    bdb_header.dump();
+    {
+        let sig = read_bios_string(&bdb_header.signature);
+        if sig != "BIOS_DATA_BLOCK " {
+            log::warn!("invalid BDB signature {:?}", sig);
+            bdb_header.dump();
+            return Err(Error::new(EIO));
+        }
+    }
+
+    let mut block_addr = bdb_addr + bdb_header.header_size.read() as usize;
+    let block_end = bdb_addr + bdb_header.bdb_size.read() as usize;
+    while block_addr + size_of::<BdbBlock>() <= block_end {
+        let block = unsafe { &*(block_addr as *const BdbBlock) };
+        //TODO: mipi sequence v3 has different size field
+        let id = block.id.read();
+        let size = block.size.read() as usize;
+        block_addr += size_of::<BdbBlock>();
+        if block_addr + size <= block_end {
+            match id {
+                2 => {
+                    if size >= size_of::<BdbGeneralDefinitions>() {
+                        let gen_defs = unsafe { &*(block_addr as *const BdbGeneralDefinitions) };
+                        gen_defs.dump();
+                    } else {
+                        log::warn!("BDB general definitions too small");
+                        block.dump();
+                    }
+                }
+                _ => block.dump(),
+            }
+            block_addr += block.size.read() as usize;
+        } else {
+            log::warn!("truncated block id {} size {}", id, size);
+            break;
+        }
+    }
+
+    Ok(())
 }

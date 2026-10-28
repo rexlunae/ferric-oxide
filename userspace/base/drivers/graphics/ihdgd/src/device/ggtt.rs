@@ -19,20 +19,13 @@ use crate::device::MmioRegion;
 ///
 /// Source: Pages 6 and 75 of intel-gfx-prm-osrc-kbl-vol05-memory_views.pdf
 pub struct GlobalGtt {
-    gttmm: Arc<MmioRegion>,
+    /// Keeps the GTTMM BAR mapped while `gtt_base` points into it.
+    _gttmm: Arc<MmioRegion>,
     /// Base the GTT
     gtt_base: *mut u64,
-    /// Size of the GTT
-    gtt_size: usize,
 
     /// Allocator for GM aperture pages
     gm_alloc: RangeAllocator<u32>,
-
-    // FIXME reuse DSM memory for something useful
-    /// Base Data of Stolen Memory (DSM)
-    base_dsm: *mut (),
-    /// Size of DSM
-    size_data_stolen_memory: usize,
 }
 
 const GTT_PAGE_SIZE: u32 = 4096;
@@ -73,19 +66,9 @@ impl GlobalGtt {
         let gm_alloc = RangeAllocator::new(0..gm_size / GTT_PAGE_SIZE);
 
         GlobalGtt {
-            gttmm,
+            _gttmm: gttmm,
             gtt_base,
-            gtt_size,
             gm_alloc,
-            base_dsm: core::ptr::with_exposed_provenance_mut(base_dsm as usize),
-            size_data_stolen_memory: dsm_size,
-        }
-    }
-
-    /// Reset the global GTT by clearing out all existing mappings.
-    pub unsafe fn reset(&mut self) {
-        for i in 0..self.gtt_size / 8 {
-            unsafe { *self.gtt_base.add(i) = 0 };
         }
     }
 

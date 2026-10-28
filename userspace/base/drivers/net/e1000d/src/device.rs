@@ -1,5 +1,5 @@
 use std::convert::TryInto;
-use std::{cmp, mem, slice, thread, time};
+use std::{cmp, slice, thread, time};
 
 use common::dma::Dma;
 use common::io::{Io, MmioPtr};
@@ -25,9 +25,6 @@ const FCTTV: u32 = 0x170;
 const ICR: u32 = 0xC0;
 
 const IMS: u32 = 0xD0;
-const IMS_TXDW: u32 = 1;
-const IMS_TXQE: u32 = 1 << 1;
-const IMS_LSC: u32 = 1 << 2;
 const IMS_RXSEQ: u32 = 1 << 3;
 const IMS_RXDMT: u32 = 1 << 4;
 const IMS_RX: u32 = 1 << 6;
@@ -36,7 +33,6 @@ const IMS_RXT: u32 = 1 << 7;
 const RCTL: u32 = 0x100;
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_UPE: u32 = 1 << 3;
-const RCTL_MPE: u32 = 1 << 4;
 const RCTL_LPE: u32 = 1 << 5;
 const RCTL_LBM: u32 = 1 << 6 | 1 << 7;
 const RCTL_BAM: u32 = 1 << 15;
@@ -65,7 +61,6 @@ struct Rd {
     special: u16,
 }
 const RD_DD: u8 = 1;
-const RD_EOP: u8 = 1 << 1;
 
 const TCTL: u32 = 0x400;
 const TCTL_EN: u32 = 1 << 1;
@@ -91,7 +86,6 @@ struct Td {
 const TD_CMD_EOP: u8 = 1;
 const TD_CMD_IFCS: u8 = 1 << 1;
 const TD_CMD_RS: u8 = 1 << 3;
-const TD_DD: u8 = 1;
 
 pub struct Intel8254x {
     base: usize,

@@ -28,7 +28,7 @@ enum MouseCommandData {
 }
 
 #[derive(Debug)]
-struct MouseTx {
+pub(crate) struct MouseTx {
     write: &'static [u8],
     write_i: usize,
     read: Vec<u8>,
@@ -84,13 +84,6 @@ enum MouseId {
     /// Mouse sends fourth byte with scroll, button 4, and button 5
     //TODO: support this mouse type
     Intellimouse2 = 0x04,
-}
-
-// From Synaptics TouchPad Interfacing Guide
-#[derive(Clone, Copy, Debug)]
-#[repr(u8)]
-pub enum TouchpadCommand {
-    Identify = 0x00,
 }
 
 #[derive(Debug)]

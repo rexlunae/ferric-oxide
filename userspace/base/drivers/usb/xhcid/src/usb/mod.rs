@@ -9,15 +9,19 @@
 //!
 //! See the crate-level documentation for the acronyms used to refer to specific documents.
 pub use self::bos::{bos_capability_descs, BosAnyDevDesc, BosDescriptor, BosSuperSpeedDesc};
-pub use self::config::ConfigDescriptor;
-pub use self::device::{DeviceDescriptor, DeviceDescriptor8Byte};
+pub use self::config::{ConfigDescriptor, OtherSpeedConfig};
+pub use self::device::{DeviceDescriptor, DeviceDescriptor8Byte, DeviceQualifier};
 pub use self::endpoint::{
     EndpointDescriptor, EndpointTy, HidDescriptor, SuperSpeedCompanionDescriptor,
     SuperSpeedPlusIsochCmpDescriptor, ENDP_ATTR_TY_MASK,
 };
 pub use self::hub::*;
 pub use self::interface::InterfaceDescriptor;
-pub use self::setup::{Setup, SetupReq};
+pub use self::setup::{
+    ReqDirection, ReqRecipient, ReqType, Setup, SetupReq, USB_SETUP_DIR_BIT, USB_SETUP_DIR_SHIFT,
+    USB_SETUP_RECIPIENT_MASK, USB_SETUP_RECIPIENT_SHIFT, USB_SETUP_REQ_TY_MASK,
+    USB_SETUP_REQ_TY_SHIFT,
+};
 
 /// Enumerates the list of descriptor kinds that can be reported by a USB device to report its
 /// attributes to the system. (See USB32 Sections 9.5 and 9.6)

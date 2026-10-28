@@ -116,7 +116,6 @@ fn main() {
 
     // Initialize states
     struct PortState {
-        port_id: PortId,
         port_sts: usb::HubPortStatus,
         handle: XhciClientHandle,
         attached: bool,
@@ -142,7 +141,6 @@ fn main() {
     for port in 1..=ports {
         let child_port_id = port_id.child(port).expect("Cannot get child port ID");
         states.push(PortState {
-            port_id: child_port_id,
             port_sts: if usb_3 {
                 usb::HubPortStatus::V3(usb::HubPortStatusV3::default())
             } else {

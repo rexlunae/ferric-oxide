@@ -18,7 +18,6 @@ mod aux;
 mod bios;
 use self::bios::*;
 mod buffer;
-use self::buffer::*;
 mod ddi;
 use self::ddi::*;
 mod dpll;
@@ -187,7 +186,6 @@ pub struct Device {
     unique: String,
     kind: DeviceKind,
     alloc_buffers: RangeAllocator<u32>,
-    bios: Option<Bios>,
     ddis: Vec<Ddi>,
     dpclka_cfgcr0: Option<MmioPtr<u32>>,
     dplls: Vec<Dpll>,
@@ -313,7 +311,7 @@ impl Device {
 
         // IGD OpRegion/Software SCI/_DSM for Skylake Processors
         let bios_base = unsafe { pcid_handle.read_config(0xFC) };
-        let bios = if bios_base != 0 {
+        if bios_base != 0 {
             log::info!("BIOS {:X?}", bios_base);
             // This is the default BIOS size
             let bios_size = 8 * 1024;
@@ -324,21 +322,16 @@ impl Device {
                     common::MemoryType::Uncacheable,
                 )
             } {
-                Ok(region) => match Bios::new(region) {
-                    Ok(bios) => Some(bios),
-                    Err(err) => {
+                Ok(region) => {
+                    if let Err(err) = dump_op_region(&region) {
                         log::warn!("failed to parse BIOS at {:08X}: {}", bios_base, err);
-                        None
                     }
-                },
+                }
                 Err(err) => {
                     log::warn!("failed to map BIOS at {:08X}: {}", bios_base, err);
-                    None
                 }
             }
-        } else {
-            None
-        };
+        }
 
         let ggtt = unsafe {
             GlobalGtt::new(
@@ -467,7 +460,6 @@ impl Device {
             unique: format!("pci:{}", pcid_handle.config().func.addr),
             kind,
             alloc_buffers: RangeAllocator::new(0..buffers),
-            bios,
             ddis,
             dpclka_cfgcr0,
             dplls,

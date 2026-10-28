@@ -140,9 +140,6 @@ impl Dpll {
 
         #[derive(Debug)]
         struct Setting {
-            pdiv: u64,
-            kdiv: u64,
-            qdiv: u64,
             cfgcr1: u32,
             dco: u64,
             dco_dist: u64,
@@ -177,9 +174,6 @@ impl Dpll {
                     let dco_dist = dco.abs_diff(dco_mid);
 
                     let setting = Setting {
-                        pdiv,
-                        kdiv,
-                        qdiv,
                         cfgcr1: pdiv_reg | kdiv_reg | qdiv_reg,
                         dco,
                         dco_dist,

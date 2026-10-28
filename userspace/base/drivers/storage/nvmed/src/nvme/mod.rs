@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::iter;
-use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
 
 use common::dma::Dma;
@@ -70,9 +69,6 @@ pub struct NvmeNamespace {
 pub type CqId = u16;
 pub type SqId = u16;
 pub type CmdId = u16;
-pub type AtomicCqId = AtomicU16;
-pub type AtomicSqId = AtomicU16;
-pub type AtomicCmdId = AtomicU16;
 pub type Iv = u16;
 
 /// The bytes one zero-copy command carries without a PRP list (two pages), and the default
@@ -97,7 +93,8 @@ pub struct Nvme {
     interrupt_vector: Mutex<InterruptVector>,
     /// Ferric Oxide: how `interrupt_vector` is masked, from its delivery mechanism.
     interrupt_mask: InterruptMask,
-    pcid_interface: Mutex<PciFunctionHandle>,
+    /// Keeps this driver's claim on the PCI function open.
+    _pcid_interface: Mutex<PciFunctionHandle>,
     regs: RwLock<&'static mut NvmeRegs>,
 
     sq_ivs: RwLock<HashMap<SqId, Iv>>,
@@ -105,9 +102,6 @@ pub struct Nvme {
 
     // maps interrupt vectors with the completion queues they have
     thread_ctxts: RwLock<HashMap<Iv, Arc<ReentrantMutex<ThreadCtxt>>>>,
-
-    next_sqid: AtomicSqId,
-    next_cqid: AtomicCqId,
 
     caps: Caps,
 
@@ -173,16 +167,6 @@ impl ThreadCtxt {
 unsafe impl Send for Nvme {}
 unsafe impl Sync for Nvme {}
 
-/// How to handle full submission queues.
-pub enum FullSqHandling {
-    /// Return an error immediately prior to posting the command.
-    ErrorDirectly,
-
-    /// Tell the executor that we want to be notified when a command on the same submission queue
-    /// has been completed.
-    Wait,
-}
-
 impl Nvme {
     pub fn new(
         address: usize,
@@ -220,11 +204,7 @@ impl Nvme {
 
             interrupt_mask: InterruptMask::new(interrupt_vector.mechanism()),
             interrupt_vector: Mutex::new(interrupt_vector),
-            pcid_interface: Mutex::new(pcid_interface),
-
-            // TODO
-            next_sqid: AtomicSqId::new(2),
-            next_cqid: AtomicCqId::new(2),
+            _pcid_interface: Mutex::new(pcid_interface),
 
             caps,
 

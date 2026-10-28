@@ -145,8 +145,9 @@ struct VboxDisplayChange {
     header: VboxHeader,
     xres: Mmio<u32>,
     yres: Mmio<u32>,
-    bpp: Mmio<u32>,
-    eventack: Mmio<u32>,
+    // The rest of the packet's layout, which the driver does not read.
+    _bpp: Mmio<u32>,
+    _eventack: Mmio<u32>,
 }
 
 impl VboxDisplayChange {
