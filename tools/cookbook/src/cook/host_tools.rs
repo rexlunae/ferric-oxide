@@ -96,8 +96,9 @@ pub fn required(kind: &BuildKind) -> BTreeSet<HostTool> {
     }
 }
 
-/// The words of `script` outside `#` comments, split at whitespace and shell
-/// operators, so `env DESTDIR=… meson install` yields `meson`.
+/// The programs `script` runs: the first word of each command outside `#`
+/// comments, after variable assignments and `env`/`exec`/`command`, so
+/// `env DESTDIR=… meson install` yields `meson` and `echo meson` yields `echo`.
 fn command_words(script: &str) -> BTreeSet<&str> {
     script
         .lines()
@@ -105,8 +106,14 @@ fn command_words(script: &str) -> BTreeSet<&str> {
             Some(at) if at == 0 || line[..at].ends_with(char::is_whitespace) => &line[..at],
             _ => line,
         })
-        .flat_map(|line| line.split(|c: char| c.is_whitespace() || ";&|()`".contains(c)))
-        .filter(|word| !word.is_empty())
+        .flat_map(|line| line.split(|c: char| ";&|()`".contains(c)))
+        .filter_map(|command| {
+            command.split_whitespace().find(|word| {
+                !word.contains('=')
+                    && !word.starts_with('-')
+                    && !matches!(*word, "env" | "exec" | "command")
+            })
+        })
         .collect()
 }
 
@@ -131,10 +138,12 @@ impl fmt::Display for MissingHostTools {
 
 impl std::error::Error for MissingHostTools {}
 
-/// Checks that every program the source-built `recipes` need is on `PATH`.
+/// Checks, before a cook starts, that every program the source-built
+/// `recipes` need is on `PATH`.
 ///
 /// Recipes that already have a staged package are skipped: an unchanged
-/// recipe reuses its stage without running its build script.
+/// recipe reuses its stage without running its build script. One whose stage
+/// turns out to be stale is checked by [`require`] when it is rebuilt.
 ///
 /// # Errors
 ///
@@ -148,6 +157,17 @@ pub fn check<'a>(
         .into_iter()
         .filter(|recipe| !recipe.stage_paths().1.is_file());
     check_with(unstaged, |tool| on_path(&path, tool.program()))
+}
+
+/// Checks that the programs `recipe`'s build script runs are on `PATH`, just
+/// before that script runs.
+///
+/// # Errors
+///
+/// Returns [`MissingHostTools`] listing each absent program.
+pub fn require(recipe: &CookRecipe) -> Result<(), MissingHostTools> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    check_with([recipe], |tool| on_path(&path, tool.program()))
 }
 
 fn check_with<'a>(
@@ -231,6 +251,14 @@ mod tests {
             "template = \"custom\"\nscript = \"\"\"\n# see the cmake log\nmake # not cmake\n\"\"\"",
         );
         assert!(required(&commented.recipe.build.kind).is_empty());
+        let printed = recipe(
+            "e",
+            "template = \"custom\"\nscript = \"echo meson; X=1 cmake --version | ninja-free\"",
+        );
+        assert_eq!(
+            required(&printed.recipe.build.kind),
+            [HostTool::Cmake].into()
+        );
         let configure = recipe("c", "template = \"configure\"");
         assert!(required(&configure.recipe.build.kind).is_empty());
     }

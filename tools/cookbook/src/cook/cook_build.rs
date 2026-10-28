@@ -7,7 +7,7 @@ use crate::bail_other_err;
 use crate::config::CookConfig;
 use crate::cook::fetch_repo;
 use crate::cook::package::{package_source_paths, package_target};
-use crate::cook::{fetch, fs, pty::PtyOut, script::*};
+use crate::cook::{fetch, fs, host_tools, pty::PtyOut, script::*};
 use crate::recipe::BuildCompiler;
 use crate::recipe::{AutoDeps, BuildKind, CookRecipe, OptionalPackageRecipe, Recipe};
 use std::io::Read;
@@ -358,6 +358,7 @@ pub fn build(
         //TODO: better integration with redoxer (library instead of binary)
         //TODO: configurable target
         //TODO: Add more configurability, convert scripts to Rust?
+        host_tools::require(cook_recipe)?;
         let script = match &recipe.build.kind {
             BuildKind::Cargo {
                 cargopath,
