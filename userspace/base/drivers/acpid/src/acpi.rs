@@ -672,6 +672,17 @@ pub struct FadtAcpi2Struct {
 }
 unsafe impl plain::Plain for FadtAcpi2Struct {}
 
+/// The DSDT's physical address: `X_DSDT` when the FADT has one and it is non-zero, which ACPI
+/// 6.5 section 5.2.9 says takes precedence over the 32-bit `DSDT` field, and `DSDT` otherwise.
+fn dsdt_address(dsdt: u32, x_dsdt: Option<u64>) -> usize {
+    x_dsdt
+        .filter(|&address| address != 0)
+        .and_then(|address| usize::try_from(address).ok())
+        .unwrap_or_else(|| {
+            usize::try_from(dsdt).expect("a u32 fits in usize on 32- and 64-bit targets")
+        })
+}
+
 #[derive(Clone)]
 pub struct Fadt(Sdt);
 
@@ -719,16 +730,11 @@ impl Fadt {
             }
         };
 
-        let dsdt_ptr = match fadt.acpi_2_struct() {
-            Some(fadt2) => usize::try_from(fadt2.x_dsdt).unwrap_or_else(|_| {
-                usize::try_from(fadt.dsdt).expect("expected any given u32 to fit within usize")
-            }),
-            None => usize::try_from(fadt.dsdt).expect("expected any given u32 to fit within usize"),
-        };
+        let dsdt_ptr = dsdt_address(fadt.dsdt, fadt.acpi_2_struct().map(|fadt2| fadt2.x_dsdt));
 
-        log::debug!("FACP at {:X}", { dsdt_ptr });
+        log::debug!("DSDT at {:X}", dsdt_ptr);
 
-        let dsdt_sdt = match Sdt::load_from_physical(fadt.dsdt as usize) {
+        let dsdt_sdt = match Sdt::load_from_physical(dsdt_ptr) {
             Ok(dsdt) => dsdt,
             Err(error) => {
                 log::error!("Failed to load DSDT: {}", error);
@@ -739,5 +745,22 @@ impl Fadt {
         context.fadt = Some(fadt.clone());
 
         context.tables.push(dsdt_sdt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dsdt_address;
+
+    #[test]
+    fn dsdt_address_prefers_non_zero_x_dsdt() {
+        assert_eq!(dsdt_address(0x1000, Some(0x2_0000_0000)), 0x2_0000_0000);
+        assert_eq!(dsdt_address(0, Some(0x3000)), 0x3000);
+    }
+
+    #[test]
+    fn dsdt_address_falls_back_to_dsdt() {
+        assert_eq!(dsdt_address(0x1000, Some(0)), 0x1000);
+        assert_eq!(dsdt_address(0x1000, None), 0x1000);
     }
 }

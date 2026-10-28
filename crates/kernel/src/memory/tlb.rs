@@ -642,8 +642,9 @@ mod tests {
 
     /// A requester displaced from `WRITING` may still be storing its list. Until it is done,
     /// nobody may claim the slots, or its late stores would overwrite the next owner's list and
-    /// the target would invalidate the wrong page (what made
-    /// `concurrent_requesters_are_all_covered` fail now and then).
+    /// the target would invalidate the wrong page. This once made
+    /// `concurrent_requesters_are_all_covered` fail now and then; `post_content` now joins the
+    /// take's release sequence through the `TAG_ALL` CAS, so it does not flake.
     #[test]
     fn displaced_writer_keeps_the_slots_until_it_is_done() {
         let mailbox = TlbMailbox::new();

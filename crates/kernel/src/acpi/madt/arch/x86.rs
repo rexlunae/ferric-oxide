@@ -12,7 +12,6 @@ use crate::{
     cpu_set::LogicalCpuId,
     memory::{
         Frame, KernelMapper, Page, PageFlags, PhysicalAddress, RmmA, RmmArch, VirtualAddress,
-        PAGE_SIZE,
     },
     startup::AP_READY,
 };
@@ -79,7 +78,7 @@ pub(super) fn init(madt: Madt) {
                 let kstack = Kstack::new().expect("no more frames in acpi stack_start");
                 let stack_end = kstack.initial_top() as usize;
 
-                let pcr_ptr = crate::arch::gdt::allocate_and_init_pcr(cpu_id, stack_end);
+                let pcr_ptr = crate::arch::gdt::allocate_and_init_pcr(cpu_id);
 
                 let idt_ptr = crate::arch::idt::allocate_and_init_idt(cpu_id, pcr_ptr);
 

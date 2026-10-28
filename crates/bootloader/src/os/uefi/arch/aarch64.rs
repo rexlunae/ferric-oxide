@@ -1,39 +1,9 @@
-use core::{arch::asm, fmt::Write, mem, slice};
+use core::{arch::asm, mem};
 use uefi::status::Result;
 
-use crate::{
-    KernelArgs,
-    arch::{ENTRY_ADDRESS_MASK, PAGE_ENTRIES, PF_PRESENT, PF_TABLE, PHYS_OFFSET},
-    logger::LOGGER,
-};
+use crate::{KernelArgs, arch::PHYS_OFFSET, logger::LOGGER};
 
 use super::super::{OsEfi, memory_map::memory_map};
-
-unsafe fn dump_page_tables(table_phys: u64, table_virt: u64, table_level: u64) {
-    unsafe {
-        let entries = slice::from_raw_parts(table_phys as *const u64, PAGE_ENTRIES);
-        for (i, entry) in entries.iter().enumerate() {
-            let phys = entry & ENTRY_ADDRESS_MASK;
-            let flags = entry & !ENTRY_ADDRESS_MASK;
-            if flags & PF_PRESENT == 0 {
-                continue;
-            }
-            let mut shift = 39u64;
-            for _ in 0..table_level {
-                shift -= 9;
-                print!("\t");
-            }
-            let virt = table_virt + (i as u64) << shift;
-            println!(
-                "index {} virt {:#x}: phys {:#x} flags {:#x}",
-                i, virt, phys, flags
-            );
-            if table_level < 3 && flags & PF_TABLE == PF_TABLE {
-                dump_page_tables(phys, virt, table_level + 1);
-            }
-        }
-    }
-}
 
 unsafe extern "C" fn kernel_entry(
     page_phys: usize,
@@ -217,8 +187,6 @@ pub fn main() -> Result<()> {
 
     unsafe {
         let stack = args.stack_base + args.stack_size + PHYS_OFFSET;
-
-        // dump_page_tables(page_phys as _, 0, 0);
 
         println!(
             "kernel_entry({:#x}, {:#x}, {:#x}, {:p})",

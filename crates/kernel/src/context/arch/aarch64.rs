@@ -4,7 +4,7 @@ use crate::{
     percpu::PercpuBlock,
     syscall::FloatRegisters,
 };
-use core::{mem::offset_of, ptr, sync::atomic::AtomicBool};
+use core::{mem::offset_of, ptr};
 use spin::Once;
 use syscall::{EnvRegisters, Result};
 

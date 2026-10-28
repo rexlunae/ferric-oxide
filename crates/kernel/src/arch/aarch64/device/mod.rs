@@ -1,4 +1,3 @@
-use crate::info;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use ferric_devicetree::Tree as Fdt;
 

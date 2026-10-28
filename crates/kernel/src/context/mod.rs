@@ -6,7 +6,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
 };
-use core::{cell::Ref, cmp::Reverse, num::NonZeroUsize, ops::Deref, sync::atomic::Ordering};
+use core::{cell::Ref, cmp::Reverse, num::NonZeroUsize, ops::Deref};
 
 use crate::{
     context::memory::AddrSpaceWrapper,
@@ -51,6 +51,7 @@ mod arch;
 pub mod context;
 
 /// Optional idle-context access and interrupt acknowledgement.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod idle;
 
 /// Timeslice selection versus physical context handoff.
@@ -108,7 +109,6 @@ pub struct RunContextData {
     timers: BTreeSet<(u128, WeakContextRef)>, // (wake, context)
     v: u64,
     total_weight: u64,
-    min_vtime: u64,
 }
 
 impl RunContextData {
@@ -118,7 +118,6 @@ impl RunContextData {
             timers: BTreeSet::new(),
             v: 0,
             total_weight: 0,
-            min_vtime: 0,
         }
     }
     pub fn is_stealable(&self) -> bool {
@@ -441,6 +440,11 @@ pub fn get_contexts_stats(token: &mut CleanLockToken) -> [usize; 6] {
 ///
 /// Only `try_` locks are taken, so an NMI that interrupted a holder of the context list or of
 /// a context skips it (and says so) instead of deadlocking; nothing is allocated.
+// The NMI handler calls this unless the profiler owns NMIs.
+#[cfg(any(
+    target_arch = "x86",
+    all(target_arch = "x86_64", not(feature = "profiling"))
+))]
 pub fn dump_for_nmi(mut token: LockToken<'_, L1>) {
     let Some(mut contexts) = CONTEXTS.try_read(token.token()) else {
         crate::println!("NMI: context list busy");

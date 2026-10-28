@@ -18,8 +18,9 @@ use {
     rmm::Arch,
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::arch::interrupt::{self, InterruptStack};
 use crate::{
-    arch::interrupt::{self, InterruptStack},
     cpu_set::LogicalCpuId,
     percpu::PercpuBlock,
     syscall::{error::*, usercopy::UserSliceWo},
@@ -119,26 +120,7 @@ pub fn bufs() -> &'static [AtomicPtr<RingBuffer>] {
     unsafe { *BUFS_RAW.get() }
 }
 
-pub const PROFILE_TOGGLEABLE: bool = true;
 pub static IS_PROFILING: AtomicBool = AtomicBool::new(false);
-
-pub fn serio_command(index: usize, data: u8) {
-    if cfg!(not(feature = "profiling")) {
-        return;
-    }
-
-    if PROFILE_TOGGLEABLE {
-        if index == 0 && data == 30 {
-            // "a" key in QEMU
-            crate::info!("Enabling profiling");
-            IS_PROFILING.store(true, Ordering::SeqCst);
-        } else if index == 0 && data == 48 {
-            // "b" key
-            crate::info!("Disabling profiling");
-            IS_PROFILING.store(false, Ordering::SeqCst);
-        }
-    }
-}
 
 #[cfg_attr(not(feature = "profiling"), expect(dead_code))]
 pub fn drain_buffer(cpu_num: LogicalCpuId, buf: UserSliceWo) -> Result<usize> {

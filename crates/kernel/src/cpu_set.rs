@@ -54,6 +54,7 @@ impl LogicalCpuId {
     /// # Panics
     ///
     /// Panics if the fixed CPU capacity is exhausted, without changing the count.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn next() -> Self {
         let id = CPU_COUNT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {

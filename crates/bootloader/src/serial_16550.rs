@@ -2,9 +2,7 @@ use bitflags::bitflags;
 use core::convert::TryInto;
 use core::fmt;
 use core::ptr::{addr_of, addr_of_mut};
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use syscall::io::Pio;
-use syscall::io::{Io, Mmio, ReadOnly};
+use syscall::io::{Io, Pio, ReadOnly};
 
 bitflags! {
     /// Interrupt enable flags
@@ -46,7 +44,6 @@ pub struct SerialPort<T: Io> {
     modem_sts: ReadOnly<T>,
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 impl SerialPort<Pio<u8>> {
     pub const fn new(base: u16) -> SerialPort<Pio<u8>> {
         SerialPort {
@@ -58,12 +55,6 @@ impl SerialPort<Pio<u8>> {
             line_sts: ReadOnly::new(Pio::new(base + 5)),
             modem_sts: ReadOnly::new(Pio::new(base + 6)),
         }
-    }
-}
-
-impl SerialPort<Mmio<u32>> {
-    pub unsafe fn new(base: usize) -> &'static mut SerialPort<Mmio<u32>> {
-        unsafe { &mut *(base as *mut Self) }
     }
 }
 
@@ -92,18 +83,6 @@ where
                 .try_into()
                 .unwrap_or(0),
         )
-    }
-
-    pub fn receive(&mut self) -> Option<u8> {
-        if self.line_sts().contains(LineStsFlags::INPUT_FULL) {
-            Some(
-                (unsafe { &*addr_of!(self.data) }.read() & 0xFF.into())
-                    .try_into()
-                    .unwrap_or(0),
-            )
-        } else {
-            None
-        }
     }
 
     pub fn send(&mut self, data: u8) {

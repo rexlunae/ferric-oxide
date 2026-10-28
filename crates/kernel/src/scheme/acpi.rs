@@ -4,20 +4,19 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::ordered::{Mutex, L4};
 use spin::Once;
 
-use syscall::data::GlobalSchemes;
 #[cfg(not(target_arch = "x86_64"))]
 use syscall::EOPNOTSUPP;
 
 use crate::{
     acpi::{RxsdtEnum, RXSDT_ENUM},
     context::file::InternalFlags,
-    scheme::{SchemeExt, StrOrBytes},
+    scheme::StrOrBytes,
     sync::CleanLockToken,
 };
 
 use crate::syscall::{
-    error::{Error, Result, EACCES, EBADFD, EINVAL, EIO, ENOENT},
-    flag::{AcpiVerb, CallFlags, EventFlags},
+    error::{Error, Result, EACCES, EBADFD, EINVAL, ENOENT},
+    flag::{AcpiVerb, CallFlags},
     usercopy::UserSliceRw,
 };
 
@@ -49,7 +48,11 @@ static RXSDT_DATA: Once<Box<[u8]>> = Once::new();
 static KSTOP_FLAG: Mutex<L4, bool> = Mutex::new(false);
 static EXISTS_KSTOP_HANDLE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn register_kstop(token: &mut CleanLockToken) -> bool {
+    use crate::{scheme::SchemeExt, syscall::flag::EventFlags};
+    use syscall::data::GlobalSchemes;
+
     *KSTOP_FLAG.lock(token.token()) = true;
 
     if !EXISTS_KSTOP_HANDLE.load(Ordering::Relaxed) {
@@ -176,7 +179,7 @@ impl KernelScheme for AcpiScheme {
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    use crate::arch::misc::MsrFault;
+                    use crate::{arch::misc::MsrFault, syscall::error::EIO};
 
                     let register = *metadata.get(1).ok_or(Error::new(EINVAL))? as u32;
 

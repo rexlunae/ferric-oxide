@@ -26,6 +26,7 @@ static MADT: SyncUnsafeCell<Option<Madt>> = SyncUnsafeCell::new(None);
 pub fn madt() -> Option<&'static Madt> {
     unsafe { &*MADT.get() }.as_ref()
 }
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub const FLAG_PCAT: u32 = 1;
 
 impl Madt {

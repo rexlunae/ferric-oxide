@@ -270,7 +270,7 @@ pub unsafe fn set_userspace_io_allowed(pcr: *mut ProcessorControlRegion, allowed
 }
 
 #[cold]
-fn init_pcr(pcr: &mut ProcessorControlRegion, stack_end: usize) {
+fn init_pcr(pcr: &mut ProcessorControlRegion) {
     pcr.self_ref = pcr as *mut _;
 
     // Setup the GDT.
@@ -377,20 +377,17 @@ pub unsafe fn install_pcr(pcr_ptr: *mut ProcessorControlRegion) {
 
 /// Initialize GDT and configure percpu for the BSP.
 #[cold]
-pub unsafe fn init_bsp(stack_end: usize) {
+pub unsafe fn init_bsp() {
     static mut BSP_PCR: ProcessorControlRegion =
         ProcessorControlRegion::new_partial_init(LogicalCpuId::BSP);
 
-    init_pcr(unsafe { &mut *ptr::addr_of_mut!(BSP_PCR) }, stack_end);
+    init_pcr(unsafe { &mut *ptr::addr_of_mut!(BSP_PCR) });
 
     unsafe { install_pcr(ptr::addr_of_mut!(BSP_PCR)) };
 }
 
 #[cold]
-pub fn allocate_and_init_pcr(
-    cpu_id: LogicalCpuId,
-    stack_end: usize,
-) -> *mut ProcessorControlRegion {
+pub fn allocate_and_init_pcr(cpu_id: LogicalCpuId) -> *mut ProcessorControlRegion {
     let alloc_order = size_of::<ProcessorControlRegion>()
         .div_ceil(PAGE_SIZE)
         .next_power_of_two()
@@ -402,7 +399,7 @@ pub fn allocate_and_init_pcr(
     let pcr_ptr = RmmA::phys_to_virt(pcr_frame.base()).data() as *mut ProcessorControlRegion;
     unsafe { core::ptr::write(pcr_ptr, ProcessorControlRegion::new_partial_init(cpu_id)) };
 
-    init_pcr(unsafe { &mut *pcr_ptr }, stack_end);
+    init_pcr(unsafe { &mut *pcr_ptr });
     // SAFETY: the PCR was just allocated and initialized, and no CPU uses it yet.
     #[cfg(target_arch = "x86_64")]
     unsafe {
