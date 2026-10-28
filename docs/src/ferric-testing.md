@@ -830,7 +830,6 @@ locked client. The retry remains correct for legitimate signal interruptions.
 Repeat image boots and repeated `ferric-blkgrant-test` worker-policy runs
 exercise the real parking/handoff path; retain the first failure and its logs.
 Linux KVM/Kleya confirmation remains required.
->>>>>>> 03f5fa20c (Restore a retained timeslice owner when its scheme handler parks)
 
 ### NVMe phase accounting
 
