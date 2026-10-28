@@ -67,8 +67,10 @@ const REPO_HELP_STR: &str = r#"
         --unset                    used in "capture-rev" and "change-rule", unset locks
 
     cook env and their defaults:
-        CI=                          set to any value to disable TUI
-        COOKBOOK_LOGS=               whether to capture build logs (default is !CI)
+        CI=                          set to any value to disable TUI; the TUI
+                                        also needs stdin and stdout to be terminals
+        COOKBOOK_LOGS=               whether to capture build logs (default is
+                                        whether the TUI runs)
         COOKBOOK_OFFLINE=false       prevent internet access if possible
                                         ignored when command "fetch" is used
         COOKBOOK_NONSTOP=false       keep running even a recipe build failed
