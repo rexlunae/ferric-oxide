@@ -137,7 +137,9 @@ dependencies, including directory changes for added or deleted inputs. Build
 outputs and Git metadata are excluded. These inputs refresh the sysroot before
 recipe/image cache decisions. Its stamp invalidates a source recipe when any
 required package archive is missing or older than the sysroot; a newer archive
-variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot.
+variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot. relibc builds its openlibm math library for Redox rather than for the build
+machine's OS, so the library is the same whether the sysroot is assembled on
+Linux or macOS (see `crates/relibc/README.md`).
 The x86-64 relibc fork transition keeps the handoff buffer live
 through address-space cloning and copies it above the child's Rust call stack,
 so ordinary compiler stack layouts cannot overwrite its file-table handles.
