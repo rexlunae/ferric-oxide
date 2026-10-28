@@ -362,7 +362,11 @@ type = "oneshot"
 symlink = false
 directory = false
 recursive_chown = false
-postinstall = false
+# The base package ships this service too, configured to wait for the network
+# asynchronously. redoxer wants the blocking form for its own guests, so this
+# must be written after the packages are installed: written before, it is an
+# unowned file the package then refuses to replace.
+postinstall = true
 
 [[files]]
 path = "/usr/lib/init.d/30_redoxer"

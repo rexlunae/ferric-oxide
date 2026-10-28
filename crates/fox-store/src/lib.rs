@@ -117,6 +117,21 @@ pub const RESERVED_DIRS: [&str; 5] = [
     REGISTRIES_FILE,
 ];
 
+/// Paths whose content each package generates for itself, so several packages
+/// legitimately produce a different version of the same path.
+///
+/// `/usr/share/info/dir` is GNU info's directory index: every package that
+/// installs info pages writes it, built from that package's own entries. The
+/// first package to install it keeps it and a later one that has it too is
+/// skipped rather than failing the install — the file is an index of what is
+/// installed, not content that belongs to one package.
+pub const SHARED_GENERATED_FILES: [&str; 1] = ["usr/share/info/dir"];
+
+/// Whether `path` is one of [`SHARED_GENERATED_FILES`].
+fn is_shared_generated(path: &str) -> bool {
+    SHARED_GENERATED_FILES.contains(&path)
+}
+
 /// Mode bits the store sets and checks on installed files (permissions,
 /// setuid, setgid and sticky), the bits pkgar signs.
 const MODE_BITS: u32 = 0o7777;
@@ -541,12 +556,23 @@ impl Store {
             source: Box::new(source),
         };
         let mut transaction = Transaction::new();
-        if let Err(error) = transaction.install_with_entries(
-            &mut package,
-            archive.head().raw_entries(),
-            &self.root,
-            true,
-        ) {
+        // A shared generated file that is already installed stays as it is: the
+        // package that installed it first owns it, and this package's version of
+        // the same index would overwrite it. Dropping the entry leaves the file
+        // and its recorded owner alone.
+        let entries: Vec<pkgar_core::Entry> = archive
+            .head()
+            .raw_entries()
+            .iter()
+            .filter(|entry| {
+                let path = std::str::from_utf8(entry.path_bytes()).unwrap_or_default();
+                !is_shared_generated(path) || !self.root.join(path).exists()
+            })
+            .cloned()
+            .collect();
+        if let Err(error) =
+            transaction.install_with_entries(&mut package, &entries, &self.root, true)
+        {
             // Best effort: the original error is the one worth reporting.
             let _ = transaction.abort();
             return Err(extract_error(error));
@@ -585,7 +611,7 @@ impl Store {
         db.legacy_pending.remove(manifest.name.as_str());
         db.packages.push(InstalledPackage {
             origin,
-            ..record(archive)
+            ..record(archive, &entries)
         });
         db.save(&db_path)?;
 
@@ -626,10 +652,14 @@ impl Store {
                 });
             }
             if let Some(owner) = owners.get(file.path.as_str()) {
-                return Err(StoreError::FileConflict {
-                    path: file.path.clone(),
-                    owner: (*owner).clone(),
-                });
+                // A shared generated file keeps the owner it already has: the
+                // paths differ between packages by design, so neither is wrong.
+                if !is_shared_generated(&file.path) {
+                    return Err(StoreError::FileConflict {
+                        path: file.path.clone(),
+                        owner: (*owner).clone(),
+                    });
+                }
             }
             if let Some(link) = symlinked_parent(&self.root, &file.path)? {
                 return Err(StoreError::SymlinkInPath {
@@ -646,7 +676,11 @@ impl Store {
                 }
                 OnDisk::Hashed(kind, blake3) => {
                     let same = kind == file.kind && blake3 == file.blake3;
-                    if !same && !options.force && !previous_paths.contains(file.path.as_str()) {
+                    if !same
+                        && !options.force
+                        && !is_shared_generated(&file.path)
+                        && !previous_paths.contains(file.path.as_str())
+                    {
                         return Err(StoreError::UnownedFile {
                             path: file.path.clone(),
                         });
@@ -855,7 +889,7 @@ fn check_identity(
 }
 
 /// The database record for a verified archive.
-fn record(archive: &Archive) -> InstalledPackage {
+fn record(archive: &Archive, installed: &[pkgar_core::Entry]) -> InstalledPackage {
     let manifest = archive.manifest();
     let signer = archive.head().signer();
     InstalledPackage {
@@ -873,7 +907,18 @@ fn record(archive: &Archive) -> InstalledPackage {
         },
         state: PackageState::Installed,
         origin: None,
-        files: archive.files().to_vec(),
+        // Only the files actually placed belong to this package; a shared
+        // generated file installed by an earlier package stays that one's.
+        files: archive
+            .files()
+            .iter()
+            .filter(|file| {
+                installed
+                    .iter()
+                    .any(|entry| entry.path_bytes() == file.path.as_bytes())
+            })
+            .cloned()
+            .collect(),
     }
 }
 
@@ -909,6 +954,26 @@ mod tests {
             "var/log/x",
         ] {
             assert_eq!(reserved_dir(path), None, "{path}");
+        }
+    }
+
+    /// The GNU info directory index is written by every package that installs
+    /// info pages, from that package's own entries, so several packages produce
+    /// a different one. It is an index of what is installed rather than content
+    /// that belongs to a package, so the first one installed keeps it.
+    #[test]
+    fn only_the_info_directory_is_a_shared_generated_file() {
+        assert!(is_shared_generated("usr/share/info/dir"));
+        for path in [
+            // The package's own info pages stay its own.
+            "usr/share/info/bash.info",
+            "usr/share/info/sed.info",
+            // A directory named "dir" elsewhere is ordinary content.
+            "usr/share/doc/dir",
+            "usr/bin/dir",
+            "etc/dir",
+        ] {
+            assert!(!is_shared_generated(path), "{path}");
         }
     }
 }
