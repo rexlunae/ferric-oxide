@@ -16,18 +16,13 @@ use core::ptr;
 
 use crate::{
     c_str::{CStr, CString},
-    error::Errno,
     header::{
         dl_tls::{__tls_get_addr, dl_tls_index},
-        fcntl, sys_mman,
+        fcntl,
         unistd::F_OK,
     },
     ld_so::dso::{Dyn, SymbolBinding},
-    out::Out,
-    platform::{
-        Pal, Sys,
-        types::{c_int, c_void},
-    },
+    platform::{Pal, Sys, types::c_void},
     sync::rwlock::RwLock,
 };
 
@@ -43,80 +38,12 @@ use super::{
     tcb::{Master, Tcb},
 };
 
-pub use super::load_error::DlError;
+pub use super::load_error::{DlError, ObjectIoOperation};
+use super::mmap_file::MmapFile;
 
 pub type Result<T> = core::result::Result<T, DlError>;
 
 pub(super) static GLOBAL_SCOPE: RwLock<Scope> = RwLock::new(Scope::global());
-
-struct MmapFile {
-    fd: i32,
-    ptr: *mut c_void,
-    size: usize,
-}
-
-impl MmapFile {
-    fn open(path: CStr, oflag: c_int) -> core::result::Result<Self, Errno> {
-        let fd = Sys::open(path, oflag, 0 /* mode */)?;
-        let mut stat = crate::header::sys_stat::stat::default();
-        Sys::fstat(fd, Out::from_mut(&mut stat))?;
-
-        Self::from_fd(
-            fd,
-            usize::try_from(stat.st_size).expect("st_size should be a positive value"),
-        )
-    }
-
-    fn from_fd(fd: i32, size: usize) -> core::result::Result<Self, Errno> {
-        let ptr = unsafe {
-            Sys::mmap(
-                ptr::null_mut(),
-                size,
-                sys_mman::PROT_READ,
-                sys_mman::MAP_PRIVATE,
-                fd,
-                0,
-            )
-        }?;
-
-        Ok(Self { fd, ptr, size })
-    }
-
-    fn anonymous(size: usize) -> core::result::Result<Self, Errno> {
-        let ptr = unsafe {
-            Sys::mmap(
-                ptr::null_mut(),
-                size,
-                sys_mman::PROT_READ | sys_mman::PROT_WRITE,
-                sys_mman::MAP_PRIVATE | sys_mman::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        }?;
-
-        Ok(Self { fd: -1, ptr, size })
-    }
-
-    fn data(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr.cast::<u8>(), self.size) }
-    }
-
-    #[expect(clippy::mut_from_ref)]
-    fn as_mut_slice(&self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.size) }
-    }
-}
-
-impl Drop for MmapFile {
-    fn drop(&mut self) {
-        unsafe {
-            Sys::munmap(self.ptr, self.size).unwrap();
-            if self.fd != -1 {
-                Sys::close(self.fd).unwrap();
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Symbol<'a> {
@@ -935,11 +862,12 @@ impl Linker {
             let flags = fcntl::O_RDONLY | fcntl::O_CLOEXEC;
             MmapFile::open(CStr::borrow(&path_c), flags).map_err(|err| {
                 if debug {
-                    eprintln!("[ld.so]: failed to open '{}': {}", path, err)
+                    eprintln!("[ld.so]: failed to load '{}': {:?}", path, err)
                 }
                 DlError::Open {
                     path: path.to_string(),
-                    source: err,
+                    operation: err.operation,
+                    source: err.source,
                 }
             })?
         };

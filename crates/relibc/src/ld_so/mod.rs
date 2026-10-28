@@ -26,6 +26,7 @@ pub mod debug;
 pub mod dso;
 pub mod linker;
 mod load_error;
+mod mmap_file;
 mod object_search;
 pub mod start;
 pub mod tcb;

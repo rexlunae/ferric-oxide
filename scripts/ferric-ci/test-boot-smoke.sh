@@ -29,6 +29,7 @@ fi
 # Stay alive for a moment like a guest that is still shutting down, so the
 # runner's watch loop reads the log instead of finding QEMU already gone.
 sleep "${FAKE_QEMU_SLEEP:-1.2}"
+exit "${FAKE_QEMU_STATUS:-0}"
 QEMU
 chmod +x "$work/bin/qemu-system-x86_64"
 export PATH="$work/bin:$PATH" OVMF_FIRMWARE="$work/firmware" BOOT_TIMEOUT=5
@@ -36,21 +37,35 @@ export FAKE_QEMU_LOG="$work/fixture" FAKE_QEMU_ARGS="$work/qemu-args"
 check() {
     local name="$1" expected="$2" contents="$3" text="${4:-}" split="${5:-}" status=0
     printf '%s\n' "$contents" > "$FAKE_QEMU_LOG"
-    FAKE_QEMU_SPLIT="$split" bash "$runner" "$work/image" "$work/serial" host \
+    FAKE_QEMU_SPLIT="$split" timeout -k 2 "${RUNNER_TIMEOUT:-30}" bash "$runner" "$work/image" "$work/serial" host \
         > "$work/output" 2>&1 || status=$?
     if [ "$status" -ne "$expected" ]; then
         echo "$name: expected $expected, got $status" >&2
-        cat "$work/output" >&2
+        tail -c 12000 "$work/output" | tail -n 60 >&2
         exit 1
     fi
     if [ -n "$text" ] && ! grep -qF -- "$text" "$work/output"; then
         echo "$name: expected the output to contain: $text" >&2
-        cat "$work/output" >&2
+        tail -c 12000 "$work/output" | tail -n 60 >&2
         exit 1
     fi
     echo "PASS: $name"
 }
 check pass 0 $'FERRIC_TEST_PASS xstate\r\nFERRIC_SMOKE_OK\r'
+# The repeated-boot investigation produced a large UTF-8 console. Shell glob
+# removal over the whole string took minutes after the guest had shut down.
+large_console="$(python3 - <<'PY'
+print(('\x1b[32mαβγ\x1b[m' * 10 + '\n') * 10000, end='')
+print('FERRIC_TEST_PASS large-console\nFERRIC_SMOKE_OK')
+PY
+)"
+RUNNER_TIMEOUT=10 FAKE_QEMU_SLEEP=0.1 check large-console 0 "$large_console" 'qemu exit 0'
+FAKE_QEMU_STATUS=1 check qemu-error-after-marker 1 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'QEMU exited with 1'
+FAKE_QEMU_SLEEP=10 BOOT_TIMEOUT=1 check timeout-after-marker 1 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'timed out after 1s'
+FAKE_QEMU_SLEEP=0.5 BOOT_TIMEOUT=1 check exit-during-final-poll 0 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'qemu exit 0'
 check skip 0 $'FERRIC_TEST_SKIP xstate\nFERRIC_SMOKE_OK'
 check missing-result 1 'FERRIC_SMOKE_OK'
 check failure 1 $'FERRIC_TEST_FAIL xstate\nFERRIC_SMOKE_OK'
@@ -68,15 +83,20 @@ check smoke-shell-unlinked-bare-path 1 \
     'the smoke shell could not start'
 # The same message after the smoke test passed says nothing about the run.
 check link-failure-after-marker 0 \
-    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound'
-# Nor does one that reaches the log while the runner is watching for the marker
-# after it saw the line: the guest printed the marker during that watch.
-check marker-during-wait 0 \
-    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' '' 1
-# A program the smoke script starts can fail to link too; that is the script's
-# test result, and the run must not be killed for it.
-check child-link-failure 0 \
-    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK'
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK\n[ld.so]: failed to link \'/usr/bin/ion\': NotFound' \
+    'qemu exit 0'
+# A later marker cannot erase a loader failure observed before completion.
+check marker-during-wait 1 \
+    $'[ld.so]: failed to link \'/usr/bin/ion\': NotFound\nFERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK' 'a program failed to link before the smoke marker' 1
+# In particular, a failed helper can make a feature check falsely report SKIP.
+check child-link-failure 1 \
+    $'FERRIC_SMOKE_BEGIN\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound\nFERRIC_TEST_SKIP profile\nFERRIC_SMOKE_OK' 'a program failed to link before the smoke marker'
+check same-line-failure-before-marker 1 \
+    $'FERRIC_TEST_PASS xstate\n[ld.so]: failed to link \'/usr/bin/cat\': NotFound FERRIC_SMOKE_OK' \
+    'a program failed to link before the smoke marker'
+check same-line-failure-after-marker 0 \
+    $'FERRIC_TEST_PASS xstate\nFERRIC_SMOKE_OK [ld.so]: failed to link \'/usr/bin/cat\': NotFound' \
+    'qemu exit 0'
 
 # A boot that never prints the marker times out. The NMI the runner sends then makes the
 # kernel list every context. The runner copies those rows, and only those, to stderr,

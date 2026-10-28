@@ -8,6 +8,28 @@ use core::fmt;
 
 use crate::error::Errno;
 
+/// Operation that failed while obtaining a dynamic object's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObjectIoOperation {
+    /// Opening the selected path.
+    Open,
+    /// Reading or validating the opened file's size.
+    Stat,
+    /// Mapping the opened file read-only.
+    Map {
+        /// Requested mapping length in bytes, before page rounding.
+        size: usize,
+    },
+}
+
+/// Operation and original errno, before the selected path is attached.
+#[derive(Debug)]
+pub(super) struct ObjectIoError {
+    pub(super) operation: ObjectIoOperation,
+    pub(super) source: Errno,
+}
+
 /// A failure to load or use a dynamic shared object.
 #[derive(Debug)]
 pub enum DlError {
@@ -22,10 +44,12 @@ pub enum DlError {
         /// Last candidate that failed for a reason other than absence, if any.
         access_error: Option<(String, Errno)>,
     },
-    /// Opening or mapping the selected object failed.
+    /// Opening, inspecting or mapping the selected object failed.
     Open {
         /// Selected object's path.
         path: String,
+        /// Exact I/O operation that failed.
+        operation: ObjectIoOperation,
         /// Original platform error.
         source: Errno,
     },
@@ -86,8 +110,19 @@ impl fmt::Display for DlError {
                 ..
             } => write!(f, "access '{path}' failed: {source} (errno {})", source.0),
             Self::Search { name, paths, .. } => write!(f, "'{name}' is in none of {paths:?}"),
-            Self::Open { path, source } => {
-                write!(f, "opening '{path}' failed: {source} (errno {})", source.0)
+            Self::Open {
+                path,
+                operation,
+                source,
+            } => {
+                match operation {
+                    ObjectIoOperation::Open => write!(f, "opening '{path}' failed"),
+                    ObjectIoOperation::Stat => write!(f, "reading size of '{path}' failed"),
+                    ObjectIoOperation::Map { size } => {
+                        write!(f, "mapping '{path}' ({size} bytes) failed")
+                    }
+                }?;
+                write!(f, ": {source} (errno {})", source.0)
             }
             _ => f.write_str(self.repr().to_str().expect("loader messages are ASCII")),
         }
@@ -133,6 +168,7 @@ mod tests {
         assert!(format!("{access}").ends_with("(errno 13)"));
         let opened = DlError::Open {
             path: "/lib/open.so".into(),
+            operation: ObjectIoOperation::Open,
             source: Errno(5),
         };
         assert!(format!("{opened}").contains("opening '/lib/open.so' failed:"));
@@ -154,5 +190,28 @@ mod tests {
             c"Invalid DSO handle. Set `LD_DEBUG=all` for more information."
         );
         assert_eq!(DlError::Oom.repr(), c"Out of memory.");
+    }
+
+    #[test]
+    fn stat_and_mapping_failures_name_the_actual_operation() {
+        for (operation, expected) in [
+            (
+                ObjectIoOperation::Stat,
+                "reading size of '/lib/test.so' failed",
+            ),
+            (
+                ObjectIoOperation::Map { size: 12345 },
+                "mapping '/lib/test.so' (12345 bytes) failed",
+            ),
+        ] {
+            let error = DlError::Open {
+                path: "/lib/test.so".into(),
+                operation,
+                source: Errno(12),
+            };
+            let fatal = format!("{}", error.fatal("/bin/test"));
+            assert!(fatal.contains(expected), "{fatal}");
+            assert!(fatal.contains("(errno 12)"));
+        }
     }
 }
