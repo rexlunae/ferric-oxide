@@ -38,8 +38,7 @@ impl HostTool {
         }
     }
 
-    /// Script fragments that run this program: the prescript helper and the
-    /// variable naming the program.
+    /// Prescript helpers and variables in a script that run this program.
     fn markers(self) -> &'static [&'static str] {
         match self {
             HostTool::Meson => &["cookbook_meson", "COOKBOOK_MESON"],
@@ -51,6 +50,16 @@ impl HostTool {
                 "COOKBOOK_CMAKE",
                 "COOKBOOK_NINJA",
             ],
+        }
+    }
+
+    /// Programs whose direct invocation in a script needs this one; Meson's
+    /// default backend is Ninja.
+    fn invoked_by(self) -> &'static [&'static str] {
+        match self {
+            HostTool::Meson => &["meson"],
+            HostTool::Cmake => &["cmake"],
+            HostTool::Ninja => &["ninja", "meson"],
         }
     }
 
@@ -70,12 +79,35 @@ pub fn required(kind: &BuildKind) -> BTreeSet<HostTool> {
     match kind {
         BuildKind::Meson { .. } => [HostTool::Meson, HostTool::Ninja].into(),
         BuildKind::Cmake { .. } => [HostTool::Cmake, HostTool::Ninja].into(),
-        BuildKind::Custom { script } => HostTool::ALL
-            .into_iter()
-            .filter(|tool| tool.markers().iter().any(|marker| script.contains(marker)))
-            .collect(),
+        BuildKind::Custom { script } => {
+            let words = command_words(script);
+            HostTool::ALL
+                .into_iter()
+                .filter(|tool| {
+                    tool.markers().iter().any(|marker| script.contains(marker))
+                        || tool
+                            .invoked_by()
+                            .iter()
+                            .any(|program| words.contains(program))
+                })
+                .collect()
+        }
         _ => BTreeSet::new(),
     }
+}
+
+/// The words of `script` outside `#` comments, split at whitespace and shell
+/// operators, so `env DESTDIR=… meson install` yields `meson`.
+fn command_words(script: &str) -> BTreeSet<&str> {
+    script
+        .lines()
+        .map(|line| match line.find('#') {
+            Some(at) if at == 0 || line[..at].ends_with(char::is_whitespace) => &line[..at],
+            _ => line,
+        })
+        .flat_map(|line| line.split(|c: char| c.is_whitespace() || ";&|()`".contains(c)))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 /// Programs missing from the build machine, each with the recipes that need it.
@@ -101,6 +133,9 @@ impl std::error::Error for MissingHostTools {}
 
 /// Checks that every program the source-built `recipes` need is on `PATH`.
 ///
+/// Recipes that already have a staged package are skipped: an unchanged
+/// recipe reuses its stage without running its build script.
+///
 /// # Errors
 ///
 /// Returns [`MissingHostTools`] listing each absent program and the recipes
@@ -109,7 +144,10 @@ pub fn check<'a>(
     recipes: impl IntoIterator<Item = &'a CookRecipe>,
 ) -> Result<(), MissingHostTools> {
     let path = env::var_os("PATH").unwrap_or_default();
-    check_with(recipes, |tool| on_path(&path, tool.program()))
+    let unstaged = recipes
+        .into_iter()
+        .filter(|recipe| !recipe.stage_paths().1.is_file());
+    check_with(unstaged, |tool| on_path(&path, tool.program()))
 }
 
 fn check_with<'a>(
@@ -180,6 +218,19 @@ mod tests {
             required(&custom.recipe.build.kind),
             [HostTool::Cmake, HostTool::Ninja].into()
         );
+        let direct = recipe(
+            "hicolor-icon-theme",
+            "template = \"custom\"\nscript = \"\"\"\nmeson setup . src\nenv DESTDIR=x meson install\n\"\"\"",
+        );
+        assert_eq!(
+            required(&direct.recipe.build.kind),
+            [HostTool::Meson, HostTool::Ninja].into()
+        );
+        let commented = recipe(
+            "d",
+            "template = \"custom\"\nscript = \"\"\"\n# see the cmake log\nmake # not cmake\n\"\"\"",
+        );
+        assert!(required(&commented.recipe.build.kind).is_empty());
         let configure = recipe("c", "template = \"configure\"");
         assert!(required(&configure.recipe.build.kind).is_empty());
     }
