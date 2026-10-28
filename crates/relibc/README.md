@@ -15,6 +15,15 @@ Currently Redox and Linux are supported.
 `redox-rt` is a runtime library that provides much of the code that enables POSIX on Redox, like `fork`, `exec`, signal handling, etc.
 Relibc uses it as backend in `src/platform/redox`, and it's intended to eventually be usable independently, without relibc.
 
+## Math library
+
+`libm` comes from the `openlibm` submodule. relibc builds it with `OS=Redox`,
+because openlibm would otherwise take its OS from the build machine's `uname`.
+On a macOS host that leaves out `-fPIC` and, on ARM64, every `long double`
+function: Apple's `long double` is a `double`, but Redox's is 128 bits wide. The
+`math_long_double` test links `frexpl`, `sqrtl` and `fmodl` to catch a libm
+built without them.
+
 ## Repository Layout
 
 - `include` - Header files (mostly macros and variadic functions `cbindgen` can't generate)

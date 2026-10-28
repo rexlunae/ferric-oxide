@@ -21,6 +21,10 @@ recipes link with its ld64, so the cookbook's `DYNAMIC_INIT` gives them only
 `-L` for the dependency sysroot rather than the ELF `-rpath-link` and
 `--export-dynamic` flags it uses for Redox. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
+Recipes that need the build-time Python (`host:python312`, for example libxcb
+through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
+Homebrew's `openssl@3` is found even though it is keg-only. OpenSSL 4 does not
+work with CPython 3.12.
 Use existing installations or install missing tools using your preferred
 method: setup never invokes Homebrew, a system package manager or sudo.
 
@@ -31,9 +35,11 @@ architecture: `aarch64` on Apple Silicon and `x86_64` on Intel/AMD. Setup adds
 the prebuilt Redox standard library for x86-64. For ARM64, the generated Cargo
 adapter builds std from rust-src; rustup does not distribute that target. Setup
 selects `image.config = "native"` and binary application packages.
-`config/native.toml` rebuilds the
-local kernel, UEFI bootloader, relibc, base services/drivers and RedoxFS, even
-with `build.repo_binary = true`. The selected package manager is added by the
+The cookbook always builds recipes whose
+source is in this repository (a `path` source, or `same_as` one: the kernel,
+UEFI bootloader, relibc, base services/drivers, RedoxFS, fox and the test
+recipes) from source, even with `build.repo_binary = true` and in every image
+configuration, because a package server cannot have this checkout's build. The selected package manager is added by the
 catalog. Existing configurations are preserved, so their image choice and
 package policy still apply. The first build downloads Rust components, target
 runtime data, Cargo dependencies and application packages.
@@ -126,8 +132,8 @@ make r.kernel
 ```
 
 Make assignments after `--` override the Cargo command's architecture,
-container and FUSE settings. Without a terminal, Cargo commands disable the
-cookbook TUI so builds can be logged. The native path currently supports
+container and FUSE settings. Without a terminal, the cookbook does not start
+its TUI, whether run through Cargo or Make, so builds can be logged. The native path currently supports
 x86-64 and ARM64 UEFI. Some third-party recipes still require GNU build utilities or
 explicit GCC compilers; dependencies for those recipes are installed only when
 needed. A full application rebuild has broader requirements than the initial
@@ -140,7 +146,9 @@ dependencies, including directory changes for added or deleted inputs. Build
 outputs and Git metadata are excluded. These inputs refresh the sysroot before
 recipe/image cache decisions. Its stamp invalidates a source recipe when any
 required package archive is missing or older than the sysroot; a newer archive
-variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot.
+variant cannot hide a stale one. Kernel and UEFI builds do not link that sysroot. relibc builds its openlibm math library for Redox rather than for the build
+machine's OS, so the library is the same whether the sysroot is assembled on
+Linux or macOS (see `crates/relibc/README.md`).
 The x86-64 relibc fork transition keeps the handoff buffer live
 through address-space cloning and copies it above the child's Rust call stack,
 so ordinary compiler stack layouts cannot overwrite its file-table handles.

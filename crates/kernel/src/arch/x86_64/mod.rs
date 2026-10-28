@@ -27,6 +27,9 @@ pub mod misc;
 /// Ferric Oxide: kernel page-table isolation
 pub mod kpti;
 
+/// Ferric Oxide: indirect branch prediction barriers between user address spaces
+pub mod ibpb;
+
 /// Ferric Oxide: kernel indirect branch tracking (CET IBT)
 pub mod ibt;
 

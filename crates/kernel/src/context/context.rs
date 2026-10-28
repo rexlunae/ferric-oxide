@@ -167,6 +167,10 @@ pub struct Context {
     /// All contexts except kmain will primarily live in userspace, and enter the kernel only when
     /// interrupts or syscalls occur. This flag is set for all contexts but kmain.
     pub userspace: bool,
+    /// Ferric Oxide: the context returns to user mode, as `context::spawn` set it up to. Unlike
+    /// `userspace`, which the scheduler needs and ring workers therefore also set, this is false
+    /// for every kernel context, including one that borrows a process's address space.
+    pub runs_user_code: bool,
     pub being_sigkilled: bool,
     /// Ferric Oxide: the context was cancelled for good (`cancel_context`, built with the
     /// `rings` feature): every
@@ -256,6 +260,7 @@ impl Context {
             name: ArrayString::new(),
             files: Arc::new(RwLock::new(FdTbl::new())),
             userspace: false,
+            runs_user_code: false,
             fmap_ret: super::fmap_reply::FmapReply::new(),
             prio: 20,
             vtime: 0,
@@ -473,6 +478,13 @@ impl Context {
             match addr_space {
                 Some(ref new) => {
                     new.used_by.atomic_set(this_percpu.cpu_id);
+                    // Ferric Oxide: as in `arch::switch_to`, for a context that changes address
+                    // space (exec).
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::ibpb::before_switch(
+                        &this_percpu.ibpb,
+                        self.runs_user_code.then_some(new),
+                    );
                     let new_addrsp = new.acquire_read(token);
                     unsafe {
                         new_addrsp.table.utable.make_current();

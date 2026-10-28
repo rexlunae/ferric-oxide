@@ -29,6 +29,10 @@ kpti = "never"
 # without flushing the TLB. "auto" uses them when KPTI is on and the CPU has
 # PCID and INVPCID; "always" panics at boot when KPTI is on and it lacks them.
 pcid = "never"
+# Ferric Oxide: indirect branch prediction barrier (IBPB) when a CPU switches to a
+# different user address space (Spectre v2 user-to-user). "auto" issues it when
+# the CPU reports IBPB; "always" panics at boot on CPUs without it.
+ibpb = "never"
 # Ferric Oxide: kernel indirect branch tracking (Intel CET IBT). Anything but
 # "never" makes the Makefile build with -Z cf-protection=branch. "auto" turns it
 # on when the CPU reports CET_IBT; "always" panics at boot on CPUs without it.

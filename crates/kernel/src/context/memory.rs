@@ -16,9 +16,9 @@ use core::{
     mem::ManuallyDrop,
     num::NonZeroUsize,
     ops::{Bound, Deref},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::Ordering,
 };
-use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush};
+use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush, PhysicalAddress};
 use smallvec::SmallVec;
 use syscall::{error::*, flag::MapFlags, GrantFlags, MunmapFlags, NumaMemoryPolicy};
 
@@ -27,9 +27,9 @@ use crate::{
     cpu_set::LogicalCpuSet,
     memory::{
         deallocate_contiguous, deallocate_frame, get_page_info, init_frame, the_zeroed_frame,
-        tlb::TlbInvalidation, AddRefError, Enomem, Frame, Page, PageFlags, PageInfo, PageMapper,
-        RaiiFrame, RefCount, RefKind, RmmA, TableKind, TheFrameAllocator, VirtualAddress,
-        PAGE_SIZE,
+        tlb::{TlbAcks, TlbInvalidation},
+        AddRefError, Enomem, Frame, Page, PageFlags, PageInfo, PageMapper, RaiiFrame, RefCount,
+        RefKind, RmmA, TableKind, TheFrameAllocator, VirtualAddress, PAGE_SIZE,
     },
     percpu::PercpuBlock,
     scheme::KernelSchemes,
@@ -185,14 +185,12 @@ fn grant_totals(grants: &UserGrants) -> (usize, usize) {
 #[derive(Debug)]
 pub struct AddrSpaceWrapper {
     pub inner: RwLock<L5, AddrSpace>,
-    pub tlb_ack: AtomicU32,
     pub used_by: LogicalCpuSet,
 }
 impl AddrSpaceWrapper {
     pub fn new() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: RwLock::new(AddrSpace::new()?),
-            tlb_ack: AtomicU32::new(0),
             used_by: LogicalCpuSet::empty(),
         }))
     }
@@ -288,7 +286,7 @@ impl AddrSpaceWrapper {
 
         let _this_mapper = &mut guard.table.utable;
         let this_mapper = &mut guard.table.utable;
-        let mut this_flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+        let mut this_flusher = Flusher::with_cpu_set(&self.used_by);
 
         for (grant_base, grant_info) in guard.grants.iter() {
             let new_grant = match grant_info.provider {
@@ -407,7 +405,7 @@ impl AddrSpaceWrapper {
             }
 
             let mapper = &mut guard.table.utable;
-            let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+            let mut flusher = Flusher::with_cpu_set(&self.used_by);
 
             // TODO: Remove allocation (might require BTreeMap::set_key or interior mutability).
             let regions = guard
@@ -494,7 +492,7 @@ impl AddrSpaceWrapper {
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
-        let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+        let mut flusher = Flusher::with_cpu_set(&self.used_by);
         let result = AddrSpace::munmap_inner(
             &mut guard.grants,
             &mut guard.table.utable,
@@ -535,7 +533,7 @@ impl AddrSpaceWrapper {
         let mut guard = self.acquire_write(token.downgrade());
         let guard = &mut *guard;
 
-        let mut flusher = Flusher::with_cpu_set(&self.used_by, &self.tlb_ack);
+        let mut flusher = Flusher::with_cpu_set(&self.used_by);
         let unmapped = AddrSpace::munmap_inner(
             &mut guard.grants,
             &mut guard.table.utable,
@@ -648,12 +646,12 @@ impl AddrSpaceWrapper {
         let mut src_flusher;
         let mut src_opt = match src_opt {
             Some((aw, a)) => {
-                src_flusher = Flusher::with_cpu_set(&aw.used_by, &aw.tlb_ack);
+                src_flusher = Flusher::with_cpu_set(&aw.used_by);
                 Some((&mut a.grants, &mut a.table.utable, &mut src_flusher))
             }
             None => None,
         };
-        let mut dst_flusher = Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack);
+        let mut dst_flusher = Flusher::with_cpu_set(&dst_lock.used_by);
 
         // Ferric Oxide: `r#move` inserts a grant without going through `mmap`, so it needs the
         // same user-space range rule (`grant_span_size`).
@@ -1112,7 +1110,7 @@ impl AddrSpace {
                         let unmapped = Self::munmap_inner(
                             &mut self.grants,
                             &mut self.table.utable,
-                            &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
+                            &mut Flusher::with_cpu_set(&dst_lock.used_by),
                             requested_span,
                             unpin,
                         );
@@ -1147,7 +1145,7 @@ impl AddrSpace {
                 selected_span.base,
                 page_flags(flags),
                 &mut self.table.utable,
-                &mut Flusher::with_cpu_set(&dst_lock.used_by, &dst_lock.tlb_ack),
+                &mut Flusher::with_cpu_set(&dst_lock.used_by),
             )?;
             self.grants.insert(grant);
 
@@ -2013,10 +2011,7 @@ impl Grant {
                         return Err(Error::new(EOPNOTSUPP));
                     }
                 }
-                let mut src_flusher = Flusher::with_cpu_set(
-                    &src.addr_space_lock.used_by,
-                    &src.addr_space_lock.tlb_ack,
-                );
+                let mut src_flusher = Flusher::with_cpu_set(&src.addr_space_lock.used_by);
                 return Self::copy_mappings(
                     src.src_base,
                     span.base,
@@ -2034,8 +2029,7 @@ impl Grant {
             }
             let mut src_addrspace = &mut *guard;
             let mut src_flusher_state =
-                Flusher::with_cpu_set(&src.addr_space_lock.used_by, &src.addr_space_lock.tlb_ack)
-                    .detach();
+                Flusher::with_cpu_set(&src.addr_space_lock.used_by).detach();
             for dst_page in span.pages() {
                 let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
@@ -2521,14 +2515,21 @@ impl Grant {
             let dst_page = dst_base.next_by(src_page.offset_from(self.base));
 
             // TODO: Validate flags?
-            let Some((phys, lvl, _flags, flush)) =
-                (unsafe { src_mapper.unmap_phys(src_page.start_address()) })
-            else {
+            // SAFETY: the grant owns these pages, and `src_flusher` shoots down the old
+            // translations (and the emptied page tables) before anything they held is freed.
+            let Some((phys, lvl)) = (unsafe {
+                src_mapper
+                    .unmap_phys_deferring_tables(
+                        src_page.start_address(),
+                        &mut queue_table_free(src_flusher),
+                    )
+                    .map(|(phys, lvl, _flags, flush)| {
+                        flush.ignore();
+                        (phys, lvl)
+                    })
+            }) else {
                 continue;
             };
-            unsafe {
-                flush.ignore();
-            }
             // TODO: huge pages
             debug_assert_eq!(lvl, 0, "no userspace pages have huge mappings");
 
@@ -2660,7 +2661,10 @@ impl Grant {
             for i in 0..self.info.page_count {
                 unsafe {
                     let (phys, lvl, _, flush) = mapper
-                        .unmap_phys(self.base.next_by(i).start_address())
+                        .unmap_phys_deferring_tables(
+                            self.base.next_by(i).start_address(),
+                            &mut queue_table_free(flusher),
+                        )
                         .expect("all physborrowed grants must be fully Present in the page tables");
                     flush.ignore();
                     // TODO: huge pages
@@ -2679,9 +2683,12 @@ impl Grant {
         } else {
             for page in self.span().pages() {
                 // Lazy mappings do not need to be unmapped.
-                let Some((phys, lvl, _, flush)) =
-                    (unsafe { mapper.unmap_phys(page.start_address()) })
-                else {
+                let Some((phys, lvl, _, flush)) = (unsafe {
+                    mapper.unmap_phys_deferring_tables(
+                        page.start_address(),
+                        &mut queue_table_free(flusher),
+                    )
+                }) else {
                     continue;
                 };
 
@@ -3188,7 +3195,7 @@ fn correct_inner<'l>(
     access: AccessMode,
     recursion_level: u32,
 ) -> Result<(Frame, PageFlush<RmmA>, RwLockWriteGuard<'l, L5, AddrSpace>), PfError> {
-    let mut flusher = Flusher::with_cpu_set(&addr_space_lock.used_by, &addr_space_lock.tlb_ack);
+    let mut flusher = Flusher::with_cpu_set(&addr_space_lock.used_by);
 
     let Some((grant_base, grant_info)) = addr_space.grants.contains(faulting_page) else {
         crate::debug!("Lacks grant");
@@ -3346,10 +3353,7 @@ fn correct_inner<'l>(
                             // SAFETY: Caller guarantees addr_space_guard is coming from this addr_space_lock
                             addr_space =
                                 unsafe { addr_space_lock.acquire_rewrite(addr_space_guard_token) };
-                            flusher = Flusher::with_cpu_set(
-                                &addr_space_lock.used_by,
-                                &addr_space_lock.tlb_ack,
-                            );
+                            flusher = Flusher::with_cpu_set(&addr_space_lock.used_by);
 
                             // SAFETY: We guarantee that guard is coming from foreign_address_space
                             guard = unsafe {
@@ -3475,7 +3479,7 @@ fn correct_inner<'l>(
 
             // SAFETY: Caller guarantees addr_space_guard is coming from this addr_space_lock
             addr_space = unsafe { addr_space_lock.acquire_rewrite(addr_space_guard_token) };
-            flusher = Flusher::with_cpu_set(&addr_space_lock.used_by, &addr_space_lock.tlb_ack);
+            flusher = Flusher::with_cpu_set(&addr_space_lock.used_by);
 
             crate::info!("Got frame {:?} from external fmap", frame);
 
@@ -3539,6 +3543,22 @@ pub trait GenericFlusher {
         actions: TlbShootdownActions,
     );
 }
+/// Returns a callback for [`rmm::PageMapper::unmap_phys_deferring_tables`] that queues each
+/// emptied page-table frame on `flusher`, so it is freed only after the shootdown.
+fn queue_table_free(flusher: &mut impl GenericFlusher) -> impl FnMut(PhysicalAddress) + '_ {
+    move |table| {
+        // No page: the round then flushes whole TLBs, paging-structure caches included, on
+        // every architecture, instead of relying on per-address invalidation to reach them.
+        flusher.queue(
+            None,
+            Frame::containing(table),
+            None,
+            TlbShootdownActions::FREE_TABLE,
+        )
+    }
+}
+/// Applies actions immediately, for address spaces that no CPU has loaded (such as one being
+/// dropped), where there is nothing to shoot down.
 pub struct NopFlusher;
 impl GenericFlusher for NopFlusher {
     fn queue(
@@ -3548,10 +3568,21 @@ impl GenericFlusher for NopFlusher {
         phys_contiguous_count: Option<NonZeroUsize>,
         actions: TlbShootdownActions,
     ) {
-        if actions.contains(TlbShootdownActions::FREE) {
+        if actions.contains(TlbShootdownActions::FREE_TABLE) {
+            // No CPU has this address space loaded, so none can still walk through the table.
+            free_table_frame(frame);
+        } else if actions.contains(TlbShootdownActions::FREE) {
             handle_free_action(frame, phys_contiguous_count);
         }
     }
+}
+/// Returns a page-table frame that [`rmm::PageMapper::unmap_phys_deferring_tables`] unlinked to
+/// the frame allocator. Callers must only do so once no CPU can still walk through it.
+fn free_table_frame(frame: Frame) {
+    // SAFETY: the frame came from `TheFrameAllocator` as a page table and holds no `PageInfo`
+    // reference; the unmap unlinked it, and the callers free it only after the shootdown that
+    // drops every cached walk through it (or when no CPU has the address space loaded).
+    unsafe { deallocate_frame(frame) };
 }
 fn handle_free_action(base: Frame, phys_contiguous_count: Option<NonZeroUsize>) {
     if let Some(count) = phys_contiguous_count {
@@ -3590,14 +3621,12 @@ fn handle_free_action(base: Frame, phys_contiguous_count: Option<NonZeroUsize>) 
     }
 }
 #[derive(Debug)]
-struct FlusherState<'addrsp> {
+struct FlusherState {
     // TODO: what capacity?
     pagequeue: ArrayVec<PageQueueEntry, 32>,
     dirty: bool,
     /// The pages this round invalidates, locally and on every other CPU in `active_cpus`.
     invalidation: TlbInvalidation,
-
-    ackword: &'addrsp AtomicU32,
 }
 
 #[derive(Debug)]
@@ -3606,6 +3635,10 @@ enum PageQueueEntry {
         base: Frame,
         phys_contiguous_count: Option<NonZeroUsize>,
     },
+    /// A page-table frame emptied by an unmap. Other CPUs' paging-structure caches may still
+    /// point at it, so the shootdown before it is freed must invalidate those caches too, not
+    /// only the TLB entries for the unmapped pages.
+    FreeTable(Frame),
     Other {
         actions: TlbShootdownActions,
         //page: Page,
@@ -3613,30 +3646,27 @@ enum PageQueueEntry {
 }
 
 #[derive(Debug)]
-pub struct Flusher<'a, 'addrsp> {
+pub struct Flusher<'a> {
     active_cpus: &'a LogicalCpuSet,
-    state: FlusherState<'addrsp>,
+    state: FlusherState,
 }
 
-impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
-    fn with_cpu_set(set: &'a LogicalCpuSet, ackword: &'addrsp AtomicU32) -> Self {
+impl<'a> Flusher<'a> {
+    fn with_cpu_set(set: &'a LogicalCpuSet) -> Self {
         Self {
             active_cpus: set,
             state: FlusherState {
                 pagequeue: ArrayVec::new(),
                 dirty: false,
                 invalidation: TlbInvalidation::new(),
-                ackword,
             },
         }
     }
-    fn detach(mut self) -> FlusherState<'addrsp> {
-        static DUMMY: AtomicU32 = AtomicU32::new(0);
+    fn detach(mut self) -> FlusherState {
         let state = core::mem::replace(
             &mut self.state,
             FlusherState {
                 pagequeue: ArrayVec::new(),
-                ackword: &DUMMY,
                 dirty: false,
                 invalidation: TlbInvalidation::new(),
             },
@@ -3657,24 +3687,28 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             invalidation.set_all();
         }
 
-        self.state.ackword.store(0, Ordering::SeqCst);
+        // Keeps the page-table writes before the reads of `active_cpus` below (a store-load
+        // order, which x86 does not keep by itself), so a CPU that set its bit before this
+        // round's reads is asked. One that sets it later loads the table afterwards. Before
+        // issue #264 the `SeqCst` reset of the shared acknowledgement counter did this.
+        core::sync::atomic::fence(Ordering::SeqCst);
 
-        let mut affected_cpu_count = 0;
-
+        // Issue #264: wait for each CPU this round asked, for its handling of this round's
+        // request, and for nothing else. A CPU that leaves the address space meanwhile still
+        // has to take its mailbox and invalidate before its acknowledgement counts.
+        let mut acks = TlbAcks::new();
+        let mut affected_cpu_count: u32 = 0;
         let current_cpu_id = crate::cpu_id();
 
         for cpu_id in self.active_cpus.iter() {
             if cpu_id == current_cpu_id {
                 continue;
             }
-
-            crate::percpu::shootdown_tlb_ipi(Some(cpu_id), &invalidation);
-
-            core::sync::atomic::fence(Ordering::SeqCst);
-
-            if self.active_cpus.contains(cpu_id) {
-                affected_cpu_count += 1;
-            }
+            let Some(ack) = crate::percpu::request_tlb_shootdown(cpu_id, &invalidation) else {
+                continue;
+            };
+            crate::percpu::expect_tlb_ack(&mut acks, cpu_id, ack);
+            affected_cpu_count = affected_cpu_count.saturating_add(1);
         }
 
         let local = self.active_cpus.contains(current_cpu_id);
@@ -3686,22 +3720,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
         // Ferric Oxide: the shootdown's wait for acknowledgements (`tlb_stats`, mm.tlb_flush).
         let waited = (affected_cpu_count > 0).then(crate::tlb_stats::Stopwatch::start);
 
-        #[cfg(target_arch = "aarch64")]
-        let mut stall_watch = crate::arch::misc::StallWatch::start(2);
-
-        while self.state.ackword.load(Ordering::SeqCst) < affected_cpu_count {
-            PercpuBlock::current().maybe_handle_tlb_shootdown();
-            #[cfg(target_arch = "aarch64")]
-            if stall_watch.stalled() {
-                crate::error!(
-                    "TLB shootdown stalled on CPU {}: acknowledgements {}/{}",
-                    current_cpu_id,
-                    self.state.ackword.load(Ordering::SeqCst),
-                    affected_cpu_count
-                );
-            }
-            core::hint::spin_loop();
-        }
+        crate::percpu::wait_for_tlb_acks(&mut acks);
         let wait_cycles = waited.map_or(0, crate::tlb_stats::Stopwatch::elapsed);
         let local_flush = match (local, invalidation.is_all()) {
             (false, _) => crate::tlb_stats::LocalFlush::None,
@@ -3718,6 +3737,11 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
                 } => {
                     handle_free_action(base, phys_contiguous_count);
                 }
+                PageQueueEntry::FreeTable(frame) => {
+                    // Every CPU that had this address space loaded has now invalidated its TLB
+                    // and paging-structure caches.
+                    free_table_frame(frame);
+                }
                 PageQueueEntry::Other { actions } => {
                     // `invalidation` covered the page above.
                     let _ = actions;
@@ -3726,7 +3750,7 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
         }
     }
 }
-impl GenericFlusher for Flusher<'_, '_> {
+impl GenericFlusher for Flusher<'_> {
     fn queue(
         &mut self,
         page: Option<Page>,
@@ -3759,7 +3783,9 @@ impl GenericFlusher for Flusher<'_, '_> {
             return;
         }
 
-        let entry = if actions.contains(TlbShootdownActions::FREE) {
+        let entry = if actions.contains(TlbShootdownActions::FREE_TABLE) {
+            PageQueueEntry::FreeTable(frame)
+        } else if actions.contains(TlbShootdownActions::FREE) {
             PageQueueEntry::Free {
                 base: frame,
                 phys_contiguous_count,
@@ -3787,7 +3813,7 @@ impl GenericFlusher for Flusher<'_, '_> {
         }
     }
 }
-impl Drop for Flusher<'_, '_> {
+impl Drop for Flusher<'_> {
     fn drop(&mut self) {
         self.flush();
     }
@@ -3795,19 +3821,26 @@ impl Drop for Flusher<'_, '_> {
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct TlbShootdownActions: usize {
-        // Delay the deallocation of one or more contiguous frames.
+        /// Delay the deallocation of one or more contiguous frames.
         const FREE = 1;
 
-        // Revoke various access flags from a page
+        /// Revoke read access from a page.
         const REVOKE_READ = 1 << 1;
+        /// Revoke write access from a page.
         const REVOKE_WRITE = 1 << 2;
+        /// Revoke execute access from a page.
         const REVOKE_EXEC = 1 << 3;
 
-        // Unmap a page from one address space without deallocating it.
+        /// Unmap a page from one address space without deallocating it.
         const MOVE = 1 << 4;
 
-        // Add a new mapping where no present PTE was. `Flusher` skips the shootdown for it on
-        // x86, which never caches not-present entries; other architectures still flush.
+        /// Delay the deallocation of a page-table frame that an unmap emptied. Unlike FREE, the
+        /// frame has no PageInfo reference count; it goes straight back to the allocator. Always
+        /// forces a shootdown round, which must also invalidate paging-structure caches.
+        const FREE_TABLE = 1 << 5;
+
+        /// Add a new mapping where no present PTE was. `Flusher` skips the shootdown for it on
+        /// x86, which never caches not-present entries; other architectures still flush.
         const NEW_MAPPING = 1 << 31;
     }
 }

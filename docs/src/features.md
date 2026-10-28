@@ -10,7 +10,7 @@ limits of each one.
 | [SMP](https://en.wikipedia.org/wiki/Symmetric_multiprocessing) | Yes | Yes | Yes | Yes |
 | [NUMA](https://en.wikipedia.org/wiki/Non-uniform_memory_access) | Partial: firmware tables parsed (`kernel.numa`, experimental); NUMA-aware placement planned | Yes | Yes | No |
 | Full disk encryption | Yes (RedoxFS); LUKS1/LUKS2 volumes read-only | Yes | Yes | No |
-| Exploit mitigations | Yes: KASLR, ASLR, KPTI, SMEP/SMAP; supervisor CET optional | Yes | Yes | No |
+| Exploit mitigations | Yes: KASLR, ASLR, KPTI, IBPB between processes, SMEP/SMAP; supervisor CET optional | Yes | Yes | No |
 | [IOMMU](https://en.wikipedia.org/wiki/Input%E2%80%93output_memory_management_unit) DMA isolation | Yes, Intel VT-d and AMD-Vi (off by default) | Yes | Yes | No |
 | Asynchronous I/O rings | Yes, `kernel.ring` (off by default) | Yes (io_uring) | No (POSIX AIO, kqueue) | No |
 | Kernel tracing | Yes, x86-64 (off by default) | Yes | Yes (DTrace) | No |

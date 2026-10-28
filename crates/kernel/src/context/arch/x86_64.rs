@@ -436,6 +436,13 @@ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
             );
         }
 
+        // Ferric Oxide: Spectre v2 user-to-user isolation. Done here rather than in
+        // `switch_arch_hook`, which sees only the address space, because a ring worker holding a
+        // process's address space runs no user code and must not count as that process.
+        crate::arch::ibpb::before_switch(
+            &(*pcr).percpu.ibpb,
+            next.addr_space.as_ref().filter(|_| next.runs_user_code),
+        );
         (*pcr).percpu.new_addrsp_tmp.set(next.addr_space.clone());
 
         switch_to_inner(

@@ -131,6 +131,15 @@ pub struct CookbookConfig {
 
 static CONFIG: OnceLock<CookbookConfig> = OnceLock::new();
 
+/// Whether the cookbook runs its TUI when neither the config nor the command
+/// line says. The TUI draws on stdout and reads its keys (including the
+/// recipe-failure prompt) from stdin, so both must be terminals: under CI,
+/// scripts, Remote Control or redirected input or output it prints plain
+/// logs instead.
+fn default_tui(ci: bool, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    !ci && stdin_is_terminal && stdout_is_terminal
+}
+
 pub fn init_config() {
     #[cfg(not(test))]
     let mut config: CookbookConfig = if fs::exists("cookbook.toml").unwrap_or(false) {
@@ -154,7 +163,12 @@ pub fn init_config() {
 
     #[cfg(not(test))]
     if config.cook_opt.tui.is_none() {
-        config.cook_opt.tui = Some(!std::env::var("CI").is_ok_and(|s| !s.is_empty()));
+        use std::io::IsTerminal;
+        config.cook_opt.tui = Some(default_tui(
+            std::env::var("CI").is_ok_and(|s| !s.is_empty()),
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ));
     }
     #[cfg(test)]
     if config.cook_opt.tui.is_none() {
@@ -314,6 +328,15 @@ pub fn translate_mirror(original_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tui_defaults_on_only_with_terminal_input_and_output() {
+        assert!(default_tui(false, true, true));
+        assert!(!default_tui(true, true, true));
+        assert!(!default_tui(false, false, true));
+        assert!(!default_tui(false, true, false));
+        assert!(!default_tui(false, false, false));
+    }
 
     fn setup_test_config() {
         // This will be called for each test. If the config is already set,
