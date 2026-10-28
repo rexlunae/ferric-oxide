@@ -12,7 +12,9 @@
 //! Repositories are read with [`gix`](https://crates.io/crates/gix), the
 //! pure-Rust git implementation. [`fetch()`] mirrors a remote into a local
 //! bare cache, and the [`tag`] module reads release tags and verifies their
-//! SSH signatures.
+//! SSH signatures. `https://` remotes and [`download_blob`] use one ureq and
+//! rustls client, built for every target including Redox; its failures are
+//! [`HttpError`]s.
 //!
 //! # The `fox-tree/1` hash
 //!
@@ -62,10 +64,12 @@
 
 pub mod download;
 mod fetch;
+mod http;
 pub mod tag;
 
 pub use download::{DownloadError, download_blob};
 pub use fetch::fetch;
+pub use http::HttpError;
 pub use tag::{SignatureFormat, Tag, TagSigner, tag_version};
 
 use std::fs;

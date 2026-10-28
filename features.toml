@@ -1658,8 +1658,8 @@ The package manager on the target.
             there), and on first boot adopts the packages the installer
             put in the image (fox adopt-pkg), so fox list, fox verify
             --installed and fox remove cover the whole system.
-            fox installs local .pkgar files; it does not fetch from
-            package servers.
+            fox fetches registries, git sources and prebuilt
+            artifacts over https:// on the target as on the host.
             The image build finishes the root with the host fox: it
             adopts the installed packages at build time, syncs
             packages.set if one is given, and writes the image SBOM to

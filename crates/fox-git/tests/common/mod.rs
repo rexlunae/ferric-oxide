@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod http_server;
+
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
