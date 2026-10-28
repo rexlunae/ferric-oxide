@@ -149,7 +149,7 @@ enum BuildError {
     )]
     Missing(&'static str),
     #[error(
-        "missing required build-machine programs: {}; run ./native_bootstrap.sh to install them (or see Prerequisites in docs/src/building-redox.md)",
+        "missing required build-machine programs: {}; install them (./native_bootstrap.sh installs everything but Podman; see Prerequisites in docs/src/building-redox.md)",
         .0.join(", ")
     )]
     MissingPrograms(Vec<&'static str>),
@@ -256,11 +256,8 @@ const SOURCE_BUILD_PROGRAMS: [&str; 14] = [
 fn doctor(arch: Architecture, podman: bool) -> Result<()> {
     eprintln!("Guest architecture: {}", arch.name());
     let nasm = (arch == Architecture::X86_64).then_some("nasm");
-    if podman && find_tool("podman").is_none() {
-        return Err(BuildError::Missing("podman"));
-    }
     let source_build = if podman {
-        &[][..]
+        &["podman"][..]
     } else {
         &SOURCE_BUILD_PROGRAMS[..]
     };
