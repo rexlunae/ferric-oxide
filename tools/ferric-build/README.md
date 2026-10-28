@@ -26,8 +26,10 @@ library to the repository's pinned rustup toolchain, installs missing or outdate
 It never invokes Homebrew, another system package manager, or sudo. Install a
 native C/C++ compiler and SDK (Xcode Command Line Tools on macOS) and QEMU
 (plus NASM for x86-64) using your preferred method. QEMU is required only for `run`.
-Recipes built from source with Meson or CMake also need `meson`, `cmake` and `ninja`;
-`doctor` reports them and `repo cook` checks for them before building.
+Application packages build from source, so the build machine also needs the
+programs recipes run (Autoconf, Automake, Meson, CMake, Ninja and others; see
+[Prerequisites](../../docs/src/building-redox.md#prerequisites)). `doctor`, which
+`setup` runs first, fails listing every missing one.
 
 The initial `native` image builds the local kernel, UEFI bootloader, relibc,
 base services/drivers and RedoxFS; applications use existing binary packages.

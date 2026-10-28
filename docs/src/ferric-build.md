@@ -9,8 +9,7 @@ Plain `cargo build` at the root builds host tools and shared libraries;
 ## Native build and QEMU
 
 ```sh
-cargo xtask doctor
-cargo xtask setup
+./native_bootstrap.sh
 cargo xtask build
 cargo xtask run --headless
 ```
@@ -18,17 +17,22 @@ cargo xtask run --headless
 Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK.
 On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
-Recipes built from source with Meson or CMake (most of the X11 and GTK stack,
-for example xkeyboard-config) also need the build machine's `meson`, `cmake`
-and `ninja`. `cargo xtask doctor` reports whether they are present, and
-`repo cook` checks every recipe it is about to build from source before
-building any of them, listing each missing program with the recipes that need it.
+Without a package server every application recipe builds from source, so the
+build machine also needs the programs recipes run: Autoconf, Automake,
+`autopoint`, Bison, CMake, Flex, M4, `makeinfo`, Meson, Ninja, `patch`, Perl,
+`pkg-config` and Python 3 (see [Building Ferric Oxide](./building-redox.md#prerequisites)). `cargo xtask doctor`, which `setup` runs first, fails
+listing every missing one. `repo cook` also checks the Meson, CMake and Ninja
+use of each recipe it is about to build from source before building any of
+them, and again before each rebuild, naming each missing program with the
+recipes that need it.
 Recipes that need the build-time Python (`host:python312`, for example libxcb
 through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
 Homebrew's `openssl@3` is found even though it is keg-only. OpenSSL 4 does not
 work with CPython 3.12.
-Use existing installations or install missing tools using your preferred
-method: setup never invokes Homebrew, a system package manager or sudo.
+`./native_bootstrap.sh` installs all of these with Homebrew, `apt-get` or `dnf`
+and then runs setup; its package lists are the reference. Setup itself never
+invokes Homebrew, a system package manager or sudo, so existing installations
+work with `./native_bootstrap.sh --no-packages` or plain `cargo xtask setup`.
 
 Setup installs missing or outdated `cbindgen` and `just` with Cargo, adds
 `rust-src` and `llvm-tools-preview` to the pinned toolchain, initializes
@@ -36,7 +40,7 @@ submodules and creates `ferric.toml` only if absent. Commands default to the hos
 architecture: `aarch64` on Apple Silicon and `x86_64` on Intel/AMD. Setup adds
 the prebuilt Redox standard library for x86-64. For ARM64, the generated Cargo
 adapter builds std from rust-src; rustup does not distribute that target. Setup
-selects `image.config = "native"` and binary application packages.
+selects `image.config = "native"`.
 The cookbook always builds recipes whose
 source is in this repository (a `path` source, or `same_as` one: the kernel,
 UEFI bootloader, relibc, base services/drivers, RedoxFS, fox and the test

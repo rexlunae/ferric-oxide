@@ -43,15 +43,16 @@ The recommended development path uses rustup, Cargo and native Clang:
 ```sh
 git clone https://github.com/rexlunae/ferric-oxide
 cd ferric-oxide
-cargo xtask setup
+./native_bootstrap.sh
 cargo xtask build
 cargo xtask run --headless
 ```
 
-Install Rust with rustup, a native C/C++ compiler and SDK (Xcode Command Line
-Tools on macOS). NASM is needed for x86-64 builds. QEMU is needed to run the image.
-Setup installs Rust components and required Cargo utilities; it never installs Homebrew or
-system packages. `./native_bootstrap.sh` is an alias for the setup command.
+Install Rust with rustup (and the Xcode Command Line Tools on macOS), then run
+`./native_bootstrap.sh`. It installs the build machine's packages (Clang, NASM,
+QEMU and the programs recipes run, such as Meson and CMake) with Homebrew, `apt-get`
+or `dnf`, then runs `cargo xtask setup`. `cargo xtask` itself never installs system
+packages; see [Building Ferric Oxide](docs/src/building-redox.md#prerequisites).
 
 Commands default to the host architecture: ARM64 (`aarch64`) on Apple Silicon,
 and x86-64 on Intel/AMD hosts. To cross-compile and emulate x86-64 on Apple Silicon:

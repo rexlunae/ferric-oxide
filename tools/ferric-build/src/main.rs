@@ -148,6 +148,11 @@ enum BuildError {
         "missing required tool {0}; install it using your preferred method, then rerun cargo xtask setup"
     )]
     Missing(&'static str),
+    #[error(
+        "missing required build-machine programs: {}; run ./native_bootstrap.sh to install them (or see Prerequisites in docs/src/building-redox.md)",
+        .0.join(", ")
+    )]
+    MissingPrograms(Vec<&'static str>),
     #[error("cannot decode ferric-config's CPU variant plan")]
     VariantPlan {
         #[source]
@@ -225,36 +230,62 @@ fn cargo(root: &Path) -> Command {
     command
 }
 
+/// Programs that recipes built from source run on the build machine. Without
+/// a package server every application recipe builds from source, so the
+/// documented build needs all of them.
+const SOURCE_BUILD_PROGRAMS: [&str; 14] = [
+    "autoconf",
+    "automake",
+    "autopoint",
+    "bison",
+    "cmake",
+    "flex",
+    "m4",
+    "makeinfo",
+    "meson",
+    "ninja",
+    "patch",
+    "perl",
+    "pkg-config",
+    "python3",
+];
+
 fn doctor(arch: Architecture) -> Result<()> {
     eprintln!("Guest architecture: {}", arch.name());
-    for tool in [
+    let nasm = (arch == Architecture::X86_64).then_some("nasm");
+    let required = [
         "rustup", "cargo", "clang", "clang++", "git", "curl", "tar", "make",
-    ] {
+    ]
+    .into_iter()
+    .chain(nasm)
+    .chain(SOURCE_BUILD_PROGRAMS);
+    let mut missing = Vec::new();
+    for tool in required {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
-            None => return Err(BuildError::Missing(tool)),
+            None => {
+                eprintln!("{tool}: MISSING");
+                missing.push(tool);
+            }
         }
     }
-    if arch == Architecture::X86_64 && find_tool("nasm").is_none() {
-        return Err(BuildError::Missing("nasm"));
-    }
-    for tool in ["cbindgen", "just", arch.qemu(), "meson", "cmake", "ninja"] {
+    for tool in ["cbindgen", "just", arch.qemu()] {
         match find_tool(tool) {
             Some(path) => eprintln!("{tool}: {}", path.display()),
-            None => eprintln!("{tool}: absent ({})", absent_tool_note(tool)),
+            None => eprintln!(
+                "{tool}: absent ({})",
+                if tool.starts_with("qemu") {
+                    "only needed to run the image"
+                } else {
+                    "cargo xtask setup installs this Cargo utility"
+                }
+            ),
         }
     }
-    Ok(())
-}
-
-/// Why an optional tool may be missing, for `doctor`'s report.
-fn absent_tool_note(tool: &str) -> &'static str {
-    match tool {
-        "cbindgen" | "just" => "cargo xtask setup installs this Cargo utility",
-        "meson" | "cmake" | "ninja" => {
-            "needed only by recipes built from source with Meson or CMake; the cook stops before building if one needs it"
-        }
-        _ => "only needed to run the image",
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BuildError::MissingPrograms(missing))
     }
 }
 
