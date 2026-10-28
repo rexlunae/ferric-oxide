@@ -102,33 +102,3 @@ diff -ruwN source/Modules/posixmodule.c source-new/Modules/posixmodule.c
      if (elapsed == (clock_t) -1) {
          return posix_error();
      }
-diff -ruwN source/Modules/resource.c source-new/Modules/resource.c
---- source/Modules/resource.c	2026-04-07 18:24:03.000000000 +0700
-+++ source-new/Modules/resource.c	2026-05-07 12:16:56.305184305 +0700
-@@ -245,7 +245,7 @@
- {
-     struct rlimit rl;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;
-@@ -273,7 +273,7 @@
- {
-     struct rlimit rl;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;
-@@ -321,7 +321,7 @@
-     struct rlimit old_limit, new_limit;
-     int retval;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;
