@@ -100,48 +100,13 @@ impl IdentifyNamespaceData {
     pub fn formatted_lba_size(&self) -> &LbaFormat {
         &self.lba_format_support[self.formatted_lba_size_idx()]
     }
-    pub fn has_metadata_after_data(&self) -> bool {
-        (self.flbas & (1 << 4)) != 0
-    }
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct LbaFormat(pub u32);
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum RelativePerformance {
-    Best = 0b00,
-    Better,
-    Good,
-    Degraded,
-}
-impl Ord for RelativePerformance {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // higher performance is better, hence reversed
-        Ord::cmp(&(*self as u8), &(*other as u8)).reverse()
-    }
-}
-impl PartialOrd for RelativePerformance {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(Ord::cmp(self, other))
-    }
-}
-
 impl LbaFormat {
-    pub fn relative_performance(&self) -> RelativePerformance {
-        match (self.0 >> 24) & 0b11 {
-            0b00 => RelativePerformance::Best,
-            0b01 => RelativePerformance::Better,
-            0b10 => RelativePerformance::Good,
-            0b11 => RelativePerformance::Degraded,
-            _ => unreachable!(),
-        }
-    }
-    pub fn is_available(&self) -> bool {
-        self.log_lba_data_size() != 0
-    }
     pub fn log_lba_data_size(&self) -> u8 {
         ((self.0 >> 16) & 0xFF) as u8
     }
@@ -153,9 +118,6 @@ impl LbaFormat {
             return None;
         }
         Some(1u64 << self.log_lba_data_size())
-    }
-    pub fn metadata_size(&self) -> u16 {
-        (self.0 & 0xFFFF) as u16
     }
 }
 

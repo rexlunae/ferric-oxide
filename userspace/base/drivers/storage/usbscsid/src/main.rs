@@ -48,7 +48,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
 
     // TODO: Perhaps the drivers should just be given the config, interface, and alternate setting
     // from xhcid.
-    let (conf_desc, configuration_value, (if_desc, interface_num, alternate_setting)) = desc
+    let (configuration_value, (if_desc, interface_num, alternate_setting)) = desc
         .config_descs
         .iter()
         .find_map(|config_desc| {
@@ -59,11 +59,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
                     None
                 }
             })?;
-            Some((
-                config_desc.clone(),
-                config_desc.configuration_value,
-                interface_desc,
-            ))
+            Some((config_desc.configuration_value, interface_desc))
         })
         .expect("Failed to find suitable configuration");
 
@@ -76,8 +72,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         })
         .expect("Failed to configure endpoints");
 
-    let mut protocol = protocol::setup(&handle, protocol, &desc, &conf_desc, &if_desc)
-        .expect("Failed to setup protocol");
+    let mut protocol =
+        protocol::setup(&handle, protocol, &if_desc).expect("Failed to setup protocol");
 
     // TODO: Let all of the USB drivers fork or be managed externally, and xhcid won't have to keep
     // track of all the drivers.

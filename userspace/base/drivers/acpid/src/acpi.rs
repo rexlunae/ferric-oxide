@@ -20,8 +20,6 @@ use rustc_hash::FxHashMap;
 use syscall::PAGE_SIZE;
 use thiserror::Error;
 
-#[cfg(target_arch = "x86_64")]
-pub mod dmar;
 use crate::aml_physmem::{AmlPageCache, AmlPhysMemHandler};
 
 /// The raw SDT header struct, as defined by the ACPI specification.
@@ -41,13 +39,6 @@ pub struct SdtHeader {
 unsafe impl plain::Plain for SdtHeader {}
 
 impl SdtHeader {
-    pub fn signature(&self) -> SdtSignature {
-        SdtSignature {
-            signature: self.signature,
-            oem_id: self.oem_id,
-            oem_table_id: self.oem_table_id,
-        }
-    }
     pub fn length(&self) -> usize {
         self.length
             .try_into()
@@ -227,9 +218,6 @@ impl fmt::Debug for Sdt {
     }
 }
 
-pub struct Dsdt(Sdt);
-pub struct Ssdt(Sdt);
-
 // Current AML implementation builds the aml_context.namespace at startup,
 // but the cache for symbols is lazy-loaded when someone
 // reads from the acpi:/symbols scheme.
@@ -370,17 +358,9 @@ impl From<AmlError> for AmlEvalError {
 
 pub struct AcpiContext {
     tables: Vec<Sdt>,
-    dsdt: Option<Dsdt>,
     fadt: Option<Fadt>,
 
     aml_symbols: RwLock<AmlSymbols>,
-
-    // TODO: The kernel ACPI code seemed to use load_table quite ubiquitously, however ACPI 5.1
-    // states that DDBHandles can only be obtained when loading XSDT-pointed tables. So, we'll
-    // generate an index only for those.
-    sdt_order: RwLock<Vec<Option<SdtSignature>>>,
-
-    pub next_ctx: RwLock<u64>,
 }
 
 impl AcpiContext {
@@ -435,34 +415,17 @@ impl AcpiContext {
 
         let mut this = Self {
             tables,
-            dsdt: None,
             fadt: None,
 
             // Temporary values
             aml_symbols: RwLock::new(AmlSymbols::new(ec)),
-
-            next_ctx: RwLock::new(0),
-
-            sdt_order: RwLock::new(Vec::new()),
         };
 
-        for table in &this.tables {
-            this.new_index(&table.signature());
-        }
-
         Fadt::init(&mut this);
-        //TODO (hangs on real hardware): Dmar::init(&this);
 
         this
     }
 
-    pub fn dsdt(&self) -> Option<&Dsdt> {
-        self.dsdt.as_ref()
-    }
-    pub fn ssdts(&self) -> impl Iterator<Item = Ssdt> + '_ {
-        self.find_multiple_sdts(*b"SSDT")
-            .map(|sdt| Ssdt(sdt.clone()))
-    }
     fn find_single_sdt_pos(&self, signature: [u8; 4]) -> Option<usize> {
         let count = self
             .tables
@@ -483,11 +446,6 @@ impl AcpiContext {
             .iter()
             .position(|sdt| sdt.signature == signature)
     }
-    pub fn find_multiple_sdts<'a>(&'a self, signature: [u8; 4]) -> impl Iterator<Item = &'a Sdt> {
-        self.tables
-            .iter()
-            .filter(move |sdt| sdt.signature == signature)
-    }
     pub fn take_single_sdt(&self, signature: [u8; 4]) -> Option<Sdt> {
         self.find_single_sdt_pos(signature)
             .map(|pos| self.tables[pos].clone())
@@ -502,20 +460,8 @@ impl AcpiContext {
                 && sdt.oem_table_id == signature.oem_table_id
         })
     }
-    pub fn get_signature_from_index(&self, index: usize) -> Option<SdtSignature> {
-        self.sdt_order.read().get(index).copied().flatten()
-    }
-    pub fn get_index_from_signature(&self, signature: &SdtSignature) -> Option<usize> {
-        self.sdt_order
-            .read()
-            .iter()
-            .rposition(|sig| sig.map_or(false, |sig| &sig == signature))
-    }
     pub fn tables(&self) -> &[Sdt] {
         &self.tables
-    }
-    pub fn new_index(&self, signature: &SdtSignature) {
-        self.sdt_order.write().push(Some(*signature));
     }
 
     pub fn aml_lookup(&self, symbol: &str) -> Option<String> {
@@ -547,12 +493,6 @@ impl AcpiContext {
 
         // return the cached value
         Ok(RwLockWriteGuard::downgrade(aml_symbols))
-    }
-
-    /// Discard any cached symbols list. To be called if the AML namespace changes.
-    pub fn aml_symbols_reset(&self) {
-        let mut aml_symbols = self.aml_symbols.write();
-        aml_symbols.symbol_cache = FxHashMap::default();
     }
 
     /// Set Power State
@@ -797,70 +737,7 @@ impl Fadt {
         };
 
         context.fadt = Some(fadt.clone());
-        context.dsdt = Some(Dsdt(dsdt_sdt.clone()));
 
         context.tables.push(dsdt_sdt);
-    }
-}
-
-pub enum PossibleAmlTables {
-    Dsdt(Dsdt),
-    Ssdt(Ssdt),
-}
-impl PossibleAmlTables {
-    pub fn try_new(inner: Sdt) -> Option<Self> {
-        match &inner.signature {
-            b"DSDT" => Some(Self::Dsdt(Dsdt(inner))),
-            b"SSDT" => Some(Self::Ssdt(Ssdt(inner))),
-            _ => None,
-        }
-    }
-}
-impl AmlContainingTable for PossibleAmlTables {
-    fn aml(&self) -> &[u8] {
-        match self {
-            Self::Dsdt(dsdt) => dsdt.aml(),
-            Self::Ssdt(ssdt) => ssdt.aml(),
-        }
-    }
-    fn header(&self) -> &SdtHeader {
-        match self {
-            Self::Dsdt(dsdt) => dsdt.header(),
-            Self::Ssdt(ssdt) => ssdt.header(),
-        }
-    }
-}
-
-pub trait AmlContainingTable {
-    fn aml(&self) -> &[u8];
-    fn header(&self) -> &SdtHeader;
-}
-
-impl<T> AmlContainingTable for &T
-where
-    T: AmlContainingTable,
-{
-    fn aml(&self) -> &[u8] {
-        T::aml(*self)
-    }
-    fn header(&self) -> &SdtHeader {
-        T::header(*self)
-    }
-}
-
-impl AmlContainingTable for Dsdt {
-    fn aml(&self) -> &[u8] {
-        self.0.data()
-    }
-    fn header(&self) -> &SdtHeader {
-        &*self.0
-    }
-}
-impl AmlContainingTable for Ssdt {
-    fn aml(&self) -> &[u8] {
-        self.0.data()
-    }
-    fn header(&self) -> &SdtHeader {
-        &*self.0
     }
 }

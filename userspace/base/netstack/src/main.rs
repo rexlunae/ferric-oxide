@@ -11,7 +11,6 @@ use smoltcp::wire::EthernetAddress;
 
 use crate::scheme::Smolnetd;
 
-mod buffer_pool;
 mod error;
 mod link;
 mod logger;
@@ -169,7 +168,7 @@ fn run(daemon: daemon::Daemon) -> Result<()> {
         .into_iter()
         .chain(event_queue.map(|r| r.map(|e| e.user_data)))
     {
-        match event_res.map_err(|e| anyhow!("event result is error: {:?}", e))? {
+        let handled = match event_res.map_err(|e| anyhow!("event result is error: {:?}", e))? {
             EventSource::Network => smolnetd.on_network_scheme_event(),
             EventSource::Time => smolnetd.on_time_event(),
             EventSource::IpScheme => smolnetd.on_ip_scheme_event(),
@@ -177,8 +176,10 @@ fn run(daemon: daemon::Daemon) -> Result<()> {
             EventSource::TcpScheme => smolnetd.on_tcp_scheme_event(),
             EventSource::IcmpScheme => smolnetd.on_icmp_scheme_event(),
             EventSource::NetcfgScheme => smolnetd.on_netcfg_scheme_event(),
+        };
+        if let Err(e) = handled {
+            error!("Received packet error: {:?}", e);
         }
-        .map_err(|e| error!("Received packet error: {:?}", e));
     }
     Ok(())
 }

@@ -544,7 +544,6 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> anyhow:
         config,
         control_queue.clone(),
         cursor_queue.clone(),
-        device.transport.clone(),
         has_edid,
     )?;
     daemon.ready();

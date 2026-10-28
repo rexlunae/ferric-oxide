@@ -136,18 +136,53 @@ fn missing_list(missing: &[fox_store::deps::MissingDependency]) -> String {
         .join(", ")
 }
 
+/// The packages the configuration installs: every listed package except
+/// those marked `"ignore"`.
+pub(crate) fn package_names(config: &Config) -> anyhow::Result<Vec<fox_core::PackageName>> {
+    Ok(config
+        .packages
+        .iter()
+        .filter(|(_, package)| !matches!(package, PackageConfig::Build(rule) if rule == "ignore"))
+        .map(|(name, _)| fox_core::PackageName::new(name.as_str()))
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Plans installing `names` and their dependencies into `store` from the
+/// cookbook's repository (`<cookbook>/repo/<target>/`), accepting archives
+/// signed by `keys`.
+///
+/// # Errors
+/// [`PackageInstallError::NotInRepository`] if a package is not in the
+/// repository, [`PackageInstallError::MissingDependencies`] if a
+/// dependency is not, and the planner's errors otherwise.
+pub(crate) fn plan_cookbook_packages(
+    names: Vec<fox_core::PackageName>,
+    cookbook: &Path,
+    keys: fox_core::TrustedKeys,
+    store: &fox_store::Store,
+) -> anyhow::Result<fox_store::deps::Plan> {
+    let repository = cookbook.join("repo").join(get_target());
+    let mut source = LocalRepository::new(&repository, keys);
+    let requested = names.into_iter().map(Request::Name).collect();
+    let plan = match fox_store::deps::plan(store, requested, &mut source) {
+        Err(PlanError::NotFound(name)) => {
+            return Err(PackageInstallError::NotInRepository { name, repository }.into());
+        }
+        plan => plan?,
+    };
+    if !plan.missing.is_empty() {
+        return Err(PackageInstallError::MissingDependencies(plan.missing).into());
+    }
+    Ok(plan)
+}
+
 /// Installs the configured packages and their dependencies from the
 /// cookbook's repository (`<cookbook>/repo/<target>/`) with fox's store, so
 /// the image's packages are recorded in fox's database (`var/lib/fox/`) as
 /// they are placed. The cookbook's signing key becomes a key the image
 /// trusts.
 fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> anyhow::Result<()> {
-    let names = config
-        .packages
-        .iter()
-        .filter(|(_, package)| !matches!(package, PackageConfig::Build(rule) if rule == "ignore"))
-        .map(|(name, _)| fox_core::PackageName::new(name.as_str()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let names = package_names(config)?;
     if names.is_empty() {
         return Ok(());
     }
@@ -160,19 +195,8 @@ fn install_packages(config: &Config, dest: &Path, cookbook: Option<&str>) -> any
     )?;
     let mut keys = fox_core::TrustedKeys::new();
     keys.insert(key.label, key.key);
-    let repository = cookbook.join("repo").join(get_target());
-    let mut source = LocalRepository::new(&repository, keys);
     let store = fox_store::Store::open(dest)?;
-    let requested = names.into_iter().map(Request::Name).collect();
-    let plan = match fox_store::deps::plan(&store, requested, &mut source) {
-        Err(PlanError::NotFound(name)) => {
-            return Err(PackageInstallError::NotInRepository { name, repository }.into());
-        }
-        plan => plan?,
-    };
-    if !plan.missing.is_empty() {
-        return Err(PackageInstallError::MissingDependencies(plan.missing).into());
-    }
+    let plan = plan_cookbook_packages(names, cookbook, keys, &store)?;
     // Without features.toml packages.signed_manifests, cookbook archives
     // carry only the unsigned metadata file the cookbook wrote beside them.
     let options = fox_store::InstallOptions {
@@ -1013,6 +1037,47 @@ pub fn try_fast_install<D: redoxfs::Disk, F: FnMut(u64, u64)>(
     Ok(true)
 }
 
+/// Makes `output` ready to hold an image of `size`: creates a missing file
+/// at that size, grows a smaller file, resizes a different-sized file when
+/// the size is `exact` (a larger one otherwise only leaves more room), and
+/// checks that a device is large enough.
+///
+/// # Errors
+/// Returns I/O errors, or an error if a device is smaller than the image
+/// needs.
+fn prepare_image_output(output: &Path, size: &crate::ImageSize, exact: bool) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = u64::from(size.mib) * MIB;
+    if !output.exists() {
+        eprintln!(
+            "Creating a new file to {} with size {} MB",
+            output.display(),
+            size.mib
+        );
+        fs::File::create(output)?.set_len(bytes)?;
+    } else if fs::metadata(output)?.is_file() {
+        let file = fs::OpenOptions::new().write(true).open(output)?;
+        let len = file.metadata()?.len();
+        if len < bytes || (exact && len != bytes) {
+            eprintln!("Resizing {} to {} MB", output.display(), size.mib);
+            file.set_len(bytes)?;
+        } else {
+            eprintln!("Overwriting {}", output.display());
+        }
+    } else {
+        let disk_mib = DiskWrapper::open(output)?.size() / MIB;
+        if disk_mib < u64::from(size.required_mib) {
+            bail!(
+                "{} holds {disk_mib} MiB, but the image needs {} MiB",
+                output.display(),
+                size.required_mib
+            );
+        }
+        eprintln!("Overwriting {} ({disk_mib} MiB)", output.display());
+    }
+    Ok(())
+}
+
 fn install_inner(config: Config, output: &Path) -> Result<()> {
     println!("Installing to {}:\n{}", output.display(), config);
     let cookbook = config.general.cookbook.clone();
@@ -1020,26 +1085,28 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
     if output.is_dir() {
         install_dir(config, output, cookbook)
     } else {
-        let fs_size = config.general.filesystem_size.unwrap_or(0) as u64;
+        let size = crate::image_size(&config, cookbook)?;
+        eprintln!(
+            "Image needs {} MiB ({} MiB of packages); building it at {} MiB",
+            size.required_mib,
+            size.packages.div_ceil(1024 * 1024),
+            size.mib
+        );
+        let fs_size = u64::from(size.mib);
         // arbitrary size approximately fit just for initfs
         if fs_size < 32 {
             bail!("Refusing to create image disk less than 32 MB");
-        }
-        if !output.exists() {
-            eprintln!(
-                "Creating a new file to {} with size {} MB",
-                output.display(),
-                fs_size
-            );
-            let file = fs::File::create(output)?;
-            file.set_len(fs_size * 1024 * 1024)?;
-        } else {
-            eprintln!("Overwriting {} with size {} MB", output.display(), fs_size);
         }
         let live = config.general.live_disk.unwrap_or(false);
         let password_opt = config.general.encrypt_disk.clone();
         let password_opt = password_opt.as_ref().map(|p| p.as_bytes());
         let (bootloader_bios, bootloader_efi) = fetch_bootloaders(&config, cookbook, live)?;
+        // Only after everything that can fail without touching the output.
+        prepare_image_output(
+            output,
+            &size,
+            config.general.filesystem_size_exact.unwrap_or(false),
+        )?;
         let efi_partition_path = match config
             .general
             .write_bootloader
@@ -1100,12 +1167,12 @@ pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A cookbook checkout with a signing key and a repository holding
     /// `app` (which needs `lib`) and `lib`.
-    fn cookbook() -> (tempfile::TempDir, fox_core::fixtures::FixtureKey) {
+    pub(crate) fn cookbook() -> (tempfile::TempDir, fox_core::fixtures::FixtureKey) {
         use fox_core::fixtures::{FixtureEntry, FixtureKey, build_package};
         use fox_core::{Manifest, PackageName};
 
@@ -1125,7 +1192,7 @@ mod tests {
         (cookbook, key)
     }
 
-    fn config(packages: &[&str]) -> Config {
+    pub(crate) fn config(packages: &[&str]) -> Config {
         let mut config = Config::default();
         for name in packages {
             config
@@ -1191,6 +1258,38 @@ mod tests {
             error.downcast_ref(),
             Some(PackageInstallError::NotInRepository { .. })
         ));
+    }
+
+    #[test]
+    fn image_files_are_sized_for_the_image() {
+        const MIB: u64 = 1024 * 1024;
+        let size = crate::ImageSize {
+            packages: 0,
+            files: 0,
+            required_mib: 64,
+            mib: 128,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let len = |path: &Path| fs::metadata(path).unwrap().len();
+
+        let new = dir.path().join("new.img");
+        prepare_image_output(&new, &size, false).unwrap();
+        assert_eq!(len(&new), 128 * MIB);
+
+        let small = dir.path().join("small.img");
+        fs::File::create(&small).unwrap().set_len(MIB).unwrap();
+        prepare_image_output(&small, &size, false).unwrap();
+        assert_eq!(len(&small), 128 * MIB);
+
+        let large = dir.path().join("large.img");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(256 * MIB)
+            .unwrap();
+        prepare_image_output(&large, &size, false).unwrap();
+        assert_eq!(len(&large), 256 * MIB);
+        prepare_image_output(&large, &size, true).unwrap();
+        assert_eq!(len(&large), 128 * MIB);
     }
 
     #[test]

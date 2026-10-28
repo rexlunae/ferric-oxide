@@ -176,16 +176,12 @@ impl EndpDesc {
         (self.attributes & 0x20) >> 4
     }
     pub fn is_periodic(&self) -> bool {
-        #[repr(u8)]
-        enum InterruptUsageBits {
-            Periodic,
-            Notification,
-            Rsvd2,
-            Rsvd3,
-        }
+        // Interrupt usage type 00b (bmAttributes bits 5:4, USB32 Section 9.6.6); 01b is
+        // notification and the rest are reserved.
+        const PERIODIC_USAGE: u8 = 0;
 
         if self.is_interrupt() {
-            self.interrupt_usage_bits() == InterruptUsageBits::Periodic as u8
+            self.interrupt_usage_bits() == PERIODIC_USAGE
         } else {
             self.is_isoch()
         }
@@ -833,37 +829,6 @@ impl XhciEndpHandle {
     pub fn transfer_nodata(&mut self) -> result::Result<PortTransferStatus, XhciClientHandleError> {
         self.generic_transfer(XhciEndpCtlDirection::NoData, |_| Ok(0), 0)
     }
-    fn transfer_stream(&mut self, total_len: u32) -> TransferStream<'_> {
-        TransferStream {
-            bytes_to_transfer: total_len,
-            bytes_transferred: 0,
-            bytes_per_transfer: 32768, // TODO
-            endp_handle: self,
-        }
-    }
-    pub fn transfer_write_stream(&mut self, total_len: u32) -> TransferWriteStream<'_> {
-        TransferWriteStream {
-            inner: self.transfer_stream(total_len),
-        }
-    }
-    pub fn transfer_read_stream(&mut self, total_len: u32) -> TransferReadStream<'_> {
-        TransferReadStream {
-            inner: self.transfer_stream(total_len),
-        }
-    }
-}
-
-pub struct TransferWriteStream<'a> {
-    inner: TransferStream<'a>,
-}
-pub struct TransferReadStream<'a> {
-    inner: TransferStream<'a>,
-}
-struct TransferStream<'a> {
-    bytes_to_transfer: u32,
-    bytes_transferred: u32,
-    bytes_per_transfer: u32,
-    endp_handle: &'a mut XhciEndpHandle,
 }
 
 #[derive(Debug, Error)]

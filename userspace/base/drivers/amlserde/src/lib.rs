@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use acpi::aml::namespace::AmlName;
 use acpi::aml::object::{
-    FieldAccessType, FieldFlags, FieldUnit, FieldUnitKind, FieldUpdateRule, MethodFlags, Object,
-    ReferenceKind, WrappedObject,
+    FieldAccessType, FieldFlags, FieldUnit, FieldUnitKind, FieldUpdateRule, Object, ReferenceKind,
+    WrappedObject,
 };
 use acpi::aml::op_region::{OpRegion, RegionSpace};
 use acpi::aml::Interpreter;
@@ -374,19 +374,8 @@ impl AmlSerdeValue {
             }),
             AmlSerdeValue::Device => Object::Device,
             AmlSerdeValue::Event(event) => Object::Event(Arc::new(AtomicU64::new(event))),
-            AmlSerdeValue::Method {
-                arg_count,
-                serialize,
-                sync_level,
-            } => Object::Method {
-                code: (return None), //TODO figure out what to do here
-                //TODO check specs to see if all bit patterns are allowed
-                flags: MethodFlags(
-                    (arg_count as u8).clamp(0, 7)
-                        + (serialize as u8).shl(3)
-                        + sync_level.clamp(0, 15).shl(4),
-                ),
-            },
+            // The serialized form has no AML byte code to rebuild the method from.
+            AmlSerdeValue::Method { .. } => return None,
             //TODO: handle native method?
             AmlSerdeValue::Buffer(buffer_data) => Object::Buffer(buffer_data),
             AmlSerdeValue::BufferField {

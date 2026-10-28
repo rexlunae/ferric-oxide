@@ -133,6 +133,15 @@ Any structure with a fixed byte order is defined with [`simple_endian`](https://
 - Existing code that returns string errors (for example `tools/ferric-config`) predates this rule. Convert it to typed errors when you touch it.
 - If possible, fix all warnings before shipping code. We want our builds clean.
 
+### Remove dead code
+
+- When a change leaves code unused (a function, type, field, variant, constant, import, module, feature flag or dependency), delete it in the same change. Version control keeps the history; the tree does not need to.
+- Do not silence `dead_code`, `unused_*` or Clippy's unused lints to keep code around: no new `#[allow(dead_code)]`, no `_`-prefixed names for things nothing reads, and no `let _ = x;` to consume a value only to quiet the compiler. A `_` prefix stays fine for parameters a trait or callback signature requires, and for guards whose `Drop` does the work.
+- Code that is only used on some targets, architectures or features is not dead. Gate it with the matching `#[cfg(...)]` so each build only compiles what it uses, rather than allowing the warning. Check `x86_64` and `aarch64`, `no_std` builds and feature combinations before deleting anything that looks unused.
+- Public API of a library crate meant for other crates is not dead because this repository does not call it yet. Keep it documented and tested; remove it only when the design no longer needs it.
+- Fields kept only to hold a layout or ABI (`#[repr(C)]` hardware or wire structures) stay, but say why in a comment and prefer a `reserved`/`_padding` name over an `allow`.
+- When you find dead code already in the tree, remove it, or open an issue if removal needs a design decision. Do not lower a lint baseline by adding `allow`s.
+
 ### Unsafe code
 
 - Keep `unsafe` blocks as small as possible and put a `// SAFETY:` comment on each one explaining why the invariants hold.

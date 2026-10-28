@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 // TODO: Do not use target architecture to distinguish these.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -11,6 +11,8 @@ mod x86;
 fn main() -> Result<()> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        use anyhow::Context;
+
         common::acquire_port_io_rights().context("failed to set iopl")?;
 
         let time_s = self::x86::get_time();

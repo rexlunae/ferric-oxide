@@ -1,22 +1,20 @@
-use std::convert::TryInto;
-
 use anyhow::{anyhow, Result};
 use plain::Plain;
 use smallvec::SmallVec;
 
+/// HID class descriptor types (HID 1.11, 7.1).
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub enum HidClassType {
-    #[default]
     HID = 0x21,
-    Report,
-    Physical,
+    Report = 0x22,
 }
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HidClassDescriptor {
-    pub desc_type: HidClassType,
+    /// A [`HidClassType`], kept as the raw byte because devices may report other types.
+    pub desc_type: u8,
     pub desc_len: u16,
 }
 
@@ -24,11 +22,6 @@ unsafe impl Plain for HidClassDescriptor {}
 
 #[derive(Clone, Debug, Default)]
 pub struct HidDescriptor {
-    pub length: u8,
-    pub kind: u8,
-    pub hid_spec_release: u16,
-    pub country_code: u8,
-    pub num_descriptors: u8,
     pub descriptors: SmallVec<[HidClassDescriptor; 1]>,
 }
 
@@ -71,23 +64,14 @@ impl HidDescriptor {
             }
         }
 
-        Ok(Self {
-            length,
-            kind,
-            hid_spec_release: u16::from_ne_bytes(bytes[2..4].try_into()?),
-            country_code: bytes[4],
-            num_descriptors,
-            descriptors,
-        })
+        Ok(Self { descriptors })
     }
 
     pub fn get_report_desc(&self) -> Result<HidClassDescriptor> {
-        for desc in self.descriptors.iter() {
-            match desc.desc_type {
-                HidClassType::Report => return Ok(*desc),
-                _ => (),
-            }
-        }
-        return Err(anyhow!("No Report descriptor found"));
+        self.descriptors
+            .iter()
+            .find(|desc| desc.desc_type == HidClassType::Report as u8)
+            .copied()
+            .ok_or_else(|| anyhow!("No Report descriptor found"))
     }
 }

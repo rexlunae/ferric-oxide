@@ -198,7 +198,11 @@ and its memory ordering. RISC-V keeps the full flush, because `sfence.vma` with
 an address does not cover the page tables an unmap frees. Shadow-stack
 teardown and a queued page the caller cannot name also flush everything. A
 requester displaced while it fills the mailbox marks the mailbox until its
-stores are done, so they cannot overwrite the next requester's list.
+stores are done, so they cannot overwrite the next requester's list. A
+requester that finds a full flush already pending still rewrites it with an
+atomic compare-and-swap rather than only reading it: a plain read can return a
+full flush the target has already taken, and it would not order the requester's
+page-table writes before the target's take, so the request could be lost.
 
 The flushing CPU frees the round's frames only after every CPU it asked has
 handled that round's request. Each post to a mailbox returns a ticket, and the

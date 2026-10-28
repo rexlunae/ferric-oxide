@@ -109,15 +109,14 @@ fn drain_wakeups(
 }
 
 #[derive(Clone)]
-struct PartitionTable {
+pub(crate) struct PartitionTable {
     partitions: Vec<Rc<partitionlib::Partition>>,
-    kind: partitionlib::PartitionTableKind,
 }
 
 #[derive(Clone)]
 pub struct RingDiskWrapper<T> {
     pub disk: T,
-    pub pt: Option<PartitionTable>,
+    pub(crate) pt: Option<PartitionTable>,
 }
 
 impl<T: Disk> RingDiskWrapper<T> {
@@ -189,7 +188,6 @@ impl<T: Disk> RingDiskWrapper<T> {
 
         Some(PartitionTable {
             partitions: table.partitions.into_iter().map(Rc::new).collect(),
-            kind: table.kind,
         })
     }
 

@@ -54,7 +54,7 @@ pub fn disks(base: usize, name: &str) -> (&'static mut HbaMem, Vec<AnyDisk>) {
             info!("{}-{}: {:?}", name, i, port_type);
 
             let disk: Option<AnyDisk> = match port_type {
-                HbaPortType::SATA => match DiskATA::new(i, port) {
+                HbaPortType::SATA => match DiskATA::new(port) {
                     Ok(disk) => Some(AnyDisk::Ata(disk)),
                     Err(err) => {
                         error!("{}: {}", i, err);

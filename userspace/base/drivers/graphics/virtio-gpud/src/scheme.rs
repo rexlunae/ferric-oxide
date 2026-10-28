@@ -13,7 +13,7 @@ use driver_graphics::{
 };
 use syscall::PAGE_SIZE;
 use virtio_core::spec::{Buffer, ChainBuilder, DescriptorFlags};
-use virtio_core::transport::{Error, Queue, Transport};
+use virtio_core::transport::{Error, Queue};
 
 use crate::*;
 
@@ -90,7 +90,6 @@ pub struct VirtGpuAdapter<'a> {
     pub config: &'a mut GpuConfig,
     control_queue: Arc<Queue>,
     cursor_queue: Arc<Queue>,
-    transport: Arc<dyn Transport>,
     has_edid: bool,
     unref_tx: Sender<ResourceId>,
     unref_rx: Receiver<ResourceId>,
@@ -591,7 +590,6 @@ impl<'a> GpuScheme {
         config: &'a mut GpuConfig,
         control_queue: Arc<Queue>,
         cursor_queue: Arc<Queue>,
-        transport: Arc<dyn Transport>,
         has_edid: bool,
     ) -> Result<GraphicsScheme<VirtGpuAdapter<'a>>, Error> {
         let (unref_tx, unref_rx) = mpsc::channel();
@@ -600,7 +598,6 @@ impl<'a> GpuScheme {
             config,
             control_queue,
             cursor_queue,
-            transport,
             has_edid,
             unref_tx,
             unref_rx,

@@ -358,6 +358,12 @@ image overrides. CI's forced test features remain separate. See
 5. The installer consumes the filesystem configuration and staged packages to
    populate the image. `mk/fstools.mk` builds the local host installer and
    obtains the host RedoxFS tools through its recipe.
+   It sizes the image from the packages it installs: the configuration's
+   `filesystem_size` grown to what the packages, files and headroom need.
+   `image.filesystem_size` in `ferric.toml` or `make FILESYSTEM_SIZE=<MiB>`
+   fixes the size instead, and a fixed size that is too small stops the build
+   before the image is written. See
+   [Filesystem Size](./configuration-settings.md#filesystem-size).
 
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.

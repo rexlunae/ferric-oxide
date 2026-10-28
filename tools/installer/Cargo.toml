@@ -44,6 +44,7 @@ redoxfs = { version = "0.9.1", optional = true, default-features = false, featur
 rust-argon2 = { version = "3", optional = true }
 serde = "1"
 serde_derive = "1.0"
+tempfile = { workspace = true, optional = true }
 termion = { version = "4", optional = true }
 thiserror = { workspace = true, features = ["std"] }
 toml = "0.8"
@@ -69,6 +70,7 @@ installer = [
     "redox_syscall",
     "redoxfs",
     "rust-argon2",
+    "tempfile",
     "termion",
     "uuid",
 ]

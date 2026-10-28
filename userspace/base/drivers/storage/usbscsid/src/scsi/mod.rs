@@ -18,10 +18,8 @@ pub struct Scsi {
 }
 
 const INQUIRY_CMD_LEN: u8 = 6;
-const REPORT_SUPP_OPCODES_CMD_LEN: u8 = 12;
 const REQUEST_SENSE_CMD_LEN: u8 = 6;
 const MIN_INQUIRY_ALLOC_LEN: u16 = 5;
-const MIN_REPORT_SUPP_OPCODES_ALLOC_LEN: u32 = 4;
 
 type Result<T, E = ScsiError> = std::result::Result<T, E>;
 

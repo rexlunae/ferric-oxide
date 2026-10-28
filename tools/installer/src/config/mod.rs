@@ -1,6 +1,6 @@
 //! Installer TOML configuration loading and precedence across included files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::fs;
 use std::mem;
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::bail;
 
 use crate::PackageConfig;
 
@@ -58,33 +57,49 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load installer config from a TOML path
+    /// Load installer config from a TOML path, with its includes.
+    ///
+    /// Includes are loaded depth first, each before the file that includes
+    /// it, and every file is loaded once: a file reached again through
+    /// another include (`desktop.toml` includes `desktop-minimal.toml` and
+    /// `server.toml`, which both include `minimal.toml`) is skipped, so it
+    /// cannot undo what the files loaded after it the first time changed.
+    ///
+    /// # Errors
+    /// Returns an error if a file cannot be read or decoded.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let mut config: Config = match fs::read_to_string(&path) {
-            Ok(config_data) => match toml::from_str(&config_data) {
-                Ok(config) => config,
-                Err(err) => {
-                    bail!("failed to decode '{}': {}", path.display(), err);
-                }
-            },
-            Err(err) => {
-                bail!("failed to read '{}': {}", path.display(), err);
+        Self::load(path, &mut BTreeSet::new())
+    }
+
+    /// [`Config::from_file`], skipping the files in `loaded` and adding
+    /// each file it loads to it.
+    fn load(path: &Path, loaded: &mut BTreeSet<PathBuf>) -> Result<Self> {
+        let config_data = fs::read_to_string(path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        let mut config: Config = toml::from_str(&config_data)
+            .with_context(|| format!("failed to decode '{}'", path.display()))?;
+        loaded.insert(
+            fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve '{}'", path.display()))?,
+        );
+
+        let config_dir = path.parent().unwrap_or(Path::new(""));
+        let mut configs = Vec::new();
+        for include in mem::take(&mut config.include) {
+            let include_path = config_dir.join(&include);
+            let canonical = fs::canonicalize(&include_path)
+                .with_context(|| format!("Importing from {}", include.display()))?;
+            if loaded.contains(&canonical) {
+                continue;
             }
-        };
-
-        let config_dir = path.parent().unwrap();
-
-        let mut configs = mem::take(&mut config.include)
-            .into_iter()
-            .map(|path| {
-                Config::from_file(&config_dir.join(&path))
-                    .with_context(|| format!("Importing from {}", path.display()))
-            })
-            .collect::<Result<Vec<Config>>>()?;
+            configs.push(
+                Config::load(&include_path, loaded)
+                    .with_context(|| format!("Importing from {}", include.display()))?,
+            );
+        }
         configs.push(config); // Put ourself last to ensure that it overwrites anything else.
 
-        config = configs.remove(0);
-
+        let mut config = configs.remove(0);
         for other_config in configs {
             config.merge(other_config);
         }
@@ -163,5 +178,59 @@ impl Display for Config {
         }
         writeln!(f, "")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn a_file_included_twice_is_loaded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "base.toml",
+            "[packages]\nshell = {}\n\n[[files]]\npath = \"/switch\"\ndata = \"on\"\n",
+        );
+        write(
+            dir.path(),
+            "left.toml",
+            "include = [\"base.toml\"]\n\n[packages]\nshell = \"ignore\"\n\n[[files]]\npath = \"/switch\"\ndata = \"\"\n",
+        );
+        write(
+            dir.path(),
+            "right.toml",
+            "include = [\"base.toml\"]\n\n[[files]]\npath = \"/right\"\ndata = \"r\"\n",
+        );
+        write(
+            dir.path(),
+            "top.toml",
+            "include = [\"left.toml\", \"right.toml\"]\n",
+        );
+
+        let config = Config::from_file(&dir.path().join("top.toml")).unwrap();
+        let files: Vec<_> = config
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.data.as_str()))
+            .collect();
+        assert_eq!(files, [("/switch", "on"), ("/switch", ""), ("/right", "r")]);
+        assert!(matches!(
+            &config.packages["shell"],
+            PackageConfig::Build(rule) if rule == "ignore"
+        ));
+    }
+
+    #[test]
+    fn include_cycles_end() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.toml", "include = [\"b.toml\"]\n");
+        write(dir.path(), "b.toml", "include = [\"a.toml\"]\n");
+        Config::from_file(&dir.path().join("a.toml")).unwrap();
     }
 }

@@ -18,22 +18,9 @@ impl Bga {
         }
     }
 
-    fn read(&mut self, index: u16) -> u16 {
-        self.index.write(index);
-        self.data.read()
-    }
-
     fn write(&mut self, index: u16, data: u16) {
         self.index.write(index);
         self.data.write(data);
-    }
-
-    pub fn width(&mut self) -> u16 {
-        self.read(BGA_INDEX_XRES)
-    }
-
-    pub fn height(&mut self) -> u16 {
-        self.read(BGA_INDEX_YRES)
     }
 
     pub fn set_size(&mut self, width: u16, height: u16) {

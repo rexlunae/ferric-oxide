@@ -4,6 +4,13 @@
 # so a change to the lock alone must rebuild the image. wildcard keeps the
 # first build working before any lock exists. The installer can rewrite the
 # lock while it builds, so each image is touched after it is moved into place.
+#
+# The installer creates harddrive.img and redox-live.iso itself, at the
+# configuration's filesystem_size grown to fit the packages it installs.
+# FILESYSTEM_SIZE=<MiB> makes the size exact: the installer stops before
+# writing if the packages do not fit. filesystem.img is formatted before the
+# installer runs, so it asks the installer for the size (and that check) first.
+INSTALLER_SIZE_OPTS=$(if $(FILESYSTEM_SIZE),--size=$(FILESYSTEM_SIZE))
 FERRIC_FOX_LOCK=$(if $(FERRIC_FOX_PACKAGES),$(wildcard $(dir $(FERRIC_FOX_PACKAGES))fox.lock))
 
 $(BUILD)/harddrive.img: $(FSTOOLS) $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
@@ -14,12 +21,7 @@ else
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	-$(FUMOUNT) /tmp/redox_installer || true
 	rm -rf $@  $@.partial $(MOUNT_DIR)
-	FILESYSTEM_SIZE=$(FILESYSTEM_SIZE) && \
-	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
-	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
-	fi && \
-	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
-	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) $@.partial
+	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) $@.partial
 	mv $@.partial $@
 	touch $@
 endif
@@ -31,12 +33,7 @@ else
 	mkdir -p $(BUILD)
 	rm -rf $@  $@.partial
 	-$(FUMOUNT) /tmp/redox_installer || true
-	FILESYSTEM_SIZE=$(FILESYSTEM_SIZE) && \
-	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
-	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
-	fi && \
-	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
-	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) -c $(FILESYSTEM_CONFIG) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
+	umask 002 && $(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) -c $(FILESYSTEM_CONFIG) --write-bootloader="$(BUILD)/bootloader-live.efi" --live $@.partial
 	mv $@.partial $@
 	touch $@
 	cp redox.ipxe $(BUILD)/redox.ipxe
@@ -50,10 +47,7 @@ else
 	-$(FUMOUNT) $(MOUNT_DIR) || true
 	rm -rf $@  $@.partial $(MOUNT_DIR)
 	-$(FUMOUNT) /tmp/redox_installer || true
-	FILESYSTEM_SIZE=$(FILESYSTEM_SIZE) && \
-	if [ -z "$$FILESYSTEM_SIZE" ] ; then \
-	FILESYSTEM_SIZE=$(shell $(INSTALLER) --filesystem-size -c $(FILESYSTEM_CONFIG)); \
-	fi && \
+	FILESYSTEM_SIZE=$$($(INSTALLER) $(INSTALLER_OPTS) $(INSTALLER_SIZE_OPTS) --filesystem-size -c $(FILESYSTEM_CONFIG)) && \
 	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file "$@.partial" --mib "$$FILESYSTEM_SIZE"
 	$(REDOXFS_MKFS) $(REDOXFS_MKFS_FLAGS) $@.partial
 	mkdir -p $(MOUNT_DIR)

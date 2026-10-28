@@ -69,11 +69,6 @@ pub enum PortClReg {
 #[repr(usize)]
 pub enum PortCompReg {
     Dw0 = 0x100,
-    Dw1 = 0x104,
-    Dw3 = 0x10C,
-    Dw8 = 0x120,
-    Dw9 = 0x124,
-    Dw10 = 0x128,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,7 +94,6 @@ pub enum PortTxReg {
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
 pub enum PortLane {
-    Aux = 0x300,
     Grp = 0x600,
     Ln0 = 0x800,
     Ln1 = 0x900,

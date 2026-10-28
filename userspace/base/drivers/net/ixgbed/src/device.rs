@@ -1,6 +1,6 @@
 use std::convert::TryInto;
 use std::time::{Duration, Instant};
-use std::{cmp, mem, slice, thread};
+use std::{cmp, slice, thread};
 
 use common::dma::Dma;
 use common::io::{Io, MmioPtr};

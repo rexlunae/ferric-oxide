@@ -35,7 +35,7 @@ pub enum EndpointTy {
 }
 
 impl EndpointDescriptor {
-    fn ty(self) -> EndpointTy {
+    pub fn ty(self) -> EndpointTy {
         match self.attributes & ENDP_ATTR_TY_MASK {
             0 => EndpointTy::Ctrl,
             1 => EndpointTy::Isoch,

@@ -1,31 +1,18 @@
 use std::sync::RwLock;
-use std::thread;
-use std::time::Duration;
 
 use common::io::{Io, Mmio};
 use driver_block::Disk;
 use syscall::{Error, Result, EINVAL};
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) unsafe fn wait_cycles(mut n: usize) {
-    use core::arch::asm;
-
-    while n > 0 {
-        asm!("nop");
-        n -= 1;
-    }
-}
-
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
-pub(crate) unsafe fn wait_msec(mut n: usize) {
+pub(crate) unsafe fn wait_msec(n: usize) {
     todo!()
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) unsafe fn wait_msec(mut n: usize) {
+pub(crate) unsafe fn wait_msec(n: usize) {
     use core::arch::asm;
 
     let mut f: usize;
@@ -48,7 +35,7 @@ pub(crate) unsafe fn wait_msec(mut n: usize) {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 pub(crate) unsafe fn wait_msec(n: usize) {
-    thread::sleep(Duration::from_millis(n as u64));
+    std::thread::sleep(std::time::Duration::from_millis(n as u64));
 }
 
 //cmd Flags
@@ -85,16 +72,10 @@ const SR_APP_CMD: u32 = 0x0000_0020;
 
 //CONTROL register settings
 
-const C0_SPI_MODE_EN: u32 = 0x0010_0000;
-const C0_HCTL_HS_EN: u32 = 0x0000_0004;
 const C0_HCTL_DWITDH: u32 = 0x0000_0002;
 
-const C1_SRST_DATA: u32 = 0x0400_0000;
-const C1_SRST_CMD: u32 = 0x0200_0000;
 const C1_SRST_HC: u32 = 0x0100_0000;
-const C1_TOUNIT_DIS: u32 = 0x000f_0000;
 const C1_TOUNIT_MAX: u32 = 0x000e_0000;
-const C1_CLK_GENSEL: u32 = 0x0000_0020;
 const C1_CLK_EN: u32 = 0x0000_0004;
 const C1_CLK_STABLE: u32 = 0x0000_0002;
 const C1_CLK_INTLEN: u32 = 0x0000_0001;
@@ -110,9 +91,7 @@ const INT_ERROR_MASK: u32 = 0x017e_8000;
 
 const HOST_SPEC_VERSION_OFFSET: u32 = 16;
 const HOST_SPEC_VERSION_MASK: u32 = 0x00ff_0000;
-const HOST_SPEC_V3: u32 = 2;
 const HOST_SPEC_V2: u32 = 1;
-const HOST_SPEC_V1: u32 = 0;
 
 const ACMD41_VOLTAGE: u32 = 0x00ff_8000;
 const ACMD41_CMD_COMPLETE: u32 = 0x8000_0000;
@@ -411,39 +390,10 @@ impl SdHostCtrl {
         wait_msec(10);
 
         let c = 4166_6666 / freq;
-        let mut x: u32 = c - 1;
-        let mut s: u32 = 32;
-
-        if x == 0 {
-            s = 0;
-        } else {
-            if (x & 0xffff_0000) == 0 {
-                x <<= 16;
-                s -= 16;
-            }
-            if (x & 0xff00_0000) == 0 {
-                x <<= 8;
-                s -= 8;
-            }
-            if (x & 0xf000_0000) == 0 {
-                x <<= 4;
-                s -= 4;
-            }
-            if (x & 0xc000_0000) == 0 {
-                x <<= 2;
-                s -= 2;
-            }
-            if (x & 0x8000_0000) == 0 {
-                x <<= 1;
-                s -= 1;
-            }
-            if s > 0 {
-                s -= 1;
-            }
-            if s > 7 {
-                s = 7;
-            }
-        }
+        // One less than the bit length of `c - 1`, capped at the 3-bit shift field.
+        let mut s = (u32::BITS - (c - 1).leading_zeros())
+            .saturating_sub(1)
+            .min(7);
         let mut d;
         if self.host_spec_ver > HOST_SPEC_V2 {
             d = c;

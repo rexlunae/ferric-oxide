@@ -694,7 +694,7 @@ impl IntelHDA {
 
     */
 
-    pub fn dump_codec(&self, codec: u8) -> String {
+    pub fn dump_codec(&self) -> String {
         let mut string = String::new();
 
         for (_, widget) in self.widget_map.iter() {
@@ -1127,7 +1127,7 @@ impl SchemeSync for IntelHDA {
                 }*/
                 let handle = match path.trim_matches('/') {
                     //TODO: allow multiple codecs
-                    "codec" => Handle::StrBuf(self.dump_codec(0).into_bytes()),
+                    "codec" => Handle::StrBuf(self.dump_codec().into_bytes()),
                     _ => Handle::Todo,
                 };
                 let id = self.handles.lock().insert(handle);
