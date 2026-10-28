@@ -1391,15 +1391,18 @@ choices = [
 id = "image.filesystem_size"
 menu = "image"
 type = "int"
-title = "Filesystem size in MiB (0 = from config)"
+title = "Exact image size in MiB (0 = fit the packages)"
 default = 0
 min = 0
 max = 1048576
-help = "Overrides filesystem_size from the base configuration."
+help = """
+0 builds the image at the base configuration's filesystem_size, grown to fit
+the packages it installs plus headroom. Any other value is the exact image
+size: the build stops before writing the image if the packages do not fit."""
 
 [[option.effect]]
 when = "value > 0"
-general = { filesystem_size = "{value}" }
+general = { filesystem_size = "{value}", filesystem_size_exact = true }
 
 [[option]]
 id = "image.packages_add"

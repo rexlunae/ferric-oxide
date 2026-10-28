@@ -21,9 +21,13 @@ mod installer;
 #[cfg(feature = "installer")]
 mod ownership;
 #[cfg(feature = "installer")]
+mod size;
+#[cfg(feature = "installer")]
 pub use crate::installer::*;
 #[cfg(feature = "installer")]
 pub use ownership::ImageOwnership;
+#[cfg(feature = "installer")]
+pub use size::{ImageSize, ImageSizeError, image_size, packages_size};
 
 pub use crate::config::Config;
 pub use crate::config::file::FileConfig;
