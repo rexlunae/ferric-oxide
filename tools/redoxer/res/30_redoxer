@@ -1,1 +1,3 @@
+requires_weak 10_net.target
+requires_weak 10_redoxer_dhcp.service
 ion /usr/lib/run_redoxer.ion

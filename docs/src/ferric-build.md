@@ -402,6 +402,14 @@ recursive `build.dev-dependencies` of the image's package set, one recipe per
 line. `build.guest_env` enables the reuse and is active whenever
 `build.build_tools = "guest"`.
 
+The environment directory holds everything a later build compares: the tool list
+it was built from (`manifest.txt`), the installer configuration generated from
+that list (`build-tools.toml`) and the installed image (`guest.img`). The
+installation is staged beside it and moved in, so a finished build leaves all
+three newer than their own prerequisites and a second `make` reuses them instead
+of reinstalling. The environment is installed before the image's packages are
+cooked, because their build scripts are what run the shims.
+
 `build.keep_build_tools` leaves the tools in the finished image as the
 `build-tools` meta-package; without it they stay in the scratch environment and
 are thrown away with it. It implies `build.build_tools = "guest"`, and setting
@@ -426,10 +434,15 @@ binary and the host cannot execute it. Two things keep recipe scripts unchanged:
 1. The toolchain directory is not put on `PATH`, because everything in it is a
    Redox binary. Instead the cookbook writes a shim of the same name for each
    binary in `toolchain/bin`, and puts the shim directory there first.
-2. A shim runs the real tool through `repo guest-run --guest <image> -- <tool>
-   <args>`, which executes it in the guest build environment and mirrors its
-   exit status. `repo guest-run` never rebuilds or reinstalls the environment —
-   it only boots it — so repeated calls in one build reuse it.
+2. A shim runs the tool through `repo guest-run --guest <image> -- <tool>
+   <args>`, which boots the environment installed for this build and mirrors the
+   tool's exit status. The command is the tool's name, not the path of the
+   toolchain binary: the guest resolves it on its own `PATH`, where the
+   installation put it. `repo guest-run` never rebuilds or reinstalls the
+   environment — it only boots it — so repeated calls in one build reuse it.
+   It passes the image to `redoxer exec --image`, which boots a private copy per
+   invocation, so recipe builds running in parallel never write to the shared
+   environment.
 
 A recipe therefore keeps writing `gperf`, `mdbook build` and so on. The
 `FERRIC_GUEST_TOOLS_DIR` variable names the environment image; it is empty when

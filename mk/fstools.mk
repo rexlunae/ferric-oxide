@@ -79,11 +79,21 @@ endif
 # A tool built for a foreign architecture cannot run inside a guest on this
 # host, so cross-compiled builds keep the host tools: FERRIC_BUILD_TOOLS_EFFECTIVE
 # falls back to "host" and config-check warns about it.
+#
+# The environment directory holds everything a run compares: the tool list
+# ($(GUEST_TOOL_MANIFEST)), the installer configuration generated from it
+# ($(GUEST_TOOL_CONFIG)) and the installed image ($(GUEST_TOOL_IMAGE)). The
+# installation is built in $(GUEST_TOOL_ENV_PARTIAL) and moved in as the last
+# step, and it leaves the manifest and configuration in place, so a finished
+# build leaves every target newer than its own prerequisites and a second make
+# is a no-op.
 
 GUEST_TOOL_ENV=$(BUILD)/build-tools
 GUEST_TOOL_ENV_PARTIAL=$(BUILD)/.build-tools.partial
 GUEST_TOOL_MANIFEST=$(GUEST_TOOL_ENV)/manifest.txt
 GUEST_TOOL_CONFIG=$(GUEST_TOOL_ENV)/build-tools.toml
+GUEST_TOOL_IMAGE=$(GUEST_TOOL_ENV)/guest.img
+GUEST_TOOL_IMAGE_PARTIAL=$(BUILD)/.build-tools.partial/guest.img
 GUEST_TOOL_STAMP=$(GUEST_TOOL_ENV).stamp
 GUEST_TOOL_SIZE_MIB?=4096
 # Recipes whose build tools the environment holds. Empty means "the image's
@@ -113,21 +123,19 @@ export FERRIC_BUILD_TOOLS:=$(FERRIC_BUILD_TOOLS_EFFECTIVE)
 # tool that was built for the target. Empty when the tools come from the host,
 # which is what makes the scripts run them directly.
 ifeq ($(FERRIC_BUILD_TOOLS_EFFECTIVE),guest)
-export FERRIC_GUEST_TOOLS_DIR:=$(abspath $(GUEST_TOOL_ENV)/guest.img)
+export FERRIC_GUEST_TOOLS_DIR:=$(abspath $(GUEST_TOOL_IMAGE))
 else
 export FERRIC_GUEST_TOOLS_DIR:=
 endif
 
 # build_tools is the prerequisite the image targets use for whatever this
 # configuration resolved to: the guest environment, or the host tools.
-ifeq ($(FERRIC_BUILD_TOOLS_EFFECTIVE),guest)
-ifeq ($(FERRIC_GUEST_BUILD_ENV),1)
+ifneq ($(FERRIC_BUILD_TOOLS_EFFECTIVE),guest)
+build_tools: $(FSTOOLS)
+else ifneq ($(FERRIC_GUEST_BUILD_ENV),1)
+build_tools: $(FSTOOLS)
+else
 build_tools: $(GUEST_TOOL_STAMP)
-else
-build_tools: $(FSTOOLS)
-endif
-else
-build_tools: $(FSTOOLS)
 endif
 
 # The final image installs the tools only when build.keep_build_tools (its
@@ -137,6 +145,22 @@ BUILD_TOOLS_INSTALLER_OPT=
 ifeq ($(FERRIC_KEEP_BUILD_TOOLS),1)
 BUILD_TOOLS_INSTALLER_OPT=--build-tools-list $(abspath $(GUEST_TOOL_MANIFEST))
 build_tools: $(GUEST_TOOL_MANIFEST)
+endif
+
+# The guest environment is a cook of its own ($(REPO_BIN) cook $(GUEST_TOOL_MANIFEST)),
+# so it must be reachable without the image's cook: when the environment does
+# not exist yet the tools are built there with the host's, which is what
+# features.toml documents. $(GUEST_TOOLS_EDGE) is the prerequisite the image's
+# cook (mk/repo.mk) adds: the environment when this build cooks with it, and
+# otherwise nothing.
+#
+# It is $(GUEST_TOOL_STAMP) and not build_tools because $(REPO_TAG), whose
+# recipe is the image's cook, waits for it. build_tools also carries the
+# manifest named by --build-tools-list, and the environment's own installation
+# reads that same manifest, so a cook that waited for build_tools would make
+# the environment depend on the cook that needs it.
+ifeq ($(FERRIC_BUILD_TOOLS_EFFECTIVE),guest)
+GUEST_TOOLS_EDGE=$(GUEST_TOOL_STAMP)
 endif
 
 $(GUEST_TOOL_MANIFEST): $(FSTOOLS_TAG) $(FILESYSTEM_CONFIG)
@@ -166,6 +190,12 @@ $(GUEST_TOOL_CONFIG): $(GUEST_TOOL_MANIFEST)
 		> $@.partial
 	mv $@.partial $@
 
+# The manifest and configuration live inside $(GUEST_TOOL_ENV), because that is
+# where the tool list `repo build-tools-list` writes and where the installer's
+# `list` names the manifest: a run must find both at the same paths it recorded
+# when it built the stamp. The environment image is installed into a staging
+# directory and moved in afterwards; sweeping $(GUEST_TOOL_ENV) would take the
+# stamp's own prerequisites with it and make every build look stale.
 $(GUEST_TOOL_STAMP): $(GUEST_TOOL_CONFIG) $(GUEST_TOOL_MANIFEST) $(FSTOOLS)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@
@@ -178,7 +208,7 @@ else
 	# not a second way to build them.
 	$(REPO_BIN) cook $$(cat $(GUEST_TOOL_MANIFEST)) $(COOKBOOK_OPTS)
 	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file \
-		$(GUEST_TOOL_ENV_PARTIAL)/guest.img --mib $(GUEST_TOOL_SIZE_MIB)
+		$(GUEST_TOOL_IMAGE_PARTIAL) --mib $(GUEST_TOOL_SIZE_MIB)
 	# The environment is a scratch image, not the image being built: it takes
 	# the packages' build tools and none of the image's fox/SBOM finishing.
 	# The configuration names the cookbook absolutely: the installer sizes the
@@ -186,9 +216,12 @@ else
 	$(INSTALLER) --config-name=$(CONFIG_NAME) \
 		$(if $(filter 1,$(FSTOOLS_NO_MOUNT)),--no-mount) \
 		--config=$(GUEST_TOOL_ENV_PARTIAL)/build-tools.toml \
-		$(GUEST_TOOL_ENV_PARTIAL)/guest.img
-	rm -rf $(GUEST_TOOL_ENV)
-	mv $(GUEST_TOOL_ENV_PARTIAL) $(GUEST_TOOL_ENV)
+		$(GUEST_TOOL_IMAGE_PARTIAL)
+	# Only the image is the installation's output. The manifest and the
+	# configuration stay where the stamp expects them, so the next run finds
+	# them newer than their own prerequisites and older than the stamp.
+	mv $(GUEST_TOOL_IMAGE_PARTIAL) $(GUEST_TOOL_IMAGE)
+	rm -rf $(GUEST_TOOL_ENV_PARTIAL)
 	touch $@
 endif
 

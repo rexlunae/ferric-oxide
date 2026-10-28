@@ -351,10 +351,19 @@ recursive_chown = false
 postinstall = false
 
 [[files]]
-path = "/usr/lib/init.d/10_dhcpd.service"
+# redoxer's own unit, so it does not collide with the signed
+# /usr/lib/init.d/10_dhcpd.service the base package owns. Rewriting that file
+# made `fox verify --installed` report `base` as modified in every guest.
+#
+# The base package's 10_dhcpd.service is `oneshot_async`, so 10_net.target does
+# not wait for a lease. redoxer's guests need the address before `redoxerd`
+# starts, so this unit runs the same daemon with the blocking `oneshot` type.
+# init orders by name and then by `requires_weak`, and this name sorts after
+# 10_smolnetd.service, which the netstack has to be listening on first.
+path = "/usr/lib/init.d/10_redoxer_dhcp.service"
 data = """
 [unit]
-description = "Network configuration using DHCP"
+description = "Configure the redoxer guest's network using DHCP"
 requires_weak = [
     "10_smolnetd.service",
 ]
@@ -372,6 +381,7 @@ postinstall = false
 path = "/usr/lib/init.d/30_redoxer"
 data = """
 requires_weak 10_net.target
+requires_weak 10_redoxer_dhcp.service
 ion /usr/lib/run_redoxer.ion
 """
 symlink = false
@@ -406,6 +416,7 @@ postinstall = false
 path = "/usr/lib/init.d/30_redoxer"
 data = """
 requires_weak 10_net.target
+requires_weak 10_redoxer_dhcp.service
 echo
 echo "## running redoxer in orbital ##"
 nowait VT=3 orbital redoxerd

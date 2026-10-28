@@ -10,6 +10,12 @@
 //! reinstalls it, it only boots it. A build that runs the same tool twice pays
 //! for the boot, not for another installation.
 //!
+//! The image is passed to `redoxer exec --image`, which boots that image
+//! instead of installing one from a configuration. Redoxer copies it per run,
+//! so the tools run in exactly the environment `make` installed while every
+//! call stays independent of the others. Without that the image would be
+//! replaced by a freshly installed one that has none of the tools in it.
+//!
 //! The tool runs from the repository root, with the recipe's working directory
 //! available at the same relative place, so a tool that takes paths sees the
 //! files it was given.
@@ -109,6 +115,12 @@ impl GuestRun {
         let mut exec =
             Command::new(std::env::var_os("REDOXER").unwrap_or_else(|| "redoxer".into()));
         exec.arg("exec");
+        // The image is the one the build installed, not one redoxer would
+        // build from the base configuration: that would run the tool in an
+        // environment where it is absent. Redoxer boots a private copy, so
+        // parallel recipes sharing this environment never write to it.
+        exec.arg("--image");
+        exec.arg(&self.guest);
         if self.silent {
             // Keep the tool's own output; only the guest's boot noise is hidden.
             exec.args(["--output", "-"]);

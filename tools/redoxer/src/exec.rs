@@ -52,6 +52,10 @@ pub fn qemu_has_kvm() -> bool {
 /// missing. Upstream Redox still ships a BIOS bootloader for x86_64, so a
 /// checkout that has one keeps using it.
 pub fn qemu_use_uefi() -> bool {
+    // Once the bootloader package has been installed its contents decide.
+    if let Some(firmware) = bootloader_firmware::get() {
+        return firmware == bootloader_firmware::Firmware::Uefi;
+    }
     match target() {
         // The BIOS bootloader is present only in an upstream-style build.
         "x86_64-unknown-redox" | "i586-unknown-redox" | "i686-unknown-redox" => {
@@ -60,6 +64,48 @@ pub fn qemu_use_uefi() -> bool {
         "aarch64-unknown-redox" => true,
         "riscv64gc-unknown-redox" => true,
         _ => panic!("Unknown target architecture for QEMU"),
+    }
+}
+
+/// Which firmware a guest boots with, once the bootloader package's contents
+/// have been seen.
+///
+/// `qemu_use_uefi` is asked while building the image, before the bootloader is
+/// installed, so it cannot always answer from the package. The answer is cached
+/// here once `bootloader()` has chosen a boot image, and the architecture
+/// decides until then.
+mod bootloader_firmware {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// Which boot image the bootloader package provides.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Firmware {
+        /// The package has a UEFI image.
+        Uefi,
+        /// The package has only a BIOS image.
+        Bios,
+    }
+
+    /// Nothing discovered yet: the architecture's default decides.
+    const UNKNOWN: u8 = 0;
+    static FIRMWARE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    /// Records the firmware the bootloader package provides.
+    pub(super) fn set(firmware: Firmware) {
+        let value = match firmware {
+            Firmware::Uefi => 1,
+            Firmware::Bios => 2,
+        };
+        FIRMWARE.store(value, Ordering::Relaxed);
+    }
+
+    /// The firmware discovered in this run, if the bootloader was installed.
+    pub(super) fn get() -> Option<Firmware> {
+        match FIRMWARE.load(Ordering::Relaxed) {
+            1 => Some(Firmware::Uefi),
+            2 => Some(Firmware::Bios),
+            _ => None,
+        }
     }
 }
 
@@ -98,6 +144,16 @@ pub fn qemu_disk_device() -> &'static str {
         _ => "virtio",
     }
 }
+/// The size the base image is built at.
+///
+/// The bootloader reads the whole image into memory before the kernel runs, so
+/// it has to fit beside the kernel in the guest's RAM. `qemu_disk_size` is what
+/// a run expands its private copy to once the base is loaded.
+#[cfg(feature = "fuse")]
+pub fn qemu_base_disk_size() -> u64 {
+    DISK_SIZE_LIVE
+}
+
 pub fn qemu_disk_size() -> u64 {
     if qemu_use_live_disk() {
         DISK_SIZE_LIVE
@@ -149,7 +205,35 @@ pub fn qemu_default_args() -> Vec<&'static str> {
         "-device", "e1000,netdev=net0",
     ];
     default_args.extend(match target() {
-        "i586-unknown-redox" | "i686-unknown-redox" | "x86_64-unknown-redox" => vec![
+        "i586-unknown-redox" | "i686-unknown-redox" => vec![
+            "-machine", "q35",
+            "-serial", "mon:stdio",
+            "-device", "isa-debugcon,chardev=log",
+            "-device", "isa-debug-exit",
+        ],
+        // x86_64 boots the firmware its bootloader package provides. Ferric
+        // Oxide is UEFI-only there, so its guests need an OVMF image rather than
+        // QEMU's default BIOS; an upstream-style build keeps the BIOS bootloader,
+        // which is what the default gives.
+        "x86_64-unknown-redox" if qemu_use_uefi() => {
+            let efi_file = if Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").is_file() {
+                "if=pflash,format=raw,unit=0,file=/usr/share/OVMF/OVMF_CODE_4M.fd,readonly=on"
+            } else if Path::new("/usr/share/OVMF/OVMF_CODE.fd").is_file() {
+                "if=pflash,format=raw,unit=0,file=/usr/share/OVMF/OVMF_CODE.fd,readonly=on"
+            } else if Path::new("/usr/share/qemu/OVMF.fd").is_file() {
+                "if=pflash,format=raw,unit=0,file=/usr/share/qemu/OVMF.fd,readonly=on"
+            } else {
+                todo!("Can't figure out where is the EFI file!")
+            };
+            vec![
+                "-machine", "q35",
+                "-serial", "mon:stdio",
+                "-device", "isa-debugcon,chardev=log",
+                "-device", "isa-debug-exit",
+                "-drive", efi_file,
+            ]
+        }
+        "x86_64-unknown-redox" => vec![
             "-machine", "q35",
             "-serial", "mon:stdio",
             "-device", "isa-debugcon,chardev=log",
@@ -266,14 +350,25 @@ fn bootloader(cookbook: &Path) -> anyhow::Result<PathBuf> {
         redox_installer::install(config, &bootloader_dir)
             .map_err(|err| io::Error::other(format!("{err}")))?;
 
-        fs::rename(
-            bootloader_dir.join(if qemu_use_uefi() {
-                "usr/lib/boot/bootloader-live.efi"
-            } else {
-                "usr/lib/boot/bootloader.bios"
-            }),
-            &bootloader_bin,
-        )?;
+        // Choose by what the package actually contains, not by architecture:
+        // Ferric Oxide builds a UEFI-only x86_64 image, while an upstream-style
+        // build still ships the BIOS one.
+        use bootloader_firmware::Firmware;
+        let installed = [
+            ("usr/lib/boot/bootloader-live.efi", Firmware::Uefi),
+            ("usr/lib/boot/bootloader-live.bios", Firmware::Bios),
+        ];
+        let (found, firmware) = installed
+            .into_iter()
+            .find(|(path, _)| bootloader_dir.join(path).is_file())
+            .with_context(|| {
+                format!(
+                    "the bootloader package in {} has neither a UEFI nor a BIOS boot image",
+                    cookbook.display()
+                )
+            })?;
+        bootloader_firmware::set(firmware);
+        fs::rename(bootloader_dir.join(found), &bootloader_bin)?;
         fs::write(&stamp_file, stamp)?;
     }
     Ok(bootloader_bin)
@@ -328,7 +423,7 @@ fn base(
                 config,
                 bootloader_bin,
                 qemu_use_uefi(),
-                qemu_disk_size(),
+                qemu_base_disk_size(),
                 &base_tar,
                 &base_dir,
                 &base_partial,
@@ -337,10 +432,11 @@ fn base(
             // only shrink disk outside CI
             if !base_tar.exists() {
                 eprintln!("redoxer: shrinking {name}");
-                // TODO: The bootloader unable to boot
-                if !qemu_use_uefi() {
-                    shrink_disk(&base_partial)?;
-                }
+                // The bootloader reads the whole image into memory, so the
+                // image has to leave room in the guest's RAM. The EFI partition
+                // the boot image lives in sits at a fixed offset, so resizing
+                // the filesystem does not move it.
+                shrink_disk(&base_partial)?;
             }
         } else {
             #[cfg(not(feature = "fuse"))]

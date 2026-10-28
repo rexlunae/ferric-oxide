@@ -22,12 +22,17 @@ redoxer <bench | build | check | doc | fetch | install | run | rustc | test> [-g
 redoxer <ar | cc | cxx> [arguments]
     Run as GNU compiler passed by `redoxer env $GNU_TARGET-*`
 
-redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui] [-h|--help] [-i|--install-config] [-o|--output file] [--] <command> [arguments]...
+redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui] [-h|--help] [-i|--install-config] [-o|--output file] [--image guest.img] [--] <command> [arguments]...
     Run a command inside QEMU, using a "base" or "gui" redox image, or provide custom one with --install-config
     The redox image will be initialized if not exist or different with the specified --install-config,
     and rebuilt when the cookbook or its built packages change
     Specify a folder to copy it into /root inside redox image, or more generic one with folder:path
     If folder for /root is not specified but <command> is a file, the file will be copied
+    --image boots an image that already exists instead of installing one:
+    the image is used as the disk as it is, with no package installation, no
+    bootloader extraction and no re-archiving, and only the redoxerd
+    configuration and the --folder copies are written. See "Running in an
+    existing image" below
     Environment flags:
         REDOXER_COOKBOOK      Ferric Oxide checkout whose built repo/$TARGET the image is made from
                               (required unless the install config sets general.cookbook)
@@ -40,6 +45,12 @@ redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui]
     - x86_64 boots through UEFI when the cookbook's bootloader recipe produced no
       BIOS bootloader, which is what a Ferric Oxide build does (it is UEFI-only);
       a checkout that still builds `bootloader.bios` boots through BIOS as before
+    - A UEFI guest needs its firmware installed on the host. When none of the
+      usual OVMF/AAVMF/EDK2 paths exists, `exec` fails with an error that names
+      the packages to install (for x86_64: `ovmf` on Debian/Ubuntu,
+      `edk2-ovmf` on Fedora, `edk2-ovmf` on Arch).
+    - `--image` and `--install-config` cannot be combined: one boots an image
+      that exists, the other builds one. A missing `--image` file is an error.
 
 redoxer pkg [install|remove|update] pkg-1 pkg-2 ...
     Install additional native packages for Cargo
@@ -53,6 +64,39 @@ redoxer toolchain [--update] [--url PATH]
     Environment flags:
         REDOXER_TOOLCHAIN   Override toolchain path
 ```
+
+## Running in an existing image
+
+`redoxer exec --image <path>` boots a whole-disk Redox image that already
+exists, rather than installing one from an install configuration. It is how the
+cookbook runs a recipe's build tools when they were built for the Redox target
+(`features.toml` `build.build_tools = "guest"`): `make` installs one guest
+environment at `build/<arch>/<config>/build-tools/guest.img`, and
+`repo guest-run` passes it here.
+
+In this mode redoxer:
+
+- treats the file as the disk: it does not install packages into it, does not
+  add a bootloader and does not re-archive the result, so the kernel, the boot
+  configuration and the installed packages are exactly what was installed;
+- copies the image to a temporary file and works on the copy. The image itself
+  is never written, so a build that runs several tools at once never races on
+  one shared environment, and the next run still finds the environment it was
+  given. The copy uses `cp --sparse=always`, so a largely empty 4 GiB image
+  costs the space it occupies;
+- writes only the files a run needs into the copy: `/etc/redoxerd` and the
+  `30_redoxer` init unit, plus each `--folder` at its destination. Everything
+  the environment installed — kernel, boot configuration, packages and their
+  signed records — is left byte-for-byte as it was, so the guest's
+  `fox verify --installed` keeps passing;
+- does not support `--artifact`: reading files back out of a guest needs the
+  FUSE mount, which this mode does not use; it fails and says so rather than
+  returning an empty directory;
+- validates the path first: a missing image is reported as an error naming
+  `make build_tools`, never silently replaced by a freshly built image.
+
+There is no execution cache: the image is the input, and a rebuilt environment
+is picked up because nothing about a previous run is remembered.
 
 ## Commands
 

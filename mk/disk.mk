@@ -13,6 +13,14 @@
 INSTALLER_SIZE_OPTS=$(if $(FILESYSTEM_SIZE),--size=$(FILESYSTEM_SIZE))
 FERRIC_FOX_LOCK=$(if $(FERRIC_FOX_PACKAGES),$(wildcard $(dir $(FERRIC_FOX_PACKAGES))fox.lock))
 
+# build_tools installs whatever this configuration builds its build tools with.
+# $(GUEST_TOOLS_EDGE) is the subset an image's cook needs first, and is empty
+# unless the tools run in a guest environment: recipe build scripts run the
+# guest tool shims, so cooking the image's packages has to wait for that
+# environment. It is not $(REPO_TAG)'s sibling but its prerequisite (see
+# mk/repo.mk): make does not order siblings, so the two named here could
+# otherwise run in either order or concurrently under -j. The tools' own cooking
+# does not go through $(REPO_TAG), so the edge does not close a cycle.
 $(BUILD)/harddrive.img: build_tools $(REPO_TAG) $(FERRIC_FOX_PACKAGES) $(FERRIC_FOX_LOCK)
 ifeq ($(FSTOOLS_IN_PODMAN),1)
 	$(PODMAN_RUN) make $@

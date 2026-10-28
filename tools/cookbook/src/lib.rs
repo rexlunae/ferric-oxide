@@ -24,15 +24,23 @@ pub fn cross_target() -> Option<String> {
 /// The build sets `FERRIC_BUILD_TOOLS=guest` from `features.toml`
 /// `build.build_tools`. Only a native build can do this: a tool built for a
 /// foreign architecture cannot run in a guest on this host, so the build
-/// resolves the option to `host` there and this stays off. Reading it here
-/// rather than in each caller keeps the tool's target, its sysroot and the
-/// toolchain a recipe sees in agreement.
+/// resolves the option to `host` there and this stays off.
+///
+/// It changes three things together, because they have to agree: the tool
+/// builds for the target rather than the host ([`cook::package`]), a `host:`
+/// recipe's dependencies are mapped for a target build — unprefixed ones stay
+/// target packages and a `target:` pin keeps its package without the pin
+/// ([`recipe::CookRecipe::new`]) — and the recipe builds against the target
+/// sysroot with no host toolchain ([`cook::cook_build`]).
 pub fn build_tools_in_guest() -> bool {
     build_tools_in_guest_for(std::env::var("FERRIC_BUILD_TOOLS").ok().as_deref())
 }
 
 /// The decision in [`build_tools_in_guest`], on the value itself, so it can be
 /// tested without the process environment.
+///
+/// The dependency mapping in [`recipe`] takes the result as a parameter for the
+/// same reason: it has to reach both modes in a test.
 fn build_tools_in_guest_for(value: Option<&str>) -> bool {
     value == Some("guest")
 }
