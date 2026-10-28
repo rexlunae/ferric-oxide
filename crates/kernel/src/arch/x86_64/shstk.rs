@@ -560,7 +560,7 @@ mod stacks {
                 }
             }
             drop(mapper);
-            crate::percpu::shootdown_tlb_ipi(None);
+            crate::percpu::shootdown_tlb_ipi(None, &crate::memory::tlb::TlbInvalidation::ALL);
         }
     }
 
