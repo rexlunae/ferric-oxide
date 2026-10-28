@@ -418,17 +418,11 @@ unsafe fn run_series() -> Verdict {
                 timed_out = true;
                 break;
             }
-            // Spin with interrupts open rather than halt: a halted CPU only
-            // reaches the timeout check when some interrupt arrives, and on a
-            // CPU whose one-shot timer never fires (with no periodic tick or
-            // IPI to fall back on) the boot would stall.
-            // SAFETY: the caller allows interrupts here, and the handlers only
-            // touch their own state. Interrupts are off again before the
-            // fired flag is read.
-            unsafe {
-                arch::interrupt::enable_and_nop();
-                arch::interrupt::disable();
-            }
+            // Spin rather than halt: a halted CPU only reaches the timeout
+            // check when some interrupt arrives, and on a CPU whose one-shot
+            // timer never fires (with no periodic tick or IPI to fall back on)
+            // the boot would stall.
+            accept_pending_interrupts();
             core::hint::spin_loop();
         }
         if timed_out {
@@ -485,6 +479,21 @@ impl core::fmt::Display for SeriesLine {
     }
 }
 
+/// Opens interrupts for one instruction so a pending timer interrupt (or the
+/// PIT tick) is taken, and returns with them off again. The boot waits use it
+/// instead of leaving interrupts on: the code around them takes the log and
+/// serial spinlocks, and a PIT tick that lands while one is held can switch
+/// the CPU away from the holder for good.
+fn accept_pending_interrupts() {
+    // SAFETY: the boot waits run where interrupts may be taken; the handlers
+    // only touch their own per-CPU state, and interrupts are off again before
+    // the caller reads the fired flag.
+    unsafe {
+        arch::interrupt::enable_and_nop();
+        arch::interrupt::disable();
+    }
+}
+
 /// The boot selftest (`kernel.time.one_shot`): validates the one-shot timer
 /// and reports the measurements the tickless work compares against. Runs once
 /// on the BSP, after the APs are up and before the bootstrap context exists,
@@ -519,16 +528,7 @@ pub fn selftest(token: &mut CleanLockToken) {
     let give_up_ticks = rate.ticks_for_nanos(5_000_000_000).get();
     let mut spins = 0u64;
     while spins < 2_000_000_000 && !fired() {
-        // Open interrupts for one instruction only: the rest of the selftest
-        // takes the log and serial spinlocks, and a PIT tick that lands while
-        // one is held can switch this CPU away from the holder for good.
-        // SAFETY: the timer interrupt needs a window to arrive; its handler
-        // only touches this CPU's one-shot state, and interrupts are off again
-        // before the fired flag is read.
-        unsafe {
-            arch::interrupt::enable_and_nop();
-            arch::interrupt::disable();
-        }
+        accept_pending_interrupts();
         spins = spins.saturating_add(1);
         if rdtsc().wrapping_sub(start_ticks) >= give_up_ticks {
             break;
@@ -578,11 +578,7 @@ pub fn selftest(token: &mut CleanLockToken) {
                 .get(),
         );
         loop {
-            // SAFETY: as in round 1, interrupts are open for one instruction.
-            unsafe {
-                arch::interrupt::enable_and_nop();
-                arch::interrupt::disable();
-            }
+            accept_pending_interrupts();
             core::hint::spin_loop();
             if rdtsc() >= quiet_until {
                 break;
