@@ -251,12 +251,13 @@ const SOURCE_BUILD_PROGRAMS: [&str; 14] = [
 ];
 
 /// Checks the build machine. With `podman`, recipes run in the container,
-/// which has its own copies of [`SOURCE_BUILD_PROGRAMS`].
+/// which has its own copies of [`SOURCE_BUILD_PROGRAMS`], so Podman itself is
+/// required instead.
 fn doctor(arch: Architecture, podman: bool) -> Result<()> {
     eprintln!("Guest architecture: {}", arch.name());
     let nasm = (arch == Architecture::X86_64).then_some("nasm");
     let source_build = if podman {
-        &[][..]
+        &["podman"][..]
     } else {
         &SOURCE_BUILD_PROGRAMS[..]
     };
