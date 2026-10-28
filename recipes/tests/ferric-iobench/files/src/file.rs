@@ -1,4 +1,5 @@
-//! File jobs: a job with `--filename` runs on a file through the file system, buffered.
+//! File jobs: a job with `--filename` runs on a file through the file system, buffered, from
+//! a buffer placed as `--align` says.
 //!
 //! Each round runs the job once through each [`Path`]: `fs`, a descriptor opened with
 //! `O_FSYNC`, which RedoxFS serves itself (the page cache leaves such descriptors alone), so
@@ -24,6 +25,7 @@ use ferric_iobench::latency::Histogram;
 use ferric_iobench::offsets::Order;
 use syscall::flag::O_FSYNC;
 
+use crate::engine::HeapBuffer;
 use crate::redox::{Failure, io, nanos, run_rounds};
 use crate::round::run_together;
 
@@ -127,14 +129,16 @@ fn submit(
 ) -> Result<Box<Histogram>, Failure> {
     let bs = job.bs as usize;
     let mut latency = Box::new(Histogram::new());
-    let mut buf = vec![0xa5; bs];
+    let mut buf = HeapBuffer::new(bs, job.buffer_align());
+    // A non-zero payload, so a file system that treats zero blocks specially writes them all.
+    buf.get().fill(0xa5);
     while let Some(block) = order.block(next.fetch_add(1, Ordering::Relaxed)) {
         let at = block * bs as u64;
         let issued = Instant::now();
         let (what, got) = if job.rw.writes() {
-            ("write", io("pwrite", file.write_at(&buf, at))?)
+            ("write", io("pwrite", file.write_at(buf.get(), at))?)
         } else {
-            ("read", io("pread", file.read_at(&mut buf, at))?)
+            ("read", io("pread", file.read_at(buf.get(), at))?)
         };
         latency.record(nanos(issued.elapsed()));
         if got != bs {

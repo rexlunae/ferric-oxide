@@ -7,7 +7,8 @@
 //!
 //! - [`job`] parses a job from fio-style options (`--rw=randread --bs=4k --iodepth=32`),
 //!   refuses what the runner does not do, and prints the fio command line that runs the
-//!   same job on Linux.
+//!   same job on Linux. Ferric's `--ioengine=regbuf|ring` and `--align=page` choose the
+//!   request path, to measure the per-request mapping of the read buffer.
 //! - [`offsets`] is the order a job reads its blocks in: in sequence, or a seeded random
 //!   permutation that reads every block once, as fio does with its random map.
 //! - [`latency`] is a latency histogram with fio's bucket layout (64 linear buckets per
