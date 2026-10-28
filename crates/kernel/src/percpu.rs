@@ -19,6 +19,7 @@ use crate::{
     },
     cpu_set::{LogicalCpuId, MAX_CPU_COUNT},
     cpu_stats::{CpuStats, CpuStatsData},
+    memory::tlb::{TlbInvalidation, TlbMailbox},
     numa::{NumaNode, NumaNodeID},
     ptrace::Session,
     syscall::debug::SyscallDebugInfo,
@@ -41,9 +42,12 @@ pub struct PercpuBlock {
     /// Ferric Oxide: this CPU's indirect branch prediction barrier state (`arch/x86_64/ibpb.rs`).
     #[cfg(target_arch = "x86_64")]
     pub ibpb: crate::arch::ibpb::PerCpu,
+    /// Ferric Oxide: what the pending shootdowns ask this CPU to invalidate. Requesters post to
+    /// it before they set `wants_tlb_shootdown`; see [`crate::memory::tlb`].
+    pub tlb_mailbox: TlbMailbox,
 
-    // TODO: Put mailbox queues here, e.g. for TLB shootdown? Just be sure to 128-byte align it
-    // first to avoid cache invalidation.
+    // TODO: 128-byte align `tlb_mailbox`, which other CPUs write, to avoid false sharing with
+    // the fields this CPU uses.
     pub profiling: Option<&'static crate::profiling::RingBuffer>,
 
     pub ptrace_flags: Cell<PtraceFlags>,
@@ -153,7 +157,9 @@ pub fn get_all_stats() -> Vec<(LogicalCpuId, CpuStatsData)> {
 
 // PercpuBlock::current() is implemented somewhere in the arch-specific modules
 
-pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
+/// Asks `target`, or every other CPU for `None`, to invalidate `inv` ([`TlbInvalidation::ALL`]
+/// for the whole TLB).
+pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>, inv: &TlbInvalidation) {
     if cfg!(not(feature = "multi_core")) {
         return;
     }
@@ -166,6 +172,8 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
             crate::warn!("Trying to TLB shootdown a CPU that doesn't exist or isn't initialized.");
             return;
         };
+        // Post before the flag below publishes it with `Release`.
+        percpublock.tlb_mailbox.post(inv);
         #[expect(clippy::bool_comparison)]
         while percpublock
             .wants_tlb_shootdown
@@ -188,21 +196,34 @@ pub fn shootdown_tlb_ipi(target: Option<LogicalCpuId>) {
             // destination shorthand "all CPUs".
             let id = LogicalCpuId::new(id);
             if id != current {
-                shootdown_tlb_ipi(Some(id));
+                shootdown_tlb_ipi(Some(id), inv);
             }
         }
     }
 }
+/// Ferric Oxide: invalidates page number `page` in this CPU's TLB (with KPTI and PCID, for both
+/// PCIDs). The page number comes from an address, so the product does not wrap.
+pub fn invalidate_tlb_page(page: usize) {
+    crate::memory::RmmA::invalidate(rmm::VirtualAddress::new(
+        page.wrapping_mul(crate::memory::PAGE_SIZE),
+    ));
+    crate::tlb_stats::tlb_count!(FlushPage);
+}
+
 impl PercpuBlock {
     pub fn maybe_handle_tlb_shootdown(&self) {
         #[expect(clippy::bool_comparison)]
-        if self.wants_tlb_shootdown.swap(false, Ordering::Relaxed) == false {
+        // `Acquire` pairs with the requester's `Release` swap, so the mailbox shows its post.
+        if self.wants_tlb_shootdown.swap(false, Ordering::Acquire) == false {
             return;
         }
 
-        // TODO: Finer-grained flush
-        crate::memory::RmmA::invalidate_all();
-        crate::tlb_stats::shootdown_handled();
+        let full = Cell::new(false);
+        self.tlb_mailbox.receive(invalidate_tlb_page, || {
+            full.set(true);
+            crate::memory::RmmA::invalidate_all();
+        });
+        crate::tlb_stats::shootdown_handled(full.get());
 
         if let Some(addrsp) = &*self.current_addrsp.borrow() {
             addrsp.tlb_ack.fetch_add(1, Ordering::Release);
@@ -305,6 +326,7 @@ impl PercpuBlock {
             wants_tlb_shootdown: AtomicBool::new(false),
             #[cfg(target_arch = "x86_64")]
             ibpb: crate::arch::ibpb::PerCpu::new(),
+            tlb_mailbox: TlbMailbox::new(),
             ptrace_flags: Cell::new(PtraceFlags::empty()),
             ptrace_session: RefCell::new(None),
             inside_syscall: Cell::new(false),
