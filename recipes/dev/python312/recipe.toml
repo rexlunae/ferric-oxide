@@ -52,9 +52,11 @@ fi
 
 cookbook_configure
 
-# A same file to save 60MB
-(cd "${COOKBOOK_STAGE}/usr/lib/python3.12/config-3.12-$ARCH-$OS" && \
-    rm -f libpython3.12.a && ln -s ../../libpython3.12.a)
+# A same file to save 60MB. CPython names this directory after its platform
+# triplet: "$ARCH-$OS" on Redox and Linux, but just "darwin" on macOS hosts.
+for config_dir in "${COOKBOOK_STAGE}"/usr/lib/python3.12/config-3.12-*/; do
+    (cd "$config_dir" && rm -f libpython3.12.a && ln -s ../../libpython3.12.a)
+done
 # monkey patching to make paths working in target system
 if [ "$TARGET" != "$COOKBOOK_HOST_TARGET" ]; then
     PYTHON_INIT
