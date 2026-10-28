@@ -11,11 +11,12 @@
 //! | `--numjobs` | 1 to [`MAX_SUBMITTERS`] | 1 |
 //! | `--io_size` (`--size`) | a size, a whole number of blocks | `4m` |
 //! | `--randseed` | a number | [`DEFAULT_SEED`] |
-//! | `--ioengine` | `psync` | `psync` |
+//! | `--ioengine` | `psync`, or Ferric's `regbuf` and `ring` on the disk ([`Engine`]) | `psync` |
 //! | `--direct` | `1` on the disk, `0` on a file | `1` on the disk, `0` on a file |
 //! | `--filename` | a file to run the job on instead of the disk ([`Spec`]) | the disk |
 //! | `--end_fsync` | `0`, `1` (`1` on a file only: `fsync` once the job's I/O is done) | `0` |
 //! | `--name` | anything (ignored; the runner names jobs itself) | |
+//! | `--align` | `heap`, `page` ([`Align`]; Ferric's, not fio's) | `heap` |
 //!
 //! Sizes take fio's suffixes with its default `kb_base=1024`: `4k` is 4096 bytes, `1m` is
 //! 1 MiB, and `k`, `m`, `g`, `t` may be followed by `b` or `ib`.
@@ -26,13 +27,39 @@
 //! the disk sees is the same as `--ioengine=io_uring --iodepth=N` ([`FioEngine`]). On the
 //! disk, writes are refused (the runner reads the disk the system runs from), and so is
 //! buffered I/O (`--direct=0`), since the runner does positioned reads straight from the disk
-//! scheme, which has no cache. Other engines are refused everywhere.
+//! scheme, which has no cache. Other fio engines are refused everywhere.
 //!
 //! A job with `--filename` is a file job ([`Job::file`]): it reads or writes a file through
 //! the file system, buffered (`--direct=0`, the only mode there: Redox has no `O_DIRECT`), so
 //! it measures the page cache and the file system rather than the disk. Writes are allowed
 //! there, and `--end_fsync=1` adds one `fsync` at the end of the job, inside the timed part,
 //! as fio does.
+//!
+//! # Request paths
+//!
+//! On the disk, `--ioengine` and `--align` choose how each read reaches it, so the cost of the
+//! kernel mapping the client's buffer into the driver for every request can be measured
+//! against paths that map nothing per request. Every path keeps the same submitters, blocks
+//! and order; only the buffer and the call differ:
+//!
+//! - `--ioengine=psync --align=heap` (the default): `pread` into a heap buffer. The kernel
+//!   copies the buffer's partial head and tail pages into bounce pages and maps them, plus any
+//!   whole pages between, into nvmed for each read, then unmaps them.
+//! - `--align=page`: the same `pread` into a page-aligned buffer, so a read of whole pages
+//!   is mapped by borrowing its pages, with no head or tail copy. The mapping and its TLB
+//!   shootdowns still happen on every read.
+//! - `--ioengine=regbuf`: a registered buffer (`kernel.regbuf`) attached once to the disk
+//!   descriptor as a grant (`drivers.grant_dma`, `ferric_blkgrant::abi`), so nvmed's controller
+//!   reads into it by DMA and each read is a call with no payload: nothing is mapped per
+//!   request. Its buffers are always page-aligned; `--align` does not change it.
+//! - `--ioengine=ring`: each read is a `Read` entry on a `kernel.ring` submission ring of the
+//!   submitter's own, entered on its own. The kernel runs it as the `pread` it stands for, so
+//!   it still maps the buffer per request; it measures the ring's entry and completion against
+//!   a system call. `--align` applies.
+//!
+//! File jobs take `--align` too, but only the `psync` engine. The Linux fio command
+//! ([`Job::fio_command`]) is the same for every path: with `--direct=1` fio's buffers are
+//! page-aligned already, and Linux maps nothing per request.
 
 use core::fmt;
 
@@ -81,6 +108,54 @@ impl Rw {
     }
 }
 
+/// How each read reaches the disk (`--ioengine`); see the module docs' "Request paths".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Engine {
+    /// `pread` on the disk descriptor (`psync`).
+    #[default]
+    Psync,
+    /// A read into a registered buffer through a grant slot of the disk descriptor
+    /// (`regbuf`): no per-request mapping. Needs `kernel.regbuf`, `drivers.grant_dma` and an
+    /// IOMMU.
+    Regbuf,
+    /// A `Read` entry on a `kernel.ring` ring per submitter (`ring`). Needs `kernel.rings`.
+    Ring,
+}
+
+impl Engine {
+    /// Its `--ioengine` value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Psync => "psync",
+            Self::Regbuf => "regbuf",
+            Self::Ring => "ring",
+        }
+    }
+}
+
+/// Where a submitter's buffer starts (`--align`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Align {
+    /// Wherever the heap allocator puts a buffer of `bs` bytes (`heap`): usually not on a page
+    /// boundary, so a read's first and last pages are partial.
+    #[default]
+    Heap,
+    /// On a page boundary (`page`), so a read of whole pages covers whole pages.
+    Page,
+}
+
+impl Align {
+    /// Its `--align` value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heap => "heap",
+            Self::Page => "page",
+        }
+    }
+}
+
 /// A job: what to read, in which order, and how many reads to keep in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Job {
@@ -100,6 +175,11 @@ pub struct Job {
     pub file: bool,
     /// Whether the job ends with one `fsync`, inside its timed part (`--end_fsync=1`).
     pub end_fsync: bool,
+    /// How each read reaches the disk.
+    pub engine: Engine,
+    /// Where each submitter's buffer starts; [`Engine::Regbuf`] buffers are always
+    /// page-aligned ([`Job::buffer_align`]).
+    pub align: Align,
 }
 
 impl Default for Job {
@@ -113,6 +193,8 @@ impl Default for Job {
             seed: DEFAULT_SEED,
             file: false,
             end_fsync: false,
+            engine: Engine::Psync,
+            align: Align::Heap,
         }
     }
 }
@@ -137,12 +219,17 @@ impl<'a> Spec<'a> {
     /// # Errors
     ///
     /// As [`Job::parse`], and [`JobError::Unsupported`] for a write, `--direct=0` or
-    /// `--end_fsync=1` without `--filename`, or `--direct=1` with it.
+    /// `--end_fsync=1` without `--filename`, or `--direct=1` or an engine other than `psync`
+    /// with it.
     pub fn parse(args: impl IntoIterator<Item = &'a str>) -> Result<Self, JobError<'a>> {
         let mut job = Job::default();
         let mut filename = None;
-        let (mut rw, mut direct, mut end_fsync): (Given<'a>, Given<'a>, Given<'a>) =
-            (None, None, None);
+        let (mut rw, mut direct, mut end_fsync, mut engine): (
+            Given<'a>,
+            Given<'a>,
+            Given<'a>,
+            Given<'a>,
+        ) = (None, None, None, None);
         for arg in args {
             let arg = arg.trim_start_matches('-');
             let (option, value) = arg.split_once('=').ok_or(JobError::NoValue(arg))?;
@@ -162,15 +249,21 @@ impl<'a> Spec<'a> {
                     job.end_fsync = flag(value).ok_or(bad)?;
                     end_fsync = Some((option, value));
                 }
+                "ioengine" => {
+                    job.set(option, value)?;
+                    engine = Some((option, value));
+                }
                 _ => job.set(option, value)?,
             }
         }
         job.file = filename.is_some();
         let unsupported = |(option, value)| JobError::Unsupported { option, value };
         // What the target does not do: a disk job only reads, directly; a file job is
-        // buffered.
+        // buffered, and the `regbuf` and `ring` request paths are the disk's.
         let refused = if job.file {
-            direct.filter(|&(_, value)| value == "1")
+            direct
+                .filter(|&(_, value)| value == "1")
+                .or(engine.filter(|_| job.engine != Engine::Psync))
         } else {
             rw.filter(|_| job.rw.writes())
                 .or(direct.filter(|&(_, value)| value == "0"))
@@ -279,7 +372,8 @@ impl Job {
             "numjobs" => self.numjobs = count(value).ok_or(bad)?,
             "io_size" | "size" => self.io_size = parse_size(value).filter(|&n| n > 0).ok_or(bad)?,
             "randseed" => self.seed = value.parse().map_err(|_| bad)?,
-            "ioengine" => check_engine(option, value)?,
+            "ioengine" => self.engine = parse_engine(option, value)?,
+            "align" => self.align = parse_align(value).ok_or(bad)?,
             "name" => {}
             _ => return Err(JobError::Unknown(option)),
         }
@@ -300,6 +394,15 @@ impl Job {
     /// time.
     pub const fn submitters(&self) -> u32 {
         self.iodepth.saturating_mul(self.numjobs)
+    }
+
+    /// Where the submitters' buffers actually start: [`Align::Page`] for [`Engine::Regbuf`],
+    /// whose buffer is registered in whole pages, and the job's `align` otherwise.
+    pub const fn buffer_align(&self) -> Align {
+        match self.engine {
+            Engine::Regbuf => Align::Page,
+            _ => self.align,
+        }
     }
 
     /// Reads in the job: `io_size / bs`.
@@ -340,7 +443,10 @@ impl Job {
     }
 
     /// A short name for the job, as in `randread-4k-qd32`: the pattern, the block size and
-    /// the I/Os in flight, after `file-` for a file job (`file-randwrite-4k-qd1`).
+    /// the I/Os in flight, after `file-` for a file job (`file-randwrite-4k-qd1`), then the
+    /// engine unless it is `psync` and `page` for page-aligned buffers unless the engine always
+    /// has them (`randread-4k-qd32-ring-page`, `randread-4k-qd1-regbuf`). The default path keeps
+    /// the plain name.
     pub const fn label(&self) -> Label {
         Label(*self)
     }
@@ -372,11 +478,22 @@ fn parse_rw<'a>(option: &'a str, value: &'a str) -> Result<Rw, JobError<'a>> {
     }
 }
 
-/// Only `psync` is what the runner does: one positioned read per thread at a time.
-fn check_engine<'a>(option: &'a str, value: &'a str) -> Result<(), JobError<'a>> {
+/// Of fio's engines only `psync` is what the runner does (one positioned read per thread at a
+/// time); `regbuf` and `ring` are Ferric's, with the same one read per thread.
+fn parse_engine<'a>(option: &'a str, value: &'a str) -> Result<Engine, JobError<'a>> {
     match value {
-        "psync" => Ok(()),
+        "psync" => Ok(Engine::Psync),
+        "regbuf" => Ok(Engine::Regbuf),
+        "ring" => Ok(Engine::Ring),
         _ => Err(JobError::Unsupported { option, value }),
+    }
+}
+
+fn parse_align(value: &str) -> Option<Align> {
+    match value {
+        "heap" => Some(Align::Heap),
+        "page" => Some(Align::Page),
+        _ => None,
     }
 }
 
@@ -442,7 +559,14 @@ impl fmt::Display for Label {
             job.rw.as_str(),
             Size(u64::from(job.bs)),
             job.submitters()
-        )
+        )?;
+        if job.engine != Engine::Psync {
+            write!(f, "-{}", job.engine.as_str())?;
+        }
+        if job.align == Align::Page && job.engine != Engine::Regbuf {
+            f.write_str("-page")?;
+        }
+        Ok(())
     }
 }
 
@@ -595,6 +719,90 @@ mod tests {
                 value: "io_uring"
             })
         );
+    }
+
+    #[test]
+    fn request_paths_parse_and_name_the_job() {
+        let job = Job::parse(["--rw=randread"]).unwrap();
+        assert_eq!((job.engine, job.align), (Engine::Psync, Align::Heap));
+        assert_eq!(job.buffer_align(), Align::Heap);
+        for (args, engine, align, label) in [
+            (
+                ["--align=page", "--ioengine=psync"],
+                Engine::Psync,
+                Align::Page,
+                "randread-4k-qd1-page",
+            ),
+            (
+                ["--align=heap", "--ioengine=regbuf"],
+                Engine::Regbuf,
+                Align::Page,
+                "randread-4k-qd1-regbuf",
+            ),
+            (
+                ["--align=page", "--ioengine=regbuf"],
+                Engine::Regbuf,
+                Align::Page,
+                "randread-4k-qd1-regbuf",
+            ),
+            (
+                ["--align=heap", "--ioengine=ring"],
+                Engine::Ring,
+                Align::Heap,
+                "randread-4k-qd1-ring",
+            ),
+            (
+                ["--align=page", "--ioengine=ring"],
+                Engine::Ring,
+                Align::Page,
+                "randread-4k-qd1-ring-page",
+            ),
+        ] {
+            let job = Job::parse(core::iter::once("--rw=randread").chain(args)).unwrap();
+            assert_eq!(job.engine, engine);
+            assert_eq!(job.buffer_align(), align);
+            assert_eq!(job.label().to_string(), label);
+        }
+        assert_eq!(
+            Job::parse(["--align=4k"]),
+            Err(JobError::Value {
+                option: "align",
+                value: "4k"
+            })
+        );
+    }
+
+    #[test]
+    fn file_jobs_take_align_but_only_psync() {
+        let spec = Spec::parse(["--filename=/tmp/f", "--align=page"]).unwrap();
+        assert_eq!(spec.job.label().to_string(), "file-read-4k-qd1-page");
+        for engine in ["regbuf", "ring"] {
+            let arg = std::format!("--ioengine={engine}");
+            assert_eq!(
+                Spec::parse(["--filename=/tmp/f", arg.as_str()]),
+                Err(JobError::Unsupported {
+                    option: "ioengine",
+                    value: engine
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_fio_command_is_the_same_for_every_path() {
+        let plain = Job::parse(["--bs=4k"]).unwrap();
+        let ring = Job::parse(["--bs=4k", "--ioengine=ring", "--align=page"]).unwrap();
+        for engine in [FioEngine::Psync, FioEngine::IoUring] {
+            assert_eq!(
+                plain
+                    .fio_command("f", engine)
+                    .to_string()
+                    .replace("read-4k-qd1", "X"),
+                ring.fio_command("f", engine)
+                    .to_string()
+                    .replace("read-4k-qd1-ring-page", "X")
+            );
+        }
     }
 
     #[test]

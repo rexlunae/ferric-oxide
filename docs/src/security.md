@@ -51,6 +51,7 @@ attach capability all require root today.
 | User-mode CET | Not implemented | |
 | IOMMU DMA isolation | Implemented, off by default | `kernel.iommu` |
 | Bounds-check hardening against Spectre v1 at kernel trust boundaries | Implemented in the paths `crates/nospec/` covers | |
+| Branch predictor barrier (IBPB) between processes against Spectre v2 user-to-user | Implemented; on automatically where the CPU reports IBPB | `kernel.cpu.ibpb`, see [barriers](./ferric-memory.md#branch-predictor-barriers-between-processes) |
 
 ## Planned: the capability model
 

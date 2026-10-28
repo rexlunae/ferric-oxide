@@ -176,9 +176,12 @@ CI checks each feature combination and a bare-metal build.
 
 Kernel algorithms that do not touch hardware have a host test package at
 `crates/kernel/tests/`, sharing the kernel's workspace and dependency lockfile.
-It includes the actual `cpu_set`, `sync/records`, TLB shootdown mailbox
-(`memory/tlb.rs`) and local APIC ID decoding
-(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations. Run from the root:
+It includes the actual `cpu_set`, `sync/records`, TLB shootdown mailbox and
+acknowledgements (`memory/tlb.rs`), broadcast global-flush generation
+(`percpu/global_flush.rs`) and local APIC ID decoding
+(`arch/x86_shared/device/apic_id.rs`) modules, rather than duplicating their implementations.
+`tests/tlb_ack.rs` wires the mailbox and the generation together as `percpu.rs`
+does and races broadcasts against targeted rounds on threads. Run from the root:
 
 ```sh
 cargo test --locked -p ferric-aligned-buffer
@@ -331,7 +334,7 @@ and builds a second kernel/image with IOMMU `enforce` and, for `ferric-smoke`,
 a third without kernel tracing. Its five boot variants
 are no IOMMU, VT-d auto/enforce, and AMD-Vi auto/enforce. It requires the
 registered-buffer and tracing result markers, the trace boot log line,
-KASLR/KPTI logs, shadow-stack detection and
+KASLR/KPTI logs, the IBPB decision (and barriers issued when it is on), shadow-stack detection and
 futex wake-race marker, and checks PCID use when the runner exposes it.
 `check-iommu-log.sh` checks driver/domain and device-test evidence for each
 IOMMU mode, and `check-blkgrant-log.sh` checks the storage-grant steps and

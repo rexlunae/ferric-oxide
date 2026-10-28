@@ -398,6 +398,24 @@ jobs:
             if grep -aF "KPTI: PCID enabled" "$LOG"; then exit 1; fi
           fi
 
+      # kernel.cpu.ibpb defaults to "auto". Whether KVM passes IBPB through depends on the
+      # runner, so accept either decision but require that it was made and report which. When
+      # barriers are on, the smoke script's sys:stat dump must show that switches issued some.
+      - name: Check IBPB decision
+        run: |
+          if line="$(grep -aF "IBPB: barriers on switches between user address spaces" "$LOG")"; then
+            echo "::notice title=IBPB::$line"
+            barriers="$(grep -aoE 'ibpb_barriers: [0-9]+' "$LOG" | tail -n 1 | awk '{print $2}')"
+            echo "::notice title=IBPB::${barriers:-no} barriers issued"
+            if [ -z "$barriers" ] || [ "$barriers" -eq 0 ]; then
+              echo "::error::IBPB is on but sys:stat reports no barriers"
+              exit 1
+            fi
+          else
+            grep -aF "IBPB: not supported by this CPU" "$LOG"
+            echo "::warning::guest CPU lacks IBPB; context switches ran without barriers"
+          fi
+
       # This image forces kpti = "always", and shadow stacks are left off whenever KPTI is on, so
       # CET is never enabled on this boot regardless of what the runner's CPU reports. Whether KVM
       # passes CET_SS through depends on the runner, so accept either decision but require the

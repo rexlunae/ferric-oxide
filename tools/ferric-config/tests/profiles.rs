@@ -145,6 +145,10 @@ fn assert_profile(profile: &str) {
         kernel["arch"]["x86_64"]["features"]["kpti"].as_str(),
         Some("always")
     );
+    assert_eq!(
+        kernel["arch"]["x86_64"]["features"]["ibpb"].as_str(),
+        Some("auto")
+    );
     let filesystem: toml::Value =
         toml::from_str(&std::fs::read_to_string(fixture.generated("filesystem.toml")).unwrap())
             .unwrap();

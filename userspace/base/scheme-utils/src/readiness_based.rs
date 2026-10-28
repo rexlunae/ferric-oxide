@@ -3,7 +3,9 @@ use std::ops::{ControlFlow, Deref};
 
 use libredox::error::Error as LError;
 use redox_scheme::scheme::{Op, SchemeResponse, SchemeState, SchemeSync};
-use redox_scheme::{CallerCtx, Id, Request, RequestKind, Response, SignalBehavior, Socket};
+use redox_scheme::{
+    CallerCtx, Id, Request, RequestKind, Response, SendFdRequest, SignalBehavior, Socket,
+};
 use syscall::Result;
 use syscall::error::{self as errno, ECANCELED, EIO, EOPNOTSUPP, Error};
 
@@ -14,6 +16,9 @@ pub struct ReadinessBased<S> {
 
     states: HashMap<Id, (CallerCtx, Op)>,
     ready_queue: VecDeque<Id>,
+    /// Ferric Oxide: fd-passing requests whose `on_sendfd` returned `EWOULDBLOCK`, polled
+    /// again with the others, so a scheme can finish one without blocking its request loop.
+    sendfds: HashMap<Id, SendFdRequest>,
 
     // FIXME only allow Socket once netstack no longer needs this to be a borrow
     socket: S,
@@ -28,6 +33,7 @@ impl<S: Deref<Target = Socket>> ReadinessBased<S> {
             states: HashMap::new(),
             socket,
             ready_queue: VecDeque::new(),
+            sendfds: HashMap::new(),
             state: SchemeState::new(),
         }
     }
@@ -53,13 +59,19 @@ impl<S: Deref<Target = Socket>> ReadinessBased<S> {
             Err(err) => return Err(err),
         }
 
-        for request in self.requests_read.drain(..) {
+        // Taken out for the loop so its arms can call `&mut self` methods; put back, empty,
+        // to keep the allocation.
+        let mut requests_read = std::mem::take(&mut self.requests_read);
+        for request in requests_read.drain(..) {
             let req = match request.kind() {
                 RequestKind::Call(c) => c,
                 RequestKind::Cancellation(req) => {
                     if let Some((_caller, op)) = self.states.remove(&req.id) {
                         self.responses_to_write
                             .push_back(Response::err(ECANCELED, op));
+                    } else if let Some(sendfd_request) = self.sendfds.remove(&req.id) {
+                        self.responses_to_write
+                            .push_back(Response::err(ECANCELED, sendfd_request));
                     }
                     continue;
                 }
@@ -69,9 +81,7 @@ impl<S: Deref<Target = Socket>> ReadinessBased<S> {
                     continue;
                 }
                 RequestKind::SendFd(sendfd_request) => {
-                    let result = scheme.on_sendfd(&sendfd_request);
-                    let response = Response::new(result, sendfd_request);
-                    self.responses_to_write.push_back(response);
+                    self.handle_sendfd(sendfd_request, scheme);
                     continue;
                 }
                 RequestKind::RecvFd(recvfd_request) => {
@@ -121,6 +131,7 @@ impl<S: Deref<Target = Socket>> ReadinessBased<S> {
             };
             self.responses_to_write.push_back(resp);
         }
+        self.requests_read = requests_read;
 
         Ok(())
     }
@@ -183,7 +194,26 @@ impl<S: Deref<Target = Socket>> ReadinessBased<S> {
         // TODO: implement waker-like API
         self.ready_queue.clear();
         self.ready_queue.extend(self.states.keys().copied());
-        self.poll_ready_requests(scheme)
+        self.poll_ready_requests(scheme)?;
+        for (_id, sendfd_request) in std::mem::take(&mut self.sendfds) {
+            self.handle_sendfd(sendfd_request, scheme);
+        }
+        Ok(())
+    }
+
+    /// Answers an fd-passing request, or parks it when `on_sendfd` returns `EWOULDBLOCK`.
+    fn handle_sendfd(&mut self, sendfd_request: SendFdRequest, scheme: &mut impl SchemeSync) {
+        match scheme.on_sendfd(&sendfd_request) {
+            Err(Error {
+                errno: errno::EWOULDBLOCK,
+            }) => {
+                self.sendfds
+                    .insert(sendfd_request.request_id(), sendfd_request);
+            }
+            result => self
+                .responses_to_write
+                .push_back(Response::new(result, sendfd_request)),
+        }
     }
     pub fn write_responses(&mut self) -> Result<()> {
         match self

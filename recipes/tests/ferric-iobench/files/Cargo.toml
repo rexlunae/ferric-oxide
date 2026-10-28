@@ -18,6 +18,11 @@ ferric-iobench = { path = "../../../../crates/iobench" }
 ferric-trace = { path = "../../../../crates/trace" }
 
 [target.'cfg(target_os = "redox")'.dependencies]
+# The registered-buffer (--ioengine=regbuf) and ring (--ioengine=ring) request paths.
+ferric-blkgrant = { path = "../../../../crates/blkgrant" }
+ferric-regbuf = { path = "../../../../crates/regbuf" }
+ferric-ring = { path = "../../../../crates/ring" }
+libc = "0.2"
 libredox = "0.1.25"
 redox_syscall = "0.9.4"
 

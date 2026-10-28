@@ -15,7 +15,12 @@
 //! - `Own` takes a netstack `udp` or `tcp` socket bound on a port. The driver keeps it open,
 //!   so netstack keeps the port reserved while the queue socket lives, and from then on the
 //!   socket may filter on that destination port and send from it. A filter on a port the
-//!   socket does not own fails with `EACCES`.
+//!   socket does not own fails with `EACCES`. The port comes from the socket's `fpath`, which
+//!   netstack answers, so it is asked on a helper thread ([`OwnLookup`]) and the `Own` request
+//!   waits, parked, until the answer is in: netstack is a client of this scheme, and an `fpath`
+//!   made from the request loop while netstack waits in a read of the adapter deadlocks both.
+//!   The helper wakes the request loop through a pipe the driver's event loop watches
+//!   ([`crate::NetworkScheme::wake_handle`]).
 //!
 //! A socket whose rings turn out corrupt, or whose grant its owner revokes (checked on every
 //! tick and call), is stopped: its calls fail with `EIO` and it takes no more frames. A revoke
@@ -27,12 +32,16 @@
 //! unprivileged sockets (every queue socket is root's, as the scheme root is root-only, so any
 //! socket may ask for raw TX), and per-core workers.
 
-use std::collections::VecDeque;
-use std::fmt;
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Arc;
+use std::{fmt, thread};
 
 use ferric_netq::call::{Bind, Mode, Request, Stats};
 use ferric_netq::copy::{offer, CopyQueue, FilterTableError, Offered, Received, Receiver, Shared};
@@ -43,11 +52,11 @@ use ferric_regbuf::abi::{GrantInfo, Request as RegbufRequest};
 use libredox::call::MmapArgs;
 use libredox::flag::{MAP_SHARED, PROT_READ, PROT_WRITE};
 use libredox::Fd;
-use redox_scheme::{CallerCtx, SendFdRequest, Socket};
+use redox_scheme::{CallerCtx, Id, SendFdRequest, Socket};
 use scheme_utils::{FpathWriter, ResourceSync};
 use syscall::{
     CallFlags, Error, EventFlags, FobtainFdFlags, Result, EACCES, EBUSY, ECANCELED, EINVAL, EIO,
-    ENOENT, ENOSPC, ENOTCONN,
+    ENOENT, ENOMEM, ENOSPC, ENOTCONN, EWOULDBLOCK, F_SETFL, O_NONBLOCK,
 };
 
 use crate::{NetworkAdapter, NetworkResource, NetworkSchemeData};
@@ -68,17 +77,58 @@ pub(crate) struct State {
     buf: Vec<u8>,
     /// Whether a socket was bound at the last steering pass.
     steering: bool,
+    /// The `Own` requests whose socket path a helper thread is asking netstack for.
+    lookups: HashMap<Id, OwnLookup>,
+    /// The pipe the helper threads write a byte to once they have an answer. The driver's
+    /// event loop watches the read end, which is non-blocking, and ticks when it is readable.
+    /// It is a pipe made before the driver enters the null namespace because a helper cannot
+    /// open anything by path after that.
+    wake_reader: PipeReader,
+    wake_writer: Arc<PipeWriter>,
 }
 
 impl State {
-    /// The state of a scheme served on `socket`.
-    pub(crate) fn new(socket: Rc<Socket>) -> Self {
-        Self {
+    /// The state of a scheme served on `socket`. Call it before the driver enters the null
+    /// namespace: it makes the wake pipe.
+    ///
+    /// # Errors
+    ///
+    /// The pipe could not be made or made non-blocking.
+    pub(crate) fn new(socket: Rc<Socket>) -> io::Result<Self> {
+        let (wake_reader, wake_writer) = io::pipe()?;
+        libredox::call::fcntl(wake_reader.as_raw_fd() as usize, F_SETFL, O_NONBLOCK)
+            .map_err(io::Error::from)?;
+        Ok(Self {
             socket,
             pending: VecDeque::new(),
             buf: vec![0; FRAME_MAX],
             steering: false,
+            lookups: HashMap::new(),
+            wake_reader,
+            wake_writer: Arc::new(wake_writer),
+        })
+    }
+
+    /// The read end of the wake pipe, for the driver's event loop.
+    pub(crate) fn wake_handle(&self) -> Option<usize> {
+        Some(self.wake_reader.as_raw_fd() as usize)
+    }
+
+    /// Runs before the parked requests are polled: empties the wake pipe and notes which
+    /// lookups have their answer, so [`State::drop_unclaimed`] can tell those whose `Own` was
+    /// cancelled.
+    pub(crate) fn note_answered(&mut self) {
+        if let Err(err) = drain(&mut self.wake_reader) {
+            log::warn!("driver-network: reading the wake pipe failed: {err}");
         }
+        note_answered(&mut self.lookups);
+    }
+
+    /// Runs after the parked requests are polled: a lookup that had its answer before the poll
+    /// and is still here belongs to an `Own` that is no longer parked, so it was cancelled.
+    /// Dropping it closes the netstack socket, so its port is not held for good.
+    pub(crate) fn drop_unclaimed(&mut self) {
+        drop_unclaimed(&mut self.lookups);
     }
 
     /// Frames steering kept for netstack.
@@ -419,23 +469,38 @@ impl<T: NetworkAdapter> ResourceSync for Queue<T> {
 impl<T: NetworkAdapter> Queue<T> {
     /// `Own`: takes the netstack socket and records the port it is bound on.
     ///
+    /// The first call takes the socket and starts an [`OwnLookup`] for its path, and returns
+    /// `EWOULDBLOCK`, which parks the request; the request loop calls again on every tick, and
+    /// the call that finds the answer finishes the `Own`.
+    ///
     /// # Errors
     ///
     /// `ENOTCONN` before `Bind`, `EIO` on a stopped socket, `EINVAL` for a descriptor that is
     /// not a netstack TCP or UDP socket bound to one address (a socket bound to `0.0.0.0` is
-    /// refused, so every owned port names the source address TX checks), and `ENOSPC` when the
-    /// socket owns as many ports as it may.
+    /// refused, so every owned port names the source address TX checks), `ENOSPC` when the
+    /// socket owns as many ports as it may, and `ENOMEM` when the helper thread cannot start.
     fn own(&mut self, data: &mut NetworkSchemeData<T>, request: &SendFdRequest) -> Result<usize> {
+        let lookup = data.bypass.lookups.remove(&request.request_id());
         let bound = self.bound.as_mut().ok_or(Error::new(ENOTCONN))?;
         if !bound.check_grants() {
             return Err(Error::new(EIO));
         }
-        let mut fds = [usize::MAX; 1];
-        request.obtain_fd(&data.bypass.socket, FobtainFdFlags::empty(), &mut fds)?;
-        let [owner] = fds.map(Fd::new);
-        let mut path = [0; SOCKET_PATH_MAX];
-        let len = owner.fpath(&mut path)?;
-        let port = core::str::from_utf8(&path[..len])
+        let mut lookup = match lookup {
+            Some(lookup) => lookup,
+            None => {
+                let mut fds = [usize::MAX; 1];
+                request.obtain_fd(&data.bypass.socket, FobtainFdFlags::empty(), &mut fds)?;
+                let [owner] = fds.map(Fd::new);
+                OwnLookup::start(owner, Arc::clone(&data.bypass.wake_writer))?
+            }
+        };
+        lookup.poll();
+        let Some(answer) = lookup.answer.take() else {
+            data.bypass.lookups.insert(request.request_id(), lookup);
+            return Err(Error::new(EWOULDBLOCK));
+        };
+        let (owner, path) = answer?;
+        let port = core::str::from_utf8(&path)
             .map_err(|_| Error::new(EINVAL))
             .and_then(|path| OwnedPort::from_fpath(path).map_err(own_errno))?;
         // One netstack socket per owned port is enough to keep it reserved: a repeated `Own`
@@ -476,6 +541,101 @@ impl<T: NetworkAdapter> Queue<T> {
     }
 }
 
+/// A netstack socket's path, asked for on a helper thread.
+///
+/// netstack serves `fpath` on its socket from the same loop that reads frames from this
+/// scheme, and those reads block until this scheme's request loop answers them. An `fpath`
+/// made from the request loop can therefore wait on a netstack that waits on it. The helper
+/// thread waits instead, then wakes the request loop through [`State`]'s wake pipe, so the
+/// parked `Own` is polled again with the answer in.
+///
+/// `S` is the socket's descriptor, generic only so the tests need no Redox descriptors.
+pub(crate) struct OwnLookup<S = Fd> {
+    receiver: mpsc::Receiver<Result<(S, Vec<u8>)>>,
+    /// The socket and its path once the helper thread has sent them.
+    answer: Option<Result<(S, Vec<u8>)>>,
+    /// Whether `answer` was in when [`State::note_answered`] last ran.
+    answered_before_poll: bool,
+}
+
+impl OwnLookup {
+    /// Starts the helper thread for `owner`'s path.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` when the thread cannot be started; `owner` is closed then.
+    fn start(owner: Fd, wake: Arc<PipeWriter>) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("netq-own".into())
+            .spawn(move || {
+                let mut path = [0; SOCKET_PATH_MAX];
+                let answer = owner
+                    .fpath(&mut path)
+                    .map(|len| (owner, path[..len].to_vec()))
+                    .map_err(Error::from);
+                // The answer goes first, so the poll the wake causes finds it.
+                if sender.send(answer).is_ok() {
+                    if let Err(err) = (&*wake).write_all(&[0]) {
+                        log::warn!("driver-network: waking the request loop failed: {err}");
+                    }
+                }
+            })
+            .map_err(|_| Error::new(ENOMEM))?;
+        Ok(Self {
+            receiver,
+            answer: None,
+            answered_before_poll: false,
+        })
+    }
+}
+
+impl<S> OwnLookup<S> {
+    /// Takes the helper thread's answer if it has sent it.
+    fn poll(&mut self) {
+        if self.answer.is_some() {
+            return;
+        }
+        match self.receiver.try_recv() {
+            Ok(answer) => self.answer = Some(answer),
+            Err(TryRecvError::Empty) => {}
+            // The thread sends before it ends, so a hang-up without an answer means it died.
+            Err(TryRecvError::Disconnected) => self.answer = Some(Err(Error::new(EIO))),
+        }
+    }
+}
+
+/// Reads `reader`, a non-blocking pipe, until it is empty or closed.
+///
+/// # Errors
+///
+/// Any read error other than `WouldBlock` (empty) and `Interrupted` (retried).
+fn drain(reader: &mut impl Read) -> io::Result<()> {
+    let mut bytes = [0; 64];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// [`State::note_answered`] for any key, so it can be tested without a scheme socket.
+fn note_answered<K, S>(lookups: &mut HashMap<K, OwnLookup<S>>) {
+    for lookup in lookups.values_mut() {
+        lookup.poll();
+        lookup.answered_before_poll = lookup.answer.is_some();
+    }
+}
+
+/// [`State::drop_unclaimed`] for any key.
+fn drop_unclaimed<K, S>(lookups: &mut HashMap<K, OwnLookup<S>>) {
+    lookups.retain(|_, lookup| !lookup.answered_before_poll);
+}
+
 /// The errno for an `Own` that failed.
 fn own_errno(err: OwnError) -> Error {
     match err {
@@ -498,5 +658,93 @@ fn kick(bound: &mut Bound, adapter: &mut impl NetworkAdapter) -> Result<usize> {
             bound.stopped = true;
             Err(Error::new(EIO))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Sender = mpsc::SyncSender<Result<((), Vec<u8>)>>;
+
+    fn lookup() -> (Sender, OwnLookup<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let lookup = OwnLookup {
+            receiver,
+            answer: None,
+            answered_before_poll: false,
+        };
+        (sender, lookup)
+    }
+
+    #[test]
+    fn poll_takes_the_answer_once_it_is_sent() {
+        let (sender, mut lookup) = lookup();
+        lookup.poll();
+        assert!(lookup.answer.is_none());
+        sender
+            .send(Err(Error::new(EINVAL)))
+            .expect("the lookup is alive");
+        lookup.poll();
+        assert!(matches!(lookup.answer, Some(Err(err)) if err == Error::new(EINVAL)));
+    }
+
+    #[test]
+    fn a_helper_that_ends_without_answering_gives_eio() {
+        let (sender, mut lookup) = lookup();
+        drop(sender);
+        lookup.poll();
+        assert!(matches!(lookup.answer, Some(Err(err)) if err == Error::new(EIO)));
+    }
+
+    /// A non-blocking pipe's read end: `bytes`, then `WouldBlock`, with an `Interrupted` first.
+    struct Pipe {
+        reads: VecDeque<io::Result<usize>>,
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads
+                .pop_front()
+                .unwrap_or_else(|| Err(io::ErrorKind::WouldBlock.into()))
+        }
+    }
+
+    #[test]
+    fn drain_reads_until_the_pipe_is_empty() {
+        let mut pipe = Pipe {
+            reads: VecDeque::from([Err(io::ErrorKind::Interrupted.into()), Ok(64), Ok(3)]),
+        };
+        drain(&mut pipe).expect("an empty pipe is not an error");
+        assert!(pipe.reads.is_empty());
+    }
+
+    #[test]
+    fn drain_reports_other_errors() {
+        let mut pipe = Pipe {
+            reads: VecDeque::from([Ok(1), Err(io::ErrorKind::BrokenPipe.into())]),
+        };
+        let err = drain(&mut pipe).expect_err("a broken pipe is reported");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn answers_left_unclaimed_by_a_poll_are_dropped() {
+        let (answered_sender, answered) = lookup();
+        let (_waiting_sender, waiting) = lookup();
+        let (late_sender, late) = lookup();
+        let mut lookups = HashMap::from([(1, answered), (2, waiting), (3, late)]);
+        answered_sender
+            .send(Err(Error::new(EINVAL)))
+            .expect("the lookup is alive");
+        note_answered(&mut lookups);
+        // An answer that arrives during the poll is kept for the next one.
+        late_sender
+            .send(Err(Error::new(EINVAL)))
+            .expect("the lookup is alive");
+        drop_unclaimed(&mut lookups);
+        let mut left: Vec<_> = lookups.keys().copied().collect();
+        left.sort_unstable();
+        assert_eq!(left, [2, 3]);
     }
 }
