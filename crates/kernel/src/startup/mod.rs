@@ -197,6 +197,13 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
 
     profiling::ready_for_profiling();
 
+    // The one-shot scheduler timer selftest (kernel.time.one_shot): validates
+    // the BSP's one-shot timer and reports the measured firing accuracy. It
+    // runs before the bootstrap context exists, so a PIT tick during its waits
+    // has nothing to switch this CPU to.
+    #[cfg(all(target_arch = "x86_64", feature = "time_one_shot"))]
+    crate::arch::timer::selftest(&mut token);
+
     let owner = None; // kmain not owned by any fd
     match context::spawn(true, owner, userspace_init, &mut token) {
         Ok(context_lock) => {
@@ -221,12 +228,6 @@ pub(crate) fn kmain(bootstrap: Bootstrap, kmain_kstack: Kstack) -> ! {
 
     #[cfg(all(target_arch = "x86_64", feature = "numa"))]
     numa::dump_info();
-
-    // The one-shot scheduler timer selftest (kernel.time.one_shot): validates
-    // the BSP's one-shot timer and reports the measured firing accuracy before
-    // the first userspace run.
-    #[cfg(all(target_arch = "x86_64", feature = "time_one_shot"))]
-    crate::arch::timer::selftest(&mut token);
 
     run_userspace(&mut token)
 }
