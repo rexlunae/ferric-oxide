@@ -1852,7 +1852,16 @@ netstack.
   `tcp` socket bound on a port (another `CallFlags::FD` call). The driver
   reads the port from the socket's path, `/scheme/udp/<remote>/<local>`, and
   keeps the socket open, so netstack keeps the port reserved; an `Own` of a
-  port the socket already owns keeps no second descriptor. The netstack
+  port the socket already owns keeps no second descriptor. netstack is itself
+  a client of the driver's scheme, and its frame reads wait on the driver's
+  request loop, so the driver asks for the path on a helper thread and parks
+  the `Own` request until the answer is in (scheme-utils' `ReadinessBased`
+  re-polls an fd-passing request whose handler returns `EWOULDBLOCK`). The
+  helper wakes the request loop through a pipe made before the driver enters
+  the null namespace, which each network driver's event loop watches next to
+  the scheme socket (`NetworkScheme::wake_handle`). Asking
+  from the request loop deadlocked the two whenever netstack was in a read
+  (#323). The netstack
   socket must be bound to one address: one bound to `0.0.0.0` (or `::`) is
   refused with `EINVAL` (`OwnError::UnspecifiedAddress`), since owning a port
   on every address would let the socket send from any source address. So an
