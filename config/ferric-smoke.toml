@@ -155,6 +155,9 @@ ferric-syscall-fuzz --seed 1 --seconds 15 || echo FERRIC_TEST_FAIL fuzz exited w
 # Every package the installer put in the image, re-checked against its signed head.
 fox list
 fox verify --installed && echo FERRIC_TEST_PASS fox-verify || echo FERRIC_TEST_FAIL fox verify --installed failed
+# Kernel counters after the tests have switched between many processes; CI checks
+# ibpb_barriers when the kernel turned IBPB on.
+cat /scheme/sys/stat
 echo FERRIC_SMOKE_OK
 shutdown
 """

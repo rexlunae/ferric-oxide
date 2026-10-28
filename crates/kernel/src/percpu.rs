@@ -39,6 +39,9 @@ pub struct PercpuBlock {
     pub new_addrsp_tmp: Cell<Option<Arc<AddrSpaceWrapper>>>,
     pub new_addrsp_guard: Cell<Option<AddrSpaceSwitchReadGuard>>,
     pub wants_tlb_shootdown: AtomicBool,
+    /// Ferric Oxide: this CPU's indirect branch prediction barrier state (`arch/x86_64/ibpb.rs`).
+    #[cfg(target_arch = "x86_64")]
+    pub ibpb: crate::arch::ibpb::PerCpu,
     /// Ferric Oxide: what the pending shootdowns ask this CPU to invalidate. Requesters post to
     /// it before they set `wants_tlb_shootdown`; see [`crate::memory::tlb`].
     pub tlb_mailbox: TlbMailbox,
@@ -379,6 +382,8 @@ impl PercpuBlock {
             new_addrsp_tmp: Cell::new(None),
             new_addrsp_guard: Cell::new(None),
             wants_tlb_shootdown: AtomicBool::new(false),
+            #[cfg(target_arch = "x86_64")]
+            ibpb: crate::arch::ibpb::PerCpu::new(),
             tlb_mailbox: TlbMailbox::new(),
             ptrace_flags: Cell::new(PtraceFlags::empty()),
             ptrace_session: RefCell::new(None),
