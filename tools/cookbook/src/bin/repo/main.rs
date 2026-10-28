@@ -732,7 +732,13 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
         // CookRecipe::is_in_tree), and so do prebuilts an offline cook
         // cannot download or the remote does not publish, so they get their
         // build and dev dependencies like any source recipe.
-        let remote = if command.is_building() && !binary_recipes.is_empty() {
+        // Only target prebuilts can come from the remote, so a host-only or
+        // in-tree list never waits on its index.
+        let remote = if fetches_artifacts(&command)
+            && binary_recipes
+                .iter()
+                .any(|r| !r.name.is_host() && !r.is_in_tree())
+        {
             fetch_repo::binary_repo()
         } else {
             None
@@ -853,8 +859,10 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
 }
 
 /// Whether a recipe the rules make a prebuilt is built from source instead:
-/// it is in the tree, an offline cook cannot download it, or a build cannot
-/// get it because `remote` does not publish it.
+/// it is in the tree, an offline cook cannot download it, or a fetch or cook
+/// cannot get it because `remote` does not publish it. Rule and lock edits
+/// (`change-rule`, `capture-rev`) leave the recipe a prebuilt so they only
+/// touch the recipes they edited before.
 fn builds_from_source(
     offline: bool,
     command: &CliCommand,
@@ -863,7 +871,16 @@ fn builds_from_source(
 ) -> bool {
     recipe.is_in_tree()
         || offline_cook_without_binaries(offline, command, recipe)
-        || (command.is_building() && !remote_publishes(remote, recipe))
+        || (fetches_artifacts(command) && !remote_publishes(remote, recipe))
+}
+
+/// Whether `command` downloads or builds packages, as opposed to only
+/// listing or editing recipe rules and locks.
+fn fetches_artifacts(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Fetch | CliCommand::Cook | CliCommand::CookList
+    )
 }
 
 /// Whether `remote`'s index lists a prebuilt `recipe`; without a remote,
@@ -1273,6 +1290,12 @@ mod tests {
         for command in [CliCommand::Cook, CliCommand::CookList, CliCommand::Fetch] {
             assert!(builds_from_source(false, &command, None, &recipe));
         }
-        assert!(!builds_from_source(false, &CliCommand::Push, None, &recipe));
+        for command in [
+            CliCommand::Push,
+            CliCommand::ChangeRule,
+            CliCommand::CaptureRev,
+        ] {
+            assert!(!builds_from_source(false, &command, None, &recipe));
+        }
     }
 }
