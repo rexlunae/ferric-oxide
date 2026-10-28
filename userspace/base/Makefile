@@ -4,6 +4,10 @@ BUILD_TYPE ?= release
 BUILD_FLAGS ?= --release
 CARGO ?= redoxer
 CARGO_HOST ?= env -u CARGO -u RUSTFLAGS cargo
+# Ferric Oxide: strip debug info from the initfs copies of binaries, which the
+# bootloader loads into memory whole. The installed and build-directory copies
+# keep it. Unset, the initfs is built from the binaries as they are.
+STRIP ?=
 
 SRC_DIR ?= $(CURDIR)
 BUILD_DIR ?= $(shell pwd)/target/$(TARGET)/build
@@ -131,6 +135,7 @@ install-base: base $(SYSROOT)/bin/redoxfs
 		cp -v "$(TARGET_DIR)/$$bin" "$(BUILD_DIR)/initfs/lib/drivers"; \
 	done
 	cp "$(SYSROOT)/bin/redoxfs" "$(BUILD_DIR)/initfs/bin"
+	$(if $(STRIP),$(STRIP) --strip-debug "$(BUILD_DIR)/initfs/bin"/* "$(BUILD_DIR)/initfs/lib/drivers"/*)
 ifneq (,$(filter rtl8125d,$(DRIVERS_BINS)))
 # Retain the vendor firmware's license in binary distributions.
 	@mkdir -p "$(DESTDIR)/usr/share/doc/rtl8125d"

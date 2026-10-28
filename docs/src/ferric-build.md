@@ -43,6 +43,15 @@ Redox target still links `libgcc`; existing C++ packages require `libstdc++` and
 its headers. Replacing these ABI runtimes with compiler-rt/libc++ is separate
 work. Native builds do not compile GCC, LLVM or Rust itself.
 
+The same archive supplies Redox's libtool: its m4 macros, `ltmain.sh` and
+`libtoolize`, which know how to link shared libraries for Redox. They go into the
+sysroot's `share/`, and `LIBTOOLIZE` points autoreconf at that `libtoolize`, so
+recipes that regenerate their build files use one libtool version. Assembling the toolchain also
+installs X.Org's `util-macros` (`xorg-macros.m4`, SHA-256 pinned in
+`scripts/native-toolchain.sh`) into the sysroot for the X11 recipes, which
+Podman images get from `xutils-dev`. Recipes that regenerate also need host
+autoconf, automake and m4.
+
 Stock Clang has no complete Redox linker driver. The generated adapter uses
 Clang's corresponding ELF/Linux driver for linker/startup handling, removes Linux
 predefines, defines `__redox__`, and selects the Redox sysroot, LLD and
@@ -352,6 +361,10 @@ Use `build.debug` for symbolized backtraces and profiles. `build.unoptimized` ma
 systems, drivers and the C library run many times slower: under QEMU emulation,
 starting a large program from RedoxFS took seconds ([#286](https://github.com/rexlunae/ferric-oxide/issues/286)).
 Keep it for bugs that need debug assertions. With both on, the debug profile wins.
+The initfs is the exception: the bootloader loads it into memory whole and it
+has a size limit, so its copies of the daemons and drivers have their debug info
+stripped. For symbols, use the unstripped binaries in
+`recipes/core/base/target/<target>/build/<target>/release/`.
 Both mark every recipe for rebuild, and the relibc recipe's build stamp includes the
 debug-info setting, so toggling `build.debug` rebuilds relibc too.
 

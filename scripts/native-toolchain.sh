@@ -36,8 +36,11 @@ fi
 staging="$prefix/runtime.partial"
 rm -rf "$staging"
 mkdir -p "$staging"
+# Redox's libtool (its m4 macros, libtoolize and ltmain.sh) knows how to link
+# shared libraries for Redox; autotools recipes regenerate with it.
 tar -xf "$archive" -C "$staging" --strip-components=1 \
-    "./$target/include" "./$target/lib" "./lib/gcc/$target"
+    "./$target/include" "./$target/lib" "./lib/gcc/$target" \
+    ./share/aclocal ./share/libtool ./bin/libtoolize.orig
 gcc_lib=$(find "$staging/lib/gcc/$target" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 [ -n "$gcc_lib" ] || { echo 'Target runtime archive has no GCC runtime objects' >&2; exit 1; }
 version=$(basename "$gcc_lib")
@@ -47,7 +50,38 @@ rm -rf "$sysroot"
 mkdir -p "$sysroot/bin" "$sysroot/lib"
 cp -R "$staging/$target" "$sysroot/$target"
 cp -R "$staging/lib/gcc" "$sysroot/lib/gcc"
+mkdir -p "$sysroot/share"
+cp -R "$staging/share/aclocal" "$staging/share/libtool" "$sysroot/share/"
+# libtoolize was installed for /usr; point it at this sysroot's copy.
+sed "s|/usr/share|$sysroot/share|g" "$staging/bin/libtoolize.orig" > "$sysroot/bin/libtoolize"
+chmod +x "$sysroot/bin/libtoolize"
 rm -rf "$staging"
+
+# X.Org's autotools macros (xorg-macros.m4), which X11 recipes need to
+# regenerate their build files. Podman images get them from xutils-dev.
+util_macros=util-macros-1.20.2
+util_macros_sha256=UTIL_MACROS_SHA256
+util_macros_archive="$prefix/$util_macros.tar.xz"
+if [ ! -f "$util_macros_archive" ]; then
+    curl --fail --location --retry 5 --output "$util_macros_archive.partial" \
+        "https://www.x.org/releases/individual/util/$util_macros.tar.xz"
+    mv "$util_macros_archive.partial" "$util_macros_archive"
+fi
+if command -v sha256sum >/dev/null; then
+    actual=$(sha256sum "$util_macros_archive")
+else
+    actual=$(shasum -a 256 "$util_macros_archive")
+fi
+if [ "${actual%% *}" != "$util_macros_sha256" ]; then
+    echo "$util_macros_archive does not have SHA-256 $util_macros_sha256" >&2
+    exit 1
+fi
+util_macros_build="$prefix/$util_macros.partial"
+rm -rf "$util_macros_build"
+mkdir -p "$util_macros_build"
+tar -xf "$util_macros_archive" -C "$util_macros_build" --strip-components=1
+(cd "$util_macros_build" && ./configure --prefix="$sysroot" >/dev/null && make install >/dev/null)
+rm -rf "$util_macros_build"
 ln -s "$rust_root/lib/rustlib" "$sysroot/lib/rustlib"
 for tool in rustc rustdoc; do
     ln -s "$rust_root/bin/$tool" "$sysroot/bin/$tool"
