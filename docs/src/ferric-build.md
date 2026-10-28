@@ -16,7 +16,10 @@ cargo xtask run --headless
 ```
 
 Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK.
-On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
+On macOS, Xcode Command Line Tools supplies Clang and the SDK; `host:`
+recipes link with its ld64, so the cookbook's `DYNAMIC_INIT` gives them only
+`-L` for the dependency sysroot rather than the ELF `-rpath-link` and
+`--export-dynamic` flags it uses for Redox. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
 Recipes that need the build-time Python (`host:python312`, for example libxcb
 through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
@@ -49,6 +52,15 @@ Redox target still links `libgcc`; existing C++ packages require `libstdc++` and
 its headers. Replacing these ABI runtimes with compiler-rt/libc++ is separate
 work. Native builds do not compile GCC, LLVM or Rust itself.
 
+The same archive supplies Redox's libtool: its m4 macros, `ltmain.sh` and
+`libtoolize`, which know how to link shared libraries for Redox. They go into the
+sysroot's `share/`, and `LIBTOOLIZE` points autoreconf at that `libtoolize`, so
+recipes that regenerate their build files use one libtool version. Assembling the toolchain also
+installs X.Org's `util-macros` (`xorg-macros.m4`, SHA-256 pinned in
+`scripts/native-toolchain.sh`) into the sysroot for the X11 recipes, which
+Podman images get from `xutils-dev`. Recipes that regenerate also need host
+autoconf, automake and m4.
+
 Stock Clang has no complete Redox linker driver. The generated adapter uses
 Clang's corresponding ELF/Linux driver for linker/startup handling, removes Linux
 predefines, defines `__redox__`, and selects the Redox sysroot, LLD and
@@ -57,7 +69,10 @@ its `*-unknown-redox` target. A small linker
 script exports the constructor-array symbols relibc needs in dynamic executables.
 Static links and shared libraries keep their normal layouts. Clang must support
 `--gcc-install-dir`; no separate Homebrew LLVM installation is needed when the
-host's Clang supports it. Native artifacts live under
+host's Clang supports it. The adapter is `<arch>-unknown-redox-clang` (and
+`clang++`); the sysroot's plain `clang` and `clang++` use it only when called
+with `--target=*-unknown-redox` and otherwise run host Clang, so `host:`
+recipes build programs for the build machine. Native artifacts live under
 `prefix/llvm/<arch>-unknown-redox/`, apart from the inherited toolchain.
 
 Configured builds default to native LLVM on x86-64 and ARM64, `build.podman = false`, and
@@ -360,6 +375,10 @@ Use `build.debug` for symbolized backtraces and profiles. `build.unoptimized` ma
 systems, drivers and the C library run many times slower: under QEMU emulation,
 starting a large program from RedoxFS took seconds ([#286](https://github.com/rexlunae/ferric-oxide/issues/286)).
 Keep it for bugs that need debug assertions. With both on, the debug profile wins.
+The initfs is the exception: the bootloader loads it into memory whole and it
+has a size limit, so its copies of the daemons and drivers have their debug info
+stripped. For symbols, use the unstripped binaries in
+`recipes/core/base/target/<target>/build/<target>/release/`.
 Both mark every recipe for rebuild, and the relibc recipe's build stamp includes the
 debug-info setting, so toggling `build.debug` rebuilds relibc too.
 

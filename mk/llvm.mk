@@ -11,6 +11,9 @@ export FERRIC_LLVM_TOOLCHAIN=1
 export FERRIC_NATIVE_SYSROOT_STAMP=$(ROOT)/$(PREFIX)/ready
 export FERRIC_UEFI_ONLY=1
 export PREFIX_RUSTFLAGS=-L $(ROOT)/$(PREFIX_INSTALL)/$(TARGET)/lib
+# autoreconf must use Redox's libtoolize from the sysroot, which matches the
+# libtool macros there; Homebrew's autoreconf otherwise runs glibtoolize.
+export LIBTOOLIZE=$(PREFIX_PATH)/libtoolize
 
 .PHONY: prefix prefix_clean
 prefix: $(PREFIX)/ready

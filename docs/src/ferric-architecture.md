@@ -189,7 +189,11 @@ rate conversions, calibration, the backend's programming and the
 With the feature on, every CPU arms a series of 24 deadlines from 50 µs to
 5 ms and logs how late they fired, and the BSP arms the timer for a second,
 arms an already-due deadline and checks a disarmed timer stays quiet. The
-periodic PIT path remains the scheduler's event source until the event-driven
+BSP's checks run before the bootstrap context is spawned, with interrupts
+open for one instruction at a time while waiting: the kernel's log and serial
+writers use plain spinlocks, and a PIT tick that preempted the selftest while
+it held one would leave any context that logs on that CPU spinning forever.
+The periodic PIT path remains the scheduler's event source until the event-driven
 scheduler (#187) takes over.
 
 Address-space mappings, sharing and copy-on-write live under

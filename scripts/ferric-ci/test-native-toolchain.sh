@@ -37,12 +37,43 @@ cat > "$mock/gcc" <<'STUB'
 #!/usr/bin/env bash
 exit 91
 STUB
+# The X.Org util-macros download is replaced by a local fixture whose configure
+# and make install only copy xorg-macros.m4; the hash check is driven by
+# FAKE_SHA256 so both the pinned-hash and mismatch paths run offline.
+util_macros=$(sed -n 's/^util_macros=//p' "$root/scripts/native-toolchain.sh")
+util_macros_sha256=$(sed -n 's/^util_macros_sha256=//p' "$root/scripts/native-toolchain.sh")
+mkdir -p "$temp/util-macros/$util_macros"
+cat > "$temp/util-macros/$util_macros/configure" <<'STUB'
+#!/usr/bin/env bash
+prefix=${1#--prefix=}
+printf 'install:\n\tmkdir -p "%s/share/aclocal"\n\tcp xorg-macros.m4 "%s/share/aclocal/"\n' "$prefix" "$prefix" > Makefile
+STUB
+chmod +x "$temp/util-macros/$util_macros/configure"
+echo 'dnl xorg-macros fixture' > "$temp/util-macros/$util_macros/xorg-macros.m4"
+tar -cJf "$temp/util-macros.tar.xz" -C "$temp/util-macros" "$util_macros"
+cat > "$mock/curl" <<'STUB'
+#!/usr/bin/env bash
+while [ "$#" -gt 1 ]; do
+    [ "$1" = --output ] && output=$2
+    shift
+done
+case "$1" in https://www.x.org/releases/individual/util/util-macros-*.tar.xz) ;; *) exit 92 ;; esac
+cp "$FAKE_UTIL_MACROS" "$output"
+STUB
+cat > "$mock/sha256sum" <<'STUB'
+#!/usr/bin/env bash
+printf '%s  %s\n' "$FAKE_SHA256" "$1"
+STUB
+export FAKE_UTIL_MACROS="$temp/util-macros.tar.xz" FAKE_SHA256="$util_macros_sha256"
 chmod +x "$mock/"* "$rust_root/bin/"*
 for target in x86_64-unknown-redox aarch64-unknown-redox; do
     prefix="$temp/prefix with a 'quote/$target"
     fixture="$temp/fixture/$target"
-    mkdir -p "$prefix" "$fixture/$target/include" "$fixture/$target/lib" "$fixture/lib/gcc/$target/13.2.0" "$fixture/bin"
-    touch "$fixture/$target/include/stdio.h" "$fixture/$target/lib/libc.a" "$fixture/lib/gcc/$target/13.2.0/crtbegin.o" "$fixture/bin/gcc"
+    mkdir -p "$prefix" "$fixture/$target/include" "$fixture/$target/lib" "$fixture/lib/gcc/$target/13.2.0" "$fixture/bin" \
+        "$fixture/share/aclocal" "$fixture/share/libtool/build-aux"
+    touch "$fixture/$target/include/stdio.h" "$fixture/$target/lib/libc.a" "$fixture/lib/gcc/$target/13.2.0/crtbegin.o" "$fixture/bin/gcc" \
+        "$fixture/share/aclocal/libtool.m4" "$fixture/share/libtool/build-aux/ltmain.sh"
+    printf '#!/bin/sh\npkgauxdir=/usr/share/libtool/build-aux\naclocaldir=/usr/share/aclocal\n' > "$fixture/bin/libtoolize.orig"
     tar -cf "$prefix/target-runtime.tar.gz" -C "$fixture" .
     export FAKE_RUST_ROOT="$rust_root" FAKE_CLANG_ARGS="$temp/clang-args" FAKE_CARGO_ARGS="$temp/cargo-args"
     PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" "$target"
@@ -50,11 +81,32 @@ for target in x86_64-unknown-redox aarch64-unknown-redox; do
     test -f "$prefix/sysroot/$target/include/stdio.h"
     test -L "$prefix/sysroot/bin/rustc"
     test -L "$prefix/sysroot/lib/gcc/$target/13.2.0/crtbeginT.o"
+    test -f "$prefix/sysroot/share/aclocal/libtool.m4"
+    test -f "$prefix/sysroot/share/libtool/build-aux/ltmain.sh"
+    test -f "$prefix/sysroot/share/aclocal/xorg-macros.m4"
+    test -x "$prefix/sysroot/bin/libtoolize"
+    grep -Fx "aclocaldir=$prefix/sysroot/share/aclocal" "$prefix/sysroot/bin/libtoolize" >/dev/null
+    if grep -F /usr/share "$prefix/sysroot/bin/libtoolize" >/dev/null; then
+        echo 'libtoolize still points at /usr/share' >&2; exit 1
+    fi
+    # make prefix exports this as LIBTOOLIZE so autoreconf uses Redox's libtool.
+    printf 'print-libtoolize:\n\t@printf "%%s\\n" "$$LIBTOOLIZE"\n' > "$temp/print.mk"
+    test "$(make --no-print-directory -f "$root/mk/llvm.mk" -f "$temp/print.mk" print-libtoolize \
+        TARGET="$target" ROOT=/root-dir)" = "/root-dir/prefix/llvm/$target/sysroot//bin/libtoolize"
     driver="${target%-unknown-redox}-unknown-linux-gnu"
     case "$(cat "$prefix/sysroot/bin/$target.cfg")" in
         *--target="$driver"*--sysroot=*) ;;
         *) echo 'Missing ELF driver or target sysroot' >&2; exit 1 ;;
     esac
+    # Plain clang is the host compiler unless a Redox target is named.
+    for tool in clang clang++; do
+        "$prefix/sysroot/bin/$tool" -c host.c
+        if grep -q -- '--config=' "$FAKE_CLANG_ARGS"; then
+            echo "Plain $tool used the Redox target config" >&2; exit 1
+        fi
+        "$prefix/sysroot/bin/$tool" --target="$target" -c target.c
+        grep -q -- "--config=.*$target.cfg" "$FAKE_CLANG_ARGS"
+    done
     "$prefix/sysroot/bin/$target-clang" --target="$target" -c 'file with spaces.c'
     case "$(cat "$FAKE_CLANG_ARGS")" in
         *--target=*-unknown-redox*|*dynamic-linker*) exit 1 ;;
@@ -79,6 +131,14 @@ for target in x86_64-unknown-redox aarch64-unknown-redox; do
     "$prefix/sysroot/bin/$target-clang" -static source.c -o app
     case "$(cat "$FAKE_CLANG_ARGS")" in *dynamic-linker*) exit 1 ;; esac
 done
+# A util-macros archive that does not match the pinned hash is rejected.
+mismatch="$temp/prefix-mismatch/$target"
+mkdir -p "$mismatch"
+cp "$temp/prefix with a 'quote/$target/target-runtime.tar.gz" "$mismatch/"
+if FAKE_SHA256=0000 PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$mismatch" "$target" 2>"$temp/mismatch.err"; then
+    echo 'util-macros archive with the wrong hash was accepted' >&2; exit 1
+fi
+grep -F 'does not have SHA-256' "$temp/mismatch.err" >/dev/null
 if PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" riscv64gc-unknown-redox; then
     echo 'Unsupported target was accepted' >&2; exit 1
 fi

@@ -10,20 +10,20 @@ publish = false
 blake3 = { workspace = true, features = ["std"] }
 fox-core = { path = "../fox-core", features = ["std"] }
 # Revision parsing, object reading and writing, and fetching over the
-# file://, ssh:// and git:// transports.
+# file://, ssh:// and git:// transports. https:// and http:// go through
+# gix's HTTP transport with fox's own backend (src/http.rs), whose trait
+# gix-transport's http-client feature provides.
 gix = { workspace = true, features = ["blocking-network-client"] }
+gix-error = "0.5"
+gix-transport = { version = "0.61", default-features = false, features = ["http-client"] }
 semver.workspace = true
 ssh-key.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-
-# HTTPS fetching of repositories and blobs. reqwest's rustls backend defaults to aws-lc-rs, which does
-# not build for Redox and is not under a license on the project's list, so
-# rustls uses ring and the transport is left out on Redox, where fox fetches
-# over file://, ssh:// and git:// only.
-[target.'cfg(not(target_os = "redox"))'.dependencies]
-gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
+# HTTP and HTTPS on every target, Redox included. rustls uses ring:
+# aws-lc-rs does not build for Redox and is not under a license on the
+# project's list. Roots come from the system store.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
 
 [dev-dependencies]
 tempfile.workspace = true

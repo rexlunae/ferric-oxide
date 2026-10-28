@@ -10,26 +10,32 @@
 //! branch the remote's `HEAD` names, so a changed default branch is picked
 //! up by the next fetch.
 //!
-//! `file://`, `ssh://` (through the `ssh` program) and `git://` URLs work
-//! everywhere. `https://` and `http://` need the HTTP transport, which is
-//! built on every target except Redox.
+//! `file://`, `ssh://` (through the `ssh` program) and `git://` URLs use
+//! gix's transports. `https://` and `http://` use fox's own HTTP backend
+//! ([`crate::http`]), on every target including Redox.
 
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+use gix::protocol::transport::Protocol;
+use gix::protocol::transport::client::blocking_io::{Transport, http};
 use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
-use gix::remote::Direction;
+use gix::remote::{Connection, Direction, fetch::Outcome};
 
+use crate::http::GitHttp;
 use crate::{GitError, Repository};
 
 /// The refspecs a cache mirrors.
 const REFSPECS: [&str; 2] = ["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
 
-/// Also asked for when updating a cache, so the remote advertises which
-/// branch its `HEAD` names. It writes no local ref.
+/// Also asked for, so the remote advertises which branch its `HEAD` names.
+/// It writes no local ref.
 const HEAD_REFSPEC: &str = "HEAD";
+
+/// The name the source's URL is saved under in a new cache.
+const ORIGIN: &str = "origin";
 
 /// Fetches `url` into the bare repository `cache`, cloning it there first
 /// if it does not exist, and returns the cache.
@@ -41,33 +47,13 @@ const HEAD_REFSPEC: &str = "HEAD";
 /// repository, and [`GitError::Export`] if the cache directory cannot be
 /// prepared.
 pub fn fetch(url: &str, cache: &Path) -> Result<Repository, GitError> {
-    install_tls_provider();
     let fetch_error = |source| GitError::Fetch {
         url: url.to_owned(),
         source: Box::new(source),
     };
-    let interrupt = AtomicBool::new(false);
     if cache.exists() {
         let repo = Repository::open(cache)?;
-        let remote = repo
-            .inner
-            .remote_at(url)
-            .and_then(|remote| {
-                remote.with_refspecs(
-                    REFSPECS.iter().copied().chain([HEAD_REFSPEC]),
-                    Direction::Fetch,
-                )
-            })
-            .map_err(fetch_error)?;
-        let outcome = remote
-            .connect(Direction::Fetch)
-            .and_then(|connection| {
-                connection.prepare_fetch(gix::progress::Discard, Default::default())
-            })
-            .and_then(|prepare| prepare.receive(gix::progress::Discard, &interrupt))
-            .map_err(fetch_error)?;
-        prune_tags(&repo, &outcome.ref_map.remote_refs).map_err(fetch_error)?;
-        follow_remote_head(&repo, &outcome.ref_map.remote_refs).map_err(fetch_error)?;
+        update(&repo, url).map_err(fetch_error)?;
         return Ok(repo);
     }
 
@@ -81,20 +67,62 @@ pub fn fetch(url: &str, cache: &Path) -> Result<Repository, GitError> {
             source,
         })?;
     }
-    let (repo, _) = gix::prepare_clone_bare(url, &partial)
-        .map(|prepare| {
-            prepare.configure_remote(|remote| {
-                remote.with_refspecs(REFSPECS[1..].iter().copied(), Direction::Fetch)
-            })
-        })
-        .and_then(|mut prepare| prepare.fetch_only(gix::progress::Discard, &interrupt))
-        .map_err(fetch_error)?;
-    drop(repo);
+    let repo = gix::init_bare(&partial).map_err(fetch_error)?;
+    save_origin(&repo, url).map_err(|source| match source {
+        Origin::Git(source) => fetch_error(source),
+        Origin::Io(source) => GitError::Export {
+            path: partial.clone(),
+            source,
+        },
+    })?;
+    update(&Repository { inner: repo }, url).map_err(fetch_error)?;
     fs::rename(&partial, cache).map_err(|source| GitError::Export {
         path: cache.to_path_buf(),
         source,
     })?;
     Repository::open(cache)
+}
+
+enum Origin {
+    Git(gix::Error),
+    Io(io::Error),
+}
+
+/// Records `url` as the cache's `origin`, as a clone does.
+fn save_origin(repo: &gix::Repository, url: &str) -> Result<(), Origin> {
+    let path = repo.path().join("config");
+    let mut config =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(Origin::Git)?;
+    repo.remote_at(url)
+        .and_then(|mut remote| remote.save_as_to(ORIGIN, &mut config))
+        .map_err(Origin::Git)?;
+    fs::write(&path, config.to_bstring()).map_err(Origin::Io)
+}
+
+/// Fetches the remote's branches and tags into `repo`, then drops the tags
+/// the remote no longer has and follows its `HEAD`.
+fn update(repo: &Repository, url: &str) -> gix::Result<()> {
+    let remote = repo.inner.remote_at(url)?.with_refspecs(
+        REFSPECS.iter().copied().chain([HEAD_REFSPEC]),
+        Direction::Fetch,
+    )?;
+    let outcome = if url.starts_with("https://") || url.starts_with("http://") {
+        let url = gix::url::parse(gix::bstr::BStr::new(url))?;
+        let transport = http::connect_http(GitHttp::new(), url, Protocol::V2, false);
+        receive(remote.to_connection_with_transport(transport))?
+    } else {
+        receive(remote.connect(Direction::Fetch)?)?
+    };
+    prune_tags(repo, &outcome.ref_map.remote_refs)?;
+    follow_remote_head(repo, &outcome.ref_map.remote_refs)
+}
+
+fn receive<T: Transport>(connection: Connection<'_, '_, '_, T>) -> gix::Result<Outcome> {
+    let interrupt = AtomicBool::new(false);
+    connection
+        .prepare_fetch(gix::progress::Discard, Default::default())?
+        .receive(gix::progress::Discard, &interrupt)
 }
 
 /// Deletes the cache's tags that the remote did not advertise.
@@ -169,15 +197,3 @@ fn remove_partial(partial: &Path) -> Result<(), GitError> {
         _ => Ok(()),
     }
 }
-
-/// rustls is built without a default crypto provider (see Cargo.toml), so
-/// the HTTP transport needs ring installed as the process default.
-#[cfg(not(target_os = "redox"))]
-pub(crate) fn install_tls_provider() {
-    // An error means a provider is already installed, which is all this
-    // needs.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-#[cfg(target_os = "redox")]
-pub(crate) fn install_tls_provider() {}

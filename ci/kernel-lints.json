@@ -6,7 +6,7 @@
   "clippy::undocumented_unsafe_blocks": 532,
   "clippy::unwrap_used": 73,
   "dead_code": 16,
-  "unsafe keyword": 1158,
+  "unsafe keyword": 1156,
   "unused_imports": 5,
   "unused_mut": 3,
   "unused_variables": 1

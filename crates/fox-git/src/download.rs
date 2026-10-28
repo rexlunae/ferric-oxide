@@ -5,8 +5,8 @@
 //! response whose BLAKE3 matches, so a mirror carries no trust. Reads stop
 //! after the caller's size limit.
 //! `file://` URLs and plain paths read the local file system; `https://`
-//! and `http://` use the same reqwest and rustls-on-ring stack as git
-//! fetching, and are not built for Redox.
+//! and `http://` use the same ureq client as git fetching, on every target
+//! (failures are [`HttpError`](crate::HttpError)s), and follow redirects.
 
 use std::fs;
 use std::io::{self, Read};
@@ -51,9 +51,8 @@ pub enum BlobError {
         source: io::Error,
     },
     /// The HTTP request failed.
-    #[cfg(not(target_os = "redox"))]
     #[error("HTTP request failed")]
-    Http(#[source] reqwest::Error),
+    Http(#[source] crate::HttpError),
     /// The URL scheme is not supported on this system.
     #[error("unsupported URL scheme")]
     Scheme,
@@ -147,24 +146,15 @@ fn read_limited(reader: impl Read, length: u64) -> Result<Vec<u8>, Limited> {
     Ok(bytes)
 }
 
-#[cfg(not(target_os = "redox"))]
 fn fetch_http(url: &str, length: u64) -> Result<Vec<u8>, BlobError> {
-    crate::fetch::install_tls_provider();
-    let response = reqwest::blocking::get(url)
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(BlobError::Http)?;
-    read_limited(response, length).map_err(|error| match error {
+    let body = crate::http::get(url).map_err(BlobError::Http)?;
+    read_limited(body, length).map_err(|error| match error {
         Limited::Io(source) => BlobError::Io {
             path: PathBuf::from(url),
             source,
         },
         Limited::TooLarge => BlobError::TooLarge { expected: length },
     })
-}
-
-#[cfg(target_os = "redox")]
-fn fetch_http(_url: &str, _length: u64) -> Result<Vec<u8>, BlobError> {
-    Err(BlobError::Scheme)
 }
 
 #[cfg(test)]
