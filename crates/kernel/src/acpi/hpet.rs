@@ -1,7 +1,9 @@
-use core::ptr::{self, read_volatile, write_volatile};
+use core::ptr;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use core::ptr::{read_volatile, write_volatile};
 
 use crate::memory::PhysicalAddress;
-#[cfg(not(target_arch = "x86"))]
+#[cfg(target_arch = "x86_64")]
 use crate::memory::{RmmA, RmmArch};
 
 use super::{sdt::Sdt, GenericAddressStructure, ACPI_TABLE};
@@ -97,6 +99,7 @@ impl Hpet {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub unsafe fn read_u64(&self, offset: usize) -> u64 {
         unsafe {
             read_volatile(
@@ -108,6 +111,7 @@ impl Hpet {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub unsafe fn write_u64(&mut self, offset: usize, value: u64) {
         unsafe {
             write_volatile(

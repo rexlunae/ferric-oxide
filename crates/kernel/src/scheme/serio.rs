@@ -1,16 +1,11 @@
 //! PS/2 unfortunately requires a kernel driver to prevent race conditions due
 //! to how status is utilized
 
-//use core::sync::atomic::AtomicBool;
-
-use syscall::data::GlobalSchemes;
-
 use crate::{
-    event,
     scheme::*,
     sync::{CleanLockToken, RwLock, WaitQueue, L1},
     syscall::{
-        flag::{EventFlags, EVENT_READ, O_NONBLOCK},
+        flag::{EventFlags, O_NONBLOCK},
         usercopy::UserSliceWo,
     },
 };
@@ -33,21 +28,9 @@ struct Handle {
 
 static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
 
-//pub static DEBUG_ENABLE: AtomicBool = AtomicBool::new(false);
-
 /// Add to the input queue
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn serio_input(index: usize, data: u8, token: &mut CleanLockToken) {
-    //unsafe {
-    if index == 0 && data == 45 {
-        // x key pressed
-        //crate::debugger::debugger(None, token);
-    } else if index == 0 && data == 44 {
-        // z key pressed
-        //DEBUG_ENABLE.fetch_xor(true, Ordering::SeqCst);
-    }
-    //}
-    //crate::profiling::serio_command(index, data);
-
     INPUT[index].send(data, token);
 
     let ids: Vec<usize> = {
@@ -59,7 +42,12 @@ pub fn serio_input(index: usize, data: u8, token: &mut CleanLockToken) {
     };
 
     for id in ids {
-        event::trigger(GlobalSchemes::Serio.scheme_id(), id, EVENT_READ, token);
+        crate::event::trigger(
+            syscall::data::GlobalSchemes::Serio.scheme_id(),
+            id,
+            EventFlags::EVENT_READ,
+            token,
+        );
     }
 }
 

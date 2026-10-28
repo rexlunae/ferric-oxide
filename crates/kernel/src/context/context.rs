@@ -706,6 +706,7 @@ impl Kstack {
     pub fn initial_top(&self) -> *mut u8 {
         unsafe { (RmmA::phys_to_virt(self.base.base()).data() as *mut u8).add(PAGE_SIZE << 4) }
     }
+    #[cfg(target_arch = "aarch64")]
     pub fn initial_top_phys(&self) -> usize {
         self.base.base().data() + self.len()
     }
@@ -1199,11 +1200,6 @@ impl RadixFdTbl {
         }
     }
 
-    #[inline]
-    pub fn allocated_size(&self) -> usize {
-        self.allocated_size
-    }
-
     pub fn get(&self, handle: usize) -> Option<&FileDescriptor> {
         if handle >= self.allocated_size {
             return None;
@@ -1226,27 +1222,6 @@ impl RadixFdTbl {
         let handle = ferric_nospec::clamp(handle, self.allocated_size);
         let shift = self.root_shift();
         self.root.as_deref_mut()?.get_mut(handle, shift)?.as_mut()
-    }
-
-    pub fn get_slot(&self, handle: usize) -> Option<&Option<FileDescriptor>> {
-        if handle >= self.allocated_size {
-            return None;
-        }
-        // Ferric Oxide: keep a mispredicted bounds check from walking the
-        // table with an attacker-chosen index (Spectre v1).
-        let handle = ferric_nospec::clamp(handle, self.allocated_size);
-        self.root.as_deref()?.get(handle, self.root_shift())
-    }
-
-    pub fn get_slot_mut(&mut self, handle: usize) -> Option<&mut Option<FileDescriptor>> {
-        if handle >= self.allocated_size {
-            return None;
-        }
-        // Ferric Oxide: keep a mispredicted bounds check from walking the
-        // table with an attacker-chosen index (Spectre v1).
-        let handle = ferric_nospec::clamp(handle, self.allocated_size);
-        let shift = self.root_shift();
-        self.root.as_deref_mut()?.get_mut(handle, shift)
     }
 
     #[inline]

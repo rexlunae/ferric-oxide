@@ -46,8 +46,6 @@ pub const SCALE: u128 = 1 << 30;
 pub const TICK_INTERVAL: u64 = 3; // Approx 6.75 ms
 pub const BASE_SLICE_TICKS: u64 = TICK_INTERVAL * 3; // Approx 20.25 ms
 pub const NANOS_PER_TICK: u128 = 2_250_000; // 2.25 ms
-pub const STEAL_THRESHOLD: usize = 2;
-pub const STEAL_INTERVAL: usize = 2;
 pub const MAX_STEAL: usize = 2;
 
 /// Determines if a given context is eligible to be scheduled on a given CPU (in
@@ -868,47 +866,10 @@ fn select_next_context(
         let num_cpu = crate::cpu_count();
         let curr_cpu = cpu_id.get();
 
-        /* // disabled: unused (see below)
-        let counter = percpu
-            .switch_internals
-            .steal_counter
-            .fetch_add(1, Ordering::Relaxed)
-            % STEAL_INTERVAL;
-        */
-
-        let mut steal_hint = None;
-        let should_steal = !contexts_data.is_stealable()
-            /* // disabled: causing livelock in webkit
-            || (counter == 0 && {
-                let mut max_neighbour = 0;
-
-                for i in 0..num_cpu {
-                    if i == curr_cpu {
-                        continue;
-                    }
-
-                    if let Some(p) = get_percpu_block(LogicalCpuId::new(i)) {
-                        let neighbour_len = p.switch_internals.queue_len.load(Ordering::Relaxed);
-
-                        if neighbour_len > max_neighbour {
-                            max_neighbour = neighbour_len;
-                            steal_hint = Some(i);
-                        }
-                    }
-                }
-
-                max_neighbour > contexts_data.queue.len().saturating_add(STEAL_THRESHOLD)
-            })*/;
-
-        if should_steal {
-            let targets = steal_hint
-                .into_iter()
-                .chain((1..num_cpu).map(|i| (curr_cpu + i) % num_cpu));
+        if !contexts_data.is_stealable() {
+            let targets = (1..num_cpu).map(|i| (curr_cpu + i) % num_cpu);
 
             for target_cpu in targets {
-                if target_cpu == curr_cpu {
-                    continue;
-                }
                 let Some(target_percpu) = get_percpu_block(LogicalCpuId::new(target_cpu)) else {
                     continue;
                 };
@@ -1492,7 +1453,6 @@ pub struct ContextSwitchPercpu {
     pub(crate) stealable: AtomicBool,
     pub(crate) queue_len: AtomicUsize,
     pub(crate) total_weight: AtomicU64,
-    pub(crate) steal_counter: AtomicUsize,
     /// Ferric Oxide: the current `schedule` call passed a runnable context over because a lock
     /// it needs was held elsewhere (see [`SwitchResult::Contended`]).
     passed_over: Cell<bool>,
@@ -1517,7 +1477,6 @@ impl ContextSwitchPercpu {
             stealable: AtomicBool::new(false),
             queue_len: AtomicUsize::new(0),
             total_weight: AtomicU64::new(0),
-            steal_counter: AtomicUsize::new(0),
             passed_over: Cell::new(false),
 
             #[cfg(feature = "profiling")]
@@ -1567,6 +1526,7 @@ impl ContextSwitchPercpu {
 
     /// Ferric Oxide: the idle context, or `None` on a CPU that never set up contexts (the
     /// `kernel.profiling` profiler CPU).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn try_idle_context(&self) -> Option<Ref<'_, Arc<ContextLock>>> {
         super::idle::get(&self.idle_ctxt)
     }
@@ -1675,17 +1635,6 @@ mod tests {
                 },
             );
         }
-        fn check_and_reset_steal(cpu0: &mut PercpuBlock) {
-            assert_eq!(
-                cpu0.switch_internals.steal_counter.load(Ordering::Relaxed),
-                1
-            );
-            // need to be done to guarantee the cpu will do stealing
-            cpu0.switch_internals
-                .steal_counter
-                .store(0, Ordering::Relaxed);
-        }
-
         // q0 have empty queue
         {
             let mut q1 = cpu1.switch_internals.run_queue.lock();
@@ -1712,7 +1661,6 @@ mod tests {
             &cpu0.switch_internals.idle_context(),
             ArcContextLockWriteGuard::rwlock(&g)
         )));
-        check_and_reset_steal(cpu0);
 
         // second test ---
 
@@ -1741,7 +1689,6 @@ mod tests {
         assert_eq!(cpu1.switch_internals.queue_len.load(Ordering::Relaxed), 2);
         assert!(chosen
             .is_some_and(|(g, _)| Arc::ptr_eq(&tasks[0], ArcContextLockWriteGuard::rwlock(&g))));
-        check_and_reset_steal(cpu0);
 
         // third test ---
 
@@ -1762,7 +1709,6 @@ mod tests {
         assert_eq!(cpu1.switch_internals.queue_len.load(Ordering::Relaxed), 2);
         assert!(chosen
             .is_some_and(|(g, _)| Arc::ptr_eq(&tasks[1], ArcContextLockWriteGuard::rwlock(&g))));
-        check_and_reset_steal(cpu1);
 
         // fourth test ---
 
@@ -1800,6 +1746,5 @@ mod tests {
         assert_eq!(cpu1.switch_internals.queue_len.load(Ordering::Relaxed), 0);
         assert!(chosen
             .is_some_and(|(g, _)| Arc::ptr_eq(&tasks[2], ArcContextLockWriteGuard::rwlock(&g))));
-        check_and_reset_steal(cpu1);
     }
 }

@@ -126,7 +126,9 @@ extern "C" fn kstart() {
 }
 
 /// The entry to Rust, all things must be initialized
-unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
+///
+/// The entry assembly also passes the boot stack's end, which the BSP needs no further setup for.
+unsafe extern "C" fn start(args_ptr: *const KernelArgs, _stack_end: usize) -> ! {
     unsafe {
         let args = args_ptr.read();
 
@@ -147,7 +149,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
         crate::arch::ibt::check();
 
         // Set up GDT
-        gdt::init_bsp(stack_end);
+        gdt::init_bsp();
 
         // Set up IDT, except its IST
         idt::init_bsp_before_mem();
@@ -157,7 +159,7 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, stack_end: usize) -> ! {
         let mut bump_allocator =
             crate::startup::memory::init(&args, Some(0x100000), Some(0x40000000));
         #[cfg(target_arch = "x86_64")]
-        let mut bump_allocator = crate::startup::memory::init(&args, Some(0x100000), None);
+        let bump_allocator = crate::startup::memory::init(&args, Some(0x100000), None);
 
         // Initialize misc features for paging
         paging::init();

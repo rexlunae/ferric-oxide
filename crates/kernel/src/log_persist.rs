@@ -16,7 +16,7 @@
 //! - [`crate::log_persist::append`], from `Log::write` under the in-memory log's lock, appends every logged byte,
 //!   the panic handler's message included.
 
-use alloc::{sync::Arc, vec};
+use alloc::sync::Arc;
 
 use ferric_trace::klog::{EarlyLog, Log, Previous, REGION_BYTES};
 use spin::{Mutex, Once};

@@ -236,16 +236,12 @@ pub fn futex(
                 let (futexes_map, mut token) = futexes_map.token_split();
 
                 let is_empty = if let Some(futexes) = futexes_map.get_mut(&target_physaddr) {
-                    let mut i = 0;
-                    // TODO: Use something like retain, once it is possible to tell it when to stop iterating...
-                    while i < futexes.len() && woken < val {
-                        // SAFETY: already verified index is less than length
-                        let futex = unsafe { futexes.get_unchecked_mut(i) };
+                    while woken < val && !futexes.is_empty() {
+                        let futex = futexes.swap_remove(0);
                         if let Some(ctx) = futex.context_lock.upgrade() {
                             unblock_context(&ctx, &mut token.token().downgrade());
                             woken += 1;
                         }
-                        futexes.swap_remove(i);
                     }
 
                     futexes.is_empty()

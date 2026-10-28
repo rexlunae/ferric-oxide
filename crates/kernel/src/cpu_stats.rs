@@ -113,6 +113,7 @@ impl CpuStats {
     /// This should be called in all `crate::arch::interrupt::irq::eoi`,
     /// for all architectures.
     #[inline]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn add_irq(&self, irq: u8) {
         IRQ_COUNT[irq as usize].fetch_add(1, Ordering::Relaxed);
         // Since this is percpu, but allowed to be accessed readonly from the outside, fetch_add is

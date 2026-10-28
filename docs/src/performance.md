@@ -105,8 +105,6 @@ This is an example flamegraph. If you open the image in a new tab, there is usef
 
 The steps below are for profiling on `x86_64`, running in `QEMU`. It is possible to run the tests on real hardware, although retrieving the data require additional effort.
 
-If you use PS/2 input devices in real hardware you need to disable the `serio_command` code in the `src/profiling.rs` file.
-
 #### Setup
 
 1. Open a terminal window in the repository root.

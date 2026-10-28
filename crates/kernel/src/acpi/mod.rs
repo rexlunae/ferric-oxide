@@ -24,11 +24,11 @@ mod rsdp;
 mod rsdt;
 mod rxsdt;
 pub mod sdt;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 pub mod slit;
 #[cfg(target_arch = "aarch64")]
 mod spcr;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "numa"))]
 pub mod srat;
 mod xsdt;
 

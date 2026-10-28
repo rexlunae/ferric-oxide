@@ -6,11 +6,7 @@ use crate::{
     memory::{map_device_memory, PhysicalAddress, PAGE_SIZE},
 };
 
-const INTERRUPT_TYPE_8259: u8 = 1 << 0;
-const INTERRUPT_TYPE_APIC: u8 = 1 << 1;
-const INTERRUPT_TYPE_SAPIC: u8 = 1 << 2;
 const INTERRUPT_TYPE_GIC: u8 = 1 << 3;
-const INTERRUPT_TYPE_PLIC: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
