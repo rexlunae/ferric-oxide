@@ -19,6 +19,7 @@ mod macros;
 mod disk;
 mod memory_map;
 mod panic;
+#[cfg(feature = "serial_debug")]
 pub(crate) mod serial;
 mod thunk;
 mod vbe;

@@ -73,9 +73,6 @@ pub fn edit_env(os: &impl Os, env_ptr: *mut u8, env_size: &mut usize, max_size: 
                 if cursor_end == 0 || *env_size == 0 {
                     continue;
                 }
-                if cursor_start == cursor_end && iline > 0 {
-                    iline -= 1;
-                }
                 for i in cursor_end..*env_size {
                     env_slice[i - 1] = env_slice[i];
                 }
