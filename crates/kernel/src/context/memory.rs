@@ -18,7 +18,7 @@ use core::{
     ops::{Bound, Deref},
     sync::atomic::Ordering,
 };
-use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush, PhysicalAddress};
+use rmm::{Arch as _, FrameAllocator, FrameCount, PageFlush, PhysicalAddress, Unmapped};
 use smallvec::SmallVec;
 use syscall::{error::*, flag::MapFlags, GrantFlags, MunmapFlags, NumaMemoryPolicy};
 
@@ -790,7 +790,8 @@ impl AddrSpaceWrapper {
             let dst_grant_base = dst_base.next_by(middle.base.offset_from(src_span.base));
             let middle_span = middle.span();
 
-            dst.grants.insert(match src_opt.as_mut() {
+            let mut middle = middle;
+            let moved = match src_opt.as_mut() {
                 Some((_, other_mapper, other_flusher)) => middle.transfer(
                     dst_grant_base,
                     page_flags(new_flags),
@@ -798,7 +799,7 @@ impl AddrSpaceWrapper {
                     Some(&mut dst.table.utable),
                     other_flusher,
                     &mut dst_flusher,
-                )?,
+                ),
                 None => middle.transfer(
                     dst_grant_base,
                     page_flags(new_flags),
@@ -806,8 +807,17 @@ impl AddrSpaceWrapper {
                     None,
                     &mut dst_flusher,
                     &mut NopFlusher,
-                )?,
-            });
+                ),
+            };
+            if let Err(err) = moved {
+                // `transfer` left the pages mapped in the source: give the grant back to it.
+                src_opt
+                    .as_mut()
+                    .map_or(&mut dst.grants, |(g, _, _)| &mut *g)
+                    .insert(middle);
+                return Err(err);
+            }
+            dst.grants.insert(middle);
 
             prev_grant_end = middle_span.base.next_by(middle_span.count);
             let pages_advanced = prev_grant_end.offset_from(remaining_src_span.base);
@@ -2027,118 +2037,128 @@ impl Grant {
                 )
                 .map_err(|_| Error::new(ENOMEM));
             }
-            let mut src_addrspace = &mut *guard;
-            let mut src_flusher_state =
-                Flusher::with_cpu_set(&src.addr_space_lock.used_by).detach();
-            for dst_page in span.pages() {
-                let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
+            // Declared after `guard`, so every return drops (and flushes) it before `guard`
+            // releases the source address space's lock, as `Flusher::flush` requires. It holds
+            // the source remaps until then: the old translations and old CoW frames they leave
+            // must be shot down and released on the error paths too. `correct_inner` may release
+            // the lock and does take `guard` with it on failure, so the queue is flushed before
+            // each call and is empty if one fails.
+            let mut src_flusher = Flusher::with_cpu_set(&src.addr_space_lock.used_by);
+            // On failure, the error and how many pages were mapped before it.
+            let result: core::result::Result<(), (usize, Error)> = 'pages: {
+                for (mapped, dst_page) in span.pages().enumerate() {
+                    let src_page = src.src_base.next_by(dst_page.offset_from(span.base));
 
-                // TODO: Error code for "scheme responded with unmapped page"?
-                let (frame, page_flags) = match src_addrspace
-                    .table
-                    .utable
-                    .translate(src_page.start_address())
-                {
-                    Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
-                    // TODO: ensure the correct context is hardblocked, if necessary
-                    None => {
-                        let (frame, _, new_guard) = correct_inner(
-                            src.addr_space_lock,
-                            guard,
-                            src_page,
-                            AccessMode::Read,
-                            0,
-                        )
-                        .map_err(|_| Error::new(EIO))?;
-                        let page_flags = new_guard
-                            .table
-                            .utable
-                            .translate(src_page.start_address())
-                            .unwrap()
-                            .1;
-                        guard = new_guard;
-                        (frame, page_flags)
-                    }
-                };
-                src_addrspace = &mut *guard;
+                    // TODO: Error code for "scheme responded with unmapped page"?
+                    let (frame, page_flags) =
+                        match guard.table.utable.translate(src_page.start_address()) {
+                            Some((phys, page_flags)) => (Frame::containing(phys), page_flags),
+                            // TODO: ensure the correct context is hardblocked, if necessary
+                            None => {
+                                src_flusher.flush();
+                                let Ok((frame, _, new_guard)) = correct_inner(
+                                    src.addr_space_lock,
+                                    guard,
+                                    src_page,
+                                    AccessMode::Read,
+                                    0,
+                                ) else {
+                                    break 'pages Err((mapped, Error::new(EIO)));
+                                };
+                                let page_flags = new_guard
+                                    .table
+                                    .utable
+                                    .translate(src_page.start_address())
+                                    .expect("correct_inner mapped the page")
+                                    .1;
+                                guard = new_guard;
+                                (frame, page_flags)
+                            }
+                        };
 
-                let frame = if let Some(page_info) = get_page_info(frame) {
-                    match page_info.add_ref(RefKind::Shared) {
-                        Ok(()) => frame,
-                        // SAFETY: `guard` holds the source address space's lock, so no other
-                        // thread can change its tables. Remapping the page to the private copy
-                        // leaves the old translation cached; `flush.ignore()` is sound because
-                        // the remap and the old frame are queued on the source flusher, which
-                        // is flushed after the loop, so the old frame is freed only after every
-                        // CPU using the source address space has dropped the old translation.
-                        Err(AddRefError::CowToShared) => unsafe {
-                            let CowResult {
-                                new_frame: new_cow_frame,
-                                old_frame,
-                            } = cow(frame, page_info, RefKind::Shared)
-                                .map_err(|_| Error::new(ENOMEM))?;
+                    let frame = if let Some(page_info) = get_page_info(frame) {
+                        match page_info.add_ref(RefKind::Shared) {
+                            Ok(()) => frame,
+                            Err(AddRefError::CowToShared) => {
+                                let Ok(CowResult {
+                                    new_frame: new_cow_frame,
+                                    old_frame,
+                                }) = cow(frame, page_info, RefKind::Shared)
+                                else {
+                                    break 'pages Err((mapped, Error::new(ENOMEM)));
+                                };
 
-                            let (old_flags, _, flush) = src_addrspace
-                                .table
-                                .utable
-                                .remap_with_full(src_page.start_address(), |_, flags| {
-                                    Some((new_cow_frame.base(), flags))
-                                })
-                                .expect("page did exist");
-                            // The source flusher, flushed after the loop, invalidates this page
-                            // on every CPU using the source address space, this one included.
-                            flush.ignore();
-
-                            let mut src_flusher = Flusher {
-                                active_cpus: &src.addr_space_lock.used_by,
-                                state: src_flusher_state,
-                            };
-                            src_flusher.queue(
-                                Some(src_page),
-                                frame,
-                                None,
-                                TlbShootdownActions::change_of_flags(old_flags, new_flags),
-                            );
-
-                            if let Some(old_frame) = old_frame {
+                                // SAFETY: `guard` holds the source address space's lock, so no
+                                // other thread can change its tables. Remapping the page to the
+                                // private copy leaves the old translation cached;
+                                // `flush.ignore()` is sound because the remap and the old frame
+                                // are queued on `src_flusher`, so the old frame is freed only
+                                // after every CPU using the source address space, this one
+                                // included, has dropped the old translation.
+                                let old_flags = unsafe {
+                                    let (old_flags, _, flush) = guard
+                                        .table
+                                        .utable
+                                        .remap_with_full(src_page.start_address(), |_, flags| {
+                                            Some((new_cow_frame.base(), flags))
+                                        })
+                                        .expect("page did exist");
+                                    flush.ignore();
+                                    old_flags
+                                };
                                 src_flusher.queue(
                                     Some(src_page),
-                                    old_frame,
+                                    frame,
                                     None,
-                                    TlbShootdownActions::FREE,
+                                    TlbShootdownActions::change_of_flags(old_flags, new_flags),
                                 );
+                                if let Some(old_frame) = old_frame {
+                                    src_flusher.queue(
+                                        Some(src_page),
+                                        old_frame,
+                                        None,
+                                        TlbShootdownActions::FREE,
+                                    );
+                                }
+
+                                // TODO: there used to be an additional remove_ref here, was that
+                                // correct?
+
+                                new_cow_frame
                             }
-                            src_flusher_state = src_flusher.detach();
+                            Err(AddRefError::SharedToCow) => unreachable!(),
+                            Err(AddRefError::RcOverflow) => {
+                                break 'pages Err((mapped, Error::new(ENOMEM)));
+                            }
+                        }
+                    } else {
+                        frame
+                    };
 
-                            // TODO: there used to be an additional remove_ref here, was that
-                            // correct?
-
-                            new_cow_frame
-                        },
-                        Err(AddRefError::SharedToCow) => unreachable!(),
-                        Err(AddRefError::RcOverflow) => return Err(Error::new(ENOMEM)),
+                    let dst_flags = new_flags
+                        // FIXME make sure this stays in sync with the MemoryType flags
+                        .uncacheable(page_flags.has_flag(RmmA::ENTRY_FLAG_UNCACHEABLE))
+                        .device_memory(page_flags.has_flag(RmmA::ENTRY_FLAG_DEVICE_MEMORY))
+                        .write_combining(page_flags.has_flag(RmmA::ENTRY_FLAG_WRITE_COMBINING));
+                    // SAFETY: the caller holds the destination's lock and the span is free; the
+                    // tables this unlinks on failure go to `flusher`, which frees them only
+                    // after its shootdown. The new mapping needs no local flush: `flusher`
+                    // covers it as NEW_MAPPING.
+                    let dst_mapped = unsafe {
+                        mapper
+                            .map_phys_or_unlink(
+                                dst_page.start_address(),
+                                frame.base(),
+                                dst_flags,
+                                &mut queue_undone_borrow(flusher),
+                            )
+                            .map(|flush| flush.ignore())
+                    };
+                    if dst_mapped.is_none() {
+                        // Release the reference taken for this page above.
+                        flusher.queue(Some(dst_page), frame, None, TlbShootdownActions::FREE);
+                        break 'pages Err((mapped, Error::new(ENOMEM)));
                     }
-                } else {
-                    frame
-                };
-
-                unsafe {
-                    let flush = mapper
-                        .map_phys(
-                            dst_page.start_address(),
-                            frame.base(),
-                            new_flags
-                                // FIXME make sure this stays in sync with the MemoryType flags
-                                .uncacheable(page_flags.has_flag(RmmA::ENTRY_FLAG_UNCACHEABLE))
-                                .device_memory(page_flags.has_flag(RmmA::ENTRY_FLAG_DEVICE_MEMORY))
-                                .write_combining(
-                                    page_flags.has_flag(RmmA::ENTRY_FLAG_WRITE_COMBINING),
-                                ),
-                            0,
-                        )
-                        .unwrap();
-                    flush.ignore();
-
                     flusher.queue(
                         Some(dst_page),
                         frame,
@@ -2146,16 +2166,22 @@ impl Grant {
                         TlbShootdownActions::NEW_MAPPING,
                     );
                 }
+                Ok(())
+            };
+            if let Err((mapped, err)) = result {
+                // No grant will own the pages mapped so far: unmap them and release the
+                // reference each one took, after the destination's shootdown.
+                // SAFETY: as for the mappings above.
+                unsafe {
+                    mapper.unmap_span_deferring_tables(
+                        span.base.start_address(),
+                        mapped,
+                        &mut queue_undone_borrow(flusher),
+                    )
+                };
+                return Err(err);
             }
-
-            // `FlusherState` has no `Drop`: without this the remaps above are never invalidated
-            // and the old CoW frames queued as FREE are never released. `guard` still holds the
-            // source address space's lock, as `Flusher::flush` requires.
-            Flusher {
-                active_cpus: &src.addr_space_lock.used_by,
-                state: src_flusher_state,
-            }
-            .flush();
+            drop(src_flusher);
         }
 
         Ok(Self {
@@ -2499,22 +2525,66 @@ impl Grant {
             },
         })
     }
-    /// Move a grant between two address spaces.
+    /// Moves a grant to `dst_base`, in `dst_mapper`'s address space or, without one, within
+    /// `src_mapper`'s.
+    ///
+    /// Every destination page is mapped before any source page is unmapped. A failure then
+    /// leaves the source untouched and is undone in the destination alone, and no page table on
+    /// a destination path can be emptied (and queued for freeing) by a source unmap in between,
+    /// which would make the next destination page need a new table again.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` when the destination needs a page table and no frame is free. Nothing has moved
+    /// then: the source maps every page as before, the grant still describes the source, and
+    /// the destination mappings and page tables made so far are queued for removal on the
+    /// destination's flusher (`src_flusher` within one address space).
     pub fn transfer(
-        mut self,
+        &mut self,
         dst_base: Page,
         flags: PageFlags<RmmA>,
         src_mapper: &mut PageMapper,
-        mut dst_mapper: Option<&mut PageMapper>,
+        dst_mapper: Option<&mut PageMapper>,
         src_flusher: &mut Flusher,
         dst_flusher: &mut impl GenericFlusher,
-    ) -> Result<Grant> {
+    ) -> Result<()> {
         assert!(!self.info.is_pinned());
 
-        for src_page in self.span().pages() {
-            let dst_page = dst_base.next_by(src_page.offset_from(self.base));
+        // TODO: Validate flags?
+        let span = self.span();
+        let src_frame = |mapper: &PageMapper, i: usize| {
+            mapper
+                .translate(span.base.next_by(i).start_address())
+                .map(|(phys, _)| phys)
+        };
+        // SAFETY: the destination span is free (the caller checked it against the grants), the
+        // frames are the grant's own, and the undo only queues what it removes on the flusher
+        // of the address space it removes it from, which shoots it down before anything is
+        // freed. Within one address space that is `src_flusher`: `dst_flusher` is then a
+        // `NopFlusher`, which would free an emptied table at once.
+        let mapped = unsafe {
+            match dst_mapper {
+                Some(dst_mapper) => dst_mapper.map_span_or_none(
+                    dst_base.start_address(),
+                    span.count,
+                    flags,
+                    |_, i| src_frame(src_mapper, i),
+                    &mut queue_undone_move(dst_flusher),
+                ),
+                None => src_mapper.map_span_or_none(
+                    dst_base.start_address(),
+                    span.count,
+                    flags,
+                    src_frame,
+                    &mut queue_undone_move(src_flusher),
+                ),
+            }
+        };
+        if mapped.is_err() {
+            return Err(Error::new(ENOMEM));
+        }
 
-            // TODO: Validate flags?
+        for src_page in span.pages() {
             // SAFETY: the grant owns these pages, and `src_flusher` shoots down the old
             // translations (and the emptied page tables) before anything they held is freed.
             let Some((phys, lvl)) = (unsafe {
@@ -2533,24 +2603,13 @@ impl Grant {
             // TODO: huge pages
             debug_assert_eq!(lvl, 0, "no userspace pages have huge mappings");
 
+            let dst_page = dst_base.next_by(src_page.offset_from(span.base));
             src_flusher.queue(
                 Some(src_page),
                 Frame::containing(phys),
                 None,
                 TlbShootdownActions::MOVE,
             );
-
-            let dst_mapper = dst_mapper.as_deref_mut().unwrap_or(&mut *src_mapper);
-
-            // TODO: Preallocate to handle OOM?
-            let flush = unsafe {
-                dst_mapper
-                    .map_phys(dst_page.start_address(), phys, flags, 0)
-                    .expect("TODO: OOM")
-            };
-            unsafe {
-                flush.ignore();
-            }
             dst_flusher.queue(
                 Some(dst_page),
                 Frame::containing(phys),
@@ -2560,7 +2619,7 @@ impl Grant {
         }
 
         self.base = dst_base;
-        Ok(self)
+        Ok(())
     }
 
     // Caller must check this doesn't violate access rights for e.g. shared memory.
@@ -3557,6 +3616,44 @@ fn queue_table_free(flusher: &mut impl GenericFlusher) -> impl FnMut(PhysicalAdd
         )
     }
 }
+/// Returns a callback for [`rmm::PageMapper::map_span_or_none`] that queues what its undo
+/// removes on `flusher`: each page as MOVE, since its frame still belongs to the source, and
+/// each emptied page table as FREE_TABLE.
+fn queue_undone_move(flusher: &mut impl GenericFlusher) -> impl FnMut(Unmapped) + '_ {
+    move |unmapped| match unmapped {
+        Unmapped::Page(phys) => flusher.queue(
+            None,
+            Frame::containing(phys),
+            None,
+            TlbShootdownActions::MOVE,
+        ),
+        Unmapped::Table(table) => flusher.queue(
+            None,
+            Frame::containing(table),
+            None,
+            TlbShootdownActions::FREE_TABLE,
+        ),
+    }
+}
+/// Returns a callback for [`rmm::PageMapper::unmap_span_deferring_tables`] that queues what
+/// [`Grant::borrow_fmap`]'s undo removes on `flusher`: each page as FREE, which drops the
+/// reference the borrow took, and each emptied page table as FREE_TABLE.
+fn queue_undone_borrow(flusher: &mut impl GenericFlusher) -> impl FnMut(Unmapped) + '_ {
+    move |unmapped| match unmapped {
+        Unmapped::Page(phys) => flusher.queue(
+            None,
+            Frame::containing(phys),
+            None,
+            TlbShootdownActions::FREE,
+        ),
+        Unmapped::Table(table) => flusher.queue(
+            None,
+            Frame::containing(table),
+            None,
+            TlbShootdownActions::FREE_TABLE,
+        ),
+    }
+}
 /// Applies actions immediately, for address spaces that no CPU has loaded (such as one being
 /// dropped), where there is nothing to shoot down.
 pub struct NopFlusher;
@@ -3661,18 +3758,6 @@ impl<'a> Flusher<'a> {
                 invalidation: TlbInvalidation::new(),
             },
         }
-    }
-    fn detach(mut self) -> FlusherState {
-        let state = core::mem::replace(
-            &mut self.state,
-            FlusherState {
-                pagequeue: ArrayVec::new(),
-                dirty: false,
-                invalidation: TlbInvalidation::new(),
-            },
-        );
-        core::mem::forget(self);
-        state
     }
     // NOTE: Lock must be held, which must be guaranteed by the caller.
     pub fn flush(&mut self) {

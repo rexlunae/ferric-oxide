@@ -310,17 +310,6 @@ pages must be allocator-owned, and frames cannot be reused while a CPU or DMA
 mapping may still reach them. [Registered buffers and IOMMUs](ferric-io.md)
 describes the strict teardown and retry behavior that enforces those lifetimes.
 
-The same ordering applies to CPU translations. When a scheme shares a page
-it holds copy-on-write with a client (`Grant::borrow_fmap`), the kernel first
-gives the scheme a private copy, then remaps the scheme's page to it. The old
-translation stays in other CPUs' TLBs until a shootdown, so the remap is queued
-on the scheme address space's flusher, and that flusher runs once all pages
-are borrowed, while the address-space lock is still held. The old frame is
-released only after every CPU using that address space has acknowledged the
-shootdown. One limitation remains: if a later page in the same call fails with
-`ENOMEM`, the call returns early, and the remaps already queued are not
-flushed or their frames released.
-
 The same holds for page-table pages. When unmapping a user page empties a page
 table, `rmm`'s `PageMapper::unmap_phys_deferring_tables` unlinks the table and
 hands its frame to the caller instead of freeing it. The kernel's user unmap
@@ -335,6 +324,35 @@ that no CPU has loaded, such as one being dropped, use `NopFlusher` and free
 tables at once. `PageMapper::unmap_phys` still frees emptied tables
 immediately; it is used for kernel-half unmaps, which never free tables on
 x86_64 and RISC-V, and for the boot-time AP trampoline.
+
+The same ordering applies to CPU translations. When a scheme shares a page
+it holds copy-on-write with a client (`Grant::borrow_fmap`), the kernel first
+gives the scheme a private copy, then remaps the scheme's page to it. The old
+translation stays in other CPUs' TLBs until a shootdown, so the remap is queued
+on the scheme address space's flusher, and that flusher runs once all pages
+are borrowed, while the address-space lock is still held. The old frame is
+released only after every CPU using that address space has acknowledged the
+shootdown. This also holds when the call fails part way (`ENOMEM` from the copy,
+a reference-count overflow, a destination page table that cannot be allocated,
+or `EIO` from faulting in a source page): the flusher is dropped, and so
+flushed, before the lock guard, and it is flushed before each source fault-in,
+which may release the lock. The destination pages mapped before the failure are
+unmapped again and the references they took are released after the
+destination's shootdown
+([#277](https://github.com/rexlunae/ferric-oxide/issues/277)).
+
+Moving a grant (`Grant::transfer`, used by `AddrSpace::r#move` for `mremap` and
+proc transfers) maps every destination page with `PageMapper::map_span_or_none`
+before it unmaps any source page. If the destination needs a page table and no
+frame is free, the move fails with `ENOMEM` instead of panicking: the
+destination pages and the page tables allocated for them are unmapped again and
+queued on the destination's flusher, the source is untouched, and the grant
+returns to the source address space
+([#278](https://github.com/rexlunae/ferric-oxide/issues/278)). Mapping the
+destination first also means a source unmap cannot empty, and so queue for
+freeing, a page table that a later destination page needs: such tables are
+never reused before the shootdown. Grants already moved by an earlier step of
+the same `r#move` stay moved; only the failing grant is rolled back.
 
 ### Branch predictor barriers between processes
 
