@@ -118,19 +118,8 @@ impl State {
     /// lookups have their answer, so [`State::drop_unclaimed`] can tell those whose `Own` was
     /// cancelled.
     pub(crate) fn note_answered(&mut self) {
-        let mut bytes = [0; 64];
-        loop {
-            match self.wake_reader.read(&mut bytes) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => {
-                    if err.kind() != io::ErrorKind::WouldBlock {
-                        log::warn!("driver-network: reading the wake pipe failed: {err}");
-                    }
-                    break;
-                }
-            }
+        if let Err(err) = drain(&mut self.wake_reader) {
+            log::warn!("driver-network: reading the wake pipe failed: {err}");
         }
         note_answered(&mut self.lookups);
     }
@@ -616,6 +605,24 @@ impl<S> OwnLookup<S> {
     }
 }
 
+/// Reads `reader`, a non-blocking pipe, until it is empty or closed.
+///
+/// # Errors
+///
+/// Any read error other than `WouldBlock` (empty) and `Interrupted` (retried).
+fn drain(reader: &mut impl Read) -> io::Result<()> {
+    let mut bytes = [0; 64];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// [`State::note_answered`] for any key, so it can be tested without a scheme socket.
 fn note_answered<K, S>(lookups: &mut HashMap<K, OwnLookup<S>>) {
     for lookup in lookups.values_mut() {
@@ -688,6 +695,37 @@ mod tests {
         drop(sender);
         lookup.poll();
         assert!(matches!(lookup.answer, Some(Err(err)) if err == Error::new(EIO)));
+    }
+
+    /// A non-blocking pipe's read end: `bytes`, then `WouldBlock`, with an `Interrupted` first.
+    struct Pipe {
+        reads: VecDeque<io::Result<usize>>,
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads
+                .pop_front()
+                .unwrap_or_else(|| Err(io::ErrorKind::WouldBlock.into()))
+        }
+    }
+
+    #[test]
+    fn drain_reads_until_the_pipe_is_empty() {
+        let mut pipe = Pipe {
+            reads: VecDeque::from([Err(io::ErrorKind::Interrupted.into()), Ok(64), Ok(3)]),
+        };
+        drain(&mut pipe).expect("an empty pipe is not an error");
+        assert!(pipe.reads.is_empty());
+    }
+
+    #[test]
+    fn drain_reports_other_errors() {
+        let mut pipe = Pipe {
+            reads: VecDeque::from([Ok(1), Err(io::ErrorKind::BrokenPipe.into())]),
+        };
+        let err = drain(&mut pipe).expect_err("a broken pipe is reported");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]
