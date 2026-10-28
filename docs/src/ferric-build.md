@@ -18,6 +18,10 @@ cargo xtask run --headless
 Prerequisites are rustup, Git, curl, tar, Make, a native C/C++ compiler and SDK.
 On macOS, Xcode Command Line Tools supplies Clang and the SDK. NASM is
 needed only for the x86-64 kernel's assembly trampoline. QEMU is needed only to boot.
+Recipes that need the build-time Python (`host:python312`, for example libxcb
+through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
+Homebrew's `openssl@3` is found even though it is keg-only. OpenSSL 4 does not
+work with CPython 3.12.
 Use existing installations or install missing tools using your preferred
 method: setup never invokes Homebrew, a system package manager or sudo.
 

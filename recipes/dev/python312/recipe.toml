@@ -43,6 +43,28 @@ if [ "$TARGET" != "$COOKBOOK_HOST_TARGET" ]; then
     )
 else
     COOKBOOK_CONFIGURE_FLAGS=(--prefix=/usr)
+    # The host interpreter's ssl module needs OpenSSL 3: CPython 3.12 does not
+    # build against OpenSSL 4, which made ASN1_STRING opaque. Use the build
+    # machine's OpenSSL 3, from pkg-config or a keg-only Homebrew or MacPorts
+    # install, and stop before configure if there is none.
+    host_openssl=
+    for candidate in "$(pkg-config --variable=prefix openssl 2>/dev/null)" \
+        /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3 /opt/local/libexec/openssl3 /usr; do
+        if [ -n "$candidate" ] && grep -Eq '^#[[:space:]]*define[[:space:]]+OPENSSL_VERSION_MAJOR[[:space:]]+3[[:space:]]*$' \
+            "$candidate/include/openssl/opensslv.h" 2>/dev/null; then
+            host_openssl="$candidate"
+            break
+        fi
+    done
+    if [ -z "$host_openssl" ]; then
+        echo "host:python312 needs OpenSSL 3 headers on the build machine (for example Homebrew's openssl@3);" >&2
+        echo "put its pkgconfig directory on PKG_CONFIG_PATH if it is installed somewhere else" >&2
+        exit 1
+    fi
+    COOKBOOK_CONFIGURE_FLAGS+=(--with-openssl="$host_openssl")
+    if [ "$host_openssl" != /usr ]; then
+        COOKBOOK_CONFIGURE_FLAGS+=(--with-openssl-rpath=auto)
+    fi
 fi
 
 if [ "${COOKBOOK_DYNAMIC}" != "1" ]; then
