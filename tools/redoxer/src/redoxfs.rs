@@ -493,7 +493,12 @@ fn resize<D: redoxfs::Disk>(fs: &mut FileSystem<D>, shrink: bool) -> Result<(u64
     } else {
         old_size
     };
-    let max_size = disk_size - (fs.block * redoxfs::BLOCK_SIZE);
+    // Leave the last block out. The bootloader reads the filesystem into memory
+    // a chunk at a time from the partition's first block, and a chunk that ends
+    // exactly at the end of the disk makes the final read run past it, which the
+    // firmware refuses ("invalid parameter"). One block of slack keeps every
+    // read inside the partition.
+    let max_size = disk_size - (fs.block * redoxfs::BLOCK_SIZE) - redoxfs::BLOCK_SIZE;
 
     let new_size = if shrink { min_size } else { max_size };
 
