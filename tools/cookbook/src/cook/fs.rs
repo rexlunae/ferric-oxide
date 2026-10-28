@@ -351,7 +351,7 @@ pub fn read_toml<T: DeserializeOwned>(file_path: &Path) -> Result<T> {
 pub fn offline_check_exists(path: &PathBuf) -> Result<()> {
     if !path.exists() {
         bail_other_err!(
-            "{path:?} is not exist and unable to continue in offline mode",
+            "{path:?} does not exist and offline mode cannot download it: run `make fetch` once with network access, or turn off build.offline (REPO_OFFLINE)",
             path = path.display(),
         );
     }

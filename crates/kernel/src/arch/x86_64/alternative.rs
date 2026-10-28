@@ -196,6 +196,7 @@ pub unsafe fn early_init(bsp: bool) {
                     && cfg!(not(cpu_feature_auto = "xsaveopt"))
                     && cfg!(not(cpu_feature_auto = "avx512"))
                     && cfg!(not(cpu_feature_auto = "kpti"))
+                    && cfg!(not(cpu_feature_auto = "ibpb"))
                     && cfg!(not(cpu_feature_auto = "shstk"))
             );
         }

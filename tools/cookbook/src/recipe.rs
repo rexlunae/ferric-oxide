@@ -517,6 +517,9 @@ impl CookRecipe {
             "source" => {}
             // keep local changes
             "local" => self.recipe.source = None,
+            // A package server only has its own builds of code kept in this
+            // repository, never this checkout's, so those build from source.
+            "binary" if self.is_in_tree() => return self.apply_filesystem_config("source"),
             // download from remote build
             "binary" => {
                 self.recipe.source = None;
@@ -540,6 +543,32 @@ impl CookRecipe {
         self.rule = rule.to_string();
 
         Ok(())
+    }
+
+    /// Whether this recipe builds code kept in this repository: its source
+    /// is a `path`, or a `same_as` recipe whose source is.
+    ///
+    /// Such recipes are always built from source, even under the `binary`
+    /// rule, because a package server cannot have this checkout's build.
+    pub fn is_in_tree(&self) -> bool {
+        match &self.recipe.source {
+            Some(SourceRecipe::Path { .. }) => true,
+            Some(SourceRecipe::SameAs { same_as }) => {
+                Recipe::new(&self.dir.join(same_as).join("recipe.toml"))
+                    .is_ok_and(|canon| matches!(canon.source, Some(SourceRecipe::Path { .. })))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the prebuilt archive and metadata of every package this
+    /// recipe makes are already downloaded, as offline mode needs them.
+    pub fn has_downloaded_binaries(&self) -> bool {
+        let target_dir = self.dir.join("target").join(self.target);
+        self.recipe.get_packages_list().into_iter().all(|package| {
+            let (_, pkgar, toml) = crate::cook::package::package_source_paths(package, &target_dir);
+            pkgar.is_file() && toml.is_file()
+        })
     }
 
     pub fn guess_version(&self) -> Option<String> {
@@ -852,6 +881,75 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    fn write_recipe(root: &std::path::Path, name: &str, toml: &str) -> crate::recipe::CookRecipe {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("recipe.toml"), toml).unwrap();
+        crate::recipe::CookRecipe::from_path(&dir, true, false).unwrap()
+    }
+
+    #[test]
+    fn binary_rule_builds_in_tree_recipes_from_source() {
+        use crate::recipe::{BuildKind, SourceRecipe};
+
+        let root = tempfile::tempdir().unwrap();
+        let build = "[build]\ntemplate = \"custom\"\nscript = \"make\"\n";
+        let mut kernel = write_recipe(
+            root.path(),
+            "kernel",
+            &format!("[source]\npath = \"crates/kernel\"\n{build}"),
+        );
+        let mut profiling = write_recipe(
+            root.path(),
+            "profiling-kernel",
+            &format!("[source]\nsame_as = \"../kernel\"\n{build}"),
+        );
+        let mut curl = write_recipe(
+            root.path(),
+            "curl",
+            &format!("[source]\ntar = \"https://example.org/curl.tar.xz\"\n{build}"),
+        );
+
+        assert!(kernel.is_in_tree());
+        assert!(profiling.is_in_tree());
+        assert!(!curl.is_in_tree());
+
+        for recipe in [&mut kernel, &mut profiling] {
+            recipe.apply_filesystem_config("binary").unwrap();
+            assert_eq!(recipe.rule, "source");
+            assert!(matches!(recipe.recipe.build.kind, BuildKind::Custom { .. }));
+            assert!(recipe.recipe.source.is_some());
+        }
+        assert!(matches!(
+            kernel.recipe.source,
+            Some(SourceRecipe::Path { .. })
+        ));
+
+        curl.apply_filesystem_config("binary").unwrap();
+        assert_eq!(curl.rule, "binary");
+        assert_eq!(curl.recipe.build.kind, BuildKind::Remote);
+        assert!(curl.recipe.source.is_none());
+    }
+
+    #[test]
+    fn downloaded_binaries_need_every_archive_and_its_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let recipe = write_recipe(
+            root.path(),
+            "curl",
+            "[source]\ntar = \"https://example.org/curl.tar.xz\"\n\n[build]\ntemplate = \"custom\"\nscript = \"make\"\n",
+        );
+        let target_dir = recipe.dir.join("target").join(recipe.target);
+        std::fs::create_dir_all(&target_dir).unwrap();
+        assert!(!recipe.has_downloaded_binaries());
+
+        std::fs::write(target_dir.join("source.pkgar"), b"").unwrap();
+        assert!(!recipe.has_downloaded_binaries());
+
+        std::fs::write(target_dir.join("source.toml"), b"").unwrap();
+        assert!(recipe.has_downloaded_binaries());
     }
 
     #[test]

@@ -79,6 +79,14 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         self.handler.socket().inner()
     }
 
+    /// Ferric Oxide: a second descriptor the driver's event loop watches for reads alongside
+    /// [`NetworkScheme::event_handle`], calling [`NetworkScheme::tick`] when it is readable.
+    /// With the `bypass` feature it is the pipe that a queue socket's `Own` lookup wakes the
+    /// request loop through; without it there is none.
+    pub fn wake_handle(&self) -> Option<usize> {
+        self.scheme.scheme_data().bypass.wake_handle()
+    }
+
     pub fn adapter(&self) -> &T {
         &self.scheme.scheme_data().adapter
     }
@@ -109,9 +117,11 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         self.handler
             .read_and_process_requests(&mut self.scheme)
             .expect("driver-network: failed to read from socket");
+        self.scheme.scheme_data_mut().bypass.note_answered();
         self.handler
             .poll_all_requests(&mut self.scheme)
             .expect("driver-network: failed to poll requests");
+        self.scheme.scheme_data_mut().bypass.drop_unclaimed();
         self.handler
             .write_responses()
             .expect("driver-network: failed to write to socket");
@@ -155,7 +165,8 @@ impl<T: NetworkAdapter> NetworkSchemeData<T> {
     pub fn new(adapter: T, socket: Rc<Socket>) -> Self {
         Self {
             adapter,
-            bypass: bypass::State::new(socket),
+            bypass: bypass::State::new(socket)
+                .expect("driver-network: failed to create the bypass wake pipe"),
         }
     }
 }

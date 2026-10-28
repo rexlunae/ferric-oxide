@@ -120,33 +120,3 @@ diff -ruwN source/Modules/_cryptmodule.c source-new/Modules/_cryptmodule.c
      if (crypt_result == NULL) {
          return PyErr_SetFromErrno(PyExc_OSError);
      }
-diff -ruwN source/Modules/resource.c source-new/Modules/resource.c
---- source/Modules/resource.c	2025-10-09 18:07:00.000000000 +0700
-+++ source-new/Modules/resource.c	2025-12-09 22:14:30.781035339 +0700
-@@ -216,7 +216,7 @@
- {
-     struct rlimit rl;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;
-@@ -244,7 +244,7 @@
- {
-     struct rlimit rl;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;
-@@ -292,7 +292,7 @@
-     struct rlimit old_limit, new_limit;
-     int retval;
- 
--    if (resource < 0 || resource >= RLIM_NLIMITS) {
-+    if (resource < 0 || resource >= RLIMIT_NLIMITS) {
-         PyErr_SetString(PyExc_ValueError,
-                         "invalid resource specified");
-         return NULL;

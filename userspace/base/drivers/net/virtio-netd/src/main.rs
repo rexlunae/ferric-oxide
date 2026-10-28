@@ -113,6 +113,14 @@ fn daemon(
         flags: syscall::EVENT_READ,
         data: 0,
     })?;
+    // Ferric Oxide: the bypass wake pipe ticks the scheme too.
+    if let Some(wake) = scheme.wake_handle() {
+        event_queue.write(&syscall::Event {
+            id: wake,
+            flags: syscall::EVENT_READ,
+            data: 0,
+        })?;
+    }
 
     libredox::call::setrens(0, 0).expect("virtio-netd: failed to enter null namespace");
 
