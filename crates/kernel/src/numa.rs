@@ -44,7 +44,7 @@ impl NumaNodeID {
         }
         Ok(NumaNodeID(node_id))
     }
-    #[cfg(all(target_arch = "x86_64", feature = "numa"))]
+    #[cfg(all(target_arch = "x86_64", any(feature = "numa", feature = "irq-percpu")))]
     pub fn get(&self) -> u32 {
         self.0
     }
