@@ -296,9 +296,10 @@ the image's `var/lib/fox/`, where the target's `fox` can use them. The
 image SBOM is not signed yet.
 
 On the target, `fox` installs local `.pkgar` files and their dependencies
-from local repository directories. It does not fetch from package servers
-over HTTPS yet, which `pkg` does. Choose `packages.manager = "pkgutils"` for
-that.
+from local repository directories, and reaches registries, git sources and
+prebuilt artifacts over `https://` as the host does (see [HTTP and
+HTTPS](#http-and-https)); the fox recipe depends on `ca-certificates` for
+the certificate store.
 
 The CI smoke image (`config/ferric-smoke.toml`) ships `fox`. Its boot test
 lists the packages the installer recorded and runs `fox verify --installed`,
@@ -437,9 +438,10 @@ fox --root ./image-root trust list
    scheme and host, no trailing `/` or `.git`), which is also the source's
    identity in the trust store and in attestations. The cache mirrors the
    remote's branches and tags; a tag deleted upstream is deleted from the
-   cache too, so a withdrawn release is not built. HTTPS uses `gix`'s reqwest transport with
-   rustls on ring and is not built for Redox, where `fox` fetches over
-   `file://`, `ssh://` (through `ssh`) and `git://` only.
+   cache too, so a withdrawn release is not built. `file://`, `ssh://`
+   (through `ssh`) and `git://` use `gix`'s transports; `https://` and
+   `http://` use fox's own client (see [HTTP and HTTPS](#http-and-https)),
+   on the target as well as the host.
 2. **Choose.** Without `#`, the newest release tag is built: the highest
    semver-named tag (`1.2.3` or `v1.2.3`) that is not a pre-release. A name
    after `#` is a tag if one exists, otherwise any revision. Without tags,
@@ -501,6 +503,32 @@ the tag itself with that unencrypted OpenSSH Ed25519 key; otherwise it runs
 back, verifies its signature and prints the key's fingerprint, which users
 see when they first install the source. It refuses a dirty work tree or an
 existing tag, and pushes nothing.
+
+### HTTP and HTTPS
+
+`fox-git` has the one HTTP client `fox` uses, on the host and on the
+target alike: [`ureq`](https://crates.io/crates/ureq) over rustls with the
+`ring` provider (aws-lc-rs does not build for Redox). It serves both git's
+smart HTTP protocol, as `gix`'s HTTP backend, and blob downloads. There is
+no reqwest or tokio in the tree.
+
+- **Certificates.** Server certificates are checked against the system
+  store through `rustls-platform-verifier`. On the target that is
+  `/etc/ssl/certs`, from the `ca-certificates` package; `SSL_CERT_FILE`
+  and `SSL_CERT_DIR` override it.
+- **Proxies.** `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY` and `NO_PROXY` are
+  honored.
+- **Redirects.** Git requests do not follow redirects: a moved repository
+  is an error that names the new location, so the URL a package or
+  registry pins is the one fetched. Blob downloads follow up to 10
+  redirects, since their content is checked against its BLAKE3 hash
+  wherever it comes from.
+- **Not supported.** Git's `http.*` settings (extra headers, credential
+  helpers, timeouts) are not read; sources and registries are fetched
+  anonymously.
+
+The tests in `crates/fox-git/tests/` serve a repository with
+`git http-backend` and blobs from a small server on 127.0.0.1.
 
 ## Registries
 
