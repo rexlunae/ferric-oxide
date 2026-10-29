@@ -42,8 +42,11 @@ pub unsafe fn paging_create(os: &impl Os, kernel_phys: u64, kernel_size: u64) ->
             pml4[0] = pdp.as_ptr() as u64 | WRITABLE | PRESENT;
             pml4[256] = pdp.as_ptr() as u64 | WRITABLE | PRESENT;
 
-            // Identity map 8 GiB using 2 MiB pages
-            for pdp_i in 0..8 {
+            // Identity map MAX_PHYSICAL_ADDRESS using 2 MiB pages. Each PDP
+            // entry covers 1 GiB and one PDP holds 512, so the bound the
+            // allocator uses fits this single level-3 table.
+            let identity_gib = (crate::MAX_PHYSICAL_ADDRESS >> 30) as usize;
+            for pdp_i in 0..identity_gib {
                 let pd = paging_allocate(os)?;
                 pdp[pdp_i] = pd.as_ptr() as u64 | WRITABLE | PRESENT;
                 for pd_i in 0..pd.len() {

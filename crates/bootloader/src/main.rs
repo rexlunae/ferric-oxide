@@ -33,6 +33,15 @@ mod serial_16550;
 const KIBI: usize = 1024;
 const MIBI: usize = KIBI * KIBI;
 
+/// The highest physical address the bootloader addresses.
+///
+/// The paging code identity maps this much memory and the allocator will not
+/// place a buffer above it, so both use this one number. The bootloader loads
+/// the whole disk image below the bound, which means an image larger than it
+/// cannot boot: it has to stay above the largest live disk with room for the
+/// firmware, the kernel and the tables built while loading.
+pub(crate) const MAX_PHYSICAL_ADDRESS: u64 = 0x4_0000_0000;
+
 //TODO: allocate this in a more reasonable manner
 static mut AREAS: [OsMemoryEntry; 1024] = [OsMemoryEntry {
     base: 0,

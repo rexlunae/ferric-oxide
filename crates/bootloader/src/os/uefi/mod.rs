@@ -47,8 +47,9 @@ pub(crate) fn alloc_zeroed_page_aligned(size: usize) -> *mut u8 {
     let pages = size.div_ceil(page_size);
 
     let ptr = {
-        // Max address mapped by src/arch paging code (8 GiB)
-        let mut ptr = 0x2_0000_0000;
+        // The same bound the paging code maps, so what this returns is always
+        // addressable. A live disk larger than it cannot be loaded.
+        let mut ptr = crate::MAX_PHYSICAL_ADDRESS;
         status_to_result((std::system_table().BootServices.AllocatePages)(
             1,                                  // AllocateMaxAddress
             MemoryType::EfiRuntimeServicesData, // Keeps this memory out of free space list
